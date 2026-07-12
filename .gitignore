@@ -1,3 +1,37 @@
 /target
-/vendor
+/vendor/*
+# Tracked: temporary patched iced_tiny_skia (5 software-renderer fixes; see
+# CHANGELOG). iced is dropping skia, so this is interim. Keep only Cargo.toml +
+# src/ — skip cargo's registry-extraction cruft.
+!/vendor/iced_tiny_skia
+/vendor/iced_tiny_skia/.cargo*
+/vendor/iced_tiny_skia/Cargo.lock
+/vendor/iced_tiny_skia/Cargo.toml.orig
 /assets/Output
+# Linux Flatpak release output (the .flatpak bundle); see bin/release-linux.sh
+/dist
+/iced-repros
+/.claude/settings.local.json
+
+# 179MB public-domain benchmark corpus — kept locally (regenerable), not for git (GitHub 100MB push limit)
+/bench/logs/TheCountOfMonteCristo.txt
+.env
+
+# scriptref wiki credentials (url/token for the DokuWiki publisher)
+/scriptref/wiki.toml
+
+# --- Terraform / infra (infra/github-runner) ---
+# Provider dirs and real state/vars never go in git. State can hold the GitHub
+# App private key + webhook secret; the runners' state lives in S3, not here.
+**/.terraform/*
+*.tfvars
+!*.tfvars.example
+*.tfstate
+*.tfstate.*
+crash.log
+# ...but the state-bucket bootstrap seeds all other state, holds no secrets, and
+# must stay managed — so keep its local state tracked.
+!/infra/github-runner/bootstrap/terraform.tfstate
+!/infra/github-runner/bootstrap/terraform.tfstate.backup
+# Downloaded Lambda release artifacts (re-fetch with runners/fetch-lambdas.sh).
+/infra/github-runner/runners/lambdas/

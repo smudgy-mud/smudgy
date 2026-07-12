@@ -1,7 +1,6 @@
 use iced::{
-    border::{radius},
+    border::radius,
     widget::rule::{self, Catalog},
-    Color,
 };
 
 use crate::Theme;
@@ -20,10 +19,10 @@ impl Catalog for Theme {
     }
 }
 
+#[must_use]
 pub fn default(theme: &Theme) -> rule::Style {
     rule::Style {
         color: theme.styles.general.rule,
-        width: 1,
         radius: radius(0.0),
         fill_mode: rule::FillMode::Full,
         snap: false,

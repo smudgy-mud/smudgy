@@ -1,6 +1,7 @@
 // Models related to profile configurations
 
 use crate::get_smudgy_home;
+use crate::models::auth::{hex_decode, hex_encode, keyring_service, obfuscate};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -34,12 +35,12 @@ pub struct Profile {
 /// cannot be deserialized into a `ProfileConfig` or fail validation.
 fn load_profile_config(path: &PathBuf) -> Result<ProfileConfig> {
     let file_content = fs::read_to_string(path)
-        .context(format!("Failed to read profile config file: {path:?}"))?;
+        .context(format!("Failed to read profile config file: {}", path.display()))?;
     let config: ProfileConfig = serde_json::from_str(&file_content)
-        .context(format!("Failed to parse profile config file: {path:?}"))?;
+        .context(format!("Failed to parse profile config file: {}", path.display()))?;
     config
         .validate()
-        .context(format!("Profile config validation failed: {path:?}"))?;
+        .context(format!("Profile config validation failed: {}", path.display()))?;
     Ok(config)
 }
 
@@ -92,7 +93,8 @@ pub fn list_profiles(server_name: &str) -> Result<Vec<Profile>> {
                             } else {
                                 // Log warning: Invalid directory name (not UTF-8)
                                 eprintln!(
-                                    "Warning: Skipping profile directory with non-UTF8 name in server '{server_name}': {path:?}"
+                                    "Warning: Skipping profile directory with non-UTF8 name in server '{server_name}': {}",
+                                    path.display()
                                 );
                             }
                         }
@@ -193,7 +195,8 @@ pub fn create_profile(
 
     // Create the profile directory
     fs::create_dir(&profile_path).context(format!(
-        "Failed to create directory for profile '{profile_name}' in server '{server_name}' at {profile_path:?}"
+        "Failed to create directory for profile '{profile_name}' in server '{server_name}' at {}",
+        profile_path.display()
     ))?;
 
     // Write the profile.json file
@@ -203,7 +206,8 @@ pub fn create_profile(
     ))?;
 
     fs::write(&config_path, config_json).context(format!(
-        "Failed to write profile.json for profile '{profile_name}' in server '{server_name}' at {config_path:?}"
+        "Failed to write profile.json for profile '{profile_name}' in server '{server_name}' at {}",
+        config_path.display()
     ))?;
 
     Ok(Profile {
@@ -239,7 +243,7 @@ pub fn load_profile(server_name: &str, profile_name: &str) -> Result<Profile> {
             profile_name,
             server_name
         ))
-        .with_context(|| format!("Looked in directory: {profile_path:?}"));
+        .with_context(|| format!("Looked in directory: {}", profile_path.display()));
     }
 
     if !profile_path.is_dir() {
@@ -304,7 +308,7 @@ pub fn update_profile(
             profile_name,
             server_name
         ))
-        .with_context(|| format!("Looked for directory: {profile_path:?}"));
+        .with_context(|| format!("Looked for directory: {}", profile_path.display()));
     }
     if !profile_path.is_dir() {
         return Err(anyhow::anyhow!(
@@ -325,7 +329,8 @@ pub fn update_profile(
 
     // Write the new config, overwriting the old one
     fs::write(&config_path, config_json).context(format!(
-        "Failed to write updated profile.json for profile '{profile_name}' in server '{server_name}' at {config_path:?}"
+        "Failed to write updated profile.json for profile '{profile_name}' in server '{server_name}' at {}",
+        config_path.display()
     ))?;
 
     // Return the profile representation with the new config
@@ -372,7 +377,8 @@ pub fn delete_profile(server_name: &str, profile_name: &str) -> Result<()> {
 
         // Recursively remove the directory
         fs::remove_dir_all(&profile_path).context(format!(
-            "Failed to delete directory for profile '{profile_name}' in server '{server_name}' at {profile_path:?}"
+            "Failed to delete directory for profile '{profile_name}' in server '{server_name}' at {}",
+            profile_path.display()
         ))?;
     } else {
         // Optionally log that the profile didn't exist? For now, silent success.
@@ -381,5 +387,210 @@ pub fn delete_profile(server_name: &str, profile_name: &str) -> Result<()> {
         );
     }
 
+    // Remove any stored auto-login password. The obfuscated fallback file lived
+    // inside the profile directory (already gone above), but the OS keyring entry
+    // is outside it and must be cleared explicitly. Best effort.
+    if let Err(e) = clear_profile_password(server_name, profile_name) {
+        log::warn!(
+            "Failed to clear stored password for deleted profile '{server_name}/{profile_name}': {e}"
+        );
+    }
+
     Ok(())
+}
+
+// ===== Auto-login password ($PASSWORD) =====
+//
+// Auto-login text may embed the literal token `$PASSWORD`. The token is what lives
+// in `profile.json`; the real password is kept in the OS keyring (Windows
+// Credential Manager / macOS Keychain / Secret Service) keyed by (server, profile),
+// with an obfuscated-file fallback, mirroring `models::auth`. The password is
+// substituted into the auto-login text only when it is sent to the MUD
+// (see `substitute_password`, called from `session::config::load_connect_action`),
+// so it never touches `profile.json` and is never logged.
+
+/// The token users embed in a profile's auto-login text to stand in for a stored
+/// password.
+pub const PASSWORD_TOKEN: &str = "$PASSWORD";
+
+/// Whether `text` contains the [`PASSWORD_TOKEN`].
+#[must_use]
+pub fn contains_password_token(text: &str) -> bool {
+    text.contains(PASSWORD_TOKEN)
+}
+
+/// keyring slot for a profile's auto-login password — unique per (server, profile).
+/// Profile names are validated to alphanumeric/`_`/`-`, so `/` is a safe delimiter.
+fn password_keyring_slot(server_name: &str, profile_name: &str) -> String {
+    format!("profile-password:{server_name}/{profile_name}")
+}
+
+fn password_keyring_entry(
+    server_name: &str,
+    profile_name: &str,
+) -> keyring::Result<keyring::Entry> {
+    keyring::Entry::new(
+        keyring_service(),
+        &password_keyring_slot(server_name, profile_name),
+    )
+}
+
+/// Obfuscated fallback file for a profile's password, used only when no OS keyring
+/// is available. Lives inside the profile directory so it travels with — and is
+/// deleted alongside — the profile.
+fn password_fallback_path(server_name: &str, profile_name: &str) -> Result<PathBuf> {
+    Ok(get_smudgy_home()?
+        .join(server_name)
+        .join("profiles")
+        .join(profile_name)
+        .join(".password"))
+}
+
+/// Stores the auto-login password for (server, profile) in the OS keyring (with an
+/// obfuscated-file fallback when no keyring is available). Never written to
+/// `profile.json`, never logged.
+///
+/// # Errors
+///
+/// Returns an error if both the keyring write and the fallback-file write fail.
+pub fn set_profile_password(server_name: &str, profile_name: &str, password: &str) -> Result<()> {
+    match password_keyring_entry(server_name, profile_name).and_then(|e| e.set_password(password)) {
+        Ok(()) => {
+            // Don't leave a stale obfuscated copy behind once the keyring holds it.
+            if let Ok(path) = password_fallback_path(server_name, profile_name) {
+                let _ = fs::remove_file(path);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!(
+                "OS keyring unavailable for profile password, falling back to obfuscated file: {e}"
+            );
+            let path = password_fallback_path(server_name, profile_name)?;
+            let encoded = hex_encode(&obfuscate(password.as_bytes()));
+            fs::write(&path, encoded).context(format!(
+                "Failed to write password fallback file {}",
+                path.display()
+            ))
+        }
+    }
+}
+
+/// Reads the stored auto-login password for (server, profile), if any. Tries the OS
+/// keyring first, then the obfuscated fallback file. Never logs password material.
+#[must_use]
+pub fn get_profile_password(server_name: &str, profile_name: &str) -> Option<String> {
+    match password_keyring_entry(server_name, profile_name).and_then(|e| e.get_password()) {
+        Ok(password) => Some(password),
+        Err(e) => {
+            if !matches!(e, keyring::Error::NoEntry) {
+                log::warn!("Failed to read profile password from the OS keyring: {e}");
+            }
+            let path = password_fallback_path(server_name, profile_name).ok()?;
+            let content = fs::read_to_string(&path).ok()?;
+            let bytes = hex_decode(content.trim())?;
+            String::from_utf8(obfuscate(&bytes)).ok()
+        }
+    }
+}
+
+/// Whether an auto-login password is stored for (server, profile).
+#[must_use]
+pub fn has_profile_password(server_name: &str, profile_name: &str) -> bool {
+    get_profile_password(server_name, profile_name).is_some()
+}
+
+/// Removes the stored auto-login password for (server, profile) from both the OS
+/// keyring and the fallback file. Missing entries are fine.
+///
+/// # Errors
+///
+/// Returns an error if an existing keyring entry could not be removed.
+pub fn clear_profile_password(server_name: &str, profile_name: &str) -> Result<()> {
+    let keyring_result = match password_keyring_entry(server_name, profile_name)
+        .and_then(|e| e.delete_credential())
+    {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to delete profile password from the OS keyring: {e}"
+        )),
+    };
+    if let Ok(path) = password_fallback_path(server_name, profile_name) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!("Failed to delete password fallback file {}: {e}", path.display());
+            }
+        }
+    }
+    keyring_result
+}
+
+/// Substitutes [`PASSWORD_TOKEN`] in auto-login `text` with the stored password for
+/// (server, profile). Text without the token is returned unchanged; if the token is
+/// present but no password is stored, it is replaced with an empty string so the
+/// literal token is never sent to the MUD.
+#[must_use]
+pub fn substitute_password(server_name: &str, profile_name: &str, text: &str) -> String {
+    substitute_password_with_redactions(server_name, profile_name, text).0
+}
+
+/// Like [`substitute_password`], but also returns the secret substrings that were
+/// substituted in, so the caller can redact them from the client's view and the
+/// session log when the auto-login text is echoed. The returned vec is empty when
+/// the token was absent or no (non-empty) password was stored.
+#[must_use]
+pub fn substitute_password_with_redactions(
+    server_name: &str,
+    profile_name: &str,
+    text: &str,
+) -> (String, Vec<String>) {
+    if !text.contains(PASSWORD_TOKEN) {
+        return (text.to_string(), Vec::new());
+    }
+    let password = get_profile_password(server_name, profile_name).unwrap_or_else(|| {
+        log::warn!(
+            "Auto-login for '{server_name}/{profile_name}' uses {PASSWORD_TOKEN} but no password is stored; sending an empty value"
+        );
+        String::new()
+    });
+    let substituted = text.replace(PASSWORD_TOKEN, &password);
+    let redactions = if password.is_empty() {
+        Vec::new()
+    } else {
+        vec![password]
+    };
+    (substituted, redactions)
+}
+
+#[cfg(test)]
+mod password_tests {
+    use super::{PASSWORD_TOKEN, contains_password_token, password_keyring_slot, substitute_password};
+
+    #[test]
+    fn detects_token() {
+        assert!(contains_password_token("connect Gandalf $PASSWORD"));
+        assert!(!contains_password_token("connect Gandalf hunter2"));
+        assert_eq!(PASSWORD_TOKEN, "$PASSWORD");
+    }
+
+    #[test]
+    fn substitute_is_noop_without_token() {
+        // No token => returned unchanged and no keyring access happens.
+        let text = "connect Gandalf hunter2";
+        assert_eq!(substitute_password("Srv", "Gandalf", text), text);
+    }
+
+    #[test]
+    fn keyring_slot_is_unique_per_server_and_profile() {
+        assert_eq!(
+            password_keyring_slot("Arctic", "Gandalf"),
+            "profile-password:Arctic/Gandalf"
+        );
+        assert_ne!(
+            password_keyring_slot("A", "Gandalf"),
+            password_keyring_slot("B", "Gandalf")
+        );
+    }
 }

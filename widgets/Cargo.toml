@@ -1,0 +1,24 @@
+[package]
+name = "smudgy_widgets"
+version = "0.4.0"
+edition = "2024"
+
+[dependencies]
+arc-swap = { workspace = true }
+deno_core = { workspace = true }
+deno_error = { workspace = true }
+tokio = { workspace = true }
+smudgy_theme = { workspace = true }
+smudgy_map_widget = { workspace = true }
+smudgy_cloud = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+iced = { workspace = true }
+log = { workspace = true }
+thiserror = "2.0.12"
+# Same version iced's `markdown` feature pulls in, so command-autolink detection tokenizes
+# identically to iced's own parse (see `expand_command_autolinks`).
+pulldown-cmark = "0.12"
+
+[lints]
+workspace = true

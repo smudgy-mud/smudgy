@@ -3,7 +3,7 @@
 use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 use validator::Validate;
 
@@ -71,7 +71,8 @@ pub fn list_servers() -> Result<Vec<Server>> {
                             } else {
                                 // Log warning: Invalid directory name (not UTF-8)
                                 eprintln!(
-                                    "Warning: Skipping directory with non-UTF8 name: {path:?}"
+                                    "Warning: Skipping directory with non-UTF8 name: {}",
+                                    path.display()
                                 );
                             }
                         }
@@ -109,13 +110,13 @@ pub fn list_servers() -> Result<Vec<Server>> {
 /// Returns an error if the file cannot be opened, read, or if the contents
 /// cannot be deserialized into a `ServerConfig`.
 fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
-    let file_content =
-        fs::read_to_string(path).context(format!("Failed to read server config file: {path:?}"))?;
+    let file_content = fs::read_to_string(path)
+        .context(format!("Failed to read server config file: {}", path.display()))?;
     let config: ServerConfig = serde_json::from_str(&file_content)
-        .context(format!("Failed to parse server config file: {path:?}"))?;
+        .context(format!("Failed to parse server config file: {}", path.display()))?;
     config
         .validate()
-        .context(format!("Server config validation failed: {path:?}"))?;
+        .context(format!("Server config validation failed: {}", path.display()))?;
     Ok(config)
 }
 
@@ -131,7 +132,7 @@ fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
 /// # Errors
 ///
 /// Returns an error if any of the directories cannot be created.
-pub fn ensure_server_subdirs(server_path: &PathBuf) -> Result<()> {
+pub fn ensure_server_subdirs(server_path: &Path) -> Result<()> {
     let subdirs = [
         "profiles", "aliases", "hotkeys", "triggers", "modules", "maps", "logs",
     ];
@@ -139,7 +140,8 @@ pub fn ensure_server_subdirs(server_path: &PathBuf) -> Result<()> {
     for subdir in &subdirs {
         let dir_path = server_path.join(subdir);
         fs::create_dir_all(&dir_path).context(format!(
-            "Failed to create subdirectory '{subdir}' in {server_path:?}"
+            "Failed to create subdirectory '{subdir}' in {}",
+            server_path.display()
         ))?;
     }
 
@@ -189,7 +191,8 @@ pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
 
     // Create the main server directory
     fs::create_dir(&server_path).context(format!(
-        "Failed to create main directory for server '{name}' at {server_path:?}"
+        "Failed to create main directory for server '{name}' at {}",
+        server_path.display()
     ))?;
 
     // Ensure standard subdirectories are created
@@ -201,7 +204,8 @@ pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
         .context(format!("Failed to serialize config for server '{name}'"))?;
 
     fs::write(&config_path, config_json).context(format!(
-        "Failed to write server.json for server '{name}' at {config_path:?}"
+        "Failed to write server.json for server '{name}' at {}",
+        config_path.display()
     ))?;
 
     Ok(Server {
@@ -235,7 +239,7 @@ pub fn load_server(name: &str) -> Result<Server> {
 
     if !server_path.exists() {
         return Err(anyhow::anyhow!("Server '{}' not found", name))
-            .with_context(|| format!("Looked in directory: {server_path:?}"));
+            .with_context(|| format!("Looked in directory: {}", server_path.display()));
     }
 
     if !server_path.is_dir() {
@@ -292,7 +296,7 @@ pub fn update_server(name: &str, new_config: ServerConfig) -> Result<Server> {
     // Ensure the server directory exists and is a directory
     if !server_path.exists() {
         return Err(anyhow::anyhow!("Server '{}' not found for update", name))
-            .with_context(|| format!("Looked for directory: {server_path:?}"));
+            .with_context(|| format!("Looked for directory: {}", server_path.display()));
     }
     if !server_path.is_dir() {
         return Err(anyhow::anyhow!(
@@ -312,7 +316,8 @@ pub fn update_server(name: &str, new_config: ServerConfig) -> Result<Server> {
 
     // Write the new config, overwriting the old one
     fs::write(&config_path, config_json).context(format!(
-        "Failed to write updated server.json for server '{name}' at {config_path:?}"
+        "Failed to write updated server.json for server '{name}' at {}",
+        config_path.display()
     ))?;
 
     // Return the server representation with the new config
@@ -354,7 +359,8 @@ pub fn delete_server(name: &str) -> Result<()> {
 
         // Recursively remove the directory
         fs::remove_dir_all(&server_path).context(format!(
-            "Failed to delete directory for server '{name}' at {server_path:?}"
+            "Failed to delete directory for server '{name}' at {}",
+            server_path.display()
         ))?;
     } else {
         // Optionally log that the server didn't exist? For now, silent success.

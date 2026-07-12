@@ -21,36 +21,24 @@ pub enum Color {
     Echo,
     Output,
     Warn,
+    /// The theme's default text color — distinct from ANSI white so light
+    /// color schemes can render plain server text readably. Bold is carried
+    /// orthogonally (SGR 1 brightens *default-ness* rather than collapsing
+    /// onto a fixed palette slot), so themes decide what "bright default"
+    /// looks like and `ESC[1;31m` still yields bright red.
+    DefaultForeground { bold: bool },
     DefaultBackground,
 }
 
-impl From<Color> for iced::Color {
-    fn from(vt_color: Color) -> Self {
-        match vt_color {
-            Color::Ansi { color, bold } => match (color, bold) {
-                (AnsiColor::Black, false) => iced::Color::from_rgb8(0, 0, 0),
-                (AnsiColor::Red, false) => iced::Color::from_rgb8(170, 0, 0),
-                (AnsiColor::Green, false) => iced::Color::from_rgb8(0, 170, 0),
-                (AnsiColor::Yellow, false) => iced::Color::from_rgb8(170, 170, 0),
-                (AnsiColor::Blue, false) => iced::Color::from_rgb8(0, 0, 170),
-                (AnsiColor::Magenta, false) => iced::Color::from_rgb8(170, 0, 170),
-                (AnsiColor::Cyan, false) => iced::Color::from_rgb8(0, 170, 170),
-                (AnsiColor::White, false) => iced::Color::from_rgb8(204, 204, 204),
-                (AnsiColor::Black, true) => iced::Color::from_rgb8(85, 85, 85),
-                (AnsiColor::Red, true) => iced::Color::from_rgb8(255, 85, 85),
-                (AnsiColor::Green, true) => iced::Color::from_rgb8(85, 255, 85),
-                (AnsiColor::Yellow, true) => iced::Color::from_rgb8(255, 255, 85),
-                (AnsiColor::Blue, true) => iced::Color::from_rgb8(85, 85, 255),
-                (AnsiColor::Magenta, true) => iced::Color::from_rgb8(255, 85, 255),
-                (AnsiColor::Cyan, true) => iced::Color::from_rgb8(85, 255, 255),
-                (AnsiColor::White, true) => iced::Color::from_rgb8(255, 255, 255),
-            },
-            Color::Rgb { r, g, b } => iced::Color::from_rgb8(r, g, b),
-            Color::Echo => iced::Color::from_rgb8(192, 255, 255),
-            Color::Warn => iced::Color::from_rgb8(255, 192, 85),
-            Color::Output => iced::Color::from_rgb8(255, 255, 192),
-            Color::DefaultBackground => iced::Color::TRANSPARENT,
-        }
+impl Color {
+    /// The bold/bright intensity carried by this foreground color, used when
+    /// a subsequent SGR 30-37 inherits intensity per ECMA-48.
+    #[must_use]
+    pub const fn is_bold(self) -> bool {
+        matches!(
+            self,
+            Self::Ansi { bold: true, .. } | Self::DefaultForeground { bold: true }
+        )
     }
 }
 
@@ -69,6 +57,10 @@ enum SgrState {
     Invalid,
 }
 
+/// Interprets one SGR (`CSI … m`) parameter list against `initial_style`, returning the style
+/// the terminal cursor carries afterward. A pure state machine over the params — no buffer or
+/// span bookkeeping — so a malformed sequence degrades to leaving the style untouched.
+#[must_use]
 #[allow(clippy::match_wildcard_for_single_variants, clippy::too_many_lines)]
 pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
     let mut state = SgrState::Ready {
@@ -81,10 +73,7 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                 CsiParam::Integer(n) => match n {
                     0 => SgrState::Ready {
                         style: Style {
-                            fg: Color::Ansi {
-                                color: AnsiColor::White,
-                                bold: false,
-                            },
+                            fg: Color::DefaultForeground { bold: false },
                             bg: Color::DefaultBackground,
                         },
                     },
@@ -93,6 +82,9 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                             fg: match style.fg {
                                 Color::Ansi { color, bold: _bold } => {
                                     Color::Ansi { color, bold: true }
+                                }
+                                Color::DefaultForeground { .. } => {
+                                    Color::DefaultForeground { bold: true }
                                 }
                                 _ => style.fg,
                             },
@@ -113,13 +105,7 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                                     37 => AnsiColor::White,
                                     _ => unreachable!(),
                                 },
-                                bold: match style.fg {
-                                    Color::Ansi {
-                                        color: _,
-                                        bold: is_bold,
-                                    } => is_bold,
-                                    _ => false,
-                                },
+                                bold: style.fg.is_bold(),
                             },
                             ..style
                         },
@@ -144,6 +130,21 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                         },
                     },
                     38 => SgrState::SetForegroundReceived { style },
+                    // 39 resets the color, not the intensity (ECMA-48).
+                    39 => SgrState::Ready {
+                        style: Style {
+                            fg: Color::DefaultForeground {
+                                bold: style.fg.is_bold(),
+                            },
+                            ..style
+                        },
+                    },
+                    49 => SgrState::Ready {
+                        style: Style {
+                            bg: Color::DefaultBackground,
+                            ..style
+                        },
+                    },
                     _ => SgrState::Invalid,
                 },
                 _ => SgrState::Ready { style },

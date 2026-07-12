@@ -13,20 +13,21 @@ use iced::{
         text::{self, Paragraph},
         widget::{Tree, tree},
     },
-    alignment,
-    event, touch,
+    alignment, touch,
     widget::text::LineHeight,
 };
-use smudgy_core::terminal_buffer::TerminalBuffer;
-
-use crate::assets::fonts::GEIST_MONO_VF;
+use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
 
 mod spans;
 
-use smudgy_core::terminal_buffer::selection::{BufferPosition, LineSelection, Selection};
+use crate::terminal_buffer::selection::{BufferPosition, LineSelection, Selection};
 use spans::Spans;
 
 type Link = ();
+
+/// 100 '0's shaped once per prefs generation to measure the monospace cell
+/// advance for the column-based line-length clamp.
+const ADVANCE_PROBE: &str = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone)]
 struct ParagraphCache<P: text::Paragraph> {
@@ -34,14 +35,28 @@ struct ParagraphCache<P: text::Paragraph> {
     paragraph: P,
     max_valid_width: f32,
     selection: LineSelection,
+    /// The prefs generation this paragraph was shaped with; a mismatch is a
+    /// cache miss (font/size/palette changes rebuild paragraphs).
+    generation: u64,
 }
 
 /// State specific to the TerminalPane widget instance.
 #[derive(Debug, Clone)]
-struct State<P: text::Paragraph> {
+pub(super) struct State<P: text::Paragraph> {
     pub last_line_number: usize,
-    pub cache: Vec<ParagraphCache<P>>,
+    cache: Vec<ParagraphCache<P>>,
     pub is_focused: bool,
+    /// Measured `(prefs generation, monospace cell advance)`.
+    pub advance: Option<(u64, f32)>,
+    /// Keyboard modifiers as of the last change event, reported with link clicks.
+    pub modifiers: keyboard::Modifiers,
+    /// The buffer cell the press landed on, kept while the pointer stays on it. A
+    /// release on the same cell is a click (fires links); any divergence — a drag,
+    /// or content scrolling under a stationary cursor — clears it. Per-pane state,
+    /// NOT derived from the shared `Selection`: a sibling pane processes the same
+    /// release first and flips `Selecting` → `Selected`, so selection state alone
+    /// cannot tell this pane a click just ended on it.
+    pub pressed_cell: Option<BufferPosition>,
 }
 
 impl<P: text::Paragraph> Default for State<P> {
@@ -50,12 +65,15 @@ impl<P: text::Paragraph> Default for State<P> {
             last_line_number: 0,
             cache: Vec::new(),
             is_focused: false,
+            advance: None,
+            modifiers: keyboard::Modifiers::default(),
+            pressed_cell: None,
         }
     }
 }
 
 impl<P: text::Paragraph> State<P> {
-    fn hit_test(&self, bounds: Rectangle, point: iced::Point) -> Option<BufferPosition> {
+    pub(super) fn hit_test(&self, bounds: Rectangle, point: iced::Point) -> Option<BufferPosition> {
         let mut line_top = bounds.height;
 
         for (line, offset) in self.cache.iter().zip(0..) {
@@ -92,7 +110,7 @@ impl<P: text::Paragraph> State<P> {
                                                     > point_in_paragraph.y
                                         })
                                         .reduce(|acc, item| if acc.x > item.x { acc } else { item })
-                                        .map(|span_bounds| (span_bounds.clone(), idx))
+                                        .map(|span_bounds| (*span_bounds, idx))
                                 })
                                 .reduce(|acc, item| if acc.0.x > item.0.x { acc } else { item })
                                 .map(|(_, idx)| BufferPosition {
@@ -117,6 +135,10 @@ pub struct TerminalPane<'a> {
     terminal_buffer: Ref<'a, TerminalBuffer>,
     selection: Rc<RefCell<Selection>>,
     last_line_number: Option<usize>,
+    /// Called with the action of a clicked link span. A plain callback rather than a
+    /// shell message so the pane stays `Message`-agnostic (it is instantiated under
+    /// several message types); the handler sends the resulting runtime action itself.
+    on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
 }
 
 impl<'a> TerminalPane<'a> {
@@ -126,6 +148,7 @@ impl<'a> TerminalPane<'a> {
             terminal_buffer: buffer,
             selection,
             last_line_number: None,
+            on_link: None,
         }
     }
 
@@ -133,8 +156,12 @@ impl<'a> TerminalPane<'a> {
         self.last_line_number = Some(last_line_number);
         self
     }
+
+    pub fn on_link(mut self, on_link: Option<Rc<dyn Fn(LinkClickEvent)>>) -> Self {
+        self.on_link = on_link;
+        self
+    }
 }
-// Widget impl now uses concrete theme::Theme for its Theme generic
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for TerminalPane<'a>
 where
@@ -160,13 +187,47 @@ where
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut Tree,
         _renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
         let selection = self.selection.borrow();
+        let prefs = crate::prefs::current();
+
+        // When a maximum line length (in columns) is configured, clamp the
+        // wrap width to `cols * advance` where advance is the measured width
+        // of one monospace cell at the current font/size. The advance is
+        // measured once per prefs generation. Text stays left-aligned in the
+        // full pane.
+        let text_width = match prefs.line_length {
+            Some(cols) => {
+                let advance = match state.advance {
+                    Some((generation, advance)) if generation == prefs.generation => advance,
+                    _ => {
+                        let probe = Renderer::Paragraph::with_text(iced::advanced::text::Text {
+                            content: ADVANCE_PROBE,
+                            bounds: iced::Size::new(f32::INFINITY, f32::INFINITY),
+                            size: Pixels(prefs.font_size),
+                            font: prefs.font,
+                            line_height: LineHeight::Absolute(Pixels(prefs.line_height)),
+                            align_x: text::Alignment::Left,
+                            align_y: alignment::Vertical::Top,
+                            shaping: text::Shaping::Advanced,
+                            wrapping: text::Wrapping::None,
+                        });
+                        let advance = probe.min_width() / ADVANCE_PROBE.len() as f32;
+                        state.advance = Some((prefs.generation, advance));
+                        advance
+                    }
+                };
+
+                limits.max().width.min(f32::from(cols) * advance)
+            }
+            None => limits.max().width,
+        };
+        let text_bounds = iced::Size::new(text_width, limits.max().height);
 
         let mut new_cache: Vec<ParagraphCache<Renderer::Paragraph>> =
             Vec::with_capacity(state.cache.len());
@@ -188,38 +249,40 @@ where
             }
 
             // look for a matching cached Paragraph in state.paragraphs[i] or state.paragraphs[i + 1],
-            // advancing i by 1 if a match is found
-            if let Some(cache) = state.cache.get_mut(i) {
-                let line_selection = selection.for_line(line_number);
+            // advancing i by 1 if a match is found; entries shaped under an
+            // older prefs generation are always misses
+            if let Some(cache) = state.cache.get_mut(i)
+                && cache.generation == prefs.generation {
+                    let line_selection = selection.for_line(line_number);
 
-                if cache.selection != line_selection {
-                    match line_selection {
-                        None => {
-                            cache.spans.select_none();
+                    if cache.selection != line_selection {
+                        match line_selection {
+                            None => {
+                                cache.spans.select_none();
+                            }
+                            Some((0, usize::MAX)) => {
+                                cache.spans.select_all();
+                            }
+                            Some((from, to)) => {
+                                cache.spans.select_range(from, to);
+                            }
                         }
-                        Some((0, usize::MAX)) => {
-                            cache.spans.select_all();
+                    } else if Rc::ptr_eq(&cache.spans.spans(), &line.spans) {
+                        i += 1;
+
+                        if text_bounds.width > cache.max_valid_width
+                            || text_bounds.width < cache.paragraph.min_bounds().width
+                        {
+                            cache.paragraph.resize(text_bounds);
+                            cache.max_valid_width = text_bounds.width;
                         }
-                        Some((from, to)) => {
-                            cache.spans.select_range(from, to);
-                        }
+
+                        new_cache.push(cache.clone());
+
+                        available_y -= cache.paragraph.min_height();
+                        continue;
                     }
-                } else if Rc::ptr_eq(&cache.spans.spans(), &line.spans) {
-                    i = i + 1;
-
-                    if limits.max().width > cache.max_valid_width
-                        || limits.max().width < cache.paragraph.min_bounds().width
-                    {
-                        cache.paragraph.resize(limits.max());
-                        cache.max_valid_width = limits.max().width;
-                    }
-
-                    new_cache.push(cache.clone());
-
-                    available_y -= cache.paragraph.min_height();
-                    continue;
                 }
-            }
 
             let line_selection = selection.for_line(line_number);
             let spans = Spans::with_selection(line.spans.clone(), line_selection);
@@ -228,10 +291,10 @@ where
 
             let text = iced::advanced::text::Text {
                 content: Vec::as_ref(&spans_vec),
-                bounds: limits.max(),
-                size: Pixels(16.0),
-                font: GEIST_MONO_VF,
-                line_height: LineHeight::Absolute(Pixels(20.0)),
+                bounds: text_bounds,
+                size: Pixels(prefs.font_size),
+                font: prefs.font,
+                line_height: LineHeight::Absolute(Pixels(prefs.line_height)),
                 align_x: text::Alignment::Left,
                 align_y: alignment::Vertical::Top,
                 shaping: text::Shaping::Advanced,
@@ -243,10 +306,11 @@ where
             available_y -= paragraph.min_height();
 
             new_cache.push(ParagraphCache {
-                spans: spans,
+                spans,
                 paragraph,
-                max_valid_width: limits.max().width,
+                max_valid_width: text_bounds.width,
                 selection: line_selection,
+                generation: prefs.generation,
             });
         }
 
@@ -266,46 +330,43 @@ where
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+        let prefs = crate::prefs::current();
 
-        layout
-            .bounds()
-            .intersection(viewport)
-            .map(|clipped_viewport| {
-                let mut y = layout.bounds().y + layout.bounds().height;
-                for cache in state.cache.iter() {
-                    y -= cache.paragraph.min_height();
+        if let Some(clipped_viewport) = layout.bounds().intersection(viewport) {
+            let mut y = layout.bounds().y + layout.bounds().height;
+            for cache in state.cache.iter() {
+                y -= cache.paragraph.min_height();
 
-                    for selected_span_idx in cache.spans.selected().iter() {
-                        let span_bounds_list = cache.paragraph.span_bounds(*selected_span_idx);
+                for selected_span_idx in cache.spans.selected().iter() {
+                    let span_bounds_list = cache.paragraph.span_bounds(*selected_span_idx);
 
-                        for span_bounds in span_bounds_list.iter() {
-                            Rectangle {
-                                x: layout.bounds().x + span_bounds.x,
-                                y: span_bounds.y + y,
-                                width: span_bounds.width,
-                                height: span_bounds.height,
-                            }
-                            .intersection(&clipped_viewport)
-                            .map(|bounds| {
-                                renderer.fill_quad(
-                                    Quad {
-                                        bounds,
-                                        ..Default::default()
-                                    },
-                                    Background::Color(iced::Color::from_rgb8(60, 60, 60)),
-                                );
-                            });
+                    for span_bounds in span_bounds_list.iter() {
+                        let span_rect = Rectangle {
+                            x: layout.bounds().x + span_bounds.x,
+                            y: span_bounds.y + y,
+                            width: span_bounds.width,
+                            height: span_bounds.height,
+                        };
+                        if let Some(bounds) = span_rect.intersection(&clipped_viewport) {
+                            renderer.fill_quad(
+                                Quad {
+                                    bounds,
+                                    ..Default::default()
+                                },
+                                Background::Color(prefs.palette.selection),
+                            );
                         }
                     }
-
-                    renderer.fill_paragraph(
-                        &cache.paragraph,
-                        iced::Point::new(layout.bounds().x, y),
-                        iced::Color::WHITE,
-                        clipped_viewport,
-                    );
                 }
-            });
+
+                renderer.fill_paragraph(
+                    &cache.paragraph,
+                    iced::Point::new(layout.bounds().x, y),
+                    iced::Color::WHITE,
+                    clipped_viewport,
+                );
+            }
+        }
     }
 
     fn mouse_interaction(
@@ -317,6 +378,22 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         if cursor.is_over(layout.bounds()) {
+            // Pointer over a link span; text cursor elsewhere. The `has_links` guard
+            // keeps linkless sessions (the common case) from paying the per-frame
+            // hit test at all.
+            if self.on_link.is_some() && self.terminal_buffer.has_links() {
+                let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+                if let Some(position) = cursor
+                    .position_in(layout.bounds())
+                    .and_then(|position| state.hit_test(layout.bounds(), position))
+                    && self
+                        .terminal_buffer
+                        .link_at(position.line, position.column)
+                        .is_some()
+                {
+                    return mouse::Interaction::Pointer;
+                }
+            }
             mouse::Interaction::Text
         } else {
             mouse::Interaction::Idle
@@ -340,20 +417,16 @@ where
                 let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
                 let mut selection = self.selection.borrow_mut();
 
-                if cursor
-                    .position_in(layout.bounds())
-                    .map(|click_position| {
-                        if let Some(position) = state.hit_test(layout.bounds(), click_position) {
-                            *selection = Selection::Selecting {
-                                origin: position.clone(),
-                                from: position.clone(),
-                                to: position,
-                            };
-                            shell.invalidate_layout();
-                        }
-                    })
-                    .is_some()
-                {
+                if let Some(click_position) = cursor.position_in(layout.bounds()) {
+                    if let Some(position) = state.hit_test(layout.bounds(), click_position) {
+                        state.pressed_cell = Some(position.clone());
+                        *selection = Selection::Selecting {
+                            origin: position.clone(),
+                            from: position.clone(),
+                            to: position,
+                        };
+                        shell.invalidate_layout();
+                    }
                     state.is_focused = true;
                     // We don't capture the event here because we want the click input to bubble up, so we can also use it to focus this session's input
                 } else {
@@ -362,8 +435,31 @@ where
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. }) => {
-                let mut selection = self.selection.borrow_mut();
+                let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
 
+                // A click is a press and release resolving to the SAME buffer cell
+                // (`pressed_cell` survives only while the pointer stays on it): a drag
+                // ends elsewhere, and content scrolling under a stationary cursor
+                // moves the release onto a different absolute line — neither fires.
+                if let Some(pressed) = state.pressed_cell.take()
+                    && let Some(on_link) = self.on_link.as_ref()
+                    && self.terminal_buffer.has_links()
+                    && let Some(position) = cursor
+                        .position_in(layout.bounds())
+                        .and_then(|position| state.hit_test(layout.bounds(), position))
+                    && position == pressed
+                    && let Some(action) =
+                        self.terminal_buffer.link_at(position.line, position.column)
+                {
+                    on_link(LinkClickEvent {
+                        action,
+                        shift: state.modifiers.shift(),
+                        ctrl: state.modifiers.control(),
+                        alt: state.modifiers.alt(),
+                    });
+                }
+
+                let mut selection = self.selection.borrow_mut();
                 if let Selection::Selecting {
                     origin: _,
                     ref from,
@@ -381,43 +477,58 @@ where
             }
             Event::Mouse(mouse::Event::CursorMoved { position: _ }) => {
                 let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+
+                // The pointer left the pressed cell (or the pane): whatever ends this
+                // press, it is a drag, not a click.
+                if state.pressed_cell.is_some() {
+                    let hit = cursor
+                        .position_from(layout.position())
+                        .and_then(|position| state.hit_test(layout.bounds(), position));
+                    if hit.as_ref() != state.pressed_cell.as_ref() {
+                        state.pressed_cell = None;
+                    }
+                }
+
                 let mut selection = self.selection.borrow_mut();
 
-                match *selection {
-                    Selection::Selecting {
+                if let Selection::Selecting {
                         ref origin,
                         from: _,
                         to: _,
-                    } => {
-                        if let Some(cursor_position) = cursor.position_from(layout.position()) {
-                            if let Some(position) = state.hit_test(layout.bounds(), cursor_position)
+                    } = *selection
+                    && let Some(cursor_position) = cursor.position_from(layout.position())
+                        && let Some(position) = state.hit_test(layout.bounds(), cursor_position)
+                        {
+                            let (from, to) = if position.line < origin.line
+                                || (position.line == origin.line
+                                    && position.column < origin.column)
                             {
-                                let (from, to) = if position.line < origin.line
-                                    || (position.line == origin.line
-                                        && position.column < origin.column)
-                                {
-                                    (position, origin.clone())
-                                } else {
-                                    (origin.clone(), position)
-                                };
+                                (position, origin.clone())
+                            } else {
+                                (origin.clone(), position)
+                            };
 
-                                *selection = Selection::Selecting {
-                                    origin: origin.clone(),
-                                    from: from,
-                                    to: to,
-                                };
+                            *selection = Selection::Selecting {
+                                origin: origin.clone(),
+                                from,
+                                to,
+                            };
 
-                                shell.invalidate_layout();
-                                shell.request_redraw();
-                                shell.capture_event();
-                            }
+                            shell.invalidate_layout();
+                            shell.request_redraw();
+                            shell.capture_event();
                         }
-                    }
-                    _ => {}
-                }
+            }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+                state.modifiers = *modifiers;
             }
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+                // Key events carry modifiers too; syncing here heals a widget whose
+                // state was created after the last ModifiersChanged (a fresh pane, a
+                // rebuilt tree) while a modifier was already held.
+                state.modifiers = *modifiers;
 
                 if state.is_focused {
                     match key.as_ref() {
@@ -431,11 +542,11 @@ where
 
                             shell.capture_event();
                         }
-                        _ => {},
+                        _ => {}
                     }
                 }
             }
-            _ => {},
+            _ => {}
         }
     }
 }

@@ -99,7 +99,8 @@ pub fn save_packages(server_name: &str, tree: &PackageTree) -> Result<()> {
     ))?;
 
     fs::write(&packages_path, json_content).context(format!(
-        "Failed to write packages.json for server '{server_name}' at {packages_path:?}"
+        "Failed to write packages.json for server '{server_name}' at {}",
+        packages_path.display()
     ))?;
 
     Ok(())
@@ -114,7 +115,7 @@ pub fn save_packages(server_name: &str, tree: &PackageTree) -> Result<()> {
 /// # Arguments
 ///
 /// * `path_str` - The package path string (e.g., "combat/defense" or "utility").
-///                An empty string signifies the root.
+///   An empty string signifies the root.
 /// * `tree` - The loaded `PackageTree`.
 ///
 /// # Returns
@@ -155,4 +156,137 @@ pub fn is_package_effectively_enabled(path_str: &str, tree: &PackageTree) -> boo
     true
 }
 
-// Functions for loading, saving, and querying the package tree will go here.
+/// Collects every folder path in the tree as full slash-joined paths, sorted.
+///
+/// Parent folders sort before their children (e.g. `combat` before
+/// `combat/healing`) since `'/'` sorts after alphanumerics.
+#[must_use]
+pub fn collect_folder_paths(tree: &PackageTree) -> Vec<String> {
+    fn walk(map: &HashMap<String, PackageNode>, prefix: &str, out: &mut Vec<String>) {
+        for (name, node) in map {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            out.push(path.clone());
+            walk(&node.children, &path, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, "", &mut out);
+    out.sort();
+    out
+}
+
+/// Ensures a folder (and all of its ancestors) exists in the tree, enabled.
+/// Existing nodes along the path are left untouched (enabled state preserved).
+pub fn insert_folder(tree: &mut PackageTree, path: &str) {
+    let mut current = tree;
+    for component in path.split('/').filter(|c| !c.is_empty()) {
+        current = &mut current
+            .entry(component.to_owned())
+            .or_insert_with(|| PackageNode {
+                enabled: true,
+                children: HashMap::new(),
+            })
+            .children;
+    }
+}
+
+/// Detaches the folder node at `path` from the tree, returning it (with its
+/// children) if present.
+fn detach_folder(tree: &mut PackageTree, path: &str) -> Option<PackageNode> {
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let (last, parents) = components.split_last()?;
+    let mut current = tree;
+    for component in parents {
+        current = &mut current.get_mut(*component)?.children;
+    }
+    current.remove(*last)
+}
+
+/// Attaches `node` at `path`, creating any missing ancestor folders.
+fn attach_folder(tree: &mut PackageTree, path: &str, node: PackageNode) {
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let Some((last, parents)) = components.split_last() else {
+        return;
+    };
+    let mut current = tree;
+    for component in parents {
+        current = &mut current
+            .entry((*component).to_owned())
+            .or_insert_with(|| PackageNode {
+                enabled: true,
+                children: HashMap::new(),
+            })
+            .children;
+    }
+    current.insert((*last).to_owned(), node);
+}
+
+/// Removes the folder node (and its descendants) at `path`. Returns whether a
+/// node was removed.
+pub fn remove_folder(tree: &mut PackageTree, path: &str) -> bool {
+    detach_folder(tree, path).is_some()
+}
+
+/// Moves/renames the folder subtree at `old_path` to `new_path`, preserving its
+/// children and enabled state. Returns whether the source existed.
+pub fn rename_folder(tree: &mut PackageTree, old_path: &str, new_path: &str) -> bool {
+    match detach_folder(tree, old_path) {
+        Some(node) => {
+            attach_folder(tree, new_path, node);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The parent path of a folder path, or `None` for a top-level folder.
+/// e.g. `combat/healing` -> `Some("combat")`, `combat` -> `None`.
+#[must_use]
+pub fn parent_path(path: &str) -> Option<String> {
+    path.rsplit_once('/').map(|(parent, _)| parent.to_owned())
+}
+
+/// The folder node's own `enabled` flag (not the effective chain). Returns
+/// `true` (the default) when the folder isn't recorded in the tree.
+#[must_use]
+pub fn folder_enabled(tree: &PackageTree, path: &str) -> bool {
+    let mut current = tree;
+    let mut enabled = true;
+    for component in path.split('/').filter(|c| !c.is_empty()) {
+        match current.get(component) {
+            Some(node) => {
+                enabled = node.enabled;
+                current = &node.children;
+            }
+            None => return true,
+        }
+    }
+    enabled
+}
+
+/// Sets the `enabled` flag of the folder node at `path`. Returns whether the
+/// node existed.
+pub fn set_folder_enabled(tree: &mut PackageTree, path: &str, enabled: bool) -> bool {
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let Some((last, parents)) = components.split_last() else {
+        return false;
+    };
+    let mut current = tree;
+    for component in parents {
+        match current.get_mut(*component) {
+            Some(node) => current = &mut node.children,
+            None => return false,
+        }
+    }
+    match current.get_mut(*last) {
+        Some(node) => {
+            node.enabled = enabled;
+            true
+        }
+        None => false,
+    }
+}

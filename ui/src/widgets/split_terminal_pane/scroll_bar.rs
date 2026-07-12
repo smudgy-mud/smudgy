@@ -1,10 +1,7 @@
 use iced::{
     Color, Element, Event, Rectangle,
-    advanced::{
-        Widget, layout, mouse,
-        renderer::Quad, widget::tree,
-    },
-    border, event, touch,
+    advanced::{Widget, layout, mouse, renderer::Quad, widget::tree},
+    border, touch,
 };
 
 pub const SCROLLBAR_WIDTH: f32 = 12.0;
@@ -71,7 +68,7 @@ where
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut tree::Tree,
         _renderer: &Renderer,
         limits: &layout::Limits,
@@ -83,7 +80,7 @@ where
 
         let total_range = self.max - self.min;
         let visible_range = self.visible - self.min;
-        let position = (self.value - self.min) / total_range;
+        let position = ((self.value - self.min) / total_range.max(1.0)).clamp(0.0, 1.0);
         let visible_portion = (visible_range / total_range.max(1.0)).clamp(0.0, 1.0);
         let grabber_height = (height * visible_portion).max(min_height);
 
@@ -112,7 +109,8 @@ where
 
         let grabber_bounds = state.grabber_bounds + iced::Vector::new(bounds.x, bounds.y);
 
-        let is_hovered = cursor.is_over(grabber_bounds) || matches!(state.drag_state, DragState::Dragging { .. });
+        let is_hovered = cursor.is_over(grabber_bounds)
+            || matches!(state.drag_state, DragState::Dragging { .. });
 
         renderer.fill_quad(
             Quad {
@@ -145,7 +143,6 @@ where
                 if cursor
                     .position_in(grabber_bounds)
                     .map(|click_position| {
-                        println!("click_position: {:?}", click_position);
                         let y_offset = click_position.y;
 
                         state.drag_state = DragState::Dragging { y_offset };
@@ -153,48 +150,39 @@ where
                     .is_some()
                 {
                     shell.capture_event();
-                    return;
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. }) => {
                 let state = tree.state.downcast_mut::<State>();
-                match state.drag_state {
-                    DragState::Dragging { .. } => {
-                        state.drag_state = DragState::Idle;
+                if let DragState::Dragging { .. } = state.drag_state {
+                    state.drag_state = DragState::Idle;
 
-                        shell.capture_event();
-                        return;
-                    }
-                    _ => {}
+                    shell.capture_event();
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 let state = tree.state.downcast_mut::<State>();
-                match state.drag_state {
-                    DragState::Dragging { y_offset } => {
-                        self.on_change.as_ref().map(|f| {
-                            let bounds = layout.bounds();
-                            let new_grabber_y = (position.y - y_offset - bounds.y)
-                                .clamp(0.0, bounds.height - state.grabber_bounds.height);
+                if let DragState::Dragging { y_offset } = state.drag_state {
+                    if let Some(f) = self.on_change.as_ref() {
+                        let bounds = layout.bounds();
+                        let new_grabber_y = (position.y - y_offset - bounds.y)
+                            .clamp(0.0, bounds.height - state.grabber_bounds.height);
 
-                            let max = (bounds.height - state.grabber_bounds.height).max(1.0);
-                            let position = new_grabber_y / max;
-                            // map position to min..max
-                            let new_value = position * (self.max - self.min) + self.min;
+                        let max = (bounds.height - state.grabber_bounds.height).max(1.0);
+                        let position = new_grabber_y / max;
+                        // map position to min..max
+                        let new_value = position * (self.max - self.min) + self.min;
 
-                            f(new_value);
+                        f(new_value);
 
-                            shell.invalidate_layout();
-                            shell.request_redraw();
-                        });
-                        shell.capture_event();
-                        return;
+                        shell.invalidate_layout();
+                        shell.request_redraw();
                     }
-                    _ => {}
+                    shell.capture_event();
                 }
             }
-            _ => {},
+            _ => {}
         }
     }
 }

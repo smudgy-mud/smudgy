@@ -2,6 +2,7 @@ use iced::{Background, Border, Color, Gradient, Shadow, Vector, border::Radius, 
 
 use super::{Button, Buttons, General, Modal, Styles, Text, Theme};
 
+#[must_use]
 pub fn smudgy() -> Theme {
     Theme {
         name: "Smudgy".to_string(),
@@ -13,6 +14,11 @@ pub fn smudgy() -> Theme {
                 border: Color::from_rgba8(255, 250, 239, 0.1),
                 rule: Color::from_rgba8(255, 250, 239, 0.1),
                 overlay_background: Color::from_rgba8(20, 20, 20, 0.9),
+                // The input strip's darker-than-terminal contrast is
+                // intentional; themes restate this pairing on purpose.
+                input_background: Color::from_rgb8(7, 7, 6),
+                input_text: Color::from_rgb8(255, 250, 239),
+                top_highlight: Color::from_rgba8(255, 255, 255, 0.05),
             },
             text: Text {
                 normal: Color::from_rgb8(255, 250, 239),

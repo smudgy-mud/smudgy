@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::mpsc::UnboundedSender;
-use anyhow::Result;
-use crate::session::runtime::{script_engine::{FunctionId, ScriptId}, RuntimeAction};
+use crate::session::runtime::script_engine::{FunctionId, ScriptId};
 
 #[derive(Clone, Debug)]
 pub enum ScriptAction {

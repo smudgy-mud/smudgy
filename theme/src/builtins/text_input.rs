@@ -18,6 +18,7 @@ impl text_input::Catalog for Theme {
     }
 }
 
+#[must_use]
 pub fn default(theme: &Theme, status: Status) -> Style {
     let active = Style {
         background: Background::Color(theme.styles.general.background),
@@ -27,7 +28,9 @@ pub fn default(theme: &Theme, status: Status) -> Style {
             color: theme.styles.general.border,
         },
         icon: theme.styles.buttons.primary.text,
-        placeholder: theme.styles.buttons.secondary.text,
+        // Muted so placeholders read as hints, not as entered values
+        // (distinct from `value`, which uses the off-white button text).
+        placeholder: theme.styles.text.normal.scale_alpha(0.4),
         value: theme.styles.buttons.primary.text,
         selection: theme.styles.general.accent,
     };
@@ -41,7 +44,7 @@ pub fn default(theme: &Theme, status: Status) -> Style {
             },
             ..active
         },
-        Status::Focused { .. }=> Style {
+        Status::Focused { .. } => Style {
             border: Border {
                 color: theme.styles.general.accent,
                 ..active.border
@@ -56,16 +59,17 @@ pub fn default(theme: &Theme, status: Status) -> Style {
     }
 }
 
+#[must_use]
 pub fn borderless(theme: &Theme, status: Status) -> Style {
     let active = Style {
-        background: Background::Color(theme.styles.general.container_background),
+        background: Background::Color(theme.styles.general.input_background),
         border: Border {
             radius: 2.0.into(),
             ..Default::default()
         },
-        icon: theme.styles.buttons.primary.text,
-        placeholder: theme.styles.buttons.secondary.text,
-        value: theme.styles.buttons.primary.text,
+        icon: theme.styles.general.input_text,
+        placeholder: theme.styles.general.input_text.scale_alpha(0.5),
+        value: theme.styles.general.input_text,
         selection: theme.styles.general.accent,
     };
 

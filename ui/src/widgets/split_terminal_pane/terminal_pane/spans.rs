@@ -5,7 +5,7 @@ use std::{
 };
 
 use iced::widget::text::Span;
-use smudgy_core::terminal_buffer::selection::LineSelection;
+use crate::terminal_buffer::selection::LineSelection;
 
 #[derive(Debug, Clone)]
 pub struct Spans<Link: Clone> {
@@ -98,7 +98,8 @@ impl<Link: Clone> Spans<Link> {
                         let selected_end = min(sel_end, span_char_end) - char_position;
 
                         if selected_end > selected_start {
-                            let text: String = span_chars[selected_start..selected_end].iter().collect();
+                            let text: String =
+                                span_chars[selected_start..selected_end].iter().collect();
                             spans.push((
                                 true,
                                 Span {

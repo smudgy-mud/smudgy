@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_core"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
@@ -8,19 +8,23 @@ edition = "2024"
 anyhow = { workspace = true }
 derive_more = { workspace = true }
 dirs = { workspace = true }
-iced = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
-smudgy_map = { workspace = true }
-iced_jsx = { workspace = true }
+smudgy_cloud = { workspace = true }
 serde_json = { workspace = true }
 validator = { workspace = true }
 cfg-if = { workspace = true }
 tokio = { workspace = true }
 pretty_env_logger = { workspace = true }
-regex = { workspace = true, optional = true }
-hyperscan = { workspace = true, optional = true }
+regex = { workspace = true }
+regex-filtered = { workspace = true }
+regex-syntax = { workspace = true }
+aho-corasick = { workspace = true }
+# SIMD byte search for the telnet preprocessor's IAC scan (the inbound hot path). Already in the
+# tree transitively via regex/aho-corasick, so this pins no new download.
+memchr = "2"
 log = { workspace = true }
-rustyscript = { workspace = true }
+smudgy_script = { workspace = true }
 vtparse = { workspace = true }
 deno_core = { workspace = true }
 deno_error = { workspace = true }
@@ -29,14 +33,46 @@ winapi = { workspace = true }
 chrono = { workspace = true }
 simplelog = "0.12.2"
 thiserror = "2.0.10"
-smudgy_theme = { workspace = true }
+keyring = { version = "3", features = ["windows-native"] }
+async-trait = "0.1"
+# P2.3 closure solve: semver-compat grouping, collapse-to-highest, exact-pin detection.
+semver = "1"
+# Collision-resistant isolate/storage dir slugs (owner/name/version can all contain '-', so the
+# readable slug is ambiguous; a crypto hash keeps distinct packages' dirs disjoint against a
+# crafted-nickname attacker). Already in the tree via smudgy_cloud.
+sha2 = "0.10"
+# Fast non-cryptographic hasher for the per-isolate waker demux ready-set (`IsolateId`-keyed,
+# hot on every wake). Already in the tree via deno; avoids SipHash over the id's `Arc<str>`s.
+rustc-hash = "2"
+# Embeds the vendored editor runtime typings (Deno lib + @types/node) into the binary so
+# they can be written into a script author's `.smudgy/` project at session start.
+include_dir = "0.7"
+
+# Linux credential store. The base `keyring` dep enables only `windows-native`;
+# with no Linux backend feature, keyring silently falls back to an in-memory
+# *mock* store, so the cloud session token, profile passwords, and package
+# secrets would never persist across launches. `sync-secret-service` targets the
+# OS Secret Service (GNOME Keyring / KWallet) over D-Bus, blocking — matching the
+# synchronous keyring calls on the UI thread; `crypto-rust` keeps the transport
+# encryption pure-Rust (no extra OpenSSL linkage). When no secret service is
+# present, keyring errors and the code falls back to its obfuscated-file store.
+# The Flatpak manifest grants --talk-name=org.freedesktop.secrets accordingly.
+# (macOS has the same latent mock-fallback gap — it needs `apple-native` — but is
+# out of scope for the Linux build and untouched here.)
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
-default = ["regex-backend-regex"] # Default to the standard regex crate
-
-# Select exactly ONE of the following backends:
-regex-backend-regex = ["dep:regex"]
-regex-backend-hyperscan = ["dep:hyperscan"]
+# Exposes otherwise-private internals so the `smudgy_bench` crate can drive real
+# subsystems: the trigger engine (`session::runtime::Manager` + `PushTriggerParams`),
+# the inbound telnet+VT ingest glue (`session::connection::{feed_inbound, TelnetBridge}`
+# and `vt_processor::sgr_process`), and the session store's flush/fanout machinery
+# (`session::runtime::SessionStore` + its signature types + `FunctionId::from_raw`).
+# Off by default — does not widen the normal public API.
+bench-api = []
 
 [lints]
 # Inherit lints from workspace

@@ -11,6 +11,10 @@ use crate::session::{
 
 mod sgr;
 pub use sgr::{AnsiColor, Color};
+// Expose the SGR interpreter to the `smudgy_bench` crate without widening the normal public
+// API: `mod sgr` stays private; the function becomes reachable only under the feature.
+#[cfg(feature = "bench-api")]
+pub use sgr::process as sgr_process;
 
 #[derive(Debug)]
 pub struct VtProcessor {
@@ -28,10 +32,7 @@ impl VtProcessor {
     pub fn new(session_runtime_tx: UnboundedSender<RuntimeAction>) -> Self {
         VtProcessor {
             cursor_style: Style {
-                fg: Color::Ansi {
-                    color: AnsiColor::White,
-                    bold: false,
-                },
+                fg: Color::DefaultForeground { bold: false },
                 bg: Color::DefaultBackground,
             },
             buf: String::with_capacity(INPUT_BUFFER_CAPACITY),
@@ -80,6 +81,32 @@ impl VtProcessor {
         self.session_runtime_tx
             .send(RuntimeAction::RequestRepaint)
             .unwrap();
+    }
+
+    /// Commit the pending bytes as a **prompt**: emit them on the partial-line path (so
+    /// `prompt:`-flagged triggers fire) and reset the buffers so the next bytes start a fresh line.
+    ///
+    /// Driven by the telnet layer when it decodes a prompt boundary (`IAC GA` / `IAC EOR`) — a
+    /// precise, server-sent signal, unlike the partial-line-at-end-of-buffer heuristic in
+    /// [`notify_end_of_buffer`](Self::notify_end_of_buffer). Clearing the buffers here is what stops
+    /// that heuristic from re-emitting the same prompt at end of read. A no-op when nothing is
+    /// pending (e.g. a bare `IAC GA` with no preceding text).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `session_runtime_tx` channel is closed (the session runtime has been dropped).
+    pub fn commit_prompt(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let pending_line = Arc::new(self.consume_into_pending_line());
+        self.session_runtime_tx
+            .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
+            .unwrap();
+        self.buf.clear();
+        self.buf_raw.clear();
+        self.buf.shrink_to(INPUT_BUFFER_CAPACITY);
+        self.buf_raw.shrink_to(INPUT_BUFFER_CAPACITY);
     }
 
     fn commit_line(&mut self) {

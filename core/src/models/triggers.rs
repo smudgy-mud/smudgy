@@ -136,7 +136,13 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
         let patterns = match (helper.pattern, helper.patterns) {
             (None, None) => None,
             (Some(p), None) => Some(vec![p]),
-            (None, Some(ps)) => if ps.is_empty() { None } else { Some(ps) },
+            (None, Some(ps)) => {
+                if ps.is_empty() {
+                    None
+                } else {
+                    Some(ps)
+                }
+            }
             (Some(p), Some(mut ps)) => {
                 ps.insert(0, p);
                 Some(ps)
@@ -147,7 +153,13 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
         let raw_patterns = match (helper.raw_pattern, helper.raw_patterns) {
             (None, None) => None,
             (Some(p), None) => Some(vec![p]),
-            (None, Some(ps)) => if ps.is_empty() { None } else { Some(ps) },
+            (None, Some(ps)) => {
+                if ps.is_empty() {
+                    None
+                } else {
+                    Some(ps)
+                }
+            }
             (Some(p), Some(mut ps)) => {
                 ps.insert(0, p);
                 Some(ps)
@@ -158,7 +170,13 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
         let anti_patterns = match (helper.anti_pattern, helper.anti_patterns) {
             (None, None) => None,
             (Some(p), None) => Some(vec![p]),
-            (None, Some(ps)) => if ps.is_empty() { None } else { Some(ps) },
+            (None, Some(ps)) => {
+                if ps.is_empty() {
+                    None
+                } else {
+                    Some(ps)
+                }
+            }
             (Some(p), Some(mut ps)) => {
                 ps.insert(0, p);
                 Some(ps)
@@ -261,9 +279,7 @@ impl TriggerDefinition {
     /// Checks if the trigger definition has any pattern specified.
     #[must_use]
     pub fn has_patterns(&self) -> bool {
-        self.patterns.is_some()
-            || self.raw_patterns.is_some()
-            || self.anti_patterns.is_some()
+        self.patterns.is_some() || self.raw_patterns.is_some() || self.anti_patterns.is_some()
     }
 }
 
@@ -367,7 +383,7 @@ mod tests {
         };
 
         let json = serde_json::to_string_pretty(&trigger).expect("Failed to serialize");
-        
+
         // Should serialize single elements as "pattern", not "patterns"
         assert!(json.contains("\"pattern\": \"test_pattern\""));
         assert!(json.contains("\"raw_pattern\": \"raw_test\""));
@@ -388,7 +404,7 @@ mod tests {
         };
 
         let json = serde_json::to_string_pretty(&trigger).expect("Failed to serialize");
-        
+
         // Should serialize multiple elements as "patterns", not "pattern"
         assert!(json.contains("\"patterns\": ["));
         assert!(json.contains("\"raw_patterns\": ["));
@@ -407,7 +423,7 @@ mod tests {
         }"#;
 
         let trigger: TriggerDefinition = serde_json::from_str(json).expect("Failed to deserialize");
-        
+
         assert_eq!(trigger.patterns, Some(vec!["test_pattern".to_string()]));
         assert_eq!(trigger.raw_patterns, Some(vec!["raw_test".to_string()]));
         assert_eq!(trigger.anti_patterns, Some(vec!["anti_test".to_string()]));
@@ -422,10 +438,19 @@ mod tests {
         }"#;
 
         let trigger: TriggerDefinition = serde_json::from_str(json).expect("Failed to deserialize");
-        
-        assert_eq!(trigger.patterns, Some(vec!["pattern1".to_string(), "pattern2".to_string()]));
-        assert_eq!(trigger.raw_patterns, Some(vec!["raw1".to_string(), "raw2".to_string()]));
-        assert_eq!(trigger.anti_patterns, Some(vec!["anti1".to_string(), "anti2".to_string()]));
+
+        assert_eq!(
+            trigger.patterns,
+            Some(vec!["pattern1".to_string(), "pattern2".to_string()])
+        );
+        assert_eq!(
+            trigger.raw_patterns,
+            Some(vec!["raw1".to_string(), "raw2".to_string()])
+        );
+        assert_eq!(
+            trigger.anti_patterns,
+            Some(vec!["anti1".to_string(), "anti2".to_string()])
+        );
     }
 
     #[test]
@@ -439,11 +464,21 @@ mod tests {
         }"#;
 
         let trigger: TriggerDefinition = serde_json::from_str(json).expect("Failed to deserialize");
-        
+
         // Single pattern should be prepended to patterns array
-        assert_eq!(trigger.patterns, Some(vec!["single".to_string(), "multi1".to_string(), "multi2".to_string()]));
+        assert_eq!(
+            trigger.patterns,
+            Some(vec![
+                "single".to_string(),
+                "multi1".to_string(),
+                "multi2".to_string()
+            ])
+        );
         assert_eq!(trigger.raw_patterns, Some(vec!["raw_single".to_string()]));
-        assert_eq!(trigger.anti_patterns, Some(vec!["anti1".to_string(), "anti2".to_string()]));
+        assert_eq!(
+            trigger.anti_patterns,
+            Some(vec!["anti1".to_string(), "anti2".to_string()])
+        );
     }
 
     #[test]
@@ -455,7 +490,7 @@ mod tests {
         };
 
         let json = serde_json::to_string_pretty(&trigger).expect("Failed to serialize");
-        
+
         // Empty vectors should not be serialized
         assert!(!json.contains("pattern"));
     }
@@ -473,8 +508,9 @@ mod tests {
         };
 
         let json = serde_json::to_string(&original).expect("Failed to serialize");
-        let deserialized: TriggerDefinition = serde_json::from_str(&json).expect("Failed to deserialize");
-        
+        let deserialized: TriggerDefinition =
+            serde_json::from_str(&json).expect("Failed to deserialize");
+
         assert_eq!(original, deserialized);
     }
 }

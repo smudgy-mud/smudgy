@@ -3,19 +3,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::assets::fonts::GEIST_MONO_VF;
-use crate::helpers::hotkeys::{HotkeyKeys, MaybePhysicalKey};
+use crate::keymap::{HotkeyKeys, MaybePhysicalKey};
 use crate::theme::{Element, builtins};
+use crate::update::Update;
 use crate::widgets::hotkey_matching_input::HotkeyMatchingInput;
-use iced::keyboard::key;
-use iced::widget::{text_input, text_input::Id};
-use iced::{Event, Length, Subscription, Task, keyboard};
+use iced::widget::{Id, operation};
+use iced::{Length, Task, keyboard};
 use smudgy_core::models::hotkeys::HotkeyDefinition;
+use smudgy_core::models::settings::CommandInputBehavior;
 use smudgy_core::session::HotkeyId;
-use smudgy_core::terminal_buffer::TerminalBuffer;
-
-
-
+use crate::terminal_buffer::TerminalBuffer;
 
 /// A component for inputting text in a session with advanced features
 #[derive(Debug, Clone)]
@@ -64,6 +61,17 @@ pub enum Message {
     NavigateHistoryDown,
     /// Handle tab completion
     HandleTabCompletion,
+    /// The input lost focus (used by the clear-on-blur behavior).
+    FocusLost,
+}
+
+/// What the parent should do in response to an update.
+#[derive(Debug, Clone)]
+pub enum Event {
+    /// The user submitted a command.
+    Submit(Arc<String>),
+    /// A registered hotkey was triggered.
+    HotkeyTriggered(HotkeyId),
 }
 
 impl SessionInput {
@@ -89,6 +97,9 @@ impl SessionInput {
     }
 
     /// Get the current input value
+    // Part of the input component's public accessor API; not currently read by
+    // the session pane but kept for callers that need the live value.
+    #[allow(dead_code)]
     pub fn value(&self) -> &str {
         &self.value
     }
@@ -98,7 +109,7 @@ impl SessionInput {
         self.input_id.clone()
     }
 
-    /// Clear the input value
+    /// Clear the input value (and reset completion / history navigation).
     pub fn clear(&mut self) {
         self.value.clear();
         self.completion_state = None;
@@ -125,8 +136,8 @@ impl SessionInput {
 
         self.hotkey_lookup
             .entry(hotkey_keys.main_key.clone())
-            .or_insert_with(Vec::new)
-            .push((hotkey_keys.modifiers, id.clone()));
+            .or_default()
+            .push((hotkey_keys.modifiers, id));
 
         self.hotkeys.insert(id, hotkey_keys);
     }
@@ -186,7 +197,7 @@ impl SessionInput {
     }
 
     /// Navigate history up (to older commands)
-    fn navigate_history_up(&mut self) -> Task<super::session_pane::Message> {
+    fn navigate_history_up(&mut self) -> Task<Message> {
         if self.history.is_empty() {
             return Task::none();
         }
@@ -202,11 +213,11 @@ impl SessionInput {
         self.completion_state = None;
 
         // Select all the text that was filled in
-        text_input::select_all(self.input_id.clone())
+        operation::select_all(self.input_id.clone())
     }
 
     /// Navigate history down (to newer commands)
-    fn navigate_history_down(&mut self) -> Task<super::session_pane::Message> {
+    fn navigate_history_down(&mut self) -> Task<Message> {
         match self.history_index {
             None => {
                 if self.completion_state.is_some() {
@@ -236,13 +247,13 @@ impl SessionInput {
                 self.completion_state = None;
 
                 // Select all the text that was filled in
-                text_input::select_all(self.input_id.clone())
+                operation::select_all(self.input_id.clone())
             }
         }
     }
 
     /// Handle tab completion
-    fn handle_tab_completion(&mut self) -> Task<super::session_pane::Message> {
+    fn handle_tab_completion(&mut self) -> Task<Message> {
         let Some(buffer_ref) = &self.terminal_buffer else {
             return Task::none();
         };
@@ -272,8 +283,8 @@ impl SessionInput {
                 suggested_words: HashSet::new(),
             });
 
-        if let Ok(buffer_ref) = buffer_ref.try_borrow() {
-            if let Some(word) = buffer_ref.find_recent_word_by_prefix(
+        if let Ok(buffer_ref) = buffer_ref.try_borrow()
+            && let Some(word) = buffer_ref.find_recent_word_by_prefix(
                 &completion_state.prefix,
                 Some(&completion_state.suggested_words),
                 1000, // Search last 1000 lines
@@ -294,26 +305,25 @@ impl SessionInput {
 
                 // Select only the newly completed portion
                 if completion_end > original_prefix_end {
-                    return text_input::select_range(
+                    return operation::select_range(
                         self.input_id.clone(),
                         original_prefix_end,
                         completion_end,
                     );
                 }
             }
-        }
 
         Task::none()
     }
 
     /// Update the component state based on messages
-    pub fn update(&mut self, message: Message) -> Task<super::session_pane::Message> {
+    pub fn update(&mut self, message: Message) -> Update<Message, Event> {
         match message {
             Message::InputChanged(value) => {
                 self.value = value;
                 self.completion_state = None;
                 self.history_index = None;
-                Task::none()
+                Update::none()
             }
             Message::Submit => {
                 if !self.value.trim().is_empty() {
@@ -321,33 +331,71 @@ impl SessionInput {
                 }
                 let command = Arc::new(self.value.clone());
 
-                Task::batch(vec![
-                    text_input::select_all(self.input_id.clone()),
-                    Task::done(super::session_pane::Message::Send(command)),
-                ])
+                // How the just-sent text is treated is user-configurable.
+                let task = match crate::prefs::current().command_input_behavior {
+                    CommandInputBehavior::Clear => {
+                        self.clear();
+                        Task::none()
+                    }
+                    // Both select-all modes leave the text in place but fully
+                    // selected, so the next keystroke overwrites it. The
+                    // clear-on-blur half of the default lives in `FocusLost`.
+                    CommandInputBehavior::SelectAll | CommandInputBehavior::SelectAllClearOnBlur => {
+                        operation::select_all(self.input_id.clone())
+                    }
+                };
+
+                Update::new(task, Some(Event::Submit(command)))
+            }
+            Message::FocusLost => {
+                // Only the default mode wipes the line (sent-and-selected, or
+                // half-typed) when the input loses focus; the others leave it.
+                if crate::prefs::current().command_input_behavior
+                    == CommandInputBehavior::SelectAllClearOnBlur
+                {
+                    self.clear();
+                }
+                Update::none()
             }
             Message::HotkeyTriggered(hotkey_id) => {
-                Task::done(super::session_pane::Message::HotkeyTriggered(hotkey_id))
+                Update::with_event(Event::HotkeyTriggered(hotkey_id))
             }
-            Message::NavigateHistoryUp => self.navigate_history_up(),
-            Message::NavigateHistoryDown => self.navigate_history_down(),
-            Message::HandleTabCompletion => self.handle_tab_completion(),
+            Message::NavigateHistoryUp => Update::with_task(self.navigate_history_up()),
+            Message::NavigateHistoryDown => Update::with_task(self.navigate_history_down()),
+            Message::HandleTabCompletion => Update::with_task(self.handle_tab_completion()),
         }
     }
 
     /// Render the component
-    pub fn view(&self) -> Element<Message> {
-        let input = HotkeyMatchingInput::<Message, crate::theme::Theme, iced::Renderer>::new(&self.hotkey_lookup, "", &self.value)
-            .font(GEIST_MONO_VF)
-            .id(self.input_id.clone())
-            .on_input(Message::InputChanged)
-            .on_submit(Message::Submit)
-            .style(builtins::text_input::borderless)
-            .width(Length::Fill)
-            .on_match(|hotkey_id| Message::HotkeyTriggered(hotkey_id))
-            .on_key_pressed(keyboard::Key::Named(keyboard::key::Named::ArrowUp), Message::NavigateHistoryUp)
-            .on_key_pressed(keyboard::Key::Named(keyboard::key::Named::ArrowDown), Message::NavigateHistoryDown)
-            .on_key_pressed(keyboard::Key::Named(keyboard::key::Named::Tab), Message::HandleTabCompletion);
+    pub fn view(&self) -> Element<'_, Message> {
+        let prefs = crate::prefs::current();
+
+        let input = HotkeyMatchingInput::<Message, crate::theme::Theme, iced::Renderer>::new(
+            &self.hotkey_lookup,
+            "",
+            &self.value,
+        )
+        .font(prefs.font)
+        .size(prefs.font_size)
+        .id(self.input_id.clone())
+        .on_input(Message::InputChanged)
+        .on_submit(Message::Submit)
+        .on_unfocus(Message::FocusLost)
+        .style(builtins::text_input::borderless)
+        .width(Length::Fill)
+        .on_match(Message::HotkeyTriggered)
+        .on_key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+            Message::NavigateHistoryUp,
+        )
+        .on_key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+            Message::NavigateHistoryDown,
+        )
+        .on_key_pressed(
+            keyboard::Key::Named(keyboard::key::Named::Tab),
+            Message::HandleTabCompletion,
+        );
 
         Element::new(input)
     }

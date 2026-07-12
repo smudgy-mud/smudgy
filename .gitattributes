@@ -1,0 +1,4 @@
+# Shell scripts must keep LF line endings so they run on macOS/Linux even when
+# the repo is checked out on Windows (this repo is developed on Windows). A
+# CRLF in the shebang or a command line breaks the script on a Mac.
+*.sh text eol=lf

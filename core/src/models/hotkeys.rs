@@ -55,6 +55,10 @@ impl HotkeyDefinition {
     }
 
     /// Attempts to retrieve the script content and its language.
+    ///
+    /// # Errors
+    /// Returns an error if the smudgy home directory cannot be determined or a
+    /// matching `.ts`/`.js` script file exists but cannot be read.
     pub fn get_script_content(
         &self,
         hotkey_name: &str,
@@ -73,7 +77,7 @@ impl HotkeyDefinition {
                 Ok(content) => return Ok(Some((content, ScriptLang::TS))),
                 Err(e) => {
                     return Err(anyhow::Error::from(e)
-                        .context(format!("Failed to read script file: {ts_path:?}")));
+                        .context(format!("Failed to read script file: {}", ts_path.display())));
                 }
             }
         }
@@ -84,16 +88,17 @@ impl HotkeyDefinition {
                 Ok(content) => return Ok(Some((content, ScriptLang::JS))),
                 Err(e) => {
                     return Err(anyhow::Error::from(e)
-                        .context(format!("Failed to read script file: {js_path:?}")));
+                        .context(format!("Failed to read script file: {}", js_path.display())));
                 }
             }
         }
         Ok(None)
     }
 
-
-
     /// Gets the expected filesystem path for a file-based script.
+    ///
+    /// # Errors
+    /// Returns an error if the smudgy home directory cannot be determined.
     pub fn get_expected_script_path(
         &self,
         hotkey_name: &str,
@@ -187,13 +192,9 @@ pub fn save_hotkeys(server_name: &str, hotkeys: &HashMap<String, HotkeyDefinitio
     ))?;
 
     fs::write(&hotkeys_path, json_content).context(format!(
-        "Failed to write hotkeys.json for server '{server_name}' at {hotkeys_path:?}"
+        "Failed to write hotkeys.json for server '{server_name}' at {}",
+        hotkeys_path.display()
     ))?;
 
     Ok(())
 }
-
-
-
-
-

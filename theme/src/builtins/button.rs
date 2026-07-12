@@ -1,5 +1,5 @@
 use crate::Theme;
-use iced::{widget::button, Border, Color};
+use iced::{Border, Color, widget::button};
 
 pub type StyleFn<'a, Theme> = Box<dyn Fn(&Theme, button::Status) -> button::Style + 'a>;
 
@@ -47,14 +47,17 @@ fn style(button_theme: &crate::Button, status: button::Status) -> button::Style 
     }
 }
 
+#[must_use]
 pub fn primary(theme: &Theme, status: button::Status) -> button::Style {
     style(&theme.styles.buttons.primary, status)
 }
 
+#[must_use]
 pub fn secondary(theme: &Theme, status: button::Status) -> button::Style {
     style(&theme.styles.buttons.secondary, status)
 }
 
+#[must_use]
 pub fn list_item(theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Active => button::Style {
@@ -80,6 +83,7 @@ pub fn list_item(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+#[must_use]
 pub fn list_item_selected(theme: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Active => button::Style {
@@ -105,6 +109,60 @@ pub fn list_item_selected(theme: &Theme, status: button::Status) -> button::Styl
     }
 }
 
+/// Quiet menu-bar item for the main window toolbar: no chrome at rest, a
+/// faint highlight on hover, text that brightens with interaction.
+#[must_use]
+pub fn toolbar(theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered => Some(Color::from_rgba8(255, 255, 255, 0.06).into()),
+            button::Status::Pressed => Some(Color::from_rgba8(255, 255, 255, 0.04).into()),
+            _ => None,
+        },
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        text_color: match status {
+            button::Status::Active => theme.styles.text.normal.scale_alpha(0.65),
+            button::Status::Hovered => theme.styles.text.normal.scale_alpha(0.95),
+            button::Status::Pressed => theme.styles.text.normal.scale_alpha(0.8),
+            button::Status::Disabled => theme.styles.text.normal.scale_alpha(0.25),
+        },
+        ..Default::default()
+    }
+}
+
+/// Low-emphasis filled button: translucent fill with a hairline border.
+/// Suits small inline actions (session reconnect, script-spawned overlay
+/// buttons) that shouldn't shout like `primary`.
+#[must_use]
+pub fn subtle(theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(
+            match status {
+                button::Status::Active => Color::from_rgba8(255, 255, 255, 0.06),
+                button::Status::Hovered => Color::from_rgba8(255, 255, 255, 0.12),
+                button::Status::Pressed => Color::from_rgba8(255, 255, 255, 0.04),
+                button::Status::Disabled => Color::from_rgba8(255, 255, 255, 0.03),
+            }
+            .into(),
+        ),
+        border: Border {
+            color: Color::from_rgba8(255, 255, 255, 0.12),
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        text_color: match status {
+            button::Status::Active => theme.styles.text.normal.scale_alpha(0.85),
+            button::Status::Hovered | button::Status::Pressed => theme.styles.text.normal,
+            button::Status::Disabled => theme.styles.text.normal.scale_alpha(0.3),
+        },
+        ..Default::default()
+    }
+}
+
+#[must_use]
 pub fn link(theme: &Theme, status: button::Status) -> button::Style {
     button::Style {
         background: match status {

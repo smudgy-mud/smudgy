@@ -1,5 +1,16 @@
 [workspace]
-members = ["ui", "core", "map"]
+members = ["ui", "core", "cloud", "map_widget", "script", "inspector"]
+# Everything except `inspector` and `scriptref`. This leaves exactly one bin target (ui's
+# `smudgy`) in the default set, so a bare `cargo run` / `cargo build` / `cargo
+# test` resolves to the app without needing `-p` or `--bin`. `inspector` is a
+# standalone dev/sidecar helper with its own bin (`smudgy_inspector`); a second
+# default bin would make `cargo run` ambiguous, so it's excluded here. Build or
+# lint it explicitly with `-p smudgy_inspector`, or include it via
+# `cargo build --workspace`; release.ps1 builds it explicitly for packaging.
+# `scriptref` (`smudgy_scriptref`) is likewise a standalone dev tool — the script
+# API reference generator/publisher — excluded for the same reason; run it with
+# `cargo run -p smudgy_scriptref`.
+default-members = ["ui", "core", "cloud", "map_widget", "script"]
 resolver = "2"
 
 # Define shared dependencies for the workspace
@@ -7,15 +18,17 @@ resolver = "2"
 color-art = "0.3.0"
 arc-swap = { version = "1.7.1", features = ["weak"] }
 anyhow = "1.0.98"
-iced = { version = "0.14.0-dev", features = [
+iced = { version = "0.14", features = [
     "tokio",
     "svg",
     "web-colors",
     "highlighter",
     "advanced",
-    "canvas"
+    "canvas",
+    "markdown",
 ] }
-iced_anim = { git = "https://github.com/wbk/iced_anim", rev = "2a0414e" }
+iced_anim = "0.3.1"
+iced_runtime = "0.14"
 derive_more = { version = "2.0.1", features = [
     "display",
     "from",
@@ -25,49 +38,52 @@ derive_more = { version = "2.0.1", features = [
 dirs = "6.0.0"
 chrono = "0.4.41"
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
+# `preserve_order` (maps back onto IndexMap) is a session-store requirement: store values
+# keep object entry order as published, and JS object property order is insertion order —
+# so serde round-trips through ops stay faithful to what scripts wrote.
+serde_json = { version = "1.0.140", features = ["preserve_order"] }
+# The session store's value tree (`smudgy_cloud::store_node`) keys objects by folded key in
+# publish order — the same ordered-map semantics `preserve_order` gives serde_json above.
+indexmap = "2"
 validator = { version = "0.20.0", features = ["derive"] }
 cfg-if = "1.0.0"
+futures = "0.3"
 regex = "1"
-hyperscan = "0.3.2"
+regex-filtered = "0.2"
+regex-syntax = "0.8"
+aho-corasick = "1.1"
+ordered-float = { version = "4.0", default-features = false }
 smudgy_core = { path = "./core" }
+smudgy_script = { path = "./script" }
 smudgy_theme = { path = "./theme" }
-smudgy_map = { path = "./map", features = ["cloud"] }
-iced_jsx = { path = "./iced_jsx" }
+smudgy_cloud = { path = "./cloud", features = ["cloud"] }
+smudgy_widgets = { path = "./widgets" }
+smudgy_map_widget = { path = "./map_widget" }
 tokio = { version = "1.44.2", features = ["full"] }
 parking_lot = "0.12.1"
 pretty_env_logger = "0.5.0"
+# `max_level_info` statically strips `debug!`/`trace!` (and any work gated on
+# `log_enabled!(Debug)`) from every build, dev and release alike — info and above only.
 log = { version = "0.4.27", features = ["max_level_info"] }
 vtparse = "0.7.0"
-deno_core = { version = "^0.347.0", features = [
+# Greenfield runtime bump (branch feat/greenfield-script-runtime): newer Deno than
+# the rustyscript fork's 0.347. deno_core is workspace-wide because core + smudgy_widgets
+# ops also use it directly (v8's `links` forbids two versions). Anchored to the
+# deno_runtime 0.250 set (deno_core 0.395 / deno_error 0.7.1 / deno_ast 0.53.1 / v8 147).
+deno_core = { version = "0.395", features = [
     "unsafe_use_unprotected_platform",
 ] }
-deno_error = "=0.5.6"
-rustyscript = { git = "https://github.com/wbk/rustyscript", branch = "master", features = [
-    "broadcast_channel",
-    "cache",
-    "console",
-    "crypto",
-    "ffi",
-    "fs",
-    "http",
-    "kv",
-    "url",
-    "io",
-    "web",
-    "websocket",
-    "webstorage",
-    "fs_import",
-    "url_import",
-    "node_experimental",
-] }
-winapi = { version = "0.3.9", features = ["sysinfoapi"] }
+pathfinding = "4.14.0"
+deno_error = "=0.7.1"
+# `std` is required by deno_io 0.152 on Windows: it assumes winapi's `ctypes::c_void`
+# aliases `std::os::raw::c_void` (only true with the `std` feature), else `GetStdHandle`
+# / `from_raw_handle` types mismatch. Feature-unified across the workspace.
+winapi = { version = "0.3.9", features = ["sysinfoapi", "std"] }
 build-time = "0.1.3"
 
 # Define workspace-wide lints
 [workspace.lints.clippy]
 pedantic = "warn"
-
 [profile.profiling]
 inherits = "release"
 debug = true
@@ -75,6 +91,3 @@ debug = true
 [profile.release-full]
 inherits = "release"
 lto = true
-
-[patch.crates-io]
-iced = { git = "https://github.com/wbk/iced", rev = "983aafb24b7b5bfa95eab1efc38e9eb928137b27" }

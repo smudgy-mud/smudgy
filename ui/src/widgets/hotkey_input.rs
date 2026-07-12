@@ -8,12 +8,12 @@ use iced::{
     },
     keyboard::{
         Key,
-        key::{self, Named, Physical},
+        key::Named,
     },
     widget::{Text, text},
 };
 
-use crate::helpers::hotkeys::MaybePhysicalKey;
+use crate::keymap::MaybePhysicalKey;
 
 /// A widget for capturing hotkey combinations
 pub struct HotkeyInput<'a, Message, Theme, Renderer>
@@ -127,16 +127,16 @@ where
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut Tree,
         renderer: &Renderer,
         limits: &iced::advanced::layout::Limits,
     ) -> iced::advanced::layout::Node {
         let state = tree.state.downcast_ref::<State>();
-        let text_widget = self.create_text(state.listening);
+        let mut text_widget = self.create_text(state.listening);
 
         Widget::<Message, Theme, Renderer>::layout(
-            &text_widget,
+            &mut text_widget,
             tree.children.get_mut(0).unwrap(),
             renderer,
             limits,
@@ -158,7 +158,7 @@ where
 
         Widget::<Message, Theme, Renderer>::draw(
             &text_widget,
-            tree.children.get(0).unwrap(),
+            tree.children.first().unwrap(),
             renderer,
             theme,
             style,
@@ -197,77 +197,74 @@ where
         let state = tree.state.downcast_mut::<State>();
 
         match event {
-            iced::Event::Mouse(mouse) if cursor.is_over(layout.bounds()) => match mouse {
-                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left) => {
-                    state.listening = true;
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+                if cursor.is_over(layout.bounds()) =>
+            {
+                state.listening = true;
+                if let Some(f) = self.on_action.as_ref() {
+                    shell.publish(f(vec![]));
+                }
+                shell.capture_event();
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key,
+                modified_key: _,
+                physical_key,
+                location: _,
+                modifiers,
+                text: _,
+                repeat: _,
+            }) if state.listening => { match key {
+                Key::Named(Named::Control)
+                | Key::Named(Named::Shift)
+                | Key::Named(Named::Alt)
+                | Key::Named(Named::Super) => {
                     if let Some(f) = self.on_action.as_ref() {
-                        shell.publish(f(vec![]));
+                        let mut ret: Vec<MaybePhysicalKey> = Vec::new();
+                        if modifiers.control() {
+                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Control)));
+                        }
+                        if modifiers.alt() {
+                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Alt)));
+                        }
+                        if modifiers.shift() {
+                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Shift)));
+                        }
+                        if modifiers.logo() {
+                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Super)));
+                        }
+                        shell.publish(f(ret));
                     }
                     shell.capture_event();
                 }
-                _ => {}
-            },
-            iced::Event::Keyboard(keyboard) if state.listening => match keyboard {
-                iced::keyboard::Event::KeyPressed {
-                    key,
-                    modified_key: _,
-                    physical_key,
-                    location: _,
-                    modifiers,
-                    text: _,
-                } => match key {
-                    Key::Named(Named::Control)
-                    | Key::Named(Named::Shift)
-                    | Key::Named(Named::Alt)
-                    | Key::Named(Named::Super) => {
-                        if let Some(f) = self.on_action.as_ref() {
-                            let mut ret: Vec<MaybePhysicalKey> = Vec::new();
-                            if modifiers.control() {
-                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Control)));
-                            }
-                            if modifiers.alt() {
-                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Alt)));
-                            }
-                            if modifiers.shift() {
-                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Shift)));
-                            }
-                            if modifiers.logo() {
-                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Super)));
-                            }
-                            shell.publish(f(ret));
+                _ => {
+                    state.listening = false;
+                    if let Some(f) = self.on_action.as_ref() {
+                        let mut ret: Vec<MaybePhysicalKey> = Vec::new();
+                        if modifiers.control() {
+                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Control)));
                         }
-                        shell.capture_event();
-                    }
-                    _ => {
-                        state.listening = false;
-                        if let Some(f) = self.on_action.as_ref() {
-                            let mut ret: Vec<MaybePhysicalKey> = Vec::new();
-                            if modifiers.control() {
-                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Control)));
-                            }
-                            if modifiers.alt() {
-                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Alt)));
-                            }
-                            if modifiers.shift() {
-                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Shift)));
-                            }
-                            if modifiers.logo() {
-                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Super)));
-                            }
-                            
-                            // For the main key, use physical or logical based on the flag
-                            if self.physical {
-                                ret.push(MaybePhysicalKey::Physical(*physical_key));
-                            } else {
-                                ret.push(MaybePhysicalKey::Key(key.clone()));
-                            }
-                            
-                            shell.publish(f(ret));
-                        };
-                    }
-                },
-                _ => {}
-            },
+                        if modifiers.alt() {
+                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Alt)));
+                        }
+                        if modifiers.shift() {
+                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Shift)));
+                        }
+                        if modifiers.logo() {
+                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Super)));
+                        }
+
+                        // For the main key, use physical or logical based on the flag
+                        if self.physical {
+                            ret.push(MaybePhysicalKey::Physical(*physical_key));
+                        } else {
+                            ret.push(MaybePhysicalKey::Key(key.clone()));
+                        }
+
+                        shell.publish(f(ret));
+                    };
+                }
+            } },
             _ => {}
         }
     }

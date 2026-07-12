@@ -1,6 +1,4 @@
-use iced::{
-    widget::svg,
-};
+use iced::widget::svg;
 
 use crate::Theme;
 

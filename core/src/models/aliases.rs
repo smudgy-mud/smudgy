@@ -78,6 +78,10 @@ impl AliasDefinition {
     /// `Ok(Some((content, language)))` if a script is found.
     /// `Ok(None)` if no inline script and no corresponding file exists.
     /// `Err(...)` if there's an error accessing files or directories.
+    ///
+    /// # Errors
+    /// Returns an error if the smudgy home directory cannot be determined or a
+    /// matching `.ts`/`.js` script file exists but cannot be read.
     pub fn get_script_content(
         &self,
         alias_name: &str,
@@ -101,7 +105,7 @@ impl AliasDefinition {
                 Ok(content) => return Ok(Some((content, ScriptLang::TS))),
                 Err(e) => {
                     return Err(anyhow::Error::from(e)
-                        .context(format!("Failed to read script file: {ts_path:?}")));
+                        .context(format!("Failed to read script file: {}", ts_path.display())));
                 }
             }
         }
@@ -113,7 +117,7 @@ impl AliasDefinition {
                 Ok(content) => return Ok(Some((content, ScriptLang::JS))),
                 Err(e) => {
                     return Err(anyhow::Error::from(e)
-                        .context(format!("Failed to read script file: {js_path:?}")));
+                        .context(format!("Failed to read script file: {}", js_path.display())));
                 }
             }
         }
@@ -152,6 +156,12 @@ impl AliasDefinition {
 }
 
 /// Loads all alias definitions from `aliases.json` for a given server.
+///
+/// If `aliases.json` does not exist, returns an empty map successfully.
+///
+/// # Errors
+/// Returns an error if the smudgy home directory cannot be determined, or if
+/// `aliases.json` exists but cannot be read or parsed.
 pub fn load_aliases(server_name: &str) -> Result<HashMap<String, AliasDefinition>> {
     let smudgy_dir = get_smudgy_home()?;
     let aliases_path = smudgy_dir
@@ -175,6 +185,11 @@ pub fn load_aliases(server_name: &str) -> Result<HashMap<String, AliasDefinition
 }
 
 /// Saves the alias definitions map to `aliases.json` for a given server.
+///
+/// # Errors
+/// Returns an error if the smudgy home directory cannot be determined, the
+/// server's `aliases` directory does not exist, or `aliases.json` cannot be
+/// serialized or written.
 pub fn save_aliases(server_name: &str, aliases: &HashMap<String, AliasDefinition>) -> Result<()> {
     let smudgy_dir = get_smudgy_home()?;
     let aliases_dir = smudgy_dir.join(server_name).join("aliases");
@@ -194,7 +209,8 @@ pub fn save_aliases(server_name: &str, aliases: &HashMap<String, AliasDefinition
     ))?;
 
     fs::write(&aliases_path, json_content).context(format!(
-        "Failed to write aliases.json for server '{server_name}' at {aliases_path:?}"
+        "Failed to write aliases.json for server '{server_name}' at {}",
+        aliases_path.display()
     ))?;
 
     Ok(())

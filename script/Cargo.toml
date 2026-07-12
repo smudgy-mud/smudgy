@@ -1,0 +1,68 @@
+[package]
+name = "smudgy_script"
+description = "Smudgy's embedded JS/TS scripting runtime"
+edition = "2021"
+version = "0.4.0"
+publish = false
+
+# Greenfield rewrite (branch feat/greenfield-script-runtime). Thin runtime built
+# directly on the deno_* crates, targeting real Deno parity (jsr/npm) on a newer
+# Deno than the rustyscript fork's 0.347. See DESIGN.md. Version anchor:
+#   deno_runtime 0.250 -> deno_core 0.395 / deno_error 0.7.1 / deno_ast 0.53.1 / v8 147.
+[lib]
+doctest = false
+
+[dependencies]
+deno_core = { workspace = true }
+deno_error = { workspace = true }
+# NB: do NOT enable "hmr" here. hmr pulls in deno_core's
+# `include_js_files_for_snapshotting`, which flips every extension's JS from
+# `include_str!`-baked-into-the-binary to read-from-disk-at-runtime, using paths
+# baked from CARGO_MANIFEST_DIR (e.g. the build machine's ~/.cargo/registry). We
+# ship no startup snapshot, so deno_core loads each extension source at boot; with
+# hmr those reads target build-machine paths that don't exist on any other machine
+# (or an installed copy), so JsRuntime init panics with os error 3 ("cannot find
+# the path specified"). release-full is the profile the installer packages/ships,
+# which is why it surfaced there.
+#
+# `snapshot` (here = just `transpile`/deno_ast) stays on; a real startup snapshot
+# was tried and reverted (it panics on load without smudgy's own ops baked in).
+deno_runtime = { version = "0.250", features = ["snapshot"] }
+# `cjs` (+ its implied `utils`) powers npm CJS->ESM interop: analyze_cjs names a
+# CommonJS module's exports so they surface as ESM named exports, and
+# analyze_es_runtime_exports covers ESM files re-exported through CJS.
+deno_ast = { version = "=0.53.1", features = ["transpiling", "cjs"] }
+deno_fetch = "0.266"
+deno_fs = "0.152"
+deno_node = "0.180"
+deno_npm = "0.54"
+deno_npm_cache = "0.61"
+deno_npmrc = "0.3"
+deno_permissions = "0.101"
+deno_resolver = "0.73"
+deno_semver = "0.9"
+deno_cache_dir = "0.34"
+deno_maybe_sync = "0.29"
+node_resolver = "0.80"
+sys_traits = "0.1.25"
+async-trait = "0.1"
+# rustls 0.23 needs an explicit process-global CryptoProvider installed before any
+# TLS use; deno_tls (Deno.connectTls / https) uses aws-lc-rs. We install it in
+# ScriptRuntime::new. (rustls default features include the aws_lc_rs provider.)
+rustls = "0.23"
+anyhow = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# deno_io 0.152 (via deno_runtime) assumes winapi's `ctypes::c_void` aliases
+# `std::os::raw::c_void`, which only holds with winapi's `std` feature. We must
+# pull winapi+std into THIS crate's own graph so it unifies into deno_io's winapi
+# (a standalone `cargo build -p smudgy_script` does not include core's winapi).
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"

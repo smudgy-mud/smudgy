@@ -4,15 +4,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'smudgy_ui'",
+            "name": "Debug executable 'smudgy'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=smudgy_ui",
+                    "--bin=smudgy",
                     "--package=smudgy_ui"
                 ],
                 "filter": {
-                    "name": "smudgy_ui",
+                    "name": "smudgy",
                     "kind": "bin"
                 }
             },
@@ -22,16 +22,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'smudgy_ui'",
+            "name": "Debug unit tests in executable 'smudgy'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=smudgy_ui",
+                    "--bin=smudgy",
                     "--package=smudgy_ui"
                 ],
                 "filter": {
-                    "name": "smudgy_ui",
+                    "name": "smudgy",
                     "kind": "bin"
                 }
             },

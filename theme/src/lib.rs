@@ -1,9 +1,8 @@
-use std::ops::Deref;
-use std::sync::LazyLock;
 
-use iced::widget::{container, scrollable, svg, text, text_editor};
+use iced::widget::{container, scrollable, text_editor};
 use iced::{Background, Border, Color, Shadow, border};
 
+pub mod markdown;
 mod secondary;
 mod smudgy;
 
@@ -12,10 +11,14 @@ pub use smudgy::smudgy;
 
 pub mod builtins {
     pub mod button;
+    pub mod checkbox;
     pub mod container;
+    pub mod pane_grid;
+    pub mod pick_list;
     pub mod progress_bar;
     pub mod radio;
     pub mod rule;
+    pub mod slider;
     pub mod svg;
     pub mod text;
     pub mod text_input;
@@ -28,6 +31,18 @@ pub struct Theme {
 }
 
 impl iced::theme::Base for Theme {
+    fn default(_preference: iced::theme::Mode) -> Self {
+        smudgy::smudgy()
+    }
+
+    fn mode(&self) -> iced::theme::Mode {
+        iced::theme::Mode::Dark
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn base(&self) -> iced::theme::Style {
         iced::theme::Style {
             background_color: self.styles.general.background,
@@ -86,6 +101,14 @@ pub struct General {
     pub border: Color,
     pub rule: Color,
     pub overlay_background: Color,
+    /// The command-input strip. Deliberately contrasts with `background`
+    /// (the terminal behind it) — themes choose the pairing.
+    pub input_background: Color,
+    pub input_text: Color,
+    /// A translucent highlight composited over a surface for a short gradient
+    /// glow at the top of a view. White at low alpha; kept subtle so it reads as
+    /// depth, not a band.
+    pub top_highlight: Color,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +139,7 @@ impl scrollable::Catalog for Theme {
                 background: None,
                 border: Border::default(),
                 scroller: scrollable::Scroller {
-                    color: self.styles.general.accent,
+                    background: Background::Color(self.styles.general.accent),
                     border: Border::default(),
                 },
             },
@@ -124,14 +147,19 @@ impl scrollable::Catalog for Theme {
                 background: None,
                 border: Border::default(),
                 scroller: scrollable::Scroller {
-                    color: self.styles.general.accent,                    
+                    background: Background::Color(self.styles.general.accent),
                     border: Border::default(),
                 },
+            },
+            auto_scroll: scrollable::AutoScroll {
+                background: Background::Color(self.styles.general.overlay_background),
+                border: Border::default(),
+                shadow: Shadow::default(),
+                icon: self.styles.text.normal,
             },
         }
     }
 }
-
 
 pub enum TextEditorClass {
     Default,
@@ -144,14 +172,43 @@ impl text_editor::Catalog for Theme {
         TextEditorClass::Default
     }
 
-    fn style(&self, class: &Self::Class<'_>, status: text_editor::Status) -> text_editor::Style {
+    fn style(&self, _class: &Self::Class<'_>, _status: text_editor::Status) -> text_editor::Style {
         text_editor::Style {
             background: Background::Color(self.styles.general.container_background),
-            border: border::color(self.styles.general.border).width(1.0).into(),
-            icon: self.styles.text.normal,
+            border: border::color(self.styles.general.border).width(1.0),
             placeholder: self.styles.text.normal.scale_alpha(0.4),
             value: self.styles.text.normal,
             selection: self.styles.general.accent,
         }
+    }
+}
+
+// `markdown::Catalog` requires `table::Catalog` as a supertrait even when the
+// rendered Markdown contains no tables, so both are implemented here. The
+// Markdown widget powers the settings "Licenses" pane.
+impl iced::widget::table::Catalog for Theme {
+    type Class<'a> = iced::widget::table::StyleFn<'a, Self>;
+
+    fn default<'a>() -> Self::Class<'a> {
+        Box::new(|theme: &Theme| iced::widget::table::Style {
+            separator_x: theme.styles.general.border.into(),
+            separator_y: theme.styles.general.border.into(),
+        })
+    }
+
+    fn style(&self, class: &Self::Class<'_>) -> iced::widget::table::Style {
+        class(self)
+    }
+}
+
+impl iced::widget::markdown::Catalog for Theme {
+    fn code_block<'a>() -> <Self as container::Catalog>::Class<'a> {
+        Box::new(|theme: &Theme| container::Style {
+            background: Some(theme.styles.general.container_background.into()),
+            border: border::color(theme.styles.general.border)
+                .width(1.0)
+                .rounded(4.0),
+            ..Default::default()
+        })
     }
 }

@@ -1,5 +1,7 @@
-
-use iced::{widget::progress_bar::{self, Catalog, Style, StyleFn}, Border, Color};
+use iced::{
+    Color,
+    widget::progress_bar::{self, Catalog, Style, StyleFn},
+};
 
 use crate::Theme;
 
@@ -15,10 +17,11 @@ impl Catalog for Theme {
     }
 }
 
+#[must_use]
 pub fn default(theme: &Theme) -> progress_bar::Style {
-    Style { 
+    Style {
         background: theme.styles.general.background.into(),
         bar: Color::WHITE.into(),
-        border: Default::default(),
+        border: iced::Border::default(),
     }
 }

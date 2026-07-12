@@ -1,6 +1,0 @@
----
-description: 
-globs: 
-alwaysApply: true
----
-All rust source code should agree with clippy's "pedantic" rules, and be linted with clippy

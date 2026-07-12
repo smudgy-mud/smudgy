@@ -1,0 +1,47 @@
+[package]
+name = "smudgy_cloud"
+version = "0.4.0"
+edition = "2024"
+
+[dependencies]
+# Core dependencies
+derive_more = { workspace = true, features = ["display", "from", "into", "add"] }
+uuid = { version = "1.7", features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = "0.1"
+thiserror = "2.0.12"
+iced = { workspace = true }
+ordered-float = { workspace = true }
+reqwest = { version = "0.12.8", features = ["json"] }
+tokio = { workspace = true, features = ["rt"] }
+arc-swap = { workspace = true }
+color-art = { workspace = true }
+pathfinding = { workspace = true }
+rstar = "0.12.2"
+sha2 = "0.10"
+# Publish-time dependency locking (range -> concrete version) and the client-version
+# gate floor both parse/compare semver.
+semver = "1"
+
+[features]
+default = ["cloud"]
+cloud = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-test = "0.4"
+pretty_env_logger = { workspace = true }
+axum = "0.7"
+hmac = "0.12"
+hex = "0.4"
+sha2 = "0.10"
+# The package mock sorts list_versions by true semver precedence, mirroring the server.
+semver = "1"
+
+[lints]
+workspace = true

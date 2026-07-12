@@ -2,24 +2,74 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "smudgy"
-#define MyAppVersion "0.2.5"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "walter.dev"
-#define MyAppURL "htttps://smudgy.org"
+#define MyAppURL "https://smudgy.org"
 #define MyAppExeName "smudgy.exe"
-#define UninstallDisplayName="smudgy"
+
+; --- Build-channel install identity ------------------------------------------
+; bin/release.ps1 passes /DSmudgyDevBuild to ISCC for a dev/pre-release build
+; and omits it for a release or release candidate. The channel rule (clean
+; X.Y.Z = release; a prerelease whose first id is `rc` = release candidate; any
+; other -/+ suffix = dev) lives in release.ps1, which derives it from
+; MyAppVersion above, mirroring core::models::settings::build_channel and
+; bin/bump-version.sh. A release and a release candidate share ONE identity
+; (same AppId, install dir, display name, and data dir), so they upgrade/clobber
+; each other; a dev build gets its OWN identity and installs side by side,
+; matching its separate "smudgy-dev" data dir. A direct Inno-IDE compile
+; (unsupported — see SignTool below) defines nothing and so builds the release
+; identity.
+#ifdef SmudgyDevBuild
+  #define SmudgyAppId "{{90266A03-2AB3-4734-BDCD-5FF7FBD94221}"
+  #define SmudgyDisplayName "smudgy (dev build)"
+  #define SmudgyInstallDirName "Smudgy Dev"
+  #define SmudgyDataDirName "smudgy-dev"
+#else
+  #define SmudgyAppId "{{30B07CC5-7CA2-4B21-96CF-32F91E5312FB}"
+  #define SmudgyDisplayName "smudgy"
+  #define SmudgyInstallDirName "Smudgy"
+  #define SmudgyDataDirName "smudgy"
+#endif
 
 [Setup]
-; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
+; NOTE: The AppId uniquely identifies this application; dev builds use a separate
+; AppId (above) so they install alongside a release rather than over it. Do not
+; reuse either AppId in installers for other applications.
 ; (To generate a new GUID, click Tools | Generate GUID inside the IDE.)
-AppId={{30B07CC5-7CA2-4B21-96CF-32F91E5312FB}
-AppName={#MyAppName}
+AppId={#SmudgyAppId}
+AppName={#SmudgyDisplayName}
 AppVersion={#MyAppVersion}
-;AppVerName={#MyAppName} {#MyAppVersion}
+;AppVerName={#SmudgyDisplayName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={autopf}\Smudgy
+; Running-app handling. Overwriting smudgy.exe while it is running is impossible,
+; so an in-place upgrade over a running instance used to fail and roll back. We do
+; NOT set AppMutex (it would force a manual "close smudgy then click OK" modal).
+; Instead CloseApplications has Setup's Restart Manager detect the running instance
+; by its file lock on smudgy.exe and close it. We use `force`, not `yes`: the app
+; cooperates by catching the RM session-end message and exiting cleanly, but that
+; exit is not instant, and in graceful-only (`yes`) mode a slow or uncooperative
+; process (the inspector sidecar, or a leftover second instance) makes RM give up
+; with a "Setup was unable to automatically close all applications" prompt. `force`
+; terminates whatever has not exited in time, so the close always succeeds; smudgy
+; persists its state continuously, so a forced close loses nothing important.
+;
+; CloseApplicationsFilter is narrowed from its default (*.exe,*.dll,*.chm) to just
+; smudgy's own executables. The bundled CRT DLLs (vcruntime140*.dll) are loaded
+; only by smudgy and released the moment it exits, so RM need not track them;
+; the CRT runtime is used everywhere, so keeping it out of scope avoids dragging
+; unrelated processes into RM's set.
+;
+; RestartApplications is OFF on purpose. RM's restart step (RmRestart) is
+; unreliable here — it hangs — so rather than have RM relaunch the closed instance
+; we relaunch via the Finished-page [Run] entry. Trade-off: a /SILENT upgrade over
+; a running smudgy closes it and does not relaunch it.
+CloseApplications=force
+CloseApplicationsFilter=smudgy.exe,smudgy_inspector.exe
+RestartApplications=no
+DefaultDirName={autopf}\{#SmudgyInstallDirName}
 ; "ArchitecturesAllowed=x64compatible" specifies that Setup cannot run
 ; on anything but x64 and Windows 11 on Arm.
 ArchitecturesAllowed=x64compatible
@@ -33,6 +83,11 @@ DisableProgramGroupPage=yes
 ;PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputBaseFilename=smudgy-setup
+; Signs the uninstaller and the setup exe. "smudgysign" is supplied on the
+; ISCC command line (/Ssmudgysign="..."), see bin/release.ps1.
+; Builds via the Inno IDE without that definition will fail; compile with
+; release.ps1 or remove this line temporarily.
+SignTool=smudgysign $f
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -42,15 +97,68 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+; Checked (opt-out) by default — Inno tasks are checked unless flagged
+; `unchecked`, so this carries no Flags. The app's only automatic smudgy.org
+; contact is an unauthenticated update check; clearing this seeds it off on
+; first run (see the [Code] section, which writes the update-check-seed file
+; the app reads).
+Name: "updatecheck"; Description: "Allow smudgy to automatically check for updates"
 
 [Files]
-Source: "..\target\release\smudgy_ui.exe"; DestName: "smudgy.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release-full\smudgy.exe"; DestDir: "{app}"; Flags: ignoreversion
+; The bundled v8-inspector DevTools sidecar, spawned by the app's "Show Inspector"
+; button. Must sit next to smudgy.exe (the app resolves it relative to its own exe).
+Source: "..\target\release-full\smudgy_inspector.exe"; DestDir: "{app}"; Flags: ignoreversion
+; App-local VC++ runtime (from the VS Redist\MSVC folder, version 14.44.35211)
+; so smudgy runs on machines without the VC++ Redistributable installed.
+; smudgy.exe imports only these two CRT DLLs (verified with dumpbin /dependents);
+; the UCRT (api-ms-win-crt-*) ships with Windows 10+.
+Source: "redist\x64\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "redist\x64\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; Channel-aware shortcut names so a side-by-side dev install doesn't overwrite
+; the release's Start Menu / desktop shortcut (and vice versa).
+Name: "{autoprograms}\{#SmudgyDisplayName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\{#SmudgyDisplayName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; The "Launch smudgy" checkbox on the Finished page. This is the sole relaunch
+; path (RestartApplications is off), so it runs for both a fresh install and an
+; upgrade over a running instance. No double-launch risk: nothing else relaunches
+; smudgy, and any prior instance was already closed by the Restart Manager during
+; install.
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(SmudgyDisplayName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// The update-check seed (below) must land in the same per-user data dir the app
+// reads, which mirrors core::get_smudgy_home(): a dev/pre-release build under
+// "smudgy-dev", a release or release candidate under "smudgy". The channel is
+// fixed at compile time by the SmudgyDevBuild define (see the install-identity
+// block at the top of this script), so the seed dir is simply SmudgyDataDirName
+// under {userdocs}.
+function SmudgyHomeDir(): String;
+begin
+  Result := ExpandConstant('{userdocs}\{#SmudgyDataDirName}');
+end;
+
+{ The "updatecheck" task is checked by default, and the app defaults the setting
+  on, so a checked box needs no signal. When the user CLEARS it, drop a one-shot
+  seed file the app folds into settings.json on its first run: "0" means "start
+  with automatic update checks off". The app deletes the seed after reading it. }
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  SmudgyDir: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if not WizardIsTaskSelected('updatecheck') then
+    begin
+      SmudgyDir := SmudgyHomeDir();
+      if ForceDirectories(SmudgyDir) then
+        SaveStringToFile(SmudgyDir + '\update-check-seed', '0', False);
+    end;
+  end;
+end;
 

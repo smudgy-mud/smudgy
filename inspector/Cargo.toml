@@ -1,0 +1,31 @@
+[package]
+name = "smudgy_inspector"
+description = "Bundled DevTools window for a smudgy session's v8 inspector (standalone helper process)"
+version = "0.4.0"
+edition = "2021"
+publish = false
+
+# Standalone sidecar the main app spawns ("Show Inspector"). It is its OWN process
+# with its own tao event loop, so it never conflicts with iced's winit loop in the
+# main app. It opens a wry (WebView2 on Windows) window pointed at a Chrome DevTools
+# frontend connected to the session's CDP WebSocket. See script/DESIGN.md s7.
+[[bin]]
+name = "smudgy_inspector"
+path = "src/main.rs"
+
+[dependencies]
+wry = "0.55"
+tao = "0.35"
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+# The Chrome DevTools frontend is vendored under `devtools-frontend/` and embedded
+# into this binary (served over a custom protocol), so the debugger UI loads offline
+# and no third-party host ever gets CDP access to the session. `debug-embed` forces
+# embedding in debug builds too (this is a dev-only tool, always built in debug).
+rust-embed = { version = "8", features = ["debug-embed"] }
+# `http` types for the custom-protocol handler. Pinned to the same major wry uses so
+# the `Request`/`Response` types unify with `with_custom_protocol`'s signature.
+http = "1"
+
+[lints]
+workspace = true
