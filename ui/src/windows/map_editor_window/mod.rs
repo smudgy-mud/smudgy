@@ -38,6 +38,9 @@ use smudgy_cloud::{
 };
 
 use area_list::SharerIndex;
+use smudgy_core::models::map_scopes::{
+    HostEntry, MapScopes, ScopeDelta, ScopeState, match_host_hints,
+};
 use smudgy_map_widget::map_editor::{
     self, EntityId, ExitTarget, MapEditor, MutationRequest, Tool,
 };
@@ -196,6 +199,17 @@ pub enum Message {
     TransferAtlasOwnershipRequested(AtlasId),
     /// Transfer-offer dialog internals, routed to [`modals::update_transfer`].
     Transfer(modals::TransferMessage),
+
+    // ===== cloud-map scope (per-server atlas visibility) =====
+    /// The scope control: `true` = All atlases, `false` = This server.
+    ScopeAllToggled(bool),
+    /// Open the "Servers…" checklist for an atlas or atlas-less area.
+    ServersChecklistRequested(ScopeTarget),
+    /// Show/hide the checklist's target on one server entry.
+    ScopeServerToggled { entry: String, show: bool },
+    /// The daemon mirrored an updated scope store into this editor (another
+    /// editor changed an association).
+    ScopesReplaced(MapScopes),
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +220,14 @@ pub enum Event {
     /// The set of disabled areas changed; the daemon persists it and fans it
     /// out to every live mapper.
     DisabledAreasChanged(std::collections::HashSet<AreaId>),
+    /// The cloud-map scope associations changed (a "Servers…" edit, a creation,
+    /// bind-on-use, or newly observed/first-sight-homed atlases). Carried as
+    /// targeted deltas — never a whole-store snapshot — so the daemon replays
+    /// them against its authoritative copy without clobbering a concurrent
+    /// write. The editor has already applied them optimistically to its own
+    /// snapshot; the daemon persists, recomputes each server's exclusions, and
+    /// mirrors the corrected store back into every editor.
+    ScopeAssociationsChanged(Vec<ScopeDelta>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +296,17 @@ fn editor_hotkeys(
 pub enum FolderKey {
     Atlas(AtlasId),
     Loose,
+    /// The "Unassigned" group in the This-server scope: atlases with no
+    /// server-entry association yet. Collapsed by default.
+    Unassigned,
+}
+
+/// A cloud-map scope association target: a whole atlas, or a genuinely
+/// atlas-less area. The unit the "Servers…" checklist writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeTarget {
+    Atlas(AtlasId),
+    Area(AreaId),
 }
 
 pub struct MapEditorWindow {
@@ -335,6 +368,19 @@ pub struct MapEditorWindow {
     /// prompt). Seeded from settings at construction; upgrading the client
     /// surfaces the banner once more.
     signin_banner_dismissed: bool,
+    /// The server entry this editor was opened from — the cloud-map scope
+    /// context. `None` when the editor has no session context (the scope
+    /// control is then hidden and everything is shown).
+    server_name: Option<String>,
+    /// A snapshot of the per-user cloud-map scope associations. The daemon owns
+    /// the authoritative copy; this window reads it to filter the session tree
+    /// and drive the "Servers…" checklist, writes into it optimistically, and
+    /// bubbles every change up via [`Event::ScopeAssociationsChanged`].
+    map_scopes: MapScopes,
+    /// The scope control: `false` = This server (the session tree, filtered to
+    /// this entry), `true` = All atlases (every atlas, unfiltered). Defaults to
+    /// This server when a server context exists, All otherwise.
+    scope_all: bool,
 }
 
 impl MapEditorWindow {
@@ -345,8 +391,11 @@ impl MapEditorWindow {
         mapper: Mapper,
         cloud: CloudHandles,
         clipboard: SharedClipboard,
+        server_name: String,
+        map_scopes: MapScopes,
     ) -> Self {
-        let first_area = area_list::first_area_id(&mapper.get_current_atlas());
+        let first_area =
+            area_list::first_area_id(&mapper.get_current_atlas(), &mapper.ephemeral_area_ids());
 
         let (mut panes, area_list_pane) = pane_grid::State::new(PaneKind::AreaList);
 
@@ -392,9 +441,119 @@ impl MapEditorWindow {
                 .dismissed_signin_banner_version
                 .as_deref()
                 == Some(env!("CARGO_PKG_VERSION")),
+            server_name: (!server_name.is_empty()).then_some(server_name),
+            map_scopes,
+            // The Unassigned group starts collapsed per the plan.
+            scope_all: false,
         };
+        // Default to This-server scope only when a server context exists.
+        window.scope_all = window.server_name.is_none();
+        window.collapsed_folders.insert(FolderKey::Unassigned);
         window.inspector.resync(&window.mapper, &window.editor);
         window
+    }
+
+    /// The server entry this editor scopes to (for the daemon's per-entry
+    /// exclusion fan-out), or `None` when it has no session context.
+    #[must_use]
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+
+    /// Creation-associates: a cloud atlas created from a session-scoped editor is
+    /// associated with that session's entry (nothing user-created starts
+    /// unassigned). Local atlases stay entry-isolated. Returns the change event
+    /// so the daemon persists and fans it out.
+    fn associate_new_atlas(&mut self, atlas_id: AtlasId) -> Option<Event> {
+        let server = self.server_name.clone()?;
+        // Query the mapper (not the tick-refreshed cache) so a just-created
+        // local atlas is recognized immediately and left entry-isolated.
+        if self.mapper.local_atlas_ids().contains(&atlas_id) {
+            return None;
+        }
+        let delta = ScopeDelta::SetAtlasEntry {
+            atlas_id,
+            entry: server,
+            show: true,
+        };
+        self.map_scopes.apply(&delta);
+        Some(Event::ScopeAssociationsChanged(vec![delta]))
+    }
+
+    /// Creation-associates: a cloud *atlas-less* area created from a
+    /// session-scoped editor gets an area-level association (an area filed into
+    /// an atlas is scoped by its atlas, so it needs none). Local/ephemeral areas
+    /// stay entry-isolated.
+    fn associate_new_area(&mut self, area_id: AreaId) -> Option<Event> {
+        let server = self.server_name.clone()?;
+        let atlas = self.mapper.get_current_atlas();
+        let has_atlas = atlas
+            .get_area(&area_id)
+            .and_then(|area| area.meta().atlas_id)
+            .is_some();
+        if has_atlas
+            || self.mapper.is_ephemeral(&area_id)
+            || self.mapper.local_area_ids().contains(&area_id)
+        {
+            return None;
+        }
+        let delta = ScopeDelta::SetAreaEntry {
+            area_id,
+            entry: server,
+            show: true,
+        };
+        self.map_scopes.apply(&delta);
+        Some(Event::ScopeAssociationsChanged(vec![delta]))
+    }
+
+    /// Bind-on-use (editor signal): opening an area of an *unassigned* cloud
+    /// atlas from a session-scoped editor's This-server tree associates that
+    /// atlas (or atlas-less area) with the session's entry. Only in the
+    /// This-server scope — opening from the All view is browsing, not homing —
+    /// and only for a currently-unassigned target, so it self-limits (a second
+    /// open is already Here). No toast: the editor's own tree makes the move
+    /// visible, and the Servers checklist is the immediate undo.
+    fn associate_opened_area(&mut self, area_id: AreaId) -> Option<Event> {
+        let server = self.server_name.clone()?;
+        if self.scope_all {
+            return None;
+        }
+        if self.mapper.is_ephemeral(&area_id) || self.mapper.local_area_ids().contains(&area_id) {
+            return None;
+        }
+        let atlas_id = self
+            .mapper
+            .get_current_atlas()
+            .get_area(&area_id)
+            .and_then(|area| area.meta().atlas_id);
+        if let Some(atlas_id) = atlas_id
+            && self.mapper.local_atlas_ids().contains(&atlas_id)
+        {
+            return None;
+        }
+        let unassigned = match atlas_id {
+            Some(atlas_id) => {
+                self.map_scopes.atlas_scope(&atlas_id, &server) == ScopeState::Unassigned
+            }
+            None => self.map_scopes.area_scope(&area_id, &server) == ScopeState::Unassigned,
+        };
+        if !unassigned {
+            return None;
+        }
+        let delta = match atlas_id {
+            Some(atlas_id) => ScopeDelta::SetAtlasEntry {
+                atlas_id,
+                entry: server,
+                show: true,
+            },
+            None => ScopeDelta::SetAreaEntry {
+                area_id,
+                entry: server,
+                show: true,
+            },
+        };
+        self.map_scopes.apply(&delta);
+        Some(Event::ScopeAssociationsChanged(vec![delta]))
     }
 
     /// Fetches received grants (for the sharer index) and the area list (for
@@ -417,6 +576,98 @@ impl MapEditorWindow {
             },
             |(grants, areas)| Message::IndicesLoaded { grants, areas },
         )
+    }
+
+    /// §5 recipient homing: on first sight of a shared atlas (or genuinely
+    /// atlas-less shared area) the viewer has no association for, match the
+    /// covering grants' grantor-authored `host_hints` against the local server
+    /// entries and, on ≥1 match, associate it with those entries **silently**.
+    /// No match leaves it Unassigned; the §3 convergence machinery takes over.
+    /// Defaults apply only on first sight and never overwrite an existing local
+    /// association (§5.4). Runs here — the sole point holding both the received
+    /// grant rows (with `host_hints`) and the area inventory (for the
+    /// area→atlas mapping that lets an area-scope grant home its atlas).
+    /// Returns the deltas applied (empty when nothing homed), applying each to
+    /// this editor's own snapshot and handing the same list to the daemon so it
+    /// replays them against the authoritative copy — never a whole-store
+    /// snapshot, which would clobber a concurrent write.
+    fn apply_recipient_homing(&mut self, grants: &[ShareGrantRow], areas: &[Area]) -> Vec<ScopeDelta> {
+        // The local server entries are the homing evidence (§5.1). Hosts are
+        // consumed here once and never stored as keys.
+        let entries: Vec<HostEntry> = smudgy_core::models::server::list_servers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|server| HostEntry {
+                name: server.name,
+                host: server.config.host,
+                port: server.config.port,
+            })
+            .collect();
+
+        // area id -> atlas id, so an area-scope grant can home the *atlas* its
+        // area belongs to (the §6 walkthrough: area grants from "Cities" home
+        // the Cities folder).
+        let area_atlas: std::collections::HashMap<AreaId, AtlasId> = areas
+            .iter()
+            .filter_map(|area| area.atlas_id.map(|atlas_id| (area.id, atlas_id)))
+            .collect();
+
+        // Aggregate the covering grants' host hints per homing target.
+        let mut atlas_hints: std::collections::HashMap<AtlasId, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut area_hints: std::collections::HashMap<AreaId, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in grants {
+            let hints = row.grant.host_hints.clone().unwrap_or_default();
+            match (row.grant.atlas_id, row.grant.area_id) {
+                (Some(atlas_id), _) => atlas_hints.entry(atlas_id).or_default().extend(hints),
+                (None, Some(area_id)) => match area_atlas.get(&area_id) {
+                    Some(atlas_id) => atlas_hints.entry(*atlas_id).or_default().extend(hints),
+                    None => area_hints.entry(area_id).or_default().extend(hints),
+                },
+                (None, None) => {}
+            }
+        }
+
+        let mut deltas = Vec::new();
+        for (atlas_id, hints) in atlas_hints {
+            // First sight only. The MarkSeen delta consumes it in every branch,
+            // so a no-match atlas isn't re-evaluated once its entries drift.
+            if self.map_scopes.has_seen(&atlas_id) {
+                continue;
+            }
+            if self.map_scopes.atlas_entries(&atlas_id).is_empty() {
+                let matched = match_host_hints(&hints, &entries);
+                if !matched.is_empty() {
+                    deltas.push(ScopeDelta::SetAtlasEntries {
+                        atlas_id,
+                        entries: matched,
+                    });
+                }
+            }
+            deltas.push(ScopeDelta::MarkSeen { atlas_id });
+        }
+        for (area_id, hints) in area_hints {
+            // Atlas-less areas have no first-seen ledger; the "no existing
+            // association" guard stands in — homing applies once (setting a
+            // record) and thereafter the record itself blocks re-homing, so a
+            // later user edit is never overwritten.
+            if self.map_scopes.area_entries(&area_id).is_empty() {
+                let matched = match_host_hints(&hints, &entries);
+                if !matched.is_empty() {
+                    deltas.push(ScopeDelta::SetAreaEntries {
+                        area_id,
+                        entries: matched,
+                    });
+                }
+            }
+        }
+        // Apply optimistically to this editor's snapshot so its tree reflects
+        // the homing before the daemon's mirrored store returns.
+        for delta in &deltas {
+            self.map_scopes.apply(delta);
+        }
+        deltas
     }
 
     /// Refetches the owned-atlas inventory (folder names + counts). Resolves
@@ -1069,6 +1320,9 @@ impl MapEditorWindow {
                     }
                     self.refresh_seen_rev();
                     self.inspector.resync(&self.mapper, &self.editor);
+                    // Bind-on-use: opening an unassigned atlas from this
+                    // session's This-server tree homes it here.
+                    return Update::new(Task::none(), self.associate_opened_area(area_id));
                 }
                 Update::none()
             }
@@ -1241,7 +1495,14 @@ impl MapEditorWindow {
                 match result {
                     Ok(area_id) => {
                         self.modal = None;
-                        return self.update(Message::AreaSelected(area_id));
+                        // Creation-associates: a cloud atlas-less area gets an
+                        // area-level association with this session's entry
+                        // (unconditional — unlike the editor-open signal, which
+                        // only fires in the This-server scope).
+                        let created = self.associate_new_area(area_id);
+                        let mut update = self.update(Message::AreaSelected(area_id));
+                        update.event = created.or(update.event);
+                        return update;
                     }
                     Err(error) => {
                         if let Some(modals::Modal::CreateArea { error: slot, .. }) =
@@ -1309,7 +1570,10 @@ impl MapEditorWindow {
                 self.mapper.delete_area(area_id);
                 self.stack.clear();
 
-                let next_area = area_list::first_area_id(&self.mapper.get_current_atlas());
+                let next_area = area_list::first_area_id(
+                    &self.mapper.get_current_atlas(),
+                    &self.mapper.ephemeral_area_ids(),
+                );
                 self.editor.set_area(next_area);
                 self.hovered_room = None;
                 if !self.can_edit_active_area() && self.editor.tool() != Tool::Select {
@@ -1338,6 +1602,18 @@ impl MapEditorWindow {
                 Update::none()
             }
             Message::IndicesLoaded { grants, areas } => {
+                // §5 first-sight homing needs BOTH halves (the grants carry the
+                // host hints; the areas map an area-scope grant to its atlas).
+                // Bubble the resulting scope change up to the central flow so
+                // it persists, fans exclusions to every mapper, and mirrors into
+                // the other editors — once, consistently.
+                let mut event = None;
+                if let (Ok(grants), Ok(areas)) = (&grants, &areas) {
+                    let deltas = self.apply_recipient_homing(grants, areas);
+                    if !deltas.is_empty() {
+                        event = Some(Event::ScopeAssociationsChanged(deltas));
+                    }
+                }
                 // Each index is rebuilt independently: a transient failure on
                 // one keeps the prior value rather than dropping attribution
                 // or family grouping.
@@ -1353,7 +1629,7 @@ impl MapEditorWindow {
                         log::warn!("map editor: area-list fetch failed: {error}");
                     }
                 }
-                Update::none()
+                event.map_or_else(Update::none, Update::with_event)
             }
             Message::ToggleAreaEnabled(area_id) => {
                 let enabled = self.mapper.is_area_enabled(&area_id);
@@ -1617,8 +1893,23 @@ impl MapEditorWindow {
 
             // ===== atlases (folders) =====
             Message::AtlasesLoaded(result) => {
+                let mut deltas = Vec::new();
                 match result {
-                    Ok(atlases) => self.atlases = atlases,
+                    Ok(atlases) => {
+                        // Record first sight of *owned* atlases only. GET /atlases
+                        // is owned-OR-administered, so a `can_admin` atlas-share
+                        // can arrive here on the same sync tick that §5 homing
+                        // runs in IndicesLoaded; marking it seen first would
+                        // suppress its recipient homing. Every shared atlas —
+                        // administered or not — is left for the homing path,
+                        // which marks it seen itself after deciding.
+                        for item in &atlases {
+                            if item.is_owner && self.map_scopes.mark_seen(item.id) {
+                                deltas.push(ScopeDelta::MarkSeen { atlas_id: item.id });
+                            }
+                        }
+                        self.atlases = atlases;
+                    }
                     // Signed out / unverified: no cloud folders to show.
                     Err(CloudError::Unauthorized(_) | CloudError::EmailNotVerified) => {
                         self.atlases.clear();
@@ -1626,7 +1917,11 @@ impl MapEditorWindow {
                     // Keep the prior inventory on a transient failure.
                     Err(error) => log::warn!("map editor: atlas list fetch failed: {error}"),
                 }
-                Update::none()
+                if deltas.is_empty() {
+                    Update::none()
+                } else {
+                    Update::with_event(Event::ScopeAssociationsChanged(deltas))
+                }
             }
             Message::NewAtlasRequested => {
                 // Cloud is the default tier when signed in; a signed-out
@@ -1684,7 +1979,10 @@ impl MapEditorWindow {
                         // Ensure the new folder is expanded, then refetch so it
                         // appears with its real name and count.
                         self.collapsed_folders.remove(&FolderKey::Atlas(atlas_id));
-                        return Update::with_task(self.fetch_atlases());
+                        // Creation-associates: a cloud atlas created from a
+                        // session-scoped editor is homed on this session's entry.
+                        let assoc = self.associate_new_atlas(atlas_id);
+                        return Update::new(self.fetch_atlases(), assoc);
                     }
                     Err(error) => {
                         if let Some(modals::Modal::CreateAtlas { error: slot, .. }) = &mut self.modal
@@ -1862,6 +2160,86 @@ impl MapEditorWindow {
                 modals::open_transfer_dialog(self, modals::TransferSubject::Atlas(atlas_id, name))
             }
             Message::Transfer(message) => modals::update_transfer(self, message),
+            Message::ScopeAllToggled(all) => {
+                self.scope_all = all;
+                Update::none()
+            }
+            Message::ServersChecklistRequested(target) => {
+                // The checklist writes associations; it needs a server
+                // inventory. Local atlases and ephemeral areas never get here
+                // (no affordance is drawn for them).
+                let name = match target {
+                    ScopeTarget::Atlas(atlas_id) => self
+                        .atlases
+                        .iter()
+                        .find(|a| a.id == atlas_id)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_default(),
+                    ScopeTarget::Area(area_id) => self
+                        .mapper
+                        .get_current_atlas()
+                        .get_area(&area_id)
+                        .map(|a| a.get_name().to_string())
+                        .unwrap_or_default(),
+                };
+                let servers = smudgy_core::models::server::list_servers()
+                    .map(|servers| servers.into_iter().map(|s| s.name).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let checked = match target {
+                    ScopeTarget::Atlas(atlas_id) => self.map_scopes.atlas_entries(&atlas_id),
+                    ScopeTarget::Area(area_id) => self.map_scopes.area_entries(&area_id),
+                };
+                self.modal = Some(modals::Modal::ServersChecklist {
+                    target,
+                    name,
+                    servers,
+                    checked,
+                });
+                Update::none()
+            }
+            Message::ScopeServerToggled { entry, show } => {
+                let Some(modals::Modal::ServersChecklist {
+                    target, checked, ..
+                }) = &mut self.modal
+                else {
+                    return Update::none();
+                };
+                if show {
+                    checked.insert(entry.clone());
+                } else {
+                    checked.remove(&entry);
+                }
+                let delta = match *target {
+                    ScopeTarget::Atlas(atlas_id) => ScopeDelta::SetAtlasEntry {
+                        atlas_id,
+                        entry,
+                        show,
+                    },
+                    ScopeTarget::Area(area_id) => ScopeDelta::SetAreaEntry {
+                        area_id,
+                        entry,
+                        show,
+                    },
+                };
+                self.map_scopes.apply(&delta);
+                Update::with_event(Event::ScopeAssociationsChanged(vec![delta]))
+            }
+            Message::ScopesReplaced(scopes) => {
+                self.map_scopes = scopes;
+                // Refresh an open "Servers…" checklist: its `checked` buffer was
+                // snapshotted at open, so a concurrent write mirrored back here
+                // would otherwise leave stale ticks on screen. Rebuild it from
+                // the fresh store for the modal's target.
+                if let Some(modals::Modal::ServersChecklist { target, checked, .. }) =
+                    &mut self.modal
+                {
+                    *checked = match *target {
+                        ScopeTarget::Atlas(atlas_id) => self.map_scopes.atlas_entries(&atlas_id),
+                        ScopeTarget::Area(area_id) => self.map_scopes.area_entries(&area_id),
+                    };
+                }
+                Update::none()
+            }
         }
     }
 

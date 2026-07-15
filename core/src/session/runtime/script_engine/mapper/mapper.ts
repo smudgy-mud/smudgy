@@ -12,6 +12,8 @@ import {
     op_smudgy_mapper_list_rooms_by_title_and_description,
     op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
     op_smudgy_mapper_create_area,
+    op_smudgy_mapper_delete_area,
+    op_smudgy_mapper_get_area_is_ephemeral,
     op_smudgy_mapper_rename_area,
     op_smudgy_mapper_get_area_by_id,
     op_smudgy_mapper_get_area_name,
@@ -34,6 +36,10 @@ import {
     op_smudgy_mapper_remove_room_tag,
     op_smudgy_mapper_find_nearest_room_with_tags,
     op_smudgy_mapper_find_nearest_room_in_area,
+    op_smudgy_mapper_get_room_external_id,
+    op_smudgy_mapper_set_room_external_id,
+    op_smudgy_mapper_find_room_by_external_id,
+    op_smudgy_mapper_rescue_room_by_external_id,
     op_smudgy_mapper_get_room_exits,
     op_smudgy_mapper_set_room_title,
     op_smudgy_mapper_set_room_description,
@@ -103,15 +109,20 @@ interface CreateRoomParams {
     x?: number;
     y?: number;
     color?: string;
+    externalId?: string;
 }
 
 // The fields `updateRoom`/`updateRooms`/`Room.update` accept: the same set as creation, minus
 // the auto-assigned room number. Any omitted field is left unchanged.
 type UpdateRoomParams = CreateRoomParams;
 
+interface CreateAreaOptions {
+    ephemeral?: boolean;
+}
+
 const mapper = {
-    async createArea(name: string) {
-        const id = await op_smudgy_mapper_create_area(name);
+    async createArea(name: string, options?: CreateAreaOptions) {
+        const id = await op_smudgy_mapper_create_area(name, options?.ephemeral === true);
         return new Area(id);
     },
 
@@ -160,6 +171,11 @@ const mapper = {
     renameArea(area: Area | AreaId, name: string) {
         const areaId = area instanceof Area ? area.id : area;
         op_smudgy_mapper_rename_area(areaId, name);
+    },
+
+    deleteArea(area: Area | AreaId) {
+        const areaId = area instanceof Area ? area.id : area;
+        op_smudgy_mapper_delete_area(areaId);
     },
 
     setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string) {
@@ -269,6 +285,34 @@ const mapper = {
         if (!ref) return undefined;
         const [refAreaId, roomNumber] = ref;
         return this.getAreaById(refAreaId).room(roomNumber);
+    },
+
+    /** The room bound to a server-global room id (a GMCP/MSDP room identity),
+     * or `undefined` if no loaded room carries it. Best-effort when the same
+     * id is bound in several areas. Requires `mapper:read`. */
+    findRoomByExternalId(externalId: string): Room | undefined {
+        const ref = op_smudgy_mapper_find_room_by_external_id(externalId);
+        if (!ref) return undefined;
+        const [refAreaId, roomNumber] = ref;
+        return this.getAreaById(refAreaId).room(roomNumber);
+    },
+
+    /** Reports whether a room with this server-global id is already mapped for a
+     * different server. When it is, the player is offered the chance to show
+     * that map here too, and this returns `true`, so a caller drawing a map as
+     * it explores knows the room is accounted for and should not recreate it.
+     * Returns `false` when the id belongs to no other server's map. Requires
+     * `mapper:read`. */
+    rescueRoomByExternalId(externalId: string): boolean {
+        return op_smudgy_mapper_rescue_room_by_external_id(externalId);
+    },
+
+    /** Bind (or, with an empty string, clear) a room's server-global room id.
+     * Requires `mapper:write`. */
+    setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string) {
+        const areaId = area instanceof Area ? area.id : area;
+        const roomNumber = room instanceof Room ? room.room_number : room;
+        op_smudgy_mapper_set_room_external_id(areaId, roomNumber, externalId);
     },
 
     createRoom(area: Area | AreaId, params: CreateRoomParams): RoomNumber {
@@ -535,6 +579,10 @@ class Area {
         return op_smudgy_mapper_list_area_room_numbers(this.#obj) || [];
     }
 
+    get isEphemeral(): boolean {
+        return op_smudgy_mapper_get_area_is_ephemeral(this.#obj) === true;
+    }
+
     get next_room_number(): RoomNumber {
         return op_smudgy_mapper_get_area_next_room_number(this.#obj);
     }
@@ -580,6 +628,10 @@ class Room {
 
     get title(): string {
         return op_smudgy_mapper_get_room_title(this.#obj);
+    }
+
+    get externalId(): string | undefined {
+        return op_smudgy_mapper_get_room_external_id(this.#obj) ?? undefined;
     }
 
     get description(): string {

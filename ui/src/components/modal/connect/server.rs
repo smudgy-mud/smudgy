@@ -62,10 +62,7 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                     return Task::none();
                 }
             };
-            let config = ServerConfig {
-                host: state.server_form_data.host.trim().to_string(),
-                port,
-            };
+            let config = ServerConfig::new(state.server_form_data.host.trim().to_string(), port);
             if let Err(e) = config.validate() {
                 state.server_crud_error = Some(format!("Configuration error: {e}"));
                 return Task::none();
@@ -86,10 +83,16 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                     return Task::none();
                 }
             };
-            let config = ServerConfig {
-                host: state.server_form_data.host.trim().to_string(),
-                port,
-            };
+            // Carry everything the form doesn't edit (the link-trust grants)
+            // forward from the existing config, so an address edit never
+            // silently revokes them.
+            let mut config = state
+                .servers
+                .iter()
+                .find(|s| s.name == *original_name)
+                .map_or_else(|| ServerConfig::new(String::new(), 0), |s| s.config.clone());
+            config.host = state.server_form_data.host.trim().to_string();
+            config.port = port;
             if let Err(e) = config.validate() {
                 state.server_crud_error = Some(format!("Configuration error: {e}"));
                 return Task::none();

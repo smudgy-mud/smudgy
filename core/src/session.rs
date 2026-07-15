@@ -1,7 +1,7 @@
 use derive_more::{Add, Display, From, Into};
 use futures::Stream;
 use runtime::RuntimeAction;
-use smudgy_cloud::{AreaId, Mapper};
+use smudgy_cloud::{AreaId, AtlasId, Mapper};
 use std::{fmt::Debug, sync::Arc};
 use styled_line::StyledLine;
 use tokio::sync::mpsc::UnboundedSender;
@@ -36,6 +36,22 @@ pub enum SessionEvent {
         operation: LineOperation,
     },
     SetCurrentLocation(AreaId, Option<i32>),
+    /// A mapper navigation op resolved a destination in this area (speedwalk /
+    /// find-nearest) — the UI daemon treats it as demonstrated navigation
+    /// intent for per-server map scoping (bind-on-use). Advisory; no state
+    /// change beyond the daemon's scope bookkeeping.
+    MapperNavigated(AreaId),
+    /// A room is already mapped on a *different* server entry — the daemon
+    /// raises the cross-entry "show here too?" rescue offer for its atlas
+    /// (checked before the auto-mapper mints ephemeral rooms).
+    OfferMapRescue {
+        area_id: AreaId,
+        atlas_id: Option<AtlasId>,
+        atlas_name: Option<String>,
+    },
+    /// A script created a non-ephemeral (cloud-tier) area; the daemon
+    /// associates it with this session's server entry.
+    MapAreaCreated(AreaId),
     /// A pane was created in this session's registry. Travels the same
     /// ordered channel as buffer updates, so the UI always sees the open
     /// before the first `AppendTo` for the key. `placement` tells the hosting

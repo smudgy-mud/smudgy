@@ -42,6 +42,7 @@ async fn cloud_mapper_crud_roundtrip() {
         .create_area(CreateAreaRequest {
             name: "Test Area".to_string(),
             atlas_id: None,
+            ephemeral: false,
         })
         .await
         .expect("create_area");

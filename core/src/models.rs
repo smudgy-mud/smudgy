@@ -4,6 +4,7 @@ pub mod aliases;
 pub mod auth;
 pub mod hotkeys;
 pub mod local_packages;
+pub mod map_scopes;
 pub mod modules;
 pub mod naming;
 pub mod packages;

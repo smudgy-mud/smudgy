@@ -294,6 +294,7 @@ pub async fn accept_transfer(
         can_copy: false,
         include_secrets: false,
         can_admin: true,
+        host_hints: None,
         parent_grant_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

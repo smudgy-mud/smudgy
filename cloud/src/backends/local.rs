@@ -36,12 +36,12 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::MapperBackend;
+use super::{MapperBackend, area_edits};
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CreateAreaRequest, Exit, ExitArgs, ExitId, ExitStyle, ExitUpdates, Label, LabelArgs, LabelId,
-    LabelUpdates, CloudError, CloudResult, Property, Room, RoomUpdates, RoomWithDetails, Shape,
-    ShapeArgs, ShapeId, ShapeUpdates, mapper::RoomKey,
+    CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, Label, LabelArgs, LabelId,
+    LabelUpdates, CloudError, CloudResult, Room, RoomUpdates, Shape, ShapeArgs, ShapeId,
+    ShapeUpdates, mapper::RoomKey,
 };
 
 /// On-disk authoritative map store. Cheaply shareable behind an `Arc`.
@@ -250,109 +250,6 @@ where
     out
 }
 
-fn apply_room_updates(room: &mut RoomWithDetails, updates: &RoomUpdates) {
-    if let Some(title) = &updates.title {
-        room.title.clone_from(title);
-    }
-    if let Some(description) = &updates.description {
-        room.description.clone_from(description);
-    }
-    if let Some(level) = updates.level {
-        room.level = level;
-    }
-    if let Some(x) = updates.x {
-        room.x = x;
-    }
-    if let Some(y) = updates.y {
-        room.y = y;
-    }
-    if let Some(color) = &updates.color {
-        room.color.clone_from(color);
-    }
-    if let Some(is_secret) = updates.is_secret {
-        room.is_secret = is_secret;
-    }
-}
-
-fn room_to_model(area_id: AreaId, room: &RoomWithDetails) -> Room {
-    Room {
-        area_id,
-        room_number: room.room_number,
-        title: room.title.clone(),
-        description: room.description.clone(),
-        level: room.level,
-        x: room.x,
-        y: room.y,
-        color: room.color.clone(),
-        created_at: Utc::now(),
-        is_secret: room.is_secret,
-    }
-}
-
-fn apply_exit_updates(exit: &mut Exit, updates: ExitUpdates) {
-    if let Some(from_direction) = updates.from_direction {
-        exit.from_direction = from_direction;
-    }
-    // Mirror the server's COALESCE semantics: only `clear_to` nulls a
-    // destination; an absent `to_*` leaves it unchanged.
-    if updates.clear_to == Some(true) {
-        exit.to_area_id = None;
-        exit.to_room_number = None;
-        exit.to_direction = None;
-    } else {
-        if let Some(to_area_id) = updates.to_area_id {
-            exit.to_area_id = Some(to_area_id);
-        }
-        if let Some(to_room_number) = updates.to_room_number {
-            exit.to_room_number = Some(to_room_number);
-        }
-        if let Some(to_direction) = updates.to_direction {
-            exit.to_direction = Some(to_direction);
-        }
-    }
-    if let Some(path) = updates.path {
-        exit.path = path;
-    }
-    if let Some(is_hidden) = updates.is_hidden {
-        exit.is_hidden = is_hidden;
-    }
-    if let Some(is_closed) = updates.is_closed {
-        exit.is_closed = is_closed;
-    }
-    if let Some(is_locked) = updates.is_locked {
-        exit.is_locked = is_locked;
-    }
-    if let Some(weight) = updates.weight {
-        exit.weight = weight;
-    }
-    if let Some(command) = updates.command {
-        exit.command = command;
-    }
-    if let Some(style) = updates.style {
-        exit.style = style;
-    }
-    if let Some(color) = updates.color {
-        exit.color = color;
-    }
-    if let Some(is_secret) = updates.is_secret {
-        exit.is_secret = is_secret;
-    }
-}
-
-/// Sets (or inserts) a property on a `Vec<Property>`, preserving secrecy on
-/// overwrite.
-fn upsert_property(properties: &mut Vec<Property>, name: &str, value: &str) {
-    if let Some(existing) = properties.iter_mut().find(|p| p.name == name) {
-        existing.value = value.to_string();
-    } else {
-        properties.push(Property {
-            name: name.to_string(),
-            value: value.to_string(),
-            is_secret: false,
-        });
-    }
-}
-
 #[async_trait]
 impl MapperBackend for LocalBackend {
     // Local areas are always the viewer's own and never need a credential.
@@ -368,6 +265,8 @@ impl MapperBackend for LocalBackend {
             id: AreaId(Uuid::new_v4()),
             user_id: None,
             atlas_id: request.atlas_id,
+            // Local areas keep no atlas name; the folder tree is local.
+            atlas_name: None,
             name: request.name,
             created_at: Utc::now(),
             rev: 1,
@@ -529,7 +428,7 @@ impl MapperBackend for LocalBackend {
         let name = name.to_string();
         let value = value.to_string();
         self.mutate_area(*area_id, move |area| {
-            upsert_property(&mut area.properties, &name, &value);
+            area_edits::upsert_property(&mut area.properties, &name, &value);
             Ok(())
         })
         .await
@@ -550,32 +449,7 @@ impl MapperBackend for LocalBackend {
         let area_id = room_key.area_id;
         let number = room_key.room_number;
         self.mutate_area(area_id, move |area| {
-            // Upsert: PUT /areas/{a}/{room} creates the room if absent.
-            if let Some(room) = area.rooms.iter_mut().find(|r| r.room_number == number) {
-                apply_room_updates(room, &updates);
-            } else {
-                let mut room = RoomWithDetails {
-                    room_number: number,
-                    title: String::new(),
-                    description: String::new(),
-                    level: 0,
-                    x: 0.0,
-                    y: 0.0,
-                    color: String::new(),
-                    properties: Vec::new(),
-                    exits: Vec::new(),
-                    tags: Default::default(),
-                    is_secret: false,
-                };
-                apply_room_updates(&mut room, &updates);
-                area.rooms.push(room);
-            }
-            let room = area
-                .rooms
-                .iter()
-                .find(|r| r.room_number == number)
-                .expect("room just upserted");
-            Ok(room_to_model(area_id, room))
+            Ok(area_edits::upsert_room(area, area_id, number, &updates))
         })
         .await
     }
@@ -584,19 +458,7 @@ impl MapperBackend for LocalBackend {
         let area_id = room_key.area_id;
         let number = room_key.room_number;
         self.mutate_area(area_id, move |area| {
-            area.rooms.retain(|r| r.room_number != number);
-            // Mirror the server's inbound-exit cascade within this area; the
-            // mapper's in-memory cache handles cross-area links for the live
-            // session.
-            for room in &mut area.rooms {
-                for exit in &mut room.exits {
-                    if exit.to_area_id == Some(area_id) && exit.to_room_number == Some(number) {
-                        exit.to_area_id = None;
-                        exit.to_room_number = None;
-                        exit.to_direction = None;
-                    }
-                }
-            }
+            area_edits::delete_room(area, area_id, number);
             Ok(())
         })
         .await
@@ -620,7 +482,7 @@ impl MapperBackend for LocalBackend {
                 .iter_mut()
                 .find(|r| r.room_number == number)
                 .ok_or(CloudError::RoomNotFound(key))?;
-            upsert_property(&mut room.properties, &name, &value);
+            area_edits::upsert_property(&mut room.properties, &name, &value);
             Ok(())
         })
         .await
@@ -679,34 +541,9 @@ impl MapperBackend for LocalBackend {
     // ===== EXIT OPERATIONS =====
 
     async fn create_room_exit(&self, room_key: &RoomKey, exit_data: ExitArgs) -> CloudResult<Exit> {
-        let number = room_key.room_number;
         let key = room_key.clone();
         self.mutate_area(room_key.area_id, move |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == number)
-                .ok_or(CloudError::RoomNotFound(key))?;
-            let exit = Exit {
-                id: ExitId(Uuid::new_v4()),
-                from_direction: exit_data.from_direction,
-                to_area_id: exit_data.to_area_id,
-                to_room_number: exit_data.to_room_number,
-                to_direction: exit_data.to_direction,
-                path: exit_data.path.unwrap_or_default(),
-                is_hidden: exit_data.is_hidden,
-                is_closed: exit_data.is_closed,
-                is_locked: exit_data.is_locked,
-                weight: exit_data.weight,
-                command: exit_data.command.unwrap_or_default(),
-                style: exit_data.style.unwrap_or(ExitStyle::Normal),
-                color: String::new(),
-                to_unknown: false,
-                to_area_token: None,
-                is_secret: exit_data.is_secret.unwrap_or(false),
-            };
-            room.exits.push(exit.clone());
-            Ok(exit)
+            area_edits::create_room_exit(area, &key, exit_data)
         })
         .await
     }
@@ -725,7 +562,7 @@ impl MapperBackend for LocalBackend {
                 .flat_map(|room| room.exits.iter_mut())
                 .find(|exit| exit.id == exit_id)
                 .ok_or(CloudError::ExitNotFound(exit_id))?;
-            apply_exit_updates(exit, updates);
+            area_edits::apply_exit_updates(exit, updates);
             Ok(())
         })
         .await
@@ -862,6 +699,7 @@ mod tests {
         CreateAreaRequest {
             name: name.to_string(),
             atlas_id,
+            ephemeral: false,
         }
     }
 

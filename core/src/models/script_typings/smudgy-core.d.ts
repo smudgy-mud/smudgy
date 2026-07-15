@@ -621,6 +621,41 @@ declare module "smudgy:core" {
   }
 
   /**
+   * The shape of the MSDP tree (`import msdp from "smudgy:state/msdp"`), one
+   * entry per variable the server reports. MSDP is string-typed on the wire,
+   * so every scalar arrives as a string ("14100", not 14100) — parse numbers
+   * where you need them. The well-known room variables are typed; everything
+   * else is open. Games document their own variables; narrow the same way as
+   * {@link GmcpTree}.
+   */
+  export interface MsdpTree {
+    /**
+     * The composite room table (servers that send one): the server's room
+     * number, name, area, and an exits map of direction to destination room
+     * number.
+     */
+    ROOM?: {
+      VNUM?: string;
+      NAME?: string;
+      AREA?: string;
+      TERRAIN?: string;
+      ENVIRONMENT?: string;
+      EXITS?: Record<string, string>;
+      COORDS?: { X?: string; Y?: string; Z?: string; [field: string]: unknown };
+      [field: string]: unknown;
+    };
+    /** Flat spellings some servers send instead of (or beside) `ROOM`. */
+    ROOM_VNUM?: string;
+    ROOM_NAME?: string;
+    ROOM_EXITS?: Record<string, string>;
+    ROOM_TERRAIN?: string;
+    AREA_NAME?: string;
+    /** The variables the server can report, sent in reply to the handshake. */
+    REPORTABLE_VARIABLES?: string[];
+    [variable: string]: unknown;
+  }
+
+  /**
    * GMCP protocol status and control for the current session.
    */
   export const gmcp: {
@@ -1659,4 +1694,36 @@ declare module "smudgy:state/gmcp" {
   const gmcp: StateConsumer<GmcpTree>;
   export { gmcp };
   export default gmcp;
+}
+
+declare module "smudgy:events/msdp" {
+  import type { EventConsumer } from "smudgy:core";
+
+  /**
+   * Fires once MSDP negotiation completes and the room variables have been
+   * requested; MSDP data starts flowing from this moment.
+   */
+  export const ready: EventConsumer<Record<string, never>>;
+
+  /**
+   * Fires when MSDP stops on a live connection: the server withdrew it, or
+   * the connection dropped while it was active. The last-received data stays
+   * readable through `smudgy:state/msdp`.
+   */
+  export const closed: EventConsumer<Record<string, never>>;
+}
+
+declare module "smudgy:state/msdp" {
+  import type { StateConsumer, MsdpTree } from "smudgy:core";
+
+  /**
+   * The live MSDP tree, one entry per variable name (see {@link MsdpTree}):
+   * read the latest value with `msdp.value`, subscribe with
+   * `msdp.watch(path, ...)`, and wire widgets with `msdp.bind(path)`. Each
+   * server update commits as its own change, so a watcher at or under a
+   * variable's path runs once per update.
+   */
+  const msdp: StateConsumer<MsdpTree>;
+  export { msdp };
+  export default msdp;
 }

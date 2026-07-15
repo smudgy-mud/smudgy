@@ -72,6 +72,7 @@ pub struct RoomCache {
     exits: Vec<ExitCache>,
     visible_exit_bitfield: ExitBitfield,
     is_secret: bool,
+    external_id: Option<String>,
 }
 
 impl RoomCache {
@@ -177,6 +178,12 @@ impl RoomCache {
     #[must_use]
     pub fn is_secret(&self) -> bool {
         self.is_secret
+    }
+
+    /// The room's server-global external id (GMCP/MSDP room identity), if bound.
+    #[must_use]
+    pub fn get_external_id(&self) -> Option<&str> {
+        self.external_id.as_deref()
     }
 
     #[must_use]
@@ -357,6 +364,9 @@ impl RoomCache {
         if let Some(is_secret) = updates.is_secret {
             new_room.is_secret = is_secret;
         }
+        if let Some(external_id) = &updates.external_id {
+            new_room.external_id.clone_from(external_id);
+        }
 
         new_room
     }
@@ -421,6 +431,7 @@ impl From<RoomWithDetails> for RoomCache {
             exits,
             iced_color,
             is_secret: room.is_secret,
+            external_id: room.external_id,
         }
     }
 }

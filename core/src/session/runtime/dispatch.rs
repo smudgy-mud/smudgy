@@ -88,8 +88,11 @@ impl Inner<'_> {
                 send_on_connect,
                 send_on_connect_redactions,
             } => {
-                let mut connection =
-                    Connection::new(self.session_runtime_tx.clone(), self.ui_tx.clone());
+                let mut connection = Connection::new(
+                    self.session_runtime_tx.clone(),
+                    self.ui_tx.clone(),
+                    self.trigger_manager.raw_wanted_flag(),
+                );
 
                 if let Some(send_on_connect) = send_on_connect {
                     let local_tx = self.session_runtime_tx.clone();
@@ -184,22 +187,26 @@ impl Inner<'_> {
                     ))),
                 }
             }
+            RuntimeAction::RetractIncomingPartialLine => {
+                self.retract_incoming_open_line_sync();
+                Ok(ActionResult::None)
+            }
             RuntimeAction::RequestRepaint => {
                 if let Some(fut) = self.flush_buffer_updates()? {
                     fut.await?;
                 }
                 Ok(ActionResult::None)
             }
+            // Echo arms append WITHOUT flushing: delivery rides the run loop's
+            // coalescing points (the storm threshold and the before-park flush),
+            // so an echo storm reaches the UI as a few batched events instead of
+            // one event per call. The ingest path already works this way.
             RuntimeAction::Echo(line) => {
-                if let Some(fut) = self.echo_str(line.as_str())? {
-                    fut.await?;
-                }
+                self.echo_str_sync(line.as_str());
                 Ok(ActionResult::None)
             }
             RuntimeAction::EchoStyled(lines) => {
-                if let Some(fut) = self.echo_styled_lines(&lines)? {
-                    fut.await?;
-                }
+                self.echo_styled_lines_sync(&lines);
                 Ok(ActionResult::None)
             }
             RuntimeAction::CompleteLineTriggersProcessed(line) => {
@@ -709,6 +716,9 @@ impl Inner<'_> {
                 if self.gmcp.on_disabled() {
                     actions.extend(self.script_engine.host_emit("gmcp:closed", "{}"));
                 }
+                if self.msdp.on_disabled() {
+                    actions.extend(self.script_engine.host_emit("msdp:closed", "{}"));
+                }
                 if actions.is_empty() {
                     Ok(ActionResult::None)
                 } else {
@@ -742,6 +752,31 @@ impl Inner<'_> {
             RuntimeAction::GmcpDisabled => {
                 if self.gmcp.on_disabled() {
                     Ok(self.run_host_event("gmcp:closed", "{}"))
+                } else {
+                    Ok(ActionResult::None)
+                }
+            }
+            RuntimeAction::MsdpMessage { payload } => {
+                let effects = self.msdp.ingest(
+                    &mut self.session_store.borrow_mut(),
+                    &self.catalogue,
+                    &payload,
+                );
+                // Same flush point as GmcpMessage: the write is readable by every
+                // consumer of any line that followed it on the wire.
+                self.queue_gmcp_echoes(effects.echoes);
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::MsdpEnabled => {
+                // The connection task already framed LIST + the baseline REPORT onto the
+                // reply buffer; here the session side clears the subtree (fresh server,
+                // fresh truth) and announces readiness.
+                self.msdp.on_enabled(&mut self.session_store.borrow_mut());
+                Ok(self.run_host_event("msdp:ready", "{}"))
+            }
+            RuntimeAction::MsdpDisabled => {
+                if self.msdp.on_disabled() {
+                    Ok(self.run_host_event("msdp:closed", "{}"))
                 } else {
                     Ok(ActionResult::None)
                 }
@@ -826,6 +861,43 @@ impl Inner<'_> {
                     })
                     .await?;
                 Ok(self.run_host_event("map:room", &payload))
+            }
+            RuntimeAction::NoteMapperNavigation(area_id) => {
+                // Advisory scope hint: forward to the UI daemon, which owns the
+                // per-server association store and decides whether to bind.
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::MapperNavigated(area_id),
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::OfferMapRescue {
+                area_id,
+                atlas_id,
+                atlas_name,
+            } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::OfferMapRescue {
+                            area_id,
+                            atlas_id,
+                            atlas_name,
+                        },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::AssociateCreatedArea(area_id) => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::MapAreaCreated(area_id),
+                    })
+                    .await?;
+                Ok(ActionResult::None)
             }
             RuntimeAction::PaneOpened { def, placement } => {
                 // The registry mutation already happened synchronously in the op; this just
@@ -975,11 +1047,10 @@ impl Inner<'_> {
                 match self.resolve_pane_target(key, &namespace, &name) {
                     // `pane.echo` on the main pane IS a normal echo: it takes
                     // the counted Append path (numbering parity), never an
-                    // `AppendTo(MAIN)`.
+                    // `AppendTo(MAIN)`. Appends only — delivery rides the run
+                    // loop's coalescing points, like every echo arm.
                     Some((_, _, true)) => {
-                        if let Some(fut) = self.echo_str(text.as_str())? {
-                            fut.await?;
-                        }
+                        self.echo_str_sync(text.as_str());
                     }
                     Some((key, PaneKind::Terminal, _)) => {
                         for line in text.split('\n') {
@@ -989,9 +1060,6 @@ impl Inner<'_> {
                                     line,
                                 )),
                             ));
-                        }
-                        if let Some(fut) = self.flush_buffer_updates()? {
-                            fut.await?;
                         }
                     }
                     Some((_, PaneKind::Widgets, _)) => {
@@ -1010,18 +1078,14 @@ impl Inner<'_> {
                 // The lines arrive pre-split and pre-styled from the op boundary.
                 match self.resolve_pane_target(key, &namespace, &name) {
                     // Main-pane delivery IS a normal styled echo: counted Append path.
+                    // Appends only — delivery rides the run loop's coalescing points.
                     Some((_, _, true)) => {
-                        if let Some(fut) = self.echo_styled_lines(&lines)? {
-                            fut.await?;
-                        }
+                        self.echo_styled_lines_sync(&lines);
                     }
                     Some((key, PaneKind::Terminal, _)) => {
-                        for line in lines.iter() {
+                        for line in &lines {
                             self.pending_buffer_updates
                                 .push(BufferUpdate::AppendTo(key, line.clone()));
-                        }
-                        if let Some(fut) = self.flush_buffer_updates()? {
-                            fut.await?;
                         }
                     }
                     Some((_, PaneKind::Widgets, _)) => {

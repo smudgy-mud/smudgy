@@ -267,7 +267,7 @@ where
                                 cache.spans.select_range(from, to);
                             }
                         }
-                    } else if Rc::ptr_eq(&cache.spans.spans(), &line.spans) {
+                    } else if Rc::ptr_eq(&cache.spans.spans(), line.spans()) {
                         i += 1;
 
                         if text_bounds.width > cache.max_valid_width
@@ -285,7 +285,7 @@ where
                 }
 
             let line_selection = selection.for_line(line_number);
-            let spans = Spans::with_selection(line.spans.clone(), line_selection);
+            let spans = Spans::with_selection(line.spans().clone(), line_selection);
 
             let spans_vec = spans.spans();
 
@@ -336,6 +336,64 @@ where
             let mut y = layout.bounds().y + layout.bounds().height;
             for cache in state.cache.iter() {
                 y -= cache.paragraph.min_height();
+
+                // Span decorations: explicit background quads and link underlines —
+                // the same geometry iced's rich_text widget draws (fill_paragraph
+                // renders glyphs only). Undecorated spans (the overwhelmingly
+                // common case) skip before any span_bounds work.
+                for (span_idx, span) in cache.spans.spans().iter().enumerate() {
+                    if span.highlight.is_none() && !span.underline {
+                        continue;
+                    }
+                    let regions = cache.paragraph.span_bounds(span_idx);
+
+                    if let Some(highlight) = span.highlight {
+                        for region in &regions {
+                            let rect = Rectangle {
+                                x: layout.bounds().x + region.x,
+                                y: region.y + y,
+                                width: region.width,
+                                height: region.height,
+                            };
+                            if let Some(bounds) = rect.intersection(&clipped_viewport) {
+                                renderer.fill_quad(
+                                    Quad {
+                                        bounds,
+                                        border: highlight.border,
+                                        ..Default::default()
+                                    },
+                                    highlight.background,
+                                );
+                            }
+                        }
+                    }
+
+                    if span.underline {
+                        // Baseline placement per iced's rich_text: the underline
+                        // sits at font size plus half the leading, nudged up by
+                        // 8% of the font size.
+                        let underline_y = prefs.font_size
+                            + (prefs.line_height - prefs.font_size) / 2.0
+                            - prefs.font_size * 0.08;
+                        for region in &regions {
+                            let rect = Rectangle {
+                                x: layout.bounds().x + region.x,
+                                y: region.y + y + underline_y,
+                                width: region.width,
+                                height: 1.0,
+                            };
+                            if let Some(bounds) = rect.intersection(&clipped_viewport) {
+                                renderer.fill_quad(
+                                    Quad {
+                                        bounds,
+                                        ..Default::default()
+                                    },
+                                    span.color.unwrap_or(iced::Color::WHITE),
+                                );
+                            }
+                        }
+                    }
+                }
 
                 for selected_span_idx in cache.spans.selected().iter() {
                     let span_bounds_list = cache.paragraph.span_bounds(*selected_span_idx);
@@ -457,6 +515,11 @@ where
                         ctrl: state.modifiers.control(),
                         alt: state.modifiers.alt(),
                     });
+                    // The handler may have staged UI state (the link-trust
+                    // confirm dialog slot) rather than publishing a message;
+                    // invalidate so it renders this frame, like the
+                    // selection updates above.
+                    shell.invalidate_layout();
                 }
 
                 let mut selection = self.selection.borrow_mut();

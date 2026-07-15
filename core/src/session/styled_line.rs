@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::connection::vt_processor;
@@ -24,6 +25,14 @@ pub enum LinkAction {
     /// processing and command splitting apply). Serialized into the line, so
     /// it works for as long as the line is on screen.
     Send(Arc<str>),
+    /// Open this http(s) URL in the system browser. Minted only by the VT
+    /// layer from a server's OSC 8 hyperlink — scripts have no wire form for
+    /// it — so activation is gated by the per-server link-trust policy.
+    OpenUrl(Arc<str>),
+    /// Send this command, but the link came from the **server** (an OSC 8
+    /// `send:` URI), not from a script: activation is gated by the same
+    /// per-server trust policy as [`LinkAction::OpenUrl`].
+    ServerSend(Arc<str>),
     /// Run a script callback in the engine that created the fragment. The
     /// line carries only this address — the function itself stays in its
     /// isolate's registry, so a click after that engine is gone is a no-op.
@@ -50,20 +59,18 @@ pub struct LinkSpan {
     pub action: LinkAction,
 }
 
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledLine {
     pub text: String,
     pub spans: Vec<VtSpan>,
     /// Clickable ranges, sorted and non-overlapping (usually empty — an empty
     /// vec does not allocate). Unlike `spans`, these need not cover the text.
     pub links: Vec<LinkSpan>,
+    /// The line's pre-VT wire form (escape sequences included, CR/LF excluded),
+    /// captured only while some trigger carries a raw pattern — raw matching is
+    /// this field's sole consumer, and the lossy copy is pure overhead for the
+    /// (overwhelmingly common) profiles without one.
     raw: Option<String>,
-}
-
-impl PartialEq for StyledLine {
-    fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
-    }
 }
 
 impl StyledLine {
@@ -78,12 +85,12 @@ impl StyledLine {
     }
 
     #[must_use]
-    pub fn new_with_raw(text: &str, span_info: Vec<VtSpan>, raw: &[u8]) -> Self {
+    pub fn new_with_raw(text: &str, span_info: Vec<VtSpan>, raw: Option<&[u8]>) -> Self {
         Self {
             text: String::from(text),
             spans: span_info,
             links: Vec::new(),
-            raw: Some(String::from_utf8_lossy(raw).into_owned()),
+            raw: raw.map(|raw| String::from_utf8_lossy(raw).into_owned()),
         }
     }
 
@@ -427,60 +434,60 @@ impl StyledLine {
         }
     }
 
-    #[must_use]
-    pub fn from_echo_str(text: &str) -> Self {
+    /// Build a whole line of one role color from locally-produced text
+    /// (echoes, notices, sent-command display). The text is display-bound and
+    /// never came through the VT parser, so control characters (a stray ESC,
+    /// a `\r` tail from CRLF-split input) are stripped here — `\t` survives.
+    fn from_role_str(text: &str, fg: Color) -> Self {
+        let text = sanitize_display_text(text);
         Self {
             spans: vec![VtSpan {
                 begin_pos: 0,
                 end_pos: text.len(),
                 style: Style {
-                    fg: { Color::Echo },
-                    bg: { Color::DefaultBackground },
+                    fg,
+                    bg: Color::DefaultBackground,
                 },
             }],
-            text: String::from(text),
+            text: text.into_owned(),
             links: Vec::new(),
             raw: None,
         }
+    }
+
+    #[must_use]
+    pub fn from_echo_str(text: &str) -> Self {
+        Self::from_role_str(text, Color::Echo)
     }
 
     #[must_use]
     pub fn from_warn_str(text: &str) -> Self {
-        Self {
-            spans: vec![VtSpan {
-                begin_pos: 0,
-                end_pos: text.len(),
-                style: Style {
-                    fg: { Color::Warn },
-                    bg: { Color::DefaultBackground },
-                },
-            }],
-            text: String::from(text),
-            links: Vec::new(),
-            raw: None,
-        }
+        Self::from_role_str(text, Color::Warn)
     }
 
     #[must_use]
     pub fn from_output_str(text: &str) -> Self {
-        Self {
-            spans: vec![VtSpan {
-                begin_pos: 0,
-                end_pos: text.len(),
-                style: Style {
-                    fg: { Color::Output },
-                    bg: { Color::DefaultBackground },
-                },
-            }],
-            text: String::from(text),
-            links: Vec::new(),
-            raw: None,
-        }
+        Self::from_role_str(text, Color::Output)
     }
 
     #[must_use]
     pub fn raw(&self) -> Option<&str> {
         self.raw.as_deref()
+    }
+}
+
+/// Strip control characters from display-bound text that bypasses the VT
+/// parser (echoes, notices, styled-echo runs). `\t` survives — scripts echo
+/// tabs for alignment — everything else in the control ranges (a stray ESC,
+/// `\r` tails, C1 bytes) is dirty data with no display meaning. Borrows when
+/// the text is already clean, which is the overwhelmingly common case.
+#[must_use]
+pub fn sanitize_display_text(text: &str) -> Cow<'_, str> {
+    let dirty = |c: char| c.is_control() && c != '\t';
+    if text.chars().any(dirty) {
+        Cow::Owned(text.chars().filter(|&c| !dirty(c)).collect())
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -1106,5 +1113,33 @@ mod tests {
 
         assert_eq!(result.text, "You hold leg high.");
         assert_spans_tile_text(&result);
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::{Cow, StyledLine, sanitize_display_text};
+
+    #[test]
+    fn clean_text_borrows() {
+        assert!(matches!(
+            sanitize_display_text("hello\tworld"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn control_chars_are_stripped_but_tab_survives() {
+        assert_eq!(sanitize_display_text("a\u{1b}[31mb\rc\td"), "a[31mbc\td");
+        assert_eq!(sanitize_display_text("nul\0del\u{7f}c1\u{9b}"), "nuldelc1");
+    }
+
+    #[test]
+    fn role_constructors_sanitize_and_the_span_still_tiles() {
+        let line = StyledLine::from_echo_str("dirty\r\u{7f}");
+        assert_eq!(line.text, "dirty");
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].begin_pos, 0);
+        assert_eq!(line.spans[0].end_pos, line.text.len());
     }
 }

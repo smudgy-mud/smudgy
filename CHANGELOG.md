@@ -5,6 +5,112 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-07-14
+
+### Changed
+
+- **Massive server output ingests in a fraction of a second.** Server lines
+  now reach the display in coalesced batches instead of one display update
+  per line, so replaying a big log or catching up after a long disconnect no
+  longer paints line by line while the client falls behind. A 16MB,
+  150,000-line dump went from ~15 seconds of visible scrolling to under a
+  second, every line intact.
+- **Less work per server line.** The raw wire form of each line (what
+  ANSI-aware `rawPatterns` triggers match against) is only captured while such
+  a trigger actually exists, and display styling is now baked per line only
+  when a line first becomes visible — output that scrolls straight through
+  scrollback during a flood skips that work entirely. Nothing changes
+  functionally; profiles without raw-pattern triggers just stop paying for
+  them on every line.
+- **Styled `echo` is ~28x faster on heavily-styled lines.** Styled fragments
+  now cross the scripting boundary packed (one string + one record table)
+  instead of as a per-run object graph. A line with 90 color changes went
+  from ~106µs to ~3.8µs per echo, and from ~914 to ~10 allocations; scripts
+  don't change — `echo`, `style`, and `link` behave exactly as before.
+- **Echo storms no longer flood the display.** Script echoes now reach the
+  terminal in coalesced batches (as server output does) instead of
+  one display event per `echo()` call, so a script echoing tens of
+  thousands of lines renders in a handful of updates and the UI stays
+  responsive while it happens.
+
+### Added
+
+- **Cloud atlases now scope to your servers.** Each atlas shows only on the
+  server entries it's associated with: a session's map tree lists that
+  server's maps plus a collapsed Unassigned group, and room identification
+  ignores maps that belong to your other games — look-alike stock zones from
+  another game can no longer capture your location. Existing atlases start
+  unassigned and home themselves as you play (sustained locates or a
+  speedwalk associate the atlas, with an undoable notice); anything you
+  create is scoped to the server you created it on. The map editor gains a
+  This server / All atlases view and a per-atlas "Servers…" checklist for
+  adjusting scope directly.
+- **Shared maps arrive organized and homed.** Areas shared to you now carry
+  their owner's folder name, so a share appears as named folders instead of
+  a flat pile. When creating a share you can disclose which game hosts the
+  maps belong to (pre-checked, removable, per share); the recipient's client
+  files the share under their matching server automatically, and with no
+  match it simply lands in Unassigned. And if rooms you're walking match a
+  map filed under another server, smudgy offers to show it here too rather
+  than re-mapping them.
+- **MSDP support.** For MUDs that publish structured data over MSDP rather
+  than GMCP: negotiation is automatic, and every variable the server reports
+  lands in the same live state tree scripts already use for GMCP — read it
+  from `smudgy:state/msdp`, with `msdp:ready` and `msdp:closed` events
+  marking availability. Reported variables also appear in the Store tab of
+  the automations window, so you can see exactly what your MUD publishes.
+- **Session maps and server room identities.** Scripts can create session
+  maps — `mapper.createArea(name, { ephemeral: true })` — that live only for
+  the current session and are never synced: the place to build maps
+  automatically from server data. Rooms can now also carry the server's own
+  room identifier (`externalId`, as reported over GMCP or MSDP), and
+  `mapper.findRoomByExternalId` turns one into a room — reliable
+  you-are-here resolution on MUDs that announce room ids. A session map
+  worth keeping can be exported with `mapper.exportArea`.
+- **Clickable server links (OSC 8 hyperlinks).** MUDs that send OSC 8
+  hyperlinks now render as clickable links in the terminal. `http`/`https`
+  links open in your browser; a MUD-specific `send:` link sends a command as
+  you. Because these come from the server, the first click to a given site
+  (or the first command link) opens a confirmation showing the exact
+  destination — nothing the server sends can disguise it — where you can also
+  choose to always allow that site or always trust every link from that
+  server. Other URI schemes are ignored.
+
+### Fixed
+
+- **Map preferences stop retrying maps that can't sync.** A map disabled
+  locally that the cloud can't store a preference for (a local-only map, or
+  one you no longer have access to) was re-pushed on every 90-second sync
+  cycle for as long as the app ran. The preference still works and stays on
+  your machine; the client now stops asking after the first refusal, and
+  tries again when you toggle the map or sign in.
+- **ANSI background colors display.** Server text styled with SGR background
+  codes (`ESC[41m`, `ESC[48;5;n`, `ESC[48;2;r;g;b`, and the bright
+  `100`–`107` range) now shows its backgrounds; they were previously ignored
+  at both ends — the codes were dropped during ingest, and the terminal
+  never painted span backgrounds (which also kept link chips and underlines
+  from rendering).
+- **One unsupported ANSI code no longer discards a whole style sequence.**
+  Codes smudgy doesn't render (underline, italic, blink, …) used to poison
+  every color that shared their sequence — `ESC[1;4;31m` displayed as plain
+  text instead of bright red. Each code now applies independently, the
+  bare-reset form `ESC[m` resets, colon-form extended colors
+  (`38:2::r:g:b`) parse, and out-of-range color components clamp instead of
+  wrapping around.
+- **Progress bars that redraw with a bare carriage return display as one
+  updating line.** Text following a `\r` now overwrites the line it returned
+  to — previously every frame concatenated into one endlessly growing line.
+  The session log keeps the final frame.
+- **A malformed telnet subnegotiation can no longer exhaust memory.** A
+  server that opens a subnegotiation and never closes it had its payload
+  buffered without bound; the buffer is now capped (256 KiB), with the
+  oversized subnegotiation discarded and the stream resynchronized at its
+  end.
+- **Echoed text is scrubbed of control characters.** Stray ESC bytes, `\r`
+  tails from split CRLF text, and other control characters in `echo`ed or
+  spliced text (tabs excepted) are stripped instead of landing in the
+  display buffer.
+
 ## [0.4.0] - 2026-07-12
 
 ### Added

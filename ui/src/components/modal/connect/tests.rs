@@ -121,10 +121,7 @@ fn test_select_server_loads_profiles_if_not_present() {
 
     state.servers.push(Server {
         name: server_name.clone(),
-        config: ServerConfig {
-            host: "test.com".to_string(),
-            port: 1234,
-        },
+        config: ServerConfig::new("test.com".to_string(), 1234),
         path: std::path::PathBuf::new(),
     });
 
@@ -142,10 +139,7 @@ fn test_select_server_does_not_load_profiles_if_present() {
 
     state.servers.push(Server {
         name: server_name.clone(),
-        config: ServerConfig {
-            host: "test.com".to_string(),
-            port: 1234,
-        },
+        config: ServerConfig::new("test.com".to_string(), 1234),
         path: std::path::PathBuf::new(),
     });
     state.profiles.insert(
@@ -284,10 +278,7 @@ fn test_server_created_chains_into_add_profile() {
     state.server_action = Some(ServerCrudAction::Create);
     let new_server = Server {
         name: "ArcticMud".to_string(),
-        config: ServerConfig {
-            host: "mud.arctic.org".to_string(),
-            port: 2700,
-        },
+        config: ServerConfig::new("mud.arctic.org".to_string(), 2700),
         path: std::path::PathBuf::new(),
     };
 

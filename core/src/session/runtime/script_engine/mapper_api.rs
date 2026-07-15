@@ -8,6 +8,7 @@ use deno_core::{
 use serde::{Deserialize, Serialize};
 
 use super::ops::SmudgyGrants;
+use crate::session::runtime::action::{ActionQueue, RuntimeAction};
 use smudgy_cloud::{
     AreaId, AreaWithDetails, ExitArgs, ExitDirection, ExitId, ExitStyle, ExitUpdates,
     HorizontalAlignment, Label, LabelArgs, LabelId, LabelUpdates, Mapper, RoomNumber, RoomUpdates,
@@ -20,6 +21,12 @@ deno_core::extension!(
   ops = [
       op_smudgy_mapper_list_area_ids,
       op_smudgy_mapper_create_area,
+      op_smudgy_mapper_delete_area,
+      op_smudgy_mapper_get_area_is_ephemeral,
+      op_smudgy_mapper_get_room_external_id,
+      op_smudgy_mapper_set_room_external_id,
+      op_smudgy_mapper_find_room_by_external_id,
+      op_smudgy_mapper_rescue_room_by_external_id,
       op_smudgy_mapper_get_area_by_id,
       op_smudgy_mapper_get_area_name,
       op_smudgy_mapper_get_area_id,
@@ -131,6 +138,19 @@ fn ensure_mapper(state: &OpState, write: bool) -> Result<(), MapperError> {
 /// room number.
 type JsRoomRef = ((u64, u64), i32);
 
+/// Queue a bind-on-use navigation hint for the UI daemon. A demonstrated
+/// speedwalk / find-nearest resolution into `area_id` is evidence the player is
+/// navigating in that area's map; the daemon (which owns the per-server scope
+/// store) decides whether the area's atlas is unassigned and worth binding, so
+/// the op stays policy-free. Cheap by construction: one `VecDeque` push, dwarfed
+/// by the pathfinding that just ran.
+fn note_navigation(state: &OpState, area_id: AreaId) {
+    state
+        .borrow::<ActionQueue>()
+        .borrow_mut()
+        .push_back(RuntimeAction::NoteMapperNavigation(area_id));
+}
+
 #[op2]
 #[serde]
 fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<(u64, u64)>, MapperError> {
@@ -140,12 +160,13 @@ fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<(u64, u64)>
     if let Some(mapper) = mapper {
         let atlas = mapper.get_current_atlas();
 
-        // Skip areas the user marked inactive so enumeration (`mapper.areas`)
-        // honors the same room-identification preference the lookup tables do.
-        // Explicit `getAreaById` still resolves an inactive area by id.
+        // Skip areas excluded from identification — whether the user marked
+        // them inactive or per-server scoping excludes them — so enumeration
+        // (`mapper.areas`) honors the same participation the lookup tables do.
+        // Explicit `getAreaById` still resolves an excluded area by id.
         Ok(atlas
             .areas()
-            .filter(|area| atlas.is_area_enabled(area.get_id()))
+            .filter(|area| atlas.is_area_included(area.get_id()))
             .map(|area| area.get_id().0.as_u64_pair())
             .collect::<Vec<_>>())
     } else {
@@ -158,6 +179,7 @@ fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<(u64, u64)>
 async fn op_smudgy_mapper_create_area(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
+    ephemeral: bool,
 ) -> Result<JSArea, MapperError> {
     let mapper = {
         let state = state.borrow();
@@ -167,10 +189,25 @@ async fn op_smudgy_mapper_create_area(
     };
 
     if let Some(mapper) = mapper {
-        let id = mapper
-            .create_area(name)
-            .await
-            .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
+        let id = if ephemeral {
+            mapper.create_area_ephemeral(name).await
+        } else {
+            mapper.create_area(name).await
+        }
+        .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
+
+        // A non-ephemeral (cloud-tier) area created from a session is associated
+        // with that session's server entry — nothing user-created starts
+        // unassigned. Ephemeral areas are session-scoped by nature and get no
+        // association. The daemon gates the association on the area actually
+        // being cloud-tier (signed in), so a local-tier create is harmless.
+        if !ephemeral {
+            state
+                .borrow()
+                .borrow::<ActionQueue>()
+                .borrow_mut()
+                .push_back(RuntimeAction::AssociateCreatedArea(id));
+        }
 
         return mapper
             .get_current_atlas()
@@ -227,6 +264,23 @@ fn op_smudgy_mapper_get_area_by_id(
 }
 
 #[op2]
+fn op_smudgy_mapper_delete_area(
+    state: &OpState,
+    #[serde] area_id: (u64, u64),
+) -> Result<(), MapperError> {
+    ensure_mapper(state, true)?;
+    let mapper = state.try_borrow::<Mapper>();
+
+    if let Some(mapper) = mapper {
+        let id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+        mapper.delete_area(id);
+        Ok(())
+    } else {
+        Err(MapperError::MapperNotEnabled)
+    }
+}
+
+#[op2]
 fn op_smudgy_mapper_rename_area(
     state: &OpState,
     #[serde] area_id: (u64, u64),
@@ -259,6 +313,18 @@ fn op_smudgy_mapper_get_area_name<'a>(
 #[serde]
 fn op_smudgy_mapper_get_area_id(#[cppgc] area_wrapper: &JSArea) -> (u64, u64) {
     area_wrapper.0.get_id().0.as_u64_pair()
+}
+
+/// `area.isEphemeral`: whether the area lives in the session-lifetime
+/// ephemeral tier. Wrapper accessor on a `JSArea` handle -- not gated.
+#[op2(fast)]
+fn op_smudgy_mapper_get_area_is_ephemeral(
+    state: &OpState,
+    #[cppgc] area_wrapper: &JSArea,
+) -> bool {
+    state
+        .try_borrow::<Mapper>()
+        .is_some_and(|mapper| mapper.is_ephemeral(area_wrapper.0.get_id()))
 }
 #[op2]
 #[serde]
@@ -405,6 +471,14 @@ fn op_smudgy_mapper_get_room_y(#[cppgc] room_wrapper: &JSRoom) -> f32 {
     room_wrapper.0.get_y()
 }
 
+/// `room.externalId`: the room's server-global external id, or `undefined`.
+/// Wrapper accessor on a `JSRoom` handle -- not gated.
+#[op2]
+#[string]
+fn op_smudgy_mapper_get_room_external_id(#[cppgc] room_wrapper: &JSRoom) -> Option<String> {
+    room_wrapper.0.get_external_id().map(str::to_string)
+}
+
 #[op2]
 fn op_smudgy_mapper_get_room_property<'a>(
     scope: &mut v8::PinScope<'a, '_>,
@@ -493,11 +567,15 @@ struct JSRoomParams {
     level: Option<i32>,
     x: Option<f32>,
     y: Option<f32>,
+    #[serde(rename = "externalId")]
+    external_id: Option<String>,
 }
 
 impl From<JSRoomParams> for RoomUpdates {
     /// Project the script-supplied room fields onto a cloud `RoomUpdates` (all-`Option`, so an
-    /// absent field is left unchanged). `is_secret` is never settable from a script.
+    /// absent field is left unchanged). `is_secret` is never settable from a script. The script
+    /// spelling of "clear the external id" is the empty string (a JS-friendly stand-in for the
+    /// wire's present-but-null).
     fn from(params: JSRoomParams) -> Self {
         Self {
             title: params.title,
@@ -507,6 +585,9 @@ impl From<JSRoomParams> for RoomUpdates {
             y: params.y,
             color: params.color,
             is_secret: None,
+            external_id: params
+                .external_id
+                .map(|id| if id.is_empty() { None } else { Some(id) }),
         }
     }
 }
@@ -564,6 +645,95 @@ fn op_smudgy_mapper_set_room_title(
     } else {
         Err(MapperError::MapperNotEnabled)
     }
+}
+
+#[op2]
+fn op_smudgy_mapper_set_room_external_id(
+    state: Rc<RefCell<OpState>>,
+    #[serde] area_id: (u64, u64),
+    room_number: i32,
+    #[string] external_id: String,
+) -> Result<(), MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, true)?;
+    if let Some(mapper) = state.try_borrow::<Mapper>() {
+        let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+        // Empty string clears the binding (the script spelling of null).
+        let binding = if external_id.is_empty() {
+            None
+        } else {
+            Some(external_id)
+        };
+        mapper.upsert_room(
+            RoomKey {
+                area_id,
+                room_number: RoomNumber(room_number),
+            },
+            RoomUpdates {
+                external_id: Some(binding),
+                ..Default::default()
+            },
+        );
+        Ok(())
+    } else {
+        Err(MapperError::MapperNotEnabled)
+    }
+}
+
+/// `mapper.findRoomByExternalId`: O(1) resolve of a server-global room id
+/// against the atlas cache's reverse index. Best-effort under duplicate
+/// bindings; disabled areas don't resolve.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_room_by_external_id(
+    state: Rc<RefCell<OpState>>,
+    #[string] external_id: String,
+) -> Result<Option<JsRoomRef>, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, false)?;
+    if let Some(mapper) = state.try_borrow::<Mapper>() {
+        Ok(mapper
+            .get_current_atlas()
+            .find_room_by_external_id(&external_id)
+            .map(|(room_key, _)| (room_key.area_id.0.as_u64_pair(), room_key.room_number.0)))
+    } else {
+        Err(MapperError::MapperNotEnabled)
+    }
+}
+
+/// Cross-entry rescue check, called by the auto-mapper before it mints a room:
+/// if this server-global id is already mapped on a *different* server entry (a
+/// scope-excluded area), raise the "show here too?" offer and return `true` so
+/// the caller does not create a duplicate. Returns `false` when the id is
+/// unknown elsewhere, leaving the caller free to map it as new terrain.
+///
+/// The policy — whether to offer, how to phrase it, the once-per-atlas
+/// rate-limit, and the association write on accept — lives entirely in the UI
+/// daemon; this op only reports the match and hands the daemon the atlas
+/// context. Keeping the offer a side effect of the same call keeps the calling
+/// package to a single decision ("was it rescued? then don't create").
+#[op2(fast)]
+fn op_smudgy_mapper_rescue_room_by_external_id(
+    state: Rc<RefCell<OpState>>,
+    #[string] external_id: String,
+) -> Result<bool, MapperError> {
+    let state = state.borrow();
+    ensure_mapper(&state, false)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Err(MapperError::MapperNotEnabled);
+    };
+    let Some(hit) = mapper.find_room_elsewhere_by_external_id(&external_id) else {
+        return Ok(false);
+    };
+    state
+        .borrow::<ActionQueue>()
+        .borrow_mut()
+        .push_back(RuntimeAction::OfferMapRescue {
+            area_id: hit.room_key.area_id,
+            atlas_id: hit.atlas_id,
+            atlas_name: hit.atlas_name,
+        });
+    Ok(true)
 }
 
 #[op2]
@@ -815,15 +985,7 @@ fn op_smudgy_mapper_create_room(
                     area_id,
                     room_number: RoomNumber(room_number),
                 },
-                RoomUpdates {
-                    title: params.title,
-                    description: params.description,
-                    color: params.color,
-                    level: params.level,
-                    x: params.x,
-                    y: params.y,
-                    ..Default::default()
-                },
+                params.into(),
             );
 
             Ok(room_number)
@@ -1468,10 +1630,16 @@ fn op_smudgy_mapper_get_path_between_rooms(
             area_id: AreaId(Uuid::from_u64_pair(to_area_id.0, to_area_id.1)),
             room_number: RoomNumber(to_room_number),
         };
-        let path = mapper
+        let resolved = mapper
             .get_current_atlas()
             .get_path_between_rooms(&from_room_key, &to_room_key)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A resolved route into the destination area is demonstrated navigation
+        // intent — hint the daemon (bind-on-use). Only on a real path.
+        if !resolved.is_empty() {
+            note_navigation(&state, to_room_key.area_id);
+        }
+        let path = resolved
             .into_iter()
             .map(|room_key| (room_key.area_id.0.as_u64_pair(), room_key.room_number.0))
             .collect();
@@ -1505,9 +1673,11 @@ fn op_smudgy_mapper_find_nearest_room_with_tags(
         };
         let nearest = mapper
             .get_current_atlas()
-            .find_nearest_room_matching_tags(&from_room_key, &required, &excluded)
-            .map(|room_key| (room_key.area_id.0.as_u64_pair(), room_key.room_number.0));
-        Ok(nearest)
+            .find_nearest_room_matching_tags(&from_room_key, &required, &excluded);
+        if let Some(room_key) = &nearest {
+            note_navigation(&state, room_key.area_id);
+        }
+        Ok(nearest.map(|room_key| (room_key.area_id.0.as_u64_pair(), room_key.room_number.0)))
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1536,9 +1706,11 @@ fn op_smudgy_mapper_find_nearest_room_in_area(
         let target_area_id = AreaId(Uuid::from_u64_pair(target_area_id.0, target_area_id.1));
         let nearest = mapper
             .get_current_atlas()
-            .find_nearest_room_in_area(&from_room_key, &target_area_id)
-            .map(|room_key| (room_key.area_id.0.as_u64_pair(), room_key.room_number.0));
-        Ok(nearest)
+            .find_nearest_room_in_area(&from_room_key, &target_area_id);
+        if let Some(room_key) = &nearest {
+            note_navigation(&state, room_key.area_id);
+        }
+        Ok(nearest.map(|room_key| (room_key.area_id.0.as_u64_pair(), room_key.room_number.0)))
     } else {
         Err(MapperError::MapperNotEnabled)
     }

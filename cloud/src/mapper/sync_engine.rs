@@ -689,6 +689,7 @@ mod tests {
                 id: area_id,
                 user_id: None,
                 atlas_id: None,
+                atlas_name: None,
                 name: format!("Area rev {rev}"),
                 created_at: Utc::now(),
                 rev,
@@ -711,6 +712,7 @@ mod tests {
     fn room_with_exit(to_area_id: Option<AreaId>, to_unknown: bool) -> RoomWithDetails {
         RoomWithDetails {
             room_number: RoomNumber(1),
+            external_id: None,
             title: "Room".to_string(),
             description: String::new(),
             level: 0,

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use deno_core::v8;
-use smudgy_cloud::AreaId;
+use smudgy_cloud::{AreaId, AtlasId};
 
 use crate::models::aliases::AliasDefinition;
 use crate::models::hotkeys::HotkeyDefinition;
@@ -41,6 +41,10 @@ pub enum RuntimeAction {
     Disconnect,
     HandleIncomingLine(Arc<StyledLine>),
     HandleIncomingPartialLine(Arc<StyledLine>),
+    /// A carriage-return overprint superseded the incoming open line: drop any
+    /// prefix already delivered as a partial (the text after the `\r` replaces
+    /// it). Emitted by the VT layer before the replacement frame's bytes.
+    RetractIncomingPartialLine,
     CompleteLineTriggersProcessed(Arc<StyledLine>),
     PartialLineTriggersProcessed(Arc<StyledLine>),
     PerformLineOperation {
@@ -196,6 +200,26 @@ pub enum RuntimeAction {
         id: HotkeyId,
     },
     SetCurrentLocation(AreaId, Option<i32>),
+    /// A mapper navigation op (speedwalk / find-nearest) resolved a destination
+    /// in this area — a demonstrated navigation intent the UI daemon weighs for
+    /// per-server map scoping (bind-on-use). Advisory only; carries no map
+    /// mutation. Emitted from the read-side nav ops, translated to
+    /// `SessionEvent::MapperNavigated`.
+    NoteMapperNavigation(AreaId),
+    /// A room the auto-mapper was about to create is already mapped on a
+    /// *different* server entry (a scope-excluded area). The UI daemon raises
+    /// the cross-entry "show here too?" rescue offer. Translated to
+    /// `SessionEvent::OfferMapRescue`.
+    OfferMapRescue {
+        area_id: AreaId,
+        atlas_id: Option<AtlasId>,
+        atlas_name: Option<String>,
+    },
+    /// A script created a non-ephemeral (cloud-tier) area in this session; the
+    /// UI daemon associates it with this session's server entry so nothing
+    /// user-created starts unassigned. Translated to
+    /// `SessionEvent::MapAreaCreated`.
+    AssociateCreatedArea(AreaId),
     /// Emit `SessionEvent::PaneOpened` for a pane the split op already
     /// created synchronously in the registry. Queued by the op so the event
     /// leaves on the ordered UI channel ahead of any `AppendTo` for the key.
@@ -322,6 +346,19 @@ pub enum RuntimeAction {
     },
     /// `gmcp.mergeKeys`: extend the deep-merge message-name set (`docs/gmcp-plan.md` §4.3).
     GmcpAddMergeKeys(Arc<Vec<String>>),
+    /// One inbound MSDP subnegotiation, raw bytes exactly as received (MSDP frames are
+    /// control-marked, so no text decode happens on the connection task); the dispatch
+    /// arm decodes on the session thread and writes the `msdp` store subtree. Rides the
+    /// same channel as `HandleIncomingLine`, so the GMCP §3.3 wire-order guarantee holds
+    /// for MSDP identically.
+    MsdpMessage { payload: Arc<[u8]> },
+    /// MSDP negotiated on; the connection task has already framed the `LIST` + baseline
+    /// `REPORT` handshake onto the reply buffer. The dispatch arm clears the `msdp`
+    /// subtree (fresh server, fresh truth) and emits `msdp:ready`.
+    MsdpEnabled,
+    /// MSDP negotiated off mid-connection (`WONT`); disconnect-while-enabled takes the
+    /// `Disconnected` arm's path instead. Emits `msdp:closed` if it was enabled.
+    MsdpDisabled,
     Reload,
     Shutdown,
     Noop,

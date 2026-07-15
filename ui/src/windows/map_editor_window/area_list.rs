@@ -23,7 +23,9 @@ use crate::assets::{bootstrap_icons, fonts};
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 
-use super::{FolderKey, MapEditorWindow, Message};
+use smudgy_core::models::map_scopes::ScopeState;
+
+use super::{FolderKey, MapEditorWindow, Message, ScopeTarget};
 
 fn icon_button(
     codepoint: &'static str,
@@ -157,6 +159,10 @@ pub struct AreaSummary {
     /// This area is one of ≥2 copies in a copy-family (linked by `copied_from`
     /// provenance or a shared `family_token`); drives the "copy" family badge.
     pub in_family: bool,
+    /// For a genuinely atlas-less **cloud** area, the scope target its row's
+    /// "Servers…" affordance writes. `None` for atlas-filed areas (scoped by
+    /// their atlas's folder header), local areas, and session maps.
+    pub scope_target: Option<ScopeTarget>,
 }
 
 fn sort_by_name(areas: &mut [AreaSummary]) {
@@ -168,30 +174,45 @@ fn sort_by_name(areas: &mut [AreaSummary]) {
     });
 }
 
-/// One shared group: keyed on the sharer's user id so handle-less sharers
-/// stay distinct, with a display label resolved separately.
-struct SharedGroup {
-    label: String,
-    areas: Vec<AreaSummary>,
-}
-
 /// One folder in the "My maps" tree: a named atlas, or the catch-all "Loose"
 /// bucket for owned areas filed under no atlas. Empty atlas folders are kept
 /// (rendered as empty), so a freshly created folder is visible before any
-/// map is filed into it.
+/// map is filed into it. `owned` distinguishes the viewer's own folders (full
+/// affordances) from a shared atlas folder surfaced under a sharer group (only
+/// the per-user "Servers…" override).
 pub struct Folder {
     pub key: FolderKey,
     pub label: String,
     pub areas: Vec<AreaSummary>,
+    /// The viewer owns this folder (drives owner-only header affordances).
+    pub owned: bool,
+}
+
+/// The shared maps handed to the viewer by one sharer: the owner's named atlas
+/// folders (only the granted areas inside — §4.1 un-redaction) plus a flat
+/// pile of any genuinely atlas-less shared areas. Keyed on the sharer's user
+/// id so handle-less sharers stay distinct, with a display label resolved
+/// separately.
+pub struct SharedGroup {
+    pub label: String,
+    pub folders: Vec<Folder>,
+    pub loose: Vec<AreaSummary>,
 }
 
 /// Some area to fall back to when no specific selection is wanted (initial
 /// open, after a delete). Owned areas first, then shared, each name-sorted.
+/// Ephemeral (session) areas are excluded — the editor doesn't manage them.
 #[must_use]
-pub fn first_area_id(atlas: &AtlasCache) -> Option<AreaId> {
+pub fn first_area_id(
+    atlas: &AtlasCache,
+    ephemeral: &std::collections::HashSet<AreaId>,
+) -> Option<AreaId> {
     let mut owned: Vec<(String, AreaId)> = Vec::new();
     let mut shared: Vec<(String, AreaId)> = Vec::new();
     for area in atlas.areas() {
+        if ephemeral.contains(area.get_id()) {
+            continue;
+        }
         let entry = (area.get_name().to_lowercase(), *area.get_id());
         if area.effective_access().is_owner {
             owned.push(entry);
@@ -209,12 +230,17 @@ pub fn first_area_id(atlas: &AtlasCache) -> Option<AreaId> {
 /// is filed under no atlas. Areas whose `atlas_id` is absent from the
 /// inventory (a just-deleted folder, or before the inventory has loaded) fall
 /// back to Loose until the inventory catches up. Shared rows are excluded —
-/// they group by sharer (see [`shared_groups`]).
+/// they group by sharer (see [`shared_groups`]). Ephemeral (session) areas
+/// are excluded too: the editor's tree only shows maps that outlive the
+/// session, so a session map can't be toggled into the per-area preference
+/// lists or picked as a folder member.
 #[must_use]
 pub fn owned_folders(
     atlas: &AtlasCache,
     atlases: &[AtlasListItem],
     family_members: &std::collections::HashSet<AreaId>,
+    ephemeral: &std::collections::HashSet<AreaId>,
+    local_areas: &std::collections::HashSet<AreaId>,
 ) -> Vec<Folder> {
     let known: std::collections::HashSet<AtlasId> = atlases.iter().map(|item| item.id).collect();
     let mut by_atlas: HashMap<AtlasId, Vec<AreaSummary>> = HashMap::new();
@@ -222,11 +248,16 @@ pub fn owned_folders(
 
     for area in atlas.areas() {
         let access = area.effective_access();
-        if !access.is_owner {
+        if !access.is_owner || ephemeral.contains(area.get_id()) {
             continue;
         }
         let area_id = *area.get_id();
         let atlas_id = area.meta().atlas_id;
+        let filed = matches!(atlas_id, Some(id) if known.contains(&id));
+        // A genuinely atlas-less *cloud* area carries its own scope target; a
+        // filed area is scoped by its atlas, and local areas aren't scoped.
+        let scope_target = (!filed && !local_areas.contains(&area_id))
+            .then_some(ScopeTarget::Area(area_id));
         let summary = AreaSummary {
             id: area_id,
             name: area.get_name().to_string(),
@@ -238,10 +269,14 @@ pub fn owned_folders(
             reshare_owner: None,
             sharer_label: None,
             in_family: family_members.contains(&area_id),
+            scope_target,
         };
-        match atlas_id {
-            Some(id) if known.contains(&id) => by_atlas.entry(id).or_default().push(summary),
-            _ => loose.push(summary),
+        if filed {
+            if let Some(id) = atlas_id {
+                by_atlas.entry(id).or_default().push(summary);
+            }
+        } else {
+            loose.push(summary);
         }
     }
 
@@ -261,6 +296,7 @@ pub fn owned_folders(
             key: FolderKey::Atlas(item.id),
             label: item.name.clone(),
             areas,
+            owned: true,
         });
     }
     if !loose.is_empty() {
@@ -269,23 +305,65 @@ pub fn owned_folders(
             key: FolderKey::Loose,
             label: "Loose maps".to_string(),
             areas: loose,
+            owned: true,
         });
     }
     folders
 }
 
-/// Groups areas shared *to* the viewer by sharer: keyed on
-/// the sharer's user id (so handle-less sharers stay distinct), labeled
-/// "Shared by {handle}" with "a friend" as the final fallback, name-sorted
-/// within each group and across groups.
+/// The viewer's ephemeral (session) areas, name-sorted. These live only for
+/// the session and are never persisted, so they never appear in the atlas
+/// folder tree — but the editor lists them under their own group so a
+/// protocol-driven auto-map can be inspected (and promoted) while it builds.
+#[must_use]
+pub fn session_maps(atlas: &AtlasCache, ephemeral: &std::collections::HashSet<AreaId>) -> Vec<AreaSummary> {
+    let mut maps: Vec<AreaSummary> = atlas
+        .areas()
+        .filter(|area| ephemeral.contains(area.get_id()))
+        .map(|area| {
+            let area_id = *area.get_id();
+            AreaSummary {
+                id: area_id,
+                name: area.get_name().to_string(),
+                has_secrets: false,
+                owned: true,
+                can_edit: true,
+                can_admin: true,
+                enabled: atlas.is_area_enabled(&area_id),
+                reshare_owner: None,
+                sharer_label: None,
+                in_family: false,
+                scope_target: None,
+            }
+        })
+        .collect();
+    sort_by_name(&mut maps);
+    maps
+}
+
+/// Groups areas shared *to* the viewer by sharer, keyed on the sharer's user
+/// id (so handle-less sharers stay distinct), labeled "Shared by {handle}"
+/// with "a friend" as the final fallback. Within each sharer group the areas
+/// are further grouped by their atlas into named folders (§4.1 un-redaction now
+/// delivers `atlas_id` + `atlas_name` to any viewer who can see the area), with
+/// genuinely atlas-less areas left in a flat pile. Name-sorted within each
+/// folder/pile and across groups.
 #[must_use]
 pub fn shared_groups(
     atlas: &AtlasCache,
     sharers: Option<&SharerIndex>,
     family_members: &std::collections::HashSet<AreaId>,
-) -> Vec<(String, Vec<AreaSummary>)> {
+) -> Vec<SharedGroup> {
+    // The accumulating shape of one sharer group before folders are ordered:
+    // atlas-id -> (name, areas), plus the atlas-less pile.
+    struct Accum {
+        label: String,
+        by_atlas: HashMap<AtlasId, (String, Vec<AreaSummary>)>,
+        loose: Vec<AreaSummary>,
+    }
+
     // Keyed on the sharer's user id (uuid), never the display handle.
-    let mut shared: HashMap<Uuid, SharedGroup> = HashMap::new();
+    let mut shared: HashMap<Uuid, Accum> = HashMap::new();
 
     for area in atlas.areas() {
         let access = area.effective_access();
@@ -321,6 +399,11 @@ pub fn shared_groups(
             _ => None,
         };
 
+        // A genuinely atlas-less shared area carries its own area-level scope
+        // target (the §5 override surface); an atlas-filed area is scoped by
+        // its folder header instead.
+        let scope_target = meta.atlas_id.is_none().then_some(ScopeTarget::Area(area_id));
+
         let summary = AreaSummary {
             id: area_id,
             name: area.get_name().to_string(),
@@ -332,33 +415,69 @@ pub fn shared_groups(
             reshare_owner,
             sharer_label: Some(sharer_label.clone()),
             in_family: family_members.contains(&area_id),
+            scope_target,
         };
 
-        shared
-            .entry(group_key)
-            .or_insert_with(|| SharedGroup {
-                label: sharer_label,
-                areas: Vec::new(),
-            })
-            .areas
-            .push(summary);
+        let accum = shared.entry(group_key).or_insert_with(|| Accum {
+            label: sharer_label,
+            by_atlas: HashMap::new(),
+            loose: Vec::new(),
+        });
+        match meta.atlas_id {
+            Some(atlas_id) => {
+                let name = meta
+                    .atlas_name
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "Shared folder".to_string());
+                let folder = accum
+                    .by_atlas
+                    .entry(atlas_id)
+                    .or_insert_with(|| (name, Vec::new()));
+                folder.1.push(summary);
+            }
+            None => accum.loose.push(summary),
+        }
     }
 
-    let mut shared: Vec<SharedGroup> = shared.into_values().collect();
-    shared.sort_by(|a, b| {
+    let mut groups: Vec<SharedGroup> = shared
+        .into_values()
+        .map(|accum| {
+            let mut folders: Vec<Folder> = accum
+                .by_atlas
+                .into_iter()
+                .map(|(atlas_id, (label, mut areas))| {
+                    sort_by_name(&mut areas);
+                    Folder {
+                        key: FolderKey::Atlas(atlas_id),
+                        label,
+                        areas,
+                        owned: false,
+                    }
+                })
+                .collect();
+            folders.sort_by(|a, b| {
+                a.label
+                    .to_lowercase()
+                    .cmp(&b.label.to_lowercase())
+                    .then_with(|| a.label.cmp(&b.label))
+            });
+            let mut loose = accum.loose;
+            sort_by_name(&mut loose);
+            SharedGroup {
+                label: format!("Shared by {}", accum.label),
+                folders,
+                loose,
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| {
         a.label
             .to_lowercase()
             .cmp(&b.label.to_lowercase())
             .then_with(|| a.label.cmp(&b.label))
     });
-
-    shared
-        .into_iter()
-        .map(|mut group| {
-            sort_by_name(&mut group.areas);
-            (format!("Shared by {}", group.label), group.areas)
-        })
-        .collect()
+    groups
 }
 
 /// A subtle, dimmed badge text used for inline row annotations.
@@ -415,53 +534,361 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     // Copy-family membership (over copied_from edges + family_token) for the
     // "copy" badge; computed once for the whole list.
     let family_members = window.family_members();
-    let folders = owned_folders(&atlas, &window.atlases, &family_members);
+    let ephemeral = window.mapper.ephemeral_area_ids();
+    let local_areas = window.mapper.local_area_ids();
+    let folders = owned_folders(
+        &atlas,
+        &window.atlases,
+        &family_members,
+        &ephemeral,
+        &local_areas,
+    );
     let shared = shared_groups(&atlas, window.sharers.as_ref(), &family_members);
-    let has_folders = !window.atlases.is_empty();
 
     let mut list = Column::new().spacing(2).padding(4);
 
-    if has_folders {
-        // "My maps" is the folder tree; only label it when shared groups also
-        // appear (otherwise the folders stand on their own).
-        if !shared.is_empty() {
-            list = list.push(group_label("My maps".to_string()));
+    // Scope mode selects how the owned folders and shared groups are organized:
+    //   This-server  — filter to the current entry (Unassigned collapses into
+    //                  its own group; other entries' atlases are omitted).
+    //   All-atlases  — with a server context, bucket everything by scope state
+    //                  (This server / Unassigned / Other servers).
+    //   No context   — flat: every folder and shared group, unfiltered.
+    list = match (window.server_name.as_deref(), window.scope_all) {
+        (Some(server), false) => render_this_server(list, window, folders, shared, selected, server),
+        (Some(server), true) => render_all_buckets(list, window, folders, shared, selected, server),
+        (None, _) => render_flat(list, window, folders, shared, selected),
+    };
+
+    // Session (ephemeral) maps render as their own flat group, so a live
+    // auto-map is inspectable while it builds. Excluded from the folder tree
+    // above (they never persist); shown here for diagnosis + promotion.
+    let session = session_maps(&atlas, &ephemeral);
+    if !session.is_empty() {
+        list = list.push(group_label("Session maps".to_string()));
+        for area in session {
+            list = list.push(area_row(window, area, selected, false));
         }
-        for folder in folders {
-            let collapsed = window.collapsed_folders.contains(&folder.key);
-            list = list.push(folder_header(window, &folder, collapsed));
-            if !collapsed {
-                for area in folder.areas {
-                    list = list.push(area_row(window, area, selected, true));
-                }
+    }
+
+    let mut chrome = column![header];
+    if let Some(control) = scope_control(window) {
+        chrome = chrome.push(control);
+    }
+    chrome = chrome.push(scrollable(list).height(Length::Fill));
+
+    container(chrome)
+        .style(builtins::container::opaque)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// One sharer's shared content narrowed to a single scope bucket: the sharer
+/// label (repeated across buckets so attribution survives bucketing) plus the
+/// atlas folders and atlas-less areas that fell into this bucket.
+struct SharedFrag {
+    label: String,
+    folders: Vec<Folder>,
+    loose: Vec<AreaSummary>,
+}
+
+impl SharedFrag {
+    fn is_empty(&self) -> bool {
+        self.folders.is_empty() && self.loose.is_empty()
+    }
+
+    fn count(&self) -> usize {
+        self.folders.len() + self.loose.len()
+    }
+}
+
+/// The scope state of an owned/shared atlas folder against `server`. Local
+/// atlases and the Loose bucket aren't scope-keyed, so they always read as
+/// `Here` (shown on every entry, including this one).
+fn folder_scope(window: &MapEditorWindow, folder: &Folder, server: &str) -> ScopeState {
+    match folder.key {
+        FolderKey::Atlas(atlas_id) if !window.local_atlas_ids.contains(&atlas_id) => {
+            window.map_scopes.atlas_scope(&atlas_id, server)
+        }
+        _ => ScopeState::Here,
+    }
+}
+
+/// The scope-bucket index of a [`ScopeState`]: 0 = Here, 1 = Unassigned,
+/// 2 = Elsewhere.
+fn scope_index(state: ScopeState) -> usize {
+    match state {
+        ScopeState::Here => 0,
+        ScopeState::Unassigned => 1,
+        ScopeState::Elsewhere => 2,
+    }
+}
+
+/// Split one sharer group's folders and atlas-less areas into the three scope
+/// buckets (`[Here, Unassigned, Elsewhere]`) for `server`. The sharer label is
+/// carried into every bucket so attribution persists wherever the content lands.
+fn partition_shared_group(
+    window: &MapEditorWindow,
+    group: SharedGroup,
+    server: &str,
+) -> [SharedFrag; 3] {
+    let mut frags = std::array::from_fn(|_| SharedFrag {
+        label: group.label.clone(),
+        folders: Vec::new(),
+        loose: Vec::new(),
+    });
+    for folder in group.folders {
+        let idx = scope_index(folder_scope(window, &folder, server));
+        frags[idx].folders.push(folder);
+    }
+    for area in group.loose {
+        // A genuinely atlas-less shared area is scoped by its own area record.
+        let idx = scope_index(window.map_scopes.area_scope(&area.id, server));
+        frags[idx].loose.push(area);
+    }
+    frags
+}
+
+/// Renders a run of shared fragments: each sharer label, then its atlas folders
+/// and atlas-less area rows.
+fn render_shared_frags<'a>(
+    mut list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    frags: Vec<SharedFrag>,
+    selected: Option<AreaId>,
+) -> Column<'a, Message, crate::Theme> {
+    for frag in frags {
+        list = list.push(group_label(frag.label));
+        for folder in frag.folders {
+            list = push_folder(list, window, folder, selected);
+        }
+        for area in frag.loose {
+            list = list.push(area_row(window, area, selected, false));
+        }
+    }
+    list
+}
+
+/// This-server scope: only content associated with (or unassigned relative to)
+/// the current entry appears — atlases bound only to other entries are omitted,
+/// and unassigned atlases/areas collapse into one "Unassigned" group.
+fn render_this_server<'a>(
+    mut list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    folders: Vec<Folder>,
+    shared: Vec<SharedGroup>,
+    selected: Option<AreaId>,
+    server: &str,
+) -> Column<'a, Message, crate::Theme> {
+    let has_shared = !shared.is_empty();
+
+    let mut owned_here = Vec::new();
+    let mut owned_unassigned = Vec::new();
+    for folder in folders {
+        match folder_scope(window, &folder, server) {
+            ScopeState::Here => owned_here.push(folder),
+            ScopeState::Unassigned => owned_unassigned.push(folder),
+            ScopeState::Elsewhere => {}
+        }
+    }
+
+    let mut shared_here: Vec<SharedFrag> = Vec::new();
+    let mut shared_unassigned: Vec<SharedFrag> = Vec::new();
+    for group in shared {
+        let [here, unassigned, _elsewhere] = partition_shared_group(window, group, server);
+        if !here.is_empty() {
+            shared_here.push(here);
+        }
+        if !unassigned.is_empty() {
+            shared_unassigned.push(unassigned);
+        }
+    }
+
+    // "My maps" labels the owned tree only when shared groups also appear.
+    if has_shared && !owned_here.is_empty() {
+        list = list.push(group_label("My maps".to_string()));
+    }
+    for folder in owned_here {
+        list = push_folder(list, window, folder, selected);
+    }
+    list = render_shared_frags(list, window, shared_here, selected);
+
+    let unassigned_count =
+        owned_unassigned.len() + shared_unassigned.iter().map(SharedFrag::count).sum::<usize>();
+    if unassigned_count > 0 {
+        let collapsed = window.collapsed_folders.contains(&FolderKey::Unassigned);
+        list = list.push(unassigned_header(unassigned_count, collapsed));
+        if !collapsed {
+            for folder in owned_unassigned {
+                list = push_folder(list, window, folder, selected);
+            }
+            list = render_shared_frags(list, window, shared_unassigned, selected);
+        }
+    }
+    list
+}
+
+/// All-atlases scope with a server context: everything, bucketed by scope state
+/// into This server / Unassigned / Other servers, composing the owned-folder and
+/// shared structures inside each bucket.
+fn render_all_buckets<'a>(
+    mut list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    folders: Vec<Folder>,
+    shared: Vec<SharedGroup>,
+    selected: Option<AreaId>,
+    server: &str,
+) -> Column<'a, Message, crate::Theme> {
+    let mut owned: [Vec<Folder>; 3] = std::array::from_fn(|_| Vec::new());
+    for folder in folders {
+        let idx = scope_index(folder_scope(window, &folder, server));
+        owned[idx].push(folder);
+    }
+    let mut shared_buckets: [Vec<SharedFrag>; 3] = std::array::from_fn(|_| Vec::new());
+    for group in shared {
+        for (idx, frag) in partition_shared_group(window, group, server)
+            .into_iter()
+            .enumerate()
+        {
+            if !frag.is_empty() {
+                shared_buckets[idx].push(frag);
             }
         }
-    } else {
-        // No atlases: keep today's flat owned list (clean single-user view).
+    }
+
+    let headers = [
+        format!("On {server}"),
+        "Unassigned".to_string(),
+        "Other servers".to_string(),
+    ];
+    for (idx, header) in headers.into_iter().enumerate() {
+        let owned_bucket = std::mem::take(&mut owned[idx]);
+        let shared_bucket = std::mem::take(&mut shared_buckets[idx]);
+        if owned_bucket.is_empty() && shared_bucket.is_empty() {
+            continue;
+        }
+        list = list.push(bucket_header(header));
+        for folder in owned_bucket {
+            list = push_folder(list, window, folder, selected);
+        }
+        list = render_shared_frags(list, window, shared_bucket, selected);
+    }
+    list
+}
+
+/// No server context: flat rendering — every owned folder, then every shared
+/// group, unfiltered (the pre-scoping single-context behavior).
+fn render_flat<'a>(
+    mut list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    folders: Vec<Folder>,
+    shared: Vec<SharedGroup>,
+    selected: Option<AreaId>,
+) -> Column<'a, Message, crate::Theme> {
+    let has_shared = !shared.is_empty();
+    if window.atlases.is_empty() {
+        // No owned atlases: keep today's flat owned list (clean single-user
+        // view) rather than a lone "Loose maps" header.
         let owned: Vec<AreaSummary> = folders.into_iter().flat_map(|folder| folder.areas).collect();
         if !owned.is_empty() {
-            if !shared.is_empty() {
+            if has_shared {
                 list = list.push(group_label("My maps".to_string()));
             }
             for area in owned {
                 list = list.push(area_row(window, area, selected, false));
             }
         }
+    } else {
+        if has_shared {
+            list = list.push(group_label("My maps".to_string()));
+        }
+        for folder in folders {
+            list = push_folder(list, window, folder, selected);
+        }
     }
-
-    // Shared groups render as flat lists, one per sharer.
-    for (label, areas) in shared {
-        list = list.push(group_label(label));
-        for area in areas {
+    for group in shared {
+        list = list.push(group_label(group.label));
+        for folder in group.folders {
+            list = push_folder(list, window, folder, selected);
+        }
+        for area in group.loose {
             list = list.push(area_row(window, area, selected, false));
         }
     }
+    list
+}
 
-    container(column![header, scrollable(list).height(Length::Fill)])
-        .style(builtins::container::opaque)
+/// A top-level scope-bucket header for the All-atlases three-bucket view.
+fn bucket_header<'a>(label: String) -> ThemedElement<'a, Message> {
+    text(label).size(13).into()
+}
+
+/// The "This server / All atlases" scope control, shown only when the editor
+/// has a server context (otherwise everything is shown and there is nothing to
+/// switch).
+fn scope_control(window: &MapEditorWindow) -> Option<ThemedElement<'_, Message>> {
+    let server = window.server_name.as_deref()?;
+    let tab = |label: String, active: bool, all: bool| {
+        let style = if active {
+            builtins::button::list_item_selected
+        } else {
+            builtins::button::toolbar
+        };
+        button(text(label).size(11))
+            .style(style)
+            .on_press(Message::ScopeAllToggled(all))
+    };
+    Some(
+        row![
+            tab(format!("This server ({server})"), !window.scope_all, false),
+            tab("All atlases".to_string(), window.scope_all, true),
+        ]
+        .spacing(4)
+        .align_y(Vertical::Center)
+        .padding([0, 8])
+        .into(),
+    )
+}
+
+/// The collapsed-by-default "Unassigned" group header (This-server scope): the
+/// atlases with no server-entry association yet.
+fn unassigned_header<'a>(count: usize, collapsed: bool) -> ThemedElement<'a, Message> {
+    let disclosure = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
+    let header = row![
+        text(disclosure)
+            .size(10)
+            .style(|theme: &crate::Theme| iced::widget::text::Style {
+                color: Some(theme.styles.text.normal.scale_alpha(0.6)),
+            }),
+        text("Unassigned").size(13),
+        space::horizontal(),
+        badge(count.to_string()),
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center)
+    .width(Length::Fill);
+    button(header)
+        .style(builtins::button::list_item)
+        .on_press(Message::ToggleFolderCollapsed(FolderKey::Unassigned))
         .width(Length::Fill)
-        .height(Length::Fill)
         .into()
+}
+
+/// Appends a folder's disclosure header and (unless collapsed) its rows.
+fn push_folder<'a>(
+    mut list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    folder: Folder,
+    selected: Option<AreaId>,
+) -> Column<'a, Message, crate::Theme> {
+    let collapsed = window.collapsed_folders.contains(&folder.key);
+    list = list.push(folder_header(window, &folder, collapsed));
+    if !collapsed {
+        for area in folder.areas {
+            list = list.push(area_row(window, area, selected, true));
+        }
+    }
+    list
 }
 
 /// One folder's disclosure header: a chevron, the folder name, a count badge,
@@ -509,30 +936,47 @@ fn folder_header<'a>(
 
     // The Loose bucket isn't a real atlas — no rename/delete/share/new-map.
     if let FolderKey::Atlas(atlas_id) = folder.key {
-        header = header.push(tooltip(
-            icon_button(bootstrap_icons::PLUS_LG, Message::NewAreaInAtlas(atlas_id)),
-            "New map in folder",
-            tooltip::Position::Bottom,
-        ));
-        header = header.push(tooltip(
-            icon_button(bootstrap_icons::PENCIL, Message::RenameAtlasStarted(atlas_id)),
-            "Rename folder",
-            tooltip::Position::Bottom,
-        ));
-        header = header.push(tooltip(
-            icon_button(bootstrap_icons::TRASH_3, Message::DeleteAtlasRequested(atlas_id)),
-            "Delete folder",
-            tooltip::Position::Bottom,
-        ));
-        // Sharing is cloud-only — a local folder has no server identity, so the
-        // affordance would always 404. New-map/rename/delete work on both tiers.
+        // Owner-only structural affordances (new-map/rename/delete/share/
+        // transfer). A shared atlas folder (surfaced under a sharer group) shows
+        // none of these — the recipient doesn't own it — only the per-user
+        // "Servers…" override below.
+        if folder.owned {
+            header = header.push(tooltip(
+                icon_button(bootstrap_icons::PLUS_LG, Message::NewAreaInAtlas(atlas_id)),
+                "New map in folder",
+                tooltip::Position::Bottom,
+            ));
+            header = header.push(tooltip(
+                icon_button(bootstrap_icons::PENCIL, Message::RenameAtlasStarted(atlas_id)),
+                "Rename folder",
+                tooltip::Position::Bottom,
+            ));
+            header = header.push(tooltip(
+                icon_button(bootstrap_icons::TRASH_3, Message::DeleteAtlasRequested(atlas_id)),
+                "Delete folder",
+                tooltip::Position::Bottom,
+            ));
+            // Sharing is cloud-only — a local folder has no server identity, so
+            // the affordance would always 404. New-map/rename/delete work on
+            // both tiers.
+            if !window.local_atlas_ids.contains(&atlas_id) {
+                header = header
+                    .push(text_button("Share\u{2026}", Message::ShareAtlasRequested(atlas_id)));
+                // Hand the whole folder to a friend (owner-only).
+                header = header.push(text_button(
+                    "Transfer\u{2026}",
+                    Message::TransferAtlasOwnershipRequested(atlas_id),
+                ));
+            }
+        }
+        // Choose which server entries this atlas is shown on (the §5 override
+        // surface). Atlas-level scoping is the norm, and the associations are
+        // per-user local — so it works on a shared atlas folder too. A local
+        // atlas is entry-isolated and never scoped.
         if !window.local_atlas_ids.contains(&atlas_id) {
-            header =
-                header.push(text_button("Share\u{2026}", Message::ShareAtlasRequested(atlas_id)));
-            // Hand the whole folder to a friend (owner-only).
             header = header.push(text_button(
-                "Transfer\u{2026}",
-                Message::TransferAtlasOwnershipRequested(atlas_id),
+                "Servers\u{2026}",
+                Message::ServersChecklistRequested(ScopeTarget::Atlas(atlas_id)),
             ));
         }
     }
@@ -672,6 +1116,16 @@ fn area_row<'a>(
             Message::TransferAreaOwnershipRequested(area.id),
         ));
     }
+    // A loose cloud area carries its own "show on servers" checklist (an
+    // atlas-filed area is scoped by its folder header instead).
+    if is_selected
+        && let Some(target) = area.scope_target
+    {
+        item = item.push(text_button(
+            "Servers\u{2026}",
+            Message::ServersChecklistRequested(target),
+        ));
+    }
 
     button(item)
         .style(if is_selected {
@@ -718,6 +1172,7 @@ mod tests {
                 updated_at: Utc::now(),
                 grantor_nickname: None,
                 owner_nickname: None,
+                host_hints: None,
             },
             depth: 0,
         }

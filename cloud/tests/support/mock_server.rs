@@ -332,6 +332,17 @@ impl MockHandle {
         id
     }
 
+    /// Create an area already filed in `atlas` (its `atlas_id` set), so the
+    /// projection surfaces the denormalized `atlas_name` (§4.1).
+    pub fn create_area_in_atlas(&self, owner: &TestUser, name: &str, atlas: Uuid) -> AreaId {
+        let mut st = self.state.lock();
+        let seq = st.next_seq();
+        let area = AreaRecord::new(Uuid::new_v4(), owner.id, Some(atlas), name.to_string(), seq);
+        let id = area.id;
+        st.areas.insert(id, area);
+        AreaId(id)
+    }
+
     /// Direct state poke: add a room (no rev bump — test setup).
     pub fn add_room(&self, area: AreaId, room_number: i32, title: &str, is_secret: bool) {
         let mut st = self.state.lock();
@@ -484,6 +495,19 @@ impl MockHandle {
         scope: GrantScope,
         flags: GrantFlags,
     ) -> Uuid {
+        self.grant_with_host_hints(owner, grantee, scope, flags, None)
+    }
+
+    /// Insert a ROOT grant directly, snapshotting `host_hints` (§4.2 advisory
+    /// host strings). `None` mirrors a hint-less share. Returns the grant id.
+    pub fn grant_with_host_hints(
+        &self,
+        owner: &TestUser,
+        grantee: &TestUser,
+        scope: GrantScope,
+        flags: GrantFlags,
+        host_hints: Option<Vec<String>>,
+    ) -> Uuid {
         let mut st = self.state.lock();
         let id = Uuid::new_v4();
         let (area_id, atlas_id) = match scope {
@@ -502,6 +526,7 @@ impl MockHandle {
             can_copy: flags.can_copy,
             include_secrets: flags.include_secrets,
             can_admin: flags.can_admin,
+            host_hints,
             parent_grant_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

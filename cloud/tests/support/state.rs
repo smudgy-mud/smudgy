@@ -80,6 +80,9 @@ pub struct RoomRecord {
     pub properties: BTreeMap<String, RoomPropRecord>,
     /// Case-insensitive room tags, normalized to UPPERCASE. Non-secret.
     pub tags: BTreeSet<String>,
+    /// Server-global room identity (GMCP/MSDP room id). Nullable, non-secret,
+    /// not unique-enforced.
+    pub external_id: Option<String>,
 }
 
 impl RoomRecord {
@@ -96,6 +99,7 @@ impl RoomRecord {
             created_at: Utc::now(),
             properties: BTreeMap::new(),
             tags: BTreeSet::new(),
+            external_id: None,
         }
     }
 }
@@ -240,6 +244,9 @@ pub struct GrantRecord {
     pub can_copy: bool,
     pub include_secrets: bool,
     pub can_admin: bool,
+    /// Grantor-authored advisory host hints snapshotted at share creation
+    /// (mirrors `share_grants.host_hints`). `None` = the share carried none.
+    pub host_hints: Option<Vec<String>>,
     pub parent_grant_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

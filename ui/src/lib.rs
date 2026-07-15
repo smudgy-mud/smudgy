@@ -8,13 +8,15 @@ use iced::widget::{center, pane_grid, text};
 use iced::window;
 use iced::window::settings::PlatformSpecific;
 use iced::{Point, Rectangle, Size, Subscription, Task};
+use smudgy_core::models::map_scopes::{MapScopes, ScopeState};
 use smudgy_core::models::settings::{MapAreaPref, Settings};
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection,
 };
 use smudgy_core::session::{SessionEvent, SessionId, TaggedSessionEvent};
 use smudgy_cloud::cloud_api::{AreaPref, CloudApiClient};
-use smudgy_cloud::{AreaId, CloudError, Mapper};
+use smudgy_cloud::{AreaId, AtlasId, CloudError, Mapper};
+use crate::session_store::{BindTarget, ToastAction};
 
 // Core session imports
 use windows::automations_window::{AutomationsWindow, Event as AutomationsWindowEvent};
@@ -95,6 +97,19 @@ struct Smudgy {
     /// cache + last-write-wins basis for cross-device sync. A present
     /// entry is an explicit preference; an absent area defaults to enabled.
     area_prefs: HashMap<AreaId, MapAreaPref>,
+    /// Areas whose pref push came back [`CloudError::NotFoundOrNoAccess`] this
+    /// launch: local-tier maps and lost grants, which the server will keep
+    /// refusing. The reconcile skips re-pushing these — without the parking,
+    /// the 90s tick re-attempted the same doomed PUTs for the life of the
+    /// process (measured at 37% of prod API traffic). An explicit user toggle
+    /// or a fresh sign-in clears an area's parking, so newly-granted access
+    /// syncs without waiting for a relaunch.
+    area_prefs_push_parked: HashSet<AreaId>,
+    /// The authoritative per-user cloud-map scope associations (atlas/area →
+    /// server entries). Owned here, persisted to `map-scopes.json`, and fanned
+    /// out to every live session mapper and open map editor window whenever an
+    /// association changes.
+    map_scopes: MapScopes,
     /// One app-global clipboard shared by every map editor window, so the
     /// two-window merge workflow can copy/paste between them.
     map_editor_clipboard: SharedClipboard,
@@ -159,9 +174,11 @@ enum Message {
     NewMapEditorWindow {
         id: window::Id,
         mapper: Mapper,
+        server_name: Arc<String>,
     },
     CreateMapEditorWindow {
         mapper: Mapper,
+        server_name: Arc<String>,
     },
     SettingsWindowMessage(window::Id, windows::settings_window::Message),
     NewSettingsWindow(window::Id),
@@ -245,6 +262,13 @@ fn init() -> (Smudgy, Task<Message>) {
     prefs::apply(&settings);
     let area_prefs = load_area_prefs(&settings);
     let disabled_map_areas = disabled_set_from_prefs(&area_prefs);
+    // Per-server cloud-map scope associations, applied to each session's mapper
+    // as it opens and re-pushed here whenever the editor changes an association.
+    let map_scopes = MapScopes::load();
+
+    // Split a pre-0.4.1 global local-map store into the per-server stores and
+    // delete it, before any session or map editor opens a LocalBackend.
+    session_store::migrate_legacy_global_local_maps();
 
     let (account, account_task) = CloudAccount::new();
     // If we resumed a signed-in session, reconcile against the cloud at once.
@@ -275,6 +299,8 @@ fn init() -> (Smudgy, Task<Message>) {
             settings_windows: BTreeMap::new(),
             disabled_map_areas,
             area_prefs,
+            area_prefs_push_parked: HashSet::new(),
+            map_scopes,
             map_editor_clipboard: Arc::new(arc_swap::ArcSwap::from_pointee(
                 map_editor_window::commands::EntityClipboard::default(),
             )),
@@ -592,9 +618,15 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         session_id,
                     }),
                 ]),
-                Some(SmudgyWindowEvent::CreateNewMapEditorWindow { mapper }) => Task::batch([
+                Some(SmudgyWindowEvent::CreateNewMapEditorWindow {
+                    mapper,
+                    server_name,
+                }) => Task::batch([
                     task,
-                    Task::done(Message::CreateMapEditorWindow { mapper }),
+                    Task::done(Message::CreateMapEditorWindow {
+                        mapper,
+                        server_name,
+                    }),
                 ]),
                 Some(SmudgyWindowEvent::SetMapperCurrentLocation(area_id, room_number)) => {
                     Task::batch([
@@ -667,6 +699,24 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         }
         Message::SessionEvent(TaggedSessionEvent { session_id, event }) => {
+            // Per-server map-scope reactions live on the daemon (it owns the
+            // authoritative `map_scopes`, which the session store doesn't), so
+            // handle them here before the event is forwarded to the session.
+            // The session's own update no-ops on them.
+            let scope_task = match &event {
+                SessionEvent::MapperNavigated(area_id) => {
+                    observe_navigation_for_binding(smudgy, session_id, *area_id)
+                }
+                SessionEvent::OfferMapRescue {
+                    area_id,
+                    atlas_id,
+                    atlas_name,
+                } => offer_map_rescue(smudgy, session_id, *area_id, *atlas_id, atlas_name.clone()),
+                SessionEvent::MapAreaCreated(area_id) => {
+                    associate_created_area(smudgy, session_id, *area_id)
+                }
+                _ => Task::none(),
+            };
             // Pane lifecycle touches both the store (display state, handled
             // by the session's own update below) and the windows' grids
             // (handled here at the daemon, which owns the window map).
@@ -689,7 +739,7 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     Some((key, None)) => remove_pane_from_windows(smudgy, session_id, key),
                     None => Task::none(),
                 };
-                Task::batch([task, pane_task])
+                Task::batch([task, pane_task, scope_task])
             } else {
                 // The session was torn down (its store entry goes first) with
                 // this event already in flight; dropping the event here is
@@ -705,22 +755,31 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             if matches!(msg, session_store::Message::Close) {
                 return close_session(smudgy, session_id);
             }
+            // A bind/rescue toast's action button: the daemon owns the scope
+            // store, so it applies the staged action (Undo a bind, accept a
+            // rescue) rather than the session store.
+            if matches!(msg, session_store::Message::BindToastActionClicked) {
+                return handle_bind_toast_action(smudgy, session_id);
+            }
             // The session's own map widgets update below; the standalone map
-            // editor windows track the current location too.
-            let editor_fan_out = if let session_store::Message::SetMapperCurrentLocation(
-                area_id,
-                room_number,
-            ) = &msg
-            {
-                Task::done(Message::SetMapperCurrentLocation(*area_id, *room_number))
-            } else {
-                Task::none()
-            };
+            // editor windows track the current location too, and a sustained
+            // locate streak is the passive bind-on-use signal (daemon-owned).
+            let (editor_fan_out, bind_task) =
+                if let session_store::Message::SetMapperCurrentLocation(area_id, room_number) = &msg
+                {
+                    let (area_id, room_number) = (*area_id, *room_number);
+                    (
+                        Task::done(Message::SetMapperCurrentLocation(area_id, room_number)),
+                        observe_locate_for_binding(smudgy, session_id, area_id),
+                    )
+                } else {
+                    (Task::none(), Task::none())
+                };
             if let Some(session) = smudgy.sessions.get_mut(session_id) {
                 let session_task = session
                     .update(msg)
                     .map(move |msg| Message::SessionAction(session_id, msg));
-                Task::batch([session_task, editor_fan_out])
+                Task::batch([session_task, editor_fan_out, bind_task])
             } else {
                 log::debug!("Dropping action for closed session {session_id}");
                 Task::none()
@@ -850,6 +909,12 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         // changes to the cloud (last-write-wins).
                         let changed =
                             stamp_area_pref_changes(&mut smudgy.area_prefs, &set, Utc::now());
+                        // An explicit toggle un-parks its area: the user may
+                        // have just been granted access, and one attempt per
+                        // action can't loop.
+                        for (area_id, _) in &changed {
+                            smudgy.area_prefs_push_parked.remove(area_id);
+                        }
                         smudgy.disabled_map_areas = set.clone();
                         persist_area_prefs(&smudgy.area_prefs);
                         apply_disabled_map_areas(smudgy, &set);
@@ -860,6 +925,23 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         };
                         Task::batch([update.task, push])
                     }
+                    Some(map_editor_window::Event::ScopeAssociationsChanged(deltas)) => {
+                        // The editor changed a cloud-map scope association (or
+                        // observed new atlases). Replay its targeted deltas
+                        // against the authoritative copy rather than adopting a
+                        // whole-store snapshot — a concurrent bind / rescue /
+                        // homing / other-editor write is thereby preserved
+                        // instead of silently erased by stale editor state.
+                        for delta in &deltas {
+                            smudgy.map_scopes.apply(delta);
+                        }
+                        // Persist, recompute each server's exclusions and push
+                        // them to every live mapper, and mirror the corrected
+                        // store back into *every* editor — including the sender,
+                        // whose optimistic snapshot the mirror reconciles.
+                        let commit = commit_scope_change(smudgy);
+                        Task::batch([update.task, commit])
+                    }
                     None => update.task,
                 }
             } else {
@@ -867,28 +949,43 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Task::none()
             }
         }
-        Message::CreateMapEditorWindow { mapper } => {
+        Message::CreateMapEditorWindow {
+            mapper,
+            server_name,
+        } => {
             let (_, task) = window::open(secondary_window_settings(Size::new(600.0, 400.0)));
             task.map(move |id| Message::NewMapEditorWindow {
                 id,
                 mapper: mapper.clone(),
+                server_name: server_name.clone(),
             })
         }
-        Message::NewMapEditorWindow { id, mapper } => {
+        Message::NewMapEditorWindow {
+            id,
+            mapper,
+            server_name,
+        } => {
             // CloudHandles are app-global, so they're attached here at
             // construction (like SettingsWindow) rather than threaded through
             // the per-session event payload the way the mapper is.
             //
-            // Apply the user's disabled-area preferences to this window's
-            // mapper up front (the editor may outlive its originating pane;
-            // set_disabled_areas is idempotent), and hand it the app-global
-            // clipboard so all editor windows share one (merge workflow).
+            // Apply the user's disabled-area preferences and this server's
+            // cloud-map scope to the window's mapper up front (the editor may
+            // outlive its originating pane; both setters are idempotent), and
+            // hand it the app-global clipboard so all editor windows share one
+            // (merge workflow) plus a snapshot of the scope associations.
             mapper.set_disabled_areas(smudgy.disabled_map_areas.clone());
+            mapper.set_scope_exclusions(
+                smudgy.map_scopes.excluded_atlases(&server_name),
+                smudgy.map_scopes.excluded_areas(&server_name),
+            );
             let window = MapEditorWindow::with_clipboard(
                 id,
                 mapper,
                 smudgy.account.handles(),
                 smudgy.map_editor_clipboard.clone(),
+                (*server_name).clone(),
+                smudgy.map_scopes.clone(),
             );
             smudgy.map_editor_windows.insert(id, window);
             Task::none()
@@ -922,6 +1019,9 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                             .map(Message::Account);
                         poke_all_mappers(smudgy);
                         // Now signed in: reconcile area prefs against the cloud.
+                        // A fresh session can carry fresh grants, so parked
+                        // pushes get another attempt.
+                        smudgy.area_prefs_push_parked.clear();
                         Task::batch([task, reconcile_area_prefs(smudgy)])
                     }
                     Some(SettingsWindowEvent::SignOut { everywhere }) => {
@@ -1016,7 +1116,11 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     return Task::none();
                 }
             };
-            let pushes = merge_server_area_prefs(&mut smudgy.area_prefs, &server);
+            let pushes = merge_server_area_prefs(
+                &mut smudgy.area_prefs,
+                &server,
+                &smudgy.area_prefs_push_parked,
+            );
             apply_and_persist_area_prefs(smudgy);
             push_area_prefs_task(smudgy, &pushes)
         }
@@ -1039,8 +1143,14 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Err(CloudError::NotFoundOrNoAccess) => {
                     // The area isn't viewable (a local-tier map, or access was
                     // lost): the pref can't sync. Leave it local — a residual
-                    // pref for a vanished area matches nothing and is harmless.
-                    log::debug!("area-prefs push for {area_id} returned 404; kept local pref");
+                    // pref for a vanished area matches nothing and is harmless
+                    // — but PARK it so the 90s reconcile stops re-attempting a
+                    // push the server will keep refusing. A user toggle or a
+                    // fresh sign-in un-parks it.
+                    smudgy.area_prefs_push_parked.insert(area_id);
+                    log::debug!(
+                        "area-prefs push for {area_id} returned 404; kept local pref, parked until user action or sign-in"
+                    );
                 }
                 Err(err) => log::warn!("area-prefs push for {area_id} failed: {err}"),
             }
@@ -1469,12 +1579,15 @@ fn stamp_area_pref_changes(
 /// - both sides present → newer `updated_at` wins; a local-newer row whose
 ///   value differs from the server is queued for push.
 /// - server only → adopt the server row.
-/// - local only (no server row) and `disabled` → queue for push. A 404 there
-///   (area not viewable: local-tier or access lost) is a harmless no-op, so a
-///   pref is never silently flipped to enabled when its server row vanishes.
+/// - local only (no server row) and `disabled` → queue for push, unless the
+///   area is `parked` — a prior push already came back "not viewable"
+///   (local-tier or access lost) this launch, and the server's answer won't
+///   change on a timer. Skipping keeps the pref local (never silently flipped
+///   to enabled) without re-attempting a refused PUT every reconcile tick.
 fn merge_server_area_prefs(
     prefs: &mut HashMap<AreaId, MapAreaPref>,
     server: &[AreaPref],
+    parked: &HashSet<AreaId>,
 ) -> Vec<(AreaId, bool)> {
     let mut pushes: Vec<(AreaId, bool)> = Vec::new();
     let server_ids: HashSet<AreaId> = server.iter().map(|pref| pref.area_id).collect();
@@ -1500,7 +1613,7 @@ fn merge_server_area_prefs(
     }
 
     for (area_id, local) in prefs.iter() {
-        if local.disabled && !server_ids.contains(area_id) {
+        if local.disabled && !server_ids.contains(area_id) && !parked.contains(area_id) {
             pushes.push((*area_id, true));
         }
     }
@@ -1554,6 +1667,312 @@ fn apply_disabled_map_areas(smudgy: &Smudgy, set: &HashSet<AreaId>) {
     for window in smudgy.map_editor_windows.values() {
         window.mapper().set_disabled_areas(set.clone());
     }
+}
+
+/// Recomputes each server entry's cloud-map scope exclusions from the
+/// authoritative [`Smudgy::map_scopes`] and pushes them to every live session's
+/// mapper and every open map editor window's mapper. Unlike the (global)
+/// disabled set, scope exclusions are per-entry, so this resolves each mapper's
+/// server context before applying (`set_scope_exclusions` is idempotent).
+fn apply_scope_exclusions(smudgy: &Smudgy) {
+    for (_, session) in smudgy.sessions.iter() {
+        if let Some(mapper) = &session.mapper {
+            mapper.set_scope_exclusions(
+                smudgy.map_scopes.excluded_atlases(&session.server_name),
+                smudgy.map_scopes.excluded_areas(&session.server_name),
+            );
+        }
+    }
+    for window in smudgy.map_editor_windows.values() {
+        if let Some(server) = window.server_name() {
+            window.mapper().set_scope_exclusions(
+                smudgy.map_scopes.excluded_atlases(server),
+                smudgy.map_scopes.excluded_areas(server),
+            );
+        }
+    }
+}
+
+// ===== per-server map scoping: bind-on-use, cross-entry rescue, creation =====
+//
+// The daemon owns the authoritative `map_scopes`, so every convergence signal
+// (a locate streak, a speedwalk, a rescue accept, a creation) resolves and
+// commits here. Session runtimes only report *evidence* (locations, navigation,
+// rescue hits, creations); the policy lives entirely in these functions.
+
+/// Resolve a session location/navigation area to the scope target it would bind
+/// (its atlas, or the atlas-less cloud area itself), or `None` when the area is
+/// ephemeral or local-tier — neither ever binds. Local ids collide across
+/// entries (the 0.4.1 migration seeded verbatim copies with preserved ids), so
+/// scoping a local area would wrongly hide its twin on another entry; ephemeral
+/// areas are session-scoped by nature.
+fn bind_target_for_area(mapper: &Mapper, area_id: AreaId) -> Option<BindTarget> {
+    if mapper.is_ephemeral(&area_id) || mapper.local_area_ids().contains(&area_id) {
+        return None;
+    }
+    let atlas = mapper.get_current_atlas();
+    let atlas_id = atlas.get_area(&area_id).and_then(|area| area.meta().atlas_id);
+    Some(match atlas_id {
+        Some(atlas_id) => BindTarget::Atlas(atlas_id),
+        None => BindTarget::Area(area_id),
+    })
+}
+
+/// The scope state of `target` for `entry`.
+fn target_scope(scopes: &MapScopes, target: BindTarget, entry: &str) -> ScopeState {
+    match target {
+        BindTarget::Atlas(atlas_id) => scopes.atlas_scope(&atlas_id, entry),
+        BindTarget::Area(area_id) => scopes.area_scope(&area_id, entry),
+    }
+}
+
+/// Show or hide `target` on a single server `entry`.
+fn set_scope_entry(scopes: &mut MapScopes, target: BindTarget, entry: &str, show: bool) {
+    match target {
+        BindTarget::Atlas(atlas_id) => scopes.set_atlas_entry(atlas_id, entry, show),
+        BindTarget::Area(area_id) => scopes.set_area_entry(area_id, entry, show),
+    }
+}
+
+/// A human label for a scope target, for the toast: the atlas's name (read from
+/// any resident member area's denormalized `atlas_name`) or the atlas-less
+/// area's own name, with a generic fallback when neither is known.
+fn scope_display_name(mapper: &Mapper, target: BindTarget) -> String {
+    let atlas = mapper.get_current_atlas();
+    match target {
+        BindTarget::Area(area_id) => atlas
+            .get_area(&area_id)
+            .map(|area| area.get_name().to_string())
+            .unwrap_or_else(|| "This map".to_string()),
+        BindTarget::Atlas(atlas_id) => atlas
+            .areas()
+            .find_map(|area| {
+                let meta = area.meta();
+                (meta.atlas_id == Some(atlas_id))
+                    .then(|| meta.atlas_name.clone())
+                    .flatten()
+            })
+            .unwrap_or_else(|| "This map".to_string()),
+    }
+}
+
+/// The `(target, is-unassigned)` bind input for a session location, or `None`
+/// when the area can never bind (ephemeral/local/unknown, or no mapper).
+fn resolve_bind_input(
+    smudgy: &Smudgy,
+    session_id: SessionId,
+    area_id: AreaId,
+) -> Option<(BindTarget, bool)> {
+    let session = smudgy.sessions.get(session_id)?;
+    let mapper = session.mapper.as_ref()?;
+    let target = bind_target_for_area(mapper, area_id)?;
+    let unassigned =
+        target_scope(&smudgy.map_scopes, target, &session.server_name) == ScopeState::Unassigned;
+    Some((target, unassigned))
+}
+
+/// Passive bind-on-use: fold one resolved locate into the session's streak and
+/// bind when it reaches [`session_store::LOCATE_BIND_STREAK`]. An
+/// ephemeral/local/unknown area (or a non-unassigned target) breaks the streak
+/// without binding.
+fn observe_locate_for_binding(
+    smudgy: &mut Smudgy,
+    session_id: SessionId,
+    area_id: AreaId,
+) -> Task<Message> {
+    let Some((target, unassigned)) = resolve_bind_input(smudgy, session_id, area_id) else {
+        if let Some(session) = smudgy.sessions.get_mut(session_id) {
+            session.bind_tracker.reset_streak();
+        }
+        return Task::none();
+    };
+    let should_bind = smudgy
+        .sessions
+        .get_mut(session_id)
+        .is_some_and(|session| session.bind_tracker.observe_locate(target, unassigned));
+    if should_bind {
+        bind_target(smudgy, session_id, target)
+    } else {
+        Task::none()
+    }
+}
+
+/// Demonstrated navigation intent (a speedwalk / find-nearest resolution): binds
+/// immediately when the destination target is unassigned and not suppressed.
+fn observe_navigation_for_binding(
+    smudgy: &mut Smudgy,
+    session_id: SessionId,
+    area_id: AreaId,
+) -> Task<Message> {
+    let Some((target, unassigned)) = resolve_bind_input(smudgy, session_id, area_id) else {
+        return Task::none();
+    };
+    let should_bind = smudgy
+        .sessions
+        .get(session_id)
+        .is_some_and(|session| session.bind_tracker.observe_navigation(target, unassigned));
+    if should_bind {
+        bind_target(smudgy, session_id, target)
+    } else {
+        Task::none()
+    }
+}
+
+/// Associate `target` with the session's server entry, commit + fan out the
+/// change, and raise the undoable bind toast over the session's main pane.
+fn bind_target(smudgy: &mut Smudgy, session_id: SessionId, target: BindTarget) -> Task<Message> {
+    let Some((server_name, display_name)) = smudgy.sessions.get(session_id).and_then(|session| {
+        let mapper = session.mapper.as_ref()?;
+        Some((session.server_name.clone(), scope_display_name(mapper, target)))
+    }) else {
+        return Task::none();
+    };
+    set_scope_entry(&mut smudgy.map_scopes, target, &server_name, true);
+    let commit = commit_scope_change(smudgy);
+    let message = format!("'{display_name}' now shows on {server_name}");
+    let toast = smudgy.sessions.get_mut(session_id).map_or_else(
+        Task::none,
+        |session| {
+            session
+                .show_bind_toast(
+                    message,
+                    Some(("Undo".to_string(), ToastAction::UndoBind(target))),
+                )
+                .map(move |msg| Message::SessionAction(session_id, msg))
+        },
+    );
+    Task::batch([commit, toast])
+}
+
+/// Cross-entry rescue: a room here is already mapped on a different entry. Offer
+/// (at most once per target per session) to show that map here too.
+fn offer_map_rescue(
+    smudgy: &mut Smudgy,
+    session_id: SessionId,
+    area_id: AreaId,
+    atlas_id: Option<AtlasId>,
+    atlas_name: Option<String>,
+) -> Task<Message> {
+    let target = match atlas_id {
+        Some(atlas_id) => BindTarget::Atlas(atlas_id),
+        None => BindTarget::Area(area_id),
+    };
+    let Some(session) = smudgy.sessions.get(session_id) else {
+        return Task::none();
+    };
+    let server_name = session.server_name.clone();
+    // Only offer for a target genuinely homed on *other* entries. (The op only
+    // fires on a scope-excluded hit, so this should always hold — but a race
+    // with a just-committed bind could make it stale.)
+    if target_scope(&smudgy.map_scopes, target, &server_name) != ScopeState::Elsewhere {
+        return Task::none();
+    }
+    let name = atlas_name
+        .filter(|name| !name.is_empty())
+        .or_else(|| session.mapper.as_ref().map(|m| scope_display_name(m, target)))
+        .unwrap_or_else(|| "another map".to_string());
+    let others = match target {
+        BindTarget::Atlas(atlas_id) => smudgy.map_scopes.atlas_entries(&atlas_id),
+        BindTarget::Area(area_id) => smudgy.map_scopes.area_entries(&area_id),
+    };
+    let others_label = if others.is_empty() {
+        "another server".to_string()
+    } else {
+        others.into_iter().collect::<Vec<_>>().join(", ")
+    };
+    // Rate-limit: offer at most once per target per session.
+    let first = smudgy
+        .sessions
+        .get_mut(session_id)
+        .is_some_and(|session| session.bind_tracker.mark_rescue_offered(target));
+    if !first {
+        return Task::none();
+    }
+    let message = format!("Rooms here match '{name}' (shown on {others_label})");
+    smudgy.sessions.get_mut(session_id).map_or_else(
+        Task::none,
+        |session| {
+            session
+                .show_bind_toast(
+                    message,
+                    Some(("Show here too".to_string(), ToastAction::AcceptRescue(target))),
+                )
+                .map(move |msg| Message::SessionAction(session_id, msg))
+        },
+    )
+}
+
+/// A script created a non-ephemeral area in this session; associate it with the
+/// session's server entry (silently — creation is deliberate). Gated on being
+/// signed in, since only then is a non-ephemeral create a cloud-tier area (a
+/// signed-out create lands in the local tier, which stays entry-isolated).
+fn associate_created_area(
+    smudgy: &mut Smudgy,
+    session_id: SessionId,
+    area_id: AreaId,
+) -> Task<Message> {
+    if !smudgy.account.handles().snapshot.get().signed_in {
+        return Task::none();
+    }
+    let Some((server_name, target)) = smudgy.sessions.get(session_id).and_then(|session| {
+        let mapper = session.mapper.as_ref()?;
+        let target = bind_target_for_area(mapper, area_id)?;
+        Some((session.server_name.clone(), target))
+    }) else {
+        return Task::none();
+    };
+    if target_scope(&smudgy.map_scopes, target, &server_name) == ScopeState::Here {
+        return Task::none();
+    }
+    set_scope_entry(&mut smudgy.map_scopes, target, &server_name, true);
+    commit_scope_change(smudgy)
+}
+
+/// Apply a bind/rescue toast's staged action to the scope store (Undo a bind, or
+/// accept a rescue), then commit + fan out.
+fn handle_bind_toast_action(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Message> {
+    let Some(session) = smudgy.sessions.get_mut(session_id) else {
+        return Task::none();
+    };
+    let server_name = session.server_name.clone();
+    let Some(action) = session.take_toast_action() else {
+        return Task::none();
+    };
+    match action {
+        ToastAction::UndoBind(target) => {
+            // Suppress re-binding for the session, or the streak refires at once.
+            session.bind_tracker.suppress(target);
+            set_scope_entry(&mut smudgy.map_scopes, target, &server_name, false);
+        }
+        ToastAction::AcceptRescue(target) => {
+            set_scope_entry(&mut smudgy.map_scopes, target, &server_name, true);
+        }
+    }
+    commit_scope_change(smudgy)
+}
+
+/// Persist and fan out an authoritative daemon-side scope change: save the
+/// store, push each entry's exclusions to every live mapper, and mirror the new
+/// store into every open map editor so their trees and checklists agree. The
+/// daemon-origin twin of the editor's `ScopeAssociationsChanged` handling.
+fn commit_scope_change(smudgy: &mut Smudgy) -> Task<Message> {
+    if let Err(e) = smudgy.map_scopes.save() {
+        log::warn!("Failed to persist map scopes: {e}");
+    }
+    apply_scope_exclusions(smudgy);
+    let scopes = smudgy.map_scopes.clone();
+    let mirror: Vec<Task<Message>> = smudgy
+        .map_editor_windows
+        .keys()
+        .copied()
+        .map(|id| {
+            Task::done(Message::MapEditorWindowMessage(
+                id,
+                map_editor_window::Message::ScopesReplaced(scopes.clone()),
+            ))
+        })
+        .collect();
+    Task::batch(mirror)
 }
 
 /// Wakes every live mapper's sync engine so credential changes (login,
@@ -1658,7 +2077,8 @@ mod tests {
     fn merge_server_newer_is_adopted() {
         let mut prefs = HashMap::new();
         prefs.insert(area(1), local(area(1), true, 10));
-        let pushes = merge_server_area_prefs(&mut prefs, &[srv(area(1), false, 20)]);
+        let pushes =
+            merge_server_area_prefs(&mut prefs, &[srv(area(1), false, 20)], &HashSet::new());
         assert!(pushes.is_empty());
         assert!(!prefs[&area(1)].disabled);
         assert_eq!(prefs[&area(1)].updated_at, ts(20));
@@ -1668,7 +2088,8 @@ mod tests {
     fn merge_local_newer_is_pushed_and_kept() {
         let mut prefs = HashMap::new();
         prefs.insert(area(1), local(area(1), true, 30));
-        let pushes = merge_server_area_prefs(&mut prefs, &[srv(area(1), false, 20)]);
+        let pushes =
+            merge_server_area_prefs(&mut prefs, &[srv(area(1), false, 20)], &HashSet::new());
         assert_eq!(pushes, vec![(area(1), true)]);
         assert!(prefs[&area(1)].disabled);
     }
@@ -1678,13 +2099,36 @@ mod tests {
         let mut prefs = HashMap::new();
         prefs.insert(area(2), local(area(2), true, 30)); // local-only disabled
         prefs.insert(area(3), local(area(3), false, 30)); // local-only enabled
-        let pushes = merge_server_area_prefs(&mut prefs, &[srv(area(1), true, 5)]);
+        let pushes =
+            merge_server_area_prefs(&mut prefs, &[srv(area(1), true, 5)], &HashSet::new());
         // Server-only row adopted.
         assert!(prefs[&area(1)].disabled);
         // A local-only *disabled* pref is pushed; a local-only *enabled* one is
         // not (server-absent already means enabled).
         assert!(pushes.contains(&(area(2), true)));
         assert!(!pushes.iter().any(|(id, _)| *id == area(3)));
+    }
+
+    #[test]
+    fn merge_never_repushes_a_parked_area() {
+        // The 4XX loop regression: a locally-disabled pref for an area the
+        // server refuses (local-tier map, revoked grant) must stop being
+        // pushed once parked — every 90s reconcile re-attempted it forever.
+        let mut prefs = HashMap::new();
+        prefs.insert(area(2), local(area(2), true, 30));
+        prefs.insert(area(4), local(area(4), true, 30));
+        let parked: HashSet<AreaId> = [area(2)].into_iter().collect();
+        let pushes = merge_server_area_prefs(&mut prefs, &[], &parked);
+        // The parked area is skipped but its local pref survives untouched;
+        // the unparked one still pushes.
+        assert_eq!(pushes, vec![(area(4), true)]);
+        assert!(prefs[&area(2)].disabled);
+        // A server row for a parked area still merges normally (parking only
+        // gates the local-only push).
+        let pushes =
+            merge_server_area_prefs(&mut prefs, &[srv(area(2), false, 99)], &parked);
+        assert!(!pushes.iter().any(|(id, _)| *id == area(2)));
+        assert!(!prefs[&area(2)].disabled, "server-newer row adopted despite parking");
     }
 
     #[test]

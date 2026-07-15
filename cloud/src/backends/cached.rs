@@ -893,6 +893,7 @@ mod tests {
                 id: area_id,
                 user_id: None,
                 atlas_id: None,
+                atlas_name: None,
                 name: format!("Area {rev}"),
                 created_at: Utc::now(),
                 rev,

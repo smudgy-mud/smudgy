@@ -3,7 +3,7 @@
 //! the share dialog (create grants, preview the recipient's view, and manage
 //! the existing grant tree).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +83,15 @@ pub enum Modal {
     CopyArea(CopyAreaDialog),
     /// Offer to transfer ownership of an area or atlas to a friend.
     TransferOffer(TransferDialog),
+    /// The per-atlas (or atlas-less area) "Show this atlas on:" checklist —
+    /// the cloud-map scope override surface. Toggles apply live; `checked` is
+    /// the display buffer kept in step with the daemon-owned store.
+    ServersChecklist {
+        target: super::ScopeTarget,
+        name: String,
+        servers: Vec<String>,
+        checked: std::collections::BTreeSet<String>,
+    },
 }
 
 /// State of the copy-to-my-maps modal.
@@ -227,6 +236,11 @@ pub struct ShareDialog {
     pub close_pending: bool,
     /// Errors from manage-tree operations (revoke, refresh).
     pub manage_error: Option<String>,
+    /// §4.2 "disclose servers": `(host, checked)` snapshot of the shared
+    /// thing's associated server entries' hosts, computed at dialog open and
+    /// never refreshed mid-dialog. Empty means nothing to disclose (no section
+    /// rendered). Checked hosts flow into every `CreateShareRequest.host_hints`.
+    pub host_hints: Vec<(String, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +252,8 @@ pub enum ShareMessage {
     FilterChanged(String),
     RecipientToggled(Uuid, bool),
     FlagToggled(GrantFlag, bool),
+    /// Check/uncheck one disclosed host (§4.2 grantor consent).
+    HostHintToggled(String, bool),
     /// Close the dialog and open the secrets audit instead.
     ReviewSecrets,
     PreviewRequested,
@@ -304,6 +320,10 @@ pub struct ShareAtlasDialog {
     pub revoking: Option<Uuid>,
     pub revoke_busy: bool,
     pub manage_error: Option<String>,
+    /// §4.2 "disclose servers": `(host, checked)` snapshot of the atlas's
+    /// associated server entries' hosts, computed at open. See
+    /// [`ShareDialog::host_hints`].
+    pub host_hints: Vec<(String, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +333,8 @@ pub enum ShareAtlasMessage {
     FilterChanged(String),
     RecipientToggled(Uuid, bool),
     FlagToggled(GrantFlag, bool),
+    /// Check/uncheck one disclosed host (§4.2 grantor consent).
+    HostHintToggled(String, bool),
     Submit,
     Submitted(Vec<(String, Result<(), CloudError>)>),
     CloseTick,
@@ -581,6 +603,9 @@ pub(super) fn open_share_atlas_dialog(
         .map(|atlas| atlas.name.clone())
         .unwrap_or_else(|| "this folder".to_string());
 
+    // §4.2: snapshot the hosts of this folder's associated entries, pre-checked.
+    let host_hints = disclose_hosts(&window.map_scopes.atlas_entries(&atlas_id));
+
     window.modal = Some(Modal::ShareAtlas(ShareAtlasDialog {
         atlas_id,
         atlas_name,
@@ -599,6 +624,7 @@ pub(super) fn open_share_atlas_dialog(
         revoking: None,
         revoke_busy: false,
         manage_error: None,
+        host_hints,
     }));
 
     let friends_client = window.cloud.client.clone();
@@ -686,6 +712,12 @@ pub(super) fn update_share_atlas(
             }
             Update::none()
         }
+        ShareAtlasMessage::HostHintToggled(host, value) => {
+            if let Some((_, checked)) = dialog.host_hints.iter_mut().find(|(h, _)| *h == host) {
+                *checked = value;
+            }
+            Update::none()
+        }
         ShareAtlasMessage::Submit => {
             if dialog.submitting || dialog.selected.is_empty() {
                 return Update::none();
@@ -696,6 +728,8 @@ pub(super) fn update_share_atlas(
             let scope = ShareScope::Atlas {
                 atlas_id: dialog.atlas_id,
             };
+            // §4.2: the grantor's checked host disclosures ride on every grant.
+            let host_hints = checked_host_hints(&dialog.host_hints);
             let requests: Vec<(String, CreateShareRequest)> = friends
                 .iter()
                 .filter(|friend| dialog.selected.contains(&friend.user_id))
@@ -710,6 +744,7 @@ pub(super) fn update_share_atlas(
                             can_copy: dialog.can_copy,
                             include_secrets: dialog.include_secrets,
                             can_admin: dialog.can_admin,
+                            host_hints: host_hints.clone(),
                         },
                     )
                 })
@@ -823,6 +858,13 @@ pub(super) fn open_share_dialog(window: &mut MapEditorWindow) -> Update<Message,
     }
 
     let is_owner = access.is_owner;
+    // §4.2: snapshot the hosts of the shared thing's associated entries. For an
+    // atlas-filed area that's its atlas's entries (atlas-level association is
+    // the norm); for a genuinely atlas-less area, the area's own entries.
+    let host_hints = disclose_hosts(&match area.meta().atlas_id {
+        Some(atlas_id) => window.map_scopes.atlas_entries(&atlas_id),
+        None => window.map_scopes.area_entries(&area_id),
+    });
     window.modal = Some(Modal::Share(ShareDialog {
         area_id,
         area_name: area.get_name().to_string(),
@@ -858,6 +900,7 @@ pub(super) fn open_share_dialog(window: &mut MapEditorWindow) -> Update<Message,
         results: Vec::new(),
         close_pending: false,
         manage_error: None,
+        host_hints,
     }));
 
     let friends_client = window.cloud.client.clone();
@@ -931,6 +974,46 @@ fn friend_label(friend: &FriendView) -> String {
     friend
         .nickname.clone()
         .unwrap_or_else(|| friend.user_id.to_string())
+}
+
+/// §4.2 consent snapshot: the hosts of the server entries a shared thing is
+/// associated with, each **pre-checked and removable**. Resolves the entry
+/// names to their configured hosts (lowercased, trimmed, port dropped — the
+/// plan's §5 matcher treats a bare host as port-agnostic, which survives port
+/// drift), deduped case-insensitively across entries. An unassigned thing (no
+/// entries) yields an empty list — nothing to disclose.
+fn disclose_hosts(entries: &BTreeSet<String>) -> Vec<(String, bool)> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let servers = smudgy_core::models::server::list_servers().unwrap_or_default();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut hosts = Vec::new();
+    for name in entries {
+        let Some(server) = servers.iter().find(|server| &server.name == name) else {
+            continue;
+        };
+        let host = server.config.host.trim().to_ascii_lowercase();
+        if host.is_empty() {
+            continue;
+        }
+        if seen.insert(host.clone()) {
+            hosts.push((host, true));
+        }
+    }
+    hosts
+}
+
+/// The checked hosts as a `CreateShareRequest.host_hints` payload: `None` when
+/// the list is empty or nothing is checked (skip-when-none keeps the wire
+/// clean and old-server compatible).
+fn checked_host_hints(host_hints: &[(String, bool)]) -> Option<Vec<String>> {
+    let checked: Vec<String> = host_hints
+        .iter()
+        .filter(|(_, checked)| *checked)
+        .map(|(host, _)| host.clone())
+        .collect();
+    (!checked.is_empty()).then_some(checked)
 }
 
 /// Routes a share-dialog message. Everything here is a no-op unless the
@@ -1049,6 +1132,12 @@ pub(super) fn update_share(
             }
             Update::none()
         }
+        ShareMessage::HostHintToggled(host, value) => {
+            if let Some((_, checked)) = dialog.host_hints.iter_mut().find(|(h, _)| *h == host) {
+                *checked = value;
+            }
+            Update::none()
+        }
         ShareMessage::PreviewRequested => {
             if !dialog.is_owner {
                 return Update::none();
@@ -1114,6 +1203,8 @@ pub(super) fn update_share(
                 && matches!(scope, ShareScope::Area { .. });
             // can_admin is owner-minted only.
             let can_admin = dialog.can_admin && dialog.is_owner;
+            // §4.2: the grantor's checked host disclosures ride on every grant.
+            let host_hints = checked_host_hints(&dialog.host_hints);
             let requests: Vec<(String, CreateShareRequest)> = friends
                 .iter()
                 .filter(|friend| dialog.selected.contains(&friend.user_id))
@@ -1128,6 +1219,7 @@ pub(super) fn update_share(
                             can_copy: dialog.can_copy,
                             include_secrets,
                             can_admin,
+                            host_hints: host_hints.clone(),
                         },
                     )
                 })
@@ -1746,6 +1838,15 @@ impl Modal {
                 format!("Transfer \u{201c}{}\u{201d}", dialog.subject.name()),
                 transfer_offer_view(dialog),
             ),
+            Modal::ServersChecklist {
+                name,
+                servers,
+                checked,
+                ..
+            } => (
+                "Show on servers".to_string(),
+                servers_checklist_view(name, servers, checked),
+            ),
         };
 
         let width = match self {
@@ -1781,6 +1882,53 @@ impl Modal {
 
 fn section_label<'a>(label: &'static str) -> iced::widget::Text<'a, crate::Theme> {
     text(label).size(11).style(muted)
+}
+
+/// The "Show this atlas on:" checklist body — one checkbox per server entry,
+/// pre-checked from the current association. Toggles apply live (each emits a
+/// [`Message::ScopeServerToggled`]); an empty tick set means Unassigned (shown
+/// everywhere).
+fn servers_checklist_view<'a>(
+    name: &'a str,
+    servers: &'a [String],
+    checked: &'a std::collections::BTreeSet<String>,
+) -> ThemedElement<'a, Message> {
+    let mut list = column![text(format!("Show \u{201c}{name}\u{201d} on:")).size(13)].spacing(6);
+
+    if servers.is_empty() {
+        list = list.push(text("No server entries yet.").size(12).style(muted));
+    } else {
+        for server in servers {
+            let entry = server.clone();
+            list = list.push(
+                checkbox(checked.contains(server))
+                    .label(server.clone())
+                    .size(14)
+                    .text_size(13)
+                    .on_toggle(move |show| Message::ScopeServerToggled {
+                        entry: entry.clone(),
+                        show,
+                    }),
+            );
+        }
+        list = list.push(
+            text("Unchecked everywhere means \u{201c}shown on every server\u{201d}.")
+                .size(11)
+                .style(muted),
+        );
+    }
+
+    list = list.push(
+        row![
+            space::horizontal(),
+            button(text("Done").size(13))
+                .style(builtins::button::primary)
+                .on_press(Message::ModalDismissed),
+        ]
+        .align_y(Vertical::Center),
+    );
+
+    container(scrollable(list)).max_height(360.0).into()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1921,6 +2069,35 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
         );
     }
     content = content.push(caps);
+
+    // ===== disclose servers (§4.2 consent moment) =========================
+    if !dialog.host_hints.is_empty() {
+        let mut section = column![
+            section_label("Disclose servers"),
+            text(
+                "Recipients see these server names so their client can place the maps on the \
+                 matching game automatically. Uncheck any you'd rather not reveal (a localhost \
+                 or staging host, say)."
+            )
+            .size(11)
+            .style(muted),
+        ]
+        .spacing(4);
+        for (host, checked) in &dialog.host_hints {
+            let host = host.clone();
+            let toggle_host = host.clone();
+            section = section.push(
+                checkbox(*checked)
+                    .label(host)
+                    .size(14)
+                    .text_size(13)
+                    .on_toggle(move |value| {
+                        share(ShareMessage::HostHintToggled(toggle_host.clone(), value))
+                    }),
+            );
+        }
+        content = content.push(section);
+    }
 
     // ===== secret-count warning (owner only) ==============================
     if let Some(counts) = dialog.secret_counts {
@@ -2491,6 +2668,35 @@ fn share_atlas_view(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
         ]
         .spacing(6),
     );
+
+    // ===== disclose servers (§4.2 consent moment) =========================
+    if !dialog.host_hints.is_empty() {
+        let mut section = column![
+            section_label("Disclose servers"),
+            text(
+                "Recipients see these server names so their client can place the maps on the \
+                 matching game automatically. Uncheck any you'd rather not reveal (a localhost \
+                 or staging host, say)."
+            )
+            .size(11)
+            .style(muted),
+        ]
+        .spacing(4);
+        for (host, checked) in &dialog.host_hints {
+            let host = host.clone();
+            let toggle_host = host.clone();
+            section = section.push(
+                checkbox(*checked)
+                    .label(host)
+                    .size(14)
+                    .text_size(13)
+                    .on_toggle(move |value| {
+                        share_atlas(ShareAtlasMessage::HostHintToggled(toggle_host.clone(), value))
+                    }),
+            );
+        }
+        content = content.push(section);
+    }
 
     // ===== per-recipient results ==========================================
     if !dialog.results.is_empty() {

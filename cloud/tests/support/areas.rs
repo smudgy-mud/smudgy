@@ -474,6 +474,11 @@ struct UpsertRoomRequest {
     y: Option<f32>,
     color: Option<String>,
     is_secret: Option<bool>,
+    /// Absent = unchanged, null = clear, string = set (`Option<Option<_>>`
+    /// needs the double-option helper — a bare nested option folds null into
+    /// absent).
+    #[serde(default, deserialize_with = "double_option")]
+    external_id: Option<Option<String>>,
 }
 
 /// PUT /areas/{id}/{room_number}
@@ -535,6 +540,9 @@ pub async fn upsert_room(
             if let Some(color) = req.color {
                 room.color = color;
             }
+            if let Some(binding) = req.external_id {
+                room.external_id = binding;
+            }
             room.is_secret = req.is_secret.unwrap_or(room.is_secret);
             (old, room.is_secret)
         }
@@ -552,6 +560,7 @@ pub async fn upsert_room(
                 created_at: Utc::now(),
                 properties: std::collections::BTreeMap::new(),
                 tags: std::collections::BTreeSet::new(),
+                external_id: req.external_id.flatten(),
             };
             area.rooms.insert(room_number, room);
             (secret, secret)
@@ -585,6 +594,7 @@ pub async fn upsert_room(
         "created_at": room.created_at,
         "properties": props,
         "exits": exits,
+        "external_id": room.external_id,
     }))
 }
 

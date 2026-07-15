@@ -1866,29 +1866,29 @@ pub(crate) struct KindSchemeRef {
 /// handles by ordinary import). Reservation is unconditional, so a package owner who happens
 /// to take one of these nicknames stays unaddressable through the schemes rather than
 /// shadowing the platform.
-const PLATFORM_PRODUCERS: [&str; 4] = ["sys", "map", "gmcp", "user"];
+const PLATFORM_PRODUCERS: [&str; 5] = ["sys", "map", "gmcp", "msdp", "user"];
 
 /// The host event catalog of a platform producer: `(export name, canonical event name)`.
 /// Mirrored by the `declare module "smudgy:events/sys"` / `"smudgy:events/map"` /
-/// `"smudgy:events/gmcp"` blocks in `smudgy-core.d.ts` (drift-checked by a test in core's
-/// `script_typings.rs`).
+/// `"smudgy:events/gmcp"` / `"smudgy:events/msdp"` blocks in `smudgy-core.d.ts`
+/// (drift-checked by a test in core's `script_typings.rs`).
 #[must_use]
 pub fn platform_event_catalog(producer: &str) -> &'static [&'static str] {
     match producer {
         "sys" => &["connect", "disconnect", "send", "receive"],
         "map" => &["room"],
-        "gmcp" => &["ready", "closed"],
+        "gmcp" | "msdp" => &["ready", "closed"],
         _ => &[],
     }
 }
 
 /// Whether a platform producer publishes **state** — i.e. `smudgy:state/<producer>` loads a
-/// consumer module over its store subtree. Only `gmcp` today (`docs/gmcp-plan.md` §3): the
-/// module exports one root-addressed handle (named and default), so `gmcp.value` /
-/// `gmcp.watch` / `gmcp.onWrite` / `gmcp.bind` cover the whole tree.
+/// consumer module over its store subtree (`docs/gmcp-plan.md` §3,
+/// `docs/gmcp-mapping-plan.md` §9): the module exports one root-addressed handle (named and
+/// default), so `.value` / `.watch` / `.onWrite` / `.bind` cover the whole tree.
 #[must_use]
 pub fn platform_state_producer(producer: &str) -> bool {
-    producer == "gmcp"
+    matches!(producer, "gmcp" | "msdp")
 }
 
 fn kind_scheme(kind: InteropKind) -> &'static str {

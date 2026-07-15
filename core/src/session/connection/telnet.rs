@@ -208,7 +208,19 @@ enum State {
     /// Saw `IAC` while collecting a subnegotiation; the next byte selects `SE` (end) / `IAC`
     /// (literal `0xFF`) / abort.
     SubIac,
+    /// A subnegotiation whose payload exceeded [`MAX_SUBNEGOTIATION_PAYLOAD`]: its bytes are
+    /// consumed and dropped until `IAC SE`, and nothing is delivered. Keeps a hostile or broken
+    /// server that never terminates a subnegotiation from growing the payload buffer without
+    /// bound.
+    SubDiscard,
+    /// Saw `IAC` while discarding an oversized subnegotiation; same byte rules as [`State::SubIac`].
+    SubDiscardIac,
 }
+
+/// The most subnegotiation payload the parser will buffer. One shared bound with the GMCP
+/// inbound cap (`gmcp::MAX_INBOUND_PAYLOAD`): nothing downstream accepts a larger payload, so
+/// buffering past it only serves a memory-exhaustion attack.
+const MAX_SUBNEGOTIATION_PAYLOAD: usize = super::gmcp::MAX_INBOUND_PAYLOAD;
 
 /// A persistent telnet protocol state machine. Construct one per connection and pump every received
 /// buffer through [`receive`](Self::receive). State (including a half-finished control sequence or
@@ -316,11 +328,37 @@ impl TelnetParser {
             State::Sub => {
                 if b == command::IAC {
                     self.state = State::SubIac;
-                } else {
+                } else if self.sub_buf.len() < MAX_SUBNEGOTIATION_PAYLOAD {
                     self.sub_buf.push(b);
+                } else {
+                    log::warn!(
+                        "Telnet subnegotiation for option {} exceeds the {} byte cap; discarding it",
+                        self.sub_option,
+                        MAX_SUBNEGOTIATION_PAYLOAD
+                    );
+                    self.sub_buf.clear();
+                    // The buffer grew to the cap; release that memory rather than keep it
+                    // parked for the (small) payloads the reuse policy is for.
+                    self.sub_buf.shrink_to(64);
+                    self.state = State::SubDiscard;
                 }
             }
             State::SubIac => self.step_sub_iac(b, sink),
+            State::SubDiscard => {
+                if b == command::IAC {
+                    self.state = State::SubDiscardIac;
+                }
+            }
+            State::SubDiscardIac => match b {
+                command::SE => self.state = State::Data,
+                // A doubled IAC is a literal payload byte — still being discarded.
+                command::IAC => self.state = State::SubDiscard,
+                // Malformed, same rule as `step_sub_iac`: re-interpret as a fresh command.
+                _ => {
+                    self.state = State::Iac;
+                    self.step_iac(b, sink);
+                }
+            },
         }
     }
 
@@ -621,5 +659,42 @@ mod tests {
         assert_eq!(r.data, b"abc");
         assert_eq!(r.prompts, 0);
         assert!(r.sent.is_empty());
+    }
+
+    #[test]
+    fn subnegotiation_at_exactly_the_cap_is_delivered() {
+        let payload = vec![b'x'; super::MAX_SUBNEGOTIATION_PAYLOAD];
+        let mut input = vec![IAC, SB, GMCP];
+        input.extend_from_slice(&payload);
+        input.extend_from_slice(&[IAC, SE]);
+        let r = run(&input);
+        assert_eq!(r.subs.len(), 1);
+        assert_eq!(r.subs[0].0, GMCP);
+        assert_eq!(r.subs[0].1.len(), super::MAX_SUBNEGOTIATION_PAYLOAD);
+    }
+
+    #[test]
+    fn oversized_subnegotiation_is_discarded_and_the_stream_resyncs() {
+        let mut input = vec![IAC, SB, GMCP];
+        input.extend_from_slice(&vec![b'x'; super::MAX_SUBNEGOTIATION_PAYLOAD + 1]);
+        // A doubled IAC while discarding is a literal payload byte, not a terminator.
+        input.extend_from_slice(&[IAC, IAC, b'y', IAC, SE]);
+        input.extend_from_slice(b"after");
+        let r = run(&input);
+        assert!(r.subs.is_empty(), "an oversized subnegotiation must deliver nothing");
+        assert_eq!(r.data, b"after", "the stream must resync at the real IAC SE");
+        assert_eq!(r.prompts, 0);
+    }
+
+    #[test]
+    fn discarded_subnegotiation_does_not_poison_the_next_one() {
+        let mut p = TelnetParser::new();
+        let mut r = Recorder::default();
+        let mut oversized = vec![IAC, SB, GMCP];
+        oversized.extend_from_slice(&vec![0u8; super::MAX_SUBNEGOTIATION_PAYLOAD + 1]);
+        oversized.extend_from_slice(&[IAC, SE]);
+        p.receive(&oversized, &mut r);
+        p.receive(&[IAC, SB, GMCP, b'o', b'k', IAC, SE], &mut r);
+        assert_eq!(r.subs, vec![(GMCP, b"ok".to_vec())]);
     }
 }

@@ -13,7 +13,9 @@ use crate::session::runtime::{
 use crate::session::runtime::script_engine::FunctionId;
 use crate::session::runtime::trigger::MatchCapture;
 use crate::session::runtime::trigger::SharedAutomationRegistry;
-use crate::session::styled_line::{Color, LinkAction, Style, StyledLine};
+use crate::session::styled_line::{
+    Color, LinkAction, Style, StyledLine, sanitize_display_text,
+};
 use crate::session::{SessionId, registry};
 
 use std::cell::{Cell, RefCell};
@@ -2498,17 +2500,270 @@ struct StyledRunWire {
     link: Option<LinkWire>,
 }
 
-/// One on-screen line of a styled payload. The JS flattener splits fragments on `\n`,
-/// so a run reaching here must not contain one.
-#[derive(serde::Deserialize)]
-struct StyledLineWire {
-    runs: Vec<StyledRunWire>,
+// ---- Packed styled-echo payload -------------------------------------------------
+//
+// A styled echo crosses the boundary PACKED: one string carrying every text piece
+// plus one `Uint32Array` record table, built by smudgy.ts `__styled_echo_packed`.
+// This replaces a serde object graph whose per-run cost (a V8 property walk per
+// field and an untagged color probe per channel) dominated styled-echo time.
+// The two sides are a matched pair — change them together.
+//
+// records:
+//   [0] line count L
+//   [1] send-link count S
+//   L × { run count R, R × 4: [text length (UTF-16 units), fg, bg, link] }
+//   S × 1: send text length (UTF-16 code units)  -- at the TAIL because the
+//          encoder discovers sends while walking runs, in one pass
+//
+// text: the S send strings in order, then every run's text in line/run order.
+//
+// color u32: 0 = unset (delivery default). Else the top byte is a tag:
+//   1 = RGB   (low 24 bits: r<<16 | g<<8 | b)
+//   2 = ANSI  (bit 3: bold; bits 0-2: black..white index)
+//   3 = role  (0 default, 1 echo, 2 output, 3 warn)
+//
+// link u32: 0 = none. Else the top 2 bits are a tag over a 30-bit index:
+//   1 = send (index into the send strings), 2 = callback (index into the
+//   callbacks array travelling beside the payload).
+
+/// Bounds-checked cursor over the packed record table.
+struct PackedReader<'a> {
+    records: &'a [u32],
+    pos: usize,
 }
 
-/// The payload of a styled echo: whole lines, in order.
-#[derive(serde::Deserialize)]
-struct StyledTextWire {
-    lines: Vec<StyledLineWire>,
+impl PackedReader<'_> {
+    fn next(&mut self) -> Result<u32, StyledTextOpError> {
+        let value = self
+            .records
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| packed_invalid("truncated styled payload records"))?;
+        self.pos += 1;
+        Ok(value)
+    }
+}
+
+fn packed_invalid(message: &str) -> StyledTextOpError {
+    StyledTextOpError::Invalid(message.to_string())
+}
+
+/// Decode one packed color. `0` is unset (`None`); an unknown tag or stray bits
+/// are a malformed payload, not a default.
+fn packed_color(value: u32) -> Result<Option<Color>, StyledTextOpError> {
+    if value == 0 {
+        return Ok(None);
+    }
+    let payload = value & 0x00ff_ffff;
+    match value >> 24 {
+        1 => Ok(Some(Color::Rgb {
+            r: ((payload >> 16) & 0xff) as u8,
+            g: ((payload >> 8) & 0xff) as u8,
+            b: (payload & 0xff) as u8,
+        })),
+        2 => {
+            if payload > 0xf {
+                return Err(packed_invalid("unknown ANSI color index"));
+            }
+            let color = match payload & 0x7 {
+                0 => AnsiColor::Black,
+                1 => AnsiColor::Red,
+                2 => AnsiColor::Green,
+                3 => AnsiColor::Yellow,
+                4 => AnsiColor::Blue,
+                5 => AnsiColor::Magenta,
+                6 => AnsiColor::Cyan,
+                _ => AnsiColor::White,
+            };
+            Ok(Some(Color::Ansi {
+                color,
+                bold: payload & 0x8 != 0,
+            }))
+        }
+        3 => Ok(Some(match payload {
+            0 => Color::DefaultForeground { bold: false },
+            1 => Color::Echo,
+            2 => Color::Output,
+            3 => Color::Warn,
+            _ => return Err(packed_invalid("unknown role color")),
+        })),
+        _ => Err(packed_invalid("unknown color tag")),
+    }
+}
+
+/// One packed link, decoded but not yet resolved against the send/callback tables.
+enum PackedLink {
+    None,
+    Send(usize),
+    Callback(usize),
+}
+
+fn packed_link(value: u32) -> Result<PackedLink, StyledTextOpError> {
+    match value >> 30 {
+        0 if value == 0 => Ok(PackedLink::None),
+        1 => Ok(PackedLink::Send((value & 0x3fff_ffff) as usize)),
+        2 => Ok(PackedLink::Callback((value & 0x3fff_ffff) as usize)),
+        _ => Err(packed_invalid("unknown link tag")),
+    }
+}
+
+/// Split `rest` at exactly `units` UTF-16 code units. Rejects a piece that would
+/// split a surrogate pair (the JS side counts whole code points, so that is a
+/// corrupt payload) and, for run text, an embedded newline — the flattener splits
+/// on `\n`, so one surviving to here is a flattener bug and should be loud. Other
+/// control characters are dirty data handled by `sanitize_display_text` at build.
+fn packed_take_units(
+    rest: &str,
+    units: u32,
+    forbid_newline: bool,
+) -> Result<(&str, &str), StyledTextOpError> {
+    let mut remaining = units as usize;
+    let mut end = 0;
+    if remaining > 0 {
+        for (idx, c) in rest.char_indices() {
+            if forbid_newline && c == '\n' {
+                return Err(packed_invalid("styled run may not contain a newline"));
+            }
+            let width = c.len_utf16();
+            if width > remaining {
+                return Err(packed_invalid("styled payload splits a surrogate pair"));
+            }
+            remaining -= width;
+            if remaining == 0 {
+                end = idx + c.len_utf8();
+                break;
+            }
+        }
+        if remaining > 0 {
+            return Err(packed_invalid("styled payload text shorter than its records"));
+        }
+    }
+    Ok((&rest[..end], &rest[end..]))
+}
+
+/// Validate a whole packed payload BEFORE any side effect: structure, color and
+/// link tags, index bounds, text coverage, and the no-newline rule — so a rejected
+/// payload cannot consume link-registry slots (evicting older live links for
+/// nothing). Walks the same path as [`packed_echo_lines`] without allocating.
+fn packed_validate(
+    text: &str,
+    records: &[u32],
+    callback_count: u32,
+) -> Result<(), StyledTextOpError> {
+    let (line_records, send_lengths) = packed_split(records)?;
+    let send_count = send_lengths.len();
+    let mut rest = text;
+    for units in send_lengths {
+        rest = packed_take_units(rest, *units, false)?.1;
+    }
+    let mut reader = PackedReader { records: line_records, pos: 2 };
+    let line_count = line_records[0];
+    for _ in 0..line_count {
+        let run_count = reader.next()?;
+        for _ in 0..run_count {
+            let units = reader.next()?;
+            packed_color(reader.next()?)?;
+            packed_color(reader.next()?)?;
+            match packed_link(reader.next()?)? {
+                PackedLink::Send(index) if index >= send_count => {
+                    return Err(packed_invalid("link send index out of range"));
+                }
+                PackedLink::Callback(index) if index >= callback_count as usize => {
+                    return Err(packed_invalid("link callback index out of range"));
+                }
+                _ => {}
+            }
+            rest = packed_take_units(rest, units, true)?.1;
+        }
+    }
+    if reader.pos != line_records.len() {
+        return Err(packed_invalid("styled payload has trailing records"));
+    }
+    if !rest.is_empty() {
+        return Err(packed_invalid("styled payload has trailing text"));
+    }
+    Ok(())
+}
+
+/// Split the record table into its line region and the tail of send lengths,
+/// bounds-checking the header.
+fn packed_split(records: &[u32]) -> Result<(&[u32], &[u32]), StyledTextOpError> {
+    if records.len() < 2 {
+        return Err(packed_invalid("truncated styled payload records"));
+    }
+    let send_count = records[1] as usize;
+    let split = records
+        .len()
+        .checked_sub(send_count)
+        .filter(|split| *split >= 2)
+        .ok_or_else(|| packed_invalid("truncated styled payload records"))?;
+    Ok(records.split_at(split))
+}
+
+/// Build the payload's `StyledLine`s in one pass: run text is sliced straight out
+/// of the crossing string (borrowed unless `sanitize_display_text` had to strip
+/// something), unset colors resolve to the delivery defaults, and links resolve
+/// through the send table / [`LinkContext`]. Spans tile by construction
+/// (`StyledLine::from_styled_runs`). Call [`packed_validate`] first; this re-walks
+/// the same structure and only reports errors that pass missed nothing of.
+fn packed_echo_lines(
+    text: &str,
+    records: &[u32],
+    links: &LinkContext,
+    default_style: Style,
+) -> Result<Vec<Arc<StyledLine>>, StyledTextOpError> {
+    let (line_records, send_lengths) = packed_split(records)?;
+    let mut rest = text;
+    let mut sends: Vec<Arc<str>> = Vec::with_capacity(send_lengths.len());
+    for units in send_lengths {
+        let (piece, tail) = packed_take_units(rest, *units, false)?;
+        sends.push(Arc::from(piece));
+        rest = tail;
+    }
+    let mut reader = PackedReader { records: line_records, pos: 2 };
+    let line_count = line_records[0] as usize;
+    let mut lines = Vec::with_capacity(line_count);
+    for _ in 0..line_count {
+        let run_count = reader.next()? as usize;
+        let mut runs: Vec<(std::borrow::Cow<str>, Style, Option<LinkAction>)> =
+            Vec::with_capacity(run_count);
+        for _ in 0..run_count {
+            let units = reader.next()?;
+            let style = Style {
+                fg: packed_color(reader.next()?)?.unwrap_or(default_style.fg),
+                bg: packed_color(reader.next()?)?
+                    .map_or(default_style.bg, normalize_bg),
+            };
+            let link = match packed_link(reader.next()?)? {
+                PackedLink::None => None,
+                PackedLink::Send(index) => Some(LinkAction::Send(
+                    sends
+                        .get(index)
+                        .cloned()
+                        .ok_or_else(|| packed_invalid("link send index out of range"))?,
+                )),
+                PackedLink::Callback(index) => {
+                    let id = links.callback_ids.get(index).copied().ok_or_else(|| {
+                        packed_invalid("link callback index out of range")
+                    })?;
+                    Some(LinkAction::Callback {
+                        session: links.session,
+                        isolate_token: links.isolate_token.clone(),
+                        id,
+                    })
+                }
+            };
+            let (piece, tail) = packed_take_units(rest, units, true)?;
+            rest = tail;
+            runs.push((sanitize_display_text(piece), style, link));
+        }
+        let refs: Vec<(&str, Style, Option<LinkAction>)> = runs
+            .iter()
+            .map(|(text, style, link)| (text.as_ref(), *style, link.clone()))
+            .collect();
+        lines.push(Arc::new(StyledLine::from_styled_runs(&refs, default_style)));
+    }
+    Ok(lines)
 }
 
 /// The error a styled-text op throws: a capability denial, or a malformed payload (an
@@ -2526,41 +2781,8 @@ pub enum StyledTextOpError {
     Invalid(String),
 }
 
-impl StyledLineWire {
-    /// Build the `StyledLine`, resolving unset run colors to the delivery defaults
-    /// and wire links to [`LinkAction`]s. Spans tile by construction
-    /// (`StyledLine::from_styled_runs`); the payload is validated, not trusted — a
-    /// run with a newline or an out-of-range callback index is rejected here.
-    fn to_styled_line(
-        &self,
-        default_style: Style,
-        links: &LinkContext,
-    ) -> Result<Arc<StyledLine>, StyledTextOpError> {
-        let mut runs = Vec::with_capacity(self.runs.len());
-        for run in &self.runs {
-            if run.text.contains('\n') {
-                return Err(StyledTextOpError::Invalid(
-                    "styled run may not contain a newline".to_string(),
-                ));
-            }
-            let style = Style {
-                fg: run
-                    .fg
-                    .as_ref()
-                    .map_or(Ok(default_style.fg), ColorWire::to_color)?,
-                bg: run
-                    .bg
-                    .as_ref()
-                    .map_or(Ok(default_style.bg), |bg| bg.to_color().map(normalize_bg))?,
-            };
-            runs.push((run.text.as_str(), style, wire_link_to_action(&run.link, links)?));
-        }
-        Ok(Arc::new(StyledLine::from_styled_runs(&runs, default_style)))
-    }
-}
-
-/// Resolve a run's wire link to its [`LinkAction`] — the one conversion the echo and
-/// splice paths share, so they cannot drift.
+/// Resolve a splice run's wire link to its [`LinkAction`]. (The echo path resolves
+/// links from the packed table in [`packed_echo_lines`].)
 fn wire_link_to_action(
     link: &Option<LinkWire>,
     links: &LinkContext,
@@ -2609,7 +2831,8 @@ impl StyledRunWire {
 
     /// Convert to the owned run a [`LineOperation::Splice`] carries: colors are
     /// resolved here but left `None` when unset — the splice point's style is only
-    /// knowable when the operation applies to its line.
+    /// knowable when the operation applies to its line. Control characters are
+    /// stripped with the same rule the echo conversion uses.
     fn into_splice_run(self, links: &LinkContext) -> Result<SpliceRun, StyledTextOpError> {
         Ok(SpliceRun {
             fg: self.fg.as_ref().map(ColorWire::to_color).transpose()?,
@@ -2619,36 +2842,19 @@ impl StyledRunWire {
                 .map(|bg| bg.to_color().map(normalize_bg))
                 .transpose()?,
             link: wire_link_to_action(&self.link, links)?,
-            text: self.text,
+            text: match sanitize_display_text(&self.text) {
+                std::borrow::Cow::Borrowed(_) => self.text,
+                std::borrow::Cow::Owned(cleaned) => cleaned,
+            },
         })
     }
 }
 
-impl StyledTextWire {
-    /// Validate the whole payload before any side effect (see
-    /// [`StyledRunWire::validate`]).
-    fn validate(&self, callback_count: u32) -> Result<(), StyledTextOpError> {
-        self.lines
-            .iter()
-            .flat_map(|line| &line.runs)
-            .try_for_each(|run| run.validate(callback_count))
-    }
-
-    /// Convert every line of the payload with echo-role defaults for unset colors.
-    fn into_echo_lines(
-        self,
-        links: &LinkContext,
-    ) -> Result<Vec<Arc<StyledLine>>, StyledTextOpError> {
-        let default_style = Style {
-            fg: Color::Echo,
-            bg: Color::DefaultBackground,
-        };
-        self.lines
-            .iter()
-            .map(|line| line.to_styled_line(default_style, links))
-            .collect()
-    }
-}
+/// The delivery defaults an echoed line's unset colors resolve to.
+const ECHO_DEFAULT_STYLE: Style = Style {
+    fg: Color::Echo,
+    bg: Color::DefaultBackground,
+};
 
 /// Convert and register the splice payload the two splice ops share: the runs of ONE
 /// line (validated BEFORE the callbacks register, so a rejected payload consumes no
@@ -2721,23 +2927,26 @@ fn op_smudgy_line_splice(
 }
 
 /// The styled sibling of [`op_smudgy_session_echo`]: same `echo` gate and routing, but
-/// the payload carries pre-flattened styled runs per line. Spans are built and
-/// validated here at the boundary; dispatch just appends. `callbacks` carries the
-/// payload's link-callback functions (indexed by the runs' `{ cb }` links) — they are
-/// registered into THIS isolate's registry, never shipped with the line.
-#[op2]
+/// the payload carries pre-flattened styled runs per line, PACKED (one text string +
+/// one u32 record table — see the packed-payload layout above `PackedReader`). Spans
+/// are built and validated here at the boundary; dispatch just appends. `callbacks`
+/// carries the payload's link-callback functions (indexed by the records' callback
+/// links) — they are registered into THIS isolate's registry, never shipped with the
+/// line.
+#[op2(fast)]
 fn op_smudgy_session_echo_styled(
     scope: &mut v8::PinScope,
     state: &mut OpState,
     session_id: u32,
-    #[serde] payload: StyledTextWire,
+    #[string] text: &str,
+    #[buffer] records: &[u32],
     callbacks: v8::Local<v8::Array>,
 ) -> Result<(), StyledTextOpError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).echo, "echo")?;
-    payload.validate(callbacks.length())?;
+    packed_validate(text, records, callbacks.length())?;
     let links = link_context(scope, state, callbacks)?;
-    let lines = payload.into_echo_lines(&links)?;
+    let lines = packed_echo_lines(text, records, &links, ECHO_DEFAULT_STYLE)?;
     route_session_action(state, target, RuntimeAction::EchoStyled(lines));
     Ok(())
 }
@@ -3912,23 +4121,24 @@ fn op_smudgy_pane_echo(
 }
 
 /// The styled sibling of [`op_smudgy_pane_echo`]: same gate and key/name resolution,
-/// with the pre-flattened styled payload of [`op_smudgy_session_echo_styled`].
-#[op2]
+/// with the packed styled payload of [`op_smudgy_session_echo_styled`].
+#[op2(fast)]
 fn op_smudgy_pane_echo_styled(
     scope: &mut v8::PinScope,
     state: &mut OpState,
     session_id: u32,
     #[string] name: &str,
-    #[serde] payload: StyledTextWire,
+    #[string] text: &str,
+    #[buffer] records: &[u32],
     callbacks: v8::Local<v8::Array>,
 ) -> Result<(), StyledTextOpError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).panes, "panes")?;
     let namespace = pane_namespace(state);
     let key = resolve_own_terminal_pane(state, target, &namespace, name)?;
-    payload.validate(callbacks.length())?;
+    packed_validate(text, records, callbacks.length())?;
     let links = link_context(scope, state, callbacks)?;
-    let lines = payload.into_echo_lines(&links)?;
+    let lines = packed_echo_lines(text, records, &links, ECHO_DEFAULT_STYLE)?;
     route_session_action(
         state,
         target,
@@ -4445,9 +4655,140 @@ fn op_smudgy_capture(state: &mut OpState, value: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{IsolateId, canonical_procedure, fold_name, param_read_allowed};
+    use super::{
+        AnsiColor, Color, ECHO_DEFAULT_STYLE, IsolateId, LinkContext, SessionId,
+        canonical_procedure, fold_name, packed_echo_lines, packed_validate, param_read_allowed,
+    };
     use crate::session::runtime::store::ProducerKey;
+    use crate::session::styled_line::LinkAction;
     use std::sync::Arc;
+
+    // ---- Packed styled-echo payload ----------------------------------------------
+
+    /// Colors as the JS encoder packs them (see `__styled_encode_color`).
+    const RGB_123: u32 = 0x0101_0203; // rgb(1, 2, 3)
+    const ANSI_RED_BRIGHT: u32 = 0x0200_0009;
+    const ROLE_DEFAULT: u32 = 0x0300_0000;
+    const LINK_SEND_0: u32 = 0x4000_0000;
+    const LINK_CB_0: u32 = 0x8000_0000;
+
+    fn link_ctx(callback_ids: Vec<u64>) -> LinkContext {
+        LinkContext {
+            session: SessionId::from(1u32),
+            isolate_token: Arc::from("test-isolate"),
+            callback_ids,
+        }
+    }
+
+    /// Validate-then-build, the exact sequence the ops run.
+    fn decode(
+        text: &str,
+        records: &[u32],
+        callback_count: u32,
+        callback_ids: Vec<u64>,
+    ) -> Result<Vec<Arc<crate::session::styled_line::StyledLine>>, super::StyledTextOpError> {
+        packed_validate(text, records, callback_count)?;
+        packed_echo_lines(text, records, &link_ctx(callback_ids), ECHO_DEFAULT_STYLE)
+    }
+
+    #[test]
+    fn packed_two_lines_roundtrip() {
+        // Line 1: "Hi" in rgb(1,2,3) + "!" unset; line 2: "ok" bright red on a
+        // "default" background (which must normalize to DefaultBackground).
+        let records = [
+            2, 0, // 2 lines, 0 sends
+            2, 2, RGB_123, 0, 0, 1, 0, 0, 0, // line 1: 2 runs
+            1, 2, ANSI_RED_BRIGHT, ROLE_DEFAULT, 0, // line 2: 1 run
+        ];
+        let lines = decode("Hi!ok", &records, 0, Vec::new()).expect("valid payload");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "Hi!");
+        assert_eq!(lines[0].spans.len(), 2);
+        assert_eq!(lines[0].spans[0].style.fg, Color::Rgb { r: 1, g: 2, b: 3 });
+        assert_eq!(lines[0].spans[0].style.bg, Color::DefaultBackground);
+        assert_eq!((lines[0].spans[0].begin_pos, lines[0].spans[0].end_pos), (0, 2));
+        assert_eq!(lines[0].spans[1].style.fg, Color::Echo);
+        assert_eq!((lines[0].spans[1].begin_pos, lines[0].spans[1].end_pos), (2, 3));
+        assert_eq!(lines[1].text, "ok");
+        assert_eq!(
+            lines[1].spans[0].style.fg,
+            Color::Ansi { color: AnsiColor::Red, bold: true }
+        );
+        assert_eq!(lines[1].spans[0].style.bg, Color::DefaultBackground);
+    }
+
+    #[test]
+    fn packed_empty_fragment_is_one_empty_line() {
+        let lines = decode("", &[1, 0, 0], 0, Vec::new()).expect("valid payload");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "");
+        assert_eq!(lines[0].spans.len(), 1);
+        assert_eq!(lines[0].spans[0].style, ECHO_DEFAULT_STYLE);
+    }
+
+    #[test]
+    fn packed_links_resolve_through_send_table_and_callback_ids() {
+        // Send strings ride at the FRONT of the text with lengths at the TAIL of
+        // the records; callbacks resolve through the registered id list.
+        let records = [
+            1, 1, // 1 line, 1 send
+            2, 4, 0, 0, LINK_SEND_0, 2, 0, 0, LINK_CB_0, // "go n" send-linked, "ok" cb-linked
+            5, // send "north" is 5 units
+        ];
+        let lines = decode("northgo nok", &records, 1, vec![42]).expect("valid payload");
+        assert_eq!(lines[0].text, "go nok");
+        assert_eq!(lines[0].links.len(), 2);
+        assert_eq!(lines[0].links[0].action, LinkAction::Send(Arc::from("north")));
+        assert_eq!((lines[0].links[0].begin_pos, lines[0].links[0].end_pos), (0, 4));
+        let LinkAction::Callback { id, .. } = &lines[0].links[1].action else {
+            panic!("second link must be a callback");
+        };
+        assert_eq!(*id, 42);
+    }
+
+    #[test]
+    fn packed_non_bmp_text_maps_utf16_units_to_byte_offsets() {
+        // "\u{1F600}!" is 3 UTF-16 units and 5 UTF-8 bytes; the differently-colored
+        // "?" pins the span boundary at the byte (not unit) offset.
+        let records = [1, 0, 2, 3, 0, 0, 0, 1, RGB_123, 0, 0];
+        let lines = decode("\u{1F600}!?", &records, 0, Vec::new()).expect("valid payload");
+        assert_eq!(lines[0].text, "\u{1F600}!?");
+        assert_eq!((lines[0].spans[0].begin_pos, lines[0].spans[0].end_pos), (0, 5));
+        assert_eq!((lines[0].spans[1].begin_pos, lines[0].spans[1].end_pos), (5, 6));
+    }
+
+    #[test]
+    fn packed_control_characters_are_stripped_not_fatal() {
+        // "a\rb" is dirty data: the \r is stripped, the run still lands.
+        let lines = decode("a\rb", &[1, 0, 1, 3, 0, 0, 0], 0, Vec::new()).expect("valid");
+        assert_eq!(lines[0].text, "ab");
+    }
+
+    #[test]
+    fn packed_validate_rejects_malformed_payloads() {
+        let cases: &[(&str, &str, Vec<u32>, u32)] = &[
+            ("newline in a run", "a\nb", vec![1, 0, 1, 3, 0, 0, 0], 0),
+            ("unknown color tag", "x", vec![1, 0, 1, 1, 0x0400_0000, 0, 0], 0),
+            ("unknown role color", "x", vec![1, 0, 1, 1, 0x0300_0004, 0, 0], 0),
+            ("unknown ansi index", "x", vec![1, 0, 1, 1, 0x0200_0010, 0, 0], 0),
+            ("unknown link tag", "x", vec![1, 0, 1, 1, 0, 0, 0xC000_0000], 0),
+            ("nonzero link with tag 0", "x", vec![1, 0, 1, 1, 0, 0, 1], 0),
+            ("callback index out of range", "x", vec![1, 0, 1, 1, 0, 0, LINK_CB_0], 0),
+            ("send index out of range", "x", vec![1, 0, 1, 1, 0, 0, LINK_SEND_0], 0),
+            ("truncated records", "x", vec![1, 0, 1, 1, 0], 0),
+            ("text shorter than records", "x", vec![1, 0, 1, 2, 0, 0, 0], 0),
+            ("trailing text", "xy", vec![1, 0, 1, 1, 0, 0, 0], 0),
+            ("trailing records", "x", vec![1, 0, 1, 1, 0, 0, 0, 0], 0),
+            ("send count past table", "x", vec![1, 9, 1, 1, 0, 0, 0], 0),
+            ("surrogate split", "\u{1F600}", vec![1, 0, 1, 1, 0, 0, 0], 0),
+        ];
+        for (what, text, records, callback_count) in cases {
+            assert!(
+                packed_validate(text, records, *callback_count).is_err(),
+                "expected {what} to be rejected"
+            );
+        }
+    }
 
     fn package(owner: &str, name: &str) -> IsolateId {
         IsolateId::Package {

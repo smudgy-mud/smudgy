@@ -37,17 +37,19 @@ const LINK_WASH_ALPHA: f32 = 0.14;
 #[inline]
 fn make_span(text: &str, style: Style, linked: bool, palette: &TerminalPalette) -> Span<'static, Link> {
     let fg = palette.resolve(style.fg);
-    let bg = if linked && style.bg == Color::DefaultBackground {
-        iced::Color {
+    let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string())).color(fg);
+    // Only a meaningful background sets the span highlight: the widget draws a
+    // quad per highlighted span region, so the (overwhelmingly common) default
+    // background must stay decoration-free rather than painting a quad of the
+    // pane's own color under every span.
+    if linked && style.bg == Color::DefaultBackground {
+        span = span.background(Background::Color(iced::Color {
             a: LINK_WASH_ALPHA,
             ..fg
-        }
-    } else {
-        palette.resolve(style.bg)
-    };
-    let span = Span::<'static, Link>::new(Cow::Owned(text.to_string()))
-        .color(fg)
-        .background(Background::Color(bg));
+        }));
+    } else if style.bg != Color::DefaultBackground {
+        span = span.background(Background::Color(palette.resolve(style.bg)));
+    }
     if linked { span.underline(true) } else { span }
 }
 
@@ -128,14 +130,19 @@ fn strip_possessive_suffix(word: &str) -> &str {
 
 impl AsRef<[Span<'static, ()>]> for BufferLine {
     fn as_ref(&self) -> &[Span<'static, ()>] {
-        self.spans.as_ref()
+        self.spans().as_slice()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct BufferLine {
     pub styled_line: Arc<StyledLine>,
-    pub spans: Rc<Vec<Span<'static, ()>>>,
+    /// Renderable spans, baked from `styled_line` on first access. Lazy so a
+    /// line that scrolls through the buffer unseen (a burst larger than the
+    /// window, scrollback eviction) never pays `to_spans` at all; only lines
+    /// the pane actually lays out are baked. Cleared — not eagerly rebaked —
+    /// on palette changes and line edits.
+    spans: std::cell::OnceCell<Rc<Vec<Span<'static, ()>>>>,
 }
 
 impl PartialEq for BufferLine {
@@ -147,9 +154,26 @@ impl PartialEq for BufferLine {
 impl From<Arc<StyledLine>> for BufferLine {
     fn from(styled_line: Arc<StyledLine>) -> Self {
         Self {
-            spans: to_spans(&styled_line, &crate::prefs::current().palette),
+            spans: std::cell::OnceCell::new(),
             styled_line,
         }
+    }
+}
+
+impl BufferLine {
+    /// The line's renderable spans, baking them against the current palette on
+    /// first access. The returned `Rc` is pointer-stable until the spans are
+    /// invalidated (palette change, line edit) — the pane's paragraph cache
+    /// keys on that identity.
+    pub fn spans(&self) -> &Rc<Vec<Span<'static, ()>>> {
+        self.spans
+            .get_or_init(|| to_spans(&self.styled_line, &crate::prefs::current().palette))
+    }
+
+    /// Drop the baked spans so the next access re-bakes them (and downstream
+    /// paragraph caches, keyed on the `Rc` identity, naturally miss).
+    fn invalidate_spans(&mut self) {
+        self.spans.take();
     }
 }
 
@@ -237,10 +261,11 @@ impl TerminalBuffer {
         }
     }
 
-    /// Re-bakes every line's spans against the current preferences if they
-    /// changed since the spans were built (palette swaps, etc.). Replacing the
-    /// span `Rc`s naturally invalidates downstream paragraph caches. Cheap
-    /// one-off per settings change; a no-op otherwise.
+    /// Invalidates every line's baked spans if the preferences changed since
+    /// they were built (palette swaps, etc.), so visible lines re-bake against
+    /// the new palette on their next layout — and never-shown scrollback pays
+    /// nothing. Dropping the span `Rc`s naturally invalidates downstream
+    /// paragraph caches. Cheap one-off per settings change; a no-op otherwise.
     pub fn refresh_styles(&mut self) {
         let prefs = crate::prefs::current();
         if prefs.generation == self.span_generation {
@@ -248,7 +273,7 @@ impl TerminalBuffer {
         }
 
         for line in &mut self.lines {
-            line.spans = to_spans(&line.styled_line, &prefs.palette);
+            line.invalidate_spans();
         }
 
         self.span_generation = prefs.generation;
@@ -547,7 +572,7 @@ impl TerminalBuffer {
         if let Some(line) = self.lines.get_mut(line_number) {
             let had_links = !line.styled_line.links.is_empty();
             line.styled_line = operation.apply(&line.styled_line);
-            line.spans = to_spans(&line.styled_line, &crate::prefs::current().palette);
+            line.invalidate_spans();
             // An edit can add or drop a line's links; keep the O(1) count true.
             let has_links = !line.styled_line.links.is_empty();
             if has_links && !had_links {

@@ -19,6 +19,7 @@ use vtparse::VTParser;
 use super::{TaggedSessionEvent, runtime::RuntimeAction};
 
 pub mod gmcp;
+pub mod msdp;
 pub mod telnet;
 pub mod vt_processor;
 
@@ -34,7 +35,7 @@ mod ingest {
 
     use super::super::runtime::RuntimeAction;
     use super::vt_processor::VtProcessor;
-    use super::{gmcp, telnet};
+    use super::{gmcp, msdp, telnet};
 
     /// Bridges the telnet preprocessor to the rest of the inbound pipeline for one socket read.
     ///
@@ -59,12 +60,23 @@ mod ingest {
 
     impl telnet::TelnetSink for TelnetBridge<'_> {
         fn on_data(&mut self, data: &[u8]) {
-            for &b in data {
-                // CR/LF drive line breaks in the VT parser but are kept out of `StyledLine::raw`.
-                if b != b'\n' && b != b'\r' {
-                    self.vt_processor.push_raw_incoming_byte(b);
+            // The capture decision is hoisted out of the byte loop: the flag
+            // only changes from the session thread (the same thread this runs
+            // on), and a line commit inside the run can only re-latch the same
+            // value, so it cannot flip mid-run.
+            if self.vt_processor.capture_raw() {
+                for &b in data {
+                    // CR/LF drive line breaks in the VT parser but are kept out
+                    // of `StyledLine::raw`.
+                    if b != b'\n' && b != b'\r' {
+                        self.vt_processor.push_raw_incoming_byte(b);
+                    }
+                    self.vt_parser.parse_byte(b, &mut *self.vt_processor);
                 }
-                self.vt_parser.parse_byte(b, &mut *self.vt_processor);
+            } else {
+                for &b in data {
+                    self.vt_parser.parse_byte(b, &mut *self.vt_processor);
+                }
             }
         }
 
@@ -77,6 +89,22 @@ mod ingest {
         }
 
         fn on_subnegotiation(&mut self, option: u8, payload: &[u8]) {
+            if option == telnet::option::MSDP {
+                if payload.len() > msdp::MAX_INBOUND_PAYLOAD {
+                    log::warn!(
+                        "MSDP payload of {} bytes exceeds the {} byte cap; dropped",
+                        payload.len(),
+                        msdp::MAX_INBOUND_PAYLOAD
+                    );
+                    return;
+                }
+                self.runtime_tx
+                    .send(RuntimeAction::MsdpMessage {
+                        payload: Arc::from(payload),
+                    })
+                    .ok();
+                return;
+            }
             if option != telnet::option::GMCP {
                 return;
             }
@@ -108,15 +136,28 @@ mod ingest {
         }
 
         fn on_option(&mut self, side: telnet::Side, option: u8, enabled: bool) {
-            if option != telnet::option::GMCP || !matches!(side, telnet::Side::Remote) {
+            if !matches!(side, telnet::Side::Remote) {
                 return;
             }
-            if enabled {
-                // Handshake immediately, in the same write the DO reply rides.
-                gmcp::frame_handshake(self.replies);
-                self.runtime_tx.send(RuntimeAction::GmcpEnabled).ok();
-            } else {
-                self.runtime_tx.send(RuntimeAction::GmcpDisabled).ok();
+            match option {
+                telnet::option::GMCP => {
+                    if enabled {
+                        // Handshake immediately, in the same write the DO reply rides.
+                        gmcp::frame_handshake(self.replies);
+                        self.runtime_tx.send(RuntimeAction::GmcpEnabled).ok();
+                    } else {
+                        self.runtime_tx.send(RuntimeAction::GmcpDisabled).ok();
+                    }
+                }
+                telnet::option::MSDP => {
+                    if enabled {
+                        msdp::frame_handshake(self.replies);
+                        self.runtime_tx.send(RuntimeAction::MsdpEnabled).ok();
+                    } else {
+                        self.runtime_tx.send(RuntimeAction::MsdpDisabled).ok();
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -176,6 +217,10 @@ pub struct Connection {
     ui_tx: mpsc::Sender<TaggedSessionEvent>,
     socket_tx: Arc<RwLock<Option<WeakUnboundedSender<OutboundFrame>>>>,
     on_connect: Option<Box<dyn FnOnce() + Send>>,
+    /// The trigger manager's "any trigger has a raw pattern" flag; each connect
+    /// task hands it to its [`VtProcessor`] so per-line raw capture only runs
+    /// while something can match on it.
+    raw_wanted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -186,6 +231,7 @@ impl std::fmt::Debug for Connection {
             .field("ui_tx", &self.ui_tx)
             .field("socket_tx", &self.socket_tx)
             .field("on_connect", &self.on_connect.is_some())
+            .field("raw_wanted", &self.raw_wanted)
             .finish()
     }
 }
@@ -195,6 +241,7 @@ impl Connection {
     pub fn new(
         runtime_tx: UnboundedSender<RuntimeAction>,
         ui_tx: futures::channel::mpsc::Sender<TaggedSessionEvent>,
+        raw_wanted: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             disconnect: None,
@@ -202,6 +249,7 @@ impl Connection {
             ui_tx,
             socket_tx: Arc::new(RwLock::new(None)),
             on_connect: None,
+            raw_wanted,
         }
     }
 
@@ -288,10 +336,12 @@ impl Connection {
         let socket_tx = self.socket_tx.clone();
 
         let on_connect = self.on_connect.take();
+        let raw_wanted = self.raw_wanted.clone();
 
         tokio::spawn(async move {
             let mut vt_parser = VTParser::new();
             let mut vt_processor = VtProcessor::new(runtime_tx.clone());
+            vt_processor.set_raw_wanted_flag(raw_wanted);
             // Telnet/IAC preprocessor: consumes negotiation + prompt markers so the VT parser only
             // ever sees pure game text. Persists across reads (a sequence may straddle a read).
             let mut telnet = telnet::TelnetParser::new();

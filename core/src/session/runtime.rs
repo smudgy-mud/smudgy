@@ -38,6 +38,7 @@ pub mod line_operation;
 mod message_bus;
 pub mod pane;
 mod gmcp;
+mod msdp;
 mod script_action;
 mod script_engine;
 mod store;
@@ -104,6 +105,14 @@ pub(crate) const MAX_EVENT_DEPTH: u32 = 64;
 /// unlimited scrollback). 1000 covers any realistic "edit a line I just saw" use without
 /// pinning the whole UI scrollback (10k) on the session thread.
 const RECENT_LINES: usize = 1000;
+
+/// Echo arms append display updates without flushing; the run loop delivers them
+/// coalesced — at the drain point (before parking) and, during a long dispatch
+/// cascade, whenever this many updates have accumulated. Bounds both the number of
+/// UI events an echo storm produces (a 100k-line storm sends ~50 events instead of
+/// 100k) and the size of any single event. Two updates per line (`Append` +
+/// `EnsureNewLine`), so this is ~2k lines per batch.
+const PENDING_UPDATE_FLUSH_THRESHOLD: usize = 4096;
 
 /// The session-side bounded ring of recently-emitted lines. Each entry is the UI
 /// line number paired with the same `Arc<StyledLine>` the UI holds. Shared (the same `Rc`)
@@ -452,6 +461,7 @@ impl Runtime {
                 session_store: session_store.clone(),
                 catalogue: catalogue.clone(),
                 gmcp: gmcp::GmcpProducer::new(gmcp_enabled.clone()),
+                msdp: msdp::MsdpProducer::new(),
                 // The spawn-time "Loading session..." append left the main
                 // buffer's tail line open — unless an engine-construction
                 // session notice (emitted directly on ui_tx, each ending in
@@ -494,6 +504,10 @@ impl Runtime {
                 let old_main_open_line = inner.main_open_line;
                 let old_open_line = inner.open_line.take();
                 let old_connection = inner.connection.take();
+                // The surviving connection's VtProcessor holds a clone of the OLD
+                // manager's raw-wanted flag; the new manager must keep writing to
+                // that same cell or raw capture goes dead across a reload.
+                let old_raw_wanted = inner.trigger_manager.raw_wanted_flag();
                 // The GMCP producer is session-scoped like the subtree it writes: the
                 // enabled flag tracks the (surviving) connection, and merge keys/memo are
                 // server facts, not engine facts. Module refs ARE engine facts (isolates
@@ -504,6 +518,8 @@ impl Runtime {
                     gmcp::GmcpProducer::new(gmcp_enabled.clone()),
                 );
                 old_gmcp.reset_engine_refs();
+                // The MSDP producer holds no engine facts at all; it survives whole.
+                let old_msdp = std::mem::replace(&mut inner.msdp, msdp::MsdpProducer::new());
                 let mut old_session_runtime_rx =
                     std::mem::replace(&mut inner.session_runtime_rx, {
                         // Create a dummy receiver that will be immediately replaced
@@ -620,11 +636,12 @@ impl Runtime {
                     crate::models::settings::ScriptSettings::from(&settings);
                 let command_separator = Arc::new(settings.command_separator);
 
-                let new_trigger_manager = Manager::new(
+                let mut new_trigger_manager = Manager::new(
                     spawned_actions.clone(),
                     command_separator.clone(),
                     automation_registry,
                 );
+                new_trigger_manager.adopt_raw_wanted_flag(old_raw_wanted);
 
                 // Replace with the new inner struct
                 inner = Inner {
@@ -660,6 +677,7 @@ impl Runtime {
                     session_store: session_store.clone(), // Committed store state survives reload
                     catalogue: catalogue.clone(),         // Samples are session history
                     gmcp: old_gmcp, // Session-scoped: enabled tracks the surviving connection
+                    msdp: old_msdp, // Same: server facts, no engine facts
                     main_open_line: old_main_open_line
                         && emitted_line_count.get() == count_before_rebuild,
                     open_line: old_open_line,
@@ -795,6 +813,10 @@ struct Inner<'a> {
     /// and the enabled flag, driven by the `Gmcp*` dispatch arms. Session-scoped like the
     /// store subtree it writes.
     gmcp: gmcp::GmcpProducer,
+    /// The host-side MSDP producer (`docs/gmcp-mapping-plan.md` §9 item 3), driven by the
+    /// `Msdp*` dispatch arms. Session-scoped like the store subtree it writes; it holds
+    /// no engine facts, so reloads carry it across whole.
+    msdp: msdp::MsdpProducer,
     /// Whether the main buffer's tail line is open (an uncommitted partial). Replaces the
     /// old `pending_buffer_updates.last()` peek — which `AppendTo` entries would confuse —
     /// and, unlike the peek, survives a flush. Drives the echo commit-first rule and
@@ -1097,6 +1119,21 @@ impl Inner<'_> {
         }
     }
 
+    /// Drop the main buffer's open (uncommitted) partial line: a
+    /// carriage-return overprint superseded it and the replacement frame is
+    /// on its way. Same rule as the gag/redirect retraction — only the
+    /// uncommitted line is affected, so numbering parity holds — plus the
+    /// routing accumulator is cleared so the stale frame never re-routes or
+    /// reaches a pane sink. A no-op when nothing is open.
+    pub(crate) fn retract_incoming_open_line_sync(&mut self) {
+        if self.main_open_line {
+            self.pending_buffer_updates
+                .push(BufferUpdate::RetractOpenLine);
+            self.main_open_line = false;
+        }
+        self.open_line = None;
+    }
+
     /// If the main buffer's tail line is open (an uncommitted partial), commit it: the
     /// committed line takes the next number. Echo paths call this so an echo never glues
     /// onto an open prompt line; the send paths deliberately do NOT (the echoed command
@@ -1170,14 +1207,6 @@ impl Inner<'_> {
         for styled_line in lines {
             self.append_counted_line(styled_line.clone());
         }
-    }
-
-    fn echo_styled_lines<'s>(
-        &'s mut self,
-        lines: &[Arc<StyledLine>],
-    ) -> Result<Option<SentSessionEvent<'s>>, anyhow::Error> {
-        self.echo_styled_lines_sync(lines);
-        self.flush_buffer_updates()
     }
 
     fn send<'s>(&'s mut self, line: &str) -> Result<Option<SentSessionEvent<'s>>, anyhow::Error> {
@@ -1281,6 +1310,33 @@ impl Inner<'_> {
         {
             warn!("Failed to send store-bindings wake: {e:?}");
         }
+    }
+
+    /// Between-actions bookkeeping, run every time the action stack drains —
+    /// before the next external action is taken, whether or not the loop is
+    /// about to park — so the broadcast cadences observe every turn even
+    /// mid-burst. Keeps automation recording in step with subscribers (and
+    /// re-sends the full set to any newly-attached window), flushes buffered
+    /// deltas to the automation broadcast as one coalesced batch, and honors
+    /// the catalogue send window's leading/trailing edges. Everything here is
+    /// cheap on the idle path: receiver-count loads and empty checks.
+    ///
+    /// Also deallocates the previous generations the turn's store flushes
+    /// displaced (`SessionStore::flush` parks them instead of dropping
+    /// inline): here the action stack is empty and the flush's deliveries are
+    /// already queued, so a whole delta's worth of blocks returns to the
+    /// allocator off the dispatch critical path. Bounded at one root per
+    /// producer that committed since the last drain.
+    fn drain_point_bookkeeping(&mut self) {
+        self.sync_automation_recording();
+        if self.trigger_manager.has_automation_deltas() {
+            let deltas = self.trigger_manager.take_automation_deltas();
+            let _ = self
+                .automation_tx
+                .send(AutomationEvent::Changed(Arc::new(deltas)));
+        }
+        self.sync_catalogue_broadcast();
+        self.session_store.borrow_mut().drop_retired_generations();
     }
 
     fn flush_buffer_updates(
@@ -1566,25 +1622,19 @@ impl Inner<'_> {
                     );
                     continue;
                 }
+            } else if let Ok(external_action) = self.session_runtime_rx.try_recv() {
+                // More external input is already queued: a socket burst queues one
+                // `HandleIncomingLine` per line, so between them the stack is empty
+                // without the loop being anywhere near parking. Run the between-actions
+                // bookkeeping, then take the next action WITHOUT the before-park flush —
+                // that skip is what lets a burst's lines coalesce into batched UI events
+                // (bounded by the storm threshold below and the reader's per-chunk
+                // `RequestRepaint`) instead of one awaited UI event per line.
+                self.drain_point_bookkeeping();
+                trace!("Handling external action: {external_action:?}");
+                Some(external_action)
             } else {
-                // Drain point: keep recording in step with subscribers (and re-send the full
-                // set to any newly-attached window), then flush buffered deltas to the
-                // automation broadcast as one coalesced batch.
-                self.sync_automation_recording();
-                if self.trigger_manager.has_automation_deltas() {
-                    let deltas = self.trigger_manager.take_automation_deltas();
-                    let _ = self
-                        .automation_tx
-                        .send(AutomationEvent::Changed(Arc::new(deltas)));
-                }
-                self.sync_catalogue_broadcast();
-                // Deallocate the previous generations the turn's store flushes displaced
-                // (`SessionStore::flush` parks them instead of dropping inline): here the
-                // action stack is empty and the flush's deliveries are already queued, so
-                // a whole delta's worth of blocks returns to the allocator off the dispatch
-                // critical path. Bounded at one root per producer that committed since the
-                // last drain.
-                self.session_store.borrow_mut().drop_retired_generations();
+                self.drain_point_bookkeeping();
                 // About to park: flush any still-buffered lines so they paint now instead of
                 // waiting for the next wake. Anything buffered at this point has already been
                 // fully drained of in-flight actions, so this can't split a coalesced batch — it
@@ -1655,15 +1705,9 @@ impl Inner<'_> {
                 match result {
                     Ok(ActionResult::None) => {}
                     Ok(ActionResult::Echo(line)) => {
-                        if let Ok(Some(fut)) = self.echo_str(line.as_str()) {
-                            if fut.await.is_err() {
-                                warn!("Failed to echo line");
-                                break;
-                            }
-                        } else {
-                            warn!("Failed to echo line");
-                            break;
-                        }
+                        // Append only; the storm-threshold flush below or the
+                        // before-park flush delivers it.
+                        self.echo_str_sync(line.as_str());
                     }
                     Ok(ActionResult::CloseSession) => {
                         info!(
@@ -1680,17 +1724,24 @@ impl Inner<'_> {
                     }
                     Err(err) => {
                         warn!("Error in runtime: {err:?}");
-                        if let Ok(Some(fut)) =
-                            self.echo_str(format!("Error in runtime: {err:?}").as_str())
-                        {
-                            if fut.await.is_err() {
-                                warn!("Failed to echo line");
-                                break;
+                        self.echo_str_sync(format!("Error in runtime: {err:?}").as_str());
+                    }
+                }
+
+                // Storm threshold: a long dispatch cascade (an alias echoing tens of
+                // thousands of lines, a trigger storm) appends without flushing, so
+                // bound the batch — paint stays incremental and no single UI event
+                // balloons. Everything below the threshold coalesces into the
+                // before-park flush at the drain point.
+                if self.pending_buffer_updates.len() >= PENDING_UPDATE_FLUSH_THRESHOLD {
+                    match self.flush_buffer_updates() {
+                        Ok(Some(fut)) => {
+                            if let Err(e) = fut.await {
+                                warn!("Failed to flush storm-threshold buffer updates: {e:?}");
                             }
-                        } else {
-                            warn!("Failed to echo line");
-                            break;
                         }
+                        Ok(None) => {}
+                        Err(e) => warn!("Failed to flush storm-threshold buffer updates: {e:?}"),
                     }
                 }
 
@@ -1703,11 +1754,7 @@ impl Inner<'_> {
                         trace!("Spliced spawned actions into current frame");
                     } else if action_stack.len() >= MAX_STACK_DEPTH {
                         warn!("Maximum action stack depth exceeded: {MAX_STACK_DEPTH}");
-                        if let Ok(Some(fut)) =
-                            self.echo_str("Error: Maximum execution depth exceeded")
-                        {
-                            let _ = fut.await;
-                        }
+                        self.echo_str_sync("Error: Maximum execution depth exceeded");
                     } else {
                         action_stack.push(VecDeque::from(spawned));
                         trace!(

@@ -7,14 +7,17 @@ use crate::{
 use async_trait::async_trait;
 use uuid::Uuid;
 
+mod area_edits;
 pub mod cached;
 pub mod cloud;
 pub mod composite;
+pub mod ephemeral;
 pub mod local;
 
 pub use cached::{CachedBackend, CachedCloudMapper};
 pub use cloud::{CloudMapper, Credential, CredentialSource};
 pub use composite::CompositeBackend;
+pub use ephemeral::EphemeralBackend;
 pub use local::LocalBackend;
 
 /// Fingerprint sentinel synthesized for areas served without an access block
@@ -170,6 +173,14 @@ pub trait MapperBackend: Send + Sync {
 
     /// Area ids served by a *local* tier.
     fn local_area_ids(&self) -> std::collections::HashSet<AreaId> {
+        std::collections::HashSet::new()
+    }
+
+    /// Area ids served by an *ephemeral* (in-memory, session-lifetime) tier.
+    /// Ephemeral areas are never persisted or synced, are excluded from the
+    /// editor's atlas tree and per-area preference writes, and their room
+    /// growth is capped by the mapper.
+    fn ephemeral_area_ids(&self) -> std::collections::HashSet<AreaId> {
         std::collections::HashSet::new()
     }
 

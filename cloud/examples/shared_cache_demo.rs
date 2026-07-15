@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 1..=500 {
         let room_updates = RoomUpdates {
             is_secret: None,
+            external_id: None,
             title: Some(format!("Room {i}")),
             description: Some(format!("This is test room number {i}")),
             level: Some(0),

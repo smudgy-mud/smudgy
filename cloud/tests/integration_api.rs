@@ -7,7 +7,7 @@ mod support;
 
 use smudgy_cloud::cloud_api::{
     CopyAreaRequest, CreateShareRequest, PreviewAudience, RoomPropertyRef, SecretEntityKind,
-    SecretMarksRequest, ShareScope,
+    SecretMarksRequest, ShareDirection, ShareScope,
 };
 use smudgy_cloud::{
     AreaId, AtlasId, CloudApiClient, CloudMapper, CreateAreaRequest, Credential, CredentialSource,
@@ -42,6 +42,7 @@ fn view_only_share(grantee_id: Uuid, area_id: AreaId) -> CreateShareRequest {
         can_copy: false,
         include_secrets: false,
         can_admin: false,
+        host_hints: None,
     }
 }
 
@@ -473,11 +474,79 @@ async fn shares_validator_uniform_404() {
             can_copy: false,
             include_secrets: true,
             can_admin: false,
+            host_hints: None,
         })
         .await
         .expect("include_secrets may ride an atlas-scope root grant (M6)");
     assert!(grant.area_id.is_none(), "atlas-scope grant");
     assert!(grant.include_secrets, "the atlas grant carries include_secrets");
+}
+
+/// §4.2: `host_hints` ride the `create_share` body, echo on the created grant,
+/// and surface on the grantee's received rows. A hint-less re-grant clears the
+/// snapshot (upsert-replace); an over-cap list is the uniform 400.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_host_hints_roundtrip() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("owner@example.com", "owner", true);
+    let grantee = server.create_user("friend@example.com", "friend", true);
+    server.befriend(&owner, &grantee);
+
+    let area = server.create_area(&owner, "Cities");
+    let owner_client = api_client(&server.base_url, &owner.api_key);
+    let grantee_client = api_client(&server.base_url, &grantee.api_key);
+
+    let hints = || vec!["arctic.org".to_string(), "localhost:4000".to_string()];
+
+    // With hints: the created grant echoes them and they reach the grantee's row.
+    let mut req = view_only_share(grantee.id, area);
+    req.host_hints = Some(hints());
+    let created = owner_client
+        .create_share(req)
+        .await
+        .expect("share with host hints");
+    assert_eq!(created.host_hints.as_deref(), Some(&hints()[..]));
+
+    let received = grantee_client
+        .shares(ShareDirection::Received)
+        .await
+        .expect("grantee received rows");
+    let row = received
+        .iter()
+        .find(|r| r.grant.area_id == Some(area))
+        .expect("the shared row is received");
+    assert_eq!(row.grant.host_hints.as_deref(), Some(&hints()[..]));
+
+    // A hint-less re-grant is a fresh consent moment and CLEARS the snapshot.
+    let plain = owner_client
+        .create_share(view_only_share(grantee.id, area))
+        .await
+        .expect("hint-less re-grant");
+    assert!(plain.host_hints.is_none());
+    let received = grantee_client
+        .shares(ShareDirection::Received)
+        .await
+        .expect("grantee received rows after re-grant");
+    let row = received
+        .iter()
+        .find(|r| r.grant.area_id == Some(area))
+        .expect("the shared row is still received");
+    assert!(
+        row.grant.host_hints.is_none(),
+        "the hint-less re-grant cleared host_hints"
+    );
+
+    // Over-cap (33 hints) is rejected uniformly as a 400.
+    let mut too_many = view_only_share(grantee.id, area);
+    too_many.host_hints = Some((0..33).map(|i| format!("h{i}.example")).collect());
+    let err = owner_client
+        .create_share(too_many)
+        .await
+        .expect_err("33 host hints exceed the cap");
+    assert!(
+        matches!(&err, CloudError::NetworkError(m) if m.contains("400")),
+        "over-cap host_hints surfaces as a 400: {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +763,7 @@ async fn clone_flow() {
         .create_area(CreateAreaRequest {
             name: "Member One".to_string(),
             atlas_id: Some(AtlasId(atlas)),
+            ephemeral: false,
         })
         .await
         .expect("member one");
@@ -701,6 +771,7 @@ async fn clone_flow() {
         .create_area(CreateAreaRequest {
             name: "Member Two".to_string(),
             atlas_id: Some(AtlasId(atlas)),
+            ephemeral: false,
         })
         .await
         .expect("member two");

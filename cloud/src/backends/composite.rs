@@ -1,25 +1,31 @@
-//! Two-tier fan-out backend: a local store alongside a cloud backend.
+//! Tiered fan-out backend: an ephemeral store and a local store alongside a
+//! cloud backend.
 //!
-//! A session's mapper owns one [`CompositeBackend`] that presents both tiers
+//! A session's mapper owns one [`CompositeBackend`] that presents the tiers
 //! as one set of areas/atlases. Each area and atlas belongs to exactly one
 //! tier; the composite routes every operation by membership:
 //!
+//! - **ephemeral** areas live in memory for the session only (auto-mapping's
+//!   landing zone; the composite owns this tier — it needs no configuration);
 //! - **local** areas/atlases live on disk forever (available signed out);
 //! - **cloud** areas/atlases sync through the existing cached cloud backend.
 //!
-//! The membership sets are refreshed on every `list_*` and sync-row
-//! synthesis, and updated incrementally on create/delete.
+//! The local membership set is refreshed on every `list_*` and sync-row
+//! synthesis, and updated incrementally on create/delete; the ephemeral set
+//! only ever changes through this backend's own create/delete, so it needs no
+//! refresh. Atlases (folders) exist only in the local and cloud tiers.
 //!
 //! ## Sync safety
 //!
 //! The mapper's sync engine prunes any cached area whose id is absent from the
 //! `/sync` row set (that is how a revoked share, or a previous account's
-//! areas, leave the tree). Local areas never appear in the cloud's `/sync`, so
-//! [`sync_state`](CompositeBackend::sync_state) **synthesizes a stable row per
-//! local area** and folds it into the cloud rows — otherwise every sync tick
-//! would wipe the local tier. Owner-fingerprinted and carrying the area's real
-//! rev, those rows stay quiet across ticks (no needless refetch) yet still let
-//! a local edit's rev bump flow through the same reconciliation path.
+//! areas, leave the tree). Local and ephemeral areas never appear in the
+//! cloud's `/sync`, so [`sync_state`](CompositeBackend::sync_state)
+//! **synthesizes a stable row per local and ephemeral area** and folds them
+//! into the cloud rows — otherwise every sync tick would wipe those tiers.
+//! Owner-fingerprinted and carrying the area's real rev, those rows stay quiet
+//! across ticks (no needless refetch) yet still let an edit's rev bump flow
+//! through the same reconciliation path.
 
 use std::{
     collections::HashSet,
@@ -31,7 +37,7 @@ use parking_lot::RwLock;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use super::{LEGACY_ACCESS_FINGERPRINT, MapperBackend};
+use super::{EphemeralBackend, LEGACY_ACCESS_FINGERPRINT, MapperBackend};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, Label, LabelArgs, LabelId, LabelUpdates,
@@ -41,10 +47,13 @@ use crate::{
 
 type DynBackend = Arc<dyn MapperBackend + Send + Sync>;
 
-/// Fans area/atlas operations across a local tier and a cloud tier.
+/// Fans area/atlas operations across an ephemeral, a local, and a cloud tier.
 pub struct CompositeBackend {
+    ephemeral: DynBackend,
     local: DynBackend,
     cloud: DynBackend,
+    /// Ids the ephemeral tier owns; only this backend's create/delete touch it.
+    ephemeral_areas: RwLock<HashSet<AreaId>>,
     /// Ids the local tier owns, refreshed on every list / sync synthesis.
     local_areas: RwLock<HashSet<AreaId>>,
     local_atlases: RwLock<HashSet<AtlasId>>,
@@ -63,16 +72,24 @@ impl std::fmt::Debug for CompositeBackend {
 
 impl CompositeBackend {
     /// Combines a `local` tier (always available) with a `cloud` tier
-    /// (available when signed in).
+    /// (available when signed in), plus an internally-owned ephemeral tier
+    /// (in-memory, session-lifetime — it takes no configuration, so callers
+    /// never construct it).
     #[must_use]
     pub fn new(local: DynBackend, cloud: DynBackend) -> Self {
         Self {
+            ephemeral: Arc::new(EphemeralBackend::new()),
             local,
             cloud,
+            ephemeral_areas: RwLock::new(HashSet::new()),
             local_areas: RwLock::new(HashSet::new()),
             local_atlases: RwLock::new(HashSet::new()),
             routing_seeded: OnceCell::new(),
         }
+    }
+
+    fn is_ephemeral_area(&self, area_id: AreaId) -> bool {
+        self.ephemeral_areas.read().contains(&area_id)
     }
 
     fn is_local_area(&self, area_id: AreaId) -> bool {
@@ -101,10 +118,12 @@ impl CompositeBackend {
 
     /// The tier that owns `area_id`, seeding the routing sets first so an
     /// unknown id isn't wrongly sent to cloud on a cold start. Cloud remains
-    /// the fallback for ids genuinely not in the local tier.
+    /// the fallback for ids genuinely not in the ephemeral or local tiers.
     async fn area_backend(&self, area_id: AreaId) -> &DynBackend {
         self.ensure_routing_seeded().await;
-        if self.is_local_area(area_id) {
+        if self.is_ephemeral_area(area_id) {
+            &self.ephemeral
+        } else if self.is_local_area(area_id) {
             &self.local
         } else {
             &self.cloud
@@ -119,21 +138,26 @@ impl CompositeBackend {
         self.local_areas.write().extend(areas.iter().map(|area| area.id));
     }
 
-    /// Synthesizes a sync row per local area from the local tier's metadata.
-    async fn local_sync_rows(&self) -> CloudResult<Vec<SyncRow>> {
+    /// Synthesizes a sync row per local and ephemeral area from each tier's
+    /// metadata, so the sync engine never prunes either tier.
+    async fn non_cloud_sync_rows(&self) -> CloudResult<Vec<SyncRow>> {
         let areas = self.local.list_areas().await?;
         self.refresh_local_areas(&areas);
-        Ok(areas
-            .into_iter()
-            .map(|area| SyncRow {
-                area_id: area.id,
-                rev: area.rev,
-                access_fingerprint: area.access.map_or_else(
-                    || LEGACY_ACCESS_FINGERPRINT.to_string(),
-                    |access| access.fingerprint(),
-                ),
-            })
-            .collect())
+        let mut rows: Vec<SyncRow> = areas.iter().map(synthesized_row).collect();
+        rows.extend(self.ephemeral.list_areas().await?.iter().map(synthesized_row));
+        Ok(rows)
+    }
+}
+
+/// A stable owner-fingerprinted sync row for an area no `/sync` covers.
+fn synthesized_row(area: &Area) -> SyncRow {
+    SyncRow {
+        area_id: area.id,
+        rev: area.rev,
+        access_fingerprint: area.access.map_or_else(
+            || LEGACY_ACCESS_FINGERPRINT.to_string(),
+            |access| access.fingerprint(),
+        ),
     }
 }
 
@@ -142,8 +166,16 @@ impl MapperBackend for CompositeBackend {
     // ===== AREA OPERATIONS =====
 
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
-        // Route by the target atlas; a loose area follows the active tier
-        // (cloud when signed in, local otherwise — the only option signed out).
+        // An explicit ephemeral request routes to the in-memory tier
+        // regardless of sign-in state or folders (ephemeral areas are loose).
+        if request.ephemeral {
+            let area = self.ephemeral.create_area(request).await?;
+            self.ephemeral_areas.write().insert(area.id);
+            return Ok(area);
+        }
+        // Otherwise route by the target atlas; a loose area follows the active
+        // tier (cloud when signed in, local otherwise — the only option signed
+        // out).
         self.ensure_routing_seeded().await;
         let go_local = match request.atlas_id {
             Some(atlas_id) => self.is_local_atlas(atlas_id),
@@ -170,10 +202,13 @@ impl MapperBackend for CompositeBackend {
     }
 
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
-        // Local always; cloud only when signed in. A cloud failure must not
-        // sink the local tier — the sync engine surfaces cloud connectivity.
-        let mut all = self.local.list_areas().await?;
-        self.refresh_local_areas(&all);
+        // Ephemeral and local always; cloud only when signed in. A cloud
+        // failure must not sink the other tiers — the sync engine surfaces
+        // cloud connectivity.
+        let mut all = self.ephemeral.list_areas().await?;
+        let local = self.local.list_areas().await?;
+        self.refresh_local_areas(&local);
+        all.extend(local);
         if self.cloud.has_credential() {
             match self.cloud.list_areas().await {
                 Ok(cloud) => all.extend(cloud),
@@ -190,7 +225,9 @@ impl MapperBackend for CompositeBackend {
     fn last_area_source(&self, area_id: &AreaId) -> AreaLoadSource {
         // Sync method: route on the current sets without seeding (a best-effort
         // load-source hint; cloud is a fine fallback for an unseeded id).
-        if self.is_local_area(*area_id) {
+        if self.is_ephemeral_area(*area_id) {
+            self.ephemeral.last_area_source(area_id)
+        } else if self.is_local_area(*area_id) {
             self.local.last_area_source(area_id)
         } else {
             self.cloud.last_area_source(area_id)
@@ -203,6 +240,7 @@ impl MapperBackend for CompositeBackend {
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
         let result = self.area_backend(*area_id).await.delete_area(area_id).await;
+        self.ephemeral_areas.write().remove(area_id);
         self.local_areas.write().remove(area_id);
         result
     }
@@ -216,13 +254,19 @@ impl MapperBackend for CompositeBackend {
         // Cross-tier moves are a data migration, not a metadata update —
         // reject them so a foreign atlas id never reaches the wrong backend. (`None`, pulling an area loose, is valid in either
         // tier.) The UI also filters cross-tier targets out of the picker; this
-        // is the load-bearing backstop.
-        if let Some(target) = atlas_id
-            && self.is_local_area(*area_id) != self.is_local_atlas(target)
-        {
-            return Err(CloudError::InvalidInput(
-                "moving a map between the local and cloud tiers isn't supported".to_string(),
-            ));
+        // is the load-bearing backstop. The ephemeral tier has no folders at
+        // all, so any filing of a session map is cross-tier by definition.
+        if let Some(target) = atlas_id {
+            if self.is_ephemeral_area(*area_id) {
+                return Err(CloudError::InvalidInput(
+                    "session maps can't be filed into folders — save the map first".to_string(),
+                ));
+            }
+            if self.is_local_area(*area_id) != self.is_local_atlas(target) {
+                return Err(CloudError::InvalidInput(
+                    "moving a map between the local and cloud tiers isn't supported".to_string(),
+                ));
+            }
         }
         self.area_backend(*area_id)
             .await
@@ -304,8 +348,12 @@ impl MapperBackend for CompositeBackend {
         self.local_areas.read().clone()
     }
 
+    fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
+        self.ephemeral_areas.read().clone()
+    }
+
     async fn sync_state(&self) -> CloudResult<Option<Vec<SyncRow>>> {
-        let local_rows = self.local_sync_rows().await?;
+        let local_rows = self.non_cloud_sync_rows().await?;
         // Without a cloud credential, reconcile against the local tier only and
         // never touch (or even log an attempt at) `/sync`: the startup sync and
         // every `sync_now` are no-ops on the cloud tier until the user signs in.
@@ -350,10 +398,11 @@ impl MapperBackend for CompositeBackend {
 
     async fn note_sync_rows(&self, rows: &[SyncRow]) {
         // Only the cloud tier caches `get_area` bytes; forward its rows alone
-        // (local ids would just be inert extras in the cloud's known set).
+        // (local/ephemeral ids would just be inert extras in the cloud's
+        // known set).
         let cloud_rows: Vec<SyncRow> = rows
             .iter()
-            .filter(|row| !self.is_local_area(row.area_id))
+            .filter(|row| !self.is_local_area(row.area_id) && !self.is_ephemeral_area(row.area_id))
             .cloned()
             .collect();
         self.cloud.note_sync_rows(&cloud_rows).await;
@@ -666,6 +715,7 @@ mod tests {
                 id,
                 user_id: None,
                 atlas_id: None,
+                atlas_name: None,
                 name: name.to_string(),
                 created_at: Utc::now(),
                 rev,
@@ -695,6 +745,7 @@ mod tests {
             .create_area(CreateAreaRequest {
                 name: "Local".to_string(),
                 atlas_id: None,
+                ephemeral: false,
             })
             .await
             .expect("local create");
@@ -822,6 +873,65 @@ mod tests {
             .await
             .expect("atlas");
         assert!(composite.local_atlas_ids().contains(&atlas.id));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The ephemeral tier: an `ephemeral: true` create routes to the
+    /// in-memory tier no matter the sign-in state, its rows join `sync_state`
+    /// (so the engine never prunes the session map), filing it into a folder
+    /// is rejected, and delete drops it from the membership set.
+    #[tokio::test]
+    async fn ephemeral_create_routes_syncs_and_rejects_folders() {
+        let root = temp_root();
+        let local = Arc::new(LocalBackend::new(&root));
+        let cloud = Arc::new(StubCloud::new(true)); // signed in — ephemeral must still win
+        let composite = CompositeBackend::new(local, cloud);
+
+        let area = composite
+            .create_area(CreateAreaRequest {
+                name: "Session map".to_string(),
+                atlas_id: None,
+                ephemeral: true,
+            })
+            .await
+            .expect("ephemeral create");
+        assert!(composite.ephemeral_area_ids().contains(&area.id));
+        assert!(
+            !composite.local_area_ids().contains(&area.id),
+            "ephemeral areas are not local-tier areas"
+        );
+
+        // Routing: reads and writes reach the in-memory tier.
+        composite
+            .update_room(
+                &RoomKey::new(area.id, crate::RoomNumber(1)),
+                RoomUpdates {
+                    title: Some("Gate".to_string()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .await
+            .expect("room write routes to ephemeral");
+        let details = composite.get_area(&area.id).await.expect("get");
+        assert_eq!(details.rooms.len(), 1);
+
+        // Sync safety: the synthesized row keeps the engine from pruning it.
+        let rows = composite.sync_state().await.unwrap().expect("rows");
+        assert!(rows.iter().any(|row| row.area_id == area.id));
+
+        // No folders in the ephemeral tier.
+        let filed = composite
+            .move_area_to_atlas(&area.id, Some(AtlasId(Uuid::new_v4())))
+            .await;
+        assert!(matches!(filed, Err(CloudError::InvalidInput(_))));
+
+        composite.delete_area(&area.id).await.expect("delete");
+        assert!(!composite.ephemeral_area_ids().contains(&area.id));
+        assert!(matches!(
+            composite.get_area(&area.id).await,
+            Err(CloudError::NotFoundOrNoAccess)
+        ));
 
         std::fs::remove_dir_all(&root).ok();
     }

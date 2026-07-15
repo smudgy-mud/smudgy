@@ -17,6 +17,62 @@ pub struct ServerConfig {
     /// The port number of the server.
     #[validate(range(min = 1, max = 65535, message = "Port must be between 1 and 65535"))]
     pub port: u16,
+    /// Hosts the user has granted this MUD's OSC 8 hyperlinks permission to
+    /// open in the browser without asking again (the "always allow links to
+    /// <host>" opt-in; compared case-insensitively).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_link_hosts: Vec<String>,
+    /// The "always trust links from this server" opt-in: every server-sent
+    /// link — any URL host, and `send:` command links — activates without
+    /// the confirm dialog.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_all_links: bool,
+}
+
+impl ServerConfig {
+    /// A fresh config with no link-trust grants.
+    #[must_use]
+    pub const fn new(host: String, port: u16) -> Self {
+        Self {
+            host,
+            port,
+            trusted_link_hosts: Vec::new(),
+            trust_all_links: false,
+        }
+    }
+
+    /// Whether a server-sent link needs no confirm dialog: `host` is `None`
+    /// for a `send:` command link (covered only by the blanket grant) and
+    /// the URL's host for a browser link.
+    #[must_use]
+    pub fn allows_server_link(&self, host: Option<&str>) -> bool {
+        if self.trust_all_links {
+            return true;
+        }
+        host.is_some_and(|host| {
+            self.trusted_link_hosts
+                .iter()
+                .any(|trusted| trusted.eq_ignore_ascii_case(host))
+        })
+    }
+}
+
+/// The host component of an http(s) URL, lowercased — the unit the per-host
+/// link grant is keyed by. `None` when the URL has no recognizable host.
+#[must_use]
+pub fn link_url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Strip userinfo, then the port — mind IPv6 bracket forms.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if host.starts_with('[') {
+        host.split_once(']').map_or(host, |(h, _)| &h[1..])
+    } else {
+        host.rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+            .map_or(host, |(h, _)| h)
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 /// Represents a server, including its configuration and associated directory path.
@@ -368,4 +424,60 @@ pub fn delete_server(name: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod link_trust_tests {
+    use super::{ServerConfig, link_url_host};
+
+    fn config(hosts: &[&str], all: bool) -> ServerConfig {
+        ServerConfig {
+            trusted_link_hosts: hosts.iter().map(ToString::to_string).collect(),
+            trust_all_links: all,
+            ..ServerConfig::new("mud.example.org".to_string(), 4000)
+        }
+    }
+
+    #[test]
+    fn blanket_trust_covers_urls_and_commands() {
+        let c = config(&[], true);
+        assert!(c.allows_server_link(Some("anything.example")));
+        assert!(c.allows_server_link(None), "send: links ride the blanket grant");
+    }
+
+    #[test]
+    fn host_grants_match_case_insensitively_and_only_urls() {
+        let c = config(&["Wiki.Example.ORG"], false);
+        assert!(c.allows_server_link(Some("wiki.example.org")));
+        assert!(!c.allows_server_link(Some("evil.example.org")));
+        assert!(!c.allows_server_link(None), "a host grant never covers send: links");
+    }
+
+    #[test]
+    fn ungranted_config_allows_nothing() {
+        let c = config(&[], false);
+        assert!(!c.allows_server_link(Some("wiki.example.org")));
+        assert!(!c.allows_server_link(None));
+    }
+
+    #[test]
+    fn url_host_extraction() {
+        assert_eq!(link_url_host("https://Wiki.Example.org/page?x=1"), Some("wiki.example.org".to_string()));
+        assert_eq!(link_url_host("http://example.org:8080/p"), Some("example.org".to_string()));
+        assert_eq!(link_url_host("https://user:pw@example.org/x"), Some("example.org".to_string()));
+        assert_eq!(link_url_host("https://[::1]:8080/x"), Some("::1".to_string()));
+        assert_eq!(link_url_host("https:///nohost"), None);
+        assert_eq!(link_url_host("nonsense"), None);
+    }
+
+    #[test]
+    fn trust_fields_round_trip_and_default_clean() {
+        let c = config(&["a.example"], false);
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<ServerConfig>(&json).unwrap(), c);
+        // Old-format files (no trust fields) still deserialize.
+        let old: ServerConfig = serde_json::from_str(r#"{"host":"h","port":1}"#).unwrap();
+        assert!(old.trusted_link_hosts.is_empty());
+        assert!(!old.trust_all_links);
+    }
 }

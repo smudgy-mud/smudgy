@@ -149,6 +149,8 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
                 "exits": exits_by_room.remove(&room.room_number).unwrap_or_default(),
                 // Tags are non-secret: emitted whenever the room itself is visible.
                 "tags": room.tags.iter().collect::<Vec<_>>(),
+                // Not a secret; rides the projection whenever the room does.
+                "external_id": room.external_id,
             })
         })
         .collect();
@@ -219,7 +221,7 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
     let mut out = json!({
         "id": area.id,
         "user_id": area.user_id,
-        "atlas_id": redacted_atlas_id(state, viewer, area, caps.is_owner),
+        "atlas_id": area.atlas_id,
         "name": area.name,
         "created_at": area.created_at,
         "rev": if see { area.rev } else { area.public_rev },
@@ -239,6 +241,12 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
         "linked_areas": linked_areas,
     });
 
+    // Denormalized atlas name, un-redacted for every can_view viewer (§4.1);
+    // key omitted when the area is atlas-less (skip-when-none).
+    if let Some(name) = atlas_name(state, area) {
+        out["atlas_name"] = json!(name);
+    }
+
     // Provenance: owner-only, null fields OMITTED.
     if caps.is_owner {
         if let Some(src) = area.copied_from_area_id {
@@ -254,23 +262,16 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
     Some(out)
 }
 
-/// atlas_id redaction: kept when the viewer owns the area (same-owner atlas
-/// rule) or holds ANY Atlas-scope grant on that atlas; nulled otherwise.
-pub fn redacted_atlas_id(
-    state: &MockState,
-    viewer: Uuid,
-    area: &AreaRecord,
-    is_owner: bool,
-) -> Option<Uuid> {
+/// The area's denormalized atlas name (§4.1 of the map-server-scoping plan;
+/// the `LEFT JOIN map_atlases` in `get_areas_for_viewer`/`get_area_projection`).
+/// `Some` iff the area is filed in an atlas that exists in `MockState.atlases`;
+/// emitted skip-when-none. The atlas CONTAINER is no longer redacted: any viewer
+/// who `can_view` the area — the only viewers these projectors are ever invoked
+/// for — sees the un-redacted `atlas_id` alongside this name. Container ops stay
+/// gated by the atlas-scope checks, so knowing the id/name confers nothing.
+pub fn atlas_name(state: &MockState, area: &AreaRecord) -> Option<String> {
     let atlas = area.atlas_id?;
-    if is_owner {
-        return Some(atlas);
-    }
-    let covered = state
-        .grants
-        .iter()
-        .any(|g| g.grantee_id == viewer && g.atlas_id == Some(atlas));
-    covered.then_some(atlas)
+    state.atlases.get(&atlas).map(|a| a.name.clone())
 }
 
 /// One row of `GET /areas` (`ProjectedAreaListItem`).
@@ -280,7 +281,7 @@ pub fn project_list_item(state: &MockState, viewer: Uuid, area: &AreaRecord) -> 
     let mut out = json!({
         "id": area.id,
         "user_id": area.user_id,
-        "atlas_id": redacted_atlas_id(state, viewer, area, caps.is_owner),
+        "atlas_id": area.atlas_id,
         "name": area.name,
         "created_at": area.created_at,
         "rev": if see { area.rev } else { area.public_rev },
@@ -293,6 +294,11 @@ pub fn project_list_item(state: &MockState, viewer: Uuid, area: &AreaRecord) -> 
             "include_secrets": caps.include_secrets,
         },
     });
+    // Denormalized atlas name, un-redacted for every can_view viewer (§4.1);
+    // key omitted when the area is atlas-less (skip-when-none).
+    if let Some(name) = atlas_name(state, area) {
+        out["atlas_name"] = json!(name);
+    }
     if caps.is_owner {
         if let Some(src) = area.copied_from_area_id {
             out["copied_from_area_id"] = json!(src);

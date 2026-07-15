@@ -123,6 +123,9 @@ pub(crate) fn is_home(homes: &HomeRegistry, producer: &ProducerKey, isolate: &Is
 pub enum PlatformProducer {
     /// The GMCP tree: message name = path, payload replaces-at-path (`docs/gmcp-plan.md` §3).
     Gmcp,
+    /// The MSDP tree: variable name = single-segment path, decoded value replaces
+    /// (`docs/gmcp-mapping-plan.md` §9 item 3).
+    Msdp,
 }
 
 impl PlatformProducer {
@@ -130,6 +133,7 @@ impl PlatformProducer {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Gmcp => "gmcp",
+            Self::Msdp => "msdp",
         }
     }
 }
@@ -171,6 +175,9 @@ impl ProducerKey {
         }
         if spec.eq_ignore_ascii_case(PlatformProducer::Gmcp.as_str()) {
             return Some(Self::Platform(PlatformProducer::Gmcp));
+        }
+        if spec.eq_ignore_ascii_case(PlatformProducer::Msdp.as_str()) {
+            return Some(Self::Platform(PlatformProducer::Msdp));
         }
         let coords = spec.strip_prefix("smudgy://").unwrap_or(spec);
         let (owner, name) = coords.split_once('/')?;

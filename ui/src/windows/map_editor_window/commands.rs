@@ -753,6 +753,7 @@ pub fn delete_selection(
                 x: Some(room.get_x()),
                 y: Some(room.get_y()),
                 color: Some(room.get_color().to_string()),
+                external_id: room.get_external_id().map(|id| Some(id.to_string())),
             },
         ));
 
@@ -1018,6 +1019,7 @@ pub fn create_exit(
                         x: Some(at.x),
                         y: Some(at.y),
                         color: Some(String::new()),
+                        external_id: None,
                     },
                 )],
             ));
@@ -1214,6 +1216,7 @@ pub fn create_room(
                     x: Some(at.x),
                     y: Some(at.y),
                     color: Some(String::new()),
+                    external_id: None,
                 },
             )],
         )],
@@ -1253,6 +1256,10 @@ pub fn bulk_edit_rooms(
                 x: updates.x.map(|_| room.get_x()),
                 y: updates.y.map(|_| room.get_y()),
                 color: updates.color.as_ref().map(|_| room.get_color().to_string()),
+                external_id: updates
+                    .external_id
+                    .as_ref()
+                    .map(|_| room.get_external_id().map(str::to_string)),
             },
         ));
     }
@@ -1628,6 +1635,9 @@ pub struct RoomClip {
     pub y: f32,
     pub color: String,
     pub is_secret: bool,
+    /// Server-global room id (GMCP/MSDP identity); rides copy/paste so the
+    /// merge workflow's cut+paste keeps bindings.
+    pub external_id: Option<String>,
     /// Sorted by name for deterministic paste mutation order. Secrecy
     /// marks don't survive the trip: the property PUT body has no secrecy
     /// channel (same gap as `delete_selection`'s undo).
@@ -1734,6 +1744,7 @@ pub fn snapshot_selection(
                 y: room.get_y(),
                 color: room.get_color().to_string(),
                 is_secret: room.is_secret(),
+                external_id: room.get_external_id().map(str::to_string),
                 properties,
                 exits,
             });
@@ -2006,6 +2017,9 @@ pub fn paste_clipboard(
                     x: Some(room.x + offset.x),
                     y: Some(room.y + offset.y),
                     color: Some(room.color.clone()),
+                    // Bindings ride the paste (cut+paste is the merge-workflow
+                    // move); duplicates resolve best-effort, own-map-first.
+                    external_id: room.external_id.clone().map(Some),
                 },
             ));
 
@@ -2217,6 +2231,10 @@ pub fn edit_room_field(
         x: updates.x.map(|_| room.get_x()),
         y: updates.y.map(|_| room.get_y()),
         color: updates.color.as_ref().map(|_| room.get_color().to_string()),
+        external_id: updates
+            .external_id
+            .as_ref()
+            .map(|_| room.get_external_id().map(str::to_string)),
     };
 
     let area_id = room_key.area_id;
@@ -2262,6 +2280,7 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                atlas_name: None,
             })
         }
 
@@ -2306,6 +2325,7 @@ mod tests {
                 color: updates.color.unwrap_or_default(),
                 created_at: chrono::Utc::now(),
                 is_secret: updates.is_secret.unwrap_or_default(),
+                external_id: updates.external_id.flatten(),
             })
         }
 

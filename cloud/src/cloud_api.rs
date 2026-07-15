@@ -184,7 +184,7 @@ pub enum ShareScope {
 /// `POST /shares` body. All four capability flags are serialized explicitly
 /// (never omitted).
 #[allow(clippy::struct_excessive_bools)] // mirrors the wire contract
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CreateShareRequest {
     pub grantee_id: Uuid,
     pub scope: ShareScope,
@@ -195,6 +195,14 @@ pub struct CreateShareRequest {
     /// Full-deputy. Accepted only from the true owner on an owner-minted root
     /// (server-enforced); implies all lower caps including `can_reshare`.
     pub can_admin: bool,
+    /// Grantor-authored advisory host strings (`"host"` or `"host:port"`)
+    /// snapshotting the hosts of the atlas's associated server entries at the
+    /// consent moment (§4.2 of the map-server-scoping plan). Helps the recipient
+    /// home the atlas onto the right local session; affects only recipient-side
+    /// default grouping. Omitted when absent (skip-when-none keeps old-server
+    /// compatibility; the server has `#[serde(default)]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_hints: Option<Vec<String>>,
 }
 
 /// A share grant row as served by the API. Exactly one of `area_id` /
@@ -234,6 +242,14 @@ pub struct ShareGrant {
     /// `grantor_nickname` on a re-share (show the owner handle then).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_nickname: Option<String>,
+    /// Grantor-authored advisory host hints snapshotted at share creation
+    /// (`"host"`/`"host:port"`; §4.2 of the map-server-scoping plan). Flows to
+    /// the grantee on `GET /shares` rows (both directions) and grant-tree nodes
+    /// so they can home the atlas onto a local session. A snapshot: never
+    /// inherited from a parent grant, never PATCH-updated. Older servers omit
+    /// it → `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_hints: Option<Vec<String>>,
 }
 
 /// One row of `GET /shares`: the grant plus its depth below the root grant
@@ -1296,12 +1312,17 @@ mod tests {
             "updated_at": "2026-06-14T12:00:00Z",
             "grantor_nickname": "friend",
             "owner_nickname": "owner",
+            "host_hints": ["arctic.org", "localhost:4000"],
         }))
         .expect("share grant with handles parses");
         assert_eq!(with.grantor_nickname.as_deref(), Some("friend"));
         assert_eq!(with.owner_nickname.as_deref(), Some("owner"));
+        assert_eq!(
+            with.host_hints.as_deref(),
+            Some(&["arctic.org".to_string(), "localhost:4000".to_string()][..])
+        );
 
-        // Omit-when-unallocated: both default to None.
+        // Omit-when-unallocated: handles AND host_hints default to None.
         let without: ShareGrant = serde_json::from_value(json!({
             "id": "00000000-0000-0000-0000-000000000001",
             "owner_id": "00000000-0000-0000-0000-000000000002",
@@ -1316,6 +1337,7 @@ mod tests {
         .expect("share grant without handles parses");
         assert!(without.grantor_nickname.is_none());
         assert!(without.owner_nickname.is_none());
+        assert!(without.host_hints.is_none());
     }
 
     #[test]
@@ -1344,6 +1366,34 @@ mod tests {
         }))
         .expect("area without family_token parses");
         assert!(without.family_token.is_none());
+    }
+
+    #[test]
+    fn area_atlas_name_parses_and_is_optional() {
+        // §4.1: a filed area carries the denormalized atlas_name alongside atlas_id.
+        let filed: Area = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000005",
+            "user_id": null,
+            "atlas_id": "00000000-0000-0000-0000-0000000000a1",
+            "atlas_name": "Cities",
+            "name": "Ironforge",
+            "created_at": "2026-06-14T12:00:00Z",
+            "rev": 1,
+        }))
+        .expect("filed area parses");
+        assert_eq!(filed.atlas_name.as_deref(), Some("Cities"));
+
+        // An atlas-less area has NO atlas_name key -> None.
+        let loose: Area = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000005",
+            "user_id": null,
+            "atlas_id": null,
+            "name": "Wilds",
+            "created_at": "2026-06-14T12:00:00Z",
+            "rev": 1,
+        }))
+        .expect("atlas-less area parses");
+        assert!(loose.atlas_name.is_none());
     }
 
     #[test]
@@ -1482,7 +1532,8 @@ mod tests {
             "created_at": "2026-06-01T00:00:00Z",
             "updated_at": "2026-06-02T00:00:00Z",
             "depth": 1,
-            "grantee_nickname": "wbk"
+            "grantee_nickname": "wbk",
+            "host_hints": ["arctic.org"]
         });
         let node: GrantTreeNode = serde_json::from_value(with_nickname).unwrap();
         assert_eq!(node.depth, 1);
@@ -1497,6 +1548,10 @@ mod tests {
         );
         assert_eq!(node.grant.atlas_id, None);
         assert_eq!(node.grant.parent_grant_id, None);
+        assert_eq!(
+            node.grant.host_hints.as_deref(),
+            Some(&["arctic.org".to_string()][..])
+        );
 
         let without_nickname = json!({
             "id": "00000000-0000-0000-0000-00000000000a",
@@ -1517,6 +1572,7 @@ mod tests {
         let node: GrantTreeNode = serde_json::from_value(without_nickname).unwrap();
         assert_eq!(node.depth, 0);
         assert_eq!(node.grantee_nickname, None);
+        assert!(node.grant.host_hints.is_none());
         assert_eq!(
             node.grant.atlas_id,
             Some(AtlasId(uuid("00000000-0000-0000-0000-00000000000e")))
@@ -1555,7 +1611,9 @@ mod tests {
             can_copy: false,
             include_secrets: false,
             can_admin: false,
+            host_hints: None,
         };
+        // All five flags explicit; host_hints omitted when None (old-server compat).
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             json!({
@@ -1567,6 +1625,24 @@ mod tests {
                 "include_secrets": false,
                 "can_admin": false
             })
+        );
+
+        // When present, host_hints rides on the wire as an array.
+        let with_hints = CreateShareRequest {
+            grantee_id: uuid("00000000-0000-0000-0000-000000000001"),
+            scope: ShareScope::Area {
+                area_id: AreaId(uuid("00000000-0000-0000-0000-000000000002")),
+            },
+            can_edit: false,
+            can_reshare: false,
+            can_copy: false,
+            include_secrets: false,
+            can_admin: false,
+            host_hints: Some(vec!["arctic.org".to_string()]),
+        };
+        assert_eq!(
+            serde_json::to_value(with_hints).unwrap()["host_hints"],
+            json!(["arctic.org"])
         );
     }
 }

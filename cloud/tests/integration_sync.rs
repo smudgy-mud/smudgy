@@ -17,7 +17,7 @@ use std::time::Duration;
 use smudgy_cloud::cloud_api::{CreateShareRequest, SharePatch, ShareScope};
 use smudgy_cloud::mapper::{RoomKey, SyncState};
 use smudgy_cloud::{
-    AreaId, CachedCloudMapper, CloudApiClient, CloudMapper, Credential, CredentialSource,
+    AreaId, AtlasId, CachedCloudMapper, CloudApiClient, CloudMapper, Credential, CredentialSource,
     ExitArgs, ExitDirection, ExitStyle, Mapper, MapperBackend, RoomNumber, RoomUpdates,
 };
 use support::{GrantFlags, GrantScope, MockServer};
@@ -180,6 +180,7 @@ async fn share_appears_in_grantee_atlas_via_sync() {
             can_copy: false,
             include_secrets: false,
             can_admin: false,
+            host_hints: None,
         })
         .await
         .expect("owner shares to a friend");
@@ -205,6 +206,55 @@ async fn share_appears_in_grantee_atlas_via_sync() {
     let access = cached.meta().access.expect("access block present");
     assert!(!access.is_owner, "shared, not owned");
     assert!(!access.can_edit && !access.include_secrets);
+}
+
+// ---------------------------------------------------------------------------
+// 1a. §4.1 atlas un-redaction: an AREA-scope grantee (no atlas-scope grant)
+//     sees the un-redacted atlas_id + denormalized atlas_name on the list row
+//     and the fetched area; an atlas-less area carries neither.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_area_carries_atlas_id_and_name() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("owner@example.com", "owner", true);
+    let grantee = server.create_user("friend@example.com", "friend", true);
+    server.befriend(&owner, &grantee);
+
+    // Owner files "Ironforge" in a named atlas; "Wilds" stays loose.
+    let atlas = server.create_atlas(&owner, "Cities");
+    let filed = server.create_area_in_atlas(&owner, "Ironforge", atlas);
+    let loose = server.create_area(&owner, "Wilds");
+
+    // AREA-scope grants only — no atlas-scope grant covers the container.
+    server.grant(&owner, &grantee, GrantScope::Area(filed), GrantFlags::VIEW_ONLY);
+    server.grant(&owner, &grantee, GrantScope::Area(loose), GrantFlags::VIEW_ONLY);
+
+    let grantee_backend = CloudMapper::new(server.base_url.clone(), grantee.api_key.clone());
+
+    // GET /areas list rows.
+    let list = grantee_backend.list_areas().await.expect("grantee area list");
+    let filed_row = list.iter().find(|a| a.id == filed).expect("filed area listed");
+    assert_eq!(
+        filed_row.atlas_id,
+        Some(AtlasId(atlas)),
+        "the area-scope grantee sees the un-redacted atlas_id"
+    );
+    assert_eq!(filed_row.atlas_name.as_deref(), Some("Cities"));
+    let loose_row = list.iter().find(|a| a.id == loose).expect("loose area listed");
+    assert!(loose_row.atlas_id.is_none(), "atlas-less area has no atlas_id");
+    assert!(
+        loose_row.atlas_name.is_none(),
+        "atlas-less area has no atlas_name"
+    );
+
+    // GET /areas/{id} fetched projection.
+    let filed_detail = grantee_backend.get_area(&filed).await.expect("fetch filed");
+    assert_eq!(filed_detail.area.atlas_id, Some(AtlasId(atlas)));
+    assert_eq!(filed_detail.area.atlas_name.as_deref(), Some("Cities"));
+    let loose_detail = grantee_backend.get_area(&loose).await.expect("fetch loose");
+    assert!(loose_detail.area.atlas_id.is_none());
+    assert!(loose_detail.area.atlas_name.is_none());
 }
 
 // ---------------------------------------------------------------------------

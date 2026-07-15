@@ -29,7 +29,7 @@ fn share_gate(st: &MockState, headers: &HeaderMap) -> Result<Uuid, Response> {
 }
 
 pub fn grant_json(g: &GrantRecord) -> Value {
-    json!({
+    let mut out = json!({
         "id": g.id,
         "owner_id": g.owner_id,
         "grantor_id": g.grantor_id,
@@ -44,7 +44,13 @@ pub fn grant_json(g: &GrantRecord) -> Value {
         "parent_grant_id": g.parent_grant_id,
         "created_at": g.created_at,
         "updated_at": g.updated_at,
-    })
+    });
+    // Advisory host hints, snapshotted at creation (§4.2); key omitted when the
+    // grant carried none (skip-when-none), matching `ShareGrant`'s serde.
+    if let Some(hints) = &g.host_hints {
+        out["host_hints"] = json!(hints);
+    }
+    out
 }
 
 /// The `validate_grant_write` invariant set: friendship + blocks + child
@@ -175,6 +181,42 @@ struct CreateShareRequest {
     include_secrets: bool,
     #[serde(default)]
     can_admin: bool,
+    /// Grantor-authored advisory host hints (§4.2). Absent = none.
+    #[serde(default)]
+    host_hints: Option<Vec<String>>,
+}
+
+/// Maximum number of host hints a single share may carry (mirrors the server's
+/// `MAX_HOST_HINTS`).
+const MAX_HOST_HINTS: usize = 32;
+/// Maximum byte length of a single host hint (mirrors `MAX_HOST_HINT_LEN`).
+const MAX_HOST_HINT_LEN: usize = 255;
+
+/// Normalize a grantor-supplied `host_hints` payload for storage: trim each
+/// entry and drop empties, returning `None` when the payload is absent or
+/// reduces to nothing. Rejects (uniform 400) more than `MAX_HOST_HINTS` entries
+/// or any entry longer than `MAX_HOST_HINT_LEN` bytes — mirrors the real
+/// `normalize_host_hints` in db.rs (length is checked before trimming empties;
+/// the `"host"`/`"host:port"` format itself is NOT validated).
+fn normalize_host_hints(hints: Option<&[String]>) -> Result<Option<Vec<String>>, Response> {
+    let Some(hints) = hints else {
+        return Ok(None);
+    };
+    if hints.len() > MAX_HOST_HINTS {
+        return Err(bad_request("at most 32 host hints are allowed"));
+    }
+    let mut out = Vec::with_capacity(hints.len());
+    for h in hints {
+        let trimmed = h.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.len() > MAX_HOST_HINT_LEN {
+            return Err(bad_request("each host hint must be at most 255 characters"));
+        }
+        out.push(trimmed.to_string());
+    }
+    Ok(if out.is_empty() { None } else { Some(out) })
 }
 
 /// POST /shares — create or idempotently re-grant; ALL denials uniform 404.
@@ -282,6 +324,14 @@ pub async fn create_share(State(state): State<Shared>, headers: HeaderMap, body:
         return e;
     }
 
+    // Snapshot the grantor's advisory host hints for THIS share; a re-grant is
+    // a fresh consent moment, so the new snapshot REPLACES any prior one (a
+    // hint-less re-grant clears it).
+    let host_hints = match normalize_host_hints(req.host_hints.as_deref()) {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
+
     // 4. Idempotent upsert on (grantor, grantee, scope).
     let existing = st.grants.iter_mut().find(|g| {
         g.grantor_id == caller
@@ -296,6 +346,7 @@ pub async fn create_share(State(state): State<Shared>, headers: HeaderMap, body:
         g.include_secrets = include_secrets;
         g.can_admin = can_admin;
         g.parent_grant_id = parent_grant_id;
+        g.host_hints = host_hints;
         g.updated_at = Utc::now();
         g.clone()
     } else {
@@ -311,6 +362,7 @@ pub async fn create_share(State(state): State<Shared>, headers: HeaderMap, body:
             can_copy,
             include_secrets,
             can_admin,
+            host_hints,
             parent_grant_id,
             created_at: Utc::now(),
             updated_at: Utc::now(),

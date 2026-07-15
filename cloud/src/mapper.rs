@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -26,7 +26,7 @@ pub mod exit_cache;
 pub mod room_cache;
 pub mod room_connection;
 pub mod sync_engine;
-pub use atlas_cache::AtlasCache;
+pub use atlas_cache::{AtlasCache, ElsewhereMatch};
 pub use sync_engine::{SyncState, SyncStatus};
 
 /// Composite key for room lookups
@@ -53,6 +53,12 @@ impl RoomKey {
 pub fn normalize_tag(tag: &str) -> String {
     tag.trim().to_uppercase()
 }
+
+/// Total rooms admitted across a session's ephemeral areas. A guard against a
+/// server minting unbounded room ids through an auto-mapper, not a sizing
+/// statement — procedural games legitimately reach ~1M rooms, so the cap sits
+/// well above that. Updates to existing rooms are never refused.
+pub const EPHEMERAL_ROOM_CAP: usize = 2_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AreaLoadSource {
@@ -189,6 +195,9 @@ pub struct Inner {
     /// In-flight local write operations per area; the sync engine defers
     /// refetching an area while its count is non-zero.
     pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
+
+    /// One teaching warning when the ephemeral room cap refuses a creation.
+    ephemeral_cap_warned: AtomicBool,
 }
 
 impl std::fmt::Debug for Mapper {
@@ -235,6 +244,7 @@ impl Mapper {
             sync_revision: AtomicU64::new(0),
             sync_notify: Arc::new(Notify::new()),
             pending_by_area: Arc::new(Mutex::new(HashMap::new())),
+            ephemeral_cap_warned: AtomicBool::new(false),
         };
 
         inner.spawn_sync_task(sync_receiver, inner.sync_stats.clone());
@@ -309,15 +319,88 @@ impl Mapper {
         HashSet::clone(self.inner.atlas_cache.load().disabled_areas())
     }
 
-    /// Whether the area participates in room identification and routing
-    /// (true for areas not in the cache).
+    /// Whether the area is enabled on the manual active/inactive axis only
+    /// (true for areas not in the cache). Ignores per-server scope exclusion, so
+    /// the editor's per-area active switch reflects only the user's toggle. Use
+    /// [`Self::is_area_included`] to ask whether an area actually participates in
+    /// room identification/routing.
     #[must_use]
     pub fn is_area_enabled(&self, area_id: &AreaId) -> bool {
         self.inner.atlas_cache.load().is_area_enabled(area_id)
     }
 
+    /// Whether the area participates in room identification and routing: neither
+    /// manually disabled nor per-server scope-excluded (true for areas not in
+    /// the cache). This is the union enumeration/identification callers honor.
+    #[must_use]
+    pub fn is_area_included(&self, area_id: &AreaId) -> bool {
+        self.inner.atlas_cache.load().is_area_included(area_id)
+    }
+
+    /// Cross-entry rescue probe: resolve a server-global external id against the
+    /// scope-excluded areas only (maps homed on a *different* server entry).
+    /// Returns the matched room plus its atlas id/name, or `None`. Used before
+    /// the auto-mapper mints ephemeral rooms so a lagging sibling entry doesn't
+    /// produce a duplicate map. See [`AtlasCache::find_room_elsewhere_by_external_id`].
+    #[must_use]
+    pub fn find_room_elsewhere_by_external_id(&self, external_id: &str) -> Option<ElsewhereMatch> {
+        self.inner
+            .atlas_cache
+            .load()
+            .find_room_elsewhere_by_external_id(external_id)
+    }
+
+    /// Replaces the per-server scope-exclusion sets wholesale (rcu-swapping the
+    /// atlas cache like [`Self::set_disabled_areas`]). Scope-excluded atlases
+    /// and atlas-less areas drop out of every room-identification lookup table
+    /// and are treated as walls in routing — semantically identical to a manual
+    /// disable, but stored on a separate axis so the user's manual toggle stays
+    /// intact. Keying by atlas id means an area that later syncs into an
+    /// excluded atlas is excluded automatically, with no recomputation. Full
+    /// table rebuild; scope changes are rare.
+    pub fn set_scope_exclusions(
+        &self,
+        excluded_atlases: HashSet<AtlasId>,
+        excluded_areas: HashSet<AreaId>,
+    ) {
+        let atlases = Arc::new(excluded_atlases);
+        let areas = Arc::new(excluded_areas);
+        self.inner.atlas_cache.rcu(|cache| {
+            Arc::new(cache.with_scope_exclusions(atlases.clone(), areas.clone()))
+        });
+    }
+
     pub fn create_area(&self, name: String) -> impl Future<Output = CloudResult<AreaId>> {
         self.inner.create_area(name)
+    }
+
+    /// Create an area in the session-lifetime ephemeral tier: in-memory,
+    /// never persisted or synced, gone when the session closes. The default
+    /// landing zone for protocol-driven auto-mapping; keeping one is an
+    /// explicit [`Self::export_area`] → [`Self::import_areas`] copy.
+    ///
+    /// # Errors
+    /// Propagates the backend's create error (the ephemeral tier itself is
+    /// infallible; a non-composite backend without the tier routes this to
+    /// its default create path).
+    pub fn create_area_ephemeral(
+        &self,
+        name: String,
+    ) -> impl Future<Output = CloudResult<AreaId>> {
+        self.inner.create_area_ephemeral(name)
+    }
+
+    /// Whether `area_id` lives in the ephemeral (session-lifetime) tier.
+    #[must_use]
+    pub fn is_ephemeral(&self, area_id: &AreaId) -> bool {
+        self.inner.backend.ephemeral_area_ids().contains(area_id)
+    }
+
+    /// Area ids of the ephemeral tier — the set the editor's atlas tree and
+    /// per-area preference writes exclude.
+    #[must_use]
+    pub fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
+        self.inner.backend.ephemeral_area_ids()
     }
 
     /// Like [`Self::create_area`] but files the new area into `atlas_id`
@@ -653,10 +736,10 @@ impl Inner {
             }
         }
 
-        // Carry the disabled set across the wholesale rebuild: a full reload
-        // must never silently re-enable areas the user switched off.
-        let disabled_areas = self.atlas_cache.load().disabled_areas_arc();
-        let new_cache = Arc::new(AtlasCache::new_with_areas(new_cache, disabled_areas));
+        // Carry every exclusion axis across the wholesale rebuild: a full
+        // reload must never silently re-include areas the user disabled or that
+        // per-server scoping excludes.
+        let new_cache = Arc::new(self.atlas_cache.load().rebuild_with_areas(new_cache));
 
         self.atlas_cache.store(new_cache);
 
@@ -701,8 +784,28 @@ impl Inner {
         name: String,
         atlas_id: Option<AtlasId>,
     ) -> CloudResult<AreaId> {
-        let request = CreateAreaRequest { name, atlas_id };
+        let request = CreateAreaRequest {
+            name,
+            atlas_id,
+            ephemeral: false,
+        };
+        self.create_area_from_request(request).await
+    }
 
+    /// Create an area in the ephemeral tier (see [`Mapper::create_area_ephemeral`]).
+    ///
+    /// # Errors
+    /// Propagates the backend's create error.
+    pub async fn create_area_ephemeral(&self, name: String) -> CloudResult<AreaId> {
+        let request = CreateAreaRequest {
+            name,
+            atlas_id: None,
+            ephemeral: true,
+        };
+        self.create_area_from_request(request).await
+    }
+
+    async fn create_area_from_request(&self, request: CreateAreaRequest) -> CloudResult<AreaId> {
         // Create area on backend first to get the real ID
         let backend_area = self.backend.create_area(request).await?;
         let area_id = backend_area.id;
@@ -888,7 +991,44 @@ impl Inner {
         self.send_sync_operation(AreaSyncOperation::DeleteAreaProperty(area_id, name));
     }
 
+    /// Refuses room *creation* into an ephemeral area once the tier holds
+    /// [`EPHEMERAL_ROOM_CAP`] rooms (updates to existing rooms always pass).
+    /// The check runs before the optimistic cache write — the cache is where
+    /// the memory lives, so a backend-side refusal would come too late.
+    fn over_ephemeral_cap(&self, area_id: AreaId, new_rooms: &[RoomNumber]) -> bool {
+        let ephemeral_ids = self.backend.ephemeral_area_ids();
+        if !ephemeral_ids.contains(&area_id) {
+            return false;
+        }
+        let cache = self.atlas_cache.load();
+        let creating = cache.get_area(&area_id).map_or(new_rooms.len(), |area| {
+            new_rooms
+                .iter()
+                .filter(|number| area.get_room(number).is_none())
+                .count()
+        });
+        if creating == 0 {
+            return false;
+        }
+        let total: usize = ephemeral_ids
+            .iter()
+            .filter_map(|id| cache.get_area(id))
+            .map(|area| area.room_count())
+            .sum();
+        let over = total + creating > EPHEMERAL_ROOM_CAP;
+        if over && !self.ephemeral_cap_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "ephemeral map tier is at its {EPHEMERAL_ROOM_CAP}-room cap; \
+                 further auto-mapped rooms are dropped (save and clear the session map to continue)"
+            );
+        }
+        over
+    }
+
     pub fn upsert_room(&self, room_key: RoomKey, updates: RoomUpdates) {
+        if self.over_ephemeral_cap(room_key.area_id, std::slice::from_ref(&room_key.room_number)) {
+            return;
+        }
         self.atlas_cache.rcu(|cache| {
             cache
                 .get_area(&room_key.area_id).map_or_else(|| cache.clone(), |area| {
@@ -903,6 +1043,10 @@ impl Inner {
     }
 
     pub fn upsert_rooms(&self, area_id: AreaId, updates: Vec<(RoomNumber, RoomUpdates)>) {
+        let numbers: Vec<RoomNumber> = updates.iter().map(|(number, _)| *number).collect();
+        if self.over_ephemeral_cap(area_id, &numbers) {
+            return;
+        }
         self.atlas_cache.rcu(|cache| {
             cache.get_area(&area_id).map_or_else(
                 || cache.clone(),
@@ -1556,6 +1700,7 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                atlas_name: None,
             },
             content_hash: None,
             properties: vec![],
@@ -1571,6 +1716,7 @@ mod tests {
                 exits: vec![],
                 tags: Default::default(),
                 is_secret: false,
+                external_id: None,
             }],
             labels: vec![],
             shapes: vec![],
@@ -1679,6 +1825,7 @@ mod tests {
             exits,
             tags: Default::default(),
             is_secret: false,
+            external_id: None,
         }
     }
 
@@ -1697,6 +1844,7 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                atlas_name: None,
             },
             content_hash: None,
             properties: vec![],
@@ -1765,5 +1913,76 @@ mod tests {
         let cross = find(&b5, 3);
         assert_eq!(cross.to_area_id, None);
         assert_eq!(cross.to_room_number, None);
+    }
+
+    #[tokio::test]
+    async fn scope_exclusion_hides_area_without_touching_the_manual_axis() {
+        let a_id = AreaId(Uuid::new_v4());
+        let b_id = AreaId(Uuid::new_v4());
+        let backend = FixedBackend::new(vec![
+            sample_area(a_id, "Midgaard"),
+            sample_area(b_id, "Midgaard"),
+        ]);
+        let mapper = Mapper::new(Arc::new(backend), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+
+        // Scope-exclude B (by area id, since these sample areas are atlas-less).
+        mapper.set_scope_exclusions(HashSet::new(), std::iter::once(b_id).collect());
+
+        let atlas = mapper.get_current_atlas();
+        let by_title: Vec<AreaId> = atlas
+            .get_rooms_by_title("Midgaard")
+            .map(|(area_id, _)| area_id)
+            .collect();
+        assert_eq!(by_title, vec![a_id], "the scope-excluded stock zone drops out");
+
+        // The manual axis is untouched: B is still "enabled", disabled set empty.
+        assert!(mapper.is_area_enabled(&b_id));
+        assert!(mapper.disabled_areas().is_empty());
+        assert!(!mapper.is_area_included(&b_id), "but it no longer participates");
+        assert!(mapper.is_area_included(&a_id));
+
+        // Scope exclusion survives an unrelated mutation (cache rebuild).
+        mapper.upsert_room(
+            RoomKey::new(a_id, RoomNumber(9)),
+            RoomUpdates {
+                title: Some("Annex".to_string()),
+                ..RoomUpdates::default()
+            },
+        );
+        assert!(!mapper.get_current_atlas().is_area_included(&b_id));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_area_survives_scope_exclusion_of_everything_else() {
+        use crate::backends::EphemeralBackend;
+
+        let mapper = Mapper::new(Arc::new(EphemeralBackend::new()), temp_cache_dir());
+        let area_id = mapper
+            .create_area_ephemeral("Session".to_string())
+            .await
+            .expect("create ephemeral");
+        mapper.upsert_room(
+            RoomKey::new(area_id, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("Wilderness".to_string()),
+                ..RoomUpdates::default()
+            },
+        );
+
+        // Only cloud atlas/area ids ever enter the scope store, so excluding a
+        // pile of arbitrary cloud ids can never touch a session-tier area.
+        mapper.set_scope_exclusions(
+            std::iter::once(AtlasId(Uuid::new_v4())).collect(),
+            std::iter::once(AreaId(Uuid::new_v4())).collect(),
+        );
+
+        assert!(mapper.is_area_included(&area_id), "ephemeral areas are never scope-excluded");
+        let by_title: Vec<AreaId> = mapper
+            .get_current_atlas()
+            .get_rooms_by_title("Wilderness")
+            .map(|(area_id, _)| area_id)
+            .collect();
+        assert_eq!(by_title, vec![area_id]);
     }
 }

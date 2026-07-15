@@ -28,6 +28,11 @@ pub struct AreaMeta {
     pub owner_id: Option<uuid::Uuid>,
     pub owner_nickname: Option<String>,
     pub atlas_id: Option<AtlasId>,
+    /// The atlas's display name, denormalized onto the area (§4.1 un-redaction
+    /// delivers it to every viewer who can see the area). `None` when the source
+    /// row carried no name — a caller that needs a label falls back to the area
+    /// name or a generic phrase. Purely descriptive; confers no capability.
+    pub atlas_name: Option<String>,
     pub copied_from_area_id: Option<AreaId>,
     pub copied_from_rev: Option<i64>,
     pub copied_at: Option<DateTime<Utc>>,
@@ -180,6 +185,7 @@ impl AreaCache {
                 owner_id: area.area.user_id,
                 owner_nickname: area.area.owner_nickname,
                 atlas_id: area.area.atlas_id,
+                atlas_name: area.area.atlas_name,
                 copied_from_area_id: area.area.copied_from_area_id,
                 copied_from_rev: area.area.copied_from_rev,
                 copied_at: area.area.copied_at,

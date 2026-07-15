@@ -100,6 +100,12 @@ pub struct Manager {
     /// is the sole writer; it refreshes the entry on every add/enable/remove so a synchronous
     /// op read sees the live `enabled`/`pattern`.
     automation_registry: SharedAutomationRegistry,
+    /// Whether any trigger (enabled or not) carries a raw pattern. Shared with the
+    /// connection's [`VtProcessor`], which captures `StyledLine::raw` — a per-line
+    /// lossy copy of the wire bytes whose only consumer is raw matching — only while
+    /// this is set. Kept true across enable/disable so a disabled raw trigger's
+    /// re-enable never races the capture of in-flight lines.
+    raw_wanted: Arc<AtomicBool>,
 }
 
 /// A single regex capture group from a trigger/alias match.
@@ -294,7 +300,36 @@ impl Manager {
             recording: false,
             automation_deltas: Vec::new(),
             automation_registry,
+            raw_wanted: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The shared "any trigger has a raw pattern" flag, for wiring into the
+    /// connection's raw-byte capture.
+    #[must_use]
+    pub fn raw_wanted_flag(&self) -> Arc<AtomicBool> {
+        self.raw_wanted.clone()
+    }
+
+    /// Continue writing to a predecessor manager's flag cell instead of this
+    /// manager's own. A reload rebuilds the manager but keeps the connection —
+    /// and with it the `VtProcessor`'s clone of the old cell — alive; adopting
+    /// keeps that clone live. Syncs the cell to this manager's (empty) trigger
+    /// set; the reloading modules' re-registrations raise it again.
+    pub fn adopt_raw_wanted_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.raw_wanted = flag;
+        self.refresh_raw_wanted();
+    }
+
+    /// Recompute [`Self::raw_wanted`] after a trigger mutation. Runs eagerly (not at the
+    /// dirty-gated `PatternSet` rebuild) so capture starts before the next line arrives,
+    /// not after it.
+    fn refresh_raw_wanted(&self) {
+        let wanted = self
+            .triggers
+            .iter()
+            .any(|trigger| !trigger.raw_patterns.is_empty());
+        self.raw_wanted.store(wanted, Ordering::Relaxed);
     }
 
     /// Set by the runtime from the automation broadcast's receiver count: record deltas
@@ -518,6 +553,7 @@ impl Manager {
         }
 
         self.trigger_regex_set_dirty = true;
+        self.refresh_raw_wanted();
         if let Some(delta) = delta {
             self.automation_deltas.push(delta);
         }
@@ -704,6 +740,7 @@ impl Manager {
     pub fn remove_trigger(&mut self, isolate: &IsolateId, origin: &Origin, name: &str) {
         if Self::remove_named(&mut self.triggers, &mut self.trigger_indices, isolate, origin, name) {
             self.trigger_regex_set_dirty = true;
+            self.refresh_raw_wanted();
             self.registry_remove(AutomationKind::Trigger, isolate, origin, name);
             if self.is_watched() && *origin != Origin::User {
                 self.automation_deltas.push(AutomationDelta::Removed {
@@ -1397,6 +1434,84 @@ impl Trigger {
 #[cfg(test)]
 mod tests {
     use super::{MatchCapture, expand_template, split_commands};
+
+    mod raw_wanted {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        use super::super::{Manager, PushTriggerParams, ScriptAction};
+        use crate::session::runtime::origin::{IsolateId, Origin};
+
+        fn manager() -> Manager {
+            Manager::new(
+                std::rc::Rc::default(),
+                Arc::new(";".to_string()),
+                std::rc::Rc::default(),
+            )
+        }
+
+        fn push(manager: &mut Manager, name: &str, raw_patterns: Vec<String>) {
+            manager
+                .push_trigger(PushTriggerParams {
+                    isolate: IsolateId::Main,
+                    origin: Origin::User,
+                    name: &Arc::new(name.to_string()),
+                    patterns: &Arc::new(vec!["plain".to_string()]),
+                    raw_patterns: &Arc::new(raw_patterns),
+                    anti_patterns: &Arc::new(Vec::new()),
+                    action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
+                    prompt: false,
+                    enabled: true,
+                    fire_limit: None,
+                    line_limit: None,
+                    source: None,
+                })
+                .unwrap();
+        }
+
+        #[test]
+        fn flag_tracks_raw_pattern_existence_across_mutations() {
+            let mut m = manager();
+            let flag = m.raw_wanted_flag();
+            assert!(!flag.load(Ordering::Relaxed), "empty manager wants no raw");
+
+            push(&mut m, "plain-only", Vec::new());
+            assert!(!flag.load(Ordering::Relaxed), "plain triggers don't ask for raw");
+
+            push(&mut m, "raw", vec!["\\x1b\\[31m".to_string()]);
+            assert!(flag.load(Ordering::Relaxed), "a raw pattern raises the flag");
+
+            m.remove_trigger(&IsolateId::Main, &Origin::User, "raw");
+            assert!(
+                !flag.load(Ordering::Relaxed),
+                "removing the last raw trigger lowers it"
+            );
+
+            // An upsert that drops the raw pattern lowers it too.
+            push(&mut m, "raw2", vec!["raw".to_string()]);
+            assert!(flag.load(Ordering::Relaxed));
+            push(&mut m, "raw2", Vec::new());
+            assert!(!flag.load(Ordering::Relaxed), "upsert away the raw pattern");
+        }
+
+        #[test]
+        fn adopted_flag_cell_keeps_feeding_the_old_clone() {
+            let mut old = manager();
+            push(&mut old, "raw", vec!["raw".to_string()]);
+            let connection_clone = old.raw_wanted_flag();
+            assert!(connection_clone.load(Ordering::Relaxed));
+
+            // Reload: a fresh manager adopts the old cell; the connection's
+            // clone immediately reflects the empty new manager…
+            let mut fresh = manager();
+            fresh.adopt_raw_wanted_flag(old.raw_wanted_flag());
+            assert!(!connection_clone.load(Ordering::Relaxed));
+
+            // …and re-registration into the NEW manager raises the OLD clone.
+            push(&mut fresh, "raw", vec!["raw".to_string()]);
+            assert!(connection_clone.load(Ordering::Relaxed));
+        }
+    }
 
     /// Build captures from a list of `(name, value)` pairs; position is the group number.
     fn caps(items: &[(Option<&str>, &str)]) -> Vec<MatchCapture> {

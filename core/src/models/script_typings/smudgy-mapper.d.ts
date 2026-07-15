@@ -207,6 +207,11 @@ interface CreateRoomParams {
     y?: number;
     /** A CSS color string. */
     color?: string;
+    /**
+     * The server's own id for this room (the room number games send over
+     * GMCP or MSDP). An empty string clears an existing binding.
+     */
+    externalId?: string;
 }
 
 /** Fields accepted when updating a room (`mapper.updateRoom`/`Room.update`): the same
@@ -279,6 +284,12 @@ interface Room {
     readonly room_number: RoomNumber;
     readonly area_id: AreaId;
     readonly title: string;
+    /**
+     * The server's own id for this room (the room number games send over
+     * GMCP or MSDP), or `undefined` if none is bound. Bind one at creation
+     * (`externalId` in the room fields) or with `mapper.setRoomExternalId`.
+     */
+    readonly externalId: string | undefined;
     readonly description: string;
     readonly level: number;
     readonly x: number;
@@ -309,6 +320,12 @@ declare class Area {
     readonly id: AreaId;
     readonly name: string;
     readonly room_numbers: RoomNumber[];
+    /**
+     * Whether this is a session map: it lives only for this session and is
+     * discarded when the session closes. Save it with `mapper.exportArea` +
+     * `mapper.importAreas` to keep it.
+     */
+    readonly isEphemeral: boolean;
     /** The next unused room number in this area. */
     readonly next_room_number: RoomNumber;
     /** The room with this number, or `undefined`. */
@@ -328,9 +345,18 @@ declare class Area {
  * The map API for the current session (each session has its own). Changes
  * sync to the cloud in the background.
  */
+interface CreateAreaOptions {
+    /**
+     * Create a session map: it lives only for this session, is never saved
+     * or synced, and is discarded when the session closes. The place for
+     * maps built automatically from server data.
+     */
+    ephemeral?: boolean;
+}
+
 interface Mapper {
     /** Create a new area and return its handle. */
-    createArea(name: string): Promise<Area>;
+    createArea(name: string, options?: CreateAreaOptions): Promise<Area>;
     /** Set the current map location (the per-session "you are here" marker). */
     setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber): void;
     /** The current map location, or `undefined` if none is set. `room` is absent when the
@@ -354,6 +380,8 @@ interface Mapper {
         visibleExitDirections: string[],
     ): (Room | undefined)[];
     renameArea(area: Area | AreaId, name: string): void;
+    /** Delete an area and everything in it. */
+    deleteArea(area: Area | AreaId): void;
     setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string): void;
     setRoomDescription(area: Area | AreaId, room: Room | RoomNumber, description: string): void;
     /** Set a room's color to a CSS color string. */
@@ -394,6 +422,23 @@ interface Mapper {
      * with `getPathBetweenRooms`.
      */
     findNearestRoomInArea(from: Room, area: Area | AreaId): Room | undefined;
+    /**
+     * The room bound to a server-global room id (the room number games send
+     * over GMCP or MSDP), or `undefined` if no loaded room carries it. When
+     * the same id is bound in more than one area, one match is returned
+     * (rooms in your own maps win over shared ones).
+     */
+    findRoomByExternalId(externalId: string): Room | undefined;
+    /**
+     * Reports whether a room with this server-global id is already mapped for a
+     * different server. When it is, the player is offered the chance to show
+     * that map here too, and this returns `true`, so a map drawn as you explore
+     * knows the room is accounted for and need not be recreated. Returns `false`
+     * when the id belongs to no other server's map.
+     */
+    rescueRoomByExternalId(externalId: string): boolean;
+    /** Bind (or, with an empty string, clear) a room's server-global room id. */
+    setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): void;
     /** Create a room and return its new room number. */
     createRoom(area: Area | AreaId, params: CreateRoomParams): RoomNumber;
     /** Update multiple fields of a room in one cache update; only present fields change. */

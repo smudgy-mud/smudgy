@@ -1986,8 +1986,12 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
     let cleared = window.secrets_cleared();
     let atlas = window.mapper.get_current_atlas();
 
+    // Session (ephemeral) areas are excluded as destinations: an exit from a
+    // persistent map into an area that vanishes with the session would dangle.
+    let ephemeral = window.mapper.ephemeral_area_ids();
     let mut area_choices: Vec<AreaChoice> = atlas
         .areas()
+        .filter(|area| !ephemeral.contains(area.get_id()))
         .map(|area| AreaChoice {
             id: *area.get_id(),
             name: area.get_name().to_string(),

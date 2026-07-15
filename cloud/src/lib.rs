@@ -382,6 +382,17 @@ pub struct Area {
     pub id: AreaId,
     pub user_id: Option<Uuid>,
     pub atlas_id: Option<AtlasId>,
+    /// The denormalized name of the area's atlas (§4.1 of the map-server-scoping
+    /// plan). Surfaced to *every* viewer who can see the area — alongside the
+    /// un-redacted `atlas_id` — so a share recipient can render the owner's
+    /// folder structure. Recipients have no other name source: `GET /atlases`
+    /// stays owned-or-administered. Refreshed whenever the list is refetched;
+    /// atlas renames don't bump member area revs (accepted staleness). `Some`
+    /// iff `atlas_id` is `Some` (an atlas-less area carries no `atlas_name`
+    /// key). Knowing the atlas id/name confers no capability — all container
+    /// ops stay grant-gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atlas_name: Option<String>,
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub rev: i64,
@@ -462,6 +473,12 @@ pub struct Room {
     /// rooms; it is populated locally (secret-audit overlay, optimistic marks).
     #[serde(default)]
     pub is_secret: bool,
+    /// Optional server-global room identity (a GMCP/MSDP room id, opaque
+    /// string — hash ids exist in the wild). Indexed by the atlas cache for
+    /// O(1) id → room resolution. Not unique-enforced; duplicate bindings are
+    /// resolved best-effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }
 
 /// Room with all associated data
@@ -482,6 +499,9 @@ pub struct RoomWithDetails {
     pub tags: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub is_secret: bool,
+    /// See [`Room::external_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }
 
 /// Exit connecting rooms
@@ -573,6 +593,11 @@ pub struct RoomUpdates {
     /// (owner OR include_secrets)`) — the server uniform-404s otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_secret: Option<bool>,
+    /// `Option<Option<_>>` like [`AreaUpdates::atlas_id`]: absent = unchanged,
+    /// present+null = clear the binding, present+string = set it. Omitted
+    /// from the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<Option<String>>,
 }
 
 /// Exit creation/update data
@@ -821,6 +846,11 @@ impl ShapeUpdates {
 pub struct CreateAreaRequest {
     pub name: String,
     pub atlas_id: Option<AtlasId>,
+    /// Route the new area to the session-lifetime ephemeral tier (in-memory,
+    /// never persisted or synced). Client-side routing only — never on the
+    /// wire, and single-tier backends ignore it.
+    #[serde(skip)]
+    pub ephemeral: bool,
 }
 
 /// Area update data.

@@ -440,22 +440,13 @@ function link(action: string | ((click: LinkClick) => void)): StyleTag {
  *  receives beside the payload. */
 type WireLink = { send: string } | { cb: number } | null;
 
-/** The wire shape of one run / one styled line (see ops.rs `StyledRunWire`). */
+/** The wire shape of one SPLICE run (see ops.rs `StyledRunWire`; the echo path
+ *  crosses packed instead -- see `__styled_echo_packed`). */
 interface WireRun {
     text: string;
     fg: Color | null;
     bg: Color | null;
     link: WireLink;
-}
-interface StyledLineWire {
-    runs: WireRun[];
-}
-
-/** A flattened fragment ready for a styled op call: the serializable payload plus the
- *  extracted callback functions, indexed by the runs' `{ cb }` links. */
-interface StyledEchoArgs {
-    payload: { lines: StyledLineWire[] };
-    callbacks: ((click: LinkClick) => void)[];
 }
 
 /** Build the link converter one flatten pass uses: `{ fn }` specs are deduplicated
@@ -474,41 +465,129 @@ function __styled_make_wire_link(
     };
 }
 
-/** Flatten a fragment into the wire payload: whole lines, split on `\n` (a run may
- *  span several lines; each piece keeps the run's colors and link). Callback links
- *  are extracted into the side array -- functions don't serialize. */
-function __styled_echo_payload(text: StyledTextImpl): StyledEchoArgs {
+// ---- Packed styled-echo payload (matched pair with ops.rs `PackedReader`) --------
+//
+// A styled echo crosses the op boundary PACKED: one string carrying every text
+// piece plus one Uint32Array record table -- the layout comment lives beside the
+// decoder in ops.rs. This replaces a per-run object graph on the boundary whose
+// deserialization dominated styled-echo cost.
+
+/** Reused record scratch, grown geometrically and never shrunk. Reuse is safe
+ *  because packing and the op call complete synchronously -- nothing can start a
+ *  second pack while a payload view is still being read. */
+let __packedScratch = new Uint32Array(512);
+
+function __packed_grow(needed: number): void {
+    let capacity = __packedScratch.length;
+    while (capacity < needed) capacity *= 2;
+    const next = new Uint32Array(capacity);
+    next.set(__packedScratch);
+    __packedScratch = next;
+}
+
+/** Encode a (validated -- see `__styled_check_color`) color to its packed u32.
+ *  0 is "unset"; the tag table lives beside the decoder in ops.rs. */
+function __styled_encode_color(value: Color | null): number {
+    if (value === null) return 0;
+    if (typeof value === "string") {
+        const role = __STYLED_ROLE_NAMES.indexOf(value);
+        if (role !== -1) return 0x03000000 | role;
+        // A bare ANSI name means the bright variant (bit 3 = bold).
+        return 0x02000008 | __STYLED_ANSI_NAMES.indexOf(value);
+    }
+    const v = value as any;
+    if (typeof v.r === "number") {
+        return 0x01000000 | (v.r << 16) | (v.g << 8) | v.b;
+    }
+    return 0x02000000 | (v.bold ? 8 : 0) | __STYLED_ANSI_NAMES.indexOf(v.color);
+}
+
+/** A flattened fragment ready for a styled echo op call. `records` is a view of
+ *  the shared scratch -- consume it before returning to script code. */
+interface PackedStyled {
+    text: string;
+    records: Uint32Array;
+    callbacks: ((click: LinkClick) => void)[];
+}
+
+/** Flatten a fragment into the packed payload: whole lines, split on `\n` (a run
+ *  may span several lines; each piece keeps the run's colors and link). Callback
+ *  links dedupe into `callbacks` by identity; send links collect at the FRONT of
+ *  `text` with their lengths at the TAIL of `records`. */
+function __styled_echo_packed(frag: StyledTextImpl): PackedStyled {
     const callbacks: ((click: LinkClick) => void)[] = [];
-    const wireLink = __styled_make_wire_link(callbacks);
-    const lines: StyledLineWire[] = [];
-    let current: StyledLineWire = { runs: [] };
-    for (const run of text._runs) {
-        const link = wireLink(run.link);
-        // Common case: no newline in the run. A linkless run object is safe to share
-        // with the payload as-is -- it is serialized synchronously by the op call.
+    const sendLengths: number[] = [];
+    let sendText = "";
+    let runText = "";
+    let w = 2; // records cursor; slots 0/1 (line/send counts) patch at the end
+    let lineCount = 0;
+    let runCountSlot = 0;
+    let runCount = 0;
+
+    const beginLine = (): void => {
+        if (__packedScratch.length < w + 1) __packed_grow(w + 1);
+        runCountSlot = w++;
+        runCount = 0;
+    };
+    const endLine = (): void => {
+        __packedScratch[runCountSlot] = runCount;
+        lineCount++;
+    };
+    const pushRun = (piece: string, fg: number, bg: number, link: number): void => {
+        if (piece === "") return;
+        if (__packedScratch.length < w + 4) __packed_grow(w + 4);
+        __packedScratch[w++] = piece.length;
+        __packedScratch[w++] = fg;
+        __packedScratch[w++] = bg;
+        __packedScratch[w++] = link;
+        runText += piece;
+        runCount++;
+    };
+    const encodeLink = (spec: LinkSpec | null): number => {
+        if (spec === null) return 0;
+        if ("send" in spec) {
+            sendText += spec.send;
+            sendLengths.push(spec.send.length);
+            return 0x40000000 | (sendLengths.length - 1);
+        }
+        let index = callbacks.indexOf(spec.fn);
+        if (index === -1) {
+            index = callbacks.length;
+            callbacks.push(spec.fn);
+        }
+        return 0x80000000 | index;
+    };
+
+    beginLine();
+    for (const run of frag._runs) {
+        const fg = __styled_encode_color(run.fg);
+        const bg = __styled_encode_color(run.bg);
+        const link = encodeLink(run.link);
+        // Common case: no newline in the run.
         if (run.text.indexOf("\n") === -1) {
-            if (run.text !== "") {
-                current.runs.push(
-                    run.link === null
-                        ? (run as unknown as WireRun)
-                        : { text: run.text, fg: run.fg, bg: run.bg, link },
-                );
-            }
+            pushRun(run.text, fg, bg, link);
             continue;
         }
         const parts = run.text.split("\n");
         for (let i = 0; i < parts.length; i++) {
             if (i > 0) {
-                lines.push(current);
-                current = { runs: [] };
+                endLine();
+                beginLine();
             }
-            if (parts[i] !== "") {
-                current.runs.push({ text: parts[i], fg: run.fg, bg: run.bg, link });
-            }
+            pushRun(parts[i], fg, bg, link);
         }
     }
-    lines.push(current);
-    return { payload: { lines }, callbacks };
+    endLine();
+
+    if (__packedScratch.length < w + sendLengths.length) __packed_grow(w + sendLengths.length);
+    for (const length of sendLengths) __packedScratch[w++] = length;
+    __packedScratch[0] = lineCount;
+    __packedScratch[1] = sendLengths.length;
+    return {
+        text: sendText + runText,
+        records: __packedScratch.subarray(0, w),
+        callbacks,
+    };
 }
 
 /** Flatten a fragment for a line splice: ONE line's wire runs (a `Line` is one line,
@@ -817,8 +896,8 @@ class Pane {
     echo(text: string | StyledTextLike | TemplateStringsArray, ...values: unknown[]): void {
         const arg = __styled_echo_arg(text, values);
         if (__is_styled_text(arg)) {
-            const { payload, callbacks } = __styled_echo_payload(arg);
-            op_smudgy_pane_echo_styled(this._sessionId, this._name, payload, callbacks);
+            const packed = __styled_echo_packed(arg);
+            op_smudgy_pane_echo_styled(this._sessionId, this._name, packed.text, packed.records, packed.callbacks);
         } else {
             op_smudgy_pane_echo(this._sessionId, this._name, String(arg));
         }
@@ -957,8 +1036,8 @@ class Session {
     echo(line: string | StyledTextLike | TemplateStringsArray, ...values: unknown[]): void {
         const arg = __styled_echo_arg(line, values);
         if (__is_styled_text(arg)) {
-            const { payload, callbacks } = __styled_echo_payload(arg);
-            op_smudgy_session_echo_styled(this.id, payload, callbacks);
+            const { text, records, callbacks } = __styled_echo_packed(arg);
+            op_smudgy_session_echo_styled(this.id, text, records, callbacks);
         } else {
             op_smudgy_session_echo(this.id, String(arg));
         }
@@ -2631,7 +2710,7 @@ function __smudgy_canonical_event(spec: string, name: string): string {
     // Platform producers key their events `producer:name` -- the form the host's
     // `host_emit` registers and emits ("sys:receive", "gmcp:ready"); package events use
     // the meatball form.
-    return spec === "sys" || spec === "map" || spec === "gmcp"
+    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp"
         ? `${spec}:${name}`
         : `${spec}#${name}`;
 }
