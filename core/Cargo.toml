@@ -47,6 +47,7 @@ rustc-hash = "2"
 # Embeds the vendored editor runtime typings (Deno lib + @types/node) into the binary so
 # they can be written into a script author's `.smudgy/` project at session start.
 include_dir = "0.7"
+encoding_rs = { workspace = true }
 
 # Linux credential store. The base `keyring` dep enables only `windows-native`;
 # with no Linux backend feature, keyring silently falls back to an in-memory

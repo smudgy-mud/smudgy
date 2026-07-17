@@ -12,6 +12,7 @@ use smudgy_cloud::{AreaId, AtlasId};
 
 use crate::models::aliases::AliasDefinition;
 use crate::models::hotkeys::HotkeyDefinition;
+use crate::models::server::ServerEncoding;
 use crate::models::triggers::TriggerDefinition;
 use crate::session::styled_line::StyledLine;
 use crate::session::{HotkeyId, SessionId};
@@ -29,6 +30,7 @@ pub enum RuntimeAction {
     Connect {
         host: Arc<String>,
         port: u16,
+        encoding: ServerEncoding,
         send_on_connect: Option<Arc<String>>,
         /// Literal substrings of `send_on_connect` to mask from the client's echo
         /// and the session log (e.g. a substituted `$PASSWORD`). Empty ⇒ the

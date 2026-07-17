@@ -10025,6 +10025,7 @@ dependencies = [
  "deno_error",
  "derive_more",
  "dirs",
+ "encoding_rs",
  "futures",
  "include_dir",
  "keyring",

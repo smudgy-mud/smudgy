@@ -9,7 +9,10 @@ use crate::theme::builtins;
 use smudgy_core::models::profile::{
     clear_profile_password, contains_password_token, has_profile_password, set_profile_password,
 };
-use smudgy_core::models::{profile::Profile, server::Server};
+use smudgy_core::models::{
+    profile::Profile,
+    server::{Server, ServerEncoding},
+};
 use std::collections::HashMap;
 
 mod profile;
@@ -87,6 +90,7 @@ pub enum Message {
     ConfirmDeleteServer(ServerName),        // User confirms deletion
     // Server Form Interaction
     UpdateServerFormField(ServerFormField, String),
+    UpdateServerEncoding(ServerEncoding),
     SubmitServerForm,
     CancelServerForm,
     // Server CRUD Async Results
@@ -135,6 +139,7 @@ pub struct ServerConfigFormData {
     pub name: String,
     pub host: String,
     pub port: String,
+    pub encoding: ServerEncoding,
 }
 
 /// Temporary storage for profile form input. `description` maps to the persisted
@@ -386,6 +391,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     name: server_to_edit.name.clone(), // Pre-fill name (though not directly editable usually)
                     host: server_to_edit.config.host.clone(),
                     port: server_to_edit.config.port.to_string(),
+                    encoding: server_to_edit.config.encoding,
                 };
                 state.server_crud_error = None;
                 state.selected_server = Some(server_name); // Ensure server remains selected
@@ -418,6 +424,15 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     ServerFormField::Port => state.server_form_data.port = value,
                 }
                 state.server_crud_error = None; // Clear error when user types
+            }
+        }
+        Message::UpdateServerEncoding(encoding) => {
+            if matches!(
+                state.server_action,
+                Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
+            ) {
+                state.server_form_data.encoding = encoding;
+                state.server_crud_error = None;
             }
         }
         Message::SubmitServerForm => {

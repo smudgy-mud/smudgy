@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -16,12 +17,73 @@ use tokio::{
 use vt_processor::VtProcessor;
 use vtparse::VTParser;
 
+use crate::models::server::ServerEncoding;
+
 use super::{TaggedSessionEvent, runtime::RuntimeAction};
 
 pub mod gmcp;
 pub mod msdp;
 pub mod telnet;
 pub mod vt_processor;
+
+/// Persistent streaming decoder for application text. Its state survives both
+/// Telnet callbacks and socket reads, so a multibyte character may straddle
+/// any transport boundary without being replaced prematurely.
+pub struct WireDecoder {
+    encoding: ServerEncoding,
+    decoder: encoding_rs::Decoder,
+    output: String,
+    reported_error: bool,
+}
+
+impl WireDecoder {
+    #[must_use]
+    pub fn new(encoding: ServerEncoding) -> Self {
+        Self {
+            encoding,
+            decoder: encoding.encoding().new_decoder_without_bom_handling(),
+            output: String::with_capacity(4096),
+            reported_error: false,
+        }
+    }
+
+    /// Decode one stream segment. `last` flushes a pending incomplete code
+    /// unit at connection teardown. The boolean is true only for the first
+    /// malformed input observed on this connection, preventing warning spam.
+    fn decode(&mut self, input: &[u8], last: bool) -> (&[u8], bool) {
+        self.output.clear();
+        let needed = self
+            .decoder
+            .max_utf8_buffer_length(input.len())
+            .unwrap_or_else(|| input.len().saturating_mul(3).saturating_add(3));
+        self.output.reserve(needed);
+
+        let mut read = 0;
+        let mut had_errors = false;
+        loop {
+            let (result, consumed, replaced) =
+                self.decoder
+                    .decode_to_string(&input[read..], &mut self.output, last);
+            read += consumed;
+            had_errors |= replaced;
+            match result {
+                encoding_rs::CoderResult::InputEmpty => break,
+                encoding_rs::CoderResult::OutputFull => {
+                    let remaining = self
+                        .decoder
+                        .max_utf8_buffer_length(input.len().saturating_sub(read))
+                        .unwrap_or(8)
+                        .max(8);
+                    self.output.reserve(remaining);
+                }
+            }
+        }
+
+        let first_error = had_errors && !self.reported_error;
+        self.reported_error |= had_errors;
+        (self.output.as_bytes(), first_error)
+    }
+}
 
 /// The glue between the telnet preprocessor and the VT parser for one socket read. A private
 /// module so these internals stay off the normal public API: the items are `pub` at the item
@@ -35,7 +97,41 @@ mod ingest {
 
     use super::super::runtime::RuntimeAction;
     use super::vt_processor::VtProcessor;
-    use super::{gmcp, msdp, telnet};
+    use super::{ServerEncoding, WireDecoder, gmcp, msdp, telnet};
+
+    fn feed_decoded(
+        data: &[u8],
+        vt_parser: &mut VTParser,
+        vt_processor: &mut VtProcessor,
+    ) {
+        // The capture decision is hoisted out of the byte loop: the flag only
+        // changes on the session thread and cannot flip mid-run.
+        if vt_processor.capture_raw() {
+            for &byte in data {
+                // CR/LF drive line breaks in the VT parser but are kept out of
+                // `StyledLine::raw`.
+                if byte != b'\n' && byte != b'\r' {
+                    vt_processor.push_raw_incoming_byte(byte);
+                }
+                vt_parser.parse_byte(byte, vt_processor);
+            }
+        } else {
+            for &byte in data {
+                vt_parser.parse_byte(byte, vt_processor);
+            }
+        }
+    }
+
+    fn report_decode_error(
+        encoding: ServerEncoding,
+        runtime_tx: &UnboundedSender<RuntimeAction>,
+    ) {
+        runtime_tx
+            .send(RuntimeAction::Echo(Arc::new(format!(
+                "Incoming text contained invalid {encoding} data; replacement characters were inserted."
+            ))))
+            .ok();
+    }
 
     /// Bridges the telnet preprocessor to the rest of the inbound pipeline for one socket read.
     ///
@@ -51,6 +147,8 @@ mod ingest {
     pub struct TelnetBridge<'a> {
         pub vt_parser: &'a mut VTParser,
         pub vt_processor: &'a mut VtProcessor,
+        /// Persistent decoder for server application text.
+        pub decoder: &'a mut WireDecoder,
         /// Reused across reads; the caller clears it before each `receive` and drains it after.
         pub replies: &'a mut Vec<u8>,
         /// The session action channel — the same one [`VtProcessor`] emits line actions on,
@@ -60,24 +158,12 @@ mod ingest {
 
     impl telnet::TelnetSink for TelnetBridge<'_> {
         fn on_data(&mut self, data: &[u8]) {
-            // The capture decision is hoisted out of the byte loop: the flag
-            // only changes from the session thread (the same thread this runs
-            // on), and a line commit inside the run can only re-latch the same
-            // value, so it cannot flip mid-run.
-            if self.vt_processor.capture_raw() {
-                for &b in data {
-                    // CR/LF drive line breaks in the VT parser but are kept out
-                    // of `StyledLine::raw`.
-                    if b != b'\n' && b != b'\r' {
-                        self.vt_processor.push_raw_incoming_byte(b);
-                    }
-                    self.vt_parser.parse_byte(b, &mut *self.vt_processor);
-                }
-            } else {
-                for &b in data {
-                    self.vt_parser.parse_byte(b, &mut *self.vt_processor);
-                }
+            let encoding = self.decoder.encoding;
+            let (decoded_bytes, first_error) = self.decoder.decode(data, false);
+            if first_error {
+                report_decode_error(encoding, self.runtime_tx);
             }
+            feed_decoded(decoded_bytes, self.vt_parser, self.vt_processor);
         }
 
         fn on_prompt(&mut self) {
@@ -170,6 +256,7 @@ mod ingest {
         telnet: &mut telnet::TelnetParser,
         vt_parser: &mut VTParser,
         vt_processor: &mut VtProcessor,
+        decoder: &mut WireDecoder,
         replies: &mut Vec<u8>,
         runtime_tx: &UnboundedSender<RuntimeAction>,
     ) {
@@ -177,22 +264,38 @@ mod ingest {
         let mut bridge = TelnetBridge {
             vt_parser,
             vt_processor,
+            decoder,
             replies,
             runtime_tx,
         };
         telnet.receive(data, &mut bridge);
     }
+
+    /// Flush a pending incomplete multibyte code unit when the socket closes.
+    pub fn finish_inbound(
+        decoder: &mut WireDecoder,
+        vt_parser: &mut VTParser,
+        vt_processor: &mut VtProcessor,
+        runtime_tx: &UnboundedSender<RuntimeAction>,
+    ) {
+        let encoding = decoder.encoding;
+        let (decoded_bytes, first_error) = decoder.decode(&[], true);
+        if first_error {
+            report_decode_error(encoding, runtime_tx);
+        }
+        feed_decoded(decoded_bytes, vt_parser, vt_processor);
+    }
 }
 
 #[cfg(not(feature = "bench-api"))]
-use ingest::feed_inbound;
+use ingest::{feed_inbound, finish_inbound};
 // Expose the inbound ingest glue to the `smudgy_bench` crate without widening the normal
 // public API (the same pattern as the trigger-engine re-export in `runtime.rs`): the module
 // stays private; the items become reachable only under the feature.
 #[cfg(feature = "bench-api")]
-pub use ingest::{TelnetBridge, feed_inbound};
+pub use ingest::{TelnetBridge, feed_inbound, finish_inbound};
 
-/// One queued socket write. Text is the ordinary command path (UTF-8, written verbatim);
+/// One queued socket write. Text is the ordinary command path (encoded for the server);
 /// Raw is the binary path for telnet-framed protocol messages (GMCP sends, future
 /// subnegotiation responders — `docs/gmcp-plan.md` §6.3). One channel carries both, so a
 /// protocol frame and a user command queued in either order reach the wire in that order.
@@ -203,10 +306,14 @@ pub enum OutboundFrame {
 }
 
 impl OutboundFrame {
-    fn bytes(&self) -> &[u8] {
+    fn bytes(&self, encoding: ServerEncoding) -> (Cow<'_, [u8]>, bool) {
         match self {
-            Self::Text(text) => text.as_bytes(),
-            Self::Raw(bytes) => bytes,
+            Self::Text(text) => {
+                let (bytes, _actual_encoding, had_unmappables) =
+                    encoding.encoding().encode(text.as_str());
+                (bytes, had_unmappables)
+            }
+            Self::Raw(bytes) => (Cow::Borrowed(bytes), false),
         }
     }
 }
@@ -320,7 +427,13 @@ impl Connection {
     /// - If `stream.set_nodelay(true)` fails on the newly connected TCP stream.
     /// - If sending the `UpdateWriteToSocketTx` action to the session runtime fails (channel closed).
     /// - If writing the `send_on_connect` data to the TCP stream fails.
-    pub fn connect(&mut self, host: &str, port: u16, raw_log_path: Option<PathBuf>) {
+    pub fn connect(
+        &mut self,
+        host: &str,
+        port: u16,
+        encoding: ServerEncoding,
+        raw_log_path: Option<PathBuf>,
+    ) {
         let addr = format!("{host}:{port}");
         let runtime_tx = self.runtime_tx.clone();
         let (tx, mut disconnect_rx) = oneshot::channel();
@@ -342,6 +455,7 @@ impl Connection {
             let mut vt_parser = VTParser::new();
             let mut vt_processor = VtProcessor::new(runtime_tx.clone());
             vt_processor.set_raw_wanted_flag(raw_wanted);
+            let mut wire_decoder = WireDecoder::new(encoding);
             // Telnet/IAC preprocessor: consumes negotiation + prompt markers so the VT parser only
             // ever sees pure game text. Persists across reads (a sequence may straddle a read).
             let mut telnet = telnet::TelnetParser::new();
@@ -391,6 +505,7 @@ impl Connection {
                     // (user-initiated, or this connection superseded by a new
                     // one) rather than because the socket dropped underneath us.
                     let mut graceful = false;
+                    let mut reported_encode_error = false;
 
                     loop {
                         select! {
@@ -418,6 +533,7 @@ impl Connection {
                                                 &mut telnet,
                                                 &mut vt_parser,
                                                 &mut vt_processor,
+                                                &mut wire_decoder,
                                                 &mut telnet_replies,
                                                 &runtime_tx,
                                             );
@@ -441,7 +557,16 @@ impl Connection {
                                 }
                             }
                             Some(ref frame) = write_to_socket_rx.recv() => {
-                                if stream.write_all(frame.bytes()).await.is_err() {
+                                let (bytes, had_unmappables) = frame.bytes(encoding);
+                                if had_unmappables && !reported_encode_error {
+                                    reported_encode_error = true;
+                                    runtime_tx
+                                        .send(RuntimeAction::Echo(Arc::new(format!(
+                                            "Some outgoing characters cannot be represented in {encoding}; numeric character references were sent instead."
+                                        ))))
+                                        .ok();
+                                }
+                                if stream.write_all(&bytes).await.is_err() {
                                     break;
                                 }
                             }
@@ -454,6 +579,14 @@ impl Connection {
                             }
                         }
                     }
+
+                    finish_inbound(
+                        &mut wire_decoder,
+                        &mut vt_parser,
+                        &mut vt_processor,
+                        &runtime_tx,
+                    );
+                    vt_processor.notify_end_of_buffer();
 
                     if let Some(mut writer) = raw_log.take()
                         && let Err(err) = writer.flush()
@@ -503,5 +636,68 @@ impl Connection {
 
     pub fn on_connect(&mut self, on_connect: impl FnOnce() + Send + 'static) {
         self.on_connect = Some(Box::new(on_connect));
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use std::sync::Arc;
+
+    use super::{OutboundFrame, WireDecoder};
+    use crate::models::server::ServerEncoding;
+
+    #[test]
+    fn big5_decoder_preserves_a_character_split_across_reads() {
+        let (encoded, _, had_unmappables) = encoding_rs::BIG5.encode("樹海");
+        assert!(!had_unmappables);
+        let mut decoder = WireDecoder::new(ServerEncoding::Big5);
+
+        let first = decoder.decode(&encoded[..1], false).0.to_vec();
+        assert!(first.is_empty(), "a lone Big5 lead byte stays pending");
+        let second = decoder.decode(&encoded[1..], false).0.to_vec();
+
+        assert_eq!(String::from_utf8(second).unwrap(), "樹海");
+    }
+
+    #[test]
+    fn big5_decoder_keeps_ansi_bytes_and_replaces_incomplete_final_input() {
+        let (encoded, _, _) = encoding_rs::BIG5.encode("北冕海");
+        let mut stream = b"\x1b[31m".to_vec();
+        stream.extend_from_slice(&encoded);
+        stream.extend_from_slice(b"\x1b[0m");
+
+        let mut decoder = WireDecoder::new(ServerEncoding::Big5);
+        let decoded = decoder.decode(&stream, false).0.to_vec();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "\x1b[31m北冕海\x1b[0m");
+
+        let pending = decoder.decode(&[0x81], false).0.to_vec();
+        assert!(pending.is_empty());
+        let (replacement, first_error) = decoder.decode(&[], true);
+        assert!(first_error);
+        assert_eq!(String::from_utf8(replacement.to_vec()).unwrap(), "�");
+    }
+
+    #[test]
+    fn outbound_encoding_changes_text_but_never_raw_protocol_frames() {
+        let text = OutboundFrame::Text(Arc::new("樹海\r\n".to_string()));
+        let (actual, text_had_errors) = text.bytes(ServerEncoding::Big5);
+        let (expected, _, expected_had_errors) = encoding_rs::BIG5.encode("樹海\r\n");
+        assert!(!text_had_errors);
+        assert!(!expected_had_errors);
+        assert_eq!(actual.as_ref(), expected.as_ref());
+
+        let protocol: Arc<[u8]> = Arc::from([255_u8, 250, 201, 255, 240]);
+        let raw = OutboundFrame::Raw(protocol.clone());
+        let (actual, raw_had_errors) = raw.bytes(ServerEncoding::Big5);
+        assert!(!raw_had_errors);
+        assert_eq!(actual.as_ref(), protocol.as_ref());
+    }
+
+    #[test]
+    fn unmappable_big5_output_uses_a_visible_numeric_reference() {
+        let frame = OutboundFrame::Text(Arc::new("🙂".to_string()));
+        let (bytes, had_unmappables) = frame.bytes(ServerEncoding::Big5);
+        assert!(had_unmappables);
+        assert_eq!(bytes.as_ref(), b"&#128578;");
     }
 }

@@ -7,6 +7,39 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 use validator::Validate;
 
+/// Character encoding used for one MUD's application text on the Telnet
+/// connection. Negotiation and subnegotiation frames remain byte-exact.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerEncoding {
+    #[default]
+    Utf8,
+    Big5,
+}
+
+impl ServerEncoding {
+    /// Every supported server encoding in picker order.
+    pub const ALL: [Self; 2] = [Self::Utf8, Self::Big5];
+
+    /// The concrete encoding implementation for streaming conversion.
+    #[must_use]
+    pub const fn encoding(self) -> &'static encoding_rs::Encoding {
+        match self {
+            Self::Utf8 => encoding_rs::UTF_8,
+            Self::Big5 => encoding_rs::BIG5,
+        }
+    }
+}
+
+impl std::fmt::Display for ServerEncoding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Utf8 => "UTF-8",
+            Self::Big5 => "Big5",
+        })
+    }
+}
+
 /// Represents the configuration for a single server connection.
 /// This struct is serialized to/from `server.json` within the server's directory.
 #[derive(Serialize, Deserialize, Debug, Validate, Clone, PartialEq, Eq)]
@@ -17,6 +50,10 @@ pub struct ServerConfig {
     /// The port number of the server.
     #[validate(range(min = 1, max = 65535, message = "Port must be between 1 and 65535"))]
     pub port: u16,
+    /// Character encoding for server text. Existing server files default to
+    /// UTF-8; legacy Traditional Chinese MUDs can opt into Big5.
+    #[serde(default)]
+    pub encoding: ServerEncoding,
     /// Hosts the user has granted this MUD's OSC 8 hyperlinks permission to
     /// open in the browser without asking again (the "always allow links to
     /// <host>" opt-in; compared case-insensitively).
@@ -36,6 +73,7 @@ impl ServerConfig {
         Self {
             host,
             port,
+            encoding: ServerEncoding::Utf8,
             trusted_link_hosts: Vec::new(),
             trust_all_links: false,
         }
@@ -428,7 +466,7 @@ pub fn delete_server(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod link_trust_tests {
-    use super::{ServerConfig, link_url_host};
+    use super::{ServerConfig, ServerEncoding, link_url_host};
 
     fn config(hosts: &[&str], all: bool) -> ServerConfig {
         ServerConfig {
@@ -479,5 +517,14 @@ mod link_trust_tests {
         let old: ServerConfig = serde_json::from_str(r#"{"host":"h","port":1}"#).unwrap();
         assert!(old.trusted_link_hosts.is_empty());
         assert!(!old.trust_all_links);
+        assert_eq!(old.encoding, ServerEncoding::Utf8);
+    }
+
+    #[test]
+    fn big5_encoding_round_trips() {
+        let mut config = ServerConfig::new("h".to_string(), 1);
+        config.encoding = ServerEncoding::Big5;
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(serde_json::from_str::<ServerConfig>(&json).unwrap(), config);
     }
 }

@@ -102,6 +102,7 @@ pub fn load_connect_action(server_name: &str, profile_name: &str) -> Result<Runt
     Ok(RuntimeAction::Connect {
         host: server.config.host.into(),
         port: server.config.port,
+        encoding: server.config.encoding,
         send_on_connect,
         send_on_connect_redactions: Arc::new(send_on_connect_redactions),
     })

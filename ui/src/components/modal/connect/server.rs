@@ -1,7 +1,7 @@
 //! Server CRUD: async wrappers, form submission handling, and server-side views.
 
 use iced::widget::{
-    Column, Row, TextInput, button, column, scrollable,
+    Column, Row, TextInput, button, column, pick_list, scrollable,
     space::{horizontal as horizontal_space, vertical as vertical_space},
     text,
 };
@@ -12,7 +12,7 @@ use validator::Validate;
 use crate::theme::Element;
 use crate::theme::builtins;
 
-use smudgy_core::models::server::{Server, ServerConfig};
+use smudgy_core::models::server::{Server, ServerConfig, ServerEncoding};
 
 use super::{
     Message, ServerCrudAction, ServerFormField, State, server_host_input_id, server_name_input_id,
@@ -62,7 +62,9 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                     return Task::none();
                 }
             };
-            let config = ServerConfig::new(state.server_form_data.host.trim().to_string(), port);
+            let mut config =
+                ServerConfig::new(state.server_form_data.host.trim().to_string(), port);
+            config.encoding = state.server_form_data.encoding;
             if let Err(e) = config.validate() {
                 state.server_crud_error = Some(format!("Configuration error: {e}"));
                 return Task::none();
@@ -93,6 +95,7 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                 .map_or_else(|| ServerConfig::new(String::new(), 0), |s| s.config.clone());
             config.host = state.server_form_data.host.trim().to_string();
             config.port = port;
+            config.encoding = state.server_form_data.encoding;
             if let Err(e) = config.validate() {
                 state.server_crud_error = Some(format!("Configuration error: {e}"));
                 return Task::none();
@@ -225,6 +228,7 @@ pub(super) fn view_server_form<'a>(
                 .push(name_field)
                 .push(host_field)
                 .push(port_field)
+                .push(encoding_field(state))
                 .push(server_error(state))
                 .push(Row::new().push(save_button).push(cancel_button).spacing(10))
                 .spacing(15)
@@ -275,6 +279,7 @@ pub(super) fn view_server_form<'a>(
                 .push(name_field)
                 .push(host_field)
                 .push(port_field)
+                .push(encoding_field(state))
                 .push(server_error(state))
                 .push(Row::new().push(save_button).push(cancel_button).spacing(10))
                 .push(vertical_space().height(Pixels(10.0)))
@@ -312,6 +317,25 @@ pub(super) fn view_server_form<'a>(
                 .into()
         }
     }
+}
+
+fn encoding_field(state: &State) -> Element<'_, Message> {
+    column![
+        text("Text encoding")
+            .size(13)
+            .style(builtins::text::muted),
+        pick_list(
+            ServerEncoding::ALL.to_vec(),
+            Some(state.server_form_data.encoding),
+            Message::UpdateServerEncoding,
+        )
+        .width(Length::Fixed(360.0)),
+        text("Use UTF-8 unless this MUD requires a legacy encoding such as Big5.")
+            .size(12)
+            .style(builtins::text::muted),
+    ]
+    .spacing(4)
+    .into()
 }
 
 /// Renders the current server-form error (if any) as danger text, or an empty

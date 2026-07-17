@@ -85,6 +85,7 @@ impl Inner<'_> {
             RuntimeAction::Connect {
                 host,
                 port,
+                encoding,
                 send_on_connect,
                 send_on_connect_redactions,
             } => {
@@ -136,7 +137,7 @@ impl Inner<'_> {
                     None
                 };
 
-                connection.connect(host.as_str(), port, raw_log_path);
+                connection.connect(host.as_str(), port, encoding, raw_log_path);
 
                 self.connection = Some(connection);
                 Ok(ActionResult::None)
