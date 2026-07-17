@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
-use super::ScriptLang;
+use super::{ScriptLang, persistence::write_atomic};
 
 // Helper function for serde to default boolean fields to true.
 fn default_true() -> bool {
@@ -393,7 +393,7 @@ pub fn save_triggers<S: ::std::hash::BuildHasher>(
         "Failed to serialize triggers for server '{server_name}'"
     ))?;
 
-    fs::write(&triggers_path, json_content).context(format!(
+    write_atomic(&triggers_path, json_content.as_bytes()).context(format!(
         "Failed to write triggers.json for server '{server_name}' at {}",
         triggers_path.display()
     ))?;
