@@ -9,7 +9,7 @@ use tokio::{
     net::TcpStream,
     select,
     sync::{
-        mpsc::{UnboundedSender, WeakUnboundedSender},
+        mpsc::{UnboundedSender, WeakSender, error::TrySendError},
         oneshot,
     },
 };
@@ -202,6 +202,12 @@ pub enum OutboundFrame {
     Raw(Arc<[u8]>),
 }
 
+/// Maximum number of application/protocol frames waiting for the socket task.
+/// A bounded queue keeps a stalled server or runaway script from retaining an
+/// unbounded amount of memory. Telnet negotiation replies are written inline
+/// and do not consume these slots.
+const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+
 impl OutboundFrame {
     fn bytes(&self) -> &[u8] {
         match self {
@@ -215,7 +221,7 @@ pub struct Connection {
     disconnect: Option<oneshot::Sender<()>>,
     runtime_tx: UnboundedSender<RuntimeAction>,
     ui_tx: mpsc::Sender<TaggedSessionEvent>,
-    socket_tx: Arc<RwLock<Option<WeakUnboundedSender<OutboundFrame>>>>,
+    socket_tx: Arc<RwLock<Option<WeakSender<OutboundFrame>>>>,
     on_connect: Option<Box<dyn FnOnce() + Send>>,
     /// The trigger manager's "any trigger has a raw pattern" flag; each connect
     /// task hands it to its [`VtProcessor`] so per-line raw capture only runs
@@ -223,7 +229,7 @@ pub struct Connection {
     raw_wanted: Arc<std::sync::atomic::AtomicBool>,
 }
 
-fn clear_socket_sender(socket_tx: &RwLock<Option<WeakUnboundedSender<OutboundFrame>>>) {
+fn clear_socket_sender(socket_tx: &RwLock<Option<WeakSender<OutboundFrame>>>) {
     match socket_tx.write() {
         Ok(mut sender) => {
             sender.take();
@@ -267,7 +273,8 @@ impl Connection {
     /// # Errors
     ///
     /// Returns an error if the socket lock is poisoned, no socket is currently
-    /// registered, the sender can no longer be upgraded, or its queue is closed.
+    /// registered, the sender can no longer be upgraded, or its bounded queue
+    /// is full or closed.
     pub fn write(&self, data: Arc<String>) -> Result<(), anyhow::Error> {
         self.write_frame(OutboundFrame::Text(data))
     }
@@ -279,7 +286,8 @@ impl Connection {
     /// # Errors
     ///
     /// Returns an error if the socket lock is poisoned, no socket is currently
-    /// registered, the sender can no longer be upgraded, or its queue is closed.
+    /// registered, the sender can no longer be upgraded, or its bounded queue
+    /// is full or closed.
     pub fn write_raw(&self, frame: Arc<[u8]>) -> Result<(), anyhow::Error> {
         self.write_frame(OutboundFrame::Raw(frame))
     }
@@ -295,9 +303,13 @@ impl Connection {
         let socket_tx = socket_tx
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("Socket tx is not upgradeable"))?;
-        socket_tx
-            .send(frame)
-            .map_err(|_| anyhow::anyhow!("Socket write queue is closed"))
+        match socket_tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(anyhow::anyhow!(
+                "Socket write queue is full ({OUTBOUND_QUEUE_CAPACITY} pending frames)"
+            )),
+            Err(TrySendError::Closed(_)) => Err(anyhow::anyhow!("Socket write queue is closed")),
+        }
     }
 
     /// Establishes a TCP connection to the specified host and port.
@@ -346,7 +358,7 @@ impl Connection {
             // Negotiation replies to write back to the server, reused across reads.
             let mut telnet_replies: Vec<u8> = Vec::new();
             let (write_to_socket_tx, mut write_to_socket_rx) =
-                tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+                tokio::sync::mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
 
             if runtime_tx
                 .send(RuntimeAction::Echo(Arc::new(format!(
@@ -544,7 +556,7 @@ mod tests {
     #[test]
     fn write_returns_an_error_when_the_socket_queue_is_closed() {
         let (mut connection, _runtime_rx) = test_connection();
-        let (socket_tx, socket_rx) = tokio_mpsc::unbounded_channel();
+        let (socket_tx, socket_rx) = tokio_mpsc::channel(1);
         let weak_socket_tx = socket_tx.downgrade();
         drop(socket_rx);
         connection.socket_tx = Arc::new(RwLock::new(Some(weak_socket_tx)));
@@ -555,6 +567,30 @@ mod tests {
 
         assert!(error.to_string().contains("closed"));
         drop(socket_tx);
+    }
+
+    #[test]
+    fn write_rejects_a_frame_when_the_socket_queue_is_full() {
+        let (mut connection, _runtime_rx) = test_connection();
+        let (socket_tx, _socket_rx) = tokio_mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        connection.socket_tx = Arc::new(RwLock::new(Some(socket_tx.downgrade())));
+
+        for index in 0..OUTBOUND_QUEUE_CAPACITY {
+            connection
+                .write(Arc::new(format!("command-{index}")))
+                .expect("the configured queue capacity should accept this frame");
+        }
+
+        let error = connection
+            .write(Arc::new("one-too-many".to_string()))
+            .expect_err("a full socket queue must reject the frame instead of growing");
+
+        assert!(error.to_string().contains("full"));
+        assert!(
+            error
+                .to_string()
+                .contains(&OUTBOUND_QUEUE_CAPACITY.to_string())
+        );
     }
 
     #[tokio::test]
