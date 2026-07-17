@@ -164,7 +164,7 @@ pub enum Modal {
     },
     /// The share dialog: create new grants for the active area (or its
     /// atlas) and manage the grant tree the viewer is allowed to see.
-    Share(ShareDialog),
+    Share(Box<ShareDialog>),
     /// "Copy to my maps": clone a shared area (and optionally its whole
     /// atlas, when the atlas is visible) into the viewer's own maps.
     CopyArea(CopyAreaDialog),
@@ -965,7 +965,7 @@ pub(super) fn open_share_dialog(window: &mut MapEditorWindow) -> Update<Message,
         Some(atlas_id) => window.map_scopes.atlas_entries(&atlas_id),
         None => window.map_scopes.area_entries(&area_id),
     });
-    window.modal = Some(Modal::Share(ShareDialog {
+    window.modal = Some(Modal::Share(Box::new(ShareDialog {
         area_id,
         area_name: area.get_name().to_string(),
         is_owner,
@@ -1001,7 +1001,7 @@ pub(super) fn open_share_dialog(window: &mut MapEditorWindow) -> Update<Message,
         close_pending: false,
         manage_error: None,
         host_hints,
-    }));
+    })));
 
     let friends_client = window.cloud.client.clone();
     let mut tasks = vec![

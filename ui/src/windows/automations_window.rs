@@ -348,7 +348,10 @@ pub enum Message {
     // ---- installed package -------------------------------------------------
     /// The [`DetailSeq`] is the manage-pane detail generation captured when the load started; a
     /// stale result (the open package changed, navigation, uninstall, or a re-resolve) is discarded.
-    InstalledDetailLoaded(DetailSeq, Result<packages::InstalledDetail, CloudError>),
+    InstalledDetailLoaded(
+        DetailSeq,
+        Box<Result<packages::InstalledDetail, CloudError>>,
+    ),
     InstalledResolvedForGraph(
         String,
         Result<(ResolvedPackageWire, PackagePermissions), CloudError>,
@@ -1340,7 +1343,7 @@ impl AutomationsWindow {
 
             // -------- installed package ------------------------------------
             Message::InstalledDetailLoaded(seq, result) => {
-                self.installed_detail_loaded(seq, result)
+                self.installed_detail_loaded(seq, *result)
             }
             Message::InstalledResolvedForGraph(spec, result) => {
                 self.installed_resolved_for_graph(&spec, result)
