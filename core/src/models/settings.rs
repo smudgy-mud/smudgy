@@ -2,6 +2,7 @@ use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use smudgy_i18n::LocalePreference;
 use std::{fs, io};
 
 /// The distribution channel this binary was built for, decided at compile time
@@ -144,6 +145,10 @@ pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
 /// account-based (session tokens in the OS secret store), not key-based.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Settings {
+    /// Language used for first-party Smudgy interface and client feedback.
+    /// Remote MUD content is never translated. `System` resolves at launch.
+    #[serde(default)]
+    pub locale: LocalePreference,
     /// The maximum number of lines to keep in the scrollback buffer.
     #[serde(default = "default_scrollback_length")]
     pub scrollback_length: usize,
@@ -478,6 +483,7 @@ const fn default_true() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            locale: LocalePreference::default(),
             scrollback_length: default_scrollback_length(),
             api_base_url: None,
             dismissed_upgrade_version: None,
@@ -784,6 +790,16 @@ mod tests {
         let existing = r#"{ "scrollback_length": 5000 }"#;
         let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
         assert!(settings.disabled_map_areas.is_empty());
+        assert_eq!(settings.locale, LocalePreference::System);
+    }
+
+    #[test]
+    fn locale_preference_roundtrips_without_changing_legacy_defaults() {
+        let mut settings = Settings::default();
+        settings.locale = LocalePreference::TraditionalChinese;
+        let json = serde_json::to_string(&settings).expect("settings serialize");
+        let parsed: Settings = serde_json::from_str(&json).expect("settings parse");
+        assert_eq!(parsed.locale, LocalePreference::TraditionalChinese);
     }
 
     #[test]

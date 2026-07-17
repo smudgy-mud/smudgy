@@ -1,0 +1,16 @@
+[package]
+name = "smudgy_i18n"
+version = "0.4.1"
+edition = "2024"
+
+[dependencies]
+fluent-bundle = { workspace = true }
+serde = { workspace = true }
+sys-locale = { workspace = true }
+unic-langid = { workspace = true }
+
+[dev-dependencies]
+regex = { workspace = true }
+
+[lints]
+workspace = true

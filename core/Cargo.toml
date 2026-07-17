@@ -25,6 +25,7 @@ aho-corasick = { workspace = true }
 memchr = "2"
 log = { workspace = true }
 smudgy_script = { workspace = true }
+smudgy_i18n = { workspace = true }
 vtparse = { workspace = true }
 deno_core = { workspace = true }
 deno_error = { workspace = true }

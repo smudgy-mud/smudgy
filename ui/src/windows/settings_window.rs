@@ -18,6 +18,7 @@ use smudgy_core::models::settings::{
 };
 use smudgy_cloud::cloud_api::{ApiKeyInfo, AuthSession, CreatedApiKey, SessionInfo, UserProfile};
 use smudgy_cloud::{CloudError, Uuid};
+use smudgy_i18n::LocalePreference;
 
 use crate::cloud_account::CloudHandles;
 use crate::components::cloud_errors::display_error;
@@ -113,6 +114,7 @@ pub enum Message {
     SessionRevoked(Result<(), CloudError>),
 
     PrefFontSelected(String),
+    PrefLocaleSelected(LocalePreference),
     PrefFontSizeChanged(String),
     PrefFontSizeSubmitted,
     PrefLineLengthChanged(String),
@@ -611,6 +613,11 @@ impl SettingsWindow {
             // whole model; numeric buffers that don't parse commit nothing.
             Message::PrefFontSelected(family) => {
                 self.settings.terminal_font_family = family;
+                self.settings_changed()
+            }
+            Message::PrefLocaleSelected(locale) => {
+                self.settings.locale = locale;
+                smudgy_i18n::activate(locale);
                 self.settings_changed()
             }
             // Typing only edits the buffer; commits happen on Enter so a
@@ -1231,6 +1238,22 @@ impl SettingsWindow {
         );
 
         let mut col = column![text("Preferences").size(20)].spacing(12);
+
+        col = col.push(
+            column![
+                dim_text_owned(smudgy_i18n::t!("language")),
+                pick_list(
+                    LocalePreference::ALL.to_vec(),
+                    Some(self.settings.locale),
+                    Message::PrefLocaleSelected,
+                )
+                .text_size(13)
+                .width(280),
+                dim_text_owned(smudgy_i18n::t!("language-description")),
+            ]
+            .spacing(2),
+        );
+        col = col.push(rule::horizontal(1));
 
         // ===== appearance =====
         col = col.push(text("Appearance").size(15));
