@@ -5,6 +5,14 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-07-21
+
+### Fixed
+
+- Plain-string `line.replace(...)` now preserves the style of the matched text,
+  including when the match starts exactly at a color boundary; it previously
+  restyled the replacement with the line's first color.
+
 ## [0.4.1] - 2026-07-14
 
 ### Changed

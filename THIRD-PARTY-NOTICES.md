@@ -3139,7 +3139,7 @@ THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO
 
 Used by:
 
-- smudgy_core 0.4.1
+- smudgy_core 0.4.2
 - rustybuzz 0.20.1
 
 ~~~
