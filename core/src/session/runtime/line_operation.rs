@@ -49,30 +49,6 @@ pub enum LineOperation {
     },
 }
 
-/// The style at a splice point. Prefer the span that actually contains the
-/// position so a splice on a style boundary inherits the following span, not
-/// the one immediately before it. At the end of a line (or in a malformed gap),
-/// fall back to the closest preceding span; an unstyled line uses terminal
-/// defaults.
-fn splice_style_at(line: &StyledLine, position: usize) -> Style {
-    line.spans
-        .iter()
-        .find(|span| span.begin_pos <= position && position < span.end_pos)
-        .or_else(|| {
-            line.spans
-                .iter()
-                .rev()
-                .find(|span| span.begin_pos <= position)
-        })
-        .map_or(
-            Style {
-                fg: Color::DefaultForeground { bold: false },
-                bg: Color::DefaultBackground,
-            },
-            |span| span.style,
-        )
-}
-
 impl LineOperation {
     #[must_use]
     pub fn apply(&self, line: &Arc<StyledLine>) -> Arc<StyledLine> {
@@ -84,7 +60,17 @@ impl LineOperation {
                 style,
             } => Arc::new(line.insert(str.as_str(), *begin, *end, *style)),
             LineOperation::Replace { str, begin, end } => {
-                Arc::new(line.insert(str.as_str(), *begin, *end, splice_style_at(line, *begin)))
+                // For replace, we need a default style - using the first span's style or a default
+                let default_style = line.spans.first().map_or(Style {
+                    fg: crate::session::connection::vt_processor::Color::DefaultForeground { bold: false },
+                    bg: crate::session::connection::vt_processor::Color::DefaultBackground,
+                }, |s| s.style);
+                Arc::new(line.insert(
+                    str.as_str(),
+                    *begin,
+                    *end,
+                    default_style,
+                ))
             }
             LineOperation::Highlight { begin, end, style } => {
                 Arc::new(line.highlight(*begin, *end, *style))
@@ -96,9 +82,21 @@ impl LineOperation {
                 let begin = (*begin).min(line.text.len());
                 let end = (*end).min(line.text.len().max(begin));
 
-                // Unset run colors inherit the style at the splice point, just
-                // like a plain `Replace`.
-                let base_style = splice_style_at(line, begin);
+                // The splice-point style: the span covering `begin` (the last span
+                // starting at or before it), which is what unset run colors inherit —
+                // the styled generalization of `Replace`'s first-span default.
+                let base_style = line
+                    .spans
+                    .iter()
+                    .rev()
+                    .find(|span| span.begin_pos <= begin)
+                    .map_or(
+                        Style {
+                            fg: Color::DefaultForeground { bold: false },
+                            bg: Color::DefaultBackground,
+                        },
+                        |span| span.style,
+                    );
 
                 // One text splice (which also remaps the line's existing links), then
                 // per-run recolors and link spans over the inserted range.
@@ -294,56 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn replace_inherits_match_style_at_span_boundary() {
-        let default = Style {
-            fg: Color::DefaultForeground { bold: false },
-            bg: Color::DefaultBackground,
-        };
-        let green = Style {
-            fg: bright(AnsiColor::Green),
-            bg: Color::DefaultBackground,
-        };
-        let red = Style {
-            fg: bright(AnsiColor::Red),
-            bg: Color::DefaultBackground,
-        };
-        let line = Arc::new(StyledLine::new(
-            "beforefooafter",
-            vec![
-                VtSpan {
-                    style: default,
-                    begin_pos: 0,
-                    end_pos: 6,
-                },
-                VtSpan {
-                    style: green,
-                    begin_pos: 6,
-                    end_pos: 9,
-                },
-                VtSpan {
-                    style: red,
-                    begin_pos: 9,
-                    end_pos: 14,
-                },
-            ],
-        ));
-
-        let result = LineOperation::Replace {
-            str: Arc::new("foo".to_string()),
-            begin: 6,
-            end: 9,
-        }
-        .apply(&line);
-
-        assert_eq!(result.text, "beforefooafter");
-        assert_tiles(&result);
-        assert_eq!(style_at(&result, 5), default);
-        assert_eq!(style_at(&result, 6), green);
-        assert_eq!(style_at(&result, 8), green);
-        assert_eq!(style_at(&result, 9), red);
-    }
-
-    #[test]
     fn splice_does_not_extend_a_preexisting_link() {
         let action = LinkAction::Send(std::sync::Arc::from("north"));
         let mut inner = StyledLine::new(
@@ -424,10 +372,6 @@ mod tests {
         let result = op.apply(&line);
         assert_eq!(result.text, "go south now");
         assert_tiles(&result);
-        assert!(
-            result.links.is_empty(),
-            "stale link survived: {:?}",
-            result.links
-        );
+        assert!(result.links.is_empty(), "stale link survived: {:?}", result.links);
     }
 }

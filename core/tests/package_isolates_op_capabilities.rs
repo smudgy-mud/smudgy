@@ -387,8 +387,11 @@ async fn get_session_character_gates_foreign_session() {
 }
 
 /// `display:change` gates the line-manipulation ops (`line.gag()` here): denied for an echo-only
-/// package, granted when `change_display` is consented. Its consent label flags the deception risk;
-/// the op gate is what enforces it.
+/// package naming the capability. When `change_display` IS consented, the capability gate opens
+/// and the same top-level call fails on the NEXT gate instead — the current-line window (module
+/// top level runs with no line in flight, so a gag there could only leak onto a later line). The
+/// two refusals are distinct and ordered: capability first, staleness second. In-window gags are
+/// exercised by the trigger/`sys:receive` suites (`pane_routing`, `sys_receive_event`).
 #[tokio::test]
 async fn change_display_gates_line_manipulation() {
     let src = r#"
@@ -419,8 +422,12 @@ async fn change_display_gates_line_manipulation() {
     )
     .await;
     assert!(
-        has_line(&allowed, "GAG_OK"),
-        "with change-display, gag must work; transcript:\n{allowed:#?}"
+        !has_line(&allowed, "GAG_OK")
+            && has_line(&allowed, "GAG_DENIED:")
+            && has_line(&allowed, "current line")
+            && !has_line(&allowed, "change-display"),
+        "with change-display consented the capability gate opens; the top-level call (no line \
+         in flight) must fail on the current-line window instead; transcript:\n{allowed:#?}"
     );
 }
 
@@ -581,7 +588,7 @@ async fn panes_capability_gates_pane_ops_and_routing() {
 
 /// The outbound GMCP verbs (`gmcp.send` / `enableModule` / `disableModule` / `mergeKeys`)
 /// are gated by their own `gmcp:send` capability — it rides with neither interop grant
-/// (`docs/gmcp-plan.md` §6.3) — while `gmcp.enabled` reads under `interop:read` like the
+/// (`docs/gmcp.md` §6.3) — while `gmcp.enabled` reads under `interop:read` like the
 /// rest of the gmcp consumer surface.
 #[tokio::test]
 async fn gmcp_send_is_its_own_capability() {

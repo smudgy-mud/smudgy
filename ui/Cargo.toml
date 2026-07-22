@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_ui"
-version = "0.4.2"
+version = "0.4.2-dev"
 edition = "2024"
 build = "build.rs"
 
@@ -41,6 +41,10 @@ open = "5"
 # Parse/compare the manifest version against published versions so the Publish button is
 # semver-fluent (disable + explain when the version is invalid or already used).
 semver = "1"
+# Grapheme <-> UTF-16 conversion at the input-mirror boundary (scripts count
+# UTF-16 code units; iced's text_input counts graphemes). Same version iced
+# already pins in Cargo.lock.
+unicode-segmentation = "1"
 # Restart Manager cooperation so the installer can upgrade over a running smudgy:
 # a window-proc subclass catches the session-end message and exits. See win_rm.rs.
 [target.'cfg(windows)'.dependencies]
@@ -51,6 +55,12 @@ winapi = { workspace = true, features = [
     "basetsd",
     "windef",
 ] }
+
+[features]
+# Attach iced's devtools to the running app (iced_debug + the in-app overlay, plus the
+# beacon a running `comet` viewer connects to). Dev-only instrumentation -- keep it out
+# of release builds. Usage: cargo run --features iced-debug
+iced-debug = ["iced/debug"]
 
 [dev-dependencies]
 async-trait = "0.1"

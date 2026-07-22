@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 
 use iced::Task;
 use iced::alignment::Vertical;
-use iced::widget::{Column, button, column, container, mouse_area, row, scrollable, text, text_input};
+use iced::widget::{
+    Column, button, column, container, mouse_area, row, scrollable, text, text_input,
+};
 use iced::widget::{Id, operation};
 use iced::{Background, Length, Padding};
 
@@ -67,16 +69,76 @@ impl AutomationsWindow {
     /// The filtered, ordered palette items (Create → Go → Jump).
     fn palette_items(&self) -> Vec<Item> {
         let mut items = vec![
-            Item { group: "Create", label: "Create alias".into(), status: None, kind: None, message: Message::NewAlias },
-            Item { group: "Create", label: "Create trigger".into(), status: None, kind: None, message: Message::NewTrigger },
-            Item { group: "Create", label: "Create hotkey".into(), status: None, kind: None, message: Message::NewHotkey },
-            Item { group: "Create", label: "Create folder".into(), status: None, kind: None, message: Message::NewFolder },
-            Item { group: "Create", label: "Create module".into(), status: None, kind: None, message: Message::NewModule },
-            Item { group: "Create", label: "Create package".into(), status: None, kind: None, message: Message::NewPackage },
-            Item { group: "Go", label: "Discover packages".into(), status: None, kind: None, message: Message::OpenDiscover },
-            Item { group: "Go", label: "Private & shared packages".into(), status: None, kind: None, message: Message::OpenShared },
-            Item { group: "Go", label: "Session store & events".into(), status: None, kind: None, message: Message::OpenStoreInspector },
-            Item { group: "Go", label: "Reload all scripts".into(), status: None, kind: None, message: Message::Reload },
+            Item {
+                group: "Create",
+                label: "Create alias".into(),
+                status: None,
+                kind: None,
+                message: Message::NewAlias,
+            },
+            Item {
+                group: "Create",
+                label: "Create trigger".into(),
+                status: None,
+                kind: None,
+                message: Message::NewTrigger,
+            },
+            Item {
+                group: "Create",
+                label: "Create hotkey".into(),
+                status: None,
+                kind: None,
+                message: Message::NewHotkey,
+            },
+            Item {
+                group: "Create",
+                label: "Create folder".into(),
+                status: None,
+                kind: None,
+                message: Message::NewFolder,
+            },
+            Item {
+                group: "Create",
+                label: "Create module".into(),
+                status: None,
+                kind: None,
+                message: Message::NewModule,
+            },
+            Item {
+                group: "Create",
+                label: "Create package".into(),
+                status: None,
+                kind: None,
+                message: Message::NewPackage,
+            },
+            Item {
+                group: "Go",
+                label: "Discover packages".into(),
+                status: None,
+                kind: None,
+                message: Message::OpenDiscover,
+            },
+            Item {
+                group: "Go",
+                label: "Private & shared packages".into(),
+                status: None,
+                kind: None,
+                message: Message::OpenShared,
+            },
+            Item {
+                group: "Go",
+                label: "Session store & events".into(),
+                status: None,
+                kind: None,
+                message: Message::OpenStoreInspector,
+            },
+            Item {
+                group: "Go",
+                label: "Reload all scripts".into(),
+                status: None,
+                kind: None,
+                message: Message::Reload,
+            },
         ];
 
         // Move: when a script is selected (and thus open in the editor), offer a
@@ -140,9 +202,7 @@ impl AutomationsWindow {
         }
         items
             .into_iter()
-            .filter(|i| {
-                i.label.to_lowercase().contains(&q) || i.group.to_lowercase().contains(&q)
-            })
+            .filter(|i| i.label.to_lowercase().contains(&q) || i.group.to_lowercase().contains(&q))
             .collect()
     }
 
@@ -161,9 +221,7 @@ impl AutomationsWindow {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(|theme: &Theme| iced::widget::container::Style {
-                    background: Some(Background::Color(
-                        theme.styles.general.overlay_background,
-                    )),
+                    background: Some(Background::Color(theme.styles.general.overlay_background)),
                     ..Default::default()
                 }),
         )
@@ -216,7 +274,10 @@ impl AutomationsWindow {
         let card = container(
             column![
                 row![
-                    text(bootstrap_icons::CURSOR).font(fonts::BOOTSTRAP_ICONS).size(13.0).style(common::faint),
+                    text(bootstrap_icons::CURSOR)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(13.0)
+                        .style(common::faint),
                     text_input("Type a command or search…", &self.palette_query)
                         .id(palette_input_id())
                         .on_input(Message::PaletteInput)

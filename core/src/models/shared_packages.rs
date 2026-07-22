@@ -1218,12 +1218,17 @@ mod tests {
         assert_eq!(entry.consented_permissions, None, "a fresh install is un-consented");
         assert!(!entry.trusted, "a fresh install is untrusted");
 
-        // Recording consent stores the granted union verbatim and reloads equal.
+        // Recording consent stores the granted union verbatim and reloads equal — including the
+        // full-access-weight axes (`run`/`ffi`) and `sys`, which must survive the lockfile so the
+        // enforcement container and the manage-pane banner keep seeing what was actually granted.
         let granted = PackagePermissions {
             net: vec!["comms.coreclan.org:6379".into()],
             read: vec!["$DATA/maps".into()],
             write: Vec::new(),
             env: vec!["MYPKG_TOKEN".into()],
+            run: vec!["git".into()],
+            ffi: vec!["$DATA/native/helper.dll".into()],
+            sys: vec!["hostname".into()],
             import: ImportPolicy::Registries,
             smudgy: SmudgyCapabilities {
                 send: true,

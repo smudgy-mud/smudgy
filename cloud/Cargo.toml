@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_cloud"
-version = "0.4.2"
+version = "0.4.2-dev"
 edition = "2024"
 
 [dependencies]
@@ -27,6 +27,7 @@ sha2 = "0.10"
 # Publish-time dependency locking (range -> concrete version) and the client-version
 # gate floor both parse/compare semver.
 semver = "1"
+imbl = "7.0.0"
 
 [features]
 default = ["cloud"]

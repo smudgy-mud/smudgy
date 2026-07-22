@@ -34,6 +34,7 @@ use trigger::Manager;
 #[cfg(feature = "bench-api")]
 pub use trigger::{Manager, MatchCapture, PushTriggerParams, SharedAutomationRegistry};
 pub mod catalogue;
+pub mod input;
 pub mod line_operation;
 mod message_bus;
 pub mod pane;
@@ -45,6 +46,10 @@ mod store;
 
 use catalogue::{CadenceDecision, CatalogueCadence, CatalogueEvent, RuntimeCatalogue};
 pub(crate) use catalogue::SharedCatalogue;
+use input::InputMirror;
+pub(crate) use input::{
+    SharedInputMirror, SharedInputSubmission, SharedInputWordSets, SharedPaneInputCallbacks,
+};
 use line_operation::LineOperation;
 use message_bus::MessageBus;
 pub(crate) use message_bus::SharedMessageBus;
@@ -262,6 +267,12 @@ type SentSessionEvent<'a> =
 /// `BufWriter`'s drop at session end.
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Maximum time a closing session waits for Tokio blocking work to finish.
+/// Async tasks are cancelled immediately by runtime shutdown; this bound is for
+/// `spawn_blocking` work started by Deno resources or ops, which Tokio otherwise
+/// waits for indefinitely when the runtime's last owner is simply dropped.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Capacity of the per-session automation broadcast. Each message is one coalesced
 /// per-drain batch (not per-automation), so a small buffer is ample; a lagging window
 /// skips intermediate batches and gets a fresh reset when it re-subscribes.
@@ -333,6 +344,33 @@ impl Runtime {
             // every isolate's ops beside `pending_line_operations`.
             let line_routing: SharedLineRouting = Rc::new(RefCell::new(LineRouting::default()));
 
+            // The input mirror (`docs/input.md` §3.3): read synchronously by every
+            // isolate's input ops, written by the `InputStateChanged` dispatch arm. Session-
+            // scoped (survives reload) like the pane registry — interest is a session fact.
+            let input_mirror: SharedInputMirror = Rc::new(RefCell::new(InputMirror::default()));
+
+            // The in-flight typed submission `sys:input` handlers act on: installed by the
+            // `SubmitInput` dispatch arm, mutated by the submission ops, consumed by the
+            // completion arm. Shared into every isolate's ops beside `line_routing`. The
+            // slot also owns the generation counter that stamps each installed submission
+            // (the staleness nonce the submission ops check).
+            let input_submission: SharedInputSubmission =
+                Rc::new(RefCell::new(input::InputSubmissionSlot::default()));
+
+            // The completion word sets (`docs/input.md` §3.8): mutated and read
+            // synchronously by every isolate's registry ops, merged and pushed to the UI by
+            // the `InputWordSetsChanged` dispatch arm. Session-scoped cell, engine-scoped
+            // contents — the reload path below resets the contributions like hotkeys.
+            let input_word_sets: SharedInputWordSets =
+                Rc::new(RefCell::new(input::InputWordSets::default()));
+
+            // The pane-input onSubmit registry (`docs/input.md` §3.7): written by
+            // the registration op, resolved by the `PaneInputSubmit` dispatch arm. Session-
+            // scoped cell, engine-scoped contents — handlers name functions of the engine
+            // that registered them, so the reload path below resets it like the word sets.
+            let pane_input_callbacks: SharedPaneInputCallbacks =
+                Rc::new(RefCell::new(input::PaneInputCallbacks::default()));
+
             // The session store (`docs/interop.md`): the same `Rc` is bound into
             // every isolate's ops (writes journal here) and held by `Inner` (the run loop
             // flushes the journal per turn). Created once per session — the committed tree
@@ -357,7 +395,7 @@ impl Runtime {
                 .borrow_mut()
                 .attach_subscriber_probe(local_catalogue_tx.clone());
 
-            // The GMCP enabled flag (`docs/gmcp-plan.md` §3.4): written by the producer's
+            // The GMCP enabled flag (`docs/gmcp.md` §3.4): written by the producer's
             // enable/disable arms, read by every isolate's `gmcp.enabled`/`gmcp.onReady`.
             // Session-scoped like the producer that owns it (survives reload).
             let gmcp_enabled = gmcp::SharedGmcpEnabled::new();
@@ -404,6 +442,10 @@ impl Runtime {
                 settings_snapshot: settings_snapshot.clone(),
                 pane_registry: pane_registry.clone(),
                 line_routing: line_routing.clone(),
+                input_mirror: input_mirror.clone(),
+                input_submission: input_submission.clone(),
+                input_word_sets: input_word_sets.clone(),
+                pane_input_callbacks: pane_input_callbacks.clone(),
                 session_store: session_store.clone(),
                 message_bus: message_bus.clone(),
                 catalogue: catalogue.clone(),
@@ -451,6 +493,12 @@ impl Runtime {
                 catalogue_cadence: CatalogueCadence::default(),
                 catalogue_resend_at: None,
                 connection: None,
+                window_size: Arc::new(std::sync::atomic::AtomicU32::new(
+                    super::connection::responders::pack_dims(
+                        super::connection::responders::DEFAULT_DIMS.0,
+                        super::connection::responders::DEFAULT_DIMS.1,
+                    ),
+                )),
                 pending_buffer_updates: Vec::new(),
                 pending_line_operations: pending_line_operations.clone(),
                 emitted_line_count: emitted_line_count.clone(),
@@ -458,6 +506,10 @@ impl Runtime {
                 current_location: current_location.clone(),
                 pane_registry: pane_registry.clone(),
                 line_routing: line_routing.clone(),
+                input_mirror: input_mirror.clone(),
+                input_submission: input_submission.clone(),
+                input_word_sets: input_word_sets.clone(),
+                pane_input_callbacks: pane_input_callbacks.clone(),
                 session_store: session_store.clone(),
                 catalogue: catalogue.clone(),
                 gmcp: gmcp::GmcpProducer::new(gmcp_enabled.clone()),
@@ -504,6 +556,10 @@ impl Runtime {
                 let old_main_open_line = inner.main_open_line;
                 let old_open_line = inner.open_line.take();
                 let old_connection = inner.connection.take();
+                // The window-size cell is session-lifetime like the connection: the
+                // surviving connection's socket task was seeded from this cell, and
+                // the UI only re-reports on actual grid changes.
+                let old_window_size = inner.window_size.clone();
                 // The surviving connection's VtProcessor holds a clone of the OLD
                 // manager's raw-wanted flag; the new manager must keep writing to
                 // that same cell or raw capture goes dead across a reload.
@@ -557,6 +613,26 @@ impl Runtime {
                 // queue; the engine they came from is gone.
                 spawned_actions.borrow_mut().clear();
 
+                // A submission caught mid-splice by the reload dies with its handlers:
+                // the completion action was queued in `spawned_actions` (just cleared),
+                // so drop the state it would have consumed.
+                input_submission.borrow_mut().take();
+
+                // Completion word sets are engine facts, like hotkeys: drop every
+                // contribution before the rebuild (the reloading modules re-register
+                // theirs). The inputs that held words — plus any whose pending push
+                // action just died in the queues cleared above — get one push action
+                // each, queued BEHIND the rebuild below, so the UI's merged copy is
+                // refreshed: re-registered words go out merged, an unclaimed input
+                // goes out empty.
+                let word_set_resyncs = input_word_sets.borrow_mut().reset_engine_state();
+
+                // Pane-input onSubmit handlers are engine facts too: their function ids
+                // index the disposed isolates' registries. Drop them all; the reloading
+                // scripts re-register theirs beside their re-claiming splits, and a pane
+                // nobody re-claims is closed by the sweep queued below anyway.
+                pane_input_callbacks.borrow_mut().reset_engine_state();
+
                 // Drop the store's engine-scoped state (watchers hold function ids into the
                 // disposed isolates; any unflushed journal belongs to the dead run) while the
                 // committed tree survives — reloads don't drop session state. Before the new
@@ -607,6 +683,10 @@ impl Runtime {
                     settings_snapshot: settings_snapshot.clone(),
                     pane_registry: pane_registry.clone(),
                     line_routing: line_routing.clone(),
+                    input_mirror: input_mirror.clone(),
+                    input_submission: input_submission.clone(),
+                    input_word_sets: input_word_sets.clone(),
+                    pane_input_callbacks: pane_input_callbacks.clone(),
                     session_store: session_store.clone(),
                     message_bus: message_bus.clone(),
                     catalogue: catalogue.clone(),
@@ -626,6 +706,16 @@ impl Runtime {
                 spawned_actions
                     .borrow_mut()
                     .push_back(RuntimeAction::PaneReloadSweep);
+
+                // The word-set resyncs queued behind the modules' own spawned actions:
+                // the pushes read the live sets at dispatch, so each carries whatever
+                // the reloaded scripts re-registered (or the empty view).
+                {
+                    let mut spawned = spawned_actions.borrow_mut();
+                    for key in word_set_resyncs {
+                        spawned.push_back(RuntimeAction::InputWordSetsChanged { key });
+                    }
+                }
 
                 // Reload rebuilds Inner, so re-seed settings from disk; this
                 // also picks up settings edits made while the session ran.
@@ -667,6 +757,7 @@ impl Runtime {
                     catalogue_cadence: CatalogueCadence::default(),
                     catalogue_resend_at: None,
                     connection: old_connection, // Preserve the connection
+                    window_size: old_window_size,
                     pending_buffer_updates: Vec::new(),
                     pending_line_operations: pending_line_operations.clone(), // Preserve the shared operations
                     emitted_line_count: emitted_line_count.clone(),
@@ -674,6 +765,10 @@ impl Runtime {
                     current_location: current_location.clone(), // Preserve current location across reload
                     pane_registry: pane_registry.clone(), // Panes survive script reloads
                     line_routing: line_routing.clone(),
+                    input_mirror: input_mirror.clone(), // Mirror + interest survive reload
+                    input_submission: input_submission.clone(), // Cleared above; the cell itself is session-scoped
+                    input_word_sets: input_word_sets.clone(), // Contributions reset above; the cell itself is session-scoped
+                    pane_input_callbacks: pane_input_callbacks.clone(), // Handlers reset above; the cell itself is session-scoped
                     session_store: session_store.clone(), // Committed store state survives reload
                     catalogue: catalogue.clone(),         // Samples are session history
                     gmcp: old_gmcp, // Session-scoped: enabled tracks the surviving connection
@@ -700,6 +795,21 @@ impl Runtime {
 
             info!("Unregistering session");
             registry::unregister_session(session_id);
+
+            // This is the last owner after `Inner` (and therefore every script
+            // isolate) has been dropped above. Consume the Tokio runtime explicitly:
+            // dropping it implicitly at closure return waits forever for a stuck
+            // `spawn_blocking` task, which in turn makes the UI's
+            // `join_runtime_threads()` hang after the main window is already gone.
+            // A bounded shutdown cancels async work immediately and caps the wait for
+            // blocking Deno resources/ops.
+            let runtime = Rc::try_unwrap(runtime).unwrap_or_else(|runtime| {
+                panic!(
+                    "session Tokio runtime still has {} owners after Inner teardown",
+                    Rc::strong_count(&runtime)
+                )
+            });
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
             info!("Runtime thread shutting down");
         });
@@ -770,6 +880,12 @@ struct Inner<'a> {
     /// window instead of waiting for the 500 ms safety tick.
     catalogue_resend_at: Option<tokio::time::Instant>,
     connection: Option<Connection>,
+    /// The session's current main-pane character grid, packed with
+    /// `connection::responders::pack_dims`. Updated by
+    /// `RuntimeAction::WindowSizeChanged` and handed to every [`Connection`] this
+    /// session creates, so a connect after a resize seeds its NAWS responder with
+    /// the real size. Session-lifetime (survives reloads, like the connection).
+    window_size: Arc<std::sync::atomic::AtomicU32>,
     pending_buffer_updates: Vec<BufferUpdate>,
     hotkeys: BTreeMap<HotkeyId, (IsolateId, ScriptAction)>,
     next_hotkey_id: HotkeyId,
@@ -800,6 +916,23 @@ struct Inner<'a> {
     /// Per-line gag/redirect/copy state, shared into every isolate's ops beside
     /// `pending_line_operations` and taken (cleared) once per line event.
     line_routing: SharedLineRouting,
+    /// The input mirror, shared (the same `Rc`) into every isolate's input read ops.
+    /// Written by the `InputStateChanged` dispatch arm; preserved across reload.
+    input_mirror: SharedInputMirror,
+    /// The in-flight typed submission slot, shared into every isolate's submission ops.
+    /// Its live cell is `Some` only between the `SubmitInput` dispatch arm's `sys:input`
+    /// handler splice and the `CompleteInputSubmission` that consumes it.
+    input_submission: SharedInputSubmission,
+    /// The completion word sets (`docs/input.md` §3.8), shared into every
+    /// isolate's registry ops (which mutate/read them synchronously). The
+    /// `InputWordSetsChanged` dispatch arm builds the merged view from here; the reload
+    /// path resets the contributions (engine-scoped contents, like hotkeys).
+    input_word_sets: SharedInputWordSets,
+    /// The pane-input `onSubmit` registry (`docs/input.md` §3.7), shared into
+    /// every isolate's pane ops (the registration op writes it). The `PaneInputSubmit`
+    /// dispatch arm resolves submissions through it; the reload path resets it (handler
+    /// addresses are engine facts, like the word sets).
+    pane_input_callbacks: SharedPaneInputCallbacks,
     /// The session store, shared (the same `Rc`) into every isolate's ops. Writes journal in
     /// the ops; [`Self::flush_session_store`] commits the journal once per turn and queues the
     /// coalesced watch deliveries. The committed tree survives reloads (like `recent_lines`).
@@ -809,11 +942,11 @@ struct Inner<'a> {
     /// message bus is engine-wired only — the run loop never touches it, so `Inner` doesn't
     /// hold it; the reload arm resets it through the thread-local handle.)
     catalogue: SharedCatalogue,
-    /// The host-side GMCP producer (`docs/gmcp-plan.md` §4): merge keys, parse memoization,
+    /// The host-side GMCP producer (`docs/gmcp.md` §4): merge keys, parse memoization,
     /// and the enabled flag, driven by the `Gmcp*` dispatch arms. Session-scoped like the
     /// store subtree it writes.
     gmcp: gmcp::GmcpProducer,
-    /// The host-side MSDP producer (`docs/gmcp-mapping-plan.md` §9 item 3), driven by the
+    /// The host-side MSDP producer (`docs/gmcp-mapping.md` §9 item 3), driven by the
     /// `Msdp*` dispatch arms. Session-scoped like the store subtree it writes; it holds
     /// no engine facts, so reloads carry it across whole.
     msdp: msdp::MsdpProducer,
@@ -1628,7 +1761,7 @@ impl Inner<'_> {
                 // without the loop being anywhere near parking. Run the between-actions
                 // bookkeeping, then take the next action WITHOUT the before-park flush —
                 // that skip is what lets a burst's lines coalesce into batched UI events
-                // (bounded by the storm threshold below and the reader's per-chunk
+                // (bounded by the storm threshold below and the reader's per-read-batch
                 // `RequestRepaint`) instead of one awaited UI event per line.
                 self.drain_point_bookkeeping();
                 trace!("Handling external action: {external_action:?}");
@@ -1674,8 +1807,9 @@ impl Inner<'_> {
                         trace!("Readiness branch: isolate made progress, re-entering Phase 1");
                         // Yield once before re-entering Phase 1 so a perpetually-`Ready` isolate
                         // (a hot microtask/timer loop, or a script erroring on every poll) cannot
-                        // busy-spin this current-thread runtime and starve the connection reader
-                        // task spawned onto it. The branch only resolves on an actual wake, so this
+                        // busy-spin this current-thread runtime and starve tasks spawned onto it
+                        // (deno op tasks and timers; the socket reader runs on its own runtime).
+                        // The branch only resolves on an actual wake, so this
                         // never affects idle parking; it bounds a pathological spin to one extra
                         tokio::task::yield_now().await;
                         continue;

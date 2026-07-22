@@ -35,7 +35,12 @@ const LINK_WASH_ALPHA: f32 = 0.14;
 /// `DefaultBackground` at the op boundary and so still washes, while a background
 /// literally painted the theme's background color counts as explicit and doesn't.
 #[inline]
-fn make_span(text: &str, style: Style, linked: bool, palette: &TerminalPalette) -> Span<'static, Link> {
+fn make_span(
+    text: &str,
+    style: Style,
+    linked: bool,
+    palette: &TerminalPalette,
+) -> Span<'static, Link> {
     let fg = palette.resolve(style.fg);
     let mut span = Span::<'static, Link>::new(Cow::Owned(text.to_string())).color(fg);
     // Only a meaningful background sets the span highlight: the widget draws a
@@ -57,12 +62,20 @@ fn make_span(text: &str, style: Style, linked: bool, palette: &TerminalPalette) 
 /// given palette. Style spans are split at link boundaries so linked ranges get
 /// the link affordance without disturbing the line's own colors.
 #[inline]
-fn to_spans(styled_line: &Arc<StyledLine>, palette: &TerminalPalette) -> Rc<Vec<Span<'static, Link>>> {
+fn to_spans(
+    styled_line: &Arc<StyledLine>,
+    palette: &TerminalPalette,
+) -> Rc<Vec<Span<'static, Link>>> {
     let mut spans = Vec::with_capacity(styled_line.spans.len());
     for span_info in &styled_line.spans {
         let (begin, end) = (span_info.begin_pos, span_info.end_pos);
         if styled_line.links.is_empty() || begin == end {
-            spans.push(make_span(&styled_line.text[begin..end], span_info.style, false, palette));
+            spans.push(make_span(
+                &styled_line.text[begin..end],
+                span_info.style,
+                false,
+                palette,
+            ));
             continue;
         }
         // Links are sorted and non-overlapping; walk the ones intersecting this span,
@@ -94,7 +107,12 @@ fn to_spans(styled_line: &Arc<StyledLine>, palette: &TerminalPalette) -> Rc<Vec<
             cursor = linked_end;
         }
         if cursor < end {
-            spans.push(make_span(&styled_line.text[cursor..end], span_info.style, false, palette));
+            spans.push(make_span(
+                &styled_line.text[cursor..end],
+                span_info.style,
+                false,
+                palette,
+            ));
         }
     }
     Rc::new(spans)
@@ -402,10 +420,7 @@ impl TerminalBuffer {
                 // Clamp to the live range `(offset, last_line_number]` and bail
                 // when nothing overlaps, so the subtraction below never
                 // underflows and `self.lines[i]` never indexes out of bounds.
-                if self.lines.is_empty()
-                    || to.line <= offset
-                    || from.line > self.last_line_number
-                {
+                if self.lines.is_empty() || to.line <= offset || from.line > self.last_line_number {
                     return String::new();
                 }
                 let first_line = from.line.max(offset + 1);
@@ -456,7 +471,12 @@ impl TerminalBuffer {
     ///
     /// # Arguments
     /// * `prefix` - The prefix to match against (case-insensitive)
-    /// * `skip_words_in` - Optional set of words to ignore in the search
+    /// * `skip_words_in` - Optional set of words to ignore in the search (exact match)
+    /// * `skip_words_folded` - Borrowed sets of lowercase-folded words to
+    ///   ignore case-insensitively (candidates are folded before the check):
+    ///   the completion blacklist and the offered-registered-suggestion
+    ///   filter, passed as the caller already holds them — no per-call union
+    ///   set is materialized
     /// * `n_recent_lines` - Number of recent lines to search through
     ///
     /// # Returns
@@ -465,6 +485,7 @@ impl TerminalBuffer {
         &self,
         prefix: &str,
         skip_words_in: Option<&HashSet<String>>,
+        skip_words_folded: &[&HashSet<String>],
         n_recent_lines: usize,
     ) -> Option<String> {
         let lowercase_prefix = prefix.to_lowercase();
@@ -486,14 +507,20 @@ impl TerminalBuffer {
             }
 
             if let Some(history) = skip_words_in
-                && history.contains(candidate_for_match) {
-                    return None;
-                }
-
-            if candidate_for_match
-                .to_lowercase()
-                .starts_with(&lowercase_prefix)
+                && history.contains(candidate_for_match)
             {
+                return None;
+            }
+
+            let folded_candidate = candidate_for_match.to_lowercase();
+            if skip_words_folded
+                .iter()
+                .any(|folded| folded.contains(&folded_candidate))
+            {
+                return None;
+            }
+
+            if folded_candidate.starts_with(&lowercase_prefix) {
                 return Some(candidate_for_match.to_string());
             }
 
@@ -528,18 +555,20 @@ impl TerminalBuffer {
                         if is_segment_delimiter(ch) {
                             if let Some(start) = segment_start.take()
                                 && start != idx
-                                    && let Some(result) = consider_candidate(&word[start..idx]) {
-                                        return Some(result);
-                                    }
+                                && let Some(result) = consider_candidate(&word[start..idx])
+                            {
+                                return Some(result);
+                            }
                         } else if segment_start.is_none() {
                             segment_start = Some(idx);
                         }
                     }
 
                     if let Some(start) = segment_start
-                        && let Some(result) = consider_candidate(&word[start..]) {
-                            return Some(result);
-                        }
+                        && let Some(result) = consider_candidate(&word[start..])
+                    {
+                        return Some(result);
+                    }
                 }
                 None
             })
@@ -804,7 +833,11 @@ mod tests {
     fn linked_line(text: &str, begin: usize, end: usize) -> Arc<StyledLine> {
         use smudgy_core::session::styled_line::{LinkSpan, VtSpan};
         let style = Style {
-            fg: Color::Rgb { r: 200, g: 10, b: 10 },
+            fg: Color::Rgb {
+                r: 200,
+                g: 10,
+                b: 10,
+            },
             bg: Color::DefaultBackground,
         };
         let mut line = StyledLine::new(
@@ -838,7 +871,11 @@ mod tests {
         // the segments around it keep the plain background.
         assert!(!spans[0].underline && !spans[2].underline);
         assert!(spans[1].underline);
-        let fg = palette.resolve(Color::Rgb { r: 200, g: 10, b: 10 });
+        let fg = palette.resolve(Color::Rgb {
+            r: 200,
+            g: 10,
+            b: 10,
+        });
         assert_eq!(
             spans[1].highlight.map(|h| h.background),
             Some(Background::Color(iced::Color {
@@ -856,7 +893,11 @@ mod tests {
     fn to_spans_keeps_explicit_background_under_a_link() {
         use smudgy_core::session::styled_line::{LinkSpan, VtSpan};
         let style = Style {
-            fg: Color::Rgb { r: 200, g: 10, b: 10 },
+            fg: Color::Rgb {
+                r: 200,
+                g: 10,
+                b: 10,
+            },
             bg: Color::Rgb { r: 1, g: 2, b: 3 },
         };
         let mut line = StyledLine::new(
@@ -879,9 +920,11 @@ mod tests {
         assert!(spans[0].underline);
         assert_eq!(
             spans[0].highlight.map(|h| h.background),
-            Some(Background::Color(
-                palette.resolve(Color::Rgb { r: 1, g: 2, b: 3 })
-            ))
+            Some(Background::Color(palette.resolve(Color::Rgb {
+                r: 1,
+                g: 2,
+                b: 3
+            })))
         );
     }
 
@@ -897,7 +940,10 @@ mod tests {
             Some(LinkAction::Send(Arc::from("north")))
         );
         // Boundary semantics: begin inclusive, end exclusive.
-        assert_eq!(buffer.link_at(2, 3), Some(LinkAction::Send(Arc::from("north"))));
+        assert_eq!(
+            buffer.link_at(2, 3),
+            Some(LinkAction::Send(Arc::from("north")))
+        );
         assert_eq!(buffer.link_at(2, 8), None);
         // Off-link text, another line, and out-of-window numbers all miss.
         assert_eq!(buffer.link_at(2, 0), None);
@@ -916,27 +962,27 @@ mod tests {
 
         // Test basic prefix matching
         assert_eq!(
-            buffer.find_recent_word_by_prefix("pref", None, 4),
+            buffer.find_recent_word_by_prefix("pref", None, &[], 4),
             Some("prefix_again".to_string())
         );
         assert_eq!(
-            buffer.find_recent_word_by_prefix("pref", None, 2),
+            buffer.find_recent_word_by_prefix("pref", None, &[], 2),
             Some("prefix_again".to_string())
         ); // Only search last 2 lines
         assert_eq!(
-            buffer.find_recent_word_by_prefix("anot", None, 4),
+            buffer.find_recent_word_by_prefix("anot", None, &[], 4),
             Some("another".to_string())
         );
 
         // Test case-insensitivity
         assert_eq!(
-            buffer.find_recent_word_by_prefix("PREFIX", None, 4),
+            buffer.find_recent_word_by_prefix("PREFIX", None, &[], 4),
             Some("prefix_again".to_string())
         );
 
         // Test not found
         assert_eq!(
-            buffer.find_recent_word_by_prefix("nonexistent", None, 4),
+            buffer.find_recent_word_by_prefix("nonexistent", None, &[], 4),
             None
         );
 
@@ -944,20 +990,23 @@ mod tests {
         let mut skip_set = HashSet::new();
         skip_set.insert("prefix_again".to_string());
         assert_eq!(
-            buffer.find_recent_word_by_prefix("pref", Some(&skip_set), 4),
+            buffer.find_recent_word_by_prefix("pref", Some(&skip_set), &[], 4),
             Some("prefix_found".to_string())
         );
 
         skip_set.insert("prefix_found".to_string());
         assert_eq!(
-            buffer.find_recent_word_by_prefix("pref", Some(&skip_set), 4),
+            buffer.find_recent_word_by_prefix("pref", Some(&skip_set), &[], 4),
             None
         ); // All "pref" words skipped
 
         // Test n_recent_lines
-        assert_eq!(buffer.find_recent_word_by_prefix("hello", None, 1), None); // "hello" is not in the last line
         assert_eq!(
-            buffer.find_recent_word_by_prefix("hello", None, 4),
+            buffer.find_recent_word_by_prefix("hello", None, &[], 1),
+            None
+        ); // "hello" is not in the last line
+        assert_eq!(
+            buffer.find_recent_word_by_prefix("hello", None, &[], 4),
             Some("hello".to_string())
         ); // "hello" is in the last 4 lines
     }
@@ -971,37 +1020,37 @@ mod tests {
         buffer.push_line(sl("An alert militia guard misses Zurek with his slash."));
 
         assert_eq!(
-            buffer.find_recent_word_by_prefix("sc", None, 5),
+            buffer.find_recent_word_by_prefix("sc", None, &[], 5),
             Some("SC".to_string())
         );
         assert_eq!(
-            buffer.find_recent_word_by_prefix("sc:", None, 5),
+            buffer.find_recent_word_by_prefix("sc:", None, &[], 5),
             Some("SC:Order".to_string())
         );
         assert_eq!(
-            buffer.find_recent_word_by_prefix("rr", None, 5),
+            buffer.find_recent_word_by_prefix("rr", None, &[], 5),
             Some("Rr'Kar".to_string())
         );
         assert_eq!(
-            buffer.find_recent_word_by_prefix("gu", None, 5),
+            buffer.find_recent_word_by_prefix("gu", None, &[], 5),
             Some("guard".to_string())
         );
         assert_eq!(
-            buffer.find_recent_word_by_prefix("guard:", None, 5),
+            buffer.find_recent_word_by_prefix("guard:", None, &[], 5),
             Some("guard:Awful".to_string())
         );
 
         buffer.push_line(sl("Half-orc's strike leaves a scratch-!"));
         assert_eq!(
-            buffer.find_recent_word_by_prefix("half", None, 5),
+            buffer.find_recent_word_by_prefix("half", None, &[], 5),
             Some("Half-orc".to_string())
         );
         assert_eq!(
-            buffer.find_recent_word_by_prefix("half-orc'", None, 5),
+            buffer.find_recent_word_by_prefix("half-orc'", None, &[], 5),
             Some("Half-orc's".to_string())
         );
         assert_eq!(
-            buffer.find_recent_word_by_prefix("scr", None, 5),
+            buffer.find_recent_word_by_prefix("scr", None, &[], 5),
             Some("scratch".to_string())
         );
     }

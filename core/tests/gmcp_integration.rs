@@ -1,4 +1,4 @@
-//! End-to-end GMCP producer coverage (`docs/gmcp-plan.md` §10): runtime actions in —
+//! End-to-end GMCP producer coverage (`docs/gmcp.md` §10): runtime actions in —
 //! exactly what the connection task's telnet bridge enqueues — and the script-facing
 //! surface out: the `smudgy:state/gmcp` consumer handle (`.value`/`watch`/`onWrite`),
 //! the `smudgy:events/gmcp` readiness events, the `gmcp` namespace on `smudgy:core`,
@@ -50,7 +50,7 @@ createTrigger(/^The Fen of Sorrows$/, () => {
     echo("TRIGGER_ROOM:" + gmcp.value?.Room?.Info?.num);
 });
 
-// Outbound surface (docs/gmcp-plan.md 6.3), main isolate (allow-all): a send before
+// Outbound surface (docs/gmcp.md 6.3), main isolate (allow-all): a send before
 // negotiation drops with a one-time notice; mergeKeys extends the deep-merge set, observed
 // through the Char.Defences deltas the test injects after enabling.
 gmcpCtl.send("Char.Items.Inv");
@@ -190,7 +190,7 @@ async fn gmcp_pipeline_end_to_end() {
     assert!(
         lines.iter().any(|l| l == "HP_WATCH:number:4123"),
         "a watch scoped BELOW the message name delivers the bare scalar at that path \
-         (sub-message granularity, docs/gmcp-plan.md \u{a7}3.2).\n{transcript}"
+         (sub-message granularity, docs/gmcp.md \u{a7}3.2).\n{transcript}"
     );
     assert_eq!(
         lines
@@ -204,7 +204,7 @@ async fn gmcp_pipeline_end_to_end() {
     assert!(
         lines.iter().any(|l| l == "TRIGGER_ROOM:32519"),
         "a trigger on the line following Room.Info reads the flushed room number \
-         (the wire-order guarantee, docs/gmcp-plan.md \u{a7}3.3).\n{transcript}"
+         (the wire-order guarantee, docs/gmcp.md \u{a7}3.3).\n{transcript}"
     );
     assert!(
         lines.iter().any(|l| l == "CLOSED_EVENT"),
@@ -221,6 +221,6 @@ async fn gmcp_pipeline_end_to_end() {
             .iter()
             .any(|l| l.starts_with("DEFENCES:") && l.contains("shield") && l.contains("armor")),
         "gmcp.mergeKeys makes the second Char.Defences delta merge, not replace \
-         (docs/gmcp-plan.md \u{a7}4.3).\n{transcript}"
+         (docs/gmcp.md \u{a7}4.3).\n{transcript}"
     );
 }

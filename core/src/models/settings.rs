@@ -142,6 +142,9 @@ pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
 ///
 /// Note: any `api_key` entry in settings.json is ignored — cloud access is
 /// account-based (session tokens in the OS secret store), not key-based.
+// Independent user toggles persisted as JSON; the enum/state-machine shape the
+// `struct_excessive_bools` suggestion points at doesn't fit a settings file.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Settings {
     /// The maximum number of lines to keep in the scrollback buffer.
@@ -206,6 +209,12 @@ pub struct Settings {
     /// [`CommandInputBehavior`].
     #[serde(default)]
     pub command_input_behavior: CommandInputBehavior,
+    /// Mask the command input while the server hides echo (telnet `WILL
+    /// ECHO`, the standard password-prompt signal — RFC 857). On by default;
+    /// off answers the negotiation the same way but leaves the input
+    /// unmasked (the Mudlet `mDisablePasswordMasking` opt-out).
+    #[serde(default = "default_true")]
+    pub mask_input_on_server_echo: bool,
 
     /// Hide session/pane headers (title bars) unless the window's toolbar is
     /// expanded — the distraction-free default. Off shows every header all
@@ -491,6 +500,7 @@ impl Default for Settings {
             command_separator: default_command_separator(),
             raw_line_prefix: default_raw_line_prefix(),
             command_input_behavior: CommandInputBehavior::default(),
+            mask_input_on_server_echo: true,
             hide_pane_headers: true,
             disabled_map_areas: Vec::new(),
             map_area_prefs: Vec::new(),
@@ -930,6 +940,24 @@ mod tests {
             .unwrap()
             .contains("\"command_input_behavior\":\"clear\"")
         );
+    }
+
+    #[test]
+    fn mask_input_on_server_echo_defaults_on_and_round_trips_off() {
+        // A settings file predating the field deserializes to on (auto-mask
+        // enabled), not an error.
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("parse");
+        assert!(settings.mask_input_on_server_echo);
+
+        // The opt-out survives a round-trip.
+        let opted_out = Settings {
+            mask_input_on_server_echo: false,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&opted_out).unwrap()).expect("parse");
+        assert!(!parsed.mask_input_on_server_echo);
     }
 
     #[test]

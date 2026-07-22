@@ -1,4 +1,5 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use iced::{
     Length, Point, Rectangle, Size, Vector,
@@ -7,11 +8,11 @@ use iced::{
 };
 use smudgy_cloud::{AreaId, Mapper, RoomNumber, mapper::RoomKey};
 
-use iced_anim::{Animated, Animation, Event as AnimEvent, spring::Motion, transition::Easing};
+use iced_anim::{Animated, spring::Motion, transition::Easing};
 
 use crate::{Update, render, viewport::Viewport};
 use iced::event::Event as IcedEvent;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 pub type Renderer = iced::Renderer;
 pub type Theme = smudgy_theme::Theme;
 pub type Element<'a, Message> = iced::Element<'a, Message, Theme, Renderer>;
@@ -45,8 +46,11 @@ pub enum Message {
     Translated(Vector),
     Scaled(f32, Option<Vector>),
     SetHoveredRoom(Option<RoomKey>),
-    UpdateTranslation(AnimEvent<Vector>),
-    UpdateAreaOpacity(AnimEvent<f32>),
+    /// Advance both in-flight animations (pan spring + area fade) to `now`.
+    /// Published by the canvas program on any event while animating; the
+    /// publish schedules a redraw, whose `RedrawRequested` produces the next
+    /// tick, so the loop self-sustains until both values settle.
+    AnimationTick(Instant),
 }
 
 #[derive(Debug, Clone)]
@@ -139,11 +143,10 @@ impl MapView {
 
     pub fn update(&mut self, message: Message) -> Update<Message, Event> {
         match message {
-            Message::UpdateTranslation(event) => {
-                let was_tick = matches!(event, AnimEvent::Tick(_));
+            Message::AnimationTick(now) => {
                 let previous = *self.translation.value();
-                self.translation.update(event);
-                if was_tick && self.translation_velocity_exceeds_threshold(previous) {
+                self.translation.tick(now);
+                if self.translation_velocity_exceeds_threshold(previous) {
                     if std::env::var_os("SMUDGY_MAP_DEBUG").is_some() {
                         eprintln!(
                             "map update: velocity guard tripped, settling at {:?} (was {previous:?})",
@@ -152,10 +155,7 @@ impl MapView {
                     }
                     self.translation.settle();
                 }
-                Update::none()
-            }
-            Message::UpdateAreaOpacity(event) => {
-                self.area_opacity.update(event);
+                self.area_opacity.tick(now);
                 self.handle_fade_progress();
                 Update::none()
             }
@@ -245,25 +245,10 @@ impl MapView {
         }
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
-        Animation::<f32, Message, Theme, Renderer>::new(
-            &self.area_opacity,
-            Animation::<Vector, Message, Theme, Renderer>::new(
-                &self.translation,
-                // Clip to widget bounds: the canvas draws rooms within
-                // SPATIAL_QUERY_PADDING of the visible region, which can land
-                // outside it. wgpu hides the spill (full-frame redraws paint
-                // neighbors over it); tiny-skia's damage-tracked partial
-                // redraws leave it on screen.
-                container(Canvas::new(self).width(Length::Fill).height(Length::Fill))
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .clip(true),
-            )
-            .on_update(Message::UpdateTranslation),
-        )
-        .on_update(Message::UpdateAreaOpacity)
-        .into()
+    /// Whether either animated value (pan spring, area fade) is in flight —
+    /// the gate for publishing [`Message::AnimationTick`].
+    fn is_animating(&self) -> bool {
+        self.translation.is_animating() || self.area_opacity.is_animating()
     }
 
     #[inline]
@@ -402,10 +387,8 @@ impl MapView {
     }
 }
 
-impl canvas::Program<Message, Theme> for MapView {
-    type State = ProgramState;
-
-    fn update(
+impl MapView {
+    fn handle_event(
         &self,
         state: &mut ProgramState,
         event: &IcedEvent,
@@ -488,14 +471,7 @@ impl canvas::Program<Message, Theme> for MapView {
         }
     }
 
-    fn draw(
-        &self,
-        _state: &ProgramState,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
+    fn draw_geometry(&self, renderer: &Renderer, bounds: Rectangle) -> Vec<canvas::Geometry> {
         // Geometry is rebuilt from scratch every frame (no canvas::Cache), so
         // build time is the frame-time cost of this widget. Only sample the
         // clock when debugging is on so the normal path pays nothing.
@@ -638,5 +614,128 @@ impl canvas::Program<Message, Theme> for MapView {
         }
 
         vec![frame.into_geometry()]
+    }
+}
+
+/// A cheaply cloneable, owning handle to a [`MapView`] — the canvas program
+/// the map widget renders through. The element it builds owns an `Rc` of the
+/// view, so it is genuinely `'static`: iced can retain it across frames and
+/// outlive the store entry that created it without any borrow dangling.
+#[derive(Clone)]
+pub struct SharedMapView {
+    view: Rc<RefCell<MapView>>,
+}
+
+impl SharedMapView {
+    #[must_use]
+    pub fn new(view: Rc<RefCell<MapView>>) -> Self {
+        Self { view }
+    }
+
+    /// The widget element: the map canvas, clipped to its bounds. The canvas
+    /// draws rooms within `SPATIAL_QUERY_PADDING` of the visible region,
+    /// which can land outside it. wgpu hides the spill (full-frame redraws
+    /// paint neighbors over it); tiny-skia's damage-tracked partial redraws
+    /// leave it on screen — hence the clipping container.
+    #[must_use]
+    pub fn element(&self) -> Element<'static, Message> {
+        container(
+            Canvas::new(self.clone())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .clip(true)
+        .into()
+    }
+}
+
+impl canvas::Program<Message, Theme> for SharedMapView {
+    type State = ProgramState;
+
+    fn update(
+        &self,
+        state: &mut ProgramState,
+        event: &IcedEvent,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<Message>> {
+        let view = self.view.borrow();
+        let action = view.handle_event(state, event, bounds, cursor);
+        if !view.is_animating() {
+            return action;
+        }
+
+        // While a spring/fade is in flight, every event must end in a
+        // publish (this program subsumes iced_anim's `Animation` widget so
+        // the element can own its state): a publish always schedules a
+        // redraw, and that redraw's `RedrawRequested` arrives back here to
+        // produce the next tick. An event's own published message takes
+        // precedence over a tick — its redraw delivers the tick one event
+        // later.
+        let tick = Message::AnimationTick(Instant::now());
+        let Some(action) = action else {
+            return Some(canvas::Action::publish(tick));
+        };
+        let (message, _redraw_request, status) = action.into_inner();
+        let action = canvas::Action::publish(message.unwrap_or(tick));
+        Some(if status == iced::event::Status::Captured {
+            action.and_capture()
+        } else {
+            action
+        })
+    }
+
+    fn draw(
+        &self,
+        _state: &ProgramState,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        self.view.borrow().draw_geometry(renderer, bounds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smudgy_cloud::{LocalBackend, Uuid};
+    use std::rc::Weak;
+    use std::sync::Arc;
+
+    /// The element must own its `MapView`: every store-side handle can drop
+    /// while iced still retains the element, and the view stays alive until
+    /// the element itself goes — the ownership guarantee that replaced the
+    /// former `'static` lifetime transmute.
+    #[tokio::test]
+    async fn element_owns_the_map_view() {
+        let cache_dir = std::env::temp_dir()
+            .join("smudgy-map-widget-test")
+            .join(format!("cache-{}", std::process::id()));
+        let mapper = Mapper::new(
+            Arc::new(LocalBackend::new(cache_dir.join("local"))),
+            cache_dir,
+        );
+
+        let view = Rc::new(RefCell::new(MapView::new(mapper, AreaId(Uuid::nil()))));
+        let weak: Weak<RefCell<MapView>> = Rc::downgrade(&view);
+
+        let shared = SharedMapView::new(Rc::clone(&view));
+        let element = shared.element();
+        drop(shared);
+        drop(view);
+
+        assert!(
+            weak.upgrade().is_some(),
+            "the element must keep the view alive"
+        );
+        drop(element);
+        assert!(
+            weak.upgrade().is_none(),
+            "dropping the element must free the view"
+        );
     }
 }

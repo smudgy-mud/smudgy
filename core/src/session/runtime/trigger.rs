@@ -15,7 +15,9 @@ use regex::{Regex, RegexSet};
 use super::{
     ActionQueue, ScriptAction,
     matcher::PatternSet,
-    origin::{AutomationBody, AutomationDelta, AutomationKind, AutomationSummary, IsolateId, Origin},
+    origin::{
+        AutomationBody, AutomationDelta, AutomationKind, AutomationSummary, IsolateId, Origin,
+    },
 };
 
 /// One automation's introspectable state for the `session.triggers`/`session.aliases`
@@ -27,10 +29,16 @@ use super::{
 pub struct AutomationEntry {
     pub enabled: bool,
     pub pattern: String,
+    pub priority: i32,
+    pub fallthrough: bool,
 }
 
 /// `name -> entry` within one `(IsolateId, Origin)` namespace.
 type AutomationNamespace = HashMap<String, AutomationEntry>;
+
+/// Stop state for one alias/trigger dispatch, partitioned by creator so one package cannot
+/// suppress another package's (or the user's) automations.
+type FallthroughScopes = HashMap<(IsolateId, Origin), Arc<AtomicBool>>;
 
 /// The introspection mirror the `get`/`list`/`exists` ops read. Keyed by
 /// `(IsolateId, Origin)` exactly like the [`Manager`]'s own indices, so a caller only ever
@@ -144,9 +152,7 @@ pub struct MatchCapture {
 /// Unknown / empty / non-participating groups expand to the empty string.
 #[must_use]
 pub fn expand_template(template: &str, captures: &[MatchCapture]) -> String {
-    let lookup_index = |idx: usize| -> &str {
-        captures.get(idx).map_or("", |c| c.value.as_str())
-    };
+    let lookup_index = |idx: usize| -> &str { captures.get(idx).map_or("", |c| c.value.as_str()) };
     let lookup_name = |name: &str| -> &str {
         captures
             .iter()
@@ -248,6 +254,8 @@ pub struct PushTriggerParams<'a> {
     pub action: ScriptAction,
     pub prompt: bool,
     pub enabled: bool,
+    pub priority: i32,
+    pub fallthrough: bool,
     pub fire_limit: Option<u32>,
     pub line_limit: Option<u32>,
     /// Display-only body source for the read-only detail pane: the JS/TS eval string, or a
@@ -403,9 +411,9 @@ impl Manager {
     /// `ScriptAction` itself.
     fn body_display(item: &Trigger) -> AutomationBody {
         match &item.script {
-            ScriptAction::SendRaw(s) | ScriptAction::SendSimple(s) => {
-                AutomationBody::Command(item.source.clone().unwrap_or_else(|| Arc::from(s.as_str())))
-            }
+            ScriptAction::SendRaw(s) | ScriptAction::SendSimple(s) => AutomationBody::Command(
+                item.source.clone().unwrap_or_else(|| Arc::from(s.as_str())),
+            ),
             ScriptAction::EvalJavascript(_) | ScriptAction::CallJavascriptFunction(_) => {
                 AutomationBody::Script(item.source.clone())
             }
@@ -433,6 +441,8 @@ impl Manager {
         let entry = AutomationEntry {
             enabled: item.enabled,
             pattern: Self::pattern_of(item),
+            priority: item.priority,
+            fallthrough: item.fallthrough,
         };
         let key = (item.isolate.clone(), item.origin.clone());
         let mut registry = self.automation_registry.borrow_mut();
@@ -567,6 +577,8 @@ impl Manager {
         name: &Arc<String>,
         patterns: &Arc<Vec<String>>,
         script_id: ScriptId,
+        priority: i32,
+        fallthrough: bool,
         fire_limit: Option<u32>,
         source: Option<Arc<str>>,
     ) -> Result<()> {
@@ -577,6 +589,8 @@ impl Manager {
                 name.to_string(),
                 patterns.iter(),
                 ScriptAction::EvalJavascript(script_id),
+                priority,
+                fallthrough,
                 fire_limit,
             )?
             .with_source(source),
@@ -596,6 +610,8 @@ impl Manager {
                 params.action,
                 params.prompt,
                 params.enabled,
+                params.priority,
+                params.fallthrough,
                 params.fire_limit,
                 params.line_limit,
             )?
@@ -612,6 +628,8 @@ impl Manager {
         name: Arc<String>,
         patterns: Arc<Vec<String>>,
         function_id: FunctionId,
+        priority: i32,
+        fallthrough: bool,
         fire_limit: Option<u32>,
         source: Option<Arc<str>>,
     ) -> Result<()> {
@@ -622,6 +640,8 @@ impl Manager {
                 name.to_string(),
                 patterns.iter(),
                 ScriptAction::CallJavascriptFunction(function_id),
+                priority,
+                fallthrough,
                 fire_limit,
             )?
             .with_source(source),
@@ -636,6 +656,8 @@ impl Manager {
         name: Arc<String>,
         patterns: Arc<Vec<String>>,
         script: Arc<String>,
+        priority: i32,
+        fallthrough: bool,
         fire_limit: Option<u32>,
     ) -> Result<()> {
         self.add_or_update_alias(Trigger::new_alias(
@@ -644,38 +666,48 @@ impl Manager {
             name.to_string(),
             patterns.iter(),
             ScriptAction::SendSimple(script),
+            priority,
+            fallthrough,
             fire_limit,
         )?);
         Ok(())
     }
 
-    pub fn enable_alias(&mut self, isolate: &IsolateId, origin: &Origin, name: &str, enabled: bool) {
+    pub fn enable_alias(
+        &mut self,
+        isolate: &IsolateId,
+        origin: &Origin,
+        name: &str,
+        enabled: bool,
+    ) {
         let mut changed = false;
         if let Some(index) = self
             .alias_indices
             .get(&(isolate.clone(), origin.clone()))
             .and_then(|by_name| by_name.get(name))
             .copied()
-            && let Some(alias) = self.aliases.get_mut(index) {
-                trace!(
-                    "{} alias: {:?}, {:?}",
-                    if enabled { "Enabling" } else { "Disabling" },
-                    alias.name,
-                    alias.patterns
-                );
-                alias.enabled = enabled;
-                changed = true;
-            }
+            && let Some(alias) = self.aliases.get_mut(index)
+        {
+            trace!(
+                "{} alias: {:?}, {:?}",
+                if enabled { "Enabling" } else { "Disabling" },
+                alias.name,
+                alias.patterns
+            );
+            alias.enabled = enabled;
+            changed = true;
+        }
         if changed {
             self.registry_set_enabled(AutomationKind::Alias, isolate, origin, name, enabled);
         }
         if changed && self.is_watched() && *origin != Origin::User {
-            self.automation_deltas.push(AutomationDelta::EnabledChanged {
-                kind: AutomationKind::Alias,
-                origin: origin.clone(),
-                name: name.to_string(),
-                enabled,
-            });
+            self.automation_deltas
+                .push(AutomationDelta::EnabledChanged {
+                    kind: AutomationKind::Alias,
+                    origin: origin.clone(),
+                    name: name.to_string(),
+                    enabled,
+                });
         }
     }
 
@@ -692,26 +724,28 @@ impl Manager {
             .get(&(isolate.clone(), origin.clone()))
             .and_then(|by_name| by_name.get(name))
             .copied()
-            && let Some(trigger) = self.triggers.get_mut(index) {
-                trace!(
-                    "{} trigger: {:?}, {:?}",
-                    if enabled { "Enabling" } else { "Disabling" },
-                    trigger.name,
-                    trigger.patterns
-                );
-                trigger.enabled = enabled;
-                changed = true;
-            }
+            && let Some(trigger) = self.triggers.get_mut(index)
+        {
+            trace!(
+                "{} trigger: {:?}, {:?}",
+                if enabled { "Enabling" } else { "Disabling" },
+                trigger.name,
+                trigger.patterns
+            );
+            trigger.enabled = enabled;
+            changed = true;
+        }
         if changed {
             self.registry_set_enabled(AutomationKind::Trigger, isolate, origin, name, enabled);
         }
         if changed && self.is_watched() && *origin != Origin::User {
-            self.automation_deltas.push(AutomationDelta::EnabledChanged {
-                kind: AutomationKind::Trigger,
-                origin: origin.clone(),
-                name: name.to_string(),
-                enabled,
-            });
+            self.automation_deltas
+                .push(AutomationDelta::EnabledChanged {
+                    kind: AutomationKind::Trigger,
+                    origin: origin.clone(),
+                    name: name.to_string(),
+                    enabled,
+                });
         }
     }
 
@@ -721,7 +755,13 @@ impl Manager {
     /// entry, and emit a [`AutomationDelta::Removed`] for the watching UI. A no-op if the key
     /// is unknown (e.g. a double `delete()`).
     pub fn remove_alias(&mut self, isolate: &IsolateId, origin: &Origin, name: &str) {
-        if Self::remove_named(&mut self.aliases, &mut self.alias_indices, isolate, origin, name) {
+        if Self::remove_named(
+            &mut self.aliases,
+            &mut self.alias_indices,
+            isolate,
+            origin,
+            name,
+        ) {
             self.alias_regex_set_dirty = true;
             self.registry_remove(AutomationKind::Alias, isolate, origin, name);
             if self.is_watched() && *origin != Origin::User {
@@ -738,7 +778,13 @@ impl Manager {
     /// [`remove_alias`](Self::remove_alias). Marks every trigger `PatternSet` dirty so the slot
     /// is freed across the normal/raw/prompt tiers.
     pub fn remove_trigger(&mut self, isolate: &IsolateId, origin: &Origin, name: &str) {
-        if Self::remove_named(&mut self.triggers, &mut self.trigger_indices, isolate, origin, name) {
+        if Self::remove_named(
+            &mut self.triggers,
+            &mut self.trigger_indices,
+            isolate,
+            origin,
+            name,
+        ) {
             self.trigger_regex_set_dirty = true;
             self.refresh_raw_wanted();
             self.registry_remove(AutomationKind::Trigger, isolate, origin, name);
@@ -794,18 +840,21 @@ impl Manager {
     fn rebuild_trigger_regex_set(&mut self) {
         let start = std::time::Instant::now();
 
+        let mut priority_order: Vec<usize> = (0..self.triggers.len()).collect();
+        // `sort_by` is stable: equal-priority automations retain their registration order.
+        priority_order.sort_by(|&a, &b| self.triggers[b].priority.cmp(&self.triggers[a].priority));
+
         self.trigger_regex_set = PatternSet::build(
-            self.triggers
+            priority_order
                 .iter()
-                .flat_map(|trigger| trigger.patterns.iter().map(regex::Regex::as_str)),
+                .flat_map(|&i| self.triggers[i].patterns.iter().map(regex::Regex::as_str)),
         )
         .unwrap();
 
-        self.trigger_regex_set_map = self
-            .triggers
+        self.trigger_regex_set_map = priority_order
             .iter()
-            .enumerate()
-            .flat_map(|(i, trigger)| {
+            .flat_map(|&i| {
+                let trigger = &self.triggers[i];
                 let mut v = Vec::with_capacity(trigger.patterns.len());
                 for _ in 0..trigger.patterns.len() {
                     v.push(i);
@@ -813,23 +862,28 @@ impl Manager {
                 v
             })
             .collect();
-        self.trigger_regex_patterns_map = self
-            .triggers
+        self.trigger_regex_patterns_map = priority_order
             .iter()
-            .flat_map(|trigger| trigger.patterns.iter().enumerate().map(|(i, _pattern)| i))
+            .flat_map(|&i| {
+                self.triggers[i]
+                    .patterns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _pattern)| i)
+            })
             .collect();
 
-        self.raw_trigger_regex_set = PatternSet::build(
-            self.triggers
+        self.raw_trigger_regex_set = PatternSet::build(priority_order.iter().flat_map(|&i| {
+            self.triggers[i]
+                .raw_patterns
                 .iter()
-                .flat_map(|trigger| trigger.raw_patterns.iter().map(regex::Regex::as_str)),
-        )
+                .map(regex::Regex::as_str)
+        }))
         .unwrap();
-        self.raw_trigger_regex_set_map = self
-            .triggers
+        self.raw_trigger_regex_set_map = priority_order
             .iter()
-            .enumerate()
-            .flat_map(|(i, trigger)| {
+            .flat_map(|&i| {
+                let trigger = &self.triggers[i];
                 let mut v = Vec::with_capacity(trigger.raw_patterns.len());
                 for _ in 0..trigger.raw_patterns.len() {
                     v.push(i);
@@ -837,11 +891,10 @@ impl Manager {
                 v
             })
             .collect();
-        self.raw_trigger_regex_patterns_map = self
-            .triggers
+        self.raw_trigger_regex_patterns_map = priority_order
             .iter()
-            .flat_map(|trigger| {
-                trigger
+            .flat_map(|&i| {
+                self.triggers[i]
                     .raw_patterns
                     .iter()
                     .enumerate()
@@ -850,18 +903,17 @@ impl Manager {
             .collect();
 
         self.prompt_trigger_regex_set = PatternSet::build(
-            self.triggers
+            priority_order
                 .iter()
-                .filter(|t| t.fire_on_prompts())
-                .flat_map(|trigger| trigger.patterns.iter().map(regex::Regex::as_str)),
+                .filter(|&&i| self.triggers[i].fire_on_prompts())
+                .flat_map(|&i| self.triggers[i].patterns.iter().map(regex::Regex::as_str)),
         )
         .unwrap();
-        self.prompt_trigger_regex_set_map = self
-            .triggers
+        self.prompt_trigger_regex_set_map = priority_order
             .iter()
-            .enumerate()
-            .filter(|(_, t)| t.fire_on_prompts())
-            .flat_map(|(i, trigger)| {
+            .filter(|&&i| self.triggers[i].fire_on_prompts())
+            .flat_map(|&i| {
+                let trigger = &self.triggers[i];
                 let mut v = Vec::with_capacity(trigger.patterns.len());
                 for _ in 0..trigger.patterns.len() {
                     v.push(i);
@@ -869,26 +921,35 @@ impl Manager {
                 v
             })
             .collect();
-        self.prompt_trigger_regex_patterns_map = self
-            .triggers
+        self.prompt_trigger_regex_patterns_map = priority_order
             .iter()
-            .filter(|t| t.fire_on_prompts())
-            .flat_map(|trigger| trigger.patterns.iter().enumerate().map(|(i, _pattern)| i))
+            .filter(|&&i| self.triggers[i].fire_on_prompts())
+            .flat_map(|&i| {
+                self.triggers[i]
+                    .patterns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _pattern)| i)
+            })
             .collect();
 
         self.prompt_raw_trigger_regex_set = PatternSet::build(
-            self.triggers
+            priority_order
                 .iter()
-                .filter(|t| t.fire_on_prompts())
-                .flat_map(|trigger| trigger.raw_patterns.iter().map(regex::Regex::as_str)),
+                .filter(|&&i| self.triggers[i].fire_on_prompts())
+                .flat_map(|&i| {
+                    self.triggers[i]
+                        .raw_patterns
+                        .iter()
+                        .map(regex::Regex::as_str)
+                }),
         )
         .unwrap();
-        self.prompt_raw_trigger_regex_set_map = self
-            .triggers
+        self.prompt_raw_trigger_regex_set_map = priority_order
             .iter()
-            .enumerate()
-            .filter(|(_, t)| t.fire_on_prompts())
-            .flat_map(|(i, trigger)| {
+            .filter(|&&i| self.triggers[i].fire_on_prompts())
+            .flat_map(|&i| {
+                let trigger = &self.triggers[i];
                 let mut v = Vec::with_capacity(trigger.raw_patterns.len());
                 for _ in 0..trigger.raw_patterns.len() {
                     v.push(i);
@@ -896,12 +957,11 @@ impl Manager {
                 v
             })
             .collect();
-        self.prompt_raw_trigger_regex_patterns_map = self
-            .triggers
+        self.prompt_raw_trigger_regex_patterns_map = priority_order
             .iter()
-            .filter(|t| t.fire_on_prompts())
-            .flat_map(|trigger| {
-                trigger
+            .filter(|&&i| self.triggers[i].fire_on_prompts())
+            .flat_map(|&i| {
+                self.triggers[i]
                     .raw_patterns
                     .iter()
                     .enumerate()
@@ -930,17 +990,19 @@ impl Manager {
     }
 
     fn rebuild_alias_regex_set(&mut self) {
+        let mut priority_order: Vec<usize> = (0..self.aliases.len()).collect();
+        priority_order.sort_by(|&a, &b| self.aliases[b].priority.cmp(&self.aliases[a].priority));
+
         self.alias_regex_set = PatternSet::build(
-            self.aliases
+            priority_order
                 .iter()
-                .flat_map(|alias| alias.patterns.iter().map(regex::Regex::as_str)),
+                .flat_map(|&i| self.aliases[i].patterns.iter().map(regex::Regex::as_str)),
         )
         .unwrap();
-        self.alias_regex_set_map = self
-            .aliases
+        self.alias_regex_set_map = priority_order
             .iter()
-            .enumerate()
-            .flat_map(|(i, alias)| {
+            .flat_map(|&i| {
+                let alias = &self.aliases[i];
                 let mut v = Vec::with_capacity(alias.patterns.len());
                 for _ in 0..alias.patterns.len() {
                     v.push(i);
@@ -948,10 +1010,15 @@ impl Manager {
                 v
             })
             .collect();
-        self.alias_regex_patterns_map = self
-            .aliases
+        self.alias_regex_patterns_map = priority_order
             .iter()
-            .flat_map(|alias| alias.patterns.iter().enumerate().map(|(i, _pattern)| i))
+            .flat_map(|&i| {
+                self.aliases[i]
+                    .patterns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _pattern)| i)
+            })
             .collect();
     }
 
@@ -966,6 +1033,7 @@ impl Manager {
         regex_set_to_patterns_map: &[usize],
         match_type: TriggerMatchType,
         is_captured: Option<Arc<AtomicBool>>,
+        fallthrough_scopes: &mut FallthroughScopes,
     ) -> Result<()> {
         if depth > 100 {
             bail!(
@@ -1002,32 +1070,19 @@ impl Manager {
                 );
 
                 let pattern_idx = *regex_set_to_patterns_map.get(match_idx).unwrap();
-                if let Some(lines) = trigger.run(
+                let stopped = fallthrough_scopes
+                    .entry((trigger.isolate.clone(), trigger.origin.clone()))
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                    .clone();
+                trigger.run(
                     line,
                     match_type,
                     pattern_idx,
                     &is_captured,
+                    stopped,
                     &self.spawned_actions,
-                    &self.command_separator,
                     depth + 1,
-                )? {
-                    for line in lines {
-                        self.process_nested_outgoing_line(&line, depth + 1)?;
-                    }
-                }
-
-                // Self-limit: a fired automation that reaches `fireLimit` queues its own
-                // removal (back of the spawned-action queue; the `RemoveAlias`/`RemoveTrigger`
-                // dispatch does the actual `&mut Manager` drop + `PatternSet` rebuild). `fires`
-                // is a `Cell` so it bumps through this `&self` path. One fire per matched line
-                // even if several of its patterns matched (we chunk by trigger).
-                let fires = trigger.fires.get() + 1;
-                trigger.fires.set(fires);
-                if let Some(limit) = trigger.fire_limit
-                    && fires >= limit
-                {
-                    self.queue_self_removal(trigger);
-                }
+                )?;
             }
         }
         Ok(())
@@ -1091,6 +1146,7 @@ impl Manager {
 
     pub fn process_nested_outgoing_line(&self, line: &str, depth: u32) -> Result<()> {
         let is_captured = Arc::new(AtomicBool::new(false));
+        let mut fallthrough_scopes = FallthroughScopes::new();
 
         self.process_line_inner(
             line,
@@ -1101,6 +1157,7 @@ impl Manager {
             &self.alias_regex_patterns_map,
             TriggerMatchType::Normal,
             Some(is_captured.clone()),
+            &mut fallthrough_scopes,
         )?;
 
         self.spawned_actions
@@ -1110,6 +1167,58 @@ impl Manager {
                 Arc::new(line.to_string()),
             ));
         Ok(())
+    }
+
+    /// Execute a matched plaintext command template. This happens at dispatch time (rather than
+    /// match-discovery time) so a prior automation can stop this invocation before it captures or
+    /// sends anything. Each separated command begins its own alias frame.
+    pub(crate) fn run_simple_automation(
+        &self,
+        script: &str,
+        captures: &[MatchCapture],
+        depth: u32,
+    ) -> Result<()> {
+        let evaluated = expand_template(script, captures);
+        for line in split_commands(&evaluated, &self.command_separator) {
+            self.process_nested_outgoing_line(line, depth)?;
+        }
+        Ok(())
+    }
+
+    /// Count an invocation only after it actually begins running. A match skipped by an earlier
+    /// `fallthrough(false)` therefore consumes neither `fireLimit` nor its one-shot lifetime.
+    pub(crate) fn record_fire(
+        &self,
+        isolate: &IsolateId,
+        origin: &Origin,
+        name: &str,
+        is_alias: bool,
+    ) {
+        let indices = if is_alias {
+            &self.alias_indices
+        } else {
+            &self.trigger_indices
+        };
+        let items = if is_alias {
+            &self.aliases
+        } else {
+            &self.triggers
+        };
+        let Some(&index) = indices
+            .get(&(isolate.clone(), origin.clone()))
+            .and_then(|namespace| namespace.get(name))
+        else {
+            return;
+        };
+        let Some(item) = items.get(index) else {
+            return;
+        };
+
+        let fires = item.fires.get() + 1;
+        item.fires.set(fires);
+        if item.fire_limit.is_some_and(|limit| fires >= limit) {
+            self.queue_self_removal(item);
+        }
     }
 
     /// Match `line` against the complete-line trigger sets, queuing the matched triggers'
@@ -1126,6 +1235,7 @@ impl Manager {
         // Zero-cost unless debug logging is compiled in; see `process_line_inner`.
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
 
+        let mut fallthrough_scopes = FallthroughScopes::new();
         if let Some(line) = line.raw() {
             debug!("Processing raw line: {line:?}");
             self.process_line_inner(
@@ -1137,6 +1247,7 @@ impl Manager {
                 &self.raw_trigger_regex_patterns_map,
                 TriggerMatchType::Raw,
                 None,
+                &mut fallthrough_scopes,
             )?;
         }
 
@@ -1149,14 +1260,18 @@ impl Manager {
             &self.trigger_regex_patterns_map,
             TriggerMatchType::Normal,
             None,
+            &mut fallthrough_scopes,
         )?;
 
         // Self-limit: one tested-line tick per incoming complete line for every
         // `lineLimit` trigger (no-op for the common unlimited case).
-       self.count_tested_lines();
+        self.count_tested_lines();
 
         if let Some(start) = timer {
-            debug!("Time to match and dispatch triggers on incoming line: {:?}", start.elapsed());
+            debug!(
+                "Time to match and dispatch triggers on incoming line: {:?}",
+                start.elapsed()
+            );
         }
 
         Ok(())
@@ -1168,6 +1283,7 @@ impl Manager {
         // Zero-cost unless debug logging is compiled in; see `process_line_inner`.
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
 
+        let mut fallthrough_scopes = FallthroughScopes::new();
         if let Some(line) = line.raw() {
             self.process_line_inner(
                 line,
@@ -1178,6 +1294,7 @@ impl Manager {
                 &self.prompt_raw_trigger_regex_patterns_map,
                 TriggerMatchType::Raw,
                 None,
+                &mut fallthrough_scopes,
             )?;
         }
 
@@ -1190,10 +1307,14 @@ impl Manager {
             &self.prompt_trigger_regex_patterns_map,
             TriggerMatchType::Normal,
             None,
+            &mut fallthrough_scopes,
         )?;
 
         if let Some(start) = timer {
-            debug!("Time to match and dispatch triggers on incoming partial line: {:?}", start.elapsed());
+            debug!(
+                "Time to match and dispatch triggers on incoming partial line: {:?}",
+                start.elapsed()
+            );
         }
 
         self.spawned_actions
@@ -1201,7 +1322,6 @@ impl Manager {
             .push_back(RuntimeAction::PartialLineTriggersProcessed(line));
         Ok(())
     }
-
 }
 
 #[derive(Debug)]
@@ -1219,6 +1339,10 @@ struct Trigger {
     script: ScriptAction,
     prompt: bool,
     enabled: bool,
+    /// Higher values are evaluated first; equal values retain registration order.
+    priority: i32,
+    /// Whether later matches in this automation's creator scope may run.
+    fallthrough: bool,
     /// Whether this entry lives in the alias `Vec` (matched on outgoing input) vs the trigger
     /// `Vec` (matched on incoming lines). Drives the `RemoveAlias`/`RemoveTrigger` self-limit
     /// removal kind. `Trigger` is reused for both by construction; this is the discriminant.
@@ -1261,6 +1385,8 @@ impl Trigger {
         script: ScriptAction,
         prompt: bool,
         enabled: bool,
+        priority: i32,
+        fallthrough: bool,
         fire_limit: Option<u32>,
         line_limit: Option<u32>,
     ) -> Result<Self>
@@ -1290,6 +1416,8 @@ impl Trigger {
             script,
             prompt,
             enabled,
+            priority,
+            fallthrough,
             is_alias: false,
             fire_limit,
             line_limit,
@@ -1305,6 +1433,8 @@ impl Trigger {
         name: String,
         patterns: TIterPattern,
         script: ScriptAction,
+        priority: i32,
+        fallthrough: bool,
         fire_limit: Option<u32>,
     ) -> Result<Self>
     where
@@ -1321,6 +1451,8 @@ impl Trigger {
             script,
             false,
             true,
+            priority,
+            fallthrough,
             fire_limit,
             // Aliases match input, not server lines, so `lineLimit` is ignored for them.
             None,
@@ -1337,17 +1469,17 @@ impl Trigger {
         self
     }
 
-    #[allow(unreachable_code, unused_variables, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         line: &str,
         match_type: TriggerMatchType,
         pattern_idx: usize,
         is_captured: &Option<Arc<AtomicBool>>,
+        stopped: Arc<AtomicBool>,
         spawned_actions: &ActionQueue,
-        command_separator: &str,
         depth: u32,
-    ) -> Result<Option<Vec<String>>> {
+    ) -> Result<()> {
         let pattern = match match_type {
             TriggerMatchType::Normal => self.patterns.get(pattern_idx).unwrap(),
             TriggerMatchType::Raw => self.raw_patterns.get(pattern_idx).unwrap(),
@@ -1366,60 +1498,21 @@ impl Trigger {
                 .collect(),
         );
 
-        match self.script {
-            ScriptAction::EvalJavascript(script_id) => {
-                spawned_actions
-                    .borrow_mut()
-                    .push_back(RuntimeAction::EvalJavascript {
-                        isolate: self.isolate.clone(),
-                        id: script_id,
-                        depth,
-                        matches: captures,
-                        is_captured: is_captured.clone(),
-                    });
-
-                Ok(None)
-            }
-            ScriptAction::CallJavascriptFunction(function_id) => {
-                spawned_actions
-                    .borrow_mut()
-                    .push_back(RuntimeAction::CallJavascriptFunction {
-                        isolate: self.isolate.clone(),
-                        id: function_id,
-                        depth,
-                        matches: captures,
-                        is_captured: is_captured.clone(),
-                    });
-
-                Ok(None)
-            }
-            ScriptAction::SendSimple(ref script) => {
-                let evaluated = expand_template(script, &captures);
-
-                if let Some(is_captured) = is_captured {
-                    is_captured.store(true, Ordering::Relaxed);
-                }
-
-                Ok(Some(
-                    split_commands(&evaluated, command_separator)
-                        .into_iter()
-                        .map(ToString::to_string)
-                        .collect(),
-                ))
-            }
-            ScriptAction::SendRaw(ref script) => {
-                spawned_actions
-                    .borrow_mut()
-                    .push_back(RuntimeAction::SendRaw(script.clone()));
-
-                if let Some(is_captured) = is_captured {
-                    is_captured.store(true, Ordering::Relaxed);
-                }
-
-                Ok(None)
-            }
-            ScriptAction::Noop => Ok(None),
-        }
+        spawned_actions
+            .borrow_mut()
+            .push_back(RuntimeAction::RunAutomation {
+                isolate: self.isolate.clone(),
+                origin: self.origin.clone(),
+                name: Arc::new(self.name.clone()),
+                script: self.script.clone(),
+                matches: captures,
+                depth,
+                is_captured: is_captured.clone(),
+                stopped,
+                fallthrough: self.fallthrough,
+                is_alias: self.is_alias,
+            });
+        Ok(())
     }
 
     pub fn name(&self) -> &str {
@@ -1462,6 +1555,8 @@ mod tests {
                     action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
                     prompt: false,
                     enabled: true,
+                    priority: 0,
+                    fallthrough: true,
                     fire_limit: None,
                     line_limit: None,
                     source: None,
@@ -1476,10 +1571,16 @@ mod tests {
             assert!(!flag.load(Ordering::Relaxed), "empty manager wants no raw");
 
             push(&mut m, "plain-only", Vec::new());
-            assert!(!flag.load(Ordering::Relaxed), "plain triggers don't ask for raw");
+            assert!(
+                !flag.load(Ordering::Relaxed),
+                "plain triggers don't ask for raw"
+            );
 
             push(&mut m, "raw", vec!["\\x1b\\[31m".to_string()]);
-            assert!(flag.load(Ordering::Relaxed), "a raw pattern raises the flag");
+            assert!(
+                flag.load(Ordering::Relaxed),
+                "a raw pattern raises the flag"
+            );
 
             m.remove_trigger(&IsolateId::Main, &Origin::User, "raw");
             assert!(

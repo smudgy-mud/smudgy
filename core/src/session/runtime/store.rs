@@ -1,6 +1,6 @@
 //! The session store (`docs/interop.md` §2): a host-held, session-scoped
 //! tree of JSON values, held as the structurally-shared immutable [`Node`] tree
-//! (`smudgy_cloud::store_node` — `docs/interop-pre-gmcp-plan.md` §4). Producers write subtrees
+//! (`smudgy_cloud::store_node` — `docs/interop.md` §2). Producers write subtrees
 //! they own with set-at-path (the only write op); consumers read snapshots synchronously and
 //! watch for changes. Values cross the op boundary as JSON text either way; the tree shape is
 //! host-internal.
@@ -22,7 +22,7 @@
 //! - **Budgets** (entry count + total bytes per producer subtree) are enforced at the write
 //!   choke point: a breaching write is rejected with an error naming the producer — never a
 //!   silent eviction.
-//! - **Previous generations** (`docs/interop-pre-gmcp-plan.md` §5): each flush that commits a
+//! - **Previous generations** (`docs/interop.md` §2): each flush that commits a
 //!   producer's writes retains the root it displaces as that producer's *previous generation*
 //!   — an `Arc` move, so the retention cost is the structural-sharing delta the new writes
 //!   forced, and budgets keep charging the logical tree only, never retained generations. The
@@ -94,7 +94,7 @@ pub(crate) fn is_home(homes: &HomeRegistry, producer: &ProducerKey, isolate: &Is
     match producer {
         ProducerKey::User => *isolate == IsolateId::Main,
         // No isolate is ever home for a platform producer: the host is the sole writer
-        // (`docs/gmcp-plan.md` §3.1), writing through `SessionStore::set` directly — the
+        // (`docs/gmcp.md` §3.1), writing through `SessionStore::set` directly — the
         // op-layer seat machinery can never mint a producer seat for one.
         ProducerKey::Platform(_) => false,
         ProducerKey::Package { owner, name } => {
@@ -114,17 +114,17 @@ pub(crate) fn is_home(homes: &HomeRegistry, producer: &ProducerKey, isolate: &Is
     }
 }
 
-/// A store producer the host itself maintains (`docs/gmcp-plan.md`). A closed set by design:
+/// A store producer the host itself maintains (`docs/gmcp.md`). A closed set by design:
 /// no creator descriptor resolves to one, so scripts can never obtain a producer seat — the
 /// host writes through [`SessionStore::set`] directly and is structurally the sole writer.
 /// The reserved scheme names (`package_resolver::PLATFORM_PRODUCERS`) are the superset; only
 /// the members here are *store* producers (`sys`/`map` are event-only platform producers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PlatformProducer {
-    /// The GMCP tree: message name = path, payload replaces-at-path (`docs/gmcp-plan.md` §3).
+    /// The GMCP tree: message name = path, payload replaces-at-path (`docs/gmcp.md` §3).
     Gmcp,
     /// The MSDP tree: variable name = single-segment path, decoded value replaces
-    /// (`docs/gmcp-mapping-plan.md` §9 item 3).
+    /// (`docs/gmcp-mapping.md` §9 item 3).
     Msdp,
 }
 
@@ -225,7 +225,7 @@ impl StorePath {
     }
 
     /// Build a path structurally from pre-split segments — the GMCP producer's ingest path
-    /// (message names split at dots, `docs/gmcp-plan.md` §3.1) and any other host-side
+    /// (message names split at dots, `docs/gmcp.md` §3.1) and any other host-side
     /// caller with segments already in hand. The string grammar is never involved, so any
     /// non-empty segment text is a valid key (a spec-legal hyphenated GMCP package name is
     /// simply a key; consumers spell it bracket-quoted).
@@ -533,7 +533,7 @@ pub struct SetOutcome {
     pub first_duplicate_key_collapse: bool,
 }
 
-/// The boundary form of one leaf-aware read (`docs/interop-pre-gmcp-plan.md` §2): the node's
+/// The boundary form of one leaf-aware read (`docs/interop.md` §4a): the node's
 /// kind, with a serialized payload only when a leaf or an array crosses. Objects cross as the
 /// bare kind — the reader walks deeper with further tagged reads instead of pulling the
 /// subtree — which is what makes a leaf read O(answer) instead of O(published tree).
@@ -579,7 +579,7 @@ pub struct SessionStore {
     /// Committed per-producer usage, kept in lockstep with `roots` at flush.
     usage: HashMap<ProducerKey, Usage>,
     /// Per-producer retained generation: the committed root each producer's last committing
-    /// flush displaced (`docs/interop-pre-gmcp-plan.md` §5). Retention is the `Arc` move out
+    /// flush displaced (`docs/interop.md` §2). Retention is the `Arc` move out
     /// of `roots`, so a generation costs only the structural delta the displacing writes
     /// forced; usage accounting never charges it (budgets bound the logical tree). Absent
     /// until a producer's *second* commit — the state before the first batch is absence.
@@ -910,7 +910,7 @@ impl SessionStore {
     }
 
     /// The previous-generation anchor for `producer` as `reader` observes it
-    /// (`docs/interop-pre-gmcp-plan.md` §5): the state before the newest write batch the
+    /// (`docs/interop.md` §2): the state before the newest write batch the
     /// reader can see. Seat-aware, mirroring [`Self::get`]'s read-your-writes visibility: a
     /// reader whose own writes for this producer sit in the journal is mid-batch, and its
     /// batch's base is the committed root; every other reader cannot observe an open journal
@@ -1278,7 +1278,7 @@ impl SessionStore {
     /// (`docs/interop.md` §10: retained state *is* its own sample). Served as the tree's
     /// own `Node` root — an O(1) share of the committed tree (`Arc`-interior), never a deep
     /// copy — so the inspector walks the store's structure lazily and can `Arc::ptr_eq`
-    /// nodes across snapshot generations (`docs/interop-pre-gmcp-plan.md` §6).
+    /// nodes across snapshot generations (`docs/interop.md` §10).
     /// Committed only — another isolate's unflushed journal is nobody's business, and the
     /// snapshot is built at the drain point, after the turn's flush.
     #[must_use]
@@ -2400,7 +2400,7 @@ mod tests {
         assert!(!is_home(&homes, &ProducerKey::User, &pkg_isolate("wbk", "sandboxed")));
     }
 
-    // ---- persistent-tree internals (docs/interop-pre-gmcp-plan.md §4) ------------------------
+    // ---- persistent-tree internals (docs/interop.md §2) ------------------------
 
     #[test]
     fn budget_credits_same_turn_replacement() {
@@ -2511,7 +2511,7 @@ mod tests {
         assert_eq!(user_get(&store, "t").unwrap().to_string(), expected, "committed read");
     }
 
-    // ---- previous generations (docs/interop-pre-gmcp-plan.md §5) ------------------------------
+    // ---- previous generations (docs/interop.md §2) ------------------------------
 
     fn user_prev_tagged(store: &SessionStore, path: &str) -> Option<TaggedSnapshot> {
         prev_tagged_as(store, path, &main_isolate())

@@ -115,7 +115,7 @@ pub struct ScriptRuntimeOptions {
     /// trusted packages share an allow-all isolate. The per-package isolate factory passes a
     /// *restricted* container here — built via [`permission_descriptor_parser`] +
     /// `Permissions::from_options` from the package's manifest-union — to sandbox a
-    /// sandboxed-package isolate's net/fs/env.
+    /// sandboxed-package isolate's net/fs/env/run/ffi/sys.
     pub permissions: Option<PermissionsContainer>,
 }
 
@@ -193,8 +193,8 @@ pub struct LoadedPackageInfo {
     pub permissions: PackagePermissions,
 }
 
-/// The descriptor parser smudgy's runtime uses to interpret `net`/`read`/`write`/`env`
-/// permission descriptors — `RealSys`-backed, identical to the one
+/// The descriptor parser smudgy's runtime uses to interpret `net`/`read`/`write`/`env`/
+/// `run`/`ffi`/`sys` permission descriptors — `RealSys`-backed, identical to the one
 /// [`ScriptRuntime::new`] builds for the default `allow_all` container. Exposed so the
 /// per-package isolate factory builds a *restricted* container the same way the runtime
 /// parses descriptors, without naming the pinned `deno_permissions`/`sys_traits`

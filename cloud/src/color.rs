@@ -20,11 +20,27 @@ pub fn parse_css_color(color: &str) -> Option<iced::Color> {
         return None;
     }
 
-    let parsed = panic::catch_unwind(AssertUnwindSafe(|| {
-        color_art::Color::from_str(color).ok()
-    }))
-    .ok()
-    .flatten()?;
+    // `color_art` accepts `#rgba`/`#rrggbbaa` but silently discards the alpha digits
+    // (`parsed.alpha()` reports 1.0), so hex-with-alpha spellings peel the alpha off here
+    // and delegate the plain-hex remainder.
+    if let Some(hex) = color.strip_prefix('#')
+        && matches!(hex.len(), 4 | 8)
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        let (rgb, alpha) = hex.split_at(hex.len() - hex.len() / 4);
+        let alpha = u8::from_str_radix(alpha, 16).ok()?;
+        // A single alpha nibble expands like CSS short hex: `x` means `xx`.
+        let alpha = if hex.len() == 4 { alpha * 17 } else { alpha };
+        let base = parse_css_color(&format!("#{rgb}"))?;
+        return Some(iced::Color {
+            a: f32::from(alpha) / 255.0,
+            ..base
+        });
+    }
+
+    let parsed = panic::catch_unwind(AssertUnwindSafe(|| color_art::Color::from_str(color).ok()))
+        .ok()
+        .flatten()?;
 
     #[allow(clippy::cast_possible_truncation)]
     let alpha = parsed.alpha() as f32;
@@ -37,9 +53,30 @@ pub fn parse_css_color(color: &str) -> Option<iced::Color> {
     ))
 }
 
+/// Parses any supported CSS spelling and returns the stable map-wire form:
+/// uppercase `#RRGGBB` (or `#RRGGBBAA` when translucent). Empty input is a
+/// caller-level reset and is therefore not accepted here.
+#[must_use]
+pub fn canonicalize_css_color(color: &str) -> Option<String> {
+    let parsed = parse_css_color(color.trim())?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let (r, g, b, a) = (
+        channel(parsed.r),
+        channel(parsed.g),
+        channel(parsed.b),
+        channel(parsed.a),
+    );
+    if a == u8::MAX {
+        Some(format!("#{r:02X}{g:02X}{b:02X}"))
+    } else {
+        Some(format!("#{r:02X}{g:02X}{b:02X}{a:02X}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_css_color;
+    use super::{canonicalize_css_color, parse_css_color};
 
     #[test]
     fn parses_common_formats() {
@@ -71,8 +108,28 @@ mod tests {
             "%",
             "-",
         ] {
-            assert!(parse_css_color(input).is_none(), "{input:?} should not parse");
+            assert!(
+                parse_css_color(input).is_none(),
+                "{input:?} should not parse"
+            );
         }
+    }
+
+    /// Hex-with-alpha spellings carry their alpha through (`color_art` alone
+    /// drops it), and the short form expands nibbles like CSS.
+    #[test]
+    fn hex_alpha_is_preserved() {
+        assert_eq!(parse_css_color("#ff000080").unwrap().a, 128.0 / 255.0);
+        assert_eq!(parse_css_color("#ffd54a00").unwrap().a, 0.0);
+        assert_eq!(parse_css_color("#ffd54aff").unwrap().a, 1.0);
+        let short = parse_css_color("#f008").unwrap();
+        assert_eq!(short.a, 136.0 / 255.0);
+        assert_eq!((short.r, short.g, short.b), (1.0, 0.0, 0.0));
+        // The rgb digits still parse as before.
+        let opaque = parse_css_color("#ffd54a33").unwrap();
+        let plain = parse_css_color("#ffd54a").unwrap();
+        assert_eq!((opaque.r, opaque.g, opaque.b), (plain.r, plain.g, plain.b));
+        assert_eq!(opaque.a, 51.0 / 255.0);
     }
 
     /// `color_art`'s validator accepts hue 360 but its conversions panic
@@ -106,5 +163,14 @@ mod tests {
                 let _ = parse_css_color(&target[..end]);
             }
         }
+    }
+
+    #[test]
+    fn canonicalizes_supported_spellings() {
+        assert_eq!(canonicalize_css_color("red").as_deref(), Some("#FF0000"));
+        assert_eq!(
+            canonicalize_css_color("rgba(255, 0, 0, 0.5)").as_deref(),
+            Some("#FF000080")
+        );
     }
 }

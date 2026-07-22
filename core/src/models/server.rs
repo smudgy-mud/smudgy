@@ -27,10 +27,36 @@ pub struct ServerConfig {
     /// the confirm dialog.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_all_links: bool,
+    /// The character encoding this server speaks, as an Encoding Standard label
+    /// (`"big5"`, `"iso-8859-1"`, …). `None` = UTF-8. CHARSET negotiation (RFC
+    /// 2066), when the server offers it, overrides this for the life of the
+    /// connection. An unresolvable label is logged and treated as UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Whether inbound compression offers (MCCP2) are accepted. On by default;
+    /// off declines every compression option with `DONT`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub compression: bool,
+    /// Connect over TLS. Off by default (don't silently change existing plain servers).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tls: bool,
+    /// When `tls`, whether to verify the server certificate against the OS trust store.
+    /// On by default; off accepts any certificate (self-signed MUD ports — insecure).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub tls_verify: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // the signature serde's skip_serializing_if wants
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl ServerConfig {
-    /// A fresh config with no link-trust grants.
+    /// A fresh config with no link-trust grants, speaking UTF-8, accepting compression.
     #[must_use]
     pub const fn new(host: String, port: u16) -> Self {
         Self {
@@ -38,6 +64,10 @@ impl ServerConfig {
             port,
             trusted_link_hosts: Vec::new(),
             trust_all_links: false,
+            encoding: None,
+            compression: true,
+            tls: false,
+            tls_verify: true,
         }
     }
 
@@ -166,13 +196,18 @@ pub fn list_servers() -> Result<Vec<Server>> {
 /// Returns an error if the file cannot be opened, read, or if the contents
 /// cannot be deserialized into a `ServerConfig`.
 fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
-    let file_content = fs::read_to_string(path)
-        .context(format!("Failed to read server config file: {}", path.display()))?;
-    let config: ServerConfig = serde_json::from_str(&file_content)
-        .context(format!("Failed to parse server config file: {}", path.display()))?;
-    config
-        .validate()
-        .context(format!("Server config validation failed: {}", path.display()))?;
+    let file_content = fs::read_to_string(path).context(format!(
+        "Failed to read server config file: {}",
+        path.display()
+    ))?;
+    let config: ServerConfig = serde_json::from_str(&file_content).context(format!(
+        "Failed to parse server config file: {}",
+        path.display()
+    ))?;
+    config.validate().context(format!(
+        "Server config validation failed: {}",
+        path.display()
+    ))?;
     Ok(config)
 }
 
@@ -442,7 +477,10 @@ mod link_trust_tests {
     fn blanket_trust_covers_urls_and_commands() {
         let c = config(&[], true);
         assert!(c.allows_server_link(Some("anything.example")));
-        assert!(c.allows_server_link(None), "send: links ride the blanket grant");
+        assert!(
+            c.allows_server_link(None),
+            "send: links ride the blanket grant"
+        );
     }
 
     #[test]
@@ -450,7 +488,10 @@ mod link_trust_tests {
         let c = config(&["Wiki.Example.ORG"], false);
         assert!(c.allows_server_link(Some("wiki.example.org")));
         assert!(!c.allows_server_link(Some("evil.example.org")));
-        assert!(!c.allows_server_link(None), "a host grant never covers send: links");
+        assert!(
+            !c.allows_server_link(None),
+            "a host grant never covers send: links"
+        );
     }
 
     #[test]
@@ -462,10 +503,22 @@ mod link_trust_tests {
 
     #[test]
     fn url_host_extraction() {
-        assert_eq!(link_url_host("https://Wiki.Example.org/page?x=1"), Some("wiki.example.org".to_string()));
-        assert_eq!(link_url_host("http://example.org:8080/p"), Some("example.org".to_string()));
-        assert_eq!(link_url_host("https://user:pw@example.org/x"), Some("example.org".to_string()));
-        assert_eq!(link_url_host("https://[::1]:8080/x"), Some("::1".to_string()));
+        assert_eq!(
+            link_url_host("https://Wiki.Example.org/page?x=1"),
+            Some("wiki.example.org".to_string())
+        );
+        assert_eq!(
+            link_url_host("http://example.org:8080/p"),
+            Some("example.org".to_string())
+        );
+        assert_eq!(
+            link_url_host("https://user:pw@example.org/x"),
+            Some("example.org".to_string())
+        );
+        assert_eq!(
+            link_url_host("https://[::1]:8080/x"),
+            Some("::1".to_string())
+        );
         assert_eq!(link_url_host("https:///nohost"), None);
         assert_eq!(link_url_host("nonsense"), None);
     }

@@ -1,4 +1,4 @@
-//! The host-side GMCP **producer** (`docs/gmcp-plan.md` §4): the session-thread half that
+//! The host-side GMCP **producer** (`docs/gmcp.md` §4): the session-thread half that
 //! turns inbound GMCP messages into session-store writes under the `gmcp` platform
 //! producer, catalogues each message for the automations window's Store tab, deep-merges
 //! the delta-shaped messages (merge keys), and memoizes parses of repeated payloads. The
@@ -50,7 +50,7 @@ impl SharedGmcpEnabled {
     }
 }
 
-/// Parse-memoization capacity (`docs/gmcp-plan.md` §4.5): distinct message names whose last
+/// Parse-memoization capacity (`docs/gmcp.md` §4.5): distinct message names whose last
 /// raw payload is retained. Real servers use dozens of names; the cap only bounds a hostile
 /// name-minting feed (whose store entries the store budgets already bound).
 const MEMO_CAP: usize = 1024;
@@ -70,7 +70,7 @@ pub(super) struct IngestEffects {
     pub echoes: Vec<String>,
 }
 
-/// One registered GMCP module (`docs/gmcp-plan.md` §6.2) — the gmod design with isolates
+/// One registered GMCP module (`docs/gmcp.md` §6.2) — the gmod design with isolates
 /// as the "user" key, so no package can drop a module another package still uses.
 struct ModuleEntry {
     /// First-registered casing — what goes on the wire.
@@ -89,11 +89,11 @@ pub(super) struct GmcpProducer {
     enabled: SharedGmcpEnabled,
     /// Folded message names whose object payloads deep-merge into the retained value
     /// instead of replacing it (IRE `Char.Status` sends deltas after the initial full
-    /// send — `docs/gmcp-plan.md` §4.3). Session-scoped; extended by `gmcp.mergeKeys`.
+    /// send — `docs/gmcp.md` §4.3). Session-scoped; extended by `gmcp.mergeKeys`.
     merge_keys: HashSet<String>,
-    /// Per-name parse memoization, keyed by folded name (`docs/gmcp-plan.md` §4.5).
+    /// Per-name parse memoization, keyed by folded name (`docs/gmcp.md` §4.5).
     memo: HashMap<String, MemoEntry>,
-    /// The module registry, keyed by folded module name (`docs/gmcp-plan.md` §6.2).
+    /// The module registry, keyed by folded module name (`docs/gmcp.md` §6.2).
     modules: HashMap<String, ModuleEntry>,
     /// The catalogue producer key (`"gmcp"`), interned once.
     producer_display: Arc<str>,
@@ -144,7 +144,7 @@ impl GmcpProducer {
 
     /// GMCP negotiated off (or the connection dropped while enabled). Returns whether it
     /// *was* enabled — the caller's cue to emit `gmcp:closed`. The subtree is retained for
-    /// post-mortem reads (`docs/gmcp-plan.md` §4.6).
+    /// post-mortem reads (`docs/gmcp.md` §4.6).
     pub fn on_disabled(&mut self) -> bool {
         self.memo.clear();
         let was = self.enabled.get();
@@ -173,7 +173,7 @@ impl GmcpProducer {
         (false, notice)
     }
 
-    /// Register `isolate`'s use of `module` (`docs/gmcp-plan.md` §6.2). Returns the framed
+    /// Register `isolate`'s use of `module` (`docs/gmcp.md` §6.2). Returns the framed
     /// wire bytes to write — empty when nothing goes out: GMCP not negotiated yet (the
     /// `GmcpEnabled` arm folds recorded modules in via [`Self::supports_add_frame`]), or
     /// the module already active with a sufficient version.
@@ -274,7 +274,7 @@ impl GmcpProducer {
     }
 
     /// Engine rebuild: every isolate's module refs are released — a reloading package
-    /// re-registers as it re-evaluates (`docs/gmcp-plan.md` §6.2), and redundant
+    /// re-registers as it re-evaluates (`docs/gmcp.md` §6.2), and redundant
     /// `Supports.Add`s are idempotent server-side, so nothing is sent here. Version
     /// memory is kept with the entries.
     pub fn reset_engine_refs(&mut self) {
@@ -283,7 +283,7 @@ impl GmcpProducer {
         }
     }
 
-    /// Extend the merge-key set (`gmcp.mergeKeys`, `docs/gmcp-plan.md` §4.3). Folded like
+    /// Extend the merge-key set (`gmcp.mergeKeys`, `docs/gmcp.md` §4.3). Folded like
     /// every structural name; additive only (the default `char.status` never leaves).
     pub fn add_merge_keys(&mut self, names: &[String]) {
         for name in names {
@@ -305,7 +305,7 @@ impl GmcpProducer {
     ) -> IngestEffects {
         let mut effects = IngestEffects::default();
 
-        // Message-name-granular catalogue entry + occurrence sample (`docs/gmcp-plan.md`
+        // Message-name-granular catalogue entry + occurrence sample (`docs/gmcp.md`
         // §5). Recorded before parse/budget outcomes: presence and history don't depend on
         // the payload being well-formed or the store having room.
         catalogue.borrow_mut().sample_dynamic(
@@ -324,7 +324,7 @@ impl GmcpProducer {
 
         let value = self.parse_payload(&folded, data);
 
-        // Host reaction (`docs/gmcp-plan.md` §6.1): surface the goodbye reason as a system
+        // Host reaction (`docs/gmcp.md` §6.1): surface the goodbye reason as a system
         // line. (`Core.Ping` is answered at the wire by the connection task.)
         if folded == "core.goodbye" {
             let reason = match &value {
@@ -339,7 +339,7 @@ impl GmcpProducer {
             });
         }
 
-        // List reducers (`docs/gmcp-plan.md` §4.4) compute against the state *before* this
+        // List reducers (`docs/gmcp.md` §4.4) compute against the state *before* this
         // message's own write; unknown shapes yield `None` and degrade to the plain write.
         let reduced = Self::reduce(store, &folded, &value);
 
@@ -381,7 +381,7 @@ impl GmcpProducer {
         }
     }
 
-    /// The protocol-level list reducers (`docs/gmcp-plan.md` §4.4): IRE's documented
+    /// The protocol-level list reducers (`docs/gmcp.md` §4.4): IRE's documented
     /// delta-shaped messages maintain the list they patch, so `.value` never lies about a
     /// list the server updates incrementally. Best-effort by design — any shape mismatch
     /// returns `None` and the message degrades to its plain set-at-name.
@@ -485,7 +485,7 @@ impl GmcpProducer {
         value
     }
 
-    /// Merge-key semantics (`docs/gmcp-plan.md` §4.3): for a matched name whose incoming
+    /// Merge-key semantics (`docs/gmcp.md` §4.3): for a matched name whose incoming
     /// and retained values are both objects, deep-merge the delta into the current subtree
     /// (objects merge recursively, everything else replaces) and return the merged
     /// document — still one set-at-path per message.

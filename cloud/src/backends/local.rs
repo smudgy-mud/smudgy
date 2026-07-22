@@ -8,9 +8,25 @@
 //! Storage layout, under a dedicated root (e.g. `~/Documents/smudgy/local/`):
 //!
 //! ```text
-//! <root>/areas/<area_id>.json     one AreaWithDetails per area (the bytes are owned here)
-//! <root>/atlases/<atlas_id>.json  one Atlas manifest per folder
+//! <root>/areas-v2/<area_id>.json          one v2 AreaWithDetails per area (authoritative)
+//! <root>/areas/<area_id>.json             the v1 namespace: read-only migration source
+//! <root>/areas-v1-backup/<id>.<ts>.json   untouched v1 bytes, written before each migration
+//! <root>/atlases/<atlas_id>.json          one Atlas manifest per folder
 //! ```
+//!
+//! v2 (Connection-contract) documents live in the **`areas-v2/`** namespace,
+//! which old binaries do not know how to overwrite (§8.3). A v1 file in the
+//! old `areas/` namespace is migrated the first time it is seen — the scan
+//! migrates stragglers **eagerly** (so a freshly-opened store lists every
+//! area consistently), and a direct `get_area` of an unscanned id migrates
+//! on demand. Each migration first writes an untouched timestamped backup,
+//! then atomically writes the migrated document into `areas-v2/`; only the
+//! completed rename marks the migration done, and any failure leaves the v1
+//! file intact and unopened (never a partial or empty replacement). Once a
+//! v2 copy exists the v1 file is never re-read, so later edits made by an
+//! old binary to the stale v1 namespace are deliberately not merged.
+//! Documents newer than [`crate::AREA_FORMAT_VERSION`] are a hard read-only
+//! error naming the file.
 //!
 //! An area's atlas membership lives in its own `atlas_id` field, so moving an
 //! area between folders is a single-file rewrite and folder deletion just
@@ -22,26 +38,27 @@
 //! not stall startup. Mutations keep the index in lock-step with disk.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
 use parking_lot::RwLock;
+use serde::Deserialize;
 use tokio::{
     sync::{Mutex, OnceCell},
     task,
 };
 use uuid::Uuid;
 
-use super::{MapperBackend, area_edits};
+use super::{MapperBackend, area_edits, local_migration};
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, Label, LabelArgs, LabelId,
-    LabelUpdates, CloudError, CloudResult, Room, RoomUpdates, Shape, ShapeArgs, ShapeId,
-    ShapeUpdates, mapper::RoomKey,
+    CloudError, CloudResult, CreateAreaRequest,
+    mutation::{MutationEnvelope, MutationResult},
 };
 
 /// On-disk authoritative map store. Cheaply shareable behind an `Arc`.
@@ -83,8 +100,20 @@ impl LocalBackend {
         }
     }
 
+    /// The authoritative v2 area namespace.
     fn areas_dir(&self) -> PathBuf {
+        self.root.join("areas-v2")
+    }
+
+    /// The v1 namespace: only ever read (as a migration source); v2 code
+    /// never writes here, so an old binary's files stay recoverable.
+    fn legacy_areas_dir(&self) -> PathBuf {
         self.root.join("areas")
+    }
+
+    /// Untouched pre-migration v1 bytes, one timestamped file per migration.
+    fn backup_dir(&self) -> PathBuf {
+        self.root.join("areas-v1-backup")
     }
 
     fn atlases_dir(&self) -> PathBuf {
@@ -93,6 +122,10 @@ impl LocalBackend {
 
     fn area_path(&self, id: AreaId) -> PathBuf {
         self.areas_dir().join(format!("{id}.json"))
+    }
+
+    fn legacy_area_path(&self, id: AreaId) -> PathBuf {
+        self.legacy_areas_dir().join(format!("{id}.json"))
     }
 
     fn atlas_path(&self, id: AtlasId) -> PathBuf {
@@ -113,9 +146,16 @@ impl LocalBackend {
     /// directory; the index alone would otherwise be a stale one-shot snapshot.
     async fn reload(&self) {
         let areas_dir = self.areas_dir();
+        let legacy_dir = self.legacy_areas_dir();
+        let backup_dir = self.backup_dir();
         let atlases_dir = self.atlases_dir();
-        match task::spawn_blocking(move || (scan_areas(&areas_dir), scan_atlases(&atlases_dir)))
-            .await
+        match task::spawn_blocking(move || {
+            (
+                scan_areas(&areas_dir, &legacy_dir, &backup_dir),
+                scan_atlases(&atlases_dir),
+            )
+        })
+        .await
         {
             Ok((areas, atlases)) => {
                 *self.areas.write() = areas;
@@ -127,15 +167,24 @@ impl LocalBackend {
         }
     }
 
-    /// Reads one area's full record from disk.
+    /// Reads one area's full record from disk: the v2 namespace first, and
+    /// only when it has no copy, the v1 namespace via on-demand migration.
     async fn load_area(&self, id: AreaId) -> CloudResult<AreaWithDetails> {
-        let path = self.area_path(id);
+        let v2_path = self.area_path(id);
+        let legacy_path = self.legacy_area_path(id);
+        let backup_dir = self.backup_dir();
         task::spawn_blocking(move || -> CloudResult<AreaWithDetails> {
-            let bytes = fs::read(&path).map_err(|err| match err.kind() {
-                io::ErrorKind::NotFound => CloudError::NotFoundOrNoAccess,
-                _ => CloudError::from(err),
-            })?;
-            Ok(serde_json::from_slice(&bytes)?)
+            match fs::read(&v2_path) {
+                Ok(bytes) => parse_v2_document(&bytes, &v2_path),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    let legacy_bytes = fs::read(&legacy_path).map_err(|err| match err.kind() {
+                        io::ErrorKind::NotFound => CloudError::NotFoundOrNoAccess,
+                        _ => CloudError::from(err),
+                    })?;
+                    migrate_legacy_file(&legacy_bytes, &legacy_path, &v2_path, &backup_dir)
+                }
+                Err(err) => Err(CloudError::from(err)),
+            }
         })
         .await
         .map_err(|err| CloudError::InternalError(err.to_string()))?
@@ -193,34 +242,250 @@ impl LocalBackend {
     }
 }
 
-/// Writes `bytes` to `path` atomically: a sibling temp file then a rename, so
-/// a reader sees either the old or the new file, never a half-written one. A
-/// leftover `.tmp` from a crash is ignored by the `.json`-only scan.
+/// Writes `bytes` to `path` atomically and durably: a sibling temp file,
+/// fsync of the temp, then a rename — so a reader sees either the old or the
+/// new file, never a half-written one, and a crash after the rename cannot
+/// lose the content. On Unix the parent directory is fsynced too so the
+/// rename itself is durable; on Windows `std` cannot open a directory handle
+/// (that needs `FILE_FLAG_BACKUP_SEMANTICS`), and NTFS journals the rename's
+/// metadata, so `File::sync_all` on the temp before the rename is
+/// sufficient. A leftover `.tmp` from a crash is ignored by the `.json`-only
+/// scan.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)
+    {
+        let mut file = fs::File::create(&tmp)?;
+        io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
-/// Reads every `*.json` under `dir` as an [`AreaWithDetails`], keyed by id.
-fn scan_areas(dir: &Path) -> HashMap<AreaId, Area> {
-    read_json_dir(dir, |bytes| {
-        serde_json::from_slice::<AreaWithDetails>(bytes)
-            .ok()
-            .map(|details| (details.area.id, details.area))
-    })
+/// Serde probe for the version dispatch: documents that predate the field
+/// are v1.
+#[derive(Deserialize)]
+struct FormatVersionProbe {
+    #[serde(default = "probe_v1")]
+    format_version: u32,
+}
+
+const fn probe_v1() -> u32 {
+    1
+}
+
+fn document_version(bytes: &[u8]) -> CloudResult<u32> {
+    Ok(serde_json::from_slice::<FormatVersionProbe>(bytes)?.format_version)
+}
+
+/// Parses bytes from the v2 namespace, refusing anything that is not the
+/// current format: a *newer* document is a hard read-only error naming the
+/// file (opening it read-write would corrupt data this build cannot
+/// represent), and an older one does not belong in `areas-v2/` at all.
+fn parse_v2_document(bytes: &[u8], path: &Path) -> CloudResult<AreaWithDetails> {
+    let version = document_version(bytes)?;
+    if version > crate::AREA_FORMAT_VERSION {
+        return Err(CloudError::InvalidInput(format!(
+            "local area file {} is format v{version}, newer than this client (max v{}); \
+             refusing to open it read-write",
+            path.display(),
+            crate::AREA_FORMAT_VERSION
+        )));
+    }
+    if version < crate::AREA_FORMAT_VERSION {
+        return Err(CloudError::InvalidInput(format!(
+            "local area file {} is format v{version} inside the v2 namespace; \
+             v1 documents belong in areas/ and migrate from there",
+            path.display(),
+        )));
+    }
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Migrates one v1-namespace file into the v2 namespace (§8.3): version
+/// dispatch, untouched timestamped backup, in-memory migration, and an
+/// atomic durable write into `areas-v2/`. The migration is complete only
+/// once the rename lands; any failure returns an error naming the file and
+/// leaves the v1 source intact — a partial or empty replacement is never
+/// opened. A file already in the current format (hand-moved) is adopted
+/// verbatim without a backup (nothing is transformed).
+fn migrate_legacy_file(
+    bytes: &[u8],
+    legacy_path: &Path,
+    v2_path: &Path,
+    backup_dir: &Path,
+) -> CloudResult<AreaWithDetails> {
+    let version = document_version(bytes).map_err(|err| {
+        CloudError::InvalidInput(format!(
+            "local area file {} is not a readable area document: {err}",
+            legacy_path.display()
+        ))
+    })?;
+    if version > crate::AREA_FORMAT_VERSION {
+        return Err(CloudError::InvalidInput(format!(
+            "local area file {} is format v{version}, newer than this client (max v{}); \
+             refusing to open it read-write",
+            legacy_path.display(),
+            crate::AREA_FORMAT_VERSION
+        )));
+    }
+
+    let details = if version == crate::AREA_FORMAT_VERSION {
+        serde_json::from_slice::<AreaWithDetails>(bytes).map_err(|err| {
+            CloudError::InvalidInput(format!(
+                "local area file {} claims v{version} but does not parse: {err}",
+                legacy_path.display()
+            ))
+        })?
+    } else {
+        let legacy: local_migration::LegacyAreaV1 =
+            serde_json::from_slice(bytes).map_err(|err| {
+                CloudError::InvalidInput(format!(
+                    "local area file {} does not parse as a v1 document: {err}",
+                    legacy_path.display()
+                ))
+            })?;
+
+        // Backup BEFORE anything else can go wrong: the untouched v1 bytes,
+        // timestamped so repeated attempts never clobber an older backup.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let backup_path = backup_dir.join(format!("{}.{timestamp}.json", legacy.area.id));
+        fs::create_dir_all(backup_dir)
+            .and_then(|()| fs::write(&backup_path, bytes))
+            .map_err(|err| {
+                CloudError::InternalError(format!(
+                    "cannot back up {} before migration (leaving the v1 file untouched): {err}",
+                    legacy_path.display()
+                ))
+            })?;
+
+        local_migration::migrate_v1(legacy)
+    };
+
+    // The atomic durable write into areas-v2 is what completes the
+    // migration; on failure the v1 source stays authoritative.
+    if let Some(parent) = v2_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_atomic(v2_path, &serde_json::to_vec_pretty(&details)?).map_err(|err| {
+        CloudError::InternalError(format!(
+            "migrating {} failed while writing {} (the v1 file is untouched): {err}",
+            legacy_path.display(),
+            v2_path.display()
+        ))
+    })?;
+    log::info!(
+        "migrated local area {} ({}) from {} to {}",
+        details.area.name,
+        details.area.id,
+        legacy_path.display(),
+        v2_path.display()
+    );
+    Ok(details)
+}
+
+/// Reads every `*.json` under the v2 namespace as an [`AreaWithDetails`],
+/// keyed by id, then **eagerly migrates stragglers** from the v1 namespace
+/// (documented choice — a freshly-opened store lists every area
+/// consistently instead of surfacing v1 areas one `get_area` at a time).
+/// Once an id has a v2 copy its v1 file is never re-read; a failed
+/// migration is reported and skipped, leaving the v1 file intact.
+fn scan_areas(dir: &Path, legacy_dir: &Path, backup_dir: &Path) -> HashMap<AreaId, Area> {
+    let mut out: HashMap<AreaId, Area> = HashMap::new();
+    let mut migrated: HashSet<AreaId> = HashSet::new();
+    let scanned = read_json_dir(dir, |bytes, path| match parse_v2_document(bytes, path) {
+        Ok(details) => Some((details.area.id, details.area)),
+        Err(err) => {
+            log::warn!("skipping local map file: {err}");
+            None
+        }
+    });
+    for (id, area) in scanned {
+        migrated.insert(id);
+        out.insert(id, area);
+    }
+
+    let Ok(entries) = fs::read_dir(legacy_dir) else {
+        return out; // no v1 namespace => nothing to migrate
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_json = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if !is_json {
+            continue;
+        }
+        // Cheap skip: a well-named `<uuid>.json` whose id already has a v2
+        // copy is not even read.
+        let stem_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| Uuid::parse_str(stem).ok())
+            .map(AreaId);
+        if stem_id.is_some_and(|id| migrated.contains(&id)) {
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                log::warn!("failed to read local map file {}: {err}", path.display());
+                continue;
+            }
+        };
+        // The embedded id is the authority (a mis-named file still checks
+        // against the v2 set before migrating).
+        let id = match serde_json::from_slice::<AreaIdProbe>(&bytes) {
+            Ok(probe) => AreaId(probe.id),
+            Err(err) => {
+                log::warn!(
+                    "skipping unreadable local map file {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if migrated.contains(&id) {
+            continue;
+        }
+        let v2_path = dir.join(format!("{id}.json"));
+        match migrate_legacy_file(&bytes, &path, &v2_path, backup_dir) {
+            Ok(details) => {
+                migrated.insert(id);
+                out.insert(details.area.id, details.area);
+            }
+            Err(err) => log::warn!("local map migration failed: {err}"),
+        }
+    }
+    out
+}
+
+/// Serde probe for a document's area id.
+#[derive(Deserialize)]
+struct AreaIdProbe {
+    id: Uuid,
 }
 
 /// Reads every `*.json` under `dir` as an [`Atlas`] manifest, keyed by id.
 fn scan_atlases(dir: &Path) -> HashMap<AtlasId, Atlas> {
-    read_json_dir(dir, |bytes| {
-        serde_json::from_slice::<Atlas>(bytes)
-            .ok()
-            .map(|atlas| (atlas.id, atlas))
+    read_json_dir(dir, |bytes, path| {
+        let parsed = serde_json::from_slice::<Atlas>(bytes).ok();
+        if parsed.is_none() {
+            log::warn!("skipping unreadable local map file {}", path.display());
+        }
+        parsed.map(|atlas| (atlas.id, atlas))
     })
 }
 
-fn read_json_dir<K, V>(dir: &Path, parse: impl Fn(&[u8]) -> Option<(K, V)>) -> HashMap<K, V>
+fn read_json_dir<K, V>(dir: &Path, parse: impl Fn(&[u8], &Path) -> Option<(K, V)>) -> HashMap<K, V>
 where
     K: std::hash::Hash + Eq,
 {
@@ -238,10 +503,8 @@ where
         }
         match fs::read(&path) {
             Ok(bytes) => {
-                if let Some((k, v)) = parse(&bytes) {
+                if let Some((k, v)) = parse(&bytes, &path) {
                     out.insert(k, v);
-                } else {
-                    log::warn!("skipping unreadable local map file {}", path.display());
                 }
             }
             Err(err) => log::warn!("failed to read local map file {}: {err}", path.display()),
@@ -281,11 +544,13 @@ impl MapperBackend for LocalBackend {
         };
         let details = AreaWithDetails {
             area: area.clone(),
+            format_version: crate::AREA_FORMAT_VERSION,
             content_hash: None,
             properties: Vec::new(),
             rooms: Vec::new(),
             labels: Vec::new(),
             shapes: Vec::new(),
+            connections: Vec::new(),
             linked_areas: Vec::new(),
         };
         self.store_area(details).await?;
@@ -324,15 +589,48 @@ impl MapperBackend for LocalBackend {
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
         self.ensure_loaded().await;
         let path = self.area_path(*area_id);
-        task::spawn_blocking(move || match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(CloudError::from(err)),
+        // The v1-namespace file goes too: deleting only the v2 copy would
+        // resurrect the area through the straggler migration on the next
+        // scan. Timestamped backups stay — they are recovery, not state.
+        let legacy_path = self.legacy_area_path(*area_id);
+        task::spawn_blocking(move || {
+            for target in [&path, &legacy_path] {
+                match fs::remove_file(target) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(CloudError::from(err)),
+                }
+            }
+            Ok(())
         })
         .await
         .map_err(|err| CloudError::InternalError(err.to_string()))??;
         self.areas.write().remove(area_id);
         Ok(())
+    }
+
+    // ===== VERSIONED MUTATIONS =====
+
+    async fn execute_mutation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult> {
+        // The compare-and-set write path: the shared applier owns the
+        // precondition check and the single revision bump, so this bypasses
+        // `mutate_area` (whose unconditional bump would double-count) while
+        // keeping the same lock + load + store shape. Any applier error
+        // discards the working copy before it reaches disk, so a failed
+        // envelope changes nothing.
+        self.ensure_loaded().await;
+        let _guard = self.write_lock.lock().await;
+        let mut area = self.load_area(*area_id).await.map_err(|err| match err {
+            CloudError::NotFoundOrNoAccess => CloudError::AreaNotFound(*area_id),
+            other => other,
+        })?;
+        let result = area_edits::apply_envelope(&mut area, *area_id, envelope)?;
+        self.store_area(area).await?;
+        Ok(result)
     }
 
     // ===== ATLAS (FOLDER) OPERATIONS =====
@@ -354,6 +652,7 @@ impl MapperBackend for LocalBackend {
                         .count(),
                 )
                 .unwrap_or(i64::MAX),
+                rev: atlas.rev,
                 // Local atlases are owned by the user (no sharing on the local tier).
                 is_owner: true,
                 can_admin: true,
@@ -371,6 +670,7 @@ impl MapperBackend for LocalBackend {
             user_id: None,
             name: name.to_string(),
             created_at: Utc::now(),
+            rev: 1,
         };
         self.store_atlas(atlas.clone()).await?;
         Ok(atlas)
@@ -385,6 +685,7 @@ impl MapperBackend for LocalBackend {
             .cloned()
             .ok_or(CloudError::NotFoundOrNoAccess)?;
         atlas.name = name.to_string();
+        atlas.rev += 1;
         self.store_atlas(atlas.clone()).await?;
         Ok(atlas)
     }
@@ -421,275 +722,16 @@ impl MapperBackend for LocalBackend {
         self.atlases.write().remove(atlas_id);
         Ok(())
     }
-
-    // ===== AREA PROPERTIES =====
-
-    async fn set_area_property(&self, area_id: &AreaId, name: &str, value: &str) -> CloudResult<()> {
-        let name = name.to_string();
-        let value = value.to_string();
-        self.mutate_area(*area_id, move |area| {
-            area_edits::upsert_property(&mut area.properties, &name, &value);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_area_property(&self, area_id: &AreaId, name: &str) -> CloudResult<()> {
-        let name = name.to_string();
-        self.mutate_area(*area_id, move |area| {
-            area.properties.retain(|p| p.name != name);
-            Ok(())
-        })
-        .await
-    }
-
-    // ===== ROOM OPERATIONS =====
-
-    async fn update_room(&self, room_key: &RoomKey, updates: RoomUpdates) -> CloudResult<Room> {
-        let area_id = room_key.area_id;
-        let number = room_key.room_number;
-        self.mutate_area(area_id, move |area| {
-            Ok(area_edits::upsert_room(area, area_id, number, &updates))
-        })
-        .await
-    }
-
-    async fn delete_room(&self, room_key: &RoomKey) -> CloudResult<()> {
-        let area_id = room_key.area_id;
-        let number = room_key.room_number;
-        self.mutate_area(area_id, move |area| {
-            area_edits::delete_room(area, area_id, number);
-            Ok(())
-        })
-        .await
-    }
-
-    // ===== ROOM PROPERTIES =====
-
-    async fn set_room_property(
-        &self,
-        room_key: &RoomKey,
-        name: &str,
-        value: &str,
-    ) -> CloudResult<()> {
-        let number = room_key.room_number;
-        let key = room_key.clone();
-        let name = name.to_string();
-        let value = value.to_string();
-        self.mutate_area(room_key.area_id, move |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == number)
-                .ok_or(CloudError::RoomNotFound(key))?;
-            area_edits::upsert_property(&mut room.properties, &name, &value);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_room_property(&self, room_key: &RoomKey, name: &str) -> CloudResult<()> {
-        let number = room_key.room_number;
-        let key = room_key.clone();
-        let name = name.to_string();
-        self.mutate_area(room_key.area_id, move |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == number)
-                .ok_or(CloudError::RoomNotFound(key))?;
-            room.properties.retain(|p| p.name != name);
-            Ok(())
-        })
-        .await
-    }
-
-    // ===== ROOM TAGS =====
-
-    async fn add_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()> {
-        let number = room_key.room_number;
-        let key = room_key.clone();
-        let tag = crate::mapper::normalize_tag(tag);
-        self.mutate_area(room_key.area_id, move |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == number)
-                .ok_or(CloudError::RoomNotFound(key))?;
-            room.tags.insert(tag);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn remove_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()> {
-        let number = room_key.room_number;
-        let key = room_key.clone();
-        let tag = crate::mapper::normalize_tag(tag);
-        self.mutate_area(room_key.area_id, move |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == number)
-                .ok_or(CloudError::RoomNotFound(key))?;
-            room.tags.remove(&tag);
-            Ok(())
-        })
-        .await
-    }
-
-    // ===== EXIT OPERATIONS =====
-
-    async fn create_room_exit(&self, room_key: &RoomKey, exit_data: ExitArgs) -> CloudResult<Exit> {
-        let key = room_key.clone();
-        self.mutate_area(room_key.area_id, move |area| {
-            area_edits::create_room_exit(area, &key, exit_data)
-        })
-        .await
-    }
-
-    async fn update_exit(
-        &self,
-        area_id: &AreaId,
-        exit_id: &ExitId,
-        updates: ExitUpdates,
-    ) -> CloudResult<()> {
-        let exit_id = *exit_id;
-        self.mutate_area(*area_id, move |area| {
-            let exit = area
-                .rooms
-                .iter_mut()
-                .flat_map(|room| room.exits.iter_mut())
-                .find(|exit| exit.id == exit_id)
-                .ok_or(CloudError::ExitNotFound(exit_id))?;
-            area_edits::apply_exit_updates(exit, updates);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_exit(&self, area_id: &AreaId, exit_id: &ExitId) -> CloudResult<()> {
-        let exit_id = *exit_id;
-        self.mutate_area(*area_id, move |area| {
-            for room in &mut area.rooms {
-                room.exits.retain(|exit| exit.id != exit_id);
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    // ===== LABEL OPERATIONS =====
-
-    async fn create_label(&self, area_id: &AreaId, label_data: LabelArgs) -> CloudResult<Label> {
-        self.mutate_area(*area_id, move |area| {
-            let label = Label {
-                id: LabelId(Uuid::new_v4()),
-                level: label_data.level,
-                x: label_data.x,
-                y: label_data.y,
-                width: label_data.width,
-                height: label_data.height,
-                horizontal_alignment: label_data.horizontal_alignment,
-                vertical_alignment: label_data.vertical_alignment,
-                text: label_data.text,
-                color: label_data.color,
-                background_color: label_data.background_color.unwrap_or_default(),
-                font_size: label_data.font_size,
-                font_weight: label_data.font_weight,
-                is_secret: label_data.is_secret.unwrap_or(false),
-            };
-            area.labels.push(label.clone());
-            Ok(label)
-        })
-        .await
-    }
-
-    async fn update_label(
-        &self,
-        area_id: &AreaId,
-        label_id: &LabelId,
-        updates: LabelUpdates,
-    ) -> CloudResult<()> {
-        let label_id = *label_id;
-        self.mutate_area(*area_id, move |area| {
-            let label = area
-                .labels
-                .iter_mut()
-                .find(|label| label.id == label_id)
-                .ok_or(CloudError::LabelNotFound(label_id))?;
-            *label = updates.apply(label);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_label(&self, area_id: &AreaId, label_id: &LabelId) -> CloudResult<()> {
-        let label_id = *label_id;
-        self.mutate_area(*area_id, move |area| {
-            area.labels.retain(|label| label.id != label_id);
-            Ok(())
-        })
-        .await
-    }
-
-    // ===== SHAPE OPERATIONS =====
-
-    async fn create_shape(&self, area_id: &AreaId, shape_data: ShapeArgs) -> CloudResult<Shape> {
-        self.mutate_area(*area_id, move |area| {
-            let shape = Shape {
-                id: ShapeId(Uuid::new_v4()),
-                level: shape_data.level,
-                x: shape_data.x,
-                y: shape_data.y,
-                width: shape_data.width,
-                height: shape_data.height,
-                background_color: shape_data.background_color,
-                stroke_color: shape_data.stroke_color,
-                shape_type: shape_data.shape_type,
-                border_radius: shape_data.border_radius,
-                stroke_width: shape_data.stroke_width.unwrap_or(1.0),
-                is_secret: shape_data.is_secret.unwrap_or(false),
-            };
-            area.shapes.push(shape.clone());
-            Ok(shape)
-        })
-        .await
-    }
-
-    async fn update_shape(
-        &self,
-        area_id: &AreaId,
-        shape_id: &ShapeId,
-        updates: ShapeUpdates,
-    ) -> CloudResult<()> {
-        let shape_id = *shape_id;
-        self.mutate_area(*area_id, move |area| {
-            let shape = area
-                .shapes
-                .iter_mut()
-                .find(|shape| shape.id == shape_id)
-                .ok_or(CloudError::ShapeNotFound(shape_id))?;
-            *shape = updates.apply(shape);
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_shape(&self, area_id: &AreaId, shape_id: &ShapeId) -> CloudResult<()> {
-        let shape_id = *shape_id;
-        self.mutate_area(*area_id, move |area| {
-            area.shapes.retain(|shape| shape.id != shape_id);
-            Ok(())
-        })
-        .await
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExitDirection, RoomNumber};
+    use crate::{
+        ExitArgs, ExitDirection, ExitId, LabelArgs, LabelId, RoomNumber, RoomUpdates, ShapeArgs,
+        ShapeId,
+        mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
+    };
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("smudgy-local-test-{}", Uuid::new_v4()))
@@ -700,6 +742,23 @@ mod tests {
             name: name.to_string(),
             atlas_id,
             ephemeral: false,
+        }
+    }
+
+    fn envelope(
+        area_id: AreaId,
+        expected_rev: i64,
+        payload: Vec<AreaMutation>,
+    ) -> MutationEnvelope {
+        MutationEnvelope {
+            operation_id: Uuid::new_v4(),
+            preconditions: vec![Precondition {
+                resource: ResourceKind::Area,
+                id: area_id.0,
+                expected_rev,
+                access_fingerprint: None,
+            }],
+            payload,
         }
     }
 
@@ -781,7 +840,10 @@ mod tests {
             .move_area_to_atlas(&area.id, None)
             .await
             .expect("move out");
-        assert_eq!(backend.get_area(&area.id).await.unwrap().area.atlas_id, None);
+        assert_eq!(
+            backend.get_area(&area.id).await.unwrap().area.atlas_id,
+            None
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -796,39 +858,53 @@ mod tests {
             .expect("area");
         assert_eq!(area.rev, 1);
 
-        let key = RoomKey::new(area.id, RoomNumber(1));
+        let exit_id = ExitId(Uuid::new_v4());
         backend
-            .update_room(
-                &key,
-                RoomUpdates {
-                    title: Some("Hall".to_string()),
-                    ..RoomUpdates::default()
-                },
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates {
+                                title: Some("Hall".to_string()),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                id: Some(exit_id),
+                                from_direction: ExitDirection::North,
+                                ..ExitArgs::default()
+                            },
+                        },
+                    ],
+                ),
             )
             .await
-            .expect("upsert room");
-        let exit = backend
-            .create_room_exit(
-                &key,
-                ExitArgs {
-                    from_direction: ExitDirection::North,
-                    ..ExitArgs::default()
-                },
-            )
-            .await
-            .expect("create exit");
+            .expect("seed envelope");
 
         let details = backend.get_area(&area.id).await.expect("get");
         assert!(details.area.rev > 1, "mutations bump rev");
         assert_eq!(details.rooms.len(), 1);
         assert_eq!(details.rooms[0].title, "Hall");
         assert_eq!(details.rooms[0].exits.len(), 1);
-        assert_eq!(details.rooms[0].exits[0].id, exit.id);
+        assert_eq!(details.rooms[0].exits[0].id, exit_id);
 
         backend
-            .delete_exit(&area.id, &exit.id)
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    details.area.rev,
+                    vec![AreaMutation::DeleteExit { exit_id }],
+                ),
+            )
             .await
-            .expect("del exit");
+            .expect("delete exit envelope");
         assert!(
             backend.get_area(&area.id).await.unwrap().rooms[0]
                 .exits
@@ -865,6 +941,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_mutation_stale_revision_conflicts_and_stores_nothing() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("A", None))
+            .await
+            .expect("area");
+
+        let result = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    41,
+                    vec![AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(1),
+                        body: RoomUpdates::default(),
+                    }],
+                ),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(CloudError::RevisionConflict {
+                    expected_rev: 41,
+                    current_rev: 1,
+                    ..
+                })
+            ),
+            "a stale precondition must conflict with the live rev, got {result:?}"
+        );
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.area.rev, 1, "a conflicted envelope moves nothing");
+        assert!(details.rooms.is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_mutation_applies_all_ops_with_one_rev_bump() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("A", None))
+            .await
+            .expect("area");
+
+        let exit_id = ExitId(Uuid::new_v4());
+        let result = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates {
+                                title: Some("Hall".to_string()),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                id: Some(exit_id),
+                                from_direction: ExitDirection::North,
+                                ..ExitArgs::default()
+                            },
+                        },
+                        AreaMutation::AddRoomTag {
+                            room_number: RoomNumber(1),
+                            tag: "INN".to_string(),
+                        },
+                    ],
+                ),
+            )
+            .await
+            .expect("envelope applies");
+
+        assert_eq!(result.versions.len(), 1);
+        assert_eq!(result.versions[0].rev, 2, "three ops bump rev exactly once");
+        assert_eq!(result.data.len(), 3);
+        assert!(matches!(&result.data[0], OpResult::Room { room } if room.title == "Hall"));
+        assert!(matches!(&result.data[1], OpResult::Exit { exit } if exit.id == exit_id));
+        assert!(matches!(&result.data[2], OpResult::RoomTag { tag, .. } if tag == "INN"));
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.area.rev, 2);
+        assert_eq!(details.rooms.len(), 1);
+        assert_eq!(details.rooms[0].title, "Hall");
+        assert_eq!(details.rooms[0].exits.len(), 1);
+        assert!(details.rooms[0].tags.contains("INN"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_mutation_failed_op_leaves_the_area_byte_identical() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("A", None))
+            .await
+            .expect("area");
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(1),
+                        body: RoomUpdates::default(),
+                    }],
+                ),
+            )
+            .await
+            .expect("seed room");
+
+        let before = backend.get_area(&area.id).await.expect("get");
+        let result = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    before.area.rev,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(2),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::DeleteRoom {
+                            room_number: RoomNumber(999),
+                        },
+                    ],
+                ),
+            )
+            .await;
+        assert!(matches!(result, Err(CloudError::RoomNotFound(_))));
+
+        let after = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(
+            serde_json::to_string(&before).expect("serialize"),
+            serde_json::to_string(&after).expect("serialize"),
+            "a failed envelope must leave the area byte-identical"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_mutation_create_ops_honor_client_ids() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("A", None))
+            .await
+            .expect("area");
+
+        let exit_id = ExitId(Uuid::new_v4());
+        let label_id = LabelId(Uuid::new_v4());
+        let shape_id = ShapeId(Uuid::new_v4());
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                id: Some(exit_id),
+                                from_direction: ExitDirection::North,
+                                ..ExitArgs::default()
+                            },
+                        },
+                        AreaMutation::CreateLabel {
+                            body: LabelArgs {
+                                id: Some(label_id),
+                                ..LabelArgs::default()
+                            },
+                        },
+                        AreaMutation::CreateShape {
+                            body: ShapeArgs {
+                                id: Some(shape_id),
+                                ..ShapeArgs::default()
+                            },
+                        },
+                    ],
+                ),
+            )
+            .await
+            .expect("envelope applies");
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.rooms[0].exits[0].id, exit_id);
+        assert_eq!(details.labels[0].id, label_id);
+        assert_eq!(details.shapes[0].id, shape_id);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn delete_room_nulls_same_area_inbound_exits() {
         let root = temp_root();
         let backend = LocalBackend::new(&root);
@@ -873,30 +1160,47 @@ mod tests {
             .await
             .expect("area");
 
-        let k1 = RoomKey::new(area.id, RoomNumber(1));
         backend
-            .update_room(&k1, RoomUpdates::default())
-            .await
-            .expect("r1");
-        backend
-            .update_room(&RoomKey::new(area.id, RoomNumber(2)), RoomUpdates::default())
-            .await
-            .expect("r2");
-        backend
-            .create_room_exit(
-                &k1,
-                ExitArgs {
-                    from_direction: ExitDirection::North,
-                    to_area_id: Some(area.id),
-                    to_room_number: Some(RoomNumber(2)),
-                    ..ExitArgs::default()
-                },
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(2),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                from_direction: ExitDirection::North,
+                                to_area_id: Some(area.id),
+                                to_room_number: Some(RoomNumber(2)),
+                                ..ExitArgs::default()
+                            },
+                        },
+                    ],
+                ),
             )
             .await
-            .expect("exit");
+            .expect("seed envelope");
 
         backend
-            .delete_room(&RoomKey::new(area.id, RoomNumber(2)))
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![AreaMutation::DeleteRoom {
+                        room_number: RoomNumber(2),
+                    }],
+                ),
+            )
             .await
             .expect("delete r2");
 
@@ -905,6 +1209,311 @@ mod tests {
         let exit = &details.rooms[0].exits[0];
         assert_eq!(exit.to_area_id, None, "inbound exit cleared");
         assert_eq!(exit.to_room_number, None);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Server parity: `CreateExit` materializes an absent from-room (and a
+    /// same-area destination room) as blank placeholders instead of
+    /// failing, exactly like the deployed server's applier — so an
+    /// envelope accepted by the cloud tier is accepted here too.
+    #[tokio::test]
+    async fn create_exit_materializes_placeholder_rooms_like_the_server() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("A", None))
+            .await
+            .expect("area");
+
+        // Neither room 42 nor its same-area destination 43 exists yet.
+        let result = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![AreaMutation::CreateExit {
+                        room_number: RoomNumber(42),
+                        body: ExitArgs {
+                            from_direction: ExitDirection::North,
+                            to_area_id: Some(area.id),
+                            to_room_number: Some(RoomNumber(43)),
+                            ..ExitArgs::default()
+                        },
+                    }],
+                ),
+            )
+            .await
+            .expect("the envelope applies with placeholder rooms");
+        assert_eq!(result.versions[0].rev, 2, "one bump");
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        let numbers: Vec<i32> = details.rooms.iter().map(|r| r.room_number.0).collect();
+        assert!(numbers.contains(&42), "from-room placeholder created");
+        assert!(
+            numbers.contains(&43),
+            "same-area destination placeholder created"
+        );
+        let from_room = details
+            .rooms
+            .iter()
+            .find(|r| r.room_number == RoomNumber(42))
+            .expect("from-room");
+        assert!(from_room.title.is_empty(), "placeholders are blank");
+        assert_eq!(from_room.exits.len(), 1);
+        assert_eq!(from_room.exits[0].to_room_number, Some(RoomNumber(43)));
+
+        // A cross-area destination stays a stored reference: a single-area
+        // applier cannot create rooms in a foreign document.
+        let foreign = AreaId(Uuid::new_v4());
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![AreaMutation::CreateExit {
+                        room_number: RoomNumber(42),
+                        body: ExitArgs {
+                            from_direction: ExitDirection::South,
+                            to_area_id: Some(foreign),
+                            to_room_number: Some(RoomNumber(7)),
+                            ..ExitArgs::default()
+                        },
+                    }],
+                ),
+            )
+            .await
+            .expect("cross-area destination applies as a reference");
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert!(
+            !details.rooms.iter().any(|r| r.room_number == RoomNumber(7)),
+            "no local room is minted for a foreign destination"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ===== v1 → v2 file migration (§8.3) =====
+
+    /// A v1 area document with one reciprocal exit pair, as an old binary
+    /// wrote it (per-exit style/color, no `format_version`, no connections).
+    fn v1_area_json(area_id: AreaId, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": area_id.0,
+            "user_id": null,
+            "atlas_id": null,
+            "name": name,
+            "created_at": "2025-01-01T00:00:00Z",
+            "rev": 5,
+            "properties": [],
+            "rooms": [
+                {
+                    "room_number": 1, "title": "West End", "description": "",
+                    "level": 0, "x": 0.0, "y": 0.0, "color": "",
+                    "properties": [],
+                    "exits": [{
+                        "id": Uuid::from_u128(0xE1), "from_direction": "East",
+                        "to_area_id": area_id.0, "to_room_number": 2,
+                        "to_direction": "West", "path": "", "is_hidden": false,
+                        "is_closed": false, "is_locked": false, "weight": 1.0,
+                        "command": "", "style": "Dashed", "color": "#ff8800"
+                    }]
+                },
+                {
+                    "room_number": 2, "title": "East End", "description": "",
+                    "level": 0, "x": 2.0, "y": 0.0, "color": "",
+                    "properties": [],
+                    "exits": [{
+                        "id": Uuid::from_u128(0xE2), "from_direction": "West",
+                        "to_area_id": area_id.0, "to_room_number": 1,
+                        "to_direction": "East", "path": "", "is_hidden": false,
+                        "is_closed": false, "is_locked": false, "weight": 1.0,
+                        "command": "", "style": "Normal", "color": ""
+                    }]
+                }
+            ],
+            "labels": [],
+            "shapes": []
+        })
+    }
+
+    fn write_v1_file(root: &Path, area_id: AreaId, json: &serde_json::Value) -> Vec<u8> {
+        let dir = root.join("areas");
+        fs::create_dir_all(&dir).expect("create v1 dir");
+        let bytes = serde_json::to_vec_pretty(json).expect("serialize v1 fixture");
+        fs::write(dir.join(format!("{area_id}.json")), &bytes).expect("write v1 file");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn v1_file_migrates_on_scan_with_backup_and_untouched_source() {
+        let root = temp_root();
+        let area_id = AreaId(Uuid::new_v4());
+        let original = write_v1_file(&root, area_id, &v1_area_json(area_id, "Old Roads"));
+
+        let backend = LocalBackend::new(&root);
+        let listed = backend.list_areas().await.expect("list");
+        assert_eq!(listed.len(), 1, "the scan migrates the straggler eagerly");
+        assert_eq!(listed[0].id, area_id);
+
+        let details = backend.get_area(&area_id).await.expect("get");
+        assert_eq!(details.format_version, crate::AREA_FORMAT_VERSION);
+        assert_eq!(details.connections.len(), 1, "the reciprocal pair paired");
+        let exits: Vec<_> = details
+            .rooms
+            .iter()
+            .flat_map(|room| room.exits.iter())
+            .collect();
+        assert_eq!(exits.len(), 2, "every exit keeps its identity");
+        assert!(
+            exits
+                .iter()
+                .all(|exit| exit.connection_id == details.connections[0].id),
+            "both members reference the one Connection"
+        );
+        assert_eq!(details.connections[0].color, "#ff8800");
+
+        // The v2 copy exists; the v1 source is byte-identical; the backup
+        // holds the untouched v1 bytes.
+        assert!(
+            root.join("areas-v2")
+                .join(format!("{area_id}.json"))
+                .exists()
+        );
+        let source = fs::read(root.join("areas").join(format!("{area_id}.json")))
+            .expect("v1 source still present");
+        assert_eq!(source, original, "the v1 source is never rewritten");
+        let backups: Vec<_> = fs::read_dir(root.join("areas-v1-backup"))
+            .expect("backup dir")
+            .flatten()
+            .collect();
+        assert_eq!(backups.len(), 1, "one timestamped backup");
+        assert_eq!(
+            fs::read(backups[0].path()).expect("backup readable"),
+            original,
+            "the backup is the untouched v1 bytes"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn v1_file_migrates_on_demand_and_is_never_reread_after() {
+        let root = temp_root();
+        let area_id = AreaId(Uuid::new_v4());
+        write_v1_file(&root, area_id, &v1_area_json(area_id, "Lazy Lane"));
+
+        // Direct get_area (no scan first): migrates on demand.
+        let backend = LocalBackend::new(&root);
+        let details = backend
+            .get_area(&area_id)
+            .await
+            .expect("on-demand migration");
+        assert_eq!(details.format_version, crate::AREA_FORMAT_VERSION);
+
+        // An old binary editing the stale v1 namespace afterwards is
+        // deliberately ignored: the v2 copy wins and the v1 file is never
+        // re-read.
+        let mut stale = v1_area_json(area_id, "Renamed By Old Binary");
+        stale["rev"] = serde_json::json!(99);
+        write_v1_file(&root, area_id, &stale);
+        let reopened = LocalBackend::new(&root);
+        let details = reopened.get_area(&area_id).await.expect("get");
+        assert_eq!(
+            details.area.name, "Lazy Lane",
+            "the stale v1 edit is not merged"
+        );
+        assert_eq!(details.area.rev, 5);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn unreadable_v1_file_is_reported_and_left_intact() {
+        let root = temp_root();
+        let dir = root.join("areas");
+        fs::create_dir_all(&dir).expect("create v1 dir");
+        let path = dir.join(format!("{}.json", Uuid::new_v4()));
+        fs::write(&path, b"{ not json").expect("write garbage");
+
+        let backend = LocalBackend::new(&root);
+        assert!(
+            backend.list_areas().await.expect("list").is_empty(),
+            "a failed migration is skipped, not fatal"
+        );
+        assert!(path.exists(), "the unreadable v1 file is left intact");
+        assert!(
+            !root.join("areas-v1-backup").exists(),
+            "no backup is written for a file that never parsed"
+        );
+        assert!(
+            fs::read_dir(root.join("areas-v2")).is_ok_and(|entries| entries.count() == 0)
+                || !root.join("areas-v2").exists(),
+            "no partial replacement is ever written"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn newer_format_is_a_hard_readonly_error_naming_the_file() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Future", None))
+            .await
+            .expect("create");
+
+        // Rewrite the stored v2 file as a claimed v3 document.
+        let path = root.join("areas-v2").join(format!("{}.json", area.id));
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
+        doc["format_version"] = serde_json::json!(3);
+        fs::write(&path, serde_json::to_vec_pretty(&doc).expect("serialize")).expect("write");
+
+        let err = backend
+            .get_area(&area.id)
+            .await
+            .expect_err("must refuse v3");
+        let message = err.to_string();
+        assert!(
+            message.contains("format v3") && message.contains(&format!("{}", area.id)),
+            "the error names the file and version: {message}"
+        );
+
+        // The scan skips it too (reported, not fatal).
+        let reopened = LocalBackend::new(&root);
+        assert!(reopened.list_areas().await.expect("list").is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_area_removes_both_namespaces() {
+        let root = temp_root();
+        let area_id = AreaId(Uuid::new_v4());
+        write_v1_file(&root, area_id, &v1_area_json(area_id, "Doomed"));
+
+        let backend = LocalBackend::new(&root);
+        backend.get_area(&area_id).await.expect("migrates");
+        backend.delete_area(&area_id).await.expect("delete");
+        assert!(
+            !root
+                .join("areas-v2")
+                .join(format!("{area_id}.json"))
+                .exists(),
+            "v2 copy removed"
+        );
+        assert!(
+            !root.join("areas").join(format!("{area_id}.json")).exists(),
+            "v1 source removed too (else the next scan would resurrect it)"
+        );
+        assert!(
+            backend.get_area(&area_id).await.is_err(),
+            "the area is gone for good"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

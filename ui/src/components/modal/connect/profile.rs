@@ -177,11 +177,8 @@ pub(super) fn view_profile_form<'a>(
         ProfileCrudAction::Edit(name) => {
             // Name is the profile key (rename isn't supported by the backend), so
             // it is shown read-only.
-            let name_field = column![
-                field_label("Profile name"),
-                text(name).size(Pixels(16.0)),
-            ]
-            .spacing(4);
+            let name_field =
+                column![field_label("Profile name"), text(name).size(Pixels(16.0)),].spacing(4);
 
             let save_button = button(text("Save"))
                 .style(builtins::button::primary)
@@ -422,10 +419,10 @@ pub(super) fn view_server_details_and_profiles<'a>(
                 col.push(profile_row(server_name, profile))
             })
             .into(),
-        (None, false) => column![
-            text("Couldn't load profiles for this server.").style(builtins::text::danger)
-        ]
-        .into(),
+        (None, false) => {
+            column![text("Couldn't load profiles for this server.").style(builtins::text::danger)]
+                .into()
+        }
     };
 
     let helper = text("Saved logins for this server.")
@@ -486,7 +483,6 @@ fn profile_row<'a>(server_name: &'a ServerName, profile: &'a Profile) -> Element
     .style(builtins::button::link)
     .padding([2, 6])
     .on_press(Message::RequestEditProfile(profile.name.clone()));
-
 
     let connect_button = button(text("Connect"))
         .style(builtins::button::primary)

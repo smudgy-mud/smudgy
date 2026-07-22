@@ -29,6 +29,9 @@ iced = { version = "0.14", features = [
 ] }
 iced_anim = "0.3.1"
 iced_runtime = "0.14"
+# Pluggable span/metrics API (comet). A no-op unless the app is built with smudgy_ui's
+# `iced-debug` feature, whose `iced/debug` unifies `iced_debug/enable` workspace-wide.
+iced_debug = "0.14"
 derive_more = { version = "2.0.1", features = [
     "display",
     "from",

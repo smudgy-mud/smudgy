@@ -8,9 +8,16 @@ mod program;
 
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use iced::{Length, Point, Rectangle, Size, Vector, widget::Canvas};
-use smudgy_cloud::{AreaId, ExitDirection, LabelId, Mapper, RoomNumber, ShapeId, mapper::RoomKey};
+use iced::{
+    Length, Point, Rectangle, Size, Vector,
+    widget::{Canvas, container},
+};
+use smudgy_cloud::{
+    AreaId, ConnectionId, ConnectionUpdates, ExitDirection, LabelId, MapPoint, Mapper, RoomNumber,
+    ShapeId, connection_geometry::ConnectionGeometry, mapper::RoomKey,
+};
 
 use crate::{Update, render, viewport::Viewport};
 
@@ -21,9 +28,20 @@ pub type Element<'a, Message> = iced::Element<'a, Message, Theme, Renderer>;
 /// Anything selectable on the editor canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EntityId {
+    Connection(ConnectionId),
     Room(RoomNumber),
     Label(LabelId),
     Shape(ShapeId),
+}
+
+/// The editable point within a selected Connection. Kept separate from the
+/// entity selection so Escape and Delete can leave the link selected while
+/// exiting point editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedConnectionHandle {
+    PortA,
+    PortB,
+    Waypoint(usize),
 }
 
 /// The active editing tool. Creation tools are momentary: the host window
@@ -32,6 +50,7 @@ pub enum EntityId {
 pub enum Tool {
     #[default]
     Select,
+    Link,
     AddRoom,
     AddLabel,
     AddShape,
@@ -66,6 +85,13 @@ impl Selection {
     pub fn rooms(&self) -> impl Iterator<Item = RoomNumber> + '_ {
         self.items.iter().filter_map(|entity| match entity {
             EntityId::Room(number) => Some(*number),
+            _ => None,
+        })
+    }
+
+    pub fn connections(&self) -> impl Iterator<Item = ConnectionId> + '_ {
+        self.items.iter().filter_map(|entity| match entity {
+            EntityId::Connection(id) => Some(*id),
             _ => None,
         })
     }
@@ -149,6 +175,18 @@ pub enum MutationRequest {
     CreateShape { rect: Rectangle },
     /// Set a label's or shape's bounds (from a resize-handle drag).
     ResizeEntity { entity: EntityId, rect: Rectangle },
+    /// Commit a port/waypoint or inspector visual edit as one Connection
+    /// mutation. Canvas drags preview locally and publish only on release.
+    UpdateConnection {
+        connection_id: ConnectionId,
+        updates: ConnectionUpdates,
+        description: &'static str,
+    },
+    /// Delete one selected stored route vertex without deleting the link.
+    DeleteWaypoint {
+        connection_id: ConnectionId,
+        index: usize,
+    },
 }
 
 /// Where an exit drag was dropped.
@@ -158,6 +196,8 @@ pub enum ExitTarget {
     /// Empty canvas; a connected room is created here (snapped already,
     /// unless the user held Alt).
     Empty(Point),
+    /// Empty canvas while Shift is held; creates no destination room.
+    Dangling(Point),
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +242,21 @@ pub enum Message {
         entity: EntityId,
         rect: Rectangle,
     },
+    ConnectionHandleSelected {
+        connection_id: ConnectionId,
+        handle: SelectedConnectionHandle,
+    },
+    ConnectionUpdated {
+        connection_id: ConnectionId,
+        updates: ConnectionUpdates,
+        description: &'static str,
+    },
+    WaypointInserted {
+        connection_id: ConnectionId,
+        index: usize,
+        points: Vec<MapPoint>,
+        selected_offset: usize,
+    },
 }
 
 /// Which entity a drag-rect creation produces.
@@ -229,6 +284,12 @@ pub struct MapEditor {
     last_viewport_size: Cell<Option<Size>>,
     player_location: Option<RoomKey>,
     hovered_room: Option<RoomKey>,
+    selected_connection_handle: Option<(ConnectionId, SelectedConnectionHandle)>,
+    /// Accepted solver output awaiting user confirmation. This is view-only:
+    /// the cache and stored Connection remain untouched until the host emits
+    /// one CAS command from the preview dialog.
+    automatic_route_preview: Option<(ConnectionId, Arc<ConnectionGeometry>)>,
+    editable: bool,
 }
 
 impl MapEditor {
@@ -251,6 +312,9 @@ impl MapEditor {
             last_viewport_size: Cell::new(None),
             player_location: None,
             hovered_room: None,
+            selected_connection_handle: None,
+            automatic_route_preview: None,
+            editable: true,
         };
         editor.set_area(area_id);
         editor
@@ -261,6 +325,8 @@ impl MapEditor {
         self.area_id = area_id;
         self.selection.clear();
         self.hovered_room = None;
+        self.selected_connection_handle = None;
+        self.automatic_route_preview = None;
         self.level = 0;
         self.translation = self.center_of_area().map_or_else(
             || Vector::new(0.0, 0.0),
@@ -303,6 +369,24 @@ impl MapEditor {
         self.tool = tool;
     }
 
+    /// Enables mutation affordances while preserving selection/inspection in
+    /// view-only areas.
+    pub fn set_editable(&mut self, editable: bool) {
+        self.editable = editable;
+        if !editable {
+            self.tool = Tool::Select;
+            self.selected_connection_handle = None;
+        }
+    }
+
+    /// Installs or clears a view-only Automatic route preview.
+    pub fn set_automatic_route_preview(
+        &mut self,
+        preview: Option<(ConnectionId, Arc<ConnectionGeometry>)>,
+    ) {
+        self.automatic_route_preview = preview;
+    }
+
     #[must_use]
     pub fn level(&self) -> i32 {
         self.level
@@ -313,6 +397,8 @@ impl MapEditor {
             self.level = level;
             self.selection.clear();
             self.hovered_room = None;
+            self.selected_connection_handle = None;
+            self.automatic_route_preview = None;
         }
     }
 
@@ -330,22 +416,55 @@ impl MapEditor {
 
     pub fn clear_selection(&mut self) {
         self.selection.clear();
+        self.selected_connection_handle = None;
     }
 
     /// Replaces the selection with a single entity (e.g. one just created).
     pub fn select(&mut self, entity: EntityId) {
         self.selection.replace_with(entity);
+        self.selected_connection_handle = None;
     }
 
     /// Adds an entity to the selection (e.g. pasted entities arriving as
     /// their asynchronous creates resolve).
     pub fn add_to_selection(&mut self, entity: EntityId) {
         self.selection.extend([entity]);
+        self.selected_connection_handle = None;
     }
 
     /// Removes an entity from the selection (e.g. after it was cut).
     pub fn remove_from_selection(&mut self, entity: EntityId) {
         self.selection.items.remove(&entity);
+        if self
+            .selected_connection_handle
+            .is_some_and(|(connection_id, _)| entity == EntityId::Connection(connection_id))
+        {
+            self.selected_connection_handle = None;
+        }
+    }
+
+    #[must_use]
+    pub fn selected_waypoint(&self) -> Option<(ConnectionId, usize)> {
+        self.selected_connection_handle
+            .and_then(|(connection_id, handle)| match handle {
+                SelectedConnectionHandle::Waypoint(index) => Some((connection_id, index)),
+                SelectedConnectionHandle::PortA | SelectedConnectionHandle::PortB => None,
+            })
+    }
+
+    #[must_use]
+    pub fn selected_connection_handle(&self) -> Option<(ConnectionId, SelectedConnectionHandle)> {
+        self.selected_connection_handle
+    }
+
+    pub fn clear_selected_waypoint(&mut self) {
+        self.selected_connection_handle = None;
+    }
+
+    /// Exits port/waypoint editing while retaining the Connection selection.
+    /// Returns whether a handle was active.
+    pub fn clear_selected_connection_handle(&mut self) -> bool {
+        self.selected_connection_handle.take().is_some()
     }
 
     #[must_use]
@@ -383,6 +502,7 @@ impl MapEditor {
                 } else {
                     self.selection.replace_with(entity);
                 }
+                self.selected_connection_handle = None;
                 Update::with_event(Event::SelectionChanged)
             }
             Message::RubberBandSelect { rect, additive } => {
@@ -399,9 +519,11 @@ impl MapEditor {
                 self.hovered_room = room_key.clone();
                 Update::with_event(Event::HoveredRoomChanged(room_key))
             }
-            Message::MoveCommitted { offset } => Update::with_event(Event::RequestMutation(
-                MutationRequest::MoveSelection { offset },
-            )),
+            Message::MoveCommitted { offset } => {
+                Update::with_event(Event::RequestMutation(MutationRequest::MoveSelection {
+                    offset,
+                }))
+            }
             Message::PlaceRoom { at, keep_tool } => {
                 if !keep_tool {
                     self.tool = Tool::Select;
@@ -440,12 +562,85 @@ impl MapEditor {
                     rect,
                 }))
             }
+            Message::ConnectionHandleSelected {
+                connection_id,
+                handle,
+            } => {
+                self.selection
+                    .replace_with(EntityId::Connection(connection_id));
+                self.selected_connection_handle = Some((connection_id, handle));
+                Update::with_event(Event::SelectionChanged)
+            }
+            Message::ConnectionUpdated {
+                connection_id,
+                updates,
+                description,
+            } => Update::with_event(Event::RequestMutation(MutationRequest::UpdateConnection {
+                connection_id,
+                updates,
+                description,
+            })),
+            Message::WaypointInserted {
+                connection_id,
+                index,
+                points,
+                selected_offset,
+            } => {
+                let Some(area) = self
+                    .area_id
+                    .and_then(|area_id| self.mapper.get_current_atlas().get_area(&area_id))
+                else {
+                    return Update::none();
+                };
+                let Some(connection) = area.get_connection(connection_id) else {
+                    return Update::none();
+                };
+                let mut route_points = connection.route_points.clone();
+                let index = index.min(route_points.len());
+                if points.is_empty()
+                    || route_points.len().saturating_add(points.len())
+                        > smudgy_cloud::MAX_ROUTE_POINTS
+                {
+                    return Update::none();
+                }
+                route_points.splice(index..index, points);
+                self.selection
+                    .replace_with(EntityId::Connection(connection_id));
+                self.selected_connection_handle = Some((
+                    connection_id,
+                    SelectedConnectionHandle::Waypoint(
+                        index + selected_offset.min(route_points.len() - index - 1),
+                    ),
+                ));
+                Update::new(
+                    iced::Task::none(),
+                    Some(Event::RequestMutation(MutationRequest::UpdateConnection {
+                        connection_id,
+                        updates: ConnectionUpdates {
+                            routing: Some(smudgy_cloud::ConnectionRouting::Manual),
+                            route_points: Some(route_points),
+                            ..ConnectionUpdates::default()
+                        },
+                        description: "Add connection waypoint",
+                    })),
+                )
+            }
         }
     }
 
     #[must_use]
     pub fn view(&self) -> Element<'_, Message> {
-        Canvas::new(self).width(Length::Fill).height(Length::Fill).into()
+        // Clip to widget bounds, as MapView does: the canvas draws entities
+        // within the spatial-query padding of the visible region plus
+        // grid/preview/ghost geometry, all of which can land outside it. wgpu
+        // hides the spill (full-frame redraws paint neighbors over it);
+        // tiny-skia's damage-tracked partial redraws leave it on screen —
+        // over the editor's own side panes.
+        container(Canvas::new(self).width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .clip(true)
+            .into()
     }
 
     #[inline]
@@ -456,16 +651,22 @@ impl MapEditor {
         }
     }
 
-    /// The topmost entity at a map-space point on the current level.
-    /// Priority: rooms above labels above shapes; among labels/shapes the
-    /// last in storage order (drawn last, visually topmost) wins.
+    /// Every selectable entity at a map-space point, in selection priority
+    /// order. The small center of a room deliberately precedes crossing
+    /// strokes; outside that refuge, visible Connection geometry precedes the
+    /// rest of the room fill. Returning the full list lets repeated clicks
+    /// cycle crossings instead of making the nearest line permanently hide
+    /// everything below it.
     #[must_use]
-    fn entity_at(&self, point: Point) -> Option<EntityId> {
+    fn entities_at(&self, point: Point) -> Vec<EntityId> {
         let atlas = self.mapper.get_current_atlas();
-        let area = atlas.get_area(self.area_id.as_ref()?)?;
+        let Some(area) = self.area_id.as_ref().and_then(|id| atlas.get_area(id)) else {
+            return Vec::new();
+        };
 
         let half_size = render::MAP_ROOM_SIZE / 2.0;
-        let mut room_hit = None;
+        let inner_half = render::MAP_ROOM_SIZE * 0.2;
+        let mut room_hits = Vec::new();
         area.with_rooms_in(
             point.x - half_size,
             point.y - half_size,
@@ -476,31 +677,60 @@ impl MapEditor {
                     && (room.get_x() - point.x).abs() < half_size
                     && (room.get_y() - point.y).abs() < half_size
                 {
-                    room_hit = Some(EntityId::Room(room.get_room_number()));
+                    let inner = (room.get_x() - point.x).abs() <= inner_half
+                        && (room.get_y() - point.y).abs() <= inner_half;
+                    room_hits.push((room.get_room_number(), inner));
                 }
             },
         );
-        if room_hit.is_some() {
-            return room_hit;
-        }
+        room_hits.sort_by_key(|(number, _)| number.0);
 
-        if let Some(label) = area
-            .get_labels()
-            .iter()
-            .rev()
-            .find(|label| label.level == self.level && rect_contains(label.x, label.y, label.width, label.height, point))
-        {
-            return Some(EntityId::Label(label.id));
-        }
+        let mut hits = Vec::new();
+        hits.extend(
+            room_hits
+                .iter()
+                .filter(|(_, inner)| *inner)
+                .map(|(number, _)| EntityId::Room(*number)),
+        );
+        hits.extend(
+            self.connection_hits(area.as_ref(), point)
+                .into_iter()
+                .map(EntityId::Connection),
+        );
+        hits.extend(
+            room_hits
+                .iter()
+                .filter(|(_, inner)| !*inner)
+                .map(|(number, _)| EntityId::Room(*number)),
+        );
 
-        area.get_shapes()
-            .iter()
-            .rev()
-            .find(|shape| {
-                shape.level == self.level
-                    && rect_contains(shape.x, shape.y, shape.width, shape.height, point)
-            })
-            .map(|shape| EntityId::Shape(shape.id))
+        hits.extend(
+            area.get_labels()
+                .iter()
+                .rev()
+                .filter(|label| {
+                    label.level == self.level
+                        && rect_contains(label.x, label.y, label.width, label.height, point)
+                })
+                .map(|label| EntityId::Label(label.id)),
+        );
+        hits.extend(
+            area.get_shapes()
+                .iter()
+                .rev()
+                .filter(|shape| {
+                    shape.level == self.level
+                        && rect_contains(shape.x, shape.y, shape.width, shape.height, point)
+                })
+                .map(|shape| EntityId::Shape(shape.id)),
+        );
+        hits
+    }
+
+    /// The first entity in the selection priority at a point.
+    #[must_use]
+    fn entity_at(&self, point: Point) -> Option<EntityId> {
+        self.entities_at(point).into_iter().next()
     }
 
     /// All entities on the current level intersecting a map-space rect.
@@ -513,6 +743,25 @@ impl MapEditor {
 
         let mut hits = Vec::new();
         let half_size = render::MAP_ROOM_SIZE / 2.0;
+
+        let mut connection_ids = HashSet::new();
+        area.with_room_connections_in(
+            rect.x,
+            rect.y,
+            rect.x + rect.width,
+            rect.y + rect.height,
+            |connection| {
+                if connection.from_level == self.level
+                    && connection.geometry.bounds.max_x >= rect.x
+                    && connection.geometry.bounds.min_x <= rect.x + rect.width
+                    && connection.geometry.bounds.max_y >= rect.y
+                    && connection.geometry.bounds.min_y <= rect.y + rect.height
+                    && connection_ids.insert(connection.connection_id)
+                {
+                    hits.push(EntityId::Connection(connection.connection_id));
+                }
+            },
+        );
 
         area.with_rooms_in(
             rect.x - half_size,
@@ -551,6 +800,43 @@ impl MapEditor {
         }
 
         hits
+    }
+
+    /// Visible Connection strokes within a stable six-pixel target, nearest
+    /// first and UUID-stable for crossing click-cycling.
+    fn connection_hits(
+        &self,
+        area: &smudgy_cloud::mapper::area_cache::AreaCache,
+        point: Point,
+    ) -> Vec<ConnectionId> {
+        let tolerance = 6.0 / self.scaling;
+        let map_point = MapPoint::new(point.x, point.y);
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
+        area.with_room_connections_in(
+            point.x - tolerance,
+            point.y - tolerance,
+            point.x + tolerance,
+            point.y + tolerance,
+            |connection| {
+                if connection.from_level != self.level
+                    || !seen.insert(connection.connection_id)
+                    || !connection.geometry.hit_test(map_point, tolerance)
+                {
+                    return;
+                }
+                hits.push((
+                    connection.connection_id,
+                    connection.geometry.distance_to(map_point),
+                ));
+            },
+        );
+        hits.sort_by(|(id_a, distance_a), (id_b, distance_b)| {
+            distance_a
+                .total_cmp(distance_b)
+                .then_with(|| id_a.cmp(id_b))
+        });
+        hits.into_iter().map(|(id, _)| id).collect()
     }
 
     #[must_use]
@@ -597,7 +883,7 @@ impl MapEditor {
                     },
                 ))
             }
-            EntityId::Room(_) => None,
+            EntityId::Room(_) | EntityId::Connection(_) => None,
         }
     }
 
@@ -629,7 +915,6 @@ impl MapEditor {
         );
         hit
     }
-
 }
 
 /// The compass octant pointing from one map-space point toward another

@@ -11,6 +11,14 @@ fn default_true() -> bool {
     true
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
+}
+
 /// Represents the definition of a single alias.
 ///
 /// This structure is used as the value in the map representation
@@ -31,6 +39,12 @@ pub struct AliasDefinition {
     /// AND all its parent packages are also enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Relative evaluation priority. Higher values run first; defaults to zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub priority: i32,
+    /// Whether matching continues to later aliases after this one runs. Defaults to true.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub fallthrough: bool,
     /// The language of the script. Defaults to Plaintext.
     #[serde(default)]
     pub language: ScriptLang,
@@ -214,4 +228,27 @@ pub fn save_aliases(server_name: &str, aliases: &HashMap<String, AliasDefinition
     ))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AliasDefinition;
+
+    #[test]
+    fn matching_options_are_backward_compatible_and_sparse() {
+        let old: AliasDefinition = serde_json::from_str(r#"{"pattern":"^look$"}"#).unwrap();
+        assert_eq!(old.priority, 0);
+        assert!(old.fallthrough);
+
+        let default_json = serde_json::to_string(&old).unwrap();
+        assert!(!default_json.contains("priority"));
+        assert!(!default_json.contains("fallthrough"));
+
+        let configured: AliasDefinition =
+            serde_json::from_str(r#"{"pattern":"^look$","priority":7,"fallthrough":false}"#)
+                .unwrap();
+        let configured_json = serde_json::to_string(&configured).unwrap();
+        assert!(configured_json.contains("\"priority\":7"));
+        assert!(configured_json.contains("\"fallthrough\":false"));
+    }
 }

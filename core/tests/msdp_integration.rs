@@ -1,4 +1,4 @@
-//! End-to-end MSDP producer coverage (`docs/gmcp-mapping-plan.md` §9 item 3): runtime
+//! End-to-end MSDP producer coverage (`docs/gmcp-mapping.md` §9 item 3): runtime
 //! actions in — exactly what the connection task's telnet bridge enqueues — and the
 //! script-facing surface out: the `smudgy:state/msdp` consumer handle, the
 //! `smudgy:events/msdp` readiness events, and the wire-order guarantee inherited from the
@@ -87,7 +87,7 @@ async fn run_msdp_session() -> Vec<String> {
     };
 
     // The sequence the telnet bridge would enqueue: negotiation on, the golden's
-    // composite ROOM table (docs/gmcp-mapping-plan.md §4.2) alongside a flat variable,
+    // composite ROOM table (docs/gmcp-mapping.md §4.2) alongside a flat variable,
     // the room's text line, and the option dropping.
     tx.send(RuntimeAction::MsdpEnabled).unwrap();
     tx.send(RuntimeAction::MsdpMessage {

@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -13,6 +14,10 @@ pub const API_KEY_PREFIX: &str = "smudgy_";
 
 /// Same fixed dev fallback the real server uses when `REDACTION_KEY` is unset.
 pub const REDACTION_KEY: &[u8] = b"smudgy-dev-redaction-key-do-not-use-in-prod";
+
+/// The area wire/file format this mock produces — the v2 Connection
+/// contract, mirroring the server's `AREA_FORMAT_VERSION`.
+pub const AREA_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct UserRecord {
@@ -118,9 +123,58 @@ pub struct ExitRecord {
     pub is_locked: bool,
     pub weight: f32,
     pub command: String,
-    pub style: String,
-    pub color: String,
+    /// The v2 contract: every exit is a member of exactly one Connection
+    /// (`map_exits.connection_id NOT NULL`); the per-exit style/color of v1
+    /// live on the Connection now.
+    pub connection_id: Uuid,
     pub is_secret: bool,
+}
+
+/// One stored Connection endpoint (`map_connections.endpoint_*`). Enum-ish
+/// fields ride as their PascalCase wire strings, like every other mock
+/// record.
+#[derive(Debug, Clone)]
+pub struct EndpointRecord {
+    pub room_number: i32,
+    pub side: String,
+    pub port_offset: f32,
+    pub port_mode: String,
+}
+
+/// A `map_connections` row: the shared visual geometry of one or two member
+/// exits. `kind` is derived at projection time (from endpoint shape,
+/// external membership, and room levels), exactly like the server.
+#[derive(Debug, Clone)]
+pub struct ConnectionRecord {
+    pub id: Uuid,
+    pub endpoint_a: EndpointRecord,
+    pub endpoint_b: Option<EndpointRecord>,
+    pub routing: String,
+    pub segment_shape: String,
+    pub corner: String,
+    pub route_points: Vec<(f32, f32)>,
+    pub dash: String,
+    pub color: String,
+    pub thickness: f32,
+}
+
+impl ConnectionRecord {
+    /// A fresh default-appearance Connection (the creation path's shape:
+    /// Simple/Direct/Sharp, no route, Solid, canonical gray, thickness 1).
+    pub fn blank(id: Uuid, endpoint_a: EndpointRecord, endpoint_b: Option<EndpointRecord>) -> Self {
+        Self {
+            id,
+            endpoint_a,
+            endpoint_b,
+            routing: "Simple".to_string(),
+            segment_shape: "Direct".to_string(),
+            corner: "Sharp".to_string(),
+            route_points: Vec::new(),
+            dash: "Solid".to_string(),
+            color: "#A4A4A4".to_string(),
+            thickness: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +228,7 @@ pub struct AreaRecord {
     pub properties: BTreeMap<String, AreaPropRecord>,
     pub rooms: BTreeMap<i32, RoomRecord>,
     pub exits: Vec<ExitRecord>,
+    pub connections: Vec<ConnectionRecord>,
     pub labels: Vec<LabelRecord>,
     pub shapes: Vec<ShapeRecord>,
 }
@@ -195,6 +250,7 @@ impl AreaRecord {
             properties: BTreeMap::new(),
             rooms: BTreeMap::new(),
             exits: Vec::new(),
+            connections: Vec::new(),
             labels: Vec::new(),
             shapes: Vec::new(),
         }
@@ -296,6 +352,22 @@ impl Caps {
     }
 }
 
+/// A `mutation_receipts` row: one accepted envelope per `(actor,
+/// operation_id)`, holding the request hash it was accepted under and the
+/// stored response body an identical retry replays verbatim.
+#[derive(Debug, Clone)]
+pub struct MutationReceipt {
+    pub request_hash: String,
+    /// The caller's access fingerprint when the mutation was accepted. The
+    /// stored result embeds that projection (secret properties, secret
+    /// exits), so a replay is served only to a caller whose projection
+    /// still matches; anyone else gets `projection_changed` and refetches.
+    pub access_fingerprint: String,
+    /// The stored `MutationResult` JSON (the `data` member of the success
+    /// envelope), exactly as first served.
+    pub result: Value,
+}
+
 /// A `pending_transfers` row. `expires_at` is always null.
 #[derive(Debug, Clone)]
 pub struct PendingTransferRecord {
@@ -324,6 +396,18 @@ pub struct MockState {
     pub friendships: Vec<FriendshipRecord>,
     pub blocks: Vec<BlockRecord>,
     pub pending_transfers: Vec<PendingTransferRecord>,
+    /// Idempotency receipts of the compound mutation endpoint, keyed
+    /// `(actor, operation_id)` (mirrors the `mutation_receipts` table).
+    pub mutation_receipts: HashMap<(Uuid, Uuid), MutationReceipt>,
+    /// Every mutation envelope the compound endpoint accepted, in arrival
+    /// order: `(operation_id, replayed_from_receipt)`. Rejected envelopes
+    /// (conflicts, validation failures) are not recorded — like the real
+    /// server, a rolled-back transaction leaves no trace.
+    pub mutation_log: Vec<(Uuid, bool)>,
+    /// Test hook: process the next N compound mutations normally (commit +
+    /// receipt) but replace their responses with a 500 — a lost response on
+    /// an applied mutation, for transport-retry/receipt-dedupe tests.
+    pub drop_mutation_responses: u32,
     /// Client-version gate floor, mirroring the server's `MIN_CLIENT_VERSION`.
     /// `None` (the default) leaves the gate disabled for every test.
     pub min_client_version: Option<String>,

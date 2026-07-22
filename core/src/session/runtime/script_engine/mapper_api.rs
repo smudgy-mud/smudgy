@@ -1,8 +1,7 @@
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use deno_core::{
-    GarbageCollected, OpState,
-    op2, thiserror,
+    GarbageCollected, OpState, op2, thiserror,
     v8::{self},
 };
 use serde::{Deserialize, Serialize};
@@ -10,10 +9,14 @@ use serde::{Deserialize, Serialize};
 use super::ops::SmudgyGrants;
 use crate::session::runtime::action::{ActionQueue, RuntimeAction};
 use smudgy_cloud::{
-    AreaId, AreaWithDetails, ExitArgs, ExitDirection, ExitId, ExitStyle, ExitUpdates,
-    HorizontalAlignment, Label, LabelArgs, LabelId, LabelUpdates, Mapper, RoomNumber, RoomUpdates,
-    Shape, ShapeArgs, ShapeId, ShapeType, ShapeUpdates, Uuid, VerticalAlignment,
+    AreaId, AreaWithDetails, Connection, ConnectionArgs, ConnectionDash, ConnectionEndpoint,
+    ConnectionId, ConnectionKind, ConnectionRouting, ConnectionUpdates, CornerStyle,
+    DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, ExitArgs, ExitDirection, ExitId,
+    ExitUpdates, HorizontalAlignment, Label, LabelArgs, LabelId, LabelUpdates, MapPoint, Mapper,
+    PortMode, RoomNumber, RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId,
+    ShapeType, ShapeUpdates, Uuid, VerticalAlignment,
     mapper::{RoomKey, area_cache::AreaCache, room_cache::RoomCache},
+    mutation::AreaMutation,
 };
 
 deno_core::extension!(
@@ -70,6 +73,12 @@ deno_core::extension!(
       op_smudgy_mapper_delete_room_exit,
       op_smudgy_mapper_get_area_labels,
       op_smudgy_mapper_get_area_shapes,
+      op_smudgy_mapper_get_area_connections,
+      op_smudgy_mapper_create_link,
+      op_smudgy_mapper_set_connection,
+      op_smudgy_mapper_unlink_exit,
+      op_smudgy_mapper_pair_connections,
+      op_smudgy_mapper_delete_link,
       op_smudgy_mapper_create_label,
       op_smudgy_mapper_create_shape,
       op_smudgy_mapper_set_label,
@@ -77,6 +86,7 @@ deno_core::extension!(
       op_smudgy_mapper_delete_label,
       op_smudgy_mapper_delete_shape,
       op_smudgy_mapper_import_areas,
+      op_smudgy_mapper_import_areas_if_absent,
       op_smudgy_mapper_export_area,
       op_smudgy_mapper_get_path_between_rooms,
       ],
@@ -318,10 +328,7 @@ fn op_smudgy_mapper_get_area_id(#[cppgc] area_wrapper: &JSArea) -> (u64, u64) {
 /// `area.isEphemeral`: whether the area lives in the session-lifetime
 /// ephemeral tier. Wrapper accessor on a `JSArea` handle -- not gated.
 #[op2(fast)]
-fn op_smudgy_mapper_get_area_is_ephemeral(
-    state: &OpState,
-    #[cppgc] area_wrapper: &JSArea,
-) -> bool {
+fn op_smudgy_mapper_get_area_is_ephemeral(state: &OpState, #[cppgc] area_wrapper: &JSArea) -> bool {
     state
         .try_borrow::<Mapper>()
         .is_some_and(|mapper| mapper.is_ephemeral(area_wrapper.0.get_id()))
@@ -522,8 +529,6 @@ struct JSExit {
     is_locked: bool,
     weight: f32,
     command: Option<String>,
-    style: ExitStyle,
-    color: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,11 +542,6 @@ struct JSExitCreateParams {
     is_locked: Option<bool>,
     weight: Option<f32>,
     command: Option<String>,
-    style: Option<ExitStyle>,
-    // Accepted from JS for parity with the exit-update API but dropped on
-    // creation: `ExitArgs` has no color field, so this is ignored.
-    #[allow(dead_code)]
-    color: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,8 +555,6 @@ struct JSExitUpdateParams {
     is_locked: Option<bool>,
     weight: Option<f32>,
     command: Option<String>,
-    style: Option<ExitStyle>,
-    color: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -612,8 +610,6 @@ fn op_smudgy_mapper_get_room_exits(#[cppgc] room_wrapper: &JSRoom) -> Vec<JSExit
             is_locked: exit.is_locked,
             weight: exit.weight,
             command: exit.command.clone(),
-            style: exit.style,
-            color: exit.color.clone(),
         })
         .collect()
 }
@@ -1068,20 +1064,21 @@ async fn op_smudgy_mapper_create_room_exit(
                     room_number: RoomNumber(room_number),
                 },
                 ExitArgs {
+                    // Script-created exits carry no pre-minted identity; the
+                    // mapper mints one before enqueue.
+                    id: None,
+                    connection_id: None,
                     from_direction: params.from_direction,
                     to_direction: params.to_direction,
                     to_area_id: params
                         .to_area_id
                         .map(|area_id| AreaId(Uuid::from_u64_pair(area_id.0, area_id.1))),
-                    to_room_number: params
-                        .to_room_number
-                        .map(RoomNumber),
+                    to_room_number: params.to_room_number.map(RoomNumber),
                     is_hidden: params.is_hidden.unwrap_or(false),
                     is_closed: params.is_closed.unwrap_or(false),
                     is_locked: params.is_locked.unwrap_or(false),
                     weight: params.weight.unwrap_or(1.0),
                     command: params.command,
-                    style: params.style,
                     path: None,
                     is_secret: None,
                 },
@@ -1118,17 +1115,13 @@ fn op_smudgy_mapper_set_room_exit(
                 to_area_id: params
                     .to_area_id
                     .map(|area_id| AreaId(Uuid::from_u64_pair(area_id.0, area_id.1))),
-                to_room_number: params
-                    .to_room_number
-                    .map(RoomNumber),
+                to_room_number: params.to_room_number.map(RoomNumber),
                 is_hidden: params.is_hidden,
                 is_closed: params.is_closed,
                 is_locked: params.is_locked,
                 weight: params.weight,
                 command: params.command,
                 path: None,
-                style: params.style,
-                color: params.color,
                 is_secret: None,
                 clear_to: None,
             },
@@ -1180,6 +1173,295 @@ fn op_smudgy_mapper_delete_room_exit(
     } else {
         Err(MapperError::MapperNotEnabled)
     }
+}
+
+// ============================================================================
+// Connections: shared topology/appearance queried at area scope and changed
+// only through the same atomic mutation envelope as the editor.
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct JSConnectionEndpoint {
+    room_number: i32,
+    side: RoomSide,
+    port_offset: f32,
+    port_mode: PortMode,
+}
+
+impl From<ConnectionEndpoint> for JSConnectionEndpoint {
+    fn from(endpoint: ConnectionEndpoint) -> Self {
+        Self {
+            room_number: endpoint.room_number.0,
+            side: endpoint.side,
+            port_offset: endpoint.port_offset,
+            port_mode: endpoint.port_mode,
+        }
+    }
+}
+
+impl From<JSConnectionEndpoint> for ConnectionEndpoint {
+    fn from(endpoint: JSConnectionEndpoint) -> Self {
+        Self {
+            room_number: RoomNumber(endpoint.room_number),
+            side: endpoint.side,
+            port_offset: endpoint.port_offset,
+            port_mode: endpoint.port_mode,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JSConnection {
+    id: (u64, u64),
+    endpoint_a: JSConnectionEndpoint,
+    endpoint_b: Option<JSConnectionEndpoint>,
+    kind: ConnectionKind,
+    routing: ConnectionRouting,
+    segment_shape: SegmentShape,
+    corner: CornerStyle,
+    route_points: Vec<MapPoint>,
+    dash: ConnectionDash,
+    color: String,
+    thickness: f32,
+}
+
+impl From<&Connection> for JSConnection {
+    fn from(connection: &Connection) -> Self {
+        Self {
+            id: connection.id.0.as_u64_pair(),
+            endpoint_a: connection.endpoint_a.into(),
+            endpoint_b: connection.endpoint_b.map(Into::into),
+            kind: connection.kind,
+            routing: connection.routing,
+            segment_shape: connection.segment_shape,
+            corner: connection.corner,
+            route_points: connection.route_points.clone(),
+            dash: connection.dash,
+            color: connection.color.clone(),
+            thickness: connection.thickness,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JSConnectionUpdateParams {
+    endpoint_a: Option<JSConnectionEndpoint>,
+    endpoint_b: Option<JSConnectionEndpoint>,
+    routing: Option<ConnectionRouting>,
+    segment_shape: Option<SegmentShape>,
+    corner: Option<CornerStyle>,
+    route_points: Option<Vec<MapPoint>>,
+    dash: Option<ConnectionDash>,
+    color: Option<String>,
+    thickness: Option<f32>,
+}
+
+impl From<JSConnectionUpdateParams> for ConnectionUpdates {
+    fn from(params: JSConnectionUpdateParams) -> Self {
+        Self {
+            endpoint_a: params.endpoint_a.map(Into::into),
+            endpoint_b: params.endpoint_b.map(Into::into),
+            routing: params.routing,
+            segment_shape: params.segment_shape,
+            corner: params.corner,
+            route_points: params.route_points,
+            dash: params.dash,
+            color: params.color,
+            thickness: params.thickness,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JSLinkCreateParams {
+    endpoint_a: JSConnectionEndpoint,
+    endpoint_b: Option<JSConnectionEndpoint>,
+    routing: Option<ConnectionRouting>,
+    segment_shape: Option<SegmentShape>,
+    corner: Option<CornerStyle>,
+    route_points: Option<Vec<MapPoint>>,
+    dash: Option<ConnectionDash>,
+    color: Option<String>,
+    thickness: Option<f32>,
+    traversals: Vec<JSLinkTraversalParams>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JSLinkTraversalParams {
+    room_number: i32,
+    #[serde(flatten)]
+    exit: JSExitCreateParams,
+}
+
+#[op2]
+#[serde]
+fn op_smudgy_mapper_get_area_connections(#[cppgc] area_wrapper: &JSArea) -> Vec<JSConnection> {
+    area_wrapper
+        .0
+        .get_connections()
+        .iter()
+        .map(JSConnection::from)
+        .collect()
+}
+
+#[op2]
+#[serde]
+fn op_smudgy_mapper_create_link(
+    state: &OpState,
+    #[serde] area_id: (u64, u64),
+    #[serde] params: JSLinkCreateParams,
+) -> Result<(u64, u64), MapperError> {
+    ensure_mapper(state, true)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Err(MapperError::MapperNotEnabled);
+    };
+    let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+    let connection_id = ConnectionId::new();
+    let mut operations = Vec::with_capacity(params.traversals.len() + 1);
+    operations.push(AreaMutation::CreateConnection {
+        body: ConnectionArgs {
+            id: connection_id,
+            endpoint_a: params.endpoint_a.into(),
+            endpoint_b: params.endpoint_b.map(Into::into),
+            routing: params.routing.unwrap_or_default(),
+            segment_shape: params.segment_shape.unwrap_or_default(),
+            corner: params.corner.unwrap_or_default(),
+            route_points: params.route_points.unwrap_or_default(),
+            dash: params.dash.unwrap_or_default(),
+            color: params
+                .color
+                .unwrap_or_else(|| DEFAULT_CONNECTION_COLOR.to_string()),
+            thickness: params.thickness.unwrap_or(DEFAULT_CONNECTION_THICKNESS),
+        },
+    });
+    for traversal in params.traversals {
+        operations.push(AreaMutation::CreateExit {
+            room_number: RoomNumber(traversal.room_number),
+            body: ExitArgs {
+                id: Some(ExitId::new()),
+                connection_id: Some(connection_id),
+                from_direction: traversal.exit.from_direction,
+                to_direction: traversal.exit.to_direction,
+                to_area_id: traversal
+                    .exit
+                    .to_area_id
+                    .map(|id| AreaId(Uuid::from_u64_pair(id.0, id.1))),
+                to_room_number: traversal.exit.to_room_number.map(RoomNumber),
+                is_hidden: traversal.exit.is_hidden.unwrap_or(false),
+                is_closed: traversal.exit.is_closed.unwrap_or(false),
+                is_locked: traversal.exit.is_locked.unwrap_or(false),
+                weight: traversal.exit.weight.unwrap_or(1.0),
+                command: traversal.exit.command,
+                path: None,
+                is_secret: None,
+            },
+        });
+    }
+    mapper
+        .mutate_area(area_id, operations, "Create scripted link")
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    Ok(connection_id.0.as_u64_pair())
+}
+
+#[op2]
+fn op_smudgy_mapper_set_connection(
+    state: &OpState,
+    #[serde] area_id: (u64, u64),
+    #[serde] connection_id: (u64, u64),
+    #[serde] params: JSConnectionUpdateParams,
+) -> Result<(), MapperError> {
+    ensure_mapper(state, true)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Err(MapperError::MapperNotEnabled);
+    };
+    mapper
+        .mutate_area(
+            AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+            vec![AreaMutation::UpdateConnection {
+                connection_id: ConnectionId(Uuid::from_u64_pair(connection_id.0, connection_id.1)),
+                body: params.into(),
+            }],
+            "Update scripted connection",
+        )
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    Ok(())
+}
+
+#[op2]
+#[serde]
+fn op_smudgy_mapper_unlink_exit(
+    state: &OpState,
+    #[serde] area_id: (u64, u64),
+    #[serde] exit_id: (u64, u64),
+) -> Result<(u64, u64), MapperError> {
+    ensure_mapper(state, true)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Err(MapperError::MapperNotEnabled);
+    };
+    let connection_id = ConnectionId::new();
+    mapper
+        .mutate_area(
+            AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+            vec![AreaMutation::Unlink {
+                exit_id: ExitId(Uuid::from_u64_pair(exit_id.0, exit_id.1)),
+                new_connection_id: connection_id,
+            }],
+            "Unlink scripted traversal",
+        )
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    Ok(connection_id.0.as_u64_pair())
+}
+
+#[op2]
+fn op_smudgy_mapper_pair_connections(
+    state: &OpState,
+    #[serde] area_id: (u64, u64),
+    #[serde] keep_connection_id: (u64, u64),
+    #[serde] merge_connection_id: (u64, u64),
+) -> Result<(), MapperError> {
+    ensure_mapper(state, true)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Err(MapperError::MapperNotEnabled);
+    };
+    mapper
+        .mutate_area(
+            AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+            vec![AreaMutation::Pair {
+                keep_connection_id: ConnectionId(Uuid::from_u64_pair(
+                    keep_connection_id.0,
+                    keep_connection_id.1,
+                )),
+                merge_connection_id: ConnectionId(Uuid::from_u64_pair(
+                    merge_connection_id.0,
+                    merge_connection_id.1,
+                )),
+            }],
+            "Pair scripted connections",
+        )
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    Ok(())
+}
+
+#[op2]
+fn op_smudgy_mapper_delete_link(
+    state: &OpState,
+    #[serde] area_id: (u64, u64),
+    #[serde] connection_id: (u64, u64),
+) -> Result<(), MapperError> {
+    ensure_mapper(state, true)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Err(MapperError::MapperNotEnabled);
+    };
+    mapper
+        .mutate_area(
+            AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
+            vec![AreaMutation::DeleteLink {
+                connection_id: ConnectionId(Uuid::from_u64_pair(connection_id.0, connection_id.1)),
+            }],
+            "Delete scripted link",
+        )
+        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+    Ok(())
 }
 
 // ============================================================================
@@ -1282,6 +1564,9 @@ impl From<JSLabelParams> for LabelArgs {
     /// from a script (matching the room/exit ops).
     fn from(params: JSLabelParams) -> Self {
         Self {
+            // Script-created labels carry no pre-minted identity; the mapper
+            // mints one before enqueue.
+            id: None,
             level: params.level.unwrap_or(0),
             x: params.x,
             y: params.y,
@@ -1357,6 +1642,9 @@ impl From<JSShapeParams> for ShapeArgs {
     /// (level 0, `Rectangle`, radius 0). `is_secret` is never settable from a script.
     fn from(params: JSShapeParams) -> Self {
         Self {
+            // Script-created shapes carry no pre-minted identity; the mapper
+            // mints one before enqueue.
+            id: None,
             level: params.level.unwrap_or(0),
             x: params.x,
             y: params.y,
@@ -1558,12 +1846,13 @@ fn op_smudgy_mapper_set_shape(
 // ============================================================================
 
 /// `importAreas(areas)`: import full areas as new LOCAL areas (fresh ids), returning their ids.
-/// Write-gated.
+/// Documents are accepted through [`smudgy_cloud::AreaImportDocument`], so a v1 (pre-Connection)
+/// export migrates on the way in; anything newer than the client is rejected. Write-gated.
 #[op2(async(lazy))]
 #[serde]
 async fn op_smudgy_mapper_import_areas(
     state: Rc<RefCell<OpState>>,
-    #[serde] areas: Vec<AreaWithDetails>,
+    #[serde] areas: Vec<smudgy_cloud::AreaImportDocument>,
 ) -> Result<Vec<(u64, u64)>, MapperError> {
     let mapper = {
         let state = state.borrow();
@@ -1572,10 +1861,61 @@ async fn op_smudgy_mapper_import_areas(
     };
     if let Some(mapper) = mapper {
         let ids = mapper
-            .import_areas(areas)
+            .import_areas(
+                areas
+                    .into_iter()
+                    .map(smudgy_cloud::AreaImportDocument::into_inner)
+                    .collect(),
+            )
             .await
             .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
         Ok(ids.into_iter().map(|id| id.0.as_u64_pair()).collect())
+    } else {
+        Err(MapperError::MapperNotEnabled)
+    }
+}
+
+/// The result shape for `importAreasIfAbsent`: the new areas' id pairs plus the names skipped
+/// because a resident area already bears them.
+#[derive(serde::Serialize)]
+struct JsAreasImportedIfAbsent {
+    added: Vec<(u64, u64)>,
+    skipped: Vec<String>,
+}
+
+/// `importAreasIfAbsent(areas)`: presence-checked import — imports only the areas whose name no
+/// resident area already bears (shared, disabled, and scope-excluded areas all count as present),
+/// after waiting for the session's initial map load. The offer-once seeding primitive: safe to
+/// call from package top-level code, which runs before maps load. Write-gated.
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_import_areas_if_absent(
+    state: Rc<RefCell<OpState>>,
+    #[serde] areas: Vec<smudgy_cloud::AreaImportDocument>,
+) -> Result<JsAreasImportedIfAbsent, MapperError> {
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, true)?;
+        state.try_borrow::<Mapper>().cloned()
+    };
+    if let Some(mapper) = mapper {
+        let outcome = mapper
+            .import_areas_if_absent(
+                areas
+                    .into_iter()
+                    .map(smudgy_cloud::AreaImportDocument::into_inner)
+                    .collect(),
+            )
+            .await
+            .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
+        Ok(JsAreasImportedIfAbsent {
+            added: outcome
+                .added
+                .into_iter()
+                .map(|id| id.0.as_u64_pair())
+                .collect(),
+            skipped: outcome.skipped,
+        })
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1671,9 +2011,11 @@ fn op_smudgy_mapper_find_nearest_room_with_tags(
             area_id: AreaId(Uuid::from_u64_pair(from_area_id.0, from_area_id.1)),
             room_number: RoomNumber(from_room_number),
         };
-        let nearest = mapper
-            .get_current_atlas()
-            .find_nearest_room_matching_tags(&from_room_key, &required, &excluded);
+        let nearest = mapper.get_current_atlas().find_nearest_room_matching_tags(
+            &from_room_key,
+            &required,
+            &excluded,
+        );
         if let Some(room_key) = &nearest {
             note_navigation(&state, room_key.area_id);
         }
@@ -1715,4 +2057,3 @@ fn op_smudgy_mapper_find_nearest_room_in_area(
         Err(MapperError::MapperNotEnabled)
     }
 }
-

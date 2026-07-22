@@ -9,26 +9,83 @@ use std::time::Duration;
 
 use iced::alignment::Vertical;
 use iced::widget::{
-    Column, button, checkbox, column, container, radio, row, scrollable, space, text, text_input,
+    Column, button, checkbox, column, container, pick_list, radio, row, scrollable, space, text,
+    text_input,
 };
 use iced::{Length, Task};
 use smudgy_cloud::cloud_api::{
-    CreateShareRequest, FriendView, GrantTreeNode, PreviewAudience, SecretEntity,
-    SecretEntityKind, ShareDirection, ShareGrant, ShareGrantRow, SharePatch, ShareScope,
+    CreateShareRequest, FriendView, GrantTreeNode, PreviewAudience, SecretEntity, SecretEntityKind,
+    ShareDirection, ShareGrant, ShareGrantRow, SharePatch, ShareScope,
 };
 use smudgy_cloud::mapper::area_cache::AreaCache;
 use smudgy_cloud::{
-    AreaId, AreaWithDetails, AtlasId, ExitId, LabelId, CloudError, Mapper, RoomNumber, ShapeId, Uuid,
+    AreaId, AreaWithDetails, AtlasId, CloudError, ConnectionDash, ConnectionId, ConnectionRouting,
+    DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, ExitDirection, ExitId, LabelId, Mapper,
+    RoomNumber, RoomSide, ShapeId, Uuid, canonicalize_css_color,
 };
 
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
 
-use super::{MapEditorWindow, Message};
+use super::{MapEditorWindow, Message, commands};
+
+const LINK_ROUTINGS: [ConnectionRouting; 2] = [ConnectionRouting::Stub, ConnectionRouting::Simple];
+
+/// Link appearance and traversal defaults retained for this editor session.
+#[derive(Debug, Clone)]
+pub struct LinkDefaults {
+    pub one_way: bool,
+    pub routing: ConnectionRouting,
+    pub dash: ConnectionDash,
+    pub color: String,
+    pub thickness: f32,
+}
+
+impl Default for LinkDefaults {
+    fn default() -> Self {
+        Self {
+            one_way: false,
+            routing: ConnectionRouting::Simple,
+            dash: ConnectionDash::Solid,
+            color: DEFAULT_CONNECTION_COLOR.to_string(),
+            thickness: DEFAULT_CONNECTION_THICKNESS,
+        }
+    }
+}
+
+/// Pending atomic Link-tool gesture. Nothing is written until Create.
+#[derive(Debug, Clone)]
+pub struct LinkDraft {
+    pub area_id: AreaId,
+    pub from: RoomNumber,
+    pub target: commands::NewExitTarget,
+    pub from_direction: ExitDirection,
+    pub to_direction: ExitDirection,
+    pub one_way: bool,
+    pub from_command: String,
+    pub to_command: String,
+    pub routing: ConnectionRouting,
+    pub dash: ConnectionDash,
+    pub color: String,
+    pub thickness: String,
+    pub pair_candidate: Option<ConnectionId>,
+    pub pair_with_candidate: bool,
+}
+
+impl LinkDraft {
+    pub fn is_valid(&self) -> bool {
+        canonicalize_css_color(&self.color).is_some()
+            && self
+                .thickness
+                .parse::<f32>()
+                .is_ok_and(|value| smudgy_cloud::THICKNESS_RANGE.contains(&value))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Modal {
+    CreateLink(LinkDraft),
     CreateArea {
         name: String,
         error: Option<String>,
@@ -40,6 +97,36 @@ pub enum Modal {
         area_id: AreaId,
         name: String,
         room_count: usize,
+    },
+    /// Undoable link deletion still needs an explicit confirmation when it
+    /// removes both traversals or exposes secret topology.
+    ConfirmDeleteConnection {
+        connection_id: ConnectionId,
+        member_count: usize,
+        is_secret: bool,
+    },
+    /// Solver output drawn on the canvas without mutating the stored route.
+    AutomaticRoutePreview {
+        connection_id: ConnectionId,
+        point_count: usize,
+        visited_states: usize,
+    },
+    /// Preview for the explicit §4.3 wall redistribution command. The
+    /// authoritative payload is recomputed from the current projection on
+    /// confirmation; these offsets are presentation only.
+    ConfirmRedistributePorts {
+        area_id: AreaId,
+        room_number: RoomNumber,
+        side: RoomSide,
+        secret: bool,
+        preview: Vec<(ConnectionId, f32)>,
+    },
+    /// Boundary links are omitted by default, but copy/cut must make that
+    /// loss visible and offer the specified dangling-link representation.
+    ConfirmCopySelection {
+        boundary_count: usize,
+        include_boundary_links: bool,
+        cut_after_copy: bool,
     },
     /// Name a new folder (atlas) and pick its tier.
     CreateAtlas {
@@ -451,12 +538,14 @@ pub(super) fn update_transfer(
             Update::with_task(Task::perform(
                 async move {
                     match subject {
-                        TransferSubject::Area(area_id, _) => {
-                            client.offer_area_transfer(area_id, to_user).await.map(|_| ())
-                        }
-                        TransferSubject::Atlas(atlas_id, _) => {
-                            client.offer_atlas_transfer(atlas_id, to_user).await.map(|_| ())
-                        }
+                        TransferSubject::Area(area_id, _) => client
+                            .offer_area_transfer(area_id, to_user)
+                            .await
+                            .map(|_| ()),
+                        TransferSubject::Atlas(atlas_id, _) => client
+                            .offer_atlas_transfer(atlas_id, to_user)
+                            .await
+                            .map(|_| ()),
                     }
                 },
                 |result| transfer(TransferMessage::Submitted(result)),
@@ -507,7 +596,11 @@ fn transfer_offer_view(dialog: &TransferDialog) -> ThemedElement<'_, Message> {
 
     let leaving_folder = matches!(dialog.subject, TransferSubject::Area(..));
     let mut body = column![
-        text(format!("Give \u{201c}{}\u{201d} to a friend.", dialog.subject.name())).size(13),
+        text(format!(
+            "Give \u{201c}{}\u{201d} to a friend.",
+            dialog.subject.name()
+        ))
+        .size(13),
         text(
             "Once they accept, they own it. You keep admin rights \u{2014} but they can revoke \
              them, and only they can transfer it again or appoint admins."
@@ -579,9 +672,16 @@ fn transfer_offer_view(dialog: &TransferDialog) -> ThemedElement<'_, Message> {
             button(text("Cancel").size(13))
                 .style(builtins::button::secondary)
                 .on_press(Message::ModalDismissed),
-            button(text(if dialog.submitting { "Sending\u{2026}" } else { "Send offer" }).size(13))
-                .style(builtins::button::primary)
-                .on_press_maybe(can_submit.then_some(transfer(TransferMessage::Submit))),
+            button(
+                text(if dialog.submitting {
+                    "Sending\u{2026}"
+                } else {
+                    "Send offer"
+                })
+                .size(13)
+            )
+            .style(builtins::button::primary)
+            .on_press_maybe(can_submit.then_some(transfer(TransferMessage::Submit))),
         ]
         .spacing(10)
         .align_y(Vertical::Center),
@@ -972,7 +1072,8 @@ fn summarize_preview(details: &AreaWithDetails, audience: &str) -> PreviewSummar
 
 fn friend_label(friend: &FriendView) -> String {
     friend
-        .nickname.clone()
+        .nickname
+        .clone()
         .unwrap_or_else(|| friend.user_id.to_string())
 }
 
@@ -1063,10 +1164,7 @@ pub(super) fn update_share(
                 Ok(nodes) => {
                     // Drop UI state pointing at grants that no longer exist.
                     let ids: HashSet<Uuid> = nodes.iter().map(|node| node.grant.id).collect();
-                    if dialog
-                        .selected_grant
-                        .is_some_and(|id| !ids.contains(&id))
-                    {
+                    if dialog.selected_grant.is_some_and(|id| !ids.contains(&id)) {
                         dialog.selected_grant = None;
                     }
                     if dialog
@@ -1169,8 +1267,7 @@ pub(super) fn update_share(
                 async move { client.preview(area_id, audience).await },
                 move |result| {
                     share(ShareMessage::PreviewLoaded(result.map(|details| {
-                        details
-                            .map(|details| summarize_preview(&details, &audience_label))
+                        details.map(|details| summarize_preview(&details, &audience_label))
                     })))
                 },
             ))
@@ -1178,9 +1275,9 @@ pub(super) fn update_share(
         ShareMessage::PreviewLoaded(result) => {
             dialog.preview = match result {
                 Ok(Some(summary)) => PreviewState::Loaded(summary),
-                Ok(None) => PreviewState::Nothing(
-                    "This audience can't see this area at all.".to_string(),
-                ),
+                Ok(None) => {
+                    PreviewState::Nothing("This audience can't see this area at all.".to_string())
+                }
                 Err(error) => PreviewState::Error(error.to_string()),
             };
             Update::none()
@@ -1464,6 +1561,118 @@ impl Modal {
     #[allow(clippy::too_many_lines)]
     pub fn view(&self, mapper: &Mapper) -> ThemedElement<'_, Message> {
         let (title, body): (String, ThemedElement<'_, Message>) = match self {
+            Modal::CreateLink(draft) => {
+                let target = match draft.target {
+                    commands::NewExitTarget::Room(room) => format!("room {room}"),
+                    commands::NewExitTarget::NewRoom { room_number, .. } => {
+                        format!("new room {room_number}")
+                    }
+                    commands::NewExitTarget::Dangling => "empty space (dangling)".to_string(),
+                };
+                let dangling = matches!(draft.target, commands::NewExitTarget::Dangling);
+                let mut one_way = checkbox(draft.one_way || dangling)
+                    .label("One-way traversal")
+                    .size(14)
+                    .text_size(13);
+                if !dangling {
+                    one_way = one_way.on_toggle(Message::LinkOneWayChanged);
+                }
+                let mut body = column![
+                    text(format!("Room {} to {target}", draft.from)).size(13),
+                    one_way,
+                    row![
+                        column![
+                            text("Source direction").size(11).style(muted),
+                            pick_list(
+                                &ExitDirection::ALL[..],
+                                Some(draft.from_direction),
+                                Message::LinkFromDirectionChanged,
+                            )
+                            .text_size(12),
+                        ]
+                        .spacing(3)
+                        .width(Length::Fill),
+                        column![
+                            text("Destination direction").size(11).style(muted),
+                            pick_list(
+                                &ExitDirection::ALL[..],
+                                Some(draft.to_direction),
+                                Message::LinkToDirectionChanged,
+                            )
+                            .text_size(12),
+                        ]
+                        .spacing(3)
+                        .width(Length::Fill),
+                    ]
+                    .spacing(8),
+                    row![
+                        text_input("source command", &draft.from_command)
+                            .on_input(Message::LinkFromCommandChanged)
+                            .size(12),
+                        text_input("return command", &draft.to_command)
+                            .on_input(Message::LinkToCommandChanged)
+                            .size(12),
+                    ]
+                    .spacing(8),
+                    row![
+                        pick_list(
+                            &LINK_ROUTINGS[..],
+                            Some(draft.routing),
+                            Message::LinkRoutingChanged,
+                        )
+                        .text_size(12),
+                        pick_list(
+                            &ConnectionDash::ALL[..],
+                            Some(draft.dash),
+                            Message::LinkDashChanged,
+                        )
+                        .text_size(12),
+                    ]
+                    .spacing(8),
+                    row![
+                        text_input("CSS color", &draft.color)
+                            .on_input(Message::LinkColorChanged)
+                            .size(12),
+                        text_input("width", &draft.thickness)
+                            .on_input(Message::LinkThicknessChanged)
+                            .size(12),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(10);
+                if draft.pair_candidate.is_some() {
+                    body = body.push(
+                        checkbox(draft.pair_with_candidate)
+                            .label("Pair with the reciprocal one-way link (keep its route)")
+                            .size(14)
+                            .text_size(12)
+                            .on_toggle(Message::LinkPairChanged),
+                    );
+                }
+                if !draft.is_valid() {
+                    body = body.push(
+                        text("Enter a supported CSS color and width from 0.25 to 8.")
+                            .size(11)
+                            .style(builtins::text::danger),
+                    );
+                }
+                body = body.push(
+                    row![
+                        space::horizontal(),
+                        button(text("Cancel").size(13))
+                            .style(builtins::button::secondary)
+                            .on_press(Message::ModalDismissed),
+                        button(text("Create").size(13))
+                            .style(builtins::button::primary)
+                            .on_press_maybe(
+                                draft.is_valid().then_some(Message::LinkCreateConfirmed)
+                            ),
+                    ]
+                    .spacing(10)
+                    .align_y(Vertical::Center),
+                );
+                ("Create link".to_string(), body.into())
+            }
             Modal::CreateArea { name, error, .. } => {
                 let mut body = column![
                     text("Name the new area").size(13),
@@ -1504,7 +1713,9 @@ impl Modal {
                         "Delete \u{201c}{name}\u{201d} and its {room_count} rooms?"
                     ))
                     .size(13),
-                    text("This cannot be undone.").size(12).style(builtins::text::danger),
+                    text("This cannot be undone.")
+                        .size(12)
+                        .style(builtins::text::danger),
                     row![
                         space::horizontal(),
                         button(text("Cancel").size(13))
@@ -1520,6 +1731,149 @@ impl Modal {
                 .spacing(10);
 
                 ("Delete area".to_string(), body.into())
+            }
+            Modal::ConfirmDeleteConnection {
+                member_count,
+                is_secret,
+                ..
+            } => {
+                let traversal = if *member_count == 1 {
+                    "This removes its traversal."
+                } else {
+                    "This removes both traversals."
+                };
+                let mut body = column![text(traversal).size(13)].spacing(10);
+                if *is_secret {
+                    body = body.push(
+                        text("This link contains secret map information.")
+                            .size(12)
+                            .style(builtins::text::danger),
+                    );
+                }
+                body = body.push(
+                    row![
+                        space::horizontal(),
+                        button(text("Cancel").size(13))
+                            .style(builtins::button::secondary)
+                            .on_press(Message::ModalDismissed),
+                        button(text("Delete link").size(13))
+                            .style(builtins::button::primary)
+                            .on_press(Message::DeleteConnectionConfirmed),
+                    ]
+                    .spacing(10)
+                    .align_y(Vertical::Center),
+                );
+                ("Delete link".to_string(), body.into())
+            }
+            Modal::AutomaticRoutePreview {
+                connection_id,
+                point_count,
+                visited_states,
+            } => {
+                let body = column![
+                    text(format!("Previewing automatic route for link {connection_id}"))
+                        .size(13),
+                    text(format!(
+                        "{point_count} stored elbow(s) · {visited_states} visited solver states"
+                    ))
+                    .size(12)
+                    .style(muted),
+                    text("Accept replaces the stored points in one undoable compare-and-set change. Cancel leaves the current route untouched.")
+                        .size(12),
+                    text("Automatic routing uses public rooms only; in a cleared view the route may overlap unrelated secret rooms.")
+                        .size(12)
+                        .style(muted),
+                    row![
+                        space::horizontal(),
+                        button(text("Cancel").size(13))
+                            .style(builtins::button::secondary)
+                            .on_press(Message::AutomaticRouteCancelled),
+                        button(text("Accept route").size(13))
+                            .style(builtins::button::primary)
+                            .on_press(Message::AutomaticRouteAccepted),
+                    ]
+                    .spacing(10)
+                    .align_y(Vertical::Center),
+                ]
+                .spacing(10);
+                ("Automatic route preview".to_string(), body.into())
+            }
+            Modal::ConfirmRedistributePorts {
+                room_number,
+                side,
+                secret,
+                preview,
+                ..
+            } => {
+                let layer = if *secret { "secret" } else { "public" };
+                let mut offsets = preview
+                    .iter()
+                    .map(|(_, offset)| format!("{offset:.3}"))
+                    .collect::<Vec<_>>();
+                offsets.sort();
+                let body = column![
+                    text(format!(
+                        "Move {} automatic {layer} ports on room {room_number} {side}?",
+                        preview.len()
+                    ))
+                    .size(13),
+                    text(format!("Preview offsets: {}", offsets.join(", ")))
+                        .size(12)
+                        .style(muted),
+                    text("Manual ports stay fixed. Orthogonal endpoint legs are repaired in the same change.")
+                        .size(12),
+                    row![
+                        space::horizontal(),
+                        button(text("Cancel").size(13))
+                            .style(builtins::button::secondary)
+                            .on_press(Message::ModalDismissed),
+                        button(text("Redistribute").size(13))
+                            .style(builtins::button::primary)
+                            .on_press(Message::RedistributePortsConfirmed),
+                    ]
+                    .spacing(10)
+                    .align_y(Vertical::Center),
+                ]
+                .spacing(10);
+                ("Redistribute ports".to_string(), body.into())
+            }
+            Modal::ConfirmCopySelection {
+                boundary_count,
+                include_boundary_links,
+                cut_after_copy,
+            } => {
+                let noun = if *boundary_count == 1 {
+                    "link"
+                } else {
+                    "links"
+                };
+                let action = if *cut_after_copy { "Cut" } else { "Copy" };
+                let body = column![
+                    text(format!(
+                        "{boundary_count} boundary {noun} leave the selected rooms."
+                    ))
+                    .size(13),
+                    text("They are omitted by default. If included, each becomes a dangling one-way link with no stored route points.")
+                        .size(12),
+                    checkbox(*include_boundary_links)
+                        .label("Include links leaving the selection")
+                        .size(14)
+                        .text_size(12)
+                        .on_toggle(Message::CopyIncludeBoundaryChanged),
+                    row![
+                        space::horizontal(),
+                        button(text("Cancel").size(13))
+                            .style(builtins::button::secondary)
+                            .on_press(Message::ModalDismissed),
+                        button(text(action).size(13))
+                            .style(builtins::button::primary)
+                            .on_press(Message::CopySelectionConfirmed),
+                    ]
+                    .spacing(10)
+                    .align_y(Vertical::Center),
+                ]
+                .spacing(10);
+                (format!("{action} selection"), body.into())
             }
             Modal::CreateAtlas {
                 name,
@@ -1703,17 +2057,13 @@ impl Modal {
                             for entity in group_entries {
                                 list = list.push(
                                     row![
-                                        button(
-                                            text(entity_label(area.as_ref(), entity)).size(13)
-                                        )
-                                        .style(builtins::button::list_item)
-                                        .on_press(Message::SecretsAuditJump(entity.clone()))
-                                        .width(Length::Fill),
+                                        button(text(entity_label(area.as_ref(), entity)).size(13))
+                                            .style(builtins::button::list_item)
+                                            .on_press(Message::SecretsAuditJump(entity.clone()))
+                                            .width(Length::Fill),
                                         button(text("Unmark").size(12))
                                             .style(builtins::button::secondary)
-                                            .on_press(Message::SecretsAuditUnmark(
-                                                entity.clone()
-                                            )),
+                                            .on_press(Message::SecretsAuditUnmark(entity.clone())),
                                     ]
                                     .spacing(8)
                                     .align_y(Vertical::Center),
@@ -1781,8 +2131,7 @@ impl Modal {
                     body = body.push(text(error.clone()).size(12).style(builtins::text::danger));
                 }
                 if let Some(report) = &dialog.atlas_report {
-                    body =
-                        body.push(text(report.clone()).size(12).style(builtins::text::success));
+                    body = body.push(text(report.clone()).size(12).style(builtins::text::success));
                 }
 
                 // Whole-atlas copy is offered only when the source's atlas
@@ -1792,12 +2141,14 @@ impl Modal {
                     body = body.push(
                         column![
                             iced::widget::rule::horizontal(1),
-                            text("This map belongs to an atlas you can see. You can fork the \
+                            text(
+                                "This map belongs to an atlas you can see. You can fork the \
                                   whole atlas instead — every member you're allowed to copy \
                                   comes along, with links between them re-pointed at your \
-                                  copies.")
-                                .size(11)
-                                .style(muted),
+                                  copies."
+                            )
+                            .size(11)
+                            .style(muted),
                             button(text("Copy whole atlas\u{2026}").size(12))
                                 .style(builtins::button::secondary)
                                 .on_press_maybe(
@@ -1815,7 +2166,12 @@ impl Modal {
                             .style(builtins::button::secondary)
                             .on_press(Message::ModalDismissed),
                         button(
-                            text(if dialog.busy { "Copying\u{2026}" } else { "Copy" }).size(13)
+                            text(if dialog.busy {
+                                "Copying\u{2026}"
+                            } else {
+                                "Copy"
+                            })
+                            .size(13)
                         )
                         .style(builtins::button::primary)
                         .on_press_maybe(
@@ -1936,14 +2292,13 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
     let mut content = Column::new().spacing(12);
 
     // ===== scope ==========================================================
-    let mut scope = column![radio(
-        "This area only",
-        false,
-        Some(dialog.scope_atlas),
-        |value| share(ShareMessage::ScopeAtlasChanged(value)),
-    )
-    .size(14)
-    .text_size(13)]
+    let mut scope = column![
+        radio("This area only", false, Some(dialog.scope_atlas), |value| {
+            share(ShareMessage::ScopeAtlasChanged(value))
+        },)
+        .size(14)
+        .text_size(13)
+    ]
     .spacing(4);
     if dialog.atlas_id.is_some() {
         scope = scope.push(
@@ -2161,8 +2516,7 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
                 content = content.push(text(message.clone()).size(12).style(muted));
             }
             PreviewState::Error(error) => {
-                content =
-                    content.push(text(error.clone()).size(12).style(builtins::text::danger));
+                content = content.push(text(error.clone()).size(12).style(builtins::text::danger));
             }
             PreviewState::Loaded(summary) => {
                 content = content.push(preview_block(summary));
@@ -2178,11 +2532,11 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
                 Ok(()) => text(format!("Shared with {label}."))
                     .size(12)
                     .style(builtins::text::success),
-                Err(CloudError::NotFoundOrNoAccess) => {
-                    text(format!("Couldn't share with {label} — are you still friends?"))
-                        .size(12)
-                        .style(builtins::text::danger)
-                }
+                Err(CloudError::NotFoundOrNoAccess) => text(format!(
+                    "Couldn't share with {label} — are you still friends?"
+                ))
+                .size(12)
+                .style(builtins::text::danger),
                 Err(error) => text(format!("Couldn't share with {label} — {error}"))
                     .size(12)
                     .style(builtins::text::danger),
@@ -2202,19 +2556,23 @@ fn share_view(dialog: &ShareDialog) -> ThemedElement<'_, Message> {
         button(text("Close").size(13))
             .style(builtins::button::secondary)
             .on_press(Message::ModalDismissed),
-        button(text(if dialog.submitting { "Sharing\u{2026}" } else { "Share" }).size(13))
-            .style(builtins::button::primary)
-            .on_press_maybe(share_enabled.then_some(share(ShareMessage::Submit))),
+        button(
+            text(if dialog.submitting {
+                "Sharing\u{2026}"
+            } else {
+                "Share"
+            })
+            .size(13)
+        )
+        .style(builtins::button::primary)
+        .on_press_maybe(share_enabled.then_some(share(ShareMessage::Submit))),
     ]
     .spacing(10)
     .align_y(Vertical::Center);
 
-    column![
-        container(scrollable(content)).max_height(540.0),
-        buttons,
-    ]
-    .spacing(12)
-    .into()
+    column![container(scrollable(content)).max_height(540.0), buttons,]
+        .spacing(12)
+        .into()
 }
 
 fn preview_block(summary: &PreviewSummary) -> ThemedElement<'_, Message> {
@@ -2240,7 +2598,11 @@ fn preview_block(summary: &PreviewSummary) -> ThemedElement<'_, Message> {
     .spacing(3);
 
     if !summary.linked_visible.is_empty() || summary.linked_unknown > 0 {
-        block = block.push(text("Linked areas, as they see them:").size(12).style(muted));
+        block = block.push(
+            text("Linked areas, as they see them:")
+                .size(12)
+                .style(muted),
+        );
         for name in &summary.linked_visible {
             block = block.push(text(format!("\u{2192} {name}")).size(12));
         }
@@ -2440,7 +2802,10 @@ fn grant_edit_row<'a>(node: &'a GrantTreeNode, edit: &'a GrantEdit) -> ThemedEle
     }
     flags = flags.push(secrets_box);
 
-    let mut admin_box = checkbox(edit.can_admin).label("admin").size(14).text_size(12);
+    let mut admin_box = checkbox(edit.can_admin)
+        .label("admin")
+        .size(14)
+        .text_size(12);
     if edit.allow_admin {
         admin_box = admin_box
             .on_toggle(|value| share(ShareMessage::EditFlagToggled(GrantFlag::Admin, value)));
@@ -2466,9 +2831,16 @@ fn grant_edit_row<'a>(node: &'a GrantTreeNode, edit: &'a GrantEdit) -> ThemedEle
             button(text("Cancel").size(11))
                 .style(builtins::button::secondary)
                 .on_press(share(ShareMessage::EditCancelled)),
-            button(text(if edit.saving { "Saving\u{2026}" } else { "Save" }).size(11))
-                .style(builtins::button::primary)
-                .on_press_maybe((!edit.saving).then_some(share(ShareMessage::EditSaved))),
+            button(
+                text(if edit.saving {
+                    "Saving\u{2026}"
+                } else {
+                    "Save"
+                })
+                .size(11)
+            )
+            .style(builtins::button::primary)
+            .on_press_maybe((!edit.saving).then_some(share(ShareMessage::EditSaved))),
         ]
         .spacing(8)
         .align_y(Vertical::Center),
@@ -2482,9 +2854,11 @@ fn revoke_confirm_row<'a>(
     node: &'a GrantTreeNode,
 ) -> ThemedElement<'a, Message> {
     let mut block = column![
-        text("Revokes their access and anything they re-shared. Copies they already made are theirs.")
-            .size(11)
-            .style(builtins::text::danger),
+        text(
+            "Revokes their access and anything they re-shared. Copies they already made are theirs."
+        )
+        .size(11)
+        .style(builtins::text::danger),
     ]
     .spacing(6)
     .padding([4, 0]);
@@ -2512,9 +2886,7 @@ fn revoke_confirm_row<'a>(
                 .size(11)
             )
             .style(builtins::button::primary)
-            .on_press_maybe(
-                (!dialog.revoke_busy).then_some(share(ShareMessage::RevokeConfirmed))
-            ),
+            .on_press_maybe((!dialog.revoke_busy).then_some(share(ShareMessage::RevokeConfirmed))),
         ]
         .spacing(8)
         .align_y(Vertical::Center),
@@ -2691,7 +3063,10 @@ fn share_atlas_view(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
                     .size(14)
                     .text_size(13)
                     .on_toggle(move |value| {
-                        share_atlas(ShareAtlasMessage::HostHintToggled(toggle_host.clone(), value))
+                        share_atlas(ShareAtlasMessage::HostHintToggled(
+                            toggle_host.clone(),
+                            value,
+                        ))
                     }),
             );
         }
@@ -2706,11 +3081,11 @@ fn share_atlas_view(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
                 Ok(()) => text(format!("Shared with {label}."))
                     .size(12)
                     .style(builtins::text::success),
-                Err(CloudError::NotFoundOrNoAccess) => {
-                    text(format!("Couldn't share with {label} — are you still friends?"))
-                        .size(12)
-                        .style(builtins::text::danger)
-                }
+                Err(CloudError::NotFoundOrNoAccess) => text(format!(
+                    "Couldn't share with {label} — are you still friends?"
+                ))
+                .size(12)
+                .style(builtins::text::danger),
                 Err(error) => text(format!("Couldn't share with {label} — {error}"))
                     .size(12)
                     .style(builtins::text::danger),
@@ -2729,9 +3104,16 @@ fn share_atlas_view(dialog: &ShareAtlasDialog) -> ThemedElement<'_, Message> {
         button(text("Close").size(13))
             .style(builtins::button::secondary)
             .on_press(Message::ModalDismissed),
-        button(text(if dialog.submitting { "Sharing\u{2026}" } else { "Share" }).size(13))
-            .style(builtins::button::primary)
-            .on_press_maybe(share_enabled.then_some(share_atlas(ShareAtlasMessage::Submit))),
+        button(
+            text(if dialog.submitting {
+                "Sharing\u{2026}"
+            } else {
+                "Share"
+            })
+            .size(13)
+        )
+        .style(builtins::button::primary)
+        .on_press_maybe(share_enabled.then_some(share_atlas(ShareAtlasMessage::Submit))),
     ]
     .spacing(10)
     .align_y(Vertical::Center);

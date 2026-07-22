@@ -8,6 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     models::hotkeys::HotkeyDefinition,
+    session::runtime::input::InputOp,
     session::runtime::line_operation::LineOperation,
     session::runtime::pane::{PaneDef, PaneKey, PanePlacement},
 };
@@ -74,6 +75,34 @@ pub enum SessionEvent {
     /// hold the new values and the widget render closures read them lock-free,
     /// so the UI needs no state change — processing the message redraws the view.
     StoreBindingsChanged,
+    /// Apply one scripted input mutation to the input of pane `key`
+    /// (`docs/input.md` §3.4). Travels the ordered channel, so ops
+    /// land in the order scripts issued them.
+    InputOp { key: PaneKey, op: InputOp },
+    /// The session thread has flagged input-mirror interest: start sending
+    /// `RuntimeAction::InputStateChanged` on input changes, and push the
+    /// current state immediately so the mirror warms up.
+    InputMirrorInterest,
+    /// The merged completion word sets for the input of pane `key`
+    /// (`docs/input.md` §3.8): every creator's registered
+    /// suggestions in merge order (creators in first-contribution order,
+    /// words in insertion order, deduplicated case-insensitively) and the
+    /// union blacklist (lowercase-folded; blacklist filtering is
+    /// case-insensitive). Replaces the UI's previous copy for that input
+    /// wholesale — Tab completion consults this beside the scrollback scan.
+    InputWordSets {
+        key: PaneKey,
+        suggestions: Arc<Vec<Arc<String>>>,
+        blacklist: Arc<std::collections::HashSet<String>>,
+    },
+    /// The server's telnet ECHO state (RFC 857): `enabled` means the server
+    /// has taken over echoing — the classic password-prompt signal — and the
+    /// UI should mask the main input (subject to the user's auto-mask
+    /// preference); `false` releases that mask. The telnet cause composes
+    /// with a script-set mask UI-side: the input stays masked while either
+    /// is active (`docs/input.md` §3.10). Also sent with `false` on
+    /// disconnect, since the option dies with the connection.
+    ServerEcho { enabled: bool },
 }
 #[derive(Debug, Clone)]
 pub struct TaggedSessionEvent {
@@ -129,7 +158,7 @@ impl Debug for SessionParams {
     }
 }
 
-#[derive(Display, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Display, Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct HotkeyId(usize);
 

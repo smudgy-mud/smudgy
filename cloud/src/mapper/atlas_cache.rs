@@ -1,8 +1,11 @@
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet},
+    hash::Hash,
     sync::Arc,
 };
 
+use imbl::HashMap as PersistentMap;
 use ordered_float::OrderedFloat;
 
 use crate::{
@@ -16,8 +19,8 @@ use crate::{
 
 /// The two independent axes that keep an area out of the room-identification
 /// lookup tables and out of routing. Exclusion is **one behavior with two
-/// sources**, folded into a single predicate ([`Self::excludes`]) so a
-/// scope-excluded area is invisible to identification exactly like a
+/// sources**, folded into a single placement (`AreaPlacement::identified`) so
+/// a scope-excluded area is invisible to identification exactly like a
 /// manually-disabled one — while the two sets stay separate so the editor's
 /// per-area active switch can keep reflecting only the manual axis.
 ///
@@ -35,12 +38,6 @@ struct Exclusions {
 }
 
 impl Exclusions {
-    /// Whether `area` (with id `area_id`) is excluded by either axis.
-    fn excludes(&self, area_id: &AreaId, area: &AreaCache) -> bool {
-        self.disabled.contains(area_id)
-            || self.scope_excludes(area_id, area)
-    }
-
     /// Whether `area` is excluded specifically by the **per-server scope** axis
     /// (associated only with other server entries) — the manual-disable axis is
     /// deliberately not consulted. This is the cross-entry rescue predicate: a
@@ -57,6 +54,23 @@ impl Exclusions {
     }
 }
 
+/// How one area participates in the lookup tables, derived from the exclusion
+/// axes and the area snapshot's own metadata. An area's contributions are
+/// always removed under the placement computed from the same snapshot that
+/// added them, so additions and removals cancel exactly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AreaPlacement {
+    /// Participates in room identification (the four lookup tables and the
+    /// external-id index): not manually disabled and not scope-excluded.
+    identified: bool,
+    /// Contributes to the cross-entry rescue index: scope-excluded. Manual
+    /// disable alone does not rescue — it is the user's own toggle, not
+    /// another entry's map.
+    rescue: bool,
+    /// Sorts into the owned prefix of every match list (own-beats-shared).
+    owned: bool,
+}
+
 /// Routing tie-bias: edge weights into rooms of areas the viewer does *not*
 /// own are multiplied by this constant, so auto-routing prefers the viewer's
 /// own zones when both contain a viable route (own-beats-shared precedence).
@@ -67,6 +81,12 @@ const SHARED_AREA_WEIGHT_PENALTY: f32 = 4.0;
 /// The ordered list of rooms a single lookup-table key resolves to, paired
 /// with the area each room belongs to (owned areas sorted first).
 type RoomMatches = Vec<(AreaId, Arc<RoomCache>)>;
+
+/// Every live room binding for one external id, rooms of owned areas first;
+/// the head is the resolution winner. Keeping the non-winning bindings lets
+/// resolution fall back correctly when the winner's area is later rewritten,
+/// excluded, or unloaded — exactly what a from-scratch rebuild would produce.
+type ExternalIdBindings = Vec<RoomKey>;
 
 static EMPTY_ROOMS_LOOKUP_VEC: RoomMatches = Vec::new();
 
@@ -81,20 +101,33 @@ pub struct ElsewhereMatch {
     pub atlas_name: Option<String>,
 }
 
+/// The atlas-wide room-identification state, maintained **area-scoped**: a
+/// write that replaces one area's snapshot edits only that area's entries in
+/// the lookup tables (skipping rooms whose `Arc` survived the rewrite), while
+/// every other area's entries ride through the RCU clone untouched via the
+/// persistent maps' structural sharing. Only operations that change an
+/// exclusion axis — which re-place *every* area at once — rebuild the tables
+/// from scratch; those are rare, user-initiated toggles.
+///
+/// The from-scratch build is itself the incremental insert applied to an empty
+/// cache once per area, so the two paths cannot drift: any sequence of
+/// area-level edits leaves the tables exactly as a full rebuild of the final
+/// area set would.
 #[derive(Clone)]
 pub struct AtlasCache {
     areas: HashMap<AreaId, Arc<AreaCache>>,
     rooms_by_title_description_and_visible_exits:
-        HashMap<(ExitBitfield, String), RoomMatches>,
-    rooms_by_title_and_description: HashMap<String, RoomMatches>,
-    rooms_by_title: HashMap<String, RoomMatches>,
-    rooms_by_description: HashMap<String, RoomMatches>,
+        PersistentMap<(ExitBitfield, String), RoomMatches>,
+    rooms_by_title_and_description: PersistentMap<String, RoomMatches>,
+    rooms_by_title: PersistentMap<String, RoomMatches>,
+    rooms_by_description: PersistentMap<String, RoomMatches>,
     /// Reverse index over rooms' server-global external ids (GMCP/MSDP room
     /// identity) — the mapper hot path for id → room resolution. Built like
-    /// the other identification tables (disabled areas excluded). Uniqueness
-    /// is not enforced; under duplicate bindings an owned area's room wins,
-    /// otherwise the winner is unspecified (documented best-effort).
-    rooms_by_external_id: HashMap<String, RoomKey>,
+    /// the other identification tables (excluded areas omitted). Uniqueness is
+    /// not enforced; under duplicate bindings an owned area's room wins,
+    /// otherwise the winner is unspecified but stable (documented
+    /// best-effort). Resolution reads the head of the binding list.
+    rooms_by_external_id: PersistentMap<String, ExternalIdBindings>,
     /// The external-id reverse index over the *scope-excluded* areas only — the
     /// mirror image of `rooms_by_external_id`, which omits them. This is the
     /// cross-entry rescue probe's index: when normal identification fails on a
@@ -102,20 +135,19 @@ pub struct AtlasCache {
     /// O(1). A second index (rather than a linear scan over excluded areas per
     /// probe) is the hot-path-honest choice: the auto-mapper consults the rescue
     /// path on *every* unmapped room while exploring, so an O(1) lookup against
-    /// a table built once per (rare) cache rebuild beats re-scanning a
-    /// potentially large sibling map on each step. Manual-disable exclusions are
-    /// excluded from this index — only per-server-scope exclusions rescue.
-    rooms_by_external_id_excluded: HashMap<String, RoomKey>,
-    rooms: HashMap<RoomKey, Arc<RoomCache>>,
+    /// an incrementally-maintained table beats re-scanning a potentially large
+    /// sibling map on each step. Manual-disable exclusions are excluded from
+    /// this index — only per-server-scope exclusions rescue.
+    rooms_by_external_id_excluded: PersistentMap<String, ExternalIdBindings>,
     /// Areas the viewer owns, for own-beats-shared precedence in lookups and
-    /// routing. Built once per cache rebuild; lookups are O(1).
+    /// routing. Maintained alongside the tables; lookups are O(1).
     owned_areas: HashSet<AreaId>,
     /// The manual-disable and per-server-scope exclusion sets. Excluded areas
-    /// drop out of the room-identification lookup tables at build time and are
-    /// never routed *through* (still present in `areas` and `rooms` so explicit
-    /// addressing keeps working). The sets are `Arc` so they ride through every
-    /// rebuild for free, and may contain ids not (yet) in `areas` — exclusion
-    /// survives the area landing later.
+    /// drop out of the room-identification lookup tables and are never routed
+    /// *through* (still present in `areas` so explicit addressing keeps
+    /// working). The sets are `Arc` so they ride through every write for free,
+    /// and may contain ids not (yet) in `areas` — exclusion survives the area
+    /// landing later.
     exclusions: Exclusions,
 }
 
@@ -134,111 +166,205 @@ impl AtlasCache {
     }
 
     fn new_with_exclusions(areas: HashMap<AreaId, Arc<AreaCache>>, exclusions: Exclusions) -> Self {
-        let owned_areas: HashSet<AreaId> = areas
-            .iter()
-            .filter(|(_, area)| area.is_owned())
-            .map(|(area_id, _)| *area_id)
-            .collect();
-
-        let mut rooms_by_title_description_and_visible_exits =
-            Self::build_rooms_by_title_description_and_visible_exits(&areas, &exclusions);
-        let mut rooms_by_title_and_description =
-            Self::build_rooms_by_title_and_description(&areas, &exclusions);
-        let mut rooms_by_title = Self::build_rooms_by_title(&areas, &exclusions);
-        let mut rooms_by_description = Self::build_rooms_by_description(&areas, &exclusions);
-        let rooms_by_external_id =
-            Self::build_rooms_by_external_id(&areas, &exclusions, &owned_areas);
-        let rooms_by_external_id_excluded =
-            Self::build_rooms_by_external_id_excluded(&areas, &exclusions);
-        let rooms = Self::build_rooms(&areas);
-
-        // Own-beats-shared: rooms from owned areas sort before rooms from
-        // shared areas in every lookup table, so session auto-location picks
-        // the viewer's own room when both match.
-        sort_owned_first(&mut rooms_by_title_description_and_visible_exits, &owned_areas);
-        sort_owned_first(&mut rooms_by_title_and_description, &owned_areas);
-        sort_owned_first(&mut rooms_by_title, &owned_areas);
-        sort_owned_first(&mut rooms_by_description, &owned_areas);
-
-        Self {
-            areas,
-            rooms_by_title_description_and_visible_exits,
-            rooms_by_title_and_description,
-            rooms_by_title,
-            rooms_by_description,
-            rooms_by_external_id,
-            rooms_by_external_id_excluded,
-            rooms,
-            owned_areas,
+        let mut cache = Self {
+            areas: HashMap::with_capacity(areas.len()),
+            rooms_by_title_description_and_visible_exits: PersistentMap::new(),
+            rooms_by_title_and_description: PersistentMap::new(),
+            rooms_by_title: PersistentMap::new(),
+            rooms_by_description: PersistentMap::new(),
+            rooms_by_external_id: PersistentMap::new(),
+            rooms_by_external_id_excluded: PersistentMap::new(),
+            owned_areas: HashSet::new(),
             exclusions,
+        };
+        for (area_id, area) in areas {
+            cache.apply_insert(area_id, area);
+        }
+        cache
+    }
+
+    /// How `area` participates in the lookup tables under the current
+    /// exclusion sets.
+    fn placement(&self, area_id: &AreaId, area: &AreaCache) -> AreaPlacement {
+        let rescue = self.exclusions.scope_excludes(area_id, area);
+        AreaPlacement {
+            identified: !rescue && !self.exclusions.disabled.contains(area_id),
+            rescue,
+            owned: area.is_owned(),
         }
     }
 
-    fn build_rooms_by_external_id(
-        areas: &HashMap<AreaId, Arc<AreaCache>>,
-        exclusions: &Exclusions,
-        owned_areas: &HashSet<AreaId>,
-    ) -> HashMap<String, RoomKey> {
-        let mut ret: HashMap<String, RoomKey> = HashMap::new();
-        for (area_id, area) in areas {
-            if exclusions.excludes(area_id, area) {
-                continue;
-            }
-            for room in area.get_rooms() {
-                let Some(external_id) = room.get_external_id() else {
-                    continue;
-                };
-                let key = RoomKey::new(*area_id, room.get_room_number());
-                match ret.entry(external_id.to_string()) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(key);
+    /// Replaces (or adds) one area's snapshot, editing only the lookup-table
+    /// entries the change touches. When the area's placement is unchanged,
+    /// rooms whose `Arc` survived the rewrite are skipped entirely — the
+    /// dominant case for a single-room edit. A placement flip (ownership,
+    /// atlas membership) re-places the area's whole contribution, still
+    /// O(that area), never O(atlas).
+    fn apply_insert(&mut self, area_id: AreaId, area: Arc<AreaCache>) {
+        let old = self.areas.get(&area_id).cloned();
+        let new_placement = self.placement(&area_id, &area);
+
+        match old {
+            Some(ref old_area) if self.placement(&area_id, old_area) == new_placement => {
+                for old_room in old_area.get_rooms() {
+                    let survives = area
+                        .get_room(&old_room.get_room_number())
+                        .is_some_and(|new_room| Arc::ptr_eq(old_room, new_room));
+                    if !survives {
+                        self.remove_room(area_id, old_room, new_placement);
                     }
-                    // Own-beats-shared under duplicate bindings; otherwise
-                    // keep the incumbent (arbitrary but stable within a build).
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        if owned_areas.contains(area_id)
-                            && !owned_areas.contains(&entry.get().area_id)
-                        {
-                            entry.insert(key);
-                        }
+                }
+                for new_room in area.get_rooms() {
+                    let survives = old_area
+                        .get_room(&new_room.get_room_number())
+                        .is_some_and(|old_room| Arc::ptr_eq(old_room, new_room));
+                    if !survives {
+                        self.add_room(area_id, new_room, new_placement);
                     }
                 }
             }
-        }
-        ret
-    }
-
-    /// The external-id reverse index over the scope-excluded areas only (the
-    /// mirror of [`Self::build_rooms_by_external_id`]). Own-beats-shared has no
-    /// meaning here — every area is another entry's map — so the first binding
-    /// for an id wins and later ones are kept out; a rescue offer only needs to
-    /// know *that* the room is homed elsewhere, not to disambiguate duplicates.
-    fn build_rooms_by_external_id_excluded(
-        areas: &HashMap<AreaId, Arc<AreaCache>>,
-        exclusions: &Exclusions,
-    ) -> HashMap<String, RoomKey> {
-        let mut ret: HashMap<String, RoomKey> = HashMap::new();
-        for (area_id, area) in areas {
-            if !exclusions.scope_excludes(area_id, area) {
-                continue;
-            }
-            for room in area.get_rooms() {
-                let Some(external_id) = room.get_external_id() else {
-                    continue;
-                };
-                ret.entry(external_id.to_string())
-                    .or_insert_with(|| RoomKey::new(*area_id, room.get_room_number()));
+            _ => {
+                if let Some(old_area) = old {
+                    self.remove_area_contribution(area_id, &old_area);
+                }
+                if new_placement.owned {
+                    self.owned_areas.insert(area_id);
+                } else {
+                    self.owned_areas.remove(&area_id);
+                }
+                for room in area.get_rooms() {
+                    self.add_room(area_id, room, new_placement);
+                }
             }
         }
-        ret
+
+        self.areas.insert(area_id, area);
     }
 
-    /// Resolve a server-global external id to its bound room. O(1); disabled
-    /// areas are excluded (external-id resolution is room identification).
+    /// Removes every table entry contributed by this snapshot of the area,
+    /// under the placement that snapshot was added with.
+    fn remove_area_contribution(&mut self, area_id: AreaId, area: &AreaCache) {
+        let placement = self.placement(&area_id, area);
+        for room in area.get_rooms() {
+            self.remove_room(area_id, room, placement);
+        }
+    }
+
+    fn add_room(&mut self, area_id: AreaId, room: &Arc<RoomCache>, placement: AreaPlacement) {
+        if placement.identified {
+            insert_match(
+                &mut self.rooms_by_title_description_and_visible_exits,
+                (
+                    room.get_visible_exit_bitfield(),
+                    room.get_title_and_description().to_string(),
+                ),
+                area_id,
+                room,
+                placement.owned,
+                &self.owned_areas,
+            );
+            insert_match(
+                &mut self.rooms_by_title_and_description,
+                room.get_title_and_description().to_string(),
+                area_id,
+                room,
+                placement.owned,
+                &self.owned_areas,
+            );
+            insert_match(
+                &mut self.rooms_by_title,
+                room.get_title().to_string(),
+                area_id,
+                room,
+                placement.owned,
+                &self.owned_areas,
+            );
+            insert_match(
+                &mut self.rooms_by_description,
+                room.get_description().to_string(),
+                area_id,
+                room,
+                placement.owned,
+                &self.owned_areas,
+            );
+            if let Some(external_id) = room.get_external_id() {
+                insert_binding(
+                    &mut self.rooms_by_external_id,
+                    external_id,
+                    RoomKey::new(area_id, room.get_room_number()),
+                    placement.owned,
+                    &self.owned_areas,
+                );
+            }
+        }
+        if placement.rescue
+            && let Some(external_id) = room.get_external_id()
+        {
+            insert_binding(
+                &mut self.rooms_by_external_id_excluded,
+                external_id,
+                RoomKey::new(area_id, room.get_room_number()),
+                placement.owned,
+                &self.owned_areas,
+            );
+        }
+    }
+
+    fn remove_room(&mut self, area_id: AreaId, room: &Arc<RoomCache>, placement: AreaPlacement) {
+        let room_number = room.get_room_number();
+        if placement.identified {
+            remove_match(
+                &mut self.rooms_by_title_description_and_visible_exits,
+                &(
+                    room.get_visible_exit_bitfield(),
+                    room.get_title_and_description().to_string(),
+                ),
+                area_id,
+                room_number,
+            );
+            remove_match(
+                &mut self.rooms_by_title_and_description,
+                room.get_title_and_description(),
+                area_id,
+                room_number,
+            );
+            remove_match(
+                &mut self.rooms_by_title,
+                room.get_title(),
+                area_id,
+                room_number,
+            );
+            remove_match(
+                &mut self.rooms_by_description,
+                room.get_description(),
+                area_id,
+                room_number,
+            );
+            if let Some(external_id) = room.get_external_id() {
+                remove_binding(
+                    &mut self.rooms_by_external_id,
+                    external_id,
+                    &RoomKey::new(area_id, room_number),
+                );
+            }
+        }
+        if placement.rescue
+            && let Some(external_id) = room.get_external_id()
+        {
+            remove_binding(
+                &mut self.rooms_by_external_id_excluded,
+                external_id,
+                &RoomKey::new(area_id, room_number),
+            );
+        }
+    }
+
+    /// Resolve a server-global external id to its bound room. O(1); excluded
+    /// areas are omitted (external-id resolution is room identification).
     #[must_use]
     pub fn find_room_by_external_id(&self, external_id: &str) -> Option<(RoomKey, Arc<RoomCache>)> {
-        let key = self.rooms_by_external_id.get(external_id)?;
-        self.rooms.get(key).map(|room| (key.clone(), room.clone()))
+        let key = self.rooms_by_external_id.get(external_id)?.first()?;
+        self.get_room(key).map(|room| (key.clone(), room))
     }
 
     /// Cross-entry rescue probe: resolve a server-global external id against the
@@ -249,11 +375,12 @@ impl AtlasCache {
     /// a separate index and the excluded areas stay resident (explicitly
     /// addressable) exactly as before.
     #[must_use]
-    pub fn find_room_elsewhere_by_external_id(
-        &self,
-        external_id: &str,
-    ) -> Option<ElsewhereMatch> {
-        let key = self.rooms_by_external_id_excluded.get(external_id)?.clone();
+    pub fn find_room_elsewhere_by_external_id(&self, external_id: &str) -> Option<ElsewhereMatch> {
+        let key = self
+            .rooms_by_external_id_excluded
+            .get(external_id)?
+            .first()?
+            .clone();
         let meta = self.areas.get(&key.area_id).map(|area| area.meta());
         Some(ElsewhereMatch {
             room_key: key,
@@ -262,138 +389,46 @@ impl AtlasCache {
         })
     }
 
-    fn build_rooms_by_title_description_and_visible_exits(
-        areas: &HashMap<AreaId, Arc<AreaCache>>,
-        exclusions: &Exclusions,
-    ) -> HashMap<(ExitBitfield, String), RoomMatches> {
-        let mut ret = HashMap::new();
-        for (area_id, area) in areas {
-            if exclusions.excludes(area_id, area) {
-                continue;
-            }
-            for room in area.get_rooms() {
-                let visible_exit_bitfield = room.get_visible_exit_bitfield();
-                ret.entry((
-                    visible_exit_bitfield,
-                    room.get_title_and_description().to_string(),
-                ))
-                .or_insert(Vec::new())
-                .push((*area_id, room.clone()));
-            }
-        }
-        ret
-    }
-
-    fn build_rooms_by_title_and_description(
-        areas: &HashMap<AreaId, Arc<AreaCache>>,
-        exclusions: &Exclusions,
-    ) -> HashMap<String, RoomMatches> {
-        let mut ret = HashMap::new();
-        for (area_id, area) in areas {
-            if exclusions.excludes(area_id, area) {
-                continue;
-            }
-            for room in area.get_rooms() {
-                ret.entry(room.get_title_and_description().to_string())
-                    .or_insert(Vec::new())
-                    .push((*area_id, room.clone()));
-            }
-        }
-        ret
-    }
-
-    fn build_rooms_by_title(
-        areas: &HashMap<AreaId, Arc<AreaCache>>,
-        exclusions: &Exclusions,
-    ) -> HashMap<String, RoomMatches> {
-        let mut ret = HashMap::new();
-        for (area_id, area) in areas {
-            if exclusions.excludes(area_id, area) {
-                continue;
-            }
-            for room in area.get_rooms() {
-                ret.entry(room.get_title().to_string())
-                    .or_insert(Vec::new())
-                    .push((*area_id, room.clone()));
-            }
-        }
-        ret
-    }
-
-    fn build_rooms_by_description(
-        areas: &HashMap<AreaId, Arc<AreaCache>>,
-        exclusions: &Exclusions,
-    ) -> HashMap<String, RoomMatches> {
-        let mut ret = HashMap::new();
-        for (area_id, area) in areas {
-            if exclusions.excludes(area_id, area) {
-                continue;
-            }
-            for room in area.get_rooms() {
-                ret.entry(room.get_description().to_string())
-                    .or_insert(Vec::new())
-                    .push((*area_id, room.clone()));
-            }
-        }
-        ret
-    }
-
-    fn build_rooms(areas: &HashMap<AreaId, Arc<AreaCache>>) -> HashMap<RoomKey, Arc<RoomCache>> {
-        let mut ret = HashMap::new();
-        for (area_id, area) in areas {
-            for room in area.get_rooms() {
-                ret.insert(
-                    RoomKey::new(*area_id, room.get_room_number()),
-                    room.clone(),
-                );
-            }
-        }
-        ret
-    }
-
     #[must_use]
     pub(super) fn add_area(&self, area_id: AreaId, area: Arc<AreaCache>) -> Self {
-        let mut new_areas = self.areas.clone();
-        new_areas.insert(area_id, area);
-
-        Self::new_with_exclusions(new_areas, self.exclusions.clone())
+        self.insert_area(area_id, area)
     }
 
     #[must_use]
     pub(super) fn insert_area(&self, area_id: AreaId, area: Arc<AreaCache>) -> Self {
-        let mut new_areas = self.areas.clone();
-        new_areas.remove(&area_id);
-        new_areas.insert(area_id, area);
-
-        Self::new_with_exclusions(new_areas, self.exclusions.clone())
+        let mut next = self.clone();
+        next.apply_insert(area_id, area);
+        next
     }
 
-    /// Replaces several areas in one pass, rebuilding the lookup tables a
-    /// single time. Equivalent to chained [`Self::insert_area`] calls but
-    /// without rebuilding per area.
+    /// Replaces several areas in one pass. Equivalent to chained
+    /// [`Self::insert_area`] calls; each area's entries are edited in place,
+    /// so the cost is the touched areas' sizes, not the atlas's.
     #[must_use]
     pub(super) fn with_areas_updated(
         &self,
         updates: impl IntoIterator<Item = (AreaId, Arc<AreaCache>)>,
     ) -> Self {
-        let mut new_areas = self.areas.clone();
+        let mut next = self.clone();
         for (area_id, area) in updates {
-            new_areas.insert(area_id, area);
+            next.apply_insert(area_id, area);
         }
-
-        Self::new_with_exclusions(new_areas, self.exclusions.clone())
+        next
     }
 
     #[must_use]
     pub(super) fn delete_area(&self, area_id: AreaId) -> Self {
-        let mut new_areas = self.areas.clone();
-        new_areas.remove(&area_id);
-
-        Self::new_with_exclusions(new_areas, self.exclusions.clone())
+        let mut next = self.clone();
+        if let Some(area) = next.areas.remove(&area_id) {
+            next.remove_area_contribution(area_id, &area);
+            next.owned_areas.remove(&area_id);
+        }
+        next
     }
 
-    /// Same areas, different manual-disable set — scope exclusions preserved
-    /// (full lookup-table rebuild).
+    /// Same areas, different manual-disable set — scope exclusions preserved.
+    /// An exclusion change re-places every area at once, so this is the full
+    /// from-scratch rebuild; toggles are rare.
     #[must_use]
     pub(super) fn with_disabled_areas(&self, disabled_areas: Arc<HashSet<AreaId>>) -> Self {
         Self::new_with_exclusions(
@@ -406,7 +441,8 @@ impl AtlasCache {
     }
 
     /// Same areas, different per-server scope-exclusion sets — the manual
-    /// disable axis preserved (full lookup-table rebuild).
+    /// disable axis preserved. An exclusion change re-places every area at
+    /// once, so this is the full from-scratch rebuild; scope changes are rare.
     #[must_use]
     pub(super) fn with_scope_exclusions(
         &self,
@@ -441,10 +477,7 @@ impl AtlasCache {
     ) -> impl ExactSizeIterator<Item = (AreaId, Arc<RoomCache>)> {
         let visible_exit_bitfield = ExitBitfield::from(visible_exit_directions);
         self.rooms_by_title_description_and_visible_exits
-            .get(&(
-                visible_exit_bitfield,
-                format!("{title}\r\n{description}"),
-            ))
+            .get(&(visible_exit_bitfield, format!("{title}\r\n{description}")))
             .unwrap_or(&EMPTY_ROOMS_LOOKUP_VEC)
             .iter()
             .cloned()
@@ -487,9 +520,15 @@ impl AtlasCache {
             .cloned()
     }
 
+    /// Resolves a room through its area's per-area table (rooms of excluded
+    /// areas stay addressable). Two O(1) probes; there is no flat atlas-wide
+    /// room table to maintain.
     #[must_use]
     pub fn get_room(&self, room_key: &RoomKey) -> Option<Arc<RoomCache>> {
-        self.rooms.get(room_key).cloned()
+        self.areas
+            .get(&room_key.area_id)?
+            .get_room(&room_key.room_number)
+            .cloned()
     }
 
     /// Whether the viewer owns the given area (false for shared areas and
@@ -575,8 +614,7 @@ impl AtlasCache {
                             if self.owned_areas.contains(&key.area_id) {
                                 (key, weight)
                             } else {
-                                let penalized =
-                                    OrderedFloat(weight.0 * SHARED_AREA_WEIGHT_PENALTY);
+                                let penalized = OrderedFloat(weight.0 * SHARED_AREA_WEIGHT_PENALTY);
                                 (key, penalized)
                             }
                         })
@@ -626,7 +664,10 @@ impl AtlasCache {
                 });
                 successors.into_iter()
             },
-            |room_key| self.get_room(room_key).is_some_and(|r| predicate(r.as_ref())),
+            |room_key| {
+                self.get_room(room_key)
+                    .is_some_and(|r| predicate(r.as_ref()))
+            },
         )
         .and_then(|(path, _cost)| path.last().cloned())
     }
@@ -711,22 +752,99 @@ impl AtlasCache {
             },
             // Existence-guarded: an exit can dangle into the target area at a
             // room number the cache has never seen; such a key must not "win".
-            |room_key| {
-                room_key.area_id == *target_area_id && self.get_room(room_key).is_some()
-            },
+            |room_key| room_key.area_id == *target_area_id && self.get_room(room_key).is_some(),
         )
         .and_then(|(path, _cost)| path.last().cloned())
     }
 }
 
-/// Stable-sorts every lookup vector so rooms from owned areas come before
-/// rooms from shared areas (relative order within each class is preserved).
-fn sort_owned_first<K>(
-    table: &mut HashMap<K, RoomMatches>,
+/// Inserts one room entry under `key`, keeping the owned-area prefix intact:
+/// an owned area's entry goes to the end of the owned prefix, a shared area's
+/// to the end of the list. Relative order within each class is insertion
+/// order — arbitrary but stable, the same contract the from-scratch build
+/// provides.
+fn insert_match<K>(
+    table: &mut PersistentMap<K, RoomMatches>,
+    key: K,
+    area_id: AreaId,
+    room: &Arc<RoomCache>,
+    owned: bool,
+    owned_areas: &HashSet<AreaId>,
+) where
+    K: Hash + Eq + Clone,
+{
+    let entry = (area_id, room.clone());
+    if let Some(matches) = table.get_mut(&key) {
+        if owned {
+            let prefix = matches
+                .iter()
+                .take_while(|(id, _)| owned_areas.contains(id))
+                .count();
+            matches.insert(prefix, entry);
+        } else {
+            matches.push(entry);
+        }
+    } else {
+        table.insert(key, vec![entry]);
+    }
+}
+
+/// Removes the entry `(area_id, room_number)` from the match list under
+/// `key`, dropping the key when its list empties.
+fn remove_match<K, Q>(
+    table: &mut PersistentMap<K, RoomMatches>,
+    key: &Q,
+    area_id: AreaId,
+    room_number: crate::RoomNumber,
+) where
+    K: Hash + Eq + Clone + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    let Some(matches) = table.get_mut(key) else {
+        return;
+    };
+    matches.retain(|(id, room)| !(*id == area_id && room.get_room_number() == room_number));
+    if matches.is_empty() {
+        table.remove(key);
+    }
+}
+
+/// Inserts one external-id binding, keeping the owned-area prefix intact so
+/// the head of the list is the own-beats-shared resolution winner.
+fn insert_binding(
+    table: &mut PersistentMap<String, ExternalIdBindings>,
+    external_id: &str,
+    room_key: RoomKey,
+    owned: bool,
     owned_areas: &HashSet<AreaId>,
 ) {
-    for rooms in table.values_mut() {
-        rooms.sort_by_key(|(area_id, _)| !owned_areas.contains(area_id));
+    if let Some(bindings) = table.get_mut(external_id) {
+        if owned {
+            let prefix = bindings
+                .iter()
+                .take_while(|key| owned_areas.contains(&key.area_id))
+                .count();
+            bindings.insert(prefix, room_key);
+        } else {
+            bindings.push(room_key);
+        }
+    } else {
+        table.insert(external_id.to_string(), vec![room_key]);
+    }
+}
+
+/// Removes one external-id binding, dropping the id when its list empties.
+fn remove_binding(
+    table: &mut PersistentMap<String, ExternalIdBindings>,
+    external_id: &str,
+    room_key: &RoomKey,
+) {
+    let Some(bindings) = table.get_mut(external_id) else {
+        return;
+    };
+    bindings.retain(|key| key != room_key);
+    if bindings.is_empty() {
+        table.remove(external_id);
     }
 }
 
@@ -734,8 +852,7 @@ fn sort_owned_first<K>(
 mod tests {
     use super::*;
     use crate::{
-        Area, AreaAccess, AreaWithDetails, Exit, ExitId, ExitStyle, RoomNumber, RoomWithDetails,
-        Uuid,
+        Area, AreaAccess, AreaWithDetails, Exit, ExitId, RoomNumber, RoomWithDetails, Uuid,
     };
     use chrono::Utc;
 
@@ -797,11 +914,13 @@ mod tests {
                 family_token: None,
                 atlas_name: None,
             },
+            format_version: crate::AREA_FORMAT_VERSION,
             content_hash: None,
             properties: Vec::new(),
             rooms,
             labels: Vec::new(),
             shapes: Vec::new(),
+            connections: Vec::new(),
             linked_areas: Vec::new(),
         };
         (id, Arc::new(AreaCache::new_with_area(details)))
@@ -848,8 +967,7 @@ mod tests {
             is_locked: false,
             weight,
             command: String::new(),
-            style: ExitStyle::Normal,
-            color: String::new(),
+            connection_id: crate::ConnectionId::new(),
             to_unknown: false,
             to_area_token: None,
             is_secret: false,
@@ -877,11 +995,13 @@ mod tests {
                 family_token: None,
                 atlas_name: None,
             },
+            format_version: crate::AREA_FORMAT_VERSION,
             content_hash: None,
             properties: Vec::new(),
             rooms,
             labels: Vec::new(),
             shapes: Vec::new(),
+            connections: Vec::new(),
             linked_areas: Vec::new(),
         };
         (id, Arc::new(AreaCache::new_with_area(details)))
@@ -972,8 +1092,7 @@ mod tests {
         lonely.external_id = Some("only-elsewhere".to_string());
 
         let mut areas = HashMap::new();
-        let (id, cache) =
-            cache_area_in_atlas(here_id, Some(here_atlas), true, vec![here_room]);
+        let (id, cache) = cache_area_in_atlas(here_id, Some(here_atlas), true, vec![here_room]);
         areas.insert(id, cache);
         let (id, cache) = cache_area_in_atlas(
             elsewhere_id,
@@ -987,7 +1106,9 @@ mod tests {
 
         // Normal identification resolves the participating binding and never the
         // scope-excluded one.
-        let (key, _) = atlas.find_room_by_external_id("shared-id").expect("resolves here");
+        let (key, _) = atlas
+            .find_room_by_external_id("shared-id")
+            .expect("resolves here");
         assert_eq!(key.area_id, here_id);
 
         // The rescue probe finds the excluded binding, with atlas context.
@@ -1224,10 +1345,7 @@ mod tests {
             room(
                 1,
                 "start",
-                vec![
-                    exit(11, owned_id, 2, 1.0),
-                    exit(12, shared_id, 10, 1.0),
-                ],
+                vec![exit(11, owned_id, 2, 1.0), exit(12, shared_id, 10, 1.0)],
             ),
             room(2, "mid", vec![exit(13, owned_id, 3, 1.0)]),
             room(3, "goal", Vec::new()),
@@ -1480,8 +1598,12 @@ mod tests {
 
         // Both areas have a room titled "Midgaard" (the stock-zone collision).
         let mut areas = HashMap::new();
-        let (id, cache) =
-            cache_area_in_atlas(kept_id, Some(kept_atlas), true, vec![room(1, "Midgaard", Vec::new())]);
+        let (id, cache) = cache_area_in_atlas(
+            kept_id,
+            Some(kept_atlas),
+            true,
+            vec![room(1, "Midgaard", Vec::new())],
+        );
         areas.insert(id, cache);
         let (id, cache) = cache_area_in_atlas(
             dropped_id,
@@ -1502,11 +1624,18 @@ mod tests {
 
         // The excluded area stays resident and explicitly addressable.
         assert!(atlas.get_area(&dropped_id).is_some());
-        assert!(atlas.get_room(&RoomKey::new(dropped_id, RoomNumber(1))).is_some());
+        assert!(
+            atlas
+                .get_room(&RoomKey::new(dropped_id, RoomNumber(1)))
+                .is_some()
+        );
 
         // is_area_enabled reflects only the manual axis (both enabled), while
         // is_area_included honors the scope exclusion.
-        assert!(atlas.is_area_enabled(&dropped_id), "manual axis untouched by scope");
+        assert!(
+            atlas.is_area_enabled(&dropped_id),
+            "manual axis untouched by scope"
+        );
         assert!(atlas.is_area_included(&kept_id));
         assert!(!atlas.is_area_included(&dropped_id));
     }
@@ -1560,7 +1689,8 @@ mod tests {
         let dropped_id = area_id(2);
 
         let mut areas = HashMap::new();
-        let (id, cache) = cache_area_in_atlas(kept_id, None, true, vec![room(1, "Plaza", Vec::new())]);
+        let (id, cache) =
+            cache_area_in_atlas(kept_id, None, true, vec![room(1, "Plaza", Vec::new())]);
         areas.insert(id, cache);
         let (id, cache) =
             cache_area_in_atlas(dropped_id, None, true, vec![room(1, "Plaza", Vec::new())]);
@@ -1583,20 +1713,217 @@ mod tests {
         let a_atlas = atlas_id(10);
 
         let mut areas = HashMap::new();
-        let (id, cache) = cache_area_in_atlas(a_id, Some(a_atlas), true, vec![room(1, "Plaza", Vec::new())]);
+        let (id, cache) = cache_area_in_atlas(
+            a_id,
+            Some(a_atlas),
+            true,
+            vec![room(1, "Plaza", Vec::new())],
+        );
         areas.insert(id, cache);
 
         // Scope-excluded but NOT manually disabled: enabled (manual) stays true,
         // included (union) is false.
         let atlas = atlas_with_scope(areas.clone(), [a_atlas], []);
-        assert!(atlas.is_area_enabled(&a_id), "scope exclusion is not the manual axis");
+        assert!(
+            atlas.is_area_enabled(&a_id),
+            "scope exclusion is not the manual axis"
+        );
         assert!(!atlas.is_area_included(&a_id));
-        assert!(atlas.disabled_areas().is_empty(), "manual set untouched by scope");
+        assert!(
+            atlas.disabled_areas().is_empty(),
+            "manual set untouched by scope"
+        );
 
         // Manually disabled but NOT scope-excluded: enabled (manual) is false,
         // and it is likewise excluded from identification.
         let atlas = atlas_with_disabled(areas, [a_id]);
         assert!(!atlas.is_area_enabled(&a_id));
         assert!(!atlas.is_area_included(&a_id));
+    }
+
+    #[test]
+    fn external_id_fallback_when_winning_binding_leaves() {
+        let owned_id = area_id(1);
+        let shared_id = area_id(2);
+
+        let mut owned_room = room(1, "Gate", Vec::new());
+        owned_room.external_id = Some("dup".to_string());
+        let mut shared_room = room(7, "Gate", Vec::new());
+        shared_room.external_id = Some("dup".to_string());
+
+        let mut areas = HashMap::new();
+        let (id, cache) = cache_area(owned_id, true, vec![owned_room]);
+        areas.insert(id, cache);
+        let (id, cache) = cache_area(shared_id, false, vec![shared_room]);
+        areas.insert(id, cache);
+        let atlas = atlas(areas);
+
+        let (key, _) = atlas.find_room_by_external_id("dup").expect("resolves");
+        assert_eq!(key.area_id, owned_id, "owned binding wins");
+
+        // Clearing the winning binding falls back to the surviving duplicate,
+        // exactly as a from-scratch rebuild of the same areas would resolve.
+        let area = atlas.get_area(&owned_id).expect("area");
+        let cleared = area.upsert_room(
+            RoomNumber(1),
+            crate::RoomUpdates {
+                external_id: Some(None),
+                ..Default::default()
+            },
+        );
+        let after_clear = atlas.insert_area(owned_id, Arc::new(cleared));
+        let (key, _) = after_clear
+            .find_room_by_external_id("dup")
+            .expect("falls back");
+        assert_eq!(key.area_id, shared_id);
+
+        // Deleting the winning area falls back the same way.
+        let after_delete = atlas.delete_area(owned_id);
+        let (key, _) = after_delete
+            .find_room_by_external_id("dup")
+            .expect("falls back");
+        assert_eq!(key.area_id, shared_id);
+    }
+
+    #[test]
+    fn ownership_flip_reorders_lookups_and_rebinds_winners() {
+        let a_id = area_id(1);
+        let b_id = area_id(2);
+
+        let mut room_a = room(1, "Plaza", Vec::new());
+        room_a.external_id = Some("x1".to_string());
+        let mut room_b = room(2, "Plaza", Vec::new());
+        room_b.external_id = Some("x1".to_string());
+
+        let mut areas = HashMap::new();
+        let (id, cache) = cache_area(a_id, true, vec![room_a]);
+        areas.insert(id, cache);
+        let (id, cache) = cache_area(b_id, false, vec![room_b.clone()]);
+        areas.insert(id, cache);
+        let atlas = atlas(areas);
+
+        let by_title: Vec<AreaId> = atlas
+            .get_rooms_by_title("Plaza")
+            .map(|(area_id, _)| area_id)
+            .collect();
+        assert_eq!(by_title, vec![a_id, b_id]);
+        let (key, _) = atlas.find_room_by_external_id("x1").expect("resolves");
+        assert_eq!(key.area_id, a_id);
+
+        // B re-lands as owned (an access upgrade through a sync refetch): its
+        // whole contribution re-places, so it joins the owned prefix and ties
+        // for the binding among owned areas; A must no longer beat it merely
+        // by having been first.
+        let (_, promoted) = cache_area(b_id, true, vec![room_b]);
+        let atlas = atlas.insert_area(b_id, promoted);
+        assert!(atlas.is_area_owned(&b_id));
+        let by_title: Vec<AreaId> = atlas
+            .get_rooms_by_title("Plaza")
+            .map(|(area_id, _)| area_id)
+            .collect();
+        assert_eq!(by_title.len(), 2, "both areas still resolve");
+        let (key, _) = atlas.find_room_by_external_id("x1").expect("resolves");
+        assert!(
+            atlas.is_area_owned(&key.area_id),
+            "the winner is an owned binding after the flip"
+        );
+    }
+
+    #[test]
+    fn incremental_edits_match_a_full_rebuild() {
+        let a_id = area_id(1);
+        let b_id = area_id(2);
+        let c_id = area_id(3);
+
+        let mut a1 = room(1, "Alpha", Vec::new());
+        a1.external_id = Some("e1".to_string());
+        let a2 = room(2, "Beta", Vec::new());
+        let mut b1 = room(1, "Alpha", Vec::new());
+        b1.external_id = Some("e1".to_string());
+        let mut b3 = room(3, "Gamma", Vec::new());
+        b3.external_id = Some("e3".to_string());
+
+        // Drive a sequence of area-level edits...
+        let atlas_incremental = atlas(HashMap::new());
+        let (_, cache_a) = cache_area(a_id, true, vec![a1, a2]);
+        let atlas_incremental = atlas_incremental.insert_area(a_id, cache_a);
+        let (_, cache_b) = cache_area(b_id, false, vec![b1, b3]);
+        let atlas_incremental = atlas_incremental.insert_area(b_id, cache_b);
+        let (_, cache_c) = cache_area(c_id, true, vec![room(9, "Delta", Vec::new())]);
+        let atlas_incremental = atlas_incremental.add_area(c_id, cache_c);
+        // ...including a retitle, a room deletion, and an area deletion.
+        let area_a = atlas_incremental.get_area(&a_id).expect("area a");
+        let retitled = area_a.upsert_room(
+            RoomNumber(2),
+            crate::RoomUpdates {
+                title: Some("Beta Prime".to_string()),
+                ..Default::default()
+            },
+        );
+        let atlas_incremental = atlas_incremental.insert_area(a_id, Arc::new(retitled));
+        let area_b = atlas_incremental.get_area(&b_id).expect("area b");
+        let shrunk = area_b.delete_room(RoomNumber(3));
+        let atlas_incremental = atlas_incremental.insert_area(b_id, Arc::new(shrunk));
+        let atlas_incremental = atlas_incremental.delete_area(c_id);
+
+        // ...and compare every observable lookup against a from-scratch build
+        // of the same final area set.
+        let final_areas: HashMap<AreaId, Arc<AreaCache>> = [a_id, b_id]
+            .into_iter()
+            .map(|id| (id, atlas_incremental.get_area(&id).expect("resident")))
+            .collect();
+        let atlas_rebuilt = atlas(final_areas);
+
+        for title in ["Alpha", "Beta", "Beta Prime", "Gamma", "Delta"] {
+            let mut incremental: Vec<(AreaId, RoomNumber)> = atlas_incremental
+                .get_rooms_by_title(title)
+                .map(|(area_id, room)| (area_id, room.get_room_number()))
+                .collect();
+            let mut rebuilt: Vec<(AreaId, RoomNumber)> = atlas_rebuilt
+                .get_rooms_by_title(title)
+                .map(|(area_id, room)| (area_id, room.get_room_number()))
+                .collect();
+            // Owned entries lead in both; order within a class is unspecified,
+            // so compare as sets after checking the prefix.
+            let owned_prefix_holds = |atlas: &AtlasCache, rooms: &[(AreaId, RoomNumber)]| {
+                let first_shared = rooms
+                    .iter()
+                    .position(|(area_id, _)| !atlas.is_area_owned(area_id));
+                first_shared.is_none_or(|pos| {
+                    rooms[pos..]
+                        .iter()
+                        .all(|(area_id, _)| !atlas.is_area_owned(area_id))
+                })
+            };
+            assert!(owned_prefix_holds(&atlas_incremental, &incremental));
+            assert!(owned_prefix_holds(&atlas_rebuilt, &rebuilt));
+            incremental.sort_by_key(|(area_id, number)| (area_id.0, number.0));
+            rebuilt.sort_by_key(|(area_id, number)| (area_id.0, number.0));
+            assert_eq!(incremental, rebuilt, "title {title:?}");
+        }
+
+        for external_id in ["e1", "e3"] {
+            let incremental = atlas_incremental.find_room_by_external_id(external_id);
+            let rebuilt = atlas_rebuilt.find_room_by_external_id(external_id);
+            assert_eq!(
+                incremental.is_some(),
+                rebuilt.is_some(),
+                "external id {external_id:?} resolvability"
+            );
+            if let (Some((incr_key, _)), Some((reb_key, _))) = (incremental, rebuilt) {
+                assert_eq!(
+                    atlas_incremental.is_area_owned(&incr_key.area_id),
+                    atlas_rebuilt.is_area_owned(&reb_key.area_id),
+                    "external id {external_id:?} winner class"
+                );
+            }
+        }
+        assert!(atlas_incremental.find_room_by_external_id("e3").is_none());
+        assert!(atlas_incremental.get_area(&c_id).is_none());
+        assert!(
+            atlas_incremental
+                .get_room(&RoomKey::new(b_id, RoomNumber(3)))
+                .is_none()
+        );
     }
 }

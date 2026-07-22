@@ -20,6 +20,10 @@
 # scriptref wiki credentials (url/token for the DokuWiki publisher)
 /scriptref/wiki.toml
 
+# Local snapshots of other MUD-client manuals used while reviewing scriptref.
+# Third-party documentation is intentionally not redistributed with smudgy.
+/scriptref/reference-manuals/
+
 # --- Terraform / infra (infra/github-runner) ---
 # Provider dirs and real state/vars never go in git. State can hold the GitHub
 # App private key + webhook secret; the runners' state lives in S3, not here.

@@ -103,6 +103,8 @@ impl AutomationsWindow {
                 enabled: t.enabled,
                 language: t.language,
                 prompt: t.prompt,
+                priority: t.priority,
+                fallthrough: t.fallthrough,
                 package: t.package.clone(),
                 rows: trigger_rows(&t),
             },
@@ -132,6 +134,8 @@ impl AutomationsWindow {
                 script: None,
                 package: self.current_folder(),
                 enabled: true,
+                priority: 0,
+                fallthrough: true,
                 language: ScriptLang::Plaintext,
             }),
             error: None,
@@ -152,6 +156,8 @@ impl AutomationsWindow {
                 enabled: true,
                 language: ScriptLang::Plaintext,
                 prompt: false,
+                priority: 0,
+                fallthrough: true,
                 package: self.current_folder(),
                 rows: vec![(PatternKind::Match, String::new())],
             },
@@ -402,6 +408,8 @@ impl AutomationsWindow {
                     enabled,
                     language,
                     prompt,
+                    priority,
+                    fallthrough,
                     package,
                     rows,
                 } => {
@@ -414,6 +422,8 @@ impl AutomationsWindow {
                         language: *language,
                         enabled: *enabled,
                         prompt: *prompt,
+                        priority: *priority,
+                        fallthrough: *fallthrough,
                     };
                     rows_into_trigger(rows, &mut t);
                     Script::Trigger(t)
@@ -945,6 +955,51 @@ impl AutomationsWindow {
         .into()
     }
 
+    fn matching_options<'a>(&self, priority: i32, fallthrough: bool) -> Elem<'a> {
+        column![
+            field_row(
+                "Priority",
+                row![
+                    button(text("-").size(14.0))
+                        .style(button_style::secondary)
+                        .on_press(Message::AdjustPriority(-1))
+                        .padding([5, 10]),
+                    container(text(priority.to_string()).size(13.0))
+                        .width(Length::Fixed(44.0))
+                        .align_x(iced::alignment::Horizontal::Center),
+                    button(text("+").size(14.0))
+                        .style(button_style::secondary)
+                        .on_press(Message::AdjustPriority(1))
+                        .padding([5, 10]),
+                    text("Higher runs first; ties keep registration order.")
+                        .size(12.0)
+                        .style(common::muted),
+                ]
+                .spacing(8.0)
+                .align_y(Vertical::Center)
+                .into(),
+            ),
+            field_row(
+                "Continue",
+                row![
+                    common::pill_switch(fallthrough, false, Some(Message::ToggleFallthrough),),
+                    text(if fallthrough {
+                        "Check later matches from this script or package."
+                    } else {
+                        "Stop after this automation runs."
+                    })
+                    .size(12.0)
+                    .style(common::muted),
+                ]
+                .spacing(10.0)
+                .align_y(Vertical::Center)
+                .into(),
+            ),
+        ]
+        .spacing(6.0)
+        .into()
+    }
+
     /// The "Folder" control in a script editor: a `pick_list` of every folder
     /// (plus "(top level)"). Picking a destination emits [`Message::SetScriptFolder`],
     /// which moves the script (immediately in edit mode, on Create otherwise).
@@ -1016,9 +1071,13 @@ impl AutomationsWindow {
             EditNode::Trigger {
                 enabled,
                 language,
+                priority,
+                fallthrough,
                 rows,
                 ..
-            } => self.view_trigger_editor(state, *enabled, *language, rows),
+            } => {
+                self.view_trigger_editor(state, *enabled, *language, *priority, *fallthrough, rows)
+            }
         }
     }
 
@@ -1103,6 +1162,7 @@ impl AutomationsWindow {
                 .into(),
         ));
         body = body.push(self.tester_box("Test against a command", &alias.pattern, true));
+        body = body.push(self.matching_options(alias.priority, alias.fallthrough));
         body = body.push(field_row("Behavior", self.behavior_radios(alias.language)));
         body = body.push(self.code_editor(alias.language));
         if let Some(bar) = self.save_bar(
@@ -1177,6 +1237,8 @@ impl AutomationsWindow {
         state: &'a EditorState,
         enabled: bool,
         language: ScriptLang,
+        priority: i32,
+        fallthrough: bool,
         rows: &'a [(PatternKind, String)],
     ) -> Elem<'a> {
         let create = state.mode == EditorMode::Create;
@@ -1277,6 +1339,7 @@ impl AutomationsWindow {
         body = body.push(field_row("Patterns", patterns.into()));
 
         body = body.push(self.tester_box("Test against a line", "", false));
+        body = body.push(self.matching_options(priority, fallthrough));
         body = body.push(field_row("Behavior", self.behavior_radios(language)));
         body = body.push(self.code_editor(language));
         if let Some(bar) = self.save_bar(

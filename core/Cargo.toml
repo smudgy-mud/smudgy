@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_core"
-version = "0.4.2"
+version = "0.4.2-dev"
 edition = "2024"
 
 [dependencies]
@@ -10,6 +10,9 @@ derive_more = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+# Insertion-ordered maps for the completion word-set registries (merge order
+# is first-contribution order, and in-place casing updates keep position).
+indexmap = { workspace = true }
 smudgy_cloud = { workspace = true }
 serde_json = { workspace = true }
 validator = { workspace = true }
@@ -23,6 +26,27 @@ aho-corasick = { workspace = true }
 # SIMD byte search for the telnet preprocessor's IAC scan (the inbound hot path). Already in the
 # tree transitively via regex/aho-corasick, so this pins no new download.
 memchr = "2"
+# Charset transcoding for non-UTF-8 MUDs (docs/telnet.md): the WHATWG
+# Encoding Standard label set behind streaming decoders/encoders that carry partial multibyte
+# sequences across socket reads. UTF-8 connections bypass it entirely.
+encoding_rs = "0.8"
+# MCCP2 inbound decompression (docs/telnet.md): a streaming zlib
+# inflater spliced ahead of the telnet parser once the server's `IAC SB MCCP2 IAC SE` marker
+# arrives. Default features = the pure-Rust miniz_oxide backend.
+flate2 = "1"
+# MCCPX inbound decompression (docs/telnet.md): the draft's `zstd`
+# encoding option, streaming decode only. The workspace already builds libzstd's cost class
+# (V8), and libzstd streaming decode is faster than the pure-Rust alternative on this path.
+zstd = "0.13"
+# TLS game connections (docs/telnet.md). rustls 0.23 is already the
+# workspace's rustls line (via smudgy_script); tokio-rustls wraps it for the async socket.
+# rustls-platform-verifier uses the OS trust store (corporate roots, enterprise MITM) rather
+# than a bundled Mozilla set. default-features off drops tokio-rustls's own ring provider so
+# the process-global aws_lc_rs provider (installed by smudgy_script, and here for headless
+# use) is the single one.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+rustls = "0.23"
+rustls-platform-verifier = "0.6"
 log = { workspace = true }
 smudgy_script = { workspace = true }
 vtparse = { workspace = true }
@@ -64,6 +88,9 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Self-signed certificate generation for the TLS integration test only.
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 [features]
 # Exposes otherwise-private internals so the `smudgy_bench` crate can drive real

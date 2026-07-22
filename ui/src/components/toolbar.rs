@@ -22,8 +22,7 @@ pub enum Message {
 }
 
 /// Context information about the active session for the toolbar
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionContext {
     pub has_active_session: bool,
     // Carries the active session's connection state; not currently read.
@@ -32,7 +31,6 @@ pub struct SessionContext {
     #[allow(dead_code)]
     pub server_name: String,
 }
-
 
 const TITLE_COLOR: Color = Color::from_rgb8(92, 92, 92);
 // Companion hover shade for the title/window-control styling; currently unused.
@@ -146,14 +144,19 @@ pub fn view(
         // title bar, so it mirrors the OS title (incl. the dev-build marker).
         let title = text(crate::MAIN_WINDOW_TITLE).size(14).color(TITLE_COLOR);
 
-        row![menu_button(), title, drag_area(), window_controls(maximized)]
-            .padding(5)
-            .spacing(10)
-            // The collapsed toolbar still spans the window so the drag area
-            // and window controls stay reachable
-            .width(Length::Fill)
-            .height(TOOLBAR_HEIGHT)
-            .align_y(Vertical::Center)
-            .into()
+        row![
+            menu_button(),
+            title,
+            drag_area(),
+            window_controls(maximized)
+        ]
+        .padding(5)
+        .spacing(10)
+        // The collapsed toolbar still spans the window so the drag area
+        // and window controls stay reachable
+        .width(Length::Fill)
+        .height(TOOLBAR_HEIGHT)
+        .align_y(Vertical::Center)
+        .into()
     }
 }

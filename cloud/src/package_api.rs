@@ -25,11 +25,11 @@ use chrono::{DateTime, Utc};
 use log::debug;
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{backends::CredentialSource, CloudError, CloudResult};
+use crate::{CloudError, CloudResult, backends::CredentialSource};
 
 // ===========================================================================
 // Wire types (mirror smudgy-api `src/models.rs` package DTOs)
@@ -442,7 +442,8 @@ impl PackageApiClient {
             ("name", name.to_string()),
             ("version", version.unwrap_or("latest").to_string()),
         ];
-        self.get_with_query_public("/packages/resolve", &query).await
+        self.get_with_query_public("/packages/resolve", &query)
+            .await
     }
 
     /// Lists a package's published versions, newest first (`GET /packages/{id}/versions`).
@@ -451,7 +452,8 @@ impl PackageApiClient {
     /// Returns a [`CloudError`] on auth failure, a missing/unauthorized package, or
     /// transport/parse failure.
     pub async fn list_versions(&self, package_id: Uuid) -> CloudResult<Vec<VersionListItem>> {
-        self.get_public(&format!("/packages/{package_id}/versions")).await
+        self.get_public(&format!("/packages/{package_id}/versions"))
+            .await
     }
 
     /// Searches public packages, optionally scoped to an aligned `host` (with host
@@ -574,7 +576,10 @@ impl PackageApiClient {
 
         // 1. begin — validate + get a presigned PUT per body not already in S3.
         let begin: BeginVersionResponse = self
-            .post(&format!("/packages/{package_id}/versions/begin"), Some(&body))
+            .post(
+                &format!("/packages/{package_id}/versions/begin"),
+                Some(&body),
+            )
             .await?;
 
         // 2. upload each missing body directly to S3 (presigned, no auth header).
@@ -590,8 +595,11 @@ impl PackageApiClient {
         }
 
         // 3. finalize — confirm the uploads + commit.
-        self.post(&format!("/packages/{package_id}/versions/finalize"), Some(&body))
-            .await
+        self.post(
+            &format!("/packages/{package_id}/versions/finalize"),
+            Some(&body),
+        )
+        .await
     }
 
     /// PUT a module body directly to its presigned URL. No `Authorization` (the URL is
@@ -694,7 +702,8 @@ impl PackageApiClient {
     /// # Errors
     /// Returns a [`CloudError`] on a missing/unauthorized package or transport/parse failure.
     pub async fn list_comments(&self, package_id: Uuid) -> CloudResult<Vec<CommentView>> {
-        self.get_public(&format!("/packages/{package_id}/comments")).await
+        self.get_public(&format!("/packages/{package_id}/comments"))
+            .await
     }
 
     /// Adds a comment (`POST /packages/{id}/comments`).
@@ -972,7 +981,9 @@ impl PackageApiClient {
     where
         T: serde::de::DeserializeOwned,
     {
-        let response = self.send(Method::GET, path, query, None, Auth::Required).await?;
+        let response = self
+            .send(Method::GET, path, query, None, Auth::Required)
+            .await?;
         Self::parse_data(response).await
     }
 
@@ -991,7 +1002,9 @@ impl PackageApiClient {
     where
         T: serde::de::DeserializeOwned,
     {
-        let response = self.send(Method::GET, path, query, None, Auth::Optional).await?;
+        let response = self
+            .send(Method::GET, path, query, None, Auth::Optional)
+            .await?;
         Self::parse_data(response).await
     }
 
@@ -999,7 +1012,9 @@ impl PackageApiClient {
     where
         T: serde::de::DeserializeOwned,
     {
-        let response = self.send(Method::POST, path, &[], body, Auth::Required).await?;
+        let response = self
+            .send(Method::POST, path, &[], body, Auth::Required)
+            .await?;
         Self::parse_data(response).await
     }
 
@@ -1007,12 +1022,16 @@ impl PackageApiClient {
     where
         T: serde::de::DeserializeOwned,
     {
-        let response = self.send(Method::PATCH, path, &[], Some(body), Auth::Required).await?;
+        let response = self
+            .send(Method::PATCH, path, &[], Some(body), Auth::Required)
+            .await?;
         Self::parse_data(response).await
     }
 
     async fn delete(&self, path: &str) -> CloudResult<()> {
-        let response = self.send(Method::DELETE, path, &[], None, Auth::Required).await?;
+        let response = self
+            .send(Method::DELETE, path, &[], None, Auth::Required)
+            .await?;
         Self::parse_unit(response).await
     }
 }
@@ -1139,17 +1158,23 @@ mod tests {
         ];
         // `^1.2` collapses to the highest published `1.x`.
         assert_eq!(
-            highest_satisfying_version(&versions, Some("^1.2")).unwrap().as_deref(),
+            highest_satisfying_version(&versions, Some("^1.2"))
+                .unwrap()
+                .as_deref(),
             Some("1.4.0")
         );
         // An incompatible-major range picks within its own major.
         assert_eq!(
-            highest_satisfying_version(&versions, Some("^2")).unwrap().as_deref(),
+            highest_satisfying_version(&versions, Some("^2"))
+                .unwrap()
+                .as_deref(),
             Some("2.0.1")
         );
         // No range means "any" -> the highest overall.
         assert_eq!(
-            highest_satisfying_version(&versions, None).unwrap().as_deref(),
+            highest_satisfying_version(&versions, None)
+                .unwrap()
+                .as_deref(),
             Some("2.0.1")
         );
     }
@@ -1162,11 +1187,16 @@ mod tests {
         ];
         // The yanked 1.4.0 is skipped, so `^1.2` collapses to 1.2.0.
         assert_eq!(
-            highest_satisfying_version(&versions, Some("^1.2")).unwrap().as_deref(),
+            highest_satisfying_version(&versions, Some("^1.2"))
+                .unwrap()
+                .as_deref(),
             Some("1.2.0")
         );
         // Nothing satisfies a 3.x range.
-        assert_eq!(highest_satisfying_version(&versions, Some("^3")).unwrap(), None);
+        assert_eq!(
+            highest_satisfying_version(&versions, Some("^3")).unwrap(),
+            None
+        );
         // A malformed range is an error, not a silent no-match.
         assert!(highest_satisfying_version(&versions, Some("not a range")).is_err());
     }
@@ -1185,7 +1215,9 @@ mod tests {
             },
         ];
         assert_eq!(
-            highest_satisfying_version(&versions, Some("^1.2")).unwrap().as_deref(),
+            highest_satisfying_version(&versions, Some("^1.2"))
+                .unwrap()
+                .as_deref(),
             Some("1.2.0")
         );
     }

@@ -8,7 +8,10 @@
 //! the iced subscription identities (which hash `SessionParams` by id) would
 //! both silently collide under per-window counters.
 
+use crate::cloud_account::CloudHandles;
 use crate::components::session_input;
+use crate::terminal_buffer::selection::Selection;
+use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
 use crate::theme::Element;
 use crate::widgets::split_terminal_pane;
 use iced::widget::{
@@ -16,34 +19,32 @@ use iced::widget::{
     svg, text,
 };
 use iced::{Alignment, Border, Color, Length, Padding, Subscription, Task};
-use smudgy_widgets::{
-    MapStore, MapWidgetId, TextEditorStore, WidgetRoot, with_store_context, with_text_store_context,
-};
 use log::info;
+use smudgy_cloud::{
+    AreaId, AtlasId, CachedCloudMapper, CloudMapper, CompositeBackend, CredentialSource,
+    LocalBackend, Mapper, PackageApiClient,
+};
 use smudgy_core::get_smudgy_home;
 use smudgy_core::models::map_scopes::MapScopes;
 use smudgy_core::models::profile::load_profile;
 use smudgy_core::models::server::{ServerConfig, link_url_host, load_server, update_server};
 use smudgy_core::models::settings::{ScriptSettings, Settings, load_settings};
+use smudgy_core::session::SessionParams;
+use smudgy_core::session::runtime::input::InputSnapshot;
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, MAIN_PANE_NAME_ID, PaneDef, PaneKey, PaneKind, TitleBarPolicy,
 };
 use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
+use smudgy_core::session::styled_line::LinkAction;
 use smudgy_core::session::{self, SessionEvent, SessionId};
 use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
-use smudgy_core::session::SessionParams;
-use crate::cloud_account::CloudHandles;
-use crate::terminal_buffer::selection::Selection;
-use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
-use smudgy_core::session::styled_line::LinkAction;
-use smudgy_cloud::{
-    AreaId, AtlasId, CachedCloudMapper, CloudMapper, CompositeBackend, CredentialSource,
-    LocalBackend, Mapper, PackageApiClient,
-};
 use smudgy_map_widget::map_view;
 use smudgy_theme::builtins::container::default;
+use smudgy_widgets::{
+    MapStore, MapWidgetId, TextEditorStore, WidgetRoot, with_store_context, with_text_store_context,
+};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -126,11 +127,15 @@ impl SessionStore {
 /// selection for a terminal pane; widgets-only panes carry no buffer. Widget
 /// trees stack over the terminal on terminal panes and are the whole body on
 /// widgets-only panes (they render from the session's shared `WidgetRoot`,
-/// matched by the pane's interned name id, so they need no state here).
+/// matched by the pane's interned name id, so they need no state here). A
+/// pane whose def carries an input owns its own `SessionInput` instance —
+/// its own value, history, and completion state, isolated from the main
+/// input's and every other pane's (`docs/input.md` §3.7).
 pub struct PaneDisplay {
     pub def: PaneDef,
     buffer: Option<Rc<RefCell<TerminalBuffer>>>,
     selection: Rc<RefCell<Selection>>,
+    input: Option<session_input::SessionInput>,
 }
 
 /// A live session: connection params, the runtime channel, and everything its
@@ -169,6 +174,14 @@ pub struct ManagedSession {
 
     runtime_tx: Option<mpsc::UnboundedSender<RuntimeAction>>,
 
+    /// The gate and coalescing cache in front of `InputStateChanged` sends
+    /// (see [`InputMirrorFeed`]).
+    input_mirror_feed: InputMirrorFeed,
+
+    /// The change detector in front of `InputHistoryChanged` sends
+    /// (see [`InputHistoryFeed`]).
+    input_history_feed: InputHistoryFeed,
+
     connected: bool,
     /// Whether to establish a connection automatically once the runtime is
     /// ready (and to reconnect after a reload). `false` for a session opened
@@ -189,16 +202,16 @@ pub struct ManagedSession {
     /// the session; see [`Self::link_confirm_dialog`].
     pending_link_confirm: Rc<RefCell<Option<PendingLinkConfirm>>>,
     /// Per-session bind-on-use state (map scoping plan §3 convergence): the
-    /// locate streak, Undo suppressions, and rescue-offer rate limits. Read and
-    /// written by the daemon, which owns the authoritative scope store.
+    /// locate streak. Read and written by the daemon, which owns the
+    /// authoritative scope store.
     pub bind_tracker: BindTracker,
-    /// The current bind-on-use / cross-entry-rescue toast over this session's
-    /// main pane, or `None`. One at a time — a new bind replaces it.
-    toast: Option<SessionToast>,
-    /// Monotonic toast generation, so a stale auto-dismiss timer can't clear a
-    /// newer toast that replaced the one it was scheduled for (mirrors the
-    /// automations window's `toast_gen`).
-    toast_gen: u64,
+
+    /// The server's current telnet ECHO state, as last delivered by
+    /// [`SessionEvent::ServerEcho`]. Remembered so a settings change can
+    /// re-run the auto-mask gate ([`telnet_mask_gate`]) mid-hold: the gate is
+    /// otherwise consulted only at ECHO edges, and a preference toggled while
+    /// the server holds ECHO must act now, not when the option next cycles.
+    server_echo: bool,
 }
 
 /// One server-sent link (OSC 8) held at the trust gate, with the dialog's
@@ -221,6 +234,12 @@ pub enum Message {
     None,
     Close,
     Input(session_input::Message),
+    /// A message for one pane-hosted input's `SessionInput`.
+    PaneInput(PaneKey, session_input::Message),
+    /// A click released over a pane body whose pane hosts an input. Focuses
+    /// that input when the click didn't create a selection — the same
+    /// convention as [`Message::TerminalClicked`] on the main pane.
+    PaneBodyClicked(PaneKey),
     SessionEvent(SessionEvent),
     SetMapperCurrentLocation(AreaId, Option<i32>),
     WidgetMapMessage {
@@ -245,14 +264,6 @@ pub enum Message {
     LinkConfirmProceed,
     /// Dismiss the pending server link without acting.
     LinkConfirmCancel,
-    /// The bind-on-use / rescue toast's timed dismiss fired (or its close was
-    /// clicked). The generation guards against a stale timer clearing a newer
-    /// toast that replaced this one.
-    DismissBindToast(u64),
-    /// The bind/rescue toast's action button was clicked (Undo a bind, or accept
-    /// a cross-entry rescue). The daemon reads the toast's staged action and
-    /// applies it to the scope store, so this carries no payload.
-    BindToastActionClicked,
 }
 
 /// The unit a per-server cloud-map scope association is written against, mirrored
@@ -270,38 +281,31 @@ pub enum BindTarget {
 /// session's server entry. Ten is long enough that a handful of incidental
 /// cross-scope locate matches never bind (they can't sustain a streak against
 /// the real map), yet short enough to converge within a minute of ordinary
-/// play. A single speedwalk into an unassigned atlas binds immediately (see
-/// [`BindTracker::observe_navigation`]) — the streak governs only the passive
-/// locate signal.
+/// play. A single speedwalk into an unassigned atlas binds immediately (the
+/// daemon's navigation observer) — the streak governs only the passive locate
+/// signal.
 pub const LOCATE_BIND_STREAK: u32 = 10;
 
 /// Per-session bind-on-use bookkeeping (convergence, map scoping plan §3): the
-/// running locate streak, the targets the user has declined (Undo) or that a
-/// rescue already covered this session, and the atlases/areas a cross-entry
-/// rescue has already been offered for. Pure and self-contained so the streak
-/// and suppression rules are unit-testable without a live session; the daemon
-/// supplies the already-resolved `(target, unassigned)` inputs.
+/// running locate streak. Pure and self-contained so the streak rules are
+/// unit-testable without a live session; the daemon supplies the
+/// already-resolved `(target, unassigned)` inputs.
 #[derive(Debug, Default)]
 pub struct BindTracker {
     /// The atlas/area the current locate streak is accruing for, and its length.
     streak: Option<(BindTarget, u32)>,
-    /// Targets suppressed for the rest of the session: an Undone bind must not
-    /// instantly re-bind when the streak refires.
-    suppressed: HashSet<BindTarget>,
-    /// Targets a cross-entry rescue has already been offered for, so the offer
-    /// fires at most once per target per session.
-    rescue_offered: HashSet<BindTarget>,
 }
 
 impl BindTracker {
     /// Feed one resolved locate. `target` is the atlas (or atlas-less cloud
     /// area) the located room belongs to; `unassigned` is whether that target is
     /// Unassigned for this session's entry — the only state that binds (Here is
-    /// already bound; Elsewhere is the rescue path). Returns `true` exactly when
-    /// the streak reaches [`LOCATE_BIND_STREAK`] and the target should bind now.
-    /// Any non-unassigned or suppressed observation breaks the streak.
+    /// already bound; showing an Elsewhere map is a map-editor decision).
+    /// Returns `true` exactly when the streak reaches [`LOCATE_BIND_STREAK`] and
+    /// the target should bind now. Any non-unassigned observation breaks the
+    /// streak.
     pub fn observe_locate(&mut self, target: BindTarget, unassigned: bool) -> bool {
-        if !unassigned || self.suppressed.contains(&target) {
+        if !unassigned {
             self.streak = None;
             return false;
         }
@@ -329,98 +333,6 @@ impl BindTracker {
     pub fn reset_streak(&mut self) {
         self.streak = None;
     }
-
-    /// Demonstrated navigation intent (a speedwalk / find-nearest resolution):
-    /// binds immediately when the destination target is unassigned and not
-    /// suppressed. No streak — one navigation is enough.
-    #[must_use]
-    pub fn observe_navigation(&self, target: BindTarget, unassigned: bool) -> bool {
-        unassigned && !self.suppressed.contains(&target)
-    }
-
-    /// Record that the user Undid a bind for `target`: suppress re-binding it for
-    /// the session and drop any streak accruing for it.
-    pub fn suppress(&mut self, target: BindTarget) {
-        self.suppressed.insert(target);
-        if matches!(&self.streak, Some((current, _)) if *current == target) {
-            self.streak = None;
-        }
-    }
-
-    /// Rescue-offer rate limit: returns `true` the first time `target` is
-    /// offered this session, `false` afterward.
-    pub fn mark_rescue_offered(&mut self, target: BindTarget) -> bool {
-        self.rescue_offered.insert(target)
-    }
-}
-
-/// A bottom-pill toast over a session's main pane: a short message and an
-/// optional action button (Undo a bind / accept a rescue). Timed-dismissed after
-/// [`BIND_TOAST_DISMISS`]; one at a time (a new bind replaces the current one).
-#[derive(Debug, Clone)]
-struct SessionToast {
-    message: String,
-    /// The action button's label and the staged action, or `None` for a
-    /// message-only toast.
-    action: Option<(String, ToastAction)>,
-}
-
-/// The action a bind/rescue toast's button performs, staged on the toast and
-/// applied by the daemon (which owns the scope store) when the button is
-/// clicked.
-#[derive(Debug, Clone, Copy)]
-pub enum ToastAction {
-    /// Undo a bind-on-use: remove this entry from the target's associations and
-    /// suppress re-binding it this session.
-    UndoBind(BindTarget),
-    /// Accept a cross-entry rescue: add this entry to the target's associations.
-    AcceptRescue(BindTarget),
-}
-
-/// The bind/rescue toast's auto-dismiss delay. Longer than the automations
-/// window's confirmation toast (2.2s) because this one carries an undo the user
-/// must have time to read and act on.
-const BIND_TOAST_DISMISS: std::time::Duration = std::time::Duration::from_secs(8);
-
-/// The bind-on-use / rescue toast: a bottom-center pill with the message and an
-/// optional action button. Styled after the automations window's toast (modal
-/// surface). Filling the pane but transparent outside the pill, so terminal
-/// clicks fall through to the layer below — only the action button captures.
-fn bind_toast_overlay(toast: &SessionToast) -> Element<'static, Message> {
-    let mut content = row![text(toast.message.clone()).size(13.0)]
-        .spacing(12.0)
-        .align_y(Alignment::Center);
-    if let Some((label, _)) = &toast.action {
-        content = content.push(
-            button(text(label.clone()).size(13.0))
-                .padding(Padding {
-                    top: 4.0,
-                    bottom: 4.0,
-                    left: 10.0,
-                    right: 10.0,
-                })
-                .on_press(Message::BindToastActionClicked),
-        );
-    }
-    let pill = container(content.align_y(Alignment::Center))
-        .padding(Padding {
-            top: 8.0,
-            bottom: 8.0,
-            left: 16.0,
-            right: 16.0,
-        })
-        .style(|theme: &crate::Theme| container::Style {
-            background: Some(theme.styles.modal.body_background),
-            border: theme.styles.modal.body_border,
-            shadow: theme.styles.modal.shadow,
-            ..Default::default()
-        });
-
-    container(column![space::vertical(), pill].align_x(Alignment::Center))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(20)
-        .into()
 }
 
 /// Open a URL in the system browser, detached; a failure is logged, never
@@ -445,6 +357,138 @@ fn elide_middle(s: &str, max: usize) -> String {
     let head_str: String = s.chars().take(head).collect();
     let tail_str: String = s.chars().skip(len - tail).collect();
     format!("{head_str}\u{2026}{tail_str}")
+}
+
+/// The UI-side feed of the session-thread input mirror: the interest gate (no
+/// messages until the session thread asks — a session that never reads its
+/// input from a script pays nothing per keystroke) in front of a per-input
+/// coalescing cache (only actual changes are sent). The gate comes first by
+/// construction: [`InputMirrorFeed::update`] takes the snapshot as a closure
+/// it only invokes once interest is flagged, so no snapshot is even built
+/// without it. Its own type so the rules are unit-testable without a live
+/// session.
+#[derive(Default)]
+struct InputMirrorFeed {
+    interest: bool,
+    last_sent: HashMap<PaneKey, InputSnapshot>,
+}
+
+impl InputMirrorFeed {
+    /// Flag interest (sticky) and forget the coalescing history, so the next
+    /// update per input sends unconditionally — the warm-up push.
+    fn start(&mut self) {
+        self.interest = true;
+        self.last_sent.clear();
+    }
+
+    /// The snapshot to send for `key`'s input, if any: `None` without
+    /// interest (`snapshot` is never called) or when the state matches the
+    /// last one sent.
+    fn update(
+        &mut self,
+        key: PaneKey,
+        snapshot: impl FnOnce() -> InputSnapshot,
+    ) -> Option<InputSnapshot> {
+        if !self.interest {
+            return None;
+        }
+        let snapshot = snapshot();
+        if self.last_sent.get(&key) == Some(&snapshot) {
+            return None;
+        }
+        self.last_sent.insert(key, snapshot.clone());
+        Some(snapshot)
+    }
+
+    /// Drop `key`'s coalescing record — the pane closed. Keys are never
+    /// reused, so the entry could never gate another send; evicting it keeps
+    /// the map from growing under split/close churn.
+    fn forget(&mut self, key: PaneKey) {
+        self.last_sent.remove(&key);
+    }
+}
+
+/// The UI-side feed of the session-thread history mirror
+/// (`docs/input.md` §3.9). Unlike the state mirror there is no
+/// interest gate: history changes when a submission enters it or a scripted
+/// push/clear lands — never per keystroke — so every change is sent and
+/// history reads on the session thread stay exact with respect to the last
+/// submission. The revision comparison is what keeps the keystroke-rate
+/// update paths from rebuilding (or resending) an unchanged snapshot.
+#[derive(Default)]
+struct InputHistoryFeed {
+    last_sent: HashMap<PaneKey, u64>,
+}
+
+impl InputHistoryFeed {
+    /// Whether `revision` is news for `key`, recording it as sent. A never-
+    /// synced input starts at revision 0 (empty history on both sides), so
+    /// the first real change is the first send. When the update cannot be
+    /// delivered (`sendable` is false: the runtime channel does not exist
+    /// yet), nothing is recorded — the revision stays owed, so it still goes
+    /// out once a channel appears rather than being coalesced into silence.
+    fn update(&mut self, key: PaneKey, revision: u64, sendable: bool) -> bool {
+        if !sendable || self.last_sent.get(&key).copied().unwrap_or(0) == revision {
+            return false;
+        }
+        self.last_sent.insert(key, revision);
+        true
+    }
+
+    /// Record `revision` as sent unconditionally — the bookkeeping half of
+    /// the `RuntimeReady` replay, which pushes the current snapshot without
+    /// consulting the coalescing record: a runtime (re)start builds its
+    /// history mirror empty, so whatever was sent to a previous runtime
+    /// proves nothing about what the new one holds.
+    fn resync(&mut self, key: PaneKey, revision: u64) {
+        self.last_sent.insert(key, revision);
+    }
+
+    /// Drop `key`'s change record — the pane closed (see
+    /// [`InputMirrorFeed::forget`]).
+    fn forget(&mut self, key: PaneKey) {
+        self.last_sent.remove(&key);
+    }
+}
+
+/// The telnet auto-mask gate (`docs/input.md` §3.10): the telnet
+/// mask cause is engaged exactly while the server holds ECHO **and** the
+/// user's auto-mask preference is on. Evaluated at ECHO edges and re-evaluated
+/// whenever settings change, so a preference toggle mid-hold engages or
+/// releases immediately; releasing feeds the component's compose rule, which
+/// leaves a script-set mask untouched. Its own function so the rule is
+/// unit-testable without a live session.
+fn telnet_mask_gate(server_echo: bool, mask_pref: bool) -> bool {
+    server_echo && mask_pref
+}
+
+/// Map a submit event from the input component to its runtime action. An
+/// unmasked submission is the typed submission, `RuntimeAction::SubmitInput`
+/// (this routing is that action's only constructor, which is what makes
+/// `sys:input` fire exactly for the user's Enter and a script's `submit()`).
+/// A masked submission rides the redaction path instead: the secret reaches
+/// the wire verbatim while the echoed/logged copy is masked, and deliberately
+/// so — no alias matching, no separator splitting, and no `sys:input`
+/// handlers ever see it. Its own function so the fork is unit-testable
+/// without a live session.
+fn submit_runtime_action(text: Arc<String>, masked: bool) -> RuntimeAction {
+    if masked {
+        let redactions = Arc::new(vec![text.as_str().to_string()]);
+        RuntimeAction::SendWithRedactions { text, redactions }
+    } else {
+        RuntimeAction::SubmitInput(text)
+    }
+}
+
+/// Map a pane-input submit to its runtime action (`docs/input.md`
+/// §3.7): always `PaneInputSubmit` — the pane's registered `onSubmit` is the
+/// sole recipient, and deliberately so even for a masked submission
+/// (collecting the secret is the point of a masked pane input; the component
+/// already kept it out of the pane's history, and nothing is echoed or sent).
+/// Its own function so the masked half is unit-testable without a live
+/// session, like [`submit_runtime_action`].
+fn pane_submit_runtime_action(key: PaneKey, text: Arc<String>, _masked: bool) -> RuntimeAction {
+    RuntimeAction::PaneInputSubmit { key, text }
 }
 
 /// The scrollback limit to fall back to when the configured value is zero.
@@ -556,7 +600,12 @@ impl ManagedSession {
         let extra_script_extensions = {
             let widget_root = WidgetRoot::clone(&widget_root);
             let mapper = mapper.clone();
-            Arc::new(move || vec![smudgy_widgets::ext::init(widget_root.clone(), mapper.clone())])
+            Arc::new(move || {
+                vec![smudgy_widgets::ext::init(
+                    widget_root.clone(),
+                    mapper.clone(),
+                )]
+            })
         };
 
         // Mounted widgets are engine-generation state: their callbacks are v8 handles minted
@@ -579,22 +628,19 @@ impl ManagedSession {
                 extra_script_extensions,
                 on_engine_rebuild,
             }),
-            server_config: Rc::new(RefCell::new(
-                load_server(&server_name).map_or_else(
-                    |e| {
-                        // Sessions can outlive an on-disk rename; a fallback
-                        // config simply has no grants, so every server link
-                        // asks (and grants made now cannot persist).
-                        log::warn!("Failed to load server config for '{server_name}': {e}");
-                        ServerConfig::new(String::new(), 1)
-                    },
-                    |server| server.config,
-                ),
-            )),
+            server_config: Rc::new(RefCell::new(load_server(&server_name).map_or_else(
+                |e| {
+                    // Sessions can outlive an on-disk rename; a fallback
+                    // config simply has no grants, so every server link
+                    // asks (and grants made now cannot persist).
+                    log::warn!("Failed to load server config for '{server_name}': {e}");
+                    ServerConfig::new(String::new(), 1)
+                },
+                |server| server.config,
+            ))),
             pending_link_confirm: Rc::new(RefCell::new(None)),
             bind_tracker: BindTracker::default(),
-            toast: None,
-            toast_gen: 0,
+            server_echo: false,
             server_name,
             profile_name,
             input: session_input::SessionInput::new().with_terminal_buffer(terminal_buffer.clone()),
@@ -603,6 +649,8 @@ impl ManagedSession {
             panes: HashMap::new(),
             main_title_bar: TitleBarPolicy::Normal,
             runtime_tx: None,
+            input_mirror_feed: InputMirrorFeed::default(),
+            input_history_feed: InputHistoryFeed::default(),
             connected: false,
             auto_connect,
             ever_connected: false,
@@ -621,6 +669,9 @@ impl ManagedSession {
     /// Materialize the display state for a freshly opened pane. Idempotent by
     /// key (`PaneKey`s are never reused, so a duplicate event is harmless).
     pub fn open_pane(&mut self, def: PaneDef) {
+        let key = def.key;
+        let main_input = &self.input;
+        let mirror_interest = self.input_mirror_feed.interest;
         self.panes.entry(def.key).or_insert_with(|| {
             let buffer = match def.kind {
                 PaneKind::Terminal => {
@@ -633,12 +684,49 @@ impl ManagedSession {
                 // pane's whole body).
                 PaneKind::Widgets => None,
             };
+            // A pane input is the same component as the main input, with its
+            // own state: completion scans the pane's own scrollback (none on
+            // a widgets-only pane — suggestion sets still complete), Escape
+            // hands focus back to the main input, and the session's hotkeys
+            // are seeded so they keep firing while this input is focused
+            // (registrations after this fan out to every input).
+            let input = def.input.as_ref().map(|spec| {
+                let mut input = session_input::SessionInput::new().with_escape_to_main();
+                if let Some(placeholder) = spec.placeholder.as_deref() {
+                    input = input.with_placeholder(placeholder);
+                }
+                if let Some(buffer) = buffer.clone() {
+                    input = input.with_terminal_buffer(buffer);
+                }
+                input.copy_hotkeys_from(main_input);
+                if mirror_interest {
+                    input.set_mirror_interest();
+                }
+                input
+            });
             PaneDisplay {
                 def,
                 buffer,
                 selection: Rc::new(RefCell::new(Selection::default())),
+                input,
             }
         });
+        // A pane input created under standing interest sends its creation-time
+        // state now: the session thread records an input's first report as the
+        // warm-up baseline (never an event), so without this push the first
+        // real keystroke would be swallowed as that baseline. A no-op without
+        // interest or without an input.
+        self.sync_input_mirror(key);
+    }
+
+    /// The keys of this session's panes that host an input — the fan-out set
+    /// for per-input bookkeeping (mirror warm-up, history resync).
+    fn pane_input_keys(&self) -> Vec<PaneKey> {
+        self.panes
+            .iter()
+            .filter(|(_, pane)| pane.input.is_some())
+            .map(|(key, _)| *key)
+            .collect()
     }
 
     /// The header-visibility policy for one of this session's panes — what
@@ -678,23 +766,59 @@ impl ManagedSession {
     /// The body of a script pane: the widget entries targeting it, stacked
     /// over the scrollback terminal on a terminal pane and standing alone on
     /// a widgets-only pane. Targets match by the interned pane name id, so a
-    /// closed-and-recreated same-name pane re-attaches its widgets.
+    /// closed-and-recreated same-name pane re-attaches its widgets. A pane
+    /// with an input composes it under the body exactly as the main pane
+    /// does, and a click released on the body focuses it (unless the click
+    /// made a selection) — the main terminal's convention. The click wrap
+    /// follows the main pane's layering rationale: on a terminal pane only
+    /// the terminal layer is wrapped (interactive overlay widgets capture the
+    /// pointer first in the stack); on a widgets-only pane the stack itself
+    /// is wrapped, so clicks its widgets don't consume fall through to the
+    /// focus.
     pub fn script_pane_body(&self, key: PaneKey) -> Element<'_, Message> {
         let body: Element<'_, Message> = match self.panes.get(&key) {
             Some(pane) => {
                 let name_id = pane.def.name_id.as_u32();
                 let widgets = self.widget_stack(move |target| target == Some(name_id));
-                match pane.buffer.as_ref() {
-                    Some(buffer) => stack![
-                        split_terminal_pane::split_terminal_pane(
+                let content: Element<'_, Message> = match pane.buffer.as_ref() {
+                    Some(buffer) => {
+                        let terminal = split_terminal_pane::split_terminal_pane(
                             buffer.borrow(),
                             pane.selection.clone(),
                             self.link_handler(),
-                        ),
-                        widgets
+                            // NAWS describes the main terminal; script panes don't report.
+                            None,
+                        );
+                        if pane.input.is_some() {
+                            stack![
+                                mouse_area(terminal).on_release(Message::PaneBodyClicked(key)),
+                                widgets
+                            ]
+                            .into()
+                        } else {
+                            stack![terminal, widgets].into()
+                        }
+                    }
+                    None => {
+                        if pane.input.is_some() {
+                            mouse_area(widgets)
+                                .on_release(Message::PaneBodyClicked(key))
+                                .into()
+                        } else {
+                            widgets
+                        }
+                    }
+                };
+                match pane.input.as_ref() {
+                    Some(input) => column![
+                        content,
+                        input.view().map(move |msg| Message::PaneInput(key, msg))
                     ]
+                    .spacing(10)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
                     .into(),
-                    None => widgets,
+                    None => content,
                 }
             }
             None => iced::widget::Space::new().into(),
@@ -722,6 +846,18 @@ impl ManagedSession {
         if let Some(tx) = self.runtime_tx.take() {
             tx.send(RuntimeAction::Shutdown).ok();
         }
+    }
+
+    /// The main terminal's character-grid reporter: forwards `(cols, rows)` to the
+    /// session runtime, which caches it and drives the connection's NAWS report
+    /// (RFC 1073). Wired only for the main terminal pane — NAWS describes "the"
+    /// window, and script-created split panes are not it.
+    fn grid_change_handler(&self) -> Option<Rc<dyn Fn(u16, u16)>> {
+        let tx = self.runtime_tx.clone()?;
+        Some(Rc::new(move |cols, rows| {
+            tx.send(RuntimeAction::WindowSizeChanged { cols, rows })
+                .ok();
+        }))
     }
 
     /// The link-click handler this session's terminal panes call: a command link
@@ -824,6 +960,179 @@ impl ManagedSession {
         }
     }
 
+    /// Act on a MAIN-input event: route a submission to the runtime (a
+    /// masked one with its echo masked, aligning with the auto-login secret
+    /// path), or fire a hotkey. Shared by the user's Enter and a script's
+    /// `submit()` — both go through the same `SessionInput` submit path.
+    fn handle_input_event(&mut self, event: session_input::Event) {
+        match event {
+            session_input::Event::Submit { text, masked } => {
+                self.send_runtime_action(submit_runtime_action(text, masked));
+            }
+            session_input::Event::HotkeyTriggered(id) => {
+                self.send_runtime_action(RuntimeAction::ExecHotkey { id });
+            }
+            // The main input never opts into Escape-to-main.
+            session_input::Event::FocusMain => {}
+        }
+    }
+
+    /// Act on a PANE-input event (`docs/input.md` §3.7): a
+    /// submission is delivered to the pane's registered `onSubmit` handler —
+    /// never the session pipeline — masked or not (collecting a secret is the
+    /// point of a masked pane input, and only the pane's creator receives
+    /// it; the component already kept it out of the pane's history). Session
+    /// hotkeys fire from pane inputs exactly as from the main input, and
+    /// Escape hands focus back to the main input.
+    fn handle_pane_input_event(
+        &mut self,
+        key: PaneKey,
+        event: session_input::Event,
+    ) -> Task<Message> {
+        match event {
+            session_input::Event::Submit { text, masked } => {
+                self.send_runtime_action(pane_submit_runtime_action(key, text, masked));
+                Task::none()
+            }
+            session_input::Event::HotkeyTriggered(id) => {
+                self.send_runtime_action(RuntimeAction::ExecHotkey { id });
+                Task::none()
+            }
+            session_input::Event::FocusMain => operation::focus(self.input.input_id()),
+        }
+    }
+
+    /// The bookkeeping every MAIN-input update owes, in its load-bearing
+    /// order: history sync first (so a history change crosses the channel
+    /// ahead of the submission it belongs to), then the event routing, then
+    /// the mirror sync (which reflects whatever the event changed). Shared by
+    /// the widget message path and a script's `InputOp`.
+    fn finish_main_input_update(
+        &mut self,
+        update: crate::update::Update<session_input::Message, session_input::Event>,
+    ) -> Task<Message> {
+        self.sync_input_history(MAIN_PANE_KEY);
+        if let Some(event) = update.event {
+            self.handle_input_event(event);
+        }
+        self.sync_input_mirror(MAIN_PANE_KEY);
+        update.task.map(Message::Input)
+    }
+
+    /// The pane-input sibling of [`Self::finish_main_input_update`]: the same
+    /// choreography with the event routed to the pane's handler and the
+    /// component task re-keyed by the pane.
+    fn finish_pane_input_update(
+        &mut self,
+        key: PaneKey,
+        update: crate::update::Update<session_input::Message, session_input::Event>,
+    ) -> Task<Message> {
+        self.sync_input_history(key);
+        let event_task = match update.event {
+            Some(event) => self.handle_pane_input_event(key, event),
+            None => Task::none(),
+        };
+        self.sync_input_mirror(key);
+        Task::batch([
+            update.task.map(move |msg| Message::PaneInput(key, msg)),
+            event_task,
+        ])
+    }
+
+    /// The `SessionInput` behind `key`: the session's own input for the main
+    /// pane, the pane's own instance for a pane that hosts one, `None` for a
+    /// pane without an input (or a closed pane).
+    fn input_for(&self, key: PaneKey) -> Option<&session_input::SessionInput> {
+        if key == MAIN_PANE_KEY {
+            Some(&self.input)
+        } else {
+            self.panes.get(&key).and_then(|pane| pane.input.as_ref())
+        }
+    }
+
+    /// Every live input — the main input first, then each pane-hosted one —
+    /// for the paths that fan a session-wide fact out to all of them
+    /// (hotkeys, mirror interest).
+    fn all_inputs_mut(&mut self) -> impl Iterator<Item = &mut session_input::SessionInput> {
+        std::iter::once(&mut self.input).chain(
+            self.panes
+                .values_mut()
+                .filter_map(|pane| pane.input.as_mut()),
+        )
+    }
+
+    /// Send an input's mirror state to the session thread when it is wanted
+    /// and actually changed (see [`InputMirrorFeed`]). Keyed by pane: the
+    /// main input and every pane-hosted input share the one feed. The
+    /// component reports what caused the change; coalescing means
+    /// last-mutation-wins, as documented. The feed's interest gate is probed
+    /// up front so no snapshot is built without it (the feed re-checks it by
+    /// construction).
+    fn sync_input_mirror(&mut self, key: PaneKey) {
+        if !self.input_mirror_feed.interest {
+            return;
+        }
+        let Some(input) = self.input_for(key) else {
+            return;
+        };
+        let snapshot = input.mirror_snapshot();
+        let source = input.last_change_source();
+        let Some(snapshot) = self.input_mirror_feed.update(key, || snapshot) else {
+            return;
+        };
+        self.send_runtime_action(RuntimeAction::InputStateChanged {
+            key,
+            snapshot,
+            source,
+        });
+    }
+
+    /// Send an input's history to the session thread when it actually changed
+    /// (see [`InputHistoryFeed`]); sits beside [`Self::sync_input_mirror`] on
+    /// every input mutation path. Callers invoke it ahead of
+    /// [`Self::handle_input_event`], so the history update crosses the channel
+    /// before the submission action it belongs to — a `sys:input` handler that
+    /// reads history already sees the submission that fired it. Before the
+    /// runtime channel exists nothing is sent *or recorded*: the change is
+    /// owed, and [`Self::resync_input_history`] settles it at `RuntimeReady`
+    /// (the same recovery the settings re-assert gives `ApplySettings`).
+    fn sync_input_history(&mut self, key: PaneKey) {
+        let Some(input) = self.input_for(key) else {
+            return;
+        };
+        let revision = input.history_revision();
+        if !self
+            .input_history_feed
+            .update(key, revision, self.runtime_tx.is_some())
+        {
+            return;
+        }
+        // Re-resolved: the feed borrow above had to end first. The snapshot
+        // is still built only when the revision actually moved.
+        let Some(entries) = self
+            .input_for(key)
+            .map(session_input::SessionInput::history_snapshot)
+        else {
+            return;
+        };
+        self.send_runtime_action(RuntimeAction::InputHistoryChanged { key, entries });
+    }
+
+    /// Push the current history snapshot to a just-(re)started runtime,
+    /// unconditionally — the `RuntimeReady` sibling of the settings
+    /// re-assert. Covers both a history change that landed before the channel
+    /// existed and a runtime reload, whose rebuilt mirror starts empty no
+    /// matter what the previous runtime was sent.
+    fn resync_input_history(&mut self, key: PaneKey) {
+        let Some(input) = self.input_for(key) else {
+            return;
+        };
+        let revision = input.history_revision();
+        let entries = input.history_snapshot();
+        self.input_history_feed.resync(key, revision);
+        self.send_runtime_action(RuntimeAction::InputHistoryChanged { key, entries });
+    }
+
     pub fn jsx_subscription(&self) -> Subscription<SessionId> {
         self.widget_root.subscription(self.id)
     }
@@ -843,8 +1152,7 @@ impl ManagedSession {
                 Task::none()
             }
             Message::SetMapperCurrentLocation(area_id, room_number) => {
-                self.map_store
-                    .set_current_location(area_id, room_number);
+                self.map_store.set_current_location(area_id, room_number);
                 Task::none()
             }
             Message::WidgetMapMessage { id, message } => {
@@ -861,18 +1169,37 @@ impl ManagedSession {
             }
             Message::Input(input_msg) => {
                 let update = self.input.update(input_msg);
-
-                match update.event {
-                    Some(session_input::Event::Submit(command)) => {
-                        self.send_runtime_action(RuntimeAction::Send(command));
-                    }
-                    Some(session_input::Event::HotkeyTriggered(id)) => {
-                        self.send_runtime_action(RuntimeAction::ExecHotkey { id });
-                    }
-                    None => {}
+                self.finish_main_input_update(update)
+            }
+            Message::PaneInput(key, input_msg) => {
+                // Deliberately not `input_for_mut`: a `PaneInput` message is
+                // minted only for pane-hosted inputs, so `main` must stay a
+                // miss here rather than aliasing the session input.
+                let update = match self
+                    .panes
+                    .get_mut(&key)
+                    .and_then(|pane| pane.input.as_mut())
+                {
+                    Some(input) => input.update(input_msg),
+                    // The pane closed with a message in flight; nothing to do.
+                    None => return Task::none(),
+                };
+                self.finish_pane_input_update(key, update)
+            }
+            Message::PaneBodyClicked(key) => {
+                // Mirrors `TerminalClicked`: only a selection-less click
+                // focuses the pane's input (see `Selection::blocks_focus`).
+                let Some(pane) = self.panes.get(&key) else {
+                    return Task::none();
+                };
+                let Some(input) = pane.input.as_ref() else {
+                    return Task::none();
+                };
+                if pane.selection.borrow().blocks_focus() {
+                    Task::none()
+                } else {
+                    operation::focus(input.input_id())
                 }
-
-                update.task.map(Message::Input)
             }
             Message::SessionEvent(event) => {
                 match event {
@@ -907,6 +1234,17 @@ impl ManagedSession {
                         let first_ready = self.runtime_tx.is_none();
                         self.runtime_tx = Some(tx);
 
+                        // Re-assert input history for the same reason as the
+                        // settings above — a history change from before
+                        // readiness never crossed — and because a reloaded
+                        // runtime's history mirror starts empty regardless of
+                        // what its predecessor was sent. Pane inputs surviving
+                        // a reload need the same replay.
+                        self.resync_input_history(MAIN_PANE_KEY);
+                        for key in self.pane_input_keys() {
+                            self.resync_input_history(key);
+                        }
+
                         if self.connected || !self.auto_connect {
                             // Already connected (e.g. a runtime reload preserved the
                             // socket), or opened offline — don't auto-connect. Orient
@@ -937,7 +1275,8 @@ impl ManagedSession {
                                     // preceded it — so a miss here is a bug: warn and drop,
                                     // never fall back to main (a raw main append would desync
                                     // the numbering parity permanently).
-                                    match self.panes.get(key).and_then(|pane| pane.buffer.as_ref()) {
+                                    match self.panes.get(key).and_then(|pane| pane.buffer.as_ref())
+                                    {
                                         Some(buffer) => {
                                             let mut buffer = buffer.borrow_mut();
                                             // Whole-line delivery: start a fresh line, commit it.
@@ -976,6 +1315,11 @@ impl ManagedSession {
                     }
                     SessionEvent::PaneClosed(key) => {
                         self.panes.remove(&key);
+                        // The feeds' per-key records die with the pane's input
+                        // (keys are never reused; the runtime purges its side
+                        // on every close path too).
+                        self.input_mirror_feed.forget(key);
+                        self.input_history_feed.forget(key);
                         Task::none()
                     }
                     SessionEvent::PaneUpdated(def) => {
@@ -989,16 +1333,26 @@ impl ManagedSession {
                         }
                         Task::none()
                     }
+                    // Hotkey registrations fan out to every input — pane
+                    // inputs share the session's hotkey set, so session
+                    // hotkeys keep firing whichever input is focused (a pane
+                    // input created later seeds its copy in `open_pane`).
                     SessionEvent::ClearHotkeys => {
-                        self.input.clear_hotkeys();
+                        for input in self.all_inputs_mut() {
+                            input.clear_hotkeys();
+                        }
                         Task::none()
                     }
                     SessionEvent::RegisterHotkey(name, hotkey) => {
-                        self.input.register_hotkey(name, hotkey);
+                        for input in self.all_inputs_mut() {
+                            input.register_hotkey(name, hotkey.clone());
+                        }
                         Task::none()
                     }
                     SessionEvent::UnregisterHotkey(name) => {
-                        self.input.unregister_hotkey(&name);
+                        for input in self.all_inputs_mut() {
+                            input.unregister_hotkey(&name);
+                        }
                         Task::none()
                     }
                     SessionEvent::PerformLineOperation {
@@ -1034,11 +1388,90 @@ impl ManagedSession {
                         // update here — processing the message redraws the view.
                         Task::none()
                     }
+                    SessionEvent::InputOp { key, op } => {
+                        // The op layer refuses targets without an input, so a
+                        // miss here can only be a bug. Warn-and-drop like an
+                        // AppendTo miss.
+                        if key == MAIN_PANE_KEY {
+                            let update = self.input.apply_script_op(&op);
+                            self.finish_main_input_update(update)
+                        } else {
+                            let update = match self
+                                .panes
+                                .get_mut(&key)
+                                .and_then(|pane| pane.input.as_mut())
+                            {
+                                Some(input) => input.apply_script_op(&op),
+                                None => {
+                                    log::warn!("Dropping input op for {key}: no input there");
+                                    return Task::none();
+                                }
+                            };
+                            self.finish_pane_input_update(key, update)
+                        }
+                    }
+                    SessionEvent::InputMirrorInterest => {
+                        // The session thread wants input state from now on.
+                        // Attach the components' caret observers and push the
+                        // current state immediately so the first reads see
+                        // reality instead of the default empty mirror. Pane
+                        // inputs created later opt in at construction.
+                        for input in self.all_inputs_mut() {
+                            input.set_mirror_interest();
+                        }
+                        self.input_mirror_feed.start();
+                        self.sync_input_mirror(MAIN_PANE_KEY);
+                        for key in self.pane_input_keys() {
+                            self.sync_input_mirror(key);
+                        }
+                        Task::none()
+                    }
+                    SessionEvent::ServerEcho { enabled } => {
+                        // The telnet ECHO password signal, aimed at the MAIN
+                        // input only (pane inputs are script surfaces; the
+                        // server has no business masking them). Engagement is
+                        // gated by the user's auto-mask preference; a release
+                        // always applies (it is a no-op unless the telnet
+                        // cause is held). The held state is remembered so the
+                        // settings path re-runs the same gate on a preference
+                        // toggle. The compose rule with a script-set mask
+                        // lives in the component.
+                        self.server_echo = enabled;
+                        let masked = telnet_mask_gate(
+                            enabled,
+                            crate::prefs::current().mask_input_on_server_echo,
+                        );
+                        let update = self.input.set_telnet_mask(masked);
+                        self.finish_main_input_update(update)
+                    }
+                    SessionEvent::InputWordSets {
+                        key,
+                        suggestions,
+                        blacklist,
+                    } => {
+                        // The merged completion word sets for one input,
+                        // replacing the previous copy wholesale. The op layer
+                        // refuses targets without an input, so a miss is a bug.
+                        if key == MAIN_PANE_KEY {
+                            self.input.set_word_sets(suggestions, blacklist);
+                        } else if let Some(input) = self
+                            .panes
+                            .get_mut(&key)
+                            .and_then(|pane| pane.input.as_mut())
+                        {
+                            input.set_word_sets(suggestions, blacklist);
+                        } else {
+                            log::warn!("Dropping word sets for {key}: no input there");
+                        }
+                        Task::none()
+                    }
                 }
             }
             Message::Reload => {
                 self.input.clear_hotkeys();
-                if let Some(tx) = self.runtime_tx.as_ref() { tx.send(RuntimeAction::Reload).ok(); }
+                if let Some(tx) = self.runtime_tx.as_ref() {
+                    tx.send(RuntimeAction::Reload).ok();
+                }
                 Task::none()
             }
             Message::Reconnect => {
@@ -1054,17 +1487,9 @@ impl ManagedSession {
                 Task::none()
             }
             Message::TerminalClicked => {
-                // The terminal's release handler already ran (it is the
-                // mouse_area's content), so a drag has settled into
-                // `Selected` with a non-empty range; a plain click reads as
-                // `None` or an empty `Selected`. Only the selection-less
-                // click focuses the input — the pre-pane behavior.
-                let selected = match &*self.terminal_pane_selection.borrow() {
-                    Selection::None => false,
-                    Selection::Selected { from, to } => from != to,
-                    Selection::Selecting { .. } => true,
-                };
-                if selected {
+                // Only the selection-less click focuses the input — the
+                // pre-pane behavior (see `Selection::blocks_focus`).
+                if self.terminal_pane_selection.borrow().blocks_focus() {
                     Task::none()
                 } else {
                     operation::focus(self.input.input_id())
@@ -1093,6 +1518,16 @@ impl ManagedSession {
                     }
                 }
 
+                // Re-run the telnet auto-mask gate under the (possibly
+                // toggled) preference: the gate is otherwise evaluated only
+                // at ECHO edges, so while the server holds ECHO a preference
+                // change must engage or release the telnet cause here. The
+                // component's compose rule keeps a script-set mask out of it.
+                let mask_update = self.input.set_telnet_mask(telnet_mask_gate(
+                    self.server_echo,
+                    settings.mask_input_on_server_echo,
+                ));
+
                 let mut script_settings = ScriptSettings::from(&settings);
                 script_settings.palette = Some(crate::prefs::script_palette(&settings));
                 self.send_runtime_action(RuntimeAction::ApplySettings {
@@ -1102,7 +1537,7 @@ impl ManagedSession {
                     script_settings: Box::new(script_settings),
                 });
 
-                Task::none()
+                self.finish_main_input_update(mask_update)
             }
             Message::LinkConfirmGrantHost(value) => {
                 if let Some(pending) = self.pending_link_confirm.borrow_mut().as_mut() {
@@ -1157,51 +1592,8 @@ impl ManagedSession {
                 }
                 Task::none()
             }
-            Message::DismissBindToast(generation) => {
-                // Only clear if this is the toast the timer was scheduled for; a
-                // newer bind may have replaced it (bumping the generation).
-                if generation == self.toast_gen {
-                    self.toast = None;
-                }
-                Task::none()
-            }
-            Message::BindToastActionClicked => {
-                // The daemon owns the scope store, so it intercepts this in its
-                // `SessionAction` handler (reading the staged action, applying it,
-                // and clearing the toast) before this arm is ever reached. Clear
-                // defensively in case that interception is bypassed.
-                self.toast = None;
-                Task::none()
-            }
-            Message::None => {
-                Task::none()
-            }
+            Message::None => Task::none(),
         }
-    }
-
-    /// Show a bind-on-use / rescue toast over this session's main pane and
-    /// schedule its timed dismiss. Replaces any current toast (one at a time)
-    /// and bumps the generation so the previous toast's timer becomes inert.
-    pub fn show_bind_toast(
-        &mut self,
-        message: String,
-        action: Option<(String, ToastAction)>,
-    ) -> Task<Message> {
-        self.toast_gen += 1;
-        let generation = self.toast_gen;
-        self.toast = Some(SessionToast { message, action });
-        Task::perform(
-            async move { tokio::time::sleep(BIND_TOAST_DISMISS).await },
-            move |()| Message::DismissBindToast(generation),
-        )
-    }
-
-    /// Take the staged action of the current toast and clear it — the daemon's
-    /// half of an action-button click (it then applies the action to the scope
-    /// store). Returns `None` if there is no toast or it is message-only.
-    pub fn take_toast_action(&mut self) -> Option<ToastAction> {
-        let action = self.toast.take().and_then(|toast| toast.action);
-        action.map(|(_, action)| action)
     }
 
     /// Title-bar content for this session's pane: the profile/server label,
@@ -1284,6 +1676,7 @@ impl ManagedSession {
             self.terminal_buffer.borrow(),
             self.terminal_pane_selection.clone(),
             self.link_handler(),
+            self.grid_change_handler(),
         ))
         .on_release(Message::TerminalClicked);
 
@@ -1302,13 +1695,6 @@ impl ManagedSession {
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
-
-        // A bind-on-use / rescue toast floats over the body as a bottom pill,
-        // below any modal link dialog (which stacks last, so it stays on top).
-        let body = match &self.toast {
-            Some(toast) => stack![body, bind_toast_overlay(toast)].into(),
-            None => body,
-        };
 
         // A server link held at the trust gate renders its confirm dialog over
         // the whole session body — terminal *and* input — so it is truly modal
@@ -1421,10 +1807,15 @@ impl ManagedSession {
     /// `filter` (each entry's interned pane name id; `None` = the untargeted
     /// main overlay), with widget interactions routed back to the creating
     /// isolate.
-    fn widget_stack(
-        &self,
-        filter: impl Fn(Option<u32>) -> bool,
-    ) -> Element<'_, Message> {
+    fn widget_stack(&self, filter: impl Fn(Option<u32>) -> bool) -> Element<'_, Message> {
+        // Free map entries whose last render closure has dropped (unmount,
+        // engine rebuild, or the JS handle getting collected): the closure is
+        // the only path back into the store, so a queued id can never render
+        // again. Safe against iced's retained tree because the map element
+        // owns its `MapView` (`SharedMapView`).
+        for id in self.widget_root.map_reaper().take() {
+            self.map_store.remove_map(id);
+        }
         with_store_context(&self.map_store, || {
             with_text_store_context(&self.text_store, || {
                 self.widget_root.view(filter, || Box::new(default))
@@ -1493,7 +1884,6 @@ impl ManagedSession {
                     .join("local")
             })
     }
-
 }
 
 /// One-shot migration of the pre-0.4.1 global local-map store (`<home>/local/`)
@@ -1592,9 +1982,7 @@ fn migrate_global_local_maps(legacy: &Path, server_local_dirs: &[PathBuf]) {
         }
     }
 
-    if complete
-        && let Err(err) = std::fs::remove_dir_all(legacy)
-    {
+    if complete && let Err(err) = std::fs::remove_dir_all(legacy) {
         log::warn!(
             "local map migration: removing migrated store {} failed: {err}",
             legacy.display()
@@ -1608,6 +1996,227 @@ mod tests {
 
     fn atlas_target(n: u128) -> BindTarget {
         BindTarget::Atlas(AtlasId(smudgy_cloud::Uuid::from_u128(n)))
+    }
+
+    /// The input mirror feed's interest gate and coalescing: without interest
+    /// no snapshot is even *built* (the closure is the allocation path — it
+    /// must be unreachable); with interest, sends coalesce to actual changes.
+    #[test]
+    fn input_mirror_feed_gates_and_coalesces() {
+        let mut feed = InputMirrorFeed::default();
+
+        // No interest: the snapshot closure must never run.
+        let sent = feed.update(MAIN_PANE_KEY, || {
+            unreachable!("no snapshot may be built without interest")
+        });
+        assert!(sent.is_none());
+
+        feed.start();
+        let typed = InputSnapshot {
+            value: Arc::new("kill rat".to_string()),
+            cursor: 8,
+            selection: None,
+            focused: true,
+            masked: false,
+        };
+        assert!(
+            feed.update(MAIN_PANE_KEY, || typed.clone()).is_some(),
+            "the first post-interest update sends (the warm-up push)"
+        );
+        assert!(
+            feed.update(MAIN_PANE_KEY, || typed.clone()).is_none(),
+            "an identical state is coalesced away"
+        );
+        let edited = InputSnapshot {
+            value: Arc::new("kill bat".to_string()),
+            ..typed.clone()
+        };
+        assert!(
+            feed.update(MAIN_PANE_KEY, || edited.clone()).is_some(),
+            "a changed state sends"
+        );
+
+        // Re-starting (interest is sticky; the runtime re-asserts it) resets
+        // the coalescing history so the warm-up push always goes out.
+        feed.start();
+        assert!(feed.update(MAIN_PANE_KEY, || edited.clone()).is_some());
+    }
+
+    /// The history feed sends exactly when the revision moved: never at
+    /// revision 0 (empty history on both sides), once per change, and not
+    /// again for the same revision — the check that keeps the keystroke-rate
+    /// update paths from resending an unchanged history.
+    #[test]
+    fn input_history_feed_sends_once_per_revision() {
+        let mut feed = InputHistoryFeed::default();
+
+        assert!(
+            !feed.update(MAIN_PANE_KEY, 0, true),
+            "revision 0 is the shared empty starting point; nothing to send"
+        );
+        assert!(feed.update(MAIN_PANE_KEY, 1, true), "a change sends");
+        assert!(
+            !feed.update(MAIN_PANE_KEY, 1, true),
+            "the same revision does not resend"
+        );
+        assert!(
+            feed.update(MAIN_PANE_KEY, 2, true),
+            "the next change sends again"
+        );
+    }
+
+    /// An update that cannot be delivered is never recorded as sent: a
+    /// history change from before the runtime channel exists stays owed, so
+    /// the same revision still sends once a channel appears — front-entry
+    /// dedup means the revision may never move again, so marking it here
+    /// would silence the entry forever. `resync` is the flip side: the
+    /// `RuntimeReady` replay just sent unconditionally, so its revision is
+    /// recorded no matter what the coalescing record held.
+    #[test]
+    fn input_history_feed_never_marks_what_it_cannot_send() {
+        let mut feed = InputHistoryFeed::default();
+
+        assert!(
+            !feed.update(MAIN_PANE_KEY, 1, false),
+            "nothing sends without a channel"
+        );
+        assert!(
+            feed.update(MAIN_PANE_KEY, 1, true),
+            "the undelivered revision is still owed once a channel exists"
+        );
+
+        feed.resync(MAIN_PANE_KEY, 2);
+        assert!(
+            !feed.update(MAIN_PANE_KEY, 2, true),
+            "a resynced revision was sent; it does not resend"
+        );
+        assert!(
+            feed.update(MAIN_PANE_KEY, 3, true),
+            "changes after a resync send as usual"
+        );
+    }
+
+    /// `PaneClosed` evicts both feeds' per-key records: keys are never
+    /// reused, so a retired entry is pure growth — and the mirror feed's
+    /// coalescing must not survive the pane either (a same-looking snapshot
+    /// under a fresh key is a different input).
+    #[test]
+    fn pane_close_forgets_both_feeds_records() {
+        // Any key works; the feeds are key-agnostic containers.
+        let key = MAIN_PANE_KEY;
+
+        let mut mirror_feed = InputMirrorFeed::default();
+        mirror_feed.start();
+        let snapshot = InputSnapshot::default();
+        assert!(mirror_feed.update(key, || snapshot.clone()).is_some());
+        mirror_feed.forget(key);
+        assert!(
+            !mirror_feed.last_sent.contains_key(&key),
+            "the mirror feed's record is evicted with the pane"
+        );
+
+        let mut history_feed = InputHistoryFeed::default();
+        assert!(history_feed.update(key, 3, true));
+        history_feed.forget(key);
+        assert!(
+            !history_feed.last_sent.contains_key(&key),
+            "the history feed's record is evicted with the pane"
+        );
+    }
+
+    /// The submit routing fork: an unmasked submission becomes the typed
+    /// submission (`SubmitInput`, the `sys:input`-firing action), while a
+    /// masked one rides the redaction path (its own text as the redaction)
+    /// and never becomes `SubmitInput` — a secret must not reach `sys:input`
+    /// handlers or the alias/split pipeline.
+    #[test]
+    fn submit_routing_discriminates_typed_from_masked() {
+        let typed = submit_runtime_action(Arc::new("kill rat".to_string()), false);
+        match typed {
+            RuntimeAction::SubmitInput(text) => assert_eq!(text.as_str(), "kill rat"),
+            other => panic!("an unmasked submission must be SubmitInput, got {other:?}"),
+        }
+
+        let masked = submit_runtime_action(Arc::new("hunter2".to_string()), true);
+        match masked {
+            RuntimeAction::SendWithRedactions { text, redactions } => {
+                assert_eq!(text.as_str(), "hunter2");
+                assert_eq!(redactions.as_slice(), &["hunter2".to_string()]);
+            }
+            other => {
+                panic!("a masked submission must ride the redaction path, got {other:?}")
+            }
+        }
+    }
+
+    /// The pane-input fork: every pane submission — masked included — becomes
+    /// `PaneInputSubmit` for the pane's own `onSubmit`, never `SubmitInput`
+    /// (no `sys:input`) and never the redaction send path (nothing is sent).
+    #[test]
+    fn pane_submissions_always_route_to_the_pane_handler() {
+        let key = MAIN_PANE_KEY; // Any key: the fork is key-agnostic.
+        for masked in [false, true] {
+            let action = pane_submit_runtime_action(key, Arc::new("hunter2".to_string()), masked);
+            match action {
+                RuntimeAction::PaneInputSubmit { key: k, text } => {
+                    assert_eq!(k, key);
+                    assert_eq!(text.as_str(), "hunter2");
+                }
+                other => panic!(
+                    "a pane submission (masked={masked}) must be PaneInputSubmit, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The auto-mask preference toggled while the server holds ECHO: the
+    /// settings path re-runs [`telnet_mask_gate`] against the remembered
+    /// ECHO state, so enabling the preference mid-hold engages the telnet
+    /// mask immediately and disabling it mid-mask releases it — no
+    /// WONT/WILL cycle required. Replays the exact `set_telnet_mask` call
+    /// sequence the `ServerEcho` and `ApplySettings` arms make.
+    #[test]
+    fn pref_toggle_mid_hold_engages_and_releases_the_telnet_mask() {
+        let server_echo = true; // WILL ECHO arrived and still holds.
+        let mut input = session_input::SessionInput::new();
+
+        // The ECHO edge landed with the preference off: no mask.
+        let _ = input.set_telnet_mask(telnet_mask_gate(server_echo, false));
+        assert!(!input.mirror_snapshot().masked);
+
+        // Preference switched ON mid-hold: the settings re-run engages now.
+        let _ = input.set_telnet_mask(telnet_mask_gate(server_echo, true));
+        assert!(
+            input.mirror_snapshot().masked,
+            "enabling the preference while ECHO is held must engage the mask"
+        );
+
+        // Preference switched OFF mid-mask: the settings re-run releases now.
+        let _ = input.set_telnet_mask(telnet_mask_gate(server_echo, false));
+        assert!(
+            !input.mirror_snapshot().masked,
+            "disabling the preference mid-mask must release the telnet cause"
+        );
+    }
+
+    /// Disabling the preference mid-mask releases only the telnet cause: a
+    /// script-set mask rides the component's compose rule and stays.
+    #[test]
+    fn pref_off_mid_mask_leaves_a_script_set_mask_standing() {
+        use smudgy_core::session::runtime::input::InputOp;
+
+        let mut input = session_input::SessionInput::new();
+        let _ = input.apply_script_op(&InputOp::SetMasked(true));
+        let _ = input.set_telnet_mask(telnet_mask_gate(true, true));
+
+        let _ = input.set_telnet_mask(telnet_mask_gate(true, false));
+        assert!(
+            input.mirror_snapshot().masked,
+            "the preference toggle releases the telnet cause only"
+        );
+
+        let _ = input.apply_script_op(&InputOp::SetMasked(false));
+        assert!(!input.mirror_snapshot().masked);
     }
 
     /// The streak binds only after `LOCATE_BIND_STREAK` *consecutive*
@@ -1655,39 +2264,6 @@ mod tests {
         assert!(!tracker.observe_locate(target, true));
     }
 
-    #[test]
-    fn navigation_binds_immediately_but_respects_suppression() {
-        let tracker_target = atlas_target(1);
-        let tracker = BindTracker::default();
-        // One unassigned navigation is enough.
-        assert!(tracker.observe_navigation(tracker_target, true));
-        // A non-unassigned target never binds.
-        assert!(!tracker.observe_navigation(tracker_target, false));
-    }
-
-    #[test]
-    fn undo_suppresses_rebinding_for_the_session() {
-        let mut tracker = BindTracker::default();
-        let target = atlas_target(1);
-        tracker.suppress(target);
-        // Neither signal re-binds a suppressed target, however many locates.
-        for _ in 0..LOCATE_BIND_STREAK * 2 {
-            assert!(!tracker.observe_locate(target, true));
-        }
-        assert!(!tracker.observe_navigation(target, true));
-        // A different target is unaffected.
-        assert!(tracker.observe_navigation(atlas_target(2), true));
-    }
-
-    #[test]
-    fn rescue_offer_fires_at_most_once_per_target() {
-        let mut tracker = BindTracker::default();
-        let target = atlas_target(1);
-        assert!(tracker.mark_rescue_offered(target), "first offer");
-        assert!(!tracker.mark_rescue_offered(target), "not offered again");
-        assert!(tracker.mark_rescue_offered(atlas_target(2)), "a different target still offers");
-    }
-
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
@@ -1696,7 +2272,9 @@ mod tests {
     fn temp_root(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "smudgy-migrate-{tag}-{:?}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
         ))
     }
 

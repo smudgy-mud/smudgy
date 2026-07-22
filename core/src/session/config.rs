@@ -56,15 +56,19 @@ pub fn load_automation_actions(server_name: &str) -> Vec<RuntimeAction> {
     }
 
     match load_aliases(server_name) {
-        Ok(aliases) => actions.extend(aliases.into_iter().map(|(name, alias)| {
-            RuntimeAction::AddAlias {
-                isolate: IsolateId::Main,
-                origin: Origin::User,
-                name: Arc::new(name),
-                alias,
-                fire_limit: None,
-            }
-        })),
+        Ok(aliases) => {
+            actions.extend(
+                aliases
+                    .into_iter()
+                    .map(|(name, alias)| RuntimeAction::AddAlias {
+                        isolate: IsolateId::Main,
+                        origin: Origin::User,
+                        name: Arc::new(name),
+                        alias,
+                        fire_limit: None,
+                    }),
+            )
+        }
         Err(e) => log::warn!("Failed to load aliases for server {server_name}: {e:?}"),
     }
 
@@ -87,22 +91,28 @@ pub fn load_connect_action(server_name: &str, profile_name: &str) -> Result<Runt
     // OS keyring for this profile, and collect the secret(s) to redact from the
     // client's view and the session log when the auto-login text is echoed. The
     // token — not the password — is what lives in profile.json.
-    let (send_on_connect, send_on_connect_redactions) =
-        if profile.config.send_on_connect.is_empty() {
-            (None, Vec::new())
-        } else {
-            let (text, redactions) = crate::models::profile::substitute_password_with_redactions(
-                server_name,
-                profile_name,
-                &profile.config.send_on_connect,
-            );
-            (Some(Arc::new(text)), redactions)
-        };
+    let (send_on_connect, send_on_connect_redactions) = if profile.config.send_on_connect.is_empty()
+    {
+        (None, Vec::new())
+    } else {
+        let (text, redactions) = crate::models::profile::substitute_password_with_redactions(
+            server_name,
+            profile_name,
+            &profile.config.send_on_connect,
+        );
+        (Some(Arc::new(text)), redactions)
+    };
 
     Ok(RuntimeAction::Connect {
         host: server.config.host.into(),
         port: server.config.port,
         send_on_connect,
         send_on_connect_redactions: Arc::new(send_on_connect_redactions),
+        encoding: server.config.encoding.map(Arc::new),
+        compression: server.config.compression,
+        tls: crate::session::connection::TlsMode::from_settings(
+            server.config.tls,
+            server.config.tls_verify,
+        ),
     })
 }

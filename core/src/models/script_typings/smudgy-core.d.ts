@@ -30,7 +30,7 @@ declare module "smudgy:core" {
    *
    * ```ts
    * import { connect } from "smudgy:events/sys";
-   * const sub = connect.on(() => { ... });
+   * const sub = connect.on(() => console.log("connected"));
    * // later, when you no longer care:
    * sub.off();
    * ```
@@ -50,12 +50,17 @@ declare module "smudgy:core" {
    * wherever a widget prop takes a value:
    *
    * ```tsx
-   * <ProgressBar value={vitals.bind('hp')} max={vitals.bind('maxhp')} />
-   * <Text>HP: {vitals.bind('hp')}</Text>
+   * import { ProgressBar, Text } from "smudgy:widgets";
+   * import { vitals } from "smudgy:state/kapusniak/arctic-prompt";
+   *
+   * <>
+   *   <ProgressBar value={vitals.bind('hp')} max={vitals.bind('maxhp')} />
+   *   <Text>HP: {vitals.bind('hp')}</Text>
+   * </>
    * ```
    *
    * The widget then tracks the published value on its own. No handler runs
-   * and no re-mount happens on updates; the mounted widget simply repaints.
+   * and no re-mount happens on updates; the mounted widget repaints.
    */
   export interface Binding<T = unknown> {
     /** @internal the host-issued binding id -- do not access. */
@@ -209,10 +214,10 @@ declare module "smudgy:core" {
    * //   vitals.value.hp = 12;
    * //   vitals.value.maxhp = 100;
    *
-   * vitals.watch(v => { ... });
+   * vitals.watch(v => console.log(v?.hp));
    * // one delivery, after the update: v is { hp: 12, maxhp: 100 }
    *
-   * vitals.onWrite((path, value) => { ... });
+   * vitals.onWrite((path, value) => console.log(path, value));
    * // three deliveries, in write order:
    * //   ("hp", 15), ("hp", 12), ("maxhp", 100)
    *
@@ -289,6 +294,7 @@ declare module "smudgy:core" {
      * arrive, with no handler in between (see {@link Binding}).
      *
      * ```tsx
+     * import { ProgressBar } from "smudgy:widgets";
      * import { vitals } from "smudgy:state/kapusniak/arctic-prompt";
      *
      * <ProgressBar value={vitals.bind('hp', { fallback: 0 })}
@@ -404,14 +410,14 @@ declare module "smudgy:core" {
    *
    * ```ts
    * import { prompt } from "smudgy:events/kapusniak/arctic-prompt";
-   * function onPrompt(p: Payload<typeof prompt>) { ... }
+   * import type { Payload } from "smudgy:core";
+   * function onPrompt(p: Payload<typeof prompt>) { console.log(p.hp); }
    * ```
    *
-   * Usually you won't need it: every generated module also exports each
-   * handle's payload as a type with the handle's own name, so
+   * Every generated module also exports each handle's payload as a type with
+   * the handle's own name, so
    * `function onPrompt(p: prompt)` works directly, and single-handle
-   * subpath modules export it as `Payload`. This helper is for generic
-   * code.
+   * subpath modules export it as `Payload`. Use this helper in generic code.
    */
   export type Payload<H> = H extends StateHandle<infer T>
     ? Readonly<T>
@@ -435,6 +441,8 @@ declare module "smudgy:core" {
    * names the state:
    *
    * ```ts
+   * import { createState } from "smudgy:core";
+   *
    * export interface PromptData { hp: number; maxhp: number }
    *
    * export const promptState = createState<PromptData>();
@@ -449,17 +457,12 @@ declare module "smudgy:core" {
    * const hp = promptState.value?.hp;
    * ```
    *
-   * It is also possible to specify a name explicitly (`export const thisStateIsCalled_promptState = createState('promptState')`),
-   * which can be useful in some situations, such as if a script author wants
-   * to provide both a state and an event with the same name.
+   * The export name is the public state name. Pass a name explicitly when the
+   * variable needs a different name, or when a state and event should share one:
+   * `export const promptState = createState('prompt')`.
    *
-   * State objects are great when other scripts might need to know the
-   * current value of something, or if they might subscribe only to
-   * some changes deep in a complicated state structure.
-   *
-   * If recipients should be notified of every occurrence, and aren't interested
-   * in comparing old vs new values, consider using
-   * an {@link createEvent | event} instead.
+   * Use state when consumers need the current value or need to watch nested
+   * paths. Use {@link createEvent | an event} when every occurrence matters.
    */
   export function createState<T = unknown>(name?: string): StateHandle<T>;
 
@@ -469,10 +472,10 @@ declare module "smudgy:core" {
    * and it must be exported from the top level of a package or module.
    *
    * ```ts
+   * import { createEvent } from "smudgy:core";
+   *
+   * interface PromptData { hp: number; maxhp: number }
    * export const prompt = createEvent<PromptData>();
-   *
-   * // ...
-   *
    * prompt.emit({ hp: 42, maxhp: 100 });
    * ```
    *
@@ -483,19 +486,17 @@ declare module "smudgy:core" {
 
   /**
    * Creates a procedure: a function other scripts and packages can call.
-   * Because it's impossible to call functions or share data across sandboxes,
-   * procedures are the only way to expose a callable function to other scripts.
+   * Direct function calls cannot cross sandbox boundaries, so a procedure is
+   * the public entry point for an operation implemented by another package.
    *
-   * Also, because all scripts run sequentially in the same thread,
-   * calling a procedure is an asynchronous operation. The event loop on the caller side
-   * completes a full cycle, the called sandbox then runs, receiving the procedure, and then,
-   * after it in turn completes a cycle, the caller sandbox receives the result of the procedure.
-   * 
+   * Calls are delivered asynchronously and are fire-and-forget. Publish a
+   * state or emit an event if the caller needs to observe an outcome.
+   *
    * ```ts
-   * export const refresh = createProcedure(async (full: boolean, sender) => {
-   *   // the first argument is the payload, and can be any type that can be serialized to JSON.
-   *   // the second argument is the name of the sender, which will be "user" if the sender was
-   *   // not in a sandbox, otherwise it will be the package owning the sandbox that called us, e.g., `smudgy://foo/bar`
+   * import { createProcedure } from "smudgy:core";
+   *
+   * export const refresh = createProcedure((args: { full: boolean }, sender) => {
+   *   console.log(`refresh requested by ${sender}`, args.full);
    * });
    * ```
    */
@@ -509,10 +510,11 @@ declare module "smudgy:core" {
 
   /**
    * Creates a state whose value is computed from another package's state.
-   * Especially useful for binding a computed value to a widget, since
-   * binding paths are plain lookups and can't contain expressions:
+   * Use it to bind computed values to widgets, because binding paths are
+   * plain lookups and cannot contain expressions:
    *
    * ```ts
+   * import { createDerived } from "smudgy:core";
    * import { vitals } from "smudgy:state/kapusniak/arctic-prompt";
    * export const hpPct = createDerived(vitals, v => v.hp / v.maxhp);
    * // <ProgressBar value={hpPct.bind()} />
@@ -670,10 +672,10 @@ declare module "smudgy:core" {
      */
     onReady(callback: () => void): void;
     /**
-     * Sends a GMCP message to the game: `gmcp.send("Char.Skills.Get",
-     * { group: "combat" })`, or without data — `gmcp.send("Char.Items.Inv")`.
-     * The data serializes as JSON. Dropped (with a one-time notice) while
-     * GMCP is not active; `onReady` is the way to wait for it.
+     * Sends a GMCP message to the game. Call `gmcp.send("Char.Items.Inv")`
+     * with only a name, or pass JSON-serializable data as the second argument.
+     * Messages are dropped (with a one-time notice) while GMCP is not active;
+     * use `onReady` to wait for it.
      */
     send(name: string, data?: unknown): void;
     /**
@@ -764,6 +766,10 @@ declare module "smudgy:core" {
     script?: string;
     /** Defaults to `true`. */
     enabled?: boolean;
+    /** Higher values run first. Defaults to `0`; equal priorities keep registration order. */
+    priority?: number;
+    /** Continue checking later aliases from the same script/package. Defaults to `true`. */
+    fallthrough?: boolean;
     /** Defaults to `"plaintext"`. */
     language?: ScriptLang;
     /** Optional folder grouping in the automations window. */
@@ -785,6 +791,10 @@ declare module "smudgy:core" {
     enabled?: boolean;
     /** Also test prompts, not just complete lines. Defaults to `false`. */
     prompt?: boolean;
+    /** Higher values run first. Defaults to `0`; equal priorities keep registration order. */
+    priority?: number;
+    /** Continue checking later triggers from the same script/package. Defaults to `true`. */
+    fallthrough?: boolean;
     /** Defaults to `"plaintext"`. */
     language?: ScriptLang;
     package?: string;
@@ -826,8 +836,11 @@ declare module "smudgy:core" {
     delete(): boolean;
   }
 
+  /** A handle to a saved alias. */
   export type SavedAliasHandle = SavedAutomationHandle<SavedAlias>;
+  /** A handle to a saved trigger. */
   export type SavedTriggerHandle = SavedAutomationHandle<SavedTrigger>;
+  /** A handle to a saved hotkey. */
   export type SavedHotkeyHandle = SavedAutomationHandle<SavedHotkey>;
 
   /**
@@ -874,6 +887,32 @@ declare module "smudgy:core" {
    */
   export type TitleBarSpec = "normal" | "always-show";
 
+  /**
+   * A pane's own input line (see {@link PaneSpecBase.input}). What the user
+   * submits there goes to your `onSubmit` handler and nowhere else: nothing
+   * is sent, matched against aliases, or echoed unless the handler does it,
+   * and the main input's history is untouched. `session.send(text)` inside
+   * the handler reproduces normal typed-command behavior.
+   *
+   * ```ts
+   * import { session } from "smudgy:core";
+   * // A chat pane whose input auto-prefixes the channel.
+   * session.mainPane.split("right", {
+   *   name: "Chat",
+   *   width: 300,
+   *   input: { onSubmit: (text) => session.send(`gt ${text}`), placeholder: "group tell..." },
+   * });
+   * ```
+   */
+  export interface PaneInputSpec {
+    /** Receives each submitted line. The text is yours alone: nothing is
+     *  sent to the server, matched against aliases, or echoed unless you do
+     *  it here, and the main input's history never records it. */
+    onSubmit: (text: string) => void;
+    /** Hint text shown while the input is empty. */
+    placeholder?: string;
+  }
+
   /** The direction-independent half of the spec for {@link Pane.split}. */
   export interface PaneSpecBase {
     /** Required. Names are case-insensitive (display case is preserved) and
@@ -883,10 +922,17 @@ declare module "smudgy:core" {
     /** Default `true`. Pass `false` for a widgets-only pane with no terminal;
      *  `echo`/`clear` throw on it. Every pane can host widgets either way. */
     terminal?: boolean;
-    /** Default `'normal'`. The one spec key that also applies to an
-     *  **existing** pane: `split()` naming an existing pane (including
-     *  `'main'`) with an explicit `titleBar` updates its policy. */
+    /** Default `'normal'`. Also applies to an **existing** pane: `split()`
+     *  naming an existing pane (including `'main'`) with an explicit
+     *  `titleBar` updates its policy. */
     titleBar?: TitleBarSpec;
+    /** Give the pane its own input line (see {@link PaneInputSpec}). Part of
+     *  what the pane is, like `terminal`: `split()` naming an existing pane
+     *  that has no input while asking for one throws (close it first). Works
+     *  on either pane kind; usable on your own session only. Re-splitting
+     *  with the same spec re-registers `onSubmit`, which is also how a
+     *  handler comes back after your script reloads. */
+    input?: PaneInputSpec;
   }
 
   /**
@@ -901,7 +947,11 @@ declare module "smudgy:core" {
 
   /**
    * A handle to one session pane. Panes are keyed by name: `split()` with an
-   * existing name returns that pane (its spec is ignored, except `titleBar`).
+   * existing name returns that pane. Most of the spec is then ignored, with
+   * two exceptions. An explicit `titleBar` updates the pane's policy. And
+   * `input` is part of what the pane is: asking for one on an existing pane
+   * that has none throws (close it first), while re-splitting a pane that
+   * has one re-registers its `onSubmit` (placeholder changes are ignored).
    * A pane closes when `close()` is called, when the session ends, or when no
    * script re-claims it during a reload; any `split()` naming it during the
    * reload keeps it, placement untouched. A later `split()` with the same
@@ -932,6 +982,13 @@ declare module "smudgy:core" {
     clear(): void;
     /** Close this pane. Throws on the main pane; safe to repeat otherwise. */
     close(): void;
+    /** This pane's own input line, or `undefined` for panes created without
+     *  one (see {@link PaneInputSpec}). The same handle as {@link InputHandle},
+     *  addressed at this pane: its text, focus, masking, completion words,
+     *  and history are all the pane input's own, independent of the main
+     *  input's. On the main pane this is `undefined` too; its input is
+     *  {@link Session.input}. */
+    readonly input: InputHandle | undefined;
     /** Split a new pane off this one (get-or-create by name; an explicit
      *  `titleBar` also updates an existing pane's policy, including main's). */
     split<D extends SplitDirection>(direction: D, spec: PaneSpec<D>): Pane;
@@ -948,7 +1005,198 @@ declare module "smudgy:core" {
     list(): Pane[];
     exists(name: string): boolean;
   }
+  /** A pane registry with both method and property access (`panes.get("chat")`
+   *  and `panes.chat`). */
   export type PaneRegistry = PaneRegistryMethods & { readonly [name: string]: Pane | undefined };
+
+  // ---- The command input ----------------------------------------------------
+
+  /**
+   * Tab-completion words registered by this script (see
+   * {@link InputHandle.completion}). Registry methods expose only this
+   * script's words; the input combines contributions from every script when
+   * it offers completions.
+   *
+   * Words are case-insensitive single tokens of at most 64 characters. A
+   * registry holds up to 512 words. Adding an existing word is idempotent and
+   * updates its stored casing. Registrations do not persist across reloads.
+   *
+   * ```ts
+   * import { input } from "smudgy:core";
+   * input.completion.add("fireball", "featherfall", "Fjord");
+   * input.completion.blacklist.add("ooc");
+   * ```
+   */
+  export interface WordSetRegistry {
+    /** Register words. Each is one token: non-empty, no spaces, at most 64
+     *  characters. A set holds up to 512 of your words. */
+    add(...words: string[]): void;
+    /** Remove one of your words (matched case-insensitively). Returns whether
+     *  it was there. */
+    delete(word: string): boolean;
+    /** Whether you registered this word (matched case-insensitively). */
+    has(word: string): boolean;
+    /** Your words, in the order you added them, as registered. */
+    list(): string[];
+    /** Remove all of your words. Other scripts' words stay. */
+    clear(): void;
+  }
+
+  /**
+   * An input's shared command history: the lines the Up arrow recalls (see
+   * {@link InputHandle.history}). Every script sees and changes the same
+   * history for that input.
+   *
+   * `list()` reflects history as of the most recent submission (or scripted
+   * change). Password-mode submissions never enter history, so they never
+   * appear here.
+   *
+   * ```ts
+   * import { input, createAlias } from "smudgy:core";
+   * // "again 2" offers back the command typed two submissions ago. When
+   * // the alias runs, list()[0] is the "again 2" line itself, so the
+   * // command before it sits at [1].
+   * createAlias(/^again (?<n>\d+)$/, ({ n }) => {
+   *   const entry = input.history.list()[Number(n)];
+   *   if (entry) input.propose(entry);
+   * });
+   * ```
+   */
+  export interface InputHistory {
+    /** The history entries, newest first. */
+    list(): string[];
+    /**
+     * Add a line to history without sending it, exactly as if the user had
+     * submitted it: the line becomes the newest entry, an older duplicate is
+     * removed, and the oldest entry falls off once history is full (100
+     * entries). The line must be non-blank and a single line.
+     */
+    push(text: string): void;
+    /** Remove every history entry. */
+    clear(): void;
+  }
+
+  /**
+   * Inspect or edit a command input. The main input is exported as
+   * {@link input}; a pane with its own input exposes the same API through
+   * {@link Pane.input}.
+   *
+   * Input state is synchronized from the UI and can briefly trail very recent
+   * typing. Text delivered by the `submit` event is exact.
+   *
+   * The command line belongs to the user. Use `propose()` to offer a command
+   * without overwriting text they are editing. The proposed text is selected:
+   * Enter submits it, while typing replaces it. Use `replace()` only when the
+   * script should overwrite the current contents.
+   *
+   * Cursor and selection positions count UTF-16 code units, the same units
+   * as JavaScript string indexing into `value`.
+   *
+   * ```ts
+   * import { input } from "smudgy:core";
+   * // Offer a command for the user to confirm or amend.
+   * input.propose("cast 'heal' Tom");
+   * input.focus();
+   * ```
+   */
+  export interface InputHandle {
+    /** The input's current text. Empty while masked. */
+    readonly value: string;
+    /** The cursor position, in UTF-16 code units (the units of JavaScript
+     *  string indexing). */
+    readonly cursor: number;
+    /** The selected range, in UTF-16 code units, or `null` when nothing is
+     *  selected. */
+    readonly selection: { start: number; end: number } | null;
+    /** Whether the input has keyboard focus. */
+    readonly focused: boolean;
+    /**
+     * Enable password mode. While masked, `value` is empty, completion and
+     * history are disabled, and submissions are not echoed. Revealing the
+     * text in the UI does not make it readable by scripts.
+     *
+     * Text already in the input is restored when masking ends. Text entered
+     * while masked is never exposed through this handle.
+     *
+     * A masked pane input still sends submitted text to that pane's
+     * `onSubmit` handler. No other script receives it.
+     *
+     * Script-controlled masking and the main input's server-controlled
+     * password masking are independent. Setting `masked = false` releases
+     * only the mask established by the script.
+     */
+    masked: boolean;
+
+    /** Replace the input's text. The cursor moves to the end. */
+    replace(text: string): void;
+    /** Add text at the end of the input. The cursor moves to the end. */
+    append(text: string): void;
+    /** Empty the input. */
+    clear(): void;
+    /**
+     * Put a command in the input, fully selected: Enter sends it, and typing
+     * anything discards it. Prefer this over `replace()` when suggesting a
+     * command.
+     */
+    propose(text: string): void;
+
+    /** Place the cursor at a position, counted in UTF-16 code units. */
+    setCursor(pos: number): void;
+    /** Select from `start` to `end`, counted in UTF-16 code units. */
+    select(start: number, end: number): void;
+    /** Select everything in the input. */
+    selectAll(): void;
+
+    /** Give the input keyboard focus. */
+    focus(): void;
+    /** Take keyboard focus away from the input. */
+    blur(): void;
+    /** Submit the input's contents, exactly as if the user pressed Enter. */
+    submit(): void;
+
+    /**
+     * Your tab-completion words for this input (see {@link WordSetRegistry}).
+     * When the user presses Tab, registered words matching the typed prefix
+     * are offered first, then words from recent output. Every script's
+     * contributions are offered together, in registration order. `blacklist`
+     * holds words never to offer, from either source, matched
+     * case-insensitively.
+     */
+    readonly completion: WordSetRegistry & { readonly blacklist: WordSetRegistry };
+
+    /** The input's command history, newest first: what the Up arrow recalls
+     *  (see {@link InputHistory}). */
+    readonly history: InputHistory;
+  }
+
+  /**
+   * The submission a `submit` event handler is processing: what the user
+   * typed, on its way into the client. Only meaningful inside a handler for
+   * the `submit` event from `smudgy:events/sys`; anywhere else it throws.
+   *
+   * Handlers run in order and act on the same submission, so a later handler
+   * reads any replacement an earlier one made, and a cancel from any handler
+   * is final.
+   */
+  export interface Submission {
+    /** The submitted line as it currently stands. */
+    readonly text: string;
+    /**
+     * Substitute the line: aliases, command splitting, and prefix handling
+     * all process the new text instead of what was typed.
+     */
+    replace(text: string): void;
+    /**
+     * Discard the submission entirely. Nothing reaches aliases or the MUD,
+     * and no later handler can restore it. The input has already applied its
+     * normal post-submit behavior; cancellation only stops further processing.
+     */
+    cancel(): void;
+  }
+
+  /** The submission a `submit` event handler is processing (see
+   *  {@link Submission}). */
+  export const submission: Submission;
 
   /**
    * A MUD session. Every method acts on the session the handle names, which
@@ -978,11 +1226,16 @@ declare module "smudgy:core" {
     readonly mainPane: Pane;
     /** This session's pane registry (see {@link PaneRegistry}). */
     readonly panes: PaneRegistry;
+    /** This session's command input (see {@link InputHandle}). Usable on your
+     *  own session only. */
+    readonly input: InputHandle;
     toString(): string;
   }
 
   /** The session your script is running in. */
   export const session: Session;
+  /** Your session's command input (see {@link InputHandle}). */
+  export const input: InputHandle;
   /** Your session's numeric id. */
   export const id: number;
   /**
@@ -1035,6 +1288,8 @@ declare module "smudgy:core" {
    * first. Each step is itself a tag, so all of these work:
    *
    * ```ts
+   * import { echo, style } from "smudgy:core";
+   *
    * echo`A ${style.red`red`} word and ${style.blue.bgYellow`a loud one`}.`;
    * echo(style.fg({ r: 255, g: 128, b: 0 })`exact orange`);
    * echo(style({ fg: "cyan", bg: "black" })`both at once`);
@@ -1091,6 +1346,8 @@ declare module "smudgy:core" {
    * clicking runs it with the modifier keys that were held:
    *
    * ```ts
+   * import { echo, link, send } from "smudgy:core";
+   *
    * echo`You see an exit ${link("north")`to the north`}.`;
    * echo`${link((click) => send(click.shift ? "open north" : "north"))`north`}`;
    * ```
@@ -1100,6 +1357,8 @@ declare module "smudgy:core" {
    * keeps up:
    *
    * ```ts
+   * import { line, link, style } from "smudgy:core";
+   *
    * line.replace("north", link("north")`${style.cyan`north`}`);
    * ```
    *
@@ -1111,8 +1370,16 @@ declare module "smudgy:core" {
   export function link(command: string): StyleTag;
   export function link(onClick: (click: LinkClick) => void): StyleTag;
 
-  /** Print a line in your session's output window; nothing is sent to the MUD.
-   *  Also usable directly as a template tag: `` echo`hi ${style.red`there`}` ``. */
+  /**
+   * Print a line in your session's output window; nothing is sent to the MUD.
+   * Also usable directly as a template tag:
+   *
+   * ```ts
+   * import { echo, style } from "smudgy:core";
+   *
+   * echo`hi ${style.red`there`}`;
+   * ```
+   */
   export function echo(line: string | StyledText): void;
   export function echo(text: TemplateStringsArray, ...values: unknown[]): void;
   /** Send a command to the MUD as if you typed it: aliases run, and the command
@@ -1186,6 +1453,10 @@ declare module "smudgy:core" {
     singleton?: boolean;
     /** The alias removes itself after firing this many times (`1` = one-shot). */
     fireLimit?: number;
+    /** Higher values run first. Defaults to `0`; equal priorities keep registration order. */
+    priority?: number;
+    /** Continue checking later aliases from this script/package. Defaults to `true`. */
+    fallthrough?: boolean;
   };
 
   /** Options for {@link createTrigger}. */
@@ -1210,6 +1481,10 @@ declare module "smudgy:core" {
     /** The trigger removes itself after testing this many incoming lines,
      *  whether or not they fired it. */
     lineLimit?: number;
+    /** Higher values run first. Defaults to `0`; equal priorities keep registration order. */
+    priority?: number;
+    /** Continue checking later triggers from this script/package. Defaults to `true`. */
+    fallthrough?: boolean;
   };
 
   /** One trigger in a {@link createTriggers} batch: its patterns, its body,
@@ -1224,6 +1499,8 @@ declare module "smudgy:core" {
     singleton?: boolean;
     fireLimit?: number;
     lineLimit?: number;
+    priority?: number;
+    fallthrough?: boolean;
   };
 
   /** Options for {@link createTimer}. */
@@ -1278,6 +1555,10 @@ declare module "smudgy:core" {
     enabled: boolean;
     /** The first pattern's regex source (`""` if the alias no longer exists). */
     readonly pattern: string;
+    /** Relative evaluation priority (higher runs first). */
+    readonly priority: number;
+    /** The declarative fallthrough default for this alias. */
+    readonly fallthrough: boolean;
     /** Remove the alias. Safe to call more than once. */
     delete(): void;
   }
@@ -1289,6 +1570,8 @@ declare module "smudgy:core" {
     readonly created?: boolean;
     enabled: boolean;
     readonly pattern: string;
+    readonly priority: number;
+    readonly fallthrough: boolean;
     delete(): void;
   }
 
@@ -1474,6 +1757,14 @@ declare module "smudgy:core" {
    * already-printed line by number. The handle remembers which line it points
    * at; methods never take a line number.
    *
+   * The line being processed accepts changes only while a trigger or
+   * `receive` handler for it is running. Once that handler returns, or after
+   * an `await` inside it, the line has moved on: any edit, `gag()`,
+   * `redirect()`, or `copy()` then throws rather than landing on whatever
+   * line comes next. Reads stay safe anywhere (`text` is `""` and `styles`
+   * an empty array outside a handler). Already-printed lines reached through
+   * `buffer.line(n)` can be edited at any time.
+   *
    * The text-search methods (`replace`, `highlight`, `remove`) find their
    * target by string; the `*At` forms take byte offsets (e.g. from `styles`).
    */
@@ -1532,8 +1823,9 @@ declare module "smudgy:core" {
     line(lineNumber: number): Line;
   }
 
-  /** The line a trigger is processing. Only meaningful inside a trigger
-   *  handler. */
+  /** The line a trigger is processing. Only meaningful inside a trigger (or
+   *  `receive` event) handler for it: elsewhere reads come back empty and
+   *  edits throw (see {@link Line}). */
   export const line: Line;
   /** This session's recent-lines buffer. */
   export const buffer: Buffer;
@@ -1552,6 +1844,16 @@ declare module "smudgy:core" {
    * `line.gag()` for similar behavior there.
    */
   export function capture(value: boolean): void;
+
+  /**
+   * Inside an alias or trigger function handler, decide whether later matching
+   * automations from the same script/package may run for this dispatch. This
+   * overrides the automation's `fallthrough` option for this invocation only.
+   * Nested `send()` calls begin a fresh alias dispatch.
+   *
+   * @throws {Error} When called outside an alias or trigger function handler.
+   */
+  export function fallthrough(value: boolean): void;
 
   // ---- Mapper -------------------------------------------------------------
 
@@ -1573,6 +1875,7 @@ declare module "smudgy:core" {
     sendRaw(text: string): void;
     reload(): void;
     capture(value: boolean): void;
+    fallthrough(value: boolean): void;
     byName(name: string): Session | undefined;
     getSessions(): Session[];
     getProfile(): Profile;
@@ -1597,10 +1900,14 @@ declare module "smudgy:core" {
     readonly vars: Record<string, any>;
     readonly line: Line;
     readonly buffer: Buffer;
+    /** The submission a `submit` event handler is processing. */
+    readonly submission: Submission;
     /** The map API. */
     readonly mapper: Mapper;
     /** The current session. */
     readonly session: Session;
+    /** The current session's command input. */
+    readonly input: InputHandle;
     /** The current session id. */
     readonly id: number;
   }
@@ -1641,6 +1948,20 @@ declare module "smudgy:events/sys" {
    * `line.replace()` work just as they do in a trigger.
    */
   export const receive: EventConsumer<{ text: string }>;
+
+  /**
+   * Fires when a command is submitted from the command input, whether the
+   * user pressed Enter or a script called `input.submit()`. `text` is the
+   * line exactly as typed, before aliases, command splitting, or prefix
+   * handling. Lines sent by scripts do not fire it, and neither do masked
+   * (password) submissions.
+   *
+   * Inside the handler, the ambient `submission` from `smudgy:core` refers
+   * to this same submission: `submission.replace()` changes what the rest
+   * of the client processes, and `submission.cancel()` discards it. The
+   * pairing mirrors `receive` and the ambient `line`.
+   */
+  export const submit: EventConsumer<{ text: string }>;
 }
 
 declare module "smudgy:events/map" {
@@ -1660,6 +1981,52 @@ declare module "smudgy:events/map" {
    * areaId, may change.
    */
   export const room: EventConsumer<{ areaId: string; roomNumber: number | null }>;
+}
+
+declare module "smudgy:events/input" {
+  import type { EventConsumer } from "smudgy:core";
+
+  /**
+   * Fires after a command input's text changes. `source` identifies whether
+   * the change came from the user, a script, a command link, or another client
+   * action such as history recall. `pane` is absent for the main input.
+   *
+   * Use this event to observe edits. To replace or cancel a submitted command,
+   * use `submit` from `smudgy:events/sys`.
+   *
+   * Identical consecutive states are coalesced. While the input is masked,
+   * typing emits no events and no text is reported. The event that begins
+   * masking contains `masked: true` without `value`; the event that ends it
+   * contains the restored text. Read `input.masked` when the current masking
+   * state matters.
+   *
+   * Changing the input from a handler emits another `change` event. Only write
+   * when the new value differs, or the handler can loop.
+   *
+   * ```ts
+   * import { change } from "smudgy:events/input";
+   * change.on(({ value, source }) => {
+   *   if (source === "user") console.log("draft:", value ?? "");
+   * });
+   * ```
+   */
+  export const change: EventConsumer<{
+    value?: string;
+    masked?: true;
+    pane?: string;
+    source: "user" | "script" | "link" | "other";
+  }>;
+
+  /**
+   * Fires when a command input gains or loses keyboard focus. `pane` names
+   * the pane whose input it is; it is absent for the main input. `masked` is
+   * present (and `true`) while that input is in password mode.
+   */
+  export const focus: EventConsumer<{
+    focused: boolean;
+    masked?: true;
+    pane?: string;
+  }>;
 }
 
 declare module "smudgy:events/gmcp" {

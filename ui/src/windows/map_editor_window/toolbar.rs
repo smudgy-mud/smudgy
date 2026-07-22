@@ -1,9 +1,10 @@
 //! The editor toolbar: tool toggles, level stepper, undo/redo, and the
 //! background-sync status indicator.
 
+use iced::Length;
 use iced::alignment::Vertical;
 use iced::widget::{button, container, row, space, text, tooltip};
-use iced::Length;
+use smudgy_cloud::mapper::AreaSaveStatus;
 use smudgy_map_widget::map_editor::Tool;
 
 use crate::assets::{bootstrap_icons, fonts};
@@ -56,6 +57,13 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
             bootstrap_icons::PLUS_SQUARE,
             "Add room",
             Tool::AddRoom,
+            active_tool,
+            can_edit
+        ),
+        tool_button(
+            bootstrap_icons::ARROW_REPEAT,
+            "Link rooms (Ctrl: one-way)",
+            Tool::Link,
             active_tool,
             can_edit
         ),
@@ -230,39 +238,42 @@ fn inactive_chip() -> ThemedElement<'static, Message> {
 /// sync — the engine no longer polls on a timer, so this is how the user pulls
 /// remote changes (and retries after a failure) on demand.
 fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
-    let stats = window.mapper.get_sync_stats();
-    let pending = stats.pending_operations();
-    let failed = stats.operations_failed();
-
-    // "Busy" = a sync is actively flushing pending writes; only then is the
-    // readout passive. Idle and post-failure states are clickable.
-    let busy = pending > 0;
-
+    const PENDING_WARNING: &str = "Pending changes are held only for this session. Closing now attempts a final sync, but may lose unsent work.";
+    let status = window
+        .editor
+        .area_id()
+        .map_or(AreaSaveStatus::Saved, |area_id| {
+            window.mapper.area_save_status(area_id)
+        });
     type StyleFn = fn(&crate::Theme) -> iced::widget::text::Style;
-    let (codepoint, label, color): (&str, String, StyleFn) = if busy {
-        (
+    let normal: StyleFn = |theme: &crate::Theme| iced::widget::text::Style {
+        color: Some(theme.styles.text.normal.scale_alpha(0.7)),
+    };
+    let error: StyleFn = |theme: &crate::Theme| iced::widget::text::Style {
+        color: Some(theme.styles.text.error),
+    };
+    let (codepoint, label, color) = match &status {
+        AreaSaveStatus::Saved => (bootstrap_icons::CLOUD_CHECK, "Saved".to_string(), normal),
+        AreaSaveStatus::Saving(pending) => (
             bootstrap_icons::CLOUD_UPLOAD,
-            format!("syncing {pending}"),
-            |theme: &crate::Theme| iced::widget::text::Style {
-                color: Some(theme.styles.text.normal.scale_alpha(0.7)),
-            },
-        )
-    } else if failed > 0 {
-        (
+            format!("Saving {pending} changes"),
+            normal,
+        ),
+        AreaSaveStatus::Offline(pending) => (
             bootstrap_icons::EXCLAMATION_TRIANGLE,
-            format!("{failed} failed"),
-            |theme: &crate::Theme| iced::widget::text::Style {
-                color: Some(theme.styles.text.error),
-            },
-        )
-    } else {
-        (
-            bootstrap_icons::CLOUD_CHECK,
-            "Sync".to_string(),
-            |theme: &crate::Theme| iced::widget::text::Style {
-                color: Some(theme.styles.text.normal.scale_alpha(0.4)),
-            },
-        )
+            format!("Offline, {pending} changes pending"),
+            error,
+        ),
+        AreaSaveStatus::ConflictNeedsReview => (
+            bootstrap_icons::EXCLAMATION_TRIANGLE,
+            "Conflict needs review".to_string(),
+            error,
+        ),
+        AreaSaveStatus::CouldNotSave(_) => (
+            bootstrap_icons::EXCLAMATION_TRIANGLE,
+            "Could not save".to_string(),
+            error,
+        ),
     };
 
     let content = row![
@@ -275,12 +286,42 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     .spacing(4)
     .align_y(Vertical::Center);
 
-    if busy {
-        // Padding matches the idle button so the row doesn't shift when a tick
-        // starts or finishes.
-        container(content).padding([2, 6]).into()
-    } else {
-        tooltip(
+    match status {
+        AreaSaveStatus::ConflictNeedsReview => row![
+            container(content).padding([2, 6]),
+            button(text("Keep mine").size(11))
+                .style(builtins::button::secondary)
+                .on_press(Message::KeepMineRequested),
+            button(text("Keep theirs").size(11))
+                .style(builtins::button::secondary)
+                .on_press(Message::KeepTheirsRequested),
+        ]
+        .spacing(4)
+        .align_y(Vertical::Center)
+        .into(),
+        AreaSaveStatus::CouldNotSave(message) => row![
+            tooltip(
+                container(content).padding([2, 6]),
+                text(message).size(12),
+                tooltip::Position::Bottom,
+            ),
+            button(text("Retry").size(11))
+                .style(builtins::button::secondary)
+                .on_press(Message::RetrySaveRequested),
+            button(text("Discard").size(11))
+                .style(builtins::button::secondary)
+                .on_press(Message::DiscardFailedSaveRequested),
+        ]
+        .spacing(4)
+        .align_y(Vertical::Center)
+        .into(),
+        AreaSaveStatus::Saving(_) => tooltip(
+            container(content).padding([2, 6]),
+            PENDING_WARNING,
+            tooltip::Position::Bottom,
+        )
+        .into(),
+        AreaSaveStatus::Saved => tooltip(
             button(content)
                 .style(builtins::button::subtle)
                 .padding([2, 6])
@@ -288,6 +329,15 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
             "Sync with the cloud now",
             tooltip::Position::Bottom,
         )
-        .into()
+        .into(),
+        AreaSaveStatus::Offline(_) => tooltip(
+            button(content)
+                .style(builtins::button::subtle)
+                .padding([2, 6])
+                .on_press(Message::SyncNowRequested),
+            PENDING_WARNING,
+            tooltip::Position::Bottom,
+        )
+        .into(),
     }
 }

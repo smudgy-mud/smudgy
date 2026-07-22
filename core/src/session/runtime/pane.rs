@@ -1,6 +1,6 @@
 //! The session's pane registry: pane *existence* lives here on the session
 //! thread (scripts and line routing run here); pane *placement* (grids,
-//! windows) lives in the UI. See `docs/flexible-panes-plan.md` §2.2.
+//! windows) lives in the UI. See `docs/panes.md` §2.2.
 //!
 //! Identity is layered:
 //! - [`PaneKey`] is a never-reused *incarnation* id. Queued buffer updates,
@@ -42,6 +42,15 @@ pub struct PaneKey(u32);
 impl std::fmt::Display for PaneKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "pane#{}", self.0)
+    }
+}
+
+#[cfg(test)]
+impl PaneKey {
+    /// Mint an arbitrary key for unit tests of key-agnostic containers; real
+    /// keys only ever come from the registry.
+    pub(crate) fn from_raw_for_tests(raw: u32) -> Self {
+        Self(raw)
     }
 }
 
@@ -112,6 +121,18 @@ impl TitleBarPolicy {
     }
 }
 
+/// A pane-hosted input line (`docs/input.md` §3.7): the pane owns
+/// its own `SessionInput` under its body, whose submissions are delivered to
+/// the creating script's `onSubmit` handler instead of the session pipeline.
+/// The handler itself never lives here — it is a v8 function registered
+/// beside the split (engine-generation state); this is the display half the
+/// UI builds the input from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneInputDef {
+    /// Hint text shown while the input is empty.
+    pub placeholder: Option<Arc<str>>,
+}
+
 /// One live pane's definition, mirrored to the UI via `PaneOpened` (and
 /// re-mirrored via `PaneUpdated` when a mutable field like `title_bar`
 /// changes on an existing pane).
@@ -128,6 +149,12 @@ pub struct PaneDef {
     /// existing pane (when given explicitly) — which is also the only way to
     /// set it on the main pane, whose def otherwise exists from construction.
     pub title_bar: TitleBarPolicy,
+    /// The pane's own input line, when the creating spec asked for one.
+    /// Creation-time identity, like `kind`: a `split()` hitting an existing
+    /// pane without one while asking for one throws rather than silently
+    /// reusing. Both pane kinds may host an input. Main carries `None` —
+    /// its fused input is the session's command input, not a pane input.
+    pub input: Option<PaneInputDef>,
 }
 
 /// Which side of the reference pane a split places the new pane on.
@@ -176,6 +203,12 @@ pub enum PaneError {
     CapExceeded,
     #[error("pane '{0}' already exists with a different kind")]
     KindMismatch(String),
+    #[error(
+        "pane '{0}' already exists without an input; close it first to recreate it with one"
+    )]
+    InputMismatch(String),
+    #[error("the main pane's input is the session's command input (session.input), not a pane input")]
+    MainInput,
     #[error("the main pane cannot be closed")]
     CloseMain,
     #[error("no pane named '{0}'")]
@@ -204,6 +237,14 @@ const RESERVED_MEMBER_NAMES: [&str; 4] = ["get", "list", "exists", "then"];
 /// and changing identity later would break get-or-create).
 fn fold(name: &str) -> String {
     name.to_lowercase()
+}
+
+/// Whether `name` folds to the reserved main-pane name — which resolves to
+/// the main pane in *every* namespace, so callers that treat main specially
+/// can fork on the name without a registry lookup.
+#[must_use]
+pub fn is_main_pane_name(name: &str) -> bool {
+    fold(name) == MAIN_PANE_NAME
 }
 
 /// Validate a pane name at `split()` time: non-empty, ≤ 64 chars, printable
@@ -269,6 +310,7 @@ impl PaneRegistry {
             kind: PaneKind::Terminal,
             is_main: true,
             title_bar: TitleBarPolicy::Normal,
+            input: None,
         };
         let mut defs = HashMap::new();
         defs.insert(MAIN_PANE_KEY, main);
@@ -298,18 +340,27 @@ impl PaneRegistry {
     /// [`SplitOutcome::title_bar_changed`]. A kind mismatch throws rather
     /// than silently reusing.
     ///
+    /// `input` is creation-time identity like `kind`: a spec asking for an
+    /// input on an existing pane that has none throws (the input line is part
+    /// of what the pane *is*), while a spec omitting it on a pane that has
+    /// one is an ignored difference — the reload re-claim path, where the
+    /// handler re-registers beside the split. Placeholder differences on an
+    /// existing input are ignored like any other spec field.
+    ///
     /// # Errors
     ///
     /// [`PaneError::InvalidName`]/[`PaneError::ReservedName`] for a name the
     /// rules reject, [`PaneError::KindMismatch`] when the existing pane (or
-    /// main) has a different kind, and [`PaneError::CapExceeded`] past the
-    /// non-main cap.
+    /// main) has a different kind, [`PaneError::InputMismatch`]/
+    /// [`PaneError::MainInput`] when the spec asks for an input the target
+    /// cannot host, and [`PaneError::CapExceeded`] past the non-main cap.
     pub fn split(
         &mut self,
         namespace: &PaneNamespace,
         name: &str,
         kind: PaneKind,
         title_bar: Option<TitleBarPolicy>,
+        input: Option<PaneInputDef>,
     ) -> Result<SplitOutcome, PaneError> {
         validate_name(name)?;
         let folded = fold(name);
@@ -318,6 +369,9 @@ impl PaneRegistry {
         if folded == MAIN_PANE_NAME {
             if kind != PaneKind::Terminal {
                 return Err(PaneError::KindMismatch(name.to_string()));
+            }
+            if input.is_some() {
+                return Err(PaneError::MainInput);
             }
             let title_bar_changed = self.apply_title_bar(MAIN_PANE_KEY, title_bar);
             return Ok(SplitOutcome {
@@ -336,6 +390,9 @@ impl PaneRegistry {
         {
             if self.defs[&key].kind != kind {
                 return Err(PaneError::KindMismatch(name.to_string()));
+            }
+            if input.is_some() && self.defs[&key].input.is_none() {
+                return Err(PaneError::InputMismatch(name.to_string()));
             }
             self.claimed.insert(key, self.claim_epoch);
             let title_bar_changed = self.apply_title_bar(key, title_bar);
@@ -372,6 +429,7 @@ impl PaneRegistry {
             kind,
             is_main: false,
             title_bar: title_bar.unwrap_or_default(),
+            input,
         };
         self.defs.insert(key, def.clone());
         self.live.insert(name_id, key);
@@ -546,15 +604,15 @@ mod tests {
     #[test]
     fn reload_sweep_closes_only_unclaimed_panes() {
         let mut reg = PaneRegistry::new();
-        let stale = reg.split(&user(), "stale", PaneKind::Terminal, None).unwrap();
-        let kept = reg.split(&pkg("a", "map"), "map", PaneKind::Widgets, None).unwrap();
+        let stale = reg.split(&user(), "stale", PaneKind::Terminal, None, None).unwrap();
+        let kept = reg.split(&pkg("a", "map"), "map", PaneKind::Widgets, None, None).unwrap();
 
         // Nothing to sweep before an epoch begins (session start).
         assert!(reg.sweep_unclaimed().is_empty());
 
         // Reload: only "map" is re-claimed (a get-or-create hit counts).
         reg.begin_claim_epoch();
-        let hit = reg.split(&pkg("a", "map"), "MAP", PaneKind::Widgets, None).unwrap();
+        let hit = reg.split(&pkg("a", "map"), "MAP", PaneKind::Widgets, None, None).unwrap();
         assert!(!hit.created);
         let swept = reg.sweep_unclaimed();
         assert_eq!(swept, vec![stale.def.key]);
@@ -566,7 +624,7 @@ mod tests {
 
         // The interned name identity survives the sweep: a later recreate
         // keeps the widget re-attach id while minting a fresh key.
-        let again = reg.split(&user(), "stale", PaneKind::Terminal, None).unwrap();
+        let again = reg.split(&user(), "stale", PaneKind::Terminal, None, None).unwrap();
         assert!(again.created);
         assert_eq!(again.def.name_id, stale.def.name_id);
         assert_ne!(again.def.key, stale.def.key);
@@ -584,31 +642,31 @@ mod tests {
     fn title_bar_policy_defaults_sets_and_updates() {
         let mut reg = PaneRegistry::new();
         // Omitted => Normal.
-        let created = reg.split(&user(), "chat", PaneKind::Terminal, None).unwrap();
+        let created = reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
         assert_eq!(created.def.title_bar, TitleBarPolicy::Normal);
         assert!(!created.title_bar_changed);
 
         // Explicit on creation.
         let pinned = reg
-            .split(&user(), "map", PaneKind::Widgets, Some(TitleBarPolicy::AlwaysShow))
+            .split(&user(), "map", PaneKind::Widgets, Some(TitleBarPolicy::AlwaysShow), None)
             .unwrap();
         assert_eq!(pinned.def.title_bar, TitleBarPolicy::AlwaysShow);
         assert!(!pinned.title_bar_changed);
 
         // Get-or-create with the key omitted leaves the policy alone...
-        let hit = reg.split(&user(), "map", PaneKind::Widgets, None).unwrap();
+        let hit = reg.split(&user(), "map", PaneKind::Widgets, None, None).unwrap();
         assert_eq!(hit.def.title_bar, TitleBarPolicy::AlwaysShow);
         assert!(!hit.title_bar_changed);
         // ...an explicit differing policy updates it and reports the change...
         let updated = reg
-            .split(&user(), "chat", PaneKind::Terminal, Some(TitleBarPolicy::AlwaysShow))
+            .split(&user(), "chat", PaneKind::Terminal, Some(TitleBarPolicy::AlwaysShow), None)
             .unwrap();
         assert!(!updated.created);
         assert!(updated.title_bar_changed);
         assert_eq!(updated.def.title_bar, TitleBarPolicy::AlwaysShow);
         // ...and an explicit same policy is not a change.
         let same = reg
-            .split(&user(), "chat", PaneKind::Terminal, Some(TitleBarPolicy::AlwaysShow))
+            .split(&user(), "chat", PaneKind::Terminal, Some(TitleBarPolicy::AlwaysShow), None)
             .unwrap();
         assert!(!same.title_bar_changed);
     }
@@ -617,7 +675,7 @@ mod tests {
     fn title_bar_policy_is_settable_on_main() {
         let mut reg = PaneRegistry::new();
         let outcome = reg
-            .split(&user(), "main", PaneKind::Terminal, Some(TitleBarPolicy::AlwaysShow))
+            .split(&user(), "main", PaneKind::Terminal, Some(TitleBarPolicy::AlwaysShow), None)
             .unwrap();
         assert!(!outcome.created);
         assert!(outcome.title_bar_changed);
@@ -626,21 +684,21 @@ mod tests {
             TitleBarPolicy::AlwaysShow
         );
         // A recreated pane starts from its own spec, not the retired def's.
-        reg.split(&user(), "chat", PaneKind::Terminal, Some(TitleBarPolicy::AlwaysShow))
+        reg.split(&user(), "chat", PaneKind::Terminal, Some(TitleBarPolicy::AlwaysShow), None)
             .unwrap();
         reg.close(&user(), "chat").unwrap();
-        let again = reg.split(&user(), "chat", PaneKind::Terminal, None).unwrap();
+        let again = reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
         assert_eq!(again.def.title_bar, TitleBarPolicy::Normal);
     }
 
     #[test]
     fn split_is_get_or_create_with_case_folding() {
         let mut reg = PaneRegistry::new();
-        let first = reg.split(&user(), "Chat", PaneKind::Terminal, None).unwrap();
+        let first = reg.split(&user(), "Chat", PaneKind::Terminal, None, None).unwrap();
         assert!(first.created);
         // Display case is preserved; identity is folded.
         assert_eq!(&*first.def.name, "Chat");
-        let second = reg.split(&user(), "chat", PaneKind::Terminal, None).unwrap();
+        let second = reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
         assert!(!second.created);
         assert_eq!(second.def.key, first.def.key);
         assert_eq!(second.def.name_id, first.def.name_id);
@@ -649,19 +707,74 @@ mod tests {
     #[test]
     fn kind_mismatch_throws() {
         let mut reg = PaneRegistry::new();
-        reg.split(&user(), "chat", PaneKind::Terminal, None).unwrap();
+        reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
         assert_eq!(
-            reg.split(&user(), "chat", PaneKind::Widgets, None),
+            reg.split(&user(), "chat", PaneKind::Widgets, None, None),
             Err(PaneError::KindMismatch("chat".to_string()))
         );
+    }
+
+    fn input_def(placeholder: Option<&str>) -> PaneInputDef {
+        PaneInputDef {
+            placeholder: placeholder.map(Arc::from),
+        }
+    }
+
+    #[test]
+    fn input_is_creation_time_identity() {
+        let mut reg = PaneRegistry::new();
+        // Both pane kinds may host an input.
+        let chat = reg
+            .split(&user(), "chat", PaneKind::Terminal, None, Some(input_def(Some("say..."))))
+            .unwrap();
+        assert_eq!(
+            chat.def.input,
+            Some(input_def(Some("say..."))),
+            "the created def carries the input"
+        );
+        let notes = reg
+            .split(&user(), "notes", PaneKind::Widgets, None, Some(input_def(None)))
+            .unwrap();
+        assert!(notes.def.input.is_some());
+
+        // A spec omitting the input on a pane that has one is an ignored
+        // difference (the reload re-claim path); the input survives.
+        let hit = reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
+        assert!(!hit.created);
+        assert!(hit.def.input.is_some());
+
+        // Placeholder differences on an existing input are ignored too.
+        let re_hit = reg
+            .split(&user(), "chat", PaneKind::Terminal, None, Some(input_def(Some("other"))))
+            .unwrap();
+        assert_eq!(re_hit.def.input, Some(input_def(Some("say..."))));
+
+        // Asking for an input on an existing pane without one throws.
+        reg.split(&user(), "plain", PaneKind::Terminal, None, None).unwrap();
+        assert_eq!(
+            reg.split(&user(), "plain", PaneKind::Terminal, None, Some(input_def(None))),
+            Err(PaneError::InputMismatch("plain".to_string()))
+        );
+
+        // Main's fused input is the session input, never a pane input.
+        assert_eq!(
+            reg.split(&user(), "main", PaneKind::Terminal, None, Some(input_def(None))),
+            Err(PaneError::MainInput)
+        );
+
+        // Close-and-recreate starts from the new spec, like title_bar.
+        reg.close(&user(), "chat").unwrap();
+        let again = reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
+        assert!(again.created);
+        assert!(again.def.input.is_none(), "a recreated pane starts from its own spec");
     }
 
     #[test]
     fn namespaces_are_isolated() {
         let mut reg = PaneRegistry::new();
-        let a = reg.split(&pkg("alice", "chat-pkg"), "chat", PaneKind::Terminal, None).unwrap();
-        let b = reg.split(&pkg("bob", "chat-pkg"), "chat", PaneKind::Terminal, None).unwrap();
-        let c = reg.split(&user(), "chat", PaneKind::Terminal, None).unwrap();
+        let a = reg.split(&pkg("alice", "chat-pkg"), "chat", PaneKind::Terminal, None, None).unwrap();
+        let b = reg.split(&pkg("bob", "chat-pkg"), "chat", PaneKind::Terminal, None, None).unwrap();
+        let c = reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
         assert_ne!(a.def.key, b.def.key);
         assert_ne!(a.def.key, c.def.key);
         assert!(reg.resolve(&user(), "chat").is_some());
@@ -676,13 +789,13 @@ mod tests {
     #[test]
     fn main_resolves_in_every_namespace_and_cannot_close() {
         let mut reg = PaneRegistry::new();
-        let via_pkg = reg.split(&pkg("a", "b"), "MAIN", PaneKind::Terminal, None).unwrap();
+        let via_pkg = reg.split(&pkg("a", "b"), "MAIN", PaneKind::Terminal, None, None).unwrap();
         assert!(!via_pkg.created);
         assert!(via_pkg.def.is_main);
         assert_eq!(reg.resolve(&pkg("a", "b"), "main").unwrap().key, MAIN_PANE_KEY);
         assert_eq!(reg.close(&user(), "main"), Err(PaneError::CloseMain));
         assert_eq!(
-            reg.split(&user(), "main", PaneKind::Widgets, None),
+            reg.split(&user(), "main", PaneKind::Widgets, None, None),
             Err(PaneError::KindMismatch("main".to_string()))
         );
     }
@@ -690,13 +803,13 @@ mod tests {
     #[test]
     fn close_retires_key_and_recreate_keeps_name_id() {
         let mut reg = PaneRegistry::new();
-        let first = reg.split(&user(), "chat", PaneKind::Terminal, None).unwrap();
+        let first = reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
         let closed_key = reg.close(&user(), "chat").unwrap();
         assert_eq!(closed_key, first.def.key);
         assert!(!reg.is_live(closed_key));
         assert!(reg.resolve(&user(), "chat").is_none());
 
-        let again = reg.split(&user(), "chat", PaneKind::Terminal, None).unwrap();
+        let again = reg.split(&user(), "chat", PaneKind::Terminal, None, None).unwrap();
         assert!(again.created);
         // Fresh incarnation key (never reused)...
         assert_ne!(again.def.key, first.def.key);
@@ -722,38 +835,38 @@ mod tests {
         let mut reg = PaneRegistry::new();
         for i in 0..NON_MAIN_PANE_CAP {
             let kind = if i % 2 == 0 { PaneKind::Terminal } else { PaneKind::Widgets };
-            reg.split(&user(), &format!("p{i}"), kind, None).unwrap();
+            reg.split(&user(), &format!("p{i}"), kind, None, None).unwrap();
         }
         assert_eq!(
-            reg.split(&user(), "overflow", PaneKind::Terminal, None),
+            reg.split(&user(), "overflow", PaneKind::Terminal, None, None),
             Err(PaneError::CapExceeded)
         );
         // Get-or-create of an existing pane still works at the cap.
-        assert!(!reg.split(&user(), "p0", PaneKind::Terminal, None).unwrap().created);
+        assert!(!reg.split(&user(), "p0", PaneKind::Terminal, None, None).unwrap().created);
         // Closing one frees a slot.
         reg.close(&user(), "p0").unwrap();
-        assert!(reg.split(&user(), "overflow", PaneKind::Terminal, None).unwrap().created);
+        assert!(reg.split(&user(), "overflow", PaneKind::Terminal, None, None).unwrap().created);
     }
 
     #[test]
     fn name_validation_and_reserved_names() {
         let mut reg = PaneRegistry::new();
         assert!(matches!(
-            reg.split(&user(), "", PaneKind::Terminal, None),
+            reg.split(&user(), "", PaneKind::Terminal, None, None),
             Err(PaneError::InvalidName(_))
         ));
         let long = "x".repeat(65);
         assert!(matches!(
-            reg.split(&user(), &long, PaneKind::Terminal, None),
+            reg.split(&user(), &long, PaneKind::Terminal, None, None),
             Err(PaneError::InvalidName(_))
         ));
         assert!(matches!(
-            reg.split(&user(), "a\nb", PaneKind::Terminal, None),
+            reg.split(&user(), "a\nb", PaneKind::Terminal, None, None),
             Err(PaneError::InvalidName(_))
         ));
         for reserved in ["get", "list", "exists", "then", "GET"] {
             assert!(matches!(
-                reg.split(&user(), reserved, PaneKind::Terminal, None),
+                reg.split(&user(), reserved, PaneKind::Terminal, None, None),
                 Err(PaneError::ReservedName(_))
             ), "{reserved} should be reserved");
         }

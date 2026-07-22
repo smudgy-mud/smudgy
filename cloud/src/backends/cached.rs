@@ -17,9 +17,8 @@ use uuid::Uuid;
 use super::{LEGACY_ACCESS_FINGERPRINT, MapperBackend, cloud::CloudMapper};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, Label, LabelArgs, LabelId, LabelUpdates,
-    CloudError, CloudResult, Room, RoomUpdates, Shape, ShapeArgs, ShapeId, ShapeUpdates, SyncRow,
-    mapper::RoomKey,
+    CloudError, CloudResult, CreateAreaRequest, SyncRow,
+    mutation::{MutationEnvelope, MutationResult},
 };
 
 /// Case-insensitive check for the `.json` cache-file extension.
@@ -29,10 +28,19 @@ fn has_json_extension(name: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
-/// Removes pre-viewer-namespace cache files (`{area_id}-{rev}.json` directly
-/// in the cache root). They are never read by the namespaced scheme and may
-/// hold map data that per-viewer isolation now guards; best-effort, synchronous
-/// (runs once at construction, before any async context exists).
+/// The versioned sub-namespace all cache files live under. Bumped with the
+/// area document format ([`crate::AREA_FORMAT_VERSION`]): cloud cache files
+/// are disposable, so a format change simply abandons the old namespace and
+/// refetches — a v1 cache file is never deserialized as v2.
+const CACHE_FORMAT_NAMESPACE: &str = "v2";
+
+/// Removes cache state from earlier formats: pre-viewer-namespace files
+/// (`{area_id}-{rev}.json` directly in the cache root) and the pre-`v2/`
+/// per-viewer directories (any subdirectory other than the current
+/// namespace). Old files are never read by the current scheme and may hold
+/// map data in a superseded format (or that per-viewer isolation now
+/// guards); best-effort, synchronous (runs once at construction, before any
+/// async context exists).
 fn remove_legacy_cache_files(cache_dir: &Path) {
     let Ok(entries) = fs::read_dir(cache_dir) else {
         return;
@@ -44,10 +52,25 @@ fn remove_legacy_cache_files(cache_dir: &Path) {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(has_json_extension);
-        if is_legacy_file
-            && let Err(err) = fs::remove_file(&path)
-        {
-            warn!("Failed to remove legacy cache file {}: {err}", path.display());
+        if is_legacy_file {
+            if let Err(err) = fs::remove_file(&path) {
+                warn!(
+                    "Failed to remove legacy cache file {}: {err}",
+                    path.display()
+                );
+            }
+            continue;
+        }
+        let is_old_namespace = path.is_dir()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name != CACHE_FORMAT_NAMESPACE);
+        if is_old_namespace && let Err(err) = fs::remove_dir_all(&path) {
+            warn!(
+                "Failed to remove old-format cache directory {}: {err}",
+                path.display()
+            );
         }
     }
 }
@@ -220,7 +243,11 @@ where
     async fn purge_ids_not_in(&self, ids: &HashSet<AreaId>) {
         let vanished: Vec<AreaId> = {
             let known = self.known.read();
-            known.keys().filter(|id| !ids.contains(id)).copied().collect()
+            known
+                .keys()
+                .filter(|id| !ids.contains(id))
+                .copied()
+                .collect()
         };
 
         {
@@ -280,11 +307,12 @@ where
         }
     }
 
-    /// Disk cache directory for the current viewer (`anon` until known).
+    /// Disk cache directory for the current viewer (`anon` until known),
+    /// inside the versioned [`CACHE_FORMAT_NAMESPACE`].
     fn viewer_dir(&self) -> PathBuf {
         let viewer = *self.viewer.read();
         let name = viewer.map_or_else(|| "anon".to_string(), |id| id.to_string());
-        self.cache_dir.join(name)
+        self.cache_dir.join(CACHE_FORMAT_NAMESPACE).join(name)
     }
 
     fn cache_file_path(&self, area_id: &AreaId, rev: i64, fingerprint: Option<&str>) -> PathBuf {
@@ -525,6 +553,20 @@ where
         Ok(())
     }
 
+    async fn execute_mutation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult> {
+        // Pure passthrough of the envelope — preconditions and conflicts are
+        // the upstream's verdict. A success moved the area, so its cached
+        // bytes are stale; a failure (including a revision conflict) changed
+        // nothing and keeps the cache.
+        let result = self.inner.execute_mutation(area_id, envelope).await?;
+        self.invalidate_area(area_id).await;
+        Ok(result)
+    }
+
     // Atlas operations are metadata-only (folders, not area bytes), so they
     // pass straight through; the area cache is untouched. `move_area_to_atlas`
     // is inherited from the trait default — it routes through `update_area`
@@ -546,128 +588,6 @@ where
         self.inner.delete_atlas(atlas_id).await
     }
 
-    async fn set_area_property(&self, area_id: &AreaId, name: &str, value: &str) -> CloudResult<()> {
-        self.inner.set_area_property(area_id, name, value).await?;
-        self.invalidate_area(area_id).await;
-        Ok(())
-    }
-
-    async fn delete_area_property(&self, area_id: &AreaId, name: &str) -> CloudResult<()> {
-        self.inner.delete_area_property(area_id, name).await?;
-        self.invalidate_area(area_id).await;
-        Ok(())
-    }
-
-    async fn update_room(&self, room_key: &RoomKey, updates: RoomUpdates) -> CloudResult<Room> {
-        let room = self.inner.update_room(room_key, updates).await?;
-        self.invalidate_area(&room_key.area_id).await;
-        Ok(room)
-    }
-
-    async fn delete_room(&self, room_key: &RoomKey) -> CloudResult<()> {
-        self.inner.delete_room(room_key).await?;
-        self.invalidate_area(&room_key.area_id).await;
-        Ok(())
-    }
-
-    async fn set_room_property(
-        &self,
-        room_key: &RoomKey,
-        name: &str,
-        value: &str,
-    ) -> CloudResult<()> {
-        self.inner.set_room_property(room_key, name, value).await?;
-        self.invalidate_area(&room_key.area_id).await;
-        Ok(())
-    }
-
-    async fn delete_room_property(&self, room_key: &RoomKey, name: &str) -> CloudResult<()> {
-        self.inner.delete_room_property(room_key, name).await?;
-        self.invalidate_area(&room_key.area_id).await;
-        Ok(())
-    }
-
-    async fn add_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()> {
-        self.inner.add_room_tag(room_key, tag).await?;
-        self.invalidate_area(&room_key.area_id).await;
-        Ok(())
-    }
-
-    async fn remove_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()> {
-        self.inner.remove_room_tag(room_key, tag).await?;
-        self.invalidate_area(&room_key.area_id).await;
-        Ok(())
-    }
-
-    async fn create_room_exit(&self, room_key: &RoomKey, exit_data: ExitArgs) -> CloudResult<Exit> {
-        let exit = self.inner.create_room_exit(room_key, exit_data).await?;
-        self.invalidate_area(&room_key.area_id).await;
-        Ok(exit)
-    }
-
-    async fn update_exit(
-        &self,
-        area_id: &AreaId,
-        exit_id: &ExitId,
-        updates: ExitUpdates,
-    ) -> CloudResult<()> {
-        self.inner.update_exit(area_id, exit_id, updates).await?;
-        self.invalidate_area(area_id).await;
-        Ok(())
-    }
-
-    async fn delete_exit(&self, area_id: &AreaId, exit_id: &ExitId) -> CloudResult<()> {
-        self.inner.delete_exit(area_id, exit_id).await?;
-        self.invalidate_area(area_id).await;
-        Ok(())
-    }
-
-    async fn create_label(&self, area_id: &AreaId, label_data: LabelArgs) -> CloudResult<Label> {
-        let label = self.inner.create_label(area_id, label_data).await?;
-        self.invalidate_area(area_id).await;
-        Ok(label)
-    }
-
-    async fn update_label(
-        &self,
-        area_id: &AreaId,
-        label_id: &LabelId,
-        updates: LabelUpdates,
-    ) -> CloudResult<()> {
-        self.inner.update_label(area_id, label_id, updates).await?;
-        self.invalidate_area(area_id).await;
-        Ok(())
-    }
-
-    async fn delete_label(&self, area_id: &AreaId, label_id: &LabelId) -> CloudResult<()> {
-        self.inner.delete_label(area_id, label_id).await?;
-        self.invalidate_area(area_id).await;
-        Ok(())
-    }
-
-    async fn create_shape(&self, area_id: &AreaId, shape_data: ShapeArgs) -> CloudResult<Shape> {
-        let shape = self.inner.create_shape(area_id, shape_data).await?;
-        self.invalidate_area(area_id).await;
-        Ok(shape)
-    }
-
-    async fn update_shape(
-        &self,
-        area_id: &AreaId,
-        shape_id: &ShapeId,
-        updates: ShapeUpdates,
-    ) -> CloudResult<()> {
-        self.inner.update_shape(area_id, shape_id, updates).await?;
-        self.invalidate_area(area_id).await;
-        Ok(())
-    }
-
-    async fn delete_shape(&self, area_id: &AreaId, shape_id: &ShapeId) -> CloudResult<()> {
-        self.inner.delete_shape(area_id, shape_id).await?;
-        self.invalidate_area(area_id).await;
-        Ok(())
-    }
-
     fn last_area_source(&self, area_id: &AreaId) -> AreaLoadSource {
         self.last_sources
             .read()
@@ -680,7 +600,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AreaAccess, CloudError, RoomNumber};
+    use crate::{AreaAccess, CloudError};
     use async_trait::async_trait;
     use chrono::Utc;
     use parking_lot::Mutex;
@@ -760,112 +680,28 @@ mod tests {
             Ok(())
         }
 
-        async fn set_area_property(
+        // Scripted success: bumps the stored rev and echoes it, so tests can
+        // observe whether the caching layer keeps serving pre-mutation bytes.
+        async fn execute_mutation(
             &self,
-            _area_id: &AreaId,
-            _name: &str,
-            _value: &str,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_area_property(&self, _area_id: &AreaId, _name: &str) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn update_room(&self, _room_key: &RoomKey, _updates: RoomUpdates) -> CloudResult<Room> {
-            Err(CloudError::RoomNotFound(RoomKey {
-                area_id: AreaId(Uuid::nil()),
-                room_number: RoomNumber(0),
-            }))
-        }
-
-        async fn delete_room(&self, _room_key: &RoomKey) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn set_room_property(
-            &self,
-            _room_key: &RoomKey,
-            _name: &str,
-            _value: &str,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_room_property(&self, _room_key: &RoomKey, _name: &str) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn add_room_tag(&self, _room_key: &RoomKey, _tag: &str) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn remove_room_tag(&self, _room_key: &RoomKey, _tag: &str) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn create_room_exit(
-            &self,
-            _room_key: &RoomKey,
-            _exit_data: ExitArgs,
-        ) -> CloudResult<Exit> {
-            Err(CloudError::NetworkError("not needed".to_string()))
-        }
-
-        async fn update_exit(
-            &self,
-            _area_id: &AreaId,
-            _exit_id: &ExitId,
-            _updates: ExitUpdates,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_exit(&self, _area_id: &AreaId, _exit_id: &ExitId) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn create_label(
-            &self,
-            _area_id: &AreaId,
-            _label_data: LabelArgs,
-        ) -> CloudResult<Label> {
-            Err(CloudError::NetworkError("not needed".to_string()))
-        }
-
-        async fn update_label(
-            &self,
-            _area_id: &AreaId,
-            _label_id: &LabelId,
-            _updates: LabelUpdates,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_label(&self, _area_id: &AreaId, _label_id: &LabelId) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn create_shape(
-            &self,
-            _area_id: &AreaId,
-            _shape_data: ShapeArgs,
-        ) -> CloudResult<Shape> {
-            Err(CloudError::NetworkError("not needed".to_string()))
-        }
-
-        async fn update_shape(
-            &self,
-            _area_id: &AreaId,
-            _shape_id: &ShapeId,
-            _updates: ShapeUpdates,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_shape(&self, _area_id: &AreaId, _shape_id: &ShapeId) -> CloudResult<()> {
-            Ok(())
+            area_id: &AreaId,
+            envelope: &MutationEnvelope,
+        ) -> CloudResult<MutationResult> {
+            let mut storage = self.storage.lock();
+            let area = storage
+                .get_mut(area_id)
+                .ok_or(CloudError::NotFoundOrNoAccess)?;
+            area.area.rev += 1;
+            Ok(MutationResult {
+                operation_id: envelope.operation_id,
+                versions: vec![crate::mutation::VersionInfo {
+                    resource: crate::mutation::ResourceKind::Area,
+                    id: area_id.0,
+                    rev: area.area.rev,
+                    deleted: false,
+                }],
+                data: Vec::new(),
+            })
         }
     }
 
@@ -904,11 +740,13 @@ mod tests {
                 copied_at: None,
                 family_token: None,
             },
+            format_version: crate::AREA_FORMAT_VERSION,
             content_hash: None,
             properties: vec![],
             rooms: vec![],
             labels: vec![],
             shapes: vec![],
+            connections: vec![],
             linked_areas: vec![],
         }
     }
@@ -1048,7 +886,7 @@ mod tests {
         cached.get_area(&area_id).await.expect("cache hit");
         assert_eq!(backend.get_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
-            area_files_in(&cache_dir.join(viewer_a.to_string()), &area_id).len(),
+            area_files_in(&cache_dir.join("v2").join(viewer_a.to_string()), &area_id).len(),
             1
         );
 
@@ -1061,11 +899,11 @@ mod tests {
         cached.get_area(&area_id).await.expect("refetch");
         assert_eq!(backend.get_calls.load(Ordering::Relaxed), 2);
         assert_eq!(
-            area_files_in(&cache_dir.join(viewer_b.to_string()), &area_id).len(),
+            area_files_in(&cache_dir.join("v2").join(viewer_b.to_string()), &area_id).len(),
             1
         );
         assert_eq!(
-            area_files_in(&cache_dir.join(viewer_a.to_string()), &area_id).len(),
+            area_files_in(&cache_dir.join("v2").join(viewer_a.to_string()), &area_id).len(),
             1
         );
 
@@ -1082,7 +920,7 @@ mod tests {
         cached.list_areas().await.expect("list ok");
         cached.get_area(&area_id).await.expect("first fetch");
 
-        let viewer_dir = cache_dir.join("anon");
+        let viewer_dir = cache_dir.join("v2").join("anon");
         assert_eq!(area_files_in(&viewer_dir, &area_id).len(), 1);
 
         cached.purge_area(&area_id).await;
@@ -1090,6 +928,40 @@ mod tests {
 
         // Memory cache and known state are gone too: next read refetches.
         cached.get_area(&area_id).await.expect("refetch");
+        assert_eq!(backend.get_calls.load(Ordering::Relaxed), 2);
+
+        fs::remove_dir_all(cache_dir).ok();
+    }
+
+    /// A successful mutation invalidates the cached copy — the next read goes
+    /// upstream and observes the post-mutation area.
+    #[tokio::test]
+    async fn execute_mutation_invalidates_the_cached_area() {
+        let area_id = AreaId(Uuid::new_v4());
+        let backend = MockBackend::new(vec![sample_area_with_rev(area_id, 1)]);
+        let cache_dir = temp_cache_dir();
+        let cached = CachedBackend::new(backend.clone(), cache_dir.clone());
+
+        cached.list_areas().await.expect("list ok");
+        cached.get_area(&area_id).await.expect("first fetch");
+        cached.get_area(&area_id).await.expect("cache hit");
+        assert_eq!(backend.get_calls.load(Ordering::Relaxed), 1);
+
+        let result = cached
+            .execute_mutation(
+                &area_id,
+                &MutationEnvelope {
+                    operation_id: Uuid::new_v4(),
+                    preconditions: Vec::new(),
+                    payload: Vec::new(),
+                },
+            )
+            .await
+            .expect("mock accepts the envelope");
+        assert_eq!(result.versions[0].rev, 2);
+
+        let refreshed = cached.get_area(&area_id).await.expect("refetch");
+        assert_eq!(refreshed.area.rev, 2, "the pre-mutation copy is not served");
         assert_eq!(backend.get_calls.load(Ordering::Relaxed), 2);
 
         fs::remove_dir_all(cache_dir).ok();
@@ -1121,13 +993,50 @@ mod tests {
             }])
             .await;
 
-        let viewer_dir = cache_dir.join("anon");
+        let viewer_dir = cache_dir.join("v2").join("anon");
         assert!(area_files_in(&viewer_dir, &area_b).is_empty());
 
         // A's known rev moved, so the stale cached copy is bypassed.
         let refreshed = cached.get_area(&area_a).await.expect("refetch a");
         assert_eq!(refreshed.area.rev, 2);
         assert_eq!(backend.get_calls.load(Ordering::Relaxed), 3);
+
+        fs::remove_dir_all(cache_dir).ok();
+    }
+
+    /// Cache files are disposable: construction abandons pre-`v2/` state
+    /// (root-level files and old per-viewer directories) best-effort, and
+    /// fresh fetches land inside the `v2/` namespace.
+    #[tokio::test]
+    async fn construction_discards_the_old_cache_namespace() {
+        let area_id = AreaId(Uuid::new_v4());
+        let backend = MockBackend::new(vec![sample_area_with_rev(area_id, 1)]);
+        let cache_dir = temp_cache_dir();
+
+        // Old layouts: a pre-namespace root file and a pre-v2 viewer dir.
+        fs::write(cache_dir.join(format!("{area_id}-1.json")), b"{}").expect("root file");
+        let old_viewer_dir = cache_dir.join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&old_viewer_dir).expect("old viewer dir");
+        fs::write(old_viewer_dir.join(format!("{area_id}-1-none.json")), b"{}")
+            .expect("old viewer file");
+
+        let cached = CachedBackend::new(backend.clone(), cache_dir.clone());
+        assert!(
+            !old_viewer_dir.exists(),
+            "the old per-viewer namespace is discarded"
+        );
+        assert!(
+            !cache_dir.join(format!("{area_id}-1.json")).exists(),
+            "pre-namespace root files are discarded"
+        );
+
+        cached.list_areas().await.expect("list ok");
+        cached.get_area(&area_id).await.expect("fetch");
+        assert_eq!(
+            area_files_in(&cache_dir.join("v2").join("anon"), &area_id).len(),
+            1,
+            "fresh fetches land inside the v2 namespace"
+        );
 
         fs::remove_dir_all(cache_dir).ok();
     }
