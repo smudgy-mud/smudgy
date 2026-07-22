@@ -57,9 +57,9 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --all-targets --all-features --locked
 
-      - name: Test workspace libraries
+      - name: Test workspace
         # This test reaches the real OS credential service, which is not a
         # deterministic dependency on headless hosted runners.
         run: >-
-          cargo test --workspace --lib --locked --
+          cargo test --workspace --lib --tests --locked --
           --skip models::shared_packages::tests::missing_required_params_tracks_only_unset_required_keys
