@@ -494,7 +494,7 @@ impl MapView {
                 frame.translate(center);
                 frame.scale(self.scaling);
                 frame.translate(*self.translation.value());
-                frame.scale(1.0);
+                frame.scale(1.0_f32);
 
                 let region = self.viewport().visible_region(bounds.size());
                 let min_x = region.x - Self::SPATIAL_QUERY_PADDING;

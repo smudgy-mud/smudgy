@@ -1869,7 +1869,7 @@ fn tweak_slider_row(
         slider(-1.0..=1.0, value, move |value| {
             Message::TweakSliderChanged(which, value)
         })
-        .step(0.01)
+        .step(0.01_f32)
         .on_release(Message::TweakSliderReleased),
     ]
     .spacing(2)
