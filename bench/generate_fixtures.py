@@ -19,7 +19,6 @@ BASE_ITEM_COUNT = 6_350
 LARGE_ITEM_COUNT = 10_000
 LOG_LINE_COUNT = 300_000
 MIN_LOG_BYTES = 16_396_134
-ANSI_LINE_RESET = "\x1b[0m\x1b[39m\x1b[49m"
 
 CONDITIONS = (
     "ancient", "bright", "carved", "dented", "dusty", "etched", "faded",
@@ -108,7 +107,7 @@ def build_session_log(names: list[str]) -> bytes:
         item = names[(turn * 97 + 19) % len(names)]
 
         if phase == 0:
-            line = f"\x1b[1;36m{room_adj} {room_type} [{room_id:05d}]\x1b[0m"
+            line = f"{room_adj} {room_type} [{room_id:05d}]"
         elif phase == 1:
             line = "A broad practice road winds between painted waystones and cedar rails."
         elif phase == 2:
@@ -144,13 +143,15 @@ def build_session_log(names: list[str]) -> bytes:
         elif phase == 17:
             line = f"You put {item} in a reinforced canvas backpack."
         elif phase == 18:
-            line = "\x1b[33mA brass bell rings once in the distance.\x1b[0m"
+            line = "A brass bell rings once in the distance."
         else:
             line = f"Map update: room={room_id:05d} x={turn % 401 - 200} y={(turn * 3) % 401 - 200}."
-        # Recorded terminal streams commonly carry redundant SGR resets. Keep
-        # them at the end so start-anchored trigger patterns still exercise
-        # successful matches while the terminal parser sees realistic traffic.
-        lines.append(line + ANSI_LINE_RESET)
+        # Keep the temporary public fixture comparable in byte size to the
+        # private corpus without adding parser work such as ANSI state changes.
+        # Preserve valid GMCP payloads and start-anchored text patterns.
+        if phase not in (15, 16):
+            line += " [synthetic]"
+        lines.append(line)
 
     payload = ("\n".join(lines) + "\n").encode("utf-8")
     assert len(lines) >= LOG_LINE_COUNT
