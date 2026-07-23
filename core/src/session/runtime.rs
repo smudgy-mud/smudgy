@@ -1675,16 +1675,13 @@ impl Inner<'_> {
             Err(e) => warn!("Failed to flush start-up buffer updates: {e:?}"),
         }
 
-        if let Err(e) = self
-            .ui_tx
-            .send(TaggedSessionEvent {
-                session_id: self.session_id,
-                event: SessionEvent::RuntimeReady(self.session_runtime_tx.clone()),
-            })
-            .await
-        {
-            error!("Failed to send runtime ready event: {e:?}");
-        }
+        // Module/package top-level code emits registration and echo actions into
+        // `spawned_actions` while the engine is constructed. Keep those in a startup frame and
+        // announce RuntimeReady only after the frame (including its depth-first descendants) has
+        // drained. Previously RuntimeReady was sent here, before the normal loop dispatched that
+        // work, so immediate socket input could beat trigger/state-watch registrations.
+        action_stack.push(self.spawned_actions.borrow_mut().drain(..).collect());
+        let mut runtime_ready_pending = true;
 
         info!("Starting session event loop");
 
@@ -1749,6 +1746,22 @@ impl Inner<'_> {
                 } else {
                     // Current frame is empty, pop it and continue
                     action_stack.pop();
+                    if runtime_ready_pending {
+                        debug_assert!(action_stack.is_empty());
+                        runtime_ready_pending = false;
+                        if let Err(e) = self
+                            .ui_tx
+                            .send(TaggedSessionEvent {
+                                session_id: self.session_id,
+                                event: SessionEvent::RuntimeReady(
+                                    self.session_runtime_tx.clone(),
+                                ),
+                            })
+                            .await
+                        {
+                            error!("Failed to send runtime ready event: {e:?}");
+                        }
+                    }
                     trace!(
                         "Completed action frame, stack depth: {}",
                         action_stack.len()

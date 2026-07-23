@@ -13,8 +13,6 @@
 /iced-repros
 /.claude/settings.local.json
 
-# 179MB public-domain benchmark corpus — kept locally (regenerable), not for git (GitHub 100MB push limit)
-/bench/logs/TheCountOfMonteCristo.txt
 .env
 
 # scriptref wiki credentials (url/token for the DokuWiki publisher)
