@@ -25,6 +25,8 @@ pub struct SessionId(u32);
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
+    /// The runtime has finished loading modules/packages and dispatching their synchronous
+    /// setup actions, so callers may immediately send input without racing registrations.
     RuntimeReady(UnboundedSender<RuntimeAction>),
     Connected,
     Disconnected,

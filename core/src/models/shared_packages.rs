@@ -913,6 +913,15 @@ fn remove_secret_from_file(dir: &Path, slot: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn use_temp_smudgy_home() {
+        static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        TEST_HOME.get_or_init(|| {
+            let dir = temp_dir("home");
+            crate::set_smudgy_home(dir.clone());
+            dir
+        });
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "smudgy-pkg-test-{name}-{}",
@@ -1206,6 +1215,7 @@ mod tests {
 
     #[test]
     fn record_consent_and_set_trusted_round_trip_through_the_lockfile() {
+        use_temp_smudgy_home();
         // The consent record and the trust flag persist and reload. A unique server
         // under the active home keeps this disjoint from other tests; cleaned up at the end.
         let server = format!("ConsentTrustTest-{}", std::process::id());
@@ -1278,6 +1288,7 @@ mod tests {
 
     #[test]
     fn set_enabled_round_trips_through_the_lockfile() {
+        use_temp_smudgy_home();
         // A unique server under the active home, cleaned up at the end.
         let server = format!("EnabledTest-{}", std::process::id());
         let spec = "smudgy://wbk/mapper";
@@ -1304,6 +1315,7 @@ mod tests {
 
     #[test]
     fn reconcile_local_installs_prunes_folderless_and_migrates_to_the_nickname() {
+        use_temp_smudgy_home();
         // A unique server under the active home, cleaned up at the end.
         let server = format!("ReconcileTest-{}", std::process::id());
         let live = "smudgy://local/keeper";
@@ -1389,6 +1401,7 @@ mod tests {
 
     #[test]
     fn missing_required_params_tracks_only_unset_required_keys() {
+        use_temp_smudgy_home();
         // A unique server under the active home, cleaned up at the end.
         let server = format!("ParamGateTest-{}", std::process::id());
         let spec = "smudgy://wbk/needsconfig";
@@ -1423,6 +1436,7 @@ mod tests {
 
     #[test]
     fn clear_param_value_unsets_and_prunes_empty_entries() {
+        use_temp_smudgy_home();
         let server = format!("ParamClearTest-{}", std::process::id());
         let spec = "smudgy://wbk/needsconfig";
 
