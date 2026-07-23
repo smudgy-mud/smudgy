@@ -4,6 +4,12 @@ version = "0.4.2-dev"
 edition = "2024"
 publish = false
 
+[lib]
+# `cargo bench` forwards Criterion's CLI flags to every selected benchmark
+# target. The library otherwise uses Rust's built-in benchmark harness, which
+# rejects Criterion options such as `--noplot`.
+bench = false
+
 # Crates the *library* modules use (`src/wire.rs` needs only std; `src/atlas.rs`
 # builds a real `AtlasCache` through the public `LocalBackend` -> `Mapper` path).
 # These must be regular dependencies: dev-dependencies are only in scope for the
