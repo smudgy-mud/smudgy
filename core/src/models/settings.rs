@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fs, io};
 
+use super::persistence::write_atomic;
+
 /// The distribution channel this binary was built for, decided at compile time
 /// from `CARGO_PKG_VERSION`. It is the single source of truth for every
 /// dev-vs-release behavior split — the default API endpoint
@@ -676,7 +678,7 @@ pub fn save_settings(settings: &Settings) -> Result<()> {
     let json_content =
         serde_json::to_string_pretty(settings).context("Failed to serialize settings")?;
 
-    fs::write(&settings_path, json_content).context(format!(
+    write_atomic(&settings_path, json_content.as_bytes()).context(format!(
         "Failed to write settings.json at {}",
         settings_path.display()
     ))?;

@@ -25,6 +25,8 @@ use std::{fs, io};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::persistence::write_atomic;
+
 pub use smudgy_script::{
     ImportPolicy, ParamKind, ParamOption, PackageManifest, PackageParameter, PackagePermissions,
     SmudgyCapabilities,
@@ -586,7 +588,8 @@ fn save_lock_in(dir: &Path, lock: &SharedPackageLock) -> Result<()> {
         .with_context(|| format!("Failed to create server dir {}", dir.display()))?;
     let path = dir.join(LOCK_FILE);
     let json = serde_json::to_string_pretty(lock).context("Failed to serialize package lock")?;
-    fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))
+    write_atomic(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +783,8 @@ fn save_param_values_in(dir: &Path, values: &PackageParamValues) -> Result<()> {
         .with_context(|| format!("Failed to create server dir {}", dir.display()))?;
     let path = dir.join(PARAMS_FILE);
     let json = serde_json::to_string_pretty(values).context("Failed to serialize option values")?;
-    fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))
+    write_atomic(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -886,7 +890,8 @@ fn save_secret_to_file(dir: &Path, slot: &str, value: &str) -> Result<()> {
     secrets.insert(slot.to_string(), hex_encode(&obfuscate(value.as_bytes())));
     let path = dir.join(SECRETS_FILE);
     let json = serde_json::to_string(&secrets).context("Failed to serialize package secrets")?;
-    fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))
+    write_atomic(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 fn load_secret_from_file(dir: &Path, slot: &str) -> Option<String> {
@@ -904,7 +909,8 @@ fn remove_secret_from_file(dir: &Path, slot: &str) -> Result<()> {
     let mut secrets = load_secrets_file(dir);
     if secrets.remove(slot).is_some() {
         let json = serde_json::to_string(&secrets).context("Failed to serialize package secrets")?;
-        fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        write_atomic(&path, json.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
     }
     Ok(())
 }

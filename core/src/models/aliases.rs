@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
-use super::ScriptLang;
+use super::{ScriptLang, persistence::write_atomic};
 
 /// Helper function for serde to default boolean fields to true.
 fn default_true() -> bool {
@@ -222,7 +222,7 @@ pub fn save_aliases(server_name: &str, aliases: &HashMap<String, AliasDefinition
         "Failed to serialize aliases for server '{server_name}'"
     ))?;
 
-    fs::write(&aliases_path, json_content).context(format!(
+    write_atomic(&aliases_path, json_content.as_bytes()).context(format!(
         "Failed to write aliases.json for server '{server_name}' at {}",
         aliases_path.display()
     ))?;

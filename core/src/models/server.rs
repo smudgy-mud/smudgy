@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 use validator::Validate;
 
+use super::persistence::write_atomic;
+
 /// Represents the configuration for a single server connection.
 /// This struct is serialized to/from `server.json` within the server's directory.
 #[derive(Serialize, Deserialize, Debug, Validate, Clone, PartialEq, Eq)]
@@ -294,7 +296,7 @@ pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
     let config_json = serde_json::to_string_pretty(&config)
         .context(format!("Failed to serialize config for server '{name}'"))?;
 
-    fs::write(&config_path, config_json).context(format!(
+    write_atomic(&config_path, config_json.as_bytes()).context(format!(
         "Failed to write server.json for server '{name}' at {}",
         config_path.display()
     ))?;
@@ -406,7 +408,7 @@ pub fn update_server(name: &str, new_config: ServerConfig) -> Result<Server> {
     ))?;
 
     // Write the new config, overwriting the old one
-    fs::write(&config_path, config_json).context(format!(
+    write_atomic(&config_path, config_json.as_bytes()).context(format!(
         "Failed to write updated server.json for server '{name}' at {}",
         config_path.display()
     ))?;
