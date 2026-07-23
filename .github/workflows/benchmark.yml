@@ -1,8 +1,8 @@
 name: Benchmarks
 
-# All EC2 work is defined by this trusted file on main. Public pull requests do
-# not trigger it: a write-authorized maintainer must dispatch PR mode manually,
-# and the resolver rejects forks before any self-hosted runner is requested.
+# All EC2 work is defined by this trusted file on main. Pull requests do not
+# trigger it: a write-authorized maintainer must dispatch PR mode manually, and
+# fork code is accepted only when the configured owner dispatches the run.
 on:
   push:
     branches: [main]
@@ -21,7 +21,7 @@ on:
           - pr
           - release
       pr_number:
-        description: Same-repository PR number (required for PR mode)
+        description: Open PR number (required for PR mode)
         required: false
         type: string
       release_ref:
@@ -73,6 +73,8 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           RELEASE_REF: ${{ inputs.release_ref }}
           REPOSITORY: ${{ github.repository }}
+          REQUEST_ACTOR: ${{ github.actor }}
+          FORK_BENCHMARK_ACTOR: ${{ vars.BENCHMARK_FORK_ACTOR }}
         run: |
           set -euo pipefail
 
@@ -107,16 +109,27 @@ jobs:
                   pr_json=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}")
                   test "$(jq -r .state <<<"${pr_json}")" = open
                   test "$(jq -r .base.ref <<<"${pr_json}")" = main
-                  test "$(jq -r .head.repo.full_name <<<"${pr_json}")" = "${REPOSITORY}" || {
-                    echo "Fork pull requests are not allowed on the self-hosted benchmark pool" >&2
+                  head_repository=$(jq -r '.head.repo.full_name // empty' <<<"${pr_json}")
+                  if [[ -z "${head_repository}" ]]; then
+                    echo "PR #${PR_NUMBER} has no accessible head repository" >&2
                     exit 1
-                  }
+                  fi
+                  if [[ "${head_repository}" != "${REPOSITORY}" ]]; then
+                    if [[ -z "${FORK_BENCHMARK_ACTOR}" ]]; then
+                      echo "BENCHMARK_FORK_ACTOR is not configured" >&2
+                      exit 1
+                    fi
+                    if [[ "${REQUEST_ACTOR}" != "${FORK_BENCHMARK_ACTOR}" ]]; then
+                      echo "Fork PR benchmarks may only be dispatched by ${FORK_BENCHMARK_ACTOR}" >&2
+                      exit 1
+                    fi
+                  fi
 
                   kind=pr
                   pr_number="${PR_NUMBER}"
                   target_sha=$(jq -r .head.sha <<<"${pr_json}")
                   baseline_sha=$(gh api "repos/${REPOSITORY}/commits/main" --jq .sha)
-                  run_label="PR #${PR_NUMBER}"
+                  run_label="PR #${PR_NUMBER} (${head_repository})"
                   ;;
                 release)
                   if [[ -z "${RELEASE_REF}" ]]; then
@@ -246,9 +259,22 @@ jobs:
         if: needs.resolve.outputs.kind == 'pr'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ needs.resolve.outputs.target_sha }}
+          ref: refs/pull/${{ needs.resolve.outputs.pr_number }}/head
           path: candidate
           persist-credentials: false
+
+      - name: Verify PR candidate checkout
+        if: needs.resolve.outputs.kind == 'pr'
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha=$(git -C candidate rev-parse HEAD)
+          if [[ "${actual_sha}" != "${EXPECTED_SHA}" ]]; then
+            echo "PR head changed after resolution: expected ${EXPECTED_SHA}, got ${actual_sha}" >&2
+            exit 1
+          fi
 
       - name: Restore Cargo downloads and canonical build cache
         if: needs.resolve.outputs.kind != 'smoke'
