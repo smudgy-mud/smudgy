@@ -26,9 +26,13 @@ def finite_number(value: Any, label: str, path: Path) -> float:
     return float(value)
 
 
-def convert(criterion_root: Path) -> list[dict[str, Any]]:
+def convert(
+    criterion_root: Path,
+    context_lines: list[str] | None = None,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     seen_names: set[str] = set()
+    context_lines = context_lines or []
 
     for estimates_path in sorted(criterion_root.glob("**/new/estimates.json")):
         result_dir = estimates_path.parent
@@ -69,6 +73,7 @@ def convert(criterion_root: Path) -> list[dict[str, Any]]:
         confidence_level = confidence.get("confidence_level", 0.95)
         throughput = benchmark.get("throughput")
         extra_lines = [
+            *context_lines,
             f"Criterion statistic: {statistic}",
             f"Sampling: {sampling_mode}",
             f"{float(confidence_level):.0%} CI: {lower:.6g}..{upper:.6g} ns/iter",
@@ -105,9 +110,15 @@ def main() -> None:
         default=Path("benchmark-results.json"),
         help="benchmark-action JSON destination",
     )
+    parser.add_argument(
+        "--extra",
+        action="append",
+        default=[],
+        help="context line to prepend to every result tooltip (repeatable)",
+    )
     args = parser.parse_args()
 
-    results = convert(args.criterion_root)
+    results = convert(args.criterion_root, args.extra)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {len(results)} benchmark results to {args.output}")
