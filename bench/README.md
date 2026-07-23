@@ -43,16 +43,22 @@ the workflow deliberately has no pull-request trigger. A manual `smoke` mode
 verifies provisioning and the pinned platform without running or publishing the
 suite.
 
-Maintainers can request a same-machine PR comparison without granting arbitrary
-fork code access to the self-hosted pool:
+Maintainers can request a same-machine PR comparison:
 
 ```powershell
 gh workflow run benchmark.yml --repo smudgy-mud/smudgy --ref main `
   --field mode=pr --field pr_number=123
 ```
 
-The resolver accepts only open, same-repository PRs targeting `main`. The
-ephemeral runner measures current `main` first and the PR head second, using
+The resolver accepts only open PRs targeting `main`. Same-repository PRs require
+a write-authorized manual dispatcher; fork PRs additionally require the
+dispatcher to match the `BENCHMARK_FORK_ACTOR` repository variable. Manually
+dispatching a fork comparison authorizes that reviewed fork's build scripts to
+run on the ephemeral self-hosted instance. The candidate is checked out through
+the base repository's pull ref and must match the immutable SHA resolved before
+the M8a job was requested.
+
+The ephemeral runner measures current `main` first and the PR head second, using
 separate build directories on the same M8a. The reporting job uses
 `github-action-benchmark`'s external baseline plus `save-data-file: false`,
 posts the delta to the PR, and never writes PR measurements into Pages history.
