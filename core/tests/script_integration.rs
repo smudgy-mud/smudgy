@@ -469,20 +469,25 @@ async fn timers_hotkeys_and_mapper_location() {
     });
 
     let mut events = Box::pin(spawn(params));
+    let mut hotkey_id: Option<HotkeyId> = None;
 
     let tx = loop {
         let event = tokio::time::timeout(Duration::from_mins(1), events.next())
             .await
             .expect("timed out waiting for RuntimeReady")
             .expect("event stream ended before RuntimeReady");
-        if let SessionEvent::RuntimeReady(tx) = event.event {
-            break tx;
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            // Module setup is now fully dispatched before RuntimeReady, so UI-facing setup
+            // events can correctly precede the readiness boundary. Preserve the id for the
+            // post-ready ExecHotkey probe instead of discarding it.
+            SessionEvent::RegisterHotkey(id, _def) => hotkey_id = Some(id),
+            _ => {}
         }
     };
 
     // Drive the session: when the hotkey registers, fire it (ExecHotkey) so the handler echoes.
     let mut lines = Vec::new();
-    let mut hotkey_id: Option<HotkeyId> = None;
     let mut fired = false;
     loop {
         let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await else {

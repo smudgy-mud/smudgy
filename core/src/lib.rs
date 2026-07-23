@@ -12,6 +12,15 @@ extern crate log;
 /// [`set_smudgy_home`].
 static SMUDGY_HOME_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+fn resolve_smudgy_base(
+    document_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    document_dir
+        .or(data_dir)
+        .context("Failed to get user document or data directory")
+}
+
 /// Points the smudgy home directory at `path` instead of `<Documents>/smudgy`
 /// for the lifetime of the process, isolating this instance's accounts, maps,
 /// settings, logs, and session token from the default install.
@@ -31,7 +40,9 @@ pub fn set_smudgy_home(path: impl Into<PathBuf>) {
 ///
 /// Honors the [`set_smudgy_home`] override when one was set at startup; otherwise defaults
 /// to `<Documents>/smudgy` for tagged releases **and release candidates**, and
-/// `<Documents>/smudgy-dev` for dev/pre-release builds
+/// `<Documents>/smudgy-dev` for dev/pre-release builds. On systems without a discoverable
+/// Documents directory (for example, a minimal/headless Linux account), the platform data
+/// directory is used as the base instead.
 /// ([`crate::models::settings::is_dev_build`]), so a dev build — which also talks to the
 /// dev API — keeps its accounts, servers, and installed packages isolated from the release
 /// client's data. A release candidate deliberately shares the release home (and API), so a
@@ -39,13 +50,13 @@ pub fn set_smudgy_home(path: impl Into<PathBuf>) {
 ///
 /// # Errors
 ///
-/// Returns an error if the user's document directory cannot be determined or if the
-/// smudgy directory cannot be created.
+/// Returns an error if neither the user's document nor data directory can be determined, or
+/// if the smudgy directory cannot be created.
 pub fn get_smudgy_home() -> Result<PathBuf> {
     let dir = if let Some(override_dir) = SMUDGY_HOME_OVERRIDE.get() {
         override_dir.clone()
     } else {
-        let mut dir = dirs::document_dir().context("Failed to get user document directory")?;
+        let mut dir = resolve_smudgy_base(dirs::document_dir(), dirs::data_dir())?;
         dir.push(if crate::models::settings::is_dev_build() {
             "smudgy-dev"
         } else {
@@ -162,3 +173,21 @@ pub fn init() {
 
 pub mod models;
 pub mod session;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smudgy_base_prefers_documents_and_falls_back_to_platform_data() {
+        let documents = PathBuf::from("documents");
+        let data = PathBuf::from("data");
+
+        assert_eq!(
+            resolve_smudgy_base(Some(documents.clone()), Some(data.clone())).unwrap(),
+            documents
+        );
+        assert_eq!(resolve_smudgy_base(None, Some(data.clone())).unwrap(), data);
+        assert!(resolve_smudgy_base(None, None).is_err());
+    }
+}
