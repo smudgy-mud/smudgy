@@ -1,0 +1,176 @@
+name: Benchmarks
+
+# This workflow intentionally has no pull_request trigger. Its self-hosted
+# runner group is also restricted to this exact file on refs/heads/main.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 9 * * 0"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run the full suite or only verify runner provisioning
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - smoke
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-m8a
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  EXPECTED_INSTANCE_TYPE: m8a.2xlarge
+  RUST_TOOLCHAIN: 1.97.1
+
+jobs:
+  benchmark:
+    name: Criterion on m8a.2xlarge
+    # This repository variable is an operational kill switch. The setup script
+    # enables it only after the runner group, AMI, and Pages branch are ready.
+    if: >-
+      github.repository == 'smudgy-mud/smudgy' &&
+      vars.BENCHMARK_ENABLED == 'true'
+    runs-on: [self-hosted, linux, X64, smudgy-benchmark]
+    timeout-minutes: 360
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the trusted main-branch source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify and record the benchmark platform
+        shell: bash
+        env:
+          EXPECTED_AMI_ID: ${{ vars.BENCHMARK_AMI_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${EXPECTED_AMI_ID}" || {
+            echo "BENCHMARK_AMI_ID repository variable is not configured" >&2
+            exit 1
+          }
+
+          token=$(curl --fail --silent --show-error --request PUT \
+            --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+            http://169.254.169.254/latest/api/token)
+          metadata() {
+            curl --fail --silent --show-error \
+              --header "X-aws-ec2-metadata-token: ${token}" \
+              "http://169.254.169.254/latest/meta-data/$1"
+          }
+
+          instance_type=$(metadata instance-type)
+          ami_id=$(metadata ami-id)
+          availability_zone=$(metadata placement/availability-zone)
+          test "${instance_type}" = "${EXPECTED_INSTANCE_TYPE}"
+          test "${ami_id}" = "${EXPECTED_AMI_ID}"
+          test "$(nproc)" -eq 8
+          test "$(lscpu -p=CORE,SOCKET | sed '/^#/d' | sort -u | wc -l)" -eq 8
+
+          source "${HOME}/.cargo/env"
+          rustc --version | grep --fixed-strings "rustc ${RUST_TOOLCHAIN} "
+
+          mkdir -p benchmark-artifacts
+          {
+            echo "instance_type=${instance_type}"
+            echo "ami_id=${ami_id}"
+            echo "availability_zone=${availability_zone}"
+            echo "logical_cpus=$(nproc)"
+            echo "physical_cores=$(lscpu -p=CORE,SOCKET | sed '/^#/d' | sort -u | wc -l)"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "kernel=$(uname -srvmo)"
+            lscpu
+          } | tee benchmark-artifacts/benchmark-runner.txt
+
+      - name: Smoke test complete
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'smoke'
+        run: echo "The pinned M8a runner provisioned and passed its identity checks."
+
+      - name: Restore Cargo build cache
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: benchmark-m8a-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run the full Criterion suite
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${HOME}/.cargo/env"
+          rm -rf target/criterion
+          cargo bench --locked -p smudgy_bench -- --noplot 2>&1 |
+            tee benchmark-artifacts/benchmark-output.txt
+
+      - name: Convert Criterion estimates for github-action-benchmark
+        if: github.event_name != 'workflow_dispatch' || inputs.mode == 'full'
+        run: >-
+          python3 .github/scripts/criterion-to-benchmark-json.py
+          --output benchmark-artifacts/benchmark-results.json
+
+      - name: Upload benchmark results and provenance
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.mode == 'full')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: criterion-results
+          path: benchmark-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish:
+    name: Publish benchmark history
+    needs: benchmark
+    if: >-
+      needs.benchmark.result == 'success' &&
+      (github.event_name != 'workflow_dispatch' || inputs.mode == 'full')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      deployments: write
+
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Download measured results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: criterion-results
+          path: benchmark-artifacts
+
+      - name: Update the public benchmark dashboard
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
+        with:
+          name: smudgy / m8a.2xlarge / Rust 1.97.1
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-artifacts/benchmark-results.json
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: benchmarks
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.sha }}
+          auto-push: true
+          alert-threshold: 125%
+          comment-on-alert: ${{ github.event_name == 'push' }}
+          fail-on-alert: false
+          summary-always: true
+          max-items-in-chart: 200
