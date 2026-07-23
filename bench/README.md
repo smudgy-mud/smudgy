@@ -16,24 +16,54 @@ that prove the measured machinery does what the bench claims).
 
 ## Continuous benchmark history
 
-The public repository's `Benchmarks` workflow runs this full suite after pushes
-to `main`, weekly, and on manual dispatch. Its canonical platform is one
-ephemeral **AWS `m8a.2xlarge` On-Demand** runner in a fixed `us-west-2` AZ,
-using a pinned Ubuntu 24.04 AMI and Rust 1.97.1. The workflow verifies the EC2
-instance type, AMI ID, physical-core count, and toolchain before measuring.
+The public repository's trusted `Benchmarks` workflow runs this full suite
+after pushes to `main`, weekly, for releases, and on manual dispatch. Its
+canonical platform is one ephemeral **AWS `m8a.2xlarge` On-Demand** runner in
+a fixed `us-west-2` AZ, using a pinned Ubuntu 24.04 AMI and Rust 1.97.1. The
+workflow verifies the EC2 instance type, AMI ID, physical-core count, and
+toolchain before measuring.
 
 Fresh Criterion estimates are converted from `target/criterion` into the
 custom-smaller-is-better input for
 [`benchmark-action/github-action-benchmark`](https://github.com/benchmark-action/github-action-benchmark).
-The dashboard records the appropriate Criterion slope/mean point estimate in a
-fixed `ns/iter` unit and retains its 95% confidence interval. A 25% slowdown is
-a screening alert, not a merge gate; confirm it with the same-day A/B discipline
-below before acting on it.
+The dashboards record the appropriate Criterion slope/mean point estimate in a
+fixed `ns/iter` unit and retain its 95% confidence interval:
+
+- [`benchmarks`](https://smudgy-mud.github.io/smudgy/benchmarks/) is the
+  `main` trend (pushes, weekly samples, and manual full runs).
+- [`benchmarks/releases`](https://smudgy-mud.github.io/smudgy/benchmarks/releases/)
+  is deliberately separate, so each comparison is against the previous
+  release rather than the latest weekly sample.
+
+A 25% slowdown is a screening alert, not a merge gate; confirm it with the
+same-day A/B discipline below before acting on it.
 
 The runner group is restricted to the exact benchmark workflow on `main`, and
 the workflow deliberately has no pull-request trigger. A manual `smoke` mode
 verifies provisioning and the pinned platform without running or publishing the
 suite.
+
+Maintainers can request a same-machine PR comparison without granting arbitrary
+fork code access to the self-hosted pool:
+
+```powershell
+gh workflow run benchmark.yml --repo smudgy-mud/smudgy --ref main `
+  --field mode=pr --field pr_number=123
+```
+
+The resolver accepts only open, same-repository PRs targeting `main`. The
+ephemeral runner measures current `main` first and the PR head second, using
+separate build directories on the same M8a. The reporting job uses
+`github-action-benchmark`'s external baseline plus `save-data-file: false`,
+posts the delta to the PR, and never writes PR measurements into Pages history.
+
+Publishing a GitHub release dispatches release mode on the trusted `main`
+workflow. A maintainer can backfill an existing version tag similarly:
+
+```powershell
+gh workflow run benchmark.yml --repo smudgy-mud/smudgy --ref main `
+  --field mode=release --field release_ref=v0.4.2
+```
 
 ## Baselines — the before/after discipline
 
