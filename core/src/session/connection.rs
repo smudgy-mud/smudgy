@@ -671,6 +671,15 @@ pub struct Connection {
     window_size: Arc<std::sync::atomic::AtomicU32>,
 }
 
+fn clear_socket_sender(socket_tx: &RwLock<Option<WeakUnboundedSender<OutboundFrame>>>) {
+    match socket_tx.write() {
+        Ok(mut sender) => {
+            sender.take();
+        }
+        Err(_) => warn!("Failed to clear socket sender because its lock is poisoned"),
+    }
+}
+
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection")
@@ -717,13 +726,8 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns an error if no socket is currently registered, or if the socket
-    /// sender can no longer be upgraded (the connection task has gone away).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `socket_tx` lock is poisoned, or if sending on the socket
-    /// channel fails (the receiver was dropped).
+    /// Returns an error if the socket lock is poisoned, no socket is currently
+    /// registered, the sender can no longer be upgraded, or its queue is closed.
     pub fn write(&self, data: Arc<String>) -> Result<(), anyhow::Error> {
         self.write_frame(OutboundFrame::Text(data))
     }
@@ -734,33 +738,28 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns an error if no socket is currently registered, or if the socket
-    /// sender can no longer be upgraded (the connection task has gone away).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `socket_tx` lock is poisoned, or if sending on the socket
-    /// channel fails (the receiver was dropped).
+    /// Returns an error if the socket lock is poisoned, no socket is currently
+    /// registered, the sender can no longer be upgraded, or its queue is closed.
     pub fn write_raw(&self, frame: Arc<[u8]>) -> Result<(), anyhow::Error> {
         self.write_frame(OutboundFrame::Raw(frame))
     }
 
     fn write_frame(&self, frame: OutboundFrame) -> Result<(), anyhow::Error> {
-        let socket_tx = self.socket_tx.read().unwrap();
-        if let Some(socket_tx) = socket_tx.as_ref() {
-            if let Some(socket_tx) = socket_tx.upgrade() {
-                // The receiver can drop between the upgrade and the send (the connect
-                // task tearing down) — an ordinary disconnected-socket error, not a
-                // panic condition.
-                socket_tx
-                    .send(frame)
-                    .map_err(|_| anyhow::anyhow!("Socket closed while sending"))
-            } else {
-                Err(anyhow::anyhow!("Socket tx is not upgradeable"))
-            }
-        } else {
-            Err(anyhow::anyhow!("Socket no longer exists"))
-        }
+        let socket_tx = self
+            .socket_tx
+            .read()
+            .map_err(|_| anyhow::anyhow!("Socket tx lock is poisoned"))?;
+        let socket_tx = socket_tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Socket no longer exists"))?;
+        let socket_tx = socket_tx
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("Socket tx is not upgradeable"))?;
+        // The receiver can drop between the upgrade and the send (the connect task
+        // tearing down) — an ordinary disconnected-socket error, not a panic condition.
+        socket_tx
+            .send(frame)
+            .map_err(|_| anyhow::anyhow!("Socket closed while sending"))
     }
 
     /// Establishes a TCP connection to the specified host and port.
@@ -787,9 +786,8 @@ impl Connection {
     /// # Panics
     ///
     /// This function panics if the socket-runtime mutex is poisoned or the shared
-    /// worker pool cannot be built. The spawned task panics if the `socket_tx` lock
-    /// is poisoned. Connect-time I/O failures (DNS, TCP, TLS handshake,
-    /// `set_nodelay`) are reported to the session, not panicked.
+    /// worker pool cannot be built. Connect-time I/O failures (DNS, TCP, TLS
+    /// handshake, `set_nodelay`) and socket-lock failures are reported, not panicked.
     pub fn connect(
         &mut self,
         host: &str,
@@ -874,10 +872,13 @@ impl Connection {
                         on_connect();
                     }
 
-                    socket_tx
-                        .write()
-                        .unwrap()
-                        .replace(write_to_socket_tx.downgrade());
+                    {
+                        let Ok(mut sender) = socket_tx.write() else {
+                            warn!("Failed to register socket sender because its lock is poisoned");
+                            return;
+                        };
+                        sender.replace(write_to_socket_tx.downgrade());
+                    }
 
                     runtime_tx.send(RuntimeAction::Connected).ok();
 
@@ -922,8 +923,13 @@ impl Connection {
                                 // The current chunk's byte count; `None` ends the drain.
                                 let mut read = match res {
                                     Ok(n) if n > 0 => Some(n),
-                                    // EOF (`0`) or a read error: tear down after the commit.
-                                    Ok(_) | Err(_) => {
+                                    // EOF (`0`): tear down after the commit.
+                                    Ok(_) => {
+                                        dead = true;
+                                        None
+                                    }
+                                    Err(err) => {
+                                        warn!("Socket read from {addr} failed: {err}");
                                         dead = true;
                                         None
                                     }
@@ -957,8 +963,12 @@ impl Connection {
                                                         log_raw(&mut raw_log, &slice[..consumed]);
                                                         fed = true;
                                                         if !telnet_replies.is_empty()
-                                                            && stream.write_all(&telnet_replies).await.is_err()
+                                                            && let Err(err) =
+                                                                stream.write_all(&telnet_replies).await
                                                         {
+                                                            warn!(
+                                                                "Failed to write telnet reply to {addr}: {err}"
+                                                            );
                                                             dead = true;
                                                             break 'route;
                                                         }
@@ -1034,8 +1044,13 @@ impl Connection {
                                                                         );
                                                                         plain = &plain[fed_n..];
                                                                         if !telnet_replies.is_empty()
-                                                                            && stream.write_all(&telnet_replies).await.is_err()
+                                                                            && let Err(err) = stream
+                                                                                .write_all(&telnet_replies)
+                                                                                .await
                                                                         {
+                                                                            warn!(
+                                                                                "Failed to write telnet reply to {addr}: {err}"
+                                                                            );
                                                                             dead = true;
                                                                             break 'route;
                                                                         }
@@ -1127,8 +1142,13 @@ impl Connection {
                                                 Ok(Some(m)) if m > 0 => Some(m),
                                                 // WouldBlock: the batch is drained.
                                                 Ok(None) => None,
-                                                // EOF (`Some(0)`) or a read error: tear down.
-                                                Ok(Some(_)) | Err(_) => {
+                                                // EOF (`Some(0)`): tear down.
+                                                Ok(Some(_)) => {
+                                                    dead = true;
+                                                    None
+                                                }
+                                                Err(err) => {
+                                                    warn!("Socket read from {addr} failed: {err}");
                                                     dead = true;
                                                     None
                                                 }
@@ -1179,7 +1199,8 @@ impl Connection {
                                         }
                                     }
                                 };
-                                if outcome.is_err() {
+                                if let Err(err) = outcome {
+                                    warn!("Socket write to {addr} failed: {err}");
                                     break;
                                 }
                             }
@@ -1227,6 +1248,7 @@ impl Connection {
                         .ok();
                 }
                 Err(err) => {
+                    warn!("Connection to {addr} failed: {err}");
                     // Name the reason in the session view — a TLS handshake failure
                     // (self-signed / expired / name mismatch) gives no other hint, and the
                     // policy is never a silent fallback to plaintext.
@@ -1241,7 +1263,7 @@ impl Connection {
                 }
             }
             trace!("Connection cleaning up");
-            socket_tx.write().unwrap().take();
+            clear_socket_sender(&socket_tx);
         });
     }
 
@@ -1258,8 +1280,30 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc as tokio_mpsc;
+    use tokio::time::timeout;
+
     use super::telnet::{command, option};
     use super::*;
+
+    fn test_connection() -> (Connection, tokio_mpsc::UnboundedReceiver<RuntimeAction>) {
+        let (runtime_tx, runtime_rx) = tokio_mpsc::unbounded_channel();
+        let (ui_tx, _ui_rx) = mpsc::channel(1);
+        (
+            Connection::new(
+                runtime_tx,
+                ui_tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU32::new(responders::pack_dims(80, 24))),
+            ),
+            runtime_rx,
+        )
+    }
 
     /// Run one inbound buffer through the real ingest bridge (telnet
     /// preprocessor + VT parser + reply buffer), returning the negotiation
@@ -1461,5 +1505,118 @@ mod tests {
             _ => None,
         });
         assert_eq!(line.as_deref(), Some("caf\u{e9} \u{ff}"));
+    }
+
+    #[test]
+    fn write_returns_an_error_when_the_socket_queue_is_closed() {
+        let (mut connection, _runtime_rx) = test_connection();
+        let (socket_tx, socket_rx) = tokio_mpsc::unbounded_channel();
+        let weak_socket_tx = socket_tx.downgrade();
+        drop(socket_rx);
+        connection.socket_tx = Arc::new(RwLock::new(Some(weak_socket_tx)));
+
+        let error = connection
+            .write(Arc::new("look".to_string()))
+            .expect_err("a closed socket queue must be reported instead of panicking");
+
+        assert!(error.to_string().contains("closed"));
+        drop(socket_tx);
+    }
+
+    #[tokio::test]
+    async fn connection_reads_data_and_reports_a_remote_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            socket.write_all(b"hello\r\n").await.expect("write line");
+            socket.shutdown().await.expect("shutdown");
+        });
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+
+        let mut connected = false;
+        let mut received_line = false;
+        let mut disconnected = false;
+        let mut reported_loss = false;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let action = runtime_rx.recv().await.expect("runtime action");
+                match action {
+                    RuntimeAction::Connected => connected = true,
+                    RuntimeAction::HandleIncomingLine(line) if line.text == "hello" => {
+                        received_line = true;
+                    }
+                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Echo(text) if text.as_str() == "Connection lost" => {
+                        reported_loss = true;
+                    }
+                    _ => {}
+                }
+                if connected && received_line && disconnected && reported_loss {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("connection should process the line and remote close");
+
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_a_pending_read_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept");
+            accepted_tx.send(()).ok();
+            release_rx.await.ok();
+        });
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.connect("127.0.0.1", port, None, None, true, TlsMode::Off);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(runtime_rx.recv().await, Some(RuntimeAction::Connected)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("connection should become ready");
+        timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("server should accept the connection")
+            .expect("accept signal");
+
+        connection.disconnect();
+
+        let mut disconnected = false;
+        let mut reported_disconnect = false;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let action = runtime_rx.recv().await.expect("runtime action");
+                match action {
+                    RuntimeAction::Disconnected => disconnected = true,
+                    RuntimeAction::Echo(text) if text.as_str() == "Disconnected." => {
+                        reported_disconnect = true;
+                    }
+                    _ => {}
+                }
+                if disconnected && reported_disconnect {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("disconnect should cancel the pending read");
+
+        release_tx.send(()).ok();
+        server.await.expect("server task");
     }
 }
