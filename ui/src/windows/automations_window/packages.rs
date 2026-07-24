@@ -1950,7 +1950,7 @@ impl AutomationsWindow {
                     rating,
                 ))
             },
-            move |result| Message::InstalledDetailLoaded(seq, result),
+            move |result| Message::InstalledDetailLoaded(seq, Box::new(result)),
         ))
     }
 
