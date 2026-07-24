@@ -32,7 +32,9 @@ use trigger::Manager;
 // `MatchCapture` rides along so benches can unpack the captures carried by the
 // `RuntimeAction::CallJavascriptFunction` deliveries the store flush queues.
 #[cfg(feature = "bench-api")]
-pub use trigger::{Manager, MatchCapture, PushTriggerParams, SharedAutomationRegistry};
+pub use trigger::{
+    BenchActionQueue, Manager, MatchCapture, PushTriggerParams, SharedAutomationRegistry,
+};
 pub mod catalogue;
 pub mod input;
 pub mod line_operation;

@@ -594,6 +594,16 @@ pub(crate) struct PendingActions {
 }
 
 impl PendingActions {
+    #[cfg(feature = "bench-api")]
+    pub(crate) fn len(&self) -> usize {
+        self.actions.len()
+    }
+
+    #[cfg(feature = "bench-api")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
     pub(crate) fn push_back(&mut self, action: RuntimeAction) {
         self.actions.push_back(action);
     }

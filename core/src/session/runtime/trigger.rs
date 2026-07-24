@@ -116,6 +116,31 @@ pub struct Manager {
     raw_wanted: Arc<AtomicBool>,
 }
 
+/// Feature-gated observation handle for trigger benchmarks.
+///
+/// The runtime action queue remains an internal implementation detail; benches
+/// only need to count, clear, and test whether trigger actions were emitted.
+#[cfg(feature = "bench-api")]
+#[derive(Clone, Debug)]
+pub struct BenchActionQueue(ActionQueue);
+
+#[cfg(feature = "bench-api")]
+impl BenchActionQueue {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+
+    pub fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+}
+
 /// A single regex capture group from a trigger/alias match.
 ///
 /// Captures are carried as an **ordered** `Vec<MatchCapture>`: position in the vec *is*
@@ -265,7 +290,7 @@ pub struct PushTriggerParams<'a> {
 }
 
 impl Manager {
-    pub fn new(
+    pub(crate) fn new(
         spawned_actions: ActionQueue,
         command_separator: Arc<String>,
         automation_registry: SharedAutomationRegistry,
@@ -310,6 +335,22 @@ impl Manager {
             automation_registry,
             raw_wanted: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Construct the real trigger manager plus its feature-gated queue
+    /// observation handle for workspace benchmarks.
+    #[cfg(feature = "bench-api")]
+    #[must_use]
+    pub fn new_for_bench(
+        command_separator: Arc<String>,
+        automation_registry: SharedAutomationRegistry,
+    ) -> (Self, BenchActionQueue) {
+        let spawned_actions: ActionQueue = Rc::new(RefCell::default());
+        let queue = BenchActionQueue(spawned_actions.clone());
+        (
+            Self::new(spawned_actions, command_separator, automation_registry),
+            queue,
+        )
     }
 
     /// The shared "any trigger has a raw pattern" flag, for wiring into the
