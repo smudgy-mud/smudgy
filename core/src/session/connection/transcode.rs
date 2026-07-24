@@ -18,14 +18,40 @@
 //! [`Transcode::is_passthrough`] is a single load, and the caller feeds bytes onward
 //! untouched, preserving the ingest fast path byte for byte.
 
-use encoding_rs::{Decoder, Encoder, Encoding, UTF_8};
+use encoding_rs::{Decoder, Encoding, UTF_8};
+
+/// A whole outbound command cannot be represented in the active server
+/// encoding. No bytes from that command are returned to the socket layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeError {
+    encoding: &'static str,
+    character: char,
+}
+
+impl EncodeError {
+    #[must_use]
+    pub const fn character(self) -> char {
+        self.character
+    }
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "outbound text cannot be represented in {}; command was not sent",
+            self.encoding
+        )
+    }
+}
+
+impl std::error::Error for EncodeError {}
 
 /// Per-connection transcoding state, owned by the connect task like the telnet parser.
 pub struct Transcode {
     encoding: &'static Encoding,
     /// `None` on the UTF-8 pass-through (no decoder is ever constructed for it).
     decoder: Option<Decoder>,
-    encoder: Option<Encoder>,
     /// Reused inbound UTF-8 output.
     in_buf: String,
     /// Reused outbound scratch (encoded, pre-doubling) and final (IAC-doubled) buffers.
@@ -56,7 +82,6 @@ impl Transcode {
         Self {
             encoding,
             decoder: convert.then(|| encoding.new_decoder()),
-            encoder: convert.then(|| encoding.new_encoder()),
             in_buf: String::new(),
             scratch: Vec::new(),
             out_buf: Vec::new(),
@@ -116,57 +141,60 @@ impl Transcode {
         &self.in_buf
     }
 
-    /// Encode one outbound text write into the active encoding, replacing unmappable
-    /// characters with `?` (never HTML numeric references — this is a game wire, not a
-    /// form post) and doubling any `0xFF` byte the encoding produced so it survives the
-    /// telnet layer as a literal.
+    /// Encode one complete outbound text write into the active encoding and
+    /// double any `0xFF` byte so it survives the telnet layer as a literal.
+    ///
+    /// Encoding is atomic at the command boundary: an unmappable character
+    /// returns [`EncodeError`] and exposes none of the representable prefix.
+    /// A fresh encoder with `last = true` makes each command self-contained
+    /// even for stateful encodings such as ISO-2022-JP.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncodeError`] when any character is not representable. No
+    /// encoded prefix is retained or exposed in that case.
     ///
     /// # Panics
     ///
     /// Panics on the pass-through — the caller must branch on [`Self::is_passthrough`]
     /// first (UTF-8 output cannot contain `0xFF`, so it needs neither stage).
-    pub fn encode_outbound(&mut self, text: &str) -> &[u8] {
-        let encoder = self
-            .encoder
-            .as_mut()
-            .expect("encode_outbound is only called on converting connections");
+    pub fn encode_outbound(&mut self, text: &str) -> Result<&[u8], EncodeError> {
+        assert!(
+            !self.is_passthrough(),
+            "encode_outbound is only called on converting connections"
+        );
+        let mut encoder = self.encoding.new_encoder();
         self.scratch.clear();
         let capacity = encoder
             .max_buffer_length_from_utf8_without_replacement(text.len())
             .unwrap_or(text.len().saturating_mul(2) + 16);
-        // The scratch is written through a fixed-size view; grow it to the bound first.
-        self.scratch.resize(capacity.max(16), 0);
+        self.scratch.reserve(capacity.max(16));
 
-        let mut written_total = 0;
         let mut src = text;
         loop {
-            let (result, read, written) = encoder.encode_from_utf8_without_replacement(
-                src,
-                &mut self.scratch[written_total..],
-                false,
-            );
-            written_total += written;
+            let (result, read) =
+                encoder.encode_from_utf8_to_vec_without_replacement(src, &mut self.scratch, true);
             src = &src[read..];
             match result {
                 encoding_rs::EncoderResult::InputEmpty => break,
                 encoding_rs::EncoderResult::OutputFull => {
-                    let grow = self.scratch.len().saturating_mul(2).max(64);
-                    self.scratch.resize(grow, 0);
+                    self.scratch.reserve(self.scratch.capacity().max(64));
                 }
-                encoding_rs::EncoderResult::Unmappable(_) => {
-                    if written_total == self.scratch.len() {
-                        self.scratch.push(0);
-                    }
-                    self.scratch[written_total] = b'?';
-                    written_total += 1;
+                encoding_rs::EncoderResult::Unmappable(character) => {
+                    self.scratch.clear();
+                    self.out_buf.clear();
+                    return Err(EncodeError {
+                        encoding: self.encoding.name(),
+                        character,
+                    });
                 }
             }
         }
 
         // Double 0xFF bytes (IAC) so the telnet layer delivers them as literals.
         self.out_buf.clear();
-        super::telnet::double_iac_into(&self.scratch[..written_total], &mut self.out_buf);
-        &self.out_buf
+        super::telnet::double_iac_into(&self.scratch, &mut self.out_buf);
+        Ok(&self.out_buf)
     }
 
     /// Flush the decoder at end of stream: a partial multibyte sequence still buffered
@@ -227,13 +255,26 @@ mod tests {
         // 'ÿ' encodes to 0xFF in windows-1252 — exactly the IAC byte — and must go out
         // doubled so the server's telnet layer reads a literal.
         let mut t = Transcode::new(WINDOWS_1252);
-        assert_eq!(t.encode_outbound("say \u{ff}"), b"say \xFF\xFF");
+        assert_eq!(t.encode_outbound("say \u{ff}").unwrap(), b"say \xFF\xFF");
     }
 
     #[test]
-    fn outbound_unmappable_becomes_question_mark() {
+    fn outbound_unmappable_rejects_the_whole_command_and_resets_cleanly() {
         let mut t = Transcode::new(WINDOWS_1252);
-        assert_eq!(t.encode_outbound("go \u{2192} east"), b"go ? east");
+        let error = t
+            .encode_outbound("go \u{2192} east")
+            .expect_err("an unmappable command must be rejected");
+        assert_eq!(error.character(), '\u{2192}');
+        assert!(
+            t.scratch.is_empty(),
+            "representable prefix must be discarded"
+        );
+        assert!(t.out_buf.is_empty(), "no bytes may reach the socket");
+        assert_eq!(
+            t.encode_outbound("go east").unwrap(),
+            b"go east",
+            "the rejected command must not corrupt the next encoder"
+        );
     }
 
     #[test]
