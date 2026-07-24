@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::ops::RangeFull;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -551,13 +552,96 @@ impl RuntimeAction {
     }
 }
 
+/// Generous per-turn sanity caps for script-originated sends. These guard the
+/// queue where synchronous script calls first accumulate without constraining
+/// ordinary pathfinding bursts; the counters reset whenever the runtime drains
+/// the current turn's action queue.
+const SCRIPT_SEND_ACTION_LIMIT: usize = 16_384;
+const SCRIPT_SEND_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ScriptSendLimit {
+    Actions,
+    Bytes,
+}
+
+impl std::fmt::Display for ScriptSendLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Actions => write!(
+                formatter,
+                "smudgy: one script turn queued more than {SCRIPT_SEND_ACTION_LIMIT} sends"
+            ),
+            Self::Bytes => write!(
+                formatter,
+                "smudgy: one script turn queued more than {SCRIPT_SEND_BYTE_LIMIT} bytes of sends"
+            ),
+        }
+    }
+}
+
 /// Actions emitted synchronously by scripts and triggers while the runtime is
 /// processing an action. The main loop drains this after every action and
 /// splices the contents in ahead of already-queued siblings (depth-first
 /// expansion), and after script event-loop polling, where the contents have
 /// no position in any expansion and are forwarded to the back of the main
 /// queue like new input.
-pub(crate) type ActionQueue = Rc<RefCell<VecDeque<RuntimeAction>>>;
+#[derive(Debug, Default)]
+pub(crate) struct PendingActions {
+    actions: VecDeque<RuntimeAction>,
+    script_send_actions: usize,
+    script_send_bytes: usize,
+}
+
+impl PendingActions {
+    pub(crate) fn push_back(&mut self, action: RuntimeAction) {
+        self.actions.push_back(action);
+    }
+
+    pub(crate) fn extend(&mut self, actions: impl IntoIterator<Item = RuntimeAction>) {
+        self.actions.extend(actions);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.actions.clear();
+        self.reset_script_send_usage();
+    }
+
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&RuntimeAction) -> bool) {
+        self.actions.retain(keep);
+    }
+
+    pub(crate) fn drain(
+        &mut self,
+        _range: RangeFull,
+    ) -> std::collections::vec_deque::Drain<'_, RuntimeAction> {
+        self.reset_script_send_usage();
+        self.actions.drain(..)
+    }
+
+    pub(crate) fn reserve_script_send(&mut self, bytes: usize) -> Result<(), ScriptSendLimit> {
+        let actions = self.script_send_actions.saturating_add(1);
+        if actions > SCRIPT_SEND_ACTION_LIMIT {
+            return Err(ScriptSendLimit::Actions);
+        }
+
+        let bytes = self.script_send_bytes.saturating_add(bytes);
+        if bytes > SCRIPT_SEND_BYTE_LIMIT {
+            return Err(ScriptSendLimit::Bytes);
+        }
+
+        self.script_send_actions = actions;
+        self.script_send_bytes = bytes;
+        Ok(())
+    }
+
+    fn reset_script_send_usage(&mut self) {
+        self.script_send_actions = 0;
+        self.script_send_bytes = 0;
+    }
+}
+
+pub(crate) type ActionQueue = Rc<RefCell<PendingActions>>;
 
 pub(crate) enum ActionResult {
     None,
@@ -570,4 +654,41 @@ pub(crate) enum ActionResult {
 pub(crate) enum RunAction {
     None,
     Reload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_large_send_bursts_fit_the_script_turn_budget() {
+        let mut actions = PendingActions::default();
+        for _ in 0..500 {
+            actions.reserve_script_send(3).unwrap();
+        }
+    }
+
+    #[test]
+    fn script_send_budget_limits_count_and_total_bytes() {
+        let mut actions = PendingActions::default();
+        for _ in 0..SCRIPT_SEND_ACTION_LIMIT {
+            actions.reserve_script_send(1).unwrap();
+        }
+        assert_eq!(
+            actions.reserve_script_send(1),
+            Err(ScriptSendLimit::Actions)
+        );
+
+        actions.clear();
+        actions.reserve_script_send(SCRIPT_SEND_BYTE_LIMIT).unwrap();
+        assert_eq!(actions.reserve_script_send(1), Err(ScriptSendLimit::Bytes));
+    }
+
+    #[test]
+    fn draining_actions_resets_the_script_send_budget() {
+        let mut actions = PendingActions::default();
+        actions.reserve_script_send(SCRIPT_SEND_BYTE_LIMIT).unwrap();
+        actions.drain(..).for_each(drop);
+        actions.reserve_script_send(SCRIPT_SEND_BYTE_LIMIT).unwrap();
+    }
 }

@@ -10,7 +10,7 @@ use tokio::{
     net::TcpStream,
     select,
     sync::{
-        mpsc::{UnboundedSender, WeakUnboundedSender},
+        mpsc::{Sender, UnboundedSender, WeakSender, error::TrySendError},
         oneshot,
     },
 };
@@ -653,11 +653,16 @@ pub enum OutboundFrame {
     WindowSize,
 }
 
+/// Frames waiting for the socket worker. Producers await capacity instead of
+/// dropping valid commands; script-side sanity caps stop genuinely runaway
+/// bursts before they reach this queue.
+const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+
 pub struct Connection {
     disconnect: Option<oneshot::Sender<()>>,
     runtime_tx: UnboundedSender<RuntimeAction>,
     ui_tx: mpsc::Sender<TaggedSessionEvent>,
-    socket_tx: Arc<RwLock<Option<WeakUnboundedSender<OutboundFrame>>>>,
+    socket_tx: Arc<RwLock<Option<WeakSender<OutboundFrame>>>>,
     on_connect: Option<Box<dyn FnOnce() + Send>>,
     /// The trigger manager's "any trigger has a raw pattern" flag; each connect
     /// task hands it to its [`VtProcessor`] so per-line raw capture only runs
@@ -671,7 +676,7 @@ pub struct Connection {
     window_size: Arc<std::sync::atomic::AtomicU32>,
 }
 
-fn clear_socket_sender(socket_tx: &RwLock<Option<WeakUnboundedSender<OutboundFrame>>>) {
+fn clear_socket_sender(socket_tx: &RwLock<Option<WeakSender<OutboundFrame>>>) {
     match socket_tx.write() {
         Ok(mut sender) => {
             sender.take();
@@ -718,8 +723,15 @@ impl Connection {
     /// changed. A no-op when disconnected — the cell already carries the value the next
     /// connect task reads.
     pub fn notify_window_size(&self) {
-        // Ignore the error: no live socket means nothing to notify.
-        let _ = self.write_frame(OutboundFrame::WindowSize);
+        let Ok(socket_tx) = self.socket_sender() else {
+            return;
+        };
+        // Size lives in a shared cell, so a full queue may coalesce this wakeup:
+        // the socket task also checks for a changed size after every queued
+        // frame, including the frames already occupying that queue.
+        match socket_tx.try_send(OutboundFrame::WindowSize) {
+            Ok(()) | Err(TrySendError::Full(_) | TrySendError::Closed(_)) => {}
+        }
     }
 
     /// Send raw data to the connected socket.
@@ -728,8 +740,8 @@ impl Connection {
     ///
     /// Returns an error if the socket lock is poisoned, no socket is currently
     /// registered, the sender can no longer be upgraded, or its queue is closed.
-    pub fn write(&self, data: Arc<String>) -> Result<(), anyhow::Error> {
-        self.write_frame(OutboundFrame::Text(data))
+    pub async fn write(&self, data: Arc<String>) -> Result<(), anyhow::Error> {
+        self.write_frame(OutboundFrame::Text(data)).await
     }
 
     /// Send a pre-framed binary message (a telnet subnegotiation such as a GMCP send) to
@@ -740,11 +752,11 @@ impl Connection {
     ///
     /// Returns an error if the socket lock is poisoned, no socket is currently
     /// registered, the sender can no longer be upgraded, or its queue is closed.
-    pub fn write_raw(&self, frame: Arc<[u8]>) -> Result<(), anyhow::Error> {
-        self.write_frame(OutboundFrame::Raw(frame))
+    pub async fn write_raw(&self, frame: Arc<[u8]>) -> Result<(), anyhow::Error> {
+        self.write_frame(OutboundFrame::Raw(frame)).await
     }
 
-    fn write_frame(&self, frame: OutboundFrame) -> Result<(), anyhow::Error> {
+    fn socket_sender(&self) -> Result<Sender<OutboundFrame>, anyhow::Error> {
         let socket_tx = self
             .socket_tx
             .read()
@@ -752,13 +764,18 @@ impl Connection {
         let socket_tx = socket_tx
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Socket no longer exists"))?;
-        let socket_tx = socket_tx
+        socket_tx
             .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("Socket tx is not upgradeable"))?;
+            .ok_or_else(|| anyhow::anyhow!("Socket tx is not upgradeable"))
+    }
+
+    async fn write_frame(&self, frame: OutboundFrame) -> Result<(), anyhow::Error> {
+        let socket_tx = self.socket_sender()?;
         // The receiver can drop between the upgrade and the send (the connect task
         // tearing down) — an ordinary disconnected-socket error, not a panic condition.
         socket_tx
             .send(frame)
+            .await
             .map_err(|_| anyhow::anyhow!("Socket closed while sending"))
     }
 
@@ -840,7 +857,7 @@ impl Connection {
             // Negotiation replies to write back to the server, reused across reads.
             let mut telnet_replies: Vec<u8> = Vec::new();
             let (write_to_socket_tx, mut write_to_socket_rx) =
-                tokio::sync::mpsc::unbounded_channel::<OutboundFrame>();
+                tokio::sync::mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
 
             runtime_tx
                 .send(RuntimeAction::Echo(Arc::new(format!(
@@ -1170,7 +1187,7 @@ impl Connection {
                                     }
                             }
                             Some(frame) = write_to_socket_rx.recv() => {
-                                let outcome = match &frame {
+                                let mut outcome = match &frame {
                                     OutboundFrame::Text(text) => {
                                         if transcode.is_passthrough() {
                                             stream.write_all(text.as_bytes()).await
@@ -1184,21 +1201,19 @@ impl Connection {
                                         }
                                     }
                                     OutboundFrame::Raw(bytes) => stream.write_all(bytes).await,
-                                    OutboundFrame::WindowSize => {
-                                        // Emit a NAWS update only when the option is
-                                        // negotiated (an unsolicited report is a protocol
-                                        // violation) and the size cell actually changed
-                                        // since the last report (a repeat is noise).
-                                        telnet_replies.clear();
-                                        if telnet.local_enabled(telnet::option::NAWS)
-                                            && protocol.send_naws_if_changed(&mut telnet_replies)
-                                        {
-                                            stream.write_all(&telnet_replies).await
-                                        } else {
-                                            Ok(())
-                                        }
-                                    }
+                                    OutboundFrame::WindowSize => Ok(()),
                                 };
+                                // Emit a changed NAWS report after every queued frame. That
+                                // makes a full queue safely coalesce a WindowSize wakeup:
+                                // one of the already-pending frames will observe the shared
+                                // size cell as soon as capacity starts draining.
+                                telnet_replies.clear();
+                                if outcome.is_ok()
+                                    && telnet.local_enabled(telnet::option::NAWS)
+                                    && protocol.send_naws_if_changed(&mut telnet_replies)
+                                {
+                                    outcome = stream.write_all(&telnet_replies).await;
+                                }
                                 if let Err(err) = outcome {
                                     warn!("Socket write to {addr} failed: {err}");
                                     break;
@@ -1507,20 +1522,87 @@ mod tests {
         assert_eq!(line.as_deref(), Some("caf\u{e9} \u{ff}"));
     }
 
-    #[test]
-    fn write_returns_an_error_when_the_socket_queue_is_closed() {
+    #[tokio::test]
+    async fn write_returns_an_error_when_the_socket_queue_is_closed() {
         let (mut connection, _runtime_rx) = test_connection();
-        let (socket_tx, socket_rx) = tokio_mpsc::unbounded_channel();
+        let (socket_tx, socket_rx) = tokio_mpsc::channel(1);
         let weak_socket_tx = socket_tx.downgrade();
         drop(socket_rx);
         connection.socket_tx = Arc::new(RwLock::new(Some(weak_socket_tx)));
 
         let error = connection
             .write(Arc::new("look".to_string()))
+            .await
             .expect_err("a closed socket queue must be reported instead of panicking");
 
         assert!(error.to_string().contains("closed"));
         drop(socket_tx);
+    }
+
+    #[tokio::test]
+    async fn write_waits_for_capacity_instead_of_dropping_a_valid_frame() {
+        let (mut connection, _runtime_rx) = test_connection();
+        let (socket_tx, mut socket_rx) = tokio_mpsc::channel(1);
+        connection.socket_tx = Arc::new(RwLock::new(Some(socket_tx.downgrade())));
+
+        connection
+            .write(Arc::new("first".to_string()))
+            .await
+            .expect("first frame fills the queue");
+
+        let second = connection.write(Arc::new("second".to_string()));
+        tokio::pin!(second);
+        assert!(
+            timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "a full queue should apply backpressure"
+        );
+
+        assert!(matches!(
+            socket_rx.recv().await,
+            Some(OutboundFrame::Text(text)) if text.as_str() == "first"
+        ));
+        timeout(Duration::from_secs(1), &mut second)
+            .await
+            .expect("write should resume when capacity is available")
+            .expect("receiver remains open");
+        assert!(matches!(
+            socket_rx.recv().await,
+            Some(OutboundFrame::Text(text)) if text.as_str() == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_delivers_a_500_frame_pathfinding_burst_in_order() {
+        const BURST: usize = 500;
+
+        let (mut connection, _runtime_rx) = test_connection();
+        let (socket_tx, mut socket_rx) = tokio_mpsc::channel(16);
+        connection.socket_tx = Arc::new(RwLock::new(Some(socket_tx.downgrade())));
+
+        let producer = async {
+            for index in 0..BURST {
+                connection
+                    .write(Arc::new(index.to_string()))
+                    .await
+                    .expect("the live receiver should eventually make capacity");
+            }
+        };
+        let consumer = async {
+            for index in 0..BURST {
+                assert!(matches!(
+                    socket_rx.recv().await,
+                    Some(OutboundFrame::Text(text)) if text.as_str() == index.to_string()
+                ));
+            }
+        };
+
+        timeout(Duration::from_secs(1), async {
+            tokio::join!(producer, consumer);
+        })
+        .await
+        .expect("the full burst should drain without drops or deadlock");
     }
 
     #[tokio::test]

@@ -2339,6 +2339,16 @@ fn queue_own_action(state: &mut OpState, action: RuntimeAction) {
     state.borrow::<ActionQueue>().borrow_mut().push_back(action);
 }
 
+/// Reserve one script-originated send in the current turn's count-and-byte
+/// budget before routing it to this or another session.
+fn reserve_script_send(state: &OpState, line: &str) -> Result<(), StoreOpError> {
+    state
+        .borrow::<ActionQueue>()
+        .borrow_mut()
+        .reserve_script_send(line.len().saturating_add(2))
+        .map_err(|error| StoreOpError(error.to_string()))
+}
+
 /// The isolate these ops are running in (seeded into `OpState` at construction). Stamped
 /// onto every automation the creation/enable ops emit so the trigger Manager keys them by
 /// `(IsolateId, Origin, name)`. Take this into a local *before* calling
@@ -3136,9 +3146,10 @@ fn op_smudgy_session_send(
     state: &mut OpState,
     session_id: u32,
     #[string] line: &str,
-) -> Result<(), NotCapable> {
+) -> Result<(), StoreOpError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).send, "send")?;
+    reserve_script_send(state, line)?;
     route_session_action(
         state,
         target,
@@ -3152,9 +3163,10 @@ fn op_smudgy_session_send_raw(
     state: &mut OpState,
     session_id: u32,
     #[string] line: &str,
-) -> Result<(), NotCapable> {
+) -> Result<(), StoreOpError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).send_direct, "send-direct")?;
+    reserve_script_send(state, line)?;
     route_session_action(
         state,
         target,
