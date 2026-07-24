@@ -9,10 +9,7 @@ use crate::theme::builtins;
 use smudgy_core::models::profile::{
     clear_profile_password, contains_password_token, has_profile_password, set_profile_password,
 };
-use smudgy_core::models::{
-    profile::Profile,
-    server::{Server, ServerEncoding},
-};
+use smudgy_core::models::{profile::Profile, server::Server};
 use std::collections::HashMap;
 
 mod profile;
@@ -90,7 +87,9 @@ pub enum Message {
     ConfirmDeleteServer(ServerName),        // User confirms deletion
     // Server Form Interaction
     UpdateServerFormField(ServerFormField, String),
-    UpdateServerEncoding(ServerEncoding),
+    ToggleServerCompression(bool),
+    ToggleServerTls(bool),
+    ToggleServerTlsVerify(bool),
     SubmitServerForm,
     CancelServerForm,
     // Server CRUD Async Results
@@ -124,6 +123,7 @@ pub enum ServerFormField {
     Name, // Only for Create
     Host,
     Port,
+    Encoding,
 }
 
 /// Fields in the profile create/edit form.
@@ -134,12 +134,34 @@ pub enum ProfileFormField {
 }
 
 /// Temporary storage for server form input.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ServerConfigFormData {
     pub name: String,
     pub host: String,
     pub port: String,
-    pub encoding: ServerEncoding,
+    /// The encoding dropdown's display value; [`server::DEFAULT_ENCODING_CHOICE`]
+    /// stands for "no override" (UTF-8, `ServerConfig::encoding = None`).
+    pub encoding: String,
+    /// Whether inbound compression offers (MCCP2) are accepted.
+    pub compression: bool,
+    /// Connect over TLS.
+    pub tls: bool,
+    /// When `tls`, verify the server certificate (off = accept any, insecure).
+    pub tls_verify: bool,
+}
+
+impl Default for ServerConfigFormData {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            host: String::new(),
+            port: String::new(),
+            encoding: server::DEFAULT_ENCODING_CHOICE.to_string(),
+            compression: true,
+            tls: false,
+            tls_verify: true,
+        }
+    }
 }
 
 /// Temporary storage for profile form input. `description` maps to the persisted
@@ -207,7 +229,10 @@ impl std::fmt::Debug for State {
             .field("server_action", &self.server_action)
             .field("profile_action", &self.profile_action)
             .field("profile_form_password", &"<redacted>")
-            .field("profile_form_password_stored", &self.profile_form_password_stored)
+            .field(
+                "profile_form_password_stored",
+                &self.profile_form_password_stored,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -227,8 +252,8 @@ impl State {
         });
         if let Some(first) = servers.first() {
             let name = first.name.clone();
-            let mut profiles = smudgy_core::models::profile::list_profiles(&name)
-                .unwrap_or_else(|e| {
+            let mut profiles =
+                smudgy_core::models::profile::list_profiles(&name).unwrap_or_else(|e| {
                     warn!("Failed to load profiles for '{name}': {e}");
                     Vec::new()
                 });
@@ -298,7 +323,9 @@ fn persist_profile_password(
         set_profile_password(server_name, profile_name, &state.profile_form_password)
     };
     if let Err(e) = result {
-        warn!("Failed to update stored auto-login password for '{server_name}/{profile_name}': {e}");
+        warn!(
+            "Failed to update stored auto-login password for '{server_name}/{profile_name}': {e}"
+        );
     }
     reset_password_form(state);
 }
@@ -391,7 +418,14 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     name: server_to_edit.name.clone(), // Pre-fill name (though not directly editable usually)
                     host: server_to_edit.config.host.clone(),
                     port: server_to_edit.config.port.to_string(),
-                    encoding: server_to_edit.config.encoding,
+                    encoding: server_to_edit
+                        .config
+                        .encoding
+                        .clone()
+                        .unwrap_or_else(|| server::DEFAULT_ENCODING_CHOICE.to_string()),
+                    compression: server_to_edit.config.compression,
+                    tls: server_to_edit.config.tls,
+                    tls_verify: server_to_edit.config.tls_verify,
                 };
                 state.server_crud_error = None;
                 state.selected_server = Some(server_name); // Ensure server remains selected
@@ -422,17 +456,33 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     ServerFormField::Name => state.server_form_data.name = value,
                     ServerFormField::Host => state.server_form_data.host = value,
                     ServerFormField::Port => state.server_form_data.port = value,
+                    ServerFormField::Encoding => state.server_form_data.encoding = value,
                 }
                 state.server_crud_error = None; // Clear error when user types
             }
         }
-        Message::UpdateServerEncoding(encoding) => {
+        Message::ToggleServerCompression(value) => {
             if matches!(
                 state.server_action,
                 Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
             ) {
-                state.server_form_data.encoding = encoding;
-                state.server_crud_error = None;
+                state.server_form_data.compression = value;
+            }
+        }
+        Message::ToggleServerTls(value) => {
+            if matches!(
+                state.server_action,
+                Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
+            ) {
+                state.server_form_data.tls = value;
+            }
+        }
+        Message::ToggleServerTlsVerify(value) => {
+            if matches!(
+                state.server_action,
+                Some(ServerCrudAction::Create) | Some(ServerCrudAction::Edit(_))
+            ) {
+                state.server_form_data.tls_verify = value;
             }
         }
         Message::SubmitServerForm => {
@@ -676,7 +726,8 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 // Clear the stored secret now — this is an explicit user action.
                 let cleared = clear_profile_password(server_name, profile_name);
                 if let Err(e) = cleared {
-                    state.profile_crud_error = Some(format!("Failed to clear stored password: {e}"));
+                    state.profile_crud_error =
+                        Some(format!("Failed to clear stored password: {e}"));
                 }
             }
             state.profile_form_password = String::new();

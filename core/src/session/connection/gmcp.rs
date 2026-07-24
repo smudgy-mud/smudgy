@@ -1,4 +1,4 @@
-//! GMCP wire-format helpers (`docs/gmcp-plan.md`; protocol reference
+//! GMCP wire-format helpers (`docs/gmcp.md`; protocol reference
 //! `docs/gmcp-reference.md`): the message-level layer over the telnet subnegotiation
 //! framing. One message is `Package[.Sub].Message <json>` — a dotted, case-insensitive
 //! name, one space, an optional JSON data part. This module owns splitting inbound
@@ -10,12 +10,12 @@ use super::telnet::{frame_subnegotiation, option};
 
 /// The game-agnostic baseline advertised in the handshake's `Core.Supports.Set` — exactly
 /// Mudlet's core set, which a decade of ecosystem use has proven safe to enable blind
-/// (`docs/gmcp-plan.md` §6.1). Deliberately absent: `Comm`/`Comm.Channel` (can eat chat),
+/// (`docs/gmcp.md` §6.1). Deliberately absent: `Comm`/`Comm.Channel` (can eat chat),
 /// `Char.Login` (credential policy), and every game-specific module (packages enable what
 /// they consume).
 pub const BASELINE_SUPPORTS: [&str; 4] = ["Char 1", "Char.Skills 1", "Char.Items 1", "Room 1"];
 
-/// Cap on an inbound GMCP payload the client will process (`docs/gmcp-plan.md` §10
+/// Cap on an inbound GMCP payload the client will process (`docs/gmcp.md` §10
 /// hardening): the server controls subnegotiation buffer growth, so a payload past this is
 /// dropped (with a log) rather than parsed and stored.
 pub const MAX_INBOUND_PAYLOAD: usize = 256 * 1024;
@@ -47,7 +47,7 @@ pub fn frame_message(name: &str, data: Option<&str>, into: &mut Vec<u8>) {
     frame_subnegotiation(option::GMCP, &payload, into);
 }
 
-/// Frame the enable handshake (`docs/gmcp-plan.md` §6.1): `Core.Hello` identifying the
+/// Frame the enable handshake (`docs/gmcp.md` §6.1): `Core.Hello` identifying the
 /// client, then `Core.Supports.Set` with the baseline module set. Registered-module adds
 /// follow from the session thread once the module registry exists (phase 2).
 pub fn frame_handshake(into: &mut Vec<u8>) {

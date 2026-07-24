@@ -97,12 +97,14 @@ impl LiveAutomations {
 
     /// An installed package's automations, matched by owner/name across any resolved version.
     pub fn package(&self, owner: &str, name: &str) -> Option<&CreatorAutomations> {
-        self.by_origin.iter().find_map(|(origin, creator)| match origin {
-            Origin::Package {
-                owner: o, name: n, ..
-            } if o == owner && n == name => Some(creator),
-            _ => None,
-        })
+        self.by_origin
+            .iter()
+            .find_map(|(origin, creator)| match origin {
+                Origin::Package {
+                    owner: o, name: n, ..
+                } if o == owner && n == name => Some(creator),
+                _ => None,
+            })
     }
 }
 
@@ -224,7 +226,10 @@ pub fn trigger_rows(trigger: &triggers::TriggerDefinition) -> Vec<(PatternKind, 
 }
 
 /// Rebuilds a trigger's three pattern vectors from the unified row list.
-pub fn rows_into_trigger(rows: &[(PatternKind, String)], trigger: &mut triggers::TriggerDefinition) {
+pub fn rows_into_trigger(
+    rows: &[(PatternKind, String)],
+    trigger: &mut triggers::TriggerDefinition,
+) {
     let collect = |kind: PatternKind| -> Option<Vec<String>> {
         let v: Vec<String> = rows
             .iter()
@@ -602,10 +607,14 @@ mod tests {
 
     /// Record that `parent` pulls `child` in (a `requires`-graph edge).
     fn imports(graph: &mut PackageGraph, parent: &str, child: &str) {
-        graph.requires.entry(parent.to_string()).or_default().push(DepEdge {
-            specifier: child.to_string(),
-            range: String::new(),
-        });
+        graph
+            .requires
+            .entry(parent.to_string())
+            .or_default()
+            .push(DepEdge {
+                specifier: child.to_string(),
+                range: String::new(),
+            });
     }
 
     #[test]
@@ -616,7 +625,10 @@ mod tests {
         install(&mut graph, "d", true);
         imports(&mut graph, "p", "d");
 
-        assert!(graph.dep_edge_active("p", "d"), "both on: D's row under P is live");
+        assert!(
+            graph.dep_edge_active("p", "d"),
+            "both on: D's row under P is live"
+        );
 
         // Disable P. D keeps its own enabled entry, so it still runs on its own...
         graph.intent.insert("p".to_string(), false);
@@ -640,7 +652,10 @@ mod tests {
 
         // Disable only P: D's row under P greys, but under still-enabled Q it stays live.
         graph.intent.insert("p".to_string(), false);
-        assert!(!graph.dep_edge_active("p", "d"), "the import via the disabled P is dead");
+        assert!(
+            !graph.dep_edge_active("p", "d"),
+            "the import via the disabled P is dead"
+        );
         assert!(graph.dep_edge_active("q", "d"), "Q still pulls D in");
         assert!(graph.effectively_enabled("d"));
     }
@@ -653,7 +668,10 @@ mod tests {
         imports(&mut graph, "p", "l");
 
         assert!(graph.is_dep_only("l"));
-        assert!(graph.dep_edge_active("p", "l"), "L is live while P pulls it in");
+        assert!(
+            graph.dep_edge_active("p", "l"),
+            "L is live while P pulls it in"
+        );
 
         // Disable P: nothing else needs L, so both its global state and its row go inactive.
         graph.intent.insert("p".to_string(), false);

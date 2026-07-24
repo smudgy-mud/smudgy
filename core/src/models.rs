@@ -8,6 +8,7 @@ pub mod map_scopes;
 pub mod modules;
 pub mod naming;
 pub mod packages;
+mod persistence;
 pub mod profile;
 pub mod script_typings;
 pub mod server;

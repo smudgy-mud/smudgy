@@ -1,0 +1,31 @@
+name: Dispatch release benchmark
+
+# Release events load this bridge from the default branch. It uses only a
+# GitHub-hosted runner and dispatches the runner-group-approved benchmark
+# workflow explicitly on main, carrying the immutable release tag as input.
+on:
+  release:
+    types: [published]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Queue canonical release benchmark
+    if: github.repository == 'smudgy-mud/smudgy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Dispatch trusted benchmark workflow on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.event.release.tag_name }}
+        run: >-
+          gh workflow run benchmark.yml
+          --repo "${GITHUB_REPOSITORY}"
+          --ref main
+          --field mode=release
+          --field release_ref="${RELEASE_REF}"

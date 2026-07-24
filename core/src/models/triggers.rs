@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
-use super::ScriptLang;
+use super::{ScriptLang, persistence::write_atomic};
 
 // Helper function for serde to default boolean fields to true.
 fn default_true() -> bool {
@@ -15,7 +15,7 @@ fn default_true() -> bool {
 ///
 /// This structure is used as the value in the map representation
 /// of the `triggers.json` file.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TriggerDefinition {
     /// Regex patterns to match against incoming server text.
     pub patterns: Option<Vec<String>>,
@@ -34,7 +34,28 @@ pub struct TriggerDefinition {
     pub enabled: bool,
     /// Whether this trigger should fire on prompts. Defaults to false.
     pub prompt: bool,
-    // TODO: Add other trigger-specific fields like sequence, sound file, highlighting, etc.
+    /// Relative evaluation priority. Higher values run first; defaults to zero.
+    pub priority: i32,
+    /// Whether matching continues to later triggers after this one runs. Defaults to true.
+    pub fallthrough: bool,
+    // TODO: Add other trigger-specific fields like sound file, highlighting, etc.
+}
+
+impl Default for TriggerDefinition {
+    fn default() -> Self {
+        Self {
+            patterns: None,
+            raw_patterns: None,
+            anti_patterns: None,
+            script: None,
+            package: None,
+            language: ScriptLang::default(),
+            enabled: true,
+            prompt: false,
+            priority: 0,
+            fallthrough: true,
+        }
+    }
 }
 
 // Custom Serialize implementation
@@ -93,6 +114,12 @@ impl Serialize for TriggerDefinition {
         if !self.enabled {
             map.serialize_entry("enabled", &self.enabled)?;
         }
+        if self.priority != 0 {
+            map.serialize_entry("priority", &self.priority)?;
+        }
+        if !self.fallthrough {
+            map.serialize_entry("fallthrough", &self.fallthrough)?;
+        }
 
         map.end()
     }
@@ -128,6 +155,10 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
             enabled: bool,
             #[serde(default)]
             prompt: bool,
+            #[serde(default)]
+            priority: i32,
+            #[serde(default = "default_true")]
+            fallthrough: bool,
         }
 
         let helper = TriggerHelper::deserialize(deserializer)?;
@@ -192,6 +223,8 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
             language: helper.language,
             enabled: helper.enabled,
             prompt: helper.prompt,
+            priority: helper.priority,
+            fallthrough: helper.fallthrough,
         })
     }
 }
@@ -360,7 +393,7 @@ pub fn save_triggers<S: ::std::hash::BuildHasher>(
         "Failed to serialize triggers for server '{server_name}'"
     ))?;
 
-    fs::write(&triggers_path, json_content).context(format!(
+    write_atomic(&triggers_path, json_content.as_bytes()).context(format!(
         "Failed to write triggers.json for server '{server_name}' at {}",
         triggers_path.display()
     ))?;
@@ -427,6 +460,8 @@ mod tests {
         assert_eq!(trigger.patterns, Some(vec!["test_pattern".to_string()]));
         assert_eq!(trigger.raw_patterns, Some(vec!["raw_test".to_string()]));
         assert_eq!(trigger.anti_patterns, Some(vec!["anti_test".to_string()]));
+        assert_eq!(trigger.priority, 0);
+        assert!(trigger.fallthrough);
     }
 
     #[test]
@@ -504,6 +539,8 @@ mod tests {
             package: Some("test/package".to_string()),
             language: ScriptLang::JS,
             enabled: false,
+            priority: 42,
+            fallthrough: false,
             ..Default::default()
         };
 
@@ -512,5 +549,7 @@ mod tests {
             serde_json::from_str(&json).expect("Failed to deserialize");
 
         assert_eq!(original, deserialized);
+        assert!(json.contains("\"priority\":42"));
+        assert!(json.contains("\"fallthrough\":false"));
     }
 }

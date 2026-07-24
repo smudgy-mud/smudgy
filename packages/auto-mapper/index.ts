@@ -1,5 +1,5 @@
 // auto-mapper: protocol-driven mapping over GMCP Room.Info and MSDP ROOM
-// (docs/gmcp-mapping-plan.md section 5.3). Known rooms are followed; unknown rooms are
+// (docs/gmcp-mapping.md section 5.3). Known rooms are followed; unknown rooms are
 // auto-created in session (ephemeral) areas, one per server-reported zone, so nothing a
 // server sends can ever touch a saved map. `savemap` promotes the session areas to local
 // maps and keeps mapping into them.
@@ -81,7 +81,7 @@ function asNumber(value: unknown): number | null {
 }
 
 // ---------------------------------------------------------------------------------------
-// Dialect adapters (docs/gmcp-mapping-plan.md sections 4/5.3).
+// Dialect adapters (docs/gmcp-mapping.md sections 4/5.3).
 // ---------------------------------------------------------------------------------------
 
 /** GMCP Room.Info / room.info: the IRE and Aardwolf dialects plus a tolerant generic. */
@@ -266,7 +266,7 @@ function occupied(area: Area, x: number, y: number, level: number): boolean {
 }
 
 /** Placement: server coords when present, else previous room + the movement vector, with
- *  nudging along the vector on collision (docs/gmcp-mapping-plan.md section 5.3). Reads go
+ *  nudging along the vector on collision (docs/gmcp-mapping.md section 5.3). Reads go
  *  through a FRESH area handle — a cached one is a stale snapshot. */
 function placement(areaId: AreaId, fix: RoomFix, direction: string | null): { x: number; y: number; level: number } {
     if (fix.coords) {
@@ -302,13 +302,13 @@ async function linkOrStub(areaId: AreaId, room: RoomNumber, dir: string, destId:
             return;
         }
     }
+    // A destination-less exit is a dangling stub on the map until (and
+    // unless) its far room is discovered.
     const exitId = await mapper.createRoomExit(areaId, room, {
         from_direction,
         command,
         weight: 1,
     });
-    // Stub styling is ignored on creation by design; set it after.
-    mapper.setRoomExit(areaId, room, exitId, { style: "Stub" });
     if (destId !== null) {
         const waiters = pendingLinks.get(destId) ?? [];
         waiters.push({ areaId, room, exitId });
@@ -325,7 +325,6 @@ function resolvePending(id: string, areaId: AreaId, room: RoomNumber) {
         mapper.setRoomExit(waiter.areaId, waiter.room, waiter.exitId, {
             to_area_id: areaId,
             to_room_number: room,
-            style: "Normal",
         });
     }
 }
@@ -350,7 +349,7 @@ async function autoCreate(fix: RoomFix): Promise<void> {
 
     // Every exit of the new room: a real link when the destination is already known
     // (including the one we just came from), else a stub that upgrades when its id
-    // finally appears (docs/gmcp-mapping-plan.md section 5.3). The exit we arrived
+    // finally appears (docs/gmcp-mapping.md section 5.3). The exit we arrived
     // THROUGH needs no special case: the previous room minted it as a stub naming this
     // room's id, and resolvePending below upgrades that stub — creating it again here
     // would double the edge.

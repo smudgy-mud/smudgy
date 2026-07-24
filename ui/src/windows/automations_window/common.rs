@@ -103,7 +103,11 @@ fn track_style(enabled: bool, locked: bool) -> impl Fn(&Theme) -> container::Sty
     move |theme: &Theme| {
         let on = theme.styles.general.accent;
         let bg = if enabled {
-            if locked { lighten(on, 0.1) } else { lighten(on, 0.25) }
+            if locked {
+                lighten(on, 0.1)
+            } else {
+                lighten(on, 0.25)
+            }
         } else {
             theme.styles.text.normal.scale_alpha(0.18)
         };
@@ -164,7 +168,9 @@ pub fn pill_switch<'a>(
 
 fn outline_box_style(theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(theme.styles.text.normal.scale_alpha(0.04))),
+        background: Some(Background::Color(
+            theme.styles.text.normal.scale_alpha(0.04),
+        )),
         border: Border {
             color: theme.styles.general.border,
             width: 1.0,
@@ -237,7 +243,9 @@ pub fn code_surface_style(theme: &Theme) -> container::Style {
 /// A subtle bordered banner (context/safety banners in package panes).
 pub fn banner_style(theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(theme.styles.text.normal.scale_alpha(0.04))),
+        background: Some(Background::Color(
+            theme.styles.text.normal.scale_alpha(0.04),
+        )),
         border: Border {
             color: theme.styles.general.border,
             width: 1.0,
@@ -346,7 +354,14 @@ pub fn mix(a: Color, b: Color, t: f32) -> Color {
 pub fn top_gradient(highlight: Color, base: Color) -> Background {
     // Composite the translucent highlight over the opaque base so the surface
     // stays opaque; the highlight's alpha controls how strongly the glow reads.
-    let top = mix(base, Color { a: 1.0, ..highlight }, highlight.a);
+    let top = mix(
+        base,
+        Color {
+            a: 1.0,
+            ..highlight
+        },
+        highlight.a,
+    );
     Background::Gradient(Gradient::Linear(
         Linear::new(std::f32::consts::PI)
             .add_stop(0.0, top)

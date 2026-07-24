@@ -20,13 +20,13 @@ use deno_core::{
 
 use derive_more::{Display, Into};
 use futures::channel::mpsc::Sender;
+use smudgy_cloud::{Mapper, PackageApiClient};
 use smudgy_script::{
     ImportPolicy, InspectorConfig, LoadReport, LoadedModuleKind, ModulePolicy, ModuleSet,
     PackagePermissions, PackageProvider, Permissions, PermissionsContainer, PermissionsOptions,
     ScriptRuntime, ScriptRuntimeOptions, SmudgySpecifier, parse_canonical,
     permission_descriptor_parser,
 };
-use smudgy_cloud::{Mapper, PackageApiClient};
 
 use crate::{
     get_smudgy_home,
@@ -34,8 +34,9 @@ use crate::{
         BufferUpdate, PackageProviderFactory, ScriptExtensionFactory, SessionEvent, SessionId,
         TaggedSessionEvent,
         runtime::{
-            ActionResult, IsolateId, SingletonRegistry, line_operation::LineOperation,
-            script_engine::ops::Capture,
+            ActionResult, IsolateId, SingletonRegistry,
+            line_operation::LineOperation,
+            script_engine::ops::{Capture, Fallthrough},
             trigger::{Manager, MatchCapture, SharedAutomationRegistry},
         },
         styled_line::StyledLine,
@@ -44,7 +45,6 @@ use crate::{
 
 use anyhow::{Result, anyhow, bail};
 use deno_core::url::Url;
-
 
 mod mapper_api;
 mod ops;
@@ -126,6 +126,22 @@ pub struct ScriptEngineParams<'a> {
     /// Per-line routing state (gag/redirect/copy), shared into every isolate's ops beside
     /// `pending_line_operations`.
     pub line_routing: super::SharedLineRouting,
+    /// The input mirror (`docs/input.md` §3.3), shared into every isolate's input
+    /// read ops. Written by the runtime's `InputStateChanged` dispatch arm; session-scoped.
+    pub input_mirror: super::SharedInputMirror,
+    /// The in-flight typed submission (`docs/input.md` §3.5), shared into every
+    /// isolate's submission ops. Installed/consumed by the runtime's `SubmitInput`/
+    /// `CompleteInputSubmission` dispatch arms; the ambient `submission` acts on it.
+    pub input_submission: super::SharedInputSubmission,
+    /// The completion word sets (`docs/input.md` §3.8), shared into every
+    /// isolate's registry ops (synchronous mutation + exact reads). The runtime's
+    /// `InputWordSetsChanged` dispatch arm builds the UI's merged view from the same cell.
+    pub input_word_sets: super::SharedInputWordSets,
+    /// The pane-input `onSubmit` registry (`docs/input.md` §3.7), shared into
+    /// every isolate's pane ops (the registration op writes it). The runtime's
+    /// `PaneInputSubmit` dispatch arm resolves through the same cell; reset by the
+    /// runtime before each rebuild (handler addresses are engine facts).
+    pub pane_input_callbacks: super::SharedPaneInputCallbacks,
     /// The session store, shared into every isolate's store ops (writes journal there; the
     /// runtime flushes per turn). Outlives this engine — reloads keep the committed tree.
     pub session_store: super::SharedSessionStore,
@@ -137,7 +153,7 @@ pub struct ScriptEngineParams<'a> {
     /// ops; this engine registers its statically-extracted handle declarations into it at
     /// construction. Outlives the engine — samples are session history.
     pub catalogue: super::SharedCatalogue,
-    /// The GMCP enabled flag (`docs/gmcp-plan.md` §3.4), shared into every isolate's
+    /// The GMCP enabled flag (`docs/gmcp.md` §3.4), shared into every isolate's
     /// `gmcp.enabled` read op. Written by the runtime's GMCP producer; session-scoped.
     pub gmcp_enabled: super::gmcp::SharedGmcpEnabled,
     pub mapper: Option<Mapper>,
@@ -285,6 +301,11 @@ pub struct ScriptEngine<'a> {
     /// refcount bumps only (the per-line `sys:receive` path allocates no key strings).
     platform_event_keys: RefCell<HashMap<String, PlatformEventKeys>>,
     current_line: Rc<RefCell<Weak<StyledLine>>>,
+    /// The current-line staleness scope (see [`ops::LineScope`]): `current` is bumped by
+    /// [`Self::set_current_line`] per installed line; `armed` is set/restored by the
+    /// user-JS entry points below around every synchronous entry, and checked by the
+    /// ambient `line` mutators. One cell shared into every isolate's ops.
+    line_scope: ops::LineScopeCell,
     #[allow(dead_code)]
     pending_line_operations: &'a Rc<RefCell<Vec<LineOperation>>>,
     #[allow(dead_code)]
@@ -659,7 +680,10 @@ impl<'a> ScriptEngine<'a> {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warn!("Could not read modules directory {}: {e}", modules_dir.display()),
+                Err(e) => warn!(
+                    "Could not read modules directory {}: {e}",
+                    modules_dir.display()
+                ),
             }
         }
 
@@ -681,7 +705,10 @@ impl<'a> ScriptEngine<'a> {
                     }
                     if let Ok(spec) = SmudgySpecifier::parse(&pkg.specifier) {
                         homes.insert(
-                            (spec.owner.to_ascii_lowercase(), spec.name.to_ascii_lowercase()),
+                            (
+                                spec.owner.to_ascii_lowercase(),
+                                spec.name.to_ascii_lowercase(),
+                            ),
                             if pkg.trusted {
                                 crate::session::runtime::store::HomeIsolate::Main
                             } else {
@@ -721,7 +748,9 @@ impl<'a> ScriptEngine<'a> {
     ) {
         let mut updates = Vec::new();
         for line in message.split('\n') {
-            updates.push(BufferUpdate::Append(Arc::new(StyledLine::from_echo_str(line))));
+            updates.push(BufferUpdate::Append(Arc::new(StyledLine::from_echo_str(
+                line,
+            ))));
             updates.push(BufferUpdate::EnsureNewLine);
             if let Some(count) = emitted_line_count.upgrade() {
                 count.set(count.get() + 1);
@@ -753,7 +782,10 @@ impl<'a> ScriptEngine<'a> {
         emitted_line_count: &std::rc::Weak<Cell<usize>>,
     ) {
         let fold = |key: &smudgy_script::PackageKey| {
-            (key.owner.to_ascii_lowercase(), key.name.to_ascii_lowercase())
+            (
+                key.owner.to_ascii_lowercase(),
+                key.name.to_ascii_lowercase(),
+            )
         };
         let scrubbed: std::collections::HashSet<(String, String)> =
             loader.scrubbed_packages().iter().map(fold).collect();
@@ -908,6 +940,7 @@ impl<'a> ScriptEngine<'a> {
         let server_path = smudgy_dir.join(params.server_name.as_str());
 
         let current_line = Rc::new(RefCell::new(Weak::new()));
+        let line_scope: ops::LineScopeCell = Rc::new(Cell::new(ops::LineScope::default()));
 
         // Per-isolate waker demux state (`EVENT-LOOP-READINESS-DEMUX.md`): `ready` records which
         // isolates have a pending wakeup; `parent` holds the session task's waker so a per-isolate
@@ -936,9 +969,18 @@ impl<'a> ScriptEngine<'a> {
         // pane/routing ops (all isolates share the one session thread).
         let pane_registry = params.pane_registry.clone();
         let line_routing = params.line_routing.clone();
+        // The same input mirror `Rc` is bound into every isolate's input read ops.
+        let input_mirror = params.input_mirror.clone();
+        // The same submission cell `Rc` is bound into every isolate's submission ops.
+        let input_submission = params.input_submission.clone();
+        // The same word-set cell `Rc` is bound into every isolate's registry ops.
+        let input_word_sets = params.input_word_sets.clone();
+        // The same pane-input handler registry `Rc` is bound into every isolate's pane ops.
+        let pane_input_callbacks = params.pane_input_callbacks.clone();
         let mapper = params.mapper.clone();
         let extra_extensions = params.extra_script_extensions.clone();
         let current_line_for_ext = current_line.clone();
+        let line_scope_for_ext = line_scope.clone();
         // The same introspection mirror the `Manager` writes; bound into every isolate's ops.
         let automation_registry = params.automation_registry.clone();
         // One session-global `singleton` reservation set, shared (the same `Rc`) into every
@@ -1008,7 +1050,12 @@ impl<'a> ScriptEngine<'a> {
             .installed_typings
             .iter()
             .filter(|pkg| !pkg.handles.is_empty())
-            .map(|pkg| (pkg.owner.to_ascii_lowercase(), pkg.name.to_ascii_lowercase()))
+            .map(|pkg| {
+                (
+                    pkg.owner.to_ascii_lowercase(),
+                    pkg.name.to_ascii_lowercase(),
+                )
+            })
             .collect();
 
         // Build the deno extension set for one isolate: its own `script_functions` registry
@@ -1031,6 +1078,9 @@ impl<'a> ScriptEngine<'a> {
                     spawned_actions.clone(),
                     pending_ops.clone(),
                     current_line_for_ext.clone(),
+                    // The current-line staleness scope the ambient `line` mutators check
+                    // (armed by the engine's user-JS entry points).
+                    line_scope_for_ext.clone(),
                     emitted_line_count.clone(),
                     // The read ops resolve `buffer.line(n)` against this ring.
                     recent_lines.clone(),
@@ -1045,6 +1095,18 @@ impl<'a> ScriptEngine<'a> {
                     pane_registry.clone(),
                     // The current-line routing ops (redirect/copy/gag) write here.
                     line_routing.clone(),
+                    // The input read op resolves `input.value`/`cursor`/… against this
+                    // mirror and flags interest on it; writes bypass it.
+                    input_mirror.clone(),
+                    // The ambient `submission` ops act on this shared cell while a
+                    // `sys:input` handler splice is live.
+                    input_submission.clone(),
+                    // The completion word-set registry ops mutate and read this shared
+                    // cell synchronously, scoped by the caller's (isolate, origin).
+                    input_word_sets.clone(),
+                    // The pane-input registration op records onSubmit handler addresses
+                    // here; the runtime's `PaneInputSubmit` dispatch arm resolves them.
+                    pane_input_callbacks.clone(),
                     // The ops stamp this id onto every automation they create, so the trigger
                     // Manager keys them under `(isolate, …)` — coexistence across isolates.
                     isolate_id,
@@ -1098,16 +1160,16 @@ impl<'a> ScriptEngine<'a> {
             build_package_provider(params.package_client, Arc::clone(params.server_name));
         // Whether sandboxed isolates have any way to resolve `smudgy://` — a cloud base to fork, or
         // a test override factory. With neither, the untrusted installs can't load (handled below).
-        let have_resolver =
-            smudgy_provider.is_some() || params.package_provider_override.is_some();
+        let have_resolver = smudgy_provider.is_some() || params.package_provider_override.is_some();
         // The MAIN isolate's loader provider: the override factory's fresh resolver, else the cloud
         // base (which is main's own provider).
-        let main_isolate_loader: Option<Rc<dyn PackageProvider>> = match &params.package_provider_override {
-            Some(factory) => Some(factory()),
-            None => smudgy_provider
-                .clone()
-                .map(|provider| -> Rc<dyn PackageProvider> { provider }),
-        };
+        let main_isolate_loader: Option<Rc<dyn PackageProvider>> =
+            match &params.package_provider_override {
+                Some(factory) => Some(factory()),
+                None => smudgy_provider
+                    .clone()
+                    .map(|provider| -> Rc<dyn PackageProvider> { provider }),
+            };
         let mut main_set = plan.main;
         let sandboxed = plan.sandboxed;
 
@@ -1148,7 +1210,10 @@ impl<'a> ScriptEngine<'a> {
                 {
                     let mut homes = home_registry.borrow_mut();
                     for key in &blocked {
-                        homes.remove(&(key.owner.to_ascii_lowercase(), key.name.to_ascii_lowercase()));
+                        homes.remove(&(
+                            key.owner.to_ascii_lowercase(),
+                            key.name.to_ascii_lowercase(),
+                        ));
                     }
                 }
                 main_set.packages.retain(|specifier| {
@@ -1335,7 +1400,9 @@ impl<'a> ScriptEngine<'a> {
                     // (the enforced-grant source below), not allow-all.
                     if provider.is_local_override(&spec.package_key()) {
                         params.tokio_runtime.block_on(async {
-                            provider.solve_closure(std::slice::from_ref(&specifier)).await;
+                            provider
+                                .solve_closure(std::slice::from_ref(&specifier))
+                                .await;
                         });
                     } else {
                         let consented = consent_lock
@@ -1557,6 +1624,65 @@ impl<'a> ScriptEngine<'a> {
                         spawned_actions
                             .borrow_mut()
                             .retain(|action| action.target_isolate() != Some(&isolate_id));
+                        // An input-bearing pane of this package would survive as a
+                        // live-looking input whose submissions vanish silently: the
+                        // handler-required design leaves nothing to deliver to, and
+                        // only this package's own re-split could ever re-register a
+                        // handler. Close such panes through the normal close
+                        // machinery — registry close, the per-pane input-state
+                        // purge, and a queued `PaneClosed` (what the reload sweep
+                        // sends) — so the UI and registry stay consistent.
+                        // Output-only panes are left open, like every other pane
+                        // whose creating script is gone: a pane outlives its
+                        // package until a reload's sweep or an explicit close.
+                        {
+                            let namespace = super::pane::PaneNamespace::Package {
+                                owner: Arc::from(spec.owner.as_str()),
+                                name: Arc::from(spec.name.as_str()),
+                            };
+                            let doomed: Vec<(Arc<str>, super::pane::PaneKey)> = pane_registry
+                                .borrow()
+                                .list(&namespace)
+                                .into_iter()
+                                .filter(|def| !def.is_main && def.input.is_some())
+                                .map(|def| (def.name.clone(), def.key))
+                                .collect();
+                            for (name, key) in doomed {
+                                if pane_registry.borrow_mut().close(&namespace, &name).is_ok() {
+                                    super::input::purge_pane_input_state(
+                                        &input_mirror,
+                                        &input_word_sets,
+                                        &pane_input_callbacks,
+                                        key,
+                                    );
+                                    spawned_actions
+                                        .borrow_mut()
+                                        .push_back(super::RuntimeAction::PaneClosed { key });
+                                }
+                            }
+                        }
+                        // Completion word-set contributions land synchronously (the registry
+                        // ops mutate the shared cell directly), so the partial evaluation may
+                        // also have seated words under this now-dead isolate — unclearable by
+                        // anything short of a full reload, and merged into every Tab push in
+                        // the meantime. Purge its seats and flag the affected inputs so the
+                        // UI's merged copy drops them. (The load's own push action was
+                        // retained above — it names no isolate — and reads the purged sets at
+                        // dispatch; the flag check keeps this from queueing a duplicate.)
+                        {
+                            let mut sets = input_word_sets.borrow_mut();
+                            for key in sets.purge_isolate(&isolate_id) {
+                                if sets.flag_push(key) {
+                                    spawned_actions.borrow_mut().push_back(
+                                        super::RuntimeAction::InputWordSetsChanged { key },
+                                    );
+                                }
+                            }
+                        }
+                        // Pane-input onSubmit registrations land synchronously too; a
+                        // handler seated under this dead isolate could only ever be a
+                        // warn-and-drop at dispatch, so purge it with the isolate.
+                        pane_input_callbacks.borrow_mut().purge_isolate(&isolate_id);
                         // This isolate is NOT being moved into `isolates`, so it drops here.
                         // Model B left it off the enter-stack (and the load bracket already
                         // released it), but `OwnedIsolate::Drop` requires it be the thread's
@@ -1694,9 +1820,11 @@ impl<'a> ScriptEngine<'a> {
         let mut keep_isolate_slugs: std::collections::HashSet<String> = isolates
             .keys()
             .filter_map(|id| match id {
-                IsolateId::Package { owner, name, version } => {
-                    Some(isolate_slug(owner, name, version))
-                }
+                IsolateId::Package {
+                    owner,
+                    name,
+                    version,
+                } => Some(isolate_slug(owner, name, version)),
                 IsolateId::Main => None,
             })
             .collect();
@@ -1734,6 +1862,7 @@ impl<'a> ScriptEngine<'a> {
             ui_tx: params.ui_tx,
             pending_line_operations: params.pending_line_operations,
             current_line,
+            line_scope,
             mapper: params.mapper,
             ready,
             parent,
@@ -1800,8 +1929,14 @@ impl<'a> ScriptEngine<'a> {
                 isolate: sub.isolate,
                 id: sub.function_id,
                 matches: Arc::new(vec![
-                    MatchCapture { name: Some(std::borrow::Cow::Borrowed("event")), value: event.to_string() },
-                    MatchCapture { name: Some(std::borrow::Cow::Borrowed("payload")), value: payload_json.to_string() },
+                    MatchCapture {
+                        name: Some(std::borrow::Cow::Borrowed("event")),
+                        value: event.to_string(),
+                    },
+                    MatchCapture {
+                        name: Some(std::borrow::Cow::Borrowed("payload")),
+                        value: payload_json.to_string(),
+                    },
                 ]),
                 depth: 0,
                 is_captured: None,
@@ -1825,11 +1960,46 @@ impl<'a> ScriptEngine<'a> {
         match line {
             Some(line) => {
                 *self.current_line.borrow_mut() = line;
+                // Stamp the installed line with a fresh generation: the staleness
+                // nonce the entry points below capture and the ambient `line`
+                // mutators check (see `ops::LineScope`).
+                let mut scope = self.line_scope.get();
+                scope.current = scope.current.wrapping_add(1);
+                self.line_scope.set(scope);
             }
             None => {
                 *self.current_line.borrow_mut() = Weak::new();
             }
         }
+    }
+
+    /// Arm the current-line scope for one synchronous user-JS entry: capture the
+    /// in-flight line's generation (0 when no line is in flight — the line's `Arc`
+    /// is held by its queued completion action, so a dead `Weak` means the line
+    /// already finished). Returns the prior armed value for the paired
+    /// [`Self::restore_line_scope`] — save/restore exactly like `EventDepth` at the
+    /// same call sites. Async continuations resume in the event-loop pump, outside
+    /// any armed entry, which is what makes a stale `line.gag()` detectable.
+    fn arm_line_scope(
+        line_scope: &ops::LineScopeCell,
+        current_line: &Rc<RefCell<Weak<StyledLine>>>,
+    ) -> u64 {
+        let mut scope = line_scope.get();
+        let prior = scope.armed;
+        scope.armed = if current_line.borrow().strong_count() > 0 {
+            scope.current
+        } else {
+            0
+        };
+        line_scope.set(scope);
+        prior
+    }
+
+    /// The restore half of [`Self::arm_line_scope`].
+    fn restore_line_scope(line_scope: &ops::LineScopeCell, prior: u64) {
+        let mut scope = line_scope.get();
+        scope.armed = prior;
+        line_scope.set(scope);
     }
 
     /// Slow safety-net interval for the session run loop's idle `select!`. Readiness driving
@@ -1958,6 +2128,10 @@ impl<'a> ScriptEngine<'a> {
         // integration test, which strands the continuation if this seed is removed).
         self.mark_isolate_ready(isolate);
 
+        // Cloned out before `isolate_mut` borrows `self`; armed below beside `EventDepth`.
+        let line_scope = self.line_scope.clone();
+        let current_line = self.current_line.clone();
+
         let bundle = self.isolate_mut(isolate)?;
         // Clone the `v8::Global` out and drop the registry `Ref` *before* the v8 call.
         // `script_functions` is the same `Rc<RefCell<…>>` this isolate's create ops
@@ -1990,6 +2164,10 @@ impl<'a> ScriptEngine<'a> {
             .try_borrow::<ops::EventDepth>()
             .map_or(0, |d| d.0);
         op_state.borrow_mut().put(ops::EventDepth(depth));
+        // Arm the current-line scope for this entry (save/restore like `EventDepth`):
+        // trigger and `sys:receive` handlers run for the line in flight, so its
+        // generation is captured here and the ambient `line` mutators compare it.
+        let prior_line_scope = Self::arm_line_scope(&line_scope, &current_line);
         // Make the owning isolate current for this call (it usually isn't — Model B leaves the
         // enter-stack empty between ops); released after the scope on the way out.
         let _entered = EnteredIsolate::enter(deno);
@@ -2048,6 +2226,7 @@ impl<'a> ScriptEngine<'a> {
 
         // Restore the enclosing depth (0 at the outermost dispatch) now the handler has returned.
         op_state.borrow_mut().put(ops::EventDepth(prior_depth));
+        Self::restore_line_scope(&line_scope, prior_line_scope);
 
         if let Some(started) = started {
             trace!(
@@ -2089,40 +2268,52 @@ impl<'a> ScriptEngine<'a> {
         // Demux: a widget/hotkey callback can schedule async work synchronously; seed the target
         // isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
+        // Cloned out before `isolate_mut` borrows `self`; armed below beside `EventDepth`.
+        let line_scope = self.line_scope.clone();
+        let current_line = self.current_line.clone();
         let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
         // A widget/hotkey callback is a top-level dispatch (depth 0); stamp it so a store `set`
         // inside the callback journals at depth 0 rather than inheriting a stale `EventDepth`
         // from an earlier handler on this isolate. No restore needed — 0 is the between-dispatch
         // baseline the save/restore in the other dispatch paths returns to.
         deno.op_state().borrow_mut().put(ops::EventDepth(0));
+        // Arm the current-line scope for this entry (paired restore below): a callback
+        // dispatched while a line is in flight may act on that line, one dispatched
+        // between lines may not.
+        let prior_line_scope = Self::arm_line_scope(&line_scope, &current_line);
         // Make the target isolate current for this callback (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
         v8::scope_with_context!(let scope, isolate, context);
 
-        v8::tc_scope!(let try_catch, scope);
-        let function = v8::Local::new(try_catch, function);
-        let this = v8::undefined(try_catch).into();
-        // Positional args (e.g. a `Markdown` `onLink`'s clicked URL). Script-controlled strings:
-        // a string too large for v8 to allocate falls back to `undefined` rather than panicking.
-        let call_args: Vec<v8::Local<v8::Value>> = args
-            .iter()
-            .map(|arg| {
-                v8::String::new(try_catch, arg)
-                    .map_or_else(|| v8::undefined(try_catch).into(), Into::into)
-            })
-            .collect();
-        function.call(try_catch, this, &call_args);
+        let result = {
+            v8::tc_scope!(let try_catch, scope);
+            let function = v8::Local::new(try_catch, function);
+            let this = v8::undefined(try_catch).into();
+            // Positional args (e.g. a `Markdown` `onLink`'s clicked URL). Script-controlled strings:
+            // a string too large for v8 to allocate falls back to `undefined` rather than panicking.
+            let call_args: Vec<v8::Local<v8::Value>> = args
+                .iter()
+                .map(|arg| {
+                    v8::String::new(try_catch, arg)
+                        .map_or_else(|| v8::undefined(try_catch).into(), Into::into)
+                })
+                .collect();
+            function.call(try_catch, this, &call_args);
 
-        if try_catch.has_caught() {
-            let ex = try_catch.exception().unwrap();
-            let exc = ex.to_string(try_catch).unwrap();
-            let exc = exc.to_rust_string_lossy(try_catch);
-            Ok(ActionResult::Echo(exc))
-        } else {
-            Ok(ActionResult::None)
-        }
+            if try_catch.has_caught() {
+                let ex = try_catch.exception().unwrap();
+                let exc = ex.to_string(try_catch).unwrap();
+                let exc = exc.to_rust_string_lossy(try_catch);
+                Ok(ActionResult::Echo(exc))
+            } else {
+                Ok(ActionResult::None)
+            }
+        };
+
+        Self::restore_line_scope(&line_scope, prior_line_scope);
+        result
     }
 
     /// Run a clicked link's callback: resolve `id` in the target isolate's
@@ -2159,6 +2350,9 @@ impl<'a> ScriptEngine<'a> {
         // Demux: a link callback can schedule async work synchronously; seed the
         // target isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
+        // Cloned out before `isolate_mut` borrows `self`; armed below beside `EventDepth`.
+        let line_scope = self.line_scope.clone();
+        let current_line = self.current_line.clone();
         let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
         let function = {
             let op_state = deno.op_state();
@@ -2172,30 +2366,81 @@ impl<'a> ScriptEngine<'a> {
         };
         // Top-level dispatch (depth 0), like a widget callback.
         deno.op_state().borrow_mut().put(ops::EventDepth(0));
+        // Arm the current-line scope for this entry (paired restore below), like the
+        // widget-callback path this mirrors.
+        let prior_line_scope = Self::arm_line_scope(&line_scope, &current_line);
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
         v8::scope_with_context!(let scope, isolate, context);
 
-        v8::tc_scope!(let try_catch, scope);
-        let function = v8::Local::new(try_catch, &function);
-        let this = v8::undefined(try_catch).into();
-        let click = v8::Object::new(try_catch);
-        for (key, value) in [("shift", shift), ("ctrl", ctrl), ("alt", alt)] {
-            let key = v8::String::new(try_catch, key).unwrap().into();
-            let value = v8::Boolean::new(try_catch, value).into();
-            click.create_data_property(try_catch, key, value);
-        }
-        function.call(try_catch, this, &[click.into()]);
+        let result = {
+            v8::tc_scope!(let try_catch, scope);
+            let function = v8::Local::new(try_catch, &function);
+            let this = v8::undefined(try_catch).into();
+            let click = v8::Object::new(try_catch);
+            for (key, value) in [("shift", shift), ("ctrl", ctrl), ("alt", alt)] {
+                let key = v8::String::new(try_catch, key).unwrap().into();
+                let value = v8::Boolean::new(try_catch, value).into();
+                click.create_data_property(try_catch, key, value);
+            }
+            function.call(try_catch, this, &[click.into()]);
 
-        if try_catch.has_caught() {
-            let ex = try_catch.exception().unwrap();
-            let exc = ex.to_string(try_catch).unwrap();
-            let exc = exc.to_rust_string_lossy(try_catch);
-            Ok(ActionResult::Echo(exc))
-        } else {
-            Ok(ActionResult::None)
+            if try_catch.has_caught() {
+                let ex = try_catch.exception().unwrap();
+                let exc = ex.to_string(try_catch).unwrap();
+                let exc = exc.to_rust_string_lossy(try_catch);
+                Ok(ActionResult::Echo(exc))
+            } else {
+                Ok(ActionResult::None)
+            }
+        };
+
+        Self::restore_line_scope(&line_scope, prior_line_scope);
+        result
+    }
+
+    /// Deliver a pane-input submission to its registered `onSubmit` handler
+    /// (`docs/input.md` §3.7): resolve `function_id` in the target isolate's
+    /// `script_functions` and call it with the submitted text. Every stale form of the
+    /// address is a defined no-op, in lockstep with [`Self::invoke_link_callback`]: a gone
+    /// isolate, a stale instance nonce (engine rebuilt under the pane — the handler died
+    /// with its generation and re-registers when the reloaded script re-splits), and an
+    /// out-of-range id. The handler fully owns the text — a returned value is ignored,
+    /// never sent (unlike the trigger dispatch paths).
+    pub fn invoke_pane_input_submit(
+        &mut self,
+        isolate_id: &IsolateId,
+        instance: u64,
+        function_id: FunctionId,
+        text: &str,
+    ) -> Result<ActionResult> {
+        let Ok(bundle) = self.isolate_mut(isolate_id) else {
+            warn!(
+                "Dropping pane-input submission into {isolate_id:?}: the isolate no longer \
+                 exists (the pane outlived its package)"
+            );
+            return Ok(ActionResult::None);
+        };
+        let live = bundle.instance;
+        if live != instance {
+            warn!(
+                "Dropping pane-input submission into {isolate_id:?}: handler registered by \
+                 isolate instance {instance}, live instance is {live} (the pane outlived an \
+                 engine rebuild; a re-split re-registers its handler)"
+            );
+            return Ok(ActionResult::None);
         }
+        let function = bundle.script_functions.borrow().get(function_id.0).cloned();
+        let Some(function) = function else {
+            warn!(
+                "Dropping pane-input submission into {isolate_id:?}: no handler at {function_id}"
+            );
+            return Ok(ActionResult::None);
+        };
+        // The nonce is verified against the live instantiation above, so the shared
+        // choreography (depth-0 stamp, line-scope arm, isolate entry) applies as-is.
+        self.execute_javascript_function(isolate_id, instance, &function, &[text.to_string()])
     }
 
     #[inline]
@@ -2214,6 +2459,10 @@ impl<'a> ScriptEngine<'a> {
         // Demux: see `call_javascript_function` — string-script dispatch can also schedule async
         // work synchronously, so seed this isolate for the next pump.
         self.mark_isolate_ready(isolate);
+
+        // Cloned out before `isolate_mut` borrows `self`; armed below beside `EventDepth`.
+        let line_scope = self.line_scope.clone();
+        let current_line = self.current_line.clone();
 
         let bundle = self.isolate_mut(isolate)?;
         // Get the script before creating the mutable scope to avoid borrowing conflicts
@@ -2236,6 +2485,10 @@ impl<'a> ScriptEngine<'a> {
             .try_borrow::<ops::EventDepth>()
             .map_or(0, |d| d.0);
         op_state.borrow_mut().put(ops::EventDepth(depth));
+        // Arm the current-line scope for this eval (save/restore like `EventDepth`):
+        // an inline trigger body runs for the line in flight; the ambient `line`
+        // mutators compare against the generation captured here.
+        let prior_line_scope = Self::arm_line_scope(&line_scope, &current_line);
         // Make the owning isolate current for this eval (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
@@ -2292,6 +2545,7 @@ impl<'a> ScriptEngine<'a> {
 
         // Restore the enclosing depth now the eval has returned (see the save above).
         op_state.borrow_mut().put(ops::EventDepth(prior_depth));
+        Self::restore_line_scope(&line_scope, prior_line_scope);
 
         if let Some(started) = started {
             trace!(
@@ -2354,6 +2608,38 @@ impl<'a> ScriptEngine<'a> {
         let captured = guard.borrow::<Capture>();
         captured.0
     }
+
+    /// Enter a synchronous alias/trigger function handler with its declarative default.
+    pub fn begin_fallthrough(&mut self, isolate: &IsolateId, value: bool) {
+        debug_assert!(
+            self.isolates.contains_key(isolate),
+            "begin_fallthrough on unknown isolate {isolate:?}"
+        );
+        let Ok(bundle) = self.isolate_mut(isolate) else {
+            return;
+        };
+        let state = bundle.runtime.deno_runtime().op_state();
+        state.borrow_mut().borrow_mut::<Fallthrough>().0 = Some(value);
+    }
+
+    /// Leave the current function handler and return its final fallthrough decision. Clearing the
+    /// slot is what makes calls from top-level or later async continuations throw.
+    pub fn end_fallthrough(&mut self, isolate: &IsolateId) -> bool {
+        debug_assert!(
+            self.isolates.contains_key(isolate),
+            "end_fallthrough on unknown isolate {isolate:?}"
+        );
+        let Ok(bundle) = self.isolate_mut(isolate) else {
+            return true;
+        };
+        let state = bundle.runtime.deno_runtime().op_state();
+        state
+            .borrow_mut()
+            .borrow_mut::<Fallthrough>()
+            .0
+            .take()
+            .unwrap_or(true)
+    }
 }
 
 /// RAII guard that makes `runtime`'s v8 isolate the thread's *current* isolate for the guard's
@@ -2411,7 +2697,10 @@ fn build_script_runtime(
         extensions,
         // `allow_https` permits the http/https module SCHEME at all; the per-isolate `import_policy`
         // is the actual gate on WHICH external code may be downloaded (npm/jsr/arbitrary web).
-        module_policy: ModulePolicy { allow_https: true, import_policy },
+        module_policy: ModulePolicy {
+            allow_https: true,
+            import_policy,
+        },
         inspector,
         tokio: tokio_runtime,
         package_provider,
@@ -2502,7 +2791,9 @@ fn sandbox_data_dir(
     name: &str,
     version: &str,
 ) -> std::path::PathBuf {
-    server_path.join(".isolates").join(isolate_slug(owner, name, version))
+    server_path
+        .join(".isolates")
+        .join(isolate_slug(owner, name, version))
 }
 
 /// The `<server>/.isolate-storage/` component naming a sandboxed package's PERSISTENT storage —
@@ -2628,7 +2919,8 @@ fn local_manifest_permissions(server_name: &str, name: &str) -> PackagePermissio
 ///
 /// # Errors
 /// Returns an error if `deno_permissions` rejects a descriptor (e.g. a malformed `net`
-/// `host:port`); the caller skips the package rather than run it ungated.
+/// `host:port`, an unknown `sys` kind, or an empty `run` program name); the caller skips the
+/// package rather than run it ungated.
 fn build_restricted_container(
     union: &PackagePermissions,
     data_dir: &std::path::Path,
@@ -2638,6 +2930,17 @@ fn build_restricted_container(
         allow_read: to_allow_list(expand_data_paths(&union.read, data_dir)),
         allow_write: to_allow_list(expand_data_paths(&union.write, data_dir)),
         allow_env: to_allow_list(union.env.clone()),
+        // `run`/`ffi` are sandbox escapes (a subprocess / native library runs outside the
+        // permission model entirely) and are only ever granted through explicit consent — the
+        // consent window presents any entry here as effectively full access. A bare `run`
+        // program name is PATH-resolved by `from_options`; an unresolvable one is logged and
+        // dropped (denied), never granted broadly. `ffi` paths get the same `$DATA` expansion
+        // (and `..`-escape drop) as `read`/`write`.
+        allow_run: to_allow_list(union.run.clone()),
+        allow_ffi: to_allow_list(expand_data_paths(&union.ffi, data_dir)),
+        // `sys` kinds are validated by `from_options`; an unknown token errors and the caller
+        // skips the package (fail-closed) rather than running it ungated.
+        allow_sys: to_allow_list(union.sys.clone()),
         // `import` is NOT set here: deno's `allow_import` is inert in this stack (smudgy's module
         // loader fetches remote imports itself and never consults this container). The live gate is
         // the loader's `ImportPolicy` (`union.import`, threaded via `ModulePolicy::import_policy`).
@@ -2660,8 +2963,8 @@ fn to_allow_list(entries: Vec<String>) -> Option<Vec<String>> {
     (!entries.is_empty()).then_some(entries)
 }
 
-/// Expand the `$DATA` placeholder in `read`/`write` path entries to the package's absolute data
-/// dir before they reach `deno_permissions` (`PACKAGE-ISOLATES-ENFORCEMENT.md`).
+/// Expand the `$DATA` placeholder in `read`/`write`/`ffi` path entries to the package's absolute
+/// data dir before they reach `deno_permissions` (`PACKAGE-ISOLATES-ENFORCEMENT.md`).
 /// Entries whose `$DATA` grant would escape the data dir are dropped (see below).
 fn expand_data_paths(entries: &[String], data_dir: &std::path::Path) -> Vec<String> {
     entries
@@ -2684,12 +2987,14 @@ fn expand_data_placeholder(entry: &str, data_dir: &std::path::Path) -> Option<St
         return Some(entry.to_string());
     };
     let sub = match rest.chars().next() {
-        None => "",                                       // bare `$DATA`
+        None => "", // bare `$DATA`
         Some('/' | '\\') => rest.trim_start_matches(['/', '\\']),
-        Some(_) => return Some(entry.to_string()),        // e.g. `$DATABASE` — not the placeholder
+        Some(_) => return Some(entry.to_string()), // e.g. `$DATABASE` — not the placeholder
     };
     if sub.split(['/', '\\']).any(|component| component == "..") {
-        warn!("dropping package permission entry {entry:?}: a $DATA grant may not escape the data dir with '..'");
+        warn!(
+            "dropping package permission entry {entry:?}: a $DATA grant may not escape the data dir with '..'"
+        );
         return None;
     }
     Some(if sub.is_empty() {
@@ -2768,8 +3073,10 @@ fn frame_origin(frame: &JsStackFrame) -> Option<String> {
 fn frame_short_location(frame: &JsStackFrame) -> Option<String> {
     let file = frame.file_name.as_deref()?;
     let name = match deno_core::ModuleSpecifier::parse(file) {
-        Ok(url) => parse_canonical(&url)
-            .map_or_else(|| basename(file).to_string(), |c| basename(&c.module_subpath).to_string()),
+        Ok(url) => parse_canonical(&url).map_or_else(
+            || basename(file).to_string(),
+            |c| basename(&c.module_subpath).to_string(),
+        ),
         Err(_) => basename(file).to_string(),
     };
     let loc = match frame.line_number.filter(|&l| l > 0) {
@@ -2788,19 +3095,21 @@ fn strip_exception_boilerplate(exception_message: &str, class: &str) -> String {
     let s = exception_message
         .trim_start_matches("Uncaught ")
         .trim_start_matches("(in promise) ");
-    s.strip_prefix(&format!("{class}: ")).unwrap_or(s).to_string()
+    s.strip_prefix(&format!("{class}: "))
+        .unwrap_or(s)
+        .to_string()
 }
 
 fn format_js_error(js: &JsError) -> String {
-    let class = js.name.as_deref().filter(|s| !s.is_empty()).unwrap_or("Error");
-    let message = js
-        .message
+    let class = js
+        .name
         .as_deref()
-        .filter(|m| !m.is_empty())
-        .map_or_else(
-            || strip_exception_boilerplate(&js.exception_message, class),
-            str::to_string,
-        );
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Error");
+    let message = js.message.as_deref().filter(|m| !m.is_empty()).map_or_else(
+        || strip_exception_boilerplate(&js.exception_message, class),
+        str::to_string,
+    );
     let uncaught = js.exception_message.contains("Uncaught");
 
     // A user frame has a non-empty file name that isn't smudgy/deno internal glue. The
@@ -2865,8 +3174,7 @@ fn compile_javascript(
         v8::script_compiler::CompileOptions::NoCompileOptions,
         v8::script_compiler::NoCacheReason::BecauseV8Extension,
     ) {
-        let bound_script = unbound_script
-            .bind_to_current_context(try_catch);
+        let bound_script = unbound_script.bind_to_current_context(try_catch);
 
         Ok(Global::new(try_catch, bound_script))
     } else if let Some(message) = try_catch.message() {
@@ -2874,12 +3182,14 @@ fn compile_javascript(
             "Failed to compile script: {}:{} {}",
             message
                 .get_script_resource_name(try_catch)
-                .map_or("[unknown script]".to_string(), |resource| resource.to_rust_string_lossy(try_catch)),
+                .map_or("[unknown script]".to_string(), |resource| resource
+                    .to_rust_string_lossy(try_catch)),
             message.get_line_number(try_catch).unwrap_or(0),
             try_catch
                 .exception()
                 .map(|e| e.to_string(try_catch))
-                .map_or(Some("[unknown error]".to_string()), |e| e.map(|e| e.to_rust_string_lossy(try_catch)))
+                .map_or(Some("[unknown error]".to_string()), |e| e
+                    .map(|e| e.to_rust_string_lossy(try_catch)))
                 .unwrap_or("[unknown error]".to_string())
         ))
     } else {
@@ -3012,9 +3322,19 @@ mod error_format_tests {
             "Name must be a non-empty string using only alphanumeric characters and underscores",
             "Uncaught (in promise) TypeError: Name must be a non-empty string using only alphanumeric characters and underscores",
             vec![
-                frame("ext:smudgy_ops/smudgy.ts", Some("validateCreateTriggerParams"), 527, 15),
+                frame(
+                    "ext:smudgy_ops/smudgy.ts",
+                    Some("validateCreateTriggerParams"),
+                    527,
+                    15,
+                ),
                 frame("ext:smudgy_ops/smudgy.ts", Some("createTrigger"), 473, 20),
-                frame("smudgy-pkg:///kapusniak/arctic-prompt/1.0.5/index.ts", None, 22, 1),
+                frame(
+                    "smudgy-pkg:///kapusniak/arctic-prompt/1.0.5/index.ts",
+                    None,
+                    22,
+                    1,
+                ),
             ],
         );
         assert_eq!(
@@ -3205,7 +3525,10 @@ mod isolate_dir_tests {
     /// keep them distinct, or two different owners' packages would share a cache/storage dir.
     #[test]
     fn slugs_disambiguate_dash_ambiguous_tuples() {
-        assert_ne!(sandbox_storage_slug("a-b", "c"), sandbox_storage_slug("a", "b-c"));
+        assert_ne!(
+            sandbox_storage_slug("a-b", "c"),
+            sandbox_storage_slug("a", "b-c")
+        );
         assert_ne!(
             isolate_slug("a-b", "c", "1.0.0"),
             isolate_slug("a", "b-c", "1.0.0")
@@ -3215,8 +3538,14 @@ mod isolate_dir_tests {
             isolate_slug("a", "b-1.0.0", "c")
         );
         // The same tuple is stable across calls (the orphan sweep relies on this).
-        assert_eq!(sandbox_storage_slug("a", "b-c"), sandbox_storage_slug("a", "b-c"));
-        assert_eq!(isolate_slug("a", "b", "1.0.0"), isolate_slug("a", "b", "1.0.0"));
+        assert_eq!(
+            sandbox_storage_slug("a", "b-c"),
+            sandbox_storage_slug("a", "b-c")
+        );
+        assert_eq!(
+            isolate_slug("a", "b", "1.0.0"),
+            isolate_slug("a", "b", "1.0.0")
+        );
     }
 
     #[test]
@@ -3234,10 +3563,22 @@ mod isolate_dir_tests {
         let keep: HashSet<String> = ["wbk-mapper-1.2.3".to_string()].into_iter().collect();
         prune_orphan_isolate_dirs(server_path, &keep);
 
-        assert!(isolates.join("wbk-mapper-1.2.3").is_dir(), "kept slug must survive");
-        assert!(!isolates.join("wbk-mapper-1.1.0").exists(), "superseded version pruned");
-        assert!(!isolates.join("old-pkg-0.0.1").exists(), "uninstalled package pruned");
-        assert!(isolates.join("stray.txt").is_file(), "non-dir entries are left alone");
+        assert!(
+            isolates.join("wbk-mapper-1.2.3").is_dir(),
+            "kept slug must survive"
+        );
+        assert!(
+            !isolates.join("wbk-mapper-1.1.0").exists(),
+            "superseded version pruned"
+        );
+        assert!(
+            !isolates.join("old-pkg-0.0.1").exists(),
+            "uninstalled package pruned"
+        );
+        assert!(
+            isolates.join("stray.txt").is_file(),
+            "non-dir entries are left alone"
+        );
     }
 
     #[test]

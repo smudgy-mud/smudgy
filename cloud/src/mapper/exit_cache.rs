@@ -1,6 +1,4 @@
-use crate::{AreaId, Exit, ExitDirection, ExitId, ExitStyle, RoomNumber, parse_css_color};
-
-const DEFAULT_EXIT_COLOR: iced::Color = iced::Color::from_rgb8(128, 128, 128);
+use crate::{AreaId, ConnectionId, Exit, ExitDirection, ExitId, RoomNumber};
 
 #[derive(Debug, Clone)]
 pub struct ExitCache {
@@ -15,9 +13,9 @@ pub struct ExitCache {
     pub is_locked: bool,
     pub weight: f32,
     pub command: Option<String>,
-    pub style: ExitStyle,
-    pub color: Option<String>,
-    pub iced_color: iced::Color,
+    /// The stored [`crate::Connection`] this exit is a member of; all visual
+    /// appearance (routing, dash, color, thickness) lives there.
+    pub connection_id: ConnectionId,
     /// Destination exists but is invisible to the viewer ("Unknown map").
     pub to_unknown: bool,
     /// Stable per-viewer token for the hidden destination; converging exits
@@ -28,8 +26,6 @@ pub struct ExitCache {
 
 impl From<Exit> for ExitCache {
     fn from(exit: Exit) -> Self {
-        let iced_color = parse_css_color(&exit.color).unwrap_or(DEFAULT_EXIT_COLOR);
-
         Self {
             id: exit.id,
             from_direction: exit.from_direction,
@@ -42,12 +38,33 @@ impl From<Exit> for ExitCache {
             is_locked: exit.is_locked,
             weight: exit.weight,
             command: (!exit.command.is_empty()).then_some(exit.command),
-            style: exit.style,
-            color: (!exit.color.is_empty()).then_some(exit.color),
-            iced_color,
+            connection_id: exit.connection_id,
             to_unknown: exit.to_unknown,
             to_area_token: exit.to_area_token,
             is_secret: exit.is_secret,
+        }
+    }
+}
+
+impl ExitCache {
+    #[must_use]
+    pub(crate) fn to_exit(&self) -> Exit {
+        Exit {
+            id: self.id,
+            from_direction: self.from_direction,
+            to_area_id: self.to_area_id,
+            to_room_number: self.to_room_number,
+            to_direction: self.to_direction,
+            path: self.path.clone().unwrap_or_default(),
+            is_hidden: self.is_hidden,
+            is_closed: self.is_closed,
+            is_locked: self.is_locked,
+            weight: self.weight,
+            command: self.command.clone().unwrap_or_default(),
+            connection_id: self.connection_id,
+            to_unknown: self.to_unknown,
+            to_area_token: self.to_area_token.clone(),
+            is_secret: self.is_secret,
         }
     }
 }

@@ -44,14 +44,18 @@ type WidgetChild =
     | null
     | undefined
     | import("smudgy:core").Binding<any>;
+/** One child or a flat array of children accepted by a widget component. */
 type WidgetChildren = WidgetChild | WidgetChild[];
 
 declare module "smudgy:widgets" {
     import type { Binding, Pane } from "smudgy:core";
 
     // Re-export the shared element/children/length types for module consumers.
+    /** An element returned by a widget component. */
     export type Element = SmudgyElement;
+    /** A widget size: pixels, `"fill"`, or `"shrink"`. */
     export type Length = WidgetLength;
+    /** The values accepted as component children. */
     export type Children = WidgetChildren;
 
     /** A prop that takes a value or a live state binding (`handle.bind(...)`
@@ -75,6 +79,7 @@ declare module "smudgy:widgets" {
         padding?: Bindable<number>;
         children?: WidgetChildren;
     }
+    /** The same layout properties as {@link ColumnProps}. */
     export type RowProps = ColumnProps;
 
     /** Props for the layering container (children stack front-to-back). */
@@ -232,6 +237,427 @@ declare module "smudgy:widgets" {
         url: string;
     }
 
+    /** Props for empty layout space (a leaf; children are ignored). Place
+     *  `<Space width="fill"/>` between Row children to create a flexible gap. */
+    export interface SpaceProps {
+        /** Default "shrink". */
+        width?: Bindable<WidgetLength>;
+        /** Default "shrink". */
+        height?: Bindable<WidgetLength>;
+        children?: WidgetChildren;
+    }
+
+    /** Props for a checkbox. Its children form the label and may include bindings.
+     *
+     *  A checkbox displays the value supplied through `checked`. To make it respond
+     *  visibly to a click, bind `checked` to state and update that state from
+     *  `onToggle`:
+     *
+     *  ```tsx
+     *  import { createState } from "smudgy:core";
+     *  import { Checkbox } from "smudgy:widgets";
+     *
+     *  const cfg = createState<{ autoloot: boolean }>("preferences");
+     *  cfg.set({ autoloot: false });
+     *
+     *  export const autolootControl = (
+     *    <Checkbox checked={cfg.bind("autoloot")}
+     *              onToggle={(checked) => { cfg.value.autoloot = checked; }}>
+     *      Autoloot
+     *    </Checkbox>
+     *  );
+     *  ```
+     *
+     *  Without `onToggle`, the checkbox is disabled and can be used as a read-only
+     *  indicator. If `checked` is a fixed value, a click still calls `onToggle`, but
+     *  the displayed value changes only when the caller supplies a different value. */
+    export interface CheckboxProps {
+        /** Whether the box is checked. Default false. */
+        checked?: Bindable<boolean>;
+        /** Called with the new state on click. Omitted, the checkbox renders disabled. */
+        onToggle?: (checked: boolean) => void;
+        /** Box size in pixels. */
+        size?: Bindable<number>;
+        /** Label text size in pixels. */
+        text_size?: Bindable<number>;
+        children?: WidgetChildren;
+    }
+
+    /** Props for one radio button. Its children form the label.
+     *
+     *  Smudgy does not provide a separate RadioGroup component. Radios that read and
+     *  update the same `selected` state behave as one group, even when they appear in
+     *  different layouts:
+     *
+     *  ```tsx
+     *  import { createState } from "smudgy:core";
+     *  import { Radio, Row } from "smudgy:widgets";
+     *
+     *  const cfg = createState<{ mode: string }>("preferences");
+     *  cfg.set({ mode: "fast" });
+     *  const selectMode = (mode: string) => { cfg.value.mode = mode; };
+     *
+     *  export const modeControls = (
+     *    <Row>
+     *      <Radio value="fast" selected={cfg.bind("mode")} onSelect={selectMode}>Fast</Radio>
+     *      <Radio value="careful" selected={cfg.bind("mode")} onSelect={selectMode}>Careful</Radio>
+     *    </Row>
+     *  );
+     *  ``` */
+    export interface RadioProps {
+        /** This radio's own value. Selection compares it (as a string) against
+         *  `selected`. */
+        value: string | number;
+        /** The currently selected value. This radio renders selected when it equals
+         *  `value` by string spelling (numbers compare as their decimal text). */
+        selected?: Bindable<string | number>;
+        /** Called with this radio's `value` on click. Required -- a radio without a
+         *  handler would render clickable and do nothing; use Text for display-only
+         *  markers. */
+        onSelect: (value: string) => void;
+        /** Dot size in pixels. */
+        size?: Bindable<number>;
+        /** Label text size in pixels. */
+        text_size?: Bindable<number>;
+        children?: WidgetChildren;
+    }
+
+    /** Where a tooltip appears relative to its target. */
+    export type TooltipPosition = "top" | "bottom" | "left" | "right" | "cursor";
+
+    /** Props for a hover tooltip. The first child is the hover target. A string,
+     *  number, or binding renders in the standard tooltip style. An element uses the
+     *  styles declared by that element. */
+    export interface TooltipProps {
+        /** The tooltip content. A `false` or null value suppresses the tooltip, so a
+         *  conditional expression such as `tip={cond && "hint"}` is supported. */
+        tip: string | number | Binding<any> | SmudgyElement | false | null;
+        /** Which side of the target the tip appears on, or `"cursor"` to follow the
+         *  pointer. Default "top". */
+        position?: TooltipPosition;
+        /** Distance between target and tip, in pixels. */
+        gap?: Bindable<number>;
+        children?: WidgetChildren;
+    }
+
+    /** One value in a table cell. Elements, text, numbers, and bindings display as
+     *  content. Null, undefined, and `false` produce an empty cell; `true` displays as
+     *  text. */
+    export type TableCell =
+        | SmudgyElement
+        | string
+        | number
+        | boolean
+        | Binding<any>
+        | null
+        | undefined;
+
+    /** One table column: its header plus optional layout. */
+    export interface TableColumnSpec {
+        /** The header cell: text or an element. */
+        header?: TableCell;
+        /** Column width. Default "shrink". */
+        width?: WidgetLength;
+        /** Horizontal alignment of the column's cells. Default "left". */
+        align_x?: HorizontalAlign;
+        /** Vertical alignment of the column's cells. Default "top". */
+        align_y?: VerticalAlign;
+    }
+
+    /** Props for a data table (a leaf; children are ignored).
+     *
+     *  Supply each row as an array in column order. A bound cell repaints when its value
+     *  changes. Re-mount the widget when rows are added, removed, or reordered. A row with
+     *  more cells than columns is invalid; a shorter row is padded with empty cells. Wrap
+     *  a tall table in `Scrollable`. */
+    export interface TableProps {
+        /** The columns, in order. Required and non-empty. */
+        columns: TableColumnSpec[];
+        /** The rows, each an array of cells in column order. */
+        rows?: TableCell[][];
+        width?: Bindable<WidgetLength>;
+        /** Cell padding in pixels, both axes. */
+        padding?: number;
+        /** Separator line thickness in pixels, both axes. */
+        separator?: number;
+        children?: WidgetChildren;
+    }
+
+    // ---- Canvas ------------------------------------------------------------------
+
+    /** A paint for canvas shapes: a CSS color string, or a linear gradient between two
+     *  scene-space points. Gradient endpoints follow the canvas `view_box` mapping and any
+     *  group transforms, like the geometry they fill. At most 8 stops. */
+    export type CanvasFill =
+        | string
+        | {
+              gradient: {
+                  /** The gradient's start point, in scene coordinates. */
+                  from: [number, number];
+                  /** The gradient's end point, in scene coordinates. */
+                  to: [number, number];
+                  /** Color stops: `[offset, color]` with offsets in 0..=1, at most 8. */
+                  stops: [number, string][];
+              };
+          };
+
+    /** A stroke for canvas shapes. */
+    export interface CanvasStroke {
+        /** Stroke paint. Default black. */
+        color?: CanvasFill;
+        /** Stroke width in scene units. Default 1. */
+        width?: number;
+        /** Dash pattern (on/off lengths). Solid when omitted. */
+        dash?: number[];
+    }
+
+    /** An animation easing curve. */
+    export type CanvasEase = "linear" | "in" | "out" | "in-out";
+
+    /** A tween for one numeric field of a canvas shape. */
+    export interface NumberTween {
+        /** The value animated to. */
+        to: number;
+        /** The starting value. Defaults to the shape's own value for the field. */
+        from?: number;
+        /** Duration of one run, in milliseconds. */
+        duration: number;
+        /** Delay before the first run, in milliseconds (applied once, not per repeat). */
+        delay?: number;
+        /** Easing curve. Default "linear". */
+        ease?: CanvasEase;
+        /** Run the tween this many times, or forever. Each repeat restarts from the
+         *  beginning. Default 1. */
+        repeat?: number | "infinite";
+    }
+
+    /** A tween for one color field of a canvas shape. Endpoints are CSS color strings. */
+    export interface ColorTween {
+        to: string;
+        /** Defaults to the shape's own color for the field. */
+        from?: string;
+        duration: number;
+        delay?: number;
+        ease?: CanvasEase;
+        repeat?: number | "infinite";
+    }
+
+    /** Fields shared by every canvas shape.
+     *
+     *  Give an animated shape an `id` that is unique within its scene. When a bound scene
+     *  changes or the widget is re-mounted, an animation keeps its progress if both its
+     *  `id` and animation specification are unchanged. Changing the specification restarts
+     *  the animation. Without an `id`, Smudgy identifies the animation by the shape's
+     *  position in the scene, so reordering shapes may restart it. */
+    interface CanvasShapeBase {
+        /** Stable identity for this shape's animations across scene rewrites. Must be
+         *  unique among animated shapes within one scene. */
+        id?: string;
+        /** Overall opacity, 0..=1. Default 1. */
+        opacity?: number;
+        /** When used with `animate`, removes the shape after every tween finishes. Later
+         *  writes that still contain the same shape do not display it again. Remove the
+         *  shape from subsequent scene values after a one-shot effect completes. */
+        transient?: boolean;
+    }
+
+    /** A rectangle, optionally rounded. */
+    export interface CanvasRect extends CanvasShapeBase {
+        kind: "rect";
+        x?: number;
+        y?: number;
+        width?: number;
+        height?: number;
+        /** Corner radius. */
+        rx?: number;
+        fill?: CanvasFill;
+        stroke?: CanvasStroke;
+        animate?: Partial<
+            Record<"x" | "y" | "width" | "height" | "rx" | "opacity" | "stroke_width", NumberTween>
+        > & { fill?: ColorTween; stroke?: ColorTween };
+    }
+
+    /** A circle. */
+    export interface CanvasCircle extends CanvasShapeBase {
+        kind: "circle";
+        cx?: number;
+        cy?: number;
+        r?: number;
+        fill?: CanvasFill;
+        stroke?: CanvasStroke;
+        animate?: Partial<
+            Record<"cx" | "cy" | "r" | "opacity" | "stroke_width", NumberTween>
+        > & { fill?: ColorTween; stroke?: ColorTween };
+    }
+
+    /** An axis-aligned ellipse. */
+    export interface CanvasEllipse extends CanvasShapeBase {
+        kind: "ellipse";
+        cx?: number;
+        cy?: number;
+        rx?: number;
+        ry?: number;
+        fill?: CanvasFill;
+        stroke?: CanvasStroke;
+        animate?: Partial<
+            Record<"cx" | "cy" | "rx" | "ry" | "opacity" | "stroke_width", NumberTween>
+        > & { fill?: ColorTween; stroke?: ColorTween };
+    }
+
+    /** A line segment. */
+    export interface CanvasLine extends CanvasShapeBase {
+        kind: "line";
+        x1?: number;
+        y1?: number;
+        x2?: number;
+        y2?: number;
+        stroke?: CanvasStroke;
+        animate?: Partial<
+            Record<"x1" | "y1" | "x2" | "y2" | "opacity" | "stroke_width", NumberTween>
+        > & { stroke?: ColorTween };
+    }
+
+    /** An open run of connected line segments. */
+    export interface CanvasPolyline extends CanvasShapeBase {
+        kind: "polyline";
+        /** The vertices, as `[x, y]` pairs. */
+        points: [number, number][];
+        stroke?: CanvasStroke;
+        animate?: Partial<Record<"opacity" | "stroke_width", NumberTween>> & {
+            stroke?: ColorTween;
+        };
+    }
+
+    /** A closed polygon. */
+    export interface CanvasPolygon extends CanvasShapeBase {
+        kind: "polygon";
+        /** The vertices, as `[x, y]` pairs. The shape closes itself. */
+        points: [number, number][];
+        fill?: CanvasFill;
+        stroke?: CanvasStroke;
+        animate?: Partial<Record<"opacity" | "stroke_width", NumberTween>> & {
+            fill?: ColorTween;
+            stroke?: ColorTween;
+        };
+    }
+
+    /** An arbitrary path in SVG path-data syntax. */
+    export interface CanvasPath extends CanvasShapeBase {
+        kind: "path";
+        /** SVG path data (`M`/`L`/`H`/`V`/`C`/`S`/`Q`/`T`/`A`/`Z`, absolute and relative). */
+        d: string;
+        fill?: CanvasFill;
+        stroke?: CanvasStroke;
+        animate?: Partial<Record<"opacity" | "stroke_width", NumberTween>> & {
+            fill?: ColorTween;
+            stroke?: ColorTween;
+        };
+    }
+
+    /** Text drawn in the canvas.
+     *
+     *  Canvas text is drawn after non-text shapes, regardless of scene order. A later
+     *  rectangle therefore cannot cover earlier text. */
+    export interface CanvasText extends CanvasShapeBase {
+        kind: "text";
+        x?: number;
+        y?: number;
+        /** The text content. */
+        text: string;
+        /** Text size in scene units. Default 16. */
+        size?: number;
+        /** A CSS color string. Default white. */
+        color?: string;
+        /** Which part of the text sits at `x`. Default "left". */
+        align_x?: HorizontalAlign;
+        /** Which part of the text sits at `y`. Default "top". */
+        align_y?: VerticalAlign;
+        /** Font family. Default the UI font. */
+        font?: "default" | "monospace";
+        animate?: Partial<Record<"x" | "y" | "size" | "opacity", NumberTween>> & {
+            color?: ColorTween;
+        };
+    }
+
+    /** A transformed group of shapes. Transform components always apply in the order
+     *  translate, then rotate, then scale, about the group's local origin. */
+    export interface CanvasGroup extends CanvasShapeBase {
+        kind: "group";
+        transform?: {
+            translate?: [number, number];
+            /** Rotation in degrees, clockwise. */
+            rotate?: number;
+            /** A uniform factor, or `[sx, sy]`. */
+            scale?: number | [number, number];
+        };
+        children: CanvasShape[];
+        animate?: Partial<
+            Record<"translate_x" | "translate_y" | "rotate" | "scale", NumberTween>
+        >;
+    }
+
+    /** One record in a canvas scene. Shapes draw in scene order, back to front (except
+     *  text; see {@link CanvasText}). */
+    export type CanvasShape =
+        | CanvasRect
+        | CanvasCircle
+        | CanvasEllipse
+        | CanvasLine
+        | CanvasPolyline
+        | CanvasPolygon
+        | CanvasPath
+        | CanvasText
+        | CanvasGroup;
+
+    /** A pointer event on a canvas, in scene coordinates (the same numbers you draw
+     *  with). `down` and `up` always arrive in pairs; `move` only arrives while a button
+     *  is held, at most once per frame, and the release is delivered even when it happens
+     *  outside the canvas. */
+    export interface CanvasPointerEvent {
+        kind: "down" | "move" | "up";
+        x: number;
+        y: number;
+        button: "left" | "middle" | "right";
+    }
+
+    /** Props for a script-drawn canvas (a leaf; children are ignored).
+     *
+     *  A scene is an array of shape records. When `scene` is a binding, each write to the
+     *  bound path repaints the drawing, including changes to the number or order of shapes.
+     *  Smudgy evaluates declared animations between writes; scripts do not need to submit
+     *  an update for each frame.
+     *
+     *  Smudgy validates the whole scene before displaying it. If the scene exceeds a
+     *  complexity limit or contains duplicate animation IDs, Smudgy reports an error and
+     *  continues displaying the previous valid scene.
+     *
+     *  Drawing is clipped to the canvas bounds, including animated shapes. A canvas without
+     *  `onPointer` does not capture pointer input from content behind it. With a `view_box`,
+     *  a `"fill"`-sized canvas rescales the scene when its pane changes size. Fixed numeric
+     *  dimensions keep a fixed widget size. Without a `view_box`, scene units are pixels. */
+    export interface CanvasProps {
+        /** Default "fill". */
+        width?: Bindable<WidgetLength>;
+        /** Default "fill". */
+        height?: Bindable<WidgetLength>;
+        /** The scene rectangle `[x, y, width, height]` mapped onto the widget's bounds.
+         *  Scene coordinates (and pointer events) then stay resolution-independent.
+         *  Omitted, scene units are pixels. See {@link CanvasProps.fit} for how the
+         *  mapping treats a mismatched aspect ratio. */
+        view_box?: [number, number, number, number];
+        /** How the `view_box` meets the widget bounds when their aspect ratios differ.
+         *  `"fill"` (default) stretches the scene to cover the bounds exactly;
+         *  `"contain"` scales uniformly to the limiting axis and centers, keeping the
+         *  scene's aspect ratio with empty margins (a pointer event in a margin reports
+         *  coordinates outside the `view_box`). Without a `view_box`, `fit` is ignored. */
+        fit?: "fill" | "contain";
+        /** The shapes to draw, in paint order. */
+        scene?: Bindable<CanvasShape[]>;
+        /** Pointer input, in scene coordinates. Omitted, the canvas is display-only. */
+        onPointer?: (event: CanvasPointerEvent) => void;
+        children?: WidgetChildren;
+    }
+
     /** A vertical layout. Children are laid out top-to-bottom. */
     export function Column(props?: ColumnProps, children?: WidgetChildren): SmudgyElement;
     /** A horizontal layout. Children are laid out left-to-right. */
@@ -256,6 +682,18 @@ declare module "smudgy:widgets" {
     export function Button(props?: ButtonProps, children?: WidgetChildren): SmudgyElement;
     /** The map view for the current session. */
     export function MapView(props?: MapViewProps, children?: WidgetChildren): SmudgyElement;
+    /** Draws shape records and runs their declared animations. */
+    export function Canvas(props?: CanvasProps, children?: WidgetChildren): SmudgyElement;
+    /** Empty layout space (use `width="fill"` as a flexible spacer). */
+    export function Space(props?: SpaceProps, children?: WidgetChildren): SmudgyElement;
+    /** A checkbox. Children are the label. */
+    export function Checkbox(props?: CheckboxProps, children?: WidgetChildren): SmudgyElement;
+    /** One radio button; radios sharing a `selected` source form a group. */
+    export function Radio(props: RadioProps, children?: WidgetChildren): SmudgyElement;
+    /** A hover tooltip around its single child. */
+    export function Tooltip(props: TooltipProps, children?: WidgetChildren): SmudgyElement;
+    /** A data table: columns as records, rows as arrays of cells. */
+    export function Table(props: TableProps, children?: WidgetChildren): SmudgyElement;
 
     /** Options for {@link createWidget}. */
     export interface CreateWidgetOptions {
@@ -303,6 +741,12 @@ declare module "smudgy:widgets" {
         TextEditor: typeof TextEditor;
         Button: typeof Button;
         MapView: typeof MapView;
+        Canvas: typeof Canvas;
+        Space: typeof Space;
+        Checkbox: typeof Checkbox;
+        Radio: typeof Radio;
+        Tooltip: typeof Tooltip;
+        Table: typeof Table;
         createWidget: typeof createWidget;
         removeWidget: typeof removeWidget;
         extractMarkdownLinks: typeof extractMarkdownLinks;

@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    Area, AreaId, AreaWithDetails, AtlasId, ExitId, LabelId, CloudError, CloudResult, ShapeId,
+    Area, AreaId, AreaWithDetails, AtlasId, CloudError, CloudResult, ExitId, LabelId, ShapeId,
     SyncRow, backends::CredentialSource,
 };
 
@@ -1038,8 +1038,12 @@ impl CloudApiClient {
         to_user_id: Uuid,
     ) -> CloudResult<TransferView> {
         let body = serde_json::json!({ "to_user_id": to_user_id });
-        self.post(&format!("/areas/{area_id}/transfer"), Some(&body), Auth::Required)
-            .await
+        self.post(
+            &format!("/areas/{area_id}/transfer"),
+            Some(&body),
+            Auth::Required,
+        )
+        .await
     }
 
     /// `POST /atlases/{id}/transfer` — offer to transfer atlas ownership (is_owner-only).
@@ -1052,8 +1056,12 @@ impl CloudApiClient {
         to_user_id: Uuid,
     ) -> CloudResult<TransferView> {
         let body = serde_json::json!({ "to_user_id": to_user_id });
-        self.post(&format!("/atlases/{atlas_id}/transfer"), Some(&body), Auth::Required)
-            .await
+        self.post(
+            &format!("/atlases/{atlas_id}/transfer"),
+            Some(&body),
+            Auth::Required,
+        )
+        .await
     }
 
     /// `GET /transfers?direction=offered|received` — the caller's live offers.
@@ -1216,8 +1224,12 @@ impl CloudApiClient {
     /// [`CloudError::from_status`].
     pub async fn copy_area(&self, area_id: AreaId, request: &CopyAreaRequest) -> CloudResult<Area> {
         let body = serde_json::to_value(request)?;
-        self.post(&format!("/areas/{area_id}/copy"), Some(&body), Auth::Required)
-            .await
+        self.post(
+            &format!("/areas/{area_id}/copy"),
+            Some(&body),
+            Auth::Required,
+        )
+        .await
     }
 
     /// `POST /atlases/{id}/copy` — copies every member the caller can copy

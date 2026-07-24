@@ -19,7 +19,7 @@ use super::state::{
     ExitRecord, FriendStatus, FriendshipRecord, GrantRecord, LabelRecord, MockState,
     RoomPropRecord, RoomRecord, SESSION_PREFIX, SessionRecord, ShapeRecord, UserRecord, gen_token,
 };
-use super::{areas, clone, identity, shares, social, transfers};
+use super::{areas, clone, identity, mutations, shares, social, transfers};
 
 pub type Shared = Arc<Mutex<MockState>>;
 
@@ -163,6 +163,7 @@ fn router(state: Shared) -> Router {
                 .put(areas::update_area)
                 .delete(areas::delete_area),
         )
+        .route("/areas/:area_id/mutations", post(mutations::area_mutations))
         .route("/areas/:area_id/shares", get(shares::area_shares))
         .route("/areas/:area_id/secret-marks", post(clone::secret_marks))
         .route("/areas/:area_id/secrets", get(clone::list_secrets))
@@ -182,14 +183,10 @@ fn router(state: Shared) -> Router {
             "/areas/:area_id/shapes/:shape_id",
             put(areas::update_shape).delete(areas::delete_shape),
         )
-        .route(
-            "/areas/:area_id/exits/:exit_id",
-            put(areas::update_exit).delete(areas::delete_exit),
-        )
-        .route(
-            "/areas/:area_id/rooms/:room_number",
-            delete(areas::delete_room),
-        )
+        // The per-entity exit and room-delete routes are gone from the mock:
+        // on the real server they are thin envelope wrappers over the same
+        // compound appliers, and every client path drives
+        // POST /areas/{id}/mutations (see `mutations.rs`).
         .route(
             "/areas/:area_id/rooms/:room_number/properties/:name",
             put(areas::upsert_room_property).delete(areas::delete_room_property),
@@ -197,10 +194,6 @@ fn router(state: Shared) -> Router {
         .route(
             "/areas/:area_id/rooms/:room_number/tags/:tag",
             put(areas::add_room_tag).delete(areas::remove_room_tag),
-        )
-        .route(
-            "/areas/:area_id/rooms/:room_number/exits",
-            post(areas::create_exit),
         )
         // NOTE the contract's bare room-upsert path: PUT /areas/{id}/{number}
         .route("/areas/:area_id/:room_number", put(areas::upsert_room))
@@ -357,7 +350,14 @@ impl MockHandle {
         );
     }
 
-    /// Direct state poke: add an exit; `to` is `(area, room_number)`.
+    /// Direct state poke: add an exit; `to` is `(area, room_number)`. The
+    /// exit attaches to a Connection through the same server-style rules as
+    /// the mutation endpoint (auto-pair the unique reciprocal one-member
+    /// candidate, else a fresh one-member Connection), so seeded state
+    /// always satisfies the v2 membership invariants. NOTE the §6 closure
+    /// consequence: a reciprocal seed pair forms ONE Connection, so one
+    /// secret member hides BOTH exits from an uncleared viewer — seed
+    /// non-reciprocal shapes when a fixture needs them redacted separately.
     pub fn add_exit(
         &self,
         area: AreaId,
@@ -368,6 +368,19 @@ impl MockHandle {
     ) -> Uuid {
         let mut st = self.state.lock();
         let id = Uuid::new_v4();
+        let connection_id = super::connections::attach_for_new_exit(
+            &mut st.areas,
+            area.0,
+            &super::connections::NewExitLink {
+                from_room,
+                from_direction: direction.to_string(),
+                to_area_id: to.map(|(a, _)| a.0),
+                to_room_number: to.map(|(_, n)| n),
+                to_direction: None,
+                is_secret,
+            },
+            true, // direct pokes are owner-level setup
+        );
         let area = st.areas.get_mut(&area.0).expect("area exists");
         area.exits.push(ExitRecord {
             id,
@@ -382,8 +395,7 @@ impl MockHandle {
             is_locked: false,
             weight: 1.0,
             command: String::new(),
-            style: "Normal".to_string(),
-            color: String::new(),
+            connection_id,
             is_secret,
         });
         id
@@ -538,6 +550,27 @@ impl MockHandle {
     pub fn bump_rev(&self, area: AreaId) {
         let mut st = self.state.lock();
         st.bump(Some(area.0), true, false);
+    }
+
+    /// Queue N compound-mutation responses to be dropped: each affected
+    /// request is processed normally (committed, receipt stored) but the
+    /// caller receives a 500 in place of the success body — a lost response
+    /// on an applied mutation, for transport-retry/receipt-dedupe tests.
+    pub fn drop_next_mutation_responses(&self, n: u32) {
+        self.state.lock().drop_mutation_responses = n;
+    }
+
+    /// Every mutation envelope the compound endpoint accepted, in arrival
+    /// order: `(operation_id, replayed_from_receipt)`.
+    pub fn mutation_requests(&self) -> Vec<(Uuid, bool)> {
+        self.state.lock().mutation_log.clone()
+    }
+
+    /// The current dual revision counters of an area: `(rev, public_rev)`.
+    pub fn area_revs(&self, area: AreaId) -> (i64, i64) {
+        let st = self.state.lock();
+        let area = st.areas.get(&area.0).expect("area exists");
+        (area.rev, area.public_rev)
     }
 
     /// Fish the latest UNCONSUMED one-time code for `email` out of state —

@@ -48,18 +48,37 @@ impl AutomationsWindow {
 
         // Stat cards.
         let cards = row![
-            stat_card("Active", stats.active, NodeStatus::Ok, Message::ShowDashboard),
+            stat_card(
+                "Active",
+                stats.active,
+                NodeStatus::Ok,
+                Message::ShowDashboard
+            ),
             stat_card(
                 "Errors",
                 stats.errors,
-                if stats.errors > 0 { NodeStatus::Error } else { NodeStatus::Disabled },
+                if stats.errors > 0 {
+                    NodeStatus::Error
+                } else {
+                    NodeStatus::Disabled
+                },
                 stats
                     .first_error
                     .clone()
                     .map_or(Message::ShowDashboard, Message::SelectScript),
             ),
-            stat_card("Disabled", stats.disabled, NodeStatus::Disabled, Message::ShowDashboard),
-            stat_card("Packages", stats.packages, NodeStatus::Ok, Message::SelectChip(Chip::Packages)),
+            stat_card(
+                "Disabled",
+                stats.disabled,
+                NodeStatus::Disabled,
+                Message::ShowDashboard
+            ),
+            stat_card(
+                "Packages",
+                stats.packages,
+                NodeStatus::Ok,
+                Message::SelectChip(Chip::Packages)
+            ),
         ]
         .spacing(12.0);
 
@@ -73,7 +92,11 @@ impl AutomationsWindow {
                 create_tile(bootstrap_icons::DPAD, "Hotkey", Message::NewHotkey),
                 create_tile(bootstrap_icons::FOLDER_PLUS, "Folder", Message::NewFolder),
                 create_tile(bootstrap_icons::FONTS, "Module", Message::NewModule),
-                create_tile(bootstrap_icons::BOUNDING_BOX, "Package", Message::NewPackage),
+                create_tile(
+                    bootstrap_icons::BOUNDING_BOX,
+                    "Package",
+                    Message::NewPackage
+                ),
                 palette_tile(),
             ])
             .spacing(10.0, 10.0),
@@ -277,7 +300,10 @@ fn tile_surface(theme: &crate::theme::Theme, fill: iced::Color) -> iced::widget:
 }
 
 /// A card-styled button (used for stat cards + create tiles).
-fn card_button_style(theme: &crate::theme::Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
+fn card_button_style(
+    theme: &crate::theme::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
     use iced::widget::button::Status;
     let base = theme.styles.general.container_background;
     let bg = match status {

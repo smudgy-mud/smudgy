@@ -41,12 +41,11 @@ pub const DIRECTIONS: [&str; 14] = [
     "Special",
     "Other",
 ];
-pub const STYLES: [&str; 5] = ["Normal", "Dashed", "Dotted", "Meandering", "Stub"];
 pub const SHAPE_TYPES: [&str; 2] = ["Rectangle", "RoundedRectangle"];
 pub const H_ALIGN: [&str; 3] = ["Left", "Center", "Right"];
 pub const V_ALIGN: [&str; 3] = ["Top", "Center", "Bottom"];
 
-fn check_enum(value: &str, allowed: &[&str], what: &str) -> Result<(), Response> {
+pub fn check_enum(value: &str, allowed: &[&str], what: &str) -> Result<(), Response> {
     if allowed.contains(&value) {
         Ok(())
     } else {
@@ -56,7 +55,7 @@ fn check_enum(value: &str, allowed: &[&str], what: &str) -> Result<(), Response>
 
 /// `Option<Option<T>>` body fields: key omitted = `None`, `null` =
 /// `Some(None)`, value = `Some(Some(v))`. Pair with `#[serde(default)]`.
-fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+pub fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,
@@ -65,11 +64,13 @@ where
 }
 
 /// Caps for a write/read on an existing area; uniform 404 when absent.
-fn require_caps(st: &MockState, viewer: Uuid, area_id: Uuid) -> Result<Caps, Response> {
+pub fn require_caps(st: &MockState, viewer: Uuid, area_id: Uuid) -> Result<Caps, Response> {
     st.caps(viewer, area_id).ok_or_else(not_found)
 }
 
-fn embedded_exit_json(e: &ExitRecord) -> Value {
+/// The `EmbeddedExit` echo shape of the v2 contract: `connection_id`
+/// instead of the retired per-exit style/color.
+pub fn embedded_exit_json(e: &ExitRecord) -> Value {
     json!({
         "id": e.id,
         "from_direction": e.from_direction,
@@ -82,12 +83,11 @@ fn embedded_exit_json(e: &ExitRecord) -> Value {
         "is_locked": e.is_locked,
         "weight": e.weight,
         "command": e.command,
-        "style": e.style,
-        "color": e.color,
+        "connection_id": e.connection_id,
     })
 }
 
-fn embedded_label_json(l: &LabelRecord) -> Value {
+pub fn embedded_label_json(l: &LabelRecord) -> Value {
     json!({
         "id": l.id,
         "level": l.level,
@@ -105,7 +105,7 @@ fn embedded_label_json(l: &LabelRecord) -> Value {
     })
 }
 
-fn embedded_shape_json(s: &ShapeRecord) -> Value {
+pub fn embedded_shape_json(s: &ShapeRecord) -> Value {
     json!({
         "id": s.id,
         "level": s.level,
@@ -598,85 +598,6 @@ pub async fn upsert_room(
     }))
 }
 
-/// DELETE /areas/{id}/rooms/{room_number} — nulls inbound exits; a secret
-/// room's deletion suppresses ALL public_rev bumps in the transaction.
-pub async fn delete_room(
-    State(state): State<Shared>,
-    Path((raw_id, raw_room)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Response {
-    let area_id = match parse_area_id(&raw_id) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let Ok(room_number) = raw_room.parse::<i32>() else {
-        return bad_request(&format!("Invalid room number: {raw_room}"));
-    };
-    let mut st = state.lock();
-    let (viewer, _) = match authenticate(&st, &headers) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let caps = match require_caps(&st, viewer, area_id) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    if !caps.can_edit {
-        return not_found();
-    }
-
-    let Some(room_secret) = st
-        .areas
-        .get(&area_id)
-        .and_then(|a| a.rooms.get(&room_number))
-        .map(|r| r.is_secret)
-    else {
-        return err(404, "Room not found");
-    };
-    let suppress = room_secret;
-
-    // 1. Null inbound exits' destinations (any area), bumping per trigger.
-    let mut inbound: Vec<(Uuid, bool)> = Vec::new();
-    for other in st.areas.values_mut() {
-        for exit in &mut other.exits {
-            if exit.to_area_id == Some(area_id) && exit.to_room_number == Some(room_number) {
-                inbound.push((other.id, exit.is_secret));
-                exit.to_area_id = None;
-                exit.to_room_number = None;
-                exit.to_direction = None;
-            }
-        }
-    }
-    for (host, secret) in inbound {
-        // From-side bump (unchanged secrecy) + old-to-side bump on this area.
-        st.bump(Some(host), !secret, suppress);
-        st.bump(Some(area_id), !secret, suppress);
-    }
-
-    // 2. Cascade deletes: room properties + outbound exits, then the room.
-    let area = st.areas.get_mut(&area_id).expect("area exists");
-    let room = area.rooms.remove(&room_number).expect("room exists");
-    let mut bumps: Vec<(Option<Uuid>, bool)> = Vec::new();
-    for prop in room.properties.values() {
-        bumps.push((Some(area_id), !prop.is_secret));
-    }
-    let mut kept = Vec::with_capacity(area.exits.len());
-    for exit in std::mem::take(&mut area.exits) {
-        if exit.from_room_number == room_number {
-            bumps.push((Some(area_id), !exit.is_secret));
-            bumps.push((exit.to_area_id, !exit.is_secret));
-        } else {
-            kept.push(exit);
-        }
-    }
-    area.exits = kept;
-    bumps.push((Some(area_id), !room.is_secret));
-    for (target, public) in bumps {
-        st.bump(target, public, suppress);
-    }
-    ok(Value::Null)
-}
-
 // ---------------------------------------------------------------------------
 // Room properties
 // ---------------------------------------------------------------------------
@@ -871,406 +792,13 @@ pub async fn remove_room_tag(
 }
 
 // ---------------------------------------------------------------------------
-// Exits — destination matrix
+// Exits: the legacy per-entity exit routes are gone from the mock. On the
+// real server they became thin envelope wrappers over the same compound
+// appliers (`handlers.rs` parses a MutationEnvelope and forwards to
+// `AreaMutation::{CreateExit, UpdateExit, DeleteExit}`), and every client
+// path drives `POST /areas/{id}/mutations` directly — which is where the
+// mock's v2 Connection semantics live (`mutations.rs`).
 // ---------------------------------------------------------------------------
-
-/// The destination matrix: viewable target, link-or-placeholder, the bounded
-/// secret-room 409 oracle. Creates the target placeholder when permitted.
-fn resolve_exit_destination(
-    st: &mut MockState,
-    host_area: Uuid,
-    host_cleared: bool,
-    viewer: Uuid,
-    to_area_id: Uuid,
-    to_room_number: Option<i32>,
-) -> Result<(), Response> {
-    let caps = st.caps(viewer, to_area_id).unwrap_or(Caps::NONE);
-    let same_area = to_area_id == host_area;
-    let target_cleared = if same_area {
-        host_cleared
-    } else {
-        caps.see_secrets()
-    };
-
-    if !same_area && !caps.can_view {
-        return Err(not_found());
-    }
-    let Some(to_room) = to_room_number else {
-        return Ok(());
-    };
-
-    let existing_secret = st
-        .areas
-        .get(&to_area_id)
-        .and_then(|a| a.rooms.get(&to_room))
-        .map(|r| r.is_secret);
-    match existing_secret {
-        Some(secret) => {
-            if secret && !target_cleared {
-                // 409 only for callers who can edit the target; view-only
-                // callers get the uniform 404 (no secret-room oracle).
-                if same_area || caps.can_edit {
-                    return Err(err(409, "room number unavailable"));
-                }
-                return Err(not_found());
-            }
-            Ok(())
-        }
-        None => {
-            if !same_area && !caps.can_edit {
-                return Err(not_found());
-            }
-            let inserted = match st.areas.get_mut(&to_area_id) {
-                Some(area) => {
-                    area.rooms
-                        .insert(to_room, RoomRecord::placeholder(to_room));
-                    true
-                }
-                None => false,
-            };
-            if inserted {
-                st.bump(Some(to_area_id), true, false);
-            }
-            Ok(())
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct CreateExitRequest {
-    from_direction: String,
-    to_area_id: Option<Uuid>,
-    to_room_number: Option<i32>,
-    to_direction: Option<String>,
-    path: Option<String>,
-    is_hidden: bool,
-    is_closed: bool,
-    is_locked: bool,
-    weight: f32,
-    command: Option<String>,
-    style: Option<String>,
-    color: Option<String>,
-    is_secret: Option<bool>,
-}
-
-/// POST /areas/{id}/rooms/{room_number}/exits
-pub async fn create_exit(
-    State(state): State<Shared>,
-    Path((raw_id, raw_room)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
-    let area_id = match parse_area_id(&raw_id) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let Ok(room_number) = raw_room.parse::<i32>() else {
-        return bad_request(&format!("Invalid room number: {raw_room}"));
-    };
-    let mut st = state.lock();
-    let (viewer, _) = match authenticate(&st, &headers) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let req: CreateExitRequest = match parse_body(&body) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    if let Err(e) = check_enum(&req.from_direction, &DIRECTIONS, "direction") {
-        return e;
-    }
-    if let Some(d) = &req.to_direction
-        && let Err(e) = check_enum(d, &DIRECTIONS, "direction")
-    {
-        return e;
-    }
-    if let Some(s) = &req.style
-        && let Err(e) = check_enum(s, &STYLES, "style")
-    {
-        return e;
-    }
-    let caps = match require_caps(&st, viewer, area_id) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    if !caps.can_edit {
-        return not_found();
-    }
-    let host_cleared = caps.cleared();
-    if req.is_secret.is_some() && !host_cleared {
-        return not_found();
-    }
-
-    if let Some(to_area_id) = req.to_area_id
-        && let Err(e) = resolve_exit_destination(
-            &mut st,
-            area_id,
-            host_cleared,
-            viewer,
-            to_area_id,
-            req.to_room_number,
-        )
-    {
-        return e;
-    }
-
-    // From-room placeholder (always allowed — caller can edit the host).
-    let from_room_created = {
-        let area = st.areas.get_mut(&area_id).expect("area exists");
-        match area.rooms.entry(room_number) {
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(RoomRecord::placeholder(room_number));
-                true
-            }
-            std::collections::btree_map::Entry::Occupied(_) => false,
-        }
-    };
-    if from_room_created {
-        st.bump(Some(area_id), true, false);
-    }
-
-    let exit = ExitRecord {
-        id: Uuid::new_v4(),
-        from_room_number: room_number,
-        from_direction: req.from_direction,
-        to_area_id: req.to_area_id,
-        to_room_number: req.to_room_number,
-        to_direction: req.to_direction,
-        path: req.path.unwrap_or_default(),
-        is_hidden: req.is_hidden,
-        is_closed: req.is_closed,
-        is_locked: req.is_locked,
-        weight: req.weight,
-        command: req.command.unwrap_or_default(),
-        style: req.style.unwrap_or_else(|| "Normal".to_string()),
-        color: req.color.unwrap_or_default(),
-        is_secret: req.is_secret.unwrap_or(false),
-    };
-    let response = embedded_exit_json(&exit);
-    let exit_secret = exit.is_secret;
-    let to_area = exit.to_area_id;
-    st.areas
-        .get_mut(&area_id)
-        .expect("area exists")
-        .exits
-        .push(exit);
-    // INSERT trigger: bump from-area AND to-area (each with its predicate).
-    st.bump(Some(area_id), !exit_secret, false);
-    st.bump(to_area, !exit_secret, false);
-    created(response)
-}
-
-#[derive(Deserialize)]
-struct UpdateExitRequest {
-    from_direction: Option<String>,
-    to_area_id: Option<Uuid>,
-    to_room_number: Option<i32>,
-    to_direction: Option<String>,
-    path: Option<String>,
-    is_hidden: Option<bool>,
-    is_closed: Option<bool>,
-    is_locked: Option<bool>,
-    weight: Option<f32>,
-    command: Option<String>,
-    style: Option<String>,
-    color: Option<String>,
-    is_secret: Option<bool>,
-    clear_to: Option<bool>,
-}
-
-/// PUT /areas/{id}/exits/{exit_id} — COALESCE semantics; `clear_to` nulls and
-/// wins; destination changes re-resolve through the matrix; touching an
-/// already-secret exit requires clearance.
-pub async fn update_exit(
-    State(state): State<Shared>,
-    Path((raw_id, raw_exit)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
-    let area_id = match parse_area_id(&raw_id) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let Ok(exit_id) = Uuid::parse_str(&raw_exit) else {
-        return bad_request(&format!("Invalid exit ID: {raw_exit}"));
-    };
-    let mut st = state.lock();
-    let (viewer, _) = match authenticate(&st, &headers) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let req: UpdateExitRequest = match parse_body(&body) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    if let Some(d) = &req.from_direction
-        && let Err(e) = check_enum(d, &DIRECTIONS, "direction")
-    {
-        return e;
-    }
-    if let Some(d) = &req.to_direction
-        && let Err(e) = check_enum(d, &DIRECTIONS, "direction")
-    {
-        return e;
-    }
-    if let Some(s) = &req.style
-        && let Err(e) = check_enum(s, &STYLES, "style")
-    {
-        return e;
-    }
-    let caps = match require_caps(&st, viewer, area_id) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    if !caps.can_edit {
-        return not_found();
-    }
-    let host_cleared = caps.cleared();
-
-    let Some(current) = st
-        .areas
-        .get(&area_id)
-        .and_then(|a| a.exits.iter().find(|e| e.id == exit_id))
-        .cloned()
-    else {
-        return not_found();
-    };
-    if req.is_secret.is_some() && !host_cleared {
-        return not_found();
-    }
-    if current.is_secret && !host_cleared {
-        return not_found();
-    }
-
-    let clear_to = req.clear_to.unwrap_or(false);
-    let (new_to_area, new_to_room) = if clear_to {
-        (None, None)
-    } else {
-        (
-            req.to_area_id.or(current.to_area_id),
-            req.to_room_number.or(current.to_room_number),
-        )
-    };
-    let destination_changed =
-        clear_to || req.to_area_id.is_some() || req.to_room_number.is_some();
-
-    if destination_changed
-        && let Some(to_area_id) = new_to_area
-        && let Err(e) = resolve_exit_destination(
-            &mut st,
-            area_id,
-            host_cleared,
-            viewer,
-            to_area_id,
-            new_to_room,
-        )
-    {
-        return e;
-    }
-
-    let old_to_area = current.to_area_id;
-    let old_secret = current.is_secret;
-    let updated = {
-        let area = st.areas.get_mut(&area_id).expect("area exists");
-        let exit = area
-            .exits
-            .iter_mut()
-            .find(|e| e.id == exit_id)
-            .expect("exit exists");
-        if let Some(d) = req.from_direction {
-            exit.from_direction = d;
-        }
-        if clear_to {
-            exit.to_area_id = None;
-            exit.to_room_number = None;
-            exit.to_direction = None;
-        } else {
-            if let Some(a) = req.to_area_id {
-                exit.to_area_id = Some(a);
-            }
-            if let Some(r) = req.to_room_number {
-                exit.to_room_number = Some(r);
-            }
-            if let Some(d) = req.to_direction {
-                exit.to_direction = Some(d);
-            }
-        }
-        if let Some(p) = req.path {
-            exit.path = p;
-        }
-        if let Some(v) = req.is_hidden {
-            exit.is_hidden = v;
-        }
-        if let Some(v) = req.is_closed {
-            exit.is_closed = v;
-        }
-        if let Some(v) = req.is_locked {
-            exit.is_locked = v;
-        }
-        if let Some(v) = req.weight {
-            exit.weight = v;
-        }
-        if let Some(c) = req.command {
-            exit.command = c;
-        }
-        if let Some(s) = req.style {
-            exit.style = s;
-        }
-        if let Some(c) = req.color {
-            exit.color = c;
-        }
-        if let Some(s) = req.is_secret {
-            exit.is_secret = s;
-        }
-        exit.clone()
-    };
-
-    // UPDATE trigger: from-side bump; to-side per old/new target.
-    let new_secret = updated.is_secret;
-    st.bump(Some(area_id), !(old_secret && new_secret), false);
-    if old_to_area == updated.to_area_id {
-        st.bump(updated.to_area_id, !(old_secret && new_secret), false);
-    } else {
-        st.bump(old_to_area, !old_secret, false);
-        st.bump(updated.to_area_id, !new_secret, false);
-    }
-    ok(embedded_exit_json(&updated))
-}
-
-/// DELETE /areas/{id}/exits/{exit_id}
-pub async fn delete_exit(
-    State(state): State<Shared>,
-    Path((raw_id, raw_exit)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Response {
-    let area_id = match parse_area_id(&raw_id) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let Ok(exit_id) = Uuid::parse_str(&raw_exit) else {
-        return bad_request(&format!("Invalid exit ID: {raw_exit}"));
-    };
-    let mut st = state.lock();
-    let (viewer, _) = match authenticate(&st, &headers) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let caps = match require_caps(&st, viewer, area_id) {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    if !caps.can_edit {
-        return not_found();
-    }
-    let area = st.areas.get_mut(&area_id).expect("area exists");
-    let Some(idx) = area.exits.iter().position(|e| e.id == exit_id) else {
-        return err(404, "Exit not found");
-    };
-    let exit = area.exits.remove(idx);
-    st.bump(Some(area_id), !exit.is_secret, false);
-    st.bump(exit.to_area_id, !exit.is_secret, false);
-    ok(Value::Null)
-}
 
 // ---------------------------------------------------------------------------
 // Labels

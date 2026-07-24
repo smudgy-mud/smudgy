@@ -769,9 +769,7 @@ mod tests {
             },
             0.7,
         );
-        let (conf, _) = layout
-            .build(Size::new(800.0, 600.0), SPACING, MIN)
-            .unwrap();
+        let (conf, _) = layout.build(Size::new(800.0, 600.0), SPACING, MIN).unwrap();
         let (mut ratios, mut leaves) = (Vec::new(), Vec::new());
         flatten(&conf, &mut ratios, &mut leaves);
         assert!((ratios[1] - 0.7).abs() < 1e-6, "{ratios:?}");
@@ -885,7 +883,11 @@ mod tests {
         assert_eq!(ratios.len(), 1, "no top-level divider for one cluster");
 
         // Nothing visible: nothing to build. The model itself is untouched.
-        assert!(layout.build_filtered(AREA, SPACING, MIN, |_| false).is_none());
+        assert!(
+            layout
+                .build_filtered(AREA, SPACING, MIN, |_| false)
+                .is_none()
+        );
         let (_, leaves) = built(&layout);
         assert_eq!(leaves, vec![A_MAIN, A_NOTES, B_MAIN, B_NOTES]);
     }

@@ -1,4 +1,4 @@
-//! The host-side MSDP **producer** (`docs/gmcp-mapping-plan.md` §9 item 3): the
+//! The host-side MSDP **producer** (`docs/gmcp-mapping.md` §9 item 3): the
 //! session-thread half that turns inbound MSDP subnegotiations into session-store writes
 //! under the `msdp` platform producer and catalogues each variable for the automations
 //! window's Store tab. The wire half (decoding, framing, the handshake) is

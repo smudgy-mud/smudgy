@@ -45,6 +45,11 @@ impl<Theme, Renderer> Clone for Entry<'_, Theme, Renderer> {
 pub struct WidgetRoot<'a, Theme, Renderer> {
     inner: Arc<ArcSwap<Inner<'a, Theme, Renderer>>>,
     tx: Arc<tokio::sync::watch::Sender<()>>,
+    /// Map-entry GC queue, shared with every map render closure this root's
+    /// widgets hold (see [`crate::map::MapReaper`]). It lives on the root
+    /// because the root is the one handle both the build ops (script thread)
+    /// and the rendering session store (UI thread) already share.
+    map_reaper: crate::map::MapReaper,
 }
 
 impl<Theme, Renderer> std::fmt::Debug for WidgetRoot<'_, Theme, Renderer> {
@@ -107,6 +112,7 @@ impl<Theme, Renderer> Clone for WidgetRoot<'_, Theme, Renderer> {
         Self {
             inner: self.inner.clone(),
             tx: self.tx.clone(),
+            map_reaper: self.map_reaper.clone(),
         }
     }
 }
@@ -143,7 +149,15 @@ where
                 elements: BTreeMap::new(),
             })),
             tx: Arc::new(tx),
+            map_reaper: crate::map::MapReaper::default(),
         }
+    }
+
+    /// The map-entry GC queue shared between this root's build ops and the
+    /// session store that renders it.
+    #[must_use]
+    pub fn map_reaper(&self) -> &crate::map::MapReaper {
+        &self.map_reaper
     }
 
     pub fn subscription<SubMessage: std::hash::Hash + Copy + Send + 'static>(
@@ -322,14 +336,23 @@ where
         let inner = self.inner.load();
         let shown: Vec<_> = inner
             .elements
-            .values()
-            .filter(|e| e.enabled && filter(e.target))
+            .iter()
+            .filter(|(_, e)| e.enabled && filter(e.target))
             .collect();
         if shown.is_empty() {
             iced::widget::column(vec![]).into()
         } else {
-            iced::widget::stack(shown.iter().map(|e| container((e.element)()).class(class()).into()))
+            // Instrumented: with iced's `debug` feature on (smudgy_ui's `iced-debug`),
+            // the whole pass and each mounted widget's element build show up as custom
+            // spans in comet ("widgets view" / "widget <name>"). No-ops otherwise.
+            iced_debug::time_with("widgets view", || {
+                iced::widget::stack(shown.iter().map(|((_, name), e)| {
+                    iced_debug::time_with(format!("widget {name}"), || {
+                        container((e.element)()).class(class()).into()
+                    })
+                }))
                 .into()
+            })
         }
     }
 }

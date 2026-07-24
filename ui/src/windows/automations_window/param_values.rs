@@ -112,11 +112,7 @@ pub fn seed(spec: &PackageParameter, stored: Option<&Value>) -> ParamValueState 
             let element = spec.fields.first();
             let items = stored
                 .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .map(|v| seed_scalar(element, Some(v)))
-                        .collect()
-                })
+                .map(|arr| arr.iter().map(|v| seed_scalar(element, Some(v))).collect())
                 .unwrap_or_default();
             ParamValueState::List(items)
         }
@@ -148,9 +144,7 @@ fn seed_scalar(spec: Option<&PackageParameter>, stored: Option<&Value>) -> Param
         Some(ParamKind::Bool) => {
             ParamValueState::Bool(stored.and_then(Value::as_bool).unwrap_or(false))
         }
-        Some(ParamKind::Dropdown) => {
-            ParamValueState::Choice(seed_choice(spec.unwrap(), stored))
-        }
+        Some(ParamKind::Dropdown) => ParamValueState::Choice(seed_choice(spec.unwrap(), stored)),
         _ => ParamValueState::Text(stored.map(scalar_text).unwrap_or_default()),
     }
 }
@@ -161,7 +155,12 @@ fn seed_choice(spec: &PackageParameter, stored: Option<&Value>) -> Option<String
     stored
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(|| spec.default.as_ref().and_then(Value::as_str).map(str::to_string))
+        .or_else(|| {
+            spec.default
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .filter(|v| spec.options.iter().any(|o| &o.value == v))
 }
 
@@ -238,7 +237,9 @@ fn scalar_to_json(
                     && !spec.options.is_empty()
                     && !spec.options.iter().any(|o| &o.value == value)
                 {
-                    return Err(format!("\u{201c}{value}\u{201d} is not one of the choices."));
+                    return Err(format!(
+                        "\u{201c}{value}\u{201d} is not one of the choices."
+                    ));
                 }
                 Ok(Some(Value::String(value.clone())))
             }
@@ -270,7 +271,11 @@ pub(super) fn parse_number(text: &str) -> Result<Value, String> {
         Ok(Value::Number(int.into()))
     } else if let Ok(uint) = text.parse::<u64>() {
         Ok(Value::Number(uint.into()))
-    } else if let Some(num) = text.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+    } else if let Some(num) = text
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+    {
         Ok(Value::Number(num))
     } else {
         Err("must be a number.".to_string())
@@ -354,7 +359,9 @@ fn apply_scalar(state: &mut ParamValueState, edit: ScalarEdit) {
 
 /// A fresh, empty state for a list element (honoring a scalar default for bool/dropdown).
 fn fresh_element(spec: &PackageParameter) -> ParamValueState {
-    spec.fields.first().map_or(ParamValueState::Text(String::new()), fresh_scalar)
+    spec.fields
+        .first()
+        .map_or(ParamValueState::Text(String::new()), fresh_scalar)
 }
 
 /// A fresh, empty row: one fresh scalar per declared column.
@@ -365,9 +372,12 @@ fn fresh_row(spec: &PackageParameter) -> Vec<ParamValueState> {
 /// A fresh, empty scalar state for `spec`'s kind (a bool/dropdown honoring its declared default).
 fn fresh_scalar(spec: &PackageParameter) -> ParamValueState {
     match spec.kind {
-        ParamKind::Bool => {
-            ParamValueState::Bool(spec.default.as_ref().and_then(Value::as_bool).unwrap_or(false))
-        }
+        ParamKind::Bool => ParamValueState::Bool(
+            spec.default
+                .as_ref()
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
         ParamKind::Dropdown => ParamValueState::Choice(
             spec.default
                 .as_ref()
@@ -421,7 +431,10 @@ pub fn view<'a>(
     match (spec.kind, state) {
         (ParamKind::List, ParamValueState::List(items)) => list_block(&label, spec, items, target),
         (ParamKind::Table, ParamValueState::Table(rows)) => table_block(&label, spec, rows, target),
-        _ => labelled_row(label, scalar_control(spec, state, target, &spec.key, Sink::Top)),
+        _ => labelled_row(
+            label,
+            scalar_control(spec, state, target, &spec.key, Sink::Top),
+        ),
     }
 }
 
@@ -498,7 +511,10 @@ fn choice_control<'a>(
     let clearable = !matches!(sink, Sink::Top) || !cell.required;
     let mut choices = Vec::with_capacity(cell.options.len() + usize::from(clearable));
     if clearable {
-        choices.push(Choice { value: String::new(), label: "(none)".to_string() });
+        choices.push(Choice {
+            value: String::new(),
+            label: "(none)".to_string(),
+        });
     }
     for option in &cell.options {
         choices.push(Choice {
@@ -541,14 +557,19 @@ fn list_block<'a>(
     target: ParamTarget,
 ) -> Elem<'a> {
     let element = spec.fields.first();
-    let mut col = Column::new().spacing(6.0).push(text(label.to_string()).size(13.0));
+    let mut col = Column::new()
+        .spacing(6.0)
+        .push(text(label.to_string()).size(13.0));
     if items.is_empty() {
         col = col.push(text("No entries.").size(12.0).style(common::faint));
     }
     for (i, item) in items.iter().enumerate() {
         let control: Elem<'a> = match element {
             Some(element) => scalar_control(element, item, target, &spec.key, Sink::List(i)),
-            None => text("(no element type declared)").size(12.0).style(common::faint).into(),
+            None => text("(no element type declared)")
+                .size(12.0)
+                .style(common::faint)
+                .into(),
         };
         col = col.push(
             row![
@@ -570,7 +591,11 @@ fn list_block<'a>(
         "Add entry",
         edit_msg(target, &spec.key, ParamValueEdit::ListAdd),
     ));
-    container(col).padding(12.0).width(Length::Fill).style(common::banner_style).into()
+    container(col)
+        .padding(12.0)
+        .width(Length::Fill)
+        .style(common::banner_style)
+        .into()
 }
 
 /// A `Table` block: its label, a column-header row, one row per data row (a cell control per column
@@ -581,11 +606,17 @@ fn table_block<'a>(
     rows: &'a [Vec<ParamValueState>],
     target: ParamTarget,
 ) -> Elem<'a> {
-    let mut col = Column::new().spacing(6.0).push(text(label.to_string()).size(13.0));
+    let mut col = Column::new()
+        .spacing(6.0)
+        .push(text(label.to_string()).size(13.0));
 
     if spec.fields.is_empty() {
         col = col.push(text("No columns declared.").size(12.0).style(common::faint));
-        return container(col).padding(12.0).width(Length::Fill).style(common::banner_style).into();
+        return container(col)
+            .padding(12.0)
+            .width(Length::Fill)
+            .style(common::banner_style)
+            .into();
     }
 
     // Column headers, aligned with the per-row cells; a trailing gap reserves the action buttons'
@@ -594,8 +625,13 @@ fn table_block<'a>(
     for field in &spec.fields {
         let name = field.label.as_deref().unwrap_or(&field.key);
         header = header.push(
-            container(text(name.to_string()).size(11.0).font(fonts::GEIST_VF).style(common::muted))
-                .width(Length::Fill),
+            container(
+                text(name.to_string())
+                    .size(11.0)
+                    .font(fonts::GEIST_VF)
+                    .style(common::muted),
+            )
+            .width(Length::Fill),
         );
     }
     header = header.push(container(text("")).width(Length::Fixed(ROW_ACTIONS_WIDTH)));
@@ -628,7 +664,11 @@ fn table_block<'a>(
         "Add row",
         edit_msg(target, &spec.key, ParamValueEdit::TableAddRow),
     ));
-    container(col).padding(12.0).width(Length::Fill).style(common::banner_style).into()
+    container(col)
+        .padding(12.0)
+        .width(Length::Fill)
+        .style(common::banner_style)
+        .into()
 }
 
 /// The reserved width of a row's two action buttons (insert + remove) plus their spacing, so table
@@ -637,18 +677,29 @@ const ROW_ACTIONS_WIDTH: f32 = 72.0;
 
 /// A small square icon button used for a row's insert/remove actions.
 fn row_icon_button<'a>(glyph: &str, msg: Message) -> Elem<'a> {
-    button(text(glyph.to_string()).font(fonts::BOOTSTRAP_ICONS).size(13.0))
-        .style(button_style::secondary)
-        .on_press(msg)
-        .padding(Padding { top: 6.0, bottom: 6.0, left: 8.0, right: 8.0 })
-        .into()
+    button(
+        text(glyph.to_string())
+            .font(fonts::BOOTSTRAP_ICONS)
+            .size(13.0),
+    )
+    .style(button_style::secondary)
+    .on_press(msg)
+    .padding(Padding {
+        top: 6.0,
+        bottom: 6.0,
+        left: 8.0,
+        right: 8.0,
+    })
+    .into()
 }
 
 /// A small secondary "＋ Add …" button (matches the manifest editor's add buttons).
 fn add_button<'a>(label: &str, msg: Message) -> Elem<'a> {
     button(
         row![
-            text(bootstrap_icons::PLUS_LG).font(fonts::BOOTSTRAP_ICONS).size(11.0),
+            text(bootstrap_icons::PLUS_LG)
+                .font(fonts::BOOTSTRAP_ICONS)
+                .size(11.0),
             text(label.to_string()).size(12.0),
         ]
         .spacing(6.0)
@@ -694,10 +745,18 @@ mod tests {
         let mut state = seed(&spec, Some(&json!(3)));
         assert_eq!(to_json(&spec, &state).unwrap(), Some(json!(3)));
         // A half-typed buffer is allowed in-state but errors on project.
-        apply(&spec, &mut state, ParamValueEdit::Scalar(ScalarEdit::Text("x".to_string())));
+        apply(
+            &spec,
+            &mut state,
+            ParamValueEdit::Scalar(ScalarEdit::Text("x".to_string())),
+        );
         assert!(to_json(&spec, &state).is_err());
         // Cleared -> unset.
-        apply(&spec, &mut state, ParamValueEdit::Scalar(ScalarEdit::Text("  ".to_string())));
+        apply(
+            &spec,
+            &mut state,
+            ParamValueEdit::Scalar(ScalarEdit::Text("  ".to_string())),
+        );
         assert_eq!(to_json(&spec, &state).unwrap(), None);
     }
 
@@ -705,11 +764,20 @@ mod tests {
     fn dropdown_validates_against_options() {
         let mut spec = scalar("mode", ParamKind::Dropdown);
         spec.options = vec![
-            ParamOption { value: "a".to_string(), label: None },
-            ParamOption { value: "b".to_string(), label: Some("Bee".to_string()) },
+            ParamOption {
+                value: "a".to_string(),
+                label: None,
+            },
+            ParamOption {
+                value: "b".to_string(),
+                label: Some("Bee".to_string()),
+            },
         ];
         // A stored value that is no longer an option seeds as unset.
-        assert!(matches!(seed(&spec, Some(&json!("gone"))), ParamValueState::Choice(None)));
+        assert!(matches!(
+            seed(&spec, Some(&json!("gone"))),
+            ParamValueState::Choice(None)
+        ));
         let state = seed(&spec, Some(&json!("b")));
         assert_eq!(to_json(&spec, &state).unwrap(), Some(json!("b")));
         // A forged out-of-set choice is rejected on project.
@@ -725,7 +793,10 @@ mod tests {
         assert!(matches!(&state, ParamValueState::List(v) if v.len() == 2));
         // Insert above index 1, leave it blank -> pruned on project.
         apply(&spec, &mut state, ParamValueEdit::ListInsert(1));
-        assert_eq!(to_json(&spec, &state).unwrap(), Some(json!(["north", "south"])));
+        assert_eq!(
+            to_json(&spec, &state).unwrap(),
+            Some(json!(["north", "south"]))
+        );
         // Remove all -> unset.
         apply(&spec, &mut state, ParamValueEdit::ListRemove(0));
         apply(&spec, &mut state, ParamValueEdit::ListRemove(0));
@@ -736,7 +807,10 @@ mod tests {
     #[test]
     fn table_round_trips_with_typed_columns() {
         let mut spec = scalar("routes", ParamKind::Table);
-        spec.fields = vec![scalar("from", ParamKind::String), scalar("hops", ParamKind::Number)];
+        spec.fields = vec![
+            scalar("from", ParamKind::String),
+            scalar("hops", ParamKind::Number),
+        ];
         let stored = json!([{ "from": "inn", "hops": 3 }]);
         let mut state = seed(&spec, Some(&stored));
         assert_eq!(to_json(&spec, &state).unwrap(), Some(stored));
@@ -763,15 +837,27 @@ mod tests {
         // A row with one filled + one blank cell stores only the filled key — never a JSON `null`,
         // so a stored row stays within the `Record<string, ParamScalar>` shape the typings promise.
         let mut spec = scalar("routes", ParamKind::Table);
-        spec.fields = vec![scalar("from", ParamKind::String), scalar("hops", ParamKind::Number)];
+        spec.fields = vec![
+            scalar("from", ParamKind::String),
+            scalar("hops", ParamKind::Number),
+        ];
         let mut state = seed(&spec, None);
         apply(&spec, &mut state, ParamValueEdit::TableAddRow);
-        apply(&spec, &mut state, ParamValueEdit::TableSet(0, 0, ScalarEdit::Text("inn".to_string())));
-        let stored = to_json(&spec, &state).unwrap().expect("a non-blank row is stored");
+        apply(
+            &spec,
+            &mut state,
+            ParamValueEdit::TableSet(0, 0, ScalarEdit::Text("inn".to_string())),
+        );
+        let stored = to_json(&spec, &state)
+            .unwrap()
+            .expect("a non-blank row is stored");
         assert_eq!(stored, json!([{ "from": "inn" }]));
         // The blank cell is an absent key, not null, and round-trips identically.
         let row = &stored.as_array().unwrap()[0];
         assert!(row.get("hops").is_none());
-        assert_eq!(to_json(&spec, &seed(&spec, Some(&stored))).unwrap(), Some(stored));
+        assert_eq!(
+            to_json(&spec, &seed(&spec, Some(&stored))).unwrap(),
+            Some(stored)
+        );
     }
 }

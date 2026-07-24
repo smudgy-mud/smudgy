@@ -7,38 +7,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 use validator::Validate;
 
-/// Character encoding used for one MUD's application text on the Telnet
-/// connection. Negotiation and subnegotiation frames remain byte-exact.
-#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ServerEncoding {
-    #[default]
-    Utf8,
-    Big5,
-}
-
-impl ServerEncoding {
-    /// Every supported server encoding in picker order.
-    pub const ALL: [Self; 2] = [Self::Utf8, Self::Big5];
-
-    /// The concrete encoding implementation for streaming conversion.
-    #[must_use]
-    pub const fn encoding(self) -> &'static encoding_rs::Encoding {
-        match self {
-            Self::Utf8 => encoding_rs::UTF_8,
-            Self::Big5 => encoding_rs::BIG5,
-        }
-    }
-}
-
-impl std::fmt::Display for ServerEncoding {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Utf8 => "UTF-8",
-            Self::Big5 => "Big5",
-        })
-    }
-}
+use super::persistence::write_atomic;
 
 /// Represents the configuration for a single server connection.
 /// This struct is serialized to/from `server.json` within the server's directory.
@@ -50,10 +19,6 @@ pub struct ServerConfig {
     /// The port number of the server.
     #[validate(range(min = 1, max = 65535, message = "Port must be between 1 and 65535"))]
     pub port: u16,
-    /// Character encoding for server text. Existing server files default to
-    /// UTF-8; legacy Traditional Chinese MUDs can opt into Big5.
-    #[serde(default)]
-    pub encoding: ServerEncoding,
     /// Hosts the user has granted this MUD's OSC 8 hyperlinks permission to
     /// open in the browser without asking again (the "always allow links to
     /// <host>" opt-in; compared case-insensitively).
@@ -64,18 +29,47 @@ pub struct ServerConfig {
     /// the confirm dialog.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_all_links: bool,
+    /// The character encoding this server speaks, as an Encoding Standard label
+    /// (`"big5"`, `"iso-8859-1"`, …). `None` = UTF-8. CHARSET negotiation (RFC
+    /// 2066), when the server offers it, overrides this for the life of the
+    /// connection. An unresolvable label is logged and treated as UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Whether inbound compression offers (MCCP2) are accepted. On by default;
+    /// off declines every compression option with `DONT`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub compression: bool,
+    /// Connect over TLS. Off by default (don't silently change existing plain servers).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tls: bool,
+    /// When `tls`, whether to verify the server certificate against the OS trust store.
+    /// On by default; off accepts any certificate (self-signed MUD ports — insecure).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub tls_verify: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // the signature serde's skip_serializing_if wants
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl ServerConfig {
-    /// A fresh config with no link-trust grants.
+    /// A fresh config with no link-trust grants, speaking UTF-8, accepting compression.
     #[must_use]
     pub const fn new(host: String, port: u16) -> Self {
         Self {
             host,
             port,
-            encoding: ServerEncoding::Utf8,
             trusted_link_hosts: Vec::new(),
             trust_all_links: false,
+            encoding: None,
+            compression: true,
+            tls: false,
+            tls_verify: true,
         }
     }
 
@@ -204,13 +198,18 @@ pub fn list_servers() -> Result<Vec<Server>> {
 /// Returns an error if the file cannot be opened, read, or if the contents
 /// cannot be deserialized into a `ServerConfig`.
 fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
-    let file_content = fs::read_to_string(path)
-        .context(format!("Failed to read server config file: {}", path.display()))?;
-    let config: ServerConfig = serde_json::from_str(&file_content)
-        .context(format!("Failed to parse server config file: {}", path.display()))?;
-    config
-        .validate()
-        .context(format!("Server config validation failed: {}", path.display()))?;
+    let file_content = fs::read_to_string(path).context(format!(
+        "Failed to read server config file: {}",
+        path.display()
+    ))?;
+    let config: ServerConfig = serde_json::from_str(&file_content).context(format!(
+        "Failed to parse server config file: {}",
+        path.display()
+    ))?;
+    config.validate().context(format!(
+        "Server config validation failed: {}",
+        path.display()
+    ))?;
     Ok(config)
 }
 
@@ -297,7 +296,7 @@ pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
     let config_json = serde_json::to_string_pretty(&config)
         .context(format!("Failed to serialize config for server '{name}'"))?;
 
-    fs::write(&config_path, config_json).context(format!(
+    write_atomic(&config_path, config_json.as_bytes()).context(format!(
         "Failed to write server.json for server '{name}' at {}",
         config_path.display()
     ))?;
@@ -409,7 +408,7 @@ pub fn update_server(name: &str, new_config: ServerConfig) -> Result<Server> {
     ))?;
 
     // Write the new config, overwriting the old one
-    fs::write(&config_path, config_json).context(format!(
+    write_atomic(&config_path, config_json.as_bytes()).context(format!(
         "Failed to write updated server.json for server '{name}' at {}",
         config_path.display()
     ))?;
@@ -466,7 +465,7 @@ pub fn delete_server(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod link_trust_tests {
-    use super::{ServerConfig, ServerEncoding, link_url_host};
+    use super::{ServerConfig, link_url_host};
 
     fn config(hosts: &[&str], all: bool) -> ServerConfig {
         ServerConfig {
@@ -480,7 +479,10 @@ mod link_trust_tests {
     fn blanket_trust_covers_urls_and_commands() {
         let c = config(&[], true);
         assert!(c.allows_server_link(Some("anything.example")));
-        assert!(c.allows_server_link(None), "send: links ride the blanket grant");
+        assert!(
+            c.allows_server_link(None),
+            "send: links ride the blanket grant"
+        );
     }
 
     #[test]
@@ -488,7 +490,10 @@ mod link_trust_tests {
         let c = config(&["Wiki.Example.ORG"], false);
         assert!(c.allows_server_link(Some("wiki.example.org")));
         assert!(!c.allows_server_link(Some("evil.example.org")));
-        assert!(!c.allows_server_link(None), "a host grant never covers send: links");
+        assert!(
+            !c.allows_server_link(None),
+            "a host grant never covers send: links"
+        );
     }
 
     #[test]
@@ -500,10 +505,22 @@ mod link_trust_tests {
 
     #[test]
     fn url_host_extraction() {
-        assert_eq!(link_url_host("https://Wiki.Example.org/page?x=1"), Some("wiki.example.org".to_string()));
-        assert_eq!(link_url_host("http://example.org:8080/p"), Some("example.org".to_string()));
-        assert_eq!(link_url_host("https://user:pw@example.org/x"), Some("example.org".to_string()));
-        assert_eq!(link_url_host("https://[::1]:8080/x"), Some("::1".to_string()));
+        assert_eq!(
+            link_url_host("https://Wiki.Example.org/page?x=1"),
+            Some("wiki.example.org".to_string())
+        );
+        assert_eq!(
+            link_url_host("http://example.org:8080/p"),
+            Some("example.org".to_string())
+        );
+        assert_eq!(
+            link_url_host("https://user:pw@example.org/x"),
+            Some("example.org".to_string())
+        );
+        assert_eq!(
+            link_url_host("https://[::1]:8080/x"),
+            Some("::1".to_string())
+        );
         assert_eq!(link_url_host("https:///nohost"), None);
         assert_eq!(link_url_host("nonsense"), None);
     }
@@ -517,14 +534,5 @@ mod link_trust_tests {
         let old: ServerConfig = serde_json::from_str(r#"{"host":"h","port":1}"#).unwrap();
         assert!(old.trusted_link_hosts.is_empty());
         assert!(!old.trust_all_links);
-        assert_eq!(old.encoding, ServerEncoding::Utf8);
-    }
-
-    #[test]
-    fn big5_encoding_round_trips() {
-        let mut config = ServerConfig::new("h".to_string(), 1);
-        config.encoding = ServerEncoding::Big5;
-        let json = serde_json::to_string(&config).unwrap();
-        assert_eq!(serde_json::from_str::<ServerConfig>(&json).unwrap(), config);
     }
 }

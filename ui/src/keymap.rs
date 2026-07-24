@@ -70,7 +70,8 @@ pub fn set_key_and_modifiers_from_maybe_physical(
         }
     }
 
-    hotkey.key = key_out.first()
+    hotkey.key = key_out
+        .first()
         .unwrap_or(&"UNIDENTIFIED".to_string())
         .clone();
     hotkey.modifiers = modifiers;
@@ -111,7 +112,8 @@ pub fn set_key_and_modifiers_from_iced(hotkey: &mut HotkeyDefinition, keys: Vec<
         }
     }
 
-    hotkey.key = key_out.first()
+    hotkey.key = key_out
+        .first()
         .unwrap_or(&"UNIDENTIFIED".to_string())
         .clone();
     hotkey.modifiers = modifiers;
@@ -122,9 +124,10 @@ pub fn hotkey_to_maybe_physical_key(hotkey: &HotkeyDefinition) -> MaybePhysicalK
     // Check for physical key codes first
     if hotkey.key.starts_with("Code(")
         && let Some(code_str) = hotkey.key.get(5..hotkey.key.len() - 1)
-            && let Some(code) = physical_code_from_str(code_str) {
-                return MaybePhysicalKey::Physical(key::Physical::Code(code));
-            }
+        && let Some(code) = physical_code_from_str(code_str)
+    {
+        return MaybePhysicalKey::Physical(key::Physical::Code(code));
+    }
 
     // Check for named logical keys
     if let Key::Named(named) = named_key_from_str(&hotkey.key) {
@@ -133,9 +136,10 @@ pub fn hotkey_to_maybe_physical_key(hotkey: &HotkeyDefinition) -> MaybePhysicalK
 
     // Check for character keys
     if hotkey.key.starts_with("Character(")
-        && let Some(c) = hotkey.key.get(10..hotkey.key.len() - 1) {
-            return MaybePhysicalKey::Key(Key::Character(c.into()));
-        }
+        && let Some(c) = hotkey.key.get(10..hotkey.key.len() - 1)
+    {
+        return MaybePhysicalKey::Key(Key::Character(c.into()));
+    }
 
     // Fallback to unidentified
     MaybePhysicalKey::Key(Key::Unidentified)

@@ -25,10 +25,14 @@ impl AutomationsWindow {
     pub(super) fn view_sidebar(&self) -> Elem<'_> {
         let new_button = button(
             row![
-                text(bootstrap_icons::PLUS_LG).font(fonts::BOOTSTRAP_ICONS).size(13.0),
+                text(bootstrap_icons::PLUS_LG)
+                    .font(fonts::BOOTSTRAP_ICONS)
+                    .size(13.0),
                 text("New").size(14.0),
                 iced::widget::space::horizontal(),
-                text(bootstrap_icons::CHEVRON_DOWN).font(fonts::BOOTSTRAP_ICONS).size(11.0),
+                text(bootstrap_icons::CHEVRON_DOWN)
+                    .font(fonts::BOOTSTRAP_ICONS)
+                    .size(11.0),
             ]
             .spacing(8.0)
             .align_y(Vertical::Center),
@@ -50,7 +54,10 @@ impl AutomationsWindow {
 
         // Search field.
         let mut search_row = row![
-            text(bootstrap_icons::SEARCH).font(fonts::BOOTSTRAP_ICONS).size(12.0).style(common::faint),
+            text(bootstrap_icons::SEARCH)
+                .font(fonts::BOOTSTRAP_ICONS)
+                .size(12.0)
+                .style(common::faint),
             text_input("Search automations…", &self.search)
                 .on_input(Message::SearchChanged)
                 .size(13.0),
@@ -66,12 +73,14 @@ impl AutomationsWindow {
             );
         }
         top = top.push(
-            container(search_row).padding(Padding {
-                top: 6.0,
-                bottom: 6.0,
-                left: 10.0,
-                right: 8.0,
-            }).style(common::code_surface_style),
+            container(search_row)
+                .padding(Padding {
+                    top: 6.0,
+                    bottom: 6.0,
+                    left: 10.0,
+                    right: 8.0,
+                })
+                .style(common::code_surface_style),
         );
 
         // Filter chips.
@@ -143,7 +152,11 @@ impl AutomationsWindow {
                 item(bootstrap_icons::DPAD, "Hotkey", Message::NewHotkey),
                 item(bootstrap_icons::FOLDER_PLUS, "Folder", Message::NewFolder),
                 item(bootstrap_icons::FONTS, "Module", Message::NewModule),
-                item(bootstrap_icons::BOUNDING_BOX, "Package", Message::NewPackage),
+                item(
+                    bootstrap_icons::BOUNDING_BOX,
+                    "Package",
+                    Message::NewPackage
+                ),
             ]
             .spacing(2.0),
         )
@@ -157,12 +170,42 @@ impl AutomationsWindow {
         let counts = self.counts();
         let chips = [
             (Chip::All, "All", None, None),
-            (Chip::Aliases, "Aliases", Some(counts.aliases), Some(bootstrap_icons::AT)),
-            (Chip::Triggers, "Triggers", Some(counts.triggers), Some(bootstrap_icons::LIGHTNING)),
-            (Chip::Hotkeys, "Hotkeys", Some(counts.hotkeys), Some(bootstrap_icons::DPAD)),
-            (Chip::Folders, "Folders", Some(counts.folders), Some(bootstrap_icons::FOLDER_PLUS)),
-            (Chip::Modules, "Modules", Some(counts.modules), Some(bootstrap_icons::FONTS)),
-            (Chip::Packages, "Packages", Some(counts.packages), Some(bootstrap_icons::BOUNDING_BOX)),
+            (
+                Chip::Aliases,
+                "Aliases",
+                Some(counts.aliases),
+                Some(bootstrap_icons::AT),
+            ),
+            (
+                Chip::Triggers,
+                "Triggers",
+                Some(counts.triggers),
+                Some(bootstrap_icons::LIGHTNING),
+            ),
+            (
+                Chip::Hotkeys,
+                "Hotkeys",
+                Some(counts.hotkeys),
+                Some(bootstrap_icons::DPAD),
+            ),
+            (
+                Chip::Folders,
+                "Folders",
+                Some(counts.folders),
+                Some(bootstrap_icons::FOLDER_PLUS),
+            ),
+            (
+                Chip::Modules,
+                "Modules",
+                Some(counts.modules),
+                Some(bootstrap_icons::FONTS),
+            ),
+            (
+                Chip::Packages,
+                "Packages",
+                Some(counts.packages),
+                Some(bootstrap_icons::BOUNDING_BOX),
+            ),
         ];
         // A wrapping flow of chips: they reflow to as many rows as the sidebar
         // width needs instead of being clipped (the narrow sidebar couldn't fit
@@ -173,7 +216,10 @@ impl AutomationsWindow {
             let mut inner = row![].spacing(6.0).align_y(Vertical::Center);
             if let Some(icon) = icon {
                 inner = inner.push(
-                    text(icon).font(fonts::BOOTSTRAP_ICONS).size(10.0).style(common::muted),
+                    text(icon)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(10.0)
+                        .style(common::muted),
                 );
             }
             // The label inherits the chip's text colour (bright when selected);
@@ -181,8 +227,11 @@ impl AutomationsWindow {
             // when it's zero so empty categories visibly recede.
             inner = inner.push(text(label).size(11.0));
             if let Some(count) = count {
-                let count_style: fn(&Theme) -> text::Style =
-                    if count == 0 { common::faint } else { common::muted };
+                let count_style: fn(&Theme) -> text::Style = if count == 0 {
+                    common::faint
+                } else {
+                    common::muted
+                };
                 inner = inner.push(text(count.to_string()).size(11.0).style(count_style));
             }
             items.push(
@@ -267,7 +316,11 @@ impl AutomationsWindow {
         // MODULES.
         if matches!(self.chip, Chip::All | Chip::Modules) && !self.modules.is_empty() {
             let mut rows: Vec<Elem> = Vec::new();
-            for m in self.modules.iter().filter(|m| self.name_matches(&m.subpath)) {
+            for m in self
+                .modules
+                .iter()
+                .filter(|m| self.name_matches(&m.subpath))
+            {
                 let selected = self.selection == Selection::Module(m.subpath.clone());
                 rows.push(tree_row(
                     0,
@@ -329,13 +382,14 @@ impl AutomationsWindow {
                 format!("{parent}/{name}")
             };
             // When filtering to a single leaf type, skip folder chrome entirely.
-            let leaf_only = matches!(
-                self.chip,
-                Chip::Aliases | Chip::Triggers | Chip::Hotkeys
-            );
+            let leaf_only = matches!(self.chip, Chip::Aliases | Chip::Triggers | Chip::Hotkeys);
             let collapsed = !searching && self.collapsed_folders.contains(&path);
             let enabled = packages::is_package_effectively_enabled(&path, &self.packages);
-            let status = if enabled { NodeStatus::Ok } else { NodeStatus::Disabled };
+            let status = if enabled {
+                NodeStatus::Ok
+            } else {
+                NodeStatus::Disabled
+            };
             if !leaf_only && self.chip != Chip::Folders {
                 if self.folder_or_descendant_matches(&path, children) {
                     let selected = self.selection == Selection::Folder(path.clone());
@@ -447,7 +501,9 @@ impl AutomationsWindow {
             if local_own_specs.contains(spec) {
                 continue; // shown as a LOCAL row instead
             }
-            if !self.name_matches(package_display_name(spec)) && !self.package_descendant_matches(spec) {
+            if !self.name_matches(package_display_name(spec))
+                && !self.package_descendant_matches(spec)
+            {
                 continue;
             }
             let status = self.package_status(spec);
@@ -607,7 +663,12 @@ impl AutomationsWindow {
             return;
         }
         let expanded = self.expanded_creators.contains(&creator_id);
-        out.push(creator_toggle_row(indent, expanded, total, creator_id.clone()));
+        out.push(creator_toggle_row(
+            indent,
+            expanded,
+            total,
+            creator_id.clone(),
+        ));
         if !expanded {
             return;
         }
@@ -624,7 +685,11 @@ impl AutomationsWindow {
             }
         };
         let mut shown = 0usize;
-        let push_leaf = |kind: AutomationKind, icon: &'static str, name: &str, enabled: bool, out: &mut Vec<Elem<'a>>| {
+        let push_leaf = |kind: AutomationKind,
+                         icon: &'static str,
+                         name: &str,
+                         enabled: bool,
+                         out: &mut Vec<Elem<'a>>| {
             let selection = Selection::CreatorAutomation {
                 creator_id: creator_id.clone(),
                 kind,
@@ -650,14 +715,26 @@ impl AutomationsWindow {
             if shown >= limit {
                 break;
             }
-            push_leaf(AutomationKind::Alias, bootstrap_icons::AT, name, entry.enabled, out);
+            push_leaf(
+                AutomationKind::Alias,
+                bootstrap_icons::AT,
+                name,
+                entry.enabled,
+                out,
+            );
             shown += 1;
         }
         for (name, entry) in &automations.triggers {
             if shown >= limit {
                 break;
             }
-            push_leaf(AutomationKind::Trigger, bootstrap_icons::LIGHTNING, name, entry.enabled, out);
+            push_leaf(
+                AutomationKind::Trigger,
+                bootstrap_icons::LIGHTNING,
+                name,
+                entry.enabled,
+                out,
+            );
             shown += 1;
         }
         if shown < total {
@@ -671,9 +748,12 @@ impl AutomationsWindow {
         let errors = self.error_count();
         let status: Elem = if errors > 0 {
             row![
-                text(format!("{errors} error{}", if errors == 1 { "" } else { "s" }))
-                    .size(11.0)
-                    .style(common::danger),
+                text(format!(
+                    "{errors} error{}",
+                    if errors == 1 { "" } else { "s" }
+                ))
+                .size(11.0)
+                .style(common::danger),
             ]
             .into()
         } else {
@@ -685,15 +765,19 @@ impl AutomationsWindow {
                 text(self.server_name.clone()).size(12.0),
                 iced::widget::space::horizontal(),
                 status,
-                button(text(common::palette_shortcut_label()).size(11.0).style(common::muted))
-                    .style(button_style::subtle)
-                    .on_press(Message::OpenPalette)
-                    .padding(Padding {
-                        top: 2.0,
-                        bottom: 2.0,
-                        left: 6.0,
-                        right: 6.0,
-                    }),
+                button(
+                    text(common::palette_shortcut_label())
+                        .size(11.0)
+                        .style(common::muted)
+                )
+                .style(button_style::subtle)
+                .on_press(Message::OpenPalette)
+                .padding(Padding {
+                    top: 2.0,
+                    bottom: 2.0,
+                    left: 6.0,
+                    right: 6.0,
+                }),
             ]
             .spacing(8.0)
             .align_y(Vertical::Center),
@@ -724,7 +808,11 @@ impl AutomationsWindow {
         }
     }
 
-    fn folder_or_descendant_matches(&self, _path: &str, children: &BTreeMap<String, Script>) -> bool {
+    fn folder_or_descendant_matches(
+        &self,
+        _path: &str,
+        children: &BTreeMap<String, Script>,
+    ) -> bool {
         if self.search.is_empty() {
             return true;
         }
@@ -873,15 +961,20 @@ fn tree_row<'a>(
             bootstrap_icons::CHEVRON_DOWN
         };
         inner = inner.push(
-            button(text(chevron).font(fonts::BOOTSTRAP_ICONS).size(10.0).style(common::muted))
-                .style(button_style::list_item)
-                .on_press(Message::ToggleFolderExpanded(path))
-                .padding(Padding {
-                    top: 0.0,
-                    bottom: 0.0,
-                    left: 2.0,
-                    right: 2.0,
-                }),
+            button(
+                text(chevron)
+                    .font(fonts::BOOTSTRAP_ICONS)
+                    .size(10.0)
+                    .style(common::muted),
+            )
+            .style(button_style::list_item)
+            .on_press(Message::ToggleFolderExpanded(path))
+            .padding(Padding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 2.0,
+                right: 2.0,
+            }),
         );
     } else {
         inner = inner.push(iced::widget::space::horizontal().width(Length::Fixed(14.0)));
@@ -892,9 +985,22 @@ fn tree_row<'a>(
     // `faint`) so a disabled row still reads — `faint` on a 13px label is too
     // low-contrast to be the primary text of a row.
     let disabled = status == NodeStatus::Disabled;
-    let icon_style: fn(&Theme) -> text::Style = if disabled { common::faint } else { common::muted };
-    let label_style: fn(&Theme) -> text::Style = if disabled { common::muted } else { common::regular };
-    inner = inner.push(text(icon).font(fonts::BOOTSTRAP_ICONS).size(13.0).style(icon_style));
+    let icon_style: fn(&Theme) -> text::Style = if disabled {
+        common::faint
+    } else {
+        common::muted
+    };
+    let label_style: fn(&Theme) -> text::Style = if disabled {
+        common::muted
+    } else {
+        common::regular
+    };
+    inner = inner.push(
+        text(icon)
+            .font(fonts::BOOTSTRAP_ICONS)
+            .size(13.0)
+            .style(icon_style),
+    );
     inner = inner.push(text(label.to_string()).size(13.0).style(label_style));
     if let Some(trailing) = trailing {
         inner = inner.push(iced::widget::space::horizontal());
@@ -964,9 +1070,22 @@ fn package_row<'a>(
     }
     inner = inner.push(common::status_dot(status));
     let disabled = status == NodeStatus::Disabled;
-    let icon_style: fn(&Theme) -> text::Style = if disabled { common::faint } else { common::muted };
-    let label_style: fn(&Theme) -> text::Style = if disabled { common::muted } else { common::regular };
-    inner = inner.push(text(icon).font(fonts::BOOTSTRAP_ICONS).size(13.0).style(icon_style));
+    let icon_style: fn(&Theme) -> text::Style = if disabled {
+        common::faint
+    } else {
+        common::muted
+    };
+    let label_style: fn(&Theme) -> text::Style = if disabled {
+        common::muted
+    } else {
+        common::regular
+    };
+    inner = inner.push(
+        text(icon)
+            .font(fonts::BOOTSTRAP_ICONS)
+            .size(13.0)
+            .style(icon_style),
+    );
     inner = inner.push(text(label).size(13.0).style(label_style));
     if let Some(trailing) = trailing {
         inner = inner.push(iced::widget::space::horizontal());
@@ -993,7 +1112,12 @@ fn package_row<'a>(
 const CREATOR_SHOW_LIMIT: usize = 100;
 
 /// The collapsible header for a creator's nested automations: a chevron + the count.
-fn creator_toggle_row<'a>(indent: usize, expanded: bool, total: usize, creator_id: String) -> Elem<'a> {
+fn creator_toggle_row<'a>(
+    indent: usize,
+    expanded: bool,
+    total: usize,
+    creator_id: String,
+) -> Elem<'a> {
     let chevron = if expanded {
         bootstrap_icons::CHEVRON_DOWN
     } else {
@@ -1002,7 +1126,10 @@ fn creator_toggle_row<'a>(indent: usize, expanded: bool, total: usize, creator_i
     let label = format!("{total} automation{}", if total == 1 { "" } else { "s" });
     button(
         row![
-            text(chevron).font(fonts::BOOTSTRAP_ICONS).size(10.0).style(common::muted),
+            text(chevron)
+                .font(fonts::BOOTSTRAP_ICONS)
+                .size(10.0)
+                .style(common::muted),
             text(label).size(12.0).style(common::muted),
         ]
         .spacing(7.0)
@@ -1022,15 +1149,19 @@ fn creator_toggle_row<'a>(indent: usize, expanded: bool, total: usize, creator_i
 
 /// The "show N more…" row revealing a creator's remaining automations beyond the cap.
 fn show_more_row<'a>(indent: usize, remaining: usize, creator_id: String) -> Elem<'a> {
-    button(text(format!("Show {remaining} more…")).size(12.0).style(common::faint))
-        .style(button_style::list_item)
-        .on_press(Message::ToggleCreatorShowAll(creator_id))
-        .width(Length::Fill)
-        .padding(Padding {
-            top: 3.0,
-            bottom: 3.0,
-            left: 6.0 + (indent as f32) * 16.0,
-            right: 6.0,
-        })
-        .into()
+    button(
+        text(format!("Show {remaining} more…"))
+            .size(12.0)
+            .style(common::faint),
+    )
+    .style(button_style::list_item)
+    .on_press(Message::ToggleCreatorShowAll(creator_id))
+    .width(Length::Fill)
+    .padding(Padding {
+        top: 3.0,
+        bottom: 3.0,
+        left: 6.0 + (indent as f32) * 16.0,
+        right: 6.0,
+    })
+    .into()
 }

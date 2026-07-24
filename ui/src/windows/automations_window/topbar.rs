@@ -35,11 +35,11 @@ impl AutomationsWindow {
         for (i, crumb) in trail.into_iter().enumerate() {
             crumbs = crumbs.push(text("\u{203A}").size(13.0).style(common::faint));
             let emphasized = i + 1 == last;
-            crumbs = crumbs.push(
-                text(crumb)
-                    .size(13.0)
-                    .style(if emphasized { common::regular } else { common::muted }),
-            );
+            crumbs = crumbs.push(text(crumb).size(13.0).style(if emphasized {
+                common::regular
+            } else {
+                common::muted
+            }));
         }
 
         // ---- actions ----
@@ -47,10 +47,30 @@ impl AutomationsWindow {
         let shared_active = matches!(self.pane, Pane::Shared);
         let store_active = matches!(self.pane, Pane::StoreInspector);
         let mut actions = row![
-            action_button(bootstrap_icons::CLOUD_CHECK, "Discover", Message::OpenDiscover, discover_active),
-            action_button(bootstrap_icons::PEOPLE, "Private & Shared", Message::OpenShared, shared_active),
-            action_button(bootstrap_icons::DATABASE, "Store", Message::OpenStoreInspector, store_active),
-            action_button(bootstrap_icons::ARROW_REPEAT, "Reload", Message::Reload, false),
+            action_button(
+                bootstrap_icons::CLOUD_CHECK,
+                "Discover",
+                Message::OpenDiscover,
+                discover_active
+            ),
+            action_button(
+                bootstrap_icons::PEOPLE,
+                "Private & Shared",
+                Message::OpenShared,
+                shared_active
+            ),
+            action_button(
+                bootstrap_icons::DATABASE,
+                "Store",
+                Message::OpenStoreInspector,
+                store_active
+            ),
+            action_button(
+                bootstrap_icons::ARROW_REPEAT,
+                "Reload",
+                Message::Reload,
+                false
+            ),
         ]
         .spacing(6.0)
         .align_y(Vertical::Center);
@@ -78,7 +98,9 @@ impl AutomationsWindow {
 
         // A hairline beneath the bar separates the action toolbar from the
         // content pane (the toolbar reads as its own region).
-        column![bar, rule::horizontal(1.0)].width(Length::Fill).into()
+        column![bar, rule::horizontal(1.0)]
+            .width(Length::Fill)
+            .into()
     }
 
     fn breadcrumb_trail(&self) -> Vec<String> {
@@ -141,9 +163,17 @@ fn toolbar_active(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-fn action_button(icon: &'static str, label: &'static str, msg: Message, active: bool) -> Elem<'static> {
-    let style: fn(&Theme, button::Status) -> button::Style =
-        if active { toolbar_active } else { button_style::toolbar };
+fn action_button(
+    icon: &'static str,
+    label: &'static str,
+    msg: Message,
+    active: bool,
+) -> Elem<'static> {
+    let style: fn(&Theme, button::Status) -> button::Style = if active {
+        toolbar_active
+    } else {
+        button_style::toolbar
+    };
     button(
         row![
             text(icon).font(fonts::BOOTSTRAP_ICONS).size(13.0),
@@ -167,7 +197,9 @@ fn inspect_button() -> Elem<'static> {
     tooltip(
         button(
             row![
-                text(bootstrap_icons::CROSSHAIR).font(fonts::BOOTSTRAP_ICONS).size(13.0),
+                text(bootstrap_icons::CROSSHAIR)
+                    .font(fonts::BOOTSTRAP_ICONS)
+                    .size(13.0),
                 text("Inspect").size(13.0),
             ]
             .spacing(7.0)
@@ -193,8 +225,13 @@ fn inspect_button() -> Elem<'static> {
 fn palette_button() -> Elem<'static> {
     button(
         row![
-            text(bootstrap_icons::SEARCH).font(fonts::BOOTSTRAP_ICONS).size(11.0).style(common::muted),
-            text(common::palette_shortcut_label()).size(12.0).style(common::muted),
+            text(bootstrap_icons::SEARCH)
+                .font(fonts::BOOTSTRAP_ICONS)
+                .size(11.0)
+                .style(common::muted),
+            text(common::palette_shortcut_label())
+                .size(12.0)
+                .style(common::muted),
         ]
         .spacing(6.0)
         .align_y(Vertical::Center),

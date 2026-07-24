@@ -5,17 +5,15 @@ use crate::models::triggers::TriggerDefinition;
 use crate::session::connection::vt_processor::AnsiColor;
 use crate::session::runtime::line_operation::{LineOperation, SpliceRun};
 use crate::session::runtime::pane;
+use crate::session::runtime::script_engine::FunctionId;
 use crate::session::runtime::store;
+use crate::session::runtime::trigger::MatchCapture;
+use crate::session::runtime::trigger::SharedAutomationRegistry;
 use crate::session::runtime::{
     ActionQueue, AutomationKind, IsolateId, MAX_EVENT_DEPTH, Origin, RuntimeAction, SingletonKey,
     SingletonRegistry,
 };
-use crate::session::runtime::script_engine::FunctionId;
-use crate::session::runtime::trigger::MatchCapture;
-use crate::session::runtime::trigger::SharedAutomationRegistry;
-use crate::session::styled_line::{
-    Color, LinkAction, Style, StyledLine, sanitize_display_text,
-};
+use crate::session::styled_line::{Color, LinkAction, Style, StyledLine, sanitize_display_text};
 use crate::session::{SessionId, registry};
 
 use std::cell::{Cell, RefCell};
@@ -71,12 +69,23 @@ deno_core::extension!(
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
+    op_smudgy_pane_input_on_submit,
     op_smudgy_pane_close,
     op_smudgy_pane_echo,
     op_smudgy_pane_echo_styled,
     op_smudgy_pane_clear,
     op_smudgy_pane_list,
     op_smudgy_pane_resolve,
+    op_smudgy_input_get,
+    op_smudgy_input_apply,
+    op_smudgy_input_submission_generation,
+    op_smudgy_input_submission_text,
+    op_smudgy_input_submission_replace,
+    op_smudgy_input_submission_cancel,
+    op_smudgy_input_words_mutate,
+    op_smudgy_input_words_query,
+    op_smudgy_input_history_mutate,
+    op_smudgy_input_history_list,
     op_smudgy_get_current_line,
     op_smudgy_get_current_line_number,
     op_smudgy_get_current_line_styles,
@@ -85,6 +94,7 @@ deno_core::extension!(
     op_smudgy_mapper_set_current_location,
     op_smudgy_mapper_get_current_location,
     op_smudgy_capture,
+    op_smudgy_fallthrough,
     op_smudgy_param_get,
     op_smudgy_get_settings,
     op_smudgy_save_user_alias,
@@ -137,6 +147,10 @@ deno_core::extension!(
     spawned_actions: ActionQueue,
     pending_line_operations: Rc<RefCell<Vec<LineOperation>>>,
     current_line: Rc<RefCell<Weak<StyledLine>>>,
+    // The current-line staleness scope (see [`LineScope`]): one cell shared engine-wide,
+    // armed by the engine's user-JS entry points and checked by the ambient `line`
+    // mutators, so a stale async continuation cannot edit/route a line it wasn't run for.
+    line_scope: LineScopeCell,
     emitted_line_count: std::rc::Weak<Cell<usize>>,
     // Ring of recently-emitted lines (UI line number + the same `Arc` the UI holds),
     // shared with the runtime. `op_smudgy_buffer_get_text`/`_styles` read it for `buffer.line(n)`.
@@ -148,7 +162,7 @@ deno_core::extension!(
     // The script-visible settings snapshot, shared with the runtime. `op_smudgy_get_settings`
     // reads it for `getSettings()`; the `ApplySettings` dispatch handler is the writer.
     settings_snapshot: crate::session::runtime::SettingsSnapshot,
-    // The GMCP enabled flag (`docs/gmcp-plan.md` §3.4), shared with the runtime's GMCP
+    // The GMCP enabled flag (`docs/gmcp.md` §3.4), shared with the runtime's GMCP
     // producer (the writer). `op_smudgy_gmcp_enabled` reads it for `gmcp.enabled`/`gmcp.onReady`.
     gmcp_enabled: crate::session::runtime::gmcp::SharedGmcpEnabled,
     // The session's pane registry, shared with the runtime. Own-session pane ops mutate it
@@ -159,6 +173,24 @@ deno_core::extension!(
     // Per-line routing state (gag/redirect/copy), shared with the runtime beside
     // `pending_line_operations` and consumed once per line event.
     line_routing: crate::session::runtime::SharedLineRouting,
+    // The input mirror (`docs/input.md` §3.3), shared with the runtime (whose
+    // `InputStateChanged` dispatch arm writes it). The input read op consults it
+    // synchronously and flags interest on it; writes leave it untouched.
+    input_mirror: crate::session::runtime::SharedInputMirror,
+    // The in-flight typed submission (`docs/input.md` §3.5), shared with the
+    // runtime (whose `SubmitInput`/`CompleteInputSubmission` dispatch arms install and
+    // consume it). The ambient `submission` ops read and mutate it while a `sys:input`
+    // handler splice is live; outside one they throw.
+    input_submission: crate::session::runtime::SharedInputSubmission,
+    // The completion word sets (`docs/input.md` §3.8), shared with the runtime
+    // (whose `InputWordSetsChanged` dispatch arm builds the UI's merged view). The
+    // registry ops mutate and read it synchronously, scoped by the caller's
+    // `(isolate, origin)` — the automation-keying creator identity.
+    input_word_sets: crate::session::runtime::SharedInputWordSets,
+    // The pane-input onSubmit registry (`docs/input.md` §3.7), shared with the
+    // runtime (whose `PaneInputSubmit` dispatch arm resolves through it). The registration
+    // op writes handler addresses — `(isolate, instance, function id)` — synchronously.
+    pane_input_callbacks: crate::session::runtime::SharedPaneInputCallbacks,
     // The isolate these ops run in. The creation/enable ops stamp it onto the actions
     // they emit so the trigger Manager keys automations by `(IsolateId, Origin, name)`
     // (see `PACKAGE-ISOLATES.md`). `script_functions` above is *this* isolate's registry.
@@ -217,6 +249,7 @@ deno_core::extension!(
     state.put::<ActionQueue>(options.spawned_actions);
     state.put::<Rc<RefCell<Vec<LineOperation>>>>(options.pending_line_operations);
     state.put::<Rc<RefCell<Weak<StyledLine>>>>(options.current_line);
+    state.put::<LineScopeCell>(options.line_scope);
     state.put::<std::rc::Weak<Cell<usize>>>(options.emitted_line_count);
     state.put::<crate::session::runtime::RecentLines>(options.recent_lines);
     state.put::<crate::session::runtime::CurrentLocation>(options.current_location);
@@ -224,6 +257,14 @@ deno_core::extension!(
     state.put::<crate::session::runtime::gmcp::SharedGmcpEnabled>(options.gmcp_enabled);
     state.put::<crate::session::runtime::SharedPaneRegistry>(options.pane_registry);
     state.put::<crate::session::runtime::SharedLineRouting>(options.line_routing);
+    state.put::<crate::session::runtime::SharedInputMirror>(options.input_mirror);
+    state.put::<crate::session::runtime::SharedInputSubmission>(options.input_submission);
+    state.put::<crate::session::runtime::SharedInputWordSets>(options.input_word_sets);
+    state.put::<crate::session::runtime::SharedPaneInputCallbacks>(options.pane_input_callbacks);
+    // The registration op stamps handler addresses with this instantiation's nonce, so
+    // dispatch can drop a submission whose handler outlived an engine rebuild (the same
+    // staleness rule the widget routing token carries in string form).
+    state.put::<IsolateInstance>(IsolateInstance(options.isolate_instance));
     // Park this isolate's routing token where the leaf `smudgy_widgets` button op can read it (it
     // cannot name `IsolateId`); a tagged widget callback is dispatched back into this isolate —
     // and only into THIS instantiation of it, via the instance nonce baked into the token.
@@ -246,7 +287,8 @@ deno_core::extension!(
     state.put::<smudgy_cloud::StoreBindings>(options.store_bindings);
     state.put::<PackageDataDir>(PackageDataDir(options.data_dir));
     state.put::<Capture>(Capture(false));
-    // The per-isolate interop identity table (`docs/interop-pre-gmcp-plan.md` §3): interned
+    state.put::<Fallthrough>(Fallthrough(None));
+    // The per-isolate interop identity table (`docs/interop.md` §3): interned
     // creators/roots/events, resolved once at handle construction, addressed by id per call.
     state.put::<InteropIdentities>(InteropIdentities::default());
     // This isolate's link-callback registry (see [`LinkCallbacks`]): the styled-echo ops
@@ -256,7 +298,7 @@ deno_core::extension!(
   },
 );
 
-/// `gmcp.enabled` (`docs/gmcp-plan.md` §3.4): whether GMCP is negotiated on for the live
+/// `gmcp.enabled` (`docs/gmcp.md` §3.4): whether GMCP is negotiated on for the live
 /// connection. Gated by `interop:read` like every other read of the `gmcp` producer — the
 /// flag is protocol state a consumer observes, same as the tree.
 #[op2(fast)]
@@ -267,7 +309,7 @@ fn op_smudgy_gmcp_enabled(state: &OpState) -> Result<bool, NotCapable> {
         .get())
 }
 
-/// Validate a script-supplied GMCP message/module name for the wire (`docs/gmcp-plan.md`
+/// Validate a script-supplied GMCP message/module name for the wire (`docs/gmcp.md`
 /// §6.3): the name travels verbatim inside the subnegotiation, so a space would truncate
 /// it server-side and control bytes have no business there. Loud, like every author-input
 /// gate.
@@ -282,7 +324,7 @@ fn validate_gmcp_name(name: &str) -> Result<&str, StoreOpError> {
     Ok(name)
 }
 
-/// `gmcp.send(name, data?)` (`docs/gmcp-plan.md` §6.3) — ⟂ `gmcp:send`. `data` arrives
+/// `gmcp.send(name, data?)` (`docs/gmcp.md` §6.3) — ⟂ `gmcp:send`. `data` arrives
 /// pre-serialized from the JS shim (`None` = no data part). The frame is written by the
 /// dispatch arm, on the same socket queue as ordinary sends.
 #[op2]
@@ -303,7 +345,7 @@ fn op_smudgy_gmcp_send(
     Ok(())
 }
 
-/// `gmcp.enableModule(name, version?)` — ⟂ `gmcp:send` (`docs/gmcp-plan.md` §6.2). The
+/// `gmcp.enableModule(name, version?)` — ⟂ `gmcp:send` (`docs/gmcp.md` §6.2). The
 /// ref is keyed to the calling isolate, so a package reload releases its own refs and no
 /// package can drop a module another still uses.
 #[op2(fast)]
@@ -345,7 +387,7 @@ fn op_smudgy_gmcp_disable_module(
     Ok(())
 }
 
-/// `gmcp.mergeKeys(...names)` — ⟂ `gmcp:send` (`docs/gmcp-plan.md` §4.3): merge keys
+/// `gmcp.mergeKeys(...names)` — ⟂ `gmcp:send` (`docs/gmcp.md` §4.3): merge keys
 /// change the retained-value semantics every consumer reads, a write-side act.
 #[op2]
 fn op_smudgy_gmcp_merge_keys(
@@ -413,9 +455,14 @@ pub struct SmudgyGrants {
     /// `panes: ["create"]` — create/close/write session panes and route lines into them.
     pub panes: bool,
     /// `gmcp: ["send"]` — outbound GMCP: `gmcp.send`, module enable/disable, merge keys
-    /// (`docs/gmcp-plan.md` §6.3). The moral equivalent of `send`; rides with neither
+    /// (`docs/gmcp.md` §6.3). The moral equivalent of `send`; rides with neither
     /// interop grant.
     pub gmcp_send: bool,
+    /// `input: ["access"]` — the command-input surface (`docs/input.md` §3.6):
+    /// read the input's mirrored state, rewrite/focus/mask/submit it, and manage its
+    /// tab-completion word sets. One capability covers the whole surface — a package
+    /// that wants any of it can see and rewrite what the user types.
+    pub input: bool,
 }
 
 impl SmudgyGrants {
@@ -437,6 +484,7 @@ impl SmudgyGrants {
             interop_write: true,
             panes: true,
             gmcp_send: true,
+            input: true,
         }
     }
 
@@ -459,6 +507,7 @@ impl SmudgyGrants {
             interop_write: caps.interop_write,
             panes: caps.panes,
             gmcp_send: caps.gmcp_send,
+            input: caps.input,
         }
     }
 }
@@ -507,6 +556,21 @@ fn ensure_session_target(
 }
 
 pub struct Capture(pub bool);
+
+/// The current function automation's fallthrough decision. `None` outside an alias/trigger
+/// handler makes accidental async or top-level calls fail instead of mutating a future frame.
+pub struct Fallthrough(pub Option<bool>);
+
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+#[class(generic)]
+#[error("fallthrough() may only be called inside an alias or trigger handler")]
+struct FallthroughContextError;
+
+/// The calling isolate's instantiation nonce (`ScriptEngine`'s process-wide counter),
+/// parked in `OpState` at construction. The pane-input registration op stamps it onto
+/// handler addresses; dispatch rejects a mismatch, so a handler can never be invoked
+/// under an instantiation other than the one that registered it.
+struct IsolateInstance(u64);
 
 /// The session's server name, used to scope package param reads to `<server>/`.
 pub struct ServerName(pub Arc<String>);
@@ -905,8 +969,9 @@ fn op_smudgy_get_user_hotkey(
 fn op_smudgy_list_user_aliases(state: &mut OpState) -> Result<Vec<String>, UserAutomationError> {
     ensure_user_automation_access(state)?;
     let server = op_server_name(state);
-    let mut names: Vec<String> =
-        crate::models::aliases::load_aliases(&server)?.into_keys().collect();
+    let mut names: Vec<String> = crate::models::aliases::load_aliases(&server)?
+        .into_keys()
+        .collect();
     names.sort();
     Ok(names)
 }
@@ -917,8 +982,9 @@ fn op_smudgy_list_user_aliases(state: &mut OpState) -> Result<Vec<String>, UserA
 fn op_smudgy_list_user_triggers(state: &mut OpState) -> Result<Vec<String>, UserAutomationError> {
     ensure_user_automation_access(state)?;
     let server = op_server_name(state);
-    let mut names: Vec<String> =
-        crate::models::triggers::load_triggers(&server)?.into_keys().collect();
+    let mut names: Vec<String> = crate::models::triggers::load_triggers(&server)?
+        .into_keys()
+        .collect();
     names.sort();
     Ok(names)
 }
@@ -929,8 +995,9 @@ fn op_smudgy_list_user_triggers(state: &mut OpState) -> Result<Vec<String>, User
 fn op_smudgy_list_user_hotkeys(state: &mut OpState) -> Result<Vec<String>, UserAutomationError> {
     ensure_user_automation_access(state)?;
     let server = op_server_name(state);
-    let mut names: Vec<String> =
-        crate::models::hotkeys::load_hotkeys(&server)?.into_keys().collect();
+    let mut names: Vec<String> = crate::models::hotkeys::load_hotkeys(&server)?
+        .into_keys()
+        .collect();
     names.sort();
     Ok(names)
 }
@@ -995,10 +1062,16 @@ pub(crate) fn fold_name(name: &str) -> std::borrow::Cow<'_, str> {
 
 /// `on(event, handler)` — register a handler for a full canonical event name (`sys:connect`,
 /// `map:room`, `smudgy://owner/name#x`, `user#x`), matched case-insensitively (the uniform fold).
-/// Open pub/sub: any `interop:read`-granted package may listen to any emitter. Registers the v8
-/// function in this isolate's registry exactly like the trigger ops, then records the
-/// subscription in the session-global bus. Returns the handler's `FunctionId` index as a token
-/// the JS sugar hands back to [`op_smudgy_off`] to unsubscribe.
+/// Open pub/sub: any `interop:read`-granted package may listen to any emitter — except the
+/// input surface: `sys:input` delivers (and lets handlers rewrite) what the user types, and
+/// `input:change`/`input:focus` observe it, so those additionally require the `input`
+/// capability, like the rest of the input surface. Subscribing to the observe events also
+/// flags input-mirror interest (exactly like a mirror read): their emit site derives from
+/// the mirror feed, so without interest the UI would never send the state changes the
+/// subscriber is waiting on.
+/// Registers the v8 function in this isolate's registry exactly like the trigger ops, then
+/// records the subscription in the session-global bus. Returns the handler's `FunctionId`
+/// index as a token the JS sugar hands back to [`op_smudgy_off`] to unsubscribe.
 #[op2(fast)]
 fn op_smudgy_on<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1007,6 +1080,20 @@ fn op_smudgy_on<'s>(
     f: v8::Local<'s, v8::Function>,
 ) -> Result<u32, NotCapable> {
     ensure(grants(state).interop_read, "interop:read")?;
+    match fold_name(event).as_ref() {
+        "sys:input" => ensure(grants(state).input, "input")?,
+        "input:change" | "input:focus" => {
+            ensure(grants(state).input, "input")?;
+            let mirror = state
+                .borrow::<crate::session::runtime::SharedInputMirror>()
+                .clone();
+            let flipped = mirror.borrow_mut().flag_interest();
+            if flipped {
+                queue_own_action(state, RuntimeAction::InputMirrorInterest);
+            }
+        }
+        _ => {}
+    }
     let f = v8::Global::new(scope, f);
     let function_id = {
         let mut script_functions = state
@@ -1022,7 +1109,10 @@ fn op_smudgy_on<'s>(
         .borrow_mut()
         .entry(fold_name(event).into_owned())
         .or_default()
-        .push(EventSubscriber { isolate, function_id });
+        .push(EventSubscriber {
+            isolate,
+            function_id,
+        });
     // The function index doubles as the subscription token. An isolate will never register
     // `u32::MAX` functions in a session (it would exhaust memory first), so the saturating
     // conversion is unreachable — it only keeps the cast truncation-clean for clippy::pedantic.
@@ -1186,7 +1276,7 @@ fn parse_path(path: &str) -> Result<store::StorePath, StoreOpError> {
 }
 
 // ============================================================================
-// Interop op identity (`docs/interop-pre-gmcp-plan.md` §3): the per-call constants of the
+// Interop op identity (`docs/interop.md` §3): the per-call constants of the
 // interop ops — the parsed creator descriptor, the producer key, the root path, the event
 // stamp+fold, the home-gate verdict — are interned ONCE where the JS handles are
 // constructed, and the per-call ops address them by u32 id. The table lives in
@@ -1218,7 +1308,7 @@ struct CreatorSeat {
 /// per call. The entry is a **root**, not merely a producer: a producer's live head or its
 /// retained previous generation ([`RootView`]), addressed at a constant `root_path` prefix;
 /// host-pinned views join the same id space later
-/// (`docs/interop-pre-gmcp-plan.md` §9).
+/// (`docs/interop.md` §14).
 struct InteropRoot {
     producer: store::ProducerKey,
     /// The producer's display spec (`"user"` / `"smudgy://owner/name"`), interned as the
@@ -1237,7 +1327,7 @@ struct InteropRoot {
     view: RootView,
 }
 
-/// The store state an interned root addresses (`docs/interop-pre-gmcp-plan.md` §5). The id
+/// The store state an interned root addresses (`docs/interop.md` §2). The id
 /// addresses the *role*, not a pinned `Arc`: a previous-view read resolves the calling
 /// isolate's diff base at that moment, through the two-armed, seat-aware anchor
 /// (`store::SessionStore::previous_anchor`). For the isolate mid-batch (its own writes for
@@ -1287,7 +1377,10 @@ enum RootIdentity {
     /// spellings of one origin are one identity).
     Creator(Origin),
     /// A producer state root: the creator's interned id plus the exact root-path spelling.
-    ProducerRoot { creator: u32, path: store::StorePath },
+    ProducerRoot {
+        creator: u32,
+        path: store::StorePath,
+    },
     /// A consumer root: the folded producer key plus the exact root-path spelling.
     Consumer {
         producer: store::ProducerKey,
@@ -1360,7 +1453,13 @@ fn interned_root(state: &OpState, id: u32) -> Result<Rc<InteropRoot>, StoreOpErr
     }
     usize::try_from(id)
         .ok()
-        .and_then(|index| state.borrow::<InteropIdentities>().roots.get(index).cloned())
+        .and_then(|index| {
+            state
+                .borrow::<InteropIdentities>()
+                .roots
+                .get(index)
+                .cloned()
+        })
         .ok_or_else(|| StoreOpError(format!("smudgy: unknown interop root id {id}")))
 }
 
@@ -1373,7 +1472,13 @@ fn interned_event(state: &OpState, id: u32) -> Result<Rc<InteropEvent>, StoreOpE
     }
     usize::try_from(id & !EVENT_ID_TAG)
         .ok()
-        .and_then(|index| state.borrow::<InteropIdentities>().events.get(index).cloned())
+        .and_then(|index| {
+            state
+                .borrow::<InteropIdentities>()
+                .events
+                .get(index)
+                .cloned()
+        })
         .ok_or_else(|| StoreOpError(format!("smudgy: unknown interop event id {id}")))
 }
 
@@ -1521,7 +1626,7 @@ fn op_smudgy_interop_resolve_consumer_root(
 }
 
 /// `resolvePreviousRoot(baseRootId) -> id` — intern the previous-generation view of an
-/// already-interned root (`docs/interop-pre-gmcp-plan.md` §5): same producer, same constant
+/// already-interned root (`docs/interop.md` §2): same producer, same constant
 /// path prefix, no seat (the view is read-only on both seats — the write-shaped ops refuse
 /// it), resolving reads against the reader's previous anchor ([`RootView::Previous`])
 /// instead of the head. Ungated like every resolve; deduped per base root.
@@ -1585,10 +1690,7 @@ fn op_smudgy_interop_resolve_event(
 }
 
 /// Combine an interned root's constant path prefix with a call's dynamic subpath.
-fn resolve_root_path(
-    root: &InteropRoot,
-    subpath: &str,
-) -> Result<store::StorePath, StoreOpError> {
+fn resolve_root_path(root: &InteropRoot, subpath: &str) -> Result<store::StorePath, StoreOpError> {
     let sub = parse_path(subpath)?;
     root.root_path
         .joined(sub)
@@ -1792,7 +1894,7 @@ fn op_smudgy_store_previous_get(
 }
 
 /// `getTagged(rootId, subpath)` — the leaf-aware read
-/// (`docs/interop-pre-gmcp-plan.md` §2): the kind at the interned root's path + `subpath`
+/// (`docs/interop.md` §4a): the kind at the interned root's path + `subpath`
 /// under exactly [`op_smudgy_store_get`]'s visibility (read-your-writes overlay, no home
 /// gate), crossing the boundary as a tagged string — first byte `o` (an object, **no
 /// payload**), `a` (an array, its JSON follows), or `v` (a scalar, its JSON follows).
@@ -2356,7 +2458,11 @@ fn op_smudgy_session_echo(
 ) -> Result<(), NotCapable> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).echo, "echo")?;
-    route_session_action(state, target, RuntimeAction::Echo(Arc::new(line.to_string())));
+    route_session_action(
+        state,
+        target,
+        RuntimeAction::Echo(Arc::new(line.to_string())),
+    );
     Ok(())
 }
 
@@ -2635,7 +2741,9 @@ fn packed_take_units(
             }
         }
         if remaining > 0 {
-            return Err(packed_invalid("styled payload text shorter than its records"));
+            return Err(packed_invalid(
+                "styled payload text shorter than its records",
+            ));
         }
     }
     Ok((&rest[..end], &rest[end..]))
@@ -2656,7 +2764,10 @@ fn packed_validate(
     for units in send_lengths {
         rest = packed_take_units(rest, *units, false)?.1;
     }
-    let mut reader = PackedReader { records: line_records, pos: 2 };
+    let mut reader = PackedReader {
+        records: line_records,
+        pos: 2,
+    };
     let line_count = line_records[0];
     for _ in 0..line_count {
         let run_count = reader.next()?;
@@ -2720,7 +2831,10 @@ fn packed_echo_lines(
         sends.push(Arc::from(piece));
         rest = tail;
     }
-    let mut reader = PackedReader { records: line_records, pos: 2 };
+    let mut reader = PackedReader {
+        records: line_records,
+        pos: 2,
+    };
     let line_count = line_records[0] as usize;
     let mut lines = Vec::with_capacity(line_count);
     for _ in 0..line_count {
@@ -2731,21 +2845,21 @@ fn packed_echo_lines(
             let units = reader.next()?;
             let style = Style {
                 fg: packed_color(reader.next()?)?.unwrap_or(default_style.fg),
-                bg: packed_color(reader.next()?)?
-                    .map_or(default_style.bg, normalize_bg),
+                bg: packed_color(reader.next()?)?.map_or(default_style.bg, normalize_bg),
             };
             let link = match packed_link(reader.next()?)? {
                 PackedLink::None => None,
-                PackedLink::Send(index) => Some(LinkAction::Send(
-                    sends
-                        .get(index)
-                        .cloned()
-                        .ok_or_else(|| packed_invalid("link send index out of range"))?,
-                )),
+                PackedLink::Send(index) => {
+                    Some(LinkAction::Send(sends.get(index).cloned().ok_or_else(
+                        || packed_invalid("link send index out of range"),
+                    )?))
+                }
                 PackedLink::Callback(index) => {
-                    let id = links.callback_ids.get(index).copied().ok_or_else(|| {
-                        packed_invalid("link callback index out of range")
-                    })?;
+                    let id = links
+                        .callback_ids
+                        .get(index)
+                        .copied()
+                        .ok_or_else(|| packed_invalid("link callback index out of range"))?;
                     Some(LinkAction::Callback {
                         session: links.session,
                         isolate_token: links.isolate_token.clone(),
@@ -2779,6 +2893,67 @@ pub enum StyledTextOpError {
     #[class(generic)]
     #[error("smudgy: {0}")]
     Invalid(String),
+    #[class(inherit)]
+    #[error(transparent)]
+    NotCurrent(#[from] LineNotCurrent),
+}
+
+/// The current-line staleness scope, one cell shared engine-wide (every
+/// isolate's `OpState` plus the engine's user-JS entry points). `current` is
+/// the generation stamped on the line in flight (`ScriptEngine::set_current_line`
+/// bumps it as dispatch installs each line); `armed` is the generation the
+/// running synchronous user-JS entry captured on its way in — 0 outside any
+/// entry, and 0 for entries made while no line was in flight. The ambient
+/// `line` mutators require `armed == current` (see [`ensure_current_line`]):
+/// an async continuation that outlives its line can only resume between
+/// entries (deno runs microtasks in the event-loop pump, never inside a
+/// synchronous call), where `armed` is 0, so it throws instead of editing
+/// whatever line is current by then. The submission ops solve the same
+/// staleness for `sys:input` with a script-side capture ([`with_submission`]);
+/// `line` is armed host-side because triggers and aliases enter user JS with
+/// no script-side wrapper to capture in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LineScope {
+    pub current: u64,
+    pub armed: u64,
+}
+
+/// The shared cell form of [`LineScope`].
+pub type LineScopeCell = Rc<Cell<LineScope>>;
+
+/// The staleness refusal for the ambient `line`'s mutators: the write arrived
+/// outside the window in which its line was in flight — no line at all (a
+/// hotkey, a timer, a module top level), or an async continuation that
+/// outlived its line. Reads stay graceful (`""`/`undefined`); writes are
+/// refused loudly because a leaked write would land on whatever line the
+/// per-line routing/transform cells are consumed for NEXT.
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+#[class(generic)]
+#[error("smudgy: the current line is only mutable inside a trigger or sys:receive handler for it")]
+pub struct LineNotCurrent;
+
+/// The current-line staleness gate shared by the ambient `line` mutators
+/// (gag/redirect/copy and the current-line transforms): the armed entry scope
+/// must name the line in flight. See [`LineScope`].
+fn ensure_current_line(state: &OpState) -> Result<(), LineNotCurrent> {
+    let scope = state.borrow::<LineScopeCell>().get();
+    if scope.armed != 0 && scope.armed == scope.current {
+        Ok(())
+    } else {
+        Err(LineNotCurrent)
+    }
+}
+
+/// Errors a current-line transform/routing op can throw: the capability
+/// denial or the staleness refusal.
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+pub enum LineCallError {
+    #[class(inherit)]
+    #[error(transparent)]
+    NotCapable(#[from] NotCapable),
+    #[class(inherit)]
+    #[error(transparent)]
+    NotCurrent(#[from] LineNotCurrent),
 }
 
 /// Resolve a splice run's wire link to its [`LinkAction`]. (The echo path resolves
@@ -2791,9 +2966,13 @@ fn wire_link_to_action(
         None => Ok(None),
         Some(LinkWire::Send { send }) => Ok(Some(LinkAction::Send(Arc::from(send.as_str())))),
         Some(LinkWire::Callback { cb }) => {
-            let id = links.callback_ids.get(*cb as usize).copied().ok_or_else(|| {
-                StyledTextOpError::Invalid("link callback index out of range".to_string())
-            })?;
+            let id = links
+                .callback_ids
+                .get(*cb as usize)
+                .copied()
+                .ok_or_else(|| {
+                    StyledTextOpError::Invalid("link callback index out of range".to_string())
+                })?;
             Ok(Some(LinkAction::Callback {
                 session: links.session,
                 isolate_token: links.isolate_token.clone(),
@@ -2888,6 +3067,7 @@ fn op_smudgy_splice(
     callbacks: v8::Local<v8::Array>,
 ) -> Result<(), StyledTextOpError> {
     ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
     let runs = splice_runs(scope, state, runs, callbacks)?;
     let pending_ops = state.borrow::<Rc<RefCell<Vec<LineOperation>>>>();
     pending_ops.borrow_mut().push(LineOperation::Splice {
@@ -2959,7 +3139,11 @@ fn op_smudgy_session_send(
 ) -> Result<(), NotCapable> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).send, "send")?;
-    route_session_action(state, target, RuntimeAction::Send(Arc::new(line.to_string())));
+    route_session_action(
+        state,
+        target,
+        RuntimeAction::Send(Arc::new(line.to_string())),
+    );
     Ok(())
 }
 
@@ -2971,7 +3155,11 @@ fn op_smudgy_session_send_raw(
 ) -> Result<(), NotCapable> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).send_direct, "send-direct")?;
-    route_session_action(state, target, RuntimeAction::SendRaw(Arc::new(line.to_string())));
+    route_session_action(
+        state,
+        target,
+        RuntimeAction::SendRaw(Arc::new(line.to_string())),
+    );
     Ok(())
 }
 
@@ -2990,10 +3178,7 @@ fn op_smudgy_session_reload(state: &mut OpState, session_id: u32) -> Result<(), 
 }
 
 /// Helper function to convert a V8 array to Vec<String>
-fn v8_array_to_vec_str(
-    scope: &mut v8::PinScope,
-    arr: &v8::Array,
-) -> Result<Vec<String>, AnyError> {
+fn v8_array_to_vec_str(scope: &mut v8::PinScope, arr: &v8::Array) -> Result<Vec<String>, AnyError> {
     (0..arr.length())
         .map(|i| {
             arr.get_index(scope, i).map_or_else(
@@ -3043,6 +3228,8 @@ fn op_smudgy_create_simple_alias(
     patterns: &v8::Array,
     #[string] script: String,
     singleton: bool,
+    priority: i32,
+    fallthrough: bool,
     fire_limit: u32,
 ) -> Result<bool, AutomationOpError> {
     ensure(grants(state).create_aliases, "aliases")?;
@@ -3064,6 +3251,8 @@ fn op_smudgy_create_simple_alias(
         script: Some(script),
         package: None,
         enabled: true,
+        priority,
+        fallthrough,
         language: ScriptLang::Plaintext,
     };
 
@@ -3097,6 +3286,8 @@ fn op_smudgy_create_simple_trigger(
     prompt: bool,
     enabled: bool,
     singleton: bool,
+    priority: i32,
+    fallthrough: bool,
     fire_limit: u32,
     line_limit: u32,
 ) -> Result<bool, AutomationOpError> {
@@ -3151,6 +3342,8 @@ fn op_smudgy_create_simple_trigger(
         language: ScriptLang::Plaintext,
         enabled,
         prompt,
+        priority,
+        fallthrough,
     };
 
     let isolate = current_isolate(state);
@@ -3184,6 +3377,8 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
     prompt: bool,
     enabled: bool,
     singleton: bool,
+    priority: i32,
+    fallthrough: bool,
     fire_limit: u32,
     line_limit: u32,
     #[string] script_source: String,
@@ -3234,6 +3429,8 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
             function_id,
             prompt,
             enabled,
+            priority,
+            fallthrough,
             fire_limit: self_limit(fire_limit),
             line_limit: self_limit(line_limit),
             script_source: script_source_arc(script_source),
@@ -3254,6 +3451,8 @@ fn op_smudgy_create_javascript_function_alias<'s>(
     patterns: &v8::Array,
     f: v8::Local<'s, v8::Function>,
     singleton: bool,
+    priority: i32,
+    fallthrough: bool,
     fire_limit: u32,
     #[string] script_source: String,
 ) -> Result<bool, AutomationOpError> {
@@ -3291,6 +3490,8 @@ fn op_smudgy_create_javascript_function_alias<'s>(
             name: Arc::new(name),
             patterns: Arc::new(patterns_vec),
             function_id,
+            priority,
+            fallthrough,
             fire_limit: self_limit(fire_limit),
             script_source: script_source_arc(script_source),
         },
@@ -3461,6 +3662,8 @@ struct AutomationView {
     name: String,
     pattern: String,
     enabled: bool,
+    priority: i32,
+    fallthrough: bool,
 }
 
 /// Read one alias from the introspection mirror, scoped to the caller's own `(isolate, origin)`
@@ -3474,7 +3677,12 @@ fn op_smudgy_get_alias(
     #[string] name: &str,
 ) -> Result<Option<AutomationView>, AutomationOpError> {
     ensure(grants(state).create_aliases, "aliases")?;
-    Ok(lookup_automation(state, AutomationKind::Alias, creator_id, name)?)
+    Ok(lookup_automation(
+        state,
+        AutomationKind::Alias,
+        creator_id,
+        name,
+    )?)
 }
 
 /// Trigger counterpart of [`op_smudgy_get_alias`]; gated on `create-triggers`.
@@ -3486,7 +3694,12 @@ fn op_smudgy_get_trigger(
     #[string] name: &str,
 ) -> Result<Option<AutomationView>, AutomationOpError> {
     ensure(grants(state).create_triggers, "triggers")?;
-    Ok(lookup_automation(state, AutomationKind::Trigger, creator_id, name)?)
+    Ok(lookup_automation(
+        state,
+        AutomationKind::Trigger,
+        creator_id,
+        name,
+    )?)
 }
 
 /// List the caller's own alias names (`triggers.list()`/`aliases.list()`). Origin-scoped.
@@ -3508,7 +3721,11 @@ fn op_smudgy_list_triggers(
     creator_id: u32,
 ) -> Result<Vec<String>, AutomationOpError> {
     ensure(grants(state).create_triggers, "triggers")?;
-    Ok(list_automations(state, AutomationKind::Trigger, creator_id)?)
+    Ok(list_automations(
+        state,
+        AutomationKind::Trigger,
+        creator_id,
+    )?)
 }
 
 /// Whether the caller owns an alias by this name (`aliases.exists(name)`). Origin-scoped.
@@ -3557,6 +3774,8 @@ fn lookup_automation(
             name: name.to_string(),
             pattern: entry.pattern.clone(),
             enabled: entry.enabled,
+            priority: entry.priority,
+            fallthrough: entry.fallthrough,
         }))
 }
 
@@ -3644,13 +3863,15 @@ fn parse_color_from_js(
             obj.get(scope, r_key),
             obj.get(scope, g_key),
             obj.get(scope, b_key),
-        )
-            && r_val.is_number() && g_val.is_number() && b_val.is_number() {
-                let r = r_val.number_value(scope).unwrap_or(0.0) as u8;
-                let g = g_val.number_value(scope).unwrap_or(0.0) as u8;
-                let b = b_val.number_value(scope).unwrap_or(0.0) as u8;
-                return Ok(Color::Rgb { r, g, b });
-            }
+        ) && r_val.is_number()
+            && g_val.is_number()
+            && b_val.is_number()
+        {
+            let r = r_val.number_value(scope).unwrap_or(0.0) as u8;
+            let g = g_val.number_value(scope).unwrap_or(0.0) as u8;
+            let b = b_val.number_value(scope).unwrap_or(0.0) as u8;
+            return Ok(Color::Rgb { r, g, b });
+        }
 
         // Check if it's an ANSI color with bold
         let color_key = v8::String::new(scope, "color").unwrap().into();
@@ -3704,9 +3925,10 @@ fn op_smudgy_insert(
     end: u32,
     fg_color: v8::Local<v8::Value>,
     bg_color: v8::Local<v8::Value>,
-) -> Result<(), NotCapable> {
+) -> Result<(), LineCallError> {
     // Inserting into the current line changes what the user sees (→ change-display).
     ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
     // Parse the style
     let style = match parse_style_from_js(
         scope,
@@ -3745,8 +3967,9 @@ fn op_smudgy_replace(
     #[string] text: String,
     begin: u32,
     end: u32,
-) -> Result<(), NotCapable> {
+) -> Result<(), LineCallError> {
     ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
     // Get pending line operations from state
     let pending_ops = state.borrow::<Rc<RefCell<Vec<LineOperation>>>>();
     let mut ops = pending_ops.borrow_mut();
@@ -3768,8 +3991,9 @@ fn op_smudgy_highlight(
     end: u32,
     fg_color: v8::Local<v8::Value>,
     bg_color: v8::Local<v8::Value>,
-) -> Result<(), NotCapable> {
+) -> Result<(), LineCallError> {
     ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
     // Parse the style
     let style = match parse_style_from_js(
         scope,
@@ -3802,8 +4026,9 @@ fn op_smudgy_highlight(
 }
 
 #[op2(fast)]
-fn op_smudgy_remove(state: &mut OpState, begin: u32, end: u32) -> Result<(), NotCapable> {
+fn op_smudgy_remove(state: &mut OpState, begin: u32, end: u32) -> Result<(), LineCallError> {
     ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
     // Get pending line operations from state
     let pending_ops = state.borrow::<Rc<RefCell<Vec<LineOperation>>>>();
     let mut ops = pending_ops.borrow_mut();
@@ -3817,8 +4042,9 @@ fn op_smudgy_remove(state: &mut OpState, begin: u32, end: u32) -> Result<(), Not
 }
 
 #[op2(fast)]
-fn op_smudgy_gag(state: &mut OpState) -> Result<(), NotCapable> {
+fn op_smudgy_gag(state: &mut OpState) -> Result<(), LineCallError> {
     ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
     // Suppression is routing state, not a transform: transforms queued before or after
     // still apply to any routed copies of the line (`line.gag(); line.replace(...)`
     // replaces on the copies; gag only removes main from the sink set).
@@ -3830,7 +4056,7 @@ fn op_smudgy_gag(state: &mut OpState) -> Result<(), NotCapable> {
 }
 
 // ============================================================================
-// Panes: session-owned, name-keyed output panes (docs/flexible-panes-plan.md).
+// Panes: session-owned, name-keyed output panes (docs/panes.md).
 // Own-session ops mutate the shared `PaneRegistry` synchronously; cross-session
 // ops (gated by `reach-others` like every cross-session route) carry NAMES —
 // the target registry lives on another session's thread — and resolve at
@@ -3851,7 +4077,8 @@ impl From<pane::PaneError> for PaneOpError {
     }
 }
 
-/// Errors a pane op can throw: the capability denial or a pane rule refusal.
+/// Errors a pane op can throw: the capability denial, a pane rule refusal, or
+/// (for the line-routing ops) the current-line staleness refusal.
 #[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
 pub enum PaneCallError {
     #[class(inherit)]
@@ -3860,6 +4087,9 @@ pub enum PaneCallError {
     #[class(inherit)]
     #[error(transparent)]
     Pane(#[from] PaneOpError),
+    #[class(inherit)]
+    #[error(transparent)]
+    NotCurrent(#[from] LineNotCurrent),
 }
 
 impl From<pane::PaneError> for PaneCallError {
@@ -3925,6 +4155,9 @@ pub struct PaneInfo {
     is_main: bool,
     name_id: Option<u32>,
     created: bool,
+    /// Whether the pane hosts its own input line (`docs/input.md`
+    /// §3.7). Backs `pane.input` returning a handle vs `undefined`.
+    has_input: bool,
 }
 
 impl PaneInfo {
@@ -3938,8 +4171,524 @@ impl PaneInfo {
             is_main: def.is_main,
             name_id: Some(def.name_id.as_u32()),
             created,
+            has_input: def.input.is_some(),
         }
     }
+}
+
+// ============================================================================
+// The command input (`docs/input.md`): reads against the
+// session-thread mirror, writes as operations forwarded to the UI widget.
+// Inputs are addressed like pane deliveries — by name in the caller's
+// namespace — and every input op is own-session only: the mirror lives on this
+// thread, and a foreign session's input is not addressable.
+// ============================================================================
+
+/// The shared back half of resolving the caller's own pane input by name:
+/// resolution in the caller's namespace, the `panes` capability (the pane is
+/// the caller's own surface — namespacing already isolates cross-package
+/// access), and the pane-hosts-an-input rule. A pane without an input —
+/// either kind — is refused here; the UI's warn-and-drop on a key with no
+/// input is defense in depth behind this check. The own-session rule and the
+/// `main` fork stay at the call sites (the input surface admits main under
+/// the `input` capability; the registration op refuses it outright).
+fn resolve_own_pane_input(state: &mut OpState, name: &str) -> Result<pane::PaneKey, PaneCallError> {
+    let namespace = pane_namespace(state);
+    let registry = pane_registry(state);
+    let registry = registry.borrow();
+    let def = registry
+        .resolve(&namespace, name)
+        .ok_or_else(|| PaneOpError(format!("no pane named '{name}'")))?;
+    ensure(grants(state).panes, "panes")?;
+    if def.input.is_none() {
+        return Err(PaneOpError(format!("pane '{name}' has no input")).into());
+    }
+    Ok(def.key)
+}
+
+/// The shared front half of every input op: the own-session rule, name→key
+/// resolution, and a capability gate that depends on the target
+/// (`docs/input.md` §3.6). The MAIN input is the session-global
+/// surface a package can read and rewrite the user's typing through, so it
+/// requires the `input` capability; a pane input rides
+/// [`resolve_own_pane_input`]'s `panes` gate.
+fn resolve_input_target(
+    state: &mut OpState,
+    session_id: u32,
+    name: &str,
+) -> Result<pane::PaneKey, PaneCallError> {
+    let target = SessionId::from(session_id);
+    if target != *state.borrow::<SessionId>() {
+        return Err(PaneOpError(
+            "input handles are own-session only (another session's input is not addressable)"
+                .to_string(),
+        )
+        .into());
+    }
+    if pane::is_main_pane_name(name) {
+        ensure(grants(state).input, "input")?;
+        return Ok(pane::MAIN_PANE_KEY);
+    }
+    resolve_own_pane_input(state, name)
+}
+
+/// Read one input's mirrored state. Eventually consistent: reads reflect the
+/// last state update the UI delivered (the first read after interest is
+/// flagged may see the default empty state until the UI's snapshot lands).
+/// Empty of content while masked.
+///
+/// Reads — and only reads — flag mirror interest: a session that merely
+/// writes (a `propose()`-only script, say) never subscribes itself to
+/// per-keystroke state traffic. The one-time interest notification for the UI
+/// is queued on the flip.
+#[op2]
+#[serde]
+fn op_smudgy_input_get(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+) -> Result<crate::session::runtime::input::InputSnapshot, PaneCallError> {
+    let key = resolve_input_target(state, session_id, name)?;
+    let mirror = state
+        .borrow::<crate::session::runtime::SharedInputMirror>()
+        .clone();
+    let flipped = mirror.borrow_mut().flag_interest();
+    if flipped {
+        queue_own_action(state, RuntimeAction::InputMirrorInterest);
+    }
+    let snapshot = mirror.borrow().snapshot(key);
+    Ok(snapshot)
+}
+
+/// The wire shape of one scripted input mutation, tagged by verb — every
+/// `input.*` write verb funnels through the one apply op with one of these.
+/// Positions count UTF-16 code units (the JS string indexing unit); the UI
+/// clamps them to the buffer.
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum InputApplyWire {
+    Replace { text: String },
+    Append { text: String },
+    Clear,
+    Propose { text: String },
+    SetCursor { pos: u32 },
+    Select { start: u32, end: u32 },
+    SelectAll,
+    Focus,
+    Blur,
+    Submit,
+    SetMasked { masked: bool },
+}
+
+impl From<InputApplyWire> for crate::session::runtime::input::InputOp {
+    fn from(wire: InputApplyWire) -> Self {
+        use crate::session::runtime::input::InputOp;
+        match wire {
+            InputApplyWire::Replace { text } => InputOp::Replace(Arc::new(text)),
+            InputApplyWire::Append { text } => InputOp::Append(Arc::new(text)),
+            InputApplyWire::Clear => InputOp::Clear,
+            InputApplyWire::Propose { text } => InputOp::Propose(Arc::new(text)),
+            InputApplyWire::SetCursor { pos } => InputOp::SetCursor(pos as usize),
+            InputApplyWire::Select { start, end } => InputOp::Select(start as usize, end as usize),
+            InputApplyWire::SelectAll => InputOp::SelectAll,
+            InputApplyWire::Focus => InputOp::Focus,
+            InputApplyWire::Blur => InputOp::Blur,
+            InputApplyWire::Submit => InputOp::Submit,
+            InputApplyWire::SetMasked { masked } => InputOp::SetMasked(masked),
+        }
+    }
+}
+
+/// Apply one scripted input mutation (the write half of the input surface):
+/// resolve and check the target synchronously, then queue the op for the UI
+/// to apply to the live widget. Writes never flag mirror interest.
+#[op2]
+fn op_smudgy_input_apply(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    #[serde] op: InputApplyWire,
+) -> Result<(), PaneCallError> {
+    let key = resolve_input_target(state, session_id, name)?;
+    queue_own_action(state, RuntimeAction::InputApply { key, op: op.into() });
+    Ok(())
+}
+
+/// Errors a submission op can throw: the capability denial, or use of the
+/// ambient `submission` object outside the `sys:input` handler call it was
+/// delivered to (never delivered, delivered but already completed, or a stale
+/// async continuation whose submission has since been replaced by another).
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+pub enum SubmissionCallError {
+    #[class(inherit)]
+    #[error(transparent)]
+    NotCapable(#[from] NotCapable),
+    #[class(generic)]
+    #[error("smudgy: submission is only usable inside a sys:input handler")]
+    NoActiveSubmission,
+}
+
+/// The shared front half of the submission ops: the `input` capability gate
+/// (the same gate as the rest of the input surface — and as `sys:input`
+/// subscription itself, so an isolate that could not subscribe cannot act
+/// either), then the live-submission requirement. The live cell holds a
+/// submission only while the `SubmitInput` dispatch arm's handler splice is
+/// running, and `generation` must name THAT submission: the script side
+/// captures it at delivery (scoped to the synchronous handler call), so an
+/// async handler continuation that outlives its submission arrives with a
+/// generation the slot no longer holds — 0 outside any handler call, or its
+/// own dead submission's while a later one is live — and throws instead of
+/// acting on a submission it was never delivered.
+fn with_submission<T>(
+    state: &mut OpState,
+    generation: u32,
+    f: impl FnOnce(&mut crate::session::runtime::input::InputSubmission) -> T,
+) -> Result<T, SubmissionCallError> {
+    ensure(grants(state).input, "input")?;
+    let cell = state
+        .borrow::<crate::session::runtime::SharedInputSubmission>()
+        .clone();
+    let mut slot = cell.borrow_mut();
+    match slot.live_mut() {
+        Some(submission) if submission.generation() == generation => Ok(f(submission)),
+        _ => Err(SubmissionCallError::NoActiveSubmission),
+    }
+}
+
+/// The live submission's generation, or 0 when none is live. Read by the
+/// `sys:input` delivery wrapper at splice time — during a delivery the live
+/// submission is the delivered one — and scoped to the synchronous handler
+/// call; the submission ops then require the value back (see
+/// [`with_submission`]).
+#[op2(fast)]
+fn op_smudgy_input_submission_generation(state: &mut OpState) -> Result<u32, NotCapable> {
+    ensure(grants(state).input, "input")?;
+    let cell = state
+        .borrow::<crate::session::runtime::SharedInputSubmission>()
+        .clone();
+    let generation = cell.borrow().live_generation();
+    Ok(generation)
+}
+
+/// `submission.text` — the submitted line as it currently stands (an earlier
+/// handler's `replace()` is visible to a later handler's read).
+#[op2]
+#[string]
+fn op_smudgy_input_submission_text(
+    state: &mut OpState,
+    generation: u32,
+) -> Result<String, SubmissionCallError> {
+    with_submission(state, generation, |submission| {
+        submission.text().to_string()
+    })
+}
+
+/// `submission.replace(text)` — substitute what enters the pipeline when the
+/// handlers finish.
+#[op2(fast)]
+fn op_smudgy_input_submission_replace(
+    state: &mut OpState,
+    generation: u32,
+    #[string] text: &str,
+) -> Result<(), SubmissionCallError> {
+    with_submission(state, generation, |submission| submission.replace(text))
+}
+
+/// `submission.cancel()` — swallow the submission entirely. Sticky: a cancel
+/// wins over any replace, from any handler, in any order.
+#[op2(fast)]
+fn op_smudgy_input_submission_cancel(
+    state: &mut OpState,
+    generation: u32,
+) -> Result<(), SubmissionCallError> {
+    with_submission(
+        state,
+        generation,
+        crate::session::runtime::input::InputSubmission::cancel,
+    )
+}
+
+/// The wire shape of one word-set mutation, tagged by verb — every
+/// `WordSetRegistry` write verb funnels through the one mutate op with one of
+/// these, the target set riding as a field
+/// ([`input::WordSetKind`](crate::session::runtime::input::WordSetKind)
+/// deserializes itself).
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum WordSetMutateWire {
+    Add {
+        set: crate::session::runtime::input::WordSetKind,
+        words: Vec<String>,
+    },
+    Delete {
+        set: crate::session::runtime::input::WordSetKind,
+        word: String,
+    },
+    Clear {
+        set: crate::session::runtime::input::WordSetKind,
+    },
+}
+
+/// The wire shape of one word-set read, mirroring [`WordSetMutateWire`].
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum WordSetQueryWire {
+    Has {
+        set: crate::session::runtime::input::WordSetKind,
+        word: String,
+    },
+    List {
+        set: crate::session::runtime::input::WordSetKind,
+    },
+}
+
+/// Errors a word-set registry op can throw: anything the shared input-target
+/// gate refuses (own-session only; the `input` capability for the main
+/// input, the `panes` capability for the caller's own pane input; a pane
+/// without an input), a creator-identity failure (unreachable in practice —
+/// the ids are host-minted), a rejected word, or a full set.
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+pub enum WordSetCallError {
+    #[class(inherit)]
+    #[error(transparent)]
+    Call(#[from] PaneCallError),
+    #[class(inherit)]
+    #[error(transparent)]
+    Store(#[from] StoreOpError),
+    #[class(generic)]
+    #[error("{0}")]
+    InvalidWord(String),
+    #[class(generic)]
+    #[error(
+        "smudgy: a script may register at most {} completion words per set on an input; \
+         this add() would exceed that, so nothing was registered. delete() or clear() \
+         words you no longer need",
+        crate::session::runtime::input::MAX_WORDS_PER_CREATOR
+    )]
+    SetFull,
+}
+
+/// A registered completion word is one token: non-empty, no whitespace, at
+/// most [`MAX_WORD_CHARS`](crate::session::runtime::input::MAX_WORD_CHARS)
+/// characters. Enforced at registration (`add`) — the author-input gate is
+/// loud, like every other one; the lookup verbs simply miss on such a string.
+fn validate_word_set_word(word: &str) -> Result<(), WordSetCallError> {
+    if word.is_empty() {
+        return Err(WordSetCallError::InvalidWord(
+            "smudgy: a completion word must be a non-empty string".to_string(),
+        ));
+    }
+    if word.chars().any(char::is_whitespace) {
+        return Err(WordSetCallError::InvalidWord(format!(
+            "smudgy: a completion word is one token with no whitespace; \
+             add({word:?}) should be add() calls for each word"
+        )));
+    }
+    let max = crate::session::runtime::input::MAX_WORD_CHARS;
+    if word.chars().count() > max {
+        return Err(WordSetCallError::InvalidWord(format!(
+            "smudgy: a completion word is at most {max} characters; completion \
+             inserts single words, not phrases or payloads"
+        )));
+    }
+    Ok(())
+}
+
+/// The caller's word-set creator identity: the same `(isolate, origin)` pair
+/// that keys automations, so `delete()`/`clear()`/`list()` see only the
+/// caller's own contributions.
+fn word_set_creator(
+    state: &OpState,
+    creator_id: u32,
+) -> Result<crate::session::runtime::input::WordSetCreator, StoreOpError> {
+    Ok((current_isolate(state), creator_origin(state, creator_id)?))
+}
+
+/// Mutate the caller's contribution to one input's suggestion set or
+/// blacklist (the write half of the `WordSetRegistry` surface,
+/// `docs/input.md` §3.8). Word identity within a contribution is
+/// case-insensitive with the registered casing preserved (a re-add updates
+/// the casing in place). `add` is atomic: the whole batch is validated —
+/// each word a bounded single token, the resulting count within the
+/// per-creator cap — before anything lands. Returns `delete`'s hit verdict;
+/// `add`/`clear` return null. A mutation that changed anything queues one
+/// coalesced merged-view push for the UI.
+#[op2]
+#[serde]
+fn op_smudgy_input_words_mutate(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    creator_id: u32,
+    #[serde] op: WordSetMutateWire,
+) -> Result<serde_json::Value, WordSetCallError> {
+    let key = resolve_input_target(state, session_id, name)?;
+    let creator = word_set_creator(state, creator_id)?;
+    let sets = state
+        .borrow::<crate::session::runtime::SharedInputWordSets>()
+        .clone();
+    let (changed, verdict) = match op {
+        WordSetMutateWire::Add { set, words } => {
+            for word in &words {
+                validate_word_set_word(word)?;
+            }
+            let changed = sets
+                .borrow_mut()
+                .add(key, set, &creator, &words)
+                .map_err(|_| WordSetCallError::SetFull)?;
+            (changed, serde_json::Value::Null)
+        }
+        WordSetMutateWire::Delete { set, word } => {
+            let hit = sets.borrow_mut().delete(key, set, &creator, &word);
+            (hit, serde_json::Value::Bool(hit))
+        }
+        WordSetMutateWire::Clear { set } => {
+            let changed = sets.borrow_mut().clear(key, set, &creator);
+            (changed, serde_json::Value::Null)
+        }
+    };
+    if changed && sets.borrow_mut().flag_push(key) {
+        queue_own_action(state, RuntimeAction::InputWordSetsChanged { key });
+    }
+    Ok(verdict)
+}
+
+/// Read the caller's contribution to one input's suggestion set or blacklist
+/// (the read half of the `WordSetRegistry` surface). Exact, not mirrored: the
+/// authoritative sets live on this thread, so `has`/`list` see every earlier
+/// mutation. `list` returns the caller's own words in insertion order,
+/// registered casing.
+#[op2]
+#[serde]
+fn op_smudgy_input_words_query(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    creator_id: u32,
+    #[serde] op: WordSetQueryWire,
+) -> Result<serde_json::Value, WordSetCallError> {
+    let key = resolve_input_target(state, session_id, name)?;
+    let creator = word_set_creator(state, creator_id)?;
+    let sets = state
+        .borrow::<crate::session::runtime::SharedInputWordSets>()
+        .clone();
+    let sets = sets.borrow();
+    Ok(match op {
+        WordSetQueryWire::Has { set, word } => {
+            serde_json::Value::Bool(sets.has(key, set, &creator, &word))
+        }
+        WordSetQueryWire::List { set } => serde_json::Value::Array(
+            sets.list(key, set, &creator)
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    })
+}
+
+/// The wire shape of one history mutation, tagged by verb
+/// (`docs/input.md` §3.9). The history verbs follow the word-set op
+/// pair — one serde-tagged mutate op beside a plain read — rather than the
+/// `InputApplyWire`/`InputSnapshot` funnel: the read half returns the
+/// mirrored history entries, not the state snapshot, so `op_smudgy_input_get`
+/// stays lean for the per-read value/cursor traffic.
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+enum InputHistoryMutateWire {
+    Push { text: String },
+    Clear,
+}
+
+/// Errors a history op can throw: anything the shared input-target gate
+/// refuses (own-session only; the `input` capability for the main input,
+/// the `panes` capability for the caller's own pane input; a pane without
+/// an input), or a rejected entry.
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+pub enum InputHistoryCallError {
+    #[class(inherit)]
+    #[error(transparent)]
+    Call(#[from] PaneCallError),
+    #[class(generic)]
+    #[error("{0}")]
+    InvalidEntry(String),
+}
+
+/// A pushed history entry is one line: non-blank, no `\n`/`\r` (history
+/// recall pastes an entry back into a single-line input). No length cap
+/// beyond what history itself enforces. Loud at the op boundary, like every
+/// other author-input gate — the UI's history keeps a trim check of its own,
+/// which would otherwise swallow a whitespace-only push silently.
+fn validate_history_entry(text: &str) -> Result<(), InputHistoryCallError> {
+    if text.trim().is_empty() {
+        return Err(InputHistoryCallError::InvalidEntry(
+            "smudgy: a history entry must be a non-blank string".to_string(),
+        ));
+    }
+    if text.contains(['\n', '\r']) {
+        return Err(InputHistoryCallError::InvalidEntry(
+            "smudgy: a history entry is a single line; push() each command separately".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Mutate one input's real history (the write half of the `input.history`
+/// surface, `docs/input.md` §3.9): a validated push or a clear
+/// crosses to the UI as an [`InputOp`](crate::session::runtime::input::InputOp)
+/// like every other input mutation, and the UI's confirming history update
+/// comes back unconditionally once the change lands. History is user-owned
+/// and session-global per input — there is no creator scoping.
+#[op2]
+fn op_smudgy_input_history_mutate(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    #[serde] op: InputHistoryMutateWire,
+) -> Result<(), InputHistoryCallError> {
+    use crate::session::runtime::input::InputOp;
+    let key = resolve_input_target(state, session_id, name)?;
+    let op = match op {
+        InputHistoryMutateWire::Push { text } => {
+            validate_history_entry(&text)?;
+            InputOp::HistoryPush(Arc::new(text))
+        }
+        InputHistoryMutateWire::Clear => InputOp::HistoryClear,
+    };
+    queue_own_action(state, RuntimeAction::InputApply { key, op });
+    Ok(())
+}
+
+/// Read one input's mirrored history, newest first. Exact with respect to the
+/// last submission: the UI sends every history change unconditionally (it
+/// changes per submission, never per keystroke), so unlike the state snapshot
+/// this read flags no mirror interest. Masked submissions never enter the
+/// UI's history, so they never appear here.
+#[op2]
+#[serde]
+fn op_smudgy_input_history_list(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+) -> Result<Vec<String>, PaneCallError> {
+    let key = resolve_input_target(state, session_id, name)?;
+    let mirror = state
+        .borrow::<crate::session::runtime::SharedInputMirror>()
+        .clone();
+    let entries = mirror.borrow().history(key);
+    Ok(entries
+        .iter()
+        .map(|entry| entry.as_str().to_string())
+        .collect())
+}
+
+/// The display half of a `PaneSpec.input` (`docs/input.md` §3.7).
+/// The `onSubmit` handler itself never rides the serde spec — the facade
+/// registers it through [`op_smudgy_pane_input_on_submit`] right after the
+/// split, since a v8 function cannot cross a serde boundary.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneInputSpecJs {
+    placeholder: Option<String>,
 }
 
 /// The script-facing split spec (`PaneSpec`), parsed from JSON.
@@ -3955,6 +4704,9 @@ pub struct PaneSpecJs {
     /// `'normal' | 'always-show'`; omitted leaves an existing pane's policy
     /// alone and defaults a new pane to `'normal'`.
     title_bar: Option<String>,
+    /// The pane's own input line. Own-session only: the `onSubmit` handler
+    /// runs in the creating isolate, which a cross-session split cannot name.
+    input: Option<PaneInputSpecJs>,
 }
 
 /// Get-or-create a pane and (on creation) place it by splitting off `ref_name`
@@ -4001,11 +4753,15 @@ fn op_smudgy_pane_split(
 
     let namespace = pane_namespace(state);
 
+    let input = spec.input.map(|input| pane::PaneInputDef {
+        placeholder: input.placeholder.map(Arc::from),
+    });
+
     if target == *state.borrow::<SessionId>() {
         let registry = pane_registry(state);
         let outcome = registry
             .borrow_mut()
-            .split(&namespace, &spec.name, kind, title_bar)?;
+            .split(&namespace, &spec.name, kind, title_bar, input)?;
         if outcome.created {
             let reference = registry
                 .borrow()
@@ -4032,6 +4788,17 @@ fn op_smudgy_pane_split(
         }
         Ok(PaneInfo::from_def(&outcome.def, outcome.created))
     } else {
+        // A pane input's onSubmit runs in the CREATING isolate, which lives on
+        // this session's thread — a foreign session's pane could never deliver
+        // to it, so the spec is refused rather than silently dropped.
+        if input.is_some() {
+            return Err(PaneOpError(
+                "pane inputs are own-session only (another session's pane cannot deliver \
+                 submissions to your onSubmit handler)"
+                    .to_string(),
+            )
+            .into());
+        }
         route_session_action(
             state,
             target,
@@ -4054,8 +4821,70 @@ fn op_smudgy_pane_split(
             is_main: false,
             name_id: None,
             created: false,
+            has_input: false,
         })
     }
+}
+
+/// Register (or replace) the `onSubmit` handler for a pane input
+/// (`docs/input.md` §3.7). The facade calls this right after the
+/// split that carried `input` in its spec — a v8 function cannot ride the
+/// serde spec — and again on every re-claiming split, which is what brings a
+/// handler back after a reload (handler addresses are engine facts and die
+/// with their isolate generation, like widget callbacks). Own-session only,
+/// gated by `panes` like the split itself: the pane is the caller's own
+/// surface, in its own namespace. `main` is refused with the split's
+/// [`pane::PaneError::MainInput`] teaching — its fused input is
+/// `session.input`, and typed submissions are intercepted through
+/// `sys:input`, never an `onSubmit`.
+#[op2(fast)]
+fn op_smudgy_pane_input_on_submit<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    f: v8::Local<'s, v8::Function>,
+) -> Result<(), PaneCallError> {
+    ensure(grants(state).panes, "panes")?;
+    let target = SessionId::from(session_id);
+    if target != *state.borrow::<SessionId>() {
+        return Err(PaneOpError(
+            "pane inputs are own-session only (another session's pane cannot deliver \
+             submissions to your onSubmit handler)"
+                .to_string(),
+        )
+        .into());
+    }
+    if pane::is_main_pane_name(name) {
+        return Err(PaneOpError(format!(
+            "{}; intercept typed submissions with the sys:input event instead",
+            pane::PaneError::MainInput
+        ))
+        .into());
+    }
+    let key = resolve_own_pane_input(state, name)?;
+    // The handler lives in this isolate's `script_functions` registry (append-only,
+    // reclaimed with the engine), like event subscribers; only its address crosses
+    // to the session-side registry the dispatch arm resolves through.
+    let f = v8::Global::new(scope, f);
+    let function_id = {
+        let mut script_functions = state
+            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow_mut();
+        let id = FunctionId(script_functions.len());
+        script_functions.push(f);
+        id
+    };
+    let callback = crate::session::runtime::input::PaneInputCallback {
+        isolate: current_isolate(state),
+        instance: state.borrow::<IsolateInstance>().0,
+        function_id,
+    };
+    state
+        .borrow::<crate::session::runtime::SharedPaneInputCallbacks>()
+        .borrow_mut()
+        .register(key, callback);
+    Ok(())
 }
 
 /// Close a pane by name. Closing main throws; closing an already-closed name
@@ -4074,6 +4903,15 @@ fn op_smudgy_pane_close(
         let closed = pane_registry(state).borrow_mut().close(&namespace, name);
         match closed {
             Ok(key) => {
+                // The closed pane's input state — mirror, word sets, onSubmit
+                // registration — dies with it (keys are never reused, so none
+                // of it could be read again).
+                crate::session::runtime::input::purge_pane_input_state(
+                    state.borrow::<crate::session::runtime::SharedInputMirror>(),
+                    state.borrow::<crate::session::runtime::SharedInputWordSets>(),
+                    state.borrow::<crate::session::runtime::SharedPaneInputCallbacks>(),
+                    key,
+                );
                 queue_own_action(state, RuntimeAction::PaneClosed { key });
                 Ok(())
             }
@@ -4277,6 +5115,7 @@ fn op_smudgy_redirect(
 ) -> Result<(), PaneCallError> {
     ensure(grants(state).panes, "panes")?;
     ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
     let key = resolve_routing_target(state, name_id, name)?;
     state
         .borrow::<crate::session::runtime::SharedLineRouting>()
@@ -4295,6 +5134,7 @@ fn op_smudgy_copy(
 ) -> Result<(), PaneCallError> {
     ensure(grants(state).panes, "panes")?;
     ensure(grants(state).change_display, "change-display")?;
+    ensure_current_line(state)?;
     let key = resolve_routing_target(state, name_id, name)?;
     let routing = state.borrow::<crate::session::runtime::SharedLineRouting>();
     let mut routing = routing.borrow_mut();
@@ -4348,10 +5188,7 @@ fn ansi_color_token(color: AnsiColor) -> &'static str {
 /// `highlightAt`/`insert`. RGB -> `{ r, g, b }`; ANSI -> `{ color, bold }` (the object
 /// form, so `bold: false` survives — the bare `"red"` token implies bold); the special slots
 /// and the theme default -> their string tokens (`"echo"`/`"output"`/`"warn"`/`"default"`).
-fn color_to_js<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    color: Color,
-) -> v8::Local<'s, v8::Value> {
+fn color_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, color: Color) -> v8::Local<'s, v8::Value> {
     match color {
         Color::Rgb { r, g, b } => {
             let obj = v8::Object::new(scope);
@@ -4365,7 +5202,9 @@ fn color_to_js<'s>(
         Color::Ansi { color, bold } => {
             let obj = v8::Object::new(scope);
             let color_key = v8::String::new(scope, "color").unwrap().into();
-            let color_val = v8::String::new(scope, ansi_color_token(color)).unwrap().into();
+            let color_val = v8::String::new(scope, ansi_color_token(color))
+                .unwrap()
+                .into();
             obj.create_data_property(scope, color_key, color_val);
             let bold_key = v8::String::new(scope, "bold").unwrap().into();
             let bold_val = v8::Boolean::new(scope, bold).into();
@@ -4394,14 +5233,18 @@ fn spans_to_js<'s>(
         .map(|span| {
             let obj = v8::Object::new(scope);
             let begin_key = v8::String::new(scope, "begin").unwrap().into();
-            let begin_val =
-                v8::Integer::new_from_unsigned(scope, u32::try_from(span.begin_pos).unwrap_or(u32::MAX))
-                    .into();
+            let begin_val = v8::Integer::new_from_unsigned(
+                scope,
+                u32::try_from(span.begin_pos).unwrap_or(u32::MAX),
+            )
+            .into();
             obj.create_data_property(scope, begin_key, begin_val);
             let end_key = v8::String::new(scope, "end").unwrap().into();
-            let end_val =
-                v8::Integer::new_from_unsigned(scope, u32::try_from(span.end_pos).unwrap_or(u32::MAX))
-                    .into();
+            let end_val = v8::Integer::new_from_unsigned(
+                scope,
+                u32::try_from(span.end_pos).unwrap_or(u32::MAX),
+            )
+            .into();
             obj.create_data_property(scope, end_key, end_val);
             let fg_key = v8::String::new(scope, "fg").unwrap().into();
             let fg_val = color_to_js(scope, span.style.fg);
@@ -4451,8 +5294,9 @@ fn op_smudgy_buffer_get_text<'s>(
     line_number: u32,
 ) -> v8::Local<'s, v8::Value> {
     match ring_line(state, line_number as usize) {
-        Some(line) => v8::String::new(scope, &line.text)
-            .map_or_else(|| v8::null(scope).into(), Into::into),
+        Some(line) => {
+            v8::String::new(scope, &line.text).map_or_else(|| v8::null(scope).into(), Into::into)
+        }
         None => v8::null(scope).into(),
     }
 }
@@ -4653,6 +5497,16 @@ fn op_smudgy_capture(state: &mut OpState, value: bool) {
     captured.0 = value;
 }
 
+#[op2(fast)]
+fn op_smudgy_fallthrough(state: &mut OpState, value: bool) -> Result<(), FallthroughContextError> {
+    let fallthrough = state.borrow_mut::<Fallthrough>();
+    let Some(current) = fallthrough.0.as_mut() else {
+        return Err(FallthroughContextError);
+    };
+    *current = value;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4696,9 +5550,22 @@ mod tests {
         // Line 1: "Hi" in rgb(1,2,3) + "!" unset; line 2: "ok" bright red on a
         // "default" background (which must normalize to DefaultBackground).
         let records = [
-            2, 0, // 2 lines, 0 sends
-            2, 2, RGB_123, 0, 0, 1, 0, 0, 0, // line 1: 2 runs
-            1, 2, ANSI_RED_BRIGHT, ROLE_DEFAULT, 0, // line 2: 1 run
+            2,
+            0, // 2 lines, 0 sends
+            2,
+            2,
+            RGB_123,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0, // line 1: 2 runs
+            1,
+            2,
+            ANSI_RED_BRIGHT,
+            ROLE_DEFAULT,
+            0, // line 2: 1 run
         ];
         let lines = decode("Hi!ok", &records, 0, Vec::new()).expect("valid payload");
         assert_eq!(lines.len(), 2);
@@ -4706,13 +5573,22 @@ mod tests {
         assert_eq!(lines[0].spans.len(), 2);
         assert_eq!(lines[0].spans[0].style.fg, Color::Rgb { r: 1, g: 2, b: 3 });
         assert_eq!(lines[0].spans[0].style.bg, Color::DefaultBackground);
-        assert_eq!((lines[0].spans[0].begin_pos, lines[0].spans[0].end_pos), (0, 2));
+        assert_eq!(
+            (lines[0].spans[0].begin_pos, lines[0].spans[0].end_pos),
+            (0, 2)
+        );
         assert_eq!(lines[0].spans[1].style.fg, Color::Echo);
-        assert_eq!((lines[0].spans[1].begin_pos, lines[0].spans[1].end_pos), (2, 3));
+        assert_eq!(
+            (lines[0].spans[1].begin_pos, lines[0].spans[1].end_pos),
+            (2, 3)
+        );
         assert_eq!(lines[1].text, "ok");
         assert_eq!(
             lines[1].spans[0].style.fg,
-            Color::Ansi { color: AnsiColor::Red, bold: true }
+            Color::Ansi {
+                color: AnsiColor::Red,
+                bold: true
+            }
         );
         assert_eq!(lines[1].spans[0].style.bg, Color::DefaultBackground);
     }
@@ -4731,15 +5607,30 @@ mod tests {
         // Send strings ride at the FRONT of the text with lengths at the TAIL of
         // the records; callbacks resolve through the registered id list.
         let records = [
-            1, 1, // 1 line, 1 send
-            2, 4, 0, 0, LINK_SEND_0, 2, 0, 0, LINK_CB_0, // "go n" send-linked, "ok" cb-linked
-            5, // send "north" is 5 units
+            1,
+            1, // 1 line, 1 send
+            2,
+            4,
+            0,
+            0,
+            LINK_SEND_0,
+            2,
+            0,
+            0,
+            LINK_CB_0, // "go n" send-linked, "ok" cb-linked
+            5,         // send "north" is 5 units
         ];
         let lines = decode("northgo nok", &records, 1, vec![42]).expect("valid payload");
         assert_eq!(lines[0].text, "go nok");
         assert_eq!(lines[0].links.len(), 2);
-        assert_eq!(lines[0].links[0].action, LinkAction::Send(Arc::from("north")));
-        assert_eq!((lines[0].links[0].begin_pos, lines[0].links[0].end_pos), (0, 4));
+        assert_eq!(
+            lines[0].links[0].action,
+            LinkAction::Send(Arc::from("north"))
+        );
+        assert_eq!(
+            (lines[0].links[0].begin_pos, lines[0].links[0].end_pos),
+            (0, 4)
+        );
         let LinkAction::Callback { id, .. } = &lines[0].links[1].action else {
             panic!("second link must be a callback");
         };
@@ -4753,8 +5644,14 @@ mod tests {
         let records = [1, 0, 2, 3, 0, 0, 0, 1, RGB_123, 0, 0];
         let lines = decode("\u{1F600}!?", &records, 0, Vec::new()).expect("valid payload");
         assert_eq!(lines[0].text, "\u{1F600}!?");
-        assert_eq!((lines[0].spans[0].begin_pos, lines[0].spans[0].end_pos), (0, 5));
-        assert_eq!((lines[0].spans[1].begin_pos, lines[0].spans[1].end_pos), (5, 6));
+        assert_eq!(
+            (lines[0].spans[0].begin_pos, lines[0].spans[0].end_pos),
+            (0, 5)
+        );
+        assert_eq!(
+            (lines[0].spans[1].begin_pos, lines[0].spans[1].end_pos),
+            (5, 6)
+        );
     }
 
     #[test]
@@ -4768,15 +5665,50 @@ mod tests {
     fn packed_validate_rejects_malformed_payloads() {
         let cases: &[(&str, &str, Vec<u32>, u32)] = &[
             ("newline in a run", "a\nb", vec![1, 0, 1, 3, 0, 0, 0], 0),
-            ("unknown color tag", "x", vec![1, 0, 1, 1, 0x0400_0000, 0, 0], 0),
-            ("unknown role color", "x", vec![1, 0, 1, 1, 0x0300_0004, 0, 0], 0),
-            ("unknown ansi index", "x", vec![1, 0, 1, 1, 0x0200_0010, 0, 0], 0),
-            ("unknown link tag", "x", vec![1, 0, 1, 1, 0, 0, 0xC000_0000], 0),
+            (
+                "unknown color tag",
+                "x",
+                vec![1, 0, 1, 1, 0x0400_0000, 0, 0],
+                0,
+            ),
+            (
+                "unknown role color",
+                "x",
+                vec![1, 0, 1, 1, 0x0300_0004, 0, 0],
+                0,
+            ),
+            (
+                "unknown ansi index",
+                "x",
+                vec![1, 0, 1, 1, 0x0200_0010, 0, 0],
+                0,
+            ),
+            (
+                "unknown link tag",
+                "x",
+                vec![1, 0, 1, 1, 0, 0, 0xC000_0000],
+                0,
+            ),
             ("nonzero link with tag 0", "x", vec![1, 0, 1, 1, 0, 0, 1], 0),
-            ("callback index out of range", "x", vec![1, 0, 1, 1, 0, 0, LINK_CB_0], 0),
-            ("send index out of range", "x", vec![1, 0, 1, 1, 0, 0, LINK_SEND_0], 0),
+            (
+                "callback index out of range",
+                "x",
+                vec![1, 0, 1, 1, 0, 0, LINK_CB_0],
+                0,
+            ),
+            (
+                "send index out of range",
+                "x",
+                vec![1, 0, 1, 1, 0, 0, LINK_SEND_0],
+                0,
+            ),
             ("truncated records", "x", vec![1, 0, 1, 1, 0], 0),
-            ("text shorter than records", "x", vec![1, 0, 1, 2, 0, 0, 0], 0),
+            (
+                "text shorter than records",
+                "x",
+                vec![1, 0, 1, 2, 0, 0, 0],
+                0,
+            ),
             ("trailing text", "xy", vec![1, 0, 1, 1, 0, 0, 0], 0),
             ("trailing records", "x", vec![1, 0, 1, 1, 0, 0, 0, 0], 0),
             ("send count past table", "x", vec![1, 9, 1, 1, 0, 0, 0], 0),
@@ -4813,7 +5745,10 @@ mod tests {
 
     #[test]
     fn main_isolate_is_trusted_for_any_namespace() {
-        assert!(param_read_allowed(&IsolateId::Main, "smudgy://anyone/anything"));
+        assert!(param_read_allowed(
+            &IsolateId::Main,
+            "smudgy://anyone/anything"
+        ));
         assert!(param_read_allowed(&IsolateId::Main, "smudgy://wbk/mapper"));
     }
 
@@ -4838,4 +5773,3 @@ mod tests {
         );
     }
 }
-

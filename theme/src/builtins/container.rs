@@ -40,6 +40,24 @@ pub fn overlay(theme: &Theme) -> container::Style {
     }
 }
 
+/// The floating chip behind a script widget's text tooltip: the overlay surface with a
+/// soft text-derived border, so tooltips read as the same material as the other floating
+/// layers and follow theme remaps.
+#[must_use]
+pub fn tooltip(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(
+            theme.styles.general.overlay_background,
+        )),
+        border: Border {
+            color: theme.styles.text.normal.scale_alpha(0.25),
+            width: 1.0,
+            radius: Radius::from(4),
+        },
+        ..Default::default()
+    }
+}
+
 #[must_use]
 pub fn modal_container(theme: &Theme) -> container::Style {
     container::Style {

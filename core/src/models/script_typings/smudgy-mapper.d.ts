@@ -34,6 +34,8 @@ type RoomNumber = number;
 
 /** An exit's identifier: a 2-element `[hi, lo]` pair, like {@link AreaId}. Opaque. */
 type ExitId = readonly [number, number];
+/** A Connection's identifier, opaque like {@link ExitId}. */
+type ConnectionId = readonly [number, number];
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -51,9 +53,6 @@ type ExitDirection =
     | "Out"
     | "Special"
     | "Other";
-
-/** How an exit is drawn on the map. */
-type ExitStyle = "Normal" | "Dashed" | "Dotted" | "Meandering" | "Stub";
 
 // ---- Labels + shapes --------------------------------------------------------
 
@@ -237,15 +236,11 @@ interface Exit {
     readonly weight: number;
     /** The command sent to traverse this exit, or `null` to use `from_direction`. */
     readonly command: string | null;
-    readonly style: ExitStyle;
-    /** A CSS color string, or `null` for the default. */
-    readonly color: string | null;
 }
 
 /** Fields accepted when creating an exit (`mapper.createRoomExit`). Only
- *  `from_direction` is required. **Careful:** `style` and `color` are accepted for
- *  symmetry but **ignored** on creation; set them afterwards with
- *  `mapper.setRoomExit`. */
+ *  `from_direction` is required. Visual appearance (routing, dash, color,
+ *  thickness) lives on the shared Connection, not the exit. */
 interface ExitArgs {
     from_direction: ExitDirection;
     to_direction?: ExitDirection;
@@ -256,10 +251,6 @@ interface ExitArgs {
     is_locked?: boolean;
     weight?: number;
     command?: string;
-    /** Accepted for parity but ignored on creation; use `setRoomExit` to set it. */
-    style?: ExitStyle;
-    /** Accepted for parity but ignored on creation; use `setRoomExit` to set it. */
-    color?: string;
 }
 
 /** Fields accepted when updating an exit (`mapper.setRoomExit`). Any omitted field is
@@ -274,9 +265,79 @@ interface ExitUpdates {
     is_locked?: boolean;
     weight?: number;
     command?: string;
-    style?: ExitStyle;
-    /** A CSS color string. */
+}
+
+// ---- Connections ------------------------------------------------------------
+
+/** One of the four walls where a Connection attaches to a room. */
+type RoomSide = "North" | "East" | "South" | "West";
+/** Whether a port follows automatic wall redistribution or keeps an author-selected offset. */
+type PortMode = "AutoPinned" | "Manual";
+/** The topology represented by a Connection. */
+type ConnectionKind = "Internal" | "SelfLoop" | "Dangling" | "External" | "CrossLevel";
+/** How a Connection's centerline is produced and stored. */
+type ConnectionRouting = "Stub" | "Simple" | "Manual" | "Automatic";
+/** Whether routed segments may be diagonal or must remain axis-aligned. */
+type ConnectionSegmentShape = "Direct" | "Orthogonal";
+/** How turns between Connection segments are drawn. */
+type ConnectionCorner = "Sharp" | "Rounded";
+/** The repeating stroke pattern used to draw a Connection. */
+type ConnectionDash = "Solid" | "Dashed" | "Dotted";
+
+/** One interior Connection centerline vertex in area coordinates. */
+interface MapPoint {
+    x: number;
+    y: number;
+}
+
+/** A Connection's wall attachment on one room. */
+interface ConnectionEndpoint {
+    room_number: RoomNumber;
+    side: RoomSide;
+    /** Normalized position along the room wall, from 0 through 1. */
+    port_offset: number;
+    port_mode: PortMode;
+}
+
+/** Shared topology, route, and appearance for one or two member Exits. */
+interface Connection {
+    readonly id: ConnectionId;
+    readonly endpoint_a: ConnectionEndpoint;
+    readonly endpoint_b: ConnectionEndpoint | null;
+    readonly kind: ConnectionKind;
+    readonly routing: ConnectionRouting;
+    readonly segment_shape: ConnectionSegmentShape;
+    readonly corner: ConnectionCorner;
+    readonly route_points: MapPoint[];
+    readonly dash: ConnectionDash;
+    readonly color: string;
+    readonly thickness: number;
+}
+
+/** Geometry/appearance fields accepted by {@link Mapper.setConnection}. */
+interface ConnectionUpdates {
+    endpoint_a?: ConnectionEndpoint;
+    endpoint_b?: ConnectionEndpoint;
+    routing?: ConnectionRouting;
+    segment_shape?: ConnectionSegmentShape;
+    corner?: ConnectionCorner;
+    route_points?: MapPoint[];
+    dash?: ConnectionDash;
     color?: string;
+    thickness?: number;
+}
+
+/** One directed Exit to create as a member of a new Connection. */
+interface LinkTraversalArgs extends ExitArgs {
+    /** Room that owns this traversal. */
+    room_number: RoomNumber;
+}
+
+/** One atomic link creation: Connection first, followed by one or two traversals. */
+interface LinkCreateArgs extends ConnectionUpdates {
+    endpoint_a: ConnectionEndpoint;
+    endpoint_b?: ConnectionEndpoint;
+    traversals: LinkTraversalArgs[];
 }
 
 /** A room read from the map. Obtain one via `area.room(n)` or the `listRooms*` helpers. */
@@ -336,24 +397,27 @@ declare class Area {
     readonly labels: Label[];
     /** This area's graphical shapes. */
     readonly shapes: Shape[];
+    /** This area's shared link geometry and appearance records. */
+    readonly connections: Connection[];
     toString(): string;
 }
 
 // ---- The mapper -------------------------------------------------------------
 
-/**
- * The map API for the current session (each session has its own). Changes
- * sync to the cloud in the background.
- */
+/** Options for {@link Mapper.createArea}. */
 interface CreateAreaOptions {
     /**
      * Create a session map: it lives only for this session, is never saved
-     * or synced, and is discarded when the session closes. The place for
-     * maps built automatically from server data.
+     * or synced, and is discarded when the session closes. Use this for maps
+     * built automatically from server data.
      */
     ephemeral?: boolean;
 }
 
+/**
+ * The map API for the current session. Each session has its own current
+ * location; changes to persistent areas sync to the cloud in the background.
+ */
 interface Mapper {
     /** Create a new area and return its handle. */
     createArea(name: string, options?: CreateAreaOptions): Promise<Area>;
@@ -453,6 +517,16 @@ interface Mapper {
     deleteRoom(area: Area | AreaId, room: Room | RoomNumber): void;
     /** Delete an exit from a room. */
     deleteRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId): void;
+    /** Atomically create one Connection and its one or two traversals. */
+    createLink(area: Area | AreaId, link: LinkCreateArgs): ConnectionId;
+    /** Update shared Connection geometry or appearance. */
+    setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): void;
+    /** Split one traversal out of a bidirectional Connection. */
+    unlinkRoomExit(area: Area | AreaId, exitId: ExitId): ConnectionId;
+    /** Merge reciprocal one-way Connections, preserving the first one's route. */
+    pairConnections(area: Area | AreaId, keepConnectionId: ConnectionId, mergeConnectionId: ConnectionId): void;
+    /** Delete a Connection and every member traversal. */
+    deleteLink(area: Area | AreaId, connectionId: ConnectionId): void;
     /** Add a text label to an area and return its new id. */
     createLabel(area: Area | AreaId, label: LabelArgs): Promise<LabelId>;
     /** Add a graphical shape to an area and return its new id. */
@@ -475,6 +549,21 @@ interface Mapper {
     importAreas(areas: AreaJson[]): Promise<AreaId[]>;
     /** Import one exported area as a new local area; returns its id. */
     importArea(area: AreaJson): Promise<AreaId>;
+    /** Import exported areas, skipping any whose **name** is already resident
+     *  in the mapper. Shared maps, deactivated maps, and maps assigned to
+     *  other server entries count too. Waits for the session's maps to finish
+     *  loading first, so it is safe to call as a package starts, on every
+     *  start, without creating duplicates. Returns the ids of the areas
+     *  imported and the names skipped. */
+    importAreasIfAbsent(areas: AreaJson[]): Promise<AreasImportedIfAbsent>;
+}
+
+/** The outcome of {@link Mapper.importAreasIfAbsent}. */
+interface AreasImportedIfAbsent {
+    /** Ids of the areas imported by this call. */
+    readonly added: AreaId[];
+    /** Names skipped because a resident map already has that name. */
+    readonly skipped: string[];
 }
 
 /**

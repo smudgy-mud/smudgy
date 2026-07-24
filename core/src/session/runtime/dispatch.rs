@@ -54,6 +54,35 @@ impl Inner<'_> {
         }
     }
 
+    /// Emit a host event only when someone is subscribed, building the payload only
+    /// then. The subscriber gate MUST run before payload construction — `sys:receive`
+    /// rides the per-line hot path and `sys:input` every typed submission, so the
+    /// common no-listener case pays neither the payload build nor a catalogue sample.
+    /// That gate-then-build invariant lives here, once.
+    fn gated_host_emit(&self, event: &str, payload: impl FnOnce() -> String) -> Vec<RuntimeAction> {
+        if self.script_engine.has_event_subscribers(event) {
+            self.script_engine.host_emit(event, &payload())
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Send `text` to the wire verbatim — '\n' splits, nothing else does, and no
+    /// alias matching — then flush the buffered display updates (the echoed copy)
+    /// to the UI. The shared tail of every raw-send arm: the raw-prefix branch of
+    /// [`Self::dispatch_send`], `SendRaw`, and `SendRawUnless`.
+    async fn send_verbatim_lines(&mut self, text: &str) -> Result<(), anyhow::Error> {
+        for line in text.split('\n') {
+            if let Some(fut) = self.send(line)? {
+                fut.await?;
+            }
+        }
+        if let Some(fut) = self.flush_buffer_updates()? {
+            fut.await?;
+        }
+        Ok(())
+    }
+
     /// Resolve a pane-delivery target to `(key, kind, is_main)`. Own-session ops carry
     /// the key they resolved synchronously at call time, so a delivery issued before a
     /// `close()` in the same script body still lands on that incarnation (the UI still
@@ -76,6 +105,36 @@ impl Inner<'_> {
         }
     }
 
+    /// The outgoing-line pipeline entry shared by `Send` and the typed-submission
+    /// actions: the raw-line prefix sends the remainder verbatim — no separator
+    /// splitting AND no alias matching — exactly like `RuntimeAction::SendRaw`
+    /// ('\n' still splits). It is checked before the legacy `=` prefix, which skips
+    /// splitting but still alias-matches. Because the check lives here, script
+    /// `send("\\...")` inherits raw behavior by design — and a `sys:input`
+    /// replacement does too, since a submission completes into this same entry.
+    async fn dispatch_send(&mut self, line: Arc<String>) -> Result<ActionResult, anyhow::Error> {
+        if !self.raw_line_prefix.is_empty()
+            && let Some(rest) = line.strip_prefix(self.raw_line_prefix.as_str())
+        {
+            self.send_verbatim_lines(rest).await?;
+            Ok(ActionResult::None)
+        } else if let Some(rest) = line.strip_prefix('=') {
+            match self.trigger_manager.process_outgoing_line(rest) {
+                Ok(()) => Ok(ActionResult::None),
+                Err(err) => Ok(ActionResult::Echo(format!(
+                    "Error processing command {err:?}"
+                ))),
+            }
+        } else {
+            Ok(ActionResult::Run(
+                trigger::split_commands(&line, &self.command_separator)
+                    .into_iter()
+                    .map(|line| RuntimeAction::ProcessOutgoingLine(Arc::new(line.to_string())))
+                    .collect(),
+            ))
+        }
+    }
+
     #[allow(clippy::unused_async)]
     pub(super) async fn handle_action(
         &mut self,
@@ -85,15 +144,37 @@ impl Inner<'_> {
             RuntimeAction::Connect {
                 host,
                 port,
-                encoding,
                 send_on_connect,
                 send_on_connect_redactions,
+                encoding,
+                compression,
+                tls,
             } => {
                 let mut connection = Connection::new(
                     self.session_runtime_tx.clone(),
                     self.ui_tx.clone(),
                     self.trigger_manager.raw_wanted_flag(),
+                    self.window_size.clone(),
                 );
+
+                // Resolve the configured encoding label; an unresolvable one falls back
+                // to UTF-8 loudly — in the session view, not just the log, since the
+                // symptom (mojibake) gives no hint of the cause. `no_replacement`: the
+                // WHATWG mapping sends ISO-2022/HZ labels to the replacement encoding,
+                // which would collapse the whole feed to U+FFFD; treat those as unknown.
+                let encoding = encoding.as_ref().and_then(|label| {
+                    let resolved =
+                        encoding_rs::Encoding::for_label_no_replacement(label.as_bytes());
+                    if resolved.is_none() {
+                        warn!("Unknown encoding label {label:?} for this server; using UTF-8");
+                        self.session_runtime_tx
+                            .send(RuntimeAction::Echo(Arc::new(format!(
+                                "Unknown encoding \"{label}\" configured for this server; using UTF-8."
+                            ))))
+                            .ok();
+                    }
+                    resolved
+                });
 
                 if let Some(send_on_connect) = send_on_connect {
                     let local_tx = self.session_runtime_tx.clone();
@@ -119,15 +200,13 @@ impl Inner<'_> {
                 // so toggling `log_raw` applies to the next connect.
                 let raw_log_path = if crate::models::settings::load_settings().logging.log_raw {
                     match crate::get_smudgy_home() {
-                        Ok(home) => Some(
-                            home.join(self.server_name.as_str()).join("logs").join(
-                                format!(
-                                    "{}-{}.raw.log",
-                                    self.profile_name,
-                                    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S%.3f")
-                                ),
+                        Ok(home) => Some(home.join(self.server_name.as_str()).join("logs").join(
+                            format!(
+                                "{}-{}.raw.log",
+                                self.profile_name,
+                                chrono::Local::now().format("%Y-%m-%d_%H-%M-%S%.3f")
                             ),
-                        ),
+                        )),
                         Err(err) => {
                             warn!("Failed to resolve smudgy home for the raw log: {err:?}");
                             None
@@ -137,7 +216,14 @@ impl Inner<'_> {
                     None
                 };
 
-                connection.connect(host.as_str(), port, encoding, raw_log_path);
+                connection.connect(
+                    host.as_str(),
+                    port,
+                    raw_log_path,
+                    encoding,
+                    compression,
+                    tls,
+                );
 
                 self.connection = Some(connection);
                 Ok(ActionResult::None)
@@ -163,14 +249,11 @@ impl Inner<'_> {
                 // trigger cascade, then these handlers, then `Complete`. So a subscriber sees
                 // the original text (edits are deferred to `Complete`) and can `gag()`/
                 // `redirect()`/`replace()` the ambient `line` before it appears, exactly like a
-                // trigger. Gated on a live subscriber so the common no-listener path pays
-                // neither the payload build nor a catalogue sample on this hot per-line path.
-                let sys_receive = if self.script_engine.has_event_subscribers("sys:receive") {
-                    let payload = serde_json::json!({ "text": &**line }).to_string();
-                    self.script_engine.host_emit("sys:receive", &payload)
-                } else {
-                    Vec::new()
-                };
+                // trigger. Gated (subscriber check before payload build) because this is the
+                // hot per-line path.
+                let sys_receive = self.gated_host_emit("sys:receive", || {
+                    serde_json::json!({ "text": &**line }).to_string()
+                });
                 {
                     let mut spawned = self.spawned_actions.borrow_mut();
                     spawned.extend(sys_receive);
@@ -226,41 +309,42 @@ impl Inner<'_> {
                 self.route_partial_line(processed_line, &routing);
                 Ok(ActionResult::None)
             }
-            RuntimeAction::Send(line) => {
-                // The raw-line prefix sends the remainder verbatim — no
-                // separator splitting AND no alias matching — exactly like
-                // `RuntimeAction::SendRaw` ('\n' still splits). It is checked
-                // before the legacy `=` prefix, which skips splitting but
-                // still alias-matches. Because the check lives here, script
-                // `send("\\...")` inherits raw behavior by design.
-                if !self.raw_line_prefix.is_empty()
-                    && let Some(rest) = line.strip_prefix(self.raw_line_prefix.as_str())
-                {
-                    for line in rest.split('\n') {
-                        if let Some(fut) = self.send(line)? {
-                            fut.await?;
-                        }
-                    }
-                    if let Some(fut) = self.flush_buffer_updates()? {
-                        fut.await?;
-                    }
-                    Ok(ActionResult::None)
-                } else if let Some(rest) = line.strip_prefix('=') {
-                    match self.trigger_manager.process_outgoing_line(rest) {
-                        Ok(()) => Ok(ActionResult::None),
-                        Err(err) => Ok(ActionResult::Echo(format!(
-                            "Error processing command {err:?}"
-                        ))),
-                    }
+            RuntimeAction::Send(line) => self.dispatch_send(line).await,
+            RuntimeAction::SubmitInput(line) => {
+                // The typed-submission pipeline entry: `sys:input` fires here, before
+                // raw-prefix/`=` handling and separator splitting, so handlers see the
+                // line exactly as submitted and can rewrite or cancel it. Only the UI's
+                // input submit routing constructs this action — `session.send()` and
+                // every other script/link route arrive as `Send`, and a masked
+                // submission rides `SendWithRedactions` (the redaction path), so
+                // neither ever reaches these handlers. Gated (subscriber check before
+                // payload build) so the common no-listener submission is exactly a `Send`.
+                let handlers = self.gated_host_emit("sys:input", || {
+                    serde_json::json!({ "text": line.as_str() }).to_string()
+                });
+                if handlers.is_empty() {
+                    self.dispatch_send(line).await
                 } else {
-                    Ok(ActionResult::Run(
-                        trigger::split_commands(&line, &self.command_separator)
-                            .into_iter()
-                            .map(|line| {
-                                RuntimeAction::ProcessOutgoingLine(Arc::new(line.to_string()))
-                            })
-                            .collect(),
-                    ))
+                    // Install the generation-stamped submission the handlers act on.
+                    self.input_submission.borrow_mut().install(line);
+                    // Depth-first: the handler splice runs, then the completion reads
+                    // what it left (the `HandleIncomingLine` → `Complete…` shape).
+                    let mut spawned = self.spawned_actions.borrow_mut();
+                    spawned.extend(handlers);
+                    spawned.push_back(RuntimeAction::CompleteInputSubmission);
+                    Ok(ActionResult::None)
+                }
+            }
+            RuntimeAction::CompleteInputSubmission => {
+                // The back half of `SubmitInput`: consume what the handlers left.
+                // Cancel wins over replace regardless of handler order; an absent
+                // submission (a reload tore the splice down) has nothing to send.
+                let submission = self.input_submission.borrow_mut().take();
+                match submission {
+                    Some(submission) if !submission.is_cancelled() => {
+                        self.dispatch_send(submission.into_text()).await
+                    }
+                    _ => Ok(ActionResult::None),
                 }
             }
             RuntimeAction::ProcessOutgoingLine(line) => {
@@ -281,19 +365,15 @@ impl Inner<'_> {
                 }
             }
             RuntimeAction::SendRaw(str) => {
-                for line in str.split('\n') {
-                    if let Some(fut) = self.send(line)? {
-                        fut.await?;
-                    }
-                }
-                if let Some(fut) = self.flush_buffer_updates()? {
-                    fut.await?;
-                }
+                self.send_verbatim_lines(&str).await?;
                 Ok(ActionResult::None)
             }
             RuntimeAction::SendWithRedactions { text, redactions } => {
                 // Verbatim to the wire (like SendRaw), but the echoed/logged copy
-                // has each secret substring masked.
+                // has each secret substring masked. Masked input submissions ride
+                // this arm too, which is what keeps them away from `sys:input`
+                // handlers (the `SubmitInput` arm) and the alias/split pipeline
+                // alike — a secret must never feed either.
                 for line in text.split('\n') {
                     if let Some(fut) = self.send_with_redactions(line, &redactions)? {
                         fut.await?;
@@ -309,15 +389,94 @@ impl Inner<'_> {
                     return Ok(ActionResult::None);
                 }
 
-                for line in str.split('\n') {
-                    if let Some(fut) = self.send(line)? {
-                        fut.await?;
-                    }
-                }
-                if let Some(fut) = self.flush_buffer_updates()? {
-                    fut.await?;
-                }
+                self.send_verbatim_lines(&str).await?;
                 Ok(ActionResult::None)
+            }
+            RuntimeAction::RunAutomation {
+                isolate,
+                origin,
+                name,
+                script,
+                matches,
+                depth,
+                is_captured,
+                stopped,
+                fallthrough,
+                is_alias,
+            } => {
+                if stopped.load(Ordering::Relaxed) {
+                    return Ok(ActionResult::None);
+                }
+
+                // Count the invocation before entering user code. Besides matching the old
+                // fire-limit timing, this ensures a handler that replaces itself cannot charge
+                // the new definition for the old definition's fire.
+                self.trigger_manager
+                    .record_fire(&isolate, &origin, &name, is_alias);
+
+                let mut continue_matching = fallthrough;
+                let result = match script {
+                    ScriptAction::EvalJavascript(id) => {
+                        self.script_engine.begin_fallthrough(&isolate, fallthrough);
+                        self.script_engine.set_is_captured(&isolate, true);
+                        let result = self
+                            .script_engine
+                            .run_script(&self.trigger_manager, &isolate, id, &matches, depth)
+                            .unwrap_or_else(|err| {
+                                ActionResult::Echo(format!("JavaScript Error: {err:?}"))
+                            });
+                        if self.script_engine.get_is_captured(&isolate)
+                            && let Some(is_captured) = &is_captured
+                        {
+                            is_captured.store(true, Ordering::Relaxed);
+                        }
+                        continue_matching = self.script_engine.end_fallthrough(&isolate);
+                        result
+                    }
+                    ScriptAction::CallJavascriptFunction(id) => {
+                        self.script_engine.begin_fallthrough(&isolate, fallthrough);
+                        self.script_engine.set_is_captured(&isolate, true);
+                        let result = self
+                            .script_engine
+                            .call_javascript_function(
+                                &self.trigger_manager,
+                                &isolate,
+                                id,
+                                &matches,
+                                depth,
+                            )
+                            .unwrap_or_else(|err| {
+                                ActionResult::Echo(format!("Error in Javascript Function: {err:?}"))
+                            });
+                        if self.script_engine.get_is_captured(&isolate)
+                            && let Some(is_captured) = &is_captured
+                        {
+                            is_captured.store(true, Ordering::Relaxed);
+                        }
+                        continue_matching = self.script_engine.end_fallthrough(&isolate);
+                        result
+                    }
+                    ScriptAction::SendSimple(script) => {
+                        if let Some(is_captured) = &is_captured {
+                            is_captured.store(true, Ordering::Relaxed);
+                        }
+                        self.trigger_manager
+                            .run_simple_automation(&script, &matches, depth)?;
+                        ActionResult::None
+                    }
+                    ScriptAction::SendRaw(script) => {
+                        if let Some(is_captured) = &is_captured {
+                            is_captured.store(true, Ordering::Relaxed);
+                        }
+                        ActionResult::Run(vec![RuntimeAction::SendRaw(script)])
+                    }
+                    ScriptAction::Noop => ActionResult::None,
+                };
+
+                if !continue_matching {
+                    stopped.store(true, Ordering::Relaxed);
+                }
+                Ok(result)
             }
             RuntimeAction::EvalJavascript {
                 isolate,
@@ -331,14 +490,13 @@ impl Inner<'_> {
                 let result = self
                     .script_engine
                     .run_script(&self.trigger_manager, &isolate, id, &matches, depth)
-                    .unwrap_or_else(|err| {
-                        ActionResult::Echo(format!("JavaScript Error: {err:?}"))
-                    });
+                    .unwrap_or_else(|err| ActionResult::Echo(format!("JavaScript Error: {err:?}")));
 
                 if self.script_engine.get_is_captured(&isolate)
-                    && let Some(is_captured) = is_captured {
-                        is_captured.store(true, Ordering::Relaxed);
-                    }
+                    && let Some(is_captured) = is_captured
+                {
+                    is_captured.store(true, Ordering::Relaxed);
+                }
 
                 Ok(result)
             }
@@ -359,9 +517,10 @@ impl Inner<'_> {
                     });
 
                 if self.script_engine.get_is_captured(&isolate)
-                    && let Some(is_captured) = is_captured {
-                        is_captured.store(true, Ordering::Relaxed);
-                    }
+                    && let Some(is_captured) = is_captured
+                {
+                    is_captured.store(true, Ordering::Relaxed);
+                }
 
                 Ok(result)
             }
@@ -370,9 +529,12 @@ impl Inner<'_> {
                 instance,
                 function,
                 args,
-            } => self
-                .script_engine
-                .execute_javascript_function(&isolate, instance, function.as_ref(), &args),
+            } => self.script_engine.execute_javascript_function(
+                &isolate,
+                instance,
+                function.as_ref(),
+                &args,
+            ),
             RuntimeAction::InvokeLinkCallback {
                 session,
                 isolate,
@@ -558,6 +720,8 @@ impl Inner<'_> {
                             name,
                             Arc::new(vec![alias.pattern]),
                             alias.script.unwrap_or_default().into(),
+                            alias.priority,
+                            alias.fallthrough,
                             fire_limit,
                         )?;
                     }
@@ -570,6 +734,8 @@ impl Inner<'_> {
                             &name,
                             &Arc::new(vec![alias.pattern]),
                             script_id,
+                            alias.priority,
+                            alias.fallthrough,
                             fire_limit,
                             Some(Arc::from(src)),
                         )?;
@@ -584,6 +750,8 @@ impl Inner<'_> {
                 name,
                 patterns,
                 function_id,
+                priority,
+                fallthrough,
                 fire_limit,
                 script_source,
             } => {
@@ -593,6 +761,8 @@ impl Inner<'_> {
                     name,
                     patterns,
                     function_id,
+                    priority,
+                    fallthrough,
                     fire_limit,
                     script_source,
                 )?;
@@ -630,6 +800,8 @@ impl Inner<'_> {
                     anti_patterns: &Arc::new(trigger.anti_patterns.unwrap_or_default()),
                     action,
                     enabled: trigger.enabled,
+                    priority: trigger.priority,
+                    fallthrough: trigger.fallthrough,
                     prompt: trigger.prompt,
                     fire_limit,
                     line_limit,
@@ -647,6 +819,8 @@ impl Inner<'_> {
                 function_id,
                 prompt,
                 enabled,
+                priority,
+                fallthrough,
                 fire_limit,
                 line_limit,
                 script_source,
@@ -660,6 +834,8 @@ impl Inner<'_> {
                     anti_patterns: &anti_patterns,
                     action: ScriptAction::CallJavascriptFunction(function_id),
                     enabled,
+                    priority,
+                    fallthrough,
                     prompt,
                     fire_limit,
                     line_limit,
@@ -711,8 +887,17 @@ impl Inner<'_> {
                         event: SessionEvent::Disconnected,
                     })
                     .await?;
+                // The telnet ECHO mask dies with the connection: a server that
+                // dropped while it held ECHO can never send the WONT, so the
+                // release rides the disconnect (a no-op when it was not held).
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::ServerEcho { enabled: false },
+                    })
+                    .await?;
                 // A drop while GMCP was negotiated closes the protocol too; the subtree is
-                // retained for post-mortem reads (`docs/gmcp-plan.md` §4.6).
+                // retained for post-mortem reads (`docs/gmcp.md` §4.6).
                 let mut actions = self.script_engine.host_emit("sys:disconnect", "{}");
                 if self.gmcp.on_disabled() {
                     actions.extend(self.script_engine.host_emit("gmcp:closed", "{}"));
@@ -736,7 +921,7 @@ impl Inner<'_> {
                 // The write flushes at the run loop's normal per-turn flush point, which
                 // precedes the next dispatched action — so a trigger on the line that
                 // followed this message on the wire reads the new value
-                // (`docs/gmcp-plan.md` §3.3).
+                // (`docs/gmcp.md` §3.3).
                 self.queue_gmcp_echoes(effects.echoes);
                 Ok(ActionResult::None)
             }
@@ -745,7 +930,7 @@ impl Inner<'_> {
                 // Core.Supports.Set onto the reply buffer; here the session side clears
                 // the subtree (fresh server, fresh truth), follows with the module
                 // registry's Supports.Add (pre-ready registrations and renegotiation
-                // re-send alike, `docs/gmcp-plan.md` §6.2), and announces readiness.
+                // re-send alike, `docs/gmcp.md` §6.2), and announces readiness.
                 self.gmcp.on_enabled(&mut self.session_store.borrow_mut());
                 self.write_gmcp_frame(self.gmcp.supports_add_frame());
                 Ok(self.run_host_event("gmcp:ready", "{}"))
@@ -756,6 +941,31 @@ impl Inner<'_> {
                 } else {
                     Ok(ActionResult::None)
                 }
+            }
+            RuntimeAction::WindowSizeChanged { cols, rows } => {
+                // Store first, then wake: the socket task re-reads the cell on the
+                // wakeup, so it can never observe the wakeup without the new value,
+                // and it decides in write order whether NAWS is negotiated and a
+                // report is due.
+                self.window_size.store(
+                    crate::session::connection::responders::pack_dims(cols, rows),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Some(connection) = self.connection.as_ref() {
+                    connection.notify_window_size();
+                }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::ServerEchoChanged { enabled } => {
+                // Forward the negotiation fact to the UI, which owns the mask
+                // (pref check, compose with a script-set mask, stash/restore).
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::ServerEcho { enabled },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
             }
             RuntimeAction::MsdpMessage { payload } => {
                 let effects = self.msdp.ingest(
@@ -950,6 +1160,14 @@ impl Inner<'_> {
                         fut.await?;
                     }
                     for key in swept {
+                        // The swept pane's input state dies with it, exactly
+                        // as on an explicit close.
+                        super::input::purge_pane_input_state(
+                            &self.input_mirror,
+                            &self.input_word_sets,
+                            &self.pane_input_callbacks,
+                            key,
+                        );
                         self.ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
@@ -972,10 +1190,12 @@ impl Inner<'_> {
                 // Cross-session create, resolved on this (owning) runtime; last-writer-wins
                 // in queue order. Best-effort: a refused split logs instead of erroring the
                 // caller (who has already moved on).
+                // Cross-session splits never carry an input (the op refuses
+                // the spec), so the registry sees `None` here by construction.
                 let outcome = self
                     .pane_registry
                     .borrow_mut()
-                    .split(&namespace, &name, kind, title_bar);
+                    .split(&namespace, &name, kind, title_bar, None);
                 match outcome {
                     Ok(outcome) if outcome.created => {
                         let reference = reference
@@ -1020,6 +1240,14 @@ impl Inner<'_> {
                 let closed = self.pane_registry.borrow_mut().close(&namespace, &name);
                 match closed {
                     Ok(key) => {
+                        // The closed pane's input state dies with it, like the
+                        // own-session close op's purge.
+                        super::input::purge_pane_input_state(
+                            &self.input_mirror,
+                            &self.input_word_sets,
+                            &self.pane_input_callbacks,
+                            key,
+                        );
                         if let Some(fut) = self.flush_buffer_updates()? {
                             fut.await?;
                         }
@@ -1057,9 +1285,7 @@ impl Inner<'_> {
                         for line in text.split('\n') {
                             self.pending_buffer_updates.push(BufferUpdate::AppendTo(
                                 key,
-                                Arc::new(StyledLine::from_echo_str(
-                                    line,
-                                )),
+                                Arc::new(StyledLine::from_echo_str(line)),
                             ));
                         }
                     }
@@ -1121,6 +1347,177 @@ impl Inner<'_> {
                     }
                     None => warn!("Dropping clear of unknown pane '{name}'"),
                 }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneInputSubmit { key, text } => {
+                // Deliver a pane input's submission to its registered onSubmit
+                // handler — and to nothing else: no pipeline entry, no
+                // `sys:input`, no main history. The handler runs in the
+                // creating isolate under its instantiation nonce; every stale
+                // form of the address (reload, uninstall) is a warn-and-drop
+                // inside the engine call, like widget callbacks.
+                let callback = self.pane_input_callbacks.borrow().get(key);
+                let Some(cb) = callback else {
+                    warn!(
+                        "Dropping pane-input submission for {key}: no registered onSubmit \
+                         handler (a reloaded script re-registers by re-splitting its pane)"
+                    );
+                    return Ok(ActionResult::None);
+                };
+                self.script_engine.invoke_pane_input_submit(
+                    &cb.isolate,
+                    cb.instance,
+                    cb.function_id,
+                    text.as_str(),
+                )
+            }
+            RuntimeAction::InputApply { key, op } => {
+                // The op already resolved (and kind-checked) the key synchronously; this
+                // just publishes the mutation on the ordered UI channel.
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::InputOp { key, op },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::InputMirrorInterest => {
+                // Queued once, on the session's first input-mirror read; the UI
+                // starts feeding the mirror and pushes the current state immediately.
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::InputMirrorInterest,
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::InputStateChanged {
+                key,
+                snapshot,
+                source,
+            } => {
+                // The UI's coalesced state update: write the mirror the read ops
+                // consult. `source` attributes the change (typing vs script
+                // stuffing); the mirror itself stores only the snapshot.
+                //
+                // The observe-only `input:change`/`input:focus` host events
+                // (`docs/input.md` §3.5) derive from this same feed:
+                // edges are detected against the mirror's prior state before it
+                // is overwritten, and the effective (content-suppressed while
+                // masked) snapshot is what the payload reads — a masked update
+                // can never leak content through the event either. Both emits
+                // are subscriber-gated before any payload builds; updates ride
+                // the UI's per-input coalescing (identical successive states
+                // collapse), and the delivered source is the last mutation's.
+                //
+                // `pane` names the pane hosting the input; omitted for main.
+                // Resolved before the mirror write because a pane update can
+                // arrive behind its pane's close (the UI had it in flight when
+                // the close purge ran): with the registry entry gone, applying
+                // it would resurrect mirror state for the dead key and the
+                // pane-less payload would read as the MAIN input's — so a
+                // non-main key with no live registry entry drops here whole.
+                let pane_name = if key == MAIN_PANE_KEY {
+                    None
+                } else {
+                    let name = self
+                        .pane_registry
+                        .borrow()
+                        .get(key)
+                        .map(|def| def.name.to_string());
+                    if name.is_none() {
+                        return Ok(ActionResult::None);
+                    }
+                    name
+                };
+                let (prior, effective) = {
+                    let mut mirror = self.input_mirror.borrow_mut();
+                    let prior = mirror.apply(key, snapshot);
+                    (prior, mirror.snapshot(key))
+                };
+                // An input's first-ever report is a BASELINE, not an edge: the
+                // UI pushes current state unconditionally when interest is
+                // flagged (and when a pane input is created under standing
+                // interest), so state that merely predates the subscription
+                // must seed the mirror without replaying as change/focus
+                // events. Edges exist only against a recorded prior.
+                let Some(prior) = prior else {
+                    return Ok(ActionResult::None);
+                };
+                let mut actions = Vec::new();
+                // A change is content news: the value moved, or masking flipped
+                // (while masked, per-keystroke updates never cross the channel
+                // at all, so masked typing is invisible here by construction).
+                if prior.value != effective.value || prior.masked != effective.masked {
+                    actions.extend(self.gated_host_emit("input:change", || {
+                        let mut payload = serde_json::Map::new();
+                        if effective.masked {
+                            payload.insert("masked".into(), serde_json::Value::Bool(true));
+                        } else {
+                            payload.insert(
+                                "value".into(),
+                                serde_json::Value::String(effective.value.as_str().to_string()),
+                            );
+                        }
+                        if let Some(pane) = &pane_name {
+                            payload.insert("pane".into(), serde_json::Value::String(pane.clone()));
+                        }
+                        payload.insert(
+                            "source".into(),
+                            serde_json::Value::String(source.as_str().to_string()),
+                        );
+                        serde_json::Value::Object(payload).to_string()
+                    }));
+                }
+                if prior.focused != effective.focused {
+                    actions.extend(self.gated_host_emit("input:focus", || {
+                        let mut payload = serde_json::Map::new();
+                        payload
+                            .insert("focused".into(), serde_json::Value::Bool(effective.focused));
+                        if effective.masked {
+                            payload.insert("masked".into(), serde_json::Value::Bool(true));
+                        }
+                        if let Some(pane) = &pane_name {
+                            payload.insert("pane".into(), serde_json::Value::String(pane.clone()));
+                        }
+                        serde_json::Value::Object(payload).to_string()
+                    }));
+                }
+                if actions.is_empty() {
+                    Ok(ActionResult::None)
+                } else {
+                    Ok(ActionResult::Run(actions))
+                }
+            }
+            RuntimeAction::InputHistoryChanged { key, entries } => {
+                // The UI's history update: write the mirror the history read op
+                // consults. Unconditional — history changes per submission, not
+                // per keystroke, so there is no interest gate to check.
+                self.input_mirror.borrow_mut().apply_history(key, entries);
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::InputWordSetsChanged { key } => {
+                // Push one input's merged word sets to the UI. The merge reads the
+                // live sets at dispatch — a burst of registry calls coalesced onto
+                // this one action all ride the same (final) view — and clearing the
+                // pending flag re-arms the ops' queue-on-flip.
+                let merged = {
+                    let mut sets = self.input_word_sets.borrow_mut();
+                    sets.take_push(key);
+                    sets.merged(key)
+                };
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::InputWordSets {
+                            key,
+                            suggestions: Arc::new(merged.suggestions),
+                            blacklist: Arc::new(merged.blacklist),
+                        },
+                    })
+                    .await?;
                 Ok(ActionResult::None)
             }
             RuntimeAction::ApplySettings {

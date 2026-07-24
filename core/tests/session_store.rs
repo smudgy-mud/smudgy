@@ -140,7 +140,7 @@ echo("WHOLE:" + JSON.stringify(vitals.value));
 setTimeout(() => echo("PATHS:" + JSON.stringify(paths)), 50);
 "#;
 
-/// Module exercising the leaf-aware read path (`docs/interop-pre-gmcp-plan.md` §2) through
+/// Module exercising the leaf-aware read path (`docs/interop.md` §4a) through
 /// `.value` on both seats. The whole module is ONE turn against an EMPTY committed tree, so
 /// every read below resolves through the journal overlay (read-your-writes) — a
 /// journal-blind tagged get / keys / has fails all of it. Covers absent-vs-null through the
@@ -208,7 +208,7 @@ echo("CARRAY:" + Array.isArray(av) + ":" + JSON.stringify(av) + ":" + Object.isF
 echo("CGHOST:" + String(consumers.state("ghost").value));
 "#;
 
-/// Module exercising `previousValue` (`docs/interop-pre-gmcp-plan.md` §5) on both seats: the
+/// Module exercising `previousValue` (`docs/interop.md` §2) on both seats: the
 /// state before the newest write batch — the open journal's base while the writer is
 /// mid-turn, else the generation the last committing flush retained; absent before the first
 /// commit; read-only everywhere. Turn separation is driven through dispatched event
@@ -382,7 +382,7 @@ setTimeout(() => {
 }, 30);
 "#;
 
-/// Module exercising the interned-identity seams (interop-pre-gmcp-plan.md §3): a malformed
+/// Module exercising the interned-identity seams (interop.md §3): a malformed
 /// creator fails loudly at resolve time (handle/API construction, before any per-call op
 /// runs), a platform spec that is not a store producer (`sys` — event-only) still fails at
 /// the READ (consumer roots resolve lazily, so scheme imports stay link-safe), a platform
@@ -430,7 +430,7 @@ vitals.set({ whole: true });
 echo("WHOLE:" + JSON.stringify(store.get("user", "vitals")));
 "#;
 
-/// Module pinning the interned-id hardening seams (interop-pre-gmcp-plan.md §3) through the
+/// Module pinning the interned-id hardening seams (interop.md §3) through the
 /// public surface (raw ops are not reachable from modules — `Deno.core` is not exposed):
 /// - repeated construction of ONE handle (the per-matched-line author mistake) retains no
 ///   host memory — far more constructions than the identity cap admits as distinct entries,

@@ -1,0 +1,187 @@
+{
+  "criterion_targets": [
+    "ingest",
+    "trigger_engine",
+    "interop_ops",
+    "store_fanout",
+    "mapper_scale",
+    "terminal_buffer",
+    "trigger_matching",
+    "script_dispatch",
+    "gmcp_automap",
+    "map_spatial",
+    "identity_tax",
+    "catalogue",
+    "interop_read",
+    "interop_delivery",
+    "trigger_verbs",
+    "trigger_churn"
+  ],
+  "max_pr_criterion_targets": 5,
+  "callgrind_targets": [
+    "ingest_callgrind"
+  ],
+  "ignore": [
+    ".github/**",
+    "docs/**",
+    "**/*.md",
+    "**/*.txt",
+    "**/tests/**",
+    "**/*_test.rs",
+    "**/*.snap"
+  ],
+  "performance_extensions": [
+    ".rs",
+    ".toml"
+  ],
+  "performance_files": [
+    "Cargo.lock"
+  ],
+  "rules": [
+    {
+      "name": "benchmark infrastructure",
+      "globs": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "bench/Cargo.toml",
+        "bench/src/**",
+        "bench/logs/**",
+        "bench/item_names*.txt"
+      ],
+      "all_criterion": true,
+      "all_callgrind": true,
+      "coverage": "direct",
+      "reason": "Shared dependencies, fixtures, or benchmark support can affect every suite."
+    },
+    {
+      "name": "benchmark target",
+      "globs": [
+        "bench/benches/*.rs"
+      ],
+      "criterion_from_filename": true,
+      "coverage": "direct",
+      "reason": "Run the Criterion target changed by the PR."
+    },
+    {
+      "name": "connection ingest",
+      "globs": [
+        "core/src/session/connection.rs",
+        "core/src/session/connection/**"
+      ],
+      "criterion": [
+        "ingest"
+      ],
+      "callgrind": [
+        "ingest_callgrind"
+      ],
+      "coverage": "partial",
+      "reason": "Measures telnet, transcoding, VT parsing, and runtime-channel ingestion.",
+      "limitation": "Does not model socket readiness scheduling, TLS, compression I/O, or remote latency."
+    },
+    {
+      "name": "styled lines",
+      "globs": [
+        "core/src/session/styled_line.rs"
+      ],
+      "criterion": [
+        "ingest",
+        "terminal_buffer"
+      ],
+      "callgrind": [
+        "ingest_callgrind"
+      ],
+      "coverage": "direct",
+      "reason": "Exercises line construction on both ingest and display paths."
+    },
+    {
+      "name": "trigger engine",
+      "globs": [
+        "core/src/session/runtime/trigger.rs",
+        "core/src/session/runtime/trigger/**",
+        "core/src/models/triggers.rs"
+      ],
+      "criterion": [
+        "trigger_matching",
+        "trigger_engine",
+        "script_dispatch",
+        "trigger_verbs",
+        "trigger_churn"
+      ],
+      "coverage": "direct",
+      "reason": "Exercises matching, dispatch, verbs, and matcher rebuilds."
+    },
+    {
+      "name": "runtime interop",
+      "globs": [
+        "core/src/session/runtime.rs",
+        "core/src/session/runtime/script_engine.rs",
+        "core/src/session/runtime/script_engine/**",
+        "script/**",
+        "widgets/**"
+      ],
+      "criterion": [
+        "script_dispatch",
+        "identity_tax",
+        "interop_ops",
+        "interop_read",
+        "interop_delivery",
+        "catalogue",
+        "trigger_verbs",
+        "trigger_churn"
+      ],
+      "coverage": "partial",
+      "reason": "Exercises the principal scripting and host-interop hot paths.",
+      "limitation": "Target selection cannot prove coverage for every Deno runtime behavior."
+    },
+    {
+      "name": "session store",
+      "globs": [
+        "core/src/session/runtime/store.rs",
+        "core/src/session/runtime/store/**",
+        "core/src/session/runtime/catalogue.rs"
+      ],
+      "criterion": [
+        "store_fanout",
+        "identity_tax",
+        "interop_ops",
+        "interop_read",
+        "interop_delivery",
+        "catalogue"
+      ],
+      "coverage": "direct",
+      "reason": "Exercises store writes, reads, delivery, and catalogue snapshots."
+    },
+    {
+      "name": "map domain",
+      "globs": [
+        "cloud/src/backends/**",
+        "cloud/src/mapper.rs",
+        "cloud/src/mapper/**",
+        "map_widget/**"
+      ],
+      "criterion": [
+        "mapper_scale",
+        "map_spatial",
+        "gmcp_automap"
+      ],
+      "coverage": "direct",
+      "reason": "Exercises map mutation, lookup, routing, spatial indexes, and automapping."
+    },
+    {
+      "name": "terminal display",
+      "globs": [
+        "ui/src/terminal_buffer.rs",
+        "ui/src/terminal_buffer/**",
+        "ui/src/**/terminal*.rs",
+        "ui/src/**/buffer*.rs",
+        "ui/src/**/line*.rs"
+      ],
+      "criterion": [
+        "terminal_buffer"
+      ],
+      "coverage": "partial",
+      "reason": "Exercises display-buffer work below rendering.",
+      "limitation": "Does not measure GPU rendering or full iced frame latency."
+    }
+  ]
+}

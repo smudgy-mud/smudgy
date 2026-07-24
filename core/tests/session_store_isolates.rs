@@ -634,7 +634,7 @@ const GEN_CONSUMER_JS: &str = r#"
     echo("CONSUMER_RAN");
 "#;
 
-/// `previousValue`'s anchor is per reader (`docs/interop-pre-gmcp-plan.md` §5): a producer
+/// `previousValue`'s anchor is per reader (`docs/interop.md` §2): a producer
 /// opening a write batch moves its OWN diff base to the committed head, but the open journal
 /// is invisible to every other isolate, so a cross-isolate consumer's `previousValue` must
 /// stay the retained generation until the batch commits. The producer commits hp=41 then

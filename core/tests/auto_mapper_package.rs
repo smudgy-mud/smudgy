@@ -1,5 +1,5 @@
 //! End-to-end coverage of the first-party `auto-mapper` package
-//! (`packages/auto-mapper/`, `docs/gmcp-mapping-plan.md` §5.3), installed **untrusted** so
+//! (`packages/auto-mapper/`, `docs/gmcp-mapping.md` §5.3), installed **untrusted** so
 //! it runs sandboxed to its manifest — a deliberate dogfood of the capability model
 //! (interop:read + mapper:write + automations:aliases + session:echo + gmcp:send).
 //!
@@ -20,7 +20,7 @@ use smudgy_core::models::shared_packages::{self, UpdateMode};
 use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 use smudgy_cloud::{
-    CloudMapper, CompositeBackend, Credential, CredentialSource, ExitStyle, LocalBackend, Mapper,
+    CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, Mapper,
     MapperBackend, PackageApiClient, RoomNumber, RoomUpdates, mapper::RoomKey,
 };
 use std::collections::HashSet;
@@ -233,13 +233,14 @@ async fn auto_mapper_maps_follows_and_promotes() {
             .any(|e| e.to_room_number == Some(key100.room_number)),
         "101 links back west to 100"
     );
-    // Unexplored exits become stubs: n:102 from room 100, e:103 from room 101.
+    // Unexplored exits stay destination-less (dangling stubs on the map):
+    // n:102 from room 100, e:103 from room 101.
     assert!(
         room100
             .get_exits()
             .iter()
-            .any(|e| e.style == ExitStyle::Stub && e.to_room_number.is_none()),
-        "room 100's unexplored north exit is a stub"
+            .any(|e| e.to_room_number.is_none()),
+        "room 100's unexplored north exit is a dangling stub"
     );
 
     // ---- savemap: promote to the local tier, drop the session original. ----
@@ -290,6 +291,318 @@ async fn auto_mapper_maps_follows_and_promotes() {
     assert_eq!(
         key102.area_id, promoted_key.area_id,
         "post-promotion rooms land in the promoted area"
+    );
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}
+
+/// The zone-crossing walk: entering a new zone opens exactly one new session area,
+/// exits across the border link area-to-area (the pending stub upgrades into the
+/// other area), and coming BACK to the first zone — both revisiting a known room and
+/// discovering a new one — reuses the original zone area instead of minting
+/// "old-town (2)". Terrain lands as the room's `terrain` property and its color wash.
+#[tokio::test]
+async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
+    const ZONE_SERVER: &str = "AutoMapperZones";
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(ZONE_SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(ZONE_SERVER).join("logs")).unwrap();
+    copy_package_source(ZONE_SERVER);
+    shared_packages::install_package(
+        ZONE_SERVER,
+        "smudgy://local/auto-mapper",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
+
+    let map_root = smudgy_home.join("map-test-zones");
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9336_u32),
+        server_name: Arc::new(ZONE_SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+
+    // ---- The walk: two rooms in old-town, east across the border into wildwood,
+    // back west to the known rooms, then north into a NEW old-town room. Room 200's
+    // north exit and room 201's east exit start as stubs naming ids seen later, so
+    // both cross the stub-upgrade path — one within the zone, one across zones.
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    for payload in [
+        r#"{ "num": 200, "name": "West Plaza", "zone": "old-town", "terrain": "city",
+             "exits": { "e": 201, "n": 202 } }"#,
+        r#"{ "num": 201, "name": "East Plaza", "zone": "old-town", "terrain": "city",
+             "exits": { "w": 200, "e": 300 } }"#,
+        r#"{ "num": 300, "name": "Forest Edge", "zone": "wildwood", "terrain": "forest",
+             "exits": { "w": 201 } }"#,
+        r#"{ "num": 201, "name": "East Plaza", "zone": "old-town", "terrain": "city",
+             "exits": { "w": 200, "e": 300 } }"#,
+        r#"{ "num": 200, "name": "West Plaza", "zone": "old-town", "terrain": "city",
+             "exits": { "e": 201, "n": 202 } }"#,
+        r#"{ "num": 202, "name": "North Lane", "zone": "old-town", "terrain": "road",
+             "exits": { "s": 200 } }"#,
+    ] {
+        tx.send(gmcp("Room.Info", payload)).unwrap();
+    }
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+
+    let atlas = mapper.get_current_atlas();
+    let (key200, room200) = atlas
+        .find_room_by_external_id("200")
+        .unwrap_or_else(|| panic!("room 200 was auto-created.\n{transcript}"));
+    let (key201, room201) = atlas
+        .find_room_by_external_id("201")
+        .unwrap_or_else(|| panic!("room 201 was auto-created.\n{transcript}"));
+    let (key300, room300) = atlas
+        .find_room_by_external_id("300")
+        .unwrap_or_else(|| panic!("room 300 was auto-created.\n{transcript}"));
+    let (key202, _room202) = atlas
+        .find_room_by_external_id("202")
+        .unwrap_or_else(|| panic!("room 202 was auto-created after the return.\n{transcript}"));
+
+    // ---- Crossing: one new area for wildwood, and only one.
+    assert_eq!(key200.area_id, key201.area_id, "old-town rooms share one area");
+    assert_ne!(
+        key300.area_id, key200.area_id,
+        "crossing zones opens a separate area"
+    );
+    assert_eq!(
+        atlas.get_area(&key300.area_id).expect("wildwood area").get_name(),
+        "wildwood"
+    );
+
+    // ---- Return: the known rooms were followed and the NEW room 202 landed in the
+    // ORIGINAL old-town area — no second area for a revisited zone.
+    assert_eq!(
+        key202.area_id, key200.area_id,
+        "a new room discovered after returning joins the original zone area.\n{transcript}"
+    );
+    assert_eq!(
+        mapper.ephemeral_area_ids().len(),
+        2,
+        "exactly two session areas: old-town and wildwood.\n{transcript}"
+    );
+    assert_eq!(
+        atlas.get_area(&key200.area_id).expect("old-town area").room_count(),
+        3,
+        "old-town holds rooms 200, 201, 202 — revisits created nothing.\n{transcript}"
+    );
+
+    // ---- The border exits link area-to-area. 201's east stub (minted while 300 was
+    // unseen) upgraded into wildwood; 300's west exit linked back on arrival.
+    // Room numbers are per-area (200 and 300 are both room 1 of their areas), so
+    // every exit match must qualify by (area, room).
+    let border_east = room201
+        .get_exits()
+        .iter()
+        .find(|e| {
+            e.to_area_id == Some(key300.area_id)
+                && e.to_room_number == Some(key300.room_number)
+        })
+        .unwrap_or_else(|| panic!("201 links east into wildwood.\n{transcript}"));
+    assert!(
+        border_east.to_room_number.is_some(),
+        "the border stub was upgraded to a real link"
+    );
+    let border_west = room300
+        .get_exits()
+        .iter()
+        .find(|e| {
+            e.to_area_id == Some(key201.area_id)
+                && e.to_room_number == Some(key201.room_number)
+        })
+        .unwrap_or_else(|| panic!("300 links west back to 201.\n{transcript}"));
+    assert!(border_west.to_room_number.is_some());
+
+    // ---- Return discovery upgrades the waiting stub within the zone too: 200's
+    // north exit now really points at 202.
+    let north = room200
+        .get_exits()
+        .iter()
+        .find(|e| {
+            e.to_area_id == Some(key202.area_id)
+                && e.to_room_number == Some(key202.room_number)
+        })
+        .unwrap_or_else(|| panic!("200's north stub upgraded to link 202.\n{transcript}"));
+    assert!(north.to_room_number.is_some());
+
+    // ---- Terrain: recorded as the room property and as the color wash.
+    assert_eq!(room200.get_property("terrain"), Some("city"));
+    assert_eq!(room300.get_property("terrain"), Some("forest"));
+    assert_eq!(room200.get_color(), "#8a8a8a", "city wash");
+    assert_eq!(room300.get_color(), "#3a7a3a", "forest wash");
+
+    // ---- The identity-withheld sentinel (Aardwolf mazes send num: -1): never map it.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": -1, "name": "A Twisty Maze", "zone": "old-town", "terrain": "city",
+             "exits": { "n": -1 } }"#,
+    ))
+    .unwrap();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+    let atlas = mapper.get_current_atlas();
+    assert!(
+        atlas.find_room_by_external_id("-1").is_none(),
+        "the -1 sentinel must not be minted as a room.\n{transcript}"
+    );
+    assert_eq!(
+        mapper.ephemeral_area_ids().len(),
+        2,
+        "an unmappable fix opens no area.\n{transcript}"
+    );
+    assert_eq!(
+        atlas.get_area(&key200.area_id).expect("old-town area").room_count(),
+        3,
+        "an unmappable fix adds no room.\n{transcript}"
+    );
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}
+
+/// The IRE dialect (Achaea-shape `Room.Info`): `area`/`environment` naming and the
+/// `"area,x,y"` coords string place rooms by server coordinates. The adapter had no
+/// end-to-end coverage — the goldens are Aardwolf (GMCP) and Luminari (MSDP).
+#[tokio::test]
+async fn auto_mapper_maps_ire_dialect_with_server_coords() {
+    const IRE_SERVER: &str = "AutoMapperIre";
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(IRE_SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(IRE_SERVER).join("logs")).unwrap();
+    copy_package_source(IRE_SERVER);
+    shared_packages::install_package(
+        IRE_SERVER,
+        "smudgy://local/auto-mapper",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
+
+    let map_root = smudgy_home.join("map-test-ire");
+    let local = Arc::new(LocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local, cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9337_u32),
+        server_name: Arc::new(IRE_SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 4711, "name": "Centre of the crossroads",
+             "area": "the village of Tasur'ke", "environment": "road",
+             "coords": "77,5,7", "exits": { "n": 4712 } }"#,
+    ))
+    .unwrap();
+
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    let transcript = lines.join("\n");
+
+    let atlas = mapper.get_current_atlas();
+    let (key, room) = atlas
+        .find_room_by_external_id("4711")
+        .unwrap_or_else(|| panic!("IRE room was auto-created.\n{transcript}"));
+    assert!(mapper.is_ephemeral(&key.area_id));
+    assert_eq!(
+        atlas.get_area(&key.area_id).expect("area").get_name(),
+        "the village of Tasur'ke",
+        "IRE's `area` field names the zone"
+    );
+    // "area,x,y" server coords place the room on the grid (GRID spacing = 2.0).
+    assert!((room.get_x() - 10.0).abs() < f32::EPSILON, "x = 5 * GRID");
+    assert!((room.get_y() - 14.0).abs() < f32::EPSILON, "y = 7 * GRID");
+    // `environment` is the IRE spelling of terrain: property + color wash.
+    assert_eq!(room.get_property("terrain"), Some("road"));
+    assert_eq!(room.get_color(), "#b09a6a", "road wash");
+    // The unexplored north exit is a dangling stub awaiting 4712.
+    assert!(
+        room.get_exits()
+            .iter()
+            .any(|e| e.to_room_number.is_none()),
+        "unexplored north exit is a dangling stub.\n{transcript}"
     );
 
     tx.send(RuntimeAction::Shutdown).ok();
@@ -427,12 +740,12 @@ async fn auto_mapper_maps_msdp_composite_room() {
     // Server coords place the room on the grid (GRID spacing = 2.0 in the package).
     assert!((room.get_x() - 8.0).abs() < f32::EPSILON, "x = 4 * GRID");
     assert!((room.get_y() - 14.0).abs() < f32::EPSILON, "y = 7 * GRID");
-    // The unexplored east exit is a stub awaiting 14101.
+    // The unexplored east exit is a dangling stub awaiting 14101.
     assert!(
         room.get_exits()
             .iter()
-            .any(|e| e.style == ExitStyle::Stub && e.to_room_number.is_none()),
-        "unexplored east exit is a stub.\n{transcript}"
+            .any(|e| e.to_room_number.is_none()),
+        "unexplored east exit is a dangling stub.\n{transcript}"
     );
 
     tx.send(RuntimeAction::Shutdown).ok();

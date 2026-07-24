@@ -58,6 +58,12 @@ import {
     op_smudgy_mapper_delete_room_exit,
     op_smudgy_mapper_get_area_labels,
     op_smudgy_mapper_get_area_shapes,
+    op_smudgy_mapper_get_area_connections,
+    op_smudgy_mapper_create_link,
+    op_smudgy_mapper_set_connection,
+    op_smudgy_mapper_unlink_exit,
+    op_smudgy_mapper_pair_connections,
+    op_smudgy_mapper_delete_link,
     op_smudgy_mapper_create_label,
     op_smudgy_mapper_create_shape,
     op_smudgy_mapper_set_label,
@@ -65,6 +71,7 @@ import {
     op_smudgy_mapper_delete_label,
     op_smudgy_mapper_delete_shape,
     op_smudgy_mapper_import_areas,
+    op_smudgy_mapper_import_areas_if_absent,
     op_smudgy_mapper_export_area,
     op_smudgy_mapper_get_path_between_rooms,
     // @ts-ignore - ext:core/ops is a deno virtual module with no type decls
@@ -81,6 +88,7 @@ import {
 type AreaId = readonly [number, number];
 type RoomNumber = number;
 type ExitId = readonly [number, number];
+type ConnectionId = readonly [number, number];
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -98,9 +106,6 @@ type ExitDirection =
     | "Out"
     | "Special"
     | "Other";
-
-/** How an exit is drawn on the map. */
-type ExitStyle = "Normal" | "Dashed" | "Dotted" | "Meandering" | "Stub";
 
 interface CreateRoomParams {
     title?: string;
@@ -355,6 +360,31 @@ const mapper = {
         const roomNumber = room instanceof Room ? room.room_number : room;
         op_smudgy_mapper_delete_room_exit(areaId, roomNumber, exitId);
     },
+    /** Atomically create one Connection and its one or two member traversals. */
+    createLink(area: Area | AreaId, link: LinkCreateArgs): ConnectionId {
+        const areaId = area instanceof Area ? area.id : area;
+        return op_smudgy_mapper_create_link(areaId, link);
+    },
+    /** Update shared Connection geometry or appearance. */
+    setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): void {
+        const areaId = area instanceof Area ? area.id : area;
+        op_smudgy_mapper_set_connection(areaId, connectionId, updates);
+    },
+    /** Split one traversal out of a bidirectional Connection. */
+    unlinkRoomExit(area: Area | AreaId, exitId: ExitId): ConnectionId {
+        const areaId = area instanceof Area ? area.id : area;
+        return op_smudgy_mapper_unlink_exit(areaId, exitId);
+    },
+    /** Merge reciprocal one-way Connections, preserving `keepConnectionId`'s route. */
+    pairConnections(area: Area | AreaId, keepConnectionId: ConnectionId, mergeConnectionId: ConnectionId): void {
+        const areaId = area instanceof Area ? area.id : area;
+        op_smudgy_mapper_pair_connections(areaId, keepConnectionId, mergeConnectionId);
+    },
+    /** Delete a Connection and all of its member traversals. */
+    deleteLink(area: Area | AreaId, connectionId: ConnectionId): void {
+        const areaId = area instanceof Area ? area.id : area;
+        op_smudgy_mapper_delete_link(areaId, connectionId);
+    },
     /** Add a text label to an area; returns its new id. Requires `mapper:write`. */
     createLabel(area: Area | AreaId, label: LabelArgs): Promise<LabelId> {
         const areaId = area instanceof Area ? area.id : area;
@@ -401,6 +431,13 @@ const mapper = {
     async importArea(area: AreaJson): Promise<AreaId> {
         const [id] = await op_smudgy_mapper_import_areas([area]);
         return id;
+    },
+    /** Import portable area JSON, skipping (by name) every map already resident in the mapper --
+     * including maps assigned to other servers and deactivated maps. Waits for the session's maps
+     * to finish loading, so it is safe to call from package top-level code. Returns the imported
+     * ids and the skipped names. Requires `mapper:write`. */
+    importAreasIfAbsent(areas: AreaJson[]): Promise<{ added: AreaId[]; skipped: string[] }> {
+        return op_smudgy_mapper_import_areas_if_absent(areas);
     }
 };
 // One exit read back from a room (`room.exits`). Optional links are present but `null` when
@@ -418,13 +455,11 @@ interface Exit {
     readonly is_locked: boolean;
     readonly weight: number;
     readonly command: string | null;
-    readonly style: ExitStyle;
-    readonly color: string | null;
 }
 
 // Fields accepted when creating an exit (`createRoomExit`); `from_direction` is required.
-// `style`/`color` are accepted for parity but IGNORED on creation (the create op drops them) --
-// set them afterward with `setRoomExit`.
+// Visual appearance (routing, dash, color, thickness) lives on the shared
+// Connection, not the exit.
 interface ExitArgs {
     from_direction: ExitDirection;
     to_direction?: ExitDirection;
@@ -435,8 +470,6 @@ interface ExitArgs {
     is_locked?: boolean;
     weight?: number;
     command?: string;
-    style?: ExitStyle;
-    color?: string;
 }
 
 // Fields accepted when updating an exit (`setRoomExit`). Any omitted field is left unchanged.
@@ -450,8 +483,62 @@ interface ExitUpdates {
     is_locked?: boolean;
     weight?: number;
     command?: string;
-    style?: ExitStyle;
+}
+
+type RoomSide = "North" | "East" | "South" | "West";
+type PortMode = "AutoPinned" | "Manual";
+type ConnectionKind = "Internal" | "SelfLoop" | "Dangling" | "External" | "CrossLevel";
+type ConnectionRouting = "Stub" | "Simple" | "Manual" | "Automatic";
+type ConnectionSegmentShape = "Direct" | "Orthogonal";
+type ConnectionCorner = "Sharp" | "Rounded";
+type ConnectionDash = "Solid" | "Dashed" | "Dotted";
+
+interface MapPoint {
+    x: number;
+    y: number;
+}
+
+interface ConnectionEndpoint {
+    room_number: RoomNumber;
+    side: RoomSide;
+    port_offset: number;
+    port_mode: PortMode;
+}
+
+interface Connection {
+    readonly id: ConnectionId;
+    readonly endpoint_a: ConnectionEndpoint;
+    readonly endpoint_b: ConnectionEndpoint | null;
+    readonly kind: ConnectionKind;
+    readonly routing: ConnectionRouting;
+    readonly segment_shape: ConnectionSegmentShape;
+    readonly corner: ConnectionCorner;
+    readonly route_points: MapPoint[];
+    readonly dash: ConnectionDash;
+    readonly color: string;
+    readonly thickness: number;
+}
+
+interface ConnectionUpdates {
+    endpoint_a?: ConnectionEndpoint;
+    endpoint_b?: ConnectionEndpoint;
+    routing?: ConnectionRouting;
+    segment_shape?: ConnectionSegmentShape;
+    corner?: ConnectionCorner;
+    route_points?: MapPoint[];
+    dash?: ConnectionDash;
     color?: string;
+    thickness?: number;
+}
+
+interface LinkTraversalArgs extends ExitArgs {
+    room_number: RoomNumber;
+}
+
+interface LinkCreateArgs extends ConnectionUpdates {
+    endpoint_a: ConnectionEndpoint;
+    endpoint_b?: ConnectionEndpoint;
+    traversals: LinkTraversalArgs[];
 }
 
 // A label/shape id: a 2-element `[hi, lo]` UUID pair, like `AreaId`/`ExitId`. Opaque.
@@ -606,6 +693,11 @@ class Area {
         return op_smudgy_mapper_get_area_shapes(this.#obj);
     }
 
+    /** This area's shared link geometry and appearance records. */
+    get connections(): Connection[] {
+        return op_smudgy_mapper_get_area_connections(this.#obj);
+    }
+
     toString() {
         return this.#obj.toString();
     }
@@ -695,3 +787,4 @@ export type MapperImpl = typeof mapper;
 export type AreaImpl = Area;
 export type RoomImpl = Room;
 export type ExitImpl = Exit;
+export type ConnectionImpl = Connection;

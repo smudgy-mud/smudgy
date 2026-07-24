@@ -536,7 +536,9 @@ async fn share_host_hints_roundtrip() {
         "the hint-less re-grant cleared host_hints"
     );
 
-    // Over-cap (33 hints) is rejected uniformly as a 400.
+    // Over-cap (33 hints) is rejected uniformly as a 400 — a permanent
+    // validation verdict (`InvalidInput`), never a retryable transport
+    // failure.
     let mut too_many = view_only_share(grantee.id, area);
     too_many.host_hints = Some((0..33).map(|i| format!("h{i}.example")).collect());
     let err = owner_client
@@ -544,8 +546,8 @@ async fn share_host_hints_roundtrip() {
         .await
         .expect_err("33 host hints exceed the cap");
     assert!(
-        matches!(&err, CloudError::NetworkError(m) if m.contains("400")),
-        "over-cap host_hints surfaces as a 400: {err:?}"
+        matches!(&err, CloudError::InvalidInput(m) if m.contains("host hints")),
+        "over-cap host_hints surfaces as a validation verdict: {err:?}"
     );
 }
 

@@ -1,7 +1,7 @@
 use super::*;
 // use iced::Command; // Ensure this line is removed or commented if present from previous edits
 use smudgy_core::models::profile::ProfileConfig;
-use smudgy_core::models::server::{ServerConfig, ServerEncoding};
+use smudgy_core::models::server::ServerConfig;
 
 // Helper to create a default state
 fn initial_state() -> State {
@@ -20,7 +20,6 @@ fn test_initial_state_is_correct() {
     assert_eq!(state.server_form_data.name, "");
     assert_eq!(state.server_form_data.host, "");
     assert_eq!(state.server_form_data.port, "");
-    assert_eq!(state.server_form_data.encoding, ServerEncoding::Utf8);
     assert!(state.server_crud_error.is_none());
     assert!(state.profile_action.is_none());
     assert_eq!(state.profile_form_data.name, "");
@@ -58,20 +57,6 @@ fn test_cancel_server_form_resets_state() {
 }
 
 #[test]
-fn test_update_server_encoding_changes_active_form() {
-    let mut state = initial_state();
-    state.server_action = Some(ServerCrudAction::Create);
-
-    let (_task, event) = update(
-        &mut state,
-        Message::UpdateServerEncoding(ServerEncoding::Big5),
-    );
-
-    assert!(event.is_none());
-    assert_eq!(state.server_form_data.encoding, ServerEncoding::Big5);
-}
-
-#[test]
 fn test_submit_server_form_create_valid() {
     let mut state = initial_state();
     state.server_action = Some(ServerCrudAction::Create);
@@ -79,7 +64,7 @@ fn test_submit_server_form_create_valid() {
         name: "MyMUD".to_string(),
         host: "mud.example.com".to_string(),
         port: "4000".to_string(),
-        ..Default::default()
+        ..ServerConfigFormData::default()
     };
 
     // The task is not asserted directly. Its effect is tested via Message::ServerCreated.
@@ -97,7 +82,7 @@ fn test_submit_server_form_create_invalid_port() {
         name: "MyMUD".to_string(),
         host: "mud.example.com".to_string(),
         port: "invalid_port".to_string(),
-        ..Default::default()
+        ..ServerConfigFormData::default()
     };
 
     // The task is not asserted directly. No task should be spawned.
@@ -119,7 +104,7 @@ fn test_submit_server_form_create_empty_name() {
         name: "".to_string(),
         host: "mud.example.com".to_string(),
         port: "4000".to_string(),
-        ..Default::default()
+        ..ServerConfigFormData::default()
     };
 
     let (_task, event) = update(&mut state, Message::SubmitServerForm);

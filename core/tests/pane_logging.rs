@@ -1,4 +1,4 @@
-//! The line-structured session log (`docs/flexible-panes-plan.md` §2.5): the
+//! The line-structured session log (`docs/panes.md` §2.5): the
 //! transcript is the union of all sinks in line-completion order. Main
 //! fragments accumulate and are written as whole lines on commit; a routed
 //! (`AppendTo`) line is written whole; a retraction never leaves duplicated

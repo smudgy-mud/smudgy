@@ -21,6 +21,8 @@ use smudgy_cloud::Uuid;
 use std::sync::OnceLock;
 use std::{fs, io, path::Path};
 
+use super::persistence::write_atomic;
+
 /// File name for the non-secret account state, relative to the smudgy home directory.
 const ACCOUNT_FILE: &str = "account.json";
 
@@ -157,7 +159,7 @@ fn load_account_in(dir: &Path) -> Option<AccountInfo> {
 fn save_account_in(dir: &Path, account: &AccountInfo) -> Result<()> {
     let path = dir.join(ACCOUNT_FILE);
     let json = serde_json::to_string_pretty(account).context("Failed to serialize account info")?;
-    fs::write(&path, json).context(format!("Failed to write {}", path.display()))
+    write_atomic(&path, json.as_bytes()).context(format!("Failed to write {}", path.display()))
 }
 
 /// Deletes `account.json` inside `dir`. See [`clear_account`].
@@ -299,7 +301,7 @@ pub(crate) fn hex_decode(hex: &str) -> Option<Vec<u8>> {
 fn save_token_to_file(dir: &Path, token: &str) -> Result<()> {
     let path = dir.join(FALLBACK_TOKEN_FILE);
     let encoded = hex_encode(&obfuscate(token.as_bytes()));
-    fs::write(&path, encoded).context(format!("Failed to write {}", path.display()))
+    write_atomic(&path, encoded.as_bytes()).context(format!("Failed to write {}", path.display()))
 }
 
 /// Reads the token back from `.cloud-session` inside `dir`, if present and intact.

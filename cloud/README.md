@@ -180,8 +180,8 @@ UI Thread                  Shared Cache              JavaScript Thread
 ## Performance Characteristics
 
 - **Read Operations**: one atomic `ArcSwap` snapshot load + O(1) hash lookup, no locks
-- **Write Operations**: copy-on-write — a write clones the cache and rebuilds the identification indices over every loaded room (plus the touched area's connection/R-tree state), then swaps atomically; O(loaded rooms), so prefer the batch helpers (`upsert_rooms`, `with_areas_updated`) which rebuild once for N changes. Backend sync is async and never blocks readers. Measured by `../bench` (`mapper_scale`).
-- **Search Operations**: O(1) via the pre-built identification indices (title/description/exits); spatial queries via `rstar` R-trees
+- **Write Operations**: copy-on-write, **area-scoped** — the identification indices live in persistent maps (`imbl`), so a write edits only the touched area's entries (skipping rooms whose `Arc` survived the rewrite) and structurally shares every other area's, plus the touched area's connection/R-tree state, then swaps atomically. O(touched area), flat in total loaded rooms; the batch helpers (`upsert_rooms`, `with_areas_updated`) still amortize N changes into one pass. Only exclusion-axis changes (disable toggles, per-server scope) rebuild from scratch — rare, user-initiated. Backend sync is async and never blocks readers. Measured by `../bench` (`mapper_scale`, `gmcp_automap`).
+- **Search Operations**: O(1) via the pre-built identification indices (title/description/exits; persistent-map probes cost a small constant over a flat table — identification stays µs-class, `find_room_by_external_id` ≈ 118 ns and scale-flat); spatial queries via `rstar` R-trees
 - **Memory Sharing**: Zero-copy via Arc<> references
 - **Thread Contention**: none on reads — writers pay the rebuild, readers keep their old snapshot until the swap
 

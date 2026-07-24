@@ -122,9 +122,10 @@ async fn run_scenario_multi(
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             for update in updates.iter() {
                 if let BufferUpdate::Append(line) = update
-                    && tokens.contains(&line.text.as_str()) {
-                        seen.push(line.text.clone());
-                    }
+                    && tokens.contains(&line.text.as_str())
+                {
+                    seen.push(line.text.clone());
+                }
             }
         }
     }
@@ -158,6 +159,8 @@ fn plaintext_alias(pattern: &str, script: &str) -> AliasDefinition {
         script: Some(script.to_string()),
         package: None,
         enabled: true,
+        priority: 0,
+        fallthrough: true,
         language: ScriptLang::Plaintext,
     }
 }
@@ -169,6 +172,8 @@ async fn plaintext_alias_expansion_preserves_command_order() {
         script: Some("pt_first;pt_second".to_string()),
         package: None,
         enabled: true,
+        priority: 0,
+        fallthrough: true,
         language: ScriptLang::Plaintext,
     };
 
@@ -190,6 +195,8 @@ async fn script_alias_sends_preserve_command_order() {
         script: Some(r#"send("js_first"); send("js_second");"#.to_string()),
         package: None,
         enabled: true,
+        priority: 0,
+        fallthrough: true,
         language: ScriptLang::JS,
     };
 

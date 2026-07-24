@@ -1,5 +1,5 @@
 //! End-to-end coverage of the catalogue broadcast wiring in the session run loop
-//! (`docs/interop-pre-gmcp-plan.md` §6): the new-subscriber snapshot sent through
+//! (`docs/interop.md` §10): the new-subscriber snapshot sent through
 //! `Runtime::subscribe_catalogue`, the leading-edge send + trailing-edge one-shot
 //! (`catalogue_resend_at`) that lands a burst's final state within the send window
 //! instead of at the 500 ms safety tick, and the entry-budget refusal notice surfacing
