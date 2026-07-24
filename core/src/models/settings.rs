@@ -2,7 +2,6 @@ use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use smudgy_i18n::LocalePreference;
 use std::{fs, io};
 
 use super::persistence::write_atomic;
@@ -150,10 +149,11 @@ pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Settings {
-    /// Language used for first-party Smudgy interface and client feedback.
-    /// Remote MUD content is never translated. `System` resolves at launch.
-    #[serde(default)]
-    pub locale: LocalePreference,
+    /// Opaque application locale preference (`system` or a BCP-47 catalog
+    /// tag). Core persists this language-independent value but does not
+    /// interpret locale policy or depend on the localization layer.
+    #[serde(default = "default_locale_preference")]
+    pub locale: String,
     /// The maximum number of lines to keep in the scrollback buffer.
     #[serde(default = "default_scrollback_length")]
     pub scrollback_length: usize,
@@ -491,10 +491,14 @@ const fn default_true() -> bool {
     true
 }
 
+fn default_locale_preference() -> String {
+    "system".to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            locale: LocalePreference::default(),
+            locale: default_locale_preference(),
             scrollback_length: default_scrollback_length(),
             api_base_url: None,
             dismissed_upgrade_version: None,
@@ -802,16 +806,16 @@ mod tests {
         let existing = r#"{ "scrollback_length": 5000 }"#;
         let settings: Settings = serde_json::from_str(existing).expect("existing settings parse");
         assert!(settings.disabled_map_areas.is_empty());
-        assert_eq!(settings.locale, LocalePreference::System);
+        assert_eq!(settings.locale, "system");
     }
 
     #[test]
     fn locale_preference_roundtrips_without_changing_legacy_defaults() {
         let mut settings = Settings::default();
-        settings.locale = LocalePreference::TraditionalChinese;
+        settings.locale = "zh-TW".to_string();
         let json = serde_json::to_string(&settings).expect("settings serialize");
         let parsed: Settings = serde_json::from_str(&json).expect("settings parse");
-        assert_eq!(parsed.locale, LocalePreference::TraditionalChinese);
+        assert_eq!(parsed.locale, "zh-TW");
     }
 
     #[test]

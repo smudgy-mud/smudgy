@@ -35,3 +35,8 @@ state-none = None
 language = Language
 language-description = Choose the language used by Smudgy. Server text is not translated.
 welcome-name = Welcome, { $name }.
+message-count =
+    { $count ->
+        [one] One message
+       *[other] { $count } messages
+    }

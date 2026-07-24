@@ -1,82 +1,60 @@
-//! Embedded localization for Smudgy's first-party client text.
+//! Catalog loading and Fluent formatting for Smudgy first-party client text.
 //!
-//! English is the authoritative fallback. The active locale is process-wide so
-//! core-generated client feedback and every window use one consistent language.
+//! This crate deliberately has no selected-locale preference, system-locale
+//! detection, or process-global active translator. Applications own that
+//! policy and keep a [`Translator`] value; this library only supplies the
+//! embedded catalog registry, locale matching, English fallback, and
+//! type-preserving Fluent formatting.
 
-use std::fmt;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU8, Ordering};
 
+pub use fluent_bundle::FluentArgs;
+use fluent_bundle::FluentResource;
 use fluent_bundle::concurrent::FluentBundle;
-use fluent_bundle::{FluentArgs, FluentResource};
-use serde::{Deserialize, Serialize};
 use unic_langid::LanguageIdentifier;
 
-const EN_US_SOURCE: &str = include_str!("../locales/en-US/main.ftl");
-const ZH_TW_SOURCE: &str = include_str!("../locales/zh-TW/main.ftl");
+mod manifest;
 
-/// The language choice persisted in `settings.json`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LocalePreference {
-    /// Follow the desktop language, falling back to English when unsupported.
-    #[default]
-    System,
-    English,
-    TraditionalChinese,
+pub(crate) struct CatalogSource {
+    tag: &'static str,
+    aliases: &'static [&'static str],
+    display_name: &'static str,
+    source: &'static str,
 }
 
-impl LocalePreference {
-    /// Every available choice in picker order.
-    pub const ALL: [Self; 3] = [Self::System, Self::TraditionalChinese, Self::English];
-
-    /// Stable BCP-47-like configuration value for diagnostics and CLI use.
-    #[must_use]
-    pub const fn tag(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::English => "en-US",
-            Self::TraditionalChinese => "zh-TW",
-        }
-    }
+/// Public metadata for one embedded catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogInfo {
+    /// Canonical BCP-47 locale tag persisted by the application.
+    pub tag: &'static str,
+    /// Native language name shown in locale pickers.
+    pub display_name: &'static str,
 }
 
-impl fmt::Display for LocalePreference {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let key = match self {
-            Self::System => "locale-system",
-            Self::English => "locale-english",
-            Self::TraditionalChinese => "locale-traditional-chinese",
-        };
-        formatter.write_str(&translate(key))
-    }
+struct Catalog {
+    info: CatalogInfo,
+    bundle: FluentBundle<FluentResource>,
 }
 
-/// The concrete catalog currently used for rendering.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Locale {
-    #[default]
-    English = 0,
-    TraditionalChinese = 1,
-}
+static CATALOGS: LazyLock<Vec<Catalog>> = LazyLock::new(|| {
+    manifest::CATALOGS
+        .iter()
+        .map(|source| Catalog {
+            info: CatalogInfo {
+                tag: source.tag,
+                display_name: source.display_name,
+            },
+            bundle: make_bundle(source.tag, source.source),
+        })
+        .collect()
+});
 
-impl Locale {
-    #[must_use]
-    pub const fn tag(self) -> &'static str {
-        match self {
-            Self::English => "en-US",
-            Self::TraditionalChinese => "zh-TW",
-        }
-    }
-}
-
-static ACTIVE_LOCALE: AtomicU8 = AtomicU8::new(Locale::English as u8);
-
-static EN_US: LazyLock<FluentBundle<FluentResource>> =
-    LazyLock::new(|| make_bundle("en-US", EN_US_SOURCE));
-static ZH_TW: LazyLock<FluentBundle<FluentResource>> =
-    LazyLock::new(|| make_bundle("zh-TW", ZH_TW_SOURCE));
+static FALLBACK_INDEX: LazyLock<usize> = LazyLock::new(|| {
+    manifest::CATALOGS
+        .iter()
+        .position(|source| source.tag == manifest::FALLBACK_TAG)
+        .expect("the catalog manifest must include its fallback locale")
+});
 
 fn make_bundle(tag: &str, source: &str) -> FluentBundle<FluentResource> {
     let language: LanguageIdentifier = tag.parse().expect("built-in locale tag is valid");
@@ -85,8 +63,8 @@ fn make_bundle(tag: &str, source: &str) -> FluentBundle<FluentResource> {
     });
     let mut bundle = FluentBundle::new_concurrent(vec![language]);
     // Smudgy renders terminal-style UI text where invisible bidi isolation
-    // marks would leak into copy/paste and cursor offsets. The supported
-    // catalogs are both left-to-right, so interpolation can stay literal.
+    // marks would leak into copy/paste and cursor offsets. Every catalog in
+    // the manifest is currently left-to-right.
     bundle.set_use_isolating(false);
     bundle
         .add_resource(resource)
@@ -94,86 +72,112 @@ fn make_bundle(tag: &str, source: &str) -> FluentBundle<FluentResource> {
     bundle
 }
 
-/// Activate a persisted preference before the first application window renders.
+/// Iterate over the data-driven catalog manifest in picker order.
 ///
-/// `SMUDGY_LOCALE` is an optional launch override. For `System`, the host's
-/// ordered UI language preferences are consulted. On Unix, this considers
-/// `LANGUAGE` before the POSIX `LC_*` variables; Windows and Apple platforms
-/// use their native locale APIs.
-pub fn activate(preference: LocalePreference) -> Locale {
-    let locale = std::env::var("SMUDGY_LOCALE")
-        .ok()
-        .and_then(|value| locale_from_tag(&value))
-        .unwrap_or_else(|| match preference {
-            LocalePreference::System => detect_system_locale(),
-            LocalePreference::English => Locale::English,
-            LocalePreference::TraditionalChinese => Locale::TraditionalChinese,
-        });
-    ACTIVE_LOCALE.store(locale as u8, Ordering::Release);
-    locale
+/// Adding a language requires one manifest entry and its Fluent file; no
+/// locale enum or selection `match` needs to change.
+#[must_use]
+pub fn available_catalogs() -> impl ExactSizeIterator<Item = CatalogInfo> {
+    manifest::CATALOGS.iter().map(|source| CatalogInfo {
+        tag: source.tag,
+        display_name: source.display_name,
+    })
 }
 
-/// The resolved concrete locale currently in use.
-#[must_use]
-pub fn current_locale() -> Locale {
-    match ACTIVE_LOCALE.load(Ordering::Acquire) {
-        1 => Locale::TraditionalChinese,
-        _ => Locale::English,
+/// A concrete catalog choice with automatic English fallback.
+///
+/// The value is cheap to copy: immutable catalog bundles live in the
+/// process-wide registry, while the application owns which `Translator` is
+/// currently active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Translator {
+    primary_index: usize,
+}
+
+impl Translator {
+    /// Match one locale tag against catalog tags and manifest aliases.
+    ///
+    /// A language-only alias (for example `en`) accepts all of that
+    /// language's regions. Script/region-bearing aliases are exact, which
+    /// lets the manifest avoid silently treating `zh-HK` as `zh-TW`.
+    #[must_use]
+    pub fn for_tag(tag: &str) -> Option<Self> {
+        let requested = parse_locale(tag)?;
+        manifest::CATALOGS
+            .iter()
+            .position(|source| {
+                locale_matches(&requested, source.tag)
+                    || source
+                        .aliases
+                        .iter()
+                        .any(|alias| locale_matches(&requested, alias))
+            })
+            .map(|primary_index| Self { primary_index })
+    }
+
+    /// Select the first supported tag in an ordered preference list.
+    #[must_use]
+    pub fn negotiate<'a>(tags: impl IntoIterator<Item = &'a str>) -> Self {
+        tags.into_iter().find_map(Self::for_tag).unwrap_or_default()
+    }
+
+    /// Canonical tag of the selected primary catalog.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        CATALOGS[self.primary_index].info.tag
+    }
+
+    /// Translate a message without variables.
+    #[must_use]
+    pub fn translate(self, id: &str) -> String {
+        self.translate_with(id, &FluentArgs::new())
+    }
+
+    /// Translate a message while preserving native Fluent argument types.
+    ///
+    /// If the selected catalog does not yet contain the message, English is
+    /// used. This permits contributors to land incomplete catalogs
+    /// incrementally without blank UI strings.
+    #[must_use]
+    pub fn translate_with(self, id: &str, args: &FluentArgs<'_>) -> String {
+        let primary = &CATALOGS[self.primary_index].bundle;
+        format_message(primary, id, args)
+            .or_else(|| {
+                (self.primary_index != *FALLBACK_INDEX)
+                    .then(|| format_message(&CATALOGS[*FALLBACK_INDEX].bundle, id, args))
+                    .flatten()
+            })
+            .unwrap_or_else(|| format!("⟦{id}⟧"))
     }
 }
 
-/// Resolve supported desktop language variables from the current process.
-#[must_use]
-pub fn detect_system_locale() -> Locale {
-    sys_locale::get_locales()
-        .find_map(|tag| locale_from_tag(&tag))
-        .unwrap_or(Locale::English)
+impl Default for Translator {
+    fn default() -> Self {
+        Self {
+            primary_index: *FALLBACK_INDEX,
+        }
+    }
 }
 
-/// Resolve a supported locale tag. Unsupported tags return `None`, allowing a
-/// later item in a desktop fallback list to be considered.
-#[must_use]
-pub fn locale_from_tag(tag: &str) -> Option<Locale> {
-    let normalized = tag
-        .trim()
+fn parse_locale(tag: &str) -> Option<LanguageIdentifier> {
+    tag.trim()
         .split(['.', '@'])
         .next()
         .unwrap_or_default()
         .replace('_', "-")
-        .to_ascii_lowercase();
-
-    if normalized == "en" || normalized.starts_with("en-") {
-        return Some(Locale::English);
-    }
-    if matches!(normalized.as_str(), "zh-tw" | "zh-hk" | "zh-mo" | "zh-hant")
-        || normalized.starts_with("zh-hant-")
-    {
-        return Some(Locale::TraditionalChinese);
-    }
-    None
+        .parse()
+        .ok()
 }
 
-/// Translate a message without variables, with English fallback.
-#[must_use]
-pub fn translate(id: &str) -> String {
-    translate_with(id, &[])
-}
-
-/// Translate a message with string variables, with English fallback.
-#[must_use]
-pub fn translate_with(id: &str, values: &[(&str, String)]) -> String {
-    let mut args = FluentArgs::new();
-    for (name, value) in values {
-        args.set(*name, value.as_str());
-    }
-
-    let primary = match current_locale() {
-        Locale::English => &*EN_US,
-        Locale::TraditionalChinese => &*ZH_TW,
+fn locale_matches(requested: &LanguageIdentifier, candidate: &str) -> bool {
+    let Some(candidate) = parse_locale(candidate) else {
+        return false;
     };
-    format_message(primary, id, &args)
-        .or_else(|| format_message(&EN_US, id, &args))
-        .unwrap_or_else(|| format!("⟦{id}⟧"))
+    if candidate.script.is_none() && candidate.region.is_none() {
+        requested.language == candidate.language
+    } else {
+        requested == &candidate
+    }
 }
 
 fn format_message(
@@ -188,31 +192,21 @@ fn format_message(
     errors.is_empty().then(|| rendered.into_owned())
 }
 
-/// Build a translated message while keeping call sites compact and variable
-/// names explicit in the catalog.
+/// Build a translated message without erasing Fluent value types.
+///
+/// The first argument is an application-owned [`Translator`]. Values are
+/// inserted directly into [`FluentArgs`], so numbers remain numbers for
+/// plural/select rules instead of becoming strings.
 #[macro_export]
 macro_rules! t {
-    ($id:literal $(,)?) => {
-        $crate::translate($id)
+    ($translator:expr, $id:literal $(,)?) => {
+        ($translator).translate($id)
     };
-    ($id:literal, $($name:literal => $value:expr),+ $(,)?) => {{
-        let values = [$(($name, ($value).to_string())),+];
-        $crate::translate_with($id, &values)
+    ($translator:expr, $id:literal, $($name:literal => $value:expr),+ $(,)?) => {{
+        let mut args = $crate::FluentArgs::new();
+        $(args.set($name, $value);)+
+        ($translator).translate_with($id, &args)
     }};
-}
-
-#[cfg(test)]
-fn catalog_ids(source: &str) -> std::collections::BTreeSet<&str> {
-    source
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_end();
-            if line.starts_with(char::is_whitespace) || line.starts_with('#') {
-                return None;
-            }
-            line.split_once(" = ").map(|(id, _)| id)
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -229,10 +223,11 @@ fn catalog_variables(
     for line in source.lines() {
         if !line.starts_with(char::is_whitespace)
             && !line.starts_with('#')
-            && let Some((id, value)) = line.split_once(" = ")
+            && let Some((id, value)) = line.split_once('=')
         {
-            current = Some(id.to_string());
-            messages.insert(id.to_string(), value.to_string());
+            let id = id.trim().to_string();
+            current = Some(id.clone());
+            messages.insert(id, value.trim_start().to_string());
             continue;
         }
         if line.starts_with(char::is_whitespace)
@@ -247,10 +242,10 @@ fn catalog_variables(
     messages
         .into_iter()
         .map(|(id, value)| {
-            let variables: BTreeSet<String> = variable
+            let variables = variable
                 .captures_iter(&value)
                 .map(|capture| capture[1].to_string())
-                .collect();
+                .collect::<BTreeSet<_>>();
             (id, variables)
         })
         .collect()
@@ -259,55 +254,72 @@ fn catalog_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static LOCALE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn locale_tags_distinguish_traditional_and_simplified_chinese() {
-        assert_eq!(
-            locale_from_tag("zh_TW.UTF-8"),
-            Some(Locale::TraditionalChinese)
-        );
-        assert_eq!(
-            locale_from_tag("zh-Hant-HK"),
-            Some(Locale::TraditionalChinese)
-        );
-        assert_eq!(locale_from_tag("en_US.UTF-8"), Some(Locale::English));
-        assert_eq!(locale_from_tag("zh_CN.UTF-8"), None);
-        assert_eq!(locale_from_tag("C.UTF-8"), None);
+    fn manifest_catalogs_parse_and_have_unique_tags() {
+        let mut tags = std::collections::BTreeSet::new();
+        for (index, catalog) in CATALOGS.iter().enumerate() {
+            assert!(tags.insert(catalog.info.tag), "duplicate catalog tag");
+            assert_eq!(catalog.info, available_catalogs().nth(index).unwrap());
+        }
     }
 
     #[test]
-    fn traditional_chinese_catalog_matches_english_keys() {
-        assert_eq!(catalog_ids(EN_US_SOURCE), catalog_ids(ZH_TW_SOURCE));
+    fn catalog_matching_is_data_driven_and_region_safe() {
+        assert_eq!(Translator::for_tag("zh_TW.UTF-8").unwrap().tag(), "zh-TW");
+        assert_eq!(Translator::for_tag("zh-Hant-TW").unwrap().tag(), "zh-TW");
+        assert_eq!(Translator::for_tag("en_GB.UTF-8").unwrap().tag(), "en-US");
+        assert!(Translator::for_tag("zh-HK").is_none());
+        assert!(Translator::for_tag("zh-MO").is_none());
+        assert!(Translator::for_tag("zh-CN").is_none());
+        assert!(Translator::for_tag("C.UTF-8").is_none());
     }
 
     #[test]
-    fn traditional_chinese_catalog_matches_english_variables() {
+    fn secondary_catalogs_may_be_incremental_but_matching_keys_keep_variables() {
+        let fallback = catalog_variables(manifest::CATALOGS[*FALLBACK_INDEX].source);
+        for source in manifest::CATALOGS
+            .iter()
+            .filter(|source| source.tag != manifest::FALLBACK_TAG)
+        {
+            for (id, variables) in catalog_variables(source.source) {
+                assert_eq!(
+                    fallback.get(&id),
+                    Some(&variables),
+                    "{id} in {} must match the fallback variables",
+                    source.tag
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_primary_message_falls_back_to_english() {
+        let partial = make_bundle("pl-PL", "language = Język");
+        let args = FluentArgs::new();
+        let rendered = format_message(&partial, "action-save", &args)
+            .or_else(|| format_message(&CATALOGS[*FALLBACK_INDEX].bundle, "action-save", &args));
+        assert_eq!(rendered.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn macro_preserves_numeric_fluent_values() {
+        let translator = Translator::default();
         assert_eq!(
-            catalog_variables(EN_US_SOURCE),
-            catalog_variables(ZH_TW_SOURCE)
+            t!(translator, "message-count", "count" => 1_i64),
+            "One message"
         );
-    }
-
-    #[test]
-    fn interpolation_and_locale_switching_work() {
-        let _guard = LOCALE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        activate(LocalePreference::English);
-        assert_eq!(t!("welcome-name", "name" => "Mira"), "Welcome, Mira.");
-        activate(LocalePreference::TraditionalChinese);
-        assert_eq!(t!("welcome-name", "name" => "Mira"), "歡迎，Mira。");
+        assert_eq!(
+            t!(translator, "message-count", "count" => 3_i64),
+            "3 messages"
+        );
     }
 
     #[test]
     fn unknown_message_is_visible_instead_of_silently_blank() {
-        let _guard = LOCALE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        activate(LocalePreference::English);
-        assert_eq!(translate("not-a-real-message"), "⟦not-a-real-message⟧");
+        assert_eq!(
+            Translator::default().translate("not-a-real-message"),
+            "⟦not-a-real-message⟧"
+        );
     }
 }

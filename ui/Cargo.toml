@@ -18,6 +18,7 @@ smudgy_cloud = { workspace = true }
 smudgy_theme = { workspace = true }
 smudgy_map_widget = { workspace = true }
 smudgy_i18n = { workspace = true }
+sys-locale = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 iced = { workspace = true }

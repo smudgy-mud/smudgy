@@ -23,6 +23,7 @@ use windows::smudgy_window::SmudgyWindow;
 
 mod assets;
 mod cloud_account;
+mod i18n;
 mod pane_drag;
 mod pane_layout;
 pub mod prefs;
@@ -257,7 +258,7 @@ fn init() -> (Smudgy, Task<Message>) {
     // also folds in the installer's update-check seed, which overrides the
     // persisted auto-check value while present.
     let settings = smudgy_core::models::settings::load_settings();
-    smudgy_i18n::activate(settings.locale);
+    i18n::activate(&settings.locale);
     prefs::apply(&settings);
     let area_prefs = load_area_prefs(&settings);
     let disabled_map_areas = disabled_set_from_prefs(&area_prefs);

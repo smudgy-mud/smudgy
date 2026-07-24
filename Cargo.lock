@@ -10528,7 +10528,6 @@ dependencies = [
  "sha2",
  "simplelog",
  "smudgy_cloud",
- "smudgy_i18n",
  "smudgy_script",
  "tempfile",
  "thiserror 2.0.12",
@@ -10542,12 +10541,10 @@ dependencies = [
 
 [[package]]
 name = "smudgy_i18n"
-version = "0.4.1"
+version = "0.4.2-dev"
 dependencies = [
  "fluent-bundle",
  "regex",
- "serde",
- "sys-locale",
  "unic-langid",
 ]
 
@@ -10638,6 +10635,7 @@ dependencies = [
  "smudgy_map_widget",
  "smudgy_theme",
  "smudgy_widgets",
+ "sys-locale",
  "tokio",
  "tokio-stream",
  "unicode-segmentation",

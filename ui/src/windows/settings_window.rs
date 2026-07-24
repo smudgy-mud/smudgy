@@ -18,12 +18,12 @@ use smudgy_cloud::{CloudError, Uuid};
 use smudgy_core::models::settings::{
     CommandInputBehavior, Settings, ThemeTweaks, clear_update_check_seed, load_settings,
 };
-use smudgy_i18n::LocalePreference;
 
 use crate::cloud_account::CloudHandles;
 use crate::components::cloud_errors::display_error;
 use crate::components::color_picker::{self, ColorPicker};
 use crate::components::social_panel::{self, SocialPanel};
+use crate::i18n::{self, LocaleChoice};
 use crate::prefs;
 use crate::theme::{self, Element as ThemedElement};
 use crate::update::Update;
@@ -114,7 +114,7 @@ pub enum Message {
     SessionRevoked(Result<(), CloudError>),
 
     PrefFontSelected(String),
-    PrefLocaleSelected(LocalePreference),
+    PrefLocaleSelected(LocaleChoice),
     PrefFontSizeChanged(String),
     PrefFontSizeSubmitted,
     PrefLineLengthChanged(String),
@@ -620,8 +620,8 @@ impl SettingsWindow {
                 self.settings_changed()
             }
             Message::PrefLocaleSelected(locale) => {
-                self.settings.locale = locale;
-                smudgy_i18n::activate(locale);
+                self.settings.locale = locale.preference().to_string();
+                i18n::activate(&self.settings.locale);
                 self.settings_changed()
             }
             // Typing only edits the buffer; commits happen on Enter so a
@@ -1254,15 +1254,15 @@ impl SettingsWindow {
 
         col = col.push(
             column![
-                dim_text_owned(smudgy_i18n::t!("language")),
+                dim_text_owned(i18n::t!("language")),
                 pick_list(
-                    LocalePreference::ALL.to_vec(),
-                    Some(self.settings.locale),
+                    i18n::locale_choices(),
+                    Some(i18n::locale_choice(&self.settings.locale)),
                     Message::PrefLocaleSelected,
                 )
                 .text_size(13)
                 .width(280),
-                dim_text_owned(smudgy_i18n::t!("language-description")),
+                dim_text_owned(i18n::t!("language-description")),
             ]
             .spacing(2),
         );

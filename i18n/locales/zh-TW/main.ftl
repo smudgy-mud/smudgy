@@ -35,3 +35,4 @@ state-none = 無
 language = 語言
 language-description = 選擇 Smudgy 介面使用的語言。伺服器傳來的文字不會翻譯。
 welcome-name = 歡迎，{ $name }。
+message-count = { $count } 則訊息
