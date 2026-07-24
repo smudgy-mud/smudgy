@@ -1,17 +1,21 @@
-﻿//! The map editor window: a toolbar over a resizable three-pane layout
+//! The map editor window: a toolbar over a resizable three-pane layout
 //! (area list | canvas | inspector). The canvas is a
 //! [`smudgy_map_widget::MapEditor`]; this module owns window chrome, pane
 //! layout, the undo stack, and the mutation funnel — every entity edit
 //! flows through [`commands::CommandStack`].
 
 mod area_list;
+mod automatic_routing;
 pub mod commands;
 mod inspector;
 mod modals;
 mod toolbar;
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -19,9 +23,9 @@ use arc_swap::ArcSwap;
 use crate::cloud_account::CloudHandles;
 use crate::theme::{self, Element as ThemedElement};
 use crate::update::Update;
+use iced::alignment::Vertical;
 use iced::event::Event as IcedEvent;
 use iced::keyboard::{self, key::Named};
-use iced::alignment::Vertical;
 use iced::widget::{
     PaneGrid, button, center, column, container, mouse_area, opaque, pane_grid, row, space, stack,
     text,
@@ -31,10 +35,14 @@ use smudgy_cloud::cloud_api::{
     AtlasCopyReport, CopyAreaRequest, SecretEntity, SecretEntityKind, SecretMarksRequest,
     SecretMarksResult, ShareDirection, ShareGrantRow,
 };
-use smudgy_cloud::mapper::AtlasCache;
+use smudgy_cloud::mapper::{AtlasCache, area_cache::AreaCache};
 use smudgy_cloud::{
-    Area, AreaAccess, AreaId, AtlasId, AtlasListItem, ExitId, LabelId, CloudError, Mapper,
-    RoomNumber, ShapeId, mapper::RoomKey,
+    Area, AreaAccess, AreaId, AtlasId, AtlasListItem, CloudError, ConnectionId, ConnectionRouting,
+    ConnectionUpdates, ExitId, LabelId, Mapper, PortMode, RoomNumber, RoomSide, SegmentShape,
+    ShapeId,
+    automatic_routing::{AutoRouteResult, RouteValidation},
+    mapper::RoomKey,
+    mutation::OperationId,
 };
 
 use area_list::SharerIndex;
@@ -42,7 +50,7 @@ use smudgy_core::models::map_scopes::{
     HostEntry, MapScopes, ScopeDelta, ScopeState, match_host_hints,
 };
 use smudgy_map_widget::map_editor::{
-    self, EntityId, ExitTarget, MapEditor, MutationRequest, Tool,
+    self, EntityId, ExitTarget, MapEditor, MutationRequest, SelectedConnectionHandle, Tool,
 };
 
 /// Bootstrap-icons codepoints used by the secrecy UI; the font itself is
@@ -58,12 +66,25 @@ const ROOM_COPY_NOTICE_TTL: Duration = Duration::from_secs(5);
 /// one shared instance.
 pub type SharedClipboard = Arc<ArcSwap<commands::EntityClipboard>>;
 
+#[derive(Debug)]
+struct PendingAutomaticRoute {
+    generation: u64,
+    snapshot: automatic_routing::Snapshot,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+struct AutomaticRoutePreview {
+    snapshot: automatic_routing::Snapshot,
+    route_points: Vec<smudgy_cloud::MapPoint>,
+}
+
 /// A keyboard action routed to the editor at window level. Only fires for
 /// events no focused widget captured (so text inputs keep their keys).
 #[derive(Debug, Clone, Copy)]
 pub enum Hotkey {
     Delete,
-    Nudge(i32, i32),
+    Nudge(i32, i32, f32),
     Undo,
     Redo,
     Copy,
@@ -82,12 +103,35 @@ pub enum Message {
     PaneResized(pane_grid::ResizeEvent),
     AreaSelected(AreaId),
     ToolSelected(Tool),
+    LinkOneWayChanged(bool),
+    LinkFromDirectionChanged(smudgy_cloud::ExitDirection),
+    LinkToDirectionChanged(smudgy_cloud::ExitDirection),
+    LinkFromCommandChanged(String),
+    LinkToCommandChanged(String),
+    LinkRoutingChanged(smudgy_cloud::ConnectionRouting),
+    LinkDashChanged(smudgy_cloud::ConnectionDash),
+    LinkColorChanged(String),
+    LinkThicknessChanged(String),
+    LinkPairChanged(bool),
+    LinkCreateConfirmed,
+    /// Keep-theirs finished for a Link gesture whose proposed new room
+    /// number was taken while its CAS envelope was in flight.
+    NewRoomLinkConflictResolved(OperationId),
+    CopyIncludeBoundaryChanged(bool),
+    CopySelectionConfirmed,
     LevelUp,
     LevelDown,
     Undo,
     Redo,
     Hotkey(window::Id, Hotkey),
     Inspector(inspector::Message),
+    AutomaticRouteSolved {
+        generation: u64,
+        snapshot: automatic_routing::Snapshot,
+        result: AutoRouteResult,
+    },
+    AutomaticRouteAccepted,
+    AutomaticRouteCancelled,
     Tick,
     CommandCompleted(commands::Outcome),
     SetCurrentLocation(AreaId, Option<i32>),
@@ -100,6 +144,8 @@ pub enum Message {
     RenameAreaCommitted,
     DeleteAreaRequested(AreaId),
     DeleteAreaConfirmed,
+    DeleteConnectionConfirmed,
+    RedistributePortsConfirmed,
     ModalDismissed,
     /// Open the share dialog for the active area (owner or re-sharer only).
     ShareDialogRequested,
@@ -141,6 +187,11 @@ pub enum Message {
     /// The toolbar sync indicator, pressed while idle; wakes the mapper for an
     /// immediate sync (the engine has no periodic poll).
     SyncNowRequested,
+    KeepMineRequested,
+    KeepTheirsRequested,
+    RetrySaveRequested,
+    DiscardFailedSaveRequested,
+    SaveResolutionCompleted,
     /// Toggle whether `area_id` participates in room identification/routing.
     ToggleAreaEnabled(AreaId),
     /// Make `area_id` the active copy of its copy-family: enable it and
@@ -206,7 +257,10 @@ pub enum Message {
     /// Open the "Servers…" checklist for an atlas or atlas-less area.
     ServersChecklistRequested(ScopeTarget),
     /// Show/hide the checklist's target on one server entry.
-    ScopeServerToggled { entry: String, show: bool },
+    ScopeServerToggled {
+        entry: String,
+        show: bool,
+    },
     /// The daemon mirrored an updated scope store into this editor (another
     /// editor changed an association).
     ScopesReplaced(MapScopes),
@@ -254,10 +308,10 @@ fn editor_hotkeys(
 
     let hotkey = match key.as_ref() {
         keyboard::Key::Named(Named::Delete | Named::Backspace) => Hotkey::Delete,
-        keyboard::Key::Named(Named::ArrowLeft) => Hotkey::Nudge(-1, 0),
-        keyboard::Key::Named(Named::ArrowRight) => Hotkey::Nudge(1, 0),
-        keyboard::Key::Named(Named::ArrowUp) => Hotkey::Nudge(0, -1),
-        keyboard::Key::Named(Named::ArrowDown) => Hotkey::Nudge(0, 1),
+        keyboard::Key::Named(Named::ArrowLeft) => Hotkey::Nudge(-1, 0, nudge_step(modifiers)),
+        keyboard::Key::Named(Named::ArrowRight) => Hotkey::Nudge(1, 0, nudge_step(modifiers)),
+        keyboard::Key::Named(Named::ArrowUp) => Hotkey::Nudge(0, -1, nudge_step(modifiers)),
+        keyboard::Key::Named(Named::ArrowDown) => Hotkey::Nudge(0, 1, nudge_step(modifiers)),
         keyboard::Key::Named(Named::Escape) => Hotkey::Escape,
         keyboard::Key::Named(Named::PageUp) if modifiers.command() => Hotkey::MoveLevelUp,
         keyboard::Key::Named(Named::PageDown) if modifiers.command() => Hotkey::MoveLevelDown,
@@ -287,6 +341,17 @@ fn editor_hotkeys(
     };
 
     Some(Message::Hotkey(window_id, hotkey))
+}
+
+/// Map-space keyboard adjustment: Alt is fine, Shift is coarse.
+fn nudge_step(modifiers: keyboard::Modifiers) -> f32 {
+    if modifiers.shift() {
+        1.0
+    } else if modifiers.alt() {
+        0.05
+    } else {
+        0.25
+    }
 }
 
 /// Identifies one folder in the "My maps" tree for collapse/expand state. A
@@ -333,6 +398,23 @@ pub struct MapEditorWindow {
     /// When the rooms-excluded-from-copy notice was shown; renders as a
     /// transient banner under the toolbar until the tick expires it.
     room_copy_notice: Option<Instant>,
+    /// Short non-modal feedback for collaboration-driven selection changes.
+    editor_notice: Option<(Instant, String)>,
+    automatic_route_generation: u64,
+    pending_automatic_route: Option<PendingAutomaticRoute>,
+    automatic_route_preview: Option<AutomaticRoutePreview>,
+    /// Automatic routes touched by an endpoint move or an external area
+    /// revision. This is intentionally UI state: the v2 wire schema has no
+    /// persisted staleness bit, and collision is recomputed from geometry.
+    automatic_routes_maybe_stale: HashSet<ConnectionId>,
+    /// Defaults remembered across Link-tool gestures in this window only.
+    link_defaults: modals::LinkDefaults,
+    /// New-room Link gestures keyed by their CAS operation so a collision on
+    /// the suggested room number can reopen the exact preview.
+    pending_new_room_links: HashMap<OperationId, modals::LinkDraft>,
+    /// A number-collision operation being discarded before its draft is
+    /// reopened against the fresh area projection.
+    recovering_new_room_link: Option<(OperationId, modals::LinkDraft, RoomNumber)>,
     modal: Option<modals::Modal>,
     /// In-progress inline rename in the area list.
     renaming_area: Option<(AreaId, String)>,
@@ -383,7 +465,204 @@ pub struct MapEditorWindow {
     scope_all: bool,
 }
 
+fn reciprocal_pair_candidate(
+    area: &AreaCache,
+    area_id: AreaId,
+    from: RoomNumber,
+    to: RoomNumber,
+    from_direction: smudgy_cloud::ExitDirection,
+    to_direction: smudgy_cloud::ExitDirection,
+) -> Option<ConnectionId> {
+    let mut candidates = area
+        .get_connections()
+        .iter()
+        .filter_map(|connection| {
+            let members: Vec<_> = area
+                .get_rooms()
+                .iter()
+                .flat_map(|room| {
+                    room.get_exits()
+                        .iter()
+                        .map(move |exit| (room.get_room_number(), exit))
+                })
+                .filter(|(_, exit)| exit.connection_id == connection.id)
+                .collect();
+            (members.len() == 1
+                && from != to
+                && members[0].0 == to
+                && members[0].1.to_area_id == Some(area_id)
+                && members[0].1.to_room_number == Some(from)
+                && members[0].1.from_direction == to_direction
+                && members[0]
+                    .1
+                    .to_direction
+                    .is_none_or(|direction| direction == from_direction))
+            .then_some(connection.id)
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
 impl MapEditorWindow {
+    fn clear_automatic_route_state(&mut self) -> bool {
+        let had_state = self.pending_automatic_route.is_some()
+            || self.automatic_route_preview.is_some()
+            || matches!(
+                self.modal,
+                Some(modals::Modal::AutomaticRoutePreview { .. })
+            );
+        if let Some(pending) = self.pending_automatic_route.take() {
+            pending.cancel.store(true, AtomicOrdering::Relaxed);
+        }
+        self.automatic_route_preview = None;
+        self.editor.set_automatic_route_preview(None);
+        if matches!(
+            self.modal,
+            Some(modals::Modal::AutomaticRoutePreview { .. })
+        ) {
+            self.modal = None;
+        }
+        had_state
+    }
+
+    pub(super) fn start_automatic_route(
+        &mut self,
+        connection_id: ConnectionId,
+    ) -> Update<Message, Event> {
+        if !self.can_edit_active_area() {
+            return Update::none();
+        }
+        let atlas = self.mapper.get_current_atlas();
+        let Some(area_id) = self.editor.area_id() else {
+            return Update::none();
+        };
+        let Some(area) = atlas.get_area(&area_id) else {
+            return Update::none();
+        };
+        let (snapshot, request) = match automatic_routing::capture(&area, connection_id) {
+            Ok(captured) => captured,
+            Err(message) => {
+                self.editor_notice = Some((Instant::now(), message.to_string()));
+                return Update::none();
+            }
+        };
+
+        self.clear_automatic_route_state();
+        self.automatic_route_generation = self.automatic_route_generation.wrapping_add(1);
+        let generation = self.automatic_route_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.pending_automatic_route = Some(PendingAutomaticRoute {
+            generation,
+            snapshot: snapshot.clone(),
+            cancel: cancel.clone(),
+        });
+        self.editor_notice = Some((Instant::now(), "Finding an automatic route…".to_string()));
+
+        let callback_snapshot = snapshot.clone();
+        Update::with_task(Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    smudgy_cloud::automatic_routing::solve(&request, cancel.as_ref())
+                })
+                .await
+                .unwrap_or(AutoRouteResult::LimitReached)
+            },
+            move |result| Message::AutomaticRouteSolved {
+                generation,
+                snapshot: callback_snapshot.clone(),
+                result,
+            },
+        ))
+    }
+
+    pub(super) fn automatic_route_validation(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<RouteValidation> {
+        let area_id = self.editor.area_id()?;
+        let atlas = self.mapper.get_current_atlas();
+        let area = atlas.get_area(&area_id)?;
+        let connection = area.get_connection(connection_id)?;
+        let (_, request) = automatic_routing::capture(&area, connection_id).ok()?;
+        Some(smudgy_cloud::automatic_routing::validate_route(
+            &request,
+            &connection.route_points,
+        ))
+    }
+
+    pub(super) fn automatic_route_is_stale(&self, connection_id: ConnectionId) -> bool {
+        self.automatic_routes_maybe_stale.contains(&connection_id)
+    }
+
+    fn mark_moved_automatic_routes_stale(&mut self) {
+        let Some(area_id) = self.editor.area_id() else {
+            return;
+        };
+        let moved_rooms: HashSet<_> = self.editor.selection().rooms().collect();
+        if moved_rooms.is_empty() {
+            return;
+        }
+        let atlas = self.mapper.get_current_atlas();
+        let Some(area) = atlas.get_area(&area_id) else {
+            return;
+        };
+        for connection in area.get_connections() {
+            if connection.routing != ConnectionRouting::Automatic {
+                continue;
+            }
+            let Some(endpoint_b) = connection.endpoint_b else {
+                continue;
+            };
+            let a_moved = moved_rooms.contains(&connection.endpoint_a.room_number);
+            let b_moved = moved_rooms.contains(&endpoint_b.room_number);
+            if a_moved ^ b_moved {
+                self.automatic_routes_maybe_stale.insert(connection.id);
+            }
+        }
+    }
+
+    fn mark_external_automatic_routes_stale(&mut self) {
+        let Some(area_id) = self.editor.area_id() else {
+            return;
+        };
+        let atlas = self.mapper.get_current_atlas();
+        let Some(area) = atlas.get_area(&area_id) else {
+            return;
+        };
+        self.automatic_routes_maybe_stale.extend(
+            area.get_connections()
+                .iter()
+                .filter(|connection| connection.routing == ConnectionRouting::Automatic)
+                .map(|connection| connection.id),
+        );
+    }
+
+    /// Best-effort final flush for the deliberately in-session pending queue.
+    /// The OS close request cannot be held open by iced on every platform, so
+    /// the toolbar warns while work is pending and this method wakes the sync
+    /// worker before the window releases its mapper clone.
+    pub fn prepare_to_close(&self) {
+        let pending = self.mapper.get_sync_stats().pending_operations();
+        let unsaved_areas = self
+            .mapper
+            .get_current_atlas()
+            .areas()
+            .filter(|area| {
+                !matches!(
+                    self.mapper.area_save_status(*area.get_id()),
+                    smudgy_cloud::mapper::AreaSaveStatus::Saved
+                )
+            })
+            .count();
+        if pending > 0 || unsaved_areas > 0 {
+            log::warn!(
+                "Map editor is closing with {pending} active operation(s) across {unsaved_areas} unsaved area(s); attempting final sync"
+            );
+            self.mapper.sync_now();
+        }
+    }
+
     /// Builds the window with an injected clipboard, so every editor window
     /// can share one app-global clipboard (for the two-window merge workflow).
     pub fn with_clipboard(
@@ -425,6 +704,14 @@ impl MapEditorWindow {
             clipboard,
             consecutive_pastes: 0,
             room_copy_notice: None,
+            editor_notice: None,
+            automatic_route_generation: 0,
+            pending_automatic_route: None,
+            automatic_route_preview: None,
+            automatic_routes_maybe_stale: HashSet::new(),
+            link_defaults: modals::LinkDefaults::default(),
+            pending_new_room_links: HashMap::new(),
+            recovering_new_room_link: None,
             modal: None,
             renaming_area: None,
             pending_copied_area: None,
@@ -449,6 +736,8 @@ impl MapEditorWindow {
         // Default to This-server scope only when a server context exists.
         window.scope_all = window.server_name.is_none();
         window.collapsed_folders.insert(FolderKey::Unassigned);
+        let editable = window.can_edit_active_area();
+        window.editor.set_editable(editable);
         window.inspector.resync(&window.mapper, &window.editor);
         window
     }
@@ -591,7 +880,11 @@ impl MapEditorWindow {
     /// this editor's own snapshot and handing the same list to the daemon so it
     /// replays them against the authoritative copy — never a whole-store
     /// snapshot, which would clobber a concurrent write.
-    fn apply_recipient_homing(&mut self, grants: &[ShareGrantRow], areas: &[Area]) -> Vec<ScopeDelta> {
+    fn apply_recipient_homing(
+        &mut self,
+        grants: &[ShareGrantRow],
+        areas: &[Area],
+    ) -> Vec<ScopeDelta> {
         // The local server entries are the homing evidence (§5.1). Hosts are
         // consumed here once and never stored as keys.
         let entries: Vec<HostEntry> = smudgy_core::models::server::list_servers()
@@ -733,7 +1026,10 @@ impl MapEditorWindow {
                     .clone()
                     .unwrap_or_else(|| "a friend".to_string());
                 // Re-share: name both the sharer and the underlying owner.
-                if meta.owner_id.is_some_and(|owner_id| owner_id != sharer.user_id) {
+                if meta
+                    .owner_id
+                    .is_some_and(|owner_id| owner_id != sharer.user_id)
+                {
                     // Owner handle: prefer GET /areas (meta), fall back to the
                     // grant's owner_nickname, then to "a friend".
                     let owner_label = meta
@@ -869,9 +1165,10 @@ impl MapEditorWindow {
     /// Fetches the owner-only secrets audit list for `area_id`.
     fn fetch_secrets_audit(&self, area_id: AreaId) -> Task<Message> {
         let client = self.cloud.client.clone();
-        Task::perform(async move { client.area_secrets(area_id).await }, |result| {
-            Message::SecretsAuditLoaded(result.map_err(|error| error.to_string()))
-        })
+        Task::perform(
+            async move { client.area_secrets(area_id).await },
+            |result| Message::SecretsAuditLoaded(result.map_err(|error| error.to_string())),
+        )
     }
 
     /// Selects an audited entity in the editor, following it to its level.
@@ -939,21 +1236,145 @@ impl MapEditorWindow {
     /// canvas, hotkeys, paste) funnels through here, so a view-only shared
     /// area can't be mutated even if some UI affordance slips through.
     fn push_command(&mut self, command: Option<commands::Command>) -> Update<Message, Event> {
+        self.push_command_tracked(command).0
+    }
+
+    /// The mutation funnel plus the operation ids assigned to compound CAS
+    /// envelopes. Most callers do not need the ids; new-room Link gestures
+    /// retain one so a number collision can restore their preview.
+    fn push_command_tracked(
+        &mut self,
+        command: Option<commands::Command>,
+    ) -> (Update<Message, Event>, Vec<OperationId>) {
         match command {
             Some(command) => {
                 if !self.can_edit_active_area() {
                     log::info!("map editor: ignoring mutation — the active area is view-only");
-                    return Update::none();
+                    return (Update::none(), Vec::new());
                 }
-                let task = self
-                    .stack
-                    .push_and_apply(&self.mapper, command)
-                    .map(Message::CommandCompleted);
+                // Every map mutation supersedes the immutable solver
+                // snapshot; signal cancellation before touching the cache.
+                self.clear_automatic_route_state();
+                let (task, operation_ids) =
+                    self.stack.push_and_apply_tracked(&self.mapper, command);
                 self.refresh_seen_rev();
-                Update::with_task(task)
+                (
+                    Update::with_task(task.map(Message::CommandCompleted)),
+                    operation_ids,
+                )
             }
-            None => Update::none(),
+            None => (Update::none(), Vec::new()),
         }
+    }
+
+    /// Recompute the one-member reciprocal suggestion from the current
+    /// projection. Direction edits and collaboration updates can invalidate
+    /// the candidate captured when the popover first opened.
+    fn refresh_link_pair_candidate(&mut self) {
+        let Some(modals::Modal::CreateLink(draft)) = &self.modal else {
+            return;
+        };
+        let commands::NewExitTarget::Room(to) = draft.target else {
+            return;
+        };
+        let area_id = draft.area_id;
+        let from = draft.from;
+        let from_direction = draft.from_direction;
+        let to_direction = draft.to_direction;
+        let atlas = self.mapper.get_current_atlas();
+        let candidate = atlas.get_area(&area_id).and_then(|area| {
+            reciprocal_pair_candidate(&area, area_id, from, to, from_direction, to_direction)
+        });
+        if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+            draft.pair_candidate = candidate;
+            draft.pair_with_candidate &= candidate.is_some();
+        }
+    }
+
+    /// Detect the special CAS conflict where another editor claimed the
+    /// proposed room number. Discard that optimistic command first; its
+    /// completion message reopens the original preview with a fresh number.
+    fn begin_new_room_link_conflict_recovery(&mut self, atlas: &Arc<AtlasCache>) -> Task<Message> {
+        if self.recovering_new_room_link.is_some() {
+            return Task::none();
+        }
+        let Some(area_id) = self.editor.area_id() else {
+            return Task::none();
+        };
+        let Some(operation_id) = self.mapper.conflicted_operation_id(area_id) else {
+            return Task::none();
+        };
+        let Some(draft) = self.pending_new_room_links.get(&operation_id).cloned() else {
+            return Task::none();
+        };
+        let commands::NewExitTarget::NewRoom { room_number, .. } = draft.target else {
+            return Task::none();
+        };
+        let Some(area) = atlas.get_area(&area_id) else {
+            return Task::none();
+        };
+        if area.get_room(&room_number).is_none() {
+            // A different structural dependency failed; leave the ordinary
+            // conflict review UI in control.
+            return Task::none();
+        }
+
+        self.pending_new_room_links.remove(&operation_id);
+        self.stack.discard_operation(operation_id);
+        self.recovering_new_room_link = Some((operation_id, draft, room_number));
+        let mapper = self.mapper.clone();
+        Task::perform(
+            async move {
+                mapper.resolve_conflict(area_id, false).await;
+                operation_id
+            },
+            Message::NewRoomLinkConflictResolved,
+        )
+    }
+
+    /// Reopen a resolved number-collision draft once it is safe to replace
+    /// the modal surface. If the user opened another dialog while the
+    /// refetch ran, the periodic tick retries after that dialog closes.
+    fn finish_new_room_link_conflict_recovery(&mut self, expected: Option<OperationId>) {
+        let Some((operation_id, draft, _)) = &self.recovering_new_room_link else {
+            return;
+        };
+        if expected.is_some_and(|expected| expected != *operation_id)
+            || self
+                .mapper
+                .is_operation_pending(draft.area_id, *operation_id)
+            || self.modal.is_some()
+            || self.editor.area_id() != Some(draft.area_id)
+            || !self.can_edit_active_area()
+        {
+            return;
+        }
+        let atlas = self.mapper.get_current_atlas();
+        let Some(area) = atlas.get_area(&draft.area_id) else {
+            self.recovering_new_room_link = None;
+            self.editor_notice = Some((
+                Instant::now(),
+                "The link was discarded because its area is no longer available.".to_string(),
+            ));
+            return;
+        };
+        let new_number = area.next_room_number();
+        let Some((_, mut draft, old_number)) = self.recovering_new_room_link.take() else {
+            return;
+        };
+        let commands::NewExitTarget::NewRoom { room_number, .. } = &mut draft.target else {
+            return;
+        };
+        *room_number = new_number;
+        self.modal = Some(modals::Modal::CreateLink(draft));
+        self.editor.clear_selection();
+        self.editor_notice = Some((
+            Instant::now(),
+            format!(
+                "Room {old_number} was taken by another editor; review the link with suggested room {new_number}."
+            ),
+        ));
+        self.inspector.resync(&self.mapper, &self.editor);
     }
 
     fn handle_mutation_request(&mut self, request: MutationRequest) -> Update<Message, Event> {
@@ -967,6 +1388,7 @@ impl MapEditorWindow {
 
         match request {
             MutationRequest::MoveSelection { offset } => {
+                self.mark_moved_automatic_routes_stale();
                 let update = self.push_command(commands::move_selection(
                     &self.mapper.get_current_atlas(),
                     area_id,
@@ -1001,10 +1423,25 @@ impl MapEditorWindow {
                 to_direction,
                 one_way,
             } => {
+                let atlas = self.mapper.get_current_atlas();
+                let pair_candidate = if let ExitTarget::Room(to_room) = to {
+                    let Some(area) = atlas.get_area(&area_id) else {
+                        return Update::none();
+                    };
+                    reciprocal_pair_candidate(
+                        &area,
+                        area_id,
+                        from,
+                        to_room,
+                        from_direction,
+                        to_direction,
+                    )
+                } else {
+                    None
+                };
                 let target = match to {
                     ExitTarget::Room(room_number) => commands::NewExitTarget::Room(room_number),
                     ExitTarget::Empty(at) => {
-                        let atlas = self.mapper.get_current_atlas();
                         let Some(area) = atlas.get_area(&area_id) else {
                             return Update::none();
                         };
@@ -1014,22 +1451,25 @@ impl MapEditorWindow {
                             level: self.editor.level(),
                         }
                     }
+                    ExitTarget::Dangling(_) => commands::NewExitTarget::Dangling,
                 };
-
-                let update = self.push_command(Some(commands::create_exit(
+                self.modal = Some(modals::Modal::CreateLink(modals::LinkDraft {
                     area_id,
                     from,
+                    target,
                     from_direction,
-                    &target,
                     to_direction,
-                    one_way,
-                )));
-
-                if let commands::NewExitTarget::NewRoom { room_number, .. } = target {
-                    self.editor.select(EntityId::Room(room_number));
-                }
-                self.inspector.resync(&self.mapper, &self.editor);
-                update
+                    one_way: one_way || self.link_defaults.one_way,
+                    from_command: String::new(),
+                    to_command: String::new(),
+                    routing: self.link_defaults.routing,
+                    dash: self.link_defaults.dash,
+                    color: self.link_defaults.color.clone(),
+                    thickness: self.link_defaults.thickness.to_string(),
+                    pair_candidate,
+                    pair_with_candidate: pair_candidate.is_some(),
+                }));
+                Update::none()
             }
             MutationRequest::CreateLabel { rect } => {
                 let update = self.push_command(Some(commands::create_label(
@@ -1061,6 +1501,35 @@ impl MapEditorWindow {
                 self.inspector.resync(&self.mapper, &self.editor);
                 update
             }
+            MutationRequest::UpdateConnection {
+                connection_id,
+                updates,
+                description,
+            } => {
+                let update = self.push_command(commands::edit_connection(
+                    &self.mapper.get_current_atlas(),
+                    area_id,
+                    connection_id,
+                    commands::FieldId::RoutePoints,
+                    updates,
+                    description,
+                ));
+                self.inspector.resync(&self.mapper, &self.editor);
+                update
+            }
+            MutationRequest::DeleteWaypoint {
+                connection_id,
+                index,
+            } => {
+                let update = self.push_command(commands::delete_waypoint(
+                    &self.mapper.get_current_atlas(),
+                    area_id,
+                    connection_id,
+                    index,
+                ));
+                self.editor.clear_selected_waypoint();
+                update
+            }
         }
     }
 
@@ -1071,11 +1540,41 @@ impl MapEditorWindow {
         if !self.can_edit_active_area() {
             return Update::none();
         }
-        let command = commands::delete_selection(
-            &self.mapper.get_current_atlas(),
-            area_id,
-            self.editor.selection(),
-        );
+        if let Some((connection_id, index)) = self.editor.selected_waypoint() {
+            return self.handle_mutation_request(MutationRequest::DeleteWaypoint {
+                connection_id,
+                index,
+            });
+        }
+        let atlas = self.mapper.get_current_atlas();
+        let command = match self.editor.selection().single() {
+            Some(EntityId::Connection(connection_id)) => {
+                let Some(area) = atlas.get_area(&area_id) else {
+                    return Update::none();
+                };
+                let member_count = area
+                    .get_rooms()
+                    .iter()
+                    .flat_map(|room| room.get_exits())
+                    .filter(|exit| exit.connection_id == connection_id)
+                    .count();
+                let is_secret = area
+                    .get_room_connections()
+                    .iter()
+                    .find(|connection| connection.connection_id == connection_id)
+                    .is_some_and(|connection| connection.is_secret);
+                if member_count >= 2 || is_secret {
+                    self.modal = Some(modals::Modal::ConfirmDeleteConnection {
+                        connection_id,
+                        member_count,
+                        is_secret,
+                    });
+                    return Update::none();
+                }
+                commands::delete_connection(&atlas, area_id, connection_id)
+            }
+            _ => commands::delete_selection(&atlas, area_id, self.editor.selection()),
+        };
         self.editor.clear_selection();
         let update = self.push_command(command);
         self.inspector.resync(&self.mapper, &self.editor);
@@ -1092,7 +1591,7 @@ impl MapEditorWindow {
     /// Copies the selection into the clipboard (rooms only where the owner
     /// allows it; see [`Self::allow_room_copy`]). Returns false when the
     /// selection holds nothing copyable (the clipboard is kept).
-    fn copy_selection(&mut self) -> bool {
+    fn copy_selection(&mut self, include_boundary_links: bool) -> bool {
         let Some(area_id) = self.editor.area_id() else {
             return false;
         };
@@ -1107,6 +1606,7 @@ impl MapEditorWindow {
             area_id,
             self.editor.selection(),
             allow_rooms,
+            include_boundary_links,
         );
         if snapshot.is_empty() {
             return false;
@@ -1114,6 +1614,64 @@ impl MapEditorWindow {
         self.clipboard.store(Arc::new(snapshot));
         self.consecutive_pastes = 0;
         true
+    }
+
+    fn cut_copied_selection(&mut self) -> Update<Message, Event> {
+        // Cutting from a view-only area degrades to a plain copy.
+        if !self.can_edit_active_area() {
+            return Update::none();
+        }
+        let allow_rooms = self.allow_room_copy();
+        let Some(area_id) = self.editor.area_id() else {
+            return Update::none();
+        };
+        let cut: map_editor::Selection = self
+            .editor
+            .selection()
+            .iter()
+            .filter(|entity| match entity {
+                EntityId::Label(_) | EntityId::Shape(_) | EntityId::Connection(_) => true,
+                EntityId::Room(_) => allow_rooms,
+            })
+            .collect();
+        let command = commands::delete_selection(&self.mapper.get_current_atlas(), area_id, &cut);
+        for entity in cut.iter() {
+            self.editor.remove_from_selection(entity);
+        }
+        let update = self.push_command(command);
+        self.inspector.resync(&self.mapper, &self.editor);
+        update
+    }
+
+    fn request_copy_selection(&mut self, cut_after_copy: bool) -> Update<Message, Event> {
+        let Some(area_id) = self.editor.area_id() else {
+            return Update::none();
+        };
+        let boundary_count = if self.allow_room_copy() {
+            commands::boundary_link_count(
+                &self.mapper.get_current_atlas(),
+                area_id,
+                self.editor.selection(),
+            )
+        } else {
+            0
+        };
+        if boundary_count > 0 {
+            self.modal = Some(modals::Modal::ConfirmCopySelection {
+                boundary_count,
+                include_boundary_links: false,
+                cut_after_copy,
+            });
+            return Update::none();
+        }
+        if !self.copy_selection(false) {
+            return Update::none();
+        }
+        if cut_after_copy {
+            self.cut_copied_selection()
+        } else {
+            Update::none()
+        }
     }
 
     fn paste_clipboard(&mut self) -> Update<Message, Event> {
@@ -1164,44 +1722,132 @@ impl MapEditorWindow {
     fn handle_hotkey(&mut self, hotkey: Hotkey) -> Update<Message, Event> {
         match hotkey {
             Hotkey::Delete => self.delete_selection(),
-            Hotkey::Copy => {
-                self.copy_selection();
-                Update::none()
-            }
-            Hotkey::Cut => {
-                // Cutting from a view-only area degrades to a plain copy.
-                let allow_rooms = self.allow_room_copy();
-                if !self.copy_selection() || !self.can_edit_active_area() {
-                    return Update::none();
-                }
-                let Some(area_id) = self.editor.area_id() else {
-                    return Update::none();
-                };
-                // Delete only what was copied; rooms stay put when the
-                // owner hasn't allowed copying them.
-                let cut: map_editor::Selection = self
-                    .editor
-                    .selection()
-                    .iter()
-                    .filter(|entity| match entity {
-                        EntityId::Label(_) | EntityId::Shape(_) => true,
-                        EntityId::Room(_) => allow_rooms,
-                    })
-                    .collect();
-                let command = commands::delete_selection(
-                    &self.mapper.get_current_atlas(),
-                    area_id,
-                    &cut,
-                );
-                for entity in cut.iter() {
-                    self.editor.remove_from_selection(entity);
-                }
-                let update = self.push_command(command);
-                self.inspector.resync(&self.mapper, &self.editor);
-                update
-            }
+            Hotkey::Copy => self.request_copy_selection(false),
+            Hotkey::Cut => self.request_copy_selection(true),
             Hotkey::Paste => self.paste_clipboard(),
-            Hotkey::Nudge(dx, dy) => {
+            Hotkey::Nudge(dx, dy, step) => {
+                if let Some((connection_id, handle)) = self.editor.selected_connection_handle() {
+                    let atlas = self.mapper.get_current_atlas();
+                    let Some(area_id) = self.editor.area_id() else {
+                        return Update::none();
+                    };
+                    let Some(area) = atlas.get_area(&area_id) else {
+                        return Update::none();
+                    };
+                    let Some(connection) = area.get_connection(connection_id) else {
+                        return Update::none();
+                    };
+                    let (updates, description) = match handle {
+                        SelectedConnectionHandle::Waypoint(index) => {
+                            let Some(point) = connection.route_points.get(index).copied() else {
+                                return Update::none();
+                            };
+                            let mut points = connection.route_points.clone();
+                            let mut target = smudgy_cloud::MapPoint::new(
+                                point.x + dx as f32 * step,
+                                point.y + dy as f32 * step,
+                            );
+                            if connection.segment_shape == SegmentShape::Orthogonal {
+                                let Some(render) =
+                                    area.get_room_connections().iter().find(|item| {
+                                        item.connection_id == connection_id
+                                            && item.from_level == self.editor.level()
+                                    })
+                                else {
+                                    return Update::none();
+                                };
+                                let previous = if index == 0 {
+                                    render.geometry.stub_tip_a
+                                } else {
+                                    points[index - 1]
+                                };
+                                let next = if index + 1 == points.len() {
+                                    let Some(tip) = render.geometry.stub_tip_b else {
+                                        return Update::none();
+                                    };
+                                    tip
+                                } else {
+                                    points[index + 1]
+                                };
+                                let previous_horizontal =
+                                    (point.y - previous.y).abs() <= (point.x - previous.x).abs();
+                                let next_horizontal =
+                                    (point.y - next.y).abs() <= (point.x - next.x).abs();
+                                if index == 0 {
+                                    if previous_horizontal {
+                                        target.y = previous.y;
+                                    } else {
+                                        target.x = previous.x;
+                                    }
+                                } else if previous_horizontal {
+                                    points[index - 1].y = target.y;
+                                } else {
+                                    points[index - 1].x = target.x;
+                                }
+                                if index + 1 == points.len() {
+                                    if next_horizontal {
+                                        target.y = next.y;
+                                    } else {
+                                        target.x = next.x;
+                                    }
+                                } else if next_horizontal {
+                                    points[index + 1].y = target.y;
+                                } else {
+                                    points[index + 1].x = target.x;
+                                }
+                            }
+                            points[index] = target;
+                            (
+                                ConnectionUpdates {
+                                    routing: Some(ConnectionRouting::Manual),
+                                    route_points: Some(points),
+                                    ..ConnectionUpdates::default()
+                                },
+                                "Nudge connection waypoint",
+                            )
+                        }
+                        SelectedConnectionHandle::PortA | SelectedConnectionHandle::PortB => {
+                            let mut endpoint = match handle {
+                                SelectedConnectionHandle::PortA => connection.endpoint_a,
+                                SelectedConnectionHandle::PortB => {
+                                    let Some(endpoint) = connection.endpoint_b else {
+                                        return Update::none();
+                                    };
+                                    endpoint
+                                }
+                                SelectedConnectionHandle::Waypoint(_) => unreachable!(),
+                            };
+                            // Port offsets are normalized wall coordinates.
+                            // Keep the same fine/default/coarse relationship
+                            // as waypoint nudging without jumping an entire
+                            // room edge at once.
+                            let along_wall = match endpoint.side {
+                                RoomSide::North | RoomSide::South => dx as f32,
+                                RoomSide::East | RoomSide::West => dy as f32,
+                            };
+                            if along_wall == 0.0 {
+                                return Update::none();
+                            }
+                            endpoint.port_offset =
+                                (endpoint.port_offset + along_wall * step * 0.1).clamp(0.0, 1.0);
+                            endpoint.port_mode = PortMode::Manual;
+                            let Some(updates) = inspector::endpoint_updates(
+                                &area,
+                                connection_id,
+                                endpoint,
+                                handle == SelectedConnectionHandle::PortB,
+                            ) else {
+                                return Update::none();
+                            };
+                            (updates, "Nudge connection port")
+                        }
+                    };
+                    return self.handle_mutation_request(MutationRequest::UpdateConnection {
+                        connection_id,
+                        updates,
+                        description,
+                    });
+                }
                 if self.editor.selection().is_empty() {
                     return Update::none();
                 }
@@ -1218,6 +1864,7 @@ impl MapEditorWindow {
                 if !self.can_edit_active_area() {
                     return Update::none();
                 }
+                self.clear_automatic_route_state();
                 let task = self.stack.undo(&self.mapper).map(Message::CommandCompleted);
                 self.refresh_seen_rev();
                 self.inspector.resync(&self.mapper, &self.editor);
@@ -1228,6 +1875,7 @@ impl MapEditorWindow {
                 if !self.can_edit_active_area() {
                     return Update::none();
                 }
+                self.clear_automatic_route_state();
                 let task = self.stack.redo(&self.mapper).map(Message::CommandCompleted);
                 self.refresh_seen_rev();
                 self.inspector.resync(&self.mapper, &self.editor);
@@ -1235,11 +1883,15 @@ impl MapEditorWindow {
             }
             Hotkey::Escape => {
                 if self.modal.is_some() {
-                    self.modal = None;
+                    if !self.clear_automatic_route_state() {
+                        self.modal = None;
+                    }
                 } else if self.renaming_area.is_some() {
                     self.renaming_area = None;
                 } else if self.renaming_atlas.is_some() {
                     self.renaming_atlas = None;
+                } else if self.editor.clear_selected_connection_handle() {
+                    self.inspector.resync(&self.mapper, &self.editor);
                 } else if self.editor.tool() == Tool::Select {
                     self.editor.clear_selection();
                 } else {
@@ -1273,7 +1925,8 @@ impl MapEditorWindow {
                 // Follow the rooms to their new level so the selection
                 // stays visible.
                 if !self.editor.selection().is_empty() {
-                    self.editor.set_level_keeping_selection(self.editor.level() + delta);
+                    self.editor
+                        .set_level_keeping_selection(self.editor.level() + delta);
                 }
                 self.inspector.resync(&self.mapper, &self.editor);
                 update
@@ -1310,7 +1963,11 @@ impl MapEditorWindow {
             }
             Message::AreaSelected(area_id) => {
                 if self.editor.area_id() != Some(area_id) {
+                    self.clear_automatic_route_state();
+                    self.automatic_routes_maybe_stale.clear();
                     self.editor.set_area(Some(area_id));
+                    let editable = self.can_edit_active_area();
+                    self.editor.set_editable(editable);
                     self.hovered_room = None;
                     // Undo history is area-local by design.
                     self.stack.clear();
@@ -1351,6 +2008,10 @@ impl MapEditorWindow {
                 // mismatch here means an external change worth resyncing
                 // the inspector for.
                 let atlas = self.mapper.get_current_atlas();
+                self.pending_new_room_links.retain(|operation_id, draft| {
+                    self.mapper
+                        .is_operation_pending(draft.area_id, *operation_id)
+                });
 
                 // A background sync (cache swap) bumps the mapper's revision;
                 // refetch the sharer index and atlas inventory then (and on
@@ -1381,6 +2042,13 @@ impl MapEditorWindow {
                 {
                     self.room_copy_notice = None;
                 }
+                if self
+                    .editor_notice
+                    .as_ref()
+                    .is_some_and(|(shown, _)| shown.elapsed() >= ROOM_COPY_NOTICE_TTL)
+                {
+                    self.editor_notice = None;
+                }
 
                 // A clone we requested selects itself once sync lands it.
                 if let Some(pending) = self.pending_copied_area
@@ -1399,6 +2067,15 @@ impl MapEditorWindow {
                 if !self.stack.is_empty() && !self.can_edit_active_area() {
                     self.stack.clear();
                 }
+                let editable = self.can_edit_active_area();
+                if !editable && self.clear_automatic_route_state() {
+                    self.editor_notice = Some((
+                        Instant::now(),
+                        "Editing access changed; the automatic route preview was discarded."
+                            .to_string(),
+                    ));
+                }
+                self.editor.set_editable(editable);
 
                 let rev = self
                     .editor
@@ -1406,12 +2083,203 @@ impl MapEditorWindow {
                     .and_then(|id| atlas.get_area(&id))
                     .map(|area| area.get_rev());
                 if rev != self.last_seen_rev {
+                    let discarded_route = self.clear_automatic_route_state();
+                    self.mark_external_automatic_routes_stale();
+                    if discarded_route {
+                        self.editor_notice = Some((
+                            Instant::now(),
+                            "The map changed; the automatic route preview was discarded."
+                                .to_string(),
+                        ));
+                    }
                     self.last_seen_rev = rev;
+                    if let Some(area_id) = self.editor.area_id() {
+                        let missing: Vec<_> = self
+                            .editor
+                            .selection()
+                            .iter()
+                            .filter(|entity| {
+                                let Some(area) = atlas.get_area(&area_id) else {
+                                    return true;
+                                };
+                                match entity {
+                                    EntityId::Room(number) => area.get_room(number).is_none(),
+                                    EntityId::Connection(id) => area.get_connection(*id).is_none(),
+                                    EntityId::Label(id) => area.get_label(id).is_none(),
+                                    EntityId::Shape(id) => area.get_shape(id).is_none(),
+                                }
+                            })
+                            .collect();
+                        if !missing.is_empty() {
+                            for entity in missing {
+                                self.editor.remove_from_selection(entity);
+                            }
+                            self.editor_notice = Some((
+                                Instant::now(),
+                                "A selected map item was removed by another editor.".to_string(),
+                            ));
+                        }
+                    }
+                    self.refresh_link_pair_candidate();
                     self.inspector.resync(&self.mapper, &self.editor);
                 }
-                Update::with_task(sharer_task)
+                let recovery_task = self.begin_new_room_link_conflict_recovery(&atlas);
+                self.finish_new_room_link_conflict_recovery(None);
+                Update::with_task(Task::batch([sharer_task, recovery_task]))
             }
-            Message::Inspector(message) => self.update_inspector(message),
+            Message::Inspector(message) => {
+                if matches!(
+                    &message,
+                    inspector::Message::RoomSecretToggled(_)
+                        | inspector::Message::ExitSecretToggled(_, _)
+                        | inspector::Message::LabelSecretToggled(_)
+                        | inspector::Message::ShapeSecretToggled(_)
+                        | inspector::Message::RoomPropertySecretToggled(_, _)
+                        | inspector::Message::AreaPropertySecretToggled(_, _)
+                        | inspector::Message::BulkSecretMark(_)
+                ) {
+                    self.clear_automatic_route_state();
+                }
+                self.update_inspector(message)
+            }
+            Message::AutomaticRouteSolved {
+                generation,
+                snapshot,
+                result,
+            } => {
+                let matches_pending =
+                    self.pending_automatic_route
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.generation == generation && pending.snapshot == snapshot
+                        });
+                if !matches_pending {
+                    return Update::none();
+                }
+                self.pending_automatic_route = None;
+                if result == AutoRouteResult::Cancelled {
+                    return Update::none();
+                }
+
+                let atlas = self.mapper.get_current_atlas();
+                let current = atlas.get_area(&snapshot.area_id).and_then(|area| {
+                    automatic_routing::capture(&area, snapshot.connection_id).ok()
+                });
+                let Some((current_snapshot, request)) = current else {
+                    self.clear_automatic_route_state();
+                    self.editor_notice = Some((
+                        Instant::now(),
+                        "The link changed; request a fresh automatic route.".to_string(),
+                    ));
+                    return Update::none();
+                };
+                if current_snapshot != snapshot {
+                    self.clear_automatic_route_state();
+                    self.editor_notice = Some((
+                        Instant::now(),
+                        "The map changed; request a fresh automatic route.".to_string(),
+                    ));
+                    return Update::none();
+                }
+
+                match result {
+                    AutoRouteResult::Solved {
+                        route_points,
+                        visited_states,
+                    } => {
+                        let Some(geometry) = smudgy_cloud::automatic_routing::validated_geometry(
+                            &request,
+                            &route_points,
+                        ) else {
+                            self.editor_notice = Some((
+                                Instant::now(),
+                                "The generated route failed final collision validation."
+                                    .to_string(),
+                            ));
+                            return Update::none();
+                        };
+                        let point_count = route_points.len();
+                        self.automatic_route_preview = Some(AutomaticRoutePreview {
+                            snapshot: snapshot.clone(),
+                            route_points,
+                        });
+                        self.editor.set_automatic_route_preview(Some((
+                            snapshot.connection_id,
+                            Arc::new(geometry),
+                        )));
+                        self.modal = Some(modals::Modal::AutomaticRoutePreview {
+                            connection_id: snapshot.connection_id,
+                            point_count,
+                            visited_states,
+                        });
+                        self.editor_notice = None;
+                    }
+                    AutoRouteResult::NoRoute => {
+                        self.editor_notice = Some((
+                            Instant::now(),
+                            "No automatic route found; the stored route is unchanged.".to_string(),
+                        ));
+                    }
+                    AutoRouteResult::LimitReached => {
+                        self.editor_notice = Some((
+                            Instant::now(),
+                            "Automatic routing reached its work limit; the stored route is unchanged."
+                                .to_string(),
+                        ));
+                    }
+                    AutoRouteResult::Cancelled => {}
+                }
+                Update::none()
+            }
+            Message::AutomaticRouteAccepted => {
+                let Some(preview) = self.automatic_route_preview.clone() else {
+                    return Update::none();
+                };
+                let atlas = self.mapper.get_current_atlas();
+                let current = atlas.get_area(&preview.snapshot.area_id).and_then(|area| {
+                    automatic_routing::capture(&area, preview.snapshot.connection_id).ok()
+                });
+                let Some((current_snapshot, request)) = current else {
+                    self.clear_automatic_route_state();
+                    self.editor_notice = Some((
+                        Instant::now(),
+                        "The link changed; request a fresh automatic route.".to_string(),
+                    ));
+                    return Update::none();
+                };
+                if current_snapshot != preview.snapshot
+                    || smudgy_cloud::automatic_routing::validate_route(
+                        &request,
+                        &preview.route_points,
+                    ) != RouteValidation::Valid
+                {
+                    self.clear_automatic_route_state();
+                    self.editor_notice = Some((
+                        Instant::now(),
+                        "The map changed; request a fresh automatic route.".to_string(),
+                    ));
+                    return Update::none();
+                }
+
+                let area_id = preview.snapshot.area_id;
+                let connection_id = preview.snapshot.connection_id;
+                self.clear_automatic_route_state();
+                self.automatic_routes_maybe_stale.remove(&connection_id);
+                self.push_command(commands::accept_automatic_route(
+                    &self.mapper.get_current_atlas(),
+                    area_id,
+                    connection_id,
+                    preview.route_points,
+                ))
+            }
+            Message::AutomaticRouteCancelled => {
+                self.clear_automatic_route_state();
+                self.editor_notice = Some((
+                    Instant::now(),
+                    "Automatic route cancelled; the stored route is unchanged.".to_string(),
+                ));
+                Update::none()
+            }
             Message::CommandCompleted(outcome) => {
                 // Drag-rect creations and pastes select their entities as
                 // the creates complete. The marker stays set (command ids
@@ -1505,8 +2373,7 @@ impl MapEditorWindow {
                         return update;
                     }
                     Err(error) => {
-                        if let Some(modals::Modal::CreateArea { error: slot, .. }) =
-                            &mut self.modal
+                        if let Some(modals::Modal::CreateArea { error: slot, .. }) = &mut self.modal
                         {
                             *slot = Some(error);
                         }
@@ -1575,6 +2442,8 @@ impl MapEditorWindow {
                     &self.mapper.ephemeral_area_ids(),
                 );
                 self.editor.set_area(next_area);
+                let editable = self.can_edit_active_area();
+                self.editor.set_editable(editable);
                 self.hovered_room = None;
                 if !self.can_edit_active_area() && self.editor.tool() != Tool::Select {
                     self.editor.set_tool(Tool::Select);
@@ -1584,21 +2453,269 @@ impl MapEditorWindow {
                 Update::none()
             }
             Message::ModalDismissed => {
-                self.modal = None;
+                if !self.clear_automatic_route_state() {
+                    self.modal = None;
+                }
                 Update::none()
             }
             Message::OpenSettingsRequested => Update::with_event(Event::OpenSettings),
             Message::DismissSigninBanner => {
                 self.signin_banner_dismissed = true;
-                if let Err(error) = smudgy_core::models::settings::set_dismissed_signin_banner_version(
-                    env!("CARGO_PKG_VERSION"),
-                ) {
-                    log::warn!("map editor: failed to persist signed-out banner dismissal: {error}");
+                if let Err(error) =
+                    smudgy_core::models::settings::set_dismissed_signin_banner_version(env!(
+                        "CARGO_PKG_VERSION"
+                    ))
+                {
+                    log::warn!(
+                        "map editor: failed to persist signed-out banner dismissal: {error}"
+                    );
                 }
                 Update::none()
             }
             Message::SyncNowRequested => {
                 self.mapper.sync_now();
+                Update::none()
+            }
+            Message::LinkOneWayChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.one_way = value;
+                }
+                Update::none()
+            }
+            Message::LinkFromDirectionChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.from_direction = value;
+                }
+                self.refresh_link_pair_candidate();
+                Update::none()
+            }
+            Message::LinkToDirectionChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.to_direction = value;
+                }
+                self.refresh_link_pair_candidate();
+                Update::none()
+            }
+            Message::LinkFromCommandChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.from_command = value;
+                }
+                Update::none()
+            }
+            Message::LinkToCommandChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.to_command = value;
+                }
+                Update::none()
+            }
+            Message::LinkRoutingChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.routing = value;
+                }
+                Update::none()
+            }
+            Message::LinkDashChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.dash = value;
+                }
+                Update::none()
+            }
+            Message::LinkColorChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.color = value;
+                }
+                Update::none()
+            }
+            Message::LinkThicknessChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.thickness = value;
+                }
+                Update::none()
+            }
+            Message::LinkPairChanged(value) => {
+                if let Some(modals::Modal::CreateLink(draft)) = &mut self.modal {
+                    draft.pair_with_candidate = value && draft.pair_candidate.is_some();
+                }
+                Update::none()
+            }
+            Message::CopyIncludeBoundaryChanged(value) => {
+                if let Some(modals::Modal::ConfirmCopySelection {
+                    include_boundary_links,
+                    ..
+                }) = &mut self.modal
+                {
+                    *include_boundary_links = value;
+                }
+                Update::none()
+            }
+            Message::CopySelectionConfirmed => {
+                let Some(modals::Modal::ConfirmCopySelection {
+                    include_boundary_links,
+                    cut_after_copy,
+                    ..
+                }) = self.modal.take()
+                else {
+                    return Update::none();
+                };
+                if !self.copy_selection(include_boundary_links) {
+                    return Update::none();
+                }
+                if cut_after_copy {
+                    self.cut_copied_selection()
+                } else {
+                    Update::none()
+                }
+            }
+            Message::LinkCreateConfirmed => {
+                let Some(modals::Modal::CreateLink(draft)) = self.modal.take() else {
+                    return Update::none();
+                };
+                if !draft.is_valid()
+                    || self.editor.area_id() != Some(draft.area_id)
+                    || !self.can_edit_active_area()
+                {
+                    self.modal = Some(modals::Modal::CreateLink(draft));
+                    return Update::none();
+                }
+                let conflict_draft = draft.clone();
+                let color = smudgy_cloud::canonicalize_css_color(&draft.color)
+                    .expect("validated link color");
+                let thickness = draft
+                    .thickness
+                    .parse::<f32>()
+                    .expect("validated link width");
+                self.link_defaults = modals::LinkDefaults {
+                    one_way: draft.one_way,
+                    routing: draft.routing,
+                    dash: draft.dash,
+                    color: color.clone(),
+                    thickness,
+                };
+                let target = draft.target;
+                let command = commands::create_exit_with_options(
+                    draft.area_id,
+                    draft.from,
+                    draft.from_direction,
+                    &target,
+                    draft.to_direction,
+                    commands::NewLinkOptions {
+                        one_way: draft.one_way,
+                        from_command: (!draft.from_command.trim().is_empty())
+                            .then_some(draft.from_command),
+                        to_command: (!draft.to_command.trim().is_empty())
+                            .then_some(draft.to_command),
+                        routing: draft.routing,
+                        dash: draft.dash,
+                        color,
+                        thickness,
+                        pair_with: draft
+                            .pair_with_candidate
+                            .then_some(draft.pair_candidate)
+                            .flatten(),
+                    },
+                );
+                let (update, operation_ids) = self.push_command_tracked(Some(command));
+                if let commands::NewExitTarget::NewRoom { room_number, .. } = target {
+                    if let Some(operation_id) = operation_ids.first().copied() {
+                        debug_assert_eq!(operation_ids.len(), 1);
+                        self.pending_new_room_links
+                            .insert(operation_id, conflict_draft);
+                        self.editor.select(EntityId::Room(room_number));
+                    } else {
+                        self.modal = Some(modals::Modal::CreateLink(conflict_draft));
+                        self.editor_notice = Some((
+                            Instant::now(),
+                            "The link could not be queued; review it and try again.".to_string(),
+                        ));
+                    }
+                }
+                self.inspector.resync(&self.mapper, &self.editor);
+                update
+            }
+            Message::NewRoomLinkConflictResolved(operation_id) => {
+                self.finish_new_room_link_conflict_recovery(Some(operation_id));
+                Update::none()
+            }
+            Message::DeleteConnectionConfirmed => {
+                let Some(modals::Modal::ConfirmDeleteConnection { connection_id, .. }) =
+                    self.modal.take()
+                else {
+                    return Update::none();
+                };
+                let Some(area_id) = self.editor.area_id() else {
+                    return Update::none();
+                };
+                if !self.can_edit_active_area() {
+                    return Update::none();
+                }
+                let command = commands::delete_connection(
+                    &self.mapper.get_current_atlas(),
+                    area_id,
+                    connection_id,
+                );
+                self.editor.clear_selection();
+                let update = self.push_command(command);
+                self.inspector.resync(&self.mapper, &self.editor);
+                update
+            }
+            Message::RedistributePortsConfirmed => {
+                let Some(modals::Modal::ConfirmRedistributePorts {
+                    area_id,
+                    room_number,
+                    side,
+                    secret,
+                    ..
+                }) = self.modal.take()
+                else {
+                    return Update::none();
+                };
+                if self.editor.area_id() != Some(area_id) || !self.can_edit_active_area() {
+                    return Update::none();
+                }
+                let atlas = self.mapper.get_current_atlas();
+                let Some(area) = atlas.get_area(&area_id) else {
+                    return Update::none();
+                };
+                let edits = inspector::redistribute_port_updates(&area, room_number, side, secret);
+                let command = commands::edit_connections(
+                    &atlas,
+                    area_id,
+                    edits,
+                    format!("Redistribute room {room_number} {side} ports"),
+                );
+                let update = self.push_command(command);
+                self.inspector.resync(&self.mapper, &self.editor);
+                update
+            }
+            resolution @ (Message::KeepMineRequested | Message::KeepTheirsRequested) => {
+                let Some(area_id) = self.editor.area_id() else {
+                    return Update::none();
+                };
+                let keep_mine = matches!(resolution, Message::KeepMineRequested);
+                let mapper = self.mapper.clone();
+                Update::with_task(Task::perform(
+                    async move {
+                        mapper.resolve_conflict(area_id, keep_mine).await;
+                    },
+                    |_| Message::SaveResolutionCompleted,
+                ))
+            }
+            resolution @ (Message::RetrySaveRequested | Message::DiscardFailedSaveRequested) => {
+                let Some(area_id) = self.editor.area_id() else {
+                    return Update::none();
+                };
+                let retry = matches!(resolution, Message::RetrySaveRequested);
+                let mapper = self.mapper.clone();
+                Update::with_task(Task::perform(
+                    async move {
+                        mapper.resolve_failed(area_id, retry).await;
+                    },
+                    |_| Message::SaveResolutionCompleted,
+                ))
+            }
+            Message::SaveResolutionCompleted => {
+                self.refresh_seen_rev();
+                self.inspector.resync(&self.mapper, &self.editor);
                 Update::none()
             }
             Message::IndicesLoaded { grants, areas } => {
@@ -1723,12 +2840,7 @@ impl MapEditorWindow {
                 };
                 let client = self.cloud.client.clone();
                 Update::with_task(Task::perform(
-                    async move {
-                        client
-                            .copy_area(source, &request)
-                            .await
-                            .map(|area| area.id)
-                    },
+                    async move { client.copy_area(source, &request).await.map(|area| area.id) },
                     move |result| Message::CopyAreaCompleted { result, duplicate },
                 ))
             }
@@ -1881,8 +2993,7 @@ impl MapEditorWindow {
                         self.refresh_seen_rev();
                         self.inspector.resync(&self.mapper, &self.editor);
                         if modal_shows_area
-                            && let Some(modals::Modal::SecretsAudit { error, .. }) =
-                                &mut self.modal
+                            && let Some(modals::Modal::SecretsAudit { error, .. }) = &mut self.modal
                         {
                             *error = Some(message);
                         }
@@ -1985,7 +3096,8 @@ impl MapEditorWindow {
                         return Update::new(self.fetch_atlases(), assoc);
                     }
                     Err(error) => {
-                        if let Some(modals::Modal::CreateAtlas { error: slot, .. }) = &mut self.modal
+                        if let Some(modals::Modal::CreateAtlas { error: slot, .. }) =
+                            &mut self.modal
                         {
                             *slot = Some(error);
                         }
@@ -2087,7 +3199,9 @@ impl MapEditorWindow {
                     .get_area(&area_id)
                     .map(|area| area.get_name().to_string())
                     .unwrap_or_default();
-                let current_atlas = atlas.get_area(&area_id).and_then(|area| area.meta().atlas_id);
+                let current_atlas = atlas
+                    .get_area(&area_id)
+                    .and_then(|area| area.meta().atlas_id);
                 // Only same-tier folders are valid targets: moving a map
                 // between the local and cloud tiers is a migration, not a
                 // re-file (and the composite would reject it). Loose is always
@@ -2100,7 +3214,9 @@ impl MapEditorWindow {
                     .map(|atlas| (atlas.id, atlas.name.clone()))
                     .collect();
                 folders.sort_by(|a, b| {
-                    a.1.to_lowercase().cmp(&b.1.to_lowercase()).then_with(|| a.1.cmp(&b.1))
+                    a.1.to_lowercase()
+                        .cmp(&b.1.to_lowercase())
+                        .then_with(|| a.1.cmp(&b.1))
                 });
                 self.modal = Some(modals::Modal::MoveArea {
                     area_id,
@@ -2230,8 +3346,9 @@ impl MapEditorWindow {
                 // snapshotted at open, so a concurrent write mirrored back here
                 // would otherwise leave stale ticks on screen. Rebuild it from
                 // the fresh store for the modal's target.
-                if let Some(modals::Modal::ServersChecklist { target, checked, .. }) =
-                    &mut self.modal
+                if let Some(modals::Modal::ServersChecklist {
+                    target, checked, ..
+                }) = &mut self.modal
                 {
                     *checked = match *target {
                         ScopeTarget::Atlas(atlas_id) => self.map_scopes.atlas_entries(&atlas_id),
@@ -2247,7 +3364,34 @@ impl MapEditorWindow {
         let panes = PaneGrid::new(&self.panes, |_pane, kind, _maximized| {
             pane_grid::Content::new(match kind {
                 PaneKind::AreaList => area_list::view(self),
-                PaneKind::Canvas => self.editor.view().map(Message::Editor),
+                PaneKind::Canvas => {
+                    let canvas = self.editor.view().map(Message::Editor);
+                    let empty = self.editor.area_id().is_some_and(|area_id| {
+                        self.mapper
+                            .get_current_atlas()
+                            .get_area(&area_id)
+                            .is_some_and(|area| area.get_rooms().is_empty())
+                    });
+                    if empty && self.can_edit_active_area() {
+                        stack(vec![
+                            canvas,
+                            center(
+                                column![
+                                    button(text("Create first room").size(14))
+                                        .style(theme::builtins::button::primary)
+                                        .on_press(Message::ToolSelected(Tool::AddRoom)),
+                                    text("Then choose its position on the grid.").size(12),
+                                ]
+                                .spacing(6)
+                                .align_x(iced::Alignment::Center),
+                            )
+                            .into(),
+                        ])
+                        .into()
+                    } else {
+                        canvas
+                    }
+                }
                 PaneKind::Inspector => inspector::view(self),
             })
         })
@@ -2262,12 +3406,19 @@ impl MapEditorWindow {
         // the periodic tick expires it.
         if self.room_copy_notice.is_some() {
             layout = layout.push(
-                container(
-                    text("This map's owner hasn't allowed copying rooms.").size(13),
-                )
-                .width(Length::Fill)
-                .padding([6, 12])
-                .style(theme::builtins::container::modal_title_bar),
+                container(text("This map's owner hasn't allowed copying rooms.").size(13))
+                    .width(Length::Fill)
+                    .padding([6, 12])
+                    .style(theme::builtins::container::modal_title_bar),
+            );
+        }
+
+        if let Some((_, notice)) = &self.editor_notice {
+            layout = layout.push(
+                container(text(notice.clone()).size(13))
+                    .width(Length::Fill)
+                    .padding([6, 12])
+                    .style(theme::builtins::container::modal_title_bar),
             );
         }
 
@@ -2401,7 +3552,8 @@ fn family_adjacency(
     }
 
     // Link every area sharing a token to that token's first-seen representative.
-    let mut representative: std::collections::HashMap<&str, AreaId> = std::collections::HashMap::new();
+    let mut representative: std::collections::HashMap<&str, AreaId> =
+        std::collections::HashMap::new();
     for (&area_id, token) in tokens {
         match representative.get(token.as_str()) {
             None => {
@@ -2519,7 +3671,9 @@ fn secret_marks_request_for(entity: &SecretEntity, secret: bool) -> SecretMarksR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smudgy_cloud::Uuid;
+    use smudgy_cloud::{
+        ExitDirection, RoomUpdates, Uuid, backends::EphemeralBackend, mapper::RoomKey,
+    };
 
     fn area(n: u128) -> AreaId {
         AreaId(Uuid::from_u128(n))
@@ -2532,14 +3686,9 @@ mod tests {
     /// 3-area chain A<-B<-C plus an unrelated solo D.
     fn chain_edges() -> std::collections::HashMap<AreaId, Option<AreaId>> {
         let (a, b, c, d) = (area(1), area(2), area(3), area(4));
-        [
-            (a, None),
-            (b, Some(a)),
-            (c, Some(b)),
-            (d, None),
-        ]
-        .into_iter()
-        .collect()
+        [(a, None), (b, Some(a)), (c, Some(b)), (d, None)]
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -2621,5 +3770,62 @@ mod tests {
         assert!(members.contains(&area(2)));
         assert!(members.contains(&area(3)));
         assert!(!members.contains(&area(4)));
+    }
+
+    #[tokio::test]
+    async fn reciprocal_pair_candidate_tracks_edited_directions() {
+        let mapper = Mapper::new(
+            Arc::new(EphemeralBackend::new()),
+            std::env::temp_dir().join(format!("smudgy-pair-candidate-{}", Uuid::new_v4())),
+        );
+        let area_id = mapper
+            .create_area_ephemeral("Pair candidates".to_string())
+            .await
+            .expect("create area");
+        for room_number in [RoomNumber(1), RoomNumber(2)] {
+            mapper.upsert_room(RoomKey::new(area_id, room_number), RoomUpdates::default());
+        }
+
+        // Existing one-way traversal: room 2 west -> room 1 east.
+        let command = commands::create_exit_with_options(
+            area_id,
+            RoomNumber(2),
+            ExitDirection::West,
+            &commands::NewExitTarget::Room(RoomNumber(1)),
+            ExitDirection::East,
+            commands::NewLinkOptions {
+                one_way: true,
+                ..commands::NewLinkOptions::default()
+            },
+        );
+        let mut stack = commands::CommandStack::default();
+        let _ = stack.push_and_apply(&mapper, command);
+        let atlas = mapper.get_current_atlas();
+        let area = atlas.get_area(&area_id).expect("area cached");
+        let expected = area.get_connections()[0].id;
+
+        assert_eq!(
+            reciprocal_pair_candidate(
+                &area,
+                area_id,
+                RoomNumber(1),
+                RoomNumber(2),
+                ExitDirection::East,
+                ExitDirection::West,
+            ),
+            Some(expected)
+        );
+        assert_eq!(
+            reciprocal_pair_candidate(
+                &area,
+                area_id,
+                RoomNumber(1),
+                RoomNumber(2),
+                ExitDirection::North,
+                ExitDirection::West,
+            ),
+            None,
+            "editing the proposed source direction invalidates the suggestion"
+        );
     }
 }

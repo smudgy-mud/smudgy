@@ -1,13 +1,182 @@
 //! Viewer-scoped area projection — the redaction core (`get_area_projection`
-//! in the real db.rs): secrecy filtering, the exit survival predicate, hidden
-//! target tokens, linked areas, the viewer-salted content hash, projected rev.
+//! in the real db.rs): the §6 Connection closure, the exit survival
+//! predicate (an exit survives exactly when its Connection does), hidden
+//! target tokens, linked areas, the viewer-salted content hash, projected
+//! rev.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::state::{AreaRecord, MockState, content_hash, to_area_token};
+use super::state::{AreaRecord, ConnectionRecord, MockState, content_hash, to_area_token};
+
+/// The §6 closure verdict for one Connection, evaluated over its whole
+/// membership exactly like the server's `member_facts` CTE.
+pub struct ConnectionVerdict {
+    /// Any host-owned secret cause: member exit, either endpoint room, or a
+    /// same-area destination room.
+    pub host_secret_cause: bool,
+    /// Any cross-area destination room is secret (cleared or not) — the
+    /// derived `effective_secret` indicator folds it in.
+    pub any_cross_secret: bool,
+    /// A cross-area secret destination the viewer is NOT cleared for
+    /// (`is_owner OR include_secrets` on the TARGET area; default deny).
+    pub uncleared_cross_secret: bool,
+    /// Any member leaves the area (drives the External kind).
+    pub any_external: bool,
+}
+
+impl ConnectionVerdict {
+    /// Whether the group is omitted for a viewer with host clearance `see`.
+    pub fn omitted(&self, see: bool) -> bool {
+        (self.host_secret_cause && !see) || self.uncleared_cross_secret
+    }
+}
+
+/// Evaluates the §6 closure for `connection` in `area`, as `viewer`,
+/// against the live state.
+pub fn connection_verdict(
+    state: &MockState,
+    viewer: Uuid,
+    area: &AreaRecord,
+    connection: &ConnectionRecord,
+) -> ConnectionVerdict {
+    connection_verdict_in(
+        &state.areas,
+        |target| state.caps(viewer, target),
+        area,
+        connection,
+    )
+}
+
+/// [`connection_verdict`] over an arbitrary area map — the mutation
+/// endpoint's echoes evaluate it against the envelope's working copy, like
+/// the server's in-transaction queries.
+pub fn connection_verdict_in(
+    areas: &BTreeMap<Uuid, AreaRecord>,
+    caps: impl Fn(Uuid) -> Option<super::state::Caps>,
+    area: &AreaRecord,
+    connection: &ConnectionRecord,
+) -> ConnectionVerdict {
+    let members: Vec<_> = area
+        .exits
+        .iter()
+        .filter(|exit| exit.connection_id == connection.id)
+        .collect();
+    let any_member_secret = members.iter().any(|exit| exit.is_secret);
+    let same_area_dest_secret = members.iter().any(|exit| {
+        exit.to_area_id == Some(area.id)
+            && exit
+                .to_room_number
+                .and_then(|room| area.rooms.get(&room))
+                .is_some_and(|room| room.is_secret)
+    });
+    let cross_secret = |exit: &super::state::ExitRecord| -> bool {
+        matches!(
+            (exit.to_area_id, exit.to_room_number),
+            (Some(to_area), Some(to_room)) if to_area != area.id
+                && areas
+                    .get(&to_area)
+                    .and_then(|target| target.rooms.get(&to_room))
+                    .is_some_and(|room| room.is_secret)
+        )
+    };
+    let any_cross_secret = members.iter().any(|exit| cross_secret(exit));
+    let uncleared_cross_secret = members.iter().any(|exit| {
+        cross_secret(exit)
+            && !exit.to_area_id.is_some_and(|to_area| {
+                caps(to_area).is_some_and(|target| target.is_owner || target.include_secrets)
+            })
+    });
+    let any_external = members
+        .iter()
+        .any(|exit| exit.to_area_id.is_some_and(|to_area| to_area != area.id));
+
+    let endpoint_room_secret = |room: i32| area.rooms.get(&room).is_some_and(|r| r.is_secret);
+    let a_room_secret = endpoint_room_secret(connection.endpoint_a.room_number);
+    let b_room_secret = connection
+        .endpoint_b
+        .as_ref()
+        .is_some_and(|b| endpoint_room_secret(b.room_number));
+
+    ConnectionVerdict {
+        host_secret_cause: any_member_secret
+            || a_room_secret
+            || b_room_secret
+            || same_area_dest_secret,
+        any_cross_secret,
+        uncleared_cross_secret,
+        any_external,
+    }
+}
+
+/// The derived, never-stored Connection kind, exactly as the server derives
+/// it at projection: endpoint shape first, then external membership, then
+/// room levels.
+pub fn connection_kind(area: &AreaRecord, connection: &ConnectionRecord, any_external: bool) -> &'static str {
+    match connection.endpoint_b.as_ref() {
+        None => {
+            if any_external {
+                "External"
+            } else {
+                "Dangling"
+            }
+        }
+        Some(b) if b.room_number == connection.endpoint_a.room_number => "SelfLoop",
+        Some(b) => {
+            let level_of = |room: i32| area.rooms.get(&room).map_or(0, |r| r.level);
+            if level_of(b.room_number) == level_of(connection.endpoint_a.room_number) {
+                "Internal"
+            } else {
+                "CrossLevel"
+            }
+        }
+    }
+}
+
+fn endpoint_json(endpoint: &super::state::EndpointRecord) -> Value {
+    json!({
+        "room_number": endpoint.room_number,
+        "side": endpoint.side,
+        "port_offset": endpoint.port_offset,
+        "port_mode": endpoint.port_mode,
+    })
+}
+
+/// One projected Connection (the server's `Connection` wire struct,
+/// `effective_secret` included).
+fn connection_json(
+    area: &AreaRecord,
+    connection: &ConnectionRecord,
+    verdict: &ConnectionVerdict,
+) -> Value {
+    let mut out = json!({
+        "id": connection.id,
+        "endpoint_a": endpoint_json(&connection.endpoint_a),
+        "kind": connection_kind(area, connection, verdict.any_external),
+        "routing": connection.routing,
+        "segment_shape": connection.segment_shape,
+        "corner": connection.corner,
+        "route_points": connection
+            .route_points
+            .iter()
+            .map(|(x, y)| json!({"x": x, "y": y}))
+            .collect::<Vec<_>>(),
+        "dash": connection.dash,
+        "color": connection.color,
+        "thickness": connection.thickness,
+        // Every cause the closure tracks, cleared or not — survivors of an
+        // uncleared viewer are all-public, so this is only ever true for a
+        // viewer cleared on every secret cause.
+        "effective_secret": verdict.host_secret_cause || verdict.any_cross_secret,
+    });
+    // Endpoint B rides the wire as an omitted field, not an explicit null.
+    if let Some(b) = connection.endpoint_b.as_ref() {
+        out["endpoint_b"] = endpoint_json(b);
+    }
+    out
+}
 
 /// Full `ProjectedArea` for `GET /areas/{id}` / preview. `None` when the area
 /// is absent or `can_view` is false (handler -> uniform 404).
@@ -27,41 +196,32 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
         .map(|(name, p)| json!({"name": name, "value": p.value}))
         .collect();
 
-    // (c) Exits — survival predicate + destination redaction.
+    // (c) Connections under the §6 closure, stably id-sorted: an omitted
+    // group leaves no trace, and its member exits vanish with it below.
+    let mut sorted_connections: Vec<&ConnectionRecord> = area.connections.iter().collect();
+    sorted_connections.sort_by_key(|connection| connection.id);
+    let mut surviving: Vec<Uuid> = Vec::new();
+    let mut connections: Vec<Value> = Vec::new();
+    for connection in sorted_connections {
+        let verdict = connection_verdict(state, viewer, area, connection);
+        if verdict.omitted(see) {
+            continue;
+        }
+        surviving.push(connection.id);
+        connections.push(connection_json(area, connection, &verdict));
+    }
+
+    // (d) Exits — an exit survives exactly when its Connection does;
+    // `to_visible` drives the unchanged unknown-target projection for
+    // surviving exits into inaccessible (but not secret) foreign areas.
     let mut exits_by_room: BTreeMap<i32, Vec<Value>> = BTreeMap::new();
     let mut visible_targets: Vec<Uuid> = Vec::new();
     let mut hidden_tokens: Vec<String> = Vec::new();
 
     for exit in &area.exits {
-        let Some(from_room) = area.rooms.get(&exit.from_room_number) else {
-            continue; // FK guarantees this in the real DB
-        };
-        if !see && (exit.is_secret || from_room.is_secret) {
+        if !surviving.contains(&exit.connection_id) {
             continue;
         }
-        // Secret to-room: same-area judged by host see_secrets; cross-area by
-        // the viewer's include_secrets ON THE TARGET (default deny).
-        if let (Some(to_area), Some(to_room)) = (exit.to_area_id, exit.to_room_number) {
-            let target_room_secret = state
-                .areas
-                .get(&to_area)
-                .and_then(|a| a.rooms.get(&to_room))
-                .is_some_and(|r| r.is_secret);
-            if target_room_secret {
-                let ok = if to_area == area_id {
-                    see
-                } else {
-                    // effective include_secrets already ORs target ownership.
-                    state
-                        .caps(viewer, to_area)
-                        .is_some_and(|c| c.include_secrets)
-                };
-                if !ok {
-                    continue;
-                }
-            }
-        }
-
         let to_visible = exit.to_area_id.is_none_or(|to_area| {
             to_area == area_id || state.caps(viewer, to_area).is_some_and(|c| c.can_view)
         });
@@ -85,8 +245,7 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
                 "path": exit.path,
                 "command": exit.command,
                 "weight": exit.weight,
-                "style": exit.style,
-                "color": exit.color,
+                "connection_id": exit.connection_id,
                 "is_hidden": exit.is_hidden,
                 "is_closed": exit.is_closed,
                 "is_locked": exit.is_locked,
@@ -112,8 +271,7 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
                 "path": exit.path,
                 "command": exit.command,
                 "weight": exit.weight,
-                "style": exit.style,
-                "color": exit.color,
+                "connection_id": exit.connection_id,
                 "is_hidden": exit.is_hidden,
                 "is_closed": exit.is_closed,
                 "is_locked": exit.is_locked,
@@ -199,7 +357,8 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
         })
         .collect();
 
-    // linked_areas: visible first (with resolved names), then hidden tokens.
+    // linked_areas: derived only from surviving projected exits — visible
+    // first (with resolved names), then hidden tokens.
     let mut linked_areas: Vec<Value> = Vec::new();
     for target in &visible_targets {
         let name = state.areas.get(target).map(|a| a.name.clone());
@@ -213,12 +372,22 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
         linked_areas.push(json!({"to_area_token": token, "visible": false}));
     }
 
-    // Viewer-salted content hash over the REDACTED projection tuple.
-    let canonical =
-        serde_json::to_vec(&(&properties, &rooms, &labels, &shapes)).unwrap_or_default();
+    // Viewer-salted content hash over the REDACTED projection tuple, the
+    // format version and closure-filtered connections included (a format
+    // change can never alias an unchanged hash).
+    let canonical = serde_json::to_vec(&(
+        super::state::AREA_FORMAT_VERSION,
+        &properties,
+        &rooms,
+        &labels,
+        &shapes,
+        &connections,
+    ))
+    .unwrap_or_default();
     let hash = content_hash(viewer, &canonical);
 
     let mut out = json!({
+        "format_version": super::state::AREA_FORMAT_VERSION,
         "id": area.id,
         "user_id": area.user_id,
         "atlas_id": area.atlas_id,
@@ -238,6 +407,7 @@ pub fn project_area(state: &MockState, viewer: Uuid, area_id: Uuid) -> Option<Va
         "rooms": rooms,
         "labels": labels,
         "shapes": shapes,
+        "connections": connections,
         "linked_areas": linked_areas,
     });
 

@@ -54,8 +54,7 @@ pub mod fonts {
     pub const FIRA_MONO_BYTES: &[u8] = include_bytes!("../../assets/fonts/FiraMono-Regular.ttf");
     pub const FIRA_MONO_MEDIUM_BYTES: &[u8] =
         include_bytes!("../../assets/fonts/FiraMono-Medium.ttf");
-    pub const FIRA_MONO_BOLD_BYTES: &[u8] =
-        include_bytes!("../../assets/fonts/FiraMono-Bold.ttf");
+    pub const FIRA_MONO_BOLD_BYTES: &[u8] = include_bytes!("../../assets/fonts/FiraMono-Bold.ttf");
     pub const FIRA_MONO: Font = Font::with_name("Fira Mono");
 
     pub const LILEX_BYTES: &[u8] = include_bytes!("../../assets/fonts/Lilex[wght].ttf");
@@ -153,8 +152,7 @@ pub mod hero_icons {
     pub const EYE_BYTES: &[u8] =
         include_bytes!("../../assets/heroicons/optimized/16/solid/eye.svg");
 
-    pub static EYE: LazyLock<svg::Handle> =
-        LazyLock::new(|| svg::Handle::from_memory(EYE_BYTES));
+    pub static EYE: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(EYE_BYTES));
 
     pub const EYE_SLASH_BYTES: &[u8] =
         include_bytes!("../../assets/heroicons/optimized/16/solid/eye-slash.svg");
@@ -171,8 +169,7 @@ pub mod hero_icons {
     pub const STOP_BYTES: &[u8] =
         include_bytes!("../../assets/heroicons/optimized/16/solid/stop.svg");
 
-    pub static STOP: LazyLock<svg::Handle> =
-        LazyLock::new(|| svg::Handle::from_memory(STOP_BYTES));
+    pub static STOP: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(STOP_BYTES));
 
     pub const SQUARE_2_STACK_BYTES: &[u8] =
         include_bytes!("../../assets/heroicons/optimized/16/solid/square-2-stack.svg");

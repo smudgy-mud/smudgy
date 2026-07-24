@@ -30,6 +30,8 @@ pub type PackageTree = HashMap<String, PackageNode>;
 use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 
+use super::persistence::write_atomic;
+
 /// Loads the package hierarchy definition from `packages.json` for a given server.
 ///
 /// If `packages.json` does not exist, returns an empty `PackageTree` successfully.
@@ -98,7 +100,7 @@ pub fn save_packages(server_name: &str, tree: &PackageTree) -> Result<()> {
         "Failed to serialize package tree for server '{server_name}'"
     ))?;
 
-    fs::write(&packages_path, json_content).context(format!(
+    write_atomic(&packages_path, json_content.as_bytes()).context(format!(
         "Failed to write packages.json for server '{server_name}' at {}",
         packages_path.display()
     ))?;

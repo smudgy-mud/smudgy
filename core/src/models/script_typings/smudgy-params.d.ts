@@ -27,14 +27,16 @@ declare module "smudgy:params" {
    * value.
    *
    * ```ts
-   * import { get } from "smudgy:params";
-   * const url = get("pg.url");       // ParamValue | null | undefined
-   * if (typeof url === "string") connect(url);
+ * import { get } from "smudgy:params";
+ * const url = get("pg.url");       // ParamValue | null | undefined
+ * if (typeof url === "string") console.log(`Configured URL: ${url}`);
    *
-   * const routes = get("routes");    // a `table` param -> array of row objects
-   * if (Array.isArray(routes)) {
-   *   for (const row of routes) console.log(row.from, row.via);
-   * }
+ * const routes = get("routes");    // a `table` param -> array of row objects
+ * if (Array.isArray(routes)) {
+ *   for (const row of routes) {
+ *     if (typeof row === "object" && row !== null) console.log(row.from, row.via);
+ *   }
+ * }
    * ```
    */
   export function get(key: string): ParamValue | null | undefined;

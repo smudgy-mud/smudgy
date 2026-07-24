@@ -1,4 +1,4 @@
-//! Phase-2 pane exit criteria (`docs/flexible-panes-plan.md` §3): the routing
+//! Phase-2 pane exit criteria (`docs/panes.md` §3): the routing
 //! matrix (gag/redirect/copy × complete/partial lines, copy-then-gag,
 //! gag-then-replace, redirect-twice, redirect+copy dedup,
 //! redirect-after-partial-flush retraction), numbering parity under pane-echo

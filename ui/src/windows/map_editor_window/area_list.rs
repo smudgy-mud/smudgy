@@ -31,13 +31,9 @@ fn icon_button(
     codepoint: &'static str,
     message: Message,
 ) -> iced::widget::Button<'static, Message, crate::Theme> {
-    button(
-        text(codepoint)
-            .font(fonts::BOOTSTRAP_ICONS)
-            .size(12.0),
-    )
-    .style(builtins::button::toolbar)
-    .on_press(message)
+    button(text(codepoint).font(fonts::BOOTSTRAP_ICONS).size(12.0))
+        .style(builtins::button::toolbar)
+        .on_press(message)
 }
 
 /// The friend who shared a map with the viewer, as resolved from the
@@ -256,8 +252,8 @@ pub fn owned_folders(
         let filed = matches!(atlas_id, Some(id) if known.contains(&id));
         // A genuinely atlas-less *cloud* area carries its own scope target; a
         // filed area is scoped by its atlas, and local areas aren't scoped.
-        let scope_target = (!filed && !local_areas.contains(&area_id))
-            .then_some(ScopeTarget::Area(area_id));
+        let scope_target =
+            (!filed && !local_areas.contains(&area_id)).then_some(ScopeTarget::Area(area_id));
         let summary = AreaSummary {
             id: area_id,
             name: area.get_name().to_string(),
@@ -316,7 +312,10 @@ pub fn owned_folders(
 /// folder tree — but the editor lists them under their own group so a
 /// protocol-driven auto-map can be inspected (and promoted) while it builds.
 #[must_use]
-pub fn session_maps(atlas: &AtlasCache, ephemeral: &std::collections::HashSet<AreaId>) -> Vec<AreaSummary> {
+pub fn session_maps(
+    atlas: &AtlasCache,
+    ephemeral: &std::collections::HashSet<AreaId>,
+) -> Vec<AreaSummary> {
     let mut maps: Vec<AreaSummary> = atlas
         .areas()
         .filter(|area| ephemeral.contains(area.get_id()))
@@ -379,7 +378,10 @@ pub fn shared_groups(
         let resolved = sharers.and_then(|index| index.sharer_for(area_id, meta.atlas_id));
         let (group_key, sharer_nickname): (Uuid, Option<String>) = match resolved {
             Some(sharer) => (sharer.user_id, sharer.nickname.clone()),
-            None => (meta.owner_id.unwrap_or_default(), meta.owner_nickname.clone()),
+            None => (
+                meta.owner_id.unwrap_or_default(),
+                meta.owner_nickname.clone(),
+            ),
         };
         let sharer_label = sharer_nickname
             .clone()
@@ -402,7 +404,10 @@ pub fn shared_groups(
         // A genuinely atlas-less shared area carries its own area-level scope
         // target (the §5 override surface); an atlas-filed area is scoped by
         // its folder header instead.
-        let scope_target = meta.atlas_id.is_none().then_some(ScopeTarget::Area(area_id));
+        let scope_target = meta
+            .atlas_id
+            .is_none()
+            .then_some(ScopeTarget::Area(area_id));
 
         let summary = AreaSummary {
             id: area_id,
@@ -554,7 +559,9 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     //                  (This server / Unassigned / Other servers).
     //   No context   — flat: every folder and shared group, unfiltered.
     list = match (window.server_name.as_deref(), window.scope_all) {
-        (Some(server), false) => render_this_server(list, window, folders, shared, selected, server),
+        (Some(server), false) => {
+            render_this_server(list, window, folders, shared, selected, server)
+        }
         (Some(server), true) => render_all_buckets(list, window, folders, shared, selected, server),
         (None, _) => render_flat(list, window, folders, shared, selected),
     };
@@ -713,8 +720,11 @@ fn render_this_server<'a>(
     }
     list = render_shared_frags(list, window, shared_here, selected);
 
-    let unassigned_count =
-        owned_unassigned.len() + shared_unassigned.iter().map(SharedFrag::count).sum::<usize>();
+    let unassigned_count = owned_unassigned.len()
+        + shared_unassigned
+            .iter()
+            .map(SharedFrag::count)
+            .sum::<usize>();
     if unassigned_count > 0 {
         let collapsed = window.collapsed_folders.contains(&FolderKey::Unassigned);
         list = list.push(unassigned_header(unassigned_count, collapsed));
@@ -789,7 +799,10 @@ fn render_flat<'a>(
     if window.atlases.is_empty() {
         // No owned atlases: keep today's flat owned list (clean single-user
         // view) rather than a lone "Loose maps" header.
-        let owned: Vec<AreaSummary> = folders.into_iter().flat_map(|folder| folder.areas).collect();
+        let owned: Vec<AreaSummary> = folders
+            .into_iter()
+            .flat_map(|folder| folder.areas)
+            .collect();
         if !owned.is_empty() {
             if has_shared {
                 list = list.push(group_label("My maps".to_string()));
@@ -947,12 +960,18 @@ fn folder_header<'a>(
                 tooltip::Position::Bottom,
             ));
             header = header.push(tooltip(
-                icon_button(bootstrap_icons::PENCIL, Message::RenameAtlasStarted(atlas_id)),
+                icon_button(
+                    bootstrap_icons::PENCIL,
+                    Message::RenameAtlasStarted(atlas_id),
+                ),
                 "Rename folder",
                 tooltip::Position::Bottom,
             ));
             header = header.push(tooltip(
-                icon_button(bootstrap_icons::TRASH_3, Message::DeleteAtlasRequested(atlas_id)),
+                icon_button(
+                    bootstrap_icons::TRASH_3,
+                    Message::DeleteAtlasRequested(atlas_id),
+                ),
                 "Delete folder",
                 tooltip::Position::Bottom,
             ));
@@ -960,8 +979,10 @@ fn folder_header<'a>(
             // the affordance would always 404. New-map/rename/delete work on
             // both tiers.
             if !window.local_atlas_ids.contains(&atlas_id) {
-                header = header
-                    .push(text_button("Share\u{2026}", Message::ShareAtlasRequested(atlas_id)));
+                header = header.push(text_button(
+                    "Share\u{2026}",
+                    Message::ShareAtlasRequested(atlas_id),
+                ));
                 // Hand the whole folder to a friend (owner-only).
                 header = header.push(text_button(
                     "Transfer\u{2026}",
@@ -1098,7 +1119,10 @@ fn area_row<'a>(
     // rename/delete are gated on "owner OR admin" (server: is_owner OR can_admin).
     // Move (same-owner) and Transfer (raw is_owner) stay owner-only.
     if is_selected && area.owned && has_folders {
-        item = item.push(text_button("Move\u{2026}", Message::MoveAreaRequested(area.id)));
+        item = item.push(text_button(
+            "Move\u{2026}",
+            Message::MoveAreaRequested(area.id),
+        ));
     }
     if is_selected && (area.owned || area.can_admin) {
         item = item.push(icon_button(
@@ -1118,9 +1142,7 @@ fn area_row<'a>(
     }
     // A loose cloud area carries its own "show on servers" checklist (an
     // atlas-filed area is scoped by its folder header instead).
-    if is_selected
-        && let Some(target) = area.scope_target
-    {
+    if is_selected && let Some(target) = area.scope_target {
         item = item.push(text_button(
             "Servers\u{2026}",
             Message::ServersChecklistRequested(target),

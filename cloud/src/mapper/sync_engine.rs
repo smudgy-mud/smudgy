@@ -20,7 +20,7 @@ use std::{
 
 use log::warn;
 
-use super::{Inner, area_cache::AreaCache};
+use super::{Inner, ReplayMode, area_cache::AreaCache};
 use crate::{
     AreaId, CloudError, CloudResult, SyncRow,
     backends::{LEGACY_ACCESS_FINGERPRINT, MapperBackend},
@@ -183,7 +183,14 @@ impl Engine {
     /// atlas membership snapshotted before the row fetch: anything in it that
     /// the fresh row set no longer covers is removed, even when the previous
     /// row state never knew about it (account switch, concurrent full loads).
-    async fn reconcile(&mut self, inner: &Inner, rows: &[SyncRow], pre_fetch_ids: &HashSet<AreaId>) {
+    async fn reconcile(
+        &mut self,
+        inner: &Inner,
+        rows: &[SyncRow],
+        pre_fetch_ids: &HashSet<AreaId>,
+    ) {
+        note_rows_confirmed(inner, rows);
+
         let prev = std::mem::take(&mut self.prev_rows);
         let new_rows: HashMap<AreaId, SyncRow> =
             rows.iter().map(|row| (row.area_id, row.clone())).collect();
@@ -310,6 +317,18 @@ impl Engine {
     }
 }
 
+/// Records every sync row as backend truth for the pending queue's CAS
+/// preconditions (projected revision + access fingerprint).
+fn note_rows_confirmed(inner: &Inner, rows: &[SyncRow]) {
+    for row in rows {
+        inner.pending.note_confirmed_rev(
+            row.area_id,
+            row.rev,
+            Some(row.access_fingerprint.clone()),
+        );
+    }
+}
+
 /// Resolves the authoritative row set, falling back to `list_areas` synthesis
 /// when `/sync` is unsupported (older server) or gated behind email
 /// verification — `GET /areas` has no verified gate, so solo mapping keeps
@@ -317,7 +336,9 @@ impl Engine {
 async fn resolve_rows(backend: &dyn MapperBackend) -> CloudResult<(Vec<SyncRow>, bool)> {
     match backend.sync_state().await {
         Ok(Some(rows)) => Ok((rows, false)),
-        Ok(None) | Err(CloudError::NotFoundOrNoAccess) => Ok((synthesize_rows(backend).await?, false)),
+        Ok(None) | Err(CloudError::NotFoundOrNoAccess) => {
+            Ok((synthesize_rows(backend).await?, false))
+        }
         Err(CloudError::EmailNotVerified) => Ok((synthesize_rows(backend).await?, true)),
         Err(err) => Err(err),
     }
@@ -344,6 +365,12 @@ async fn synthesize_rows(backend: &dyn MapperBackend) -> CloudResult<Vec<SyncRow
 /// revision. The swap is suppressed when the server's content hash proves the
 /// projection is byte-identical to the cached copy (no re-render needed).
 /// Returns false when the fetch failed and should be retried next tick.
+///
+/// The swap routes through the mapper's pending-replay fold rather than
+/// landing the fetched document raw: refetches are deferred while an area
+/// has pending writes, so the fold is normally over an empty queue, but an
+/// envelope enqueued *during* the fetch must keep its optimistic effect
+/// instead of vanishing under the swap.
 async fn refetch_area(inner: &Inner, area_id: &AreaId) -> bool {
     let details = match inner.backend.get_area(area_id).await {
         Ok(details) => details,
@@ -352,6 +379,14 @@ async fn refetch_area(inner: &Inner, area_id: &AreaId) -> bool {
             return false;
         }
     };
+
+    // The fetched document is backend truth for CAS preconditions, whether
+    // or not the swap below is suppressed.
+    inner.pending.note_confirmed_rev(
+        *area_id,
+        details.area.rev,
+        details.area.access.map(|access| access.fingerprint()),
+    );
 
     // Suppress the swap only when the projection is byte-identical AND the access
     // block is unchanged. An ownership transfer (or a flag change) can leave the
@@ -372,11 +407,7 @@ async fn refetch_area(inner: &Inner, area_id: &AreaId) -> bool {
         return true;
     }
 
-    let area_cache = Arc::new(AreaCache::new_with_area(details));
-    inner
-        .atlas_cache
-        .rcu(|cache| Arc::new(cache.insert_area(*area_id, area_cache.clone())));
-    inner.sync_revision.fetch_add(1, Ordering::AcqRel);
+    inner.replay_pending_over(*area_id, &details, ReplayMode::SkipFailures);
     true
 }
 
@@ -417,7 +448,7 @@ fn set_state(inner: &Inner, state: SyncState) {
     }));
 }
 
-fn set_status(inner: &Inner, state: SyncState, last_error: Option<String>) {
+pub(super) fn set_status(inner: &Inner, state: SyncState, last_error: Option<String>) {
     let last_sync = inner.sync_status.load().last_sync;
     inner.sync_status.store(Arc::new(SyncStatus {
         state,
@@ -430,10 +461,8 @@ fn set_status(inner: &Inner, state: SyncState, last_error: Option<String>) {
 mod tests {
     use super::*;
     use crate::{
-        Area, AreaAccess, AreaUpdates, AreaWithDetails, CreateAreaRequest, Exit, ExitArgs,
-        ExitDirection, ExitId, ExitStyle, ExitUpdates, Label, LabelArgs, LabelId, LabelUpdates,
-        Room, RoomNumber, RoomUpdates, RoomWithDetails, Shape, ShapeArgs, ShapeId, ShapeUpdates,
-        mapper::{Mapper, RoomKey},
+        Area, AreaAccess, AreaUpdates, AreaWithDetails, CreateAreaRequest, Exit, ExitDirection,
+        ExitId, RoomNumber, RoomWithDetails, mapper::Mapper,
     };
     use async_trait::async_trait;
     use chrono::Utc;
@@ -482,7 +511,11 @@ mod tests {
         }
 
         fn get_count(&self, area_id: &AreaId) -> usize {
-            self.get_calls.lock().iter().filter(|id| *id == area_id).count()
+            self.get_calls
+                .lock()
+                .iter()
+                .filter(|id| *id == area_id)
+                .count()
         }
 
         fn purged(&self, area_id: &AreaId) -> bool {
@@ -554,109 +587,22 @@ mod tests {
             Ok(())
         }
 
-        async fn set_area_property(
+        async fn execute_mutation(
             &self,
-            _area_id: &AreaId,
-            _name: &str,
-            _value: &str,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_area_property(&self, _area_id: &AreaId, _name: &str) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn update_room(&self, room_key: &RoomKey, _updates: RoomUpdates) -> CloudResult<Room> {
-            Err(CloudError::RoomNotFound(room_key.clone()))
-        }
-
-        async fn delete_room(&self, _room_key: &RoomKey) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn set_room_property(
-            &self,
-            _room_key: &RoomKey,
-            _name: &str,
-            _value: &str,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_room_property(&self, _room_key: &RoomKey, _name: &str) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn add_room_tag(&self, _room_key: &RoomKey, _tag: &str) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn remove_room_tag(&self, _room_key: &RoomKey, _tag: &str) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn create_room_exit(
-            &self,
-            _room_key: &RoomKey,
-            _exit_data: ExitArgs,
-        ) -> CloudResult<Exit> {
-            Err(CloudError::NetworkError("not needed".to_string()))
-        }
-
-        async fn update_exit(
-            &self,
-            _area_id: &AreaId,
-            _exit_id: &ExitId,
-            _updates: ExitUpdates,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_exit(&self, _area_id: &AreaId, _exit_id: &ExitId) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn create_label(
-            &self,
-            _area_id: &AreaId,
-            _label_data: LabelArgs,
-        ) -> CloudResult<Label> {
-            Err(CloudError::NetworkError("not needed".to_string()))
-        }
-
-        async fn update_label(
-            &self,
-            _area_id: &AreaId,
-            _label_id: &LabelId,
-            _updates: LabelUpdates,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_label(&self, _area_id: &AreaId, _label_id: &LabelId) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn create_shape(
-            &self,
-            _area_id: &AreaId,
-            _shape_data: ShapeArgs,
-        ) -> CloudResult<Shape> {
-            Err(CloudError::NetworkError("not needed".to_string()))
-        }
-
-        async fn update_shape(
-            &self,
-            _area_id: &AreaId,
-            _shape_id: &ShapeId,
-            _updates: ShapeUpdates,
-        ) -> CloudResult<()> {
-            Ok(())
-        }
-
-        async fn delete_shape(&self, _area_id: &AreaId, _shape_id: &ShapeId) -> CloudResult<()> {
-            Ok(())
+            area_id: &AreaId,
+            envelope: &crate::mutation::MutationEnvelope,
+        ) -> CloudResult<crate::mutation::MutationResult> {
+            let mut areas = self.areas.lock();
+            let details = areas
+                .get_mut(area_id)
+                .ok_or(CloudError::AreaNotFound(*area_id))?;
+            // All-or-nothing like the server: apply to a working copy and
+            // commit only a fully-successful envelope.
+            let mut working = details.clone();
+            let result =
+                crate::backends::area_edits::apply_envelope(&mut working, *area_id, envelope)?;
+            *details = working;
+            Ok(result)
         }
     }
 
@@ -700,11 +646,13 @@ mod tests {
                 copied_at: None,
                 family_token: None,
             },
+            format_version: crate::AREA_FORMAT_VERSION,
             content_hash: content_hash.map(ToString::to_string),
             properties: vec![],
             rooms: vec![],
             labels: vec![],
             shapes: vec![],
+            connections: vec![],
             linked_areas: vec![],
         }
     }
@@ -732,8 +680,7 @@ mod tests {
                 is_locked: false,
                 weight: 1.0,
                 command: String::new(),
-                style: ExitStyle::Normal,
-                color: String::new(),
+                connection_id: crate::ConnectionId::new(),
                 to_unknown,
                 to_area_token: to_unknown.then(|| "token-1".to_string()),
                 is_secret: false,
@@ -930,11 +877,17 @@ mod tests {
             2,
             "row-set change must refetch areas holding to_unknown exits"
         );
-        assert!(backend.purged(&area_a), "stale cached copy must be purged first");
+        assert!(
+            backend.purged(&area_a),
+            "stale cached copy must be purged first"
+        );
         let atlas = mapper.get_current_atlas();
         assert!(atlas.get_area(&area_b).is_some());
         let cached_a = atlas.get_area(&area_a).unwrap();
-        assert!(!has_unknown_exit(&cached_a), "unknown link should be resolved");
+        assert!(
+            !has_unknown_exit(&cached_a),
+            "unknown link should be resolved"
+        );
     }
 
     #[tokio::test]
@@ -1029,7 +982,10 @@ mod tests {
             has_unknown_exit(&cached_a),
             "the link must now be redacted to unknown"
         );
-        assert!(!has_exit_into(&cached_a, &std::iter::once(area_b).collect()));
+        assert!(!has_exit_into(
+            &cached_a,
+            &std::iter::once(area_b).collect()
+        ));
     }
 
     #[tokio::test]

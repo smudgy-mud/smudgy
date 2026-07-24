@@ -17,12 +17,12 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use iced::Task;
+use smudgy_cloud::cloud_api::{AuthSession, CloudApiClient, SessionInfo, UserProfile};
+use smudgy_cloud::{CloudError, Credential, CredentialSource};
 use smudgy_core::models::auth::{
     self, AccountInfo, clear_session_token, load_session_token, save_session_token,
 };
 use smudgy_core::models::settings::{load_settings, set_dismissed_upgrade_version};
-use smudgy_cloud::cloud_api::{AuthSession, CloudApiClient, SessionInfo, UserProfile};
-use smudgy_cloud::{Credential, CredentialSource, CloudError};
 
 /// Read-only view of the account state, refreshed by the controller.
 #[derive(Debug, Clone, Default)]
@@ -462,12 +462,11 @@ impl CloudAccount {
             CredentialSource::new(self.credentials.get()),
         );
         let server_task = Task::future(async move {
-            if everywhere
-                && let Ok(sessions) = revoke_client.sessions().await {
-                    for session in sessions {
-                        let _ = revoke_client.delete_session(session.id).await;
-                    }
+            if everywhere && let Ok(sessions) = revoke_client.sessions().await {
+                for session in sessions {
+                    let _ = revoke_client.delete_session(session.id).await;
                 }
+            }
             let _ = revoke_client.logout().await;
         })
         .discard();

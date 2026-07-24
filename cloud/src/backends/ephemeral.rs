@@ -25,9 +25,8 @@ use uuid::Uuid;
 use super::{MapperBackend, area_edits};
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, CloudError, CloudResult,
-    CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, Label, LabelArgs, LabelId,
-    LabelUpdates, Room, RoomUpdates, Shape, ShapeArgs, ShapeId, ShapeUpdates,
-    mapper::RoomKey,
+    CreateAreaRequest,
+    mutation::{MutationEnvelope, MutationResult},
 };
 
 /// In-memory authoritative map store for session-lifetime areas. Cheaply
@@ -59,7 +58,9 @@ impl EphemeralBackend {
         f: impl FnOnce(&mut AreaWithDetails) -> CloudResult<R>,
     ) -> CloudResult<R> {
         let mut areas = self.areas.write();
-        let area = areas.get_mut(&area_id).ok_or(CloudError::NotFoundOrNoAccess)?;
+        let area = areas
+            .get_mut(&area_id)
+            .ok_or(CloudError::NotFoundOrNoAccess)?;
         let result = f(area)?;
         area.area.rev += 1;
         Ok(result)
@@ -89,11 +90,13 @@ impl MapperBackend for EphemeralBackend {
         };
         let details = AreaWithDetails {
             area: area.clone(),
+            format_version: crate::AREA_FORMAT_VERSION,
             content_hash: None,
             properties: Vec::new(),
             rooms: Vec::new(),
             labels: Vec::new(),
             shapes: Vec::new(),
+            connections: Vec::new(),
             linked_areas: Vec::new(),
         };
         self.areas.write().insert(area.id, details);
@@ -138,234 +141,38 @@ impl MapperBackend for EphemeralBackend {
         Ok(())
     }
 
-    // ===== AREA PROPERTIES =====
+    // ===== VERSIONED MUTATIONS =====
 
-    async fn set_area_property(&self, area_id: &AreaId, name: &str, value: &str) -> CloudResult<()> {
-        self.mutate(*area_id, |area| {
-            area_edits::upsert_property(&mut area.properties, name, value);
-            Ok(())
-        })
-    }
-
-    async fn delete_area_property(&self, area_id: &AreaId, name: &str) -> CloudResult<()> {
-        self.mutate(*area_id, |area| {
-            area.properties.retain(|p| p.name != name);
-            Ok(())
-        })
-    }
-
-    // ===== ROOM OPERATIONS =====
-
-    async fn update_room(&self, room_key: &RoomKey, updates: RoomUpdates) -> CloudResult<Room> {
-        let area_id = room_key.area_id;
-        let number = room_key.room_number;
-        self.mutate(area_id, |area| {
-            Ok(area_edits::upsert_room(area, area_id, number, &updates))
-        })
-    }
-
-    async fn delete_room(&self, room_key: &RoomKey) -> CloudResult<()> {
-        self.mutate(room_key.area_id, |area| {
-            area_edits::delete_room(area, room_key.area_id, room_key.room_number);
-            Ok(())
-        })
-    }
-
-    // ===== ROOM PROPERTIES =====
-
-    async fn set_room_property(
-        &self,
-        room_key: &RoomKey,
-        name: &str,
-        value: &str,
-    ) -> CloudResult<()> {
-        self.mutate(room_key.area_id, |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == room_key.room_number)
-                .ok_or_else(|| CloudError::RoomNotFound(room_key.clone()))?;
-            area_edits::upsert_property(&mut room.properties, name, value);
-            Ok(())
-        })
-    }
-
-    async fn delete_room_property(&self, room_key: &RoomKey, name: &str) -> CloudResult<()> {
-        self.mutate(room_key.area_id, |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == room_key.room_number)
-                .ok_or_else(|| CloudError::RoomNotFound(room_key.clone()))?;
-            room.properties.retain(|p| p.name != name);
-            Ok(())
-        })
-    }
-
-    // ===== ROOM TAGS =====
-
-    async fn add_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()> {
-        let tag = crate::mapper::normalize_tag(tag);
-        self.mutate(room_key.area_id, |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == room_key.room_number)
-                .ok_or_else(|| CloudError::RoomNotFound(room_key.clone()))?;
-            room.tags.insert(tag);
-            Ok(())
-        })
-    }
-
-    async fn remove_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()> {
-        let tag = crate::mapper::normalize_tag(tag);
-        self.mutate(room_key.area_id, |area| {
-            let room = area
-                .rooms
-                .iter_mut()
-                .find(|r| r.room_number == room_key.room_number)
-                .ok_or_else(|| CloudError::RoomNotFound(room_key.clone()))?;
-            room.tags.remove(&tag);
-            Ok(())
-        })
-    }
-
-    // ===== EXIT OPERATIONS =====
-
-    async fn create_room_exit(&self, room_key: &RoomKey, exit_data: ExitArgs) -> CloudResult<Exit> {
-        self.mutate(room_key.area_id, |area| {
-            area_edits::create_room_exit(area, room_key, exit_data)
-        })
-    }
-
-    async fn update_exit(
+    async fn execute_mutation(
         &self,
         area_id: &AreaId,
-        exit_id: &ExitId,
-        updates: ExitUpdates,
-    ) -> CloudResult<()> {
-        self.mutate(*area_id, |area| {
-            let exit = area
-                .rooms
-                .iter_mut()
-                .flat_map(|room| room.exits.iter_mut())
-                .find(|exit| exit.id == *exit_id)
-                .ok_or(CloudError::ExitNotFound(*exit_id))?;
-            area_edits::apply_exit_updates(exit, updates);
-            Ok(())
-        })
-    }
-
-    async fn delete_exit(&self, area_id: &AreaId, exit_id: &ExitId) -> CloudResult<()> {
-        self.mutate(*area_id, |area| {
-            for room in &mut area.rooms {
-                room.exits.retain(|exit| exit.id != *exit_id);
-            }
-            Ok(())
-        })
-    }
-
-    // ===== LABEL OPERATIONS =====
-
-    async fn create_label(&self, area_id: &AreaId, label_data: LabelArgs) -> CloudResult<Label> {
-        self.mutate(*area_id, |area| {
-            let label = Label {
-                id: LabelId(Uuid::new_v4()),
-                level: label_data.level,
-                x: label_data.x,
-                y: label_data.y,
-                width: label_data.width,
-                height: label_data.height,
-                horizontal_alignment: label_data.horizontal_alignment,
-                vertical_alignment: label_data.vertical_alignment,
-                text: label_data.text,
-                color: label_data.color,
-                background_color: label_data.background_color.unwrap_or_default(),
-                font_size: label_data.font_size,
-                font_weight: label_data.font_weight,
-                is_secret: label_data.is_secret.unwrap_or(false),
-            };
-            area.labels.push(label.clone());
-            Ok(label)
-        })
-    }
-
-    async fn update_label(
-        &self,
-        area_id: &AreaId,
-        label_id: &LabelId,
-        updates: LabelUpdates,
-    ) -> CloudResult<()> {
-        self.mutate(*area_id, |area| {
-            let label = area
-                .labels
-                .iter_mut()
-                .find(|label| label.id == *label_id)
-                .ok_or(CloudError::LabelNotFound(*label_id))?;
-            *label = updates.apply(label);
-            Ok(())
-        })
-    }
-
-    async fn delete_label(&self, area_id: &AreaId, label_id: &LabelId) -> CloudResult<()> {
-        self.mutate(*area_id, |area| {
-            area.labels.retain(|label| label.id != *label_id);
-            Ok(())
-        })
-    }
-
-    // ===== SHAPE OPERATIONS =====
-
-    async fn create_shape(&self, area_id: &AreaId, shape_data: ShapeArgs) -> CloudResult<Shape> {
-        self.mutate(*area_id, |area| {
-            let shape = Shape {
-                id: ShapeId(Uuid::new_v4()),
-                level: shape_data.level,
-                x: shape_data.x,
-                y: shape_data.y,
-                width: shape_data.width,
-                height: shape_data.height,
-                background_color: shape_data.background_color,
-                stroke_color: shape_data.stroke_color,
-                shape_type: shape_data.shape_type,
-                border_radius: shape_data.border_radius,
-                stroke_width: shape_data.stroke_width.unwrap_or(1.0),
-                is_secret: shape_data.is_secret.unwrap_or(false),
-            };
-            area.shapes.push(shape.clone());
-            Ok(shape)
-        })
-    }
-
-    async fn update_shape(
-        &self,
-        area_id: &AreaId,
-        shape_id: &ShapeId,
-        updates: ShapeUpdates,
-    ) -> CloudResult<()> {
-        self.mutate(*area_id, |area| {
-            let shape = area
-                .shapes
-                .iter_mut()
-                .find(|shape| shape.id == *shape_id)
-                .ok_or(CloudError::ShapeNotFound(*shape_id))?;
-            *shape = updates.apply(shape);
-            Ok(())
-        })
-    }
-
-    async fn delete_shape(&self, area_id: &AreaId, shape_id: &ShapeId) -> CloudResult<()> {
-        self.mutate(*area_id, |area| {
-            area.shapes.retain(|shape| shape.id != *shape_id);
-            Ok(())
-        })
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult> {
+        // The compare-and-set write path. The shared applier owns the
+        // precondition check and the single revision bump; it runs against a
+        // working clone that replaces the stored area only on full success,
+        // so a failed envelope changes nothing (`mutate` edits in place and
+        // bumps unconditionally, which would break both properties).
+        let mut areas = self.areas.write();
+        let stored = areas
+            .get_mut(area_id)
+            .ok_or(CloudError::AreaNotFound(*area_id))?;
+        let mut working = stored.clone();
+        let result = area_edits::apply_envelope(&mut working, *area_id, envelope)?;
+        *stored = working;
+        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExitDirection, RoomNumber};
+    use crate::{
+        ConnectionArgs, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind,
+        ConnectionRouting, CornerStyle, ExitArgs, ExitDirection, ExitId, LabelArgs, LabelId,
+        MapPoint, PortMode, RoomNumber, RoomSide, RoomUpdates, SegmentShape, ShapeArgs, ShapeId,
+        mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
+    };
 
     fn request(name: &str) -> CreateAreaRequest {
         CreateAreaRequest {
@@ -375,33 +182,58 @@ mod tests {
         }
     }
 
+    fn envelope(
+        area_id: AreaId,
+        expected_rev: i64,
+        payload: Vec<AreaMutation>,
+    ) -> MutationEnvelope {
+        MutationEnvelope {
+            operation_id: Uuid::new_v4(),
+            preconditions: vec![Precondition {
+                resource: ResourceKind::Area,
+                id: area_id.0,
+                expected_rev,
+                access_fingerprint: None,
+            }],
+            payload,
+        }
+    }
+
     #[tokio::test]
     async fn create_room_exit_roundtrip_stays_in_memory() {
         let backend = EphemeralBackend::new();
-        let area = backend.create_area(request("Session")).await.expect("create");
+        let area = backend
+            .create_area(request("Session"))
+            .await
+            .expect("create");
         assert!(area.effective_access().is_owner);
 
-        let key = RoomKey::new(area.id, RoomNumber(1));
         backend
-            .update_room(
-                &key,
-                RoomUpdates {
-                    title: Some("Gate".to_string()),
-                    ..RoomUpdates::default()
-                },
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates {
+                                title: Some("Gate".to_string()),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                from_direction: ExitDirection::North,
+                                ..ExitArgs::default()
+                            },
+                        },
+                    ],
+                ),
             )
             .await
-            .expect("upsert");
-        backend
-            .create_room_exit(
-                &key,
-                ExitArgs {
-                    from_direction: ExitDirection::North,
-                    ..ExitArgs::default()
-                },
-            )
-            .await
-            .expect("exit");
+            .expect("seed envelope");
 
         let details = backend.get_area(&area.id).await.expect("get");
         assert!(details.area.rev > 1, "mutations bump rev");
@@ -413,40 +245,697 @@ mod tests {
     #[tokio::test]
     async fn delete_room_nulls_inbound_exits() {
         let backend = EphemeralBackend::new();
-        let area = backend.create_area(request("Session")).await.expect("create");
-        let k1 = RoomKey::new(area.id, RoomNumber(1));
-        backend.update_room(&k1, RoomUpdates::default()).await.expect("r1");
-        backend
-            .update_room(&RoomKey::new(area.id, RoomNumber(2)), RoomUpdates::default())
+        let area = backend
+            .create_area(request("Session"))
             .await
-            .expect("r2");
+            .expect("create");
         backend
-            .create_room_exit(
-                &k1,
-                ExitArgs {
-                    from_direction: ExitDirection::North,
-                    to_area_id: Some(area.id),
-                    to_room_number: Some(RoomNumber(2)),
-                    ..ExitArgs::default()
-                },
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(2),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                from_direction: ExitDirection::North,
+                                to_area_id: Some(area.id),
+                                to_room_number: Some(RoomNumber(2)),
+                                ..ExitArgs::default()
+                            },
+                        },
+                    ],
+                ),
             )
             .await
-            .expect("exit");
+            .expect("seed envelope");
 
         backend
-            .delete_room(&RoomKey::new(area.id, RoomNumber(2)))
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![AreaMutation::DeleteRoom {
+                        room_number: RoomNumber(2),
+                    }],
+                ),
+            )
             .await
             .expect("delete");
 
         let details = backend.get_area(&area.id).await.expect("get");
         assert_eq!(details.rooms.len(), 1);
-        assert_eq!(details.rooms[0].exits[0].to_area_id, None, "inbound exit cleared");
+        assert_eq!(
+            details.rooms[0].exits[0].to_area_id, None,
+            "inbound exit cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_mutation_stale_revision_conflicts_and_stores_nothing() {
+        let backend = EphemeralBackend::new();
+        let area = backend
+            .create_area(request("Session"))
+            .await
+            .expect("create");
+
+        let result = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    41,
+                    vec![AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(1),
+                        body: RoomUpdates::default(),
+                    }],
+                ),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(CloudError::RevisionConflict {
+                    expected_rev: 41,
+                    current_rev: 1,
+                    ..
+                })
+            ),
+            "a stale precondition must conflict with the live rev, got {result:?}"
+        );
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.area.rev, 1, "a conflicted envelope moves nothing");
+        assert!(details.rooms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_mutation_applies_all_ops_with_one_rev_bump() {
+        let backend = EphemeralBackend::new();
+        let area = backend
+            .create_area(request("Session"))
+            .await
+            .expect("create");
+
+        let exit_id = ExitId(Uuid::new_v4());
+        let result = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates {
+                                title: Some("Gate".to_string()),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                id: Some(exit_id),
+                                from_direction: ExitDirection::North,
+                                ..ExitArgs::default()
+                            },
+                        },
+                        AreaMutation::AddRoomTag {
+                            room_number: RoomNumber(1),
+                            tag: "INN".to_string(),
+                        },
+                    ],
+                ),
+            )
+            .await
+            .expect("envelope applies");
+
+        assert_eq!(result.versions.len(), 1);
+        assert_eq!(result.versions[0].rev, 2, "three ops bump rev exactly once");
+        assert_eq!(result.data.len(), 3);
+        assert!(matches!(&result.data[0], OpResult::Room { room } if room.title == "Gate"));
+        assert!(matches!(&result.data[1], OpResult::Exit { exit } if exit.id == exit_id));
+        assert!(matches!(&result.data[2], OpResult::RoomTag { tag, .. } if tag == "INN"));
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.area.rev, 2);
+        assert_eq!(details.rooms.len(), 1);
+        assert_eq!(details.rooms[0].title, "Gate");
+        assert_eq!(details.rooms[0].exits.len(), 1);
+        assert!(details.rooms[0].tags.contains("INN"));
+    }
+
+    #[tokio::test]
+    async fn execute_mutation_failed_op_leaves_the_area_byte_identical() {
+        let backend = EphemeralBackend::new();
+        let area = backend
+            .create_area(request("Session"))
+            .await
+            .expect("create");
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(1),
+                        body: RoomUpdates::default(),
+                    }],
+                ),
+            )
+            .await
+            .expect("seed room");
+
+        let before = backend.get_area(&area.id).await.expect("get");
+        let result = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    before.area.rev,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(2),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::DeleteRoom {
+                            room_number: RoomNumber(999),
+                        },
+                    ],
+                ),
+            )
+            .await;
+        assert!(matches!(result, Err(CloudError::RoomNotFound(_))));
+
+        let after = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(
+            serde_json::to_string(&before).expect("serialize"),
+            serde_json::to_string(&after).expect("serialize"),
+            "a failed envelope must leave the area byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_mutation_create_ops_honor_client_ids() {
+        let backend = EphemeralBackend::new();
+        let area = backend
+            .create_area(request("Session"))
+            .await
+            .expect("create");
+
+        let exit_id = ExitId(Uuid::new_v4());
+        let label_id = LabelId(Uuid::new_v4());
+        let shape_id = ShapeId(Uuid::new_v4());
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                id: Some(exit_id),
+                                from_direction: ExitDirection::North,
+                                ..ExitArgs::default()
+                            },
+                        },
+                        AreaMutation::CreateLabel {
+                            body: LabelArgs {
+                                id: Some(label_id),
+                                ..LabelArgs::default()
+                            },
+                        },
+                        AreaMutation::CreateShape {
+                            body: ShapeArgs {
+                                id: Some(shape_id),
+                                ..ShapeArgs::default()
+                            },
+                        },
+                    ],
+                ),
+            )
+            .await
+            .expect("envelope applies");
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.rooms[0].exits[0].id, exit_id);
+        assert_eq!(details.labels[0].id, label_id);
+        assert_eq!(details.shapes[0].id, shape_id);
+    }
+
+    fn endpoint(room_number: i32, side: RoomSide) -> ConnectionEndpoint {
+        ConnectionEndpoint {
+            room_number: RoomNumber(room_number),
+            side,
+            port_offset: 0.5,
+            port_mode: PortMode::AutoPinned,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn connection_lifecycle_create_unlink_pair_delete_is_atomic() {
+        let backend = EphemeralBackend::new();
+        let area = backend.create_area(request("Links")).await.expect("create");
+        let connection_id = ConnectionId::new();
+        let split_id = ConnectionId::new();
+        let east = ExitId(Uuid::new_v4());
+        let west = ExitId(Uuid::new_v4());
+
+        let created = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates::default(),
+                        },
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(2),
+                            body: RoomUpdates {
+                                x: Some(2.0),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                        AreaMutation::CreateConnection {
+                            body: ConnectionArgs {
+                                id: connection_id,
+                                endpoint_a: endpoint(1, RoomSide::East),
+                                endpoint_b: Some(endpoint(2, RoomSide::West)),
+                                routing: ConnectionRouting::Simple,
+                                segment_shape: SegmentShape::Direct,
+                                corner: CornerStyle::Sharp,
+                                route_points: vec![],
+                                dash: ConnectionDash::Solid,
+                                color: "#a4a4a4".to_string(),
+                                thickness: 1.0,
+                            },
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(1),
+                            body: ExitArgs {
+                                id: Some(east),
+                                connection_id: Some(connection_id),
+                                from_direction: ExitDirection::East,
+                                to_area_id: Some(area.id),
+                                to_room_number: Some(RoomNumber(2)),
+                                to_direction: Some(ExitDirection::West),
+                                weight: 1.0,
+                                ..ExitArgs::default()
+                            },
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(2),
+                            body: ExitArgs {
+                                id: Some(west),
+                                connection_id: Some(connection_id),
+                                from_direction: ExitDirection::West,
+                                to_area_id: Some(area.id),
+                                to_room_number: Some(RoomNumber(1)),
+                                to_direction: Some(ExitDirection::East),
+                                weight: 1.0,
+                                ..ExitArgs::default()
+                            },
+                        },
+                    ],
+                ),
+            )
+            .await
+            .expect("atomic link create");
+        assert_eq!(created.versions[0].rev, 2, "five rows are one revision");
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.connections.len(), 1);
+        assert_eq!(
+            details
+                .rooms
+                .iter()
+                .map(|room| room.exits.len())
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(details.connections[0].color, "#A4A4A4");
+
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![AreaMutation::Unlink {
+                        exit_id: east,
+                        new_connection_id: split_id,
+                    }],
+                ),
+            )
+            .await
+            .expect("unlink");
+        let split = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(split.connections.len(), 2);
+        assert!(split.connections.iter().all(|connection| {
+            split
+                .rooms
+                .iter()
+                .flat_map(|room| &room.exits)
+                .filter(|exit| exit.connection_id == connection.id)
+                .count()
+                == 1
+        }));
+
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    3,
+                    vec![AreaMutation::Pair {
+                        keep_connection_id: connection_id,
+                        merge_connection_id: split_id,
+                    }],
+                ),
+            )
+            .await
+            .expect("pair");
+        let paired = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(paired.connections.len(), 1);
+        assert!(
+            paired
+                .rooms
+                .iter()
+                .flat_map(|room| &room.exits)
+                .all(|exit| { exit.connection_id == connection_id })
+        );
+
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(area.id, 4, vec![AreaMutation::DeleteLink { connection_id }]),
+            )
+            .await
+            .expect("delete link");
+        let deleted = backend.get_area(&area.id).await.expect("get");
+        assert!(deleted.connections.is_empty());
+        assert!(deleted.rooms.iter().all(|room| room.exits.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn reciprocal_cross_level_exits_share_one_connection() {
+        let backend = EphemeralBackend::new();
+        let area = backend
+            .create_area(request("Cross-level link"))
+            .await
+            .expect("create");
+        let connection_id = ConnectionId::new();
+        let mut operations = routed_link_ops(area.id, connection_id);
+        if let AreaMutation::UpsertRoom { body, .. } = &mut operations[1] {
+            body.level = Some(1);
+        }
+        if let AreaMutation::CreateConnection { body } = &mut operations[2] {
+            body.routing = ConnectionRouting::Simple;
+            body.segment_shape = SegmentShape::Direct;
+            body.route_points.clear();
+        }
+
+        backend
+            .execute_mutation(&area.id, &envelope(area.id, 1, operations))
+            .await
+            .expect("cross-level pair");
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.connections.len(), 1);
+        assert_eq!(details.connections[0].kind, ConnectionKind::CrossLevel);
+        assert_eq!(
+            details
+                .rooms
+                .iter()
+                .flat_map(|room| &room.exits)
+                .filter(|exit| exit.connection_id == connection_id)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_one_member_connections_are_rejected_atomically() {
+        let malformed_cases = [
+            (
+                "missing traversal",
+                Some(endpoint(2, RoomSide::West)),
+                None,
+                None,
+            ),
+            (
+                "same-area destination without endpoint B",
+                None,
+                Some(RoomNumber(2)),
+                Some(ExitDirection::West),
+            ),
+        ];
+
+        for (name, endpoint_b, to_room_number, to_direction) in malformed_cases {
+            let backend = EphemeralBackend::new();
+            let area = backend.create_area(request(name)).await.expect("create");
+            let connection_id = ConnectionId::new();
+            let result = backend
+                .execute_mutation(
+                    &area.id,
+                    &envelope(
+                        area.id,
+                        1,
+                        vec![
+                            AreaMutation::UpsertRoom {
+                                room_number: RoomNumber(1),
+                                body: RoomUpdates::default(),
+                            },
+                            AreaMutation::UpsertRoom {
+                                room_number: RoomNumber(2),
+                                body: RoomUpdates::default(),
+                            },
+                            AreaMutation::CreateConnection {
+                                body: ConnectionArgs {
+                                    id: connection_id,
+                                    endpoint_a: endpoint(1, RoomSide::East),
+                                    endpoint_b,
+                                    routing: ConnectionRouting::Simple,
+                                    segment_shape: SegmentShape::Direct,
+                                    corner: CornerStyle::Sharp,
+                                    route_points: vec![],
+                                    dash: ConnectionDash::Solid,
+                                    color: "#A4A4A4".to_string(),
+                                    thickness: 1.0,
+                                },
+                            },
+                            AreaMutation::CreateExit {
+                                room_number: RoomNumber(1),
+                                body: ExitArgs {
+                                    id: Some(ExitId::new()),
+                                    connection_id: Some(connection_id),
+                                    from_direction: ExitDirection::East,
+                                    to_area_id: to_room_number.map(|_| area.id),
+                                    to_room_number,
+                                    to_direction,
+                                    weight: 1.0,
+                                    ..ExitArgs::default()
+                                },
+                            },
+                        ],
+                    ),
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(CloudError::InvalidConnection(reason)) if reason == "invalid_endpoint"),
+                "{name} should fail topology validation"
+            );
+            let stored = backend
+                .get_area(&area.id)
+                .await
+                .expect("get after rejection");
+            assert_eq!(stored.area.rev, 1, "{name} must not bump the revision");
+            assert!(stored.rooms.is_empty(), "{name} must roll back every room");
+            assert!(
+                stored.connections.is_empty(),
+                "{name} must roll back the connection"
+            );
+        }
+    }
+
+    fn routed_link_ops(area_id: AreaId, connection_id: ConnectionId) -> Vec<AreaMutation> {
+        let east = ExitId::new();
+        let west = ExitId::new();
+        vec![
+            AreaMutation::UpsertRoom {
+                room_number: RoomNumber(1),
+                body: RoomUpdates::default(),
+            },
+            AreaMutation::UpsertRoom {
+                room_number: RoomNumber(2),
+                body: RoomUpdates {
+                    x: Some(2.0),
+                    ..RoomUpdates::default()
+                },
+            },
+            AreaMutation::CreateConnection {
+                body: ConnectionArgs {
+                    id: connection_id,
+                    endpoint_a: endpoint(1, RoomSide::East),
+                    endpoint_b: Some(endpoint(2, RoomSide::West)),
+                    routing: ConnectionRouting::Manual,
+                    segment_shape: SegmentShape::Orthogonal,
+                    corner: CornerStyle::Sharp,
+                    route_points: vec![MapPoint::new(0.4, 1.0), MapPoint::new(1.6, 1.0)],
+                    dash: ConnectionDash::Solid,
+                    color: "#A4A4A4".to_string(),
+                    thickness: 1.0,
+                },
+            },
+            AreaMutation::CreateExit {
+                room_number: RoomNumber(1),
+                body: ExitArgs {
+                    id: Some(east),
+                    connection_id: Some(connection_id),
+                    from_direction: ExitDirection::East,
+                    to_area_id: Some(area_id),
+                    to_room_number: Some(RoomNumber(2)),
+                    to_direction: Some(ExitDirection::West),
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            },
+            AreaMutation::CreateExit {
+                room_number: RoomNumber(2),
+                body: ExitArgs {
+                    id: Some(west),
+                    connection_id: Some(connection_id),
+                    from_direction: ExitDirection::West,
+                    to_area_id: Some(area_id),
+                    to_room_number: Some(RoomNumber(1)),
+                    to_direction: Some(ExitDirection::East),
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn moving_both_endpoints_translates_manual_route_points() {
+        let backend = EphemeralBackend::new();
+        let area = backend
+            .create_area(request("Route move"))
+            .await
+            .expect("create");
+        let connection_id = ConnectionId::new();
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(area.id, 1, routed_link_ops(area.id, connection_id)),
+            )
+            .await
+            .expect("seed routed link");
+
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates {
+                                x: Some(3.0),
+                                y: Some(2.0),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(2),
+                            body: RoomUpdates {
+                                x: Some(5.0),
+                                y: Some(2.0),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                    ],
+                ),
+            )
+            .await
+            .expect("move both rooms");
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(
+            details.connections[0].route_points,
+            vec![MapPoint::new(3.4, 3.0), MapPoint::new(4.6, 3.0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn moving_one_endpoint_repairs_the_adjacent_orthogonal_leg() {
+        let backend = EphemeralBackend::new();
+        let area = backend
+            .create_area(request("Route repair"))
+            .await
+            .expect("create");
+        let connection_id = ConnectionId::new();
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(area.id, 1, routed_link_ops(area.id, connection_id)),
+            )
+            .await
+            .expect("seed routed link");
+
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(1),
+                        body: RoomUpdates {
+                            x: Some(1.0),
+                            ..RoomUpdates::default()
+                        },
+                    }],
+                ),
+            )
+            .await
+            .expect("move one room");
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(
+            details.connections[0].route_points[0],
+            MapPoint::new(1.4, 1.0)
+        );
     }
 
     #[tokio::test]
     async fn folders_are_rejected_and_deletion_is_final() {
         let backend = EphemeralBackend::new();
-        let area = backend.create_area(request("Session")).await.expect("create");
+        let area = backend
+            .create_area(request("Session"))
+            .await
+            .expect("create");
 
         let filed = backend
             .update_area(

@@ -4,6 +4,7 @@ use std::{
     time::Instant,
 };
 
+use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer, selection::Selection};
 use iced::{
     Element, Event, Point, Rectangle, Size,
     advanced::{
@@ -11,9 +12,9 @@ use iced::{
         layout::{self, Node},
         mouse, text,
         widget::{Tree, tree},
-    }, window,
+    },
+    window,
 };
-use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer, selection::Selection};
 
 mod scroll_bar;
 mod terminal_pane;
@@ -24,6 +25,12 @@ struct SplitTerminalPane<'a> {
     pub selection: Rc<RefCell<Selection>>,
     pub buffer: Ref<'a, TerminalBuffer>,
     pub on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    /// Called with `(cols, rows)` when the pane's character grid changes — the full
+    /// terminal region in cells, quantized so it only fires on actual grid changes.
+    /// A plain callback for the same reason as `on_link`: the pane stays
+    /// `Message`-agnostic, and the handler sends the runtime action itself (the
+    /// session's NAWS report — wired only for the session's main terminal).
+    pub on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
 }
 
 impl<'a> SplitTerminalPane<'a> {
@@ -32,6 +39,7 @@ impl<'a> SplitTerminalPane<'a> {
             selection,
             buffer,
             on_link: None,
+            on_grid_change: None,
         }
     }
 
@@ -276,6 +284,26 @@ struct State {
     autoscroll_tick: Option<Instant>,
     /// Fractional lines accumulated but not yet scrolled.
     autoscroll_debt: f32,
+    /// The `(cols, rows)` grid last reported through `on_grid_change`, so layout
+    /// re-runs only fire the callback on an actual grid change.
+    reported_grid: Option<(u16, u16)>,
+}
+
+/// The whole character cells that fit in `extent` pixels of `cell`-sized cells,
+/// clamped to `1..=u16::MAX` (NAWS carries 16-bit dimensions, and a zero report
+/// is a protocol hazard).
+fn whole_cells(extent: f32, cell: f32) -> u16 {
+    let cells = (extent / cell).floor();
+    // `clamp` propagates NaN (and a NaN cast saturates to 0), so a degenerate
+    // extent or cell must bail out before the cast, not rely on the clamp.
+    if !cells.is_finite() {
+        return 1;
+    }
+    // The clamp bounds the value to the u16 range before the cast.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        cells.clamp(1.0, 65_535.0) as u16
+    }
 }
 
 impl State {
@@ -371,9 +399,11 @@ where
             (main_pane_node, Node::new(Size::new(0.0, 0.0)))
         };
 
+        let prefs = crate::prefs::current();
+
         // Use the same line height the panes lay text out with, so the
         // scrollbar's visible-lines math matches what is on screen.
-        let visible_lines = terminal_pane_limits.max().height / crate::prefs::current().line_height;
+        let visible_lines = terminal_pane_limits.max().height / prefs.line_height;
 
         let scrollbar_node = self
             .scroll_bar_element::<Message, Theme, Renderer>(
@@ -387,6 +417,26 @@ where
 
         let mut state = state.borrow_mut();
         state.visible_lines = visible_lines;
+
+        // Report the character grid of the FULL terminal region — not the
+        // split-shrunk main pane; the scrollback split is a UI affordance, not
+        // a terminal resize — whenever it actually changes. Cell-boundary
+        // quantization means a pixel-level resize drag only fires on real grid
+        // steps. The cell advance was measured by the child layout above.
+        if let Some(on_grid_change) = &self.on_grid_change
+            && let Some((_, advance)) = main_pane_tree
+                .state
+                .downcast_ref::<terminal_pane::State<Renderer::Paragraph>>()
+                .advance
+        {
+            let full = terminal_pane_limits.max();
+            let cols = whole_cells(full.width, advance).min(prefs.line_length.unwrap_or(u16::MAX));
+            let rows = whole_cells(full.height, prefs.line_height);
+            if state.reported_grid != Some((cols, rows)) {
+                state.reported_grid = Some((cols, rows));
+                on_grid_change(cols, rows);
+            }
+        }
 
         Node::with_children(
             limits.max(),
@@ -508,39 +558,40 @@ where
         let state = tree.state.downcast_ref::<Rc<RefCell<State>>>();
 
         if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event
-            && cursor.position_in(layout.bounds()).is_some() {
-                let mut state = state.borrow_mut();
-                let max_line = self.buffer.last_line_number() as f32;
-                let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f32;
+            && cursor.position_in(layout.bounds()).is_some()
+        {
+            let mut state = state.borrow_mut();
+            let max_line = self.buffer.last_line_number() as f32;
+            let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f32;
 
-                // We don't update the scroll bar position when new lines come in, so if we're not split (it's fixed to the bottom),
-                // update it lazily now before we do any arithmetic dependant on its value
-                if !state.is_split {
-                    state.scroll_bar_value = max_line;
-                }
-
-                match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => {
-                        state.scroll_bar_value -= y;
-                        state.scroll_bar_value = state.scroll_bar_value.clamp(min_line, max_line);
-                        state.is_split = state.scroll_bar_value < max_line;
-                        shell.invalidate_layout();
-                        shell.request_redraw();
-                        shell.capture_event();
-                    }
-                    mouse::ScrollDelta::Pixels { y, .. } => {
-                        // Positive y scrolls up (toward older lines); cap the
-                        // per-event step at one line in either direction.
-                        state.scroll_bar_value -= (*y / 10.0).clamp(-1.0, 1.0);
-                        state.scroll_bar_value = state.scroll_bar_value.clamp(min_line, max_line);
-                        state.is_split = state.scroll_bar_value < max_line;
-                        shell.invalidate_layout();
-                        shell.request_redraw();
-                        shell.capture_event();
-                    }
-                }
-                return;
+            // We don't update the scroll bar position when new lines come in, so if we're not split (it's fixed to the bottom),
+            // update it lazily now before we do any arithmetic dependant on its value
+            if !state.is_split {
+                state.scroll_bar_value = max_line;
             }
+
+            match delta {
+                mouse::ScrollDelta::Lines { y, .. } => {
+                    state.scroll_bar_value -= y;
+                    state.scroll_bar_value = state.scroll_bar_value.clamp(min_line, max_line);
+                    state.is_split = state.scroll_bar_value < max_line;
+                    shell.invalidate_layout();
+                    shell.request_redraw();
+                    shell.capture_event();
+                }
+                mouse::ScrollDelta::Pixels { y, .. } => {
+                    // Positive y scrolls up (toward older lines); cap the
+                    // per-event step at one line in either direction.
+                    state.scroll_bar_value -= (*y / 10.0).clamp(-1.0, 1.0);
+                    state.scroll_bar_value = state.scroll_bar_value.clamp(min_line, max_line);
+                    state.is_split = state.scroll_bar_value < max_line;
+                    shell.invalidate_layout();
+                    shell.request_redraw();
+                    shell.capture_event();
+                }
+            }
+            return;
+        }
 
         self.drag_autoscroll::<Renderer::Paragraph, Message>(tree, event, layout, cursor, shell);
 
@@ -568,6 +619,7 @@ pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     buffer: Ref<'a, TerminalBuffer>,
     selection: Rc<RefCell<Selection>>,
     on_link: Option<Rc<dyn Fn(LinkClickEvent)>>,
+    on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
 ) -> Element<'a, Message, Theme, Renderer>
 where
     Renderer: text::Renderer<Font = iced::Font> + 'a,
@@ -578,5 +630,6 @@ where
 {
     let mut pane = SplitTerminalPane::new(buffer, selection);
     pane.on_link = on_link;
+    pane.on_grid_change = on_grid_change;
     Element::new(pane)
 }

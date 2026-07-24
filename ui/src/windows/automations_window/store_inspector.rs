@@ -96,7 +96,14 @@ impl AutomationsWindow {
                 .spacing(8.0),
             );
             let mut rows = Column::new().spacing(2.0);
-            rows = self.json_rows(rows, &producer.producer, String::new(), None, &producer.tree, 0);
+            rows = self.json_rows(
+                rows,
+                &producer.producer,
+                String::new(),
+                None,
+                &producer.tree,
+                0,
+            );
             section = section.push(rows);
         }
         section.into()
@@ -123,7 +130,10 @@ impl AutomationsWindow {
         // addressed whole (no index grammar), but their elements still render.
         let (child_count, summary) = match node {
             Node::Object(object) => (Some(object.len()), format!("{{{}}}", object.len())),
-            Node::Array(array) => (Some(array.items().len()), format!("[{}]", array.items().len())),
+            Node::Array(array) => (
+                Some(array.items().len()),
+                format!("[{}]", array.items().len()),
+            ),
             _ => (None, String::new()),
         };
         match child_count {
@@ -149,7 +159,10 @@ impl AutomationsWindow {
                     bootstrap_icons::CHEVRON_RIGHT
                 };
                 let head = row![
-                    text(chevron).font(fonts::BOOTSTRAP_ICONS).size(10.0).style(common::faint),
+                    text(chevron)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(10.0)
+                        .style(common::faint),
                     match label {
                         Some(label) => text(label).size(12.0).font(MONO),
                         None => text("\u{2022}").size(12.0).style(common::faint),
@@ -175,9 +188,7 @@ impl AutomationsWindow {
                 if expanded {
                     let children: Box<dyn Iterator<Item = (&str, &Node)>> = match node {
                         Node::Object(object) => Box::new(object.iter()),
-                        Node::Array(array) => {
-                            Box::new(array.items().iter().map(|item| ("", item)))
-                        }
+                        Node::Array(array) => Box::new(array.items().iter().map(|item| ("", item))),
                         _ => unreachable!("only containers report a child count"),
                     };
                     for (index, (child_label, child)) in children.enumerate() {
@@ -203,7 +214,11 @@ impl AutomationsWindow {
                         } else {
                             format!("{key}/{child_label}")
                         };
-                        let label = if child_label.is_empty() { None } else { Some(child_label) };
+                        let label = if child_label.is_empty() {
+                            None
+                        } else {
+                            Some(child_label)
+                        };
                         rows = self.json_rows(rows, producer, child_key, label, child, depth + 1);
                     }
                 }
@@ -230,7 +245,10 @@ impl AutomationsWindow {
                 current_producer = Some(&*entry.producer);
                 section = section.push(
                     iced::widget::container(
-                        text(entry.producer.to_string()).size(13.0).font(MONO).style(common::muted),
+                        text(entry.producer.to_string())
+                            .size(13.0)
+                            .font(MONO)
+                            .style(common::muted),
                     )
                     .padding(Padding {
                         top: 8.0,
@@ -260,19 +278,29 @@ fn entry_block(entry: &CatalogueEntryView) -> Elem<'_> {
     };
     head = head.push(text(provenance).size(11.0).style(common::faint));
     if let Some(alias) = &entry.type_alias {
-        head = head.push(text(alias.to_string()).size(11.0).font(MONO).style(common::faint));
+        head = head.push(
+            text(alias.to_string())
+                .size(11.0)
+                .font(MONO)
+                .style(common::faint),
+        );
     }
     if entry.occurrences > 0 {
         head = head.push(iced::widget::space::horizontal());
         head = head.push(
-            text(format!("\u{00D7}{}", entry.occurrences)).size(11.0).style(common::muted),
+            text(format!("\u{00D7}{}", entry.occurrences))
+                .size(11.0)
+                .style(common::muted),
         );
     }
 
     let mut block = column![head].spacing(4.0);
     if let Some(shape) = &entry.inferred_shape {
         block = block.push(
-            text(format!("shape: {shape}")).size(11.0).font(MONO).style(common::muted),
+            text(format!("shape: {shape}"))
+                .size(11.0)
+                .font(MONO)
+                .style(common::muted),
         );
     }
     if let Some(declared) = &entry.declared_shape {
@@ -305,7 +333,10 @@ fn sample_row(sample: &CatalogueSample) -> Elem<'_> {
         meta.push_str(" \u{00B7} truncated");
     }
     row![
-        text(meta).size(11.0).style(common::faint).width(Length::Fixed(190.0)),
+        text(meta)
+            .size(11.0)
+            .style(common::faint)
+            .width(Length::Fixed(190.0)),
         text(sample.display.clone()).size(11.0).font(MONO),
     ]
     .spacing(8.0)

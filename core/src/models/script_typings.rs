@@ -937,8 +937,8 @@ mod tests {
         );
     }
 
-    /// The declaration-grammar conformance fixture (interop.md §4/§5, interop-refinement-plan
-    /// task 9): FOUR independent mechanisms parse producer declarations — transpile-time name
+    /// The declaration-grammar conformance fixture (interop.md §4/§5): FOUR
+    /// independent mechanisms parse producer declarations — transpile-time name
     /// injection, static extraction, the typings generator, and the non-home scrub. One
     /// golden source, asserted against all four, so they can never drift on what a
     /// declaration means.
@@ -1265,7 +1265,7 @@ export function make() { return createEvent('dynamic'); }
             "assignment through the consumer's read-only .value must be a compile error"
         );
 
-        // `previousValue` is read-only on BOTH seats (interop-pre-gmcp-plan.md §5): even on
+        // `previousValue` is read-only on BOTH seats (interop.md §2): even on
         // the producer handle, whose `.value` writes, assignment through the pre-batch view
         // must fail to compile.
         let mut sources = BTreeMap::new();
@@ -1302,7 +1302,7 @@ export function make() { return createEvent('dynamic'); }
                 "smudgy:state/{producer} missing from smudgy-core.d.ts"
             );
         }
-        for producer in ["sys", "map", "gmcp", "msdp"] {
+        for producer in ["sys", "map", "gmcp", "msdp", "input"] {
             let catalog = smudgy_script::platform_event_catalog(producer);
             assert!(!catalog.is_empty(), "platform catalog {producer} is empty");
             let header = format!("declare module \"smudgy:events/{producer}\"");
@@ -1313,10 +1313,10 @@ export function make() { return createEvent('dynamic'); }
                 .find("\ndeclare module")
                 .map_or(SMUDGY_CORE_DTS.len(), |o| start + o + 1);
             let block = &SMUDGY_CORE_DTS[start..block_end];
-            for name in catalog {
+            for (export, _event) in catalog {
                 assert!(
-                    block.contains(&format!("export const {name}:")),
-                    "smudgy:events/{producer} declaration is missing `{name}` (runtime synthesizes it)"
+                    block.contains(&format!("export const {export}:")),
+                    "smudgy:events/{producer} declaration is missing `{export}` (runtime synthesizes it)"
                 );
             }
         }
@@ -1335,10 +1335,13 @@ export function make() { return createEvent('dynamic'); }
         ambient.insert("smudgy-mapper.d.ts".to_string(), SMUDGY_MAPPER_DTS.to_string());
 
         let good = "import { session } from \"smudgy:core\";\n\
-             import type { TitleBarSpec } from \"smudgy:core\";\n\
+             import type { TitleBarSpec, InputHandle } from \"smudgy:core\";\n\
              export function wire() {\n\
                const pinned: TitleBarSpec = \"always-show\";\n\
-               const chat = session.mainPane.split(\"right\", { name: \"chat\", width: 300, titleBar: pinned });\n\
+               const chat = session.mainPane.split(\"right\", { name: \"chat\", width: 300, titleBar: pinned,\n\
+                 input: { onSubmit: (text: string) => session.send(`gt ${text}`), placeholder: \"group tell...\" } });\n\
+               const chatInput: InputHandle | undefined = chat.input;\n\
+               chatInput?.propose(\"hello\");\n\
                chat.split(\"bottom\", { name: \"log\", height: 120, terminal: false, titleBar: \"normal\" });\n\
                session.mainPane.split(\"top\", { name: \"status\", height: 80 });\n\
                session.mainPane.split(\"left\", { name: \"map\" });\n\
@@ -1438,6 +1441,70 @@ export function make() { return createEvent('dynamic'); }
                      <Button variant=\"primary\" onPress={() => { void draft; }}>Save</Button>\n\
                    </Scrollable>\n\
                  </Modal>,\n\
+               );\n\
+             }\n"
+                .to_string(),
+        );
+        // A third consumer proves the Canvas contract (shape-record discriminated unions,
+        // animate specs, view_box/fit, pointer events, a bound scene) and the form widgets
+        // (bound checked, the boolean onToggle, a radio group with a numeric-bindable
+        // `selected`) compile as authored.
+        sources.insert(
+            "hud.tsx".to_string(),
+            "import { createWidget, Canvas, Space, Checkbox, Radio, Row, Column, Tooltip, Table, ProgressBar, Text } from \"smudgy:widgets\";\n\
+             import type { CanvasShape, CanvasPointerEvent, CanvasFill } from \"smudgy:widgets\";\n\
+             import { createState } from \"smudgy:core\";\n\
+             interface Cfg { autoloot: boolean; mode: string; slot: number; scene: CanvasShape[] }\n\
+             const cfg = createState<Cfg>('cfg');\n\
+             export function mountHud() {\n\
+               const gradient: CanvasFill = { gradient: { from: [0, 0], to: [100, 0], stops: [[0, \"#000\"], [1, \"#fff\"]] } };\n\
+               const scene: CanvasShape[] = [\n\
+                 { kind: \"rect\", x: 0, y: 0, width: 100, height: 8, rx: 2, fill: gradient },\n\
+                 { kind: \"path\", d: \"M 0 0 A 5 5 0 0 1 10 0 Z\", stroke: { color: \"#fff\", width: 1, dash: [2, 2] } },\n\
+                 { kind: \"text\", x: 4, y: 4, text: \"hp\", size: 10, color: \"#8fa\", align_x: \"center\", font: \"monospace\" },\n\
+                 { kind: \"group\", transform: { translate: [5, 5], rotate: 45, scale: [1, 2] }, children: [\n\
+                   { kind: \"circle\", id: \"ring\", cx: 0, cy: 0, r: 2, transient: true,\n\
+                     animate: { r: { to: 100, duration: 500, ease: \"out\", repeat: 2 } } },\n\
+                 ] },\n\
+               ];\n\
+               createWidget(\"hud\",\n\
+                 <Column>\n\
+                   <Canvas width=\"fill\" height={120} view_box={[0, 0, 100, 50]} fit=\"contain\"\n\
+                           scene={cfg.bind('scene')}\n\
+                           onPointer={(ev: CanvasPointerEvent) => { void ev.kind; void ev.x; void ev.button; }} />\n\
+                   <Canvas scene={scene} />\n\
+                   <Row>\n\
+                     <Checkbox checked={cfg.bind('autoloot')} size={14} text_size={12}\n\
+                               onToggle={(v) => { cfg.value.autoloot = v; }}>Autoloot: {cfg.bind('autoloot')}</Checkbox>\n\
+                     <Tooltip tip=\"mirrors the box beside it\" position=\"right\" gap={4}>\n\
+                       <Checkbox checked={true}>read-only</Checkbox>\n\
+                     </Tooltip>\n\
+                     <Tooltip tip={cfg.bind('mode')} position=\"cursor\">\n\
+                       <Text size={11}>mode</Text>\n\
+                     </Tooltip>\n\
+                     <Tooltip tip={<Column><Text>styled</Text><Text>element tip</Text></Column>}>\n\
+                       <Text size={11}>details</Text>\n\
+                     </Tooltip>\n\
+                     <Tooltip tip={false}>\n\
+                       <Text size={11}>conditional: no tooltip</Text>\n\
+                     </Tooltip>\n\
+                     <Space width=\"fill\" />\n\
+                     <Radio value=\"fast\" selected={cfg.bind('mode')} onSelect={(v) => { cfg.value.mode = v; }}>Fast</Radio>\n\
+                     <Radio value={2} selected={cfg.bind('slot')} size={12} onSelect={(v) => { void v; }}>Slot two</Radio>\n\
+                   </Row>\n\
+                   <Table\n\
+                     columns={[\n\
+                       { header: \"Name\", width: 120 },\n\
+                       { header: <Text size={10}>HP</Text>, width: \"fill\", align_x: \"center\" },\n\
+                       { header: \"MV\", align_y: \"center\" },\n\
+                     ]}\n\
+                     rows={[\n\
+                       [\"Mora\", <ProgressBar value={cfg.bind('slot')} max={100} />, cfg.bind('mode')],\n\
+                       [\"Kessik\", null, 42],\n\
+                     ]}\n\
+                     width=\"fill\" padding={4} separator={1}\n\
+                   />\n\
+                 </Column>,\n\
                );\n\
              }\n"
                 .to_string(),
@@ -1599,7 +1666,7 @@ export function make() { return createEvent('dynamic'); }
     /// (quoted) in BOTH the published contract and the runtime impl, whose string unions
     /// mirror the Rust enums by hand. The impl↔contract guards above cannot catch this class
     /// (they compare TS against TS); this pins both to the Rust source of truth — the
-    /// regression that added a fifth `ExitStyle` (`Stub`) invisible to scripts. A tripwire on
+    /// original regression was a Rust-side enum variant invisible to scripts. A tripwire on
     /// quoted-name presence, not a union parser: adding a Rust variant fails here until the
     /// unions name it.
     #[test]
@@ -1619,11 +1686,32 @@ export function make() { return createEvent('dynamic'); }
                 }
             }
         }
-        assert_covered(&smudgy_cloud::ExitStyle::ALL, "ExitStyle");
         assert_covered(&smudgy_cloud::ExitDirection::ALL, "ExitDirection");
         assert_covered(&smudgy_cloud::ShapeType::ALL, "ShapeType");
         assert_covered(&smudgy_cloud::HorizontalAlignment::ALL, "HorizontalAlignment");
         assert_covered(&smudgy_cloud::VerticalAlignment::ALL, "VerticalAlignment");
+        assert_covered(&smudgy_cloud::RoomSide::ALL, "RoomSide");
+        assert_covered(
+            &[
+                smudgy_cloud::PortMode::AutoPinned,
+                smudgy_cloud::PortMode::Manual,
+            ],
+            "PortMode",
+        );
+        assert_covered(
+            &[
+                smudgy_cloud::ConnectionKind::Internal,
+                smudgy_cloud::ConnectionKind::SelfLoop,
+                smudgy_cloud::ConnectionKind::Dangling,
+                smudgy_cloud::ConnectionKind::External,
+                smudgy_cloud::ConnectionKind::CrossLevel,
+            ],
+            "ConnectionKind",
+        );
+        assert_covered(&smudgy_cloud::ConnectionRouting::ALL, "ConnectionRouting");
+        assert_covered(&smudgy_cloud::SegmentShape::ALL, "SegmentShape");
+        assert_covered(&smudgy_cloud::CornerStyle::ALL, "CornerStyle");
+        assert_covered(&smudgy_cloud::ConnectionDash::ALL, "ConnectionDash");
     }
 
     /// Coverage guard for EXTERNAL packages: compile a consumer that reaches the map the way

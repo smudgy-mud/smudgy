@@ -13,7 +13,9 @@ use iced::{
     widget::canvas::{self, LineDash, Stroke, gradient, stroke},
 };
 use smudgy_cloud::{
-    ExitDirection, ExitStyle, HorizontalAlignment, Label, Shape, ShapeType, VerticalAlignment,
+    ConnectionDash, ConnectionRouting, ExitDirection, HorizontalAlignment, Label, MapPoint,
+    Shape, ShapeType, VerticalAlignment,
+    connection_geometry::{ConnectionGeometry, PathPrimitive},
     mapper::{
         AtlasCache,
         room_cache::RoomCache,
@@ -23,13 +25,22 @@ use smudgy_cloud::{
 
 use crate::viewport::Region;
 
+/// The default exit gray — the rendered form of
+/// [`smudgy_cloud::DEFAULT_CONNECTION_COLOR`]; a drift test asserts the two
+/// stay one color.
 pub const EXIT_COLOR: Color = Color::from_rgb8(164, 164, 164);
 pub const AREA_NAME_FONT_COLOR: Color = EXIT_COLOR;
 
-pub const MAP_ROOM_SIZE: f32 = 0.5;
+/// Room square edge length: the geometry pipeline owns this value so ports,
+/// hit-testing, culling, and the drawn squares can never disagree.
+pub const MAP_ROOM_SIZE: f32 = smudgy_cloud::connection_geometry::ROOM_SIZE;
 pub const MAP_ROOM_SIZE_AS_SIZE: Size = Size::new(MAP_ROOM_SIZE, MAP_ROOM_SIZE);
 pub const MAP_ROOM_BORDER_RADIUS: f32 = MAP_ROOM_SIZE * 0.2;
-pub const MAP_EXIT_STUB_LENGTH: f32 = 0.4;
+/// Reach of a center-anchored exit stub: the wall half-size plus the
+/// pipeline's port→tip stub, so legacy-drawn stubs and Connection stub tips
+/// land on the same point.
+pub const MAP_EXIT_STUB_LENGTH: f32 =
+    MAP_ROOM_SIZE / 2.0 + smudgy_cloud::connection_geometry::STUB_LENGTH;
 pub const MAP_PLAYER_INDICATOR_RADIUS: f32 = MAP_ROOM_SIZE / 4.0;
 
 pub const MIN_SCALING_FOR_MAP_GRID: f32 = 20.0;
@@ -37,11 +48,6 @@ pub const MIN_SCALING_FOR_MAP_GRID_OPAQUE: f32 = 50.0;
 
 const LEVEL_STUB_HALF_SIZE: f32 = 0.08;
 const LEVEL_STUB_OFFSET: f32 = MAP_ROOM_SIZE / 2.0 + 0.09;
-
-/// Radius (map units) of the self-loop marker: a small circle tangent to the
-/// room's wall. Sized to read as a loop rather than the smaller external/player
-/// dots, and to reach out about as far as a directional stub.
-const SELF_LOOP_RADIUS: f32 = 0.15;
 
 /// Dash pattern (in map units) for secret connections.
 const SECRET_DASH_SEGMENTS: &[f32] = &[0.12, 0.08];
@@ -85,30 +91,35 @@ pub fn parse_color(color: &str) -> Option<Color> {
     smudgy_cloud::parse_css_color(color)
 }
 
-/// The connection/stub stroke. The exit's [`ExitStyle`] selects the dash
-/// pattern (solid / dashed / dotted); a secret connection whose style is
-/// otherwise pattern-less falls back to the secret dash so it still reads as
-/// secret. `Meandering` and `Stub` stroke solid — their distinction is in
-/// geometry, not the line pattern.
+/// The Connection stroke: the Connection's own color and dash, with the
+/// secret fallback dash for a `Solid` secret connection so it still reads as
+/// secret. Stroke widths in this canvas are pixel-space (see the module
+/// docs); until zoom-aware map-space strokes land, `thickness: 1.0` is the
+/// legacy 1-px stroke.
 #[must_use]
-pub fn exit_stroke(opacity: f32, is_secret: bool, style: ExitStyle) -> Stroke<'static> {
+pub fn connection_stroke(
+    color: Color,
+    thickness: f32,
+    dash: ConnectionDash,
+    is_secret: bool,
+) -> Stroke<'static> {
     Stroke {
-        line_cap: style_line_cap(style),
+        line_cap: dash_line_cap(dash),
         line_dash: LineDash {
-            segments: style_segments(style, is_secret),
+            segments: dash_segments(dash, is_secret),
             offset: 0,
         },
-        ..solid_stroke(apply_opacity(EXIT_COLOR, opacity), 1.0)
+        ..solid_stroke(color, thickness)
     }
 }
 
-/// Dash segments for an exit's [`ExitStyle`], falling back to the secret dash
-/// for pattern-less styles on a secret connection.
-fn style_segments(style: ExitStyle, is_secret: bool) -> &'static [f32] {
-    match style {
-        ExitStyle::Dashed => STYLE_DASH_SEGMENTS,
-        ExitStyle::Dotted => DOTTED_SEGMENTS,
-        ExitStyle::Normal | ExitStyle::Meandering | ExitStyle::Stub => {
+/// Dash segments for a [`ConnectionDash`], falling back to the secret dash
+/// for a pattern-less (`Solid`) secret connection.
+fn dash_segments(dash: ConnectionDash, is_secret: bool) -> &'static [f32] {
+    match dash {
+        ConnectionDash::Dashed => STYLE_DASH_SEGMENTS,
+        ConnectionDash::Dotted => DOTTED_SEGMENTS,
+        ConnectionDash::Solid => {
             if is_secret {
                 SECRET_DASH_SEGMENTS
             } else {
@@ -118,10 +129,10 @@ fn style_segments(style: ExitStyle, is_secret: bool) -> &'static [f32] {
     }
 }
 
-/// Round caps turn the short `Dotted` on-segments into dots; every other style
-/// keeps butt caps.
-fn style_line_cap(style: ExitStyle) -> stroke::LineCap {
-    if matches!(style, ExitStyle::Dotted) {
+/// Round caps turn the short `Dotted` on-segments into dots; every other
+/// dash keeps butt caps.
+fn dash_line_cap(dash: ConnectionDash) -> stroke::LineCap {
+    if matches!(dash, ConnectionDash::Dotted) {
         stroke::LineCap::Round
     } else {
         stroke::LineCap::Butt
@@ -277,46 +288,8 @@ pub fn draw_grid(frame: &mut canvas::Frame, region: &Region, scaling: f32) {
     }
 }
 
-/// The stub line poking out of a room for a cardinal-direction exit, if the
-/// direction has a stub representation.
-#[must_use]
-fn cardinal_stub(x: f32, y: f32, direction: ExitDirection) -> Option<(Point, Point)> {
-    let from = Point { x, y };
-    match direction {
-        ExitDirection::North => Some((
-            from,
-            Point {
-                x,
-                y: y - MAP_EXIT_STUB_LENGTH,
-            },
-        )),
-        ExitDirection::East => Some((
-            from,
-            Point {
-                x: x + MAP_EXIT_STUB_LENGTH,
-                y,
-            },
-        )),
-        ExitDirection::South => Some((
-            from,
-            Point {
-                x,
-                y: y + MAP_EXIT_STUB_LENGTH,
-            },
-        )),
-        ExitDirection::West => Some((
-            from,
-            Point {
-                x: x - MAP_EXIT_STUB_LENGTH,
-                y,
-            },
-        )),
-        _ => None,
-    }
-}
-
 /// Draws a small up (▲) or down (▼) triangle centered at `(cx, cy)`.
-fn draw_level_triangle(frame: &mut canvas::Frame, cx: f32, cy: f32, up: bool, opacity: f32) {
+fn draw_level_triangle(frame: &mut canvas::Frame, cx: f32, cy: f32, up: bool, color: Color) {
     let dir = if up { -1.0 } else { 1.0 };
 
     let mut path = canvas::path::Builder::new();
@@ -331,18 +304,18 @@ fn draw_level_triangle(frame: &mut canvas::Frame, cx: f32, cy: f32, up: bool, op
     ));
     path.close();
 
-    frame.fill(&path.build(), apply_opacity(EXIT_COLOR, opacity));
+    frame.fill(&path.build(), color);
 }
 
 /// Draws the small triangle marking an Up (▲, top-right corner) or Down
 /// (▼, bottom-left corner) connection on a room.
-pub fn draw_level_stub(frame: &mut canvas::Frame, x: f32, y: f32, up: bool, opacity: f32) {
+pub fn draw_level_stub(frame: &mut canvas::Frame, x: f32, y: f32, up: bool, color: Color) {
     let (cx, cy) = if up {
         (x + LEVEL_STUB_OFFSET, y - LEVEL_STUB_OFFSET)
     } else {
         (x - LEVEL_STUB_OFFSET, y + LEVEL_STUB_OFFSET)
     };
-    draw_level_triangle(frame, cx, cy, up, opacity);
+    draw_level_triangle(frame, cx, cy, up, color);
 }
 
 /// The center of a cross-level exit's level triangle when the exit carries a
@@ -375,39 +348,20 @@ fn cardinal_unit(direction: ExitDirection) -> Option<Vector> {
     }
 }
 
-/// The outward unit vector a self-loop arc bulges along. Covers all eight
-/// compass points; non-planar directions (Up/Down/In/Out/Special/Other) have no
-/// wall of their own, so the loop defaults to the north wall rather than
-/// vanishing.
-fn self_loop_unit(direction: ExitDirection) -> Vector {
-    const DIAG: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    match direction {
-        ExitDirection::South => Vector { x: 0.0, y: 1.0 },
-        ExitDirection::East => Vector { x: 1.0, y: 0.0 },
-        ExitDirection::West => Vector { x: -1.0, y: 0.0 },
-        ExitDirection::Northeast => Vector { x: DIAG, y: -DIAG },
-        ExitDirection::Southeast => Vector { x: DIAG, y: DIAG },
-        ExitDirection::Southwest => Vector { x: -DIAG, y: DIAG },
-        ExitDirection::Northwest => Vector { x: -DIAG, y: -DIAG },
-        // North plus every non-planar direction defaults to the north wall.
-        _ => Vector { x: 0.0, y: -1.0 },
-    }
-}
-
 /// Draws a cross-level cardinal exit as a directional stub in the exit's
 /// compass direction, fading from full opacity at the room's edge toward
 /// [`CROSS_LEVEL_FADE_FLOOR`] at its tip so it reads as leaving for the
-/// neighbouring floor. `style` supplies the dash pattern. Deliberately carries
-/// no up/down glyph — the vertical sense is left to the fade; the `Stub` style
-/// is the one that keeps the ▲/▼ marker.
+/// neighbouring floor. Deliberately carries no up/down glyph — the vertical
+/// sense is left to the fade; `Stub` routing is the one that keeps the ▲/▼
+/// marker.
 fn draw_cross_level_stub(
     frame: &mut canvas::Frame,
+    connection: &RoomConnection,
     x: f32,
     y: f32,
     unit: Vector,
     opacity: f32,
     is_secret: bool,
-    style: ExitStyle,
 ) {
     let half = MAP_ROOM_SIZE / 2.0;
     let edge = Point {
@@ -420,57 +374,36 @@ fn draw_cross_level_stub(
         y: y + unit.y * reach,
     };
 
-    let near = apply_opacity(EXIT_COLOR, opacity);
-    let far = apply_opacity(EXIT_COLOR, opacity * CROSS_LEVEL_FADE_FLOOR);
+    let near = apply_opacity(connection.color, opacity);
+    let far = apply_opacity(connection.color, opacity * CROSS_LEVEL_FADE_FLOOR);
     let fade = gradient::Linear::new(edge, tip)
         .add_stop(0.0, near)
         .add_stop(1.0, far);
     let stroke = Stroke {
         style: stroke::Style::Gradient(fade.into()),
-        width: 1.0,
-        line_cap: style_line_cap(style),
+        width: connection.thickness,
+        line_cap: dash_line_cap(connection.dash),
         line_join: stroke::LineJoin::Round,
         line_dash: LineDash {
-            segments: style_segments(style, is_secret),
+            segments: dash_segments(connection.dash, is_secret),
             offset: 0,
         },
     };
     frame.stroke(&canvas::Path::line(edge, tip), stroke);
 }
 
-/// Draws a self-loop exit (destination == origin) as a small circle tangent to
-/// the room's wall on the exit's side, bulging outward. Reuses the exit
-/// `stroke` so style/secret/color read the same as any other exit, while the
-/// loop shape keeps a self-referential exit visually distinct from a dangling
-/// stub (which is otherwise geometrically identical).
-fn draw_self_loop(
-    frame: &mut canvas::Frame,
-    x: f32,
-    y: f32,
-    direction: ExitDirection,
-    stroke: Stroke<'_>,
-) {
-    let unit = self_loop_unit(direction);
-    // Place the center a radius beyond the wall so the circle is tangent to the
-    // room edge and grows outward along the exit direction.
-    let offset = MAP_ROOM_SIZE / 2.0 + SELF_LOOP_RADIUS;
-    let center = Point {
-        x: x + unit.x * offset,
-        y: y + unit.y * offset,
-    };
-    frame.stroke(&canvas::Path::circle(center, SELF_LOOP_RADIUS), stroke);
-}
-
-/// Draws one room connection: stubs, connecting line, arrowheads for
-/// one-way exits, external-area markers, and level-change stubs.
+/// Draws one resolved Connection half: the geometry pipeline's stroke,
+/// arrowheads for one-way links, external-area markers, and level-change
+/// treatments. Everything positional comes from the pre-resolved
+/// [`ConnectionGeometry`]; this function never re-derives ports, stubs, or
+/// routes.
 ///
 /// When `show_secrets` is false the connection's secrecy is ignored and it
 /// renders like any other exit — the map widget hides what the editor marks.
 ///
 /// `suppress_level_stubs` collapses cross-level exits back to the compact
-/// corner triangle (today's look), so ghosted adjacent floors don't bristle
-/// with directional stubs; the current floor passes it `false`.
-#[allow(clippy::too_many_lines)]
+/// corner triangle, so ghosted adjacent floors don't bristle with
+/// directional stubs; the current floor passes it `false`.
 pub fn draw_connection(
     frame: &mut canvas::Frame,
     atlas: &AtlasCache,
@@ -480,152 +413,55 @@ pub fn draw_connection(
     suppress_level_stubs: bool,
 ) {
     let is_secret = show_secrets && connection.is_secret;
-    let style = connection.style;
-    // The exit's style selects the dash pattern; secret connections still mute
-    // their fill-only pieces (level stubs, arrowheads, external markers).
-    let stroke = exit_stroke(opacity, is_secret, style);
+    let color = apply_opacity(connection.color, opacity);
+    let stroke = connection_stroke(color, connection.thickness, connection.dash, is_secret);
+    // Secret connections mute their fill-only pieces (level markers,
+    // arrowheads, external dots) — the dash carries secrecy on the stroke.
     let fill_opacity = if is_secret {
         opacity * SECRET_OPACITY
     } else {
         opacity
     };
+    let fill_color = apply_opacity(connection.color, fill_opacity);
+    let geometry = &connection.geometry;
 
-    match connection.to {
-        RoomConnectionEnd::Normal {
-            ref direction,
-            x,
-            y,
-            ..
-        } => {
-            let from_stub = cardinal_stub(
-                connection.from_x,
-                connection.from_y,
-                connection.from_direction,
-            );
-            let to_stub = cardinal_stub(x, y, *direction);
-
-            // A same-level Stub exit shows only bare directional stubs, no
-            // connecting line — both ends of a bidirectional pair, the source
-            // alone otherwise. Non-cardinal exits have no stub geometry, so they
-            // fall through to the normal line and never vanish.
-            if style == ExitStyle::Stub && from_stub.is_some() {
-                if let Some((from, to)) = from_stub {
-                    frame.stroke(&canvas::Path::line(from, to), stroke);
-                }
-                if connection.is_bidirectional
-                    && let Some((from, to)) = to_stub
-                {
-                    frame.stroke(&canvas::Path::line(from, to), stroke);
-                }
-                return;
-            }
-
-            let conn_line = match (from_stub, to_stub) {
-                (Some(from_stub), _) if !connection.is_bidirectional => {
-                    let start = from_stub.1;
-                    let end = Point { x, y };
-                    let clipped_end = clip_line_end_to_square(start, end, MAP_ROOM_SIZE * 1.25);
-                    Some((start, clipped_end))
-                }
-                (None, _) if !connection.is_bidirectional => {
-                    let start = Point {
-                        x: connection.from_x,
-                        y: connection.from_y,
-                    };
-                    let end = Point { x, y };
-                    let clipped_end = clip_line_end_to_square(start, end, MAP_ROOM_SIZE * 1.25);
-                    Some((start, clipped_end))
-                }
-                (Some(from_stub), Some(to_stub)) => Some((from_stub.1, to_stub.1)),
-                (Some(from_stub), None) => Some((from_stub.1, Point { x, y })),
-                (None, Some(to_stub)) => Some((
-                    Point {
-                        x: connection.from_x,
-                        y: connection.from_y,
-                    },
-                    to_stub.1,
-                )),
-                (None, None) => Some((
-                    Point {
-                        x: connection.from_x,
-                        y: connection.from_y,
-                    },
-                    Point { x, y },
-                )),
-            };
-
-            if let Some((from, to)) = from_stub {
-                let path = canvas::Path::line(from, to);
-                frame.stroke(&path, stroke);
-            }
-
-            if let Some((from, to)) = to_stub {
-                let path = canvas::Path::line(from, to);
-                frame.stroke(&path, stroke);
-            }
-
-            if let Some((from, to)) = conn_line {
-                let path = canvas::Path::line(from, to);
-                frame.stroke(&path, stroke);
-
-                if !connection.is_bidirectional {
-                    draw_arrow_head(
-                        frame,
-                        Vector {
-                            x: from.x,
-                            y: from.y,
-                        },
-                        Vector { x: to.x, y: to.y },
-                        apply_opacity(EXIT_COLOR, fill_opacity),
-                        0.1,
-                    );
-                }
+    match &connection.to {
+        RoomConnectionEnd::Normal { .. } | RoomConnectionEnd::SelfLoop => {
+            frame.stroke(&path_from_primitives(&geometry.primitives), stroke);
+            // One-way arrow at the arrival port, oriented by the resolved
+            // tangent; Stub routing has no line to arrow.
+            if !geometry.centerline.is_empty()
+                && let Some(toward_b) = connection.arrow_toward_b
+            {
+                draw_connection_arrow(frame, geometry, toward_b, fill_color);
             }
         }
-        RoomConnectionEnd::ToLevel { level, .. } => {
-            let up = level > connection.from_level
-                || (level == connection.from_level
-                    && connection.from_direction == ExitDirection::Up);
-            let (x, y) = (connection.from_x, connection.from_y);
-            if suppress_level_stubs {
-                // Ghost passes keep the compact corner triangle.
-                draw_level_stub(frame, x, y, up, fill_opacity);
-            } else if style == ExitStyle::Stub {
-                // Option 1: re-anchor the level triangle to the exit's side.
-                let (cx, cy) = level_stub_anchor(x, y, connection.from_direction, up);
-                draw_level_triangle(frame, cx, cy, up, fill_opacity);
-            } else if let Some(unit) = cardinal_unit(connection.from_direction) {
-                // Option 3: a fade-only directional gradient stub (no glyph)
-                // for planar cardinals.
-                draw_cross_level_stub(frame, x, y, unit, opacity, is_secret, style);
-            } else {
-                // Diagonal or non-planar (Up/Down): fall back to the corner.
-                draw_level_stub(frame, x, y, up, fill_opacity);
+        RoomConnectionEnd::None => {
+            // Dangling: the geometry's port → tip → directional tail, with
+            // an arrowhead at the tail end (skipped under Stub routing,
+            // whose geometry has no tail).
+            frame.stroke(&path_from_primitives(&geometry.primitives), stroke);
+            if let Some(&tail) = geometry.centerline.last() {
+                let tangent = geometry.end_tangent;
+                draw_arrow_head(
+                    frame,
+                    Vector::new(tail.x - tangent.x, tail.y - tangent.y),
+                    Vector::new(tail.x, tail.y),
+                    fill_color,
+                    0.1,
+                );
             }
         }
         RoomConnectionEnd::External { area_id } => {
-            let area_name = atlas.get_area(&area_id).map_or_else(
+            let area_name = atlas.get_area(area_id).map_or_else(
                 || "(unknown area)".to_string(),
                 |area| area.get_name().to_string(),
             );
+            frame.stroke(&path_from_primitives(&geometry.primitives), stroke);
 
-            let (end, text_anchor, align_x, align_y) = out_of_area_stub(connection);
-
-            let path = canvas::Path::line(
-                Point {
-                    x: connection.from_x,
-                    y: connection.from_y,
-                },
-                end,
-            );
-
-            frame.stroke(&path, stroke);
-
-            let circle = canvas::Path::circle(end, 0.075);
-
-            frame.fill(&circle, apply_opacity(EXIT_COLOR, fill_opacity));
-
-            let text = canvas::Text {
+            let (tip, text_anchor, align_x, align_y) = marker_anchor(geometry);
+            frame.fill(&canvas::Path::circle(tip, 0.075), fill_color);
+            frame.fill_text(canvas::Text {
                 content: area_name,
                 position: text_anchor,
                 align_x,
@@ -633,48 +469,42 @@ pub fn draw_connection(
                 color: apply_opacity(AREA_NAME_FONT_COLOR, fill_opacity),
                 size: 0.375.into(),
                 ..Default::default()
-            };
-
-            frame.fill_text(text);
+            });
         }
         RoomConnectionEnd::Unknown { .. } => {
             // Redacted destination: the link exists but its target was not
             // shared with the viewer. Render dimmer than a real external
-            // stub, mark the stub end with a small "?", and label it with
+            // stub, mark the stub tip with a small "?", and label it with
             // the literal "Unknown map" — never a name or id. Exits whose
             // hidden destinations coincide share a server token and thus
             // converge on the identical label.
             let dim = fill_opacity * UNKNOWN_MAP_OPACITY;
-            let (end, text_anchor, align_x, align_y) = out_of_area_stub(connection);
-
-            let path = canvas::Path::line(
-                Point {
-                    x: connection.from_x,
-                    y: connection.from_y,
-                },
-                end,
-            );
-
             frame.stroke(
-                &path,
-                exit_stroke(opacity * UNKNOWN_MAP_OPACITY, is_secret, style),
+                &path_from_primitives(&geometry.primitives),
+                connection_stroke(
+                    apply_opacity(connection.color, opacity * UNKNOWN_MAP_OPACITY),
+                    connection.thickness,
+                    connection.dash,
+                    is_secret,
+                ),
             );
 
+            let (tip, text_anchor, align_x, align_y) = marker_anchor(geometry);
             // A small "?" stands in for the usual stub dot.
             frame.fill_text(canvas::Text {
                 content: "?".to_string(),
-                position: end,
+                position: tip,
                 align_x: Alignment::Center,
                 align_y: Vertical::Center,
-                color: apply_opacity(EXIT_COLOR, dim),
+                color: apply_opacity(connection.color, dim),
                 size: 0.3.into(),
                 ..Default::default()
             });
 
             // Push the label one extra step out so it clears the "?" glyph.
             let label_anchor = Point {
-                x: text_anchor.x + (text_anchor.x - end.x),
-                y: text_anchor.y + (text_anchor.y - end.y),
+                x: text_anchor.x + (text_anchor.x - tip.x),
+                y: text_anchor.y + (text_anchor.y - tip.y),
             };
             frame.fill_text(canvas::Text {
                 content: "Unknown map".to_string(),
@@ -686,117 +516,84 @@ pub fn draw_connection(
                 ..Default::default()
             });
         }
-        RoomConnectionEnd::SelfLoop => {
-            draw_self_loop(
-                frame,
-                connection.from_x,
-                connection.from_y,
-                connection.from_direction,
-                stroke,
-            );
+        RoomConnectionEnd::ToLevel { level, direction, .. } => {
+            // Cross-level halves draw a marker treatment only — the shared
+            // geometry carries both rooms' stubs, so stroking it from each
+            // half would double-draw.
+            let up = *level > connection.from_level;
+            let (x, y) = (connection.room.get_x(), connection.room.get_y());
+            let marker_color = apply_opacity(connection.color, fill_opacity);
+            if suppress_level_stubs {
+                // Ghost passes keep the compact corner triangle.
+                draw_level_stub(frame, x, y, up, marker_color);
+            } else if connection.routing == ConnectionRouting::Stub {
+                // Stub routing re-anchors the level triangle to the
+                // endpoint's side.
+                let (cx, cy) = level_stub_anchor(x, y, *direction, up);
+                draw_level_triangle(frame, cx, cy, up, marker_color);
+            } else if let Some(unit) = cardinal_unit(*direction) {
+                // A fade-only directional gradient stub (no glyph) for
+                // planar cardinals.
+                draw_cross_level_stub(frame, connection, x, y, unit, opacity, is_secret);
+            } else {
+                // Diagonal or non-planar (Up/Down): fall back to the corner.
+                draw_level_stub(frame, x, y, up, marker_color);
+            }
         }
-        RoomConnectionEnd::None => match connection.from_direction {
-            ExitDirection::Up | ExitDirection::Down => {
-                draw_level_stub(
-                    frame,
-                    connection.from_x,
-                    connection.from_y,
-                    connection.from_direction == ExitDirection::Up,
-                    fill_opacity,
-                );
-            }
-            direction => {
-                if let Some((from, to)) =
-                    cardinal_stub(connection.from_x, connection.from_y, direction)
-                {
-                    let path = canvas::Path::line(from, to);
-                    frame.stroke(&path, stroke);
-                }
-            }
-        },
     }
 }
 
-/// Geometry shared by the out-of-area connection markers (external area and
-/// "Unknown map"): the stub endpoint, the label anchor just beyond it, and
-/// the label alignment, all derived from the exit's direction.
-fn out_of_area_stub(connection: &RoomConnection) -> (Point, Point, Alignment, Vertical) {
-    let (x, y, text_x, text_y, text_align_x, text_align_y) = match connection.from_direction {
-        ExitDirection::North | ExitDirection::Up => (
-            connection.from_x,
-            connection.from_y - MAP_EXIT_STUB_LENGTH,
-            connection.from_x,
-            connection.from_y - MAP_EXIT_STUB_LENGTH - 0.1,
-            Alignment::Center,
-            Vertical::Bottom,
-        ),
-        ExitDirection::East => (
-            connection.from_x + MAP_EXIT_STUB_LENGTH,
-            connection.from_y,
-            connection.from_x + MAP_EXIT_STUB_LENGTH + 0.1,
-            connection.from_y,
-            Alignment::Left,
-            Vertical::Center,
-        ),
-        ExitDirection::West => (
-            connection.from_x - MAP_EXIT_STUB_LENGTH,
-            connection.from_y,
-            connection.from_x - MAP_EXIT_STUB_LENGTH - 0.1,
-            connection.from_y,
-            Alignment::Right,
-            Vertical::Center,
-        ),
-        ExitDirection::Northeast => (
-            connection.from_x + MAP_EXIT_STUB_LENGTH,
-            connection.from_y - MAP_EXIT_STUB_LENGTH,
-            connection.from_x + MAP_EXIT_STUB_LENGTH + 0.1,
-            connection.from_y - MAP_EXIT_STUB_LENGTH - 0.1,
-            Alignment::Left,
-            Vertical::Bottom,
-        ),
-        ExitDirection::Southeast => (
-            connection.from_x + MAP_EXIT_STUB_LENGTH,
-            connection.from_y + MAP_EXIT_STUB_LENGTH,
-            connection.from_x + MAP_EXIT_STUB_LENGTH + 0.1,
-            connection.from_y + MAP_EXIT_STUB_LENGTH + 0.1,
-            Alignment::Left,
-            Vertical::Top,
-        ),
-        ExitDirection::Southwest => (
-            connection.from_x - MAP_EXIT_STUB_LENGTH,
-            connection.from_y + MAP_EXIT_STUB_LENGTH,
-            connection.from_x - MAP_EXIT_STUB_LENGTH - 0.1,
-            connection.from_y + MAP_EXIT_STUB_LENGTH + 0.1,
-            Alignment::Right,
-            Vertical::Top,
-        ),
-        ExitDirection::Northwest => (
-            connection.from_x - MAP_EXIT_STUB_LENGTH,
-            connection.from_y - MAP_EXIT_STUB_LENGTH,
-            connection.from_x - MAP_EXIT_STUB_LENGTH - 0.1,
-            connection.from_y - MAP_EXIT_STUB_LENGTH - 0.1,
-            Alignment::Right,
-            Vertical::Bottom,
-        ),
-        _ => (
-            connection.from_x,
-            connection.from_y + MAP_EXIT_STUB_LENGTH,
-            connection.from_x,
-            connection.from_y + MAP_EXIT_STUB_LENGTH + 0.1,
-            Alignment::Center,
-            Vertical::Top,
-        ),
+/// The one-way arrowhead at a Connection's arrival port, oriented by the
+/// resolved tangent in that traversal's direction.
+fn draw_connection_arrow(
+    frame: &mut canvas::Frame,
+    geometry: &ConnectionGeometry,
+    toward_b: bool,
+    color: Color,
+) {
+    let (anchor, tangent) = if toward_b {
+        let Some(port) = geometry.port_b else { return };
+        (port, geometry.end_tangent)
+    } else {
+        // Traversal runs B→A: the arrival direction at A is the reversed
+        // start tangent.
+        (geometry.port_a, geometry.start_tangent.scale(-1.0))
     };
+    draw_arrow_head(
+        frame,
+        Vector::new(anchor.x - tangent.x, anchor.y - tangent.y),
+        Vector::new(anchor.x, anchor.y),
+        color,
+        0.1,
+    );
+}
 
-    (
-        Point { x, y },
-        Point {
-            x: text_x,
-            y: text_y,
-        },
-        text_align_x,
-        text_align_y,
-    )
+/// Geometry shared by the out-of-area connection markers (external area and
+/// "Unknown map"): the stub tip they anchor on, the label anchor just beyond
+/// it, and the label alignment, all derived from the resolved stub's outward
+/// direction.
+fn marker_anchor(geometry: &ConnectionGeometry) -> (Point, Point, Alignment, Vertical) {
+    let tip = to_point(geometry.stub_tip_a);
+    let outward = geometry
+        .port_a
+        .direction_to(geometry.stub_tip_a)
+        .unwrap_or(MapPoint::new(0.0, 1.0));
+    let text_anchor = Point::new(tip.x + outward.x * 0.1, tip.y + outward.y * 0.1);
+    let align_x = if outward.x > 0.5 {
+        Alignment::Left
+    } else if outward.x < -0.5 {
+        Alignment::Right
+    } else {
+        Alignment::Center
+    };
+    let align_y = if outward.y > 0.5 {
+        Vertical::Top
+    } else if outward.y < -0.5 {
+        Vertical::Bottom
+    } else {
+        Vertical::Center
+    };
+    (tip, text_anchor, align_x, align_y)
 }
 
 /// Draws a room as a filled, outlined rounded square centered on its
@@ -948,5 +745,53 @@ pub fn draw_shape(frame: &mut canvas::Frame, shape: &Shape, opacity: f32, show_s
             &path,
             solid_stroke(apply_opacity(stroke_color, opacity), shape.stroke_width),
         );
+    }
+}
+
+/// Converts geometry-pipeline primitives into a drawable canvas path. The
+/// 1:1 bridge every renderer uses so the stroke can never diverge from the
+/// hit-tested/culled geometry.
+#[must_use]
+pub fn path_from_primitives(primitives: &[PathPrimitive]) -> canvas::Path {
+    canvas::Path::new(|builder| {
+        for &primitive in primitives {
+            match primitive {
+                PathPrimitive::MoveTo(p) => builder.move_to(to_point(p)),
+                PathPrimitive::LineTo(p) => builder.line_to(to_point(p)),
+                PathPrimitive::QuadTo { control, to } => {
+                    builder.quadratic_curve_to(to_point(control), to_point(to));
+                }
+                PathPrimitive::Circle { center, radius } => {
+                    builder.circle(to_point(center), radius);
+                }
+            }
+        }
+    })
+}
+
+fn to_point(p: MapPoint) -> Point {
+    Point::new(p.x, p.y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `EXIT_COLOR` is the rendered form of the wire-canonical default
+    /// Connection color; the two authorities must stay one gray.
+    #[test]
+    fn exit_color_matches_the_connection_default() {
+        let parsed = parse_color(smudgy_cloud::DEFAULT_CONNECTION_COLOR)
+            .expect("the default connection color parses");
+        for (channel, (a, b)) in [
+            ("r", (parsed.r, EXIT_COLOR.r)),
+            ("g", (parsed.g, EXIT_COLOR.g)),
+            ("b", (parsed.b, EXIT_COLOR.b)),
+        ] {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "channel {channel} drifted: parsed {a} vs EXIT_COLOR {b}"
+            );
+        }
     }
 }

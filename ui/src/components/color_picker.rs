@@ -173,9 +173,7 @@ fn track_drag(
         iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
             let position = cursor.position_in(bounds)?;
             state.dragging = true;
-            Some(
-                canvas::Action::publish(message(position, bounds.size(), false)).and_capture(),
-            )
+            Some(canvas::Action::publish(message(position, bounds.size(), false)).and_capture())
         }
         iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
             // Clamp to bounds so dragging past an edge pins to it.
@@ -186,9 +184,7 @@ fn track_drag(
             );
             Some(canvas::Action::publish(message(clamped, bounds.size(), false)).and_capture())
         }
-        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-            if state.dragging =>
-        {
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
             state.dragging = false;
             let position = cursor.position().map_or_else(
                 || Point::new(bounds.width / 2.0, bounds.height / 2.0),
@@ -262,21 +258,15 @@ impl canvas::Program<Message, Theme> for SvSquare {
 
         frame.fill(
             &full,
-            gradient::Linear::new(
-                Point::new(0.0, 0.0),
-                Point::new(bounds.width, 0.0),
-            )
-            .add_stop(0.0, Color::WHITE)
-            .add_stop(1.0, hue_color),
+            gradient::Linear::new(Point::new(0.0, 0.0), Point::new(bounds.width, 0.0))
+                .add_stop(0.0, Color::WHITE)
+                .add_stop(1.0, hue_color),
         );
         frame.fill(
             &full,
-            gradient::Linear::new(
-                Point::new(0.0, 0.0),
-                Point::new(0.0, bounds.height),
-            )
-            .add_stop(0.0, Color::TRANSPARENT)
-            .add_stop(1.0, Color::BLACK),
+            gradient::Linear::new(Point::new(0.0, 0.0), Point::new(0.0, bounds.height))
+                .add_stop(0.0, Color::TRANSPARENT)
+                .add_stop(1.0, Color::BLACK),
         );
 
         cursor_ring(
@@ -339,10 +329,8 @@ impl canvas::Program<Message, Theme> for HueStrip {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let full = canvas::Path::rectangle(Point::ORIGIN, bounds.size());
 
-        let mut rainbow = gradient::Linear::new(
-            Point::new(0.0, 0.0),
-            Point::new(bounds.width, 0.0),
-        );
+        let mut rainbow =
+            gradient::Linear::new(Point::new(0.0, 0.0), Point::new(bounds.width, 0.0));
         for sextant in 0..=6 {
             #[allow(clippy::cast_precision_loss)]
             let offset = sextant as f32 / 6.0;
@@ -360,10 +348,7 @@ impl canvas::Program<Message, Theme> for HueStrip {
 
         cursor_ring(
             &mut frame,
-            Point::new(
-                (self.hsv.hue / 360.0) * bounds.width,
-                bounds.height / 2.0,
-            ),
+            Point::new((self.hsv.hue / 360.0) * bounds.width, bounds.height / 2.0),
             Hsv {
                 hue: self.hsv.hue,
                 saturation: 1.0,

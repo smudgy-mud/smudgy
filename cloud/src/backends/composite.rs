@@ -27,10 +27,7 @@
 //! across ticks (no needless refetch) yet still let an edit's rev bump flow
 //! through the same reconciliation path.
 
-use std::{
-    collections::HashSet,
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -40,9 +37,8 @@ use uuid::Uuid;
 use super::{EphemeralBackend, LEGACY_ACCESS_FINGERPRINT, MapperBackend};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, Label, LabelArgs, LabelId, LabelUpdates,
-    CloudError, CloudResult, Room, RoomUpdates, Shape, ShapeArgs, ShapeId, ShapeUpdates, SyncRow,
-    mapper::RoomKey,
+    CloudError, CloudResult, CreateAreaRequest, SyncRow,
+    mutation::{MutationEnvelope, MutationResult},
 };
 
 type DynBackend = Arc<dyn MapperBackend + Send + Sync>;
@@ -135,7 +131,9 @@ impl CompositeBackend {
     /// race that insert away). Local ids only leave the set through this
     /// backend's own `delete_area`, so a union never leaks a stale id.
     fn refresh_local_areas(&self, areas: &[Area]) {
-        self.local_areas.write().extend(areas.iter().map(|area| area.id));
+        self.local_areas
+            .write()
+            .extend(areas.iter().map(|area| area.id));
     }
 
     /// Synthesizes a sync row per local and ephemeral area from each tier's
@@ -144,7 +142,13 @@ impl CompositeBackend {
         let areas = self.local.list_areas().await?;
         self.refresh_local_areas(&areas);
         let mut rows: Vec<SyncRow> = areas.iter().map(synthesized_row).collect();
-        rows.extend(self.ephemeral.list_areas().await?.iter().map(synthesized_row));
+        rows.extend(
+            self.ephemeral
+                .list_areas()
+                .await?
+                .iter()
+                .map(synthesized_row),
+        );
         Ok(rows)
     }
 }
@@ -235,7 +239,10 @@ impl MapperBackend for CompositeBackend {
     }
 
     async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()> {
-        self.area_backend(*area_id).await.update_area(area_id, updates).await
+        self.area_backend(*area_id)
+            .await
+            .update_area(area_id, updates)
+            .await
     }
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
@@ -243,6 +250,21 @@ impl MapperBackend for CompositeBackend {
         self.ephemeral_areas.write().remove(area_id);
         self.local_areas.write().remove(area_id);
         result
+    }
+
+    // ===== VERSIONED MUTATIONS =====
+
+    async fn execute_mutation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult> {
+        // Route to the owning tier with the envelope untouched: preconditions
+        // are the addressed backend's to judge, never this layer's.
+        self.area_backend(*area_id)
+            .await
+            .execute_mutation(area_id, envelope)
+            .await
     }
 
     async fn move_area_to_atlas(
@@ -280,7 +302,9 @@ impl MapperBackend for CompositeBackend {
         let local = self.local.list_atlases().await?;
         // Union (not wholesale replace) for the same reason as
         // `refresh_local_areas`: don't race a concurrent `create_atlas` away.
-        self.local_atlases.write().extend(local.iter().map(|atlas| atlas.id));
+        self.local_atlases
+            .write()
+            .extend(local.iter().map(|atlas| atlas.id));
         let mut all = local;
         if self.cloud.has_credential() {
             match self.cloud.list_atlases().await {
@@ -436,160 +460,12 @@ impl MapperBackend for CompositeBackend {
         // it rather than skip. Cloud-specific gating happens per-call.
         true
     }
-
-    // ===== AREA PROPERTIES =====
-
-    async fn set_area_property(&self, area_id: &AreaId, name: &str, value: &str) -> CloudResult<()> {
-        self.area_backend(*area_id)
-            .await
-            .set_area_property(area_id, name, value)
-            .await
-    }
-
-    async fn delete_area_property(&self, area_id: &AreaId, name: &str) -> CloudResult<()> {
-        self.area_backend(*area_id)
-            .await
-            .delete_area_property(area_id, name)
-            .await
-    }
-
-    // ===== ROOM OPERATIONS =====
-
-    async fn update_room(&self, room_key: &RoomKey, updates: RoomUpdates) -> CloudResult<Room> {
-        self.area_backend(room_key.area_id)
-            .await
-            .update_room(room_key, updates)
-            .await
-    }
-
-    async fn delete_room(&self, room_key: &RoomKey) -> CloudResult<()> {
-        self.area_backend(room_key.area_id).await.delete_room(room_key).await
-    }
-
-    async fn set_room_property(
-        &self,
-        room_key: &RoomKey,
-        name: &str,
-        value: &str,
-    ) -> CloudResult<()> {
-        self.area_backend(room_key.area_id)
-            .await
-            .set_room_property(room_key, name, value)
-            .await
-    }
-
-    async fn delete_room_property(&self, room_key: &RoomKey, name: &str) -> CloudResult<()> {
-        self.area_backend(room_key.area_id)
-            .await
-            .delete_room_property(room_key, name)
-            .await
-    }
-
-    // ===== ROOM TAGS =====
-
-    async fn add_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()> {
-        self.area_backend(room_key.area_id)
-            .await
-            .add_room_tag(room_key, tag)
-            .await
-    }
-
-    async fn remove_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()> {
-        self.area_backend(room_key.area_id)
-            .await
-            .remove_room_tag(room_key, tag)
-            .await
-    }
-
-    // ===== EXIT OPERATIONS =====
-
-    async fn create_room_exit(&self, room_key: &RoomKey, exit_data: ExitArgs) -> CloudResult<Exit> {
-        self.area_backend(room_key.area_id)
-            .await
-            .create_room_exit(room_key, exit_data)
-            .await
-    }
-
-    async fn update_exit(
-        &self,
-        area_id: &AreaId,
-        exit_id: &ExitId,
-        updates: ExitUpdates,
-    ) -> CloudResult<()> {
-        self.area_backend(*area_id)
-            .await
-            .update_exit(area_id, exit_id, updates)
-            .await
-    }
-
-    async fn delete_exit(&self, area_id: &AreaId, exit_id: &ExitId) -> CloudResult<()> {
-        self.area_backend(*area_id).await.delete_exit(area_id, exit_id).await
-    }
-
-    // ===== LABEL OPERATIONS =====
-
-    async fn create_label(&self, area_id: &AreaId, label_data: LabelArgs) -> CloudResult<Label> {
-        self.area_backend(*area_id)
-            .await
-            .create_label(area_id, label_data)
-            .await
-    }
-
-    async fn update_label(
-        &self,
-        area_id: &AreaId,
-        label_id: &LabelId,
-        updates: LabelUpdates,
-    ) -> CloudResult<()> {
-        self.area_backend(*area_id)
-            .await
-            .update_label(area_id, label_id, updates)
-            .await
-    }
-
-    async fn delete_label(&self, area_id: &AreaId, label_id: &LabelId) -> CloudResult<()> {
-        self.area_backend(*area_id)
-            .await
-            .delete_label(area_id, label_id)
-            .await
-    }
-
-    // ===== SHAPE OPERATIONS =====
-
-    async fn create_shape(&self, area_id: &AreaId, shape_data: ShapeArgs) -> CloudResult<Shape> {
-        self.area_backend(*area_id)
-            .await
-            .create_shape(area_id, shape_data)
-            .await
-    }
-
-    async fn update_shape(
-        &self,
-        area_id: &AreaId,
-        shape_id: &ShapeId,
-        updates: ShapeUpdates,
-    ) -> CloudResult<()> {
-        self.area_backend(*area_id)
-            .await
-            .update_shape(area_id, shape_id, updates)
-            .await
-    }
-
-    async fn delete_shape(&self, area_id: &AreaId, shape_id: &ShapeId) -> CloudResult<()> {
-        self.area_backend(*area_id)
-            .await
-            .delete_shape(area_id, shape_id)
-            .await
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AreaAccess, CreateAreaRequest, Label, LabelArgs, LabelId, LabelUpdates, CloudError, Room,
-        RoomUpdates, Shape, ShapeArgs, ShapeId, ShapeUpdates, backends::LocalBackend,
-    };
+    use crate::{AreaAccess, CloudError, CreateAreaRequest, RoomUpdates, backends::LocalBackend};
     use chrono::Utc;
     use parking_lot::Mutex;
     use std::path::PathBuf;
@@ -656,56 +532,14 @@ mod tests {
         async fn delete_area(&self, _: &AreaId) -> CloudResult<()> {
             Ok(())
         }
-        async fn set_area_property(&self, _: &AreaId, _: &str, _: &str) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn delete_area_property(&self, _: &AreaId, _: &str) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn update_room(&self, room_key: &RoomKey, _: RoomUpdates) -> CloudResult<Room> {
-            Err(CloudError::RoomNotFound(room_key.clone()))
-        }
-        async fn delete_room(&self, _: &RoomKey) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn set_room_property(&self, _: &RoomKey, _: &str, _: &str) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn delete_room_property(&self, _: &RoomKey, _: &str) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn add_room_tag(&self, _: &RoomKey, _: &str) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn remove_room_tag(&self, _: &RoomKey, _: &str) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn create_room_exit(&self, _: &RoomKey, _: ExitArgs) -> CloudResult<Exit> {
+        // The stub never accepts envelopes, so a routing mistake (a local
+        // area's mutation reaching the cloud tier) fails the test loudly.
+        async fn execute_mutation(
+            &self,
+            _: &AreaId,
+            _: &MutationEnvelope,
+        ) -> CloudResult<MutationResult> {
             Err(CloudError::NotFoundOrNoAccess)
-        }
-        async fn update_exit(&self, _: &AreaId, _: &ExitId, _: ExitUpdates) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn delete_exit(&self, _: &AreaId, _: &ExitId) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn create_label(&self, _: &AreaId, _: LabelArgs) -> CloudResult<Label> {
-            Err(CloudError::NotFoundOrNoAccess)
-        }
-        async fn update_label(&self, _: &AreaId, _: &LabelId, _: LabelUpdates) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn delete_label(&self, _: &AreaId, _: &LabelId) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn create_shape(&self, _: &AreaId, _: ShapeArgs) -> CloudResult<Shape> {
-            Err(CloudError::NotFoundOrNoAccess)
-        }
-        async fn update_shape(&self, _: &AreaId, _: &ShapeId, _: ShapeUpdates) -> CloudResult<()> {
-            Ok(())
-        }
-        async fn delete_shape(&self, _: &AreaId, _: &ShapeId) -> CloudResult<()> {
-            Ok(())
         }
     }
 
@@ -726,11 +560,13 @@ mod tests {
                 copied_at: None,
                 family_token: None,
             },
+            format_version: crate::AREA_FORMAT_VERSION,
             content_hash: None,
             properties: Vec::new(),
             rooms: Vec::new(),
             labels: Vec::new(),
             shapes: Vec::new(),
+            connections: Vec::new(),
             linked_areas: Vec::new(),
         }
     }
@@ -902,13 +738,26 @@ mod tests {
             "ephemeral areas are not local-tier areas"
         );
 
-        // Routing: reads and writes reach the in-memory tier.
+        // Routing: reads and writes reach the in-memory tier (the cloud stub
+        // rejects every envelope, so success proves the routing).
         composite
-            .update_room(
-                &RoomKey::new(area.id, crate::RoomNumber(1)),
-                RoomUpdates {
-                    title: Some("Gate".to_string()),
-                    ..RoomUpdates::default()
+            .execute_mutation(
+                &area.id,
+                &MutationEnvelope {
+                    operation_id: Uuid::new_v4(),
+                    preconditions: vec![crate::mutation::Precondition {
+                        resource: crate::mutation::ResourceKind::Area,
+                        id: area.id.0,
+                        expected_rev: 1,
+                        access_fingerprint: None,
+                    }],
+                    payload: vec![crate::mutation::AreaMutation::UpsertRoom {
+                        room_number: crate::RoomNumber(1),
+                        body: RoomUpdates {
+                            title: Some("Gate".to_string()),
+                            ..RoomUpdates::default()
+                        },
+                    }],
                 },
             )
             .await
@@ -932,6 +781,46 @@ mod tests {
             composite.get_area(&area.id).await,
             Err(CloudError::NotFoundOrNoAccess)
         ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A mutation envelope routes to the tier that owns the area, envelope
+    /// unchanged: a local area's envelope lands on the local backend's CAS
+    /// (the cloud stub rejects every envelope, so success proves routing).
+    #[tokio::test]
+    async fn execute_mutation_routes_to_the_owning_tier() {
+        let root = temp_root();
+        let (local, local_id) = local_with_one_area(&root).await;
+        let cloud = Arc::new(StubCloud::new(true)); // signed in — routing must still pick local
+        let composite = CompositeBackend::new(local, cloud);
+
+        let envelope = MutationEnvelope {
+            operation_id: Uuid::new_v4(),
+            preconditions: vec![crate::mutation::Precondition {
+                resource: crate::mutation::ResourceKind::Area,
+                id: local_id.0,
+                expected_rev: 1,
+                access_fingerprint: None,
+            }],
+            payload: vec![crate::mutation::AreaMutation::UpsertRoom {
+                room_number: crate::RoomNumber(1),
+                body: RoomUpdates {
+                    title: Some("Hall".to_string()),
+                    ..RoomUpdates::default()
+                },
+            }],
+        };
+        let result = composite
+            .execute_mutation(&local_id, &envelope)
+            .await
+            .expect("envelope reaches the local tier");
+        assert_eq!(result.versions[0].rev, 2);
+
+        let details = composite.get_area(&local_id).await.expect("get");
+        assert_eq!(details.area.rev, 2);
+        assert_eq!(details.rooms.len(), 1);
+        assert_eq!(details.rooms[0].title, "Hall");
 
         std::fs::remove_dir_all(&root).ok();
     }

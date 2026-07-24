@@ -4,18 +4,26 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use log::warn;
 
 use crate::{
-    AreaAccess, AreaId, AreaWithDetails, AtlasId, ExitId, ExitStyle, Label, LabelId, CloudError, CloudResult,
-    RoomNumber, RoomUpdates, Shape, ShapeId,
+    AREA_FORMAT_VERSION, Area, AreaAccess, AreaId, AreaWithDetails, AtlasId, CloudError,
+    CloudResult, Connection, ConnectionKind, ExitDirection, ExitId, Label, LabelId, MapPoint,
+    RoomNumber, RoomUpdates, Shape, ShapeId, connection_geometry,
+    connection_lifecycle::{self, ExitTopology, RoomSite},
     mapper::{
         RoomKey,
         exit_cache::ExitCache,
         room_cache::{PropertyEntry, RoomCache},
         room_connection::{RoomConnection, RoomConnectionEnd},
     },
+    parse_css_color,
 };
 use rstar::{AABB, RTree, RTreeObject};
+
+/// The rendered fallback when a Connection's stored color fails to parse —
+/// the same gray as [`crate::DEFAULT_CONNECTION_COLOR`].
+const DEFAULT_CONNECTION_ICED_COLOR: iced::Color = iced::Color::from_rgb8(164, 164, 164);
 
 /// Cloud metadata for an area beyond its geometry: the viewer's access block,
 /// owner attribution, atlas membership, and clone provenance.
@@ -47,6 +55,10 @@ pub struct AreaCache {
     meta: AreaMeta,
     rooms_by_number: HashMap<RoomNumber, Arc<RoomCache>>,
     rooms: Vec<Arc<RoomCache>>,
+    /// The stored Connection rows, as projected (or locally maintained by
+    /// the optimistic edit paths); [`Self::room_connections`] is resolved
+    /// from these.
+    connections: Vec<Connection>,
     room_connections: Vec<RoomConnection>,
     properties: HashMap<String, PropertyEntry>,
     labels: Vec<Label>,
@@ -89,8 +101,11 @@ struct ConnectionSpatialEntry {
 
 impl ConnectionSpatialEntry {
     fn new(index: usize, connection: &RoomConnection) -> Self {
-        let bounds = connection_bounds(connection);
-        Self { bounds, index }
+        let bounds = &connection.geometry.bounds;
+        Self {
+            bounds: AABB::from_corners([bounds.min_x, bounds.min_y], [bounds.max_x, bounds.max_y]),
+            index,
+        }
     }
 }
 
@@ -114,6 +129,9 @@ impl AreaCache {
         let entries: Vec<_> = room_connections
             .iter()
             .enumerate()
+            // An empty bounds is the inverted-infinity sentinel; it must
+            // never reach the spatial index.
+            .filter(|(_, connection)| !connection.geometry.bounds.is_empty())
             .map(|(index, connection)| ConnectionSpatialEntry::new(index, connection))
             .collect();
         RTree::bulk_load(entries)
@@ -124,8 +142,10 @@ impl AreaCache {
         rooms_by_number: HashMap<RoomNumber, Arc<RoomCache>>,
         rooms: Vec<Arc<RoomCache>>,
         max_room_number: RoomNumber,
+        connections: Vec<Connection>,
     ) -> Self {
-        let room_connections = Self::build_room_connections(&self.id, &rooms_by_number);
+        let room_connections =
+            Self::build_room_connections(&self.id, &connections, &rooms_by_number);
         let rooms_index = Self::build_rooms_index(&rooms);
         let room_connections_index = Self::build_room_connections_index(&room_connections);
 
@@ -134,6 +154,7 @@ impl AreaCache {
             rooms_by_number,
             rooms,
             max_room_number,
+            connections,
             room_connections,
             rooms_index,
             room_connections_index,
@@ -172,7 +193,8 @@ impl AreaCache {
             })
             .collect();
 
-        let room_connections = Self::build_room_connections(&area.area.id, &rooms_by_number);
+        let room_connections =
+            Self::build_room_connections(&area.area.id, &area.connections, &rooms_by_number);
         let rooms_index = Self::build_rooms_index(&rooms);
         let room_connections_index = Self::build_room_connections_index(&room_connections);
 
@@ -197,6 +219,7 @@ impl AreaCache {
             properties,
             labels: area.labels,
             shapes: area.shapes,
+            connections: area.connections,
             room_connections,
             rooms_index,
             room_connections_index,
@@ -238,173 +261,246 @@ impl AreaCache {
         &self.shapes
     }
 
+    /// Resolves the stored `connections` array into render views: for each
+    /// Connection, look up its endpoint rooms and member exits, resolve the
+    /// geometry exactly once, and derive the special-kind end facts from
+    /// visible topology. A Connection whose projection is corrupt (missing
+    /// endpoint room, no member exit) is skipped with a warning — never a
+    /// panic. Cross-level Connections emit two halves, one per endpoint
+    /// level, sharing one geometry [`Arc`].
     #[allow(clippy::too_many_lines)]
     fn build_room_connections(
         area_id: &AreaId,
+        connections: &[Connection],
         rooms_by_number: &HashMap<RoomNumber, Arc<RoomCache>>,
     ) -> Vec<RoomConnection> {
-        let mut skip_exit_ids = HashSet::new();
-
-        let mut room_connections = Vec::new();
-
+        // One walk of the rooms builds the connection_id → members map.
+        let mut members_by_connection: HashMap<
+            crate::ConnectionId,
+            Vec<(&Arc<RoomCache>, &ExitCache)>,
+        > = HashMap::new();
         for room in rooms_by_number.values() {
-            for from_exit in room.get_exits() {
-                if skip_exit_ids.contains(&from_exit.id) {
+            for exit in room.get_exits() {
+                members_by_connection
+                    .entry(exit.connection_id)
+                    .or_default()
+                    .push((room, exit));
+            }
+        }
+
+        let mut room_connections = Vec::with_capacity(connections.len());
+        for connection in connections {
+            let Some(room_a) = rooms_by_number.get(&connection.endpoint_a.room_number) else {
+                warn!(
+                    "area {area_id}: connection {} endpoint room {} missing from the projection; skipping",
+                    connection.id, connection.endpoint_a.room_number.0
+                );
+                continue;
+            };
+            let room_b = if let Some(endpoint) = &connection.endpoint_b {
+                let Some(room) = rooms_by_number.get(&endpoint.room_number) else {
+                    warn!(
+                        "area {area_id}: connection {} endpoint room {} missing from the projection; skipping",
+                        connection.id, endpoint.room_number.0
+                    );
                     continue;
-                }
+                };
+                Some(room)
+            } else {
+                None
+            };
+            let members = members_by_connection
+                .get(&connection.id)
+                .map_or(&[][..], Vec::as_slice);
+            let Some(&(member_room, member_exit)) = members.first() else {
+                warn!(
+                    "area {area_id}: connection {} has no member exit; skipping",
+                    connection.id
+                );
+                continue;
+            };
 
-                // let's see if we have a matching exit coming back
-                let paired_room: Option<&Arc<RoomCache>> =
-                    if from_exit.to_area_id.as_ref() == Some(area_id) {
-                        from_exit
-                            .to_room_number
-                            .and_then(|ref n| rooms_by_number.get(n))
-                    } else {
-                        // if the exit is in a different area, let's say it isn't bidirectional for simplicy's sake
-                        // (this field is meant primarily for the graphical mapper, which will only show one area at a time)
-                        None
-                    };
-
-                let mut is_bidirectional = false;
-                let mut paired_exit_secret = false;
-                let mut paired_exit_style: Option<ExitStyle> = None;
-
-                if let Some(paired_room) = paired_room {
-                    for paired_exit in paired_room.get_exits() {
-                        if paired_exit.to_area_id.as_ref() == Some(area_id)
-                            && paired_exit.to_room_number == Some(room.get_room_number())
-                            && paired_exit.to_direction == Some(from_exit.from_direction)
-                            && Some(paired_exit.from_direction) == from_exit.to_direction
-                        {
-                            is_bidirectional = true;
-                            paired_exit_secret = paired_exit.is_secret;
-                            paired_exit_style = Some(paired_exit.style);
-                            skip_exit_ids.insert(paired_exit.id);
-                        }
-                    }
-                }
-
-                let exit_secret = from_exit.is_secret || room.is_secret();
-                let exit_style = from_exit.style;
-
-                if let Some(paired_room) = paired_room {
-                    let is_secret =
-                        exit_secret || paired_exit_secret || paired_room.is_secret();
-                    if paired_room.get_room_number() == room.get_room_number() {
-                        // Self-loop: the exit returns to its own room. A Normal
-                        // end would collapse to a bare stub (source == target),
-                        // reading identically to a dangling exit, so emit a
-                        // SelfLoop for the renderer to mark with a loop arc.
-                        room_connections.push(RoomConnection {
-                            from_level: room.get_level(),
-                            from_x: room.get_x(),
-                            from_y: room.get_y(),
-                            from_direction: from_exit.from_direction,
-                            room: room.clone(),
-                            is_bidirectional,
-                            is_secret,
-                            style: exit_style,
-                            to: RoomConnectionEnd::SelfLoop,
-                        });
-                    } else if paired_room.get_level() == room.get_level() {
-                        room_connections.push(RoomConnection {
-                            from_level: room.get_level(),
-                            from_x: room.get_x(),
-                            from_y: room.get_y(),
-                            from_direction: from_exit.from_direction,
-                            room: room.clone(),
-                            is_bidirectional,
-                            is_secret,
-                            style: exit_style,
-                            to: RoomConnectionEnd::Normal {
-                                x: paired_room.get_x(),
-                                y: paired_room.get_y(),
-                                direction: from_exit.to_direction.unwrap_or_default(),
-                                room: paired_room.clone(),
-                            },
-                        });
-                    } else {
-                        room_connections.push(RoomConnection {
-                            from_level: room.get_level(),
-                            from_x: room.get_x(),
-                            from_y: room.get_y(),
-                            from_direction: from_exit.from_direction,
-                            room: room.clone(),
-                            is_bidirectional,
-                            is_secret,
-                            style: exit_style,
-                            to: RoomConnectionEnd::ToLevel {
-                                level: paired_room.get_level(),
-                                x: paired_room.get_x(),
-                                y: paired_room.get_y(),
-                                direction: from_exit.to_direction.unwrap_or_default(),
-                                room: paired_room.clone(),
-                            },
-                        });
-                        room_connections.push(RoomConnection {
-                            from_level: paired_room.get_level(),
-                            from_x: paired_room.get_x(),
-                            from_y: paired_room.get_y(),
-                            from_direction: from_exit.to_direction.unwrap_or_default(),
-                            room: paired_room.clone(),
-                            is_bidirectional,
-                            is_secret,
-                            style: paired_exit_style.unwrap_or(exit_style),
-                            to: RoomConnectionEnd::ToLevel {
-                                level: room.get_level(),
-                                x: room.get_x(),
-                                y: room.get_y(),
-                                direction: from_exit.from_direction,
-                                room: room.clone(),
-                            },
-                        });
-                    }
-                } else if from_exit.to_unknown {
-                    // Redacted destination: the server nulled `to_*` and set
-                    // `to_unknown`, so this must render as "Unknown map" —
-                    // not as a dangling exit.
-                    room_connections.push(RoomConnection {
-                        from_level: room.get_level(),
-                        from_x: room.get_x(),
-                        from_y: room.get_y(),
-                        from_direction: from_exit.from_direction,
-                        room: room.clone(),
-                        is_bidirectional,
-                        is_secret: exit_secret,
-                        style: exit_style,
-                        to: RoomConnectionEnd::Unknown {
-                            token: from_exit.to_area_token.clone().unwrap_or_default(),
+            let geometry = Arc::new(connection_geometry::resolve(
+                &connection_geometry::GeometryInput {
+                    kind: connection.kind,
+                    routing: connection.routing,
+                    corner: connection.corner,
+                    endpoint_a: connection_geometry::EndpointGeometry {
+                        room_center: MapPoint::new(room_a.get_x(), room_a.get_y()),
+                        side: connection.endpoint_a.side,
+                        port_offset: connection.endpoint_a.port_offset,
+                    },
+                    endpoint_b: connection.endpoint_b.as_ref().zip(room_b).map(
+                        |(endpoint, room)| connection_geometry::EndpointGeometry {
+                            room_center: MapPoint::new(room.get_x(), room.get_y()),
+                            side: endpoint.side,
+                            port_offset: endpoint.port_offset,
                         },
-                    });
-                } else if let Some(area_id) = from_exit.to_area_id {
+                    ),
+                    route_points: &connection.route_points,
+                    thickness: connection.thickness,
+                },
+            ));
+
+            let is_bidirectional = members.len() == 2;
+            let arrow_toward_b = if is_bidirectional || connection.kind == ConnectionKind::SelfLoop
+            {
+                None
+            } else {
+                Some(member_room.get_room_number() == connection.endpoint_a.room_number)
+            };
+            let is_secret = members.iter().any(|(_, exit)| exit.is_secret)
+                || room_a.is_secret()
+                || room_b.is_some_and(|room| room.is_secret());
+            let base = RoomConnection {
+                connection_id: connection.id,
+                from_level: room_a.get_level(),
+                geometry: geometry.clone(),
+                kind: connection.kind,
+                routing: connection.routing,
+                dash: connection.dash,
+                corner: connection.corner,
+                thickness: connection.thickness,
+                color: parse_css_color(&connection.color).unwrap_or(DEFAULT_CONNECTION_ICED_COLOR),
+                is_bidirectional,
+                arrow_toward_b,
+                is_secret,
+                to: RoomConnectionEnd::None,
+                room: (*room_a).clone(),
+            };
+
+            match connection.kind {
+                ConnectionKind::SelfLoop => {
                     room_connections.push(RoomConnection {
-                        from_level: room.get_level(),
-                        from_x: room.get_x(),
-                        from_y: room.get_y(),
-                        from_direction: from_exit.from_direction,
-                        room: room.clone(),
-                        is_bidirectional,
-                        is_secret: exit_secret,
-                        style: exit_style,
-                        to: RoomConnectionEnd::External { area_id },
+                        to: RoomConnectionEnd::SelfLoop,
+                        ..base
                     });
-                } else {
+                }
+                ConnectionKind::Internal => {
+                    let (Some(room_b), Some(endpoint_b)) = (room_b, connection.endpoint_b) else {
+                        warn!(
+                            "area {area_id}: internal connection {} without endpoint B; skipping",
+                            connection.id
+                        );
+                        continue;
+                    };
                     room_connections.push(RoomConnection {
-                        from_level: room.get_level(),
-                        from_x: room.get_x(),
-                        from_y: room.get_y(),
-                        from_direction: from_exit.from_direction,
-                        room: room.clone(),
-                        is_bidirectional,
-                        is_secret: exit_secret,
-                        style: exit_style,
-                        to: RoomConnectionEnd::None,
+                        to: RoomConnectionEnd::Normal {
+                            direction: Self::direction_at(
+                                members,
+                                endpoint_b.room_number,
+                                Some(endpoint_b.side),
+                            ),
+                            x: room_b.get_x(),
+                            y: room_b.get_y(),
+                            room: (*room_b).clone(),
+                        },
+                        ..base
                     });
+                }
+                ConnectionKind::CrossLevel => {
+                    let (Some(room_b), Some(endpoint_b)) = (room_b, connection.endpoint_b) else {
+                        warn!(
+                            "area {area_id}: cross-level connection {} without endpoint B; skipping",
+                            connection.id
+                        );
+                        continue;
+                    };
+                    // Two halves — one per endpoint room's level — sharing
+                    // the one resolved geometry.
+                    room_connections.push(RoomConnection {
+                        to: RoomConnectionEnd::ToLevel {
+                            level: room_b.get_level(),
+                            direction: Self::direction_at(
+                                members,
+                                connection.endpoint_a.room_number,
+                                Some(connection.endpoint_a.side),
+                            ),
+                            x: room_b.get_x(),
+                            y: room_b.get_y(),
+                            room: (*room_b).clone(),
+                        },
+                        ..base.clone()
+                    });
+                    room_connections.push(RoomConnection {
+                        from_level: room_b.get_level(),
+                        room: (*room_b).clone(),
+                        to: RoomConnectionEnd::ToLevel {
+                            level: room_a.get_level(),
+                            direction: Self::direction_at(
+                                members,
+                                endpoint_b.room_number,
+                                Some(endpoint_b.side),
+                            ),
+                            x: room_a.get_x(),
+                            y: room_a.get_y(),
+                            room: (*room_a).clone(),
+                        },
+                        ..base
+                    });
+                }
+                ConnectionKind::Dangling => {
+                    let to = if member_exit.to_unknown {
+                        // Redacted destination: must render as "Unknown map",
+                        // never as a plain dangling exit.
+                        RoomConnectionEnd::Unknown {
+                            token: member_exit.to_area_token.clone().unwrap_or_default(),
+                        }
+                    } else {
+                        RoomConnectionEnd::None
+                    };
+                    room_connections.push(RoomConnection { to, ..base });
+                }
+                ConnectionKind::External => {
+                    let to = if member_exit.to_unknown {
+                        RoomConnectionEnd::Unknown {
+                            token: member_exit.to_area_token.clone().unwrap_or_default(),
+                        }
+                    } else if let Some(to_area_id) = member_exit.to_area_id {
+                        RoomConnectionEnd::External {
+                            area_id: to_area_id,
+                        }
+                    } else {
+                        // The member lost its destination without the kind
+                        // catching up (mid-edit projection); degrade to a
+                        // bare stub rather than invent a destination.
+                        RoomConnectionEnd::None
+                    };
+                    room_connections.push(RoomConnection { to, ..base });
                 }
             }
         }
 
         room_connections
+    }
+
+    /// The compass direction a Connection anchors on at `room`: the member
+    /// exit originating there knows it directly (`from_direction`); a member
+    /// arriving there knows it as its `to_direction` (or the opposite of its
+    /// origin direction); with neither, the endpoint's wall side stands in.
+    fn direction_at(
+        members: &[(&Arc<RoomCache>, &ExitCache)],
+        room: RoomNumber,
+        side: Option<crate::RoomSide>,
+    ) -> ExitDirection {
+        for (member_room, exit) in members {
+            if member_room.get_room_number() == room {
+                return exit.from_direction;
+            }
+        }
+        for (_, exit) in members {
+            if exit.to_room_number == Some(room) {
+                return exit
+                    .to_direction
+                    .unwrap_or_else(|| exit.from_direction.opposite());
+            }
+        }
+        match side {
+            Some(crate::RoomSide::North) => ExitDirection::North,
+            Some(crate::RoomSide::East) => ExitDirection::East,
+            Some(crate::RoomSide::South) => ExitDirection::South,
+            Some(crate::RoomSide::West) | None => ExitDirection::West,
+        }
     }
 
     #[must_use]
@@ -588,10 +684,26 @@ impl AreaCache {
                 .filter_map(|n| new_rooms_by_number.get(n).cloned()),
         );
 
-        self.rebuild_room_state(new_rooms_by_number, new_rooms, max_room_number)
+        self.rebuild_room_state(
+            new_rooms_by_number,
+            new_rooms,
+            max_room_number,
+            self.connections.clone(),
+        )
     }
 
     fn upsert_room_cache(&self, room_number: RoomNumber, room: Arc<RoomCache>) -> Self {
+        self.upsert_room_cache_with_connections(room_number, room, self.connections.clone())
+    }
+
+    /// [`Self::upsert_room_cache`] for the edit paths that also changed the
+    /// stored Connection rows (exit lifecycle).
+    fn upsert_room_cache_with_connections(
+        &self,
+        room_number: RoomNumber,
+        room: Arc<RoomCache>,
+        connections: Vec<Connection>,
+    ) -> Self {
         let mut new_rooms_by_number = self.rooms_by_number.clone();
         let mut new_rooms = self.rooms.clone();
 
@@ -600,7 +712,7 @@ impl AreaCache {
         new_rooms.push(room);
         let max_room_number = RoomNumber(room_number.0.max(self.max_room_number.0));
 
-        self.rebuild_room_state(new_rooms_by_number, new_rooms, max_room_number)
+        self.rebuild_room_state(new_rooms_by_number, new_rooms, max_room_number, connections)
     }
 
     pub(super) fn delete_room(&self, room_number: RoomNumber) -> Self {
@@ -619,7 +731,15 @@ impl AreaCache {
             self.max_room_number
         };
 
-        self.rebuild_room_state(new_rooms_by_number, new_rooms, max_room_number)
+        // §3.3: Connections orphaned by the room's outgoing exits are
+        // deleted; those kept alive by a surviving inbound member become
+        // dangling. (The inbound destinations themselves are nulled by the
+        // caller's follow-up `null_inbound_exits` cascade.)
+        let mut connections = self.connections.clone();
+        let survivors = Self::topologies_of(&self.id, &new_rooms_by_number, None);
+        connection_lifecycle::repair_after_room_delete(room_number, &survivors, &mut connections);
+
+        self.rebuild_room_state(new_rooms_by_number, new_rooms, max_room_number, connections)
     }
 
     /// Resets every exit in this area that points to `target` to no
@@ -630,8 +750,17 @@ impl AreaCache {
     pub(super) fn null_inbound_exits(&self, target: &RoomKey) -> Option<Self> {
         let mut new_rooms_by_number = self.rooms_by_number.clone();
         let mut touched = HashSet::new();
+        // The pre-null copies of every affected exit, for Connection repair.
+        let mut affected: Vec<(RoomNumber, ExitCache)> = Vec::new();
         for (room_number, room) in &self.rooms_by_number {
             if let Some(updated) = room.null_exits_to(target) {
+                for exit in room.get_exits() {
+                    if exit.to_area_id == Some(target.area_id)
+                        && exit.to_room_number == Some(target.room_number)
+                    {
+                        affected.push((*room_number, exit.clone()));
+                    }
+                }
                 new_rooms_by_number.insert(*room_number, Arc::new(updated));
                 touched.insert(*room_number);
             }
@@ -639,6 +768,35 @@ impl AreaCache {
 
         if touched.is_empty() {
             return None;
+        }
+
+        // Each exit that lost its destination drags its Connection along:
+        // the far side is gone, so the row becomes dangling (idempotent when
+        // a same-area room deletion already repaired it).
+        let mut connections = self.connections.clone();
+        let site = |number: RoomNumber| {
+            new_rooms_by_number.get(&number).map(|room| RoomSite {
+                x: room.get_x(),
+                y: room.get_y(),
+                level: room.get_level(),
+            })
+        };
+        for (room_number, before_exit) in &affected {
+            let before = Self::exit_topology(&self.id, *room_number, before_exit);
+            let after = ExitTopology {
+                to_room_in_area: None,
+                to_direction: None,
+                leaves_area: false,
+                ..before
+            };
+            let peers = Self::topologies_of(&self.id, &new_rooms_by_number, Some(before_exit.id));
+            connection_lifecycle::reattach_after_update(
+                &before,
+                &after,
+                &peers,
+                &mut connections,
+                site,
+            );
         }
 
         let mut new_rooms = self.rooms.clone();
@@ -649,7 +807,12 @@ impl AreaCache {
                 .filter_map(|n| new_rooms_by_number.get(n).cloned()),
         );
 
-        Some(self.rebuild_room_state(new_rooms_by_number, new_rooms, self.max_room_number))
+        Some(self.rebuild_room_state(
+            new_rooms_by_number,
+            new_rooms,
+            self.max_room_number,
+            connections,
+        ))
     }
 
     pub(super) fn set_room_property(
@@ -717,32 +880,124 @@ impl AreaCache {
         }
     }
 
-    pub(super) fn upsert_exit(&self, room_number: RoomNumber, exit: ExitCache) -> CloudResult<Self> {
-        let room = self.rooms_by_number.get(&room_number);
-
-        if let Some(room) = room {
-            let room = room.upsert_exit(exit);
-            Ok(self.upsert_room_cache(room_number, Arc::new(room)))
-        } else {
-            Err(CloudError::RoomNotFound(RoomKey {
+    /// Upserts an exit, maintaining its Connection membership: a new exit
+    /// attaches (auto-pairing onto the unique reciprocal one-member
+    /// candidate or minting a fresh Connection); an existing exit whose
+    /// topology changed re-attaches. The incoming `connection_id` on a new
+    /// exit is a placeholder and is overwritten here.
+    pub(super) fn upsert_exit(
+        &self,
+        room_number: RoomNumber,
+        mut exit: ExitCache,
+    ) -> CloudResult<Self> {
+        let Some(room) = self.rooms_by_number.get(&room_number) else {
+            return Err(CloudError::RoomNotFound(RoomKey {
                 area_id: self.id,
                 room_number,
-            }))
+            }));
+        };
+
+        let mut connections = self.connections.clone();
+        let site = |number: RoomNumber| {
+            self.rooms_by_number.get(&number).map(|room| RoomSite {
+                x: room.get_x(),
+                y: room.get_y(),
+                level: room.get_level(),
+            })
+        };
+        match room.get_exits().iter().find(|e| e.id == exit.id) {
+            None => {
+                let peers = Self::topologies_of(&self.id, &self.rooms_by_number, None);
+                let topology = Self::exit_topology(&self.id, room_number, &exit);
+                exit.connection_id =
+                    connection_lifecycle::attach_exit(&topology, &peers, &mut connections, site);
+            }
+            Some(existing) => {
+                exit.connection_id = existing.connection_id;
+                let before = Self::exit_topology(&self.id, room_number, existing);
+                let after = Self::exit_topology(&self.id, room_number, &exit);
+                if connection_lifecycle::topology_differs(&before, &after) {
+                    let peers = Self::topologies_of(&self.id, &self.rooms_by_number, Some(exit.id));
+                    exit.connection_id = connection_lifecycle::reattach_after_update(
+                        &before,
+                        &after,
+                        &peers,
+                        &mut connections,
+                        site,
+                    );
+                }
+            }
+        }
+
+        let room = room.upsert_exit(exit);
+        Ok(self.upsert_room_cache_with_connections(room_number, Arc::new(room), connections))
+    }
+
+    pub(super) fn delete_exit(
+        &self,
+        room_number: RoomNumber,
+        exit_id: ExitId,
+    ) -> CloudResult<Self> {
+        let Some(room) = self.rooms_by_number.get(&room_number) else {
+            return Err(CloudError::RoomNotFound(RoomKey {
+                area_id: self.id,
+                room_number,
+            }));
+        };
+
+        let removed_connection = room
+            .get_exits()
+            .iter()
+            .find(|e| e.id == exit_id)
+            .map(|e| e.connection_id);
+        let room = room.delete_exit(exit_id);
+
+        // Deleting the last member exit deletes the Connection; a surviving
+        // member keeps it (now one-way).
+        let mut connections = self.connections.clone();
+        if let Some(connection_id) = removed_connection {
+            let survivors = Self::topologies_of(&self.id, &self.rooms_by_number, Some(exit_id));
+            connection_lifecycle::remove_orphan_connection(
+                connection_id,
+                &survivors,
+                &mut connections,
+            );
+        }
+
+        Ok(self.upsert_room_cache_with_connections(room_number, Arc::new(room), connections))
+    }
+
+    /// Projects one cached exit into its connection-relevant topology.
+    fn exit_topology(area_id: &AreaId, from_room: RoomNumber, exit: &ExitCache) -> ExitTopology {
+        let same_area = exit.to_area_id.as_ref() == Some(area_id);
+        ExitTopology {
+            id: exit.id,
+            connection_id: exit.connection_id,
+            from_room,
+            from_direction: exit.from_direction,
+            to_room_in_area: if same_area { exit.to_room_number } else { None },
+            to_direction: exit.to_direction,
+            leaves_area: exit.to_unknown || (!same_area && exit.to_area_id.is_some()),
         }
     }
 
-    pub(super) fn delete_exit(&self, room_number: RoomNumber, exit_id: ExitId) -> CloudResult<Self> {
-        let room = self.rooms_by_number.get(&room_number);
-
-        if let Some(room) = room {
-            let room = room.delete_exit(exit_id);
-            Ok(self.upsert_room_cache(room_number, Arc::new(room)))
-        } else {
-            Err(CloudError::RoomNotFound(RoomKey {
-                area_id: self.id,
-                room_number,
-            }))
-        }
+    /// Every exit's topology, optionally excluding one (the exit being
+    /// edited or deleted).
+    fn topologies_of(
+        area_id: &AreaId,
+        rooms_by_number: &HashMap<RoomNumber, Arc<RoomCache>>,
+        exclude: Option<ExitId>,
+    ) -> Vec<ExitTopology> {
+        rooms_by_number
+            .iter()
+            .flat_map(|(room_number, room)| {
+                room.get_exits()
+                    .iter()
+                    .filter(|exit| Some(exit.id) != exclude)
+                    .map(|exit| Self::exit_topology(area_id, *room_number, exit))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     pub(super) fn upsert_label(&self, label_id: LabelId, label: Label) -> Self {
@@ -804,8 +1059,7 @@ impl AreaCache {
         room_properties: &[(RoomNumber, String)],
         area_properties: &[String],
     ) -> Self {
-        let rooms_touched =
-            !(rooms.is_empty() && exits.is_empty() && room_properties.is_empty());
+        let rooms_touched = !(rooms.is_empty() && exits.is_empty() && room_properties.is_empty());
 
         let mut next = if rooms_touched {
             let mut new_rooms_by_number = self.rooms_by_number.clone();
@@ -831,9 +1085,7 @@ impl AreaCache {
                         let flipped: Vec<ExitCache> = room
                             .get_exits()
                             .iter()
-                            .filter(|exit| {
-                                exit.is_secret != secret && exits.contains(&exit.id)
-                            })
+                            .filter(|exit| exit.is_secret != secret && exits.contains(&exit.id))
                             .map(|exit| ExitCache {
                                 is_secret: secret,
                                 ..exit.clone()
@@ -866,7 +1118,12 @@ impl AreaCache {
                 })
                 .collect();
 
-            self.rebuild_room_state(new_rooms_by_number, new_rooms, self.max_room_number)
+            self.rebuild_room_state(
+                new_rooms_by_number,
+                new_rooms,
+                self.max_room_number,
+                self.connections.clone(),
+            )
         } else {
             Self {
                 rev: self.rev + 1,
@@ -902,6 +1159,61 @@ impl AreaCache {
     #[must_use]
     pub fn get_room_connections(&self) -> &[RoomConnection] {
         &self.room_connections
+    }
+
+    /// Stored Connection rows (as opposed to their resolved render views).
+    #[must_use]
+    pub fn get_connections(&self) -> &[Connection] {
+        &self.connections
+    }
+
+    #[must_use]
+    pub fn get_connection(&self, id: crate::ConnectionId) -> Option<&Connection> {
+        self.connections
+            .iter()
+            .find(|connection| connection.id == id)
+    }
+
+    /// Rebuilds the full editable document used by the shared mutation
+    /// applier. Cache-only metadata that the editor never mutates is retained;
+    /// list-only family tokens and linked-area presentation rows are omitted.
+    #[must_use]
+    pub(super) fn to_details(&self) -> AreaWithDetails {
+        let mut properties: Vec<_> = self
+            .properties
+            .iter()
+            .map(|(name, entry)| crate::Property {
+                name: name.clone(),
+                value: entry.value.clone(),
+                is_secret: entry.is_secret,
+            })
+            .collect();
+        properties.sort_by(|a, b| a.name.cmp(&b.name));
+        AreaWithDetails {
+            area: Area {
+                id: self.id,
+                user_id: self.meta.owner_id,
+                atlas_id: self.meta.atlas_id,
+                atlas_name: self.meta.atlas_name.clone(),
+                name: self.name.clone(),
+                created_at: Utc::now(),
+                rev: self.rev,
+                access: self.meta.access,
+                owner_nickname: self.meta.owner_nickname.clone(),
+                copied_from_area_id: self.meta.copied_from_area_id,
+                copied_from_rev: self.meta.copied_from_rev,
+                copied_at: self.meta.copied_at,
+                family_token: None,
+            },
+            format_version: AREA_FORMAT_VERSION,
+            content_hash: self.meta.content_hash.clone(),
+            properties,
+            rooms: self.rooms.iter().map(|room| room.to_details()).collect(),
+            labels: self.labels.clone(),
+            shapes: self.shapes.clone(),
+            connections: self.connections.clone(),
+            linked_areas: Vec::new(),
+        }
     }
 
     pub fn with_rooms_in<F>(&self, min_x: f32, min_y: f32, max_x: f32, max_y: f32, mut fun: F)
@@ -951,59 +1263,81 @@ fn bounds_to_envelope(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> AABB<[f
     AABB::from_corners([min_x, min_y], [max_x, max_y])
 }
 
-fn connection_bounds(connection: &RoomConnection) -> AABB<[f32; 2]> {
-    let (target_x, target_y) = match &connection.to {
-        RoomConnectionEnd::Normal { x, y, .. } | RoomConnectionEnd::ToLevel { x, y, .. } => {
-            (*x, *y)
-        }
-        RoomConnectionEnd::External { .. }
-        | RoomConnectionEnd::Unknown { .. }
-        | RoomConnectionEnd::SelfLoop
-        | RoomConnectionEnd::None => (connection.from_x, connection.from_y),
-    };
-
-    let min_x = connection.from_x.min(target_x);
-    let max_x = connection.from_x.max(target_x);
-    let min_y = connection.from_y.min(target_y);
-    let max_y = connection.from_y.max(target_y);
-
-    AABB::from_corners([min_x, min_y], [max_x, max_y])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ExitDirection;
+    use crate::{
+        ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionRouting, CornerStyle,
+        ExitDirection, PortMode, RoomSide, RoomUpdates, SegmentShape,
+    };
     use uuid::Uuid;
 
-    /// A visible exit leaving via `from_direction` and arriving at
-    /// `(to_area, to_room)` from `to_direction`.
-    fn linked_exit(
+    /// A visible exit leaving via `from_direction` toward `(to_area,
+    /// to_room)` (arriving from `to_direction`), as a member of `connection`.
+    fn member_exit(
         id: u128,
+        connection: ConnectionId,
         from_direction: ExitDirection,
-        to_area: AreaId,
-        to_room: RoomNumber,
-        to_direction: ExitDirection,
+        to_area: Option<AreaId>,
+        to_room: Option<RoomNumber>,
+        to_direction: Option<ExitDirection>,
     ) -> ExitCache {
         ExitCache {
             id: ExitId(Uuid::from_u128(id)),
             from_direction,
-            to_area_id: Some(to_area),
-            to_room_number: Some(to_room),
-            to_direction: Some(to_direction),
+            to_area_id: to_area,
+            to_room_number: to_room,
+            to_direction,
             path: None,
             is_hidden: false,
             is_closed: false,
             is_locked: false,
             weight: 1.0,
             command: None,
-            style: ExitStyle::Normal,
-            color: None,
-            iced_color: iced::Color::from_rgb8(128, 128, 128),
+            connection_id: connection,
             to_unknown: false,
             to_area_token: None,
             is_secret: false,
         }
+    }
+
+    fn endpoint(room: RoomNumber, side: RoomSide) -> ConnectionEndpoint {
+        ConnectionEndpoint {
+            room_number: room,
+            side,
+            port_offset: 0.5,
+            port_mode: PortMode::AutoPinned,
+        }
+    }
+
+    fn stored_connection(
+        id: ConnectionId,
+        kind: ConnectionKind,
+        endpoint_a: ConnectionEndpoint,
+        endpoint_b: Option<ConnectionEndpoint>,
+    ) -> Connection {
+        Connection {
+            id,
+            endpoint_a,
+            endpoint_b,
+            kind,
+            routing: ConnectionRouting::Simple,
+            segment_shape: SegmentShape::Direct,
+            corner: CornerStyle::Sharp,
+            route_points: Vec::new(),
+            dash: ConnectionDash::Solid,
+            color: crate::DEFAULT_CONNECTION_COLOR.to_string(),
+            thickness: 1.0,
+        }
+    }
+
+    fn placed_room(number: RoomNumber, x: f32, y: f32, level: i32) -> RoomCache {
+        RoomCache::new(number).apply_updates(RoomUpdates {
+            x: Some(x),
+            y: Some(y),
+            level: Some(level),
+            ..RoomUpdates::default()
+        })
     }
 
     fn rooms_by_number(list: Vec<RoomCache>) -> HashMap<RoomNumber, Arc<RoomCache>> {
@@ -1013,43 +1347,300 @@ mod tests {
     }
 
     #[test]
-    fn self_referential_exit_builds_a_self_loop_end() {
+    fn self_loop_connection_resolves_a_self_loop_end() {
         let area = AreaId(Uuid::from_u128(1));
         let n = RoomNumber(1);
+        let connection_id = ConnectionId::new();
         // North leaves and returns to the same room (arriving from the south).
-        let room = RoomCache::new(n).upsert_exit(linked_exit(
+        let room = placed_room(n, 0.0, 0.0, 0).upsert_exit(member_exit(
             10,
+            connection_id,
             ExitDirection::North,
-            area,
-            n,
-            ExitDirection::South,
+            Some(area),
+            Some(n),
+            Some(ExitDirection::South),
         ));
+        let connections = vec![stored_connection(
+            connection_id,
+            ConnectionKind::SelfLoop,
+            endpoint(n, RoomSide::North),
+            Some(endpoint(n, RoomSide::South)),
+        )];
 
-        let conns = AreaCache::build_room_connections(&area, &rooms_by_number(vec![room]));
+        let conns =
+            AreaCache::build_room_connections(&area, &connections, &rooms_by_number(vec![room]));
 
         assert_eq!(conns.len(), 1);
         assert!(matches!(conns[0].to, RoomConnectionEnd::SelfLoop));
-        // The loop attaches to the wall the exit leaves by.
-        assert_eq!(conns[0].from_direction, ExitDirection::North);
+        assert_eq!(conns[0].connection_id, connection_id);
+        // Self-loops carry no arrow.
+        assert!(conns[0].arrow_toward_b.is_none());
+        assert!(!conns[0].geometry.circles.is_empty(), "loop arc resolved");
     }
 
     #[test]
-    fn exit_to_a_different_room_stays_normal() {
+    fn one_member_internal_connection_resolves_normal_with_an_arrow() {
         let area = AreaId(Uuid::from_u128(1));
         let (a, b) = (RoomNumber(1), RoomNumber(2));
-        let room_a = RoomCache::new(a).upsert_exit(linked_exit(
+        let connection_id = ConnectionId::new();
+        let room_a = placed_room(a, 0.0, 0.0, 0).upsert_exit(member_exit(
             10,
+            connection_id,
             ExitDirection::East,
-            area,
-            b,
-            ExitDirection::West,
+            Some(area),
+            Some(b),
+            Some(ExitDirection::West),
         ));
-        let room_b = RoomCache::new(b);
+        let room_b = placed_room(b, 4.0, 0.0, 0);
+        let connections = vec![stored_connection(
+            connection_id,
+            ConnectionKind::Internal,
+            endpoint(a, RoomSide::East),
+            Some(endpoint(b, RoomSide::West)),
+        )];
 
-        let conns =
-            AreaCache::build_room_connections(&area, &rooms_by_number(vec![room_a, room_b]));
+        let conns = AreaCache::build_room_connections(
+            &area,
+            &connections,
+            &rooms_by_number(vec![room_a, room_b]),
+        );
 
         assert_eq!(conns.len(), 1);
-        assert!(matches!(conns[0].to, RoomConnectionEnd::Normal { .. }));
+        let conn = &conns[0];
+        assert!(matches!(
+            conn.to,
+            RoomConnectionEnd::Normal {
+                direction: ExitDirection::West,
+                ..
+            }
+        ));
+        assert!(!conn.is_bidirectional);
+        // The single member runs A→B: arrow at B.
+        assert_eq!(conn.arrow_toward_b, Some(true));
+        assert!(!conn.geometry.centerline.is_empty(), "stroke resolved");
+        assert!(!conn.geometry.bounds.is_empty());
+    }
+
+    #[test]
+    fn two_member_connection_is_bidirectional_without_an_arrow() {
+        let area = AreaId(Uuid::from_u128(1));
+        let (a, b) = (RoomNumber(1), RoomNumber(2));
+        let connection_id = ConnectionId::new();
+        let room_a = placed_room(a, 0.0, 0.0, 0).upsert_exit(member_exit(
+            10,
+            connection_id,
+            ExitDirection::East,
+            Some(area),
+            Some(b),
+            Some(ExitDirection::West),
+        ));
+        let room_b = placed_room(b, 4.0, 0.0, 0).upsert_exit(member_exit(
+            11,
+            connection_id,
+            ExitDirection::West,
+            Some(area),
+            Some(a),
+            Some(ExitDirection::East),
+        ));
+        let connections = vec![stored_connection(
+            connection_id,
+            ConnectionKind::Internal,
+            endpoint(a, RoomSide::East),
+            Some(endpoint(b, RoomSide::West)),
+        )];
+
+        let conns = AreaCache::build_room_connections(
+            &area,
+            &connections,
+            &rooms_by_number(vec![room_a, room_b]),
+        );
+
+        assert_eq!(conns.len(), 1);
+        assert!(conns[0].is_bidirectional);
+        assert!(conns[0].arrow_toward_b.is_none());
+    }
+
+    #[test]
+    fn cross_level_connection_emits_two_halves_sharing_geometry() {
+        let area = AreaId(Uuid::from_u128(1));
+        let (a, b) = (RoomNumber(1), RoomNumber(2));
+        let connection_id = ConnectionId::new();
+        let room_a = placed_room(a, 0.0, 0.0, 0).upsert_exit(member_exit(
+            10,
+            connection_id,
+            ExitDirection::Up,
+            Some(area),
+            Some(b),
+            Some(ExitDirection::Down),
+        ));
+        let room_b = placed_room(b, 1.0, 1.0, 1);
+        let connections = vec![stored_connection(
+            connection_id,
+            ConnectionKind::CrossLevel,
+            endpoint(a, RoomSide::East),
+            Some(endpoint(b, RoomSide::West)),
+        )];
+
+        let conns = AreaCache::build_room_connections(
+            &area,
+            &connections,
+            &rooms_by_number(vec![room_a, room_b]),
+        );
+
+        assert_eq!(conns.len(), 2);
+        let by_level = |level: i32| {
+            conns
+                .iter()
+                .find(|c| c.from_level == level)
+                .expect("one half per level")
+        };
+        let (half_a, half_b) = (by_level(0), by_level(1));
+        assert!(matches!(
+            half_a.to,
+            RoomConnectionEnd::ToLevel { level: 1, .. }
+        ));
+        assert!(matches!(
+            half_b.to,
+            RoomConnectionEnd::ToLevel { level: 0, .. }
+        ));
+        assert!(
+            Arc::ptr_eq(&half_a.geometry, &half_b.geometry),
+            "both halves share one resolved geometry"
+        );
+    }
+
+    #[test]
+    fn dangling_external_and_unknown_members_resolve_their_ends() {
+        let area = AreaId(Uuid::from_u128(1));
+        let other_area = AreaId(Uuid::from_u128(2));
+        let n = RoomNumber(1);
+        let dangling_id = ConnectionId::new();
+        let external_id = ConnectionId::new();
+        let unknown_id = ConnectionId::new();
+        let unknown_exit = ExitCache {
+            to_unknown: true,
+            to_area_token: Some("tok".to_string()),
+            ..member_exit(12, unknown_id, ExitDirection::South, None, None, None)
+        };
+        let room = placed_room(n, 0.0, 0.0, 0)
+            .upsert_exit(member_exit(
+                10,
+                dangling_id,
+                ExitDirection::North,
+                None,
+                None,
+                None,
+            ))
+            .upsert_exit(member_exit(
+                11,
+                external_id,
+                ExitDirection::East,
+                Some(other_area),
+                Some(RoomNumber(7)),
+                None,
+            ))
+            .upsert_exit(unknown_exit);
+        let connections = vec![
+            stored_connection(
+                dangling_id,
+                ConnectionKind::Dangling,
+                endpoint(n, RoomSide::North),
+                None,
+            ),
+            stored_connection(
+                external_id,
+                ConnectionKind::External,
+                endpoint(n, RoomSide::East),
+                None,
+            ),
+            stored_connection(
+                unknown_id,
+                ConnectionKind::External,
+                endpoint(n, RoomSide::South),
+                None,
+            ),
+        ];
+
+        let conns =
+            AreaCache::build_room_connections(&area, &connections, &rooms_by_number(vec![room]));
+
+        assert_eq!(conns.len(), 3);
+        let end_of = |id: ConnectionId| &conns.iter().find(|c| c.connection_id == id).unwrap().to;
+        assert!(matches!(end_of(dangling_id), RoomConnectionEnd::None));
+        assert!(matches!(
+            end_of(external_id),
+            RoomConnectionEnd::External { area_id } if *area_id == other_area
+        ));
+        assert!(matches!(
+            end_of(unknown_id),
+            RoomConnectionEnd::Unknown { token } if token == "tok"
+        ));
+    }
+
+    #[test]
+    fn corrupt_connections_are_skipped_not_fatal() {
+        let area = AreaId(Uuid::from_u128(1));
+        let n = RoomNumber(1);
+        let memberless = ConnectionId::new();
+        let missing_room = ConnectionId::new();
+        let orphan_member = ConnectionId::new();
+        // An exit whose connection row is missing entirely: it simply does
+        // not render.
+        let room = placed_room(n, 0.0, 0.0, 0).upsert_exit(member_exit(
+            10,
+            orphan_member,
+            ExitDirection::North,
+            None,
+            None,
+            None,
+        ));
+        let connections = vec![
+            stored_connection(
+                memberless,
+                ConnectionKind::Dangling,
+                endpoint(n, RoomSide::North),
+                None,
+            ),
+            stored_connection(
+                missing_room,
+                ConnectionKind::Dangling,
+                endpoint(RoomNumber(99), RoomSide::North),
+                None,
+            ),
+        ];
+
+        let conns =
+            AreaCache::build_room_connections(&area, &connections, &rooms_by_number(vec![room]));
+        assert!(conns.is_empty());
+    }
+
+    #[test]
+    fn secrecy_folds_member_exits_and_endpoint_rooms() {
+        let area = AreaId(Uuid::from_u128(1));
+        let (a, b) = (RoomNumber(1), RoomNumber(2));
+        let connection_id = ConnectionId::new();
+        let room_a = placed_room(a, 0.0, 0.0, 0).upsert_exit(member_exit(
+            10,
+            connection_id,
+            ExitDirection::East,
+            Some(area),
+            Some(b),
+            Some(ExitDirection::West),
+        ));
+        // The *destination* room is secret: the resolved view must be too.
+        let room_b = placed_room(b, 4.0, 0.0, 0).with_secrecy(true);
+        let connections = vec![stored_connection(
+            connection_id,
+            ConnectionKind::Internal,
+            endpoint(a, RoomSide::East),
+            Some(endpoint(b, RoomSide::West)),
+        )];
+
+        let conns = AreaCache::build_room_connections(
+            &area,
+            &connections,
+            &rooms_by_number(vec![room_a, room_b]),
+        );
+        assert!(conns[0].is_secret);
     }
 }

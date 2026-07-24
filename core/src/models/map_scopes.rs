@@ -28,6 +28,8 @@ use smudgy_cloud::{AreaId, AtlasId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::{fs, io};
 
+use super::persistence::write_atomic;
+
 /// File name of the association store in the smudgy home.
 const MAP_SCOPES_FILE: &str = "map-scopes.json";
 
@@ -233,7 +235,7 @@ impl MapScopes {
 
         let path = get_smudgy_home()?.join(MAP_SCOPES_FILE);
         let json = serde_json::to_string_pretty(&pruned).context("Failed to serialize map scopes")?;
-        fs::write(&path, json)
+        write_atomic(&path, json.as_bytes())
             .context(format!("Failed to write map-scopes.json at {}", path.display()))?;
         Ok(())
     }

@@ -5,6 +5,80 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Scripts can work with the command input.** A new `input` object reads
+  what's in the box, puts text there (`propose()` suggests a command
+  fully selected, so typing anything discards it), moves the cursor,
+  controls focus, and submits — the missing piece for clickable "put this
+  command in my input" links and widgets. Reachable as `input` from
+  `smudgy:core`, or `session.input`.
+- **Password masking.** Scripts can switch any input into password mode:
+  the box shows dots (with an eye button to peek), and the secret is kept
+  from everything else — it never enters history or tab completion,
+  scripts can't read it back, and the submission is sent with its echo
+  redacted. Anything you were typing when masking engages is set aside
+  and restored afterward.
+- **Automatic password masking at login prompts.** When a MUD hides echo
+  for a password prompt (telnet ECHO), the input masks itself with all of
+  the protections above, and unmasks when the server restores echo. Can
+  be turned off in Preferences under Input.
+- **Intercept what you type.** The new `submit` event
+  (`smudgy:events/sys`) fires for each line submitted from the input,
+  before aliases and command splitting: a handler can observe it, rewrite
+  it (`submission.replace()`), or swallow it (`submission.cancel()`) —
+  shorthand expanders, confirm-before-send guards, and chat modes without
+  an alias for every case. Lines sent by scripts don't fire it, and
+  masked submissions never reach it.
+- **Game-aware tab completion.** Scripts contribute words the input
+  offers before the scrollback scan — spell names, group members from
+  GMCP, speedwalk targets — via `input.completion.add(...)`, with a
+  blacklist to keep noise words out of completion entirely. Each script's
+  contributions stay its own; the user sees them merged.
+- **Input history for scripts.** `input.history` lists what the Up arrow
+  recalls (newest first), adds entries without sending, or clears it.
+- **Panes can host their own input line.** A pane created with
+  `input: { onSubmit }` gets a full command input under its body — its
+  own history, tab completion, hotkeys, even masking — and its
+  submissions go to your handler instead of the game: chat panes that
+  prefix a channel, search boxes, note takers. Click a pane to focus its
+  input; Escape returns to the main input.
+- **Watch the input as the user types.** Observe-only `change` and
+  `focus` events (`smudgy:events/input`) report edits (with what caused
+  them: typing, a script, a link) and focus changes — enough for inline
+  hints and validation, while masked typing reports nothing.
+- **Duplicate-proof map seeding for packages.** A new
+  `mapper.importAreasIfAbsent(...)` imports bundled maps only where no
+  map of the same name exists anywhere on the profile — maps assigned
+  to other servers and deactivated maps count — and waits for maps to
+  finish loading first, so a package can safely offer its starter maps
+  on every start without ever creating duplicates.
+
+### Changed
+
+- Creating rooms while auto-mapping no longer slows down as more maps
+  are loaded: the cost of a map write now scales with the touched map,
+  not with everything loaded. With 100,000 rooms loaded, an auto-mapped
+  step dropped from ~120 ms to ~2 ms, and stays single-digit
+  milliseconds even at procedural-MUD scale.
+
+### Fixed
+
+- Every map overlay (`MapView`) a script ever mounted quietly kept its
+  pan/zoom state and player-location tracking for the rest of the
+  session, even after the widget was removed. Unmounted maps are now
+  fully released.
+- The map editor could paint map and drag-preview geometry past the
+  canvas edge, over its own area list and inspector panes (visible under
+  the software renderer, whose partial repaints don't paint over the
+  spill). The editor canvas now clips to its bounds, as the session
+  minimap has since 0.3.0.
+- The software renderer announces itself in the log at startup, so
+  rendering reports can be triaged without guessing which renderer was
+  active.
+
 ## [0.4.1] - 2026-07-14
 
 ### Changed
@@ -41,18 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignores maps that belong to your other games — look-alike stock zones from
   another game can no longer capture your location. Existing atlases start
   unassigned and home themselves as you play (sustained locates or a
-  speedwalk associate the atlas, with an undoable notice); anything you
-  create is scoped to the server you created it on. The map editor gains a
-  This server / All atlases view and a per-atlas "Servers…" checklist for
-  adjusting scope directly.
+  speedwalk associate the atlas); anything you create is scoped to the
+  server you created it on. The map editor gains a This server / All
+  atlases view and a per-atlas "Servers…" checklist for adjusting scope
+  directly.
 - **Shared maps arrive organized and homed.** Areas shared to you now carry
   their owner's folder name, so a share appears as named folders instead of
   a flat pile. When creating a share you can disclose which game hosts the
   maps belong to (pre-checked, removable, per share); the recipient's client
   files the share under their matching server automatically, and with no
-  match it simply lands in Unassigned. And if rooms you're walking match a
-  map filed under another server, smudgy offers to show it here too rather
-  than re-mapping them.
+  match it simply lands in Unassigned.
 - **MSDP support.** For MUDs that publish structured data over MSDP rather
   than GMCP: negotiation is automatic, and every variable the server reports
   lands in the same live state tree scripts already use for GMCP — read it

@@ -1,7 +1,7 @@
 //! Server CRUD: async wrappers, form submission handling, and server-side views.
 
 use iced::widget::{
-    Column, Row, TextInput, button, column, scrollable,
+    Column, Row, TextInput, button, checkbox, column, pick_list, scrollable,
     space::{horizontal as horizontal_space, vertical as vertical_space},
     text,
 };
@@ -21,6 +21,94 @@ use super::{
 
 /// Helper text shown beneath the port field in the server form.
 const PORT_HELP: &str = "Usually 23 or 4000.";
+
+/// The encoding dropdown's "no override" entry — UTF-8, i.e.
+/// `ServerConfig::encoding = None`.
+pub(super) const DEFAULT_ENCODING_CHOICE: &str = "Default (UTF-8)";
+
+/// The curated encoding choices: [`DEFAULT_ENCODING_CHOICE`] plus the
+/// MUD-relevant Encoding Standard labels (each resolves via
+/// `encoding_rs::Encoding::for_label`; the connection falls back to UTF-8 on
+/// anything unresolvable, so a hand-edited `server.json` can hold any label).
+const ENCODING_CHOICES: [&str; 15] = [
+    DEFAULT_ENCODING_CHOICE,
+    "windows-1252", // Latin-1 / Western European superset
+    "iso-8859-2",
+    "iso-8859-15",
+    "windows-1250",
+    "windows-1251", // Cyrillic
+    "koi8-r",
+    "koi8-u",
+    "windows-1256", // Arabic
+    "big5",         // Traditional Chinese
+    "gbk",          // Simplified Chinese
+    "gb18030",
+    "shift_jis", // Japanese
+    "euc-jp",
+    "euc-kr", // Korean
+];
+
+/// Map the dropdown value back to the persisted form (`None` = UTF-8).
+fn form_encoding_to_config(choice: &str) -> Option<String> {
+    (choice != DEFAULT_ENCODING_CHOICE).then(|| choice.to_string())
+}
+
+/// The compression checkbox for the server form.
+fn compression_field(state: &State) -> Element<'_, Message> {
+    checkbox(state.server_form_data.compression)
+        .label("Allow compression (MCCP2)")
+        .on_toggle(Message::ToggleServerCompression)
+        .size(16)
+        .into()
+}
+
+/// The TLS checkbox, with a nested "Verify certificate" shown only when TLS is on.
+fn tls_field(state: &State) -> Element<'_, Message> {
+    let secure = checkbox(state.server_form_data.tls)
+        .label("Secure connection (TLS)")
+        .on_toggle(Message::ToggleServerTls)
+        .size(16);
+    let mut col = column![secure].spacing(4);
+    if state.server_form_data.tls {
+        let verify = checkbox(state.server_form_data.tls_verify)
+            .label("Verify certificate")
+            .on_toggle(Message::ToggleServerTlsVerify)
+            .size(16);
+        col = col.push(
+            column![
+                verify,
+                text("Uncheck only for servers with self-signed certificates (insecure).")
+                    .size(12)
+                    .style(builtins::text::muted),
+            ]
+            .spacing(2)
+            .padding(iced::Padding::default().left(24.0)),
+        );
+    }
+    col.into()
+}
+
+/// The `Encoding` field for the server form: a dropdown over
+/// [`ENCODING_CHOICES`]. A config label outside the curated list (a hand-edited
+/// `server.json`) shows as no selection; it persists untouched unless re-picked.
+fn encoding_field(state: &State) -> Element<'_, Message> {
+    let selected = ENCODING_CHOICES
+        .iter()
+        .copied()
+        .find(|choice| *choice == state.server_form_data.encoding);
+    column![
+        text("Encoding").size(13).style(builtins::text::muted),
+        pick_list(&ENCODING_CHOICES[..], selected, |val: &'static str| {
+            Message::UpdateServerFormField(ServerFormField::Encoding, val.to_string())
+        })
+        .width(Length::Fixed(220.0)),
+        text("For servers that don't send UTF-8. CHARSET negotiation overrides this.")
+            .size(12)
+            .style(builtins::text::muted),
+    ]
+    .spacing(4)
+    .into()
+}
 
 // --- Server CRUD Async Wrappers ---
 
@@ -62,7 +150,12 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                     return Task::none();
                 }
             };
-            let config = ServerConfig::new(state.server_form_data.host.trim().to_string(), port);
+            let mut config =
+                ServerConfig::new(state.server_form_data.host.trim().to_string(), port);
+            config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
+            config.compression = state.server_form_data.compression;
+            config.tls = state.server_form_data.tls;
+            config.tls_verify = state.server_form_data.tls_verify;
             if let Err(e) = config.validate() {
                 state.server_crud_error = Some(format!("Configuration error: {e}"));
                 return Task::none();
@@ -93,6 +186,10 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
                 .map_or_else(|| ServerConfig::new(String::new(), 0), |s| s.config.clone());
             config.host = state.server_form_data.host.trim().to_string();
             config.port = port;
+            config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
+            config.compression = state.server_form_data.compression;
+            config.tls = state.server_form_data.tls;
+            config.tls_verify = state.server_form_data.tls_verify;
             if let Err(e) = config.validate() {
                 state.server_crud_error = Some(format!("Configuration error: {e}"));
                 return Task::none();
@@ -225,6 +322,9 @@ pub(super) fn view_server_form<'a>(
                 .push(name_field)
                 .push(host_field)
                 .push(port_field)
+                .push(encoding_field(state))
+                .push(compression_field(state))
+                .push(tls_field(state))
                 .push(server_error(state))
                 .push(Row::new().push(save_button).push(cancel_button).spacing(10))
                 .spacing(15)
@@ -275,6 +375,9 @@ pub(super) fn view_server_form<'a>(
                 .push(name_field)
                 .push(host_field)
                 .push(port_field)
+                .push(encoding_field(state))
+                .push(compression_field(state))
+                .push(tls_field(state))
                 .push(server_error(state))
                 .push(Row::new().push(save_button).push(cancel_button).spacing(10))
                 .push(vertical_space().height(Pixels(10.0)))

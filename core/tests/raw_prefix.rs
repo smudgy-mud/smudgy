@@ -77,14 +77,18 @@ async fn raw_prefix_bypasses_splitting_and_alias_matching() {
             script: Some("alias_fired".to_string()),
             package: None,
             enabled: true,
+            priority: 0,
+            fallthrough: true,
             language: ScriptLang::Plaintext,
         },
         fire_limit: None,
     })
     .unwrap();
 
-    tx.send(RuntimeAction::Send(Arc::new("\\alias_name;foo".to_string())))
-        .unwrap();
+    tx.send(RuntimeAction::Send(Arc::new(
+        "\\alias_name;foo".to_string(),
+    )))
+    .unwrap();
 
     // There is no "done" signal; collect until the session goes quiet.
     let tokens = ["alias_name;foo", "alias_fired", "alias_name", "foo"];

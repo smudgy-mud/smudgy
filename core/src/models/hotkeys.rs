@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
-use super::ScriptLang;
+use super::{ScriptLang, persistence::write_atomic};
 
 // Helper function for serde to default boolean fields to true.
 fn default_true() -> bool {
@@ -191,7 +191,7 @@ pub fn save_hotkeys(server_name: &str, hotkeys: &HashMap<String, HotkeyDefinitio
         "Failed to serialize hotkeys for server '{server_name}'"
     ))?;
 
-    fs::write(&hotkeys_path, json_content).context(format!(
+    write_atomic(&hotkeys_path, json_content.as_bytes()).context(format!(
         "Failed to write hotkeys.json for server '{server_name}' at {}",
         hotkeys_path.display()
     ))?;

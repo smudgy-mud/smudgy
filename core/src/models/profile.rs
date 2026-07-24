@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::{fs, io};
 use validator::Validate;
 
+use super::persistence::write_atomic;
+
 /// Represents the configuration for a single profile within a server.
 /// This struct is serialized to/from `profile.json` within the profile's directory.
 #[derive(Serialize, Deserialize, Debug, Validate, Clone, PartialEq, Eq)]
@@ -205,7 +207,7 @@ pub fn create_profile(
         "Failed to serialize config for profile '{profile_name}' in server '{server_name}'"
     ))?;
 
-    fs::write(&config_path, config_json).context(format!(
+    write_atomic(&config_path, config_json.as_bytes()).context(format!(
         "Failed to write profile.json for profile '{profile_name}' in server '{server_name}' at {}",
         config_path.display()
     ))?;
@@ -328,7 +330,7 @@ pub fn update_profile(
     ))?;
 
     // Write the new config, overwriting the old one
-    fs::write(&config_path, config_json).context(format!(
+    write_atomic(&config_path, config_json.as_bytes()).context(format!(
         "Failed to write updated profile.json for profile '{profile_name}' in server '{server_name}' at {}",
         config_path.display()
     ))?;
@@ -468,7 +470,7 @@ pub fn set_profile_password(server_name: &str, profile_name: &str, password: &st
             );
             let path = password_fallback_path(server_name, profile_name)?;
             let encoded = hex_encode(&obfuscate(password.as_bytes()));
-            fs::write(&path, encoded).context(format!(
+            write_atomic(&path, encoded.as_bytes()).context(format!(
                 "Failed to write password fallback file {}",
                 path.display()
             ))

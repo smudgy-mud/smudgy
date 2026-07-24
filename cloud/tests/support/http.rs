@@ -48,6 +48,22 @@ pub fn err(status: u16, msg: &str) -> Response {
         .into_response()
 }
 
+/// `{"success":false,"data":null,"error":code,"details":{…}}` — the CAS
+/// conflict shape (`api_error_response` attaching `ApiError::details`).
+pub fn err_with_details(status: u16, msg: &str, details: Value) -> Response {
+    let code = StatusCode::from_u16(status).expect("valid status");
+    (
+        code,
+        axum::Json(json!({
+            "success": false,
+            "data": null,
+            "error": msg,
+            "details": details,
+        })),
+    )
+        .into_response()
+}
+
 /// The single uniform 404 used for every resource/validator denial.
 pub fn not_found() -> Response {
     err(404, "Not found")

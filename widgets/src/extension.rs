@@ -31,46 +31,19 @@ fn ensure_widgets(state: &OpState) -> Result<(), WidgetsNotCapable> {
 #[derive(Clone)]
 struct Element {
     view_fn: Arc<dyn Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>>,
-    _drop_cleanup: Arc<ElementDropCleanup>,
-}
-
-struct ElementDropCleanup {
-    cleanup: Option<Box<dyn Fn() + 'static>>,
 }
 
 impl Element {
     fn new(
         f: impl Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> + 'static,
     ) -> Self {
-        Self::with_cleanup(f, None)
-    }
-
-    fn with_cleanup(
-        f: impl Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> + 'static,
-        cleanup: Option<Box<dyn Fn() + 'static>>,
-    ) -> Self {
         Self {
             view_fn: Arc::new(f),
-            _drop_cleanup: Arc::new(ElementDropCleanup::new(cleanup)),
         }
     }
 
     fn element(&self) -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer> {
         (self.view_fn)()
-    }
-}
-
-impl ElementDropCleanup {
-    fn new(cleanup: Option<Box<dyn Fn() + 'static>>) -> Self {
-        Self { cleanup }
-    }
-}
-
-impl Drop for ElementDropCleanup {
-    fn drop(&mut self) {
-        if let Some(cleanup) = self.cleanup.take() {
-            (cleanup)();
-        }
     }
 }
 struct ElementList(pub RefCell<Vec<Element>>);
@@ -126,6 +99,12 @@ deno_core::extension!(
     op_smudgy_widget_build_modal,
     op_smudgy_widget_build_text_editor,
     op_smudgy_widget_build_map_view,
+    op_smudgy_widget_build_canvas,
+    op_smudgy_widget_build_space,
+    op_smudgy_widget_build_checkbox,
+    op_smudgy_widget_build_radio,
+    op_smudgy_widget_build_tooltip,
+    op_smudgy_widget_build_table,
     op_smudgy_widget_extract_markdown_links,
   ],
   esm_entry_point = "ext:smudgy_widgets/widgets.ts",
@@ -303,14 +282,10 @@ impl BoundProp {
         } else {
             &loaded
         };
-        let text = match value {
-            Node::Null => String::new(),
-            Node::String(s) => s.to_string(),
-            // `to_json` rather than `to_string`: `Node`'s `Display` routes through `to_json`
-            // anyway, so calling it directly emits the same text in one allocation instead of
-            // two — this runs in the render closure every frame.
-            other => other.to_json(),
-        };
+        // One spelling source for value→text: `string_from_value` (strings unquoted,
+        // everything else in its JSON spelling), with null/absent rendering empty — the
+        // same spelling `Radio.selected` compares against.
+        let text = string_from_value(value).unwrap_or_default();
         match &self.format {
             Some(template) => template.replacen("{}", &text, 1),
             None => text,
@@ -413,6 +388,28 @@ fn color_from_value(value: &Node) -> Option<iced::Color> {
     value.as_str().and_then(smudgy_cloud::parse_css_color)
 }
 
+/// Strict boolean: only a JSON `true`/`false` drives a bound bool prop — no truthiness
+/// coercion, so a stray string/number reads as absent (widget default) rather than "on".
+fn bool_from_value(value: &Node) -> Option<bool> {
+    match value {
+        Node::Bool(flag) => Some(*flag),
+        _ => None,
+    }
+}
+
+/// A value in its JSON string form (strings unquoted); `None` for null/absent. The one
+/// spelling shared by bound-text display ([`BoundProp::display_text`]) and string-compared
+/// props like `Radio.selected` — so `selected={h.bind('mode')}` matches `value="fast"` for
+/// a stored `"fast"` and `value="5"` for a stored `5`, exactly as a `Text` binding would
+/// show them.
+fn string_from_value(value: &Node) -> Option<String> {
+    match value {
+        Node::Null => None,
+        Node::String(text) => Some(text.to_string()),
+        other => Some(other.to_json()),
+    }
+}
+
 // Binding-aware twins of the static prop macros: a binding token resolves to `Bound` (read
 // per render), anything else takes the exact static path the old macro took. An absent prop
 // is `None` either way, so the `if let Some(...)` attr-fn pattern is unchanged at call sites.
@@ -473,6 +470,40 @@ macro_rules! get_dyn_color_prop {
         } else {
             None
         }
+    }};
+}
+
+macro_rules! get_dyn_bool_prop {
+    ($scope:ident, $state:ident, $obj:ident, $name:expr) => {{
+        let prop = ascii_str!($name)
+            .v8_string($scope)
+            .expect("Could not allocate string")
+            .into();
+        $obj.get($scope, prop).and_then(|v| {
+            if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
+                Some(DynProp::Bound { prop: bound, parse: bool_from_value })
+            } else if v.is_boolean() {
+                Some(DynProp::Static(v.boolean_value($scope)))
+            } else {
+                None
+            }
+        })
+    }};
+}
+
+macro_rules! get_dyn_string_prop {
+    ($scope:ident, $state:ident, $obj:ident, $name:expr) => {{
+        let prop = ascii_str!($name)
+            .v8_string($scope)
+            .expect("Could not allocate string")
+            .into();
+        $obj.get($scope, prop).and_then(|v| {
+            if let Some(bound) = bound_prop_from_v8($scope, $state, v) {
+                Some(DynProp::Bound { prop: bound, parse: string_from_value })
+            } else {
+                get_opt_string_prop!($scope, $obj, $name).map(DynProp::Static)
+            }
+        })
     }};
 }
 
@@ -834,11 +865,81 @@ fn op_smudgy_widget_build_stack(
     })
 }
 
-/// One piece of a `Text` widget's content: literal text, or a store binding rendered as its
-/// display text each frame (`<Text>HP: {vitals.bind('hp')}</Text>` — mixed children, interop.md §7).
+/// One piece of a text-bearing prop's content: literal text, or a store binding rendered as
+/// its display text each frame (`<Text>HP: {vitals.bind('hp')}</Text>` — mixed children,
+/// interop.md §7). Shared by `Text` and the labeled form widgets (`Checkbox`/`Radio`).
 enum TextPart {
     Static(String),
     Bound(BoundProp),
+}
+
+/// Read a `widgets.ts`-normalized parts array (strings + binding tokens verbatim). A token
+/// whose id no longer resolves (stale engine generation) renders as empty text rather than
+/// its object spelling.
+fn collect_text_parts(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    parts: v8::Local<v8::Array>,
+) -> Vec<TextPart> {
+    let mut content = Vec::with_capacity(parts.length() as usize);
+    for index in 0..parts.length() {
+        let Some(item) = parts.get_index(scope, index) else {
+            continue;
+        };
+        if is_binding_token(scope, item) {
+            match bound_prop_from_v8(scope, state, item) {
+                Some(bound) => content.push(TextPart::Bound(bound)),
+                None => content.push(TextPart::Static(String::new())),
+            }
+        } else {
+            content.push(TextPart::Static(item.to_rust_string_lossy(scope)));
+        }
+    }
+    content
+}
+
+/// Assemble parts into the current display string (bound parts re-read their cells).
+fn assemble_text_parts(parts: &[TextPart]) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            TextPart::Static(text) => text.clone(),
+            TextPart::Bound(bound) => bound.display_text(),
+        })
+        .collect()
+}
+
+/// A text-bearing prop's content with the all-static assembly folded once at build:
+/// entirely-literal content pays its string build a single time (the `Text` fast path,
+/// shared by every labeled widget); any bound part re-assembles per render.
+struct TextContent {
+    parts: Vec<TextPart>,
+    fixed: Option<String>,
+}
+
+impl TextContent {
+    fn collect(scope: &mut v8::PinScope, state: &OpState, parts: v8::Local<v8::Array>) -> Self {
+        let parts = collect_text_parts(scope, state, parts);
+        let fixed = parts
+            .iter()
+            .all(|part| matches!(part, TextPart::Static(_)))
+            .then(|| assemble_text_parts(&parts));
+        Self { parts, fixed }
+    }
+
+    /// Whether any content was authored at all. A build-time fact — empty-label decisions
+    /// hang off this rather than the per-frame string, so a bound part that transiently
+    /// renders empty cannot flicker the label in and out of the layout.
+    fn has_parts(&self) -> bool {
+        !self.parts.is_empty()
+    }
+
+    fn current(&self) -> String {
+        match &self.fixed {
+            Some(text) => text.clone(),
+            None => assemble_text_parts(&self.parts),
+        }
+    }
 }
 
 #[op2]
@@ -854,49 +955,10 @@ fn op_smudgy_widget_build_text(
     // Text size in pixels; absent leaves the theme default.
     let size = get_dyn_f32_prop!(scope, state, props, "size");
 
-    // `widgets.ts` sends the normalized children: strings, plus binding tokens passed through
-    // verbatim. A token whose id no longer resolves (stale engine generation) renders as
-    // empty text rather than its object spelling.
-    let mut content: Vec<TextPart> = Vec::new();
-    for index in 0..parts.length() {
-        let Some(item) = parts.get_index(scope, index) else {
-            continue;
-        };
-        if is_binding_token(scope, item) {
-            match bound_prop_from_v8(scope, state, item) {
-                Some(bound) => content.push(TextPart::Bound(bound)),
-                None => content.push(TextPart::Static(String::new())),
-            }
-        } else {
-            content.push(TextPart::Static(item.to_rust_string_lossy(scope)));
-        }
-    }
-    // All-literal content assembles once at build; any bound part re-assembles per render.
-    let fixed: Option<String> = if content.iter().all(|p| matches!(p, TextPart::Static(_))) {
-        Some(
-            content
-                .iter()
-                .map(|p| match p {
-                    TextPart::Static(text) => text.as_str(),
-                    TextPart::Bound(_) => unreachable!("all parts are static"),
-                })
-                .collect(),
-        )
-    } else {
-        None
-    };
+    let content = TextContent::collect(scope, state, parts);
 
     Element::new(move || {
-        let assembled = match &fixed {
-            Some(text) => text.clone(),
-            None => content
-                .iter()
-                .map(|part| match part {
-                    TextPart::Static(text) => text.clone(),
-                    TextPart::Bound(bound) => bound.display_text(),
-                })
-                .collect(),
-        };
+        let assembled = content.current();
         let mut text: iced::widget::Text<'static, smudgy_theme::Theme, iced::Renderer> =
             iced::widget::text(assembled);
         if let Some(color) = color.as_ref().and_then(DynProp::get) {
@@ -1570,13 +1632,13 @@ fn op_smudgy_widget_build_text_editor(
         size: get_number_prop!(scope, props, "size").map(|v| v as f32),
     };
 
-    // Best-effort cleanup, mirroring the map widget: drop the buffer when the element drops if the
-    // store is reachable at that point.
-    let cleanup_key = key.clone();
-    let drop_cleanup = crate::text_editor::with_active_text_store(|store| {
-        let store = store.clone();
-        Box::new(move || store.remove_editor(&cleanup_key)) as Box<dyn Fn() + 'static>
-    });
+    // Buffers are never removed from the store: an explicit-`id` buffer is
+    // *reclaimed* (reseeded) by the next mount of that id, and an auto-keyed
+    // buffer persists for the session. Reaping unmounted buffers the way map
+    // entries are reaped must wait until `EditorHandle::element` no longer
+    // lifts its `Content` borrow to `'static` (docs/widgets.md, "Widget
+    // lifecycle") — freeing a borrowed buffer would turn that lift into a
+    // use-after-free.
 
     // `value` is authoritative per mount. The build op runs on the session thread where the
     // UI-thread store isn't reachable, so we reseed on the FIRST frame of this build instead: a
@@ -1584,31 +1646,28 @@ fn op_smudgy_widget_build_text_editor(
     // while later frames of the same mount preserve in-progress edits.
     let seeded = std::cell::Cell::new(false);
 
-    Element::with_cleanup(
-        move || {
-            let key = key.clone();
-            let isolate = isolate.clone();
-            let on_change = on_change.clone();
-            let first_frame = !seeded.replace(true);
-            crate::text_editor::with_active_text_store(|store| {
-                let handle = if first_frame {
-                    store.seed_editor(&key, &initial_text)
-                } else {
-                    store.ensure_editor(&key, &initial_text)
-                };
-                handle
-                    .element(&config)
-                    .map(move |action| WidgetMessage::TextEditorAction {
-                        key: key.clone(),
-                        action,
-                        on_change: on_change.clone(),
-                        isolate: isolate.clone(),
-                    })
-            })
-            .unwrap_or_else(|| iced::widget::text("text editor unavailable").into())
-        },
-        drop_cleanup,
-    )
+    Element::new(move || {
+        let key = key.clone();
+        let isolate = isolate.clone();
+        let on_change = on_change.clone();
+        let first_frame = !seeded.replace(true);
+        crate::text_editor::with_active_text_store(|store| {
+            let handle = if first_frame {
+                store.seed_editor(&key, &initial_text)
+            } else {
+                store.ensure_editor(&key, &initial_text)
+            };
+            handle
+                .element(&config)
+                .map(move |action| WidgetMessage::TextEditorAction {
+                    key: key.clone(),
+                    action,
+                    on_change: on_change.clone(),
+                    isolate: isolate.clone(),
+                })
+        })
+        .unwrap_or_else(|| iced::widget::text("text editor unavailable").into())
+    })
 }
 
 #[op2]
@@ -1669,52 +1728,421 @@ fn op_smudgy_widget_build_map_view(state: &mut OpState) -> Element {
     let mapper = state.borrow::<Option<Mapper>>().clone();
     let widget_id = NEXT_MAP_WIDGET_ID.fetch_add(1, Ordering::Relaxed);
 
-    let drop_cleanup = crate::map::with_active_store(|store| {
-        let store = store.clone();
-        Box::new(move || store.remove_map(widget_id)) as Box<dyn Fn() + 'static>
-    });
+    // The reap guard rides inside the render closure: the closure is the only
+    // path back into the session's `MapStore`, and its clones are exactly the
+    // JS-held element handle plus any `WidgetRoot` mount. When the last clone
+    // drops — unmount, engine-rebuild clear, or cppgc collecting the JS
+    // handle, on whichever thread — the guard queues the id and the UI thread
+    // frees the entry on its next render pass.
+    let reap = state
+        .borrow::<SmudgyWidgetRoot>()
+        .map_reaper()
+        .guard(widget_id);
 
-    Element::with_cleanup(
-        move || {
-            if let Some(mapper) = mapper.clone() {
-                crate::map::with_active_store(|store| {
-                    let handle = store.ensure_map(mapper.clone(), widget_id);
-                    Some(handle.element().map(move |message| {
-                        crate::WidgetMessage::MapMessage {
+    Element::new(move || {
+        if let Some(mapper) = mapper.clone() {
+            crate::map::with_active_store(|store| {
+                let widget_id = reap.id();
+                let handle = store.ensure_map(mapper.clone(), widget_id);
+                Some(
+                    handle
+                        .element()
+                        .map(move |message| crate::WidgetMessage::MapMessage {
                             id: widget_id,
                             message,
+                        }),
+                )
+            })
+            .flatten()
+            .unwrap_or_else(|| iced::widget::text("map unavailable").into())
+        } else {
+            iced::widget::text("map unavailable (no mapper)").into()
+        }
+    })
+}
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_build_canvas(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+    #[string] isolate_token: &str,
+) -> Element {
+    use crate::canvas::{ParsedScene, PointerHandler, SceneMemo, SceneProgram, SceneSource};
+
+    let width = get_dyn_length_prop!(scope, state, props, "width");
+    let height = get_dyn_length_prop!(scope, state, props, "height");
+
+    // `view_box: [x, y, w, h]` in scene units — frozen as an exact rect-to-bounds mapping
+    // (non-uniform when aspects differ), so the scene<->pointer transform stays bijective.
+    let view_box = {
+        let key = ascii_str!("view_box")
+            .v8_string(scope)
+            .expect("Could not allocate string")
+            .into();
+        props
+            .get(scope, key)
+            .and_then(|v| deno_core::serde_v8::from_v8::<[f32; 4]>(scope, v).ok())
+            .filter(|[_, _, w, h]| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
+            .map(|[x, y, w, h]| {
+                iced::Rectangle::new(iced::Point::new(x, y), iced::Size::new(w, h))
+            })
+    };
+
+    // The scene: a store binding (the live path — repaints per store flush, parse memoized by
+    // snapshot pointer) or a static value converted to the store's `Node` shape once so both
+    // sources share one parser. A rejected *static* scene has no previous generation to keep,
+    // so it renders empty — loudly.
+    let scene_key = ascii_str!("scene")
+        .v8_string(scope)
+        .expect("Could not allocate string")
+        .into();
+    let scene_value = props.get(scope, scene_key);
+    let scene = match scene_value {
+        Some(value) if is_binding_token(scope, value) => match bound_prop_from_v8(scope, state, value) {
+            Some(bound) => {
+                let fallback = bound
+                    .fallback
+                    .as_ref()
+                    .and_then(|node| match crate::canvas::parse_scene(node) {
+                        Ok(parsed) => {
+                            crate::canvas::log_warnings(&parsed);
+                            Some(parsed)
                         }
-                    }))
-                })
-                .flatten()
-                .unwrap_or_else(|| iced::widget::text("map unavailable").into())
-            } else {
-                iced::widget::text("map unavailable (no mapper)").into()
+                        Err(reject) => {
+                            log::warn!(
+                                "smudgy canvas: binding fallback rejected ({reject}); using an empty fallback"
+                            );
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                SceneSource::Bound {
+                    cell: bound.cell,
+                    memo: Arc::new(std::sync::Mutex::new(SceneMemo::default())),
+                    fallback: Arc::new(fallback),
+                }
             }
+            None => SceneSource::Static(Arc::new(ParsedScene::default())),
         },
-        drop_cleanup,
-    )
+        Some(value) if !value.is_null_or_undefined() => {
+            let parsed = deno_core::serde_v8::from_v8::<serde_json::Value>(scope, value)
+                .ok()
+                .map_or_else(ParsedScene::default, |value| {
+                    match crate::canvas::parse_scene(&Node::from(value)) {
+                        Ok(parsed) => {
+                            crate::canvas::log_warnings(&parsed);
+                            parsed
+                        }
+                        Err(reject) => {
+                            log::warn!(
+                                "smudgy canvas: static scene rejected ({reject}); rendering nothing"
+                            );
+                            ParsedScene::default()
+                        }
+                    }
+                });
+            SceneSource::Static(Arc::new(parsed))
+        }
+        _ => SceneSource::Static(Arc::new(ParsedScene::default())),
+    };
+
+    let on_pointer = get_v8_function_prop!(scope, props, "onPointer").map(|callback| PointerHandler {
+        callback: Arc::new(callback),
+        isolate: WidgetIsolate(isolate_token.to_string()),
+    });
+
+    // `fit: "contain"` opts into uniform scale-to-fit with centering; the default is the
+    // exact (possibly non-uniform) rect-to-bounds mapping.
+    let fit = match get_opt_string_prop!(scope, props, "fit").as_deref() {
+        Some("contain") => crate::canvas::ViewFit::Contain,
+        _ => crate::canvas::ViewFit::Fill,
+    };
+
+    let program = SceneProgram {
+        scene,
+        view_box,
+        fit,
+        on_pointer,
+    };
+
+    Element::new(move || {
+        let width = width.as_ref().and_then(DynProp::get).unwrap_or(iced::Length::Fill);
+        let height = height.as_ref().and_then(DynProp::get).unwrap_or(iced::Length::Fill);
+        // Clipped like the map canvas: scene geometry may exceed the bounds (the burst-alert
+        // ring deliberately does), and tiny-skia's damage-tracked partial redraws would leave
+        // the spill on screen without the clipping container.
+        iced::widget::container(
+            iced::widget::canvas(program.clone()).width(width).height(height),
+        )
+        .width(width)
+        .height(height)
+        .clip(true)
+        .into()
+    })
+}
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_build_space(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+) -> Element {
+    let width = get_dyn_length_prop!(scope, state, props, "width");
+    let height = get_dyn_length_prop!(scope, state, props, "height");
+    Element::new(move || {
+        let mut space = iced::widget::Space::new();
+        if let Some(width) = width.as_ref().and_then(DynProp::get) {
+            space = space.width(width);
+        }
+        if let Some(height) = height.as_ref().and_then(DynProp::get) {
+            space = space.height(height);
+        }
+        space.into()
+    })
+}
+
+type Checkbox = iced::widget::Checkbox<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_build_checkbox(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+    parts: v8::Local<v8::Array>,
+    #[string] isolate_token: &str,
+) -> Element {
+    let checked = get_dyn_bool_prop!(scope, state, props, "checked");
+    let size = get_dyn_f32_prop!(scope, state, props, "size");
+    let text_size = get_dyn_f32_prop!(scope, state, props, "text_size");
+    let label = TextContent::collect(scope, state, parts);
+    // No `onToggle` leaves iced's `on_toggle` unset, which renders the disabled style — the
+    // right read for a display-only checkmark (unlike Radio, whose factory requires a
+    // handler, because iced has no disabled radio rendering).
+    let on_toggle = get_v8_function_prop!(scope, props, "onToggle").map(Arc::new);
+    let isolate = WidgetIsolate(isolate_token.to_string());
+
+    Element::new(move || {
+        let mut checkbox: Checkbox =
+            iced::widget::checkbox(checked.as_ref().and_then(DynProp::get).unwrap_or(false));
+        if label.has_parts() {
+            checkbox = checkbox.label(label.current());
+        }
+        if let Some(on_toggle) = &on_toggle {
+            let callback = on_toggle.clone();
+            let isolate = isolate.clone();
+            checkbox = checkbox.on_toggle(move |now_checked| WidgetMessage::InvokeCallback {
+                callback: callback.clone(),
+                isolate: isolate.clone(),
+                args: vec![now_checked.to_string()],
+            });
+        }
+        if let Some(size) = size.as_ref().and_then(DynProp::get) {
+            checkbox = checkbox.size(size);
+        }
+        if let Some(text_size) = text_size.as_ref().and_then(DynProp::get) {
+            checkbox = checkbox.text_size(text_size);
+        }
+        checkbox.into()
+    })
+}
+
+type Radio = iced::widget::Radio<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
+type Tooltip = iced::widget::Tooltip<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>;
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_build_tooltip(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+    #[cppgc] target: &Element,
+    #[cppgc] tip: &Element,
+) -> Element {
+    use iced::widget::tooltip::Position;
+
+    let target = target.clone();
+    let tip = tip.clone();
+    let position = match get_string_prop!(scope, props, "position").as_deref() {
+        Some("bottom") => Position::Bottom,
+        Some("left") => Position::Left,
+        Some("right") => Position::Right,
+        Some("cursor") => Position::FollowCursor,
+        _ => Position::Top,
+    };
+    let gap = get_dyn_f32_prop!(scope, state, props, "gap");
+    // Set by the factory for string/binding tips: those get the themed chrome (surface +
+    // border + padding) from the tooltip's own container styling — never an extra wrapper
+    // element, whose padding and background would stack with the tooltip's. Element tips
+    // render chrome-free; styling them is the author's element's job.
+    let chrome = get_bool_prop!(scope, props, "tip_chrome").unwrap_or(false);
+
+    Element::new(move || {
+        let mut tooltip: Tooltip =
+            iced::widget::tooltip(target.element(), tip.element(), position);
+        if let Some(gap) = gap.as_ref().and_then(DynProp::get) {
+            tooltip = tooltip.gap(gap);
+        }
+        if chrome {
+            tooltip = tooltip
+                .padding(6.0)
+                .style(smudgy_theme::builtins::container::tooltip);
+        }
+        tooltip.into()
+    })
+}
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_build_radio(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+    parts: v8::Local<v8::Array>,
+    #[string] isolate_token: &str,
+) -> Element {
+    let value = get_string_prop!(scope, props, "value").unwrap_or_default();
+    let selected = get_dyn_string_prop!(scope, state, props, "selected");
+    let size = get_dyn_f32_prop!(scope, state, props, "size");
+    let text_size = get_dyn_f32_prop!(scope, state, props, "text_size");
+    let label = TextContent::collect(scope, state, parts);
+    // The factory requires `onSelect` (a handler-less radio would render enabled and swallow
+    // clicks); the op stays defensive with a Noop for direct op callers. The click message
+    // depends only on build-time values, so it is built once here and cloned per frame.
+    let on_select = get_v8_function_prop!(scope, props, "onSelect").map(Arc::new);
+    let isolate = WidgetIsolate(isolate_token.to_string());
+    let message = match on_select {
+        Some(callback) => WidgetMessage::InvokeCallback {
+            callback,
+            isolate,
+            args: vec![value.clone()],
+        },
+        None => WidgetMessage::Noop,
+    };
+
+    Element::new(move || {
+        // iced's radio wants `V: Copy + Eq`, which the script-level string value is not;
+        // the string comparison happens here and a `bool` adapter drives iced. The label
+        // rides unconditionally — unlike Checkbox, iced's radio has no label-less form,
+        // so authored-empty content renders as an empty text run.
+        let is_selected = selected
+            .as_ref()
+            .and_then(DynProp::get)
+            .is_some_and(|current| current == value);
+        let message = message.clone();
+        let mut radio: Radio = iced::widget::radio(
+            label.current(),
+            true,
+            is_selected.then_some(true),
+            move |_| message,
+        );
+        if let Some(size) = size.as_ref().and_then(DynProp::get) {
+            radio = radio.size(size);
+        }
+        if let Some(text_size) = text_size.as_ref().and_then(DynProp::get) {
+            radio = radio.text_size(text_size);
+        }
+        radio.into()
+    })
+}
+
+/// One table column's layout facts, read once at build from the factory's `columns`
+/// records (the header elements ride separately, in the headers list).
+#[derive(Default)]
+struct ColumnMeta {
+    width: Option<iced::Length>,
+    align_x: Option<Horizontal>,
+    align_y: Option<Vertical>,
+}
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_build_table(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+    #[cppgc] headers: &ElementList,
+    #[cppgc] cells: &ElementList,
+) -> Element {
+    let width = get_dyn_length_prop!(scope, state, props, "width");
+    let padding = get_number_prop!(scope, props, "padding");
+    let separator = get_number_prop!(scope, props, "separator");
+
+    // Per-column layout from the `columns` records; the factory guarantees the headers
+    // list is the same length. Anything unreadable simply leaves the column defaults.
+    let metas: Vec<ColumnMeta> = {
+        let key = ascii_str!("columns")
+            .v8_string(scope)
+            .expect("Could not allocate string")
+            .into();
+        let columns = props
+            .get(scope, key)
+            .and_then(|v| v8::Local::<v8::Array>::try_from(v).ok());
+        let mut metas = Vec::new();
+        if let Some(columns) = columns {
+            for index in 0..columns.length() {
+                let meta = columns
+                    .get_index(scope, index)
+                    .and_then(|v| v8::Local::<v8::Object>::try_from(v).ok())
+                    .map_or_else(ColumnMeta::default, |record| ColumnMeta {
+                        width: get_length_prop!(scope, record, "width"),
+                        align_x: get_horizontal_prop!(scope, record, "align_x"),
+                        align_y: get_vertical_prop!(scope, record, "align_y"),
+                    });
+                metas.push(meta);
+            }
+        }
+        metas
+    };
+
+    let headers: Arc<Vec<Element>> = Arc::new(headers.0.take());
+    let cells: Arc<Vec<Element>> = Arc::new(cells.0.take());
+    // The factory keeps `columns` and the headers list the same length; clamping defends
+    // the render thread against a direct op caller that doesn't (an out-of-range
+    // `headers[index]` would panic mid-frame).
+    let column_count = metas.len().min(headers.len());
+    let row_count = cells.len().checked_div(column_count).unwrap_or(0);
+
+    Element::new(move || {
+        let columns = metas.iter().take(column_count).enumerate().map(|(index, meta)| {
+            let cells = cells.clone();
+            let mut column = iced::widget::table::column(
+                headers[index].element(),
+                move |row: usize| cells[row * column_count + index].element(),
+            );
+            if let Some(width) = meta.width {
+                column = column.width(width);
+            }
+            if let Some(align_x) = meta.align_x {
+                column = column.align_x(align_x);
+            }
+            if let Some(align_y) = meta.align_y {
+                column = column.align_y(align_y);
+            }
+            column
+        });
+        let mut table = iced::widget::table(columns, 0..row_count);
+        if let Some(width) = width.as_ref().and_then(DynProp::get) {
+            table = table.width(width);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        if let Some(padding) = padding {
+            table = table.padding(padding as f32);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        if let Some(separator) = separator {
+            table = table.separator(separator as f32);
+        }
+        table.into()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, rc::Rc};
-
-    #[test]
-    fn element_cleanup_runs_on_last_drop() {
-        let cleaned = Rc::new(Cell::new(false));
-        {
-            let flag = Rc::clone(&cleaned);
-            let element = Element::with_cleanup(
-                || iced::widget::text("test").into(),
-                Some(Box::new(move || flag.set(true))),
-            );
-            let another = element.clone();
-            drop(another);
-        }
-        assert!(cleaned.get());
-    }
 
     #[test]
     fn command_autolinks_become_links() {

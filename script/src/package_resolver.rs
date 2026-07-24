@@ -407,7 +407,7 @@ pub fn module_type_for(path: &str) -> deno_core::ModuleType {
 // ---------------------------------------------------------------------------
 
 /// A package manifest. Parsed and recorded immediately; the `permissions` block is **enforced**
-/// per sandboxed package isolate: the deno-native fields (`net`/`read`/`write`/`env`)
+/// per sandboxed package isolate: the deno-native fields (`net`/`read`/`write`/`env`/`run`/`ffi`/`sys`)
 /// (`script/PACKAGE-ISOLATES-ENFORCEMENT.md`) — the isolate factory builds a restricted
 /// `PermissionsContainer` from their closure union — and the `smudgy` op-capability block
 /// (`script/PACKAGE-ISOLATES-OP-CAPABILITIES.md`), which gates smudgy's own ops via a
@@ -666,11 +666,22 @@ impl ImportPolicy {
 }
 
 /// Requested permissions, enforced per sandboxed package isolate. The deno-native fields
-/// (`net`/`read`/`write`/`env`, `script/PACKAGE-ISOLATES-ENFORCEMENT.md`) are each a
-/// deny-by-default allowlist: an absent/empty field denies that kind entirely. Value formats:
-/// `net` entries are `host:port` (only that port) or bare `host` (any port); `read`/`write` are
-/// paths whose directory grants cover the whole subtree (and may use the `$DATA` placeholder,
-/// host-expanded before enforcement); `env` are exact var names.
+/// (`net`/`read`/`write`/`env`/`run`/`ffi`/`sys`, `script/PACKAGE-ISOLATES-ENFORCEMENT.md`) are
+/// each a deny-by-default allowlist: an absent/empty field denies that kind entirely. Value
+/// formats: `net` entries are `host:port` (only that port) or bare `host` (any port);
+/// `read`/`write` are paths whose directory grants cover the whole subtree (and may use the
+/// `$DATA` placeholder, host-expanded before enforcement); `env` are exact var names; `run` are
+/// program names (PATH-resolved at container build) or absolute paths; `ffi` are dynamic-library
+/// paths with the same subtree + `$DATA` semantics as `read`/`write`; `sys` are deno system-info
+/// kind tokens (`hostname`, `osRelease`, …), exact-matched.
+///
+/// **`run` and `ffi` are sandbox escapes**: a subprocess or a native library runs *outside* the
+/// permission model with the user's full privileges, and a `write` entry that reaches outside
+/// `$DATA` is equivalent (it can rewrite config, scripts, or other packages). They are declarable
+/// so a package that genuinely needs them can ask honestly — but every surface that shows a
+/// permission set (the consent window, the package panes) must present them as what they are:
+/// effectively full access, not a scoped grant (see `permission_can_lines` / `PermissionRisk` in
+/// the automations window).
 ///
 /// `import` is a tri-state [`ImportPolicy`] (not a host list) and a separate axis from `net`: `net`
 /// governs runtime network *connections* (opening sockets / `fetch`, where the package could send
@@ -690,6 +701,24 @@ pub struct PackagePermissions {
     pub write: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
+    /// Programs the package may spawn as subprocesses (deno `allow_run`): bare names
+    /// (PATH-resolved when the container is built; an unresolvable name is logged and denied) or
+    /// absolute paths, exact-matched. A subprocess is NOT sandboxed — any entry here is
+    /// effectively full access. Pre-0.4.2 clients ignore this field and keep `run` denied
+    /// (fail-closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run: Vec<String>,
+    /// Dynamic libraries the package may load (deno `allow_ffi`): paths with the same subtree +
+    /// `$DATA` semantics as `read`/`write`. Native code is NOT sandboxed — any entry here is
+    /// effectively full access. Pre-0.4.2 clients ignore this field and keep `ffi` denied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ffi: Vec<String>,
+    /// System-information kinds the package may query (deno `allow_sys`): exact kind tokens such
+    /// as `hostname`, `osRelease`, `networkInterfaces`, `userInfo`. Information disclosure
+    /// (fingerprinting), not a capability escape. An unknown token fails the container build, so
+    /// the package is skipped rather than run ungated (fail-closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sys: Vec<String>,
     /// How far outside the smudgy ecosystem this package may download code to run
     /// ([`ImportPolicy`]): `None` (default) = smudgy:// only; `Registries` = + npm/jsr; `Any` = +
     /// arbitrary https/http. Enforced at the module loader, not via deno's permission container.
@@ -708,6 +737,9 @@ impl PackagePermissions {
             && self.read.is_empty()
             && self.write.is_empty()
             && self.env.is_empty()
+            && self.run.is_empty()
+            && self.ffi.is_empty()
+            && self.sys.is_empty()
             && self.import.is_none()
             && self.smudgy.is_empty()
     }
@@ -724,6 +756,9 @@ impl PackagePermissions {
         merge_dedup(&mut self.read, &other.read);
         merge_dedup(&mut self.write, &other.write);
         merge_dedup(&mut self.env, &other.env);
+        merge_dedup(&mut self.run, &other.run);
+        merge_dedup(&mut self.ffi, &other.ffi);
+        merge_dedup(&mut self.sys, &other.sys);
         // `import` is an ordered lattice (None < Registries < Any); the closure union is the max.
         self.import = self.import.max(other.import);
         self.smudgy.merge(&other.smudgy);
@@ -749,7 +784,10 @@ impl PackagePermissions {
             net: added_entries(&self.net, &baseline.net, PermField::Net),
             read: added_entries(&self.read, &baseline.read, PermField::Path),
             write: added_entries(&self.write, &baseline.write, PermField::Path),
-            env: added_entries(&self.env, &baseline.env, PermField::Env),
+            env: added_entries(&self.env, &baseline.env, PermField::Exact),
+            run: added_entries(&self.run, &baseline.run, PermField::Exact),
+            ffi: added_entries(&self.ffi, &baseline.ffi, PermField::Path),
+            sys: added_entries(&self.sys, &baseline.sys, PermField::Exact),
             // The "additionally wants" for `import` is the new level only when it escalates past the
             // consented one (a higher level is a superset); otherwise nothing new.
             import: if self.import > baseline.import { self.import } else { ImportPolicy::None },
@@ -773,7 +811,10 @@ impl PackagePermissions {
         self.net.iter().all(|e| covered_by(PermField::Net, &ceiling.net, e))
             && self.read.iter().all(|e| covered_by(PermField::Path, &ceiling.read, e))
             && self.write.iter().all(|e| covered_by(PermField::Path, &ceiling.write, e))
-            && self.env.iter().all(|e| covered_by(PermField::Env, &ceiling.env, e))
+            && self.env.iter().all(|e| covered_by(PermField::Exact, &ceiling.env, e))
+            && self.run.iter().all(|e| covered_by(PermField::Exact, &ceiling.run, e))
+            && self.ffi.iter().all(|e| covered_by(PermField::Path, &ceiling.ffi, e))
+            && self.sys.iter().all(|e| covered_by(PermField::Exact, &ceiling.sys, e))
             // `import` fits iff it asks for no higher level than the ceiling grants.
             && self.import <= ceiling.import
             && self.smudgy.is_within(&ceiling.smudgy)
@@ -828,10 +869,15 @@ pub struct SmudgyCapabilities {
     /// `panes: ["create"]` — create/close/write session output panes and route lines into them.
     pub panes: bool,
     /// `gmcp: ["send"]` — send GMCP messages to the game and manage GMCP modules
-    /// (`gmcp.send`/`enableModule`/`disableModule`/`mergeKeys`, `docs/gmcp-plan.md` §6.3).
+    /// (`gmcp.send`/`enableModule`/`disableModule`/`mergeKeys`, `docs/gmcp.md` §6.3).
     /// Outbound GMCP can drive server-side state, so it is the moral equivalent of
     /// `session: ["send"]` and deliberately rides with neither `interop` grant.
     pub gmcp_send: bool,
+    /// `input: ["access"]` — the command-input surface (`docs/input.md` §3.6):
+    /// read the input's mirrored state (value/cursor/selection/focus) and rewrite, focus,
+    /// mask, or submit it. One capability covers the whole surface — a package holding it
+    /// can see and rewrite what the user types.
+    pub input: bool,
 }
 
 impl SmudgyCapabilities {
@@ -854,6 +900,7 @@ impl SmudgyCapabilities {
             interop_write: true,
             panes: true,
             gmcp_send: true,
+            input: true,
         }
     }
 
@@ -882,6 +929,7 @@ impl SmudgyCapabilities {
         self.interop_write |= other.interop_write;
         self.panes |= other.panes;
         self.gmcp_send |= other.gmcp_send;
+        self.input |= other.input;
     }
 
     /// Whether `self` requests **nothing beyond** `ceiling` — every capability `self` wants is also
@@ -907,6 +955,7 @@ impl SmudgyCapabilities {
             && (!self.interop_write || ceiling.interop_write)
             && (!self.panes || ceiling.panes)
             && (!self.gmcp_send || ceiling.gmcp_send)
+            && (!self.input || ceiling.input)
     }
 
     /// The capabilities requested by `self` (a newly-resolved closure union) but **not** by
@@ -930,6 +979,7 @@ impl SmudgyCapabilities {
             interop_write: self.interop_write && !baseline.interop_write,
             panes: self.panes && !baseline.panes,
             gmcp_send: self.gmcp_send && !baseline.gmcp_send,
+            input: self.input && !baseline.input,
         }
     }
 }
@@ -976,6 +1026,8 @@ struct SmudgyCapabilitiesWire {
     panes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     gmcp: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    input: Vec<String>,
 }
 
 // Build-time sunset for the legacy `events` capability alias. `const` panics are compile
@@ -1035,6 +1087,7 @@ impl From<SmudgyCapabilitiesWire> for SmudgyCapabilities {
             interop_write: has_token(&wire.interop, "write") || has_token(&wire.events, "emit"),
             panes: has_token(&wire.panes, "create"),
             gmcp_send: has_token(&wire.gmcp, "send"),
+            input: has_token(&wire.input, "access"),
         }
     }
 }
@@ -1106,6 +1159,10 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
         if caps.gmcp_send {
             gmcp.push("send".to_string());
         }
+        let mut input = Vec::new();
+        if caps.input {
+            input.push("access".to_string());
+        }
         Self {
             automations,
             session,
@@ -1116,6 +1173,7 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
             events,
             panes,
             gmcp,
+            input,
         }
     }
 }
@@ -1127,10 +1185,14 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
 enum PermField {
     /// `net`: a bare `host` grant covers any port; an exact `host:port` covers only that port.
     Net,
-    /// `read`/`write`: a path grant covers its whole subtree (prefix at a component boundary).
+    /// `read`/`write`/`ffi`: a path grant covers its whole subtree (prefix at a component
+    /// boundary).
     Path,
-    /// `env`: exact (trimmed) variable-name match — no subtree.
-    Env,
+    /// `env`/`run`/`sys`: exact (trimmed) token match — a var name, program name/path, or sys
+    /// kind. Deliberately conservative for `run`: two spellings of the same program (`git` vs an
+    /// absolute path) don't unify, so a re-spelled entry re-prompts rather than silently riding
+    /// an old grant.
+    Exact,
 }
 
 /// Entries of `new` not **covered** by any entry of `old` under `field`'s containment semantics — a
@@ -1160,7 +1222,7 @@ fn covered_by(field: PermField, ceiling: &[String], requested: &str) -> bool {
                     .iter()
                     .any(|grant| !path_entry_dropped(grant) && path_covers(grant, requested))
         }
-        PermField::Env => ceiling
+        PermField::Exact => ceiling
             .iter()
             .any(|grant| normalize_plain(grant) == normalize_plain(requested)),
     }
@@ -1187,7 +1249,7 @@ fn path_entry_dropped(entry: &str) -> bool {
 fn dedup_key(field: PermField, entry: &str) -> String {
     match field {
         PermField::Net => normalize_host(entry),
-        PermField::Path | PermField::Env => normalize_plain(entry),
+        PermField::Path | PermField::Exact => normalize_plain(entry),
     }
 }
 
@@ -1271,8 +1333,9 @@ fn normalize_host(entry: &str) -> String {
     entry.trim().to_lowercase()
 }
 
-/// Comparison key for a path/env entry: trimmed only (filesystem paths and env var names are
-/// case-sensitive on the platforms that matter, so casing is significant).
+/// Comparison key for a path or exact-token entry (env var, run program, sys kind): trimmed only
+/// (paths, var names, and deno's sys kinds are case-sensitive on the platforms that matter, so
+/// casing is significant).
 fn normalize_plain(entry: &str) -> String {
     entry.trim().to_string()
 }
@@ -1726,8 +1789,10 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
          export const link = __api.link;\n\
          export const reload = __api.reload;\n\
          export const capture = __api.capture;\n\
+         export const fallthrough = __api.fallthrough;\n\
          export const line = __api.line;\n\
          export const buffer = __api.buffer;\n\
+         export const submission = __api.submission;\n\
          export const vars = __api.vars;\n\
          export const byName = __api.byName;\n\
          export const getSessions = __api.getSessions;\n\
@@ -1737,6 +1802,7 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
          export const userAutomations = __api.userAutomations;\n\
          export const session = __api.session;\n\
          export const currentSession = __api.currentSession;\n\
+         export const input = __api.input;\n\
          export const mapper = __api.mapper;\n\
          export const id = __api.id;\n\
          export const createState = __api.createState;\n\
@@ -1826,6 +1892,12 @@ pub(crate) fn load_widgets_module(
              export const TextEditor = __w.TextEditor;\n\
              export const Button = __w.Button;\n\
              export const MapView = __w.MapView;\n\
+             export const Canvas = __w.Canvas;\n\
+             export const Space = __w.Space;\n\
+             export const Checkbox = __w.Checkbox;\n\
+             export const Radio = __w.Radio;\n\
+             export const Tooltip = __w.Tooltip;\n\
+             export const Table = __w.Table;\n\
              export default __w;\n"
         )
     };
@@ -1860,31 +1932,46 @@ pub(crate) struct KindSchemeRef {
     pub handle: Option<String>,
 }
 
-/// Single-segment kind-scheme paths reserved for the platform (interop.md §4). `sys`/`map` are the
-/// host event catalogs; `gmcp` is the host GMCP producer (state + readiness events,
-/// `docs/gmcp-plan.md`); `user` is reserved unpublished (main-isolate code shares user
+/// Single-segment kind-scheme paths reserved for the platform (interop.md §4). `sys`/`map`/
+/// `input` are the host event catalogs; `gmcp` is the host GMCP producer (state + readiness
+/// events, `docs/gmcp.md`); `user` is reserved unpublished (main-isolate code shares user
 /// handles by ordinary import). Reservation is unconditional, so a package owner who happens
 /// to take one of these nicknames stays unaddressable through the schemes rather than
 /// shadowing the platform.
-const PLATFORM_PRODUCERS: [&str; 5] = ["sys", "map", "gmcp", "msdp", "user"];
+const PLATFORM_PRODUCERS: [&str; 6] = ["sys", "map", "gmcp", "msdp", "user", "input"];
 
-/// The host event catalog of a platform producer: `(export name, canonical event name)`.
+/// The host event catalog of a platform producer: `(export name, event name)`, where the
+/// event name is the canonical kind's suffix (`("receive", "receive")` ⇒ `sys:receive`).
+/// The two differ only where the natural export identifier is taken by a `smudgy:core`
+/// export the subscriber needs in the same scope: `sys:input` exports as `submit` because
+/// `input` is the ambient input handle (the same collision that renamed `sys:line` to
+/// `sys:receive`, resolved on the export side this time — the kind names what happened,
+/// the export keeps the catalog's bare-verb style).
 /// Mirrored by the `declare module "smudgy:events/sys"` / `"smudgy:events/map"` /
-/// `"smudgy:events/gmcp"` / `"smudgy:events/msdp"` blocks in `smudgy-core.d.ts`
-/// (drift-checked by a test in core's `script_typings.rs`).
+/// `"smudgy:events/gmcp"` / `"smudgy:events/msdp"` / `"smudgy:events/input"` blocks in
+/// `smudgy-core.d.ts` (drift-checked by a test in core's `script_typings.rs`).
 #[must_use]
-pub fn platform_event_catalog(producer: &str) -> &'static [&'static str] {
+pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'static str)] {
     match producer {
-        "sys" => &["connect", "disconnect", "send", "receive"],
-        "map" => &["room"],
-        "gmcp" | "msdp" => &["ready", "closed"],
+        "sys" => &[
+            ("connect", "connect"),
+            ("disconnect", "disconnect"),
+            ("send", "send"),
+            ("receive", "receive"),
+            ("submit", "input"),
+        ],
+        "map" => &[("room", "room")],
+        "gmcp" | "msdp" => &[("ready", "ready"), ("closed", "closed")],
+        // The observe-only command-input notifications (`docs/input.md`
+        // §3.5): subscribing requires the `input` capability, enforced at `on()`.
+        "input" => &[("change", "change"), ("focus", "focus")],
         _ => &[],
     }
 }
 
 /// Whether a platform producer publishes **state** — i.e. `smudgy:state/<producer>` loads a
-/// consumer module over its store subtree (`docs/gmcp-plan.md` §3,
-/// `docs/gmcp-mapping-plan.md` §9): the module exports one root-addressed handle (named and
+/// consumer module over its store subtree (`docs/gmcp.md` §3,
+/// `docs/gmcp-mapping.md` §9): the module exports one root-addressed handle (named and
 /// default), so `.value` / `.watch` / `.onWrite` / `.bind` cover the whole tree.
 #[must_use]
 pub fn platform_state_producer(producer: &str) -> bool {
@@ -2029,15 +2116,23 @@ fn kind_scheme_producer_spec(target: &KindSchemeTarget) -> String {
     }
 }
 
-/// Emit the consumer-module JS for `names` (original casing). Each handle is exported under
-/// its name string (interop.md §4 naming rules) plus, when it differs, the case-folded spelling —
-/// types steer authors to the canonical casing; the runtime stays lenient like every other
-/// interop name. `selected` (a folded name) narrows to the single-handle subpath form, which
-/// additionally default-exports the handle.
+/// A consumer module's handle list: `(export name, handle name)` pairs in original casing.
+/// The two sides are equal for package producers; the platform catalogs may decouple them
+/// (see [`platform_event_catalog`]).
+type HandleExports = Vec<(String, String)>;
+
+/// Emit the consumer-module JS for `handles` — `(export name, handle name)` pairs in
+/// original casing. Each handle is constructed on its handle name and exported under its
+/// export name (interop.md §4 naming rules) plus, when it differs, the export name's
+/// case-folded spelling — types steer authors to the canonical casing; the runtime stays
+/// lenient like every other interop name. Package producers export each handle under its
+/// own name (the two sides of every pair are equal); the platform catalogs may decouple
+/// them (see [`platform_event_catalog`]). `selected` (a folded export name) narrows to the
+/// single-handle subpath form, which additionally default-exports the handle.
 fn synthesize_consumer_code(
     producer_spec: &str,
     kind: InteropKind,
-    names: &[String],
+    handles: &[(String, String)],
     selected: Option<&str>,
 ) -> String {
     let spec_literal = serde_json::to_string(producer_spec).expect("a string always serializes");
@@ -2045,19 +2140,20 @@ fn synthesize_consumer_code(
     let mut code = format!(
         "const __c = globalThis.__smudgy_interop_consumer({spec_literal});\n"
     );
-    for (index, name) in names.iter().enumerate() {
-        let folded = crate::interop_extract::fold_interop_name(name);
+    for (index, (export, name)) in handles.iter().enumerate() {
+        let folded = crate::interop_extract::fold_interop_name(export);
         if let Some(selected) = selected {
             if folded != selected {
                 continue;
             }
         }
+        let export_literal = serde_json::to_string(export).expect("a string always serializes");
         let name_literal = serde_json::to_string(name).expect("a string always serializes");
         let folded_literal = serde_json::to_string(&folded).expect("a string always serializes");
         code.push_str(&format!(
-            "const __h{index} = __c.{ctor}({name_literal});\nexport {{ __h{index} as {name_literal} }};\n"
+            "const __h{index} = __c.{ctor}({name_literal});\nexport {{ __h{index} as {export_literal} }};\n"
         ));
-        if folded != *name {
+        if folded != *export {
             code.push_str(&format!("export {{ __h{index} as {folded_literal} }};\n"));
         }
         if selected.is_some() {
@@ -2087,7 +2183,7 @@ pub(crate) async fn load_kind_scheme_module(
     let display = kind_scheme_display(parsed.kind);
     let producer_spec = kind_scheme_producer_spec(&parsed.target);
 
-    let (names, other_kind_names): (Vec<String>, Vec<(InteropKind, Vec<String>)>) = match &parsed.target {
+    let (handles, other_kind_names): (HandleExports, Vec<(InteropKind, Vec<String>)>) = match &parsed.target {
         KindSchemeTarget::Platform(producer) => {
             // A platform *state* producer serves one root-addressed consumer handle over
             // its whole subtree — synthesized directly (the generic per-handle flow below
@@ -2131,7 +2227,13 @@ pub(crate) async fn load_kind_scheme_module(
                     "{display}/{producer} does not exist — {hint}"
                 )));
             }
-            (catalog.iter().map(|s| (*s).to_string()).collect(), Vec::new())
+            (
+                catalog
+                    .iter()
+                    .map(|(export, name)| ((*export).to_string(), (*name).to_string()))
+                    .collect(),
+                Vec::new(),
+            )
         }
         KindSchemeTarget::Package(key) => {
             let provider = provider.ok_or_else(|| {
@@ -2183,14 +2285,21 @@ pub(crate) async fn load_kind_scheme_module(
                 .filter(|kind| *kind != parsed.kind)
                 .map(|kind| (kind, of(kind)))
                 .collect();
-            (of(parsed.kind), others)
+            // A package handle exports under its own name.
+            (
+                of(parsed.kind)
+                    .into_iter()
+                    .map(|name| (name.clone(), name))
+                    .collect(),
+                others,
+            )
         }
     };
 
     if let Some(handle) = &parsed.handle {
-        let known = names
+        let known = handles
             .iter()
-            .any(|n| crate::interop_extract::fold_interop_name(n) == *handle);
+            .any(|(export, _)| crate::interop_extract::fold_interop_name(export) == *handle);
         if !known {
             let declared_as_other = other_kind_names.iter().find(|(_, other_names)| {
                 other_names
@@ -2203,10 +2312,12 @@ pub(crate) async fn load_kind_scheme_module(
                     other_kind.as_str(),
                     kind_scheme_display(*other_kind)
                 )
-            } else if names.is_empty() {
+            } else if handles.is_empty() {
                 String::new()
             } else {
-                format!(" (declared: {})", names.join(", "))
+                let declared: Vec<&str> =
+                    handles.iter().map(|(export, _)| export.as_str()).collect();
+                format!(" (declared: {})", declared.join(", "))
             };
             return Err(crate::generic_loader_error(format!(
                 "{producer_spec} declares no {} handle named {handle}{hint}",
@@ -2218,7 +2329,7 @@ pub(crate) async fn load_kind_scheme_module(
     let code = synthesize_consumer_code(
         &producer_spec,
         parsed.kind,
-        &names,
+        &handles,
         parsed.handle.as_deref(),
     );
     Ok(ModuleSource::new(
@@ -2866,8 +2977,8 @@ mod tests {
         assert!(code.contains("export const hotkeys = __api.hotkeys;"), "{code}");
         // The convenience surface is delivered as named exports too.
         for name in [
-            "send", "sendRaw", "echo", "style", "link", "reload", "capture", "line", "buffer",
-            "vars", "byName",
+            "send", "sendRaw", "echo", "style", "link", "reload", "capture", "fallthrough",
+            "line", "buffer", "submission", "vars", "byName",
         ] {
             assert!(
                 code.contains(&format!("export const {name} = __api.{name};")),
@@ -2924,12 +3035,17 @@ mod tests {
         assert!(kind_scheme_url(InteropKind::Event, "a/b/c/d").is_err());
     }
 
+    /// An `(export, handle)` pair whose two sides are equal — the package-producer form.
+    fn own_name(name: &str) -> (String, String) {
+        (name.to_string(), name.to_string())
+    }
+
     #[test]
     fn consumer_synthesis_exports_name_strings_with_folded_aliases() {
         let code = synthesize_consumer_code(
             "smudgy://o/p",
             InteropKind::State,
-            &["PromptState".to_string(), "roster".to_string()],
+            &[own_name("PromptState"), own_name("roster")],
             None,
         );
         assert!(code.contains(r#"globalThis.__smudgy_interop_consumer("smudgy://o/p")"#), "{code}");
@@ -2945,12 +3061,37 @@ mod tests {
         let code = synthesize_consumer_code(
             "smudgy://o/p",
             InteropKind::Event,
-            &["Prompt".to_string(), "other".to_string()],
+            &[own_name("Prompt"), own_name("other")],
             Some("prompt"),
         );
         assert!(code.contains(r#"__c.event("Prompt")"#), "{code}");
         assert!(code.contains("export default __h0;"), "{code}");
         assert!(!code.contains(r#""other""#), "{code}");
+    }
+
+    #[test]
+    fn consumer_synthesis_decouples_export_from_handle_name() {
+        // The platform-catalog form: the handle is constructed on its event name and
+        // exported under a distinct identifier (`sys:input` ⇒ `submit`), including in the
+        // narrowed subpath form, which selects by the EXPORT name.
+        let code = synthesize_consumer_code(
+            "sys",
+            InteropKind::Event,
+            &[("submit".to_string(), "input".to_string())],
+            None,
+        );
+        assert!(code.contains(r#"__c.event("input")"#), "{code}");
+        assert!(code.contains(r#"as "submit""#), "{code}");
+        assert!(!code.contains(r#"as "input""#), "{code}");
+
+        let narrowed = synthesize_consumer_code(
+            "sys",
+            InteropKind::Event,
+            &[("submit".to_string(), "input".to_string())],
+            Some("submit"),
+        );
+        assert!(narrowed.contains(r#"__c.event("input")"#), "{narrowed}");
+        assert!(narrowed.contains("export default __h0;"), "{narrowed}");
     }
 
     #[test]
@@ -3344,6 +3485,101 @@ mod tests {
     }
 
     #[test]
+    fn run_ffi_sys_axes_have_their_own_containment_semantics() {
+        // `run`/`sys` are exact-token grants; `ffi` uses the read/write path-subtree semantics.
+        let consented = PackagePermissions {
+            run: vec!["git".into()],
+            ffi: vec!["$DATA/native".into()],
+            sys: vec!["hostname".into()],
+            ..Default::default()
+        };
+
+        // Exact matches (trimmed) fit and add nothing; ffi subtree entries are covered.
+        let within = PackagePermissions {
+            run: vec![" git ".into()],
+            ffi: vec!["$DATA/native/lib.dll".into()],
+            sys: vec!["hostname".into()],
+            ..Default::default()
+        };
+        assert!(within.is_within(&consented), "trimmed run + nested ffi + same sys all fit");
+        assert!(within.added_since(&consented).is_empty(), "...and add nothing");
+
+        // `run` does NOT unify spellings: an absolute path to the same program is a new ask
+        // (conservative — it re-prompts rather than riding the bare-name grant).
+        let respelled = PackagePermissions {
+            run: vec!["C:/Program Files/Git/cmd/git.exe".into()],
+            ..Default::default()
+        };
+        assert!(!respelled.is_within(&consented), "a re-spelled run program is a new ask");
+
+        // A new program, a sibling ffi path, and a new sys kind each exceed the grant.
+        let grown = PackagePermissions {
+            run: vec!["git".into(), "curl".into()],
+            ffi: vec!["$DATA/native".into(), "$DATA/other".into()],
+            sys: vec!["hostname".into(), "osRelease".into()],
+            ..Default::default()
+        };
+        assert!(!grown.is_within(&consented));
+        let added = grown.added_since(&consented);
+        assert_eq!(added.run, vec!["curl"]);
+        assert_eq!(added.ffi, vec!["$DATA/other"]);
+        assert_eq!(added.sys, vec!["osRelease"]);
+
+        // Merge unions per field; a run/ffi/sys ask makes the union non-empty (the consent
+        // window can never treat it as the calm zero-permission case).
+        let mut union = PackagePermissions::default();
+        union.merge(&consented);
+        union.merge(&grown);
+        assert_eq!(union.run, vec!["git", "curl"]);
+        assert_eq!(union.ffi, vec!["$DATA/native", "$DATA/other"]);
+        assert_eq!(union.sys, vec!["hostname", "osRelease"]);
+        assert!(!union.is_empty());
+
+        // A `$DATA/..` ffi escape is inert exactly like a read/write one: enforcement drops it,
+        // so it is "covered" by anything and covers nothing.
+        let escape = PackagePermissions {
+            ffi: vec!["$DATA/../outside".into()],
+            ..Default::default()
+        };
+        assert!(escape.is_within(&PackagePermissions::default()), "a dropped ffi escape asks nothing");
+    }
+
+    #[test]
+    fn manifest_permissions_run_ffi_sys_round_trip_and_default_empty() {
+        // The wire form: absent fields parse empty (deny), declared ones round-trip verbatim.
+        let manifest = PackageManifest::parse(
+            r#"{
+                "version": "1.0.0",
+                "permissions": {
+                    "run": ["git"],
+                    "ffi": ["$DATA/native"],
+                    "sys": ["hostname", "osRelease"]
+                }
+            }"#,
+        )
+        .expect("parses");
+        assert_eq!(manifest.permissions.run, vec!["git"]);
+        assert_eq!(manifest.permissions.ffi, vec!["$DATA/native"]);
+        assert_eq!(manifest.permissions.sys, vec!["hostname", "osRelease"]);
+
+        let json = serde_json::to_string(&manifest).expect("serializes");
+        let back = PackageManifest::parse(&json).expect("re-parses");
+        assert_eq!(back.permissions, manifest.permissions);
+
+        // A manifest without them keeps every new axis empty (deny-by-default), and empty axes
+        // are skipped on serialization (an old-schema manifest re-saves without the new keys).
+        let plain = PackageManifest::parse(r#"{ "version": "1.0.0" }"#).expect("parses");
+        assert!(plain.permissions.run.is_empty());
+        assert!(plain.permissions.ffi.is_empty());
+        assert!(plain.permissions.sys.is_empty());
+        let plain_json = serde_json::to_string(&plain).expect("serializes");
+        assert!(
+            !plain_json.contains("\"run\"") && !plain_json.contains("\"ffi\"") && !plain_json.contains("\"sys\""),
+            "empty axes are omitted from the wire form: {plain_json}"
+        );
+    }
+
+    #[test]
     fn import_policy_is_an_ordered_lattice_and_independent_of_net() {
         use ImportPolicy::{Any, None as ImpNone, Registries};
         // Ordered None < Registries < Any; the closure union is the max (escalates monotonically).
@@ -3652,7 +3888,7 @@ mod tests {
         assert!(caps.gmcp_send);
         assert!(
             !caps.interop_read && !caps.interop_write && !caps.send,
-            "gmcp:send rides with no other grant (docs/gmcp-plan.md §6.3)"
+            "gmcp:send rides with no other grant (docs/gmcp.md §6.3)"
         );
         let json = serde_json::to_string(&caps).expect("serialize");
         assert!(json.contains(r#""gmcp""#), "{json}");
@@ -3662,6 +3898,25 @@ mod tests {
         let none = SmudgyCapabilities::default();
         assert!(!caps.is_within(&none));
         assert!(caps.added_since(&none).gmcp_send);
+        assert!(caps.is_within(&SmudgyCapabilities::all()));
+    }
+
+    #[test]
+    fn smudgy_input_tokens_parse_and_round_trip() {
+        let caps = perms_with_smudgy(r#"{ "input": ["access"] }"#).smudgy;
+        assert!(caps.input);
+        assert!(
+            !caps.send && !caps.echo && !caps.change_display,
+            "input rides with no other grant (docs/input.md §3.6)"
+        );
+        let json = serde_json::to_string(&caps).expect("serialize");
+        assert!(json.contains(r#""input""#), "{json}");
+        let back: SmudgyCapabilities = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, caps, "input tokens round-trip");
+        // Containment: an input ask needs an input grant.
+        let none = SmudgyCapabilities::default();
+        assert!(!caps.is_within(&none));
+        assert!(caps.added_since(&none).input);
         assert!(caps.is_within(&SmudgyCapabilities::all()));
     }
 

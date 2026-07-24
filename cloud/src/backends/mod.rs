@@ -1,18 +1,18 @@
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, Label, LabelArgs, LabelId, LabelUpdates,
-    CloudError, CloudResult, Room, RoomUpdates, Shape, ShapeArgs, ShapeId, ShapeUpdates, SyncRow,
-    mapper::RoomKey,
+    CloudError, CloudResult, CreateAreaRequest, SyncRow,
+    mutation::{MutationEnvelope, MutationResult},
 };
 use async_trait::async_trait;
 use uuid::Uuid;
 
-mod area_edits;
+pub(crate) mod area_edits;
 pub mod cached;
 pub mod cloud;
 pub mod composite;
 pub mod ephemeral;
 pub mod local;
+pub mod local_migration;
 
 pub use cached::{CachedBackend, CachedCloudMapper};
 pub use cloud::{CloudMapper, Credential, CredentialSource};
@@ -95,6 +95,18 @@ pub trait MapperBackend: Send + Sync {
     async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()>;
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()>;
+
+    // ===== VERSIONED MUTATIONS (the CAS envelope) =====
+
+    /// Applies one mutation envelope to an area atomically, honoring its
+    /// preconditions (revision + access fingerprint) and its idempotent
+    /// operation id. This is the one write path every mapper content
+    /// mutation compiles to.
+    async fn execute_mutation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult>;
 
     // ===== ATLAS (FOLDER) OPERATIONS =====
     //
@@ -183,70 +195,4 @@ pub trait MapperBackend: Send + Sync {
     fn ephemeral_area_ids(&self) -> std::collections::HashSet<AreaId> {
         std::collections::HashSet::new()
     }
-
-    // ===== AREA PROPERTIES =====
-
-    async fn set_area_property(&self, area_id: &AreaId, name: &str, value: &str) -> CloudResult<()>;
-
-    async fn delete_area_property(&self, area_id: &AreaId, name: &str) -> CloudResult<()>;
-
-    // ===== ROOM OPERATIONS =====
-
-    async fn update_room(&self, room_key: &RoomKey, updates: RoomUpdates) -> CloudResult<Room>;
-
-    async fn delete_room(&self, room_key: &RoomKey) -> CloudResult<()>;
-
-    // ===== ROOM PROPERTIES =====
-
-    async fn set_room_property(&self, room_key: &RoomKey, name: &str, value: &str)
-    -> CloudResult<()>;
-
-    async fn delete_room_property(&self, room_key: &RoomKey, name: &str) -> CloudResult<()>;
-
-    // ===== ROOM TAGS =====
-
-    /// Add a tag to a room (idempotent). `tag` is pre-normalized (UPPERCASE).
-    async fn add_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()>;
-
-    /// Remove a tag from a room. `tag` is pre-normalized (UPPERCASE).
-    async fn remove_room_tag(&self, room_key: &RoomKey, tag: &str) -> CloudResult<()>;
-
-    // ===== EXIT OPERATIONS =====
-
-    async fn create_room_exit(&self, room_key: &RoomKey, exit_data: ExitArgs) -> CloudResult<Exit>;
-
-    async fn update_exit(
-        &self,
-        area_id: &AreaId,
-        exit_id: &ExitId,
-        updates: ExitUpdates,
-    ) -> CloudResult<()>;
-
-    async fn delete_exit(&self, area_id: &AreaId, exit_id: &ExitId) -> CloudResult<()>;
-
-    // ===== LABEL OPERATIONS =====
-
-    async fn create_label(&self, area_id: &AreaId, label_data: LabelArgs) -> CloudResult<Label>;
-
-    async fn update_label(
-        &self,
-        area_id: &AreaId,
-        label_id: &LabelId,
-        updates: LabelUpdates,
-    ) -> CloudResult<()>;
-
-    async fn delete_label(&self, area_id: &AreaId, label_id: &LabelId) -> CloudResult<()>;
-
-    // ===== SHAPE OPERATIONS =====
-
-    async fn create_shape(&self, area_id: &AreaId, shape_data: ShapeArgs) -> CloudResult<Shape>;
-
-    async fn update_shape(
-        &self,
-        area_id: &AreaId,
-        shape_id: &ShapeId,
-        updates: ShapeUpdates,
-    ) -> CloudResult<()>;
-
-    async fn delete_shape(&self, area_id: &AreaId, shape_id: &ShapeId) -> CloudResult<()>;
 }

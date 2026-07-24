@@ -1,8 +1,13 @@
+pub mod automatic_routing;
 pub mod backends;
 pub mod cloud_api;
 pub mod color;
+pub mod connection;
+pub mod connection_geometry;
+pub mod connection_lifecycle;
 pub mod error;
 pub mod mapper;
+pub mod mutation;
 pub mod package_api;
 pub mod store_bindings;
 pub mod store_node;
@@ -14,15 +19,22 @@ pub use backends::{
     MapperBackend,
 };
 pub use cloud_api::CloudApiClient;
-pub use color::parse_css_color;
-pub use package_api::{
-    highest_satisfying_version, CommentView, ModuleMetaView, PackageApiClient, PackageDetail,
-    PackageGrantView, PackageSearchResult, PackageView, PublishDependency, PublishModule,
-    PublishedVersionView, ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire,
-    SearchCategory, ShareClosureItem, StaleDependencyView, VersionListItem,
+pub use color::{canonicalize_css_color, parse_css_color};
+pub use connection::{
+    Connection, ConnectionArgs, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind,
+    ConnectionRouting, ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR,
+    DEFAULT_CONNECTION_THICKNESS, MAX_COLOR_LEN, MAX_COORDINATE, MAX_MUTATION_OPERATIONS,
+    MAX_ROUTE_POINTS, MapPoint, PortMode, RoomSide, SegmentShape, THICKNESS_RANGE,
+    default_anchor_for_direction,
 };
 pub use error::{CloudError, CloudResult};
-pub use mapper::{AreaLoadSource, AreaLoadStat, LoadMapsSummary, Mapper};
+pub use mapper::{AreaImportDocument, AreaLoadSource, AreaLoadStat, LoadMapsSummary, Mapper};
+pub use package_api::{
+    CommentView, ModuleMetaView, PackageApiClient, PackageDetail, PackageGrantView,
+    PackageSearchResult, PackageView, PublishDependency, PublishModule, PublishedVersionView,
+    ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire, SearchCategory, ShareClosureItem,
+    StaleDependencyView, VersionListItem, highest_satisfying_version,
+};
 pub use store_bindings::{StoreBindingCell, StoreBindings};
 pub use store_node::{ArrayNode, Node, ObjectNode, Usage};
 
@@ -146,26 +158,6 @@ impl ExitDirection {
             Self::Other => Self::Other,
         }
     }
-}
-
-/// Exit direction enum matching the backend
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Display)]
-pub enum ExitStyle {
-    #[default]
-    Normal,
-    Dashed,
-    Dotted,
-    Meandering,
-    /// Minimal marker: a same-level exit draws only a bare directional stub
-    /// (no connecting line), and a cross-level cardinal exit re-anchors its
-    /// level triangle to the exit's compass side instead of a fixed corner.
-    Stub,
-}
-
-impl ExitStyle {
-    /// Every style, for pickers.
-    pub const ALL: [Self; 5] =
-        [Self::Normal, Self::Dashed, Self::Dotted, Self::Meandering, Self::Stub];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, Display)]
@@ -305,6 +297,13 @@ pub struct AreaId(pub Uuid);
 #[serde(transparent)]
 pub struct ExitId(pub Uuid);
 
+impl ExitId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, Display, Copy)]
 #[serde(transparent)]
 pub struct AtlasId(pub Uuid);
@@ -343,6 +342,10 @@ pub struct Atlas {
     pub user_id: Option<Uuid>,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    /// Aggregate revision for atlas CAS preconditions; recorded now so the
+    /// atlas-route conversion can build on values clients already hold.
+    #[serde(default)]
+    pub rev: i64,
 }
 
 /// One row of `GET /atlases`: an owned atlas (folder) with its member count.
@@ -356,6 +359,9 @@ pub struct AtlasListItem {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub area_count: i64,
+    /// Aggregate revision for atlas CAS preconditions; see [`Atlas::rev`].
+    #[serde(default)]
+    pub rev: i64,
     /// The caller owns this atlas (vs. only administers it). Older servers
     /// (owned-only `GET /atlases`) omit it → defaults true.
     #[serde(default = "default_true")]
@@ -445,6 +451,11 @@ impl Area {
 pub struct AreaWithDetails {
     #[serde(flatten)]
     pub area: Area,
+    /// The area document format. [`AREA_FORMAT_VERSION`] (2) is the
+    /// Connection contract; documents that predate the field are v1 and
+    /// require migration before this code can consume them.
+    #[serde(default = "format_version_v1")]
+    pub format_version: u32,
     /// Viewer-salted hash of the projected content; equal hashes mean the
     /// refetched projection is byte-identical (skip re-render).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -453,9 +464,19 @@ pub struct AreaWithDetails {
     pub rooms: Vec<RoomWithDetails>,
     pub labels: Vec<Label>,
     pub shapes: Vec<Shape>,
+    #[serde(default)]
+    pub connections: Vec<Connection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub linked_areas: Vec<LinkedAreaInfo>,
 }
+
+/// Serde default for documents that predate `format_version`: they are v1.
+fn format_version_v1() -> u32 {
+    1
+}
+
+/// The current area document format (the Connection contract).
+pub const AREA_FORMAT_VERSION: u32 = 2;
 
 /// Room within an area
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,9 +539,7 @@ pub struct Exit {
     pub is_locked: bool,
     pub weight: f32,
     pub command: String,
-    #[serde(default)]
-    pub style: ExitStyle,
-    pub color: String,
+    pub connection_id: ConnectionId,
     /// True when the destination area exists but is not visible to the
     /// viewer; the real `to_*` fields are nulled and `to_area_token` set.
     #[serde(default)]
@@ -596,13 +615,26 @@ pub struct RoomUpdates {
     /// `Option<Option<_>>` like [`AreaUpdates::atlas_id`]: absent = unchanged,
     /// present+null = clear the binding, present+string = set it. Omitted
     /// from the wire when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "double_option::deserialize"
+    )]
     pub external_id: Option<Option<String>>,
 }
 
 /// Exit creation/update data
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ExitArgs {
+    /// Client-minted identity (assigned before enqueue so optimistic
+    /// references, batches, and retries stay unambiguous); the server mints
+    /// one only when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<ExitId>,
+    /// Explicit membership for compound Connection creation/restore. When
+    /// absent, the backend runs the conservative auto-pair/create rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<ConnectionId>,
     pub from_direction: ExitDirection,
     pub to_area_id: Option<AreaId>,
     pub to_room_number: Option<RoomNumber>,
@@ -613,8 +645,6 @@ pub struct ExitArgs {
     pub is_locked: bool,
     pub weight: f32,
     pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub style: Option<ExitStyle>,
     /// Only send when cleared for secrets; see [`RoomUpdates::is_secret`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_secret: Option<bool>,
@@ -633,9 +663,6 @@ pub struct ExitUpdates {
     pub is_locked: Option<bool>,
     pub weight: Option<f32>,
     pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub style: Option<ExitStyle>,
-    pub color: Option<String>,
     /// Only send when cleared for secrets; see [`RoomUpdates::is_secret`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_secret: Option<bool>,
@@ -648,14 +675,6 @@ pub struct ExitUpdates {
 impl ExitUpdates {
     #[must_use]
     pub fn apply(self, exit: &ExitCache) -> ExitCache {
-        let (color, iced_color) = self
-            .color
-            .map(|c| {
-                let iced_color = parse_css_color(&c).unwrap_or(exit.iced_color);
-                (Some(c), iced_color)
-            })
-            .unwrap_or((exit.color.clone(), exit.iced_color));
-
         let clear_to = self.clear_to == Some(true);
         // Mirror the server's COALESCE semantics: `None` means "unchanged";
         // the only way to null a destination is `clear_to`. (Diverging here
@@ -691,9 +710,10 @@ impl ExitUpdates {
             is_locked: self.is_locked.unwrap_or(exit.is_locked),
             weight: self.weight.unwrap_or(exit.weight),
             command: self.command.or_else(|| exit.command.clone()),
-            style: self.style.unwrap_or(exit.style),
-            color,
-            iced_color,
+            // Connection membership is repaired by the caller when the
+            // destination changed (see the area cache's upsert path); the
+            // updates themselves never carry it.
+            connection_id: exit.connection_id,
             to_unknown,
             to_area_token,
             is_secret: self.is_secret.unwrap_or(exit.is_secret),
@@ -703,6 +723,9 @@ impl ExitUpdates {
 /// Label creation/update data
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct LabelArgs {
+    /// Client-minted identity; see [`ExitArgs::id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<LabelId>,
     pub level: i32,
     pub x: f32,
     pub y: f32,
@@ -772,6 +795,9 @@ impl LabelUpdates {
 /// Shape creation/update data
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ShapeArgs {
+    /// Client-minted identity; see [`ExitArgs::id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<ShapeId>,
     pub level: i32,
     pub x: f32,
     pub y: f32,
@@ -832,9 +858,7 @@ impl ShapeUpdates {
                 .background_color
                 .or_else(|| shape.background_color.clone()),
             stroke_color: self.stroke_color.or_else(|| shape.stroke_color.clone()),
-            shape_type: self
-                .shape_type
-                .unwrap_or_else(|| shape.shape_type.clone()),
+            shape_type: self.shape_type.unwrap_or_else(|| shape.shape_type.clone()),
             border_radius: self.border_radius.unwrap_or(shape.border_radius),
             stroke_width: self.stroke_width.unwrap_or(shape.stroke_width),
         }
@@ -865,8 +889,28 @@ pub struct CreateAreaRequest {
 pub struct AreaUpdates {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "double_option::deserialize"
+    )]
     pub atlas_id: Option<Option<AtlasId>>,
+}
+
+/// Deserializer preserving the two-level `Option` distinction — absent key
+/// (`None`) versus explicit `null` (`Some(None)`) — which serde's default
+/// otherwise folds together. Pairs with `skip_serializing_if` so the same
+/// distinction survives serialization; mirrors the server's ingest.
+mod double_option {
+    // The nested Option IS the wire contract here (absent vs null vs value).
+    #[allow(clippy::option_option)]
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        T: serde::Deserialize<'de>,
+        D: serde::Deserializer<'de>,
+    {
+        serde::Deserialize::deserialize(deserializer).map(Some)
+    }
 }
 
 // This is meant to represent a doubly or singly connected exit pair of exits between two rooms
