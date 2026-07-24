@@ -12,6 +12,8 @@
 /dist
 /iced-repros
 /.claude/settings.local.json
+__pycache__/
+*.pyc
 
 .env
 

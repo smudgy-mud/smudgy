@@ -60,6 +60,11 @@ jobs:
       baseline_sha: ${{ steps.request.outputs.baseline_sha }}
       pr_number: ${{ steps.request.outputs.pr_number }}
       run_label: ${{ steps.request.outputs.run_label }}
+      has_benchmarks: ${{ steps.scope.outputs.has_benchmarks }}
+      has_criterion: ${{ steps.scope.outputs.has_criterion }}
+      has_callgrind: ${{ steps.scope.outputs.has_callgrind }}
+      coverage_status: ${{ steps.scope.outputs.coverage_status }}
+      scope_json: ${{ steps.scope.outputs.scope_json }}
 
     steps:
       - name: Validate and resolve refs
@@ -83,6 +88,7 @@ jobs:
           baseline_sha=
           pr_number=
           run_label="main push"
+          changed_file_count=
 
           case "${EVENT_NAME}" in
             push)
@@ -128,8 +134,15 @@ jobs:
                   kind=pr
                   pr_number="${PR_NUMBER}"
                   target_sha=$(jq -r .head.sha <<<"${pr_json}")
+                  changed_file_count=$(jq -r .changed_files <<<"${pr_json}")
+                  if [[ ! "${changed_file_count}" =~ ^[0-9]+$ ]]; then
+                    echo "PR #${PR_NUMBER} has an invalid changed_files count" >&2
+                    exit 1
+                  fi
                   baseline_sha=$(gh api "repos/${REPOSITORY}/commits/main" --jq .sha)
                   run_label="PR #${PR_NUMBER} (${head_repository})"
+                  gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" \
+                    --jq '.[].filename' > benchmark-changed-files.txt
                   ;;
                 release)
                   if [[ -z "${RELEASE_REF}" ]]; then
@@ -170,12 +183,38 @@ jobs:
             echo "baseline_sha=${baseline_sha}"
             echo "pr_number=${pr_number}"
             echo "run_label=${run_label}"
+            echo "changed_file_count=${changed_file_count}"
           } >>"${GITHUB_OUTPUT}"
 
+      - name: Check out trusted benchmark scope tooling
+        if: steps.request.outputs.kind == 'pr'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: refs/heads/main
+          path: trusted
+          persist-credentials: false
+
+      - name: Select performance-relevant PR suites
+        if: steps.request.outputs.kind == 'pr'
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 trusted/.github/scripts/select-pr-benchmarks.py \
+            --config trusted/.github/benchmark-scope.json \
+            --changed-files benchmark-changed-files.txt \
+            --expected-file-count "${{ steps.request.outputs.changed_file_count }}" \
+            --output benchmark-scope.json \
+            --github-output "${GITHUB_OUTPUT}"
+          cat benchmark-scope.json >>"${GITHUB_STEP_SUMMARY}"
+
   benchmark:
-    name: Criterion on m8a.2xlarge
+    name: Measure on pinned m8a.2xlarge
     needs: resolve
-    if: needs.resolve.result == 'success'
+    if: >-
+      needs.resolve.result == 'success' &&
+      (needs.resolve.outputs.kind != 'pr' ||
+       needs.resolve.outputs.has_benchmarks == 'true')
     runs-on: [self-hosted, linux, X64, smudgy-benchmark]
     timeout-minutes: 360
     permissions:
@@ -210,6 +249,14 @@ jobs:
           test "$(nproc)" -eq 8
           test "$(lscpu -p=CORE,SOCKET | sed '/^#/d' | sort -u | wc -l)" -eq 8
 
+          governor_files=(/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor)
+          if [[ -e "${governor_files[0]}" ]]; then
+            for governor_file in "${governor_files[@]}"; do
+              echo performance | sudo tee "${governor_file}" >/dev/null
+            done
+            test "$(sort -u "${governor_files[@]}")" = performance
+          fi
+
           source "${HOME}/.cargo/env"
           rustc --version | grep --fixed-strings "rustc ${RUST_TOOLCHAIN} "
 
@@ -223,9 +270,15 @@ jobs:
             echo "rustc=$(rustc --version)"
             echo "cargo=$(cargo --version)"
             echo "kernel=$(uname -srvmo)"
+            echo "cpu_list=2-7"
+            echo "loadavg=$(cat /proc/loadavg)"
+            echo "governors=$(cat "${governor_files[@]}" 2>/dev/null | sort -u | paste -sd, || true)"
+            echo "top_processes:"
+            ps -eo pid,psr,pcpu,pmem,comm --sort=-pcpu | sed -n '1,12p'
             lscpu
           } | tee benchmark-artifacts/benchmark-runner.txt
           echo "BENCHMARK_AMI_ACTUAL=${ami_id}" >>"${GITHUB_ENV}"
+          echo "BENCHMARK_CPU_LIST=2-7" >>"${GITHUB_ENV}"
 
       - name: Smoke test complete
         if: needs.resolve.outputs.kind == 'smoke'
@@ -315,64 +368,106 @@ jobs:
             --extra "Source: ${TARGET_SHA}" \
             --extra "AMI: ${BENCHMARK_AMI_ACTUAL}"
 
-      - name: Run current main baseline
+      - name: Record selected PR scope
         if: needs.resolve.outputs.kind == 'pr'
-        working-directory: baseline
+        shell: bash
+        env:
+          SCOPE_JSON: ${{ needs.resolve.outputs.scope_json }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${SCOPE_JSON}" > benchmark-artifacts/benchmark-scope.json
+
+      - name: Run balanced targeted Criterion comparison
+        if: >-
+          needs.resolve.outputs.kind == 'pr' &&
+          needs.resolve.outputs.has_criterion == 'true'
         shell: bash
         run: |
           set -euo pipefail
           source "${HOME}/.cargo/env"
-          rm -rf "${RUNNER_TEMP}/smudgy-benchmark-baseline"
-          CARGO_TARGET_DIR="${RUNNER_TEMP}/smudgy-benchmark-baseline" \
-            cargo bench --locked -p smudgy_bench -- --noplot 2>&1 |
-            tee ../benchmark-artifacts/baseline-output.txt
+          mapfile -t targets < <(
+            jq -r '.criterion_targets[]' benchmark-artifacts/benchmark-scope.json
+          )
+          args=()
+          for target in "${targets[@]}"; do
+            args+=(--target "${target}")
+          done
+          python3 trusted/.github/scripts/run-paired-criterion.py \
+            --baseline-dir baseline \
+            --candidate-dir candidate \
+            --target-root "${RUNNER_TEMP}/smudgy-revision-targets" \
+            --output-dir benchmark-artifacts/paired \
+            --converter trusted/.github/scripts/criterion-to-benchmark-json.py \
+            --cpu-list "${BENCHMARK_CPU_LIST}" \
+            --blocks 2 \
+            "${args[@]}"
 
-      - name: Convert current main baseline
-        if: needs.resolve.outputs.kind == 'pr'
+      - name: Aggregate replicated wall-clock results
+        if: >-
+          needs.resolve.outputs.kind == 'pr' &&
+          needs.resolve.outputs.has_criterion == 'true'
         shell: bash
-        env:
-          BASELINE_SHA: ${{ needs.resolve.outputs.baseline_sha }}
         run: |
           set -euo pipefail
-          python3 trusted/.github/scripts/criterion-to-benchmark-json.py \
-            --criterion-root "${RUNNER_TEMP}/smudgy-benchmark-baseline/criterion" \
-            --output benchmark-artifacts/baseline-results.json \
-            --extra "Comparison arm: current main" \
-            --extra "Source: ${BASELINE_SHA}" \
-            --extra "AMI: ${BENCHMARK_AMI_ACTUAL}"
+          python3 trusted/.github/scripts/aggregate-paired-criterion.py \
+            --manifest benchmark-artifacts/paired/paired-manifest.json \
+            --output benchmark-artifacts/paired-results.json
 
-      - name: Run PR candidate
-        if: needs.resolve.outputs.kind == 'pr'
-        working-directory: candidate
+      - name: Install deterministic benchmark tools
+        if: >-
+          needs.resolve.outputs.kind == 'pr' &&
+          needs.resolve.outputs.has_callgrind == 'true'
         shell: bash
         run: |
           set -euo pipefail
           source "${HOME}/.cargo/env"
-          rm -rf "${RUNNER_TEMP}/smudgy-benchmark-candidate"
-          CARGO_TARGET_DIR="${RUNNER_TEMP}/smudgy-benchmark-candidate" \
-            cargo bench --locked -p smudgy_bench -- --noplot 2>&1 |
-            tee ../benchmark-artifacts/candidate-output.txt
+          if ! command -v valgrind >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes valgrind
+          fi
+          version=$(cargo metadata --locked --format-version=1 \
+            --manifest-path candidate/Cargo.toml \
+            --features smudgy_bench/callgrind |
+            jq -r '.packages[] | select(.name == "gungraun") | .version')
+          test -n "${version}"
+          if ! gungraun-runner --version 2>/dev/null |
+              grep --fixed-strings " ${version}" >/dev/null; then
+            cargo install --locked --version "${version}" gungraun-runner
+          fi
+          valgrind --version
+          gungraun-runner --version
 
-      - name: Convert PR candidate
-        if: needs.resolve.outputs.kind == 'pr'
+      - name: Run deterministic Callgrind comparison
+        if: >-
+          needs.resolve.outputs.kind == 'pr' &&
+          needs.resolve.outputs.has_callgrind == 'true'
         shell: bash
-        env:
-          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
-          TARGET_SHA: ${{ needs.resolve.outputs.target_sha }}
         run: |
           set -euo pipefail
-          python3 trusted/.github/scripts/criterion-to-benchmark-json.py \
-            --criterion-root "${RUNNER_TEMP}/smudgy-benchmark-candidate/criterion" \
-            --output benchmark-artifacts/candidate-results.json \
-            --extra "Comparison arm: PR #${PR_NUMBER}" \
-            --extra "Source: ${TARGET_SHA}" \
-            --extra "AMI: ${BENCHMARK_AMI_ACTUAL}"
+          source "${HOME}/.cargo/env"
+          mapfile -t targets < <(
+            jq -r '.callgrind_targets[]' benchmark-artifacts/benchmark-scope.json
+          )
+          args=()
+          for target in "${targets[@]}"; do
+            args+=(--target "${target}")
+          done
+          python3 trusted/.github/scripts/run-callgrind-comparison.py \
+            --baseline-dir baseline \
+            --candidate-dir candidate \
+            --target-root "${RUNNER_TEMP}/smudgy-revision-targets" \
+            --output-dir benchmark-artifacts/callgrind \
+            --cpu-list "${BENCHMARK_CPU_LIST}" \
+            "${args[@]}"
+          python3 trusted/.github/scripts/aggregate-callgrind.py \
+            --manifest benchmark-artifacts/callgrind/callgrind-manifest.json \
+            --output benchmark-artifacts/callgrind-results.json
 
       - name: Upload benchmark results and provenance
         if: always() && needs.resolve.outputs.kind != 'smoke'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: criterion-results
+          name: benchmark-results
           path: benchmark-artifacts/
           if-no-files-found: warn
           retention-days: 14
@@ -401,7 +496,7 @@ jobs:
       - name: Download measured results
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: criterion-results
+          name: benchmark-results
           path: benchmark-artifacts
 
       - name: Update the public benchmark dashboard
@@ -434,7 +529,10 @@ jobs:
   report-pr:
     name: Report PR comparison
     needs: [resolve, benchmark]
-    if: needs.benchmark.result == 'success' && needs.resolve.outputs.kind == 'pr'
+    if: >-
+      always() &&
+      needs.resolve.result == 'success' &&
+      needs.resolve.outputs.kind == 'pr'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -451,62 +549,74 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download both measured arms
+      - name: Download targeted measurements
+        id: measurements
+        if: needs.resolve.outputs.has_benchmarks == 'true'
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: criterion-results
+          name: benchmark-results
           path: benchmark-artifacts
 
-      - name: Seed same-run main baseline
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
-        with:
-          name: smudgy PR comparison / m8a.2xlarge / Rust 1.97.1
-          tool: customSmallerIsBetter
-          output-file-path: benchmark-artifacts/baseline-results.json
-          external-data-json-path: benchmark-artifacts/pr-comparison-data.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          ref: ${{ needs.resolve.outputs.baseline_sha }}
-          save-data-file: true
-          alert-threshold: 125%
-          fail-on-alert: false
+      - name: Materialize trusted benchmark scope
+        env:
+          SCOPE_JSON: ${{ needs.resolve.outputs.scope_json }}
+        run: |
+          mkdir -p benchmark-artifacts
+          printf '%s\n' "${SCOPE_JSON}" > benchmark-artifacts/benchmark-scope.json
 
-      - name: Compare PR candidate without saving it to history
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
-        with:
-          name: smudgy PR comparison / m8a.2xlarge / Rust 1.97.1
-          tool: customSmallerIsBetter
-          output-file-path: benchmark-artifacts/candidate-results.json
-          external-data-json-path: benchmark-artifacts/pr-comparison-data.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          ref: ${{ needs.resolve.outputs.target_sha }}
-          save-data-file: false
-          alert-threshold: 125%
-          fail-on-alert: false
-          summary-always: true
-
-      - name: Build concise PR report
+      - name: Build evidence-calibrated PR report
         env:
           BASELINE_SHA: ${{ needs.resolve.outputs.baseline_sha }}
           CANDIDATE_SHA: ${{ needs.resolve.outputs.target_sha }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BENCHMARK_STATUS: ${{ needs.benchmark.result }}
+          ARTIFACT_STATUS: ${{ steps.measurements.outcome }}
+          HAS_BENCHMARKS: ${{ needs.resolve.outputs.has_benchmarks }}
         run: |
+          set -euo pipefail
+          report_status="${BENCHMARK_STATUS}"
+          if [[ "${HAS_BENCHMARKS}" == "true" &&
+                "${BENCHMARK_STATUS}" == "success" &&
+                "${ARTIFACT_STATUS}" != "success" ]]; then
+            report_status=artifact_failure
+          fi
+          inputs=(--scope benchmark-artifacts/benchmark-scope.json)
+          if [[ -f benchmark-artifacts/paired-results.json ]]; then
+            inputs+=(--paired benchmark-artifacts/paired-results.json)
+          fi
+          if [[ -f benchmark-artifacts/callgrind-results.json ]]; then
+            inputs+=(--callgrind benchmark-artifacts/callgrind-results.json)
+          fi
           python3 .github/scripts/compare-benchmark-json.py \
-            --baseline benchmark-artifacts/baseline-results.json \
-            --candidate benchmark-artifacts/candidate-results.json \
             --output benchmark-artifacts/pr-comment.md \
             --repository "${GITHUB_REPOSITORY}" \
             --baseline-sha "${BASELINE_SHA}" \
             --candidate-sha "${CANDIDATE_SHA}" \
             --pr-number "${PR_NUMBER}" \
-            --run-url "${RUN_URL}"
+            --run-url "${RUN_URL}" \
+            --benchmark-status "${report_status}" \
+            "${inputs[@]}"
           cat benchmark-artifacts/pr-comment.md >>"${GITHUB_STEP_SUMMARY}"
 
-      - name: Comment on the measured PR
+      - name: Create or update the benchmark PR comment
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
-        run: >-
-          gh pr comment "${PR_NUMBER}"
-          --repo "${GITHUB_REPOSITORY}"
-          --body-file benchmark-artifacts/pr-comment.md
+        run: |
+          set -euo pipefail
+          comment_id=$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq 'first(.[][] | select((.body // "") | contains("<!-- smudgy-benchmark-comparison -->")) | .id) // empty')
+          if [[ -n "${comment_id}" ]]; then
+            jq -n --rawfile body benchmark-artifacts/pr-comment.md \
+              '{body: $body}' > benchmark-artifacts/comment-update.json
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" \
+              --input benchmark-artifacts/comment-update.json >/dev/null
+          else
+            gh pr comment "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --body-file benchmark-artifacts/pr-comment.md
+          fi
