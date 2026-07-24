@@ -6,10 +6,7 @@ use iced::{
         Widget,
         widget::{Tree, tree},
     },
-    keyboard::{
-        Key,
-        key::Named,
-    },
+    keyboard::{Key, key::Named},
     widget::{Text, text},
 };
 
@@ -214,57 +211,59 @@ where
                 modifiers,
                 text: _,
                 repeat: _,
-            }) if state.listening => { match key {
-                Key::Named(Named::Control)
-                | Key::Named(Named::Shift)
-                | Key::Named(Named::Alt)
-                | Key::Named(Named::Super) => {
-                    if let Some(f) = self.on_action.as_ref() {
-                        let mut ret: Vec<MaybePhysicalKey> = Vec::new();
-                        if modifiers.control() {
-                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Control)));
+            }) if state.listening => {
+                match key {
+                    Key::Named(Named::Control)
+                    | Key::Named(Named::Shift)
+                    | Key::Named(Named::Alt)
+                    | Key::Named(Named::Super) => {
+                        if let Some(f) = self.on_action.as_ref() {
+                            let mut ret: Vec<MaybePhysicalKey> = Vec::new();
+                            if modifiers.control() {
+                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Control)));
+                            }
+                            if modifiers.alt() {
+                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Alt)));
+                            }
+                            if modifiers.shift() {
+                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Shift)));
+                            }
+                            if modifiers.logo() {
+                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Super)));
+                            }
+                            shell.publish(f(ret));
                         }
-                        if modifiers.alt() {
-                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Alt)));
-                        }
-                        if modifiers.shift() {
-                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Shift)));
-                        }
-                        if modifiers.logo() {
-                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Super)));
-                        }
-                        shell.publish(f(ret));
+                        shell.capture_event();
                     }
-                    shell.capture_event();
-                }
-                _ => {
-                    state.listening = false;
-                    if let Some(f) = self.on_action.as_ref() {
-                        let mut ret: Vec<MaybePhysicalKey> = Vec::new();
-                        if modifiers.control() {
-                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Control)));
-                        }
-                        if modifiers.alt() {
-                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Alt)));
-                        }
-                        if modifiers.shift() {
-                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Shift)));
-                        }
-                        if modifiers.logo() {
-                            ret.push(MaybePhysicalKey::Key(Key::Named(Named::Super)));
-                        }
+                    _ => {
+                        state.listening = false;
+                        if let Some(f) = self.on_action.as_ref() {
+                            let mut ret: Vec<MaybePhysicalKey> = Vec::new();
+                            if modifiers.control() {
+                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Control)));
+                            }
+                            if modifiers.alt() {
+                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Alt)));
+                            }
+                            if modifiers.shift() {
+                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Shift)));
+                            }
+                            if modifiers.logo() {
+                                ret.push(MaybePhysicalKey::Key(Key::Named(Named::Super)));
+                            }
 
-                        // For the main key, use physical or logical based on the flag
-                        if self.physical {
-                            ret.push(MaybePhysicalKey::Physical(*physical_key));
-                        } else {
-                            ret.push(MaybePhysicalKey::Key(key.clone()));
-                        }
+                            // For the main key, use physical or logical based on the flag
+                            if self.physical {
+                                ret.push(MaybePhysicalKey::Physical(*physical_key));
+                            } else {
+                                ret.push(MaybePhysicalKey::Key(key.clone()));
+                            }
 
-                        shell.publish(f(ret));
-                    };
+                            shell.publish(f(ret));
+                        };
+                    }
                 }
-            } },
+            }
             _ => {}
         }
     }

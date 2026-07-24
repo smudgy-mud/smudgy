@@ -3,20 +3,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::session_store::BindTarget;
 use chrono::{DateTime, Utc};
 use iced::widget::{center, pane_grid, text};
 use iced::window;
 use iced::window::settings::PlatformSpecific;
 use iced::{Point, Rectangle, Size, Subscription, Task};
+use smudgy_cloud::cloud_api::{AreaPref, CloudApiClient};
+use smudgy_cloud::{AreaId, CloudError, Mapper};
 use smudgy_core::models::map_scopes::{MapScopes, ScopeState};
 use smudgy_core::models::settings::{MapAreaPref, Settings};
-use smudgy_core::session::runtime::pane::{
-    MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection,
-};
+use smudgy_core::session::runtime::pane::{MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection};
 use smudgy_core::session::{SessionEvent, SessionId, TaggedSessionEvent};
-use smudgy_cloud::cloud_api::{AreaPref, CloudApiClient};
-use smudgy_cloud::{AreaId, AtlasId, CloudError, Mapper};
-use crate::session_store::{BindTarget, ToastAction};
 
 // Core session imports
 use windows::automations_window::{AutomationsWindow, Event as AutomationsWindowEvent};
@@ -358,8 +356,8 @@ fn flag_value(name: &str, arg: &str, rest: &mut impl Iterator<Item = String>) ->
 
 /// Runs the smudgy application: applies the launch-flag overrides, initializes
 /// `smudgy_core` (logging, data dir), and drives the iced daemon until the last
-/// window closes; joins the session runtime threads before returning. The
-/// `smudgy` binary's `main` is a thin wrapper around this.
+/// window closes; joins the session and connection-worker threads before
+/// returning. The `smudgy` binary's `main` is a thin wrapper around this.
 pub fn run() -> anyhow::Result<()> {
     apply_launch_overrides();
     smudgy_core::init();
@@ -407,6 +405,7 @@ pub fn run() -> anyhow::Result<()> {
 
     log::info!("Application closing");
 
+    smudgy_core::session::connection::shutdown_io_runtime();
     smudgy_core::session::runtime::join_runtime_threads();
 
     Ok(())
@@ -486,9 +485,7 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
     // client eventually notices a release (launch covers the startup case).
     // Master-switched on `auto_check_for_updates` and independent of sign-in.
     if smudgy.account.auto_check_for_updates() {
-        subs.push(
-            iced::time::every(Duration::from_secs(21_600)).map(|_| Message::UpdateCheckTick),
-        );
+        subs.push(iced::time::every(Duration::from_secs(21_600)).map(|_| Message::UpdateCheckTick));
     }
 
     Subscription::batch(subs)
@@ -556,9 +553,7 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 let orphans: Vec<PaneRef> = window
                     .pane_refs()
                     .into_iter()
-                    .filter(|slot| {
-                        slot.key != MAIN_PANE_KEY && !victims.contains(&slot.session_id)
-                    })
+                    .filter(|slot| slot.key != MAIN_PANE_KEY && !victims.contains(&slot.session_id))
                     .collect();
                 for session_id in &victims {
                     smudgy.sessions.shutdown_and_remove(*session_id);
@@ -582,6 +577,9 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     );
                 }
                 if smudgy.smudgy_windows.is_empty() {
+                    for editor in smudgy.map_editor_windows.values() {
+                        editor.prepare_to_close();
+                    }
                     Task::batch([purge_task, iced::exit()])
                 } else {
                     purge_task
@@ -593,6 +591,9 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 smudgy.settings_windows.remove(&id);
                 Task::none()
             } else {
+                if let Some(window) = smudgy.map_editor_windows.get(&id) {
+                    window.prepare_to_close();
+                }
                 smudgy.map_editor_windows.remove(&id);
                 Task::none()
             }
@@ -673,10 +674,9 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Some(SmudgyWindowEvent::PaneDragCanceled(pane)) => {
                     Task::batch([task, finish_drag_canceled(smudgy, id, pane)])
                 }
-                Some(SmudgyWindowEvent::OpenSettingsWindow) => Task::batch([
-                    task,
-                    Task::done(Message::CreateSettingsWindow),
-                ]),
+                Some(SmudgyWindowEvent::OpenSettingsWindow) => {
+                    Task::batch([task, Task::done(Message::CreateSettingsWindow)])
+                }
                 Some(SmudgyWindowEvent::OpenDownloadPage) => {
                     // User clicked an "out of date"/"upgrade available" link —
                     // opening the browser here is user-initiated, not autonomous.
@@ -708,11 +708,6 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 SessionEvent::MapperNavigated(area_id) => {
                     observe_navigation_for_binding(smudgy, session_id, *area_id)
                 }
-                SessionEvent::OfferMapRescue {
-                    area_id,
-                    atlas_id,
-                    atlas_name,
-                } => offer_map_rescue(smudgy, session_id, *area_id, *atlas_id, atlas_name.clone()),
                 SessionEvent::MapAreaCreated(area_id) => {
                     associate_created_area(smudgy, session_id, *area_id)
                 }
@@ -722,9 +717,7 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             // by the session's own update below) and the windows' grids
             // (handled here at the daemon, which owns the window map).
             let pane_lifecycle = match &event {
-                SessionEvent::PaneOpened { def, placement } => {
-                    Some((def.key, Some(*placement)))
-                }
+                SessionEvent::PaneOpened { def, placement } => Some((def.key, Some(*placement))),
                 SessionEvent::PaneClosed(key) => Some((*key, None)),
                 _ => None,
             };
@@ -755,12 +748,6 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             // before the store lookup makes a repeated close a clean no-op.
             if matches!(msg, session_store::Message::Close) {
                 return close_session(smudgy, session_id);
-            }
-            // A bind/rescue toast's action button: the daemon owns the scope
-            // store, so it applies the staged action (Undo a bind, accept a
-            // rescue) rather than the session store.
-            if matches!(msg, session_store::Message::BindToastActionClicked) {
-                return handle_bind_toast_action(smudgy, session_id);
             }
             // The session's own map widgets update below; the standalone map
             // editor windows track the current location too, and a sustained
@@ -794,12 +781,9 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             // Tear-out inserts its window synchronously (it must adopt the
             // transplanted pane before the open task completes), so this may
             // find the entry already present.
-            smudgy
-                .smudgy_windows
-                .entry(id)
-                .or_insert_with(|| {
-                    windows::smudgy_window::SmudgyWindow::new(id, smudgy.account.handles())
-                });
+            smudgy.smudgy_windows.entry(id).or_insert_with(|| {
+                windows::smudgy_window::SmudgyWindow::new(id, smudgy.account.handles())
+            });
             Task::batch([
                 // Install the Restart Manager shutdown hook on this window's
                 // HWND so the installer can close smudgy for an in-place
@@ -808,12 +792,15 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 // Seed the tracker: the window's `Opened` event may have
                 // fired before the daemon subscription was polled (true for
                 // the first window at startup).
-                window::position(id)
-                    .map(move |origin| Message::WindowTracking(id, pane_drag::TrackEvent::Origin(origin))),
-                window::size(id)
-                    .map(move |size| Message::WindowTracking(id, pane_drag::TrackEvent::Resized(size))),
-                window::scale_factor(id)
-                    .map(move |scale| Message::WindowTracking(id, pane_drag::TrackEvent::Rescaled(scale))),
+                window::position(id).map(move |origin| {
+                    Message::WindowTracking(id, pane_drag::TrackEvent::Origin(origin))
+                }),
+                window::size(id).map(move |size| {
+                    Message::WindowTracking(id, pane_drag::TrackEvent::Resized(size))
+                }),
+                window::scale_factor(id).map(move |scale| {
+                    Message::WindowTracking(id, pane_drag::TrackEvent::Rescaled(scale))
+                }),
             ])
         }
         Message::HookWindowForShutdown(raw_id) => {
@@ -890,7 +877,9 @@ fn update(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         let retab = smudgy.settings_windows.keys().next().map(|&id| {
                             Task::done(Message::SettingsWindowMessage(
                                 id,
-                                settings_window::Message::TabSelected(settings_window::Tab::Account),
+                                settings_window::Message::TabSelected(
+                                    settings_window::Tab::Account,
+                                ),
                             ))
                         });
                         Task::batch(
@@ -1269,9 +1258,10 @@ fn remove_pane_from_windows(
     key: PaneKey,
 ) -> Task<Message> {
     // The dragged pane closing mid-drag (script `pane.close()`) aborts the drag.
-    if smudgy.pane_drag.is_some_and(|drag| {
-        drag.slot.session_id == session_id && drag.slot.key == key
-    }) {
+    if smudgy
+        .pane_drag
+        .is_some_and(|drag| drag.slot.session_id == session_id && drag.slot.key == key)
+    {
         smudgy.pane_drag = None;
     }
 
@@ -1458,7 +1448,12 @@ fn tear_out_pane(
     } else {
         Task::none()
     };
-    Task::batch([open_task.map(Message::NewSmudgyWindow), activate, close, repair])
+    Task::batch([
+        open_task.map(Message::NewSmudgyWindow),
+        activate,
+        close,
+        repair,
+    ])
 }
 
 /// Loads the per-area prefs from settings, migrating a legacy disabled-only
@@ -1712,7 +1707,9 @@ fn bind_target_for_area(mapper: &Mapper, area_id: AreaId) -> Option<BindTarget> 
         return None;
     }
     let atlas = mapper.get_current_atlas();
-    let atlas_id = atlas.get_area(&area_id).and_then(|area| area.meta().atlas_id);
+    let atlas_id = atlas
+        .get_area(&area_id)
+        .and_then(|area| area.meta().atlas_id);
     Some(match atlas_id {
         Some(atlas_id) => BindTarget::Atlas(atlas_id),
         None => BindTarget::Area(area_id),
@@ -1732,28 +1729,6 @@ fn set_scope_entry(scopes: &mut MapScopes, target: BindTarget, entry: &str, show
     match target {
         BindTarget::Atlas(atlas_id) => scopes.set_atlas_entry(atlas_id, entry, show),
         BindTarget::Area(area_id) => scopes.set_area_entry(area_id, entry, show),
-    }
-}
-
-/// A human label for a scope target, for the toast: the atlas's name (read from
-/// any resident member area's denormalized `atlas_name`) or the atlas-less
-/// area's own name, with a generic fallback when neither is known.
-fn scope_display_name(mapper: &Mapper, target: BindTarget) -> String {
-    let atlas = mapper.get_current_atlas();
-    match target {
-        BindTarget::Area(area_id) => atlas
-            .get_area(&area_id)
-            .map(|area| area.get_name().to_string())
-            .unwrap_or_else(|| "This map".to_string()),
-        BindTarget::Atlas(atlas_id) => atlas
-            .areas()
-            .find_map(|area| {
-                let meta = area.meta();
-                (meta.atlas_id == Some(atlas_id))
-                    .then(|| meta.atlas_name.clone())
-                    .flatten()
-            })
-            .unwrap_or_else(|| "This map".to_string()),
     }
 }
 
@@ -1799,7 +1774,7 @@ fn observe_locate_for_binding(
 }
 
 /// Demonstrated navigation intent (a speedwalk / find-nearest resolution): binds
-/// immediately when the destination target is unassigned and not suppressed.
+/// immediately when the destination target is unassigned.
 fn observe_navigation_for_binding(
     smudgy: &mut Smudgy,
     session_id: SessionId,
@@ -1808,99 +1783,26 @@ fn observe_navigation_for_binding(
     let Some((target, unassigned)) = resolve_bind_input(smudgy, session_id, area_id) else {
         return Task::none();
     };
-    let should_bind = smudgy
-        .sessions
-        .get(session_id)
-        .is_some_and(|session| session.bind_tracker.observe_navigation(target, unassigned));
-    if should_bind {
+    if unassigned {
         bind_target(smudgy, session_id, target)
     } else {
         Task::none()
     }
 }
 
-/// Associate `target` with the session's server entry, commit + fan out the
-/// change, and raise the undoable bind toast over the session's main pane.
+/// Associate `target` with the session's server entry and commit + fan out the
+/// change. Silent — unwinding an unwanted association is a map-editor decision
+/// (the scope checklist), not an in-session one.
 fn bind_target(smudgy: &mut Smudgy, session_id: SessionId, target: BindTarget) -> Task<Message> {
-    let Some((server_name, display_name)) = smudgy.sessions.get(session_id).and_then(|session| {
-        let mapper = session.mapper.as_ref()?;
-        Some((session.server_name.clone(), scope_display_name(mapper, target)))
-    }) else {
+    let Some(server_name) = smudgy
+        .sessions
+        .get(session_id)
+        .map(|session| session.server_name.clone())
+    else {
         return Task::none();
     };
     set_scope_entry(&mut smudgy.map_scopes, target, &server_name, true);
-    let commit = commit_scope_change(smudgy);
-    let message = format!("'{display_name}' now shows on {server_name}");
-    let toast = smudgy.sessions.get_mut(session_id).map_or_else(
-        Task::none,
-        |session| {
-            session
-                .show_bind_toast(
-                    message,
-                    Some(("Undo".to_string(), ToastAction::UndoBind(target))),
-                )
-                .map(move |msg| Message::SessionAction(session_id, msg))
-        },
-    );
-    Task::batch([commit, toast])
-}
-
-/// Cross-entry rescue: a room here is already mapped on a different entry. Offer
-/// (at most once per target per session) to show that map here too.
-fn offer_map_rescue(
-    smudgy: &mut Smudgy,
-    session_id: SessionId,
-    area_id: AreaId,
-    atlas_id: Option<AtlasId>,
-    atlas_name: Option<String>,
-) -> Task<Message> {
-    let target = match atlas_id {
-        Some(atlas_id) => BindTarget::Atlas(atlas_id),
-        None => BindTarget::Area(area_id),
-    };
-    let Some(session) = smudgy.sessions.get(session_id) else {
-        return Task::none();
-    };
-    let server_name = session.server_name.clone();
-    // Only offer for a target genuinely homed on *other* entries. (The op only
-    // fires on a scope-excluded hit, so this should always hold — but a race
-    // with a just-committed bind could make it stale.)
-    if target_scope(&smudgy.map_scopes, target, &server_name) != ScopeState::Elsewhere {
-        return Task::none();
-    }
-    let name = atlas_name
-        .filter(|name| !name.is_empty())
-        .or_else(|| session.mapper.as_ref().map(|m| scope_display_name(m, target)))
-        .unwrap_or_else(|| "another map".to_string());
-    let others = match target {
-        BindTarget::Atlas(atlas_id) => smudgy.map_scopes.atlas_entries(&atlas_id),
-        BindTarget::Area(area_id) => smudgy.map_scopes.area_entries(&area_id),
-    };
-    let others_label = if others.is_empty() {
-        "another server".to_string()
-    } else {
-        others.into_iter().collect::<Vec<_>>().join(", ")
-    };
-    // Rate-limit: offer at most once per target per session.
-    let first = smudgy
-        .sessions
-        .get_mut(session_id)
-        .is_some_and(|session| session.bind_tracker.mark_rescue_offered(target));
-    if !first {
-        return Task::none();
-    }
-    let message = format!("Rooms here match '{name}' (shown on {others_label})");
-    smudgy.sessions.get_mut(session_id).map_or_else(
-        Task::none,
-        |session| {
-            session
-                .show_bind_toast(
-                    message,
-                    Some(("Show here too".to_string(), ToastAction::AcceptRescue(target))),
-                )
-                .map(move |msg| Message::SessionAction(session_id, msg))
-        },
-    )
+    commit_scope_change(smudgy)
 }
 
 /// A script created a non-ephemeral area in this session; associate it with the
@@ -1926,29 +1828,6 @@ fn associate_created_area(
         return Task::none();
     }
     set_scope_entry(&mut smudgy.map_scopes, target, &server_name, true);
-    commit_scope_change(smudgy)
-}
-
-/// Apply a bind/rescue toast's staged action to the scope store (Undo a bind, or
-/// accept a rescue), then commit + fan out.
-fn handle_bind_toast_action(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Message> {
-    let Some(session) = smudgy.sessions.get_mut(session_id) else {
-        return Task::none();
-    };
-    let server_name = session.server_name.clone();
-    let Some(action) = session.take_toast_action() else {
-        return Task::none();
-    };
-    match action {
-        ToastAction::UndoBind(target) => {
-            // Suppress re-binding for the session, or the streak refires at once.
-            session.bind_tracker.suppress(target);
-            set_scope_entry(&mut smudgy.map_scopes, target, &server_name, false);
-        }
-        ToastAction::AcceptRescue(target) => {
-            set_scope_entry(&mut smudgy.map_scopes, target, &server_name, true);
-        }
-    }
     commit_scope_change(smudgy)
 }
 
@@ -2100,8 +1979,7 @@ mod tests {
         let mut prefs = HashMap::new();
         prefs.insert(area(2), local(area(2), true, 30)); // local-only disabled
         prefs.insert(area(3), local(area(3), false, 30)); // local-only enabled
-        let pushes =
-            merge_server_area_prefs(&mut prefs, &[srv(area(1), true, 5)], &HashSet::new());
+        let pushes = merge_server_area_prefs(&mut prefs, &[srv(area(1), true, 5)], &HashSet::new());
         // Server-only row adopted.
         assert!(prefs[&area(1)].disabled);
         // A local-only *disabled* pref is pushed; a local-only *enabled* one is
@@ -2126,10 +2004,12 @@ mod tests {
         assert!(prefs[&area(2)].disabled);
         // A server row for a parked area still merges normally (parking only
         // gates the local-only push).
-        let pushes =
-            merge_server_area_prefs(&mut prefs, &[srv(area(2), false, 99)], &parked);
+        let pushes = merge_server_area_prefs(&mut prefs, &[srv(area(2), false, 99)], &parked);
         assert!(!pushes.iter().any(|(id, _)| *id == area(2)));
-        assert!(!prefs[&area(2)].disabled, "server-newer row adopted despite parking");
+        assert!(
+            !prefs[&area(2)].disabled,
+            "server-newer row adopted despite parking"
+        );
     }
 
     #[test]

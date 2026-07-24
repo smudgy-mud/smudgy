@@ -13,11 +13,11 @@ use iced::widget::{
     text_input,
 };
 use iced::{Alignment, Background, Color, Length, Task};
+use smudgy_cloud::cloud_api::{ApiKeyInfo, AuthSession, CreatedApiKey, SessionInfo, UserProfile};
+use smudgy_cloud::{CloudError, Uuid};
 use smudgy_core::models::settings::{
     CommandInputBehavior, Settings, ThemeTweaks, clear_update_check_seed, load_settings,
 };
-use smudgy_cloud::cloud_api::{ApiKeyInfo, AuthSession, CreatedApiKey, SessionInfo, UserProfile};
-use smudgy_cloud::{CloudError, Uuid};
 use smudgy_i18n::LocalePreference;
 
 use crate::cloud_account::CloudHandles;
@@ -127,6 +127,7 @@ pub enum Message {
     PrefRawPrefixChanged(String),
     PrefRawPrefixSubmitted,
     PrefCommandInputBehaviorSelected(CommandInputBehavior),
+    PrefMaskOnServerEchoToggled(bool),
     PrefHidePaneHeadersToggled(bool),
     PrefLoggingToggled(bool),
     PrefRawLoggingToggled(bool),
@@ -495,7 +496,10 @@ impl SettingsWindow {
                     Ok(profile) => {
                         // Collapse the editor back behind its button on success.
                         self.editing_nickname = false;
-                        self.notice = profile.nickname.clone().map(|h| format!("You are now {h}."));
+                        self.notice = profile
+                            .nickname
+                            .clone()
+                            .map(|h| format!("You are now {h}."));
                         Update::with_event(Event::ProfileUpdated(profile))
                     }
                     Err(err) => {
@@ -627,15 +631,13 @@ impl SettingsWindow {
                 self.font_size_input = value;
                 Update::none()
             }
-            Message::PrefFontSizeSubmitted => {
-                match self.font_size_input.trim().parse::<f32>() {
-                    Ok(size) if (8.0..=40.0).contains(&size) => {
-                        self.settings.terminal_font_size = size;
-                        self.settings_changed()
-                    }
-                    _ => Update::none(),
+            Message::PrefFontSizeSubmitted => match self.font_size_input.trim().parse::<f32>() {
+                Ok(size) if (8.0..=40.0).contains(&size) => {
+                    self.settings.terminal_font_size = size;
+                    self.settings_changed()
                 }
-            }
+                _ => Update::none(),
+            },
             Message::PrefLineLengthChanged(value) => {
                 self.line_length_input = value;
                 Update::none()
@@ -703,6 +705,10 @@ impl SettingsWindow {
                 self.settings.command_input_behavior = behavior;
                 self.settings_changed()
             }
+            Message::PrefMaskOnServerEchoToggled(mask) => {
+                self.settings.mask_input_on_server_echo = mask;
+                self.settings_changed()
+            }
             Message::PrefHidePaneHeadersToggled(hide) => {
                 self.settings.hide_pane_headers = hide;
                 self.settings_changed()
@@ -767,8 +773,8 @@ impl SettingsWindow {
                 } else {
                     // Seed from the slot's current *effective* color, so the
                     // picker opens on what the user is looking at.
-                    let color = prefs::slot_color(&self.effective_palette(), slot)
-                        .unwrap_or(Color::WHITE);
+                    let color =
+                        prefs::slot_color(&self.effective_palette(), slot).unwrap_or(Color::WHITE);
                     self.tweak_picker = Some((slot, ColorPicker::from_color(color)));
                 }
                 Update::none()
@@ -836,7 +842,10 @@ impl SettingsWindow {
     /// The current theme's tweak entry, created on first edit.
     fn tweak_entry(&mut self) -> &mut ThemeTweaks {
         let key = self.tweak_key();
-        self.settings.theme_tweaks.entry(key.to_string()).or_default()
+        self.settings
+            .theme_tweaks
+            .entry(key.to_string())
+            .or_default()
     }
 
     /// The current theme's base palette with its tweak entry applied — what
@@ -909,7 +918,11 @@ impl SettingsWindow {
     pub fn view(&self) -> ThemedElement<'_, Message> {
         let nav = column![
             nav_button("Account", self.tab == Tab::Account, Tab::Account),
-            nav_button("Preferences", self.tab == Tab::Preferences, Tab::Preferences),
+            nav_button(
+                "Preferences",
+                self.tab == Tab::Preferences,
+                Tab::Preferences
+            ),
             nav_button("Security", self.tab == Tab::Security, Tab::Security),
             nav_button("Friends", self.tab == Tab::Friends, Tab::Friends),
             nav_button("Licenses", self.tab == Tab::Licenses, Tab::Licenses),
@@ -1367,8 +1380,19 @@ impl SettingsWindow {
                 )
                 .text_size(13)
                 .width(320),
+                dim_text("What happens to the input box and its text after you press Enter",),
+            ]
+            .spacing(2),
+        );
+        col = col.push(
+            column![
+                checkbox(self.settings.mask_input_on_server_echo)
+                    .label("Hide typing when the server asks for a password")
+                    .on_toggle(Message::PrefMaskOnServerEchoToggled),
                 dim_text(
-                    "What happens to the input box and its text after you press Enter",
+                    "When a MUD turns off echo for a password prompt, the input shows \
+                     dots instead of your text (with an eye button to peek). Turn off \
+                     to keep your typing visible.",
                 ),
             ]
             .spacing(2),
@@ -1416,9 +1440,9 @@ impl SettingsWindow {
         // ===== updates =====
         col = col.push(text("Updates").size(15));
         col = col.push(
-                checkbox(self.settings.auto_check_for_updates)
-                    .label("Automatically check for updates")
-                    .on_toggle(Message::PrefAutoCheckForUpdatesToggled),
+            checkbox(self.settings.auto_check_for_updates)
+                .label("Automatically check for updates")
+                .on_toggle(Message::PrefAutoCheckForUpdatesToggled),
         );
 
         col.into()
@@ -1475,8 +1499,16 @@ impl SettingsWindow {
         let effective = self.effective_palette();
 
         let tabs = row![
-            tweak_tab_button("Adjust", self.tweak_tab == TweakTab::Adjust, TweakTab::Adjust),
-            tweak_tab_button("Colors", self.tweak_tab == TweakTab::Colors, TweakTab::Colors),
+            tweak_tab_button(
+                "Adjust",
+                self.tweak_tab == TweakTab::Adjust,
+                TweakTab::Adjust
+            ),
+            tweak_tab_button(
+                "Colors",
+                self.tweak_tab == TweakTab::Colors,
+                TweakTab::Colors
+            ),
         ]
         .spacing(4);
 
@@ -1617,8 +1649,7 @@ impl SettingsWindow {
                             ))
                             .size(13)
                             .width(120),
-                            text(format!("created {}", key.created_at.format("%Y-%m-%d")))
-                                .size(12),
+                            text(format!("created {}", key.created_at.format("%Y-%m-%d"))).size(12),
                             text(match &key.last_used_at {
                                 Some(at) => format!("last used {}", at.format("%Y-%m-%d")),
                                 None => "never used".to_string(),
@@ -1752,11 +1783,11 @@ fn enumerate_system_fonts() -> Task<Message> {
 /// De-emphasized text for field labels and helper lines under preference
 /// controls (the map inspector's `field_label` convention, copied locally).
 fn dim_text<'a>(label: &'static str) -> iced::widget::Text<'a, crate::Theme> {
-    text(label).size(11).style(|theme: &crate::Theme| {
-        iced::widget::text::Style {
+    text(label)
+        .size(11)
+        .style(|theme: &crate::Theme| iced::widget::text::Style {
             color: Some(theme.styles.text.normal.scale_alpha(0.6)),
-        }
-    })
+        })
 }
 
 /// A labeled text input for the Preferences tab: dimmed label above, the raw
@@ -1799,11 +1830,11 @@ fn pref_input<'a>(
 
 /// [`dim_text`] for runtime strings (the open override's slot name).
 fn dim_text_owned<'a>(label: String) -> iced::widget::Text<'a, crate::Theme> {
-    text(label).size(11).style(|theme: &crate::Theme| {
-        iced::widget::text::Style {
+    text(label)
+        .size(11)
+        .style(|theme: &crate::Theme| iced::widget::text::Style {
             color: Some(theme.styles.text.normal.scale_alpha(0.6)),
-        }
-    })
+        })
 }
 
 /// A tab selector for the tweak panel, styled like the window nav with a
@@ -1861,7 +1892,7 @@ fn tweak_slider_row(
         slider(-1.0..=1.0, value, move |value| {
             Message::TweakSliderChanged(which, value)
         })
-        .step(0.01)
+        .step(0.01_f32)
         .on_release(Message::TweakSliderReleased),
     ]
     .spacing(2)
@@ -1880,23 +1911,25 @@ fn tweak_swatch(
         .width(24.0)
         .height(24.0)
         .padding(0)
-        .style(move |theme: &crate::Theme, _status| iced::widget::button::Style {
-            background: Some(Background::Color(color)),
-            border: if selected {
-                iced::border::color(theme.styles.text.normal)
-                    .width(2.0)
-                    .rounded(3.0)
-            } else if overridden {
-                iced::border::color(theme.styles.general.accent)
-                    .width(2.0)
-                    .rounded(3.0)
-            } else {
-                iced::border::color(theme.styles.general.border)
-                    .width(1.0)
-                    .rounded(3.0)
+        .style(
+            move |theme: &crate::Theme, _status| iced::widget::button::Style {
+                background: Some(Background::Color(color)),
+                border: if selected {
+                    iced::border::color(theme.styles.text.normal)
+                        .width(2.0)
+                        .rounded(3.0)
+                } else if overridden {
+                    iced::border::color(theme.styles.general.accent)
+                        .width(2.0)
+                        .rounded(3.0)
+                } else {
+                    iced::border::color(theme.styles.general.border)
+                        .width(1.0)
+                        .rounded(3.0)
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        })
+        )
         .on_press(Message::TweakSwatchPressed(slot))
         .into()
 }
@@ -1913,18 +1946,22 @@ fn preview_strip(palette: &prefs::TerminalPalette) -> ThemedElement<'static, Mes
             container(space::horizontal().width(0.0))
                 .width(12.0)
                 .height(12.0)
-                .style(move |_theme: &crate::Theme| iced::widget::container::Style {
-                    background: Some(Background::Color(color)),
-                    ..Default::default()
-                }),
+                .style(
+                    move |_theme: &crate::Theme| iced::widget::container::Style {
+                        background: Some(Background::Color(color)),
+                        ..Default::default()
+                    },
+                ),
         );
     }
 
     container(
         column![
-            text("The quick brown fox").size(13).style(move |_theme: &crate::Theme| {
-                iced::widget::text::Style { color: Some(fg) }
-            }),
+            text("The quick brown fox")
+                .size(13)
+                .style(move |_theme: &crate::Theme| {
+                    iced::widget::text::Style { color: Some(fg) }
+                }),
             chips,
         ]
         .spacing(6),

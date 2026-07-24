@@ -112,6 +112,8 @@ pub enum EditNode {
         enabled: bool,
         language: ScriptLang,
         prompt: bool,
+        priority: i32,
+        fallthrough: bool,
         package: Option<String>,
         /// The unified, ordered pattern list (Match/Anti/Raw per row).
         rows: Vec<(PatternKind, String)>,
@@ -202,7 +204,10 @@ pub enum Selection {
     /// A dependency *reference* row nested under `parent` (an installed/local package). Distinct
     /// from [`Selection::InstalledPackage`] so that selecting the reference highlights only the
     /// clicked row — not the same package's own top-level row, when it has one.
-    Dependency { parent: String, spec: String },
+    Dependency {
+        parent: String,
+        spec: String,
+    },
     /// A script-created (package/module) automation leaf, keyed by its creator tree node
     /// (`module:<subpath>` / `package:<spec>`), kind, and name. Drives the read-only detail pane.
     CreatorAutomation {
@@ -234,7 +239,10 @@ pub enum Message {
     SelectInstalledPackage(String),
     /// Open an installed package via a nested dependency-reference row (keeps the clicked row,
     /// not the package's top-level row, as the highlighted selection).
-    SelectDependency { parent: String, spec: String },
+    SelectDependency {
+        parent: String,
+        spec: String,
+    },
     /// Open the read-only detail pane for a script-created automation.
     SelectCreatorAutomation {
         creator_id: String,
@@ -264,6 +272,8 @@ pub enum Message {
     /// the palette's "Move to…" group for the selected script.
     SetScriptFolder(Option<String>),
     SetBehavior(ScriptLang),
+    AdjustPriority(i32),
+    ToggleFallthrough,
     ScriptEditorAction(text_editor::Action),
     SetTestInput(String),
     ToggleEnabled,
@@ -313,7 +323,10 @@ pub enum Message {
     // owned sharing / versions
     SetVisibility(bool),
     VisibilityUpdated(Result<bool, CloudError>),
-    YankVersion { version: String, yanked: bool },
+    YankVersion {
+        version: String,
+        yanked: bool,
+    },
     DeleteVersion(String),
     VersionsUpdated(Result<Vec<VersionListItem>, CloudError>),
     ShareWithFriend(Uuid),
@@ -335,12 +348,21 @@ pub enum Message {
     // ---- installed package -------------------------------------------------
     /// The [`DetailSeq`] is the manage-pane detail generation captured when the load started; a
     /// stale result (the open package changed, navigation, uninstall, or a re-resolve) is discarded.
-    InstalledDetailLoaded(DetailSeq, Result<packages::InstalledDetail, CloudError>),
-    InstalledResolvedForGraph(String, Result<(ResolvedPackageWire, PackagePermissions), CloudError>),
+    InstalledDetailLoaded(
+        DetailSeq,
+        Box<Result<packages::InstalledDetail, CloudError>>,
+    ),
+    InstalledResolvedForGraph(
+        String,
+        Result<(ResolvedPackageWire, PackagePermissions), CloudError>,
+    ),
     SetInstalledUpdateMode(UpdateMode),
     TogglePackageEnabled(String),
     /// Make `target_spec` the active member of a same-name group (enable it, disabling siblings).
-    SetActiveMember { target_spec: String, siblings: Vec<String> },
+    SetActiveMember {
+        target_spec: String,
+        siblings: Vec<String>,
+    },
     /// Enable/disable a lone (non-colliding) local package from the tree.
     ToggleLocalEnabled(String),
     SelectInstalledFile(String),
@@ -400,10 +422,16 @@ pub enum Message {
     DiscoverSearch,
     DiscoverScopeChanged(DiscoverScope),
     DiscoverResultsLoaded(Result<Vec<PackageSearchResult>, CloudError>),
-    DiscoverSelect { package_id: Uuid, owner: String },
+    DiscoverSelect {
+        package_id: Uuid,
+        owner: String,
+    },
     /// Install a search result directly (the result-card "Install" / dashboard teaser): routes to
     /// the Discover pane (so the consent window shows) and begins the install for `owner/name`.
-    DiscoverInstallResult { owner: String, name: String },
+    DiscoverInstallResult {
+        owner: String,
+        name: String,
+    },
     DiscoverDetailLoaded(Result<PackageDetail, CloudError>),
     DiscoverCommentsLoaded(Result<Vec<CommentView>, CloudError>),
     DiscoverBack,
@@ -419,12 +447,18 @@ pub enum Message {
     InstallResolved(InstallSeq, Result<InstallResolution, CloudError>),
     // install-time consent confirmation; `enable` = "Install & enable" vs "Install, don't
     // enable" (both record the same consent — they differ only in turning the package on now).
-    ConsentGrant { enable: bool },
+    ConsentGrant {
+        enable: bool,
+    },
     ConsentCancel,
     // One edit to a parameter's value, routed by `ParamTarget` to the install-time prompt or the
     // in-pane config editor. The `String` is the parameter key; `ParamValueEdit` is the addressed
     // change (a scalar edit, or a list/table row op). Shared by both value-entry surfaces.
-    ParamValueEdit(param_values::ParamTarget, String, param_values::ParamValueEdit),
+    ParamValueEdit(
+        param_values::ParamTarget,
+        String,
+        param_values::ParamValueEdit,
+    ),
     ParamPromptSubmit,
     ParamPromptCancel,
     // in-pane param-value editor (installed & owned package panes): save all, or clear a stored
@@ -439,7 +473,10 @@ pub enum Message {
     /// shared-with-me list in the "Private & Shared" pane — including private ones with
     /// no local copy on this machine, which appear in no other surface.
     MyCloudLoaded(Result<Vec<PackageDetail>, CloudError>),
-    InstallShared { owner: String, name: String },
+    InstallShared {
+        owner: String,
+        name: String,
+    },
 
     // ---- top action bar ----------------------------------------------------
     Reload,
@@ -832,7 +869,9 @@ impl AutomationsWindow {
                 (keyboard::Key::Character("p"), _) if modifiers.command() => {
                     Some(Message::OpenPalette)
                 }
-                (keyboard::Key::Named(Named::Escape), Status::Ignored) => Some(Message::ClosePalette),
+                (keyboard::Key::Named(Named::Escape), Status::Ignored) => {
+                    Some(Message::ClosePalette)
+                }
                 (keyboard::Key::Named(Named::ArrowDown), Status::Ignored) => {
                     Some(Message::PaletteMove(1))
                 }
@@ -845,20 +884,17 @@ impl AutomationsWindow {
         });
         // Stream this session's script-created automation updates, keyed by session id so
         // iced keeps a single broadcast subscription (one runtime receiver) across renders.
-        let automations = Subscription::run_with(self.session_id, |session_id| {
-            automation_stream(*session_id)
-        })
-        .map(Message::AutomationEvent);
+        let automations =
+            Subscription::run_with(self.session_id, |session_id| automation_stream(*session_id))
+                .map(Message::AutomationEvent);
         let mut subscriptions = vec![keyboard, automations];
         // The catalogue broadcast is subscribed only while the store pane is showing: the
         // runtime builds snapshots only while receivers exist, so a closed pane costs it
         // nothing, and re-opening gets a fresh snapshot (the new-subscriber resync).
         if matches!(self.pane, Pane::StoreInspector) {
             subscriptions.push(
-                Subscription::run_with(self.session_id, |session_id| {
-                    catalogue_stream(*session_id)
-                })
-                .map(Message::CatalogueEvent),
+                Subscription::run_with(self.session_id, |session_id| catalogue_stream(*session_id))
+                    .map(Message::CatalogueEvent),
             );
         }
         Subscription::batch(subscriptions)
@@ -898,10 +934,11 @@ impl AutomationsWindow {
                 }
             }
             Message::LoadFolders => {
-                self.packages = core_packages::load_packages(&self.server_name).unwrap_or_else(|e| {
-                    log::warn!("Failed to load folders for {}: {e}", self.server_name);
-                    PackageTree::new()
-                });
+                self.packages =
+                    core_packages::load_packages(&self.server_name).unwrap_or_else(|e| {
+                        log::warn!("Failed to load folders for {}: {e}", self.server_name);
+                        PackageTree::new()
+                    });
                 self.merge_folders();
                 Update::none()
             }
@@ -1070,6 +1107,32 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
+            Message::AdjustPriority(delta) => {
+                if let Pane::Editor(state) = &mut self.pane {
+                    match &mut state.node {
+                        EditNode::Alias(alias) => {
+                            alias.priority = alias.priority.saturating_add(delta);
+                        }
+                        EditNode::Trigger { priority, .. } => {
+                            *priority = priority.saturating_add(delta);
+                        }
+                        EditNode::Hotkey(_) => {}
+                    }
+                }
+                Update::none()
+            }
+            Message::ToggleFallthrough => {
+                if let Pane::Editor(state) = &mut self.pane {
+                    match &mut state.node {
+                        EditNode::Alias(alias) => alias.fallthrough = !alias.fallthrough,
+                        EditNode::Trigger { fallthrough, .. } => {
+                            *fallthrough = !*fallthrough;
+                        }
+                        EditNode::Hotkey(_) => {}
+                    }
+                }
+                Update::none()
+            }
             Message::ScriptEditorAction(action) => {
                 self.editor_content.perform(action);
                 Update::none()
@@ -1199,7 +1262,10 @@ impl AutomationsWindow {
                     Ok(summary) => {
                         let mut feedback = format!("Published v{}", summary.version);
                         if summary.typings_generated > 0 {
-                            feedback.push_str(&format!(" \u{b7} {} typings", summary.typings_generated));
+                            feedback.push_str(&format!(
+                                " \u{b7} {} typings",
+                                summary.typings_generated
+                            ));
                         }
                         // Surface tsc warnings to the author — typings are best-effort, so a
                         // warning here never means the publish failed.
@@ -1240,7 +1306,9 @@ impl AutomationsWindow {
                             ));
                         }
                         self.authoring_feedback = Some(feedback);
-                        Update::with_task(self.show_toast(format!("Published v{}", summary.version)))
+                        Update::with_task(
+                            self.show_toast(format!("Published v{}", summary.version)),
+                        )
                     }
                     Err(e) => {
                         self.authoring_feedback = Some(format!("Publish failed: {e}"));
@@ -1274,15 +1342,18 @@ impl AutomationsWindow {
             Message::OwnedShareLoaded(result) => self.owned_share_loaded(result),
 
             // -------- installed package ------------------------------------
-            Message::InstalledDetailLoaded(seq, result) => self.installed_detail_loaded(seq, result),
+            Message::InstalledDetailLoaded(seq, result) => {
+                self.installed_detail_loaded(seq, *result)
+            }
             Message::InstalledResolvedForGraph(spec, result) => {
                 self.installed_resolved_for_graph(&spec, result)
             }
             Message::SetInstalledUpdateMode(mode) => self.set_installed_update_mode(mode),
             Message::TogglePackageEnabled(spec) => self.toggle_package_enabled(spec),
-            Message::SetActiveMember { target_spec, siblings } => {
-                self.set_active_member(target_spec, siblings)
-            }
+            Message::SetActiveMember {
+                target_spec,
+                siblings,
+            } => self.set_active_member(target_spec, siblings),
             Message::ToggleLocalEnabled(name) => self.toggle_local_enabled(name),
             Message::SelectInstalledFile(subpath) => self.select_installed_file(subpath),
             Message::SelectInstalledFileTab(tab) => {
@@ -1365,7 +1436,9 @@ impl AutomationsWindow {
                 self.discover_search()
             }
             Message::DiscoverResultsLoaded(result) => self.discover_results_loaded(result),
-            Message::DiscoverSelect { package_id, owner } => self.discover_select(package_id, owner),
+            Message::DiscoverSelect { package_id, owner } => {
+                self.discover_select(package_id, owner)
+            }
             Message::DiscoverInstallResult { owner, name } => {
                 self.discover_install_result(owner, name)
             }
@@ -1405,10 +1478,7 @@ impl AutomationsWindow {
                 // Pick up a Settings change to the advanced-features gate without reopening.
                 self.advanced_features =
                     smudgy_core::models::settings::load_settings().advanced_scripting_features;
-                let toast = self.show_toast(format!(
-                    "Reloaded scripts for {}.",
-                    self.server_name
-                ));
+                let toast = self.show_toast(format!("Reloaded scripts for {}.", self.server_name));
                 Update::new(
                     Task::batch([
                         Task::done(self.load_scripts_message()),
@@ -1491,6 +1561,8 @@ impl AutomationsWindow {
             Message::SetName(_)
             | Message::SetAliasPattern(_)
             | Message::SetBehavior(_)
+            | Message::AdjustPriority(_)
+            | Message::ToggleFallthrough
             | Message::AddPattern
             | Message::RemovePattern(_)
             | Message::SetPatternKind(_, _)
@@ -1606,7 +1678,10 @@ impl AutomationsWindow {
             layers.push(common::toast(message));
         }
 
-        stack(layers).width(Length::Fill).height(Length::Fill).into()
+        stack(layers)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// The sticky unsaved-changes banner, shown while a navigation is deferred.
@@ -1614,7 +1689,9 @@ impl AutomationsWindow {
         use iced::alignment::Vertical;
         use iced::widget::{button, text};
         if self.pending_nav.is_none() {
-            return iced::widget::space::vertical().height(Length::Fixed(0.0)).into();
+            return iced::widget::space::vertical()
+                .height(Length::Fixed(0.0))
+                .into();
         }
         container(
             row![

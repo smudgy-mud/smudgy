@@ -1,5 +1,5 @@
 [workspace]
-members = ["ui", "core", "cloud", "i18n", "map_widget", "script", "inspector"]
+members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "inspector"]
 # Everything except `inspector` and `scriptref`. This leaves exactly one bin target (ui's
 # `smudgy`) in the default set, so a bare `cargo run` / `cargo build` / `cargo
 # test` resolves to the app without needing `-p` or `--bin`. `inspector` is a
@@ -10,7 +10,7 @@ members = ["ui", "core", "cloud", "i18n", "map_widget", "script", "inspector"]
 # `scriptref` (`smudgy_scriptref`) is likewise a standalone dev tool — the script
 # API reference generator/publisher — excluded for the same reason; run it with
 # `cargo run -p smudgy_scriptref`.
-default-members = ["ui", "core", "cloud", "map_widget", "script"]
+default-members = ["ui", "core", "cloud", "map_widget", "bench", "script"]
 resolver = "2"
 
 # Define shared dependencies for the workspace
@@ -29,6 +29,9 @@ iced = { version = "0.14", features = [
 ] }
 iced_anim = "0.3.1"
 iced_runtime = "0.14"
+# Pluggable span/metrics API (comet). A no-op unless the app is built with smudgy_ui's
+# `iced-debug` feature, whose `iced/debug` unifies `iced_debug/enable` workspace-wide.
+iced_debug = "0.14"
 derive_more = { version = "2.0.1", features = [
     "display",
     "from",

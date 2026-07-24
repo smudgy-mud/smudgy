@@ -72,6 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚪 Creating exits...");
     for i in 1..499 {
         let exit_args = ExitArgs {
+            id: None,
+            connection_id: None,
             is_secret: None,
             from_direction: ExitDirection::East,
             to_area_id: Some(area_id),
@@ -83,7 +85,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             is_locked: false,
             weight: 1.0,
             command: None,
-            style: None,
         };
 
         mapper
@@ -99,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a label
     let label_args = LabelArgs {
+        id: None,
         is_secret: None,
         level: 0,
         x: 25.0,
@@ -117,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a shape
     let shape_args = ShapeArgs {
+        id: None,
         is_secret: None,
         level: 0,
         x: 0.0,

@@ -27,9 +27,11 @@
 
 pub mod areas;
 pub mod clone;
+pub mod connections;
 pub mod http;
 pub mod identity;
 pub mod mock_server;
+pub mod mutations;
 pub mod projection;
 pub mod shares;
 pub mod social;

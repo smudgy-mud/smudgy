@@ -61,12 +61,23 @@ const {
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
+    op_smudgy_pane_input_on_submit,
     op_smudgy_pane_close,
     op_smudgy_pane_echo,
     op_smudgy_pane_echo_styled,
     op_smudgy_pane_clear,
     op_smudgy_pane_list,
     op_smudgy_pane_resolve,
+    op_smudgy_input_get,
+    op_smudgy_input_apply,
+    op_smudgy_input_submission_generation,
+    op_smudgy_input_submission_text,
+    op_smudgy_input_submission_replace,
+    op_smudgy_input_submission_cancel,
+    op_smudgy_input_words_mutate,
+    op_smudgy_input_words_query,
+    op_smudgy_input_history_mutate,
+    op_smudgy_input_history_list,
     op_smudgy_get_current_line,
     op_smudgy_get_current_line_number,
     op_smudgy_get_current_line_styles,
@@ -79,6 +90,7 @@ const {
     op_smudgy_line_highlight,
     op_smudgy_line_remove,
     op_smudgy_capture,
+    op_smudgy_fallthrough,
     op_smudgy_param_get,
     op_smudgy_get_settings,
     op_smudgy_gmcp_enabled,
@@ -667,6 +679,10 @@ interface SavedAlias {
     script?: string;
     /** Defaults to true. */
     enabled?: boolean;
+    /** Higher values run first. Defaults to 0. */
+    priority?: number;
+    /** Continue checking later aliases after a match. Defaults to true. */
+    fallthrough?: boolean;
     /** Defaults to "plaintext". */
     language?: ScriptLang;
     /** Optional package-folder grouping in the automations window. */
@@ -686,6 +702,10 @@ interface SavedTrigger {
     enabled?: boolean;
     /** Also fire on prompts. Defaults to false. */
     prompt?: boolean;
+    /** Higher values run first. Defaults to 0. */
+    priority?: number;
+    /** Continue checking later triggers after a match. Defaults to true. */
+    fallthrough?: boolean;
     /** Defaults to "plaintext". */
     language?: ScriptLang;
     package?: string;
@@ -760,6 +780,10 @@ interface AliasOptions {
     singleton?: boolean;
     /** Auto-remove after this many fires (`1` = one-shot). */
     fireLimit?: number;
+    /** Higher values run first. Defaults to 0. */
+    priority?: number;
+    /** Continue checking later aliases after a match. Defaults to true. */
+    fallthrough?: boolean;
 }
 
 interface TriggerOptions {
@@ -775,6 +799,10 @@ interface TriggerOptions {
     fireLimit?: number;
     /** Auto-remove after this many tested incoming lines (trigger-only). */
     lineLimit?: number;
+    /** Higher values run first. Defaults to 0. */
+    priority?: number;
+    /** Continue checking later triggers after a match. Defaults to true. */
+    fallthrough?: boolean;
 }
 
 interface TriggerDef extends TriggerPatterns {
@@ -784,6 +812,8 @@ interface TriggerDef extends TriggerPatterns {
     singleton?: boolean;
     fireLimit?: number;
     lineLimit?: number;
+    priority?: number;
+    fallthrough?: boolean;
 }
 
 interface TimerOptions {
@@ -824,6 +854,14 @@ type SplitDirection = "left" | "right" | "top" | "bottom";
  *  global hide-unless-toolbar rule; 'always-show' pins the header on. */
 type TitleBarSpec = "normal" | "always-show";
 
+/** A pane-hosted input line: the submit handler that receives what the user
+ *  types there (the text never enters the session pipeline), plus optional
+ *  hint text shown while the input is empty. */
+interface PaneInputSpec {
+    onSubmit: (text: string) => void;
+    placeholder?: string;
+}
+
 /** The direction-independent half of the spec for `pane.split()`.
  *  `terminal: false` creates a widgets-only pane (no terminal scrollback);
  *  every pane hosts widgets either way. */
@@ -831,6 +869,7 @@ interface PaneSpecBase {
     name: string;
     terminal?: boolean;
     titleBar?: TitleBarSpec;
+    input?: PaneInputSpec;
 }
 
 /** The spec for `pane.split()`. The initial pixel size is keyed to the split
@@ -850,6 +889,8 @@ interface PaneInfoWire {
      *  path); null on a cross-session optimistic handle. */
     nameId: number | null;
     created: boolean;
+    /** Whether the pane hosts its own input line (`pane.input`). */
+    hasInput: boolean;
 }
 
 /**
@@ -865,15 +906,23 @@ class Pane {
     _kind: "terminal" | "widgets";
     _isMain: boolean;
     _nameId: number | null;
+    _hasInput: boolean;
+    /** The creator whose completion-word contributions this handle's `input`
+     *  addresses -- threaded from the minting Session handle and propagated
+     *  through `split()`. A private field, like Session's (strictest handle
+     *  hygiene): a Pane cannot be re-aimed at another creator's words. */
+    #creatorId: number | null;
     /** false when `split()` returned an already-existing pane. */
     created?: boolean;
 
-    constructor(sessionId: number, info: PaneInfoWire) {
+    constructor(sessionId: number, info: PaneInfoWire, creatorId: number | null = null) {
         this._sessionId = sessionId;
         this._name = info.name;
         this._kind = info.kind;
         this._isMain = info.isMain;
         this._nameId = info.nameId;
+        this._hasInput = info.hasInput;
+        this.#creatorId = creatorId;
         this.created = info.created;
     }
 
@@ -913,10 +962,17 @@ class Pane {
         op_smudgy_pane_close(this._sessionId, this._name);
     }
 
+    /** This pane's own input line, or undefined for panes created without
+     *  one. The same handle surface as `session.input`, addressed here. */
+    get input(): InputHandle | undefined {
+        if (!this._hasInput) return undefined;
+        return __smudgy_make_input_handle(this._sessionId, this._name, this.#creatorId);
+    }
+
     /** Split a new pane off this one. Get-or-create by (folded) name; an
      *  explicit `titleBar` also re-policies an existing pane (incl. main). */
     split<D extends SplitDirection>(direction: D, spec: PaneSpec<D>): Pane {
-        return __smudgy_pane_split(this._sessionId, this._name, direction, spec);
+        return __smudgy_pane_split(this._sessionId, this._name, direction, spec, this.#creatorId);
     }
 }
 
@@ -925,14 +981,26 @@ function __smudgy_pane_split(
     refName: string,
     direction: SplitDirection,
     spec: PaneSpec<SplitDirection>,
+    creatorId: number | null = null,
 ): Pane {
     if (direction !== "left" && direction !== "right" && direction !== "top" && direction !== "bottom") {
         throw new TypeError('direction must be one of "left" | "right" | "top" | "bottom"');
     }
     if (typeof spec !== "object" || spec === null || typeof spec.name !== "string") {
         throw new TypeError(
-            "spec must be an object of the form { name, width?, height?, terminal?, titleBar? }",
+            "spec must be an object of the form { name, width?, height?, terminal?, titleBar?, input? }",
         );
+    }
+    if (spec.input !== undefined) {
+        if (
+            typeof spec.input !== "object" ||
+            spec.input === null ||
+            typeof spec.input.onSubmit !== "function"
+        ) {
+            throw new TypeError(
+                "input must be an object of the form { onSubmit: (text) => void, placeholder? }",
+            );
+        }
     }
     const info = op_smudgy_pane_split(sessionId, refName, direction, {
         name: spec.name,
@@ -940,9 +1008,371 @@ function __smudgy_pane_split(
         height: typeof spec.height === "number" ? spec.height : null,
         terminal: spec.terminal !== undefined ? Boolean(spec.terminal) : null,
         titleBar: typeof spec.titleBar === "string" ? spec.titleBar : null,
+        input:
+            spec.input !== undefined
+                ? {
+                      placeholder:
+                          typeof spec.input.placeholder === "string"
+                              ? spec.input.placeholder
+                              : null,
+                  }
+                : null,
     });
-    return new Pane(sessionId, info);
+    // The handler cannot ride the serde spec; register it against the pane the
+    // split just created (or re-claimed). Re-running this on every split is
+    // what re-arms the handler after a reload -- handler registrations die
+    // with their isolate generation, like widget callbacks.
+    if (spec.input !== undefined) {
+        op_smudgy_pane_input_on_submit(sessionId, spec.name, spec.input.onSubmit);
+    }
+    return new Pane(sessionId, info, creatorId);
 }
+
+// ---- The command input -------------------------------------------------
+
+/** Validate a cursor/selection position: a non-negative integer. Clamped to
+ *  0x7fffffff -- comfortably past any real input, and safely inside the op's
+ *  unsigned 32-bit range (an unclamped 2**32 would wrap to 0 at the
+ *  boundary). */
+function __smudgy_input_position(fn: string, value: unknown): number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+        throw new TypeError(`${fn} expects a non-negative integer position`);
+    }
+    return Math.min(value, 0x7fffffff);
+}
+
+/**
+ * One creator-scoped word set on an input (mirrored by smudgy-core.d.ts):
+ * the registry verbs over the caller's own contributions, which the client
+ * merges with every other contributor's at completion time.
+ */
+interface WordSetRegistry {
+    add(...words: string[]): void;
+    delete(word: string): boolean;
+    has(word: string): boolean;
+    list(): string[];
+    clear(): void;
+}
+
+/** Which of an input's word sets a registry addresses on the wire. */
+type WordSetName = "suggestions" | "blacklist";
+
+/**
+ * Build one word-set registry, bound to an input and to the creator whose
+ * contributions it addresses. The creator id is closure-captured like the
+ * input identity; a handle minted without one (a session handle constructed
+ * outside the smudgy:core api surface) teaches instead of guessing.
+ */
+function __smudgy_make_word_set(
+    sessionId: number,
+    pane: string,
+    creatorId: number | null,
+    set: WordSetName,
+): WordSetRegistry {
+    const creator = (): number => {
+        if (creatorId === null) {
+            throw new TypeError(
+                "this input handle carries no script identity for completion words; " +
+                    "use the `input` or `session` your script imports from smudgy:core",
+            );
+        }
+        return creatorId;
+    };
+    return {
+        /** Register words. Each word is one token: non-empty, no whitespace,
+         *  at most 64 characters; a set holds up to 512 of your words. */
+        add(...words: string[]): void {
+            op_smudgy_input_words_mutate(sessionId, pane, creator(), {
+                op: "add",
+                set,
+                words: words.map((w) => String(w)),
+            });
+        },
+
+        /** Remove one of your words (matched case-insensitively). */
+        delete(word: string): boolean {
+            return op_smudgy_input_words_mutate(sessionId, pane, creator(), {
+                op: "delete",
+                set,
+                word: String(word),
+            }) as boolean;
+        },
+
+        /** Whether you registered this word (matched case-insensitively). */
+        has(word: string): boolean {
+            return op_smudgy_input_words_query(sessionId, pane, creator(), {
+                op: "has",
+                set,
+                word: String(word),
+            }) as boolean;
+        },
+
+        /** Your words, insertion order, as registered. */
+        list(): string[] {
+            return op_smudgy_input_words_query(sessionId, pane, creator(), {
+                op: "list",
+                set,
+            }) as string[];
+        },
+
+        /** Remove all of your words (other contributors' words stay). */
+        clear(): void {
+            op_smudgy_input_words_mutate(sessionId, pane, creator(), { op: "clear", set });
+        },
+    };
+}
+
+/**
+ * One input's command history (mirrored by smudgy-core.d.ts): user-owned,
+ * session-global per input -- no creator scoping, unlike the word sets.
+ * Reads are mirrored on every history change (a change happens per
+ * submission, never per keystroke), so `list()` is exact with respect to the
+ * last submission.
+ */
+interface InputHistory {
+    list(): string[];
+    push(text: string): void;
+    clear(): void;
+}
+
+/**
+ * Build the history surface, bound to an input like the word sets are.
+ */
+function __smudgy_make_input_history(sessionId: number, pane: string): InputHistory {
+    return {
+        /** The history entries, newest first. */
+        list(): string[] {
+            return op_smudgy_input_history_list(sessionId, pane) as string[];
+        },
+
+        /** Add one line to history without sending it. */
+        push(text: string): void {
+            op_smudgy_input_history_mutate(sessionId, pane, {
+                op: "push",
+                text: String(text),
+            });
+        },
+
+        /** Remove every history entry. */
+        clear(): void {
+            op_smudgy_input_history_mutate(sessionId, pane, { op: "clear" });
+        },
+    };
+}
+
+/**
+ * A handle to one command input line (mirrored by smudgy-core.d.ts). Reads
+ * are mirrored (they reflect the last change the client delivered); writes
+ * are operations applied to the live input. Cursor and selection positions
+ * count UTF-16 code units, the same units as JavaScript string indexing.
+ */
+interface InputHandle {
+    readonly value: string;
+    readonly cursor: number;
+    readonly selection: { start: number; end: number } | null;
+    readonly focused: boolean;
+    masked: boolean;
+    replace(text: string): void;
+    append(text: string): void;
+    clear(): void;
+    propose(text: string): void;
+    setCursor(pos: number): void;
+    select(start: number, end: number): void;
+    selectAll(): void;
+    focus(): void;
+    blur(): void;
+    submit(): void;
+    readonly completion: WordSetRegistry & { readonly blacklist: WordSetRegistry };
+    readonly history: InputHistory;
+}
+
+/**
+ * Build an input handle. Identity (session id + pane name + the creator
+ * whose completion words the handle addresses) is closure-captured and the
+ * handle frozen -- the file's strictest handle hygiene -- so a handle cannot
+ * be re-aimed at another pane after creation. The main input is the input of
+ * the "main" pane; pane-hosted inputs share this surface.
+ */
+function __smudgy_make_input_handle(
+    sessionId: number,
+    pane: string,
+    creatorId: number | null,
+): InputHandle {
+    const apply = (op: Record<string, unknown>): void => {
+        op_smudgy_input_apply(sessionId, pane, op);
+    };
+    const blacklist = Object.freeze(
+        __smudgy_make_word_set(sessionId, pane, creatorId, "blacklist"),
+    );
+    const completion = Object.freeze(
+        Object.assign(__smudgy_make_word_set(sessionId, pane, creatorId, "suggestions"), {
+            blacklist,
+        }),
+    );
+    const history = Object.freeze(__smudgy_make_input_history(sessionId, pane));
+    return Object.freeze({
+        /** The input's current text. Empty while masked. */
+        get value(): string {
+            return op_smudgy_input_get(sessionId, pane).value as string;
+        },
+
+        /** The cursor position, in UTF-16 code units. */
+        get cursor(): number {
+            return op_smudgy_input_get(sessionId, pane).cursor as number;
+        },
+
+        /** The selected range in UTF-16 code units, or null when nothing is
+         *  selected. */
+        get selection(): { start: number; end: number } | null {
+            const selection = op_smudgy_input_get(sessionId, pane).selection;
+            if (selection === null || selection === undefined) return null;
+            return { start: selection[0] as number, end: selection[1] as number };
+        },
+
+        /** Whether the input has keyboard focus. */
+        get focused(): boolean {
+            return op_smudgy_input_get(sessionId, pane).focused as boolean;
+        },
+
+        /** Password mode: masked display, and nothing typed is readable or kept. */
+        get masked(): boolean {
+            return op_smudgy_input_get(sessionId, pane).masked as boolean;
+        },
+
+        set masked(value: boolean) {
+            apply({ op: "setMasked", masked: Boolean(value) });
+        },
+
+        /** Replace the input's text. */
+        replace(text: string): void {
+            apply({ op: "replace", text: String(text) });
+        },
+
+        /** Add text at the end of the input. */
+        append(text: string): void {
+            apply({ op: "append", text: String(text) });
+        },
+
+        /** Empty the input. */
+        clear(): void {
+            apply({ op: "clear" });
+        },
+
+        /** Put a command in the input, fully selected, so the user can press
+         *  Enter to send it or type to discard it. */
+        propose(text: string): void {
+            apply({ op: "propose", text: String(text) });
+        },
+
+        /** Place the cursor at a position, in UTF-16 code units. */
+        setCursor(pos: number): void {
+            apply({ op: "setCursor", pos: __smudgy_input_position("setCursor()", pos) });
+        },
+
+        /** Select from `start` to `end`, in UTF-16 code units. */
+        select(start: number, end: number): void {
+            apply({
+                op: "select",
+                start: __smudgy_input_position("select()", start),
+                end: __smudgy_input_position("select()", end),
+            });
+        },
+
+        /** Select everything in the input. */
+        selectAll(): void {
+            apply({ op: "selectAll" });
+        },
+
+        /** Give the input keyboard focus. */
+        focus(): void {
+            apply({ op: "focus" });
+        },
+
+        /** Take keyboard focus away from the input. */
+        blur(): void {
+            apply({ op: "blur" });
+        },
+
+        /** Submit the input's contents, exactly as if the user pressed Enter. */
+        submit(): void {
+            apply({ op: "submit" });
+        },
+
+        /** Your completion words for this input (plus your blacklist), merged
+         *  with every other contributor's when the user presses Tab. */
+        completion,
+
+        /** The input's command history (newest first): what the Up arrow
+         *  recalls. */
+        history,
+    });
+}
+
+/**
+ * The submission a `sys:input` handler is processing (mirrored by
+ * smudgy-core.d.ts). Only meaningful inside a `sys:input` handler -- the ops
+ * throw outside one, like the ambient `line` object's current-line contract.
+ */
+interface Submission {
+    readonly text: string;
+    replace(text: string): void;
+    cancel(): void;
+}
+
+/**
+ * The generation of the submission the running `sys:input` handler was
+ * delivered: captured from the host by the delivery wrapper
+ * (`__smudgy_deliver_submission_event`) for the duration of the synchronous
+ * handler call, 0 anywhere else. Every submission op takes it as the expected
+ * generation and throws on a mismatch, so an async handler continuation that
+ * resumes after its submission completed (0 here by then) throws instead of
+ * cancelling or rewriting a later, unrelated submission.
+ */
+let __smudgy_submission_generation = 0;
+
+/**
+ * Run one `sys:input` delivery with the ambient `submission` scoped to it:
+ * read the live submission's generation (during a delivery, the live
+ * submission IS the delivered one) and hold it in
+ * `__smudgy_submission_generation` for exactly the synchronous handler call.
+ * The save/restore shape keeps the surrounding value intact; microtasks run
+ * only after this frame unwinds, so a continuation never observes the scoped
+ * value.
+ */
+function __smudgy_deliver_submission_event(handler: (payload: any) => void, payload: any): void {
+    const previous = __smudgy_submission_generation;
+    __smudgy_submission_generation = op_smudgy_input_submission_generation() as number;
+    try {
+        handler(payload);
+    } finally {
+        __smudgy_submission_generation = previous;
+    }
+}
+
+/**
+ * The ambient `submission` object: the mutable state behind the current
+ * `sys:input` delivery. One frozen instance -- identity carries nothing; the
+ * host's shared submission cell is the state, so handlers in every isolate
+ * compose through it (later handlers read earlier replacements; cancel is
+ * sticky). Each call passes the delivery-scoped generation, which is what
+ * binds the ambient object to the handler's own submission.
+ */
+const submission: Submission = Object.freeze({
+    /** The submitted line as it currently stands (replacements included). */
+    get text(): string {
+        return op_smudgy_input_submission_text(__smudgy_submission_generation) as string;
+    },
+
+    /** Substitute what the rest of the client processes. */
+    replace(text: string): void {
+        op_smudgy_input_submission_replace(__smudgy_submission_generation, String(text));
+    },
+
+    /** Discard the submission entirely. */
+    cancel(): void {
+        op_smudgy_input_submission_cancel(__smudgy_submission_generation);
+    },
+});
 
 /** The methods half of a session's pane registry; the proxy below adds
  *  dot-access (`session.panes.chat`). */
@@ -961,14 +1391,18 @@ type PaneRegistry = PaneRegistryMethods & { readonly [name: string]: Pane | unde
  * are reachable via `get()` only in the sense that they cannot exist at all --
  * `split()` refuses to create them.
  */
-function __smudgy_make_pane_registry(sessionId: number): PaneRegistry {
+function __smudgy_make_pane_registry(sessionId: number, creatorId: number | null = null): PaneRegistry {
     const methods: PaneRegistryMethods = {
         get(name: string): Pane | undefined {
             const info = op_smudgy_pane_resolve(sessionId, String(name));
-            return info === null || info === undefined ? undefined : new Pane(sessionId, info);
+            return info === null || info === undefined
+                ? undefined
+                : new Pane(sessionId, info, creatorId);
         },
         list(): Pane[] {
-            return op_smudgy_pane_list(sessionId).map((info: PaneInfoWire) => new Pane(sessionId, info));
+            return op_smudgy_pane_list(sessionId).map(
+                (info: PaneInfoWire) => new Pane(sessionId, info, creatorId),
+            );
         },
         exists(name: string): boolean {
             const info = op_smudgy_pane_resolve(sessionId, String(name));
@@ -1020,9 +1454,18 @@ function __smudgy_pane_route_arg(pane: Pane | string): [number, string] {
  */
 class Session {
     _id: number;
+    /** The creator whose completion-word contributions this handle's `input`
+     *  addresses -- bound when the handle is minted by a creator-bound api
+     *  surface (`session`/`getSessions`/`byName`). A private field, matching
+     *  the input handle's closure-captured identity (strictest handle
+     *  hygiene): a Session cannot be re-aimed at another creator's words
+     *  after construction. A hand-constructed Session carries none, and its
+     *  word-set registries teach on use. */
+    #creatorId: number | null;
 
-    constructor(id: number) {
+    constructor(id: number, creatorId: number | null = null) {
         this._id = id;
+        this.#creatorId = creatorId;
     }
 
     /** The ID of the session. */
@@ -1065,21 +1508,33 @@ class Session {
 
     /** This session's main (output + input) pane. */
     get mainPane(): Pane {
-        return new Pane(this.id, {
-            name: "main",
-            kind: "terminal",
-            isMain: true,
-            // The main pane's name id is 0 in every session's registry.
-            nameId: 0,
-            created: false,
-        });
+        return new Pane(
+            this.id,
+            {
+                name: "main",
+                kind: "terminal",
+                isMain: true,
+                // The main pane's name id is 0 in every session's registry.
+                nameId: 0,
+                created: false,
+                // Main's fused input is the session input (`session.input`),
+                // never a pane input.
+                hasInput: false,
+            },
+            this.#creatorId,
+        );
     }
 
     /** This session's pane registry (`get`/`list`/`exists` + dot access).
      *  Introspection is own-session only; a foreign session's `get`/`list`/
      *  `exists` throw (pane mutations still route by name). */
     get panes(): PaneRegistry {
-        return __smudgy_make_pane_registry(this.id);
+        return __smudgy_make_pane_registry(this.id, this.#creatorId);
+    }
+
+    /** This session's main command input. Own-session only. */
+    get input(): InputHandle {
+        return __smudgy_make_input_handle(this.id, "main", this.#creatorId);
     }
 
     toString(): string {
@@ -1117,6 +1572,18 @@ class Alias {
         return view ? view.pattern : "";
     }
 
+    /** Relative evaluation priority (higher runs first). */
+    get priority(): number {
+        const view = op_smudgy_get_alias(this._creatorId, this.name);
+        return view ? view.priority : 0;
+    }
+
+    /** Whether matching continues after this alias runs. */
+    get fallthrough(): boolean {
+        const view = op_smudgy_get_alias(this._creatorId, this.name);
+        return view ? view.fallthrough : true;
+    }
+
     /** Remove the alias. Idempotent. */
     delete(): void {
         op_smudgy_remove_alias(this._creatorId, this.name);
@@ -1150,6 +1617,18 @@ class Trigger {
         return view ? view.pattern : "";
     }
 
+    /** Relative evaluation priority (higher runs first). */
+    get priority(): number {
+        const view = op_smudgy_get_trigger(this._creatorId, this.name);
+        return view ? view.priority : 0;
+    }
+
+    /** Whether matching continues after this trigger runs. */
+    get fallthrough(): boolean {
+        const view = op_smudgy_get_trigger(this._creatorId, this.name);
+        return view ? view.fallthrough : true;
+    }
+
     /** Remove the trigger. Idempotent. */
     delete(): void {
         op_smudgy_remove_trigger(this._creatorId, this.name);
@@ -1157,14 +1636,18 @@ class Trigger {
 }
 
 /** The current Session (the one whose script is running). The session id is constant for
- *  the life of a runtime, so the returned handle is stable. */
-const getCurrentSession = (): Session => new Session(op_smudgy_get_current_session());
+ *  the life of a runtime, so the returned handle is stable. `creatorId` binds the handle's
+ *  creator-scoped surfaces (`input.completion`); the api object passes its own, so every
+ *  author-reachable Session carries one. */
+const getCurrentSession = (creatorId: number | null = null): Session =>
+    new Session(op_smudgy_get_current_session(), creatorId);
 
 /** All of the user's connected sessions. The set changes as sessions connect/disconnect,
  *  so this is a function (read live), not a snapshot value. For sandboxed packages the
- *  enumeration itself is the `reach-others` capability (see the Session class doc). */
-const getSessions = (): Session[] =>
-    op_smudgy_get_sessions().map((id: number) => new Session(id));
+ *  enumeration itself is the `reach-others` capability (see the Session class doc).
+ *  `creatorId` binds the handles like {@link getCurrentSession}'s. */
+const getSessions = (creatorId: number | null = null): Session[] =>
+    op_smudgy_get_sessions().map((id: number) => new Session(id, creatorId));
 
 /** The current session's profile (name + subtext), read live. */
 const getProfile = (): Profile => getCurrentSession().profile;
@@ -1177,9 +1660,10 @@ const getSettings = (): Settings => op_smudgy_get_settings();
  *  here). Ungated. */
 const getDataDir = (): string => op_smudgy_data_dir();
 
-/** Look a session up by its profile name. Returns the first match, or undefined. */
-const byName = (name: string): Session | undefined =>
-    getSessions().find((s) => {
+/** Look a session up by its profile name. Returns the first match, or undefined.
+ *  `creatorId` binds the handle like {@link getCurrentSession}'s. */
+const byName = (name: string, creatorId: number | null = null): Session | undefined =>
+    getSessions(creatorId).find((s) => {
         const profile = s.profile;
         return profile !== undefined && profile !== null && profile.name === name;
     });
@@ -1216,6 +1700,32 @@ function normalizeSelfLimit(options: Record<string, any>, key: string): number {
         throw new TypeError(`Option "${key}" must be a positive integer`);
     }
     return value;
+}
+
+/** Normalize the signed 32-bit priority carried over the Rust op boundary. */
+function normalizePriority(options: Record<string, any>): number {
+    if (!("priority" in options) || options.priority === undefined) {
+        return 0;
+    }
+    const value = options.priority;
+    if (
+        typeof value !== "number" || !Number.isInteger(value) ||
+        value < -2147483648 || value > 2147483647
+    ) {
+        throw new TypeError('Option "priority" must be a signed 32-bit integer');
+    }
+    return value;
+}
+
+/** Normalize whether matching continues after this automation runs. */
+function normalizeFallthrough(options: Record<string, any>): boolean {
+    if (
+        "fallthrough" in options && options.fallthrough !== undefined &&
+        typeof options.fallthrough !== "boolean"
+    ) {
+        throw new TypeError('Option "fallthrough" must be a boolean');
+    }
+    return options.fallthrough ?? true;
 }
 
 /**
@@ -1315,12 +1825,16 @@ function createAlias(
     // Reject unknown keys (parity with createTrigger), so a fat-fingered opt-in like
     // {singletonn:true} fails loudly instead of silently registering a non-singleton alias.
     const unexpectedOptions = Object.keys(options).filter(
-        (key) => key !== "name" && key !== "singleton" && key !== "fireLimit",
+        (key) =>
+            key !== "name" && key !== "singleton" && key !== "fireLimit" &&
+            key !== "priority" && key !== "fallthrough",
     );
     if (unexpectedOptions.length > 0) {
         throw new TypeError(`Unexpected option(s): ${unexpectedOptions.join(", ")}`);
     }
     const fireLimit = normalizeSelfLimit(options, "fireLimit");
+    const priority = normalizePriority(options);
+    const fallthrough = normalizeFallthrough(options);
 
     const patternList = (Array.isArray(patterns) ? patterns : [patterns]).map((p) =>
         p instanceof RegExp ? p.source : p,
@@ -1332,9 +1846,28 @@ function createAlias(
     if (script instanceof Function) {
         // Pass the handler's source (`toString()`) in good faith so the automations window can
         // show it read-only; the host treats it as display-only and never executes it.
-        created = op_smudgy_create_javascript_function_alias(creatorId, name, patternList, script, singleton, fireLimit, script.toString());
+        created = op_smudgy_create_javascript_function_alias(
+            creatorId,
+            name,
+            patternList,
+            script,
+            singleton,
+            priority,
+            fallthrough,
+            fireLimit,
+            script.toString(),
+        );
     } else {
-        created = op_smudgy_create_simple_alias(creatorId, name, patternList, script, singleton, fireLimit);
+        created = op_smudgy_create_simple_alias(
+            creatorId,
+            name,
+            patternList,
+            script,
+            singleton,
+            priority,
+            fallthrough,
+            fireLimit,
+        );
     }
 
     const alias = new Alias(name, creatorId);
@@ -1361,6 +1894,8 @@ function createTriggers(
                 singleton,
                 fireLimit,
                 lineLimit,
+                priority,
+                fallthrough,
             } = triggerDef;
 
             const validPatterns: TriggerPatterns = {
@@ -1376,6 +1911,8 @@ function createTriggers(
                 ...(singleton !== undefined && { singleton }),
                 ...(fireLimit !== undefined && { fireLimit }),
                 ...(lineLimit !== undefined && { lineLimit }),
+                ...(priority !== undefined && { priority }),
+                ...(fallthrough !== undefined && { fallthrough }),
             };
 
             return [name, createTrigger(creatorId, validPatterns, script, options)] as [
@@ -1398,6 +1935,8 @@ function createTrigger(
     const singleton = options.singleton ?? false;
     const fireLimit = normalizeSelfLimit(options, "fireLimit");
     const lineLimit = normalizeSelfLimit(options, "lineLimit");
+    const priority = normalizePriority(options);
+    const fallthrough = normalizeFallthrough(options);
     let created: boolean;
     if (typeof script === "function") {
         created = op_smudgy_create_javascript_function_trigger(
@@ -1410,6 +1949,8 @@ function createTrigger(
             options.prompt ?? false,
             options.enabled ?? true,
             singleton,
+            priority,
+            fallthrough,
             fireLimit,
             lineLimit,
             // Pass the handler's source (`toString()`) in good faith for the read-only detail
@@ -1427,6 +1968,8 @@ function createTrigger(
             options.prompt ?? false,
             options.enabled ?? true,
             singleton,
+            priority,
+            fallthrough,
             fireLimit,
             lineLimit,
         );
@@ -1472,7 +2015,16 @@ function validateCreateTriggerParams(
     }
 
     // Check for unexpected options
-    const validOptions = ["name", "prompt", "enabled", "singleton", "fireLimit", "lineLimit"];
+    const validOptions = [
+        "name",
+        "prompt",
+        "enabled",
+        "singleton",
+        "fireLimit",
+        "lineLimit",
+        "priority",
+        "fallthrough",
+    ];
     const unexpectedOptions = Object.keys(options).filter((key) => !validOptions.includes(key));
     if (unexpectedOptions.length > 0) {
         throw new TypeError(`Unexpected option(s): ${unexpectedOptions.join(", ")}`);
@@ -2066,6 +2618,13 @@ const buffer = {
  */
 const capture: (value: boolean) => void = op_smudgy_capture;
 
+/**
+ * Controls whether later matching automations from this script/package are considered for the
+ * current alias or trigger dispatch. The declarative option supplies the initial value; calling
+ * this from a function handler overrides it for that invocation only.
+ */
+const fallthrough: (value: boolean) => void = op_smudgy_fallthrough;
+
 // ---- vars (server-scoped persistent store) ----------------------------------
 
 const VARS_PREFIX = "smudgy.vars/";
@@ -2187,6 +2746,8 @@ const patternArray = (single: any, multi: any): string[] | undefined => {
 const aliasToWire = (def: SavedAlias) => ({
     pattern: String(def.pattern),
     enabled: def.enabled ?? true,
+    priority: def.priority ?? 0,
+    fallthrough: def.fallthrough ?? true,
     language: langToWire(def.language),
     ...(def.script !== undefined ? { script: String(def.script) } : {}),
     ...(def.package !== undefined ? { package: String(def.package) } : {}),
@@ -2194,6 +2755,8 @@ const aliasToWire = (def: SavedAlias) => ({
 const triggerToWire = (def: SavedTrigger) => ({
     enabled: def.enabled ?? true,
     prompt: def.prompt ?? false,
+    priority: def.priority ?? 0,
+    fallthrough: def.fallthrough ?? true,
     language: langToWire(def.language),
     ...(def.patterns !== undefined ? { patterns: def.patterns } : {}),
     ...(def.rawPatterns !== undefined ? { raw_patterns: def.rawPatterns } : {}),
@@ -2215,6 +2778,8 @@ const aliasFromWire = (w: any): SavedAlias => ({
     pattern: w.pattern,
     script: w.script ?? undefined,
     enabled: w.enabled,
+    priority: w.priority ?? 0,
+    fallthrough: w.fallthrough ?? true,
     language: langFromWire(w.language),
     package: w.package ?? undefined,
 });
@@ -2225,6 +2790,8 @@ const triggerFromWire = (w: any): SavedTrigger => ({
     script: w.script ?? undefined,
     enabled: w.enabled,
     prompt: w.prompt,
+    priority: w.priority ?? 0,
+    fallthrough: w.fallthrough ?? true,
     language: langFromWire(w.language),
     package: w.package ?? undefined,
 });
@@ -2456,7 +3023,7 @@ function __smudgy_key_as_segment(key: string): string {
 
 /**
  * An abstract root reference the value proxies resolve every hop through
- * (docs/interop-pre-gmcp-plan.md 2): the traps know only "read a tag", "list keys",
+ * (docs/interop.md 4a, tagged gets): the traps know only "read a tag", "list keys",
  * "materialize a subtree", "publish" -- how a path is addressed is the root's business, so
  * roots other than a producer's live head (retained generations, host-pinned views) plug in
  * without touching the traps. `write` is the seat split: present on producer roots
@@ -2708,9 +3275,9 @@ function __smudgy_freeze_snapshot<T>(value: T): T {
  *  use their `sys:`/`map:` prefixes; user/package producers use the stamped `#` form. */
 function __smudgy_canonical_event(spec: string, name: string): string {
     // Platform producers key their events `producer:name` -- the form the host's
-    // `host_emit` registers and emits ("sys:receive", "gmcp:ready"); package events use
-    // the meatball form.
-    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp"
+    // `host_emit` registers and emits ("sys:receive", "gmcp:ready", "input:change");
+    // package events use the meatball form.
+    return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp" || spec === "input"
         ? `${spec}:${name}`
         : `${spec}#${name}`;
 }
@@ -2721,7 +3288,7 @@ function __smudgy_producer_spec(creator: { kind: string; owner?: string; name?: 
     return creator.kind === "package" ? `smudgy://${creator.owner}/${creator.name}` : "user";
 }
 
-// ---- Interned interop identity ids (docs/interop-pre-gmcp-plan.md 3) ----------------
+// ---- Interned interop identity ids (docs/interop.md 3) ------------------------------
 // The per-call constants of the interop ops -- the creator descriptor, producer roots,
 // event stamps, the home-gate verdict -- resolve to per-isolate u32 ids once at handle/API
 // construction; the per-call ops take the ids. The host table lives in this isolate's
@@ -2963,6 +3530,12 @@ function __smudgy_make_event_consumer<T>(canonical: string, name: string): Event
         try { payload = JSON.parse(raw); } catch { payload = null; }
         return __smudgy_freeze_snapshot(payload);
     };
+    // A `sys:input` delivery binds the ambient `submission` to the handler call
+    // it was made for; every other event invokes the handler plainly.
+    const invoke: (handler: (payload: Readonly<T>) => void, payload: Readonly<T>) => void =
+        canonical === "sys:input"
+            ? __smudgy_deliver_submission_event
+            : (handler, payload) => handler(payload);
     const subscribe_once = (handler: (payload: Readonly<T>) => void): EventSubscription => {
         let fired = false;
         let id = -1;
@@ -2971,7 +3544,7 @@ function __smudgy_make_event_consumer<T>(canonical: string, name: string): Event
             if (fired) return;
             fired = true;
             off();
-            handler(parse_frozen(m.payload));
+            invoke(handler, parse_frozen(m.payload));
         });
         return { off };
     };
@@ -2979,7 +3552,7 @@ function __smudgy_make_event_consumer<T>(canonical: string, name: string): Event
         on(handler: (payload: Readonly<T>) => void): EventSubscription {
             __smudgy_require_callback("on", "event", name, handler);
             const id = op_smudgy_on(canonical, (m: { event: string; payload: string }) => {
-                handler(parse_frozen(m.payload));
+                invoke(handler, parse_frozen(m.payload));
             });
             return { off: () => op_smudgy_off(canonical, id) };
         },
@@ -3032,13 +3605,19 @@ function __smudgy_make_api(creator: { kind: string }) {
         // lookup until after mapper.ts installs `globalThis.mapper`. The session id is constant
         // for a runtime's life, so `session`/``id` are stable in value.
         get session(): Session {
-            return getCurrentSession();
+            return getCurrentSession(creatorId);
         },
         get id(): number {
             return getCurrentSession().id;
         },
         get mapper(): any {
             return (globalThis as any).mapper;
+        },
+        // The current session's main command input. A getter for symmetry with
+        // `session`; the handle itself is a stable addresser (session id + "main"
+        // + this api's creator, whose completion words it manages).
+        get input(): InputHandle {
+            return getCurrentSession(creatorId).input;
         },
         // Provenance-free value members (stable identity, safe to destructure as named exports).
         send,
@@ -3048,12 +3627,17 @@ function __smudgy_make_api(creator: { kind: string }) {
         link,
         reload,
         capture,
+        fallthrough,
         line,
         buffer,
+        submission,
         vars,
-        byName,
-        // Live-state accessors as functions (read fresh on each call).
-        getSessions,
+        // Session-handle accessors, creator-bound (the handles' `input.completion`
+        // manages THIS api's words) and reading live on each call. Wrappers, not the
+        // module-level functions themselves: exposing the creator-id parameter would
+        // let a caller name another creator's contribution set.
+        byName: (name: string): Session | undefined => byName(String(name), creatorId),
+        getSessions: (): Session[] => getSessions(creatorId),
         getProfile,
         getSettings,
         getDataDir,

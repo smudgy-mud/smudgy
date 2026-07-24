@@ -371,41 +371,51 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
         }
     }
 
-    // PASS 2 — placeholders + exits, with the secret to-room predicate and the remap.
+    // PASS 2 — Connections first (fresh UUIDs, §6-closure-filtered), then
+    // exits with rewired `connection_id`s, mirroring the server: a group is
+    // copied IFF the cloner's projection of the source would include it,
+    // and an exit is copied exactly when its Connection was — an uncleared
+    // clone can never resurrect a group scrubbed from its source
+    // projection.
     for (src, new_area) in area_map {
         let see = see_secrets_by_src[src];
         let Some(source) = st.areas.get(src).cloned() else {
             continue;
         };
+
+        // (f)+(g) surviving Connections, copied under fresh ids. Endpoint B
+        // (and the stored route with it) clears when the clone lacks its
+        // room — a copied route may never keep a coordinate frame the clone
+        // does not contain.
+        let mut connection_map: HashMap<Uuid, Uuid> = HashMap::new();
+        let mut copied_connections = Vec::new();
+        for connection in &source.connections {
+            let verdict = super::projection::connection_verdict(st, viewer, &source, connection);
+            if verdict.omitted(see) {
+                continue;
+            }
+            let mut copied = connection.clone();
+            copied.id = Uuid::new_v4();
+            connection_map.insert(connection.id, copied.id);
+            let clone_has_b = copied.endpoint_b.as_ref().is_some_and(|b| {
+                st.areas
+                    .get(new_area)
+                    .is_some_and(|clone| clone.rooms.contains_key(&b.room_number))
+            });
+            if copied.endpoint_b.is_some() && !clone_has_b {
+                copied.endpoint_b = None;
+                copied.route_points.clear();
+            }
+            copied_connections.push(copied);
+        }
+
+        // (h) Exits — copied iff their Connection was, destination
+        // re-resolved (remapped clone / kept visible target / dangled).
         let mut staged = Vec::new();
         for exit in &source.exits {
-            let Some(from_room) = source.rooms.get(&exit.from_room_number) else {
+            let Some(new_connection) = connection_map.get(&exit.connection_id) else {
                 continue;
             };
-            if !see && (exit.is_secret || from_room.is_secret) {
-                continue;
-            }
-            // Secret to-room predicate (same-area: host see; cross-area: the
-            // viewer's effective include_secrets on the target).
-            if let (Some(ta), Some(tn)) = (exit.to_area_id, exit.to_room_number) {
-                let target_room_secret = st
-                    .areas
-                    .get(&ta)
-                    .and_then(|a| a.rooms.get(&tn))
-                    .is_some_and(|r| r.is_secret);
-                if target_room_secret {
-                    let ok = if ta == *src {
-                        see
-                    } else {
-                        st.caps(viewer, ta).is_some_and(|c| c.include_secrets)
-                    };
-                    if !ok {
-                        continue;
-                    }
-                }
-            }
-
-            // Destination re-resolution.
             let (new_to_area, new_to_room, new_to_dir) = match exit.to_area_id {
                 None => (None, None, None),
                 Some(target) => {
@@ -422,6 +432,7 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
 
             let mut copied = exit.clone();
             copied.id = Uuid::new_v4();
+            copied.connection_id = *new_connection;
             copied.to_area_id = new_to_area;
             copied.to_room_number = new_to_room;
             copied.to_direction = new_to_dir;
@@ -429,10 +440,12 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
             staged.push(copied);
         }
 
-        // FK placeholders for from/internal-to coordinates lacking rooms.
+        // Defensive FK placeholders (the closure normally guarantees every
+        // surviving from-room/same-area to-room was copied in pass 1).
         let mut placeholder_rooms: Vec<i32> = Vec::new();
         {
             let clone = st.areas.get_mut(new_area).expect("clone exists");
+            clone.connections.extend(copied_connections);
             for exit in &staged {
                 if let Entry::Vacant(slot) = clone.rooms.entry(exit.from_room_number) {
                     slot.insert(RoomRecord::placeholder(exit.from_room_number));

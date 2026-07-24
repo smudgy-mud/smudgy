@@ -16,11 +16,13 @@ use crate::models::triggers::TriggerDefinition;
 use crate::session::styled_line::StyledLine;
 use crate::session::{HotkeyId, SessionId};
 
+use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
 use super::pane::{
     PaneDef, PaneKey, PaneKind, PaneNamespace, PanePlacement, SplitDirection, TitleBarPolicy,
 };
+use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::trigger::MatchCapture;
 
@@ -34,6 +36,15 @@ pub enum RuntimeAction {
         /// and the session log (e.g. a substituted `$PASSWORD`). Empty ⇒ the
         /// auto-login text is sent with ordinary `Send` semantics.
         send_on_connect_redactions: Arc<Vec<String>>,
+        /// The server's configured character encoding as an Encoding Standard
+        /// label (`ServerConfig::encoding`); `None` = UTF-8. Resolved at
+        /// dispatch; CHARSET negotiation overrides it mid-connection.
+        encoding: Option<Arc<String>>,
+        /// Whether inbound compression offers (MCCP2) are accepted
+        /// (`ServerConfig::compression`).
+        compression: bool,
+        /// The transport mode resolved from `ServerConfig::tls` + `tls_verify`.
+        tls: crate::session::connection::TlsMode,
     },
     /// Tears down the active TCP connection (if any) at the user's request. The
     /// socket task then emits [`RuntimeAction::Disconnected`] like any other
@@ -52,6 +63,24 @@ pub enum RuntimeAction {
         operation: LineOperation,
     },
     Send(Arc<String>),
+    /// The user's typed submission of the main input — the Enter key, or a scripted
+    /// `input.submit()` (which replays the same UI submit path). Enters the identical
+    /// pipeline as [`Self::Send`], but first fires the `sys:input` host event so
+    /// handlers can rewrite or cancel the line before raw-prefix/`=` handling and
+    /// separator splitting.
+    ///
+    /// INVARIANT: constructed only by the UI's input submit routing (and tests
+    /// standing in for it). Every scripted or link-driven send — `session.send()`,
+    /// link actions, auto-login — must use [`Self::Send`], so `sys:input` fires
+    /// exactly for what the user typed; a masked submission must use
+    /// [`Self::SendWithRedactions`], so a secret never reaches `sys:input` handlers.
+    SubmitInput(Arc<String>),
+    /// The back half of [`Self::SubmitInput`]: queued behind the `sys:input` handler
+    /// splice, it consumes the shared submission state the handlers acted on and
+    /// hands the surviving text to the [`Self::Send`] pipeline (nothing, on cancel).
+    /// Constructed only by the `SubmitInput` dispatch arm; it rides the
+    /// spawned-action queue, which a reload clears along with the state it consumes.
+    CompleteInputSubmission,
     SendRaw(Arc<String>),
     /// Sends `text` to the server verbatim (split on `\n`, like `SendRaw`), but
     /// echoes the copy shown in the client's view and written to the session log
@@ -64,6 +93,21 @@ pub enum RuntimeAction {
     },
     SendRawUnless(Arc<AtomicBool>, Arc<String>),
     ProcessOutgoingLine(Arc<String>),
+    /// One matched alias/trigger, deferred so an earlier invocation in the same dispatch frame
+    /// can prevent it from running. `stopped` is shared only by automations of the same kind and
+    /// `(isolate, origin)`; nested sends create fresh frames.
+    RunAutomation {
+        isolate: IsolateId,
+        origin: Origin,
+        name: Arc<String>,
+        script: ScriptAction,
+        matches: Arc<Vec<MatchCapture>>,
+        depth: u32,
+        is_captured: Option<Arc<AtomicBool>>,
+        stopped: Arc<AtomicBool>,
+        fallthrough: bool,
+        is_alias: bool,
+    },
     Echo(Arc<String>),
     /// Echo pre-styled whole lines (a styled `echo`): each element is one on-screen
     /// line whose spans were built — tiling, gap-free — at the op boundary. Takes the
@@ -156,6 +200,8 @@ pub enum RuntimeAction {
         name: Arc<String>,
         patterns: Arc<Vec<String>>,
         function_id: FunctionId,
+        priority: i32,
+        fallthrough: bool,
         fire_limit: Option<u32>,
         /// The handler's `toString()`, passed in good faith from JS-land for the read-only
         /// detail pane. `None` when the caller supplied no source. Display-only.
@@ -181,6 +227,8 @@ pub enum RuntimeAction {
         function_id: FunctionId,
         prompt: bool,
         enabled: bool,
+        priority: i32,
+        fallthrough: bool,
         fire_limit: Option<u32>,
         line_limit: Option<u32>,
         /// The handler's `toString()`, passed in good faith from JS-land for the read-only
@@ -230,12 +278,16 @@ pub enum RuntimeAction {
     /// Emit `SessionEvent::PaneClosed` for a pane the close op already
     /// retired from the registry. The dispatch handler flushes buffered
     /// updates first, so the event trails every `AppendTo` that preceded it.
-    PaneClosed { key: PaneKey },
+    PaneClosed {
+        key: PaneKey,
+    },
     /// Emit `SessionEvent::PaneUpdated` for a def the split op already
     /// mutated in place (an explicit `titleBar` on an existing pane). A pure
     /// display refresh — no placement, so no ordering constraints beyond the
     /// channel itself.
-    PaneUpdated { def: PaneDef },
+    PaneUpdated {
+        def: PaneDef,
+    },
     /// Close every pane no script re-claimed during a reload. The reload loop
     /// queues this *behind* the freshly loaded modules' own spawned actions,
     /// so load-time deliveries to a doomed pane still land before its
@@ -293,6 +345,67 @@ pub enum RuntimeAction {
         namespace: PaneNamespace,
         name: Arc<str>,
     },
+    /// Forward one scripted input mutation to the UI as
+    /// `SessionEvent::InputOp` (`docs/input.md` §3.4). The op already
+    /// resolved `key` synchronously against the live pane registry; the UI
+    /// applies the mutation to that input's widget.
+    InputApply {
+        key: PaneKey,
+        op: InputOp,
+    },
+    /// A pane-hosted input's submission (`docs/input.md` §3.7): the
+    /// user pressed Enter in the pane's input (or a script's `submit()`
+    /// replayed the same UI path). The dispatch arm delivers `text` to the
+    /// `onSubmit` handler registered for the pane's input — in the creating
+    /// isolate, under its instantiation nonce, exactly the widget-callback
+    /// lifecycle — and to nothing else: the text never enters the session
+    /// pipeline, fires no `sys:input`, and touches no history but the pane
+    /// input's own (which the UI already recorded). A masked pane submission
+    /// delivers too — collecting the secret is the point of a masked pane
+    /// input, and the pane's creator is the only recipient.
+    ///
+    /// Carries no engine-state ids itself (the handler address lives in the
+    /// session-side registry, re-checked at dispatch), so it is deliberately
+    /// NOT in [`Self::references_engine_state`] — staleness is a defined
+    /// warn-and-drop, like [`Self::InvokeLinkCallback`].
+    PaneInputSubmit {
+        key: PaneKey,
+        text: Arc<String>,
+    },
+    /// The session thread's first input-mirror read: tell the UI to start
+    /// feeding the input mirror (`SessionEvent::InputMirrorInterest`). Sent
+    /// once per session — interest never clears.
+    InputMirrorInterest,
+    /// One coalesced input-state update from the UI (sent only while the
+    /// session has flagged interest). The dispatch arm writes it into the
+    /// session-thread [`super::input::InputMirror`] the read ops consult.
+    /// While masked the snapshot carries no content (and the mirror enforces
+    /// that again on apply).
+    InputStateChanged {
+        key: PaneKey,
+        snapshot: InputSnapshot,
+        source: InputSource,
+    },
+    /// One input's real history, sent by the UI whenever it changes — a
+    /// submission entered it, or a scripted push/clear landed. Unconditional
+    /// (no interest gate): history changes per submission, not per keystroke,
+    /// so the mirror stays exact with respect to the last submission
+    /// (`docs/input.md` §3.9). `entries` are newest first. The
+    /// dispatch arm writes it into the session-thread
+    /// [`super::input::InputMirror`] the history read op consults.
+    InputHistoryChanged {
+        key: PaneKey,
+        entries: Arc<Vec<Arc<String>>>,
+    },
+    /// An input's completion word sets changed (`docs/input.md`
+    /// §3.8): the dispatch arm builds the input's merged suggestion list +
+    /// blacklist from the live [`super::input::InputWordSets`] and forwards
+    /// them as `SessionEvent::InputWordSets`. Queued once per mutation burst
+    /// (the registry ops coalesce on the pending-push flag) and once per
+    /// populated input behind a reload's rebuilt engine.
+    InputWordSetsChanged {
+        key: PaneKey,
+    },
     /// Live-applies global settings the runtime cares about (separator, raw
     /// prefix, logging). Sent by the UI when settings change; the runtime also
     /// seeds the same values itself from `load_settings()` at construction.
@@ -307,7 +420,7 @@ pub enum RuntimeAction {
     RequestRepaint,
     Connected,
     Disconnected,
-    /// One inbound GMCP message (`docs/gmcp-plan.md` §3): the dotted message name and the
+    /// One inbound GMCP message (`docs/gmcp.md` §3): the dotted message name and the
     /// raw data part exactly as received — unparsed; the dispatch arm parses on the session
     /// thread and writes the `gmcp` store subtree. Enqueued by the connection task at the
     /// exact stream position the subnegotiation occupied — the same channel as
@@ -332,7 +445,7 @@ pub enum RuntimeAction {
         data: Option<Arc<str>>,
     },
     /// `gmcp.enableModule`: register the calling isolate's ref on a GMCP module
-    /// (`docs/gmcp-plan.md` §6.2). 0→1 (while negotiated) sends `Core.Supports.Add`.
+    /// (`docs/gmcp.md` §6.2). 0→1 (while negotiated) sends `Core.Supports.Add`.
     GmcpEnableModule {
         isolate: IsolateId,
         module: Arc<str>,
@@ -344,14 +457,16 @@ pub enum RuntimeAction {
         isolate: IsolateId,
         module: Arc<str>,
     },
-    /// `gmcp.mergeKeys`: extend the deep-merge message-name set (`docs/gmcp-plan.md` §4.3).
+    /// `gmcp.mergeKeys`: extend the deep-merge message-name set (`docs/gmcp.md` §4.3).
     GmcpAddMergeKeys(Arc<Vec<String>>),
     /// One inbound MSDP subnegotiation, raw bytes exactly as received (MSDP frames are
     /// control-marked, so no text decode happens on the connection task); the dispatch
     /// arm decodes on the session thread and writes the `msdp` store subtree. Rides the
     /// same channel as `HandleIncomingLine`, so the GMCP §3.3 wire-order guarantee holds
     /// for MSDP identically.
-    MsdpMessage { payload: Arc<[u8]> },
+    MsdpMessage {
+        payload: Arc<[u8]>,
+    },
     /// MSDP negotiated on; the connection task has already framed the `LIST` + baseline
     /// `REPORT` handshake onto the reply buffer. The dispatch arm clears the `msdp`
     /// subtree (fresh server, fresh truth) and emits `msdp:ready`.
@@ -359,6 +474,28 @@ pub enum RuntimeAction {
     /// MSDP negotiated off mid-connection (`WONT`); disconnect-while-enabled takes the
     /// `Disconnected` arm's path instead. Emits `msdp:closed` if it was enabled.
     MsdpDisabled,
+    /// The server's telnet ECHO option flipped (RFC 857: `WILL ECHO` = the
+    /// server has taken over echoing, the classic password-prompt signal;
+    /// `WONT` hands it back). Enqueued by the connection task at the exact
+    /// stream position the negotiation occupied; the dispatch arm forwards it
+    /// as `SessionEvent::ServerEcho`, where the UI masks/unmasks the main
+    /// input (`docs/input.md` §3.10 — subject to the user's
+    /// auto-mask preference, and composed with any script-set mask). A
+    /// disconnect releases the mask the same way (the option dies with the
+    /// connection, so a `WONT` may never arrive).
+    ServerEchoChanged {
+        enabled: bool,
+    },
+    /// The UI-reported character grid (cols × rows) of the session's main
+    /// terminal pane changed. Sent by the UI's pane layout on actual grid
+    /// changes only (cell-boundary quantized). The dispatch arm records it in
+    /// the shared size cell every future connect task reads, and forwards it
+    /// to the live connection, whose socket task emits a NAWS update (RFC
+    /// 1073) iff the option is negotiated.
+    WindowSizeChanged {
+        cols: u16,
+        rows: u16,
+    },
     Reload,
     Shutdown,
     Noop,
@@ -382,6 +519,7 @@ impl RuntimeAction {
             self,
             Self::EvalJavascript { .. }
                 | Self::CallJavascriptFunction { .. }
+                | Self::RunAutomation { .. }
                 | Self::ExecuteJavascriptFunction { .. }
         )
     }
@@ -397,6 +535,7 @@ impl RuntimeAction {
             Self::EvalJavascript { isolate, .. }
             | Self::ExecuteJavascriptFunction { isolate, .. }
             | Self::CallJavascriptFunction { isolate, .. }
+            | Self::RunAutomation { isolate, .. }
             | Self::AddHotkey { isolate, .. }
             | Self::AddAlias { isolate, .. }
             | Self::AddJavascriptFunctionAlias { isolate, .. }
@@ -419,7 +558,6 @@ impl RuntimeAction {
 /// no position in any expansion and are forwarded to the back of the main
 /// queue like new input.
 pub(crate) type ActionQueue = Rc<RefCell<VecDeque<RuntimeAction>>>;
-
 
 pub(crate) enum ActionResult {
     None,

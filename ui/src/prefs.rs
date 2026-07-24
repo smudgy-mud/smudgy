@@ -11,10 +11,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::ArcSwap;
 use iced::{Background, Color, Font};
+use smudgy_cloud::parse_css_color;
 use smudgy_core::models::settings::{CommandInputBehavior, ScriptPalette, Settings, ThemeTweaks};
 use smudgy_core::session::connection::vt_processor::AnsiColor;
 use smudgy_core::session::styled_line::Color as VtColor;
-use smudgy_cloud::parse_css_color;
 
 use crate::assets;
 use crate::components::color_picker::Hsv;
@@ -92,9 +92,12 @@ impl TerminalPalette {
     fn bright_default(&self) -> Color {
         let bright = self.ansi[15];
         let bg = self.background;
-        let distance =
-            (bright.r - bg.r).abs() + (bright.g - bg.g).abs() + (bright.b - bg.b).abs();
-        if distance < 0.3 { self.foreground } else { bright }
+        let distance = (bright.r - bg.r).abs() + (bright.g - bg.g).abs() + (bright.b - bg.b).abs();
+        if distance < 0.3 {
+            self.foreground
+        } else {
+            bright
+        }
     }
 
     /// Archetypal interpretation of a truecolor (and 256-color, which core
@@ -163,6 +166,10 @@ pub struct TerminalPrefs {
     /// What the command input does with the text after a send (and, for the
     /// default, on focus loss). Non-visual, so it never bumps `generation`.
     pub command_input_behavior: CommandInputBehavior,
+    /// Mask the command input while the server hides echo (telnet `WILL
+    /// ECHO`). Negotiation is answered either way; this only gates whether
+    /// the input masks. Non-visual, so it never bumps `generation`.
+    pub mask_input_on_server_echo: bool,
     /// Hide pane headers unless the window's toolbar is expanded (the
     /// distraction-free rule; per-pane `always-show` overrides it). Read per
     /// frame by the pane-grid view; chrome-level, so it never bumps
@@ -218,6 +225,7 @@ impl TerminalPrefs {
             line_length: settings.terminal_line_length.map(|len| len.clamp(20, 1000)),
             palette: Arc::new(effective_palette(settings)),
             command_input_behavior: settings.command_input_behavior,
+            mask_input_on_server_echo: settings.mask_input_on_server_echo,
             hide_pane_headers: settings.hide_pane_headers,
             generation,
         }
@@ -246,8 +254,7 @@ fn scale_saturation(color: Color, t: f32) -> Color {
 /// RGB mapping uses.
 fn expand_from(color: Color, anchor: Color, t: f32) -> Color {
     let factor = 1.0 + t;
-    let stretch =
-        |c: f32, a: f32| (c - a).mul_add(factor, a).clamp(0.0, 1.0);
+    let stretch = |c: f32, a: f32| (c - a).mul_add(factor, a).clamp(0.0, 1.0);
     Color {
         r: stretch(color.r, anchor.r),
         g: stretch(color.g, anchor.g),
@@ -367,9 +374,8 @@ pub fn apply_tweaks(base: &TerminalPalette, tweaks: &ThemeTweaks) -> TerminalPal
     palette
 }
 
-static PREFS: LazyLock<ArcSwap<TerminalPrefs>> = LazyLock::new(|| {
-    ArcSwap::from_pointee(TerminalPrefs::from_settings(&Settings::default(), 0))
-});
+static PREFS: LazyLock<ArcSwap<TerminalPrefs>> =
+    LazyLock::new(|| ArcSwap::from_pointee(TerminalPrefs::from_settings(&Settings::default(), 0)));
 
 /// The current preferences snapshot (lock-free).
 #[must_use]

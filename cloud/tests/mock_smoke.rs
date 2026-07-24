@@ -8,9 +8,11 @@ mod support;
 
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use smudgy_cloud::mapper::RoomKey;
+use smudgy_cloud::mutation::{
+    AreaMutation, MutationEnvelope, OpResult, Precondition, ResourceKind,
+};
 use smudgy_cloud::{
-    AreaId, CloudMapper, CreateAreaRequest, MapperBackend, RoomNumber, RoomUpdates,
+    AreaId, CloudMapper, CreateAreaRequest, MapperBackend, RoomNumber, RoomUpdates, Uuid,
 };
 use support::{GrantFlags, GrantScope, MockServer};
 
@@ -70,18 +72,37 @@ async fn cloud_mapper_crud_roundtrip() {
         "projection carries a content hash"
     );
 
-    // Room upsert bumps the served rev.
-    let room = mapper
-        .update_room(
-            &RoomKey::new(area.id, RoomNumber(1)),
-            RoomUpdates {
-                title: Some("Entry Hall".to_string()),
-                ..RoomUpdates::default()
+    // A room upsert rides a mutation envelope and bumps the served rev. The
+    // area precondition REQUIRES the access fingerprint (bare revisions are
+    // ambiguous across projection classes).
+    let result = mapper
+        .execute_mutation(
+            &area.id,
+            &MutationEnvelope {
+                operation_id: Uuid::new_v4(),
+                preconditions: vec![Precondition {
+                    resource: ResourceKind::Area,
+                    id: area.id.0,
+                    expected_rev: rev_before,
+                    access_fingerprint: details.area.access.map(|access| access.fingerprint()),
+                }],
+                payload: vec![AreaMutation::UpsertRoom {
+                    room_number: RoomNumber(1),
+                    body: RoomUpdates {
+                        title: Some("Entry Hall".to_string()),
+                        ..RoomUpdates::default()
+                    },
+                }],
             },
         )
         .await
-        .expect("update_room");
-    assert_eq!(room.title, "Entry Hall");
+        .expect("compound mutation");
+    assert!(
+        matches!(&result.data[0], OpResult::Room { room } if room.title == "Entry Hall"),
+        "the envelope echoes the stored room"
+    );
+    assert_eq!(result.versions.len(), 1);
+    assert_eq!(result.versions[0].rev, rev_before + 1);
 
     let details_after = mapper.get_area(&area.id).await.expect("get_area again");
     let rev_after = details_after.area.rev;
@@ -237,7 +258,10 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
     server.add_room(area, 3, "Market", false);
     let e_public = server.add_exit(area, 1, "North", Some((area, 3)), false);
     let e_to_secret = server.add_exit(area, 1, "East", Some((area, 2)), false);
-    let e_secret = server.add_exit(area, 3, "South", Some((area, 1)), true);
+    // Deliberately NOT the reciprocal of e_public: under the §6 closure a
+    // secret member would scrub its whole pair (e_public included); a
+    // dangling secret exit keeps this fixture about per-exit secrecy.
+    let e_secret = server.add_exit(area, 3, "South", None, true);
     let e_cross = server.add_exit(area, 1, "West", Some((hidden, 1)), false);
 
     server.grant(&owner, &grantee, GrantScope::Area(area), GrantFlags::VIEW_ONLY);

@@ -96,12 +96,15 @@ pub struct VtProcessor {
     pending_cr: Option<usize>,
     session_runtime_tx: UnboundedSender<RuntimeAction>,
     /// Whether any trigger currently carries a raw pattern — the only consumer
-    /// of `StyledLine::raw`. Owned by the trigger manager, read here at line
-    /// boundaries; `None` (tests, benches) means always capture.
+    /// of `StyledLine::raw`. Owned by the trigger manager on the session thread
+    /// and read here from the socket runtime; `None` (tests, benches) means
+    /// always capture.
     raw_wanted: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// The `raw_wanted` value latched for the line being accumulated. Refreshed
-    /// only when the raw buffer is empty, so an emitted line's raw form is
-    /// always complete-or-absent, never a torn suffix.
+    /// The `raw_wanted` value latched for the lines being accumulated: it FALLS
+    /// at line boundaries but RISES only at read-batch boundaries, so an emitted
+    /// line's raw form is always complete-or-absent — never a torn suffix — even
+    /// though the flag flips concurrently with an in-flight parse run (see
+    /// [`Self::refresh_capture_raw`]).
     capture_raw: bool,
 }
 
@@ -129,24 +132,34 @@ impl VtProcessor {
     }
 
     /// Ties raw capture to the given flag (the trigger manager's "any raw
-    /// pattern exists" bit). Takes effect at the next line boundary.
+    /// pattern exists" bit). A drop takes effect at the next line boundary; a
+    /// rise waits for the next read-batch boundary.
     pub fn set_raw_wanted_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
         self.capture_raw = flag.load(std::sync::atomic::Ordering::Relaxed);
         self.raw_wanted = Some(flag);
     }
 
-    /// Re-latch `capture_raw` from the shared flag. Called wherever `buf_raw`
-    /// empties (line commit, prompt commit, buffer flush), keeping each line's
-    /// raw form all-or-nothing.
+    /// Fall-only re-latch of `capture_raw`, called where the line buffers empty
+    /// mid-run (line commit, prompt commit). The reader parses on the socket
+    /// runtime while the trigger manager flips the flag from the session
+    /// thread, and `TelnetBridge::on_data` hoists its per-byte raw push behind
+    /// [`Self::capture_raw`] once per run: a mid-run FALL is safe under either
+    /// hoisted branch (the push re-checks per byte, and a fallen commit
+    /// attaches nothing), but a mid-run RISE would attach a torn raw suffix
+    /// pushed only from the flip onward. Rises therefore wait for the batch
+    /// boundary ([`Self::notify_end_of_buffer`]), where no run is in flight
+    /// and the buffers are empty.
     fn refresh_capture_raw(&mut self) {
         if let Some(flag) = &self.raw_wanted {
-            self.capture_raw = flag.load(std::sync::atomic::Ordering::Relaxed);
+            self.capture_raw =
+                self.capture_raw && flag.load(std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     /// Whether raw bytes are currently being captured. The byte loop hoists
-    /// its per-byte push behind this — sound because the flag only changes
-    /// from the session thread, never mid-run.
+    /// its per-byte push behind this — sound across threads because the value
+    /// can only fall mid-run (rises are deferred to batch boundaries), and a
+    /// fall is safe under either hoisted branch.
     #[must_use]
     pub fn capture_raw(&self) -> bool {
         self.capture_raw
@@ -227,24 +240,24 @@ impl VtProcessor {
         line
     }
 
-    /// Notifies that the end of a buffer of incoming data has been reached.
+    /// Notifies that the end of a read batch of incoming data has been reached — the
+    /// connection reader calls this once per socket wake (up to its byte budget), not once
+    /// per read chunk.
     ///
     /// This finalizes any pending partial line and sends it, then requests a repaint.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `session_runtime_tx` channel is closed (i.e., the session runtime has been dropped).
+    /// Sends are best-effort: the session runtime can tear down while the reader is
+    /// mid-batch on the socket runtime, and the connection task then exits via its
+    /// disconnect signal.
     pub fn notify_end_of_buffer(&mut self) {
         let pending_line = Arc::new(self.consume_into_pending_line());
         if !self.buf.is_empty() {
             self.session_runtime_tx
                 .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
-                .unwrap();
+                .ok();
             self.buf.clear();
             self.buf_raw.clear();
             self.buf.shrink_to(INPUT_BUFFER_CAPACITY);
             self.buf_raw.shrink_to(INPUT_BUFFER_CAPACITY);
-            self.refresh_capture_raw();
             // The frame a pending `\r` marked was just flushed upstream as a
             // partial; the restart's retraction covers it, and no local raw
             // bytes remain to drop.
@@ -254,7 +267,14 @@ impl VtProcessor {
         }
         self.session_runtime_tx
             .send(RuntimeAction::RequestRepaint)
-            .unwrap();
+            .ok();
+        // The batch boundary is the one place capture may RISE: no parse run is
+        // in flight (the reader calls this between batches) and the line buffers
+        // are empty, so the next batch starts a fresh line under the new value
+        // and `TelnetBridge::on_data` re-hoists it before any byte flows.
+        if let Some(flag) = &self.raw_wanted {
+            self.capture_raw = flag.load(std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Commit the pending bytes as a **prompt**: emit them on the partial-line path (so
@@ -264,11 +284,8 @@ impl VtProcessor {
     /// precise, server-sent signal, unlike the partial-line-at-end-of-buffer heuristic in
     /// [`notify_end_of_buffer`](Self::notify_end_of_buffer). Clearing the buffers here is what stops
     /// that heuristic from re-emitting the same prompt at end of read. A no-op when nothing is
-    /// pending (e.g. a bare `IAC GA` with no preceding text).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `session_runtime_tx` channel is closed (the session runtime has been dropped).
+    /// pending (e.g. a bare `IAC GA` with no preceding text). The send is best-effort, like
+    /// [`notify_end_of_buffer`](Self::notify_end_of_buffer)'s.
     pub fn commit_prompt(&mut self) {
         // A prompt boundary finalizes the line; a `\r` just before it must
         // not overwrite what follows.
@@ -279,7 +296,7 @@ impl VtProcessor {
         let pending_line = Arc::new(self.consume_into_pending_line());
         self.session_runtime_tx
             .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
-            .unwrap();
+            .ok();
         self.buf.clear();
         self.buf_raw.clear();
         self.buf.shrink_to(INPUT_BUFFER_CAPACITY);
@@ -291,7 +308,7 @@ impl VtProcessor {
         let pending_line = Arc::new(self.consume_into_pending_line());
         self.session_runtime_tx
             .send(RuntimeAction::HandleIncomingLine(pending_line))
-            .unwrap();
+            .ok();
         self.buf.clear();
         self.buf_raw.clear();
         self.refresh_capture_raw();
@@ -500,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_capture_follows_the_wanted_flag_at_line_boundaries() {
+    fn raw_capture_rises_at_batch_boundaries_and_falls_at_line_boundaries() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -514,18 +531,25 @@ mod tests {
         assert_eq!(lines[0].text, "plain");
         assert_eq!(lines[0].raw(), None);
 
-        // The flag flips mid-line: the in-flight line stays complete-or-absent
-        // (absent), and capture starts with the next line.
+        // The flag rises mid-batch: no line captures yet — the reader may be
+        // mid-run with the push branch hoisted off, so a rise waits for the
+        // batch boundary and every line stays complete-or-absent (absent).
         h.feed(b"mid");
         flag.store(true, Ordering::Relaxed);
         h.feed(b"line\n\x1b[32mnext\x1b[0m\n");
         let lines = committed_lines(&h.actions());
-        assert_eq!(lines[0].raw(), None, "flag flips apply at line boundaries");
-        assert_eq!(lines[1].raw(), Some("\x1b[32mnext\x1b[0m"));
+        assert_eq!(lines[0].raw(), None, "a rise never applies mid-batch");
+        assert_eq!(lines[1].raw(), None, "a rise never applies mid-batch");
 
-        // And back off: the latch was taken at the last commit, so one more
-        // line still captures (harmless — it's yesterday's behavior), and the
-        // flip settles at the next boundary.
+        // The batch boundary latches the rise; capture starts with the next batch.
+        h.processor.notify_end_of_buffer();
+        h.feed(b"\x1b[32mnow\x1b[0m\n");
+        let lines = committed_lines(&h.actions());
+        assert_eq!(lines[0].raw(), Some("\x1b[32mnow\x1b[0m"));
+
+        // A drop applies at the next line boundary: the line in flight when
+        // the flag fell was fully pushed, so it still captures (complete), and
+        // the one after it does not.
         flag.store(false, Ordering::Relaxed);
         h.feed(b"latched\nafter\n");
         let lines = committed_lines(&h.actions());

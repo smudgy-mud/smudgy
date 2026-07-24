@@ -1,0 +1,128 @@
+[package]
+name = "smudgy_bench"
+version = "0.4.2-dev"
+edition = "2024"
+publish = false
+
+[lib]
+# `cargo bench` forwards Criterion's CLI flags to every selected benchmark
+# target. The library otherwise uses Rust's built-in benchmark harness, which
+# rejects Criterion options such as `--noplot`.
+bench = false
+
+[features]
+# PR-only harnesses stay out of the canonical `cargo bench -p smudgy_bench`
+# longitudinal run unless selected explicitly by the trusted workflow.
+pr-benchmarks = []
+callgrind = ["dep:gungraun"]
+
+# Crates the *library* modules use (`src/wire.rs` needs only std; `src/atlas.rs`
+# builds a real `AtlasCache` through the public `LocalBackend` -> `Mapper` path).
+# These must be regular dependencies: dev-dependencies are only in scope for the
+# bench/test targets themselves, never for the lib they link against.
+[dependencies]
+futures = { workspace = true }
+smudgy_cloud = { workspace = true }
+# `bench-api` exposes the otherwise-private hot-path internals: the trigger
+# engine (`Manager`/`PushTriggerParams`), the inbound ingest glue
+# (`feed_inbound`/`TelnetBridge`/`sgr_process`), and the session store
+# (`SessionStore` + watcher/flush types). A regular dependency (not dev):
+# `src/session.rs` — the live-session harness the interop/churn benches
+# drive — builds on `smudgy_core`'s public session API.
+smudgy_core = { path = "../core", features = ["bench-api"] }
+# `src/session.rs` installs sandboxed bench packages through the same
+# in-memory provider + consent path the core integration tests use.
+smudgy_script = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+
+[dev-dependencies]
+aho-corasick = { workspace = true }
+criterion = "0.5"
+regex = { workspace = true }
+regex-filtered = { workspace = true }
+regex-syntax = { workspace = true }
+smudgy_ui = { path = "../ui" }
+vtparse = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Gungraun is the maintained successor to iai-callgrind. It supplies
+# deterministic instruction/cache counters for CPU-only PR comparisons.
+gungraun = { version = "0.19.4", optional = true }
+
+[[bench]]
+name = "trigger_matching"
+harness = false
+
+[[bench]]
+name = "trigger_engine"
+harness = false
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "script_dispatch"
+harness = false
+
+[[bench]]
+name = "terminal_buffer"
+harness = false
+
+[[bench]]
+name = "mapper_scale"
+harness = false
+
+[[bench]]
+name = "gmcp_automap"
+harness = false
+
+[[bench]]
+name = "store_fanout"
+harness = false
+
+[[bench]]
+name = "map_spatial"
+harness = false
+
+[[bench]]
+name = "identity_tax"
+harness = false
+
+[[bench]]
+name = "interop_ops"
+harness = false
+
+[[bench]]
+name = "catalogue"
+harness = false
+
+[[bench]]
+name = "interop_read"
+harness = false
+
+[[bench]]
+name = "interop_delivery"
+harness = false
+
+[[bench]]
+name = "trigger_verbs"
+harness = false
+
+[[bench]]
+name = "trigger_churn"
+harness = false
+
+[[bench]]
+name = "runner_control"
+harness = false
+required-features = ["pr-benchmarks"]
+
+[[bench]]
+name = "ingest_callgrind"
+harness = false
+required-features = ["callgrind"]
+
+[lints]
+workspace = true

@@ -3,8 +3,9 @@ use std::collections::{BTreeSet, HashMap};
 use ordered_float::OrderedFloat;
 
 use crate::{
-    ExitDirection, ExitId, RoomNumber, RoomUpdates, RoomWithDetails, parse_css_color,
+    ExitDirection, ExitId, Property, RoomNumber, RoomUpdates, RoomWithDetails,
     mapper::{RoomKey, exit_cache::ExitCache},
+    parse_css_color,
 };
 
 const DEFAULT_ROOM_COLOR: iced::Color = iced::Color::from_rgb8(128, 128, 128);
@@ -184,6 +185,34 @@ impl RoomCache {
     #[must_use]
     pub fn get_external_id(&self) -> Option<&str> {
         self.external_id.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn to_details(&self) -> RoomWithDetails {
+        let mut properties: Vec<_> = self
+            .properties
+            .iter()
+            .map(|(name, entry)| Property {
+                name: name.clone(),
+                value: entry.value.clone(),
+                is_secret: entry.is_secret,
+            })
+            .collect();
+        properties.sort_by(|a, b| a.name.cmp(&b.name));
+        RoomWithDetails {
+            room_number: self.room_number,
+            title: self.title.clone(),
+            description: self.description.clone(),
+            level: self.level,
+            x: self.x,
+            y: self.y,
+            color: self.color.clone(),
+            properties,
+            exits: self.exits.iter().map(ExitCache::to_exit).collect(),
+            tags: self.tags.clone(),
+            is_secret: self.is_secret,
+            external_id: self.external_id.clone(),
+        }
     }
 
     #[must_use]
@@ -402,7 +431,11 @@ impl From<RoomWithDetails> for RoomCache {
     fn from(room: RoomWithDetails) -> Self {
         let iced_color = parse_css_color(&room.color).unwrap_or(DEFAULT_ROOM_COLOR);
 
-        let exits: Vec<ExitCache> = room.exits.into_iter().map(std::convert::Into::into).collect();
+        let exits: Vec<ExitCache> = room
+            .exits
+            .into_iter()
+            .map(std::convert::Into::into)
+            .collect();
 
         Self {
             room_number: room.room_number,

@@ -580,7 +580,9 @@ impl SocialPanel {
                             text(format!(
                                 "{} wants to give you \u{201c}{}\u{201d}",
                                 nickname_or_fallback(t.from_nickname.clone()),
-                                t.subject_name.clone().unwrap_or_else(|| t.subject_kind.clone()),
+                                t.subject_name
+                                    .clone()
+                                    .unwrap_or_else(|| t.subject_kind.clone()),
                             ))
                             .size(13),
                             space::horizontal(),
@@ -604,7 +606,9 @@ impl SocialPanel {
                         row![
                             text(format!(
                                 "You offered \u{201c}{}\u{201d} to {}",
-                                t.subject_name.clone().unwrap_or_else(|| t.subject_kind.clone()),
+                                t.subject_name
+                                    .clone()
+                                    .unwrap_or_else(|| t.subject_kind.clone()),
                                 nickname_or_fallback(t.to_nickname.clone()),
                             ))
                             .size(13),

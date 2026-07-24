@@ -1,5 +1,5 @@
 //! The session store's value tree (`smudgy/docs/interop.md` §2): an immutable,
-//! structurally-shared JSON tree (`smudgy/docs/interop-pre-gmcp-plan.md` §4).
+//! structurally-shared JSON tree (`smudgy/docs/interop.md` §2).
 //!
 //! `Node` lives **here** for the same crate-DAG reason as [`StoreBindingCell`]
 //! (`crate::store_bindings`): the widget binding cells hold `Node` snapshots, their readers are
@@ -193,7 +193,9 @@ impl ObjectNode {
 
     /// `(first-published key spelling, child)` pairs in publish order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Node)> {
-        self.entries.values().map(|entry| (&*entry.key, &entry.node))
+        self.entries
+            .values()
+            .map(|entry| (&*entry.key, &entry.node))
     }
 
     /// Fold-aware child lookup.
@@ -306,8 +308,14 @@ impl Node {
     #[must_use]
     pub fn usage(&self) -> Usage {
         match self {
-            Self::Null => Usage { entries: 1, bytes: 4 },
-            Self::Bool(_) => Usage { entries: 1, bytes: 5 },
+            Self::Null => Usage {
+                entries: 1,
+                bytes: 4,
+            },
+            Self::Bool(_) => Usage {
+                entries: 1,
+                bytes: 5,
+            },
             Self::Number(number) => Usage {
                 entries: 1,
                 bytes: number_json_len(number),
@@ -472,8 +480,7 @@ fn from_value(value: serde_json::Value, collapsed: &mut bool) -> Node {
             Node::Array(Arc::new(ArrayNode { items, usage }))
         }
         serde_json::Value::Object(map) => {
-            let mut entries: IndexMap<FoldedKey, ObjectEntry> =
-                IndexMap::with_capacity(map.len());
+            let mut entries: IndexMap<FoldedKey, ObjectEntry> = IndexMap::with_capacity(map.len());
             for (key, child) in map {
                 let child = from_value(child, collapsed);
                 // Fold-duplicate spellings within one published object collapse to one entry:
@@ -563,13 +570,16 @@ impl PartialEq<serde_json::Value> for Node {
             (Self::String(a), serde_json::Value::String(b)) => &**a == b.as_str(),
             (Self::Array(a), serde_json::Value::Array(b)) => {
                 a.items.len() == b.len()
-                    && a.items.iter().zip(b.iter()).all(|(item, other)| item == other)
+                    && a.items
+                        .iter()
+                        .zip(b.iter())
+                        .all(|(item, other)| item == other)
             }
             (Self::Object(a), serde_json::Value::Object(b)) => {
                 a.entries.len() == b.len()
-                    && a.entries.values().all(|entry| {
-                        b.get(&*entry.key).is_some_and(|child| entry.node == *child)
-                    })
+                    && a.entries
+                        .values()
+                        .all(|entry| b.get(&*entry.key).is_some_and(|child| entry.node == *child))
             }
             _ => false,
         }
@@ -623,7 +633,10 @@ mod tests {
         let node = Node::from(value.clone());
         assert_eq!(node.to_string(), value.to_string());
         assert_eq!(node.to_value().to_string(), value.to_string());
-        assert!(node == value, "structural equality matches the source value");
+        assert!(
+            node == value,
+            "structural equality matches the source value"
+        );
     }
 
     #[test]
@@ -655,7 +668,11 @@ mod tests {
             serde_json::from_str(r#"{ "Foo": 1, "foo": 2, "bar": 3 }"#).expect("parse");
         let (node, collapsed) = Node::from_value_reporting(value);
         assert!(collapsed);
-        assert_eq!(node.to_string(), r#"{"Foo":2,"bar":3}"#, "first spelling, last value");
+        assert_eq!(
+            node.to_string(),
+            r#"{"Foo":2,"bar":3}"#,
+            "first spelling, last value"
+        );
         let (_, clean) = Node::from_value_reporting(json!({ "a": 1, "b": { "C": 1, "d": 2 } }));
         assert!(!clean);
     }
@@ -679,18 +696,28 @@ mod tests {
         let mut node = Node::from(json!({ "Char": { "Vitals": { "hp": 10 } } }));
         node.set_at(&segments(&["CHAR", "VITALS", "hp"]), Node::from(json!(11)));
         assert_eq!(node.to_string(), r#"{"Char":{"Vitals":{"hp":11}}}"#);
-        node.set_at(&segments(&["Char", "Vitals", "mp", "deep"]), Node::from(json!(1)));
+        node.set_at(
+            &segments(&["Char", "Vitals", "mp", "deep"]),
+            Node::from(json!(1)),
+        );
         assert_eq!(
             node.to_string(),
             r#"{"Char":{"Vitals":{"hp":11,"mp":{"deep":1}}}}"#
         );
         // Writing through a scalar replaces it with an object spine.
-        node.set_at(&segments(&["Char", "Vitals", "hp", "sub"]), Node::from(json!(2)));
+        node.set_at(
+            &segments(&["Char", "Vitals", "hp", "sub"]),
+            Node::from(json!(2)),
+        );
         assert_eq!(
             node.to_string(),
             r#"{"Char":{"Vitals":{"hp":{"sub":2},"mp":{"deep":1}}}}"#
         );
-        assert_eq!(measured(&node), node.usage(), "memoized usage tracks the tree");
+        assert_eq!(
+            measured(&node),
+            node.usage(),
+            "memoized usage tracks the tree"
+        );
     }
 
     #[test]
@@ -701,7 +728,10 @@ mod tests {
         assert_eq!(measured(&node), node.usage());
         node.set_at(&segments(&["a", "b", "c"]), Node::from(json!("shorter")));
         assert_eq!(measured(&node), node.usage());
-        node.set_at(&segments(&["a", "b"]), Node::from(json!({ "x": 1, "Y": [null, true] })));
+        node.set_at(
+            &segments(&["a", "b"]),
+            Node::from(json!({ "x": 1, "Y": [null, true] })),
+        );
         assert_eq!(measured(&node), node.usage());
         node.set_at(&[], Node::from(json!(7)));
         assert_eq!(measured(&node), node.usage());
@@ -719,7 +749,10 @@ mod tests {
         let (Node::Object(head_root), Node::Object(pinned_root)) = (&head, &pinned) else {
             panic!("roots are objects");
         };
-        assert!(!Arc::ptr_eq(head_root, pinned_root), "the written spine diverged");
+        assert!(
+            !Arc::ptr_eq(head_root, pinned_root),
+            "the written spine diverged"
+        );
         let (Some(Node::Object(head_left)), Some(Node::Object(pinned_left))) =
             (head.get("left"), pinned.get("left"))
         else {
@@ -729,8 +762,15 @@ mod tests {
             Arc::ptr_eq(head_left, pinned_left),
             "the untouched sibling subtree stays shared"
         );
-        assert!(pinned.get("right").is_some_and(|n| *n == json!({ "deep": [4, 5, 6] })));
-        assert!(head.get("right").is_some_and(|n| *n == json!({ "deep": 0 })));
+        assert!(
+            pinned
+                .get("right")
+                .is_some_and(|n| *n == json!({ "deep": [4, 5, 6] }))
+        );
+        assert!(
+            head.get("right")
+                .is_some_and(|n| *n == json!({ "deep": 0 }))
+        );
         // With the pin dropped the next write finds unique spines and mutates in place.
         drop(pinned);
         let before = match head.get("right") {
@@ -742,7 +782,10 @@ mod tests {
             Some(Node::Object(right)) => Arc::as_ptr(right),
             _ => panic!("right is an object"),
         };
-        assert_eq!(before, after, "a uniquely-owned spine node is reused in place");
+        assert_eq!(
+            before, after,
+            "a uniquely-owned spine node is reused in place"
+        );
     }
 
     #[test]

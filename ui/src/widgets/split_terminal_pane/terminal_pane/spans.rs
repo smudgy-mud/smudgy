@@ -4,8 +4,8 @@ use std::{
     rc::Rc,
 };
 
-use iced::widget::text::Span;
 use crate::terminal_buffer::selection::LineSelection;
+use iced::widget::text::Span;
 
 #[derive(Debug, Clone)]
 pub struct Spans<Link: Clone> {

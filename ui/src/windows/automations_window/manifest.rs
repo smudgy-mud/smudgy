@@ -4,7 +4,8 @@
 //! file itself is hidden from the owned-package source browser, and this editor is the
 //! way an author edits the manifest's `version`/`description`/`entry`, aligned hosts,
 //! dependencies, declared parameters, and the requested permission set (the deno-native
-//! `net`/`read`/`write`/`env` allowlists plus the `smudgy` op-capability flags).
+//! `net`/`read`/`write`/`env`/`run`/`ffi`/`sys` allowlists plus the `smudgy` op-capability
+//! flags).
 //!
 //! The on-disk manifest stays canonical: the form is seeded from the parsed
 //! [`PackageManifest`] when the package opens, edited as a [`ManifestDraft`], and on Save
@@ -16,7 +17,8 @@ use std::collections::HashSet;
 
 use iced::alignment::Vertical;
 use iced::widget::{
-    Column, button, checkbox, column, container, mouse_area, pick_list, radio, row, text, text_input,
+    Column, button, checkbox, column, container, mouse_area, pick_list, radio, row, text,
+    text_input,
 };
 use iced::{Length, Padding};
 
@@ -56,6 +58,14 @@ pub struct ManifestDraft {
     pub read: Vec<String>,
     pub write: Vec<String>,
     pub env: Vec<String>,
+    /// Programs the package may spawn (`permissions.run`). A subprocess is not sandboxed —
+    /// declaring any entry makes installers see the "effectively full access" warning.
+    pub run: Vec<String>,
+    /// Native libraries the package may load (`permissions.ffi`), same full-access weight as
+    /// [`run`](Self::run).
+    pub ffi: Vec<String>,
+    /// System-info kinds the package may query (`permissions.sys`), e.g. `hostname`, `osRelease`.
+    pub sys: Vec<String>,
     /// How far outside the smudgy ecosystem the package may download code to run
     /// (`permissions.import`): None / public registries (npm, jsr) / anywhere. A separate axis from
     /// `net`.
@@ -85,6 +95,9 @@ impl Default for ManifestDraft {
             read: Vec::new(),
             write: Vec::new(),
             env: Vec::new(),
+            run: Vec::new(),
+            ffi: Vec::new(),
+            sys: Vec::new(),
             import: ImportPolicy::None,
             caps: SmudgyCapabilities::default(),
             // Packages are importable unless the author opts out — match the manifest default.
@@ -160,6 +173,12 @@ pub enum ListField {
     Write,
     /// `permissions.env`
     Env,
+    /// `permissions.run` — programs the package may spawn (full-access weight).
+    Run,
+    /// `permissions.ffi` — native libraries the package may load (full-access weight).
+    Ffi,
+    /// `permissions.sys` — system-info kinds the package may query.
+    Sys,
 }
 
 /// The `permissions.smudgy` op-capability flags, addressed individually by the toggles.
@@ -179,6 +198,7 @@ pub enum Cap {
     InteropWrite,
     Panes,
     GmcpSend,
+    Input,
 }
 
 /// A single field-level edit to the open manifest draft. Folded into one [`Message`] variant
@@ -242,7 +262,8 @@ pub enum ManifestTab {
     Network,
     /// `permissions.read` + `permissions.write` — filesystem paths.
     Files,
-    /// `permissions.env` — environment variables.
+    /// `permissions.env` + `permissions.sys` + `permissions.run` + `permissions.ffi` —
+    /// environment variables, system info, subprocesses, and native libraries.
     System,
 }
 
@@ -336,6 +357,9 @@ impl ManifestDraft {
             read: manifest.permissions.read.clone(),
             write: manifest.permissions.write.clone(),
             env: manifest.permissions.env.clone(),
+            run: manifest.permissions.run.clone(),
+            ffi: manifest.permissions.ffi.clone(),
+            sys: manifest.permissions.sys.clone(),
             import: manifest.permissions.import,
             caps: manifest.permissions.smudgy,
             importable: manifest.importable,
@@ -381,7 +405,10 @@ impl ManifestDraft {
             // Param values are keyed by `key` (case-insensitively), so duplicates would collide in
             // storage and the value editor — reject them, mirroring the table-column key check.
             if !seen_keys.insert(projected.key.to_lowercase()) {
-                return Err(format!("Duplicate parameter key \u{201c}{}\u{201d}.", projected.key));
+                return Err(format!(
+                    "Duplicate parameter key \u{201c}{}\u{201d}.",
+                    projected.key
+                ));
             }
             params.push(projected);
         }
@@ -407,6 +434,9 @@ impl ManifestDraft {
                 read: clean_list(&self.read),
                 write: clean_list(&self.write),
                 env: clean_list(&self.env),
+                run: clean_list(&self.run),
+                ffi: clean_list(&self.ffi),
+                sys: clean_list(&self.sys),
                 import: self.import,
                 smudgy: caps,
             },
@@ -520,7 +550,11 @@ fn project_fields(draft: &ParamDraft) -> Result<Vec<PackageParameter>, String> {
                 if !seen.insert(key.to_lowercase()) {
                     return Err(format!("duplicate column key \u{201c}{key}\u{201d}."));
                 }
-                columns.push(project_sub_param(field, key.clone(), &format!("column \u{201c}{key}\u{201d}"))?);
+                columns.push(project_sub_param(
+                    field,
+                    key.clone(),
+                    &format!("column \u{201c}{key}\u{201d}"),
+                )?);
             }
             if columns.is_empty() {
                 return Err("a table needs at least one column with a key.".to_string());
@@ -544,7 +578,9 @@ fn project_sub_param(
     let options = if field.kind == ParamKind::Dropdown {
         let options = clean_options(&field.options)?;
         if options.is_empty() {
-            return Err(format!("{what} is a dropdown and needs at least one option."));
+            return Err(format!(
+                "{what} is a dropdown and needs at least one option."
+            ));
         }
         options
     } else {
@@ -576,7 +612,10 @@ fn clean_options(options: &[OptionDraft]) -> Result<Vec<ParamOption>, String> {
             return Err(format!("duplicate option value \u{201c}{value}\u{201d}."));
         }
         let label = trim_opt(&option.label).filter(|label| label != value);
-        out.push(ParamOption { value: value.to_string(), label });
+        out.push(ParamOption {
+            value: value.to_string(),
+            label,
+        });
     }
     Ok(out)
 }
@@ -659,7 +698,11 @@ fn parse_default(kind: ParamKind, text: &str) -> Result<Option<serde_json::Value
                 Ok(Some(serde_json::Value::Number(int.into())))
             } else if let Ok(uint) = text.parse::<u64>() {
                 Ok(Some(serde_json::Value::Number(uint.into())))
-            } else if let Some(num) = text.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+            } else if let Some(num) = text
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+            {
                 Ok(Some(serde_json::Value::Number(num)))
             } else {
                 Err("default must be a number.".to_string())
@@ -681,6 +724,9 @@ fn list_mut(draft: &mut ManifestDraft, field: ListField) -> &mut Vec<String> {
         ListField::Read => &mut draft.read,
         ListField::Write => &mut draft.write,
         ListField::Env => &mut draft.env,
+        ListField::Run => &mut draft.run,
+        ListField::Ffi => &mut draft.ffi,
+        ListField::Sys => &mut draft.sys,
     }
 }
 
@@ -707,6 +753,7 @@ fn set_cap(caps: &mut SmudgyCapabilities, cap: Cap, on: bool) {
         Cap::InteropWrite => caps.interop_write = on,
         Cap::Panes => caps.panes = on,
         Cap::GmcpSend => caps.gmcp_send = on,
+        Cap::Input => caps.input = on,
     }
 }
 
@@ -735,7 +782,10 @@ impl AutomationsWindow {
                 // Don't add a duplicate the picker already inserted (compare the bare
                 // `smudgy://owner/name`, ignoring any `@range` an existing entry carries).
                 let bare = value.split('@').next().unwrap_or(&value);
-                if !list.iter().any(|e| e.trim().split('@').next() == Some(bare)) {
+                if !list
+                    .iter()
+                    .any(|e| e.trim().split('@').next() == Some(bare))
+                {
                     list.push(value);
                 }
             }
@@ -888,7 +938,11 @@ impl AutomationsWindow {
     /// and the draft re-seeded from the freshly-parsed manifest; on a projection/serialize/write
     /// failure the reason is shown above the form and nothing is written.
     pub(super) fn save_manifest(&mut self) -> Update<Message, Event> {
-        let Some(name) = self.local_package.as_ref().map(|package| package.name.clone()) else {
+        let Some(name) = self
+            .local_package
+            .as_ref()
+            .map(|package| package.name.clone())
+        else {
             return Update::none();
         };
         let manifest = match self.manifest_draft.as_ref().map(ManifestDraft::to_manifest) {
@@ -940,7 +994,11 @@ impl AutomationsWindow {
         }
         // Re-seed the inline "Settings" editor: a manifest save can add, remove, or re-flag params,
         // so the value editor must track the new schema (preserving the on-disk values it pre-fills).
-        if let Some(params) = self.local_package.as_deref().map(|p| p.manifest.params.clone()) {
+        if let Some(params) = self
+            .local_package
+            .as_deref()
+            .map(|p| p.manifest.params.clone())
+        {
             let spec = self.local_own_spec(&name);
             self.seed_param_config(spec, params);
         }
@@ -989,12 +1047,18 @@ impl AutomationsWindow {
     /// to the summary. Renders nothing off-pane.
     pub(super) fn view_manifest_section(&self) -> Elem<'_> {
         let Some(package) = self.local_package.as_deref() else {
-            return iced::widget::space::vertical().height(Length::Fixed(0.0)).into();
+            return iced::widget::space::vertical()
+                .height(Length::Fixed(0.0))
+                .into();
         };
         let body: Elem<'_> = if self.manifest_editing {
             match self.manifest_draft.as_ref() {
                 Some(draft) => self.manifest_editor_body(draft),
-                None => return iced::widget::space::vertical().height(Length::Fixed(0.0)).into(),
+                None => {
+                    return iced::widget::space::vertical()
+                        .height(Length::Fixed(0.0))
+                        .into();
+                }
             }
         } else {
             manifest_readonly_body(&package.manifest)
@@ -1030,7 +1094,8 @@ impl AutomationsWindow {
                 .size(14.0)
                 .into(),
         ));
-        if !draft.version.trim().is_empty() && semver::Version::parse(draft.version.trim()).is_err() {
+        if !draft.version.trim().is_empty() && semver::Version::parse(draft.version.trim()).is_err()
+        {
             body = body.push(
                 text("Not a valid semver version yet — required before you can publish (e.g. 1.2.3).")
                     .size(11.0)
@@ -1039,10 +1104,13 @@ impl AutomationsWindow {
         }
         body = body.push(field_row(
             "Description",
-            text_input("What this package does (shown in Discover)", &draft.description)
-                .on_input(|v| Message::EditManifest(ManifestEdit::Description(v)))
-                .size(14.0)
-                .into(),
+            text_input(
+                "What this package does (shown in Discover)",
+                &draft.description,
+            )
+            .on_input(|v| Message::EditManifest(ManifestEdit::Description(v)))
+            .size(14.0)
+            .into(),
         ));
         body = body.push(field_row(
             "Entry",
@@ -1055,7 +1123,9 @@ impl AutomationsWindow {
         // Tabs group the rest of the manifest; the package identity above stays pinned across them.
         body = body.push(manifest_tab_bar(self.manifest_tab, draft));
         body = body.push(match self.manifest_tab {
-            ManifestTab::Settings => manifest_tab_settings(draft, &self.dependency_candidates(draft)),
+            ManifestTab::Settings => {
+                manifest_tab_settings(draft, &self.dependency_candidates(draft))
+            }
             ManifestTab::Capabilities => manifest_capabilities(draft.caps),
             ManifestTab::Network => manifest_tab_network(draft),
             ManifestTab::Files => manifest_tab_files(draft),
@@ -1100,12 +1170,15 @@ impl AutomationsWindow {
     /// The edit-mode action bar: Cancel (discard edits + back to the read-only summary) and Save
     /// (commit + back to the summary; enabled only when there are unsaved changes).
     fn manifest_edit_bar(&self) -> Elem<'_> {
-        let mut bar = row![].spacing(12.0).align_y(Vertical::Center).padding(Padding {
-            top: 8.0,
-            bottom: 0.0,
-            left: 0.0,
-            right: 0.0,
-        });
+        let mut bar = row![]
+            .spacing(12.0)
+            .align_y(Vertical::Center)
+            .padding(Padding {
+                top: 8.0,
+                bottom: 0.0,
+                left: 0.0,
+                right: 0.0,
+            });
         if self.manifest_dirty {
             bar = bar
                 .push(text("\u{25CF}").size(9.0).style(common::accent))
@@ -1136,7 +1209,9 @@ fn manifest_readonly_body(manifest: &PackageManifest) -> Elem<'_> {
         iced::widget::space::horizontal(),
         button(
             row![
-                text(bootstrap_icons::PENCIL).font(fonts::BOOTSTRAP_ICONS).size(12.0),
+                text(bootstrap_icons::PENCIL)
+                    .font(fonts::BOOTSTRAP_ICONS)
+                    .size(12.0),
                 text("Edit").size(13.0),
             ]
             .spacing(6.0)
@@ -1159,22 +1234,43 @@ fn manifest_readonly_body(manifest: &PackageManifest) -> Elem<'_> {
     column![
         header,
         // Trim version/description to match the pane header (which shows the same values trimmed).
-        ro_block("Version", text(manifest.version.trim().to_string()).size(14.0).into()),
-        ro_block("Description", ro_text_or(manifest.description.trim(), "No description")),
+        ro_block(
+            "Version",
+            text(manifest.version.trim().to_string()).size(14.0).into()
+        ),
+        ro_block(
+            "Description",
+            ro_text_or(manifest.description.trim(), "No description")
+        ),
         ro_block("Entry", entry),
         ro_block(
             "Requires smudgy",
-            ro_text_or(manifest.min_smudgy_version.as_deref().unwrap_or(""), "Any version"),
+            ro_text_or(
+                manifest.min_smudgy_version.as_deref().unwrap_or(""),
+                "Any version"
+            ),
         ),
-        ro_block("Aligned hosts", ro_value_list(&manifest.hosts, "Any host", true)),
-        ro_block("Dependencies", ro_value_list(&manifest.dependencies, "None", true)),
+        ro_block(
+            "Aligned hosts",
+            ro_value_list(&manifest.hosts, "Any host", true)
+        ),
+        ro_block(
+            "Dependencies",
+            ro_value_list(&manifest.dependencies, "None", true)
+        ),
         ro_block("Parameters", ro_params(&manifest.params)),
         common::section_label("Permissions"),
         ro_block("Connections", ro_value_list(&perms.net, "None", true)),
-        ro_block("Code imports", ro_text_or(import_policy_summary(perms.import), "None")),
+        ro_block(
+            "Code imports",
+            ro_text_or(import_policy_summary(perms.import), "None")
+        ),
         ro_block("Read files", ro_value_list(&perms.read, "None", true)),
         ro_block("Write files", ro_value_list(&perms.write, "None", true)),
         ro_block("Environment", ro_value_list(&perms.env, "None", true)),
+        ro_block("System info", ro_value_list(&perms.sys, "None", true)),
+        ro_block("Run programs", ro_value_list(&perms.run, "None", true)),
+        ro_block("Native libraries", ro_value_list(&perms.ffi, "None", true)),
         ro_block("Capabilities", ro_caps(perms.smudgy)),
     ]
     .spacing(10.0)
@@ -1196,7 +1292,10 @@ fn ro_block<'a>(label: &str, value: Elem<'a>) -> Elem<'a> {
 /// A value text, or a faint placeholder when the string is blank.
 fn ro_text_or<'a>(value: &str, empty: &str) -> Elem<'a> {
     if value.trim().is_empty() {
-        text(empty.to_string()).size(14.0).style(common::faint).into()
+        text(empty.to_string())
+            .size(14.0)
+            .style(common::faint)
+            .into()
     } else {
         text(value.to_string()).size(14.0).into()
     }
@@ -1205,9 +1304,15 @@ fn ro_text_or<'a>(value: &str, empty: &str) -> Elem<'a> {
 /// A read-only list value: one line per non-blank entry (monospace when `mono`), or a faint
 /// placeholder when the list is empty.
 fn ro_value_list<'a>(items: &[String], empty: &str, mono: bool) -> Elem<'a> {
-    let kept: Vec<&String> = items.iter().filter(|item| !item.trim().is_empty()).collect();
+    let kept: Vec<&String> = items
+        .iter()
+        .filter(|item| !item.trim().is_empty())
+        .collect();
     if kept.is_empty() {
-        return text(empty.to_string()).size(13.0).style(common::faint).into();
+        return text(empty.to_string())
+            .size(13.0)
+            .style(common::faint)
+            .into();
     }
     let mut col = Column::new().spacing(2.0);
     for item in kept {
@@ -1235,9 +1340,13 @@ fn ro_params<'a>(params: &[PackageParameter]) -> Elem<'a> {
         if param.secret {
             tags.push("secret".to_string());
         }
-        let mut line = row![text(param.key.clone()).size(13.0).font(fonts::GEIST_MONO_VF)]
-            .spacing(8.0)
-            .align_y(Vertical::Center);
+        let mut line = row![
+            text(param.key.clone())
+                .size(13.0)
+                .font(fonts::GEIST_MONO_VF)
+        ]
+        .spacing(8.0)
+        .align_y(Vertical::Center);
         if let Some(label) = &param.label
             && !label.is_empty()
         {
@@ -1374,8 +1483,11 @@ fn manifest_params(draft: &ManifestDraft) -> Elem<'_> {
     for (i, param) in draft.params.iter().enumerate() {
         col = col.push(param_card(i, param));
     }
-    col.push(add_button("Add parameter", Message::EditManifest(ManifestEdit::AddParam)))
-        .into()
+    col.push(add_button(
+        "Add parameter",
+        Message::EditManifest(ManifestEdit::AddParam),
+    ))
+    .into()
 }
 
 /// One parameter's editable card.
@@ -1393,10 +1505,14 @@ fn param_card(i: usize, param: &ParamDraft) -> Elem<'_> {
             .size(14.0)
             .width(Length::Fill),
         kind_picker,
-        button(text(bootstrap_icons::TRASH_3).font(fonts::BOOTSTRAP_ICONS).size(14.0))
-            .style(button_style::secondary)
-            .on_press(Message::EditManifest(ManifestEdit::RemoveParam(i)))
-            .padding(8),
+        button(
+            text(bootstrap_icons::TRASH_3)
+                .font(fonts::BOOTSTRAP_ICONS)
+                .size(14.0)
+        )
+        .style(button_style::secondary)
+        .on_press(Message::EditManifest(ManifestEdit::RemoveParam(i)))
+        .padding(8),
     ]
     .spacing(8.0)
     .align_y(Vertical::Center);
@@ -1550,16 +1666,21 @@ fn options_editor(path: OptionPath, options: &[OptionDraft]) -> Elem<'_> {
                     .on_input(move |v| Message::EditManifest(path.label(k, v)))
                     .size(14.0)
                     .width(Length::Fill),
-                button(text(bootstrap_icons::TRASH_3).font(fonts::BOOTSTRAP_ICONS).size(13.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::EditManifest(path.remove(k)))
-                    .padding(6),
+                button(
+                    text(bootstrap_icons::TRASH_3)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(13.0)
+                )
+                .style(button_style::secondary)
+                .on_press(Message::EditManifest(path.remove(k)))
+                .padding(6),
             ]
             .spacing(8.0)
             .align_y(Vertical::Center),
         );
     }
-    col.push(add_button("Add option", Message::EditManifest(path.add()))).into()
+    col.push(add_button("Add option", Message::EditManifest(path.add())))
+        .into()
 }
 
 /// A `pick_list` to choose a dropdown param's default from its declared options (plus "(no default)").
@@ -1572,7 +1693,11 @@ fn dropdown_default_picker(i: usize, param: &ParamDraft) -> Elem<'_> {
                 value: value.to_string(),
                 label: {
                     let label = option.label.trim();
-                    if label.is_empty() { value.to_string() } else { label.to_string() }
+                    if label.is_empty() {
+                        value.to_string()
+                    } else {
+                        label.to_string()
+                    }
                 },
             });
         }
@@ -1604,7 +1729,10 @@ struct DefaultChoice {
 
 impl DefaultChoice {
     fn none() -> Self {
-        Self { value: String::new(), label: "(no default)".to_string() }
+        Self {
+            value: String::new(),
+            label: "(no default)".to_string(),
+        }
     }
 }
 
@@ -1636,17 +1764,20 @@ fn sub_param_editor<'a>(i: usize, j: usize, field: &'a SubParamDraft, is_column:
         );
     } else {
         header = header.push(
-            container(text("a value of type").size(13.0).style(common::muted))
-                .width(Length::Fill),
+            container(text("a value of type").size(13.0).style(common::muted)).width(Length::Fill),
         );
     }
     header = header.push(kind_picker);
     if is_column {
         header = header.push(
-            button(text(bootstrap_icons::TRASH_3).font(fonts::BOOTSTRAP_ICONS).size(13.0))
-                .style(button_style::secondary)
-                .on_press(Message::EditManifest(ManifestEdit::ParamRemoveField(i, j)))
-                .padding(6),
+            button(
+                text(bootstrap_icons::TRASH_3)
+                    .font(fonts::BOOTSTRAP_ICONS)
+                    .size(13.0),
+            )
+            .style(button_style::secondary)
+            .on_press(Message::EditManifest(ManifestEdit::ParamRemoveField(i, j)))
+            .padding(6),
         );
     }
 
@@ -1673,12 +1804,24 @@ fn sub_param_editor<'a>(i: usize, j: usize, field: &'a SubParamDraft, is_column:
 /// faint count of how many entries it currently holds (so the populated tabs are visible at a glance).
 fn manifest_tab_bar(active: ManifestTab, draft: &ManifestDraft) -> Elem<'_> {
     let files = nonblank(&draft.read) + nonblank(&draft.write);
+    let system =
+        nonblank(&draft.env) + nonblank(&draft.sys) + nonblank(&draft.run) + nonblank(&draft.ffi);
     row![
         tab_button(active, ManifestTab::Settings, "Settings", None),
-        tab_button(active, ManifestTab::Capabilities, "Capabilities", Some(granted_cap_count(draft.caps))),
-        tab_button(active, ManifestTab::Network, "Network", Some(nonblank(&draft.net) + usize::from(draft.import != ImportPolicy::None))),
+        tab_button(
+            active,
+            ManifestTab::Capabilities,
+            "Capabilities",
+            Some(granted_cap_count(draft.caps))
+        ),
+        tab_button(
+            active,
+            ManifestTab::Network,
+            "Network",
+            Some(nonblank(&draft.net) + usize::from(draft.import != ImportPolicy::None))
+        ),
         tab_button(active, ManifestTab::Files, "Files", Some(files)),
-        tab_button(active, ManifestTab::System, "System", Some(nonblank(&draft.env))),
+        tab_button(active, ManifestTab::System, "System", Some(system)),
     ]
     .spacing(4.0)
     .align_y(Vertical::Center)
@@ -1687,7 +1830,12 @@ fn manifest_tab_bar(active: ManifestTab, draft: &ManifestDraft) -> Elem<'_> {
 
 /// One tab button. Active uses the selected list-item fill; inactive is quiet. A `count` of `0`
 /// renders no badge (so an empty tab isn't visually noisy).
-fn tab_button<'a>(active: ManifestTab, tab: ManifestTab, label: &str, count: Option<usize>) -> Elem<'a> {
+fn tab_button<'a>(
+    active: ManifestTab,
+    tab: ManifestTab,
+    label: &str,
+    count: Option<usize>,
+) -> Elem<'a> {
     let mut content = row![text(label.to_string()).size(13.0)]
         .spacing(6.0)
         .align_y(Vertical::Center);
@@ -1754,8 +1902,7 @@ fn dependency_lock_note<'a>() -> Elem<'a> {
             "Publishing locks the exact version of every \
              dependency at PUBLISH time. Users of your package will \
              only realize newer versions of your dependencies if you release a new version of \
-             your package that updates them."
-             ,
+             your package that updates them.",
         )
         .size(11.0)
         .style(common::muted),
@@ -1902,13 +2049,24 @@ fn manifest_tab_network(draft: &ManifestDraft) -> Elem<'_> {
 fn import_policy_picker<'a>(selected: ImportPolicy) -> Elem<'a> {
     let on_pick = |v| Message::EditManifest(ManifestEdit::ImportPolicy(v));
     let choice = |label: &'static str, value: ImportPolicy| {
-        radio(label, value, Some(selected), on_pick).size(16).text_size(13)
+        radio(label, value, Some(selected), on_pick)
+            .size(16)
+            .text_size(13)
     };
     column![
         common::section_label("Code imports"),
-        choice("No modules outside of the smudgy ecosystem", ImportPolicy::None),
-        choice("Can download and run modules from public registries (npm, jsr)", ImportPolicy::Registries),
-        choice("Can download and run modules from anywhere", ImportPolicy::Any),
+        choice(
+            "No modules outside of the smudgy ecosystem",
+            ImportPolicy::None
+        ),
+        choice(
+            "Can download and run modules from public registries (npm, jsr)",
+            ImportPolicy::Registries
+        ),
+        choice(
+            "Can download and run modules from anywhere",
+            ImportPolicy::Any
+        ),
     ]
     .spacing(6.0)
     .into()
@@ -1924,9 +2082,12 @@ fn import_policy_summary(policy: ImportPolicy) -> &'static str {
     }
 }
 
-/// Files tab: `permissions.read` + `permissions.write`.
+/// Files tab: `permissions.read` + `permissions.write`. A path outside `$DATA` changes the
+/// grant's meaning — a read reaches the user's files, a write can rewrite config/scripts/other
+/// packages (effectively full access) — so escaping entries surface the same warning installers
+/// will see.
 fn manifest_tab_files(draft: &ManifestDraft) -> Elem<'_> {
-    column![
+    let mut col = column![
         perm_note(),
         list_editor(
             "Readable paths",
@@ -1936,22 +2097,40 @@ fn manifest_tab_files(draft: &ManifestDraft) -> Elem<'_> {
             "$DATA/maps",
             "path",
         ),
-        list_editor(
-            "Writable paths",
-            None,
-            ListField::Write,
-            &draft.write,
-            "$DATA",
-            "path",
-        ),
     ]
-    .spacing(16.0)
-    .into()
+    .spacing(16.0);
+    if escapes_data(&draft.read) {
+        col = col.push(
+            text(
+                "A readable path outside $DATA reaches the user's own files. Installers will see \
+                 it flagged. Prefer $DATA unless reading their files is the point.",
+            )
+            .size(11.0)
+            .style(common::warning),
+        );
+    }
+    col = col.push(list_editor(
+        "Writable paths",
+        None,
+        ListField::Write,
+        &draft.write,
+        "$DATA",
+        "path",
+    ));
+    if escapes_data(&draft.write) {
+        col = col.push(full_access_author_note(
+            "A writable path outside $DATA can rewrite the user's config, scripts, or other \
+             packages — it effectively un-sandboxes the package.",
+        ));
+    }
+    col.into()
 }
 
-/// System tab: `permissions.env`.
+/// System tab: `permissions.env` + `permissions.sys` + `permissions.run` + `permissions.ffi`.
+/// `run`/`ffi` carry the author-facing version of the consent window's full-access warning: an
+/// entry here is honest to declare, but it is a trust ask, not a scoped grant.
 fn manifest_tab_system(draft: &ManifestDraft) -> Elem<'_> {
-    column![
+    let mut col = column![
         perm_note(),
         list_editor(
             "Readable environment variables",
@@ -1961,8 +2140,88 @@ fn manifest_tab_system(draft: &ManifestDraft) -> Elem<'_> {
             "MYPKG_TOKEN",
             "variable",
         ),
+        list_editor(
+            "System information",
+            Some(
+                "Deno system-info kinds it may query, one per entry: hostname, osRelease, \
+                 osUptime, loadavg, networkInterfaces, systemMemoryInfo, uid, gid, cpus, homedir, \
+                 statfs, getPriority, setPriority, userInfo. An unknown kind refuses to load.",
+            ),
+            ListField::Sys,
+            &draft.sys,
+            "hostname",
+            "kind",
+        ),
+        list_editor(
+            "Runnable programs",
+            Some(
+                "Program names (found on the user's PATH) or absolute paths this package may run \
+                 as subprocesses.",
+            ),
+            ListField::Run,
+            &draft.run,
+            "git",
+            "program",
+        ),
     ]
-    .spacing(12.0)
+    .spacing(16.0);
+    if nonblank(&draft.run) > 0 {
+        col = col.push(full_access_author_note(
+            "A program this package runs is NOT sandboxed — it acts with the user's full \
+             privileges, whatever the program is.",
+        ));
+    }
+    col = col.push(list_editor(
+        "Loadable native libraries",
+        Some("Paths to dynamic libraries it may load via FFI ($DATA works here too)."),
+        ListField::Ffi,
+        &draft.ffi,
+        "$DATA/native/helper.dll",
+        "library",
+    ));
+    if nonblank(&draft.ffi) > 0 {
+        col = col.push(full_access_author_note(
+            "Native code this package loads is NOT sandboxed — it acts with the user's full \
+             privileges.",
+        ));
+    }
+    col.into()
+}
+
+/// Whether any non-blank path entry escapes the package's own `$DATA` dir (the author-side twin
+/// of the installer-facing risk cliff — see `packages::data_scoped`).
+fn escapes_data(paths: &[String]) -> bool {
+    paths
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .any(|p| !super::packages::data_scoped(p))
+}
+
+/// The author-facing "this is a full-access ask" warning under a `run`/`ffi`/escaping-`write`
+/// editor: names the consequence and what installers will be shown, so a heavyweight grant is
+/// never declared casually.
+fn full_access_author_note(consequence: &str) -> Elem<'_> {
+    container(
+        row![
+            text("\u{26A0}").size(13.0).style(common::danger),
+            text(format!(
+                "{consequence} Installers will see a prominent \u{201c}effectively full \
+                 access\u{201d} warning on the install window."
+            ))
+            .size(11.0)
+            .style(common::warning),
+        ]
+        .spacing(8.0)
+        .align_y(Vertical::Top),
+    )
+    .width(Length::Fill)
+    .padding(Padding {
+        top: 8.0,
+        bottom: 8.0,
+        left: 12.0,
+        right: 12.0,
+    })
+    .style(common::banner_style)
     .into()
 }
 
@@ -1980,7 +2239,12 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
             None,
         )
     } else {
-        cap_check("mapper", "read your maps", caps.mapper_read, Cap::MapperRead)
+        cap_check(
+            "mapper",
+            "read your maps",
+            caps.mapper_read,
+            Cap::MapperRead,
+        )
     };
 
     column![
@@ -1995,6 +2259,7 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
             cap_check("send", "send commands as if typed (runs through your aliases)", caps.send, Cap::Send),
             cap_check("sendRaw", "send straight to the game (bypasses your aliases)", caps.send_direct, Cap::SendDirect),
             cap_check("echo", "print text to your screen", caps.echo, Cap::Echo),
+            cap_check("input", "access, change, and focus input change; manage autocomplete list", caps.input, Cap::Input),
             cap_check("sessions / byName", "reach your other connected sessions", caps.reach_others, Cap::ReachOthers),
         ]),
         cap_group("Display", vec![
@@ -2074,7 +2339,10 @@ fn cap_row<'a>(
     on_press: Option<Message>,
 ) -> Elem<'a> {
     let label = row![
-        text(api).size(13.0).font(fonts::GEIST_MONO_VF).style(common::regular),
+        text(api)
+            .size(13.0)
+            .font(fonts::GEIST_MONO_VF)
+            .style(common::regular),
         text(gloss).size(13.0).style(gloss_style),
     ]
     .spacing(8.0)
@@ -2083,7 +2351,10 @@ fn cap_row<'a>(
         Some(msg) => mouse_area(label).on_press(msg).into(),
         None => label.into(),
     };
-    row![box_, label].spacing(10.0).align_y(Vertical::Center).into()
+    row![box_, label]
+        .spacing(10.0)
+        .align_y(Vertical::Center)
+        .into()
 }
 
 // ---- shared form helpers ---------------------------------------------------
@@ -2112,7 +2383,9 @@ fn list_editor<'a>(
     placeholder: &'static str,
     add_label: &str,
 ) -> Elem<'a> {
-    let mut col = Column::new().spacing(6.0).push(common::section_label(title));
+    let mut col = Column::new()
+        .spacing(6.0)
+        .push(common::section_label(title));
     if let Some(hint) = hint {
         col = col.push(text(hint.to_string()).size(11.0).style(common::muted));
     }
@@ -2126,10 +2399,14 @@ fn list_editor<'a>(
                     .on_input(move |v| Message::EditManifest(ManifestEdit::SetItem(field, i, v)))
                     .size(14.0)
                     .width(Length::Fill),
-                button(text(bootstrap_icons::TRASH_3).font(fonts::BOOTSTRAP_ICONS).size(14.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::EditManifest(ManifestEdit::RemoveItem(field, i)))
-                    .padding(8),
+                button(
+                    text(bootstrap_icons::TRASH_3)
+                        .font(fonts::BOOTSTRAP_ICONS)
+                        .size(14.0)
+                )
+                .style(button_style::secondary)
+                .on_press(Message::EditManifest(ManifestEdit::RemoveItem(field, i)))
+                .padding(8),
             ]
             .spacing(8.0)
             .align_y(Vertical::Center),
@@ -2146,7 +2423,9 @@ fn list_editor<'a>(
 fn add_button<'a>(label: &str, msg: Message) -> Elem<'a> {
     button(
         row![
-            text(bootstrap_icons::PLUS_LG).font(fonts::BOOTSTRAP_ICONS).size(12.0),
+            text(bootstrap_icons::PLUS_LG)
+                .font(fonts::BOOTSTRAP_ICONS)
+                .size(12.0),
             text(label.to_string()).size(13.0),
         ]
         .spacing(6.0)
@@ -2178,7 +2457,9 @@ fn manifest_error<'a>(message: &str) -> Elem<'a> {
         right: 12.0,
     })
     .style(|theme: &crate::theme::Theme| container::Style {
-        background: Some(iced::Background::Color(theme.styles.text.error.scale_alpha(0.1))),
+        background: Some(iced::Background::Color(
+            theme.styles.text.error.scale_alpha(0.1),
+        )),
         border: iced::Border {
             color: theme.styles.text.error.scale_alpha(0.4),
             width: 1.0,
@@ -2270,7 +2551,10 @@ mod tests {
                     kind: ParamKind::Dropdown,
                     default: Some(json!("fast")),
                     options: vec![
-                        ParamOption { value: "fast".to_string(), label: None },
+                        ParamOption {
+                            value: "fast".to_string(),
+                            label: None,
+                        },
                         ParamOption {
                             value: "slow".to_string(),
                             label: Some("Careful".to_string()),
@@ -2326,8 +2610,14 @@ mod tests {
                             kind: ParamKind::Dropdown,
                             default: None,
                             options: vec![
-                                ParamOption { value: "road".to_string(), label: None },
-                                ParamOption { value: "portal".to_string(), label: None },
+                                ParamOption {
+                                    value: "road".to_string(),
+                                    label: None,
+                                },
+                                ParamOption {
+                                    value: "portal".to_string(),
+                                    label: None,
+                                },
                             ],
                             fields: Vec::new(),
                         },
@@ -2339,6 +2629,9 @@ mod tests {
                 read: vec!["$DATA/maps".to_string()],
                 write: vec!["$DATA".to_string()],
                 env: vec!["MYPKG_TOKEN".to_string()],
+                run: vec!["git".to_string()],
+                ffi: vec!["$DATA/native/helper.dll".to_string()],
+                sys: vec!["hostname".to_string(), "osRelease".to_string()],
                 import: ImportPolicy::Registries,
                 smudgy: SmudgyCapabilities {
                     create_aliases: true,
@@ -2370,7 +2663,10 @@ mod tests {
             Some(json!(18_446_744_073_709_551_615_u64))
         );
         // A real fractional number still takes the f64 path.
-        assert_eq!(parse_default(ParamKind::Number, "1.5").unwrap(), Some(json!(1.5)));
+        assert_eq!(
+            parse_default(ParamKind::Number, "1.5").unwrap(),
+            Some(json!(1.5))
+        );
         assert!(parse_default(ParamKind::Number, "not-a-number").is_err());
     }
 
@@ -2396,7 +2692,9 @@ mod tests {
             ..ManifestDraft::default()
         };
         let manifest = draft.to_manifest().expect("projects");
-        assert!(manifest.permissions.smudgy.mapper_read && manifest.permissions.smudgy.mapper_write);
+        assert!(
+            manifest.permissions.smudgy.mapper_read && manifest.permissions.smudgy.mapper_write
+        );
     }
 
     #[test]
@@ -2430,7 +2728,10 @@ mod tests {
             min_smudgy_version: "  ".to_string(),
             ..ManifestDraft::default()
         };
-        assert_eq!(blank.to_manifest().expect("projects").min_smudgy_version, None);
+        assert_eq!(
+            blank.to_manifest().expect("projects").min_smudgy_version,
+            None
+        );
         // A version (trimmed) -> kept.
         let ok = ManifestDraft {
             version: "1.0.0".to_string(),
@@ -2438,7 +2739,10 @@ mod tests {
             ..ManifestDraft::default()
         };
         assert_eq!(
-            ok.to_manifest().expect("projects").min_smudgy_version.as_deref(),
+            ok.to_manifest()
+                .expect("projects")
+                .min_smudgy_version
+                .as_deref(),
             Some("0.4.0")
         );
     }
@@ -2476,18 +2780,31 @@ mod tests {
     #[test]
     fn dropdown_requires_options_and_validates_default() {
         // No options -> rejected.
-        assert!(one_param_draft(ParamKind::Dropdown, |_| {}).to_manifest().is_err());
+        assert!(
+            one_param_draft(ParamKind::Dropdown, |_| {})
+                .to_manifest()
+                .is_err()
+        );
         // A default that isn't a declared option -> rejected.
         let bad_default = one_param_draft(ParamKind::Dropdown, |p| {
-            p.options = vec![OptionDraft { value: "a".to_string(), label: String::new() }];
+            p.options = vec![OptionDraft {
+                value: "a".to_string(),
+                label: String::new(),
+            }];
             p.default = "z".to_string();
         });
         assert!(bad_default.to_manifest().is_err());
         // Options + a matching default -> projects, with blank option rows dropped.
         let ok = one_param_draft(ParamKind::Dropdown, |p| {
             p.options = vec![
-                OptionDraft { value: "a".to_string(), label: "Ay".to_string() },
-                OptionDraft { value: String::new(), label: "blank".to_string() },
+                OptionDraft {
+                    value: "a".to_string(),
+                    label: "Ay".to_string(),
+                },
+                OptionDraft {
+                    value: String::new(),
+                    label: "blank".to_string(),
+                },
             ];
             p.default = "a".to_string();
         });
@@ -2501,8 +2818,14 @@ mod tests {
     fn duplicate_dropdown_option_values_are_rejected() {
         let draft = one_param_draft(ParamKind::Dropdown, |p| {
             p.options = vec![
-                OptionDraft { value: "a".to_string(), label: String::new() },
-                OptionDraft { value: "a".to_string(), label: "again".to_string() },
+                OptionDraft {
+                    value: "a".to_string(),
+                    label: String::new(),
+                },
+                OptionDraft {
+                    value: "a".to_string(),
+                    label: "again".to_string(),
+                },
             ];
         });
         assert!(draft.to_manifest().is_err());
@@ -2525,11 +2848,18 @@ mod tests {
     #[test]
     fn table_requires_a_keyed_column_and_rejects_duplicates() {
         // A single blank (keyless) column -> no usable columns -> rejected.
-        assert!(one_param_draft(ParamKind::Table, |_| {}).to_manifest().is_err());
+        assert!(
+            one_param_draft(ParamKind::Table, |_| {})
+                .to_manifest()
+                .is_err()
+        );
         // Duplicate column keys (case-insensitive) -> rejected.
         let dup = one_param_draft(ParamKind::Table, |p| {
             p.fields[0].key = "From".to_string();
-            p.fields.push(SubParamDraft { key: "from".to_string(), ..SubParamDraft::default() });
+            p.fields.push(SubParamDraft {
+                key: "from".to_string(),
+                ..SubParamDraft::default()
+            });
         });
         assert!(dup.to_manifest().is_err());
         // One keyed column + a trailing blank one -> the blank is dropped, the keyed one kept.
@@ -2565,9 +2895,15 @@ mod tests {
         let draft = ManifestDraft {
             version: "1.0.0".to_string(),
             params: vec![
-                ParamDraft { key: "x".to_string(), ..ParamDraft::default() },
+                ParamDraft {
+                    key: "x".to_string(),
+                    ..ParamDraft::default()
+                },
                 // Case-insensitive collision with the first.
-                ParamDraft { key: "X".to_string(), ..ParamDraft::default() },
+                ParamDraft {
+                    key: "X".to_string(),
+                    ..ParamDraft::default()
+                },
             ],
             ..ManifestDraft::default()
         };

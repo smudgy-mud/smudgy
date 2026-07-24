@@ -25,6 +25,8 @@ use std::{fs, io};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::persistence::write_atomic;
+
 pub use smudgy_script::{
     ImportPolicy, ParamKind, ParamOption, PackageManifest, PackageParameter, PackagePermissions,
     SmudgyCapabilities,
@@ -586,7 +588,8 @@ fn save_lock_in(dir: &Path, lock: &SharedPackageLock) -> Result<()> {
         .with_context(|| format!("Failed to create server dir {}", dir.display()))?;
     let path = dir.join(LOCK_FILE);
     let json = serde_json::to_string_pretty(lock).context("Failed to serialize package lock")?;
-    fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))
+    write_atomic(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +783,8 @@ fn save_param_values_in(dir: &Path, values: &PackageParamValues) -> Result<()> {
         .with_context(|| format!("Failed to create server dir {}", dir.display()))?;
     let path = dir.join(PARAMS_FILE);
     let json = serde_json::to_string_pretty(values).context("Failed to serialize option values")?;
-    fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))
+    write_atomic(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -886,7 +890,8 @@ fn save_secret_to_file(dir: &Path, slot: &str, value: &str) -> Result<()> {
     secrets.insert(slot.to_string(), hex_encode(&obfuscate(value.as_bytes())));
     let path = dir.join(SECRETS_FILE);
     let json = serde_json::to_string(&secrets).context("Failed to serialize package secrets")?;
-    fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))
+    write_atomic(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))
 }
 
 fn load_secret_from_file(dir: &Path, slot: &str) -> Option<String> {
@@ -904,7 +909,8 @@ fn remove_secret_from_file(dir: &Path, slot: &str) -> Result<()> {
     let mut secrets = load_secrets_file(dir);
     if secrets.remove(slot).is_some() {
         let json = serde_json::to_string(&secrets).context("Failed to serialize package secrets")?;
-        fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        write_atomic(&path, json.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
     }
     Ok(())
 }
@@ -912,6 +918,15 @@ fn remove_secret_from_file(dir: &Path, slot: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn use_temp_smudgy_home() {
+        static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        TEST_HOME.get_or_init(|| {
+            let dir = temp_dir("home");
+            crate::set_smudgy_home(dir.clone());
+            dir
+        });
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1206,6 +1221,7 @@ mod tests {
 
     #[test]
     fn record_consent_and_set_trusted_round_trip_through_the_lockfile() {
+        use_temp_smudgy_home();
         // The consent record and the trust flag persist and reload. A unique server
         // under the active home keeps this disjoint from other tests; cleaned up at the end.
         let server = format!("ConsentTrustTest-{}", std::process::id());
@@ -1218,12 +1234,17 @@ mod tests {
         assert_eq!(entry.consented_permissions, None, "a fresh install is un-consented");
         assert!(!entry.trusted, "a fresh install is untrusted");
 
-        // Recording consent stores the granted union verbatim and reloads equal.
+        // Recording consent stores the granted union verbatim and reloads equal — including the
+        // full-access-weight axes (`run`/`ffi`) and `sys`, which must survive the lockfile so the
+        // enforcement container and the manage-pane banner keep seeing what was actually granted.
         let granted = PackagePermissions {
             net: vec!["comms.coreclan.org:6379".into()],
             read: vec!["$DATA/maps".into()],
             write: Vec::new(),
             env: vec!["MYPKG_TOKEN".into()],
+            run: vec!["git".into()],
+            ffi: vec!["$DATA/native/helper.dll".into()],
+            sys: vec!["hostname".into()],
             import: ImportPolicy::Registries,
             smudgy: SmudgyCapabilities {
                 send: true,
@@ -1273,6 +1294,7 @@ mod tests {
 
     #[test]
     fn set_enabled_round_trips_through_the_lockfile() {
+        use_temp_smudgy_home();
         // A unique server under the active home, cleaned up at the end.
         let server = format!("EnabledTest-{}", std::process::id());
         let spec = "smudgy://wbk/mapper";
@@ -1299,6 +1321,7 @@ mod tests {
 
     #[test]
     fn reconcile_local_installs_prunes_folderless_and_migrates_to_the_nickname() {
+        use_temp_smudgy_home();
         // A unique server under the active home, cleaned up at the end.
         let server = format!("ReconcileTest-{}", std::process::id());
         let live = "smudgy://local/keeper";
@@ -1384,6 +1407,7 @@ mod tests {
 
     #[test]
     fn missing_required_params_tracks_only_unset_required_keys() {
+        use_temp_smudgy_home();
         // A unique server under the active home, cleaned up at the end.
         let server = format!("ParamGateTest-{}", std::process::id());
         let spec = "smudgy://wbk/needsconfig";
@@ -1418,6 +1442,7 @@ mod tests {
 
     #[test]
     fn clear_param_value_unsets_and_prunes_empty_entries() {
+        use_temp_smudgy_home();
         let server = format!("ParamClearTest-{}", std::process::id());
         let spec = "smudgy://wbk/needsconfig";
 

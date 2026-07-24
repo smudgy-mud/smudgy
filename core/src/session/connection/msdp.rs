@@ -1,4 +1,4 @@
-//! MSDP wire-format helpers (`docs/gmcp-mapping-plan.md` §9 item 3; protocol reference
+//! MSDP wire-format helpers (`docs/gmcp-mapping.md` §9 item 3; protocol reference
 //! <https://tintin.mudhalla.net/protocols/msdp/>): the variable-level layer over the telnet
 //! subnegotiation framing. One subnegotiation carries one or more variables as
 //! `VAR <name> VAL <value>` sequences, where a value is text, a `TABLE_OPEN … TABLE_CLOSE`
@@ -7,7 +7,7 @@
 //! session-side producer (store writes, catalogue) lives in `session::runtime::msdp`.
 //!
 //! Decoding is liberal by design, informed by live captures of real servers
-//! (`docs/gmcp-mapping-plan.md` §4.2):
+//! (`docs/gmcp-mapping.md` §4.2):
 //!
 //! - **all scalar values decode as JSON strings** — MSDP is stringly-typed on the wire
 //!   (Luminari sends vnums as ASCII digits); consumers parse what they need;
@@ -30,12 +30,12 @@ pub mod marker {
 }
 
 /// Cap on an inbound MSDP payload the client will process — same hardening rationale as
-/// the GMCP cap (`docs/gmcp-plan.md` §10): the server controls subnegotiation buffer
+/// the GMCP cap (`docs/gmcp.md` §10): the server controls subnegotiation buffer
 /// growth, so a payload past this is dropped (with a log) rather than parsed and stored.
 pub const MAX_INBOUND_PAYLOAD: usize = 256 * 1024;
 
 /// The variables the enable handshake `REPORT`s — the mapping-relevant baseline
-/// (`docs/gmcp-mapping-plan.md` §9 item 3): the composite `ROOM` table (Luminari-style)
+/// (`docs/gmcp-mapping.md` §9 item 3): the composite `ROOM` table (Luminari-style)
 /// plus the flat spellings a KaVir-snippet server sends instead. Reporting a variable a
 /// server doesn't define is specified as ignored, so the union is safe to request blind.
 pub const BASELINE_REPORTS: [&str; 6] = [
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn luminari_room_table_decodes_with_nested_tables() {
-        // The golden's composite ROOM shape (docs/gmcp-mapping-plan.md §4.2).
+        // The golden's composite ROOM shape (docs/gmcp-mapping.md §4.2).
         let payload = bytes(&[
             &[VAR],
             b"ROOM",

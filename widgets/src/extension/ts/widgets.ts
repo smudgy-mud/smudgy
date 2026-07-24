@@ -31,6 +31,12 @@ import {
     op_smudgy_widget_build_modal,
     op_smudgy_widget_build_text_editor,
     op_smudgy_widget_build_map_view,
+    op_smudgy_widget_build_canvas,
+    op_smudgy_widget_build_space,
+    op_smudgy_widget_build_checkbox,
+    op_smudgy_widget_build_radio,
+    op_smudgy_widget_build_tooltip,
+    op_smudgy_widget_build_table,
     op_smudgy_widget_extract_markdown_links,
     op_smudgy_widget_isolate_token,
     // The `smudgy_ops` (core) session ops, used to build `Markdown`'s default link handler and
@@ -63,6 +69,30 @@ function buildChildList(children: any) {
         op_smudgy_widget_push_element(list, child);
     }
     return list;
+}
+
+// The single-child slot shared by the wrapper components (Container/Scrollable/Modal/
+// Tooltip): exactly one child renders -- the first -- and an empty slot falls back to an
+// empty text element.
+function firstChild(children: any) {
+    const kids = normalizeChildren(children);
+    return kids.length > 0 ? kids[0] : op_smudgy_widget_build_text({}, []);
+}
+
+// A single-value content slot (a Tooltip tip, a Table cell/header): an element passes
+// through, text and binding tokens become a text run, and arrays/functions fail loudly
+// here -- past this point they would die opaquely at the element boundary, far from the
+// offending call site.
+function elementOrText(value: any, slot: string) {
+    if (Array.isArray(value) || typeof value === "function") {
+        throw new TypeError(
+            "widgets: " + slot + " must be text, a binding, or a single element",
+        );
+    }
+    if (typeof value === "object" && value !== null && !isBindingToken(value)) {
+        return value;
+    }
+    return op_smudgy_widget_build_text({}, textParts([value]));
 }
 
 // A store-binding token from smudgy:core's `handle.bind(path?)` -- plain frozen data carrying
@@ -153,11 +183,8 @@ function makeWidgets(creator: { kind: string } | string) {
     const Stack = (props: Record<string, any>, children: any) =>
         op_smudgy_widget_build_stack(buildChildList(children), props || {});
 
-    const Container = (props: Record<string, any>, children: any) => {
-        const kids = normalizeChildren(children);
-        const child = kids.length > 0 ? kids[0] : op_smudgy_widget_build_text({}, []);
-        return op_smudgy_widget_build_container(props || {}, child);
-    };
+    const Container = (props: Record<string, any>, children: any) =>
+        op_smudgy_widget_build_container(props || {}, firstChild(children));
 
     const Text = (props: Record<string, any>, children: any) =>
         op_smudgy_widget_build_text(props || {}, textParts(children));
@@ -165,17 +192,11 @@ function makeWidgets(creator: { kind: string } | string) {
     const ProgressBar = (props: Record<string, any>, _children?: any) =>
         op_smudgy_widget_build_progress_bar(props || {});
 
-    const Scrollable = (props: Record<string, any>, children: any) => {
-        const kids = normalizeChildren(children);
-        const child = kids.length > 0 ? kids[0] : op_smudgy_widget_build_text({}, []);
-        return op_smudgy_widget_build_scrollable(props || {}, child);
-    };
+    const Scrollable = (props: Record<string, any>, children: any) =>
+        op_smudgy_widget_build_scrollable(props || {}, firstChild(children));
 
-    const Modal = (props: Record<string, any>, children: any) => {
-        const kids = normalizeChildren(children);
-        const child = kids.length > 0 ? kids[0] : op_smudgy_widget_build_text({}, []);
-        return op_smudgy_widget_build_modal(props || {}, child, isolateToken);
-    };
+    const Modal = (props: Record<string, any>, children: any) =>
+        op_smudgy_widget_build_modal(props || {}, firstChild(children), isolateToken);
 
     const TextEditor = (props: Record<string, any>, _children?: any) => {
         // The editor's buffer is stateful UI-side; a live binding cannot drive it. Loud,
@@ -225,6 +246,127 @@ function makeWidgets(creator: { kind: string } | string) {
 
     const MapView = (_props?: Record<string, any>, _children?: any) =>
         op_smudgy_widget_build_map_view();
+
+    const Space = (props: Record<string, any>, _children?: any) =>
+        op_smudgy_widget_build_space(props || {});
+
+    const Checkbox = (props: Record<string, any>, children: any) => {
+        const p = props || {};
+        // The host delivers the new checked state as the string "true"/"false"; hand the
+        // script a real boolean.
+        const onToggle =
+            typeof p.onToggle === "function"
+                ? (raw: string) => p.onToggle(raw === "true")
+                : undefined;
+        return op_smudgy_widget_build_checkbox({ ...p, onToggle }, textParts(children), isolateToken);
+    };
+
+    const Radio = (props: Record<string, any>, children: any) => {
+        const p = props || {};
+        // Required: iced renders a radio enabled whenever it has a click handler, and the
+        // host must always give it one -- a silently inert-but-clickable radio would read
+        // as broken. Display-only one-of-N markers belong to Text/Canvas.
+        if (typeof p.onSelect !== "function") {
+            throw new TypeError("widgets: Radio requires an onSelect handler");
+        }
+        if (p.value === undefined || p.value === null) {
+            throw new TypeError("widgets: Radio requires a value");
+        }
+        // Selection compares by string spelling: a static `selected` coerces exactly like
+        // `value` does (so selected={5} matches value={5}); binding tokens pass through for
+        // the host to resolve with the same spelling.
+        const selected =
+            p.selected === undefined || p.selected === null || isBindingToken(p.selected)
+                ? p.selected
+                : String(p.selected);
+        return op_smudgy_widget_build_radio(
+            { ...p, value: String(p.value), selected },
+            textParts(children),
+            isolateToken,
+        );
+    };
+
+    const Tooltip = (props: Record<string, any>, children: any) => {
+        const p = props || {};
+        const target = firstChild(children);
+        // Conditional-friendly: a false/absent tip renders the target bare, so
+        // tip={cond && "hint"} toggles the tooltip without restructuring the tree.
+        if (p.tip === undefined || p.tip === null || p.tip === false) {
+            return target;
+        }
+        // A string/binding tip becomes a text run inside the tooltip's themed chrome; an
+        // element tip passes through chrome-free (the author's element is all there is).
+        const tipIsElement = typeof p.tip === "object" && !isBindingToken(p.tip);
+        const tip = elementOrText(p.tip, "a Tooltip tip");
+        const { tip: _tipProp, ...rest } = p;
+        return op_smudgy_widget_build_tooltip({ ...rest, tip_chrome: !tipIsElement }, target, tip);
+    };
+
+    // A cell/header slot: null/undefined is an empty cell (handy for conditional cells);
+    // everything else classifies through the shared element-or-text rule.
+    const contentElement = (value: any, slot: string) => {
+        if (value === undefined || value === null) {
+            return op_smudgy_widget_build_text({}, []);
+        }
+        return elementOrText(value, slot);
+    };
+
+    const Table = (props: Record<string, any>, _children?: any) => {
+        const p = props || {};
+        if (!Array.isArray(p.columns) || p.columns.length === 0) {
+            throw new TypeError("widgets: Table requires a non-empty columns array");
+        }
+        const columnCount = p.columns.length;
+        const headers = op_smudgy_widget_build_element_list();
+        for (const column of p.columns) {
+            const header = column === null || column === undefined ? undefined : column.header;
+            op_smudgy_widget_push_element(headers, contentElement(header, "a Table header"));
+        }
+        const cells = op_smudgy_widget_build_element_list();
+        const rows = p.rows === undefined || p.rows === null ? [] : p.rows;
+        if (!Array.isArray(rows)) {
+            throw new TypeError("widgets: Table rows must be an array of cell arrays");
+        }
+        for (const row of rows) {
+            if (!Array.isArray(row)) {
+                throw new TypeError("widgets: each Table row must be an array of cells");
+            }
+            // Overflow throws: with row-major cell indexing, extra cells would silently
+            // shift every later row one column left. Short rows pad with empty cells,
+            // loudly -- silent misalignment is worse than noise.
+            if (row.length > columnCount) {
+                throw new TypeError(
+                    "widgets: a Table row has " + row.length + " cells but there are only " +
+                        columnCount + " columns",
+                );
+            }
+            if (row.length < columnCount) {
+                console.warn(
+                    "widgets: a Table row has " + row.length + " cells; padding to " +
+                        columnCount + " columns",
+                );
+            }
+            for (let i = 0; i < columnCount; i++) {
+                op_smudgy_widget_push_element(cells, contentElement(row[i], "a Table cell"));
+            }
+        }
+        // Rows ride in the cells list, never in the prop bag; `columns` passes through
+        // whole -- the op reads only its layout keys (width/align_x/align_y) and ignores
+        // `header`, whose elements ride positionally in the headers list.
+        const { rows: _rowsProp, ...rest } = p;
+        return op_smudgy_widget_build_table(rest, headers, cells);
+    };
+
+    const Canvas = (props: Record<string, any>, _children?: any) => {
+        const p = props || {};
+        // The host delivers pointer events as one JSON string argument; hand the script a
+        // real object so the contract's CanvasPointerEvent is what the callback sees.
+        const onPointer =
+            typeof p.onPointer === "function"
+                ? (raw: string) => p.onPointer(JSON.parse(raw))
+                : undefined;
+        return op_smudgy_widget_build_canvas({ ...p, onPointer }, isolateToken);
+    };
 
     // Fragment: no iced analog -- it just yields its children for the parent to absorb
     // (via `normalizeChildren`'s flatten). It is a component `type` like the others.
@@ -285,6 +427,12 @@ function makeWidgets(creator: { kind: string } | string) {
         TextEditor,
         Button,
         MapView,
+        Canvas,
+        Space,
+        Checkbox,
+        Radio,
+        Tooltip,
+        Table,
         jsx,
         jsxs,
         Fragment,
@@ -316,5 +464,11 @@ if ((globalThis as any).__smudgy_user_api) {
         TextEditor: w.TextEditor,
         Button: w.Button,
         MapView: w.MapView,
+        Canvas: w.Canvas,
+        Space: w.Space,
+        Checkbox: w.Checkbox,
+        Radio: w.Radio,
+        Tooltip: w.Tooltip,
+        Table: w.Table,
     });
 }

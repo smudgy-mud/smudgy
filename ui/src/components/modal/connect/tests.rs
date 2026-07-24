@@ -64,6 +64,7 @@ fn test_submit_server_form_create_valid() {
         name: "MyMUD".to_string(),
         host: "mud.example.com".to_string(),
         port: "4000".to_string(),
+        ..ServerConfigFormData::default()
     };
 
     // The task is not asserted directly. Its effect is tested via Message::ServerCreated.
@@ -81,6 +82,7 @@ fn test_submit_server_form_create_invalid_port() {
         name: "MyMUD".to_string(),
         host: "mud.example.com".to_string(),
         port: "invalid_port".to_string(),
+        ..ServerConfigFormData::default()
     };
 
     // The task is not asserted directly. No task should be spawned.
@@ -102,6 +104,7 @@ fn test_submit_server_form_create_empty_name() {
         name: "".to_string(),
         host: "mud.example.com".to_string(),
         port: "4000".to_string(),
+        ..ServerConfigFormData::default()
     };
 
     let (_task, event) = update(&mut state, Message::SubmitServerForm);

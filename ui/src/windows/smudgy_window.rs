@@ -3,17 +3,18 @@ use std::sync::Arc;
 use iced::{
     Event as IcedEvent, Length, Point, Size, Subscription, Task,
     alignment::{Horizontal, Vertical},
-    keyboard, window,
+    keyboard,
     widget::{
         PaneGrid, center, column, container, mouse_area, opaque, operation, pane_grid, row, stack,
         svg, text,
     },
+    window,
 };
+use smudgy_cloud::{AreaId, Mapper};
 use smudgy_core::session::SessionId;
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection, TitleBarPolicy,
 };
-use smudgy_cloud::{AreaId, Mapper};
 
 use crate::{
     assets,
@@ -282,18 +283,16 @@ impl SmudgyWindow {
         // which case the hidden state is ignored (an all-hidden window would
         // otherwise render the empty connect state over live sessions).
         let hidden = &self.hidden_panes;
-        let show_all = self.toolbar_expanded
-            || self.layout.panes().iter().all(|slot| hidden.contains(slot));
+        let show_all =
+            self.toolbar_expanded || self.layout.panes().iter().all(|slot| hidden.contains(slot));
         let built = if show_all {
             self.layout
                 .build(self.grid_area.get(), GRID_SPACING, GRID_MIN_SIZE)
         } else {
-            self.layout.build_filtered(
-                self.grid_area.get(),
-                GRID_SPACING,
-                GRID_MIN_SIZE,
-                |slot| !hidden.contains(&slot),
-            )
+            self.layout
+                .build_filtered(self.grid_area.get(), GRID_SPACING, GRID_MIN_SIZE, |slot| {
+                    !hidden.contains(&slot)
+                })
         };
         match built {
             Some((config, mirror)) => {
@@ -525,12 +524,12 @@ impl SmudgyWindow {
             return;
         }
         let (axis, new_first) = direction_axis(placement.direction);
-        let sizing = placement.size_px.map_or(SplitSizing::Ratio(0.5), |px| {
-            SplitSizing::Px {
+        let sizing = placement
+            .size_px
+            .map_or(SplitSizing::Ratio(0.5), |px| SplitSizing::Px {
                 px,
                 sized_first: new_first,
-            }
-        });
+            });
         let reference = PaneRef {
             session_id,
             key: placement.reference,
@@ -539,7 +538,9 @@ impl SmudgyWindow {
             session_id,
             key: MAIN_PANE_KEY,
         };
-        let placed = self.layout.split_leaf(reference, axis, new_first, sizing, slot)
+        let placed = self
+            .layout
+            .split_leaf(reference, axis, new_first, sizing, slot)
             || self.layout.split_leaf(main, axis, new_first, sizing, slot);
         if !placed {
             // Neither the reference nor the session's main pane is here (the
@@ -740,7 +741,8 @@ impl SmudgyWindow {
                     pane_grid::Edge::Left => self.layout.insert_cluster_front(dragged),
                     pane_grid::Edge::Right => self.layout.push_cluster(dragged),
                     pane_grid::Edge::Top => {
-                        self.layout.wrap_all(pane_grid::Axis::Horizontal, true, dragged);
+                        self.layout
+                            .wrap_all(pane_grid::Axis::Horizontal, true, dragged);
                     }
                     pane_grid::Edge::Bottom => {
                         self.layout
@@ -820,12 +822,8 @@ impl SmudgyWindow {
                     self.modal = Some(new_modal);
                     Update::with_task(modal_init_task.map(Message::ModalMessage))
                 }
-                toolbar::Message::SettingsPressed => {
-                    Update::with_event(Event::OpenSettingsWindow)
-                }
-                toolbar::Message::DragWindow => {
-                    Update::with_task(window::drag(self.window_id))
-                }
+                toolbar::Message::SettingsPressed => Update::with_event(Event::OpenSettingsWindow),
+                toolbar::Message::DragWindow => Update::with_task(window::drag(self.window_id)),
                 toolbar::Message::MinimizePressed => {
                     Update::with_task(window::minimize(self.window_id, true))
                 }
@@ -865,9 +863,7 @@ impl SmudgyWindow {
                                 .map(|mapper| {
                                     Update::with_event(Event::CreateNewMapEditorWindow {
                                         mapper: mapper.clone(),
-                                        server_name: Arc::new(
-                                            active_session.server_name.clone(),
-                                        ),
+                                        server_name: Arc::new(active_session.server_name.clone()),
                                     })
                                 })
                                 .unwrap_or_else(Update::none)
@@ -1215,10 +1211,9 @@ impl SmudgyWindow {
                             .padding(2)
                             .style(bar_style)
                     } else {
-                        let controls = container(
-                            row![visibility_button].spacing(8).align_y(Vertical::Center),
-                        )
-                        .padding(controls_padding);
+                        let controls =
+                            container(row![visibility_button].spacing(8).align_y(Vertical::Center))
+                                .padding(controls_padding);
                         pane_grid::TitleBar::new(session.script_pane_title(slot.key).map(wrap))
                             .controls(pane_grid::Controls::new(controls))
                             .always_show_controls()
@@ -1263,12 +1258,10 @@ impl SmudgyWindow {
                     text("Choose a server and profile to connect.")
                         .font(assets::fonts::GEIST_VF)
                         .style(theme::builtins::text::muted),
-                    iced::widget::button(
-                        text("Connect to a server").font(assets::fonts::GEIST_VF)
-                    )
-                    .style(theme::builtins::button::primary)
-                    .padding([10, 22])
-                    .on_press(Message::ToolbarAction(toolbar::Message::ConnectPressed)),
+                    iced::widget::button(text("Connect to a server").font(assets::fonts::GEIST_VF))
+                        .style(theme::builtins::button::primary)
+                        .padding([10, 22])
+                        .on_press(Message::ToolbarAction(toolbar::Message::ConnectPressed)),
                 ]
                 .spacing(16)
                 .align_x(Horizontal::Center),
@@ -1308,8 +1301,10 @@ impl SmudgyWindow {
             snapshot.show_upgrade_banner().then(|| {
                 container(
                     row![
-                        text("smudgy is out of date — a newer version is required for some features.")
-                            .size(13),
+                        text(
+                            "smudgy is out of date — a newer version is required for some features."
+                        )
+                        .size(13),
                         iced::widget::button(
                             text(format!("Get it at {}", crate::DOWNLOAD_URL)).size(12),
                         )
@@ -1390,12 +1385,10 @@ impl SmudgyWindow {
             stack(vec![
                 main_layout,
                 opaque(
-                    mouse_area(
-                        center(opaque(popup)).style(theme::builtins::container::overlay),
-                    )
-                    // Click the backdrop to dismiss — the gentle, session-only
-                    // dismissal (not the permanent "skip this version").
-                    .on_press(Message::DismissUpgrade),
+                    mouse_area(center(opaque(popup)).style(theme::builtins::container::overlay))
+                        // Click the backdrop to dismiss — the gentle, session-only
+                        // dismissal (not the permanent "skip this version").
+                        .on_press(Message::DismissUpgrade),
                 ),
             ])
             .into()

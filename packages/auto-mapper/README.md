@@ -17,6 +17,6 @@ Maps as you explore, from the room data your game already sends. Works with GMCP
 
 Development notes (not user docs): this is the first-party reference consumer of the
 ephemeral map tier, `externalId` room identity, and the dual-protocol room-data producers
-(`docs/gmcp-mapping-plan.md` §5.3). It runs sandboxed under
+(`docs/gmcp-mapping.md` §5.3). It runs sandboxed under
 `interop:read + mapper:write + automations:aliases + session:echo + gmcp:send`; the e2e
 coverage lives in `core/tests/auto_mapper_package.rs`.

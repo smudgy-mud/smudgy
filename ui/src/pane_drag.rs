@@ -1,7 +1,7 @@
 //! Cross-window pane drag support: daemon-side window tracking and the
 //! geometry that turns a pane_grid `DragEvent::Canceled` into a no-op
 //! re-dock, a cross-window transplant, or a tear-out (§2.9 of
-//! `docs/flexible-panes-plan.md`).
+//! `docs/panes.md`).
 //!
 //! pane_grid handles in-window drags natively; everything here exists because
 //! a drag released outside the source grid surfaces only as `Canceled` in the
@@ -208,7 +208,10 @@ pub fn window_rect(track: &TrackedWindow) -> Option<Rectangle> {
     let origin = track.origin?;
     Some(Rectangle::new(
         Point::new(origin.x * track.scale, origin.y * track.scale),
-        Size::new(track.size.width * track.scale, track.size.height * track.scale),
+        Size::new(
+            track.size.width * track.scale,
+            track.size.height * track.scale,
+        ),
     ))
 }
 
@@ -303,11 +306,23 @@ mod tests {
     #[test]
     fn region_thirds_match_pane_grid_order() {
         let bounds = Rectangle::new(Point::new(0.0, 0.0), Size::new(300.0, 300.0));
-        assert_eq!(region_for(bounds, Point::new(50.0, 150.0)), DropRegion::Left);
-        assert_eq!(region_for(bounds, Point::new(250.0, 150.0)), DropRegion::Right);
+        assert_eq!(
+            region_for(bounds, Point::new(50.0, 150.0)),
+            DropRegion::Left
+        );
+        assert_eq!(
+            region_for(bounds, Point::new(250.0, 150.0)),
+            DropRegion::Right
+        );
         assert_eq!(region_for(bounds, Point::new(150.0, 50.0)), DropRegion::Top);
-        assert_eq!(region_for(bounds, Point::new(150.0, 250.0)), DropRegion::Bottom);
-        assert_eq!(region_for(bounds, Point::new(150.0, 150.0)), DropRegion::Center);
+        assert_eq!(
+            region_for(bounds, Point::new(150.0, 250.0)),
+            DropRegion::Bottom
+        );
+        assert_eq!(
+            region_for(bounds, Point::new(150.0, 150.0)),
+            DropRegion::Center
+        );
         // x wins over y in the corners, exactly like pane_grid.
         assert_eq!(region_for(bounds, Point::new(50.0, 50.0)), DropRegion::Left);
     }
@@ -331,7 +346,11 @@ mod tests {
 
     #[test]
     fn mru_orders_focus_then_stragglers() {
-        let (a, b, c) = (window::Id::unique(), window::Id::unique(), window::Id::unique());
+        let (a, b, c) = (
+            window::Id::unique(),
+            window::Id::unique(),
+            window::Id::unique(),
+        );
         let mut tracker = WindowTracker::default();
         tracker.apply(a, TrackEvent::Resized(Size::new(1.0, 1.0)));
         tracker.apply(b, TrackEvent::Resized(Size::new(1.0, 1.0)));

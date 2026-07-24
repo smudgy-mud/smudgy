@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use iced::Task;
 use iced::alignment::Vertical;
 use iced::widget::{
-    Column, button, column, container, markdown, pick_list, radio, rich_text, row, scrollable, span,
-    text, text_input,
+    Column, button, column, container, markdown, pick_list, radio, rich_text, row, scrollable,
+    span, text, text_input,
 };
 use iced::{Color, Font, Length, Padding};
 
@@ -97,13 +97,17 @@ impl ParamConfig {
         let mut secret_stored = HashSet::new();
         for param in &params {
             if is_secret_string(param) {
-                if shared_packages::load_secret_param(server_name, &specifier, &param.key).is_some() {
+                if shared_packages::load_secret_param(server_name, &specifier, &param.key).is_some()
+                {
                     secret_stored.insert(param.key.clone());
                 }
                 values.insert(param.key.clone(), ParamValueState::Text(String::new()));
             } else {
                 let stored = shared_packages::get_param_value(server_name, &specifier, &param.key);
-                values.insert(param.key.clone(), param_values::seed(param, stored.as_ref()));
+                values.insert(
+                    param.key.clone(),
+                    param_values::seed(param, stored.as_ref()),
+                );
             }
         }
         Self {
@@ -183,9 +187,15 @@ fn secret_field_row<'a>(
         _ => "",
     };
     let key = param.key.clone();
-    let input = text_input(placeholder, value).secure(true).on_input(move |v| {
-        Message::ParamValueEdit(target, key.clone(), ParamValueEdit::Scalar(ScalarEdit::Text(v)))
-    });
+    let input = text_input(placeholder, value)
+        .secure(true)
+        .on_input(move |v| {
+            Message::ParamValueEdit(
+                target,
+                key.clone(),
+                ParamValueEdit::Scalar(ScalarEdit::Text(v)),
+            )
+        });
     let mut field = row![
         container(text(label).size(13.0)).width(Length::Fixed(140.0)),
         input,
@@ -641,10 +651,13 @@ async fn resolve_required_closure(
     while let Some((requirer, edge)) = frontier.pop() {
         let key = (edge.owner.clone(), edge.name.clone());
         // Record this edge's range for the conflict computation.
-        requirer_ranges.entry(key.clone()).or_default().push(RequirerRange {
-            requirer: requirer.clone(),
-            range: edge.range.clone(),
-        });
+        requirer_ranges
+            .entry(key.clone())
+            .or_default()
+            .push(RequirerRange {
+                requirer: requirer.clone(),
+                range: edge.range.clone(),
+            });
         // A back-edge to something already walked (incl. the root) is a cycle — warn, don't block.
         if walked.contains(&key) {
             let line = format!(
@@ -767,7 +780,9 @@ async fn plan_required_root(
     // An already-installed root whose version satisfies every range is reused untouched.
     if let Some(version) = &existing
         && let Ok(parsed) = semver::Version::parse(version)
-        && ranges.iter().all(|r| range_admits(r.range.as_deref(), &parsed))
+        && ranges
+            .iter()
+            .all(|r| range_admits(r.range.as_deref(), &parsed))
     {
         let Ok(wire) = client.resolve_package(owner, name, Some(version)).await else {
             return Ok(None);
@@ -853,7 +868,9 @@ fn highest_version_satisfying_all(
         let Ok(parsed) = semver::Version::parse(&item.version) else {
             continue;
         };
-        if ranges.iter().all(|r| range_admits(r.range.as_deref(), &parsed))
+        if ranges
+            .iter()
+            .all(|r| range_admits(r.range.as_deref(), &parsed))
             && best.as_ref().is_none_or(|b| parsed > *b)
         {
             best = Some(parsed);
@@ -878,7 +895,10 @@ async fn resolve_requires_of(
             continue;
         };
         let pinned = pkg.pinned_version().map(str::to_string);
-        let Ok(wire) = client.resolve_package(&owner, &name, pinned.as_deref()).await else {
+        let Ok(wire) = client
+            .resolve_package(&owner, &name, pinned.as_deref())
+            .await
+        else {
             continue;
         };
         let requires: Vec<String> = manifest_requires(&wire)
@@ -943,7 +963,11 @@ async fn closure_permission_union(
         }
     };
 
-    seen.insert((root.owner_nickname.clone(), root.name.clone(), root.version.clone()));
+    seen.insert((
+        root.owner_nickname.clone(),
+        root.name.clone(),
+        root.version.clone(),
+    ));
     fold(root, &mut union, &mut floor);
     for dep in &root.dependencies {
         stack.push((
@@ -975,12 +999,31 @@ async fn closure_permission_union(
     (union, floor)
 }
 
+/// How dangerous one granted permission is — the tier that drives the consent/pane styling, so
+/// the display conveys *risk*, not just a flat list (the deno-style framing: some grants are
+/// scoped capabilities, some are the whole computer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PermissionRisk {
+    /// A scoped grant that does what the line says and nothing more.
+    Normal,
+    /// Elevated exposure (reading files outside the package's own data folder, downloading
+    /// arbitrary web code to run) — flagged amber, but still contained by the sandbox.
+    Caution,
+    /// Sandbox-escape-equivalent: subprocesses (`run`), native code (`ffi`), or writes outside
+    /// `$DATA`. A subprocess or native library runs with the user's full privileges, and an
+    /// outside write can rewrite config/scripts/other packages — whatever the line says, the
+    /// honest summary is "effectively full access".
+    Critical,
+}
+
 /// A single "can do" / "cannot do" line in the consent enumeration.
 struct PermissionLine {
     /// The capability label (e.g. `"connect to"`, `"read"`), or the categorical denial.
     head: String,
-    /// The specific target (host/path/var), when the line lists one.
+    /// The specific target (host/path/var/program), when the line lists one.
     detail: Option<String>,
+    /// How this line should be framed (colors + the full-access banner roll-up).
+    risk: PermissionRisk,
 }
 
 /// The `import` "can do" line for the consent enumeration — one line whose wording follows the
@@ -993,9 +1036,10 @@ fn import_can_line(policy: ImportPolicy) -> Option<&'static str> {
     }
 }
 
-/// The "this package will be able to" lines for a granted union: one per host/path/var.
+/// The "this package will be able to" lines for a granted union: one per host/path/var/program.
 /// Empty when the package asks for nothing — callers phrase the no-access case in context (see
-/// `sandbox_summary`).
+/// `sandbox_summary`). Lines carry a [`PermissionRisk`] so the rows and the callers' full-access
+/// banner ([`union_risk`]) agree on what's scoped and what's effectively unlimited.
 fn permission_can_lines(perms: &PackagePermissions) -> Vec<PermissionLine> {
     let mut lines = Vec::new();
     // Hosts dedup case-insensitively (DNS is case-insensitive) so the list shows no near-dupes,
@@ -1006,32 +1050,92 @@ fn permission_can_lines(perms: &PackagePermissions) -> Vec<PermissionLine> {
             lines.push(PermissionLine {
                 head: "connect to".to_string(),
                 detail: Some(host.clone()),
+                risk: PermissionRisk::Normal,
             });
         }
     }
     // `import` is a separate axis from `net`: it downloads third-party code to RUN (sandboxed, but
     // not visible in the package source you reviewed), rather than opening a data connection.
+    // Registry code is at least published/auditable; "anywhere on the web" is not — amber.
     if let Some(head) = import_can_line(perms.import) {
-        lines.push(PermissionLine { head: head.to_string(), detail: None });
-    }
-    // Only advertise read/write paths the engine will actually grant: a `$DATA/..` entry is dropped
-    // by the enforcement guardrail (it would escape the data dir), so it isn't a real capability.
-    for path in perms.read.iter().filter(|p| path_grant_enforced(p)) {
         lines.push(PermissionLine {
-            head: "read".to_string(),
+            head: head.to_string(),
+            detail: None,
+            risk: if perms.import == ImportPolicy::Any {
+                PermissionRisk::Caution
+            } else {
+                PermissionRisk::Normal
+            },
+        });
+    }
+    // Only advertise read/write/ffi paths the engine will actually grant: a `$DATA/..` entry is
+    // dropped by the enforcement guardrail (it would escape the data dir), so it isn't a real
+    // capability. A path OUTSIDE the package's own data folder changes the line's meaning: a read
+    // reaches the user's files (privacy), a write can rewrite config/scripts/other packages — the
+    // unbox — so it is flagged, not listed as if it were a scoped grant.
+    for path in perms.read.iter().filter(|p| path_grant_enforced(p)) {
+        let scoped = data_scoped(path);
+        lines.push(PermissionLine {
+            head: if scoped {
+                "read"
+            } else {
+                "read (outside its data folder)"
+            }
+            .to_string(),
             detail: Some(pretty_path(path)),
+            risk: if scoped {
+                PermissionRisk::Normal
+            } else {
+                PermissionRisk::Caution
+            },
         });
     }
     for path in perms.write.iter().filter(|p| path_grant_enforced(p)) {
+        let scoped = data_scoped(path);
         lines.push(PermissionLine {
-            head: "write".to_string(),
+            head: if scoped {
+                "write"
+            } else {
+                "write (outside its data folder)"
+            }
+            .to_string(),
             detail: Some(pretty_path(path)),
+            risk: if scoped {
+                PermissionRisk::Normal
+            } else {
+                PermissionRisk::Critical
+            },
         });
     }
     for var in &perms.env {
         lines.push(PermissionLine {
             head: "read environment variable".to_string(),
             detail: Some(var.clone()),
+            risk: PermissionRisk::Normal,
+        });
+    }
+    // Subprocesses and native libraries run OUTSIDE the sandbox with your full privileges —
+    // always critical, however narrow the listed target looks.
+    for program in &perms.run {
+        lines.push(PermissionLine {
+            head: "run the program".to_string(),
+            detail: Some(program.clone()),
+            risk: PermissionRisk::Critical,
+        });
+    }
+    for path in perms.ffi.iter().filter(|p| path_grant_enforced(p)) {
+        lines.push(PermissionLine {
+            head: "load the native library".to_string(),
+            detail: Some(pretty_path(path)),
+            risk: PermissionRisk::Critical,
+        });
+    }
+    // System details roll into one line (fingerprinting-grade info, not a capability).
+    if !perms.sys.is_empty() {
+        lines.push(PermissionLine {
+            head: "read system details".to_string(),
+            detail: Some(perms.sys.join(", ")),
+            risk: PermissionRisk::Normal,
         });
     }
     // The granted smudgy op-capabilities (one row each, no target list).
@@ -1044,6 +1148,96 @@ fn cap_line(head: &str) -> PermissionLine {
     PermissionLine {
         head: head.to_string(),
         detail: None,
+        risk: PermissionRisk::Normal,
+    }
+}
+
+/// Whether a `read`/`write`/`ffi` entry stays inside the package's OWN data folder (the `$DATA`
+/// placeholder). Callers filter `..`-escapes with [`path_grant_enforced`] first, so a `$DATA/…`
+/// entry seen here really is contained; a `$DATA`-lookalike (`$DATABASE`) or an absolute path is
+/// not. Outside-`$DATA` grants are what change a file permission from "its own storage" to "your
+/// computer" — the risk cliff the consent framing keys on. `pub(super)` so the manifest editor
+/// warns the author on the same predicate installers will be warned on.
+pub(super) fn data_scoped(entry: &str) -> bool {
+    let Some(rest) = entry.trim().strip_prefix("$DATA") else {
+        return false;
+    };
+    matches!(rest.chars().next(), None | Some('/' | '\\'))
+}
+
+/// The highest [`PermissionRisk`] across a union's lines — what decides whether a pane shows the
+/// full-access banner over the enumeration.
+fn union_risk(perms: &PackagePermissions) -> PermissionRisk {
+    permission_can_lines(perms)
+        .iter()
+        .map(|line| line.risk)
+        .max()
+        .unwrap_or(PermissionRisk::Normal)
+}
+
+/// The specific sandbox-escape grants in a union, phrased for the full-access banner ("it can
+/// {a}, {b}"). Empty iff the union has no [`PermissionRisk::Critical`] line.
+fn escape_reasons(perms: &PackagePermissions) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if !perms.run.is_empty() {
+        reasons.push("run other programs");
+    }
+    if perms.ffi.iter().any(|p| path_grant_enforced(p)) {
+        reasons.push("load native code");
+    }
+    if perms
+        .write
+        .iter()
+        .any(|p| path_grant_enforced(p) && !data_scoped(p))
+    {
+        reasons.push("write files outside its own data folder");
+    }
+    reasons
+}
+
+/// The "effectively full access" banner shown over a permission enumeration whose union contains a
+/// sandbox-escape grant ([`escape_reasons`]). One honest paragraph instead of letting a
+/// scoped-looking line (`run git`) read like a scoped grant: programs it runs, native code it
+/// loads, and files it writes outside its data folder are NOT sandboxed. `None` when the union has
+/// no critical grant.
+fn full_access_banner<'a>(perms: &PackagePermissions) -> Option<Elem<'a>> {
+    let reasons = escape_reasons(perms);
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(
+        container(
+            column![
+                row![
+                    text("\u{26A0}").size(14.0).style(common::danger),
+                    text("Effectively full access").size(14.0).style(common::danger),
+                ]
+                .spacing(8.0)
+                .align_y(Vertical::Center),
+                text(format!(
+                    "Because this package can {}, which are outside of its sandbox in smudgy, it \
+                    will be able to affect your computer in ways the sandbox in smudgy cannot offer protection from. \
+                    Be certain that you trust it before enabling it.",
+                    join_reasons(&reasons)
+                ))
+                .size(12.0),
+            ]
+            .spacing(6.0),
+        )
+        .padding(12.0)
+        .width(Length::Fill)
+        .style(common::banner_style)
+        .into(),
+    )
+}
+
+/// Join escape reasons into prose: `a`, `a and b`, `a, b, and c`.
+fn join_reasons(reasons: &[&str]) -> String {
+    match reasons {
+        [one] => (*one).to_string(),
+        [a, b] => format!("{a} and {b}"),
+        [head @ .., last] => format!("{}, and {last}", head.join(", ")),
+        [] => String::new(),
     }
 }
 
@@ -1058,9 +1252,7 @@ fn smudgy_can_lines(caps: &SmudgyCapabilities) -> Vec<PermissionLine> {
         out.push(cap_line("Create aliases"));
     }
     if caps.create_triggers {
-        out.push(cap_line(
-            "Create triggers",
-        ));
+        out.push(cap_line("Create triggers"));
     }
     if let Some(line) = send_can_line(caps) {
         out.push(cap_line(&line));
@@ -1093,6 +1285,12 @@ fn smudgy_can_lines(caps: &SmudgyCapabilities) -> Vec<PermissionLine> {
     if caps.gmcp_send {
         out.push(cap_line(
             "Send GMCP messages to the game and manage GMCP modules",
+        ));
+    }
+    if caps.input {
+        out.push(cap_line(
+            "See and rewrite what you type in the command input, including \
+             submitting commands and switching it into password mode",
         ));
     }
     out
@@ -1168,6 +1366,9 @@ fn smudgy_cannot_lines(caps: &SmudgyCapabilities) -> Vec<String> {
     if !caps.gmcp_send {
         out.push("send GMCP messages to the game".to_string());
     }
+    if !caps.input {
+        out.push("see or change what you type in the command input".to_string());
+    }
     out
 }
 
@@ -1177,21 +1378,38 @@ fn sandbox_summary() -> &'static str {
     "Runs fully sandboxed — no access to your files, network, or system."
 }
 
-/// The capabilities a sandboxed package can *never* be granted, regardless of its manifest —
-/// the part of the guarantee that holds even for a package that asks for everything grantable.
-/// (Note the second line is about *running state*, not code: a sandboxed package may still
-/// `import "smudgy://…"` its own declared dependencies — those load into its own isolate — it just
-/// can't reach into the data/state of your other packages or scripts.)
-fn never_grantable_lines() -> [&'static str; 2] {
-    [
-        "load native code / run other programs",
-        "read or change the data of your other packages or scripts",
-    ]
+/// The sandbox guarantees that still HOLD for this union — the closing rows of the "cannot"
+/// list. These used to be unconditional ("never grantable"), but `run`/`ffi` and outside-`$DATA`
+/// file grants are now declarable, so each guarantee is computed from the union rather than
+/// promised falsely:
+///
+/// - "native code / other programs" holds only while `run` and `ffi` are empty;
+/// - "your other packages' data" holds only while, additionally, every enforced file grant stays
+///   inside the package's own `$DATA` (an absolute-path read/write could reach another package's
+///   storage — and a subprocess could reach anything). Note this line is about *running state*,
+///   not code: a sandboxed package may still `import "smudgy://…"` its own declared dependencies —
+///   those load into its own isolate.
+fn sandbox_guarantee_lines(perms: &PackagePermissions) -> Vec<&'static str> {
+    let mut lines = Vec::new();
+    let no_native = perms.run.is_empty() && !perms.ffi.iter().any(|p| path_grant_enforced(p));
+    if no_native {
+        lines.push("load native code / run other programs");
+    }
+    let fs_contained = perms
+        .read
+        .iter()
+        .chain(&perms.write)
+        .filter(|p| path_grant_enforced(p))
+        .all(|p| data_scoped(p));
+    if no_native && fs_contained {
+        lines.push("read or change the data of your other packages or scripts");
+    }
+    lines
 }
 
 /// The "this package will NOT be able to" lines for a sandboxed package: the categorical
-/// denial for each empty deno capability, plus the always-true never-grantable rows that make the
-/// sandbox guarantee legible.
+/// denial for each empty deno capability, plus the still-true guarantee rows
+/// ([`sandbox_guarantee_lines`]) that make the sandbox legible.
 fn permission_cannot_lines(perms: &PackagePermissions) -> Vec<String> {
     let mut lines = Vec::new();
     // The net assurance must not over-promise. A package granted `import` (but not `net`) can still
@@ -1225,9 +1443,16 @@ fn permission_cannot_lines(perms: &PackagePermissions) -> Vec<String> {
     if perms.env.is_empty() {
         lines.push("read environment variables".to_string());
     }
+    if perms.sys.is_empty() {
+        lines.push("read details about your computer (hostname, OS, …)".to_string());
+    }
     // The un-granted smudgy op-capabilities (send/echo/automations/display/mapper/widgets).
     lines.extend(smudgy_cannot_lines(&perms.smudgy));
-    lines.extend(never_grantable_lines().iter().map(|s| (*s).to_string()));
+    lines.extend(
+        sandbox_guarantee_lines(perms)
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
     lines
 }
 
@@ -1248,9 +1473,9 @@ fn path_grant_enforced(entry: &str) -> bool {
         return true;
     };
     let sub = match rest.chars().next() {
-        None => return true,                              // bare `$DATA`
+        None => return true, // bare `$DATA`
         Some('/' | '\\') => rest.trim_start_matches(['/', '\\']),
-        Some(_) => return true,                           // `$DATABASE` etc. — not the placeholder
+        Some(_) => return true, // `$DATABASE` etc. — not the placeholder
     };
     !sub.split(['/', '\\']).any(|component| component == "..")
 }
@@ -1307,9 +1532,7 @@ impl AutomationsWindow {
             // Seed the enable intent from the persisted lockfile flag (the engine's source of
             // truth), so a package installed "don't enable" — or toggled off — shows disabled and
             // is held out of execution until enabled.
-            self.graph
-                .intent
-                .insert(pkg.specifier.clone(), pkg.enabled);
+            self.graph.intent.insert(pkg.specifier.clone(), pkg.enabled);
             if let Some(v) = &pkg.last_resolved_version {
                 self.graph.resolved.insert(pkg.specifier.clone(), v.clone());
             }
@@ -1350,7 +1573,9 @@ impl AutomationsWindow {
             let client = self.package_client();
             tasks.push(Task::perform(
                 async move {
-                    let resolved = client.resolve_package(&owner, &name, pinned.as_deref()).await?;
+                    let resolved = client
+                        .resolve_package(&owner, &name, pinned.as_deref())
+                        .await?;
                     // Fold the newest resolvable version's closure union too, so the tree can flag
                     // an update that's blocked because it needs more permissions than were granted.
                     // (The version floor isn't surfaced in the graph; the manage pane covers it.)
@@ -1424,7 +1649,11 @@ impl AutomationsWindow {
             return Update::none();
         }
         self.graph.intent.insert(spec.clone(), new_enabled);
-        if let Some(pkg) = self.installed_packages.iter_mut().find(|p| p.specifier == spec) {
+        if let Some(pkg) = self
+            .installed_packages
+            .iter_mut()
+            .find(|p| p.specifier == spec)
+        {
             pkg.enabled = new_enabled;
         }
         let after = self.effective_set();
@@ -1440,7 +1669,10 @@ impl AutomationsWindow {
             if dropped.is_empty() {
                 format!("Disabled {name}.")
             } else {
-                format!("Disabled {name} + {} (no longer required).", dropped.join(", "))
+                format!(
+                    "Disabled {name} + {} (no longer required).",
+                    dropped.join(", ")
+                )
             }
         } else {
             let added: Vec<String> = after
@@ -1471,11 +1703,19 @@ impl AutomationsWindow {
         target_spec: String,
         siblings: Vec<String>,
     ) -> Update<Message, Event> {
-        let in_lock = self.installed_packages.iter().any(|p| p.specifier == target_spec);
+        let in_lock = self
+            .installed_packages
+            .iter()
+            .any(|p| p.specifier == target_spec);
         let result = if in_lock {
             shared_packages::set_enabled(&self.server_name, &target_spec, true)
         } else {
-            shared_packages::install_package(&self.server_name, &target_spec, UpdateMode::Auto, true)
+            shared_packages::install_package(
+                &self.server_name,
+                &target_spec,
+                UpdateMode::Auto,
+                true,
+            )
         };
         if let Err(e) = result {
             return Update::with_task(self.show_toast(format!("Couldn't switch: {e}")));
@@ -1485,7 +1725,10 @@ impl AutomationsWindow {
                 let _ = shared_packages::set_enabled(&self.server_name, sib, false);
             }
         }
-        let toast = self.show_toast(format!("Switched to {}.", package_display_name(&target_spec)));
+        let toast = self.show_toast(format!(
+            "Switched to {}.",
+            package_display_name(&target_spec)
+        ));
         Update::new(
             Task::batch([
                 Task::done(Message::LoadInstalledPackages),
@@ -1504,7 +1747,10 @@ impl AutomationsWindow {
     pub(super) fn toggle_local_enabled(&mut self, name: String) -> Update<Message, Event> {
         let own_spec = self.local_own_spec(&name);
         let active = self.graph.effectively_enabled(&own_spec);
-        let in_lock = self.installed_packages.iter().any(|p| p.specifier == own_spec);
+        let in_lock = self
+            .installed_packages
+            .iter()
+            .any(|p| p.specifier == own_spec);
         let result = if active {
             shared_packages::set_enabled(&self.server_name, &own_spec, false)
         } else if in_lock {
@@ -1515,7 +1761,10 @@ impl AutomationsWindow {
         if let Err(e) = result {
             return Update::with_task(self.show_toast(format!("Couldn't update {name}: {e}")));
         }
-        let toast = self.show_toast(format!("{} {name}.", if active { "Disabled" } else { "Enabled" }));
+        let toast = self.show_toast(format!(
+            "{} {name}.",
+            if active { "Disabled" } else { "Enabled" }
+        ));
         Update::new(
             Task::batch([
                 Task::done(Message::LoadInstalledPackages),
@@ -1602,7 +1851,8 @@ impl AutomationsWindow {
         // Open the pane even for a package that isn't a direct lockfile install (e.g. a transitive
         // dependency) so it can be inspected and forked ("Edit a copy"). The synthetic lock entry
         // is transient (never persisted); detail loads via resolve, gated to smudgy:// specifiers.
-        let open = locked.unwrap_or_else(|| LockedPackage::new(specifier.clone(), UpdateMode::Auto));
+        let open =
+            locked.unwrap_or_else(|| LockedPackage::new(specifier.clone(), UpdateMode::Auto));
         self.installed_open = Some(Box::new(open));
         self.pane = Pane::InstalledPackage;
         self.load_installed_detail(&specifier)
@@ -1673,7 +1923,9 @@ impl AutomationsWindow {
         let seq = self.detail_seq;
         Update::with_task(Task::perform(
             async move {
-                let resolved = client.resolve_package(&owner, &name, pinned.as_deref()).await?;
+                let resolved = client
+                    .resolve_package(&owner, &name, pinned.as_deref())
+                    .await?;
                 // Fold the closure union too, so the manage pane can detect an update that adds
                 // permission asks beyond the consented baseline (delta re-prompt), and the
                 // version floor, so it can explain a version held back by `min_smudgy_version`.
@@ -1698,7 +1950,7 @@ impl AutomationsWindow {
                     rating,
                 ))
             },
-            move |result| Message::InstalledDetailLoaded(seq, result),
+            move |result| Message::InstalledDetailLoaded(seq, Box::new(result)),
         ))
     }
 
@@ -1735,7 +1987,12 @@ impl AutomationsWindow {
         // preview in the pane whose whole job is letting the user read the source before trusting it.
         if matches!(
             self.installed_source.get(&hash),
-            Some(FilePreview::Loading | FilePreview::Text { .. } | FilePreview::Binary { .. } | FilePreview::TooLarge { .. })
+            Some(
+                FilePreview::Loading
+                    | FilePreview::Text { .. }
+                    | FilePreview::Binary { .. }
+                    | FilePreview::TooLarge { .. }
+            )
         ) {
             return Update::none();
         }
@@ -1744,13 +2001,15 @@ impl AutomationsWindow {
         // can't smuggle an oversized body through.
         if u64::try_from(module.byte_size).is_ok_and(|n| n > SOURCE_PREVIEW_CAP_BYTES) {
             let size = u64::try_from(module.byte_size).unwrap_or(u64::MAX);
-            self.installed_source.insert(hash, FilePreview::TooLarge { size });
+            self.installed_source
+                .insert(hash, FilePreview::TooLarge { size });
             return Update::none();
         }
         let url = module.content_url.clone();
         let fetch_hash = hash.clone();
         let client = self.package_client();
-        self.installed_source.insert(hash.clone(), FilePreview::Loading);
+        self.installed_source
+            .insert(hash.clone(), FilePreview::Loading);
         Update::with_task(Task::perform(
             async move {
                 // `fetch_module_bytes` verifies the body against `content_hash`, so a tampered or
@@ -1803,19 +2062,26 @@ impl AutomationsWindow {
                 self.local_readme = resolved.readme.as_deref().map(markdown::Content::parse);
                 // Feed the dependency graph (and the blocked-update flag, via the closure union).
                 if let Some(spec) = self.installed_open.as_ref().map(|p| p.specifier.clone()) {
-                    self.installed_resolved_for_graph(&spec, Ok((resolved.clone(), permissions.clone())));
+                    self.installed_resolved_for_graph(
+                        &spec,
+                        Ok((resolved.clone(), permissions.clone())),
+                    );
                 }
                 // Update re-prompt: compare this freshly-resolved version's closure union
                 // against the consented baseline. A trusted package runs allow-all, so consent is
                 // moot — neither path applies.
                 self.update_delta = None;
-                let open_info = self.installed_open.as_deref().filter(|open| !open.trusted).map(|open| {
-                    (
-                        open.specifier.clone(),
-                        open.consented_permissions.clone().unwrap_or_default(),
-                        open.last_resolved_version.clone(),
-                    )
-                });
+                let open_info = self
+                    .installed_open
+                    .as_deref()
+                    .filter(|open| !open.trusted)
+                    .map(|open| {
+                        (
+                            open.specifier.clone(),
+                            open.consented_permissions.clone().unwrap_or_default(),
+                            open.last_resolved_version.clone(),
+                        )
+                    });
                 // A resolved version whose closure floor is above this smudgy is refused or
                 // held back by the engine no matter what is granted, so the version card
                 // takes precedence over any permission delta — and, unlike the delta, it
@@ -1842,8 +2108,12 @@ impl AutomationsWindow {
                         // keeps enforcing the consented union, so this only ever narrows access.
                         let removed = baseline.added_since(&permissions);
                         if !removed.is_empty()
-                            && shared_packages::record_consent(&self.server_name, &spec, &permissions)
-                                .is_ok()
+                            && shared_packages::record_consent(
+                                &self.server_name,
+                                &spec,
+                                &permissions,
+                            )
+                            .is_ok()
                         {
                             if let Some(pkg) = self
                                 .installed_packages
@@ -1881,7 +2151,8 @@ impl AutomationsWindow {
                 self.installed_versions = versions;
                 if matches!(self.selection, Selection::Dependency { .. }) {
                     self.param_config = None;
-                } else if let Some(spec) = self.installed_open.as_ref().map(|p| p.specifier.clone()) {
+                } else if let Some(spec) = self.installed_open.as_ref().map(|p| p.specifier.clone())
+                {
                     self.seed_param_config(spec, params);
                 }
                 // A re-resolve (e.g. a version-pin change) can swap the module set out from under a
@@ -1923,14 +2194,12 @@ impl AutomationsWindow {
         Update::none()
     }
 
-    pub(super) fn set_installed_update_mode(
-        &mut self,
-        mode: UpdateMode,
-    ) -> Update<Message, Event> {
+    pub(super) fn set_installed_update_mode(&mut self, mode: UpdateMode) -> Update<Message, Event> {
         let Some(specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone()) else {
             return Update::none();
         };
-        if let Err(e) = shared_packages::set_update_mode(&self.server_name, &specifier, mode.clone())
+        if let Err(e) =
+            shared_packages::set_update_mode(&self.server_name, &specifier, mode.clone())
         {
             self.manage_feedback = Some(format!("Failed to set update mode: {e}"));
             return Update::none();
@@ -2041,7 +2310,8 @@ impl AutomationsWindow {
     }
 
     pub(super) fn fork_installed(&mut self) -> Update<Message, Event> {
-        let Some(source_specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone()) else {
+        let Some(source_specifier) = self.installed_open.as_ref().map(|p| p.specifier.clone())
+        else {
             self.manage_feedback = Some("No package selected.".to_string());
             return Update::none();
         };
@@ -2068,7 +2338,9 @@ impl AutomationsWindow {
         let client = self.package_client();
         let server = self.server_name.clone();
         self.manage_busy = true;
-        self.manage_feedback = Some(format!("Copying to a local package \u{201c}{new_name}\u{201d}\u{2026}"));
+        self.manage_feedback = Some(format!(
+            "Copying to a local package \u{201c}{new_name}\u{201d}\u{2026}"
+        ));
         Update::with_task(Task::perform(
             async move {
                 let mut modules = Vec::new();
@@ -2100,8 +2372,13 @@ impl AutomationsWindow {
                 let fork_is_self = fork_specifier == source_specifier;
                 let activation = fork_activation(activate, fork_is_self);
                 if !matches!(activation, ForkActivation::Inactive) {
-                    shared_packages::install_package(&server, &fork_specifier, UpdateMode::Auto, true)
-                        .map_err(|e| e.to_string())?;
+                    shared_packages::install_package(
+                        &server,
+                        &fork_specifier,
+                        UpdateMode::Auto,
+                        true,
+                    )
+                    .map_err(|e| e.to_string())?;
                     if matches!(activation, ForkActivation::TookOver) {
                         // Distinct slot: the local fork supersedes the original install, so remove
                         // the original from the lockfile entirely. (Merely disabling it left a stale
@@ -2121,8 +2398,11 @@ impl AutomationsWindow {
     /// Keeps the source's leaf name, de-duping against existing local packages only on a
     /// collision (`boo`, then `boo-2`, `boo-3`, …), case-folded like the filesystem.
     fn derive_fork_name(&self, source_leaf: &str) -> String {
-        let taken =
-            |candidate: &str| self.local_packages.iter().any(|n| n.eq_ignore_ascii_case(candidate));
+        let taken = |candidate: &str| {
+            self.local_packages
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(candidate))
+        };
         if !taken(source_leaf) {
             return source_leaf.to_string();
         }
@@ -2151,7 +2431,9 @@ impl AutomationsWindow {
                         format!("Now editing {name} (installed copy removed)."),
                     ),
                     ForkActivation::Mirrored => (
-                        format!("Editing a copy named \u{201c}{name}\u{201d} — your local copy is now active."),
+                        format!(
+                            "Editing a copy named \u{201c}{name}\u{201d} — your local copy is now active."
+                        ),
                         format!("Now editing {name}."),
                     ),
                     ForkActivation::Inactive => (
@@ -2200,7 +2482,9 @@ impl AutomationsWindow {
         let dir = match local_packages::packages_dir(&self.server_name) {
             Ok(dir) => dir.join(&name),
             Err(e) => {
-                return Update::with_task(self.show_toast(format!("Couldn't locate the folder: {e}")));
+                return Update::with_task(
+                    self.show_toast(format!("Couldn't locate the folder: {e}")),
+                );
             }
         };
         if !dir.exists() {
@@ -2241,7 +2525,9 @@ impl AutomationsWindow {
             self.authoring_feedback = Some(message);
             return Update::none();
         }
-        if let Err(e) = local_packages::rename_local_package(&self.server_name, &old_name, &new_name) {
+        if let Err(e) =
+            local_packages::rename_local_package(&self.server_name, &old_name, &new_name)
+        {
             self.authoring_feedback = Some(format!("Rename failed: {e}"));
             return Update::none();
         }
@@ -2263,7 +2549,8 @@ impl AutomationsWindow {
                 .ok()
                 .and_then(|lock| lock.find(&old_spec).map(|p| (p.mode.clone(), p.enabled)));
             if let Some((mode, enabled)) = migrate {
-                let _ = shared_packages::install_package(&self.server_name, &new_spec, mode, enabled);
+                let _ =
+                    shared_packages::install_package(&self.server_name, &new_spec, mode, enabled);
                 let _ = shared_packages::uninstall_package(&self.server_name, &old_spec);
                 session_changed = true;
             }
@@ -2364,13 +2651,21 @@ impl AutomationsWindow {
             return Update::none();
         };
         let own_spec = self.local_own_spec(&name);
-        let in_lock = self.installed_packages.iter().any(|p| p.specifier == own_spec);
+        let in_lock = self
+            .installed_packages
+            .iter()
+            .any(|p| p.specifier == own_spec);
         let result = if unsandboxed {
             // Ensure it's installed + enabled, then trust it (allow-all on the main isolate).
             if in_lock {
                 shared_packages::set_enabled(&self.server_name, &own_spec, true)
             } else {
-                shared_packages::install_package(&self.server_name, &own_spec, UpdateMode::Auto, true)
+                shared_packages::install_package(
+                    &self.server_name,
+                    &own_spec,
+                    UpdateMode::Auto,
+                    true,
+                )
             }
             .and_then(|()| shared_packages::set_trusted(&self.server_name, &own_spec, true))
         } else if in_lock {
@@ -2431,10 +2726,7 @@ impl AutomationsWindow {
         if let Some(open) = &mut self.installed_open {
             open.consented_permissions = Some(delta.new_union);
         }
-        let toast = self.show_toast(format!(
-            "Updated permissions for {}",
-            delta.name
-        ));
+        let toast = self.show_toast(format!("Updated permissions for {}", delta.name));
         Update::new(
             toast,
             Some(Event::ScriptsChanged {
@@ -2491,8 +2783,9 @@ impl AutomationsWindow {
                 self.seed_param_config(spec, params);
             }
             Ok(None) => {
-                self.pane =
-                    Pane::Error(std::sync::Arc::new(vec![format!("Package '{name}' not found")]));
+                self.pane = Pane::Error(std::sync::Arc::new(vec![format!(
+                    "Package '{name}' not found"
+                )]));
                 return Update::none();
             }
             Err(e) => {
@@ -2584,9 +2877,12 @@ impl AutomationsWindow {
             (Some(name), Some(subpath)) => (name, subpath),
             _ => return Update::none(),
         };
-        if let Err(e) =
-            local_packages::write_local_file(&self.server_name, &name, &subpath, &self.editor_content.text())
-        {
+        if let Err(e) = local_packages::write_local_file(
+            &self.server_name,
+            &name,
+            &subpath,
+            &self.editor_content.text(),
+        ) {
             self.authoring_feedback = Some(format!("Save failed: {e}"));
             return Update::none();
         }
@@ -2763,7 +3059,10 @@ impl AutomationsWindow {
             .iter()
             .filter_map(|p| p.specifier.strip_prefix(&prefix).map(str::to_string))
             .filter(|name| {
-                !self.local_packages.iter().any(|n| n.eq_ignore_ascii_case(name))
+                !self
+                    .local_packages
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(name))
             })
             .collect();
         if candidates.is_empty() {
@@ -3010,7 +3309,11 @@ impl AutomationsWindow {
         Update::none()
     }
 
-    pub(super) fn discover_select(&mut self, package_id: Uuid, owner: String) -> Update<Message, Event> {
+    pub(super) fn discover_select(
+        &mut self,
+        package_id: Uuid,
+        owner: String,
+    ) -> Update<Message, Event> {
         // Reachable from the dashboard teaser too, so make sure we're on the Discover pane (the
         // detail renders there). Harmless when already on it.
         self.pane = Pane::Discover;
@@ -3152,7 +3455,11 @@ impl AutomationsWindow {
         let Some(owner) = self.discover_owner.clone() else {
             return Update::none();
         };
-        let Some(name) = self.discover_detail.as_ref().map(|d| d.package.name.clone()) else {
+        let Some(name) = self
+            .discover_detail
+            .as_ref()
+            .map(|d| d.package.name.clone())
+        else {
             return Update::none();
         };
         self.begin_install(owner, name)
@@ -3273,15 +3580,19 @@ impl AutomationsWindow {
             .collect();
 
         // Install + consent the chosen package first (the user's explicit, user-owned root).
-        if let Err(e) =
-            shared_packages::install_package(&self.server_name, &specifier, UpdateMode::Auto, enable)
-        {
+        if let Err(e) = shared_packages::install_package(
+            &self.server_name,
+            &specifier,
+            UpdateMode::Auto,
+            enable,
+        ) {
             if let Some(prompt) = self.consent_prompt.as_mut() {
                 prompt.error = Some(format!("Failed to install: {e}"));
             }
             return Update::none();
         }
-        if let Err(e) = shared_packages::record_consent(&self.server_name, &specifier, &permissions) {
+        if let Err(e) = shared_packages::record_consent(&self.server_name, &specifier, &permissions)
+        {
             // The lock entry is written; surface the consent-record failure rather than roll back
             // (a missing record just means the engine denies everything until consent is recorded).
             if let Some(prompt) = self.consent_prompt.as_mut() {
@@ -3303,20 +3614,23 @@ impl AutomationsWindow {
                 enable,
             ) {
                 if let Some(prompt) = self.consent_prompt.as_mut() {
-                    prompt.error =
-                        Some(format!("Failed to install required {}: {e}", root.name));
+                    prompt.error = Some(format!("Failed to install required {}: {e}", root.name));
                 }
                 return Update::none();
             }
-            let _ =
-                shared_packages::record_consent(&self.server_name, &root.specifier, &root.permissions);
+            let _ = shared_packages::record_consent(
+                &self.server_name,
+                &root.specifier,
+                &root.permissions,
+            );
         }
         self.consent_prompt = None;
 
         // Build the required-params prompt queue across the chosen package and every co-installed
         // required root, in install order, skipping any with no missing required params.
         let mut prompts: Vec<ParamPrompt> = Vec::new();
-        if let Some(prompt) = self.build_param_prompt(&specifier, &name, &version, &params, enable) {
+        if let Some(prompt) = self.build_param_prompt(&specifier, &name, &version, &params, enable)
+        {
             prompts.push(prompt);
         }
         for root in &required {
@@ -3353,7 +3667,8 @@ impl AutomationsWindow {
         let missing: Vec<PackageParameter> = params
             .iter()
             .filter(|param| {
-                param.required && !shared_packages::param_has_value(&self.server_name, specifier, param)
+                param.required
+                    && !shared_packages::param_has_value(&self.server_name, specifier, param)
             })
             .cloned()
             .collect();
@@ -3426,7 +3741,10 @@ impl AutomationsWindow {
         let event = enable.then(|| Event::ScriptsChanged {
             server_name: self.server_name.clone(),
         });
-        Update::new(Task::batch([Task::done(Message::LoadInstalledPackages), toast]), event)
+        Update::new(
+            Task::batch([Task::done(Message::LoadInstalledPackages), toast]),
+            event,
+        )
     }
 
     /// Apply one parameter-value edit, routed by `target` to the install-time prompt or the in-pane
@@ -3477,7 +3795,10 @@ impl AutomationsWindow {
         // Project + validate every value (all prompt params are required) before writing anything.
         let mut plan: Vec<(String, Persist)> = Vec::new();
         for param in &params {
-            let state = self.param_prompt.as_ref().and_then(|p| p.values.get(&param.key));
+            let state = self
+                .param_prompt
+                .as_ref()
+                .and_then(|p| p.values.get(&param.key));
             if is_secret_string(param) {
                 let text = secret_text(state);
                 if text.is_empty() {
@@ -3530,8 +3851,8 @@ impl AutomationsWindow {
     /// declares no params, so the section renders nothing. Called when a package pane opens (and
     /// when an owned package's manifest is saved, which can add/remove params).
     pub(super) fn seed_param_config(&mut self, specifier: String, params: Vec<PackageParameter>) {
-        self.param_config = (!params.is_empty())
-            .then(|| ParamConfig::seed(&self.server_name, specifier, params));
+        self.param_config =
+            (!params.is_empty()).then(|| ParamConfig::seed(&self.server_name, specifier, params));
     }
 
     /// Persist every declared param's configured value: non-secrets to `smudgy.params.json`
@@ -3561,7 +3882,10 @@ impl AutomationsWindow {
         // with an empty box (the box only ever *replaces* a secret, never reveals it).
         let mut plan: Vec<(String, Persist)> = Vec::new();
         for param in &params {
-            let state = self.param_config.as_ref().and_then(|c| c.values.get(&param.key));
+            let state = self
+                .param_config
+                .as_ref()
+                .and_then(|c| c.values.get(&param.key));
             if is_secret_string(param) {
                 let text = secret_text(state);
                 if param.required && text.is_empty() && !secret_stored.contains(&param.key) {
@@ -3586,7 +3910,10 @@ impl AutomationsWindow {
                 if !param.required && !touched.contains(&param.key) {
                     continue;
                 }
-                plan.push((param.key.clone(), projected.map_or(Persist::Clear, Persist::Value)));
+                plan.push((
+                    param.key.clone(),
+                    projected.map_or(Persist::Clear, Persist::Value),
+                ));
             }
         }
 
@@ -3602,7 +3929,9 @@ impl AutomationsWindow {
             for (key, persist) in &plan {
                 if matches!(persist, Persist::Secret(_)) {
                     config.secret_stored.insert(key.clone());
-                    config.values.insert(key.clone(), ParamValueState::Text(String::new()));
+                    config
+                        .values
+                        .insert(key.clone(), ParamValueState::Text(String::new()));
                 }
             }
             // The current state is now the on-disk state; a follow-up Save without edits writes
@@ -3639,7 +3968,9 @@ impl AutomationsWindow {
         }
         if let Some(config) = self.param_config.as_mut() {
             config.secret_stored.remove(&key);
-            config.values.insert(key.clone(), ParamValueState::Text(String::new()));
+            config
+                .values
+                .insert(key.clone(), ParamValueState::Text(String::new()));
             config.error = None;
             config.saved = false;
         }
@@ -3813,13 +4144,9 @@ impl AutomationsWindow {
             NodeStatus::Disabled
         };
 
-        let mut body = column![self.scene_header(
-            Some(status),
-            &name,
-            Some(specifier.clone()),
-            switch,
-        )]
-        .spacing(16.0);
+        let mut body =
+            column![self.scene_header(Some(status), &name, Some(specifier.clone()), switch,)]
+                .spacing(16.0);
 
         // Context banner.
         let banner_text = if dep_only {
@@ -3901,7 +4228,11 @@ impl AutomationsWindow {
         // the detail is still loading).
         if let Some(rating) = self.installed_rating.as_deref() {
             let star_color = crate::prefs::current().palette.output;
-            meta = meta.push(rating_metric(rating.avg_rating, rating.rating_count, star_color));
+            meta = meta.push(rating_metric(
+                rating.avg_rating,
+                rating.rating_count,
+                star_color,
+            ));
             meta = meta.push(metric("Installs", &rating.install_count.to_string()));
         }
         body = body.push(meta);
@@ -3938,7 +4269,9 @@ impl AutomationsWindow {
 
         // Required by.
         if !enabled_dependents.is_empty() || !self.graph.required_by(specifier).is_empty() {
-            let mut req = Column::new().spacing(4.0).push(common::section_label("Required by"));
+            let mut req = Column::new()
+                .spacing(4.0)
+                .push(common::section_label("Required by"));
             for parent in self.graph.required_by(specifier) {
                 let enabled = self.graph.effectively_enabled(&parent);
                 req = req.push(self.dep_link_row(&parent, enabled, "needs", None));
@@ -3949,8 +4282,7 @@ impl AutomationsWindow {
         // Settings (configured param values). A dependency-reference view configures nothing of its
         // own — like permissions, its params belong to its own top-level pane — so it's suppressed
         // here; the section also renders nothing unless the package declares params.
-        if !viewing_as_dependency
-            && let Some(settings) = self.view_param_config_section(specifier)
+        if !viewing_as_dependency && let Some(settings) = self.view_param_config_section(specifier)
         {
             body = body.push(settings);
         }
@@ -3984,9 +4316,16 @@ impl AutomationsWindow {
         }
 
         // Dependencies.
-        let deps = self.graph.requires.get(specifier).cloned().unwrap_or_default();
+        let deps = self
+            .graph
+            .requires
+            .get(specifier)
+            .cloned()
+            .unwrap_or_default();
         if !deps.is_empty() {
-            let mut dep_col = Column::new().spacing(4.0).push(common::section_label("Dependencies"));
+            let mut dep_col = Column::new()
+                .spacing(4.0)
+                .push(common::section_label("Dependencies"));
             for edge in &deps {
                 // This row exists because the open package (`specifier`) depends on
                 // `edge.specifier`, so its dot follows the parent's context: it greys when the
@@ -3995,7 +4334,10 @@ impl AutomationsWindow {
                 let enabled = self.graph.dep_edge_active(specifier, &edge.specifier);
                 let resolved = self.graph.resolved.get(&edge.specifier).cloned();
                 let range = if edge.range.is_empty() {
-                    resolved.clone().map(|v| format!("→ v{v}")).unwrap_or_default()
+                    resolved
+                        .clone()
+                        .map(|v| format!("→ v{v}"))
+                        .unwrap_or_default()
                 } else {
                     format!(
                         "{} → v{}",
@@ -4003,17 +4345,26 @@ impl AutomationsWindow {
                         resolved.clone().unwrap_or_else(|| "?".to_string())
                     )
                 };
-                dep_col = dep_col.push(self.dep_link_row(&edge.specifier, enabled, &range, Some(())));
+                dep_col =
+                    dep_col.push(self.dep_link_row(&edge.specifier, enabled, &range, Some(())));
             }
-            if controllable && !effective && deps.iter().any(|e| !self.graph.effectively_enabled(&e.specifier)) {
+            if controllable
+                && !effective
+                && deps
+                    .iter()
+                    .any(|e| !self.graph.effectively_enabled(&e.specifier))
+            {
                 let names: Vec<String> = deps
                     .iter()
                     .map(|e| package_display_name(&e.specifier).to_string())
                     .collect();
                 dep_col = dep_col.push(
-                    text(format!("Enabling {name} will also enable {}.", names.join(", ")))
-                        .size(12.0)
-                        .style(common::muted),
+                    text(format!(
+                        "Enabling {name} will also enable {}.",
+                        names.join(", ")
+                    ))
+                    .size(12.0)
+                    .style(common::muted),
                 );
             }
             body = body.push(dep_col);
@@ -4140,7 +4491,8 @@ impl AutomationsWindow {
         let mut files = Column::new().spacing(2.0);
         if let Some(detail) = detail {
             for module in &detail.modules {
-                let selected = self.installed_selected_file.as_deref() == Some(module.subpath.as_str());
+                let selected =
+                    self.installed_selected_file.as_deref() == Some(module.subpath.as_str());
                 files = files.push(file_row(
                     &module.subpath,
                     selected,
@@ -4150,16 +4502,22 @@ impl AutomationsWindow {
         }
 
         let right: Elem = match detail {
-            None => container(text("Loading…").size(13.0).style(common::muted)).padding(10.0).into(),
-            Some(detail) if detail.modules.is_empty() => {
-                container(text("This package ships no source files.").size(13.0).style(common::muted))
-                    .padding(10.0)
-                    .into()
-            }
+            None => container(text("Loading…").size(13.0).style(common::muted))
+                .padding(10.0)
+                .into(),
+            Some(detail) if detail.modules.is_empty() => container(
+                text("This package ships no source files.")
+                    .size(13.0)
+                    .style(common::muted),
+            )
+            .padding(10.0)
+            .into(),
             Some(detail) => match self.installed_selected_file.as_deref() {
                 Some(subpath) => self.installed_source_view(detail, subpath),
                 None => container(
-                    text("Select a file to view its source.").size(13.0).style(common::muted),
+                    text("Select a file to view its source.")
+                        .size(13.0)
+                        .style(common::muted),
                 )
                 .padding(10.0)
                 .into(),
@@ -4279,18 +4637,18 @@ impl AutomationsWindow {
     /// stays resolved as their dependency — so the uninstall action says exactly that rather than
     /// implying full removal.
     fn installed_actions(&self, name: &str, kept_by: &[String]) -> Elem<'_> {
-        let mut col = Column::new().spacing(10.0).push(common::section_label("Actions"));
+        let mut col = Column::new()
+            .spacing(10.0)
+            .push(common::section_label("Actions"));
 
         // Edit a copy (local fork). The button sits on its own row so the explainer text can't
         // squeeze it into a sliver.
         col = col.push(
             column![
                 text("Edit a copy").size(13.0),
-                text(
-                    "Make an editable local copy of this package."
-                )
-                .size(11.0)
-                .style(common::muted),
+                text("Make an editable local copy of this package.")
+                    .size(11.0)
+                    .style(common::muted),
                 row![
                     iced::widget::space::horizontal(),
                     button(text("Edit a copy").size(12.0))
@@ -4317,14 +4675,16 @@ impl AutomationsWindow {
                 .map(|s| package_display_name(s).to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            uninstall = uninstall.push(text("Remove standalone install").size(13.0)).push(
-                text(format!(
-                    "Removes the on-its-own copy. {name} stays installed as a dependency of \
+            uninstall = uninstall
+                .push(text("Remove standalone install").size(13.0))
+                .push(
+                    text(format!(
+                        "Removes the on-its-own copy. {name} stays installed as a dependency of \
                      {kept_names}."
-                ))
-                .size(11.0)
-                .style(common::muted),
-            );
+                    ))
+                    .size(11.0)
+                    .style(common::muted),
+                );
         }
         if self.confirm_uninstall {
             let breaks = &self.uninstall_breaks;
@@ -4342,7 +4702,11 @@ impl AutomationsWindow {
                     container(
                         text(format!(
                             "{names} {} {name} and will be removed too.",
-                            if breaks.len() == 1 { "requires" } else { "require" },
+                            if breaks.len() == 1 {
+                                "requires"
+                            } else {
+                                "require"
+                            },
                         ))
                         .size(12.0)
                         .style(common::warning),
@@ -4453,16 +4817,18 @@ impl AutomationsWindow {
             AutomationKind::Trigger => "trigger",
             AutomationKind::Hotkey => "hotkey",
         };
-        let entry = self.creator_automations(creator_id).and_then(|creator| {
-            match kind {
+        let entry = self
+            .creator_automations(creator_id)
+            .and_then(|creator| match kind {
                 AutomationKind::Alias => creator.aliases.get(name),
                 AutomationKind::Trigger => creator.triggers.get(name),
                 AutomationKind::Hotkey => None,
-            }
-        });
+            });
         let Some(entry) = entry else {
             return pane_scroll(column![
-                text(format!("{name} is no longer available.")).size(13.0).style(common::muted)
+                text(format!("{name} is no longer available."))
+                    .size(13.0)
+                    .style(common::muted)
             ]);
         };
 
@@ -4484,8 +4850,14 @@ impl AutomationsWindow {
         let mut body = column![self.scene_header(
             Some(status),
             name,
-            Some(format!("Read-only {kind_label} · created by {creator_label}")),
-            Some(common::badge(if entry.enabled { "Enabled" } else { "Disabled" })),
+            Some(format!(
+                "Read-only {kind_label} · created by {creator_label}"
+            )),
+            Some(common::badge(if entry.enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            })),
         )]
         .spacing(16.0);
 
@@ -4521,14 +4893,14 @@ impl AutomationsWindow {
         let (body_label, body_text): (&str, String) = match &entry.body {
             AutomationBody::Command(cmd) => ("Sends", cmd.to_string()),
             AutomationBody::Script(Some(src)) => ("Script", src.to_string()),
-            AutomationBody::Script(None) => {
-                ("Script", "(JavaScript handler — source not available)".to_string())
-            }
+            AutomationBody::Script(None) => (
+                "Script",
+                "(JavaScript handler — source not available)".to_string(),
+            ),
             AutomationBody::Noop => ("Does", "(nothing)".to_string()),
         };
-        body = body.push(
-            column![common::section_label(body_label), code_block(&body_text)].spacing(6.0),
-        );
+        body = body
+            .push(column![common::section_label(body_label), code_block(&body_text)].spacing(6.0));
 
         pane_scroll(body)
     }
@@ -4540,16 +4912,27 @@ impl AutomationsWindow {
             return pane_scroll(column![text("No package selected.").size(13.0)]);
         };
         let manifest = &package.manifest;
-        let visibility = if self.share_is_public { "Public" } else { "Private" };
+        let visibility = if self.share_is_public {
+            "Public"
+        } else {
+            "Private"
+        };
         // Display the *draft* manifest the form is editing (falling back to the on-disk one), so the
         // header/meta/publish-verdict never contradict the editor below while there are unsaved edits.
         let draft = self.manifest_draft.as_ref();
-        let disp_version =
-            draft.map_or_else(|| manifest.version.clone(), |d| d.version.trim().to_string());
-        let disp_description =
-            draft.map_or_else(|| manifest.description.clone(), |d| d.description.trim().to_string());
+        let disp_version = draft.map_or_else(
+            || manifest.version.clone(),
+            |d| d.version.trim().to_string(),
+        );
+        let disp_description = draft.map_or_else(
+            || manifest.description.clone(),
+            |d| d.description.trim().to_string(),
+        );
         let disp_dep_count = draft.map_or(manifest.dependencies.len(), |d| {
-            d.dependencies.iter().filter(|s| !s.trim().is_empty()).count()
+            d.dependencies
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .count()
         });
         let verdict = publish_verdict(&disp_version, &self.share_versions);
 
@@ -4635,7 +5018,8 @@ impl AutomationsWindow {
         // Settings (configured param values) — the manifest above declares the params; this sets
         // the values the package reads when run locally. Keyed by the local package's own-handle
         // specifier, the same one the runtime resolves it under. Renders nothing without params.
-        if let Some(settings) = self.view_param_config_section(&self.local_own_spec(&package.name)) {
+        if let Some(settings) = self.view_param_config_section(&self.local_own_spec(&package.name))
+        {
             body = body.push(settings);
         }
 
@@ -4700,7 +5084,11 @@ impl AutomationsWindow {
             .spacing(4.0)
             .push(common::section_label("Published versions"));
         if self.share_versions.is_empty() {
-            versions = versions.push(text("No published versions yet.").size(12.0).style(common::muted));
+            versions = versions.push(
+                text("No published versions yet.")
+                    .size(12.0)
+                    .style(common::muted),
+            );
         }
         // "latest" is the highest live (non-yanked, non-deleted) version. The list now
         // also carries hard-deleted numbers (reserved forever) which render greyed.
@@ -4714,7 +5102,9 @@ impl AutomationsWindow {
             if v.deleted {
                 versions = versions.push(
                     row![
-                        text(format!("v{}", v.version)).size(13.0).style(common::faint),
+                        text(format!("v{}", v.version))
+                            .size(13.0)
+                            .style(common::faint),
                         text("deleted").size(11.0).style(common::faint),
                     ]
                     .spacing(8.0)
@@ -4754,9 +5144,11 @@ impl AutomationsWindow {
             versions = versions.push(actions);
         }
         versions = versions.push(
-            text("Yank prevents new installs without forcefully removing it from existing installs.")
-                .size(11.0)
-                .style(common::faint),
+            text(
+                "Yank prevents new installs without forcefully removing it from existing installs.",
+            )
+            .size(11.0)
+            .style(common::faint),
         );
         body = body.push(versions);
 
@@ -4815,7 +5207,11 @@ impl AutomationsWindow {
         let mut files = Column::new().spacing(2.0).push(source_header);
         let readme_selected = self.owned_selected_file.is_none();
         if package.readme.is_some() {
-            files = files.push(file_row("README.md", readme_selected, Message::SelectOwnedFile("README.md".to_string())));
+            files = files.push(file_row(
+                "README.md",
+                readme_selected,
+                Message::SelectOwnedFile("README.md".to_string()),
+            ));
         }
         // `smudgy.package.json` is intentionally not listed: the manifest is edited through the
         // rich manifest editor (`view_manifest_section`) instead of a raw text editor.
@@ -4835,15 +5231,21 @@ impl AutomationsWindow {
                     markdown::Style::from_palette(iced::theme::Palette::DARK),
                 );
                 scrollable(
-                    container(markdown::view(readme.items(), settings).map(Message::OpenReadmeLink))
-                        .padding(10.0),
+                    container(
+                        markdown::view(readme.items(), settings).map(Message::OpenReadmeLink),
+                    )
+                    .padding(10.0),
                 )
                 .height(Length::Fixed(340.0))
                 .into()
             } else {
-                container(text("Select a file to edit.").size(13.0).style(common::muted))
-                    .padding(10.0)
-                    .into()
+                container(
+                    text("Select a file to edit.")
+                        .size(13.0)
+                        .style(common::muted),
+                )
+                .padding(10.0)
+                .into()
             }
         } else {
             let subpath = self.owned_selected_file.clone().unwrap_or_default();
@@ -4895,7 +5297,9 @@ impl AutomationsWindow {
     }
 
     fn owned_sharing_section(&self) -> Elem<'_> {
-        let mut col = Column::new().spacing(10.0).push(common::section_label("Sharing"));
+        let mut col = Column::new()
+            .spacing(10.0)
+            .push(common::section_label("Sharing"));
         if self.share_package_id.is_none() {
             return col
                 .push(
@@ -4910,8 +5314,12 @@ impl AutomationsWindow {
             container(
                 row![
                     column![
-                        text(if self.share_is_public { "Public" } else { "Private" })
-                            .size(13.0),
+                        text(if self.share_is_public {
+                            "Public"
+                        } else {
+                            "Private"
+                        })
+                        .size(13.0),
                         text(if self.share_is_public {
                             "Anyone can discover and install it."
                         } else {
@@ -4948,7 +5356,10 @@ impl AutomationsWindow {
                 friends = friends.push(text("No friends found.").size(12.0).style(common::muted));
             }
             for friend in &self.share_friends {
-                let handle = friend.nickname.clone().unwrap_or_else(|| "unknown".to_string());
+                let handle = friend
+                    .nickname
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
                 let shared = self
                     .share_grants
                     .iter()
@@ -4961,11 +5372,9 @@ impl AutomationsWindow {
                             .style(common::muted),
                         text(handle).size(13.0),
                         iced::widget::space::horizontal(),
-                        button(
-                            text(if shared { "\u{2713} Shared" } else { "Share" }).size(12.0)
-                        )
-                        .style(button_style::secondary)
-                        .on_press(Message::ShareWithFriend(friend.user_id)),
+                        button(text(if shared { "\u{2713} Shared" } else { "Share" }).size(12.0))
+                            .style(button_style::secondary)
+                            .on_press(Message::ShareWithFriend(friend.user_id)),
                     ]
                     .spacing(8.0)
                     .align_y(Vertical::Center),
@@ -5051,7 +5460,12 @@ impl AutomationsWindow {
         // changing any radio re-runs the search (handled in `update`).
         let mut scope = row![
             text("Scope").size(13.0).style(common::muted),
-            radio("Relevant", DiscoverScope::Relevant, Some(self.discover_scope), Message::DiscoverScopeChanged),
+            radio(
+                "Relevant",
+                DiscoverScope::Relevant,
+                Some(self.discover_scope),
+                Message::DiscoverScopeChanged
+            ),
         ]
         .spacing(16.0)
         .align_y(Vertical::Center);
@@ -5064,8 +5478,18 @@ impl AutomationsWindow {
             ));
         }
         scope = scope
-            .push(radio("Universal packages only", DiscoverScope::Universal, Some(self.discover_scope), Message::DiscoverScopeChanged))
-            .push(radio("All packages", DiscoverScope::All, Some(self.discover_scope), Message::DiscoverScopeChanged));
+            .push(radio(
+                "Universal packages only",
+                DiscoverScope::Universal,
+                Some(self.discover_scope),
+                Message::DiscoverScopeChanged,
+            ))
+            .push(radio(
+                "All packages",
+                DiscoverScope::All,
+                Some(self.discover_scope),
+                Message::DiscoverScopeChanged,
+            ));
         body = body.push(scope);
 
         if self.discover_busy {
@@ -5140,18 +5564,30 @@ impl AutomationsWindow {
             result.latest_version.as_deref().unwrap_or("—"),
             result.install_count,
         ))];
-        meta_spans.extend(rating_spans(result.avg_rating, result.rating_count, star_color));
+        meta_spans.extend(rating_spans(
+            result.avg_rating,
+            result.rating_count,
+            star_color,
+        ));
         let meta_line: Elem = rich_text(meta_spans).size(11.0).style(common::faint).into();
         container(
             row![
                 column![
                     row![
                         text(result.name.clone()).size(15.0),
-                        if installed { common::badge("Installed") } else { iced::widget::space::horizontal().width(Length::Shrink).into() },
+                        if installed {
+                            common::badge("Installed")
+                        } else {
+                            iced::widget::space::horizontal()
+                                .width(Length::Shrink)
+                                .into()
+                        },
                     ]
                     .spacing(8.0)
                     .align_y(Vertical::Center),
-                    text(result.description.clone()).size(12.0).style(common::muted),
+                    text(result.description.clone())
+                        .size(12.0)
+                        .style(common::muted),
                     meta_line,
                 ]
                 .spacing(3.0),
@@ -5169,10 +5605,15 @@ impl AutomationsWindow {
 
     fn view_discover_detail(&self, detail: &PackageDetail) -> Elem<'_> {
         let pkg = &detail.package;
-        let owner = pkg.owner_nickname.clone().unwrap_or_else(|| "you".to_string());
+        let owner = pkg
+            .owner_nickname
+            .clone()
+            .unwrap_or_else(|| "you".to_string());
         let installed = super::model::is_installed(&self.installed_packages, &owner, &pkg.name);
         let action: Elem = if installed {
-            button(text("Installed").size(12.0)).style(button_style::secondary).into()
+            button(text("Installed").size(12.0))
+                .style(button_style::secondary)
+                .into()
         } else {
             button(text("Install").size(12.0))
                 .style(button_style::primary)
@@ -5187,7 +5628,11 @@ impl AutomationsWindow {
             detail.latest_version.as_deref().unwrap_or("—"),
             detail.install_count,
         ))];
-        meta_spans.extend(rating_spans(detail.avg_rating, detail.rating_count, star_color));
+        meta_spans.extend(rating_spans(
+            detail.avg_rating,
+            detail.rating_count,
+            star_color,
+        ));
         let meta_line: Elem = rich_text(meta_spans).size(12.0).style(common::muted).into();
         let mut col = column![
             row![
@@ -5242,7 +5687,10 @@ impl AutomationsWindow {
             col = col.push(text("No comments yet.").size(12.0).style(common::muted));
         }
         for comment in &self.discover_comments {
-            let who = comment.user_nickname.clone().unwrap_or_else(|| "someone".to_string());
+            let who = comment
+                .user_nickname
+                .clone()
+                .unwrap_or_else(|| "someone".to_string());
             col = col.push(
                 column![
                     text(who).size(12.0).style(common::accent),
@@ -5291,7 +5739,10 @@ impl AutomationsWindow {
             .spacing(8.0)
             .align_y(Vertical::Center),
         );
-        container(form).padding(12.0).style(common::banner_style).into()
+        container(form)
+            .padding(12.0)
+            .style(common::banner_style)
+            .into()
     }
 
     /// The inline "Settings" section shown in the installed and owned package panes: an editable
@@ -5300,7 +5751,10 @@ impl AutomationsWindow {
     /// `specifier` (i.e. the open package declares params) — the caller guards on a matching
     /// specifier so a stale config from a previous pane can't leak in.
     fn view_param_config_section<'a>(&'a self, specifier: &str) -> Option<Elem<'a>> {
-        let config = self.param_config.as_ref().filter(|c| c.specifier == specifier)?;
+        let config = self
+            .param_config
+            .as_ref()
+            .filter(|c| c.specifier == specifier)?;
 
         let mut form = Column::new().spacing(10.0).push(
             text("Values this package reads at runtime. Required ones must be set for it to load.")
@@ -5312,7 +5766,11 @@ impl AutomationsWindow {
             let state = config.values.get(&param.key);
             let field = if is_secret_string(param) {
                 let stored = config.secret_stored.contains(&param.key);
-                let placeholder = if stored { "set — leave blank to keep" } else { "secret value" };
+                let placeholder = if stored {
+                    "set — leave blank to keep"
+                } else {
+                    "secret value"
+                };
                 // A stored secret can only be replaced through the box (never revealed), so offer an
                 // explicit Clear — the one way to unset it.
                 let clear = stored.then(|| Message::ParamConfigClearSecret(param.key.clone()));
@@ -5344,7 +5802,10 @@ impl AutomationsWindow {
         Some(
             column![
                 common::section_label("Settings"),
-                container(form).padding(16.0).width(Length::Fill).style(common::card_style),
+                container(form)
+                    .padding(16.0)
+                    .width(Length::Fill)
+                    .style(common::card_style),
             ]
             .spacing(8.0)
             .into(),
@@ -5366,9 +5827,9 @@ impl AutomationsWindow {
         let can = permission_can_lines(&prompt.permissions);
         if can.is_empty() {
             // Zero-permission package: a calm one-liner, then the smudgy op-capabilities it can't use
-            // (reinforcing the sandbox guarantee) and the never-grantable guarantees. The deno
-            // per-category denials are omitted — `sandbox_summary` already states "no files/network/
-            // system".
+            // (reinforcing the sandbox guarantee) and the guarantee rows (all of which hold for an
+            // empty union). The deno per-category denials are omitted — `sandbox_summary` already
+            // states "no files/network/system".
             form = form.push(text(sandbox_summary()).size(13.0));
             let mut cannot = Column::new()
                 .spacing(4.0)
@@ -5376,11 +5837,16 @@ impl AutomationsWindow {
             for line in smudgy_cannot_lines(&prompt.permissions.smudgy) {
                 cannot = cannot.push(consent_cannot_row(&line));
             }
-            for line in never_grantable_lines() {
+            for line in sandbox_guarantee_lines(&prompt.permissions) {
                 cannot = cannot.push(consent_cannot_row(line));
             }
             form = form.push(cannot);
         } else {
+            // A sandbox-escape grant changes what this window IS: not a scoped-permission review
+            // but a trust decision. Say so before the enumeration.
+            if let Some(banner) = full_access_banner(&prompt.permissions) {
+                form = form.push(banner);
+            }
             let mut can_col = Column::new()
                 .spacing(4.0)
                 .push(text("This package will be able to:").size(13.0));
@@ -5431,7 +5897,8 @@ impl AutomationsWindow {
                     column![
                         row![
                             text("\u{26A0}").size(14.0).style(common::danger),
-                            text("Can't install \u{2014} required-package version conflict").size(14.0),
+                            text("Can't install \u{2014} required-package version conflict")
+                                .size(14.0),
                         ]
                         .spacing(8.0)
                         .align_y(Vertical::Center),
@@ -5515,9 +5982,12 @@ impl AutomationsWindow {
                 col = col.push(
                     row![
                         text("\u{2022}").size(13.0).style(common::muted),
-                        text(format!("{} v{} \u{2014} already installed", root.name, root.version))
-                            .size(12.0)
-                            .style(common::muted),
+                        text(format!(
+                            "{} v{} \u{2014} already installed",
+                            root.name, root.version
+                        ))
+                        .size(12.0)
+                        .style(common::muted),
                     ]
                     .spacing(8.0)
                     .align_y(Vertical::Center),
@@ -5536,6 +6006,23 @@ impl AutomationsWindow {
             if can.is_empty() {
                 entry = entry.push(text(sandbox_summary()).size(12.0).style(common::muted));
             } else {
+                // A co-installed root with a sandbox-escape grant gets its own compact call-out —
+                // the main banner above only covers the package the user actually picked.
+                if union_risk(&root.permissions) == PermissionRisk::Critical {
+                    entry = entry.push(
+                        row![
+                            text("\u{26A0}").size(12.0).style(common::danger),
+                            text(format!(
+                                "Effectively full access \u{2014} it can {}.",
+                                join_reasons(&escape_reasons(&root.permissions))
+                            ))
+                            .size(12.0)
+                            .style(common::danger),
+                        ]
+                        .spacing(8.0)
+                        .align_y(Vertical::Center),
+                    );
+                }
                 for line in &can {
                     entry = entry.push(consent_can_row(line));
                 }
@@ -5554,8 +6041,9 @@ impl AutomationsWindow {
     /// permissions — the manifest IS the grant table, so the author edits it (here, via "Edit
     /// capabilities") and reloads to test the exact sandbox an installer gets. Reuses the installed
     /// pane's `permission_can_lines`/`consent_can_row`/`sandbox_summary` so both panes describe the
-    /// sandbox identically. Also offers the advanced "develop unsandboxed" (trust) escape hatch for
-    /// capabilities a sandbox can never grant (`ffi`/`run`).
+    /// sandbox identically. Also offers the advanced "develop unsandboxed" (trust) escape hatch —
+    /// full, unenumerated access while iterating (scoped `run`/`ffi` grants are declarable in the
+    /// manifest, so the hatch is a convenience, no longer the only route to native power).
     fn view_owned_sandbox_section(&self, package: &LocalPackage) -> Elem<'_> {
         let own_spec = self.local_own_spec(&package.name);
         let unsandboxed = self
@@ -5605,13 +6093,18 @@ impl AutomationsWindow {
         }
 
         // Sandboxed against the live manifest: show what it currently grants (reusing the consent
-        // can-lines), and point at the manifest editor as the grant mechanism.
+        // can-lines), and point at the manifest editor as the grant mechanism. The full-access
+        // banner shows here too — the author sees exactly the framing installers will get.
         let can = permission_can_lines(&package.manifest.permissions);
         let mut card =
-            column![text("Runs sandboxed against this package\u{2019}s manifest").size(14.0)].spacing(6.0);
+            column![text("Runs sandboxed against this package\u{2019}s manifest").size(14.0)]
+                .spacing(6.0);
         if can.is_empty() {
             card = card.push(text(sandbox_summary()).size(12.0).style(common::muted));
         } else {
+            if let Some(banner) = full_access_banner(&package.manifest.permissions) {
+                card = card.push(banner);
+            }
             card = card.push(text("It can:").size(12.0).style(common::muted));
             let mut lines = Column::new().spacing(4.0);
             for line in &can {
@@ -5651,8 +6144,9 @@ impl AutomationsWindow {
                             text(
                                 "It will run with FULL access to your computer, on your main isolate, \
                                  sharing state with your own scripts — ignoring its manifest's \
-                                 permissions. Use this only for capabilities a sandbox can't grant \
-                                 (e.g. ffi/run) while developing."
+                                 permissions. Use this only while developing, when maintaining the \
+                                 manifest's permission list gets in the way. To ship native power, \
+                                 declare scoped run/ffi permissions in the manifest instead."
                             )
                             .size(12.0),
                             row![
@@ -5772,13 +6266,23 @@ impl AutomationsWindow {
         }
 
         // Sandboxed: mirror the trusted card — a heading plus a breakdown of the consented access
-        // (read-only; the union is whatever was granted at install).
+        // (read-only; the union is whatever was granted at install). A consented sandbox-escape
+        // grant keeps its banner here too: "Runs in sandbox" must not read as containment the
+        // grant no longer provides.
         let consented = locked.consented_permissions.clone().unwrap_or_default();
         let can = permission_can_lines(&consented);
-        let mut card = column![text("Runs in sandbox").size(14.0)].spacing(6.0);
+        let heading = if union_risk(&consented) == PermissionRisk::Critical {
+            "Runs in sandbox \u{2014} with grants that can escape it"
+        } else {
+            "Runs in sandbox"
+        };
+        let mut card = column![text(heading).size(14.0)].spacing(6.0);
         if can.is_empty() {
             card = card.push(text(sandbox_summary()).size(12.0).style(common::muted));
         } else {
+            if let Some(banner) = full_access_banner(&consented) {
+                card = card.push(banner);
+            }
             card = card.push(text("It can only:").size(12.0).style(common::muted));
             let mut lines = Column::new().spacing(4.0);
             for line in &can {
@@ -5880,8 +6384,11 @@ impl AutomationsWindow {
                 .push(
                     row![
                         common::status_dot(NodeStatus::Warning),
-                        text(format!("Update held back — {} needs a newer smudgy", delta.name))
-                            .size(14.0),
+                        text(format!(
+                            "Update held back — {} needs a newer smudgy",
+                            delta.name
+                        ))
+                        .size(14.0),
                     ]
                     .spacing(8.0)
                     .align_y(Vertical::Center),
@@ -5891,9 +6398,12 @@ impl AutomationsWindow {
                     // be stale (a floored pin, or a smudgy downgrade since it last loaded),
                     // so the card states only what is certainly true. The reason carries its
                     // own remedy.
-                    text(format!("v{} is held back \u{2014} {reason}.", delta.version))
-                        .size(12.0)
-                        .style(common::muted),
+                    text(format!(
+                        "v{} is held back \u{2014} {reason}.",
+                        delta.version
+                    ))
+                    .size(12.0)
+                    .style(common::muted),
                 )
                 .push(
                     row![
@@ -5916,7 +6426,11 @@ impl AutomationsWindow {
             .push(
                 row![
                     common::status_dot(NodeStatus::Warning),
-                    text(format!("Update blocked — {} needs more permissions", delta.name)).size(14.0),
+                    text(format!(
+                        "Update blocked — {} needs more permissions",
+                        delta.name
+                    ))
+                    .size(14.0),
                 ]
                 .spacing(8.0)
                 .align_y(Vertical::Center),
@@ -5936,6 +6450,11 @@ impl AutomationsWindow {
                 .size(12.0)
                 .style(common::muted),
             );
+        // An update whose ADDED asks include a sandbox escape is a bigger decision than "more
+        // hosts" — the banner makes granting it a deliberate trust call, not a reflex.
+        if let Some(banner) = full_access_banner(&delta.added) {
+            col = col.push(banner);
+        }
         let mut lines = Column::new().spacing(4.0);
         for line in permission_can_lines(&delta.added) {
             lines = lines.push(consent_can_row(&line));
@@ -5964,21 +6483,24 @@ impl AutomationsWindow {
     // ---- Shared-with-me ----------------------------------------------------
 
     pub(super) fn view_shared(&self) -> Elem<'_> {
-        let mut body = column![self.scene_header(
-            None,
-            "Private & Shared",
-            Some(
-                "Private packages you own and packages friends have shared with you."
-                    .to_string()
-            ),
-            None,
-        )]
-        .spacing(16.0);
+        let mut body =
+            column![
+                self.scene_header(
+                    None,
+                    "Private & Shared",
+                    Some(
+                        "Private packages you own and packages friends have shared with you."
+                            .to_string()
+                    ),
+                    None,
+                )
+            ]
+            .spacing(16.0);
 
         if !self.signed_in() {
-            return pane_scroll(
-                body.push(self.signed_out_banner("see the packages you own and ones friends have shared")),
-            );
+            return pane_scroll(body.push(
+                self.signed_out_banner("see the packages you own and ones friends have shared"),
+            ));
         }
         if let Some(error) = &self.discover_error {
             body = body.push(text(error.clone()).size(13.0).style(common::danger));
@@ -5994,7 +6516,12 @@ impl AutomationsWindow {
         body = body.push(common::section_label("Your packages"));
         // Your own nickname is the owner handle for installing/resolving these — the server omits
         // owner_nickname on /packages/mine (it's you), so it isn't carried on the rows.
-        let my_nick = self.cloud.snapshot.get().nickname_text().unwrap_or_default();
+        let my_nick = self
+            .cloud
+            .snapshot
+            .get()
+            .nickname_text()
+            .unwrap_or_default();
         match &self.my_cloud_packages {
             None => {
                 body = body.push(text("Loading…").size(13.0).style(common::muted));
@@ -6038,10 +6565,15 @@ impl AutomationsWindow {
                             row![
                                 column![
                                     title_row,
-                                    text(detail.package.description.clone()).size(12.0).style(common::muted),
-                                    text(format!("v{}", detail.latest_version.as_deref().unwrap_or("—")))
-                                        .size(11.0)
-                                        .style(common::faint),
+                                    text(detail.package.description.clone())
+                                        .size(12.0)
+                                        .style(common::muted),
+                                    text(format!(
+                                        "v{}",
+                                        detail.latest_version.as_deref().unwrap_or("—")
+                                    ))
+                                    .size(11.0)
+                                    .style(common::faint),
                                 ]
                                 .spacing(3.0),
                                 iced::widget::space::horizontal(),
@@ -6081,8 +6613,11 @@ impl AutomationsWindow {
             Some(list) => {
                 for detail in list {
                     let owner = detail.package.owner_nickname.clone().unwrap_or_default();
-                    let installed =
-                        super::model::is_installed(&self.installed_packages, &owner, &detail.package.name);
+                    let installed = super::model::is_installed(
+                        &self.installed_packages,
+                        &owner,
+                        &detail.package.name,
+                    );
                     let action: Elem = if installed {
                         common::badge("Installed")
                     } else {
@@ -6099,10 +6634,15 @@ impl AutomationsWindow {
                             row![
                                 column![
                                     text(detail.package.name.clone()).size(15.0),
-                                    text(detail.package.description.clone()).size(12.0).style(common::muted),
-                                    text(format!("{owner} · v{}", detail.latest_version.as_deref().unwrap_or("—")))
-                                        .size(11.0)
-                                        .style(common::faint),
+                                    text(detail.package.description.clone())
+                                        .size(12.0)
+                                        .style(common::muted),
+                                    text(format!(
+                                        "{owner} · v{}",
+                                        detail.latest_version.as_deref().unwrap_or("—")
+                                    ))
+                                    .size(11.0)
+                                    .style(common::faint),
                                 ]
                                 .spacing(3.0),
                                 iced::widget::space::horizontal(),
@@ -6152,11 +6692,9 @@ fn star_rate_row<'a>(make_msg: fn(i16) -> Message) -> Elem<'a> {
         .align_y(Vertical::Center);
     for stars in 1..=5_i16 {
         rate = rate.push(
-            button(
-                text("\u{2605}")
-                    .size(13.0)
-                    .style(move |_| text::Style { color: Some(star_color) }),
-            )
+            button(text("\u{2605}").size(13.0).style(move |_| text::Style {
+                color: Some(star_color),
+            }))
             .style(button_style::subtle)
             .on_press(make_msg(stars))
             .padding(2),
@@ -6207,9 +6745,22 @@ fn code_block<'a>(content: &str) -> Elem<'a> {
 /// One "can do" row in the consent enumeration: a bullet, the capability label, and (when the line
 /// names one) the specific host/path/var in monospace.
 fn consent_can_row<'a>(line: &PermissionLine) -> Elem<'a> {
+    // The row's framing follows its risk tier: a plain scoped grant keeps the quiet accent
+    // bullet; a caution line goes amber; a sandbox-escape line goes red and says so inline, so
+    // the tier survives even when a caller shows rows without the full-access banner.
+    let (bullet, bullet_style, head_style): (&str, _, fn(&crate::theme::Theme) -> text::Style) =
+        match line.risk {
+            PermissionRisk::Normal => (
+                "\u{2022}",
+                common::accent as fn(&crate::theme::Theme) -> text::Style,
+                common::regular,
+            ),
+            PermissionRisk::Caution => ("\u{26A0}", common::warning, common::warning),
+            PermissionRisk::Critical => ("\u{26A0}", common::danger, common::danger),
+        };
     let mut r = row![
-        text("\u{2022}").size(13.0).style(common::accent),
-        text(line.head.clone()).size(13.0),
+        text(bullet).size(13.0).style(bullet_style),
+        text(line.head.clone()).size(13.0).style(head_style),
     ]
     .spacing(8.0)
     .align_y(Vertical::Center);
@@ -6242,7 +6793,9 @@ fn file_row<'a>(label: &str, selected: bool, msg: Message) -> Elem<'a> {
                 .font(fonts::BOOTSTRAP_ICONS)
                 .size(12.0)
                 .style(common::muted),
-            text(label.to_string()).size(12.0).font(fonts::GEIST_MONO_VF),
+            text(label.to_string())
+                .size(12.0)
+                .font(fonts::GEIST_MONO_VF),
         ]
         .spacing(8.0)
         .align_y(Vertical::Center),
@@ -6335,7 +6888,9 @@ mod tests {
         // Zero-width space hidden in an identifier.
         assert!(has_deceptive_unicode("ad\u{200B}min"));
         // Plain Arabic (RTL letters, no control chars) is legitimate source/text — no warning.
-        assert!(!has_deceptive_unicode("\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} = 1"));
+        assert!(!has_deceptive_unicode(
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} = 1"
+        ));
         assert!(!has_deceptive_unicode("const greeting = \"hello\";"));
     }
 

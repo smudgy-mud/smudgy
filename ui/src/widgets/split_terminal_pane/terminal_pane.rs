@@ -3,6 +3,7 @@ use std::{
     rc::Rc,
 };
 
+use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
 use iced::{
     Background, Event, Pixels, Rectangle,
     advanced::{
@@ -16,7 +17,6 @@ use iced::{
     alignment, touch,
     widget::text::LineHeight,
 };
-use crate::terminal_buffer::{LinkClickEvent, TerminalBuffer};
 
 mod spans;
 
@@ -196,35 +196,35 @@ where
         let selection = self.selection.borrow();
         let prefs = crate::prefs::current();
 
+        // The measured width of one monospace cell at the current font/size,
+        // measured once per prefs generation. It clamps the wrap width when a
+        // maximum line length is configured, and the parent split pane reads
+        // it to derive the character grid NAWS reports.
+        let advance = match state.advance {
+            Some((generation, advance)) if generation == prefs.generation => advance,
+            _ => {
+                let probe = Renderer::Paragraph::with_text(iced::advanced::text::Text {
+                    content: ADVANCE_PROBE,
+                    bounds: iced::Size::new(f32::INFINITY, f32::INFINITY),
+                    size: Pixels(prefs.font_size),
+                    font: prefs.font,
+                    line_height: LineHeight::Absolute(Pixels(prefs.line_height)),
+                    align_x: text::Alignment::Left,
+                    align_y: alignment::Vertical::Top,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                });
+                let advance = probe.min_width() / ADVANCE_PROBE.len() as f32;
+                state.advance = Some((prefs.generation, advance));
+                advance
+            }
+        };
+
         // When a maximum line length (in columns) is configured, clamp the
-        // wrap width to `cols * advance` where advance is the measured width
-        // of one monospace cell at the current font/size. The advance is
-        // measured once per prefs generation. Text stays left-aligned in the
+        // wrap width to `cols * advance`. Text stays left-aligned in the
         // full pane.
         let text_width = match prefs.line_length {
-            Some(cols) => {
-                let advance = match state.advance {
-                    Some((generation, advance)) if generation == prefs.generation => advance,
-                    _ => {
-                        let probe = Renderer::Paragraph::with_text(iced::advanced::text::Text {
-                            content: ADVANCE_PROBE,
-                            bounds: iced::Size::new(f32::INFINITY, f32::INFINITY),
-                            size: Pixels(prefs.font_size),
-                            font: prefs.font,
-                            line_height: LineHeight::Absolute(Pixels(prefs.line_height)),
-                            align_x: text::Alignment::Left,
-                            align_y: alignment::Vertical::Top,
-                            shaping: text::Shaping::Advanced,
-                            wrapping: text::Wrapping::None,
-                        });
-                        let advance = probe.min_width() / ADVANCE_PROBE.len() as f32;
-                        state.advance = Some((prefs.generation, advance));
-                        advance
-                    }
-                };
-
-                limits.max().width.min(f32::from(cols) * advance)
-            }
+            Some(cols) => limits.max().width.min(f32::from(cols) * advance),
             None => limits.max().width,
         };
         let text_bounds = iced::Size::new(text_width, limits.max().height);
@@ -252,37 +252,38 @@ where
             // advancing i by 1 if a match is found; entries shaped under an
             // older prefs generation are always misses
             if let Some(cache) = state.cache.get_mut(i)
-                && cache.generation == prefs.generation {
-                    let line_selection = selection.for_line(line_number);
+                && cache.generation == prefs.generation
+            {
+                let line_selection = selection.for_line(line_number);
 
-                    if cache.selection != line_selection {
-                        match line_selection {
-                            None => {
-                                cache.spans.select_none();
-                            }
-                            Some((0, usize::MAX)) => {
-                                cache.spans.select_all();
-                            }
-                            Some((from, to)) => {
-                                cache.spans.select_range(from, to);
-                            }
+                if cache.selection != line_selection {
+                    match line_selection {
+                        None => {
+                            cache.spans.select_none();
                         }
-                    } else if Rc::ptr_eq(&cache.spans.spans(), line.spans()) {
-                        i += 1;
-
-                        if text_bounds.width > cache.max_valid_width
-                            || text_bounds.width < cache.paragraph.min_bounds().width
-                        {
-                            cache.paragraph.resize(text_bounds);
-                            cache.max_valid_width = text_bounds.width;
+                        Some((0, usize::MAX)) => {
+                            cache.spans.select_all();
                         }
-
-                        new_cache.push(cache.clone());
-
-                        available_y -= cache.paragraph.min_height();
-                        continue;
+                        Some((from, to)) => {
+                            cache.spans.select_range(from, to);
+                        }
                     }
+                } else if Rc::ptr_eq(&cache.spans.spans(), line.spans()) {
+                    i += 1;
+
+                    if text_bounds.width > cache.max_valid_width
+                        || text_bounds.width < cache.paragraph.min_bounds().width
+                    {
+                        cache.paragraph.resize(text_bounds);
+                        cache.max_valid_width = text_bounds.width;
+                    }
+
+                    new_cache.push(cache.clone());
+
+                    available_y -= cache.paragraph.min_height();
+                    continue;
                 }
+            }
 
             let line_selection = selection.for_line(line_number);
             let spans = Spans::with_selection(line.spans().clone(), line_selection);
@@ -555,32 +556,31 @@ where
                 let mut selection = self.selection.borrow_mut();
 
                 if let Selection::Selecting {
-                        ref origin,
-                        from: _,
-                        to: _,
-                    } = *selection
+                    ref origin,
+                    from: _,
+                    to: _,
+                } = *selection
                     && let Some(cursor_position) = cursor.position_from(layout.position())
-                        && let Some(position) = state.hit_test(layout.bounds(), cursor_position)
-                        {
-                            let (from, to) = if position.line < origin.line
-                                || (position.line == origin.line
-                                    && position.column < origin.column)
-                            {
-                                (position, origin.clone())
-                            } else {
-                                (origin.clone(), position)
-                            };
+                    && let Some(position) = state.hit_test(layout.bounds(), cursor_position)
+                {
+                    let (from, to) = if position.line < origin.line
+                        || (position.line == origin.line && position.column < origin.column)
+                    {
+                        (position, origin.clone())
+                    } else {
+                        (origin.clone(), position)
+                    };
 
-                            *selection = Selection::Selecting {
-                                origin: origin.clone(),
-                                from,
-                                to,
-                            };
+                    *selection = Selection::Selecting {
+                        origin: origin.clone(),
+                        from,
+                        to,
+                    };
 
-                            shell.invalidate_layout();
-                            shell.request_redraw();
-                            shell.capture_event();
-                        }
+                    shell.invalidate_layout();
+                    shell.request_redraw();
+                    shell.capture_event();
+                }
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();

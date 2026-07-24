@@ -84,6 +84,37 @@ pub enum CloudError {
     /// 409 `version_not_yanked` — a version must be yanked before it can be
     /// deleted (delete is the heavy, two-step action). Yank it first.
     VersionNotYanked,
+
+    /// 409 `revision_conflict` — the aggregate moved past the mutation's
+    /// precondition. Carries what the caller expected and where the server's
+    /// projection of the aggregate now stands; the pending queue refetches
+    /// and re-validates before resending.
+    RevisionConflict {
+        id: uuid::Uuid,
+        expected_rev: i64,
+        current_rev: i64,
+    },
+
+    /// 409 `projection_changed` — the caller's capabilities on the aggregate
+    /// changed (access fingerprint mismatch), so their whole projection may
+    /// differ. Requires an authorization-aware refetch before any rebase,
+    /// even if the numeric revision happens to match.
+    ProjectionChanged { access_fingerprint: String },
+
+    /// 409 `operation_id_reused` — this operation id was already accepted
+    /// with a different request body. A client bug or id collision; never
+    /// retried automatically.
+    OperationIdReused,
+
+    /// 409 `structural_conflict` — the revision matched but the requested
+    /// link topology is no longer valid (normally only possible in a
+    /// compound operation). Carries the server's stable reason string.
+    StructuralConflict(String),
+
+    /// 422 `invalid_connection` — a Connection payload failed validation.
+    /// Carries the stable reason code (`too_many_members`, `wrong_area`,
+    /// `invalid_endpoint`, `non_orthogonal`, `invalid_point`, …).
+    InvalidConnection(String),
 }
 
 impl fmt::Display for CloudError {
@@ -135,6 +166,32 @@ impl fmt::Display for CloudError {
                 }
             }
             CloudError::VersionNotYanked => write!(f, "Yank this version before deleting it"),
+            CloudError::RevisionConflict {
+                expected_rev,
+                current_rev,
+                ..
+            } => write!(
+                f,
+                "Someone else changed this map (expected rev {expected_rev}, now {current_rev})"
+            ),
+            CloudError::ProjectionChanged { .. } => {
+                write!(f, "Your access to this map changed; refreshing")
+            }
+            CloudError::OperationIdReused => {
+                write!(
+                    f,
+                    "This operation id was already used for a different change"
+                )
+            }
+            CloudError::StructuralConflict(reason) => {
+                write!(
+                    f,
+                    "The map's structure changed underneath this edit: {reason}"
+                )
+            }
+            CloudError::InvalidConnection(reason) => {
+                write!(f, "Invalid connection: {reason}")
+            }
         }
     }
 }
@@ -143,26 +200,79 @@ impl std::error::Error for CloudError {}
 
 impl CloudError {
     /// Maps an HTTP error status plus the server's envelope `error` string to
-    /// the client error taxonomy.
+    /// the client error taxonomy. Responses that may carry a structured
+    /// `details` object (the CAS conflicts) go through [`Self::from_response`].
     #[must_use]
     pub fn from_status(status: u16, message: &str) -> Self {
-        match status {
-            401 => Self::Unauthorized(message.to_string()),
-            403 if message.contains("email_not_verified") => Self::EmailNotVerified,
-            403 => Self::PermissionDenied(message.to_string()),
-            404 => Self::NotFoundOrNoAccess,
+        Self::from_response(status, message, None)
+    }
+
+    /// Full response mapping: status, envelope `error` code/message, and the
+    /// optional structured `details` object. Each 409 keeps its own variant —
+    /// callers branch on the specific conflict, never on a collapsed bucket.
+    #[must_use]
+    pub fn from_response(status: u16, message: &str, details: Option<&serde_json::Value>) -> Self {
+        match (status, message) {
+            // A 400 is a permanent contract verdict (malformed envelope,
+            // size bounds, missing precondition) — never a transport
+            // failure, so it must not enter the retry/backoff path.
+            (400, _) => Self::InvalidInput(message.to_string()),
+            (401, _) => Self::Unauthorized(message.to_string()),
+            (403, m) if m.contains("email_not_verified") => Self::EmailNotVerified,
+            (403, _) => Self::PermissionDenied(message.to_string()),
+            (404, _) => Self::NotFoundOrNoAccess,
+            (409, "revision_conflict") => {
+                let d = details.unwrap_or(&serde_json::Value::Null);
+                Self::RevisionConflict {
+                    id: d
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                        .unwrap_or_default(),
+                    expected_rev: d
+                        .get("expected_rev")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0),
+                    current_rev: d
+                        .get("current_rev")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0),
+                }
+            }
+            (409, "projection_changed") => Self::ProjectionChanged {
+                access_fingerprint: details
+                    .and_then(|d| d.get("access_fingerprint"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+            (409, "operation_id_reused") => Self::OperationIdReused,
+            (409, "structural_conflict") => Self::StructuralConflict(
+                details
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            (422, "invalid_connection") => Self::InvalidConnection(
+                details
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
             // Package publish/delete conflicts carry a machine token in the message
             // (the envelope has no separate code field), mirrored from smudgy-api.
-            409 if message.starts_with("version_unavailable") => {
-                let version = message
+            (409, m) if m.starts_with("version_unavailable") => {
+                let version = m
                     .split_once(':')
                     .map(|(_, v)| v.trim().to_string())
                     .unwrap_or_default();
                 Self::VersionUnavailable(version)
             }
-            409 if message.contains("version_not_yanked") => Self::VersionNotYanked,
-            409 => Self::NameUnavailable(message.to_string()),
-            426 => Self::UpgradeRequired,
+            (409, m) if m.contains("version_not_yanked") => Self::VersionNotYanked,
+            (409, _) => Self::NameUnavailable(message.to_string()),
+            (426, _) => Self::UpgradeRequired,
             _ => Self::NetworkError(format!("HTTP {status}: {message}")),
         }
     }
@@ -171,10 +281,7 @@ impl CloudError {
     /// login) rather than a per-resource denial.
     #[must_use]
     pub const fn is_auth_error(&self) -> bool {
-        matches!(
-            self,
-            Self::Unauthorized(_) | Self::AuthenticationError(_)
-        )
+        matches!(self, Self::Unauthorized(_) | Self::AuthenticationError(_))
     }
 
     /// True for transient transport-level failures worth retrying/backing

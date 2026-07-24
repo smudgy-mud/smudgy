@@ -15,6 +15,30 @@ use smudgy_core::session::HotkeyId;
 
 use crate::keymap::MaybePhysicalKey;
 
+/// The wrapped input's caret state as observed after an event: focus plus the
+/// widget's raw [`text_input::cursor::Cursor`] (grapheme-indexed and
+/// unclamped — `select_all` parks an endpoint at `usize::MAX`). Published raw
+/// through `on_caret_change` whenever it differs from the previous event's
+/// reading; the consumer clamps against its own copy of the value when it
+/// needs positions, so an observation made in the same event that edited the
+/// text is never clamped against the stale pre-edit string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CaretState {
+    pub focused: bool,
+    pub cursor: text_input::cursor::Cursor,
+}
+
+/// Whether a key press is one of the wrapped input's clipboard-write
+/// shortcuts (copy or cut): `command`+`c`/`x` by the same latin-key dispatch
+/// the `TextInput` itself uses.
+fn is_clipboard_write_shortcut(
+    key: &keyboard::Key,
+    physical_key: key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> bool {
+    modifiers.command() && matches!(key.to_latin(physical_key), Some('c' | 'x'))
+}
+
 pub struct HotkeyMatchingInput<'a, Message, Theme, Renderer>
 where
     Message: Clone,
@@ -26,6 +50,8 @@ where
     text_input: TextInput<'a, Message, Theme, Renderer>,
     on_match: Option<Box<dyn Fn(HotkeyId) -> Message>>,
     on_unfocus: Option<Message>,
+    on_caret_change: Option<Box<dyn Fn(CaretState) -> Message>>,
+    suppress_clipboard_writes: bool,
     _p: PhantomData<(Message, Theme, Renderer)>,
 }
 
@@ -47,6 +73,8 @@ where
             text_input: TextInput::<'a, Message, Theme, Renderer>::new(placeholder, value),
             on_match: None,
             on_unfocus: None,
+            on_caret_change: None,
+            suppress_clipboard_writes: false,
             _p: PhantomData,
         }
     }
@@ -61,6 +89,30 @@ where
     /// unfocused (e.g. the user clicks away or the window loses focus).
     pub fn on_unfocus(mut self, message: Message) -> Self {
         self.on_unfocus = Some(message);
+        self
+    }
+
+    /// Set the callback published whenever the wrapped input's caret state
+    /// (focus, cursor, selection) differs from the previous event's reading.
+    pub fn on_caret_change(mut self, f: impl Fn(CaretState) -> Message + 'static) -> Self {
+        self.on_caret_change = Some(Box::new(f));
+        self
+    }
+
+    /// Render the wrapped input in secure (password) mode: glyphs are masked
+    /// and clipboard/word-selection affordances are disabled by the widget.
+    pub fn secure(mut self, is_secure: bool) -> Self {
+        self.text_input = self.text_input.secure(is_secure);
+        self
+    }
+
+    /// Capture the clipboard-write shortcuts (copy/cut) before the wrapped
+    /// input sees them. The `TextInput` only withholds clipboard writes while
+    /// rendering secure; a masked input revealed on screen is
+    /// rendering-insecure yet still holds a secret, so the wrapper suppresses
+    /// the writes for the whole masked lifetime.
+    pub fn suppress_clipboard_writes(mut self, suppress: bool) -> Self {
+        self.suppress_clipboard_writes = suppress;
         self
     }
 
@@ -143,6 +195,9 @@ struct State {
     /// Whether the wrapped input held focus as of the previous event, so a
     /// focused→unfocused edge can fire `on_unfocus` exactly once.
     was_focused: bool,
+    /// The caret state as of the previous event, so `on_caret_change` fires
+    /// only on an actual change.
+    last_caret: Option<CaretState>,
 }
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -255,23 +310,33 @@ where
                 modifiers,
                 ..
             }) = event
-            {
-                if let Some(hotkey_id) = self.check_hotkey(key, physical_key, modifiers).as_ref()
-                {
-                    if let Some(on_match) = self.on_match.as_ref() {
-                        shell.publish(on_match(*hotkey_id));
-                    }
-                    shell.capture_event();
-                    return;
+        {
+            if let Some(hotkey_id) = self.check_hotkey(key, physical_key, modifiers).as_ref() {
+                if let Some(on_match) = self.on_match.as_ref() {
+                    shell.publish(on_match(*hotkey_id));
                 }
-
-                if let Some(hook) = self.hooks.get(key)
-                    && modifiers.is_empty() {
-                        shell.publish(hook.clone());
-                        shell.capture_event();
-                        return;
-                    }
+                shell.capture_event();
+                return;
             }
+
+            if let Some(hook) = self.hooks.get(key)
+                && modifiers.is_empty()
+            {
+                shell.publish(hook.clone());
+                shell.capture_event();
+                return;
+            }
+
+            // Swallow copy/cut before the wrapped input can service them
+            // (see `suppress_clipboard_writes`). Nothing is published:
+            // the keystroke simply lands on nothing.
+            if self.suppress_clipboard_writes
+                && is_clipboard_write_shortcut(key, *physical_key, *modifiers)
+            {
+                shell.capture_event();
+                return;
+            }
+        }
 
         self.text_input.update(
             &mut tree.children[0],
@@ -297,15 +362,33 @@ where
                 .state
                 .downcast_ref::<text_input::State<Renderer::Paragraph>>()
                 .is_focused();
-            let window_blurred = matches!(
-                event,
-                iced::Event::Window(iced::window::Event::Unfocused)
-            );
+            let window_blurred =
+                matches!(event, iced::Event::Window(iced::window::Event::Unfocused));
             let state = tree.state.downcast_mut::<State>();
             if (state.was_focused && !now_focused) || (window_blurred && now_focused) {
                 shell.publish(on_unfocus.clone());
             }
             state.was_focused = now_focused;
+        }
+
+        // Observe the wrapped input's caret after the event settled: focus
+        // plus the raw cursor, published as-is (see [`CaretState`]). Only a
+        // change publishes, so idle event traffic costs one compare.
+        if let Some(on_caret_change) = self.on_caret_change.as_ref() {
+            let caret = {
+                let input_state = tree.children[0]
+                    .state
+                    .downcast_ref::<text_input::State<Renderer::Paragraph>>();
+                CaretState {
+                    focused: input_state.is_focused(),
+                    cursor: input_state.cursor(),
+                }
+            };
+            let state = tree.state.downcast_mut::<State>();
+            if state.last_caret != Some(caret) {
+                state.last_caret = Some(caret);
+                shell.publish(on_caret_change(caret));
+            }
         }
     }
 
@@ -318,5 +401,44 @@ where
     ) {
         self.text_input
             .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::keyboard::key::{Code, Physical};
+
+    /// The clipboard-write gate `suppress_clipboard_writes` hangs on: copy
+    /// and cut (command-modified) are write shortcuts; paste and unmodified
+    /// keys are not (reading the clipboard into a masked box is the user's
+    /// own business).
+    #[test]
+    fn clipboard_write_shortcut_classification() {
+        let c = keyboard::Key::Character("c".into());
+        let x = keyboard::Key::Character("x".into());
+        let v = keyboard::Key::Character("v".into());
+        let command = keyboard::Modifiers::COMMAND;
+
+        assert!(is_clipboard_write_shortcut(
+            &c,
+            Physical::Code(Code::KeyC),
+            command
+        ));
+        assert!(is_clipboard_write_shortcut(
+            &x,
+            Physical::Code(Code::KeyX),
+            command
+        ));
+        assert!(!is_clipboard_write_shortcut(
+            &v,
+            Physical::Code(Code::KeyV),
+            command
+        ));
+        assert!(!is_clipboard_write_shortcut(
+            &c,
+            Physical::Code(Code::KeyC),
+            keyboard::Modifiers::empty()
+        ));
     }
 }

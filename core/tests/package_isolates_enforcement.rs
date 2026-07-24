@@ -1050,3 +1050,126 @@ async fn events_deliver_across_sandboxed_isolates() {
         "an emit in one sandboxed isolate must deliver to a smudgy:events/… subscriber in another; transcript:\n{lines:#?}"
     );
 }
+
+/// run + sys grants: a sandboxed package granted `run:[<shell>]` + `sys:["hostname"]` spawns the
+/// granted program and reads the hostname, while an un-granted program and an un-granted sys kind
+/// reject `NotCapable` at the gate. Proves the two new manifest axes reach the isolate's
+/// container (`run`/`ffi` are consent-framed as full access — enforcement is still exact:
+/// only the listed program is spawnable).
+#[tokio::test]
+async fn sandboxed_package_run_and_sys_grants_are_enforced() {
+    prepare_server("pi_enf_run_sys");
+    // The one program every host has: the platform shell. PATH-resolved by the container build.
+    // The un-granted probe must be a program that EXISTS (deno resolves the name before the
+    // permission check — an unresolvable name is `NotFound`, which wouldn't prove the gate).
+    let (shell, flag) = if cfg!(windows) { ("cmd", "/c") } else { ("sh", "-c") };
+    let ungranted = if cfg!(windows) { "whoami" } else { "ls" };
+
+    // `clearEnv: true` on the granted spawn: deno refuses a SCOPED run grant when the subprocess
+    // would inherit loader-hijack env vars (LD_LIBRARY_PATH & co.) from the parent — correct, and
+    // exactly the kind of edge a sandboxed package must handle by spawning with a clean env.
+    let src = r#"
+        import { echo } from "smudgy:core";
+        try {
+          const out = await new Deno.Command("__SHELL__", { args: ["__FLAG__", "echo RUNOK"], clearEnv: true }).output();
+          echo("RUN_ALLOWED:" + new TextDecoder().decode(out.stdout).trim());
+        } catch (e) { echo("RUN_ALLOWED_ERR:" + (e?.name ?? String(e)) + ":" + (e?.message ?? "")); }
+        try {
+          await new Deno.Command("__UNGRANTED__", { clearEnv: true }).output();
+          echo("RUN_OTHER:NO_ERROR");
+        } catch (e) { echo("RUN_OTHER_ERR:" + (e?.name ?? String(e))); }
+        try { echo("SYS_ALLOWED:" + (Deno.hostname().length > 0)); }
+        catch (e) { echo("SYS_ALLOWED_ERR:" + (e?.name ?? String(e))); }
+        try { Deno.osRelease(); echo("SYS_OTHER:NO_ERROR"); }
+        catch (e) { echo("SYS_OTHER_ERR:" + (e?.name ?? String(e))); }
+        echo("DONE");
+    "#
+    .replace("__SHELL__", shell)
+    .replace("__FLAG__", flag)
+    .replace("__UNGRANTED__", ungranted);
+
+    let pkg = make_package(
+        "wbk",
+        "native",
+        "1.0.0",
+        &format!(r#", "permissions": {{ "run": ["{shell}"], "sys": ["hostname"] }}"#),
+        &src,
+    );
+    let lines = collect_session_lines(
+        9431,
+        "pi_enf_run_sys",
+        &["smudgy://wbk/native"],
+        factory_for(vec![pkg]),
+    )
+    .await;
+
+    assert!(
+        has_line(&lines, "RUN_ALLOWED:RUNOK"),
+        "the granted program must spawn and produce its stdout; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "RUN_OTHER:NO_ERROR")
+            && has_line(&lines, "RUN_OTHER_ERR:NotCapable"),
+        "an un-granted program must be denied at the gate (NotCapable), not attempted; \
+         transcript:\n{lines:#?}"
+    );
+    assert!(
+        has_line(&lines, "SYS_ALLOWED:true"),
+        "the granted sys kind must be readable; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "SYS_OTHER:NO_ERROR")
+            && has_line(&lines, "SYS_OTHER_ERR:NotCapable"),
+        "an un-granted sys kind must reject NotCapable; transcript:\n{lines:#?}"
+    );
+}
+
+/// run/ffi/sys deny by default: a package declaring no `permissions` may neither spawn a
+/// subprocess, load a native library, nor read system info — the empty-allowlist → `None` recipe
+/// (deny, not deno's `Some(vec![])` allow-all) holds for the new axes exactly as it does for
+/// `net` (`sandboxed_package_with_no_permissions_denies_net`).
+#[tokio::test]
+async fn sandboxed_package_with_no_permissions_denies_run_ffi_sys() {
+    prepare_server("pi_enf_native_deny");
+    let (shell, flag) = if cfg!(windows) { ("cmd", "/c") } else { ("sh", "-c") };
+
+    let src = r#"
+        import { echo } from "smudgy:core";
+        try {
+          await new Deno.Command("__SHELL__", { args: ["__FLAG__", "echo hi"] }).output();
+          echo("RUN:NO_ERROR");
+        } catch (e) { echo("RUN_ERR:" + (e?.name ?? String(e))); }
+        try {
+          Deno.dlopen("not-a-lib.dll", {});
+          echo("FFI:NO_ERROR");
+        } catch (e) { echo("FFI_ERR:" + (e?.name ?? String(e))); }
+        try { Deno.hostname(); echo("SYS:NO_ERROR"); }
+        catch (e) { echo("SYS_ERR:" + (e?.name ?? String(e))); }
+        echo("DONE");
+    "#
+    .replace("__SHELL__", shell)
+    .replace("__FLAG__", flag);
+
+    let pkg = make_package("wbk", "grounded", "1.0.0", "", &src);
+    let lines = collect_session_lines(
+        9432,
+        "pi_enf_native_deny",
+        &["smudgy://wbk/grounded"],
+        factory_for(vec![pkg]),
+    )
+    .await;
+
+    assert!(has_line(&lines, "DONE"), "denials are caught, not fatal; transcript:\n{lines:#?}");
+    assert!(
+        !has_line(&lines, "RUN:NO_ERROR") && has_line(&lines, "RUN_ERR:NotCapable"),
+        "a zero-permission package must not spawn subprocesses; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "FFI:NO_ERROR") && has_line(&lines, "FFI_ERR:NotCapable"),
+        "a zero-permission package must not load native libraries; transcript:\n{lines:#?}"
+    );
+    assert!(
+        !has_line(&lines, "SYS:NO_ERROR") && has_line(&lines, "SYS_ERR:NotCapable"),
+        "a zero-permission package must not read system info; transcript:\n{lines:#?}"
+    );
+}
