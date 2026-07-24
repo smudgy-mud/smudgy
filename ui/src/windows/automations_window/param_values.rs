@@ -278,7 +278,7 @@ pub(super) fn parse_number(text: &str) -> Result<Value, String> {
     {
         Ok(Value::Number(num))
     } else {
-        Err("must be a number.".to_string())
+        Err(crate::i18n::t!("param-value-number-error"))
     }
 }
 
@@ -491,11 +491,11 @@ fn scalar_placeholder(cell: &PackageParameter, sink: Sink) -> String {
     if let Sink::Top = sink
         && let Some(default) = &cell.default
     {
-        return format!("default: {}", scalar_text(default));
+        return crate::i18n::t!("param-value-default", "value" => scalar_text(default));
     }
     match cell.kind {
-        ParamKind::Number => "number".to_string(),
-        _ => "value".to_string(),
+        ParamKind::Number => crate::i18n::t!("param-value-number"),
+        _ => crate::i18n::t!("param-value-value"),
     }
 }
 
@@ -561,7 +561,7 @@ fn list_block<'a>(
         .spacing(6.0)
         .push(text(label.to_string()).size(13.0));
     if items.is_empty() {
-        col = col.push(text("No entries.").size(12.0).style(common::faint));
+        col = col.push(text(crate::i18n::t!("param-value-no-entries")).size(12.0).style(common::faint));
     }
     for (i, item) in items.iter().enumerate() {
         let control: Elem<'a> = match element {
@@ -588,7 +588,7 @@ fn list_block<'a>(
         );
     }
     col = col.push(add_button(
-        "Add entry",
+        crate::i18n::ts!("param-value-add-entry"),
         edit_msg(target, &spec.key, ParamValueEdit::ListAdd),
     ));
     container(col)
@@ -611,7 +611,11 @@ fn table_block<'a>(
         .push(text(label.to_string()).size(13.0));
 
     if spec.fields.is_empty() {
-        col = col.push(text("No columns declared.").size(12.0).style(common::faint));
+        col = col.push(
+            text(crate::i18n::t!("param-value-no-columns"))
+                .size(12.0)
+                .style(common::faint),
+        );
         return container(col)
             .padding(12.0)
             .width(Length::Fill)
@@ -638,7 +642,7 @@ fn table_block<'a>(
     col = col.push(header);
 
     if rows.is_empty() {
-        col = col.push(text("No rows.").size(12.0).style(common::faint));
+        col = col.push(text(crate::i18n::t!("param-value-no-rows")).size(12.0).style(common::faint));
     }
     for (r, row_state) in rows.iter().enumerate() {
         let mut cells = row![].spacing(8.0).align_y(Vertical::Center);
@@ -661,7 +665,7 @@ fn table_block<'a>(
         col = col.push(cells);
     }
     col = col.push(add_button(
-        "Add row",
+        crate::i18n::ts!("param-value-add-row"),
         edit_msg(target, &spec.key, ParamValueEdit::TableAddRow),
     ));
     container(col)

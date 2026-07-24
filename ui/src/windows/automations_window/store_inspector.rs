@@ -40,11 +40,11 @@ const MONO: Font = fonts::GEIST_MONO_VF;
 impl AutomationsWindow {
     pub(super) fn view_store_inspector(&self) -> Elem<'_> {
         let header = column![
-            text("Session Store").size(30.0).font(Font {
+            text(crate::i18n::t!("store-title")).size(30.0).font(Font {
                 weight: iced::font::Weight::Light,
                 ..fonts::GEIST_VF
             }),
-            text("A live view of state updates, events, and messages published in this session")
+            text(crate::i18n::t!("store-description"))
                 .size(13.0)
                 .style(common::muted),
             iced::widget::rule::horizontal(1.0),
@@ -55,7 +55,7 @@ impl AutomationsWindow {
         match &self.catalogue {
             None => {
                 body = body.push(
-                    text("Waiting for the session's first snapshot\u{2026}")
+                    text(crate::i18n::t!("store-waiting"))
                         .size(13.0)
                         .style(common::muted),
                 );
@@ -70,21 +70,22 @@ impl AutomationsWindow {
 
     /// The committed store tree per producer, collapsible per node.
     fn view_store_trees<'a>(&'a self, snapshot: &'a CatalogueSnapshot) -> Elem<'a> {
-        let mut section = column![common::section_label("Published state")].spacing(8.0);
+        let mut section = column![common::section_label(crate::i18n::ts!("store-published-state"))]
+            .spacing(8.0);
         if snapshot.producers.is_empty() {
             return section
                 .push(
-                    text("Nothing is published yet. State appears here the moment a script or package sets it.")
+                    text(crate::i18n::t!("store-empty"))
                         .size(13.0)
                         .style(common::muted),
                 )
                 .into();
         }
         for producer in &snapshot.producers {
-            let usage = format!(
-                "{} entries \u{00B7} {}",
-                producer.entries,
-                format_bytes(producer.bytes)
+            let usage = crate::i18n::t!(
+                "store-usage",
+                "entries" => producer.entries,
+                "bytes" => format_bytes(producer.bytes)
             );
             section = section.push(
                 row![
@@ -195,9 +196,9 @@ impl AutomationsWindow {
                         if index >= NODE_CHILD_CAP {
                             rows = rows.push(
                                 iced::widget::container(
-                                    text(format!(
-                                        "\u{2026} {} more not shown",
-                                        count - NODE_CHILD_CAP
+                                    text(crate::i18n::t!(
+                                        "store-more-hidden",
+                                        "count" => count - NODE_CHILD_CAP
                                     ))
                                     .size(12.0)
                                     .style(common::faint),
@@ -229,11 +230,12 @@ impl AutomationsWindow {
 
     /// The interop catalogue: one block per entry, grouped under producer sub-headers.
     fn view_catalogue_entries<'a>(&'a self, snapshot: &'a CatalogueSnapshot) -> Elem<'a> {
-        let mut section = column![common::section_label("State, events & messages")].spacing(10.0);
+        let mut section = column![common::section_label(crate::i18n::ts!("store-catalogue"))]
+            .spacing(10.0);
         if snapshot.entries.is_empty() {
             return section
                 .push(
-                    text("No interop handles seen yet. Declared handles, emitted events, and posted messages all appear here.")
+                    text(crate::i18n::t!("store-catalogue-empty"))
                         .size(13.0)
                         .style(common::muted),
                 )
@@ -271,10 +273,10 @@ fn entry_block(entry: &CatalogueEntryView) -> Elem<'_> {
     .spacing(8.0)
     .align_y(Vertical::Center);
     let provenance = match (entry.declared, entry.runtime_confirmed) {
-        (true, true) => "declared",
-        (true, false) => "declared \u{00B7} not seen this session",
-        (false, true) => "created at runtime",
-        (false, false) => "observed \u{00B7} undeclared",
+        (true, true) => crate::i18n::ts!("store-provenance-declared"),
+        (true, false) => crate::i18n::ts!("store-provenance-declared-unseen"),
+        (false, true) => crate::i18n::ts!("store-provenance-runtime"),
+        (false, false) => crate::i18n::ts!("store-provenance-undeclared"),
     };
     head = head.push(text(provenance).size(11.0).style(common::faint));
     if let Some(alias) = &entry.type_alias {
@@ -305,7 +307,10 @@ fn entry_block(entry: &CatalogueEntryView) -> Elem<'_> {
     }
     if let Some(declared) = &entry.declared_shape {
         block = block.push(
-            text(format!("declared: {}", first_lines(declared, 6)))
+            text(crate::i18n::t!(
+                "store-declared-shape",
+                "shape" => first_lines(declared, 6)
+            ))
                 .size(11.0)
                 .font(MONO)
                 .style(common::faint),
@@ -330,7 +335,8 @@ fn entry_block(entry: &CatalogueEntryView) -> Elem<'_> {
 fn sample_row(sample: &CatalogueSample) -> Elem<'_> {
     let mut meta = format!("{} \u{00B7} {}", ago(sample.at_epoch_ms), sample.sender);
     if sample.truncated {
-        meta.push_str(" \u{00B7} truncated");
+        meta.push_str(" \u{00B7} ");
+        meta.push_str(&crate::i18n::t!("store-truncated"));
     }
     row![
         text(meta)
@@ -350,10 +356,12 @@ fn ago(at_epoch_ms: u64) -> String {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     let elapsed_s = now_ms.saturating_sub(at_epoch_ms) / 1000;
     match elapsed_s {
-        0..=2 => "just now".to_string(),
-        3..=99 => format!("{elapsed_s}s ago"),
-        100..=5999 => format!("{}m ago", elapsed_s / 60),
-        _ => format!("{}h ago", elapsed_s / 3600),
+        0..=2 => crate::i18n::t!("time-just-now"),
+        3..=99 => crate::i18n::t!("time-seconds-ago", "count" => elapsed_s),
+        100..=5999 => {
+            crate::i18n::t!("time-minutes-ago", "count" => elapsed_s / 60)
+        }
+        _ => crate::i18n::t!("time-hours-ago", "count" => elapsed_s / 3600),
     }
 }
 

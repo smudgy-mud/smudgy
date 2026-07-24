@@ -5,14 +5,19 @@
 //! translator used by Smudgy's windows.
 
 use std::fmt;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::{LazyLock, RwLock};
 
-use smudgy_i18n::Translator;
+use smudgy_i18n::{FluentArgs, Translator};
 
 const SYSTEM_PREFERENCE: &str = "system";
 
 static ACTIVE_TRANSLATOR: LazyLock<RwLock<Translator>> =
     LazyLock::new(|| RwLock::new(Translator::default()));
+static STATIC_TRANSLATIONS: LazyLock<
+    Mutex<HashMap<(&'static str, &'static str), &'static str>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// One application locale picker item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +126,28 @@ pub(crate) fn translate(id: &str) -> String {
     with_translator(|translator| translator.translate(id))
 }
 
+pub(crate) fn translate_with(id: &str, args: &FluentArgs<'_>) -> String {
+    with_translator(|translator| translator.translate_with(id, args))
+}
+
+/// Translate a literal for Iced APIs that retain a borrowed label or
+/// placeholder. Each `(catalog, message id)` allocation is cached once for the
+/// process lifetime; the selected locale itself remains application-owned.
+pub(crate) fn translate_static(id: &'static str) -> &'static str {
+    with_translator(|translator| {
+        let key = (translator.tag(), id);
+        let mut cache = STATIC_TRANSLATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(value) = cache.get(&key) {
+            return *value;
+        }
+        let value = Box::leak(translator.translate(id).into_boxed_str());
+        cache.insert(key, value);
+        value
+    })
+}
+
 macro_rules! t {
     ($id:literal $(,)?) => {
         $crate::i18n::with_translator(|translator| smudgy_i18n::t!(translator, $id))
@@ -132,6 +159,15 @@ macro_rules! t {
     };
 }
 pub(crate) use t;
+
+// Placeholders and other Iced APIs retain a borrowed label. Keep this adapter
+// in the application layer so the catalog crate stays stateless.
+macro_rules! ts {
+    ($id:literal $(,)?) => {
+        $crate::i18n::translate_static($id)
+    };
+}
+pub(crate) use ts;
 
 #[cfg(test)]
 mod tests {

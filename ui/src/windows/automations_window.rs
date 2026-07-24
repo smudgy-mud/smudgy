@@ -1260,7 +1260,10 @@ impl AutomationsWindow {
                 self.authoring_busy = false;
                 match result {
                     Ok(summary) => {
-                        let mut feedback = format!("Published v{}", summary.version);
+                        let mut feedback = crate::i18n::t!(
+                            "automation-published",
+                            "version" => &summary.version
+                        );
                         if summary.typings_generated > 0 {
                             feedback.push_str(&format!(
                                 " \u{b7} {} typings",
@@ -1270,9 +1273,10 @@ impl AutomationsWindow {
                         // Surface tsc warnings to the author — typings are best-effort, so a
                         // warning here never means the publish failed.
                         if !summary.typings_warnings.is_empty() {
-                            feedback.push_str(&format!(
-                                " \u{b7} \u{26a0} typings: {}",
-                                summary.typings_warnings.join("; ")
+                            feedback.push_str(" \u{b7} ");
+                            feedback.push_str(&crate::i18n::t!(
+                                "automation-typings-warning",
+                                "warnings" => summary.typings_warnings.join("; ")
                             ));
                         }
                         // Show exactly what each dependency froze to — a publish pins the whole tree,
@@ -1285,7 +1289,11 @@ impl AutomationsWindow {
                                     format!("{}@{ver}", spec.trim_start_matches("smudgy://"))
                                 })
                                 .collect();
-                            feedback.push_str(&format!(" \u{b7} deps: {}", locked.join(", ")));
+                            feedback.push_str(" \u{b7} ");
+                            feedback.push_str(&crate::i18n::t!(
+                                "automation-locked-dependencies",
+                                "dependencies" => locked.join(", ")
+                            ));
                         }
                         // A range that excludes a newer published version (the 0.0.x caret footgun):
                         // non-fatal, but the author almost certainly wanted the newer one.
@@ -1300,9 +1308,10 @@ impl AutomationsWindow {
                         // name is the identity consumers import, so these deserve eyes even
                         // though the publish succeeded.
                         if !summary.interop_warnings.is_empty() {
-                            feedback.push_str(&format!(
-                                " \u{b7} \u{26a0} interop: {}",
-                                summary.interop_warnings.join("; ")
+                            feedback.push_str(" \u{b7} ");
+                            feedback.push_str(&crate::i18n::t!(
+                                "automation-interop-warning",
+                                "warnings" => summary.interop_warnings.join("; ")
                             ));
                         }
                         self.authoring_feedback = Some(feedback);
@@ -1311,7 +1320,10 @@ impl AutomationsWindow {
                         )
                     }
                     Err(e) => {
-                        self.authoring_feedback = Some(format!("Publish failed: {e}"));
+                        self.authoring_feedback = Some(crate::i18n::t!(
+                            "automation-publish-failed",
+                            "error" => e.to_string()
+                        ));
                         Update::none()
                     }
                 }
@@ -1511,10 +1523,9 @@ impl AutomationsWindow {
                              time; reconnect this session to start it.",
                             self.server_name
                         );
-                        Update::with_task(self.show_toast(
-                            "No inspector yet — it starts when the session connects. \
-                             Reconnect this session, then click Inspect again.",
-                        ))
+                        Update::with_task(
+                            self.show_toast(crate::i18n::t!("automation-inspector-unavailable")),
+                        )
                     }
                 }
             }
@@ -1696,12 +1707,12 @@ impl AutomationsWindow {
         container(
             row![
                 text("\u{25CF}").size(10.0).style(common::danger),
-                text("You have unsaved changes.").size(13.0),
+                text(crate::i18n::t!("automation-nav-unsaved")).size(13.0),
                 iced::widget::space::horizontal(),
-                button(text("Discard").size(13.0))
+                button(text(crate::i18n::t!("editor-discard")).size(13.0))
                     .style(crate::theme::builtins::button::secondary)
                     .on_press(Message::ConfirmDiscardNav),
-                button(text("Keep editing").size(13.0))
+                button(text(crate::i18n::t!("automation-keep-editing")).size(13.0))
                     .style(crate::theme::builtins::button::primary)
                     .on_press(Message::CancelDiscardNav),
             ]

@@ -1252,13 +1252,13 @@ impl SmudgyWindow {
             container(
                 column![
                     chip,
-                    text("No active sessions")
-                        .font(assets::fonts::GEIST_VF)
-                        .size(22),
-                    text("Choose a server and profile to connect.")
-                        .font(assets::fonts::GEIST_VF)
+                    text(crate::i18n::t!("shell-no-sessions")).size(22),
+                    text(crate::i18n::t!("shell-connect-help"))
                         .style(theme::builtins::text::muted),
-                    iced::widget::button(text("Connect to a server").font(assets::fonts::GEIST_VF))
+                    iced::widget::button(
+                        text(crate::i18n::t!("shell-connect-action"))
+                            .font(assets::fonts::GEIST_VF)
+                    )
                         .style(theme::builtins::button::primary)
                         .padding([10, 22])
                         .on_press(Message::ToolbarAction(toolbar::Message::ConnectPressed)),
@@ -1279,9 +1279,8 @@ impl SmudgyWindow {
         let banner: Option<ThemedElement<Message>> = snapshot.show_verify_banner().then(|| {
             container(
                 row![
-                    text("Verify your email to use cloud features (friends, sharing, sync).")
-                        .size(13),
-                    iced::widget::button(text("Open Settings").size(12))
+                    text(crate::i18n::t!("shell-verify-email")).size(13),
+                    iced::widget::button(text(crate::i18n::t!("shell-open-settings")).size(12))
                         .style(theme::builtins::button::secondary)
                         .padding([2, 8])
                         .on_press(Message::OpenSettingsPressed),
@@ -1301,12 +1300,14 @@ impl SmudgyWindow {
             snapshot.show_upgrade_banner().then(|| {
                 container(
                     row![
-                        text(
-                            "smudgy is out of date — a newer version is required for some features."
-                        )
+                        text(crate::i18n::t!("shell-client-outdated"))
                         .size(13),
                         iced::widget::button(
-                            text(format!("Get it at {}", crate::DOWNLOAD_URL)).size(12),
+                            text(crate::i18n::t!(
+                                "shell-download-at",
+                                "url" => crate::DOWNLOAD_URL
+                            ))
+                            .size(12),
                         )
                         .style(theme::builtins::button::secondary)
                         .padding([2, 8])
@@ -1355,19 +1356,19 @@ impl SmudgyWindow {
         let main_layout: ThemedElement<Message> = if let Some(version) = snapshot.upgrade_prompt() {
             let popup = container(
                 column![
-                    text("An update is available").size(18),
-                    text(format!("smudgy {version} is ready to download.")).size(13),
-                    iced::widget::button(text("Visit download page").size(13))
+                    text(crate::i18n::t!("shell-update-available")).size(18),
+                    text(crate::i18n::t!("shell-update-ready", "version" => version)).size(13),
+                    iced::widget::button(text(crate::i18n::t!("shell-visit-download")).size(13))
                         .style(theme::builtins::button::primary)
                         .padding([8, 18])
                         .on_press(Message::OpenDownloadPage),
                     text(crate::DOWNLOAD_URL).size(11),
                     row![
-                        iced::widget::button(text("Remind me later").size(12))
+                        iced::widget::button(text(crate::i18n::t!("shell-remind-later")).size(12))
                             .style(theme::builtins::button::secondary)
                             .padding([6, 12])
                             .on_press(Message::DismissUpgrade),
-                        iced::widget::button(text("Skip this version").size(12))
+                        iced::widget::button(text(crate::i18n::t!("shell-skip-version")).size(12))
                             .style(theme::builtins::button::link)
                             .padding([6, 12])
                             .on_press(Message::DismissUpgradeForVersion),

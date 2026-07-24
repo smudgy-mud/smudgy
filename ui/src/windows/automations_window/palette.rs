@@ -149,10 +149,10 @@ impl AutomationsWindow {
             let current = key.folder_name.as_deref();
             if current.is_some() {
                 items.push(Item {
-                    group: "Move",
-                    label: format!("Move {subject} to top level"),
+                    group: crate::i18n::ts!("palette-group-move"),
+                    label: crate::i18n::t!("palette-move-top", "subject" => subject),
                     status: None,
-                    kind: Some("folder"),
+                    kind: Some(crate::i18n::ts!("palette-kind-folder")),
                     message: Message::SetScriptFolder(None),
                 });
             }
@@ -166,10 +166,14 @@ impl AutomationsWindow {
                     NodeStatus::Disabled
                 };
                 items.push(Item {
-                    group: "Move",
-                    label: format!("Move {subject} to {path}"),
+                    group: crate::i18n::ts!("palette-group-move"),
+                    label: crate::i18n::t!(
+                        "palette-move-folder",
+                        "subject" => subject,
+                        "folder" => &path
+                    ),
                     status: Some(status),
-                    kind: Some("folder"),
+                    kind: Some(crate::i18n::ts!("palette-kind-folder")),
                     message: Message::SetScriptFolder(Some(path)),
                 });
             }
@@ -179,19 +183,19 @@ impl AutomationsWindow {
         collect_jump(&self.scripts, "", self, &mut items);
         for pkg in &self.installed_packages {
             items.push(Item {
-                group: "Jump to",
+                group: crate::i18n::ts!("palette-group-jump"),
                 label: package_display_name(&pkg.specifier).to_string(),
                 status: Some(self.package_status_for_palette(&pkg.specifier)),
-                kind: Some("package"),
+                kind: Some(crate::i18n::ts!("palette-kind-package")),
                 message: Message::SelectInstalledPackage(pkg.specifier.clone()),
             });
         }
         for name in &self.local_packages {
             items.push(Item {
-                group: "Jump to",
+                group: crate::i18n::ts!("palette-group-jump"),
                 label: name.clone(),
                 status: Some(NodeStatus::Ok),
-                kind: Some("package"),
+                kind: Some(crate::i18n::ts!("palette-kind-package")),
                 message: Message::SelectOwnedPackage(name.clone()),
             });
         }
@@ -278,12 +282,12 @@ impl AutomationsWindow {
                         .font(fonts::BOOTSTRAP_ICONS)
                         .size(13.0)
                         .style(common::faint),
-                    text_input("Type a command or search…", &self.palette_query)
+                    text_input(crate::i18n::ts!("palette-input-placeholder"), &self.palette_query)
                         .id(palette_input_id())
                         .on_input(Message::PaletteInput)
                         .on_submit(Message::PaletteRun)
                         .size(15.0),
-                    text("Esc").size(11.0).style(common::faint),
+                    text(crate::i18n::t!("palette-escape")).size(11.0).style(common::faint),
                 ]
                 .spacing(8.0)
                 .align_y(Vertical::Center),
@@ -334,23 +338,23 @@ fn collect_jump(
                     format!("{parent}/{name}")
                 };
                 items.push(Item {
-                    group: "Jump to",
+                    group: crate::i18n::ts!("palette-group-jump"),
                     label: name.clone(),
                     status: None,
-                    kind: Some("folder"),
+                    kind: Some(crate::i18n::ts!("palette-kind-folder")),
                     message: Message::SelectFolder(path.clone()),
                 });
                 collect_jump(children, &path, window, items);
             }
             other => {
                 let kind = match other {
-                    Script::Alias(_) => "alias",
-                    Script::Trigger(_) => "trigger",
-                    Script::Hotkey(_) => "hotkey",
-                    Script::Folder(_, _) => "folder",
+                    Script::Alias(_) => crate::i18n::ts!("automation-alias"),
+                    Script::Trigger(_) => crate::i18n::ts!("automation-trigger"),
+                    Script::Hotkey(_) => crate::i18n::ts!("automation-hotkey"),
+                    Script::Folder(_, _) => crate::i18n::ts!("palette-kind-folder"),
                 };
                 items.push(Item {
-                    group: "Jump to",
+                    group: crate::i18n::ts!("palette-group-jump"),
                     label: name.clone(),
                     status: Some(window.script_status(other)),
                     kind: Some(kind),

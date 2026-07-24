@@ -23,7 +23,7 @@ use crate::cloud_account::CloudHandles;
 use crate::components::cloud_errors::display_error;
 use crate::components::color_picker::{self, ColorPicker};
 use crate::components::social_panel::{self, SocialPanel};
-use crate::i18n::{self, LocaleChoice};
+use crate::i18n::{self, LocaleChoice, t, ts};
 use crate::prefs;
 use crate::theme::{self, Element as ThemedElement};
 use crate::update::Update;
@@ -185,7 +185,7 @@ pub struct SettingsWindow {
     editing_nickname: bool,
     sign_out_everywhere: bool,
 
-    busy: Option<&'static str>,
+    busy: Option<String>,
     error: Option<String>,
     notice: Option<String>,
 
@@ -342,10 +342,10 @@ impl SettingsWindow {
                 self.clear_feedback();
                 let email = self.email.trim().to_string();
                 if !email.contains('@') {
-                    self.error = Some("Enter a valid email address.".to_string());
+                    self.error = Some(t!("account-error-invalid-email"));
                     return Update::none();
                 }
-                self.busy = Some("Emailing you a code…");
+                self.busy = Some(t!("account-busy-emailing-code"));
                 let client = self.cloud.client.clone();
                 let target = email.clone();
                 Update::with_task(Task::perform(
@@ -384,18 +384,15 @@ impl SettingsWindow {
                 self.clear_feedback();
                 let code = Self::extract_code(&self.code_input);
                 if code.is_empty() {
-                    self.error = Some("Paste the code from the email.".to_string());
+                    self.error = Some(t!("account-error-paste-code"));
                     return Update::none();
                 }
                 let email = self.code_target_email();
                 if email.is_empty() {
-                    self.error = Some(
-                        "Enter your email first so we know which account the code is for."
-                            .to_string(),
-                    );
+                    self.error = Some(t!("account-error-email-for-code"));
                     return Update::none();
                 }
-                self.busy = Some("Verifying…");
+                self.busy = Some(t!("account-busy-verifying"));
                 let client = self.cloud.client.clone();
                 Update::with_task(Task::perform(
                     async move { client.verify_email(&email, &code).await },
@@ -412,9 +409,9 @@ impl SettingsWindow {
                         // different account than whatever was cached here.
                         self.reset_account_caches();
                         self.notice = Some(if session.needs_nickname {
-                            "Signed in! Choose a nickname to claim your handle.".to_string()
+                            t!("account-notice-signed-in-needs-nickname")
                         } else {
-                            "Signed in — you're all set.".to_string()
+                            t!("account-notice-signed-in-ready")
                         });
                         Update::with_event(Event::SessionEstablished(Box::new(session)))
                     }
@@ -422,9 +419,7 @@ impl SettingsWindow {
                         // The server's uniform 404 also covers the attempt
                         // rate-limit, so the copy must not promise the code
                         // is merely mistyped.
-                        self.error = Some(
-                            "That code is invalid or expired — request a new one.".to_string(),
-                        );
+                        self.error = Some(t!("account-error-invalid-code"));
                         Update::none()
                     }
                     Err(err) => {
@@ -440,13 +435,10 @@ impl SettingsWindow {
                 self.clear_feedback();
                 let email = self.code_target_email();
                 if email.is_empty() {
-                    self.error = Some(
-                        "Enter your email in the form first so we know where to send it."
-                            .to_string(),
-                    );
+                    self.error = Some(t!("account-error-email-for-resend"));
                     return Update::none();
                 }
-                self.busy = Some("Sending…");
+                self.busy = Some(t!("account-busy-sending"));
                 let client = self.cloud.client.clone();
                 Update::with_task(Task::perform(
                     async move { client.login(&email).await },
@@ -457,11 +449,7 @@ impl SettingsWindow {
                 self.busy = None;
                 match result {
                     Ok(()) => {
-                        self.notice = Some(
-                            "If that address has an account, a fresh code is on its way \
-                             (it replaces any earlier one)."
-                                .to_string(),
-                        );
+                        self.notice = Some(t!("account-notice-code-resent"));
                     }
                     Err(err) => self.error = Some(display_error(&err)),
                 }
@@ -483,7 +471,7 @@ impl SettingsWindow {
                     self.error = Some(problem);
                     return Update::none();
                 }
-                self.busy = Some("Saving nickname…");
+                self.busy = Some(t!("account-busy-saving-nickname"));
                 let client = self.cloud.client.clone();
                 Update::with_task(Task::perform(
                     async move { client.set_nickname(&nickname).await.map(Box::new) },
@@ -531,7 +519,7 @@ impl SettingsWindow {
                 let everywhere = self.sign_out_everywhere;
                 self.sign_out_everywhere = false;
                 self.reset_account_caches();
-                self.notice = Some("Signed out.".to_string());
+                self.notice = Some(t!("account-notice-signed-out"));
                 Update::with_event(Event::SignOut { everywhere })
             }
             Message::SignOutEverywhereChanged(v) => {
@@ -573,8 +561,7 @@ impl SettingsWindow {
                 Err(err) => {
                     self.security_error = Some(match err {
                         CloudError::Unauthorized(_) => {
-                            "Creating API keys requires being logged in (not just an API key)."
-                                .to_string()
+                            t!("security-create-key-login-error")
                         }
                         other => display_error(&other),
                     });
@@ -917,15 +904,15 @@ impl SettingsWindow {
 
     pub fn view(&self) -> ThemedElement<'_, Message> {
         let nav = column![
-            nav_button("Account", self.tab == Tab::Account, Tab::Account),
+            nav_button(t!("nav-account"), self.tab == Tab::Account, Tab::Account),
             nav_button(
-                "Preferences",
+                t!("nav-preferences"),
                 self.tab == Tab::Preferences,
                 Tab::Preferences
             ),
-            nav_button("Security", self.tab == Tab::Security, Tab::Security),
-            nav_button("Friends", self.tab == Tab::Friends, Tab::Friends),
-            nav_button("Licenses", self.tab == Tab::Licenses, Tab::Licenses),
+            nav_button(t!("nav-security"), self.tab == Tab::Security, Tab::Security),
+            nav_button(t!("nav-friends"), self.tab == Tab::Friends, Tab::Friends),
+            nav_button(t!("nav-licenses"), self.tab == Tab::Licenses, Tab::Licenses),
         ]
         .spacing(4)
         .width(140);
@@ -950,7 +937,7 @@ impl SettingsWindow {
 
     fn feedback(&self) -> ThemedElement<'_, Message> {
         let mut col = column![].spacing(6);
-        if let Some(busy) = self.busy {
+        if let Some(busy) = &self.busy {
             col = col.push(text(busy).size(13));
         }
         if let Some(error) = &self.error {
@@ -964,10 +951,10 @@ impl SettingsWindow {
 
     fn account_view(&self) -> ThemedElement<'_, Message> {
         let snapshot = self.cloud.snapshot.get();
-        let mut col = column![text("Account").size(20)].spacing(12);
+        let mut col = column![text(t!("account-title")).size(20)].spacing(12);
 
         if snapshot.busy {
-            col = col.push(text("Checking account status…").size(13));
+            col = col.push(text(t!("account-checking")).size(13));
         }
 
         if snapshot.signed_in {
@@ -991,11 +978,11 @@ impl SettingsWindow {
                     text(profile.email.clone()).size(14),
                     space::horizontal(),
                     if snapshot.email_verified {
-                        text("verified")
+                        text(t!("account-verified"))
                             .size(12)
                             .style(theme::builtins::text::success)
                     } else {
-                        text("not verified")
+                        text(t!("account-not-verified"))
                             .size(12)
                             .style(theme::builtins::text::danger)
                     },
@@ -1005,13 +992,13 @@ impl SettingsWindow {
             );
             col = col.push(
                 text(match profile.nickname.clone() {
-                    Some(handle) => format!("Signed in as {handle}"),
-                    None => "Signed in (no nickname yet)".to_string(),
+                    Some(handle) => t!("account-signed-in-as", "handle" => handle),
+                    None => t!("account-signed-in-no-nickname"),
                 })
                 .size(14),
             );
         } else {
-            col = col.push(text("Signed in.").size(14));
+            col = col.push(text(t!("account-signed-in")).size(14));
         }
 
         if !snapshot.email_verified {
@@ -1021,25 +1008,22 @@ impl SettingsWindow {
             col = col.push(
                 container(
                     column![
-                        text(
-                            "Verify your email to use cloud features \
-                             (friends, sharing, sync).",
-                        )
+                        text(t!("account-verify-description"))
                         .size(13),
-                        text_input("code from the email", &self.code_input)
+                        text_input(ts!("account-code-placeholder"), &self.code_input)
                             .on_input(Message::CodeChanged)
                             .on_submit(Message::VerifySubmitted)
                             .width(380),
                         row![
-                            button(text("Verify").size(13))
+                            button(text(t!("account-verify")).size(13))
                                 .style(theme::builtins::button::primary)
                                 .padding([4, 10])
                                 .on_press(Message::VerifySubmitted),
-                            button(text("Email me a code").size(13))
+                            button(text(t!("account-email-code")).size(13))
                                 .style(theme::builtins::button::secondary)
                                 .padding([4, 10])
                                 .on_press(Message::ResendCode),
-                            button(text("Re-check").size(13))
+                            button(text(t!("account-recheck")).size(13))
                                 .style(theme::builtins::button::secondary)
                                 .padding([4, 10])
                                 .on_press(Message::RefreshStatusPressed),
@@ -1057,12 +1041,12 @@ impl SettingsWindow {
 
         col = col.push(
             row![
-                button(text("Sign out").size(13))
+                button(text(t!("action-sign-out")).size(13))
                     .style(theme::builtins::button::secondary)
                     .padding([4, 10])
                     .on_press(Message::SignOutPressed),
                 checkbox(self.sign_out_everywhere)
-                    .label("also sign out everywhere (all devices)")
+                    .label(t!("account-sign-out-everywhere"))
                     .on_toggle(Message::SignOutEverywhereChanged),
             ]
             .spacing(12)
@@ -1083,18 +1067,18 @@ impl SettingsWindow {
         &self,
         snapshot: &crate::cloud_account::AccountSnapshot,
     ) -> ThemedElement<'_, Message> {
-        const NICKNAME_PLACEHOLDER: &str = "nickname (3-24 letters, digits, - or _)";
+        let nickname_placeholder = ts!("account-nickname-placeholder");
 
         if snapshot.needs_nickname {
             return column![
-                text("Choose your nickname").size(14),
-                text("This is your public handle — others find and friend you by it.").size(12),
+                text(t!("account-choose-nickname")).size(14),
+                text(t!("account-nickname-description")).size(12),
                 row![
-                    text_input(NICKNAME_PLACEHOLDER, &self.nickname_input)
+                    text_input(nickname_placeholder, &self.nickname_input)
                         .on_input(Message::NicknameChanged)
                         .on_submit(Message::NicknameSubmitted)
                         .width(280),
-                    button(text("Claim handle").size(13))
+                    button(text(t!("account-claim-handle")).size(13))
                         .style(theme::builtins::button::primary)
                         .padding([4, 10])
                         .on_press(Message::NicknameSubmitted),
@@ -1109,28 +1093,28 @@ impl SettingsWindow {
         if self.editing_nickname {
             return column![
                 row![
-                    text_input(NICKNAME_PLACEHOLDER, &self.nickname_input)
+                    text_input(nickname_placeholder, &self.nickname_input)
                         .on_input(Message::NicknameChanged)
                         .on_submit(Message::NicknameSubmitted)
                         .width(280),
-                    button(text("Save").size(13))
+                    button(text(t!("action-save")).size(13))
                         .style(theme::builtins::button::primary)
                         .padding([4, 10])
                         .on_press(Message::NicknameSubmitted),
-                    button(text("Cancel").size(13))
+                    button(text(t!("action-cancel")).size(13))
                         .style(theme::builtins::button::secondary)
                         .padding([4, 10])
                         .on_press(Message::EditNickname(false)),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
-                text("Changing your nickname changes how others find you.").size(12),
+                text(t!("account-nickname-change-warning")).size(12),
             ]
             .spacing(4)
             .into();
         }
 
-        button(text("Change nickname").size(13))
+        button(text(t!("account-change-nickname")).size(13))
             .style(theme::builtins::button::secondary)
             .padding([4, 10])
             .on_press(Message::EditNickname(true))
@@ -1150,21 +1134,18 @@ impl SettingsWindow {
     /// sign-in.
     fn sign_in_card(&self) -> ThemedElement<'_, Message> {
         column![
-            text("Sign in").size(15),
-            text_input("email", &self.email)
+            text(t!("action-sign-in")).size(15),
+            text_input(ts!("account-email-placeholder"), &self.email)
                 .on_input(Message::EmailChanged)
                 .on_submit(Message::CodeRequested)
                 .width(280),
-            text(
-                "We'll email you a one-time code — there is no password. New to \
-                 smudgy? Just enter your email; your account is created automatically.",
-            )
+            text(t!("account-sign-in-description"))
             .size(12),
-            button(text("Email me a code").size(14))
+            button(text(t!("account-email-code")).size(14))
                 .style(theme::builtins::button::primary)
                 .padding([6, 16])
                 .on_press(Message::CodeRequested),
-            button(text("I already have a code").size(12))
+            button(text(t!("account-have-code")).size(12))
                 .style(theme::builtins::button::link)
                 .padding([2, 0])
                 .on_press(Message::ShowFlow(AccountFlow::EnterCode {
@@ -1178,41 +1159,38 @@ impl SettingsWindow {
     /// Rendered once an email submission mailed a code. The same card serves
     /// first-time verification and returning-device login.
     fn enter_code_card(&self, email: &str) -> ThemedElement<'_, Message> {
-        let mut col = column![text("Check your email").size(15)].spacing(8);
+        let mut col = column![text(t!("account-check-email")).size(15)].spacing(8);
 
         if email.is_empty() {
             // Reached via "I already have a code" without a tracked address:
             // ask for the email alongside the code.
             col = col.push(
-                text_input("email", &self.email)
+                text_input(ts!("account-email-placeholder"), &self.email)
                     .on_input(Message::EmailChanged)
                     .on_submit(Message::VerifySubmitted)
                     .width(280),
             );
         } else {
             col = col.push(
-                text(format!(
-                    "We emailed a code to {email}. Paste it below — codes expire \
-                     after 15 minutes.",
-                ))
+                text(t!("account-code-sent", "email" => email))
                 .size(13),
             );
         }
 
         col = col
             .push(
-                text_input("code from the email", &self.code_input)
+                text_input(ts!("account-code-placeholder"), &self.code_input)
                     .on_input(Message::CodeChanged)
                     .on_submit(Message::VerifySubmitted)
                     .width(280),
             )
             .push(
                 row![
-                    button(text("Sign in").size(14))
+                    button(text(t!("action-sign-in")).size(14))
                         .style(theme::builtins::button::primary)
                         .padding([6, 16])
                         .on_press(Message::VerifySubmitted),
-                    button(text("Resend code").size(13))
+                    button(text(t!("account-resend-code")).size(13))
                         .style(theme::builtins::button::secondary)
                         .padding([6, 12])
                         .on_press(Message::ResendCode),
@@ -1220,7 +1198,7 @@ impl SettingsWindow {
                 .spacing(8),
             )
             .push(
-                button(text("Back").size(12))
+                button(text(t!("action-back")).size(12))
                     .style(theme::builtins::button::link)
                     .padding([2, 0])
                     .on_press(Message::ShowFlow(AccountFlow::SignIn)),
@@ -1250,7 +1228,7 @@ impl SettingsWindow {
             Ok(lines) if (100..=10_000_000).contains(&lines)
         );
 
-        let mut col = column![text("Preferences").size(20)].spacing(12);
+        let mut col = column![text(t!("preferences-title")).size(20)].spacing(12);
 
         col = col.push(
             column![
@@ -1269,10 +1247,10 @@ impl SettingsWindow {
         col = col.push(rule::horizontal(1));
 
         // ===== appearance =====
-        col = col.push(text("Appearance").size(15));
+        col = col.push(text(t!("preferences-appearance")).size(15));
         col = col.push(
             column![
-                dim_text("Terminal font"),
+                dim_text_owned(t!("preferences-terminal-font")),
                 pick_list(
                     self.font_options(),
                     Some(self.settings.terminal_font_family.clone()),
@@ -1284,31 +1262,28 @@ impl SettingsWindow {
             .spacing(2),
         );
         col = col.push(pref_input(
-            "Font size",
+            t!("preferences-font-size"),
             "16",
             &self.font_size_input,
             font_size_valid,
-            Some("Press Enter to apply."),
+            Some(t!("preferences-press-enter")),
             120.0,
             Message::PrefFontSizeChanged,
             Message::PrefFontSizeSubmitted,
         ));
         col = col.push(pref_input(
-            "Line length",
-            "wrap to window",
+            t!("preferences-line-length"),
+            ts!("preferences-wrap-window"),
             &self.line_length_input,
             line_length_valid,
-            Some(
-                "Maximum characters per line before wrapping; empty wraps to the \
-                 window width. Press Enter to apply.",
-            ),
+            Some(t!("preferences-line-length-help")),
             120.0,
             Message::PrefLineLengthChanged,
             Message::PrefLineLengthSubmitted,
         ));
         col = col.push(
             column![
-                dim_text("Theme"),
+                dim_text_owned(t!("preferences-theme")),
                 pick_list(
                     self.theme_options(),
                     Some(self.settings.theme.clone()),
@@ -1321,11 +1296,11 @@ impl SettingsWindow {
         );
         col = col.push(self.tweak_panel());
         col = col.push(pref_input(
-            "Scrollback",
+            t!("preferences-scrollback"),
             "100000",
             &self.scrollback_input,
             scrollback_valid,
-            Some("Lines kept per session. Press Enter to apply."),
+            Some(t!("preferences-scrollback-help")),
             140.0,
             Message::PrefScrollbackChanged,
             Message::PrefScrollbackSubmitted,
@@ -1333,13 +1308,9 @@ impl SettingsWindow {
         col = col.push(
             column![
                 checkbox(self.settings.hide_pane_headers)
-                    .label("Hide panel headers unless the main menu is active")
+                    .label(t!("preferences-hide-pane-headers"))
                     .on_toggle(Message::PrefHidePaneHeadersToggled),
-                dim_text(
-                    "Session and pane title bars show only while a window's toolbar is \
-                     expanded (headers are also the drag handles for rearranging panes; \
-                     dividers still resize either way). Scripts can pin a pane's header on.",
-                ),
+                dim_text_owned(t!("preferences-hide-pane-headers-help")),
             ]
             .spacing(2),
         );
@@ -1347,32 +1318,30 @@ impl SettingsWindow {
         col = col.push(rule::horizontal(1));
 
         // ===== input =====
-        col = col.push(text("Input").size(15));
+        col = col.push(text(t!("preferences-input")).size(15));
         col = col.push(pref_input(
-            "Command separator",
+            t!("preferences-command-separator"),
             ";",
             &self.separator_input,
             true,
-            Some("Splits one input line into multiple commands."),
+            Some(t!("preferences-command-separator-help")),
             80.0,
             Message::PrefSeparatorChanged,
             Message::PrefSeparatorSubmitted,
         ));
         col = col.push(pref_input(
-            "Raw line prefix",
+            t!("preferences-raw-prefix"),
             "\\",
             &self.raw_prefix_input,
             true,
-            Some(
-                "Lines starting with this are sent exactly as typed, minus the prefix. Bypasses aliases and the command separator above.",
-            ),
+            Some(t!("preferences-raw-prefix-help")),
             80.0,
             Message::PrefRawPrefixChanged,
             Message::PrefRawPrefixSubmitted,
         ));
         col = col.push(
             column![
-                dim_text("Command input"),
+                dim_text_owned(t!("preferences-command-input")),
                 pick_list(
                     CommandInputBehavior::ALL.to_vec(),
                     Some(self.settings.command_input_behavior),
@@ -1387,7 +1356,7 @@ impl SettingsWindow {
         col = col.push(
             column![
                 checkbox(self.settings.mask_input_on_server_echo)
-                    .label("Hide typing when the server asks for a password")
+                    .label(t!("preferences-mask-password-input"))
                     .on_toggle(Message::PrefMaskOnServerEchoToggled),
                 dim_text(
                     "When a MUD turns off echo for a password prompt, the input shows \
@@ -1401,18 +1370,18 @@ impl SettingsWindow {
         col = col.push(rule::horizontal(1));
 
         // ===== logging =====
-        col = col.push(text("Logging").size(15));
+        col = col.push(text(t!("preferences-logging")).size(15));
         col = col.push(
             checkbox(self.settings.logging.enabled)
-                .label("Write session logs (plain text)")
+                .label(t!("preferences-logging-plain"))
                 .on_toggle(Message::PrefLoggingToggled),
         );
         col = col.push(
             column![
                 checkbox(self.settings.logging.log_raw)
-                    .label("Also write raw logs (includes ANSI color codes)")
+                    .label(t!("preferences-logging-raw"))
                     .on_toggle(Message::PrefRawLoggingToggled),
-                dim_text("Raw logs start with the next connection."),
+                dim_text_owned(t!("preferences-logging-raw-help")),
             ]
             .spacing(2),
         );
@@ -1420,17 +1389,13 @@ impl SettingsWindow {
         col = col.push(rule::horizontal(1));
 
         // ===== advanced =====
-        col = col.push(text("Advanced").size(15));
+        col = col.push(text(t!("preferences-advanced")).size(15));
         col = col.push(
             column![
                 checkbox(self.settings.advanced_scripting_features)
-                    .label("Enable advanced scripting features")
+                    .label(t!("preferences-advanced-scripting"))
                     .on_toggle(Message::PrefAdvancedScriptingToggled),
-                dim_text(
-                    "Unlocks \u{201c}Remove sandbox\u{201d} (run an installed package with full \
-                     access, as if you wrote it) and the script inspector in the Automations \
-                     window. Reopen Automations after changing this.",
-                ),
+                dim_text_owned(t!("preferences-advanced-scripting-help")),
             ]
             .spacing(2),
         );
@@ -1438,10 +1403,10 @@ impl SettingsWindow {
         col = col.push(rule::horizontal(1));
 
         // ===== updates =====
-        col = col.push(text("Updates").size(15));
+        col = col.push(text(t!("preferences-updates")).size(15));
         col = col.push(
             checkbox(self.settings.auto_check_for_updates)
-                .label("Automatically check for updates")
+                .label(t!("preferences-auto-updates"))
                 .on_toggle(Message::PrefAutoCheckForUpdatesToggled),
         );
 
@@ -1500,12 +1465,12 @@ impl SettingsWindow {
 
         let tabs = row![
             tweak_tab_button(
-                "Adjust",
+                t!("theme-adjust"),
                 self.tweak_tab == TweakTab::Adjust,
                 TweakTab::Adjust
             ),
             tweak_tab_button(
-                "Colors",
+                t!("theme-colors"),
                 self.tweak_tab == TweakTab::Colors,
                 TweakTab::Colors
             ),
@@ -1572,9 +1537,9 @@ impl SettingsWindow {
             col = col.push(
                 column![
                     row![
-                        dim_text_owned(format!("Override: {slot}")),
+                        dim_text_owned(t!("theme-override", "slot" => *slot)),
                         space::horizontal(),
-                        button(text("Clear override").size(11))
+                        button(text(t!("theme-clear-override")).size(11))
                             .style(theme::builtins::button::secondary)
                             .padding([2, 6])
                             .on_press(Message::TweakClearOverride),
@@ -1588,7 +1553,7 @@ impl SettingsWindow {
         }
 
         col = col.push(
-            button(text("Reset all colors").size(12))
+            button(text(t!("theme-reset-colors")).size(12))
                 .style(theme::builtins::button::secondary)
                 .padding([3, 8])
                 .on_press(Message::TweakResetOverrides),
@@ -1600,9 +1565,9 @@ impl SettingsWindow {
     fn security_view(&self) -> ThemedElement<'_, Message> {
         let mut col = column![
             row![
-                text("Security").size(20),
+                text(t!("security-title")).size(20),
                 space::horizontal(),
-                button(text("Refresh").size(13))
+                button(text(t!("action-refresh")).size(13))
                     .style(theme::builtins::button::secondary)
                     .padding([4, 10])
                     .on_press(Message::SecurityRefresh),
@@ -1616,14 +1581,14 @@ impl SettingsWindow {
         }
 
         // ===== API keys =====
-        col = col.push(text("API keys").size(15));
+        col = col.push(text(t!("security-api-keys")).size(15));
         if let Some(created) = &self.created_key {
             col = col.push(
                 container(
                     column![
-                        text("New API key — copy it now, it will not be shown again:").size(13),
+                        text(t!("security-new-key")).size(13),
                         text_input("", &created.api_key).size(13),
-                        button(text("Done — I copied it").size(13))
+                        button(text(t!("security-key-copied")).size(13))
                             .style(theme::builtins::button::primary)
                             .padding([4, 10])
                             .on_press(Message::DismissCreatedKey),
@@ -1635,9 +1600,9 @@ impl SettingsWindow {
             );
         }
         match &self.api_keys {
-            None => col = col.push(text("Loading…").size(13)),
+            None => col = col.push(text(t!("state-loading")).size(13)),
             Some(keys) if keys.is_empty() => {
-                col = col.push(text("No API keys.").size(13));
+                col = col.push(text(t!("security-no-api-keys")).size(13));
             }
             Some(keys) => {
                 for key in keys {
@@ -1651,12 +1616,15 @@ impl SettingsWindow {
                             .width(120),
                             text(format!("created {}", key.created_at.format("%Y-%m-%d"))).size(12),
                             text(match &key.last_used_at {
-                                Some(at) => format!("last used {}", at.format("%Y-%m-%d")),
-                                None => "never used".to_string(),
+                                Some(at) => t!(
+                                    "security-last-used",
+                                    "date" => at.format("%Y-%m-%d").to_string()
+                                ),
+                                None => t!("security-never-used"),
                             })
                             .size(12),
                             space::horizontal(),
-                            button(text("Revoke").size(12))
+                            button(text(t!("security-revoke")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::RevokeApiKey(key.id)),
@@ -1668,43 +1636,49 @@ impl SettingsWindow {
             }
         }
         col = col.push(
-            button(text("Create API key").size(13))
+            button(text(t!("security-create-key")).size(13))
                 .style(theme::builtins::button::primary)
                 .padding([4, 10])
                 .on_press(Message::CreateApiKeyPressed),
         );
         col = col.push(
-            text("Creating a key requires a logged-in session; keys are shown once at creation.")
+            text(t!("security-create-key-help"))
                 .size(11),
         );
 
         col = col.push(rule::horizontal(1));
 
         // ===== sessions =====
-        col = col.push(text("Sessions").size(15));
+        col = col.push(text(t!("security-sessions")).size(15));
         match &self.sessions {
-            None => col = col.push(text("Loading…").size(13)),
+            None => col = col.push(text(t!("state-loading")).size(13)),
             Some(sessions) if sessions.is_empty() => {
-                col = col.push(text("No active sessions.").size(13));
+                col = col.push(text(t!("security-no-sessions")).size(13));
             }
             Some(sessions) => {
                 for session in sessions {
                     col = col.push(
                         row![
-                            text(format!(
-                                "created {}",
-                                session.created_at.format("%Y-%m-%d %H:%M")
+                            text(t!(
+                                "security-session-created",
+                                "date" => session.created_at.format("%Y-%m-%d %H:%M").to_string()
                             ))
                             .size(12),
-                            text(format!("expires {}", session.expires_at.format("%Y-%m-%d")))
+                            text(t!(
+                                "security-session-expires",
+                                "date" => session.expires_at.format("%Y-%m-%d").to_string()
+                            ))
                                 .size(12),
                             text(match &session.last_used_at {
-                                Some(at) => format!("last used {}", at.format("%Y-%m-%d %H:%M")),
-                                None => "unused".to_string(),
+                                Some(at) => t!(
+                                    "security-last-used",
+                                    "date" => at.format("%Y-%m-%d %H:%M").to_string()
+                                ),
+                                None => t!("security-session-unused"),
                             })
                             .size(12),
                             space::horizontal(),
-                            button(text("Revoke").size(12))
+                            button(text(t!("security-revoke")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::RevokeSession(session.id)),
@@ -1715,7 +1689,7 @@ impl SettingsWindow {
                 }
             }
         }
-        col = col.push(text("Revoking the session you're currently using signs you out.").size(11));
+        col = col.push(text(t!("security-revoke-current-warning")).size(11));
 
         col.into()
     }
@@ -1728,9 +1702,9 @@ impl SettingsWindow {
         let snapshot = self.cloud.snapshot.get();
         if !snapshot.email_verified || self.social.needs_email_verification() {
             return column![
-                text("Friends").size(20),
-                text("Verify your email to add friends and share maps").size(14),
-                button(text("Go to Account").size(13))
+                text(t!("friends-title")).size(20),
+                text(t!("friends-verify-email")).size(14),
+                button(text(t!("friends-go-account")).size(13))
                     .style(theme::builtins::button::primary)
                     .padding([6, 16])
                     .on_press(Message::TabSelected(Tab::Account)),
@@ -1748,7 +1722,7 @@ impl SettingsWindow {
     /// Markdown's own `# Open Source Licenses` heading serves as the title.
     fn licenses_view(&self) -> ThemedElement<'_, Message> {
         let Some(content) = &self.notices else {
-            return text("Loading…").size(13).into();
+            return text(t!("state-loading")).size(13).into();
         };
         let settings = markdown::Settings::with_text_size(
             13.0,
@@ -1795,17 +1769,17 @@ fn dim_text<'a>(label: &'static str) -> iced::widget::Text<'a, crate::Theme> {
 /// optional helper line below (the map inspector's `labeled_input`
 /// convention, copied locally).
 fn pref_input<'a>(
-    label: &'static str,
+    label: String,
     placeholder: &'static str,
     value: &str,
     valid: bool,
-    helper: Option<&'static str>,
+    helper: Option<String>,
     width: f32,
     on_input: impl Fn(String) -> Message + 'a,
     on_submit: Message,
 ) -> ThemedElement<'a, Message> {
     let mut col = column![
-        dim_text(label),
+        dim_text_owned(label),
         text_input(placeholder, value)
             .size(14)
             .width(width)
@@ -1816,19 +1790,19 @@ fn pref_input<'a>(
 
     if !valid {
         col = col.push(
-            text("invalid value")
+            text(t!("validation-invalid-value"))
                 .size(11)
                 .style(theme::builtins::text::danger),
         );
     }
     if let Some(helper) = helper {
-        col = col.push(dim_text(helper));
+        col = col.push(dim_text_owned(helper));
     }
 
     col.into()
 }
 
-/// [`dim_text`] for runtime strings (the open override's slot name).
+/// De-emphasized owned text for translated labels and runtime strings.
 fn dim_text_owned<'a>(label: String) -> iced::widget::Text<'a, crate::Theme> {
     text(label)
         .size(11)
@@ -1840,7 +1814,7 @@ fn dim_text_owned<'a>(label: String) -> iced::widget::Text<'a, crate::Theme> {
 /// A tab selector for the tweak panel, styled like the window nav with a
 /// selected state.
 fn tweak_tab_button(
-    label: &'static str,
+    label: String,
     selected: bool,
     tab: TweakTab,
 ) -> ThemedElement<'static, Message> {
@@ -1858,14 +1832,12 @@ fn tweak_tab_button(
 /// The Adjust tab: the four tweak sliders, their semantics hint, and reset.
 fn tweak_adjust_view(tweaks: &ThemeTweaks) -> ThemedElement<'static, Message> {
     column![
-        tweak_slider_row("Background", TweakSlider::Background, tweaks.background),
-        tweak_slider_row("Brightness", TweakSlider::Brightness, tweaks.brightness),
-        tweak_slider_row("Contrast", TweakSlider::Contrast, tweaks.contrast),
-        tweak_slider_row("Saturation", TweakSlider::Saturation, tweaks.saturation),
-        dim_text(
-            "Background moves surfaces only; Contrast expands text away from the background.",
-        ),
-        button(text("Reset adjustments").size(12))
+        tweak_slider_row(t!("theme-background"), TweakSlider::Background, tweaks.background),
+        tweak_slider_row(t!("theme-brightness"), TweakSlider::Brightness, tweaks.brightness),
+        tweak_slider_row(t!("theme-contrast"), TweakSlider::Contrast, tweaks.contrast),
+        tweak_slider_row(t!("theme-saturation"), TweakSlider::Saturation, tweaks.saturation),
+        dim_text_owned(t!("theme-adjust-help")),
+        button(text(t!("theme-reset-adjustments")).size(12))
             .style(theme::builtins::button::secondary)
             .padding([3, 8])
             .on_press(Message::TweakResetSliders),
@@ -1878,13 +1850,13 @@ fn tweak_adjust_view(tweaks: &ThemeTweaks) -> ThemedElement<'static, Message> {
 /// preview strip follows live); release commits, so sessions re-bake their
 /// scrollback once per gesture instead of per tick.
 fn tweak_slider_row(
-    label: &'static str,
+    label: String,
     which: TweakSlider,
     value: f32,
 ) -> ThemedElement<'static, Message> {
     column![
         row![
-            dim_text(label),
+            dim_text_owned(label),
             space::horizontal(),
             text(format!("{value:+.2}")).size(11),
         ]
@@ -1957,7 +1929,7 @@ fn preview_strip(palette: &prefs::TerminalPalette) -> ThemedElement<'static, Mes
 
     container(
         column![
-            text("The quick brown fox")
+            text(t!("theme-preview"))
                 .size(13)
                 .style(move |_theme: &crate::Theme| {
                     iced::widget::text::Style { color: Some(fg) }
@@ -1976,7 +1948,7 @@ fn preview_strip(palette: &prefs::TerminalPalette) -> ThemedElement<'static, Mes
     .into()
 }
 
-fn nav_button(label: &'static str, selected: bool, tab: Tab) -> ThemedElement<'static, Message> {
+fn nav_button(label: String, selected: bool, tab: Tab) -> ThemedElement<'static, Message> {
     button(text(label).size(14))
         .style(if selected {
             theme::builtins::button::list_item_selected
@@ -1994,7 +1966,7 @@ fn nav_button(label: &'static str, selected: bool, tab: Tab) -> ThemedElement<'s
 fn nickname_problem(nickname: &str) -> Option<String> {
     let nickname = nickname.trim();
     if nickname.is_empty() {
-        return Some("Enter a nickname.".to_string());
+        return Some(t!("account-error-nickname-empty"));
     }
     let len = nickname.chars().count();
     if !(3..=24).contains(&len)
@@ -2002,7 +1974,7 @@ fn nickname_problem(nickname: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        return Some("Nickname must be 3-24 characters: letters, digits, '-' or '_'.".to_string());
+        return Some(t!("account-error-nickname-format"));
     }
     None
 }

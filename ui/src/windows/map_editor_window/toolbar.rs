@@ -48,14 +48,14 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     let tools = row![
         tool_button(
             bootstrap_icons::CURSOR,
-            "Select",
+            crate::i18n::ts!("mapper-tool-select"),
             Tool::Select,
             active_tool,
             true
         ),
         tool_button(
             bootstrap_icons::PLUS_SQUARE,
-            "Add room",
+            crate::i18n::ts!("mapper-tool-add-room"),
             Tool::AddRoom,
             active_tool,
             can_edit
@@ -69,14 +69,14 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
         ),
         tool_button(
             bootstrap_icons::FONTS,
-            "Add label",
+            crate::i18n::ts!("mapper-tool-add-label"),
             Tool::AddLabel,
             active_tool,
             can_edit
         ),
         tool_button(
             bootstrap_icons::BOUNDING_BOX,
-            "Add shape",
+            crate::i18n::ts!("mapper-tool-add-shape"),
             Tool::AddShape,
             active_tool,
             can_edit
@@ -89,15 +89,15 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
             button(icon(bootstrap_icons::CHEVRON_DOWN))
                 .style(builtins::button::toolbar)
                 .on_press(Message::LevelDown),
-            "Level down",
+            crate::i18n::ts!("mapper-level-down"),
             tooltip::Position::Bottom,
         ),
-        text(format!("Level {}", window.editor.level())).size(14),
+        text(crate::i18n::t!("mapper-level", "level" => window.editor.level())).size(14),
         tooltip(
             button(icon(bootstrap_icons::CHEVRON_UP))
                 .style(builtins::button::toolbar)
                 .on_press(Message::LevelUp),
-            "Level up",
+            crate::i18n::ts!("mapper-level-up"),
             tooltip::Position::Bottom,
         ),
     ]
@@ -111,14 +111,14 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
             button(icon(bootstrap_icons::ARROW_COUNTERCLOCKWISE))
                 .style(builtins::button::toolbar)
                 .on_press_maybe((can_edit && window.can_undo()).then_some(Message::Undo)),
-            "Undo",
+            crate::i18n::ts!("mapper-undo"),
             tooltip::Position::Bottom,
         ),
         tooltip(
             button(icon(bootstrap_icons::ARROW_CLOCKWISE))
                 .style(builtins::button::toolbar)
                 .on_press_maybe((can_edit && window.can_redo()).then_some(Message::Redo)),
-            "Redo",
+            crate::i18n::ts!("mapper-redo"),
             tooltip::Position::Bottom,
         ),
     ]
@@ -140,7 +140,7 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
             )
             .style(builtins::button::toolbar)
             .on_press(Message::SecretsAuditRequested),
-            "Secrets in this area",
+            crate::i18n::ts!("mapper-secrets-title"),
             tooltip::Position::Bottom,
         ));
     }
@@ -149,10 +149,10 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     if window.can_share_active_area() {
         bar = bar.push(space::horizontal().width(8.0));
         bar = bar.push(tooltip(
-            button(text("Share").size(13))
+            button(text(crate::i18n::t!("mapper-share")).size(13))
                 .style(builtins::button::toolbar)
                 .on_press(Message::ShareDialogRequested),
-            "Share this area with friends",
+            crate::i18n::ts!("mapper-share-area-tip"),
             tooltip::Position::Bottom,
         ));
     }
@@ -161,10 +161,10 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     if window.can_copy_active_area() {
         bar = bar.push(space::horizontal().width(8.0));
         bar = bar.push(tooltip(
-            button(text("Copy to my maps").size(13))
+            button(text(crate::i18n::t!("mapper-copy-to-my-maps")).size(13))
                 .style(builtins::button::toolbar)
                 .on_press(Message::CopyAreaRequested),
-            "Make your own editable copy of this shared map",
+            crate::i18n::ts!("mapper-copy-shared-tip"),
             tooltip::Position::Bottom,
         ));
     }
@@ -174,10 +174,10 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     if window.area_is_owned() {
         bar = bar.push(space::horizontal().width(8.0));
         bar = bar.push(tooltip(
-            button(text("Duplicate").size(13))
+            button(text(crate::i18n::t!("mapper-duplicate")).size(13))
                 .style(builtins::button::toolbar)
                 .on_press(Message::DuplicateAreaRequested),
-            "Make a copy of this map \u{2014} useful for sharing a version with some secrets unmarked",
+            crate::i18n::ts!("mapper-duplicate-tip"),
             tooltip::Position::Bottom,
         ));
     }
@@ -186,10 +186,10 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     if window.area_is_owned() {
         bar = bar.push(space::horizontal().width(8.0));
         bar = bar.push(tooltip(
-            button(text("Transfer\u{2026}").size(13))
+            button(text(crate::i18n::t!("mapper-transfer-action")).size(13))
                 .style(builtins::button::toolbar)
                 .on_press(Message::TransferOwnershipRequested),
-            "Give this map to a friend (they become the owner once they accept)",
+            crate::i18n::ts!("mapper-transfer-tip"),
             tooltip::Position::Bottom,
         ));
     }
@@ -223,11 +223,11 @@ fn inactive_chip() -> ThemedElement<'static, Message> {
                 .font(fonts::BOOTSTRAP_ICONS)
                 .size(13.0)
                 .style(muted),
-            text("Inactive").size(12).style(muted),
+            text(crate::i18n::t!("inspector-inactive")).size(12).style(muted),
         ]
         .spacing(4)
         .align_y(Vertical::Center),
-        "Not used to find your location \u{2014} activate it in the area list",
+        crate::i18n::ts!("mapper-inactive-location-tip"),
         tooltip::Position::Bottom,
     )
     .into()
@@ -289,10 +289,10 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     match status {
         AreaSaveStatus::ConflictNeedsReview => row![
             container(content).padding([2, 6]),
-            button(text("Keep mine").size(11))
+            button(text(crate::i18n::t!("mapper-save-keep-mine")).size(11))
                 .style(builtins::button::secondary)
                 .on_press(Message::KeepMineRequested),
-            button(text("Keep theirs").size(11))
+            button(text(crate::i18n::t!("mapper-save-keep-theirs")).size(11))
                 .style(builtins::button::secondary)
                 .on_press(Message::KeepTheirsRequested),
         ]
@@ -305,10 +305,10 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
                 text(message).size(12),
                 tooltip::Position::Bottom,
             ),
-            button(text("Retry").size(11))
+            button(text(crate::i18n::t!("action-retry")).size(11))
                 .style(builtins::button::secondary)
                 .on_press(Message::RetrySaveRequested),
-            button(text("Discard").size(11))
+            button(text(crate::i18n::t!("editor-discard")).size(11))
                 .style(builtins::button::secondary)
                 .on_press(Message::DiscardFailedSaveRequested),
         ]
@@ -326,7 +326,7 @@ fn sync_indicator(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
                 .style(builtins::button::subtle)
                 .padding([2, 6])
                 .on_press(Message::SyncNowRequested),
-            "Sync with the cloud now",
+            crate::i18n::ts!("mapper-sync-tip"),
             tooltip::Position::Bottom,
         )
         .into(),

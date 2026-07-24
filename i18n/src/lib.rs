@@ -210,6 +210,19 @@ macro_rules! t {
 }
 
 #[cfg(test)]
+fn catalog_ids(source: &str) -> std::collections::BTreeSet<&str> {
+    source
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with(char::is_whitespace) || line.starts_with('#') {
+                return None;
+            }
+            line.split_once('=').map(|(id, _)| id.trim())
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn catalog_variables(
     source: &str,
 ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
@@ -254,6 +267,8 @@ fn catalog_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn manifest_catalogs_parse_and_have_unique_tags() {
@@ -291,6 +306,131 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn traditional_chinese_catalog_matches_english_keys_and_variables() {
+        let english = manifest::CATALOGS
+            .iter()
+            .find(|source| source.tag == "en-US")
+            .unwrap();
+        let traditional_chinese = manifest::CATALOGS
+            .iter()
+            .find(|source| source.tag == "zh-TW")
+            .unwrap();
+        assert_eq!(
+            catalog_ids(english.source),
+            catalog_ids(traditional_chinese.source)
+        );
+        assert_eq!(
+            catalog_variables(english.source),
+            catalog_variables(traditional_chinese.source)
+        );
+    }
+
+    fn rust_sources(root: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(root)
+            .unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
+            .map(|entry| entry.expect("read source entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn workspace_sources() -> Vec<PathBuf> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("i18n crate has workspace parent");
+        let mut sources = Vec::new();
+        for root in [
+            "i18n/src",
+            "ui/src",
+            "core/src",
+            "cloud/src",
+            "widgets/src",
+            "map_widget/src",
+        ] {
+            rust_sources(&workspace.join(root), &mut sources);
+        }
+        sources
+    }
+
+    #[test]
+    fn every_translation_macro_references_a_catalog_message() {
+        let fallback = manifest::CATALOGS
+            .iter()
+            .find(|source| source.tag == manifest::FALLBACK_TAG)
+            .unwrap();
+        let known = catalog_ids(fallback.source);
+        let invocation =
+            Regex::new(r#"(?:[a-z_][a-z0-9_]*::)*t(?:s)?!\s*\(\s*"([a-z][a-z0-9-]*)""#)
+                .unwrap();
+        let mut missing = Vec::new();
+        for path in workspace_sources() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            for capture in invocation.captures_iter(&source) {
+                let id = &capture[1];
+                if !known.contains(id) {
+                    missing.push(format!("{}: {id}", path.display()));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "translation keys missing from catalogs:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn first_party_visible_literals_are_classified() {
+        let visible_literal = Regex::new(
+            r#"(?s)(?:\btext|\btext_input|\bsection_label|\berror_bar|\bshow_toast|\.label|\.placeholder|echo_str_sync|echo_warn_str_sync|StyledLine::from_echo_str)\s*\(\s*"([A-Za-z][^"]*)""#,
+        )
+        .unwrap();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("i18n crate has workspace parent");
+        let allowlist: [(&str, &str, &str); 0] = [];
+        // Locale policy and user-facing copy live in the UI crate. Lower
+        // crates deliberately remain independent of the selected app locale.
+        let mut visible_sources = Vec::new();
+        rust_sources(&workspace.join("ui/src"), &mut visible_sources);
+        let mut unclassified = Vec::new();
+        for path in visible_sources {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let relative = path
+                .strip_prefix(workspace)
+                .unwrap_or(&path)
+                .to_string_lossy();
+            for capture in visible_literal.captures_iter(production) {
+                let literal = &capture[1];
+                let allowed = allowlist
+                    .iter()
+                    .any(|(file, value, _reason)| relative == *file && literal == *value);
+                if !allowed {
+                    let line = production[..capture.get(0).unwrap().start()]
+                        .lines()
+                        .count()
+                        + 1;
+                    unclassified.push(format!("{relative}:{line}: {literal:?}"));
+                }
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "unclassified first-party visible literals:\n{}",
+            unclassified.join("\n")
+        );
     }
 
     #[test]

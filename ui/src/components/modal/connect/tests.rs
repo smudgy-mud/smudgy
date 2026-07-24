@@ -118,6 +118,42 @@ fn test_submit_server_form_create_empty_name() {
 }
 
 #[test]
+fn test_submit_server_form_rejects_untranslated_core_name_error_early() {
+    let mut state = initial_state();
+    state.server_action = Some(ServerCrudAction::Create);
+    state.server_form_data = ServerConfigFormData {
+        name: "My MUD".to_string(),
+        host: "mud.example.com".to_string(),
+        port: "4000".to_string(),
+        ..Default::default()
+    };
+
+    let (_task, event) = update(&mut state, Message::SubmitServerForm);
+
+    assert!(event.is_none());
+    assert_eq!(
+        state.server_crud_error.as_deref(),
+        Some("Server name may contain only letters, numbers, underscores, and hyphens.")
+    );
+}
+
+#[test]
+fn test_submit_profile_form_rejects_untranslated_core_name_error_early() {
+    let mut state = initial_state();
+    state.selected_server = Some("MyMUD".to_string());
+    state.profile_action = Some(ProfileCrudAction::Create);
+    state.profile_form_data.name = "My Character".to_string();
+
+    let (_task, event) = update(&mut state, Message::SubmitProfileForm);
+
+    assert!(event.is_none());
+    assert_eq!(
+        state.profile_crud_error.as_deref(),
+        Some("Profile name may contain only letters, numbers, underscores, and hyphens.")
+    );
+}
+
+#[test]
 fn test_select_server_loads_profiles_if_not_present() {
     let mut state = initial_state();
     let server_name = "TestServer".to_string();

@@ -55,13 +55,20 @@ use windows::smudgy_window::{Event as SmudgyWindowEvent, PaneRef};
 /// exact version so a tester can see which RC they are running. The channel
 /// decision lives in `core` so the title and the API/data-dir defaults can't
 /// drift. A clean release gets the bare title.
-const MAIN_WINDOW_TITLE: &str = match smudgy_core::models::settings::build_channel() {
-    smudgy_core::models::settings::BuildChannel::Dev => "smudgy - DEV BUILD",
-    smudgy_core::models::settings::BuildChannel::ReleaseCandidate => {
-        concat!("smudgy - RELEASE CANDIDATE ", env!("CARGO_PKG_VERSION"))
+fn main_window_title() -> String {
+    match smudgy_core::models::settings::build_channel() {
+        smudgy_core::models::settings::BuildChannel::Dev => {
+            i18n::t!("window-main-development")
+        }
+        smudgy_core::models::settings::BuildChannel::ReleaseCandidate => {
+            i18n::t!(
+                "window-main-release-candidate",
+                "version" => env!("CARGO_PKG_VERSION")
+            )
+        }
+        smudgy_core::models::settings::BuildChannel::Release => "smudgy".to_string(),
     }
-    smudgy_core::models::settings::BuildChannel::Release => "smudgy",
-};
+}
 
 use crate::cloud_account::CloudAccount;
 use crate::session_store::SessionStore;
@@ -362,6 +369,10 @@ fn flag_value(name: &str, arg: &str, rest: &mut impl Iterator<Item = String>) ->
 pub fn run() -> anyhow::Result<()> {
     apply_launch_overrides();
     smudgy_core::init();
+    // Resolve the persisted/system locale before configuring the daemon's
+    // first window. `init` reloads the same settings for the live model.
+    let startup_settings = smudgy_core::models::settings::load_settings();
+    i18n::activate(&startup_settings.locale);
 
     iced::daemon(init, update, view)
         .theme(|smudgy: &Smudgy, window_id| {
@@ -395,11 +406,11 @@ pub fn run() -> anyhow::Result<()> {
         .default_font(assets::fonts::GEIST_VF)
         .title(|smudgy: &Smudgy, window_id: window::Id| {
             if let Some(window) = smudgy.automations_windows.get(&window_id) {
-                format!("smudgy automations - {}", window.server_name())
+                i18n::t!("window-automations", "server" => window.server_name())
             } else if let Some(window) = smudgy.map_editor_windows.get(&window_id) {
                 window.title()
             } else {
-                MAIN_WINDOW_TITLE.to_string()
+                main_window_title()
             }
         })
         .run()?;
@@ -1896,7 +1907,7 @@ fn view(smudgy: &Smudgy, id: window::Id) -> Element<'_, Message> {
         )
         .into()
     } else {
-        text("No windows open").into()
+        text(i18n::t!("window-none-open")).into()
     }
 }
 

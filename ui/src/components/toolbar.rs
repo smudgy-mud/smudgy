@@ -68,7 +68,7 @@ fn drag_area() -> Element<'static, Message> {
 }
 
 /// Quiet text button used for the toolbar's menu items.
-fn toolbar_button(label: &'static str, message: Message) -> Element<'static, Message> {
+fn toolbar_button(label: String, message: Message) -> Element<'static, Message> {
     button(text(label).size(14))
         .style(builtins::button::toolbar)
         .padding([4, 10])
@@ -117,16 +117,25 @@ pub fn view(
         // Expanded view: quiet menu-bar items
         let mut buttons = vec![
             menu_button(),
-            toolbar_button("Connect", Message::ConnectPressed),
+            toolbar_button(crate::i18n::t!("toolbar-connect"), Message::ConnectPressed),
         ];
 
         // Only show automations button if there's an active session
         if session_context.has_active_session {
-            buttons.push(toolbar_button("Automations", Message::AutomationsPressed));
-            buttons.push(toolbar_button("Map Editor", Message::MapEditorPressed));
+            buttons.push(toolbar_button(
+                crate::i18n::t!("toolbar-automations"),
+                Message::AutomationsPressed,
+            ));
+            buttons.push(toolbar_button(
+                crate::i18n::t!("toolbar-map-editor"),
+                Message::MapEditorPressed,
+            ));
         }
 
-        buttons.push(toolbar_button("Settings", Message::SettingsPressed));
+        buttons.push(toolbar_button(
+            crate::i18n::t!("toolbar-settings"),
+            Message::SettingsPressed,
+        ));
 
         buttons.push(drag_area());
         buttons.push(window_controls(maximized));
@@ -142,7 +151,9 @@ pub fn view(
     } else {
         // Collapsed view: Hamburger + Text. This bar doubles as the window's
         // title bar, so it mirrors the OS title (incl. the dev-build marker).
-        let title = text(crate::MAIN_WINDOW_TITLE).size(14).color(TITLE_COLOR);
+        let title = text(crate::main_window_title())
+            .size(14)
+            .color(TITLE_COLOR);
 
         row![
             menu_button(),

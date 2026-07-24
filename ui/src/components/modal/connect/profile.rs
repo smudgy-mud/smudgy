@@ -10,6 +10,7 @@ use iced::widget::{
 use iced::{Alignment, Font, Length, Padding, Pixels, Task};
 use log::warn;
 use validator::Validate;
+use crate::i18n::{t, ts};
 
 use crate::assets::{bootstrap_icons, fonts};
 use crate::theme::Element;
@@ -22,9 +23,6 @@ use super::{
     profile_description_input_id, profile_name_input_id, profile_password_input_id,
     profile_send_on_connect_id,
 };
-
-/// The plain-text auto-login disclosure shown beneath the on-connect field.
-const PLAINTEXT_NOTICE: &str = "Auto-login text is stored in plain text on this device. Use $PASSWORD to insert a password securely.";
 
 // --- Profile CRUD Async Wrappers ---
 
@@ -71,7 +69,7 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
         name
     } else {
         warn!("Error: SubmitProfileForm called without a server selected.");
-        state.profile_crud_error = Some("Error: No server selected.".to_string());
+        state.profile_crud_error = Some(t!("profile-error-no-server"));
         return Task::none();
     };
 
@@ -82,10 +80,7 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
         && state.profile_form_password.trim().is_empty()
         && !state.profile_form_password_stored
     {
-        state.profile_crud_error = Some(
-            "Enter a password for $PASSWORD, or remove $PASSWORD from the auto-login text."
-                .to_string(),
-        );
+        state.profile_crud_error = Some(t!("profile-error-password-required"));
         return Task::none();
     }
 
@@ -96,12 +91,16 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
                 send_on_connect: state.profile_form_send_on_connect_content.text(),
             };
             if let Err(e) = config.validate() {
-                state.profile_crud_error = Some(format!("Configuration error: {e}"));
+                state.profile_crud_error = Some(t!("profile-error-config", "error" => e.to_string()));
                 return Task::none();
             }
             let profile_name = state.profile_form_data.name.trim().to_string();
             if profile_name.is_empty() {
-                state.profile_crud_error = Some("Profile name cannot be empty.".to_string());
+                state.profile_crud_error = Some(t!("profile-error-name-empty"));
+                return Task::none();
+            }
+            if profile_name.contains(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+                state.profile_crud_error = Some(t!("profile-error-name-format"));
                 return Task::none();
             }
             Task::perform(
@@ -115,7 +114,7 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
                 send_on_connect: state.profile_form_send_on_connect_content.text(),
             };
             if let Err(e) = config.validate() {
-                state.profile_crud_error = Some(format!("Configuration error: {e}"));
+                state.profile_crud_error = Some(t!("profile-error-config", "error" => e.to_string()));
                 return Task::none();
             }
             Task::perform(
@@ -125,13 +124,12 @@ pub(super) fn handle_submit_profile_form(state: &mut State) -> Task<Message> {
         }
         Some(ProfileCrudAction::ConfirmDelete(_)) => {
             warn!("Error: SubmitProfileForm called during ConfirmDelete state.");
-            state.profile_crud_error =
-                Some("Unexpected error: Cannot submit while confirming delete.".to_string());
+            state.profile_crud_error = Some(t!("profile-error-action-delete"));
             Task::none()
         }
         None => {
             warn!("Error: SubmitProfileForm called without a profile action set.");
-            state.profile_crud_error = Some("Unexpected error: No action in progress.".to_string());
+            state.profile_crud_error = Some(t!("profile-error-action-missing"));
             Task::none()
         }
     }
@@ -147,25 +145,25 @@ pub(super) fn view_profile_form<'a>(
     match action {
         ProfileCrudAction::Create => {
             let name_field = column![
-                field_label("Profile name"),
-                TextInput::new("Gandalf", &state.profile_form_data.name)
+                field_label(t!("profile-name")),
+                TextInput::new(ts!("profile-name-placeholder"), &state.profile_form_data.name)
                     .id(profile_name_input_id())
                     .on_input(|val| Message::UpdateProfileFormField(ProfileFormField::Name, val))
                     .on_submit(Message::SubmitProfileForm),
             ]
             .spacing(4);
 
-            let save_button = button(text("Create profile"))
+            let save_button = button(text(t!("profile-create")))
                 .style(builtins::button::primary)
                 .padding([8, 18])
                 .on_press(Message::SubmitProfileForm);
-            let cancel_button = button(text("Cancel"))
+            let cancel_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
                 .on_press(Message::CancelProfileForm);
 
             Column::new()
-                .push(form_title("Add profile", state))
+                .push(form_title(t!("profile-add"), state))
                 .push(name_field)
                 .push(description_field(state))
                 .push(on_connect_field(state))
@@ -177,23 +175,26 @@ pub(super) fn view_profile_form<'a>(
         ProfileCrudAction::Edit(name) => {
             // Name is the profile key (rename isn't supported by the backend), so
             // it is shown read-only.
-            let name_field =
-                column![field_label("Profile name"), text(name).size(Pixels(16.0)),].spacing(4);
+            let name_field = column![
+                field_label(t!("profile-name")),
+                text(name).size(Pixels(16.0)),
+            ]
+            .spacing(4);
 
-            let save_button = button(text("Save"))
+            let save_button = button(text(t!("action-save")))
                 .style(builtins::button::primary)
                 .padding([8, 18])
                 .on_press(Message::SubmitProfileForm);
-            let cancel_button = button(text("Cancel"))
+            let cancel_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
                 .on_press(Message::CancelProfileForm);
-            let delete_button = button(text("Delete profile"))
+            let delete_button = button(text(t!("profile-delete")))
                 .style(builtins::button::link)
                 .on_press(Message::RequestConfirmDeleteProfile(name.clone()));
 
             Column::new()
-                .push(form_title("Edit profile", state))
+                .push(form_title(t!("profile-edit"), state))
                 .push(name_field)
                 .push(description_field(state))
                 .push(on_connect_field(state))
@@ -206,20 +207,19 @@ pub(super) fn view_profile_form<'a>(
         }
         ProfileCrudAction::ConfirmDelete(name) => {
             let confirmation_text =
-                text(format!("Are you sure you want to delete profile '{name}'?"))
-                    .size(Pixels(16.0));
+                text(t!("profile-confirm-delete", "name" => name)).size(Pixels(16.0));
 
-            let confirm_delete_button = button(text("Yes, delete this profile"))
+            let confirm_delete_button = button(text(t!("profile-confirm-delete-action")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
                 .on_press(Message::ConfirmDeleteProfile(name.clone()));
-            let cancel_delete_button = button(text("Cancel"))
+            let cancel_delete_button = button(text(t!("action-cancel")))
                 .style(builtins::button::secondary)
                 .padding([8, 18])
                 .on_press(Message::CancelProfileForm);
 
             Column::new()
-                .push(text("Delete profile").size(Pixels(22.0)))
+                .push(text(t!("profile-delete")).size(Pixels(22.0)))
                 .push(confirmation_text)
                 .push(profile_error(state))
                 .push(
@@ -235,12 +235,12 @@ pub(super) fn view_profile_form<'a>(
 }
 
 /// A muted field label rendered above its input.
-fn field_label(label: &str) -> Element<'_, Message> {
+fn field_label(label: String) -> Element<'static, Message> {
     text(label).size(13).style(builtins::text::muted).into()
 }
 
 /// Form title: `{verb} · {server}`, with the owning server name muted.
-fn form_title<'a>(verb: &'a str, state: &'a State) -> Element<'a, Message> {
+fn form_title<'a>(verb: String, state: &'a State) -> Element<'a, Message> {
     let server = state.selected_server.as_deref().unwrap_or_default();
     Row::new()
         .push(text(verb).size(Pixels(22.0)))
@@ -256,8 +256,8 @@ fn form_title<'a>(verb: &'a str, state: &'a State) -> Element<'a, Message> {
 /// The optional description field.
 fn description_field(state: &State) -> Element<'_, Message> {
     column![
-        field_label("Description (optional)"),
-        TextInput::new("Magician", &state.profile_form_data.description)
+        field_label(t!("profile-description")),
+        TextInput::new(ts!("profile-description-placeholder"), &state.profile_form_data.description)
             .id(profile_description_input_id())
             .on_input(|val| Message::UpdateProfileFormField(ProfileFormField::Description, val))
             .on_submit(Message::SubmitProfileForm),
@@ -277,9 +277,9 @@ fn on_connect_field(state: &State) -> Element<'_, Message> {
     let uses_password = contains_password_token(&state.profile_form_send_on_connect_content.text());
 
     let notice_text = if uses_password {
-        "Auto-login text is stored in plain text; the $PASSWORD value is kept in your OS keychain."
+        t!("profile-keychain-notice")
     } else {
-        PLAINTEXT_NOTICE
+        t!("profile-plaintext-notice")
     };
     let notice = container(
         Row::new()
@@ -297,10 +297,10 @@ fn on_connect_field(state: &State) -> Element<'_, Message> {
     .style(builtins::container::notice);
 
     let mut col = column![
-        field_label("On connect, send (optional)"),
+        field_label(t!("profile-on-connect")),
         text_editor(&state.profile_form_send_on_connect_content)
             .id(profile_send_on_connect_id())
-            .placeholder("Gandalf\n$PASSWORD")
+            .placeholder(ts!("profile-on-connect-example"))
             // ~7 lines tall (≈20px per line).
             .height(Length::Fixed(140.0))
             .font(fonts::GEIST_MONO_VF)
@@ -321,16 +321,16 @@ fn on_connect_field(state: &State) -> Element<'_, Message> {
 fn password_control(state: &State) -> Element<'_, Message> {
     if state.profile_form_password_stored && !state.profile_form_password_editing {
         Row::new()
-            .push(text("Password saved").size(12).style(builtins::text::muted))
+            .push(text(t!("profile-password-saved")).size(12).style(builtins::text::muted))
             .push(horizontal_space())
             .push(
-                button(text("Change").size(12))
+                button(text(t!("profile-password-change")).size(12))
                     .style(builtins::button::link)
                     .padding([2, 8])
                     .on_press(Message::RequestChangeProfilePassword),
             )
             .push(
-                button(text("Clear").size(12))
+                button(text(t!("profile-password-clear")).size(12))
                     .style(builtins::button::link)
                     .padding([2, 8])
                     .on_press(Message::ClearProfilePassword),
@@ -340,8 +340,8 @@ fn password_control(state: &State) -> Element<'_, Message> {
             .into()
     } else {
         column![
-            field_label("Password for $PASSWORD"),
-            TextInput::new("Password", &state.profile_form_password)
+            field_label(t!("profile-password-label")),
+            TextInput::new(ts!("profile-password-placeholder"), &state.profile_form_password)
                 .secure(true)
                 .id(profile_password_input_id())
                 .on_input(Message::UpdateProfileFormPassword)
@@ -376,7 +376,7 @@ pub(super) fn view_server_details_and_profiles<'a>(
                     .font(fonts::BOOTSTRAP_ICONS)
                     .size(13),
             )
-            .push(text("Edit"))
+            .push(text(t!("server-edit-short")))
             .spacing(6)
             .align_y(Alignment::Center),
     )
@@ -398,7 +398,7 @@ pub(super) fn view_server_details_and_profiles<'a>(
             .style(builtins::text::muted)
             .into()
     } else {
-        text("Server details not found?")
+        text(t!("server-details-missing"))
             .style(builtins::text::danger)
             .into()
     };
@@ -420,12 +420,14 @@ pub(super) fn view_server_details_and_profiles<'a>(
             })
             .into(),
         (None, false) => {
-            column![text("Couldn't load profiles for this server.").style(builtins::text::danger)]
-                .into()
+            column![
+                text(t!("profiles-load-error")).style(builtins::text::danger)
+            ]
+            .into()
         }
     };
 
-    let helper = text("Saved logins for this server.")
+    let helper = text(t!("profiles-saved-help"))
         .size(12)
         .style(builtins::text::muted);
 
@@ -433,7 +435,7 @@ pub(super) fn view_server_details_and_profiles<'a>(
         .push(title_row)
         .push(address)
         .push(vertical_space().height(Pixels(4.0)))
-        .push(text("Profiles").size(Pixels(18.0)))
+        .push(text(t!("profiles-title")).size(Pixels(18.0)))
         .push(helper)
         // Right padding keeps the rows' trailing `Connect`/`Offline` buttons clear
         // of the overlaid vertical scrollbar that appears once the list overflows.
@@ -447,7 +449,7 @@ pub(super) fn view_server_details_and_profiles<'a>(
     // its own primary CTA (one primary action per view).
     if profiles.is_some_and(|p| !p.is_empty()) {
         content_col = content_col.push(
-            button(text("+ New Profile"))
+            button(text(t!("profiles-new")))
                 .width(Length::Fill)
                 .padding([6, 10])
                 .style(builtins::button::secondary)
@@ -484,7 +486,7 @@ fn profile_row<'a>(server_name: &'a ServerName, profile: &'a Profile) -> Element
     .padding([2, 6])
     .on_press(Message::RequestEditProfile(profile.name.clone()));
 
-    let connect_button = button(text("Connect"))
+    let connect_button = button(text(t!("profile-connect")))
         .style(builtins::button::primary)
         .padding([6, 16])
         .on_press(Message::ConnectProfile(
@@ -493,7 +495,7 @@ fn profile_row<'a>(server_name: &'a ServerName, profile: &'a Profile) -> Element
         ));
 
     // Open the session without connecting (map editor / automations offline).
-    let open_offline_button = button(text("Offline"))
+    let open_offline_button = button(text(t!("profile-offline")))
         .style(builtins::button::subtle)
         .padding([6, 16])
         .on_press(Message::OpenOfflineProfile(
@@ -515,8 +517,8 @@ fn profile_row<'a>(server_name: &'a ServerName, profile: &'a Profile) -> Element
 fn view_empty_profiles() -> Element<'static, Message> {
     container(
         column![
-            text("Add a profile to connect").size(Pixels(16.0)),
-            button(text("+ New Profile"))
+            text(t!("profiles-empty")).size(Pixels(16.0)),
+            button(text(t!("profiles-new")))
                 .padding([8, 18])
                 .style(builtins::button::primary)
                 .on_press(Message::RequestCreateProfile),
