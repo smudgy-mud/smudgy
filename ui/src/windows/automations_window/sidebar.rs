@@ -28,7 +28,7 @@ impl AutomationsWindow {
                 text(bootstrap_icons::PLUS_LG)
                     .font(fonts::BOOTSTRAP_ICONS)
                     .size(13.0),
-                text("New").size(14.0),
+                text(crate::i18n::t!("automations-new")).size(14.0),
                 iced::widget::space::horizontal(),
                 text(bootstrap_icons::CHEVRON_DOWN)
                     .font(fonts::BOOTSTRAP_ICONS)
@@ -58,7 +58,7 @@ impl AutomationsWindow {
                 .font(fonts::BOOTSTRAP_ICONS)
                 .size(12.0)
                 .style(common::faint),
-            text_input("Search automations…", &self.search)
+            text_input(crate::i18n::ts!("automations-search-placeholder"), &self.search)
                 .on_input(Message::SearchChanged)
                 .size(13.0),
         ]
@@ -261,12 +261,12 @@ impl AutomationsWindow {
     fn create_new_button(&self) -> Option<Elem<'_>> {
         let (label, msg) = match self.chip {
             Chip::All => return None,
-            Chip::Aliases => ("Alias", Message::NewAlias),
-            Chip::Triggers => ("Trigger", Message::NewTrigger),
-            Chip::Hotkeys => ("Hotkey", Message::NewHotkey),
-            Chip::Folders => ("Folder", Message::NewFolder),
-            Chip::Modules => ("Module", Message::NewModule),
-            Chip::Packages => ("Package", Message::NewPackage),
+            Chip::Aliases => (crate::i18n::ts!("automation-alias"), Message::NewAlias),
+            Chip::Triggers => (crate::i18n::ts!("automation-trigger"), Message::NewTrigger),
+            Chip::Hotkeys => (crate::i18n::ts!("automation-hotkey"), Message::NewHotkey),
+            Chip::Folders => (crate::i18n::ts!("automation-folder"), Message::NewFolder),
+            Chip::Modules => (crate::i18n::ts!("automation-module"), Message::NewModule),
+            Chip::Packages => (crate::i18n::ts!("automation-package"), Message::NewPackage),
         };
         Some(
             button(
@@ -275,7 +275,7 @@ impl AutomationsWindow {
                         .font(fonts::BOOTSTRAP_ICONS)
                         .size(10.0)
                         .style(common::muted),
-                    text(format!("Create new {label}")).size(11.0),
+                    text(crate::i18n::t!("automations-create-new", "kind" => label)).size(11.0),
                 ]
                 .spacing(6.0)
                 .align_y(Vertical::Center),
@@ -306,7 +306,7 @@ impl AutomationsWindow {
             let mut rows = Vec::new();
             self.build_script_rows(&self.scripts, 0, "", searching, &mut rows);
             if !rows.is_empty() {
-                col = col.push(section_header("Scripts"));
+                col = col.push(section_header(crate::i18n::ts!("automations-scripts")));
                 for r in rows {
                     col = col.push(r);
                 }
@@ -342,7 +342,7 @@ impl AutomationsWindow {
                 }
             }
             if !rows.is_empty() {
-                col = col.push(section_header("Modules"));
+                col = col.push(section_header(crate::i18n::ts!("automations-modules-plural")));
                 for r in rows {
                     col = col.push(r);
                 }
@@ -599,11 +599,11 @@ impl AutomationsWindow {
         }
 
         if !installed_rows.is_empty() {
-            out.push(section_header("Packages"));
+            out.push(section_header(crate::i18n::ts!("automations-packages-plural")));
             out.append(&mut installed_rows);
         }
         if !local_rows.is_empty() {
-            out.push(section_header("Local"));
+            out.push(section_header(crate::i18n::ts!("automations-local")));
             out.append(&mut local_rows);
         }
     }

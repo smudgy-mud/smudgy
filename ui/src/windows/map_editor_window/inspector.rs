@@ -29,6 +29,7 @@ use smudgy_map_widget::map_editor::{EntityId, MapEditor};
 use smudgy_map_widget::render::parse_color;
 
 use crate::assets::{bootstrap_icons, fonts};
+use crate::components::cloud_errors::display_error;
 use crate::components::color_picker::{self, ColorPicker};
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
@@ -895,7 +896,7 @@ impl MapEditorWindow {
             // Everything already matches the target: nothing to apply,
             // send, or revert.
             if bulk {
-                self.inspector.secret_notice = Some("Nothing changed".to_string());
+                self.inspector.secret_notice = Some(crate::i18n::t!("inspector-nothing-changed"));
             }
             return Update::none();
         }
@@ -2113,9 +2114,9 @@ impl MapEditorWindow {
                             // The server never distinguishes "missing" from
                             // "not allowed"; neither do we.
                             CloudError::NotFoundOrNoAccess => {
-                                "You can't change secrets here.".to_string()
+                                crate::i18n::t!("inspector-secrets-not-editable")
                             }
-                            other => other.to_string(),
+                            other => display_error(&other),
                         });
                     }
                 }
@@ -2225,37 +2226,60 @@ pub(super) fn apply_marks_locally(
 fn format_marks_notice(counts: SecretMarksResult, secret: bool) -> String {
     fn push_part(parts: &mut Vec<String>, count: u64, singular: &str, plural: &str) {
         if count > 0 {
-            let noun = if count == 1 { singular } else { plural };
-            parts.push(format!("{count} {noun}"));
+            let key = if count == 1 { singular } else { plural };
+            let mut args = smudgy_i18n::FluentArgs::new();
+            args.set("count", count);
+            parts.push(crate::i18n::translate_with(key, &args));
         }
     }
 
     let mut parts = Vec::new();
-    push_part(&mut parts, counts.rooms, "room", "rooms");
-    push_part(&mut parts, counts.exits, "exit", "exits");
-    push_part(&mut parts, counts.labels, "label", "labels");
-    push_part(&mut parts, counts.shapes, "shape", "shapes");
+    push_part(
+        &mut parts,
+        counts.rooms,
+        "inspector-count-room-one",
+        "inspector-count-rooms",
+    );
+    push_part(
+        &mut parts,
+        counts.exits,
+        "inspector-count-exit-one",
+        "inspector-count-exits",
+    );
+    push_part(
+        &mut parts,
+        counts.labels,
+        "inspector-count-label-one",
+        "inspector-count-labels",
+    );
+    push_part(
+        &mut parts,
+        counts.shapes,
+        "inspector-count-shape-one",
+        "inspector-count-shapes",
+    );
     push_part(
         &mut parts,
         counts.room_properties,
-        "room property",
-        "room properties",
+        "inspector-count-room-property-one",
+        "inspector-count-room-properties",
     );
     push_part(
         &mut parts,
         counts.area_properties,
-        "area property",
-        "area properties",
+        "inspector-count-area-property-one",
+        "inspector-count-area-properties",
     );
 
     if parts.is_empty() {
-        return "Nothing changed".to_string();
+        return crate::i18n::t!("inspector-nothing-changed");
     }
-    format!(
-        "{} {}",
-        parts.join(", "),
-        if secret { "marked secret" } else { "unmarked" }
-    )
+    let items = parts.join(", ");
+    if secret {
+        crate::i18n::t!("inspector-marked-secret", "items" => items)
+    } else {
+        crate::i18n::t!("inspector-unmarked", "items" => items)
+    }
 }
 
 // ===== view =====
@@ -2332,8 +2356,8 @@ fn lock_toggle<'a>(is_secret: bool, on_press: super::Message) -> ThemedElement<'
     .into()
 }
 
-fn field_label<'a>(label: &'static str) -> iced::widget::Text<'a, crate::Theme> {
-    text(label)
+fn field_label<'a>(label: impl Into<String>) -> iced::widget::Text<'a, crate::Theme> {
+    text(label.into())
         .size(11)
         .style(|theme: &crate::Theme| iced::widget::text::Style {
             color: Some(theme.styles.text.normal.scale_alpha(0.6)),
@@ -2341,7 +2365,7 @@ fn field_label<'a>(label: &'static str) -> iced::widget::Text<'a, crate::Theme> 
 }
 
 fn labeled_input<'a>(
-    label: &'static str,
+    label: impl Into<String>,
     placeholder: &'static str,
     value: &str,
     valid: bool,
@@ -2356,7 +2380,11 @@ fn labeled_input<'a>(
     .spacing(2);
 
     if !valid {
-        col = col.push(text("invalid value").size(11).style(builtins::text::danger));
+        col = col.push(
+            text(crate::i18n::t!("inspector-invalid-value"))
+                .size(11)
+                .style(builtins::text::danger),
+        );
     }
 
     col.into()
@@ -2463,7 +2491,7 @@ fn properties_section<'a>(
     hooks: &PropertyHooks,
 ) -> ThemedElement<'a, super::Message> {
     let mut section = Column::new().spacing(4);
-    section = section.push(field_label("Properties"));
+    section = section.push(field_label(crate::i18n::t!("inspector-properties")));
 
     let on_value_change = hooks.on_value_change;
     let on_delete = hooks.on_delete;
@@ -2475,7 +2503,7 @@ fn properties_section<'a>(
             text(property_row.name.clone())
                 .size(13)
                 .width(Length::FillPortion(2)),
-            text_input("value", &property_row.value)
+            text_input(crate::i18n::ts!("inspector-value-placeholder"), &property_row.value)
                 .size(13)
                 .on_input(move |value| { super::Message::Inspector(on_value_change(index, value)) })
                 .width(Length::FillPortion(3)),
@@ -2496,16 +2524,16 @@ fn properties_section<'a>(
 
     section = section.push(
         row![
-            text_input("name", new_name)
+            text_input(crate::i18n::ts!("inspector-name-placeholder"), new_name)
                 .size(13)
                 .on_input(move |value| super::Message::Inspector(on_new_name(value)))
                 .width(Length::FillPortion(2)),
-            text_input("value", new_value)
+            text_input(crate::i18n::ts!("inspector-value-placeholder"), new_value)
                 .size(13)
                 .on_input(move |value| super::Message::Inspector(on_new_value(value)))
                 .on_submit(super::Message::Inspector(hooks.on_add.clone()))
                 .width(Length::FillPortion(3)),
-            button(text("Add").size(13))
+            button(text(crate::i18n::t!("action-add")).size(13))
                 .style(builtins::button::secondary)
                 .on_press(super::Message::Inspector(hooks.on_add.clone())),
         ]
@@ -2525,7 +2553,7 @@ fn tags_section<'a>(
     new_tag: &'a str,
 ) -> ThemedElement<'a, super::Message> {
     let mut section = Column::new().spacing(4);
-    section = section.push(field_label("Tags"));
+    section = section.push(field_label(crate::i18n::t!("inspector-tags")));
 
     if !tags.is_empty() {
         let chips: Vec<ThemedElement<'a, super::Message>> = tags
@@ -2543,14 +2571,14 @@ fn tags_section<'a>(
 
     section = section.push(
         row![
-            text_input("add a tag", new_tag)
+            text_input(crate::i18n::ts!("inspector-add-tag-placeholder"), new_tag)
                 .size(13)
                 .on_input(|value| super::Message::Inspector(Message::RoomTagInputChanged(value)))
                 .on_submit(super::Message::Inspector(Message::RoomTagAdded(
                     new_tag.to_string()
                 )))
                 .width(Length::Fill),
-            button(text("Add").size(13))
+            button(text(crate::i18n::t!("action-add")).size(13))
                 .style(builtins::button::secondary)
                 .on_press(super::Message::Inspector(Message::RoomTagAdded(
                     new_tag.to_string()
@@ -2574,7 +2602,7 @@ fn tags_section<'a>(
         .collect();
     if !suggestions.is_empty() {
         section = section
-            .push(text("In this area:").size(11))
+            .push(text(crate::i18n::t!("inspector-in-this-area")).size(11))
             .push(wrap_row(suggestions).spacing(6.0, 4.0));
     }
 
@@ -2590,22 +2618,22 @@ fn single_room_view<'a>(
 
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
     content = content.push(secret_aware_heading(
-        format!("Room #{room_number}"),
+        crate::i18n::t!("inspector-room-heading", "number" => room_number.to_string()),
         state.is_secret,
     ));
 
     content = content.push(labeled_input(
-        "Title",
-        "room title",
+        crate::i18n::t!("inspector-title"),
+        crate::i18n::ts!("inspector-room-title-placeholder"),
         &state.title,
         true,
         Message::TitleChanged,
     ));
     content = content.push(
         column![
-            field_label("Description"),
+            field_label(crate::i18n::t!("inspector-description")),
             text_editor(&state.description)
-                .placeholder("room description")
+                .placeholder(crate::i18n::ts!("inspector-room-description-placeholder"))
                 .size(14)
                 .on_action(|action| {
                     super::Message::Inspector(Message::DescriptionEdited(action))
@@ -2614,7 +2642,7 @@ fn single_room_view<'a>(
         .spacing(2),
     );
     content = content.push(labeled_input(
-        "Level",
+        crate::i18n::t!("inspector-level"),
         "0",
         &state.level,
         state.level.parse::<i32>().is_ok(),
@@ -2623,7 +2651,7 @@ fn single_room_view<'a>(
     content = content.push(
         row![
             container(labeled_input(
-                "X",
+                "X".to_string(),
                 "0",
                 &state.x,
                 state.x.parse::<f32>().is_ok(),
@@ -2631,7 +2659,7 @@ fn single_room_view<'a>(
             ))
             .width(Length::FillPortion(1)),
             container(labeled_input(
-                "Y",
+                "Y".to_string(),
                 "0",
                 &state.y,
                 state.y.parse::<f32>().is_ok(),
@@ -2644,8 +2672,8 @@ fn single_room_view<'a>(
     content = content.push(
         row![
             container(labeled_input(
-                "Color",
-                "(default)",
+                crate::i18n::t!("inspector-color"),
+                crate::i18n::ts!("inspector-default-placeholder"),
                 &state.color,
                 state.color.is_empty() || parse_color(&state.color).is_some(),
                 Message::ColorChanged,
@@ -2666,7 +2694,7 @@ fn single_room_view<'a>(
     if cleared {
         content = content.push(
             checkbox(state.is_secret)
-                .label("Secret room")
+                .label(crate::i18n::t!("inspector-secret-room"))
                 .size(14)
                 .text_size(13)
                 .on_toggle(|secret| super::Message::Inspector(Message::RoomSecretToggled(secret))),
@@ -2764,13 +2792,15 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
                     text("\u{2192}").size(13),
                     // No `.on_input`: renders as a disabled field whose
                     // placeholder reads "Unknown map".
-                    text_input("Unknown map", "").size(12).width(Length::Fill),
+                    text_input(crate::i18n::ts!("inspector-unknown-map"), "")
+                        .size(12)
+                        .width(Length::Fill),
                 ]
                 .spacing(4)
                 .align_y(Vertical::Center),
             );
             section = section.push(
-                text("Leads to a map that wasn't shared with you.")
+                text(crate::i18n::t!("inspector-unshared-destination"))
                     .size(11)
                     .style(muted_text),
             );
@@ -2790,7 +2820,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
                     pick_list(area_choices.clone(), selected_area, move |choice| {
                         super::Message::Inspector(Message::ExitToAreaChanged(index, choice))
                     })
-                    .placeholder("area")
+                    .placeholder(crate::i18n::t!("inspector-area-placeholder"))
                     .text_size(12)
                     .width(Length::Fill),
                     trash_button(super::Message::Inspector(Message::ExitDeleted(index))),
@@ -2801,7 +2831,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
 
             section = section.push(
                 row![
-                    text_input("room #", &exit.to_room)
+                    text_input(crate::i18n::ts!("inspector-room-number-placeholder"), &exit.to_room)
                         .size(12)
                         .on_input(move |value| {
                             super::Message::Inspector(Message::ExitToRoomChanged(index, value))
@@ -2810,7 +2840,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
                     pick_list(&ExitDirection::ALL[..], exit.to_direction, move |d| {
                         super::Message::Inspector(Message::ExitToDirectionChanged(index, d))
                     })
-                    .placeholder("return dir")
+                    .placeholder(crate::i18n::t!("inspector-return-direction-placeholder"))
                     .text_size(12)
                     .width(Length::FillPortion(2)),
                 ]
@@ -2821,21 +2851,21 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
 
         let mut flags = row![
             checkbox(exit.is_hidden)
-                .label("hidden")
+                .label(crate::i18n::t!("inspector-hidden"))
                 .size(14)
                 .text_size(12)
                 .on_toggle(move |checked| {
                     super::Message::Inspector(Message::ExitHiddenToggled(index, checked))
                 }),
             checkbox(exit.is_closed)
-                .label("closed")
+                .label(crate::i18n::t!("inspector-closed"))
                 .size(14)
                 .text_size(12)
                 .on_toggle(move |checked| {
                     super::Message::Inspector(Message::ExitClosedToggled(index, checked))
                 }),
             checkbox(exit.is_locked)
-                .label("locked")
+                .label(crate::i18n::t!("inspector-locked"))
                 .size(14)
                 .text_size(12)
                 .on_toggle(move |checked| {
@@ -2848,7 +2878,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
         if cleared {
             flags = flags.push(
                 checkbox(exit.is_secret)
-                    .label("secret")
+                    .label(crate::i18n::t!("inspector-secret"))
                     .size(14)
                     .text_size(12)
                     .on_toggle(move |checked| {
@@ -2862,7 +2892,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
         // Connection appearance moves to the Connection inspector.
         section = section.push(
             row![
-                text_input("weight", &exit.weight)
+                text_input(crate::i18n::ts!("inspector-weight-placeholder"), &exit.weight)
                     .size(12)
                     .on_input(move |value| {
                         super::Message::Inspector(Message::ExitWeightChanged(index, value))
@@ -2875,13 +2905,13 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
 
         section = section.push(
             row![
-                text_input("command", &exit.command)
+                text_input(crate::i18n::ts!("inspector-command-placeholder"), &exit.command)
                     .size(12)
                     .on_input(move |value| {
                         super::Message::Inspector(Message::ExitCommandChanged(index, value))
                     })
                     .width(Length::FillPortion(1)),
-                text_input("path", &exit.path)
+                text_input(crate::i18n::ts!("inspector-path-placeholder"), &exit.path)
                     .size(12)
                     .on_input(move |value| {
                         super::Message::Inspector(Message::ExitPathChanged(index, value))
@@ -2893,7 +2923,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
         );
         if connection_selected && state.exits.len() == 2 {
             section = section.push(
-                button(text("Unlink this direction").size(12))
+                button(text(crate::i18n::t!("inspector-unlink-direction")).size(12))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(Message::ConnectionUnlink(index))),
             );
@@ -2902,7 +2932,7 @@ fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> 
 
     if !connection_selected {
         section = section.push(
-            button(text("Add exit").size(13))
+            button(text(crate::i18n::t!("inspector-add-exit")).size(13))
                 .style(builtins::button::secondary)
                 .on_press(super::Message::Inspector(Message::AddExit)),
         );
@@ -2919,23 +2949,28 @@ fn connection_view(
     let state = &window.inspector;
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
     let Some(area_id) = window.editor.area_id() else {
-        return content.push(text("No area selected"));
+        return content.push(text(crate::i18n::t!("inspector-no-area-selected")));
     };
     let Some(area) = atlas.get_area(&area_id) else {
-        return content.push(text("No area selected"));
+        return content.push(text(crate::i18n::t!("inspector-no-area-selected")));
     };
     let Some(connection) = area.get_connection(connection_id) else {
-        return content.push(text("Connection no longer exists"));
+        return content.push(text(crate::i18n::t!("inspector-connection-missing")));
     };
     let endpoints = connection.endpoint_b.map_or_else(
-        || format!("Room {} outward", connection.endpoint_a.room_number),
+        || {
+            crate::i18n::t!(
+                "inspector-connection-outward",
+                "room" => connection.endpoint_a.room_number.to_string()
+            )
+        },
         |endpoint| {
-            format!(
-                "Room {} {} to room {} {}",
-                connection.endpoint_a.room_number,
-                connection.endpoint_a.side,
-                endpoint.room_number,
-                endpoint.side
+            crate::i18n::t!(
+                "inspector-connection-between",
+                "room_a" => connection.endpoint_a.room_number.to_string(),
+                "side_a" => connection.endpoint_a.side.to_string(),
+                "room_b" => endpoint.room_number.to_string(),
+                "side_b" => endpoint.side.to_string()
             )
         },
     );
@@ -2958,18 +2993,21 @@ fn connection_view(
             )
             .text_size(12)
             .width(Length::FillPortion(2)),
-            text_input("port 0–1", &state.connection.endpoint_a_offset)
+            text_input(
+                crate::i18n::ts!("inspector-connection-port-placeholder"),
+                &state.connection.endpoint_a_offset
+            )
                 .on_input(|value| super::Message::Inspector(
                     Message::ConnectionEndpointOffsetChanged(false, value),
                 ))
                 .size(12)
                 .width(Length::FillPortion(1)),
-            button(text("Auto").size(11))
+            button(text(crate::i18n::t!("inspector-connection-auto")).size(11))
                 .style(builtins::button::secondary)
                 .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
                     false,
                 ))),
-            button(text("Redistribute").size(11))
+            button(text(crate::i18n::t!("inspector-connection-redistribute")).size(11))
                 .style(builtins::button::secondary)
                 .on_press(super::Message::Inspector(
                     Message::ConnectionRedistributePorts(false,)
@@ -2989,18 +3027,21 @@ fn connection_view(
                 )
                 .text_size(12)
                 .width(Length::FillPortion(2)),
-                text_input("port 0–1", &state.connection.endpoint_b_offset)
+                text_input(
+                    crate::i18n::ts!("inspector-connection-port-placeholder"),
+                    &state.connection.endpoint_b_offset
+                )
                     .on_input(|value| super::Message::Inspector(
                         Message::ConnectionEndpointOffsetChanged(true, value),
                     ))
                     .size(12)
                     .width(Length::FillPortion(1)),
-                button(text("Auto").size(11))
+                button(text(crate::i18n::t!("inspector-connection-auto")).size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
                         true,
                     ))),
-                button(text("Redistribute").size(11))
+                button(text(crate::i18n::t!("inspector-connection-redistribute")).size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::Inspector(
                         Message::ConnectionRedistributePorts(true,)
@@ -3044,7 +3085,9 @@ fn connection_view(
                     .is_none_or(|direction| direction == selected.from_direction);
             if reciprocal {
                 content = content.push(
-                    button(text("Pair with reciprocal connection").size(12))
+                    button(
+                        text(crate::i18n::t!("inspector-connection-pair-reciprocal")).size(12)
+                    )
                         .style(builtins::button::secondary)
                         .on_press(super::Message::Inspector(Message::ConnectionPair(
                             candidate.id,
@@ -3056,7 +3099,7 @@ fn connection_view(
 
     // Route
     content = content.push(rule::horizontal(1));
-    content = content.push(field_label("Route"));
+    content = content.push(field_label(crate::i18n::t!("inspector-connection-route")));
     let routing_choices = if connection.kind == smudgy_cloud::ConnectionKind::Internal {
         &ConnectionRouting::ALL[..]
     } else {
@@ -3084,7 +3127,7 @@ fn connection_view(
             .width(Length::Fill)
             .into()
         } else {
-            container(text("Orthogonal").size(12))
+            container(text(crate::i18n::t!("inspector-connection-orthogonal")).size(12))
                 .width(Length::Fill)
                 .into()
         };
@@ -3104,7 +3147,7 @@ fn connection_view(
     }
     if connection.kind == smudgy_cloud::ConnectionKind::Internal {
         content = content.push(
-            button(text("Re-route…").size(12))
+            button(text(crate::i18n::t!("inspector-connection-reroute")).size(12))
                 .style(builtins::button::secondary)
                 .on_press_maybe(
                     window
@@ -3116,7 +3159,7 @@ fn connection_view(
     if connection.routing == ConnectionRouting::Automatic {
         if window.automatic_route_is_stale(connection_id) {
             content = content.push(
-                text("Route may be stale after map changes; use Re-route.")
+                text(crate::i18n::t!("inspector-connection-route-stale"))
                     .size(12)
                     .style(builtins::text::danger),
             );
@@ -3124,14 +3167,14 @@ fn connection_view(
         match window.automatic_route_validation(connection_id) {
             Some(smudgy_cloud::automatic_routing::RouteValidation::Collision) => {
                 content = content.push(
-                    text("Route intersects a public room; use Re-route or edit it manually.")
+                    text(crate::i18n::t!("inspector-connection-route-collision"))
                         .size(12)
                         .style(builtins::text::danger),
                 );
             }
             Some(smudgy_cloud::automatic_routing::RouteValidation::Invalid) => {
                 content = content.push(
-                    text("Stored automatic route is invalid; use Re-route.")
+                    text(crate::i18n::t!("inspector-connection-route-invalid"))
                         .size(12)
                         .style(builtins::text::danger),
                 );
@@ -3145,10 +3188,12 @@ fn connection_view(
             ConnectionRouting::Stub | ConnectionRouting::Simple
         )
     {
-        content = content.push(text("A stored route is inactive in this mode.").size(12));
+        content = content.push(
+            text(crate::i18n::t!("inspector-connection-route-inactive")).size(12)
+        );
     }
     content = content.push(
-        button(text("Clear stored route").size(12))
+        button(text(crate::i18n::t!("inspector-connection-clear-route")).size(12))
             .style(builtins::button::secondary)
             .on_press_maybe(
                 (window.can_edit_active_area()
@@ -3174,13 +3219,19 @@ fn connection_view(
     );
     content = content.push(
         row![
-            text_input("CSS color", &state.connection.color)
+            text_input(
+                crate::i18n::ts!("inspector-css-color-placeholder"),
+                &state.connection.color
+            )
                 .on_input(
                     |value| super::Message::Inspector(Message::ConnectionColorChanged(value),)
                 )
                 .size(12)
                 .width(Length::FillPortion(2)),
-            text_input("width", &state.connection.thickness)
+            text_input(
+                crate::i18n::ts!("inspector-width-placeholder"),
+                &state.connection.thickness
+            )
                 .on_input(
                     |value| super::Message::Inspector(Message::ConnectionThicknessChanged(value),)
                 )
@@ -3190,7 +3241,7 @@ fn connection_view(
         .spacing(6),
     );
     content = content.push(
-        button(text("Reset route and appearance").size(12))
+        button(text(crate::i18n::t!("inspector-connection-reset")).size(12))
             .style(builtins::button::secondary)
             .on_press(super::Message::Inspector(Message::ConnectionReset)),
     );
@@ -3199,9 +3250,9 @@ fn connection_view(
     content = content.push(
         button(
             text(if state.exits.len() == 2 {
-                "Delete link and both directions"
+                crate::i18n::t!("inspector-connection-delete-both")
             } else {
-                "Delete link"
+                crate::i18n::t!("inspector-connection-delete")
             })
             .size(12),
         )
@@ -3219,7 +3270,7 @@ fn bounds_fields<'a>(
     height: &'a str,
     on_change: fn(BoundsField, String) -> Message,
 ) -> ThemedElement<'a, super::Message> {
-    let bound_input = move |label: &'static str, value: &'a str, field: BoundsField| {
+    let bound_input = move |label: String, value: &'a str, field: BoundsField| {
         container(labeled_input(
             label,
             "0",
@@ -3232,13 +3283,13 @@ fn bounds_fields<'a>(
 
     column![
         row![
-            bound_input("X", x, BoundsField::X),
-            bound_input("Y", y, BoundsField::Y),
+            bound_input("X".to_string(), x, BoundsField::X),
+            bound_input("Y".to_string(), y, BoundsField::Y),
         ]
         .spacing(8),
         row![
-            bound_input("Width", width, BoundsField::Width),
-            bound_input("Height", height, BoundsField::Height),
+            bound_input(crate::i18n::t!("inspector-width"), width, BoundsField::Width),
+            bound_input(crate::i18n::t!("inspector-height"), height, BoundsField::Height),
         ]
         .spacing(8),
     ]
@@ -3249,7 +3300,7 @@ fn bounds_fields<'a>(
 fn color_input<'a>(
     window: &'a MapEditorWindow,
     field: ColorField,
-    label: &'static str,
+    label: String,
     placeholder: &'static str,
     value: &'a str,
     allow_empty: bool,
@@ -3282,14 +3333,14 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
 
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
     content = content.push(secret_aware_heading(
-        "Label".to_string(),
+        crate::i18n::t!("inspector-label"),
         window.inspector.is_secret,
     ));
 
     if window.secrets_cleared() {
         content = content.push(
             checkbox(window.inspector.is_secret)
-                .label("Secret")
+                .label(crate::i18n::t!("inspector-secret"))
                 .size(14)
                 .text_size(13)
                 .on_toggle(|secret| super::Message::Inspector(Message::LabelSecretToggled(secret))),
@@ -3300,8 +3351,8 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     }
 
     content = content.push(labeled_input(
-        "Text",
-        "label text",
+        crate::i18n::t!("inspector-label-text"),
+        crate::i18n::ts!("inspector-label-text-placeholder"),
         &state.text,
         true,
         Message::LabelTextChanged,
@@ -3309,8 +3360,8 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     content = content.push(color_input(
         window,
         ColorField::LabelText,
-        "Color",
-        "(default)",
+        crate::i18n::t!("inspector-color"),
+        crate::i18n::ts!("inspector-default-placeholder"),
         &state.color,
         false,
         Message::LabelColorChanged,
@@ -3318,8 +3369,8 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     content = content.push(color_input(
         window,
         ColorField::LabelBackground,
-        "Background",
-        "(none)",
+        crate::i18n::t!("inspector-background"),
+        crate::i18n::ts!("inspector-none-placeholder"),
         &state.background,
         true,
         Message::LabelBackgroundChanged,
@@ -3327,7 +3378,7 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     content = content.push(
         row![
             container(labeled_input(
-                "Font size",
+                crate::i18n::t!("inspector-font-size"),
                 "16",
                 &state.font_size,
                 state.font_size.parse::<i32>().is_ok_and(|v| v > 0),
@@ -3335,7 +3386,7 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
             ))
             .width(Length::FillPortion(1)),
             container(labeled_input(
-                "Font weight",
+                crate::i18n::t!("inspector-font-weight"),
                 "400",
                 &state.font_weight,
                 state.font_weight.parse::<i32>().is_ok_and(|v| v > 0),
@@ -3347,7 +3398,7 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     );
     content = content.push(
         column![
-            field_label("Alignment"),
+            field_label(crate::i18n::t!("inspector-alignment")),
             row![
                 pick_list(
                     &HorizontalAlignment::ALL[..],
@@ -3390,14 +3441,14 @@ fn shape_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
 
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
     content = content.push(secret_aware_heading(
-        "Shape".to_string(),
+        crate::i18n::t!("inspector-shape"),
         window.inspector.is_secret,
     ));
 
     if window.secrets_cleared() {
         content = content.push(
             checkbox(window.inspector.is_secret)
-                .label("Secret")
+                .label(crate::i18n::t!("inspector-secret"))
                 .size(14)
                 .text_size(13)
                 .on_toggle(|secret| super::Message::Inspector(Message::ShapeSecretToggled(secret))),
@@ -3409,7 +3460,7 @@ fn shape_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
 
     content = content.push(
         column![
-            field_label("Shape"),
+            field_label(crate::i18n::t!("inspector-shape")),
             pick_list(
                 &ShapeType::ALL[..],
                 Some(state.shape_type.clone()),
@@ -3423,8 +3474,8 @@ fn shape_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     content = content.push(color_input(
         window,
         ColorField::ShapeFill,
-        "Fill",
-        "(none)",
+        crate::i18n::t!("inspector-fill"),
+        crate::i18n::ts!("inspector-none-placeholder"),
         &state.background,
         true,
         Message::ShapeBackgroundChanged,
@@ -3432,8 +3483,8 @@ fn shape_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     content = content.push(color_input(
         window,
         ColorField::ShapeStroke,
-        "Stroke",
-        "(none)",
+        crate::i18n::t!("inspector-stroke"),
+        crate::i18n::ts!("inspector-none-placeholder"),
         &state.stroke_color,
         true,
         Message::ShapeStrokeColorChanged,
@@ -3441,7 +3492,7 @@ fn shape_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     content = content.push(
         row![
             container(labeled_input(
-                "Stroke width",
+                crate::i18n::t!("inspector-stroke-width"),
                 "1",
                 &state.stroke_width,
                 state.stroke_width.parse::<f32>().is_ok_and(|v| v >= 0.0),
@@ -3449,7 +3500,7 @@ fn shape_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
             ))
             .width(Length::FillPortion(1)),
             container(labeled_input(
-                "Corner radius",
+                crate::i18n::t!("inspector-corner-radius"),
                 "0",
                 &state.border_radius,
                 state.border_radius.parse::<f32>().is_ok_and(|v| v >= 0.0),
@@ -3492,13 +3543,13 @@ fn multi_selection_view(window: &MapEditorWindow) -> Column<'_, super::Message, 
         // An empty buffer means the rooms either disagree ("(mixed)") or
         // all have no color ("(default)") — never a fake value.
         let color_placeholder = if state.bulk_color_mixed {
-            "(mixed)"
+            crate::i18n::ts!("inspector-mixed-placeholder")
         } else {
-            "(default)"
+            crate::i18n::ts!("inspector-default-placeholder")
         };
         content = content.push(
             column![
-                field_label("Set color (Enter to apply)"),
+                field_label(crate::i18n::t!("inspector-set-color")),
                 row![
                     text_input(color_placeholder, &state.bulk_color)
                         .size(14)
@@ -3525,7 +3576,7 @@ fn multi_selection_view(window: &MapEditorWindow) -> Column<'_, super::Message, 
         };
         content = content.push(
             column![
-                field_label("Set level (Enter to apply)"),
+                field_label(crate::i18n::t!("inspector-set-level")),
                 text_input(level_placeholder, &state.bulk_level)
                     .size(14)
                     .on_input(|value| {
@@ -3540,12 +3591,12 @@ fn multi_selection_view(window: &MapEditorWindow) -> Column<'_, super::Message, 
     if window.secrets_cleared() {
         content = content.push(
             column![
-                field_label("Secrecy"),
+                field_label(crate::i18n::t!("inspector-secrecy")),
                 row![
-                    button(text("Mark secret").size(13))
+                    button(text(crate::i18n::t!("inspector-mark-secret")).size(13))
                         .style(builtins::button::secondary)
                         .on_press(super::Message::Inspector(Message::BulkSecretMark(true))),
-                    button(text("Unmark secret").size(13))
+                    button(text(crate::i18n::t!("inspector-unmark-secret")).size(13))
                         .style(builtins::button::secondary)
                         .on_press(super::Message::Inspector(Message::BulkSecretMark(false))),
                 ]
@@ -3570,9 +3621,15 @@ fn identification_toggle<'a>(
 ) -> ThemedElement<'a, super::Message> {
     let enabled = window.mapper.is_area_enabled(&area_id);
     let (icon, tip) = if enabled {
-        (bootstrap_icons::TOGGLE_ON, "Active — click to deactivate")
+        (
+            bootstrap_icons::TOGGLE_ON,
+            crate::i18n::t!("inspector-active-tip"),
+        )
     } else {
-        (bootstrap_icons::TOGGLE_OFF, "Inactive — click to activate")
+        (
+            bootstrap_icons::TOGGLE_OFF,
+            crate::i18n::t!("inspector-inactive-tip"),
+        )
     };
     let status_style: fn(&crate::Theme) -> iced::widget::text::Style = if enabled {
         builtins::text::success
@@ -3580,8 +3637,12 @@ fn identification_toggle<'a>(
         muted_text
     };
     let status_line = row![
-        text("This map:").size(12).style(muted_text),
-        text(if enabled { "Active" } else { "Inactive" })
+        text(crate::i18n::t!("inspector-this-map")).size(12).style(muted_text),
+        text(if enabled {
+            crate::i18n::t!("inspector-active")
+        } else {
+            crate::i18n::t!("inspector-inactive")
+        })
             .size(12)
             .style(status_style),
         space::horizontal(),
@@ -3589,7 +3650,7 @@ fn identification_toggle<'a>(
             button(text(icon).font(fonts::BOOTSTRAP_ICONS).size(16.0),)
                 .style(builtins::button::toolbar)
                 .on_press(super::Message::ToggleAreaEnabled(area_id)),
-            tip,
+            text(tip),
             tooltip::Position::Bottom,
         ),
     ]
@@ -3598,7 +3659,7 @@ fn identification_toggle<'a>(
 
     column![
         status_line,
-        text("Active maps are used to find your location as you play.")
+        text(crate::i18n::t!("inspector-active-help"))
             .size(11)
             .style(muted_text),
     ]
@@ -3627,7 +3688,7 @@ fn copies_section<'a>(
 
     let mut section = Column::new()
         .spacing(4)
-        .push(field_label("Copies of this map"));
+        .push(field_label(crate::i18n::t!("inspector-copies")));
 
     for member in &family {
         let Some(member_area) = atlas.get_area(member) else {
@@ -3638,7 +3699,7 @@ fn copies_section<'a>(
 
         let name = member_area.get_name().to_string();
         let label = if is_current {
-            format!("{name} (this map)")
+            crate::i18n::t!("inspector-this-map-suffix", "name" => name)
         } else {
             name
         };
@@ -3650,9 +3711,13 @@ fn copies_section<'a>(
 
         let mut row_widgets = row![name_text].spacing(6).align_y(Vertical::Center);
         row_widgets = row_widgets.push(if enabled {
-            text("Active").size(11).style(builtins::text::success)
+            text(crate::i18n::t!("inspector-active"))
+                .size(11)
+                .style(builtins::text::success)
         } else {
-            text("Inactive").size(11).style(muted_text)
+            text(crate::i18n::t!("inspector-inactive"))
+                .size(11)
+                .style(muted_text)
         });
         row_widgets = row_widgets.push(space::horizontal());
 
@@ -3661,7 +3726,7 @@ fn copies_section<'a>(
         // the sole active copy (where it would be a no-op).
         if !(enabled && enabled_count == 1) {
             row_widgets = row_widgets.push(
-                button(text("Use only this copy").size(11))
+                button(text(crate::i18n::t!("inspector-use-only-copy")).size(11))
                     .style(builtins::button::secondary)
                     .on_press(super::Message::SetActiveCopy(*member)),
             );
@@ -3671,9 +3736,7 @@ fn copies_section<'a>(
     }
 
     section = section.push(
-        text(
-            "You may have multiple copies active at a time. When visiting rooms with copies in multiple active maps, the mapper may place you unpredictably.",
-        )
+        text(crate::i18n::t!("inspector-multiple-copies-warning"))
         .size(11)
         .style(muted_text),
     );
@@ -3688,7 +3751,7 @@ fn area_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Them
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
 
     let Some(area) = window.editor.area_id().and_then(|id| atlas.get_area(&id)) else {
-        return content.push(text("No area selected"));
+        return content.push(text(crate::i18n::t!("inspector-no-area-selected")));
     };
 
     content = content.push(heading(area.get_name().to_string()));
@@ -3707,21 +3770,27 @@ fn area_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Them
     {
         let source = atlas.get_area(&source_id);
         let source_name = source.as_ref().map_or_else(
-            || "a shared map".to_string(),
+            || crate::i18n::t!("inspector-shared-map"),
             |source| format!("\u{201c}{}\u{201d}", source.get_name()),
         );
-        let mut line = format!("Copied from {source_name}");
+        let mut line = crate::i18n::t!("inspector-copied-from", "source" => source_name);
         if let Some(rev) = area.meta().copied_from_rev {
-            line.push_str(&format!(" at rev {rev}"));
+            line.push(' ');
+            line.push_str(&crate::i18n::t!("inspector-copy-revision", "revision" => rev));
         }
         if let Some(copied_at) = area.meta().copied_at {
-            line.push_str(&format!(" on {}", copied_at.format("%Y-%m-%d")));
+            line.push(' ');
+            line.push_str(&crate::i18n::t!(
+                "inspector-copy-date",
+                "date" => copied_at.format("%Y-%m-%d").to_string()
+            ));
         }
         // Rev is opaque — inequality means "changed", never a count.
         if let (Some(source), Some(rev)) = (source.as_ref(), area.meta().copied_from_rev)
             && source.get_rev() != rev
         {
-            line.push_str(" (source has changed since)");
+            line.push(' ');
+            line.push_str(&crate::i18n::t!("inspector-source-changed"));
         }
         content = content.push(text(line).size(12).style(muted_text));
     }
@@ -3770,7 +3839,10 @@ fn area_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Them
     if let Some(RoomKey { room_number, .. }) = window.hovered_room
         && let Some(room) = area.get_room(&room_number)
     {
-        content = content.push(heading(format!("Room #{room_number}")));
+        content = content.push(heading(crate::i18n::t!(
+            "inspector-room-heading",
+            "number" => room_number.to_string()
+        )));
         content = content.push(text(room.get_title().to_string()).size(13));
         content = content.push(text(room.get_description().to_string()).size(12));
     }
@@ -3792,7 +3864,9 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> {
         .is_some_and(|area| !area.effective_access().can_edit);
 
     let content: Column<'_, super::Message, crate::Theme> = if area.is_none() {
-        Column::new().padding(12).push(text("No area selected"))
+        Column::new()
+            .padding(12)
+            .push(text(crate::i18n::t!("inspector-no-area-selected")))
     } else if read_only {
         read_only_view(window)
     } else if let Some(entity) = selection.single() {
@@ -3819,19 +3893,28 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> {
 /// projection: unknown destinations never get a name.
 fn exit_summary(atlas: &AtlasCache, area: &AreaCache, exit: &ExitCache) -> String {
     let target = if exit.to_unknown {
-        "Unknown map".to_string()
+        crate::i18n::t!("inspector-unknown-map")
     } else if let Some(to_area) = exit.to_area_id.filter(|to| to != area.get_id()) {
         let name = atlas
             .get_area(&to_area)
-            .map_or_else(|| "another area".to_string(), |a| a.get_name().to_string());
+            .map_or_else(
+                || crate::i18n::t!("inspector-another-area"),
+                |a| a.get_name().to_string(),
+            );
         match exit.to_room_number {
-            Some(number) => format!("{name}, room {number}"),
+            Some(number) => crate::i18n::t!(
+                "inspector-exit-target-area-room",
+                "area" => name,
+                "room" => number.to_string()
+            ),
             None => name,
         }
     } else {
         match exit.to_room_number {
-            Some(number) => format!("room {number}"),
-            None => "nowhere".to_string(),
+            Some(number) => {
+                crate::i18n::t!("inspector-exit-target-room", "room" => number.to_string())
+            }
+            None => crate::i18n::t!("inspector-exit-target-nowhere"),
         }
     };
     format!("{} \u{2192} {}", exit.from_direction, target)
@@ -3851,14 +3934,17 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
     let mut content = Column::new().padding(12).spacing(8);
 
     let Some(area) = window.editor.area_id().and_then(|id| atlas.get_area(&id)) else {
-        return content.push(text("No area selected"));
+        return content.push(text(crate::i18n::t!("inspector-no-area-selected")));
     };
 
     // Attribution enriched from the sharer index: names the re-sharer and the
     // underlying owner when they differ.
     let attribution = window.sharer_attribution(*area.get_id());
     content = content.push(
-        text(format!("{attribution} \u{2014} view only."))
+        text(crate::i18n::t!(
+            "inspector-view-only",
+            "attribution" => attribution
+        ))
             .size(12)
             .style(muted_text),
     );
@@ -3895,7 +3981,10 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
             }
             EntityId::Room(room_number) => {
                 if let Some(room) = area.get_room(&room_number) {
-                    content = content.push(heading(format!("Room #{room_number}")));
+                    content = content.push(heading(crate::i18n::t!(
+                        "inspector-room-heading",
+                        "number" => room_number.to_string()
+                    )));
                     if !room.get_title().is_empty() {
                         content = content.push(text(room.get_title().to_string()).size(13));
                     }
@@ -3903,11 +3992,11 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
                         content = content.push(text(room.get_description().to_string()).size(12));
                     }
                     content = content.push(
-                        text(format!(
-                            "Level {} \u{00b7} ({:.1}, {:.1})",
-                            room.get_level(),
-                            room.get_x(),
-                            room.get_y()
+                        text(crate::i18n::t!(
+                            "inspector-room-position",
+                            "level" => room.get_level(),
+                            "x" => format!("{:.1}", room.get_x()),
+                            "y" => format!("{:.1}", room.get_y())
                         ))
                         .size(12)
                         .style(muted_text),
@@ -3919,7 +4008,7 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
                         .collect();
                     if !properties.is_empty() {
                         properties.sort();
-                        content = content.push(field_label("Properties"));
+                        content = content.push(field_label(crate::i18n::t!("inspector-properties")));
                         for (name, value) in properties {
                             content = content.push(text(format!("{name}: {value}")).size(12));
                         }
@@ -3927,7 +4016,7 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
 
                     let exits = room.get_exits();
                     if !exits.is_empty() {
-                        content = content.push(field_label("Exits"));
+                        content = content.push(field_label(crate::i18n::t!("inspector-exits")));
                         for exit in exits {
                             content =
                                 content.push(text(exit_summary(&atlas, &area, exit)).size(12));
@@ -3937,17 +4026,20 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
             }
             EntityId::Label(label_id) => {
                 if let Some(label) = area.get_label(&label_id) {
-                    content = content.push(heading("Label".to_string()));
+                    content = content.push(heading(crate::i18n::t!("inspector-label")));
                     content = content.push(text(label.text.clone()).size(13));
                 }
             }
             EntityId::Shape(shape_id) => {
                 if let Some(shape) = area.get_shape(&shape_id) {
-                    content = content.push(heading("Shape".to_string()));
+                    content = content.push(heading(crate::i18n::t!("inspector-shape")));
                     content = content.push(
-                        text(format!(
-                            "{:.0}\u{00d7}{:.0} at ({:.1}, {:.1})",
-                            shape.width, shape.height, shape.x, shape.y
+                        text(crate::i18n::t!(
+                            "inspector-shape-summary",
+                            "width" => format!("{:.0}", shape.width),
+                            "height" => format!("{:.0}", shape.height),
+                            "x" => format!("{:.1}", shape.x),
+                            "y" => format!("{:.1}", shape.y)
                         ))
                         .size(12)
                         .style(muted_text),
@@ -3958,7 +4050,10 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
     } else if selection.is_empty() {
         content = content.push(heading(area.get_name().to_string()));
         content = content.push(
-            text(format!("{} rooms", area.room_count()))
+            text(crate::i18n::t!(
+                "inspector-room-count",
+                "count" => area.room_count()
+            ))
                 .size(12)
                 .style(muted_text),
         );
@@ -3968,19 +4063,28 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
             .collect();
         if !properties.is_empty() {
             properties.sort();
-            content = content.push(field_label("Area properties"));
+            content = content.push(field_label(crate::i18n::t!("inspector-area-properties")));
             for (name, value) in properties {
                 content = content.push(text(format!("{name}: {value}")).size(12));
             }
         }
     } else {
-        content = content.push(text(format!("{} entities selected", selection.len())).size(13));
+        content = content.push(
+            text(crate::i18n::t!(
+                "inspector-entities-selected",
+                "count" => selection.len()
+            ))
+            .size(13),
+        );
     }
 
     if let Some(RoomKey { room_number, .. }) = window.hovered_room
         && let Some(room) = area.get_room(&room_number)
     {
-        content = content.push(heading(format!("Room #{room_number}")));
+        content = content.push(heading(crate::i18n::t!(
+            "inspector-room-heading",
+            "number" => room_number.to_string()
+        )));
         content = content.push(text(room.get_title().to_string()).size(13));
         content = content.push(text(room.get_description().to_string()).size(12));
     }

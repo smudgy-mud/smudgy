@@ -153,7 +153,11 @@ pub fn pill_switch<'a>(
         .padding(3)
         .style(track_style(enabled, locked));
 
-    let label = if enabled { "Enabled" } else { "Disabled" };
+    let label = if enabled {
+        crate::i18n::ts!("state-enabled")
+    } else {
+        crate::i18n::ts!("state-disabled")
+    };
     let body = row![text(label).size(13.0).style(muted), track]
         .spacing(8.0)
         .align_y(Vertical::Center);
@@ -195,7 +199,7 @@ pub fn badge<'a>(label: impl Into<String>) -> ThemedElement<'a, Message> {
 
 /// The small `DEP` tag shown on nested dependency rows.
 pub fn dep_tag<'a>() -> ThemedElement<'a, Message> {
-    container(text("DEP").size(9.0).style(faint))
+    container(text(crate::i18n::t!("badge-dependency")).size(9.0).style(faint))
         .padding(Padding {
             top: 1.0,
             bottom: 1.0,

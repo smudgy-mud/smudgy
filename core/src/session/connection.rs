@@ -1175,12 +1175,23 @@ impl Connection {
                                         if transcode.is_passthrough() {
                                             stream.write_all(text.as_bytes()).await
                                         } else {
-                                            // Encode to the active charset and double any
-                                            // 0xFF the encoding produced (UTF-8 output can
-                                            // never contain one; legacy encodings can).
-                                            stream
-                                                .write_all(transcode.encode_outbound(text))
-                                                .await
+                                            // Reject an unmappable command atomically: do not
+                                            // send a representable prefix, `?`, or an HTML
+                                            // numeric reference. The error text deliberately
+                                            // omits command content so redacted secrets stay
+                                            // out of logs and client feedback.
+                                            match transcode.encode_outbound(text) {
+                                                Ok(encoded) => stream.write_all(encoded).await,
+                                                Err(err) => {
+                                                    warn!(
+                                                        "Rejected outbound text for {addr}: {err}"
+                                                    );
+                                                    let _ = runtime_tx.send(RuntimeAction::Echo(
+                                                        Arc::new(format!("Send error: {err}")),
+                                                    ));
+                                                    Ok(())
+                                                }
+                                            }
                                         }
                                     }
                                     OutboundFrame::Raw(bytes) => stream.write_all(bytes).await,
@@ -1283,7 +1294,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::time::Duration;
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc as tokio_mpsc;
     use tokio::time::timeout;
@@ -1521,6 +1532,70 @@ mod tests {
 
         assert!(error.to_string().contains("closed"));
         drop(socket_tx);
+    }
+
+    #[tokio::test]
+    async fn legacy_encoding_rejects_an_unmappable_command_without_wire_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut bytes = [0_u8; 6];
+            timeout(Duration::from_secs(5), socket.read_exact(&mut bytes))
+                .await
+                .expect("a later valid command should arrive")
+                .expect("read");
+            bytes
+        });
+
+        let (mut connection, mut runtime_rx) = test_connection();
+        connection.connect(
+            "127.0.0.1",
+            port,
+            None,
+            Some(encoding_rs::WINDOWS_1252),
+            true,
+            TlsMode::Off,
+        );
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(runtime_rx.recv().await, Some(RuntimeAction::Connected)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("connection should become ready");
+
+        connection
+            .write(Arc::new("go \u{2192} east\r\n".to_string()))
+            .expect("the socket queue is live");
+
+        let warning = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(RuntimeAction::Echo(text)) = runtime_rx.recv().await
+                    && text.contains("cannot be represented")
+                {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("the rejected command should be reported");
+        assert!(
+            !warning.contains('\u{2192}'),
+            "feedback must not leak command content"
+        );
+
+        connection
+            .write(Arc::new("look\r\n".to_string()))
+            .expect("rejection must leave the connection usable");
+        assert_eq!(
+            server.await.expect("server task"),
+            *b"look\r\n",
+            "no prefix, replacement marker, or numeric reference may precede the valid command"
+        );
     }
 
     #[tokio::test]

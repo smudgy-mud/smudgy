@@ -329,12 +329,12 @@ impl From<KindChoice> for ParamKind {
 impl std::fmt::Display for KindChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            KindChoice::String => "Text",
-            KindChoice::Bool => "Boolean",
-            KindChoice::Number => "Number",
-            KindChoice::Dropdown => "Dropdown",
-            KindChoice::List => "List",
-            KindChoice::Table => "Table",
+            KindChoice::String => crate::i18n::ts!("manifest-kind-text"),
+            KindChoice::Bool => crate::i18n::ts!("manifest-kind-boolean"),
+            KindChoice::Number => crate::i18n::ts!("manifest-kind-number"),
+            KindChoice::Dropdown => crate::i18n::ts!("manifest-kind-dropdown"),
+            KindChoice::List => crate::i18n::ts!("manifest-kind-list"),
+            KindChoice::Table => crate::i18n::ts!("manifest-kind-table"),
         })
     }
 }
@@ -374,7 +374,7 @@ impl ManifestDraft {
     fn to_manifest(&self) -> Result<PackageManifest, String> {
         let version = self.version.trim().to_string();
         if version.is_empty() {
-            return Err("Version is required (e.g. 1.0.0).".to_string());
+            return Err(crate::i18n::t!("manifest-version-required"));
         }
         let entry = {
             let entry = self.entry.trim();
@@ -386,8 +386,9 @@ impl ManifestDraft {
         let min_smudgy_version = {
             let min = self.min_smudgy_version.trim();
             if !min.is_empty() && semver::Version::parse(min).is_err() {
-                return Err(format!(
-                    "Requires-smudgy \u{201c}{min}\u{201d} isn't a version (e.g. 0.4.0)."
+                return Err(crate::i18n::t!(
+                    "manifest-min-version-invalid",
+                    "version" => min
                 ));
             }
             (!min.is_empty()).then(|| min.to_string())
@@ -397,10 +398,17 @@ impl ManifestDraft {
         let mut seen_keys = HashSet::new();
         for (i, param) in self.params.iter().enumerate() {
             if param.key.trim().is_empty() {
-                return Err(format!("Parameter #{} needs a key.", i + 1));
+                return Err(crate::i18n::t!(
+                    "manifest-param-needs-key",
+                    "number" => i + 1
+                ));
             }
             let projected = project_param(param).map_err(|reason| {
-                format!("Parameter \u{201c}{}\u{201d}: {reason}", param.key.trim())
+                crate::i18n::t!(
+                    "manifest-param-error",
+                    "key" => param.key.trim(),
+                    "reason" => reason
+                )
             })?;
             // Param values are keyed by `key` (case-insensitively), so duplicates would collide in
             // storage and the value editor — reject them, mirroring the table-column key check.
@@ -501,7 +509,7 @@ fn project_param(draft: &ParamDraft) -> Result<PackageParameter, String> {
     let options = if draft.kind == ParamKind::Dropdown {
         let options = clean_options(&draft.options)?;
         if options.is_empty() {
-            return Err("a dropdown needs at least one option.".to_string());
+            return Err(crate::i18n::t!("manifest-dropdown-needs-option"));
         }
         options
     } else {
@@ -532,11 +540,15 @@ fn project_fields(draft: &ParamDraft) -> Result<Vec<PackageParameter>, String> {
             let element = draft
                 .fields
                 .first()
-                .ok_or_else(|| "a list needs an element type.".to_string())?;
+                .ok_or_else(|| crate::i18n::t!("manifest-list-needs-element"))?;
             // A list's values are stored bare (not keyed), so the element key is cosmetic — default
             // it rather than demanding one.
             let key = trim_opt(&element.key).unwrap_or_else(|| "value".to_string());
-            Ok(vec![project_sub_param(element, key, "the list element")?])
+            Ok(vec![project_sub_param(
+                element,
+                key,
+                crate::i18n::ts!("manifest-list-element"),
+            )?])
         }
         ParamKind::Table => {
             let mut columns = Vec::new();
@@ -548,7 +560,7 @@ fn project_fields(draft: &ParamDraft) -> Result<Vec<PackageParameter>, String> {
                     continue;
                 };
                 if !seen.insert(key.to_lowercase()) {
-                    return Err(format!("duplicate column key \u{201c}{key}\u{201d}."));
+                    return Err(crate::i18n::t!("manifest-duplicate-column", "key" => key));
                 }
                 columns.push(project_sub_param(
                     field,
@@ -557,7 +569,7 @@ fn project_fields(draft: &ParamDraft) -> Result<Vec<PackageParameter>, String> {
                 )?);
             }
             if columns.is_empty() {
-                return Err("a table needs at least one column with a key.".to_string());
+                return Err(crate::i18n::t!("manifest-table-needs-column"));
             }
             Ok(columns)
         }
@@ -573,7 +585,7 @@ fn project_sub_param(
     what: &str,
 ) -> Result<PackageParameter, String> {
     if field.kind.is_container() {
-        return Err(format!("{what} can't itself be a list or table."));
+        return Err(crate::i18n::t!("manifest-no-nested-container", "item" => what));
     }
     let options = if field.kind == ParamKind::Dropdown {
         let options = clean_options(&field.options)?;
@@ -609,7 +621,7 @@ fn clean_options(options: &[OptionDraft]) -> Result<Vec<ParamOption>, String> {
             continue;
         }
         if !seen.insert(value.to_string()) {
-            return Err(format!("duplicate option value \u{201c}{value}\u{201d}."));
+            return Err(crate::i18n::t!("manifest-duplicate-option", "value" => value));
         }
         let label = trim_opt(&option.label).filter(|label| label != value);
         out.push(ParamOption {
@@ -637,7 +649,7 @@ fn project_default(
             } else if options.iter().any(|o| o.value == default) {
                 Ok(Some(serde_json::Value::String(default.to_string())))
             } else {
-                Err("the default must be one of the options.".to_string())
+                Err(crate::i18n::t!("manifest-default-from-options"))
             }
         }
         ParamKind::List | ParamKind::Table => Ok(None),
@@ -688,7 +700,7 @@ fn parse_default(kind: ParamKind, text: &str) -> Result<Option<serde_json::Value
             "" => Ok(None),
             "true" => Ok(Some(serde_json::Value::Bool(true))),
             "false" => Ok(Some(serde_json::Value::Bool(false))),
-            _ => Err("default must be true or false.".to_string()),
+            _ => Err(crate::i18n::t!("manifest-default-boolean-error")),
         },
         ParamKind::Number => {
             let text = text.trim();
@@ -705,7 +717,7 @@ fn parse_default(kind: ParamKind, text: &str) -> Result<Option<serde_json::Value
             {
                 Ok(Some(serde_json::Value::Number(num)))
             } else {
-                Err("default must be a number.".to_string())
+                Err(crate::i18n::t!("manifest-default-number-error"))
             }
         }
         // Dropdown defaults are validated against the declared options in [`project_default`];
@@ -959,7 +971,10 @@ impl AutomationsWindow {
             Ok(json) => format!("{json}\n"),
             Err(e) => {
                 if let Some(draft) = self.manifest_draft.as_mut() {
-                    draft.error = Some(format!("Failed to serialize manifest: {e}"));
+                    draft.error = Some(crate::i18n::t!(
+                        "manifest-serialize-failed",
+                        "error" => e.to_string()
+                    ));
                 }
                 return Update::none();
             }
@@ -968,7 +983,7 @@ impl AutomationsWindow {
             local_packages::write_local_file(&self.server_name, &name, "smudgy.package.json", &json)
         {
             if let Some(draft) = self.manifest_draft.as_mut() {
-                draft.error = Some(format!("Save failed: {e}"));
+                draft.error = Some(crate::i18n::t!("manifest-save-failed", "error" => e.to_string()));
             }
             return Update::none();
         }
@@ -1006,7 +1021,7 @@ impl AutomationsWindow {
         // A successful save returns to the read-only summary (now showing the saved manifest).
         self.manifest_editing = false;
         self.rebuild_graph();
-        Update::with_task(self.show_toast("Saved manifest."))
+        Update::with_task(self.show_toast(crate::i18n::t!("manifest-saved")))
     }
 
     /// Enter the structured editor from the read-only summary, (re)seeding the draft from the
@@ -1075,9 +1090,9 @@ impl AutomationsWindow {
     fn manifest_editor_body<'a>(&'a self, draft: &'a ManifestDraft) -> Elem<'a> {
         let mut body = Column::new()
             .spacing(14.0)
-            .push(common::section_label("Edit manifest"))
+            .push(common::section_label(crate::i18n::ts!("manifest-edit")))
             .push(
-                text("A structured editor for smudgy.package.json — what you publish.")
+                text(crate::i18n::t!("manifest-edit-help"))
                     .size(12.0)
                     .style(common::muted),
             );
@@ -1088,8 +1103,8 @@ impl AutomationsWindow {
 
         // Identity / entry (pinned above the tabs).
         body = body.push(field_row(
-            "Version",
-            text_input("e.g. 1.0.0", &draft.version)
+            crate::i18n::ts!("manifest-version"),
+            text_input(crate::i18n::ts!("manifest-version-placeholder"), &draft.version)
                 .on_input(|v| Message::EditManifest(ManifestEdit::Version(v)))
                 .size(14.0)
                 .into(),
@@ -1097,7 +1112,7 @@ impl AutomationsWindow {
         if !draft.version.trim().is_empty() && semver::Version::parse(draft.version.trim()).is_err()
         {
             body = body.push(
-                text("Not a valid semver version yet — required before you can publish (e.g. 1.2.3).")
+                text(crate::i18n::t!("manifest-version-warning"))
                     .size(11.0)
                     .style(common::warning),
             );
@@ -1105,7 +1120,7 @@ impl AutomationsWindow {
         body = body.push(field_row(
             "Description",
             text_input(
-                "What this package does (shown in Discover)",
+                crate::i18n::ts!("manifest-description-placeholder"),
                 &draft.description,
             )
             .on_input(|v| Message::EditManifest(ManifestEdit::Description(v)))
@@ -1113,8 +1128,8 @@ impl AutomationsWindow {
             .into(),
         ));
         body = body.push(field_row(
-            "Entry",
-            text_input("index.ts", &draft.entry)
+            crate::i18n::ts!("manifest-entry"),
+            text_input(crate::i18n::ts!("manifest-entry-placeholder"), &draft.entry)
                 .on_input(|v| Message::EditManifest(ManifestEdit::Entry(v)))
                 .size(14.0)
                 .into(),
@@ -1182,16 +1197,16 @@ impl AutomationsWindow {
         if self.manifest_dirty {
             bar = bar
                 .push(text("\u{25CF}").size(9.0).style(common::accent))
-                .push(text("Unsaved changes").size(13.0).style(common::muted));
+                .push(text(crate::i18n::t!("manifest-unsaved")).size(13.0).style(common::muted));
         }
         bar = bar.push(iced::widget::space::horizontal());
         bar = bar.push(
-            button(text("Cancel").size(13.0))
+            button(text(crate::i18n::t!("action-cancel")).size(13.0))
                 .style(button_style::secondary)
                 .on_press(Message::RevertManifest),
         );
         bar = bar.push(
-            button(text("Save manifest").size(13.0))
+            button(text(crate::i18n::t!("manifest-save")).size(13.0))
                 .style(button_style::primary)
                 .on_press_maybe(self.manifest_dirty.then_some(Message::SaveManifest)),
         );
@@ -1205,14 +1220,14 @@ impl AutomationsWindow {
 /// drops into the structured editor.
 fn manifest_readonly_body(manifest: &PackageManifest) -> Elem<'_> {
     let header = row![
-        common::section_label("Manifest"),
+        common::section_label(crate::i18n::ts!("manifest-title")),
         iced::widget::space::horizontal(),
         button(
             row![
                 text(bootstrap_icons::PENCIL)
                     .font(fonts::BOOTSTRAP_ICONS)
                     .size(12.0),
-                text("Edit").size(13.0),
+                text(crate::i18n::t!("action-edit")).size(13.0),
             ]
             .spacing(6.0)
             .align_y(Vertical::Center),
@@ -1224,7 +1239,7 @@ fn manifest_readonly_body(manifest: &PackageManifest) -> Elem<'_> {
 
     let entry: Elem = match &manifest.entry {
         Some(entry) if !entry.is_empty() => text(entry.clone()).size(14.0).into(),
-        _ => text("index.* (resolved automatically)")
+        _ => text(crate::i18n::t!("manifest-auto-entry"))
             .size(14.0)
             .style(common::faint)
             .into(),
@@ -1235,43 +1250,80 @@ fn manifest_readonly_body(manifest: &PackageManifest) -> Elem<'_> {
         header,
         // Trim version/description to match the pane header (which shows the same values trimmed).
         ro_block(
-            "Version",
+            crate::i18n::ts!("manifest-version"),
             text(manifest.version.trim().to_string()).size(14.0).into()
         ),
         ro_block(
-            "Description",
-            ro_text_or(manifest.description.trim(), "No description")
+            crate::i18n::ts!("manifest-description"),
+            ro_text_or(
+                manifest.description.trim(),
+                crate::i18n::ts!("manifest-no-description")
+            )
         ),
-        ro_block("Entry", entry),
+        ro_block(crate::i18n::ts!("manifest-entry"), entry),
         ro_block(
-            "Requires smudgy",
+            crate::i18n::ts!("manifest-requires-smudgy"),
             ro_text_or(
                 manifest.min_smudgy_version.as_deref().unwrap_or(""),
-                "Any version"
+                crate::i18n::ts!("manifest-any-version")
             ),
         ),
         ro_block(
-            "Aligned hosts",
-            ro_value_list(&manifest.hosts, "Any host", true)
+            crate::i18n::ts!("manifest-aligned-hosts"),
+            ro_value_list(&manifest.hosts, crate::i18n::ts!("manifest-any-host"), true)
         ),
         ro_block(
-            "Dependencies",
-            ro_value_list(&manifest.dependencies, "None", true)
+            crate::i18n::ts!("manifest-dependencies"),
+            ro_value_list(
+                &manifest.dependencies,
+                crate::i18n::ts!("manifest-none"),
+                true
+            )
         ),
-        ro_block("Parameters", ro_params(&manifest.params)),
-        common::section_label("Permissions"),
-        ro_block("Connections", ro_value_list(&perms.net, "None", true)),
         ro_block(
-            "Code imports",
-            ro_text_or(import_policy_summary(perms.import), "None")
+            crate::i18n::ts!("manifest-parameters"),
+            ro_params(&manifest.params)
         ),
-        ro_block("Read files", ro_value_list(&perms.read, "None", true)),
-        ro_block("Write files", ro_value_list(&perms.write, "None", true)),
-        ro_block("Environment", ro_value_list(&perms.env, "None", true)),
-        ro_block("System info", ro_value_list(&perms.sys, "None", true)),
-        ro_block("Run programs", ro_value_list(&perms.run, "None", true)),
-        ro_block("Native libraries", ro_value_list(&perms.ffi, "None", true)),
-        ro_block("Capabilities", ro_caps(perms.smudgy)),
+        common::section_label(crate::i18n::ts!("manifest-permissions")),
+        ro_block(
+            crate::i18n::ts!("manifest-connections"),
+            ro_value_list(&perms.net, crate::i18n::ts!("manifest-none"), true)
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-code-imports"),
+            ro_text_or(
+                import_policy_summary(perms.import),
+                crate::i18n::ts!("manifest-none")
+            )
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-read-files"),
+            ro_value_list(&perms.read, crate::i18n::ts!("manifest-none"), true)
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-write-files"),
+            ro_value_list(&perms.write, crate::i18n::ts!("manifest-none"), true)
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-environment"),
+            ro_value_list(&perms.env, crate::i18n::ts!("manifest-none"), true)
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-system-info"),
+            ro_value_list(&perms.sys, crate::i18n::ts!("manifest-none"), true)
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-run-programs"),
+            ro_value_list(&perms.run, crate::i18n::ts!("manifest-none"), true)
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-native-libraries"),
+            ro_value_list(&perms.ffi, crate::i18n::ts!("manifest-none"), true)
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-capabilities"),
+            ro_caps(perms.smudgy)
+        ),
     ]
     .spacing(10.0)
     .into()
@@ -1329,16 +1381,16 @@ fn ro_value_list<'a>(items: &[String], empty: &str, mono: bool) -> Elem<'a> {
 /// and a non-secret default).
 fn ro_params<'a>(params: &[PackageParameter]) -> Elem<'a> {
     if params.is_empty() {
-        return text("None").size(13.0).style(common::faint).into();
+        return text(crate::i18n::t!("manifest-none")).size(13.0).style(common::faint).into();
     }
     let mut col = Column::new().spacing(4.0);
     for param in params {
         let mut tags = vec![kind_summary(param)];
         if param.required {
-            tags.push("required".to_string());
+            tags.push(crate::i18n::t!("manifest-required"));
         }
         if param.secret {
-            tags.push("secret".to_string());
+            tags.push(crate::i18n::t!("manifest-secret"));
         }
         let mut line = row![
             text(param.key.clone())
@@ -1358,7 +1410,7 @@ fn ro_params<'a>(params: &[PackageParameter]) -> Elem<'a> {
             let default = default_to_text(param.default.as_ref());
             if !default.is_empty() {
                 line = line.push(
-                    text(format!("default {default}"))
+                    text(crate::i18n::t!("manifest-default-value", "value" => default))
                         .size(12.0)
                         .style(common::faint),
                 );
@@ -1373,17 +1425,23 @@ fn ro_params<'a>(params: &[PackageParameter]) -> Elem<'a> {
 /// the new shapes (a dropdown's option count, a list's element type, a table's column keys).
 fn kind_summary(param: &PackageParameter) -> String {
     match param.kind {
-        ParamKind::String => "text".to_string(),
-        ParamKind::Bool => "boolean".to_string(),
-        ParamKind::Number => "number".to_string(),
-        ParamKind::Dropdown => format!("dropdown ({} options)", param.options.len()),
+        ParamKind::String => crate::i18n::t!("manifest-kind-text"),
+        ParamKind::Bool => crate::i18n::t!("manifest-kind-boolean"),
+        ParamKind::Number => crate::i18n::t!("manifest-kind-number"),
+        ParamKind::Dropdown => crate::i18n::t!(
+            "manifest-kind-dropdown-summary",
+            "count" => param.options.len()
+        ),
         ParamKind::List => {
-            let element = param.fields.first().map_or("text", |f| kind_word(f.kind));
-            format!("list of {element}")
+            let element = param
+                .fields
+                .first()
+                .map_or(crate::i18n::ts!("manifest-kind-text"), |f| kind_word(f.kind));
+            crate::i18n::t!("manifest-kind-list-summary", "kind" => element)
         }
         ParamKind::Table => {
             let columns: Vec<&str> = param.fields.iter().map(|f| f.key.as_str()).collect();
-            format!("table [{}]", columns.join(", "))
+            crate::i18n::t!("manifest-kind-table-summary", "columns" => columns.join(", "))
         }
     }
 }
@@ -1391,12 +1449,12 @@ fn kind_summary(param: &PackageParameter) -> String {
 /// The bare one-word name of a (scalar) kind, for nesting inside [`kind_summary`].
 fn kind_word(kind: ParamKind) -> &'static str {
     match kind {
-        ParamKind::String => "text",
-        ParamKind::Bool => "boolean",
-        ParamKind::Number => "number",
-        ParamKind::Dropdown => "dropdown",
-        ParamKind::List => "list",
-        ParamKind::Table => "table",
+        ParamKind::String => crate::i18n::ts!("manifest-kind-text"),
+        ParamKind::Bool => crate::i18n::ts!("manifest-kind-boolean"),
+        ParamKind::Number => crate::i18n::ts!("manifest-kind-number"),
+        ParamKind::Dropdown => crate::i18n::ts!("manifest-kind-dropdown"),
+        ParamKind::List => crate::i18n::ts!("manifest-kind-list"),
+        ParamKind::Table => crate::i18n::ts!("manifest-kind-table"),
     }
 }
 
@@ -1404,7 +1462,7 @@ fn kind_word(kind: ParamKind) -> &'static str {
 fn ro_caps<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
     let labels = granted_cap_labels(caps);
     if labels.is_empty() {
-        return text("Fully sandboxed — no special abilities.")
+        return text(crate::i18n::t!("manifest-fully-sandboxed"))
             .size(13.0)
             .style(common::faint)
             .into();
@@ -1420,65 +1478,76 @@ fn ro_caps<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
 /// order. Each leads with the `smudgy:core` API the capability gates, so an author maps a row
 /// straight to the call in their code (the end-user-facing wording lives in the install consent
 /// window, `packages.rs`).
-fn granted_cap_labels(caps: SmudgyCapabilities) -> Vec<&'static str> {
+fn granted_cap_labels(caps: SmudgyCapabilities) -> Vec<String> {
     let mut out = Vec::new();
     if caps.create_aliases {
-        out.push("createAlias \u{2014} define input aliases");
+        out.push(cap_summary("createAlias", "manifest-cap-create-aliases"));
     }
     if caps.create_triggers {
-        out.push("createTrigger / createTriggers \u{2014} act on game output");
+        out.push(cap_summary(
+            "createTrigger / createTriggers",
+            "manifest-cap-create-triggers",
+        ));
     }
     if caps.send {
-        out.push("send \u{2014} send commands as if typed (runs through your aliases)");
+        out.push(cap_summary("send", "manifest-cap-send"));
     }
     if caps.send_direct {
-        out.push("sendRaw \u{2014} send straight to the game (bypasses your aliases)");
+        out.push(cap_summary("sendRaw", "manifest-cap-send-raw"));
     }
     if caps.echo {
-        out.push("echo \u{2014} print text to your screen");
+        out.push(cap_summary("echo", "manifest-cap-echo"));
     }
     if caps.reach_others {
-        out.push("getSessions / byName \u{2014} reach your other connected sessions");
+        out.push(cap_summary("getSessions / byName", "manifest-cap-sessions"));
     }
     if caps.change_display {
-        out.push("line / buffer \u{2014} gag, highlight, insert, or replace text");
+        out.push(cap_summary("line / buffer", "manifest-cap-display"));
     }
     if caps.mapper_read {
-        out.push("mapper \u{2014} read your maps");
+        out.push(cap_summary("mapper", "manifest-cap-mapper-read"));
     }
     if caps.mapper_write {
-        out.push("mapper \u{2014} change your maps");
+        out.push(cap_summary("mapper", "manifest-cap-mapper-write"));
     }
     if caps.widgets {
-        out.push("widgets \u{2014} create and change on-screen widgets");
+        out.push(cap_summary("widgets", "manifest-cap-widgets"));
     }
     if caps.interop_write {
-        out.push("emit / set \u{2014} broadcast events and publish shared state");
+        out.push(cap_summary("emit / set", "manifest-cap-interop-write"));
     }
     if caps.interop_read {
-        out.push("on / get / watch \u{2014} listen for events and read shared state");
+        out.push(cap_summary("on / get / watch", "manifest-cap-interop-read"));
     }
     if caps.panes {
-        out.push("pane \u{2014} create or interact with split panes");
+        out.push(cap_summary("pane", "manifest-cap-panes"));
     }
     if caps.gmcp_send {
-        out.push("gmcp.send \u{2014} send GMCP messages to the game and manage GMCP modules");
+        out.push(cap_summary("gmcp.send", "manifest-cap-gmcp"));
     }
     out
+}
+
+fn cap_summary(api: &str, gloss_key: &str) -> String {
+    crate::i18n::t!(
+        "manifest-cap-summary",
+        "api" => api,
+        "gloss" => crate::i18n::translate(gloss_key)
+    )
 }
 
 /// The "Parameters" block: one editable card per declared parameter, plus an add button.
 fn manifest_params(draft: &ManifestDraft) -> Elem<'_> {
     let mut col = Column::new()
         .spacing(8.0)
-        .push(common::section_label("Parameters"))
+        .push(common::section_label(crate::i18n::ts!("manifest-parameters")))
         .push(
-            text("Values configured at install time. Required ones gate loading until set; secrets go to the OS keychain.")
+            text(crate::i18n::t!("manifest-params-help"))
                 .size(11.0)
                 .style(common::muted),
         );
     if draft.params.is_empty() {
-        col = col.push(text("No parameters.").size(12.0).style(common::faint));
+        col = col.push(text(crate::i18n::t!("manifest-no-parameters")).size(12.0).style(common::faint));
     }
     for (i, param) in draft.params.iter().enumerate() {
         col = col.push(param_card(i, param));
@@ -1500,7 +1569,7 @@ fn param_card(i: usize, param: &ParamDraft) -> Elem<'_> {
     .text_size(13.0);
 
     let top = row![
-        text_input("key (e.g. apiToken)", &param.key)
+        text_input(crate::i18n::ts!("manifest-param-key-placeholder"), &param.key)
             .on_input(move |v| Message::EditManifest(ManifestEdit::ParamKey(i, v)))
             .size(14.0)
             .width(Length::Fill),
@@ -1517,7 +1586,7 @@ fn param_card(i: usize, param: &ParamDraft) -> Elem<'_> {
     .spacing(8.0)
     .align_y(Vertical::Center);
 
-    let label_row = text_input("label shown to users (optional)", &param.label)
+    let label_row = text_input(crate::i18n::ts!("manifest-param-label-placeholder"), &param.label)
         .on_input(move |v| Message::EditManifest(ManifestEdit::ParamLabel(i, v)))
         .size(14.0);
 
@@ -1539,7 +1608,7 @@ fn param_kind_config(i: usize, param: &ParamDraft) -> Elem<'_> {
     match param.kind {
         ParamKind::String | ParamKind::Bool | ParamKind::Number => default_text_row(i, param),
         ParamKind::Dropdown => column![
-            common::section_label("Options"),
+            common::section_label(crate::i18n::ts!("manifest-options")),
             options_editor(OptionPath::Param(i), &param.options),
             dropdown_default_picker(i, param),
         ]
@@ -1548,7 +1617,7 @@ fn param_kind_config(i: usize, param: &ParamDraft) -> Elem<'_> {
         ParamKind::List => {
             let mut col = Column::new()
                 .spacing(8.0)
-                .push(common::section_label("Each entry is"));
+                .push(common::section_label(crate::i18n::ts!("manifest-each-entry-is")));
             if let Some(element) = param.fields.first() {
                 col = col.push(sub_param_editor(i, 0, element, false));
             }
@@ -1557,9 +1626,9 @@ fn param_kind_config(i: usize, param: &ParamDraft) -> Elem<'_> {
         ParamKind::Table => {
             let mut col = Column::new()
                 .spacing(8.0)
-                .push(common::section_label("Columns"))
+                .push(common::section_label(crate::i18n::ts!("manifest-columns")))
                 .push(
-                    text("Each row stores one value per column, keyed by the column key.")
+                    text(crate::i18n::t!("manifest-columns-help"))
                         .size(11.0)
                         .style(common::muted),
                 );
@@ -1567,7 +1636,7 @@ fn param_kind_config(i: usize, param: &ParamDraft) -> Elem<'_> {
                 col = col.push(sub_param_editor(i, j, field, true));
             }
             col.push(add_button(
-                "Add column",
+                crate::i18n::ts!("manifest-add-column"),
                 Message::EditManifest(ManifestEdit::ParamAddField(i)),
             ))
             .into()
@@ -1578,9 +1647,9 @@ fn param_kind_config(i: usize, param: &ParamDraft) -> Elem<'_> {
 /// The scalar default text input for a String/Bool/Number param.
 fn default_text_row(i: usize, param: &ParamDraft) -> Elem<'_> {
     let placeholder = match param.kind {
-        ParamKind::Bool => "default: true or false",
-        ParamKind::Number => "default number (optional)",
-        _ => "default text (optional)",
+        ParamKind::Bool => crate::i18n::ts!("manifest-default-bool-placeholder"),
+        ParamKind::Number => crate::i18n::ts!("manifest-default-number-placeholder"),
+        _ => crate::i18n::ts!("manifest-default-text-placeholder"),
     };
     text_input(placeholder, &param.default)
         .on_input(move |v| Message::EditManifest(ManifestEdit::ParamDefault(i, v)))
@@ -1593,7 +1662,7 @@ fn default_text_row(i: usize, param: &ParamDraft) -> Elem<'_> {
 fn param_toggles(i: usize, param: &ParamDraft) -> Elem<'_> {
     let mut toggles = row![
         checkbox(param.required)
-            .label("Required")
+            .label(crate::i18n::t!("manifest-required"))
             .size(14)
             .text_size(13)
             .on_toggle(move |v| Message::EditManifest(ManifestEdit::ParamRequired(i, v))),
@@ -1603,7 +1672,7 @@ fn param_toggles(i: usize, param: &ParamDraft) -> Elem<'_> {
     if param.kind == ParamKind::String {
         toggles = toggles.push(
             checkbox(param.secret)
-                .label("Secret")
+                .label(crate::i18n::t!("manifest-secret"))
                 .size(14)
                 .text_size(13)
                 .on_toggle(move |v| Message::EditManifest(ManifestEdit::ParamSecret(i, v))),
@@ -1653,16 +1722,16 @@ impl OptionPath {
 fn options_editor(path: OptionPath, options: &[OptionDraft]) -> Elem<'_> {
     let mut col = Column::new().spacing(6.0);
     if options.is_empty() {
-        col = col.push(text("No options yet.").size(12.0).style(common::faint));
+        col = col.push(text(crate::i18n::t!("manifest-no-options")).size(12.0).style(common::faint));
     }
     for (k, option) in options.iter().enumerate() {
         col = col.push(
             row![
-                text_input("value (stored)", &option.value)
+                text_input(crate::i18n::ts!("manifest-option-value-placeholder"), &option.value)
                     .on_input(move |v| Message::EditManifest(path.value(k, v)))
                     .size(14.0)
                     .width(Length::Fill),
-                text_input("label (optional)", &option.label)
+                text_input(crate::i18n::ts!("manifest-option-label-placeholder"), &option.label)
                     .on_input(move |v| Message::EditManifest(path.label(k, v)))
                     .size(14.0)
                     .width(Length::Fill),
@@ -1709,7 +1778,7 @@ fn dropdown_default_picker(i: usize, param: &ParamDraft) -> Elem<'_> {
         .cloned()
         .or_else(|| choices.first().cloned());
     row![
-        container(text("Default").size(13.0).style(common::muted)).width(Length::Fixed(72.0)),
+        container(text(crate::i18n::t!("manifest-default")).size(13.0).style(common::muted)).width(Length::Fixed(72.0)),
         pick_list(choices, selected, move |choice: DefaultChoice| {
             Message::EditManifest(ManifestEdit::ParamDefault(i, choice.value))
         })
@@ -1757,14 +1826,19 @@ fn sub_param_editor<'a>(i: usize, j: usize, field: &'a SubParamDraft, is_column:
     let mut header = row![].spacing(8.0).align_y(Vertical::Center);
     if is_column {
         header = header.push(
-            text_input("column key", &field.key)
+            text_input(crate::i18n::ts!("manifest-column-key-placeholder"), &field.key)
                 .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldKey(i, j, v)))
                 .size(14.0)
                 .width(Length::Fill),
         );
     } else {
         header = header.push(
-            container(text("a value of type").size(13.0).style(common::muted)).width(Length::Fill),
+            container(
+                text(crate::i18n::t!("manifest-value-of-type"))
+                    .size(13.0)
+                    .style(common::muted)
+            )
+            .width(Length::Fill),
         );
     }
     header = header.push(kind_picker);
@@ -1781,14 +1855,14 @@ fn sub_param_editor<'a>(i: usize, j: usize, field: &'a SubParamDraft, is_column:
         );
     }
 
-    let label_row = text_input("label (optional)", &field.label)
+    let label_row = text_input(crate::i18n::ts!("manifest-option-label-placeholder"), &field.label)
         .on_input(move |v| Message::EditManifest(ManifestEdit::ParamFieldLabel(i, j, v)))
         .size(14.0);
 
     let mut col = Column::new().spacing(6.0).push(header).push(label_row);
     if field.kind == ParamKind::Dropdown {
         col = col
-            .push(common::section_label("Options"))
+            .push(common::section_label(crate::i18n::ts!("manifest-options")))
             .push(options_editor(OptionPath::Field(i, j), &field.options));
     }
     container(col)
@@ -1888,7 +1962,7 @@ fn granted_cap_count(caps: SmudgyCapabilities) -> usize {
 
 /// The framing note shared by the permission tabs (Network/Files/System).
 fn perm_note<'a>() -> Elem<'a> {
-    text("A sandboxed install is denied anything not listed here.")
+    text(crate::i18n::t!("manifest-sandbox-deny-note"))
         .size(11.0)
         .style(common::muted)
         .into()
@@ -1898,12 +1972,7 @@ fn perm_note<'a>() -> Elem<'a> {
 /// freezes the whole tree, so installs only ever move forward when this package is re-published.
 fn dependency_lock_note<'a>() -> Elem<'a> {
     container(
-        text(
-            "Publishing locks the exact version of every \
-             dependency at PUBLISH time. Users of your package will \
-             only realize newer versions of your dependencies if you release a new version of \
-             your package that updates them.",
-        )
+        text(crate::i18n::t!("manifest-dependency-lock-note"))
         .size(11.0)
         .style(common::muted),
     )
@@ -1924,12 +1993,12 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
     // The dependency block: the free-text editor (smudgy://, jsr:, npm:, relative), an
     // owned/installed-package picker that inserts a correctly-owned specifier, then the lock note.
     let mut deps = column![list_editor(
-        "Dependencies",
-        Some("Other smudgy packages this one imports: smudgy://owner/name@^1.2. Currently this only supports smudgy:// packages. Version management for jsr and npm packages is handled by the module loaders backing `import` and `require`, and any jsr or npm package may be imported by a package with permission to access those registries."),
+        crate::i18n::ts!("manifest-dependencies"),
+        Some(crate::i18n::ts!("manifest-dependencies-help")),
         ListField::Dependency,
         &draft.dependencies,
         "smudgy://owner/name@^1.0",
-        "dependency",
+        crate::i18n::ts!("manifest-dependency"),
     )]
     .spacing(8.0);
     if !dep_candidates.is_empty() {
@@ -1937,7 +2006,7 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
             pick_list(dep_candidates.to_vec(), None::<String>, |chosen: String| {
                 Message::EditManifest(ManifestEdit::AddItemValue(ListField::Dependency, chosen))
             })
-            .placeholder("Add one of your installed or local packages\u{2026}")
+            .placeholder(crate::i18n::ts!("manifest-add-dependency-placeholder"))
             .text_size(13.0),
         );
     }
@@ -1948,15 +2017,13 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
     // exceeds this build (legit while targeting an unreleased smudgy, so it never blocks).
     let mut requires_smudgy = column![
         field_row(
-            "Requires smudgy",
-            text_input("any version", &draft.min_smudgy_version)
+            crate::i18n::ts!("manifest-requires-smudgy"),
+            text_input(crate::i18n::ts!("manifest-any-version-placeholder"), &draft.min_smudgy_version)
                 .on_input(|v| Message::EditManifest(ManifestEdit::MinSmudgyVersion(v)))
                 .size(14.0)
                 .into(),
         ),
-        text(
-            "The minimum smudgy version this package runs on. Generally used to prevent users of this package on older smudgy versions from auto-updating to a new package version that won't run. Leave empty to allow any smudgy version.",
-        )
+        text(crate::i18n::t!("manifest-min-version-help"))
         .size(12.0)
         .style(common::muted),
     ]
@@ -1966,17 +2033,17 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
         match semver::Version::parse(min) {
             Err(_) => {
                 requires_smudgy = requires_smudgy.push(
-                    text("Not a version. Must be in semver format, e.g. 0.3.5 (or empty) to save.")
+                    text(crate::i18n::t!("manifest-min-version-format-error"))
                         .size(11.0)
                         .style(common::warning),
                 );
             }
             Ok(parsed) if parsed > running_smudgy_release() => {
                 requires_smudgy = requires_smudgy.push(
-                    text(format!(
-                        "Newer than this smudgy ({}) — installing and loading are refused \
-                         below {parsed} (your local dev copy stays exempt).",
-                        running_smudgy_release()
+                    text(crate::i18n::t!(
+                        "manifest-min-version-newer",
+                        "running" => running_smudgy_release().to_string(),
+                        "required" => parsed.to_string()
                     ))
                     .size(11.0)
                     .style(common::warning),
@@ -1988,32 +2055,30 @@ fn manifest_tab_settings<'a>(draft: &'a ManifestDraft, dep_candidates: &[String]
 
     column![
         list_editor(
-            "Aligned MUD hosts",
-            Some("Hosts this package targets in Discover, applied when you publish. Leave empty for host-agnostic."),
+            crate::i18n::ts!("manifest-aligned-hosts"),
+            Some(crate::i18n::ts!("manifest-hosts-help")),
             ListField::Host,
             &draft.hosts,
-            "e.g. aardwolf.org",
-            "host",
+            crate::i18n::ts!("manifest-host-example"),
+            crate::i18n::ts!("manifest-host"),
         ),
         requires_smudgy,
         deps,
         list_editor(
-            "Required packages",
-            Some("Packages that will be automatically installed _alongside_ this one, but will run in their own separate sandbox. smudgy://owner/name[@^1.2]."),
+            crate::i18n::ts!("manifest-required-packages"),
+            Some(crate::i18n::ts!("manifest-required-packages-help")),
             ListField::Requires,
             &draft.requires,
             "smudgy://owner/arctic-prompt",
-            "required package",
+            crate::i18n::ts!("manifest-required-package"),
         ),
         column![
             checkbox(draft.importable)
-                .label("Allow others to import this package")
+                .label(crate::i18n::t!("manifest-allow-import"))
                 .size(14)
                 .text_size(13)
                 .on_toggle(|v| Message::EditManifest(ManifestEdit::Importable(v))),
-            text(
-                "Off: only your packages may import this one's modules.  Other packages may still import it but will only receive its types.  Note: This is subject to change and it is likely in the future that even your own packages will only receive types as well.",
-            )
+            text(crate::i18n::t!("manifest-allow-import-help"))
             .size(12.0)
             .style(common::muted),
         ]
@@ -2030,12 +2095,12 @@ fn manifest_tab_network(draft: &ManifestDraft) -> Elem<'_> {
     column![
         perm_note(),
         list_editor(
-            "Allowed hosts",
-            Some("hostname or hostname:port."),
+            crate::i18n::ts!("manifest-allowed-hosts"),
+            Some(crate::i18n::ts!("manifest-host-format-help")),
             ListField::Net,
             &draft.net,
             "comms.example.org:6667",
-            "host",
+            crate::i18n::ts!("manifest-host"),
         ),
         import_policy_picker(draft.import),
     ]
@@ -2054,7 +2119,7 @@ fn import_policy_picker<'a>(selected: ImportPolicy) -> Elem<'a> {
             .text_size(13)
     };
     column![
-        common::section_label("Code imports"),
+        common::section_label(crate::i18n::ts!("manifest-code-imports")),
         choice(
             "No modules outside of the smudgy ecosystem",
             ImportPolicy::None
@@ -2077,8 +2142,8 @@ fn import_policy_picker<'a>(selected: ImportPolicy) -> Elem<'a> {
 fn import_policy_summary(policy: ImportPolicy) -> &'static str {
     match policy {
         ImportPolicy::None => "",
-        ImportPolicy::Registries => "Public registries (npm, jsr)",
-        ImportPolicy::Any => "Anywhere on the web",
+        ImportPolicy::Registries => crate::i18n::ts!("manifest-import-registries-summary"),
+        ImportPolicy::Any => crate::i18n::ts!("manifest-import-any-summary"),
     }
 }
 
@@ -2090,21 +2155,18 @@ fn manifest_tab_files(draft: &ManifestDraft) -> Elem<'_> {
     let mut col = column![
         perm_note(),
         list_editor(
-            "Readable paths",
-            Some("$DATA is the package's data dir"),
+            crate::i18n::ts!("manifest-readable-paths"),
+            Some(crate::i18n::ts!("manifest-data-dir-help")),
             ListField::Read,
             &draft.read,
             "$DATA/maps",
-            "path",
+            crate::i18n::ts!("manifest-path"),
         ),
     ]
     .spacing(16.0);
     if escapes_data(&draft.read) {
         col = col.push(
-            text(
-                "A readable path outside $DATA reaches the user's own files. Installers will see \
-                 it flagged. Prefer $DATA unless reading their files is the point.",
-            )
+            text(crate::i18n::t!("manifest-readable-path-warning"))
             .size(11.0)
             .style(common::warning),
         );
@@ -2133,12 +2195,12 @@ fn manifest_tab_system(draft: &ManifestDraft) -> Elem<'_> {
     let mut col = column![
         perm_note(),
         list_editor(
-            "Readable environment variables",
-            Some("Exact variable names it may read."),
+            crate::i18n::ts!("manifest-readable-env"),
+            Some(crate::i18n::ts!("manifest-env-help")),
             ListField::Env,
             &draft.env,
             "MYPKG_TOKEN",
-            "variable",
+            crate::i18n::ts!("manifest-variable"),
         ),
         list_editor(
             "System information",
@@ -2234,7 +2296,7 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
         cap_row(
             checkbox(true).size(16).into(),
             "mapper",
-            "read your maps (required by change maps)",
+            crate::i18n::ts!("manifest-cap-mapper-read-required"),
             common::faint,
             None,
         )
@@ -2248,12 +2310,12 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
     };
 
     column![
-        text("The smudgy:core APIs your scripts may call (the permissions.smudgy block). Calling one you didn't request throws at runtime.")
+        text(crate::i18n::t!("manifest-capabilities-help"))
             .size(11.0)
             .style(common::muted),
-        cap_group("Automations", vec![
-            cap_check("createAlias", "define input aliases", caps.create_aliases, Cap::CreateAliases),
-            cap_check("createTrigger / createTriggers", "act on game output", caps.create_triggers, Cap::CreateTriggers),
+        cap_group(crate::i18n::ts!("manifest-cap-group-automations"), vec![
+            cap_check("createAlias", crate::i18n::ts!("manifest-cap-create-aliases"), caps.create_aliases, Cap::CreateAliases),
+            cap_check("createTrigger / createTriggers", crate::i18n::ts!("manifest-cap-create-triggers"), caps.create_triggers, Cap::CreateTriggers),
         ]),
         cap_group("Session", vec![
             cap_check("send", "send commands as if typed (runs through your aliases)", caps.send, Cap::Send),
@@ -2262,25 +2324,25 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
             cap_check("input", "access, change, and focus input change; manage autocomplete list", caps.input, Cap::Input),
             cap_check("sessions / byName", "reach your other connected sessions", caps.reach_others, Cap::ReachOthers),
         ]),
-        cap_group("Display", vec![
-            cap_check("line / buffer", "gag, highlight, insert, or replace text", caps.change_display, Cap::ChangeDisplay),
+        cap_group(crate::i18n::ts!("manifest-cap-group-display"), vec![
+            cap_check("line / buffer", crate::i18n::ts!("manifest-cap-display"), caps.change_display, Cap::ChangeDisplay),
         ]),
-        cap_group("Mapper", vec![
+        cap_group(crate::i18n::ts!("manifest-cap-group-mapper"), vec![
             mapper_read,
-            cap_check("mapper", "change your maps", caps.mapper_write, Cap::MapperWrite),
+            cap_check("mapper", crate::i18n::ts!("manifest-cap-mapper-write"), caps.mapper_write, Cap::MapperWrite),
         ]),
-        cap_group("Widgets", vec![
-            cap_check("createWidget", "create & change on-screen widgets", caps.widgets, Cap::Widgets),
+        cap_group(crate::i18n::ts!("manifest-cap-group-widgets"), vec![
+            cap_check("createWidget", crate::i18n::ts!("manifest-cap-widgets"), caps.widgets, Cap::Widgets),
         ]),
-        cap_group("Interop", vec![
-            cap_check("emit / set", "broadcast events and publish shared state other packages can react to", caps.interop_write, Cap::InteropWrite),
-            cap_check("on / get / watch", "listen for events and read shared state", caps.interop_read, Cap::InteropRead),
+        cap_group(crate::i18n::ts!("manifest-cap-group-interop"), vec![
+            cap_check("emit / set", crate::i18n::ts!("manifest-cap-interop-write"), caps.interop_write, Cap::InteropWrite),
+            cap_check("on / get / watch", crate::i18n::ts!("manifest-cap-interop-read"), caps.interop_read, Cap::InteropRead),
         ]),
-        cap_group("Panes", vec![
-            cap_check("pane",  "create or interact with split panes", caps.panes, Cap::Panes),
+        cap_group(crate::i18n::ts!("manifest-cap-group-panes"), vec![
+            cap_check("pane",  crate::i18n::ts!("manifest-cap-panes"), caps.panes, Cap::Panes),
         ]),
-        cap_group("GMCP", vec![
-            cap_check("gmcp.send", "send GMCP messages to the game and manage GMCP modules", caps.gmcp_send, Cap::GmcpSend),
+        cap_group(crate::i18n::ts!("manifest-cap-group-gmcp"), vec![
+            cap_check("gmcp.send", crate::i18n::ts!("manifest-cap-gmcp"), caps.gmcp_send, Cap::GmcpSend),
         ]),
     ]
     .spacing(16.0)
@@ -2390,7 +2452,7 @@ fn list_editor<'a>(
         col = col.push(text(hint.to_string()).size(11.0).style(common::muted));
     }
     if items.is_empty() {
-        col = col.push(text("None.").size(12.0).style(common::faint));
+        col = col.push(text(crate::i18n::t!("manifest-none-period")).size(12.0).style(common::faint));
     }
     for (i, item) in items.iter().enumerate() {
         col = col.push(
@@ -2413,7 +2475,7 @@ fn list_editor<'a>(
         );
     }
     col.push(add_button(
-        &format!("Add {add_label}"),
+        &crate::i18n::t!("manifest-add-item", "item" => add_label),
         Message::EditManifest(ManifestEdit::AddItem(field)),
     ))
     .into()

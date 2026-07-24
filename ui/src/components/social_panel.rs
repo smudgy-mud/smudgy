@@ -25,9 +25,6 @@ use crate::cloud_account::CloudHandles;
 use crate::components::cloud_errors::display_error;
 use crate::theme::{self, Element as ThemedElement};
 
-const NO_MATCH: &str = "No user with that nickname.";
-const NICKNAME_PLACEHOLDER: &str = "nickname";
-
 #[derive(Debug, Clone)]
 pub enum Message {
     Refresh,
@@ -226,10 +223,10 @@ impl SocialPanel {
                 self.clear_feedback();
                 let handle = self.add_nickname_input.trim().to_string();
                 if handle.is_empty() {
-                    self.error = Some("Enter a nickname.".to_string());
+                    self.error = Some(crate::i18n::t!("social-enter-nickname"));
                     return Task::none();
                 }
-                self.busy = Some("Sending request…");
+                self.busy = Some(crate::i18n::ts!("social-sending-request"));
                 let client = self.cloud.client.clone();
                 Task::perform(
                     async move { client.lookup(&handle).await },
@@ -246,7 +243,7 @@ impl SocialPanel {
                 }
                 Err(CloudError::NotFoundOrNoAccess) => {
                     self.busy = None;
-                    self.error = Some(NO_MATCH.to_string());
+                    self.error = Some(crate::i18n::t!("social-no-nickname-match"));
                     Task::none()
                 }
                 Err(err) => {
@@ -262,7 +259,7 @@ impl SocialPanel {
                         // Uniform 202: never distinguish created / duplicate /
                         // blocked / nonexistent (enumeration resistance).
                         self.add_nickname_input.clear();
-                        self.notice = Some("Request sent.".to_string());
+                        self.notice = Some(crate::i18n::t!("social-request-sent"));
                         self.refresh_requests()
                     }
                     Err(err) => {
@@ -388,7 +385,7 @@ impl SocialPanel {
                 }
                 self.clear_feedback();
                 if self.block_nickname_input.trim().is_empty() {
-                    self.error = Some("Enter a nickname.".to_string());
+                    self.error = Some(crate::i18n::t!("social-enter-nickname"));
                     return Task::none();
                 }
                 self.confirming_block = true;
@@ -408,7 +405,7 @@ impl SocialPanel {
                 if handle.is_empty() {
                     return Task::none();
                 }
-                self.busy = Some("Blocking…");
+                self.busy = Some(crate::i18n::ts!("social-blocking"));
                 let client = self.cloud.client.clone();
                 Task::perform(
                     async move { client.lookup(&handle).await },
@@ -425,7 +422,7 @@ impl SocialPanel {
                 }
                 Err(CloudError::NotFoundOrNoAccess) => {
                     self.busy = None;
-                    self.error = Some(NO_MATCH.to_string());
+                    self.error = Some(crate::i18n::t!("social-no-nickname-match"));
                     Task::none()
                 }
                 Err(err) => {
@@ -470,9 +467,9 @@ impl SocialPanel {
     pub fn view(&self) -> ThemedElement<'_, Message> {
         let mut col = column![
             row![
-                text("Friends").size(20),
+                text(crate::i18n::t!("social-title")).size(20),
                 space::horizontal(),
-                button(text("Refresh").size(13))
+                button(text(crate::i18n::t!("action-refresh")).size(13))
                     .style(theme::builtins::button::secondary)
                     .padding([4, 10])
                     .on_press(Message::Refresh),
@@ -484,14 +481,17 @@ impl SocialPanel {
         col = col.push(self.feedback());
 
         // ===== add a friend =====
-        col = col.push(text("Add a friend").size(15));
+        col = col.push(text(crate::i18n::t!("social-add-friend")).size(15));
         col = col.push(
             row![
-                text_input(NICKNAME_PLACEHOLDER, &self.add_nickname_input)
+                text_input(
+                    crate::i18n::ts!("social-nickname-placeholder"),
+                    &self.add_nickname_input,
+                )
                     .on_input(Message::AddHandleChanged)
                     .on_submit(Message::SendRequestPressed)
                     .width(220),
-                button(text("Send request").size(13))
+                button(text(crate::i18n::t!("social-send-request")).size(13))
                     .style(theme::builtins::button::primary)
                     .padding([4, 10])
                     .on_press(Message::SendRequestPressed),
@@ -503,11 +503,11 @@ impl SocialPanel {
         col = col.push(rule::horizontal(1));
 
         // ===== incoming requests =====
-        col = col.push(text("Incoming requests").size(15));
+        col = col.push(text(crate::i18n::t!("social-incoming-requests")).size(15));
         col = match &self.incoming {
-            None => col.push(text("Loading…").size(13)),
+            None => col.push(text(crate::i18n::t!("state-loading")).size(13)),
             Some(incoming) if incoming.is_empty() => {
-                col.push(text("No incoming requests.").size(13))
+                col.push(text(crate::i18n::t!("social-no-incoming-requests")).size(13))
             }
             Some(incoming) => {
                 let mut col = col;
@@ -516,11 +516,11 @@ impl SocialPanel {
                         row![
                             text(nickname_or_fallback(request.nickname.clone())).size(13),
                             space::horizontal(),
-                            button(text("Accept").size(12))
+                            button(text(crate::i18n::t!("social-accept")).size(12))
                                 .style(theme::builtins::button::primary)
                                 .padding([2, 8])
                                 .on_press(Message::AcceptRequest(request.user_id)),
-                            button(text("Decline").size(12))
+                            button(text(crate::i18n::t!("social-decline")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::CancelRequest(request.user_id)),
@@ -534,11 +534,11 @@ impl SocialPanel {
         };
 
         // ===== outgoing requests =====
-        col = col.push(text("Outgoing requests").size(15));
+        col = col.push(text(crate::i18n::t!("social-outgoing-requests")).size(15));
         col = match &self.outgoing {
-            None => col.push(text("Loading…").size(13)),
+            None => col.push(text(crate::i18n::t!("state-loading")).size(13)),
             Some(outgoing) if outgoing.is_empty() => {
-                col.push(text("No outgoing requests.").size(13))
+                col.push(text(crate::i18n::t!("social-no-outgoing-requests")).size(13))
             }
             Some(outgoing) => {
                 let mut col = col;
@@ -546,9 +546,9 @@ impl SocialPanel {
                     col = col.push(
                         row![
                             text(nickname_or_fallback(request.nickname.clone())).size(13),
-                            text("(pending)").size(12),
+                            text(crate::i18n::t!("social-pending")).size(12),
                             space::horizontal(),
-                            button(text("Cancel").size(12))
+                            button(text(crate::i18n::t!("action-cancel")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::CancelRequest(request.user_id)),
@@ -572,7 +572,7 @@ impl SocialPanel {
                 .is_some_and(|t| !t.is_empty());
         if has_transfers {
             col = col.push(rule::horizontal(1));
-            col = col.push(text("Ownership transfers").size(15));
+            col = col.push(text(crate::i18n::t!("social-ownership-transfers")).size(15));
             if let Some(incoming) = &self.incoming_transfers {
                 for t in incoming {
                     col = col.push(
@@ -586,11 +586,11 @@ impl SocialPanel {
                             ))
                             .size(13),
                             space::horizontal(),
-                            button(text("Accept").size(12))
+                            button(text(crate::i18n::t!("social-accept")).size(12))
                                 .style(theme::builtins::button::primary)
                                 .padding([2, 8])
                                 .on_press(Message::AcceptTransfer(t.id)),
-                            button(text("Decline").size(12))
+                            button(text(crate::i18n::t!("social-decline")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::DeclineTransfer(t.id)),
@@ -612,9 +612,9 @@ impl SocialPanel {
                                 nickname_or_fallback(t.to_nickname.clone()),
                             ))
                             .size(13),
-                            text("(pending)").size(12),
+                            text(crate::i18n::t!("social-pending")).size(12),
                             space::horizontal(),
-                            button(text("Cancel").size(12))
+                            button(text(crate::i18n::t!("action-cancel")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::CancelTransfer(t.id)),
@@ -629,10 +629,12 @@ impl SocialPanel {
         col = col.push(rule::horizontal(1));
 
         // ===== friends =====
-        col = col.push(text("Friends").size(15));
+        col = col.push(text(crate::i18n::t!("social-title")).size(15));
         col = match &self.friends {
-            None => col.push(text("Loading…").size(13)),
-            Some(friends) if friends.is_empty() => col.push(text("No friends yet.").size(13)),
+            None => col.push(text(crate::i18n::t!("state-loading")).size(13)),
+            Some(friends) if friends.is_empty() => {
+                col.push(text(crate::i18n::t!("social-no-friends")).size(13))
+            }
             Some(friends) => {
                 let mut col = col;
                 for friend in friends {
@@ -645,14 +647,17 @@ impl SocialPanel {
         col = col.push(rule::horizontal(1));
 
         // ===== blocks =====
-        col = col.push(text("Blocks").size(15));
+        col = col.push(text(crate::i18n::t!("social-blocks")).size(15));
         col = col.push(
             row![
-                text_input(NICKNAME_PLACEHOLDER, &self.block_nickname_input)
+                text_input(
+                    crate::i18n::ts!("social-nickname-placeholder"),
+                    &self.block_nickname_input,
+                )
                     .on_input(Message::BlockHandleChanged)
                     .on_submit(Message::BlockPressed)
                     .width(220),
-                button(text("Block").size(13))
+                button(text(crate::i18n::t!("social-block")).size(13))
                     .style(theme::builtins::button::secondary)
                     .padding([4, 10])
                     .on_press(Message::BlockPressed),
@@ -664,19 +669,15 @@ impl SocialPanel {
             col = col.push(
                 container(
                     column![
-                        text(
-                            "Blocking is silent — they won't be told. It removes any \
-                             friendship and ends all sharing between you, both directions. \
-                             Unblocking restores nothing.",
-                        )
+                        text(crate::i18n::t!("social-block-warning"))
                         .size(13)
                         .style(theme::builtins::text::danger),
                         row![
-                            button(text("Confirm block").size(12))
+                            button(text(crate::i18n::t!("social-confirm-block")).size(12))
                                 .style(theme::builtins::button::primary)
                                 .padding([2, 8])
                                 .on_press(Message::BlockConfirmed),
-                            button(text("Cancel").size(12))
+                            button(text(crate::i18n::t!("action-cancel")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::BlockCancelled),
@@ -690,8 +691,10 @@ impl SocialPanel {
             );
         }
         col = match &self.blocks {
-            None => col.push(text("Loading…").size(13)),
-            Some(blocks) if blocks.is_empty() => col.push(text("No blocked users.").size(13)),
+            None => col.push(text(crate::i18n::t!("state-loading")).size(13)),
+            Some(blocks) if blocks.is_empty() => {
+                col.push(text(crate::i18n::t!("social-no-blocked-users")).size(13))
+            }
             Some(blocks) => {
                 let mut col = col;
                 for block in blocks {
@@ -699,7 +702,7 @@ impl SocialPanel {
                         row![
                             text(nickname_or_fallback(block.nickname.clone())).size(13),
                             space::horizontal(),
-                            button(text("Unblock").size(12))
+                            button(text(crate::i18n::t!("social-unblock")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::Unblock(block.user_id)),
@@ -711,9 +714,7 @@ impl SocialPanel {
                 col
             }
         };
-        col = col.push(
-            text("Blocked users can't see this entry; unblocking never restores shares.").size(11),
-        );
+        col = col.push(text(crate::i18n::t!("social-block-note")).size(11));
 
         col.into()
     }
@@ -721,7 +722,11 @@ impl SocialPanel {
     fn friend_row(&self, friend: &FriendView) -> ThemedElement<'_, Message> {
         let info = row![
             text(nickname_or_fallback(friend.nickname.clone())).size(13),
-            text(format!("since {}", friend.since.format("%Y-%m-%d"))).size(12),
+            text(crate::i18n::t!(
+                "social-friend-since",
+                "date" => friend.since.format("%Y-%m-%d").to_string()
+            ))
+            .size(12),
         ]
         .spacing(12)
         .align_y(Alignment::Center);
@@ -731,18 +736,15 @@ impl SocialPanel {
                 info,
                 container(
                     column![
-                        text(
-                            "Really unfriend? This ends all map sharing between you, \
-                             both directions.",
-                        )
+                        text(crate::i18n::t!("social-unfriend-warning"))
                         .size(13)
                         .style(theme::builtins::text::danger),
                         row![
-                            button(text("Confirm").size(12))
+                            button(text(crate::i18n::t!("action-confirm")).size(12))
                                 .style(theme::builtins::button::primary)
                                 .padding([2, 8])
                                 .on_press(Message::UnfriendConfirmed(friend.user_id)),
-                            button(text("Keep").size(12))
+                            button(text(crate::i18n::t!("social-keep-friend")).size(12))
                                 .style(theme::builtins::button::secondary)
                                 .padding([2, 8])
                                 .on_press(Message::UnfriendKept),
@@ -760,7 +762,7 @@ impl SocialPanel {
             row![
                 info,
                 space::horizontal(),
-                button(text("Unfriend").size(12))
+                button(text(crate::i18n::t!("social-unfriend")).size(12))
                     .style(theme::builtins::button::secondary)
                     .padding([2, 8])
                     .on_press(Message::UnfriendPressed(friend.user_id)),
@@ -787,5 +789,5 @@ impl SocialPanel {
 }
 
 fn nickname_or_fallback(nickname: Option<String>) -> String {
-    nickname.unwrap_or_else(|| "(no nickname)".to_string())
+    nickname.unwrap_or_else(|| crate::i18n::t!("social-no-nickname"))
 }

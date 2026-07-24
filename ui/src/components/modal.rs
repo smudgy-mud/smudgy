@@ -51,7 +51,7 @@ impl Modal {
             Modal::Connect(state) => connect::view(state).map(Message::Connect),
         };
 
-        let title_bar_text = text("Connect")
+        let title_bar_text = text(crate::i18n::t!("toolbar-connect"))
             .center()
             .width(Length::Fill)
             .height(Length::Fixed(34.0));
