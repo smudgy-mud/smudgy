@@ -32,7 +32,9 @@ use trigger::Manager;
 // `MatchCapture` rides along so benches can unpack the captures carried by the
 // `RuntimeAction::CallJavascriptFunction` deliveries the store flush queues.
 #[cfg(feature = "bench-api")]
-pub use trigger::{Manager, MatchCapture, PushTriggerParams, SharedAutomationRegistry};
+pub use trigger::{
+    BenchActionQueue, Manager, MatchCapture, PushTriggerParams, SharedAutomationRegistry,
+};
 pub mod catalogue;
 pub mod input;
 pub mod line_operation;
@@ -408,7 +410,7 @@ impl Runtime {
                     &load_settings(),
                 )));
 
-            let spawned_actions: ActionQueue = Rc::new(RefCell::new(VecDeque::new()));
+            let spawned_actions: ActionQueue = Rc::new(RefCell::default());
 
             let runtime = Rc::new(
                 tokio::runtime::Builder::new_current_thread()
@@ -1342,11 +1344,21 @@ impl Inner<'_> {
         }
     }
 
-    fn send<'s>(&'s mut self, line: &str) -> Result<Option<SentSessionEvent<'s>>, anyhow::Error> {
+    async fn send(&mut self, line: &str) -> Result<(), anyhow::Error> {
         let mut socket_str = String::with_capacity(line.len() + 2);
         socket_str.push_str(line);
         socket_str.push_str("\r\n");
         let arc_socket_str = Arc::new(socket_str);
+
+        if let Some(ref connection) = self.connection
+            && let Err(error) = connection.write(arc_socket_str).await
+        {
+            warn!("Error writing to connection: {error:?}");
+            if let Some(future) = self.echo_warn_str(format!("Send error: {error:?}").as_str())? {
+                future.await?;
+            }
+            return Ok(());
+        }
 
         let styled_line = Arc::new(StyledLine::from_output_str(line));
 
@@ -1363,27 +1375,34 @@ impl Inner<'_> {
             .set(self.emitted_line_count.get() + 1);
         self.record_emitted_line(&styled_line);
 
-        if let Some(ref connection) = self.connection
-            && let Err(e) = connection.write(arc_socket_str) {
-                warn!("Error writing to connection: {e:?}");
-                self.echo_warn_str(format!("Send error: {e:?}").as_str())?;
-            }
-
-        self.flush_buffer_updates()
+        if let Some(future) = self.flush_buffer_updates()? {
+            future.await?;
+        }
+        Ok(())
     }
 
     /// Like [`Self::send`], but the copy echoed to the client view and written to
     /// the session log has each secret substring masked. The server still receives
     /// the unmodified `line` (the secret reaches the wire, never the screen/log).
-    fn send_with_redactions<'s>(
-        &'s mut self,
+    async fn send_with_redactions(
+        &mut self,
         line: &str,
         redactions: &[String],
-    ) -> Result<Option<SentSessionEvent<'s>>, anyhow::Error> {
+    ) -> Result<(), anyhow::Error> {
         let mut socket_str = String::with_capacity(line.len() + 2);
         socket_str.push_str(line);
         socket_str.push_str("\r\n");
         let arc_socket_str = Arc::new(socket_str);
+
+        if let Some(ref connection) = self.connection
+            && let Err(error) = connection.write(arc_socket_str).await
+        {
+            warn!("Error writing to connection: {error:?}");
+            if let Some(future) = self.echo_warn_str(format!("Send error: {error:?}").as_str())? {
+                future.await?;
+            }
+            return Ok(());
+        }
 
         let display = redact(line, redactions);
         let styled_line = Arc::new(StyledLine::from_output_str(&display));
@@ -1398,13 +1417,10 @@ impl Inner<'_> {
             .set(self.emitted_line_count.get() + 1);
         self.record_emitted_line(&styled_line);
 
-        if let Some(ref connection) = self.connection
-            && let Err(e) = connection.write(arc_socket_str) {
-                warn!("Error writing to connection: {e:?}");
-                self.echo_warn_str(format!("Send error: {e:?}").as_str())?;
-            }
-
-        self.flush_buffer_updates()
+        if let Some(future) = self.flush_buffer_updates()? {
+            future.await?;
+        }
+        Ok(())
     }
 
     /// Flush the session store's write journal: commit this turn's writes to the host tree and

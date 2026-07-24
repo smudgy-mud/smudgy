@@ -38,10 +38,7 @@
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    cell::RefCell,
-    collections::VecDeque,
     hint::black_box,
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -58,8 +55,8 @@ use smudgy_core::session::{
         vt_processor::VtProcessor,
     },
     runtime::{
-        IsolateId, Manager, Origin, PushTriggerParams, RuntimeAction, ScriptAction,
-        SharedAutomationRegistry,
+        BenchActionQueue, IsolateId, Manager, Origin, PushTriggerParams, RuntimeAction,
+        ScriptAction, SharedAutomationRegistry,
     },
     styled_line::{Color, Style, StyledLine, VtSpan},
 };
@@ -143,10 +140,8 @@ const DEFAULT_STYLE: Style = Style {
     bg: Color::DefaultBackground,
 };
 
-/// The trigger engine's `spawned_actions` sink (mirrors
-/// `benches/trigger_engine.rs`; only `RuntimeAction` is named, so the
-/// `pub(crate)` `ActionQueue` alias doesn't need to be reachable).
-type Queue = Rc<RefCell<VecDeque<RuntimeAction>>>;
+/// Feature-gated trigger action observation handle.
+type Queue = BenchActionQueue;
 
 /// Marker matched only by the literal-tier sanity probe; never occurs in a
 /// log corpus, so the measured passes are unaffected by the probe triggers.
@@ -166,9 +161,8 @@ const PROBE_REGEX: &str = r"^__ALLOC_STATS_PROBE_REGEX__ (\d+)$";
 /// observable through an action-carrying trigger; the probes' markers match
 /// no corpus line, keeping the measured passes identical to the engine bench.
 fn build_manager(names: &[String], regexes: &[&str]) -> (Manager, Queue) {
-    let queue: Queue = Rc::new(RefCell::new(VecDeque::new()));
     let registry = SharedAutomationRegistry::default();
-    let mut mgr = Manager::new(queue.clone(), Arc::new(String::from(";")), registry);
+    let (mut mgr, queue) = Manager::new_for_bench(Arc::new(String::from(";")), registry);
     let empty: Arc<Vec<String>> = Arc::new(Vec::new());
 
     let push = |mgr: &mut Manager, name: String, pattern: String, action: ScriptAction| {
@@ -396,8 +390,8 @@ fn trigger_pass(mgr: &mut Manager, queue: &Queue, styled: &[Arc<StyledLine>]) ->
             mgr.process_incoming_line(line)
                 .expect("process_incoming_line");
         }
-        let fired = queue.borrow().len();
-        queue.borrow_mut().clear();
+        let fired = queue.len();
+        queue.clear();
         fired
     })
 }
@@ -494,12 +488,12 @@ fn sanity_trigger(mgr: &mut Manager, queue: &Queue) {
     ));
     mgr.process_incoming_line(&literal_probe)
         .expect("literal probe line");
-    let literal_fired = queue.borrow().len();
+    let literal_fired = queue.len();
     assert!(
         literal_fired >= 1,
         "trigger sanity: the literal-tier probe must fire"
     );
-    queue.borrow_mut().clear();
+    queue.clear();
 
     let regex_probe = Arc::new(StyledLine::new(
         "__ALLOC_STATS_PROBE_REGEX__ 4242",
@@ -507,12 +501,12 @@ fn sanity_trigger(mgr: &mut Manager, queue: &Queue) {
     ));
     mgr.process_incoming_line(&regex_probe)
         .expect("regex probe line");
-    let regex_fired = queue.borrow().len();
+    let regex_fired = queue.len();
     assert!(
         regex_fired >= 1,
         "trigger sanity: the regex-tier probe must fire"
     );
-    queue.borrow_mut().clear();
+    queue.clear();
     eprintln!(
         "sanity: trigger engine fired on both tiers ({literal_fired} literal / {regex_fired} regex action(s))"
     );
@@ -654,7 +648,7 @@ fn main() {
     // does).
     mgr.process_incoming_line(&Arc::new(StyledLine::new("warmup", Vec::new())))
         .expect("warmup");
-    queue.borrow_mut().clear();
+    queue.clear();
 
     if skip_sanity {
         eprintln!("sanity checks SKIPPED (SMUDGY_BENCH_SKIP_SANITY set)");

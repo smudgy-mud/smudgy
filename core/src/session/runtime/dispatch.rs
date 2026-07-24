@@ -32,13 +32,13 @@ impl Inner<'_> {
     /// path, ordered with normal sends by the shared socket channel). An empty frame is
     /// the registry's "nothing to send"; a missing connection can only be a race with a
     /// drop — logged, never fatal.
-    fn write_gmcp_frame(&self, frame: Vec<u8>) {
+    async fn write_gmcp_frame(&self, frame: Vec<u8>) {
         if frame.is_empty() {
             return;
         }
         match self.connection.as_ref() {
             Some(connection) => {
-                if let Err(err) = connection.write_raw(Arc::from(frame)) {
+                if let Err(err) = connection.write_raw(Arc::from(frame)).await {
                     warn!("GMCP frame dropped: {err:?}");
                 }
             }
@@ -73,9 +73,7 @@ impl Inner<'_> {
     /// [`Self::dispatch_send`], `SendRaw`, and `SendRawUnless`.
     async fn send_verbatim_lines(&mut self, text: &str) -> Result<(), anyhow::Error> {
         for line in text.split('\n') {
-            if let Some(fut) = self.send(line)? {
-                fut.await?;
-            }
+            self.send(line).await?;
         }
         if let Some(fut) = self.flush_buffer_updates()? {
             fut.await?;
@@ -375,9 +373,7 @@ impl Inner<'_> {
                 // handlers (the `SubmitInput` arm) and the alias/split pipeline
                 // alike — a secret must never feed either.
                 for line in text.split('\n') {
-                    if let Some(fut) = self.send_with_redactions(line, &redactions)? {
-                        fut.await?;
-                    }
+                    self.send_with_redactions(line, &redactions).await?;
                 }
                 if let Some(fut) = self.flush_buffer_updates()? {
                     fut.await?;
@@ -648,9 +644,7 @@ impl Inner<'_> {
                 if let Some((isolate, action)) = self.hotkeys.get(&id) {
                     match action {
                         ScriptAction::SendRaw(script) => {
-                            if let Some(fut) = self.send(script.clone().as_str())? {
-                                fut.await?;
-                            }
+                            self.send(script.clone().as_str()).await?;
                             Ok(ActionResult::None)
                         }
                         ScriptAction::SendSimple(script) => Ok(ActionResult::Run(
@@ -932,7 +926,7 @@ impl Inner<'_> {
                 // registry's Supports.Add (pre-ready registrations and renegotiation
                 // re-send alike, `docs/gmcp.md` §6.2), and announces readiness.
                 self.gmcp.on_enabled(&mut self.session_store.borrow_mut());
-                self.write_gmcp_frame(self.gmcp.supports_add_frame());
+                self.write_gmcp_frame(self.gmcp.supports_add_frame()).await;
                 Ok(self.run_host_event("gmcp:ready", "{}"))
             }
             RuntimeAction::GmcpDisabled => {
@@ -1004,7 +998,7 @@ impl Inner<'_> {
                         data.as_deref(),
                         &mut frame,
                     );
-                    self.write_gmcp_frame(frame);
+                    self.write_gmcp_frame(frame).await;
                 }
                 Ok(ActionResult::None)
             }
@@ -1014,12 +1008,12 @@ impl Inner<'_> {
                 version,
             } => {
                 let frame = self.gmcp.enable_module(isolate, &module, version);
-                self.write_gmcp_frame(frame);
+                self.write_gmcp_frame(frame).await;
                 Ok(ActionResult::None)
             }
             RuntimeAction::GmcpDisableModule { isolate, module } => {
                 let frame = self.gmcp.disable_module(&isolate, &module);
-                self.write_gmcp_frame(frame);
+                self.write_gmcp_frame(frame).await;
                 Ok(ActionResult::None)
             }
             RuntimeAction::GmcpAddMergeKeys(names) => {

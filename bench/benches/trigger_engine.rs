@@ -31,7 +31,7 @@
 //! `SMUDGY_BENCH_SKIP_SANITY=1` skips the `engine_build` check that a pushed
 //! trigger really is matchable on the very next processed line.
 
-use std::{cell::RefCell, collections::VecDeque, hint::black_box, rc::Rc, sync::Arc};
+use std::{hint::black_box, sync::Arc};
 
 use criterion::{
     BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
@@ -39,15 +39,14 @@ use criterion::{
 use smudgy_bench::{REGEX_TRIGGERS, load_item_names_10k, log_corpora};
 use smudgy_core::session::{
     runtime::{
-        IsolateId, Manager, Origin, PushTriggerParams, RuntimeAction, ScriptAction,
+        BenchActionQueue, IsolateId, Manager, Origin, PushTriggerParams, ScriptAction,
         SharedAutomationRegistry,
     },
     styled_line::StyledLine,
 };
 
-/// The engine's `spawned_actions` sink. Only `RuntimeAction` is named, so the
-/// `pub(crate)` `ActionQueue` alias doesn't need to be reachable.
-type Queue = Rc<RefCell<VecDeque<RuntimeAction>>>;
+/// Feature-gated trigger action observation handle.
+type Queue = BenchActionQueue;
 
 /// Pushes one enabled single-pattern trigger carrying `action`. The corpus
 /// triggers all carry `ScriptAction::Noop` (no JS engine exists here, and a
@@ -84,9 +83,8 @@ fn push_one_trigger(mgr: &mut Manager, name: String, pattern: String, action: Sc
 /// entry in `regexes` (→ the regex-filtered tier). Returns the engine's action
 /// queue so callers can drain it per pass.
 fn build_manager(names: &[String], regexes: &[&str]) -> (Manager, Queue) {
-    let queue: Queue = Rc::new(RefCell::new(VecDeque::new()));
     let registry = SharedAutomationRegistry::default();
-    let mut mgr = Manager::new(queue.clone(), Arc::new(String::from(";")), registry);
+    let (mut mgr, queue) = Manager::new_for_bench(Arc::new(String::from(";")), registry);
 
     for (i, name) in names.iter().enumerate() {
         push_one_trigger(
@@ -123,7 +121,7 @@ fn trigger_engine(c: &mut Criterion) {
     // outside the timed loop so per-file scans measure steady-state matching.
     mgr.process_incoming_line(&Arc::new(StyledLine::new("warmup", Vec::new())))
         .expect("warmup");
-    queue.borrow_mut().clear();
+    queue.clear();
 
     let mut group = c.benchmark_group("engine_scan");
     group.sample_size(10);
@@ -153,7 +151,7 @@ fn trigger_engine(c: &mut Criterion) {
             }
             // Drop the matched-trigger actions the engine enqueues, else they
             // pile up over a sample iteration.
-            queue.borrow_mut().clear();
+            queue.clear();
         };
 
         group.throughput(Throughput::Elements(styled.len() as u64));
@@ -195,7 +193,7 @@ fn trigger_engine(c: &mut Criterion) {
         // Pay the initial (cold) build outside the loop; iterations then time
         // pure dirty-flag rebuilds.
         mgr.process_incoming_line(&probe).expect("initial build");
-        queue.borrow_mut().clear();
+        queue.clear();
 
         if std::env::var("SMUDGY_BENCH_SKIP_SANITY").is_err() {
             // The measurement is honest only if (a) a trigger pushed before a
@@ -212,14 +210,14 @@ fn trigger_engine(c: &mut Criterion) {
             );
             mgr.process_incoming_line(&probe).expect("sanity rebuild");
             assert!(
-                !queue.borrow().is_empty(),
+                !queue.is_empty(),
                 "a trigger pushed before the line must fire on it: the lazy rebuild did not run"
             );
             mgr.remove_trigger(&IsolateId::Main, &Origin::User, "zz_sanity");
-            queue.borrow_mut().clear();
+            queue.clear();
             mgr.process_incoming_line(&probe).expect("sanity probe");
             assert!(
-                queue.borrow().is_empty(),
+                queue.is_empty(),
                 "the probe line must not fire any corpus trigger"
             );
             eprintln!("  engine_build sanity: rebuilds integrate pushes; probe line is inert");

@@ -53,10 +53,7 @@
 //! handler's create/delete really take effect through live dispatch.
 
 use std::{
-    cell::RefCell,
-    collections::VecDeque,
     env,
-    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -70,14 +67,14 @@ use smudgy_bench::{
 };
 use smudgy_core::session::{
     runtime::{
-        IsolateId, Manager, Origin, PushTriggerParams, RuntimeAction, ScriptAction,
+        BenchActionQueue, IsolateId, Manager, Origin, PushTriggerParams, ScriptAction,
         SharedAutomationRegistry,
     },
     styled_line::StyledLine,
 };
 use smudgy_script::{PackagePermissions, SmudgyCapabilities};
 
-type Queue = Rc<RefCell<VecDeque<RuntimeAction>>>;
+type Queue = BenchActionQueue;
 
 // ---------------------------------------------------------------------------
 // churn_residue: disabled-vs-absent, Manager-level
@@ -133,9 +130,8 @@ fn residue_manager(
     rex_d: usize,
     include_disabled: bool,
 ) -> (Manager, Queue) {
-    let queue: Queue = Rc::new(RefCell::new(VecDeque::new()));
     let registry = SharedAutomationRegistry::default();
-    let mut mgr = Manager::new(queue.clone(), Arc::new(String::from(";")), registry);
+    let (mut mgr, queue) = Manager::new_for_bench(Arc::new(String::from(";")), registry);
     let lit_start = if include_disabled { 0 } else { lit_d };
     for (i, name) in names[lit_start..population].iter().enumerate() {
         push_one_trigger(
@@ -158,7 +154,7 @@ fn residue_manager(
     }
     mgr.process_incoming_line(&Arc::new(StyledLine::new("warmup", Vec::new())))
         .expect("warmup build");
-    queue.borrow_mut().clear();
+    queue.clear();
     (mgr, queue)
 }
 
@@ -166,9 +162,8 @@ fn residue_manager(
 /// explicit rebuild step (the flag flip is the whole mutation).
 fn residue_sanity() {
     let probe = Arc::new(StyledLine::new("zzqx residue probe zzqx", Vec::new()));
-    let queue: Queue = Rc::new(RefCell::new(VecDeque::new()));
     let registry = SharedAutomationRegistry::default();
-    let mut mgr = Manager::new(queue.clone(), Arc::new(String::from(";")), registry);
+    let (mut mgr, queue) = Manager::new_for_bench(Arc::new(String::from(";")), registry);
     push_one_trigger(
         &mut mgr,
         "zz_probe".to_owned(),
@@ -177,14 +172,11 @@ fn residue_sanity() {
         false,
     );
     mgr.process_incoming_line(&probe).expect("probe disabled");
-    assert!(
-        queue.borrow().is_empty(),
-        "a disabled trigger must not fire"
-    );
+    assert!(queue.is_empty(), "a disabled trigger must not fire");
     mgr.enable_trigger(&IsolateId::Main, &Origin::User, "zz_probe", true);
     mgr.process_incoming_line(&probe).expect("probe enabled");
     assert!(
-        !queue.borrow().is_empty(),
+        !queue.is_empty(),
         "an enable flag-flip must take effect on the next line without a create/delete"
     );
     eprintln!("  residue sanity: disabled triggers are inert; enable is a live flag flip");
@@ -218,7 +210,7 @@ fn churn_residue(c: &mut Criterion) {
             for line in &styled_lines {
                 mgr.process_incoming_line(line).expect("process line");
             }
-            queue.borrow_mut().clear();
+            queue.clear();
         });
     };
 

@@ -113,10 +113,11 @@ async fn tls_no_verify_accepts_self_signed_and_data_flows_both_ways() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while connection
         .write(Arc::new("look\n".to_string()))
+        .await
         .is_err()
         && Instant::now() < deadline
     {
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     let (lines, echoes) = drain(&mut runtime_rx, Duration::from_secs(10));
