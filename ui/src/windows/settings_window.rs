@@ -23,6 +23,7 @@ use crate::cloud_account::CloudHandles;
 use crate::components::cloud_errors::display_error;
 use crate::components::color_picker::{self, ColorPicker};
 use crate::components::social_panel::{self, SocialPanel};
+use crate::i18n::{self, LocaleChoice};
 use crate::prefs;
 use crate::theme::{self, Element as ThemedElement};
 use crate::update::Update;
@@ -113,6 +114,7 @@ pub enum Message {
     SessionRevoked(Result<(), CloudError>),
 
     PrefFontSelected(String),
+    PrefLocaleSelected(LocaleChoice),
     PrefFontSizeChanged(String),
     PrefFontSizeSubmitted,
     PrefLineLengthChanged(String),
@@ -615,6 +617,11 @@ impl SettingsWindow {
             // whole model; numeric buffers that don't parse commit nothing.
             Message::PrefFontSelected(family) => {
                 self.settings.terminal_font_family = family;
+                self.settings_changed()
+            }
+            Message::PrefLocaleSelected(locale) => {
+                self.settings.locale = locale.preference().to_string();
+                i18n::activate(&self.settings.locale);
                 self.settings_changed()
             }
             // Typing only edits the buffer; commits happen on Enter so a
@@ -1244,6 +1251,22 @@ impl SettingsWindow {
         );
 
         let mut col = column![text("Preferences").size(20)].spacing(12);
+
+        col = col.push(
+            column![
+                dim_text_owned(i18n::t!("language")),
+                pick_list(
+                    i18n::locale_choices(),
+                    Some(i18n::locale_choice(&self.settings.locale)),
+                    Message::PrefLocaleSelected,
+                )
+                .text_size(13)
+                .width(280),
+                dim_text_owned(i18n::t!("language-description")),
+            ]
+            .spacing(2),
+        );
+        col = col.push(rule::horizontal(1));
 
         // ===== appearance =====
         col = col.push(text("Appearance").size(15));
