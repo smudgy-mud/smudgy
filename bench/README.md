@@ -10,6 +10,15 @@ cargo bench -p smudgy_bench --bench trigger_churn -- churn_packet   # one group
 cargo bench -p smudgy_bench -- --quick               # fast indicative pass
 ```
 
+On Linux, the small deterministic CPU suite uses
+[Gungraun](https://gungraun.github.io/gungraun/) (the maintained successor to
+iai-callgrind) and Valgrind:
+
+```powershell
+cargo install --locked --version 0.19.4 gungraun-runner
+cargo bench -p smudgy_bench --features callgrind --bench ingest_callgrind
+```
+
 Env vars honored where a bench says so: `SMUDGY_BENCH_LINES=n` (truncate-only
 corpus/pass cap), `SMUDGY_BENCH_SKIP_SANITY=1` (skip the warmup assertions
 that prove the measured machinery does what the bench claims).
@@ -35,8 +44,9 @@ fixed `ns/iter` unit and retain its 95% confidence interval:
   is deliberately separate, so each comparison is against the previous
   release rather than the latest weekly sample.
 
-A 25% slowdown is a screening alert, not a merge gate; confirm it with the
-same-day A/B discipline below before acting on it.
+A 25% slowdown in longitudinal history is a screening alert, not a merge gate.
+PR comparisons use the replicated, targeted method below instead of applying
+that history threshold to a single A/B pair.
 
 The runner group is restricted to the exact benchmark workflow on `main`, and
 the workflow deliberately has no pull-request trigger. A manual `smoke` mode
@@ -58,10 +68,48 @@ run on the ephemeral self-hosted instance. The candidate is checked out through
 the base repository's pull ref and must match the immutable SHA resolved before
 the M8a job was requested.
 
-The ephemeral runner measures current `main` first and the PR head second, using
-separate build directories on the same M8a. The reporting job uses
-`github-action-benchmark`'s external baseline plus `save-data-file: false`,
-posts the delta to the PR, and never writes PR measurements into Pages history.
+The ephemeral runner selects PR suites through the trusted
+`.github/benchmark-scope.json` map. A changed path can have direct coverage,
+partial coverage with an explicit limitation, no performance relevance, or a
+coverage gap. A gap is reported as a gap; it is never presented as evidence
+that performance is unchanged.
+
+To keep eight full observations inside the runner budget, a PR run selects at
+most five product Criterion targets plus `runner_control`, in the priority order
+declared by the map. If a broad change maps to more, the report names every
+omitted target and marks coverage partial. The canonical main/weekly/release
+run remains uncapped.
+
+For selected Criterion targets, both revisions are compiled before measurement
+and pinned to CPUs 2-7. The runner executes two balanced blocks, `ABBA` then
+`BAAB`, where A is current `main` and B is the PR. Each block independently
+uses the geometric mean of its two observations per revision. A wall-clock
+change is called **confirmed** only when both blocks cross +/-5% in the same
+direction and each arm's two observations within every block stay within 5%
+of one another. Any product cell with internally unstable replicates is
+**inconclusive**, regardless of its aggregate delta. A threshold crossing in
+only one block, or opposite-direction crossings between blocks, is likewise
+inconclusive rather than stable.
+
+`runner_control` travels with every targeted Criterion comparison. Its
+revision-independent integer and memory cells must remain within +/-3% in both
+blocks. The workflow also requires the performance CPU governor when the
+kernel exposes one, pins the benchmark cpuset, and records load, frequency,
+temperature, steal-time, process, CPU, AMI, kernel, and toolchain provenance.
+Failed controls, excess steal, or concurrent runnable work invalidate the
+whole wall-clock result. The one-minute load average is retained as diagnostic
+context because it decays too slowly after compilation to be a reliable gate.
+
+CPU-only paths with a mapped Gungraun target also receive a same-run
+Callgrind comparison. Instruction counts are deterministic enough to remain
+useful on a virtualized runner, but they do not stand in for wall-clock
+latency, readiness scheduling, TLS, allocator contention, or network behavior.
+The PR report keeps those two kinds of evidence separate.
+
+PR measurements and their environment telemetry are retained as workflow
+artifacts but never written to Pages history. The bot updates its existing PR
+comment in place. The comment is explicitly a review aid rather than a merge
+gate; complete JSON, logs, and Gungraun profiles stay in the artifact.
 
 Publishing a GitHub release dispatches release mode on the trusted `main`
 workflow. A maintainer can backfill an existing version tag similarly:
@@ -157,7 +205,11 @@ Store (below the op layer):
 
 Ingest & display:
 - `ingest` — socket-bytes → `StyledLine` glue.
+- `ingest_callgrind` — deterministic instruction counts for the synchronous
+  telnet/VT/runtime-channel ingest CPU path; Linux + Valgrind only.
 - `terminal_buffer` — display-side buffer work.
+- `runner_control` — short integer/memory wall-clock controls used to reject a
+  noisy PR comparison; not a product-performance benchmark.
 
 Mapper:
 - `mapper_scale`, `map_spatial` — map-domain scaling.

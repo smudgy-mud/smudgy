@@ -10,6 +10,12 @@ publish = false
 # rejects Criterion options such as `--noplot`.
 bench = false
 
+[features]
+# PR-only harnesses stay out of the canonical `cargo bench -p smudgy_bench`
+# longitudinal run unless selected explicitly by the trusted workflow.
+pr-benchmarks = []
+callgrind = ["dep:gungraun"]
+
 # Crates the *library* modules use (`src/wire.rs` needs only std; `src/atlas.rs`
 # builds a real `AtlasCache` through the public `LocalBackend` -> `Mapper` path).
 # These must be regular dependencies: dev-dependencies are only in scope for the
@@ -38,6 +44,11 @@ regex-filtered = { workspace = true }
 regex-syntax = { workspace = true }
 smudgy_ui = { path = "../ui" }
 vtparse = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Gungraun is the maintained successor to iai-callgrind. It supplies
+# deterministic instruction/cache counters for CPU-only PR comparisons.
+gungraun = { version = "0.19.4", optional = true }
 
 [[bench]]
 name = "trigger_matching"
@@ -102,6 +113,16 @@ harness = false
 [[bench]]
 name = "trigger_churn"
 harness = false
+
+[[bench]]
+name = "runner_control"
+harness = false
+required-features = ["pr-benchmarks"]
+
+[[bench]]
+name = "ingest_callgrind"
+harness = false
+required-features = ["callgrind"]
 
 [lints]
 workspace = true
