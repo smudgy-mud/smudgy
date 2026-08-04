@@ -70,12 +70,15 @@ deno_core::extension!(
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
+    op_smudgy_pane_add_tab,
     op_smudgy_pane_close,
     op_smudgy_pane_set_hidden,
     op_smudgy_pane_set_font_size,
     op_smudgy_pane_def_state,
     op_smudgy_pane_resize,
     op_smudgy_pane_relocate,
+    op_smudgy_pane_group_with,
+    op_smudgy_pane_select,
     op_smudgy_pane_tear_out,
     op_smudgy_pane_swap,
     op_smudgy_pane_size,
@@ -5104,6 +5107,9 @@ pub struct PaneSpecJs {
     /// handler address on the target and routes submissions back to the
     /// creating runtime before dereferencing V8 state.
     input: Option<PaneInputSpecJs>,
+    /// `addTab()` creation-only selection request. Ignored by `split()` and
+    /// on get-or-create hits.
+    selected: Option<bool>,
 }
 
 /// Parse the split spec's kind + def-state trio.
@@ -5204,7 +5210,7 @@ fn op_smudgy_pane_split<'s>(
                 target,
                 RuntimeAction::PaneOpened {
                     def: outcome.def.clone(),
-                    placement: pane::PanePlacement {
+                    placement: pane::PanePlacement::Split {
                         reference,
                         direction,
                         size_px,
@@ -5224,6 +5230,76 @@ fn op_smudgy_pane_split<'s>(
         }
         Ok(PaneInfo::from_def(&outcome.def, outcome.created))
     }
+}
+
+/// Get-or-create a pane and, on creation, insert it after `ref_name` in that
+/// pane's current tab group. Existing panes are claimed without moving or
+/// selecting them, preserving user-owned workspace placement.
+#[op2]
+#[serde]
+fn op_smudgy_pane_add_tab<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    session_id: u32,
+    #[string] ref_name: &str,
+    #[serde] spec: PaneSpecJs,
+    on_submit: v8::Local<'s, v8::Value>,
+) -> Result<PaneInfo, PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let reconcile_registry = target != *state.borrow::<SessionId>();
+    let selected = spec.selected.unwrap_or(false);
+    let (kind, def_state) = parse_split_def_state(&spec)?;
+    let namespace = pane_namespace(state);
+
+    if def_state.font_size.is_some() && pane::is_main_pane_name(&spec.name) {
+        ensure(grants(state).change_display, "change-display")?;
+    }
+
+    let register_input = spec.input.is_some();
+    let input = spec.input.map(|input| pane::PaneInputDef {
+        placeholder: input.placeholder.map(Arc::from),
+    });
+    let registry = target_pane_registry(state, target)?;
+    let outcome = registry
+        .lock()
+        .unwrap()
+        .split(&namespace, &spec.name, kind, def_state, input)?;
+    if register_input {
+        let callback = v8::Local::<v8::Function>::try_from(on_submit)
+            .map_err(|_| PaneOpError("input.onSubmit must be a function".to_string()))?;
+        register_pane_input_callback(scope, state, target, outcome.def.key, callback)?;
+    }
+    if outcome.created {
+        let reference = registry
+            .lock()
+            .unwrap()
+            .resolve(&namespace, ref_name)
+            .map_or(pane::MAIN_PANE_KEY, |def| def.key);
+        route_session_action(
+            state,
+            target,
+            RuntimeAction::PaneOpened {
+                def: outcome.def.clone(),
+                placement: pane::PanePlacement::Tab {
+                    reference,
+                    position: pane::TabPosition::After,
+                    selected,
+                },
+                reconcile_registry,
+            },
+        );
+    } else if outcome.def_changed {
+        route_session_action(
+            state,
+            target,
+            RuntimeAction::PaneUpdated {
+                def: outcome.def.clone(),
+                announce_visibility: outcome.hidden_changed,
+            },
+        );
+    }
+    Ok(PaneInfo::from_def(&outcome.def, outcome.created))
 }
 
 fn register_pane_input_callback<'s>(
@@ -5480,6 +5556,16 @@ fn resolve_placement_pane(
     if pane::is_main_pane_name(name) {
         return Err(main_error.into());
     }
+    resolve_live_pane(state, target, name)
+}
+
+/// Resolve any live pane, including main. Grouping and selection deliberately
+/// admit main panes for multi-boxing layouts.
+fn resolve_live_pane(
+    state: &OpState,
+    target: SessionId,
+    name: &str,
+) -> Result<pane::PaneKey, PaneCallError> {
     let namespace = pane_namespace(state);
     let registry = target_pane_registry(state, target)?;
     let registry = registry.lock().unwrap();
@@ -5562,6 +5648,61 @@ fn op_smudgy_pane_relocate(
             size_px: placement_px(size_px),
         },
     );
+    Ok(())
+}
+
+/// `pane.groupWith(reference, options?)`: move or reorder this pane in the
+/// tab group currently hosting `reference`. Main panes are deliberately
+/// admitted for multi-boxing; cross-session references are same-server and
+/// `reach-others` gated by the ordinary session-target checks.
+#[op2(fast)]
+fn op_smudgy_pane_group_with(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+    reference_session_id: u32,
+    #[string] reference_name: &str,
+    #[string] position: &str,
+    selected: bool,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    let reference_session = SessionId::from(reference_session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    ensure_session_target(state, reference_session, grants(state).panes, "panes")?;
+    let position = pane::TabPosition::parse(position)
+        .ok_or_else(|| PaneOpError(format!("invalid tab position '{position}'")))?;
+    let key = resolve_live_pane(state, target, name)?;
+    let reference = resolve_live_pane(state, reference_session, reference_name)?;
+    if target == reference_session && key == reference {
+        return Ok(());
+    }
+    route_session_action(
+        state,
+        target,
+        RuntimeAction::PaneGroupWith {
+            key,
+            reference_session,
+            reference,
+            position,
+            selected,
+        },
+    );
+    Ok(())
+}
+
+/// `pane.select()`: make this pane its group's durable selection. Main panes
+/// are valid; the UI changes active-session identity but deliberately does not
+/// focus the newly shown input.
+#[op2(fast)]
+fn op_smudgy_pane_select(
+    state: &mut OpState,
+    session_id: u32,
+    #[string] name: &str,
+) -> Result<(), PaneCallError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).panes, "panes")?;
+    let key = resolve_live_pane(state, target, name)?;
+    route_session_action(state, target, RuntimeAction::PaneSelect { key });
     Ok(())
 }
 

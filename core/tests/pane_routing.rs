@@ -17,7 +17,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::runtime::pane::{
-    MAIN_PANE_KEY, PaneKey, PaneNameId, PanePlacement, SplitDirection,
+    MAIN_PANE_KEY, PaneKey, PaneNameId, PanePlacement, SplitDirection, TabPosition,
 };
 use smudgy_core::session::styled_line::StyledLine;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
@@ -28,6 +28,9 @@ import { createTrigger, echo, line, session, vars } from "smudgy:core";
 const chat = session.mainPane.split("right", { name: "Chat", width: 300 });
 const again = session.mainPane.split("right", { name: "chat" });
 const info = chat.split("bottom", { name: "info", height: 120 });
+const alerts = chat.addTab({ name: "alerts", selected: true });
+alerts.groupWith(session.mainPane, { position: "end", selected: true });
+alerts.select();
 echo("SETUP created=" + chat.created
     + " again=" + again.created
     + " display=" + again.name
@@ -99,6 +102,13 @@ enum Seen {
         placement: PanePlacement,
     },
     Closed(PaneKey),
+    Grouped {
+        key: PaneKey,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    Selected(PaneKey),
 }
 
 // One end-to-end scenario deliberately drives the whole routing matrix through
@@ -179,6 +189,19 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
                 });
             }
             SessionEvent::PaneClosed(key) => seen.push(Seen::Closed(key)),
+            SessionEvent::PaneGroupWith {
+                key,
+                reference,
+                position,
+                selected,
+                ..
+            } => seen.push(Seen::Grouped {
+                key,
+                reference,
+                position,
+                selected,
+            }),
+            SessionEvent::PaneSelect { key } => seen.push(Seen::Selected(key)),
             _ => {}
         }
 
@@ -320,12 +343,12 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
             && setups[0].contains("kind=terminal")
             && setups[0].contains("exists=true")
             && setups[0].contains("dot=true")
-            && setups[0].contains("count=3"),
+            && setups[0].contains("count=4"),
         "get-or-create + case folding + dot access on first load: {}\n{transcript}",
         setups[0]
     );
     // After the reload the registry persisted: every split is a
-    // get-or-create hit and all panes (chat/INFO/fresh + the 13 cap panes +
+    // get-or-create hit and all panes (chat/INFO/fresh/alerts + 12 cap panes +
     // main) are still there.
     assert!(
         setups[1].contains("created=false") && setups[1].contains("count=17"),
@@ -351,12 +374,44 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
     };
     let chat = find_opened("Chat");
     let info = find_opened("info");
-    assert_eq!(chat.3.reference, MAIN_PANE_KEY, "Chat splits off main");
-    assert!(matches!(chat.3.direction, SplitDirection::Right));
-    assert_eq!(chat.3.size_px, Some(300.0), "width honored on a right split");
-    assert_eq!(info.3.reference, chat.1, "info splits off Chat");
-    assert!(matches!(info.3.direction, SplitDirection::Bottom));
-    assert_eq!(info.3.size_px, Some(120.0), "height honored on a bottom split");
+    let alerts = find_opened("alerts");
+    assert_eq!(
+        chat.3,
+        PanePlacement::Split {
+            reference: MAIN_PANE_KEY,
+            direction: SplitDirection::Right,
+            size_px: Some(300.0),
+        },
+        "Chat splits off main"
+    );
+    assert_eq!(
+        info.3,
+        PanePlacement::Split {
+            reference: chat.1,
+            direction: SplitDirection::Bottom,
+            size_px: Some(120.0),
+        },
+        "info splits off Chat"
+    );
+    assert_eq!(
+        alerts.3,
+        PanePlacement::Tab {
+            reference: chat.1,
+            position: TabPosition::After,
+            selected: true,
+        },
+        "alerts starts as a selected tab after Chat"
+    );
+    assert!(seen.iter().any(|event| matches!(
+        event,
+        Seen::Grouped {
+            key,
+            reference,
+            position: TabPosition::End,
+            selected: true,
+        } if *key == alerts.1 && *reference == MAIN_PANE_KEY
+    )));
+    assert!(seen.iter().any(|event| matches!(event, Seen::Selected(key) if *key == alerts.1)));
     let chat_key = chat.1;
     let info_key = info.1;
 
@@ -376,8 +431,8 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
     );
 
     // ---- Reload sweep -------------------------------------------------------
-    // The reloaded module re-splits Chat and info at top level (re-claiming
-    // them); 'fresh' and the cap panes were trigger-created mid-session, so
+    // The reloaded module re-claims Chat, info, and alerts at top level;
+    // 'fresh' and the cap panes were trigger-created mid-session, so
     // the sweep behind the reload must close exactly those.
     let closed: Vec<PaneKey> = seen
         .iter()
@@ -391,7 +446,7 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
         closed.contains(&fresh_key),
         "the reload sweep must close the unclaimed 'fresh' pane.\n{transcript}"
     );
-    for i in 0..13 {
+    for i in 0..12 {
         let cap_key = find_opened(&format!("cap{i}")).1;
         assert!(
             closed.contains(&cap_key),
@@ -406,11 +461,11 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
         !closed.contains(&recreated.1),
         "the re-claimed INFO pane must survive the sweep.\n{transcript}"
     );
-    // The post-sweep probe sees only main + the two re-claimed panes.
+    // The post-sweep probe sees main + the three re-claimed panes.
     assert!(
         seen.iter()
-            .any(|s| matches!(s, Seen::Append(text) if text.as_str() == "COUNT=3")),
-        "post-sweep registry must hold main + Chat + info only.\n{transcript}"
+            .any(|s| matches!(s, Seen::Append(text) if text.as_str() == "COUNT=4")),
+        "post-sweep registry must hold main + Chat + info + alerts only.\n{transcript}"
     );
 
     // ---- The routing matrix -------------------------------------------------

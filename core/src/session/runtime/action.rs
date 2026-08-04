@@ -20,7 +20,9 @@ use crate::session::{HotkeyId, SessionId};
 use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
-use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection};
+use super::pane::{
+    PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection, TabPosition,
+};
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
@@ -397,6 +399,16 @@ pub enum RuntimeAction {
         direction: SplitDirection,
         size_px: Option<f32>,
     },
+    /// Move or reorder a pane into another pane's current tab group.
+    PaneGroupWith {
+        key: PaneKey,
+        reference_session: SessionId,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    /// Select a pane's tab without requesting keyboard focus.
+    PaneSelect { key: PaneKey },
     /// Forward `pane.tearOut` to the UI as `SessionEvent::PaneTearOut`.
     PaneTearOut {
         key: PaneKey,

@@ -28,15 +28,12 @@ fn prepare_pane_open(
 
     let registry = registry.lock().unwrap();
     let def = registry.get(def.key)?.clone();
-    let placement = super::pane::PanePlacement {
-        reference: if registry.is_live(placement.reference) {
-            placement.reference
-        } else {
-            super::pane::MAIN_PANE_KEY
-        },
-        direction: placement.direction,
-        size_px: placement.size_px,
-    };
+    let reference = placement.reference();
+    let placement = placement.with_reference(if registry.is_live(reference) {
+        reference
+    } else {
+        super::pane::MAIN_PANE_KEY
+    });
     Some((def, placement))
 }
 
@@ -1542,6 +1539,36 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
+            RuntimeAction::PaneGroupWith {
+                key,
+                reference_session,
+                reference,
+                position,
+                selected,
+            } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneGroupWith {
+                            key,
+                            reference_session,
+                            reference,
+                            position,
+                            selected,
+                        },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneSelect { key } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneSelect { key },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
             RuntimeAction::PaneTearOut { key, width, height } => {
                 self.ui_tx
                     .send(TaggedSessionEvent {
@@ -1974,7 +2001,7 @@ mod tests {
             )
             .unwrap()
             .def;
-        let placement = PanePlacement {
+        let placement = PanePlacement::Split {
             reference: MAIN_PANE_KEY,
             direction: SplitDirection::Right,
             size_px: None,
@@ -2032,7 +2059,7 @@ mod tests {
         let prepared = prepare_pane_open(
             &registry,
             original,
-            PanePlacement {
+            PanePlacement::Split {
                 reference: reference.key,
                 direction: SplitDirection::Left,
                 size_px: Some(240.0),
@@ -2041,8 +2068,13 @@ mod tests {
         )
         .expect("the foreign target remains live");
         assert!(prepared.0.hidden);
-        assert_eq!(prepared.1.reference, MAIN_PANE_KEY);
-        assert_eq!(prepared.1.direction, SplitDirection::Left);
-        assert_eq!(prepared.1.size_px, Some(240.0));
+        assert_eq!(
+            prepared.1,
+            PanePlacement::Split {
+                reference: MAIN_PANE_KEY,
+                direction: SplitDirection::Left,
+                size_px: Some(240.0),
+            }
+        );
     }
 }

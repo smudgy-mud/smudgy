@@ -62,12 +62,15 @@ const {
     op_smudgy_redirect,
     op_smudgy_copy,
     op_smudgy_pane_split,
+    op_smudgy_pane_add_tab,
     op_smudgy_pane_close,
     op_smudgy_pane_set_hidden,
     op_smudgy_pane_set_font_size,
     op_smudgy_pane_def_state,
     op_smudgy_pane_resize,
     op_smudgy_pane_relocate,
+    op_smudgy_pane_group_with,
+    op_smudgy_pane_select,
     op_smudgy_pane_tear_out,
     op_smudgy_pane_swap,
     op_smudgy_pane_size,
@@ -927,6 +930,21 @@ type PaneSpec<D extends SplitDirection> = PaneSpecBase &
         ? { width?: number; height?: never }
         : { height?: number; width?: never });
 
+/** The spec for `pane.addTab()`. Tab creation has no spatial dimensions;
+ *  `selected` is a creation-only default. */
+type TabPaneSpec = PaneSpecBase & {
+    selected?: boolean;
+    width?: never;
+    height?: never;
+};
+
+type TabPosition = "before" | "after" | "end";
+
+interface GroupWithOptions {
+    position?: TabPosition;
+    selected?: boolean;
+}
+
 /** The wire shape a pane op returns for one pane. */
 interface PaneInfoWire {
     name: string;
@@ -941,9 +959,9 @@ interface PaneInfoWire {
 }
 
 /**
- * A handle to one session pane. Get-or-create via `split()` (an existing name
- * returns the existing pane); a pane is removed by `close()`, session end, or
- * the reload sweep (a reload closes panes no script re-claimed via `split()`).
+ * A handle to one session pane. Get-or-create via `split()` or `addTab()` (an
+ * existing name returns the existing pane); a pane is removed by `close()`,
+ * session end, or the reload sweep (which closes unclaimed panes).
  * Handles carry their owning session id -- passing another session's `Pane` to
  * a line-routing op throws.
  */
@@ -1021,6 +1039,12 @@ class Pane {
      *  updates an existing pane (`titleBar`/`fontSize` incl. main). */
     split<D extends SplitDirection>(direction: D, spec: PaneSpec<D>): Pane {
         return __smudgy_pane_split(this._sessionId, this._name, direction, spec, this.#creatorId);
+    }
+
+    /** Create a pane as a tab immediately after this pane. Existing panes are
+     *  returned without moving or selecting them. */
+    addTab(spec: TabPaneSpec): Pane {
+        return __smudgy_pane_add_tab(this._sessionId, this._name, spec, this.#creatorId);
     }
 
     /** Hide this pane -- the title-bar eyeball's script spelling. A soft
@@ -1123,6 +1147,33 @@ class Pane {
         op_smudgy_pane_relocate(this._sessionId, this._name, direction, refName, sizePx);
     }
 
+    /** Move or reorder this pane in the group currently hosting `reference`. */
+    groupWith(reference: Pane, options?: GroupWithOptions): void {
+        if (!(reference instanceof Pane)) {
+            throw new TypeError("groupWith expects a Pane reference");
+        }
+        if (options !== undefined && (typeof options !== "object" || options === null)) {
+            throw new TypeError("groupWith options must be an object of the form { position?, selected? }");
+        }
+        const position = options?.position ?? "after";
+        if (position !== "before" && position !== "after" && position !== "end") {
+            throw new TypeError('position must be one of "before" | "after" | "end"');
+        }
+        op_smudgy_pane_group_with(
+            this._sessionId,
+            this._name,
+            reference._sessionId,
+            reference._name,
+            position,
+            options?.selected === true,
+        );
+    }
+
+    /** Select this pane and activate its session without requesting focus. */
+    select(): void {
+        op_smudgy_pane_select(this._sessionId, this._name);
+    }
+
     /** Move this pane into a fresh dedicated window -- the drag tear-out
      *  minus the drag. Windows stay anonymous: there is no window handle,
      *  the window closes when its last pane leaves, and re-docking is a
@@ -1207,6 +1258,55 @@ function __smudgy_pane_split(
                                   : null,
                       }
                     : null,
+        },
+        spec.input?.onSubmit ?? null,
+    );
+    return new Pane(sessionId, info, creatorId);
+}
+
+function __smudgy_pane_add_tab(
+    sessionId: number,
+    refName: string,
+    spec: TabPaneSpec,
+    creatorId: number | null = null,
+): Pane {
+    if (typeof spec !== "object" || spec === null || typeof spec.name !== "string") {
+        throw new TypeError(
+            "spec must be an object of the form { name, terminal?, titleBar?, hidden?, fontSize?, input?, selected? }",
+        );
+    }
+    if (spec.input !== undefined) {
+        if (
+            typeof spec.input !== "object" ||
+            spec.input === null ||
+            typeof spec.input.onSubmit !== "function"
+        ) {
+            throw new TypeError(
+                "input must be an object of the form { onSubmit: (text) => void, placeholder? }",
+            );
+        }
+    }
+    const info = op_smudgy_pane_add_tab(
+        sessionId,
+        refName,
+        {
+            name: spec.name,
+            width: null,
+            height: null,
+            terminal: spec.terminal !== undefined ? Boolean(spec.terminal) : null,
+            titleBar: typeof spec.titleBar === "string" ? spec.titleBar : null,
+            hidden: typeof spec.hidden === "boolean" ? spec.hidden : null,
+            fontSize: typeof spec.fontSize === "number" ? spec.fontSize : null,
+            input:
+                spec.input !== undefined
+                    ? {
+                          placeholder:
+                              typeof spec.input.placeholder === "string"
+                                  ? spec.input.placeholder
+                                  : null,
+                      }
+                    : null,
+            selected: typeof spec.selected === "boolean" ? spec.selected : null,
         },
         spec.input?.onSubmit ?? null,
     );

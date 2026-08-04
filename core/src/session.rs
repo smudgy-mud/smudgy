@@ -15,7 +15,9 @@ use crate::{
     models::hotkeys::HotkeyDefinition,
     session::runtime::input::InputOp,
     session::runtime::line_operation::LineOperation,
-    session::runtime::pane::{PaneDef, PaneKey, PanePlacement, SplitDirection},
+    session::runtime::pane::{
+        PaneDef, PaneKey, PanePlacement, SplitDirection, TabPosition,
+    },
 };
 
 pub mod config;
@@ -102,6 +104,14 @@ pub enum SessionEvent {
         direction: SplitDirection,
         size_px: Option<f32>,
     },
+    PaneGroupWith {
+        key: PaneKey,
+        reference_session: SessionId,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    PaneSelect { key: PaneKey },
     /// A script asked to move a pane into a fresh dedicated window
     /// (`pane.tearOut`): the drag tear-out flow minus the drag. `width`/
     /// `height` size the new window (floored by the window minimum); omitted

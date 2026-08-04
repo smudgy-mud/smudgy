@@ -1588,6 +1588,8 @@ impl ManagedSession {
                     // forward; no session-store state is involved.
                     SessionEvent::PaneResize { .. }
                     | SessionEvent::PaneRelocate { .. }
+                    | SessionEvent::PaneGroupWith { .. }
+                    | SessionEvent::PaneSelect { .. }
                     | SessionEvent::PaneTearOut { .. }
                     | SessionEvent::PaneSwap { .. }
                     | SessionEvent::LayoutSave { .. }

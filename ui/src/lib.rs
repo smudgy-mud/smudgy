@@ -13,7 +13,9 @@ use smudgy_cloud::cloud_api::{AreaPref, CloudApiClient};
 use smudgy_cloud::{AreaId, CloudError, Mapper};
 use smudgy_core::models::map_scopes::{MapScopes, ScopeState};
 use smudgy_core::models::settings::{MapAreaPref, Settings};
-use smudgy_core::session::runtime::pane::{MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection};
+use smudgy_core::session::runtime::pane::{
+    MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection, TabPosition,
+};
 use smudgy_core::session::{SessionEvent, SessionId, TaggedSessionEvent};
 
 // Core session imports
@@ -1590,7 +1592,7 @@ fn reset_session_layout(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Mess
             smudgy,
             session_id,
             pane.key,
-            PanePlacement {
+            PanePlacement::Split {
                 reference: MAIN_PANE_KEY,
                 direction: SplitDirection::Right,
                 size_px: None,
@@ -1769,7 +1771,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         smudgy,
                         slot.session_id,
                         slot.key,
-                        PanePlacement {
+                        PanePlacement::Split {
                             reference: MAIN_PANE_KEY,
                             direction: SplitDirection::Right,
                             size_px: None,
@@ -2137,6 +2139,20 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     direction: *direction,
                     size_px: *size_px,
                 }),
+                SessionEvent::PaneGroupWith {
+                    key,
+                    reference_session,
+                    reference,
+                    position,
+                    selected,
+                } => Some(PaneFollowUp::GroupWith {
+                    key: *key,
+                    reference_session: *reference_session,
+                    reference: *reference,
+                    position: *position,
+                    selected: *selected,
+                }),
+                SessionEvent::PaneSelect { key } => Some(PaneFollowUp::Select { key: *key }),
                 SessionEvent::PaneTearOut { key, width, height } => Some(PaneFollowUp::TearOut {
                     key: *key,
                     width: *width,
@@ -2194,14 +2210,21 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         placement,
                         hidden,
                     }) => {
-                        place_pane_in_windows(smudgy, session_id, key, placement);
+                        let placed = place_pane_in_windows(smudgy, session_id, key, placement);
                         // A pre-hidden spec (`hidden: true` at split) seeds
                         // the hosting window's toggle before first paint —
                         // reveal-on-event panes never flash at load.
                         if hidden {
                             sync_pane_hidden(smudgy, PaneRef { session_id, key }, true);
                         }
-                        report_pane_sizes(smudgy)
+                        let select = if placed
+                            && matches!(placement, PanePlacement::Tab { selected: true, .. })
+                        {
+                            select_script_pane(smudgy, PaneRef { session_id, key })
+                        } else {
+                            Task::none()
+                        };
+                        Task::batch([select, report_pane_sizes(smudgy)])
                     }
                     Some(PaneFollowUp::Closed(key)) => {
                         remove_pane_from_windows(smudgy, session_id, key)
@@ -2225,6 +2248,25 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         direction,
                         size_px,
                     }) => relocate_script_pane(smudgy, session_id, key, reference, direction, size_px),
+                    Some(PaneFollowUp::GroupWith {
+                        key,
+                        reference_session,
+                        reference,
+                        position,
+                        selected,
+                    }) => group_script_pane(
+                        smudgy,
+                        PaneRef { session_id, key },
+                        PaneRef {
+                            session_id: reference_session,
+                            key: reference,
+                        },
+                        position,
+                        selected,
+                    ),
+                    Some(PaneFollowUp::Select { key }) => {
+                        select_script_pane(smudgy, PaneRef { session_id, key })
+                    }
                     Some(PaneFollowUp::TearOut { key, width, height }) => {
                         tear_out_script_pane(smudgy, session_id, key, width, height)
                     }
@@ -2965,6 +3007,16 @@ enum PaneFollowUp {
         direction: smudgy_core::session::runtime::pane::SplitDirection,
         size_px: Option<f32>,
     },
+    GroupWith {
+        key: PaneKey,
+        reference_session: SessionId,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    Select {
+        key: PaneKey,
+    },
     TearOut {
         key: PaneKey,
         width: Option<f32>,
@@ -3111,6 +3163,118 @@ fn report_pane_sizes(smudgy: &mut Smudgy) -> Task<Message> {
         }
     }
     Task::batch(flushes)
+}
+
+/// Select a pane from script without requesting input focus. Durable tab
+/// selection and the hosting window's active session still follow the pane.
+fn select_script_pane(smudgy: &mut Smudgy, slot: PaneRef) -> Task<Message> {
+    let Some(window_id) = smudgy
+        .smudgy_windows
+        .iter()
+        .find_map(|(id, window)| window.hosts_pane(slot.session_id, slot.key).then_some(*id))
+    else {
+        log::warn!(
+            "No window hosts {} for session {}; dropping select",
+            slot.key,
+            slot.session_id
+        );
+        return Task::none();
+    };
+    let select = smudgy
+        .smudgy_windows
+        .get_mut(&window_id)
+        .map_or_else(Task::none, |window| {
+            window
+                .select_pane_without_focus(slot, &mut smudgy.sessions)
+                .map(move |message| Message::SmudgyWindowMessage(window_id, message))
+        });
+    Task::batch([select, report_pane_sizes(smudgy)])
+}
+
+/// Move one pane into the reference pane's current tab group, including main
+/// panes and cross-window/cross-session pairs. Selection is opt-in and never
+/// requests keyboard focus.
+fn group_script_pane(
+    smudgy: &mut Smudgy,
+    slot: PaneRef,
+    reference: PaneRef,
+    position: TabPosition,
+    selected: bool,
+) -> Task<Message> {
+    if slot == reference {
+        return Task::none();
+    }
+    let source_id = smudgy
+        .smudgy_windows
+        .iter()
+        .find_map(|(id, window)| window.hosts_pane(slot.session_id, slot.key).then_some(*id));
+    let target_id = smudgy
+        .smudgy_windows
+        .iter()
+        .find_map(|(id, window)| {
+            window.hosts_pane(reference.session_id, reference.key).then_some(*id)
+        });
+    let (Some(source_id), Some(target_id)) = (source_id, target_id) else {
+        log::warn!("Dropping groupWith because one of its panes is no longer hosted");
+        return Task::none();
+    };
+
+    if source_id == target_id {
+        let moved = smudgy
+            .smudgy_windows
+            .get_mut(&source_id)
+            .is_some_and(|window| window.group_pane_with(slot, reference, position));
+        if !moved {
+            return Task::none();
+        }
+        let select = if selected {
+            select_script_pane(smudgy, slot)
+        } else {
+            Task::none()
+        };
+        return Task::batch([select, report_pane_sizes(smudgy)]);
+    }
+
+    let Some((target_group, insertion_slot)) = smudgy
+        .smudgy_windows
+        .get(&target_id)
+        .and_then(|window| window.tab_merge_target(reference, position))
+    else {
+        return Task::none();
+    };
+    let Some((tab, hidden, emptied)) = smudgy
+        .smudgy_windows
+        .get_mut(&source_id)
+        .and_then(|source| source.extract_pane_tab(slot))
+    else {
+        return Task::none();
+    };
+    if let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) {
+        source.repair_active_session_without_focus();
+    }
+    if let Some(target) = smudgy.smudgy_windows.get_mut(&target_id) {
+        target.adopt_drag_tab_merge(tab, target_group, insertion_slot);
+        target.set_pane_hidden(slot, hidden);
+    } else {
+        debug_assert!(false, "groupWith destination vanished during one update");
+        if let Some(source) = smudgy.smudgy_windows.get_mut(&source_id) {
+            source.adopt_torn_out_tab(tab);
+            source.set_pane_hidden(slot, hidden);
+        }
+        return report_pane_sizes(smudgy);
+    }
+
+    let select = if selected {
+        select_script_pane(smudgy, slot)
+    } else {
+        Task::none()
+    };
+    let close = if emptied {
+        close_emptied_windows(smudgy, vec![source_id])
+    } else {
+        Task::none()
+    };
+    Task::batch([select, close, report_pane_sizes(smudgy)])
 }
 
 /// Apply a script `pane.relocate` (panes.md placement commands): detach the
@@ -3394,7 +3558,7 @@ fn place_pane_in_windows(
     session_id: SessionId,
     key: PaneKey,
     placement: PanePlacement,
-) {
+) -> bool {
     // A placeholder staged for this pane (a template restore or an adopted
     // vacancy) wins over the script's placement request: the pane binds in
     // place, in its stored position, and its stored eyeball preference
@@ -3417,7 +3581,7 @@ fn place_pane_in_windows(
             } else {
                 smudgy.restore.owe_hidden(session_id, key, hidden);
             }
-            return;
+            return false;
         }
     }
     let target = smudgy
@@ -3425,7 +3589,7 @@ fn place_pane_in_windows(
         .iter()
         .find_map(|(id, window)| {
             window
-                .hosts_pane(session_id, placement.reference)
+                .hosts_pane(session_id, placement.reference())
                 .then_some(*id)
         })
         .or_else(|| {
@@ -3435,8 +3599,14 @@ fn place_pane_in_windows(
         })
         .or_else(|| smudgy.smudgy_windows.keys().next().copied());
     match target.and_then(|id| smudgy.smudgy_windows.get_mut(&id)) {
-        Some(window) => window.place_session_pane(session_id, key, placement),
-        None => log::warn!("No window available to place {key} for session {session_id}"),
+        Some(window) => {
+            window.place_session_pane(session_id, key, placement);
+            true
+        }
+        None => {
+            log::warn!("No window available to place {key} for session {session_id}");
+            false
+        }
     }
 }
 
