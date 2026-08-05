@@ -181,8 +181,8 @@ pub struct ManagedSession {
     main_title_bar: TitleBarPolicy,
     /// The main pane's terminal font override, mirrored beside
     /// `main_title_bar` (set via `setFontSize` on main, `change-display`
-    /// gated). Scrollback text only — the session input stays on the global
-    /// preference.
+    /// gated). The fused session input uses the same effective size as the
+    /// terminal.
     main_font_size: Option<f32>,
 
     widget_root: WidgetRoot<'static, crate::Theme, crate::Renderer>,
@@ -963,14 +963,22 @@ impl ManagedSession {
                     }
                 };
                 match pane.input.as_ref() {
-                    Some(input) => column![
-                        content,
-                        input.view().map(move |msg| Message::PaneInput(key, msg))
-                    ]
-                    .spacing(10)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into(),
+                    Some(input) => {
+                        // A terminal pane's attached input follows its local
+                        // font override. Widgets-only pane inputs keep using
+                        // the global terminal preference.
+                        let font_size = pane.buffer.as_ref().and(pane.def.font_size);
+                        column![
+                            content,
+                            input
+                                .view(font_size)
+                                .map(move |msg| Message::PaneInput(key, msg))
+                        ]
+                        .spacing(10)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                    }
                     None => content,
                 }
             }
@@ -1859,7 +1867,7 @@ impl ManagedSession {
         let terminal_area = stack![terminal, widgets];
 
         // Map input messages to session messages
-        let input = self.input.view().map(Message::Input);
+        let input = self.input.view(self.main_font_size).map(Message::Input);
 
         let body: Element<'_, Message> = column![terminal_area, input]
             .spacing(10)
