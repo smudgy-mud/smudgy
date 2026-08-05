@@ -83,7 +83,10 @@ pub(crate) use store::SharedSessionStore;
 
 use crate::get_smudgy_home;
 use crate::models::settings::load_settings;
-use crate::session::{HotkeyId, PackageProviderFactory, ScriptExtensionFactory, registry};
+use crate::session::{
+    HotkeyId, PackageProviderFactory, ScriptExtensionFactory, registry,
+    ui_command::{UiCommandBus, UiCommandProducer},
+};
 
 use super::{SessionId, TaggedSessionEvent, connection::Connection, styled_line::StyledLine};
 
@@ -332,6 +335,7 @@ impl Runtime {
         // on the session thread before every `ScriptEngine::new` below.
         on_engine_rebuild: Option<crate::session::EngineResetHook>,
         ui_tx: Sender<TaggedSessionEvent>,
+        ui_commands: Option<UiCommandBus>,
     ) -> Self {
         let (session_runtime_tx, session_runtime_rx) =
             tokio::sync::mpsc::unbounded_channel::<RuntimeAction>();
@@ -341,6 +345,7 @@ impl Runtime {
         let local_server_name = server_name.clone();
         let local_profile_name = profile_name.clone();
         let local_ui_tx = ui_tx.clone();
+        let ui_command_producer = ui_commands.map(|bus| UiCommandProducer::new(session_id, bus));
         let (automation_tx, _) =
             broadcast::channel::<AutomationEvent>(AUTOMATION_BROADCAST_CAPACITY);
         let local_automation_tx = automation_tx.clone();
@@ -494,6 +499,7 @@ impl Runtime {
                 session_id,
                 server_name: &local_server_name,
                 ui_tx: local_ui_tx.clone(),
+                ui_command_producer: ui_command_producer.clone(),
                 spawned_actions: spawned_actions.clone(),
                 pending_line_operations: &pending_line_operations,
                 emitted_line_count: Rc::downgrade(&emitted_line_count),
@@ -547,6 +553,7 @@ impl Runtime {
                 session_runtime_tx: local_session_runtime_tx.clone(),
                 spawned_actions: spawned_actions.clone(),
                 ui_tx: local_ui_tx.clone(),
+                ui_command_producer: ui_command_producer.clone(),
                 automation_tx: local_automation_tx.clone(),
                 last_automation_receivers: 0,
                 catalogue_tx: local_catalogue_tx.clone(),
@@ -756,6 +763,7 @@ impl Runtime {
                     session_id,
                     server_name: &local_server_name,
                     ui_tx: local_ui_tx.clone(),
+                    ui_command_producer: ui_command_producer.clone(),
                     spawned_actions: spawned_actions.clone(),
                     pending_line_operations: &pending_line_operations,
                     emitted_line_count: Rc::downgrade(&emitted_line_count),
@@ -832,6 +840,7 @@ impl Runtime {
                     session_runtime_tx: local_session_runtime_tx.clone(),
                     spawned_actions: spawned_actions.clone(),
                     ui_tx: local_ui_tx.clone(),
+                    ui_command_producer: ui_command_producer.clone(),
                     automation_tx: local_automation_tx.clone(),
                     last_automation_receivers: 0,
                     catalogue_tx: local_catalogue_tx.clone(),
@@ -962,6 +971,7 @@ struct Inner<'a> {
     session_runtime_tx: UnboundedSender<RuntimeAction>,
     spawned_actions: ActionQueue,
     ui_tx: Sender<TaggedSessionEvent>,
+    ui_command_producer: Option<UiCommandProducer>,
     automation_tx: broadcast::Sender<AutomationEvent>,
     /// Receiver count last seen at the drain point; an increase means a new window
     /// subscribed and needs a fresh reset broadcast.

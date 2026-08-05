@@ -1,5 +1,5 @@
 #![allow(clippy::pedantic)]
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +15,9 @@ use smudgy_core::models::map_scopes::{MapScopes, ScopeState};
 use smudgy_core::models::settings::{MapAreaPref, Settings};
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection, TabPosition,
+};
+use smudgy_core::session::ui_command::{
+    PaneCommand, UiCommand, UiCommandEnvelope, UiCommandReceiver,
 };
 use smudgy_core::session::{SessionEvent, SessionId, TaggedSessionEvent};
 
@@ -100,6 +103,17 @@ struct Smudgy {
     /// All live sessions, window-independent: windows' grids hold pane
     /// references into this store, and session events route here directly.
     sessions: SessionStore,
+    /// Single consumer for imperative UI mutations issued by every script
+    /// runtime. Its channel receive order is the daemon's canonical order.
+    ui_commands: UiCommandReceiver,
+    /// Commands whose pane dependencies are not hosted yet. A later Open
+    /// retries them in bus order; retirement cancels them permanently.
+    pending_pane_commands: VecDeque<PaneCommand>,
+    retired_panes: HashSet<PaneRef>,
+    /// Ordered close events that overtook their command on iced's independent
+    /// subscriptions. The command completes display-state retirement.
+    pending_ordered_pane_closes: HashSet<PaneRef>,
+    last_ui_command_seq: HashMap<SessionId, u64>,
     smudgy_windows: BTreeMap<window::Id, SmudgyWindow>,
     automations_windows: BTreeMap<window::Id, AutomationsWindow>,
     map_editor_windows: BTreeMap<window::Id, MapEditorWindow>,
@@ -189,6 +203,7 @@ enum Message {
     /// session store (whatever window hosts the session's pane repaints from
     /// the shared state).
     SessionEvent(TaggedSessionEvent),
+    UiCommand(UiCommandEnvelope),
     /// A session-level action carrying no window context: task continuations
     /// from store-routed updates and daemon fan-outs (settings changes,
     /// script reloads, widget wake-ups).
@@ -373,7 +388,8 @@ fn init() -> (Smudgy, Task<Message>) {
         Task::none()
     };
 
-    let sessions = SessionStore::new(account.handles());
+    let (ui_command_bus, ui_commands) = smudgy_core::session::ui_command::channel();
+    let sessions = SessionStore::with_ui_commands(account.handles(), ui_command_bus);
     let discord = DiscordPresence::new(settings.discord_rich_presence);
 
     // The workspace mirror is disabled entirely under the scripted-matrix
@@ -408,6 +424,11 @@ fn init() -> (Smudgy, Task<Message>) {
             account,
             discord,
             sessions,
+            ui_commands,
+            pending_pane_commands: VecDeque::new(),
+            retired_panes: HashSet::new(),
+            pending_ordered_pane_closes: HashSet::new(),
+            last_ui_command_seq: HashMap::new(),
             smudgy_windows,
             automations_windows: BTreeMap::new(),
             map_editor_windows: BTreeMap::new(),
@@ -538,6 +559,7 @@ pub fn run() -> anyhow::Result<()> {
 
 fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
     let mut subs = vec![
+        Subscription::run_with(smudgy.ui_commands.clone(), Clone::clone).map(Message::UiCommand),
         // Session runtimes: one event stream per live session, owned at the
         // daemon because sessions are window-independent.
         Subscription::batch(
@@ -1759,6 +1781,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     .collect();
                 for session_id in &victims {
                     smudgy.sessions.shutdown_and_remove(*session_id);
+                    forget_session_pane_commands(smudgy, *session_id);
                 }
                 let purge_task = purge_sessions_from_windows(smudgy, &victims);
                 for slot in orphans {
@@ -2090,7 +2113,38 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             // way: finish the deferred quit.
             iced::exit()
         }
+        Message::UiCommand(envelope) => handle_ui_command(smudgy, envelope),
         Message::SessionEvent(TaggedSessionEvent { session_id, event }) => {
+            // Open is repeated on the owning session stream to order display
+            // state before output. A fast later Close can win the independent
+            // bus subscription; do not let that delayed echo resurrect the
+            // retired layout entry.
+            if let SessionEvent::PaneOpened { def, .. } = &event {
+                let pane = PaneRef {
+                    session_id,
+                    key: def.key,
+                };
+                if smudgy.retired_panes.contains(&pane) {
+                    log::debug!("Dropping delayed PaneOpened for retired pane {pane:?}");
+                    return Task::none();
+                }
+            }
+            // The command bus and each session stream are separate iced
+            // subscriptions. If the flush-confirming close event wins their
+            // race, hold it until the command has removed the pane from the
+            // layout in canonical bus order.
+            if let SessionEvent::PaneClosedOrdered(key) = &event {
+                let pane = PaneRef {
+                    session_id,
+                    key: *key,
+                };
+                if !smudgy.retired_panes.contains(&pane) {
+                    if smudgy.sessions.get(session_id).is_some() {
+                        smudgy.pending_ordered_pane_closes.insert(pane);
+                    }
+                    return Task::none();
+                }
+            }
             // Connection edges re-derive the Discord activity — after the
             // session's own update below has adopted the new connected state.
             let presence_edge =
@@ -2118,7 +2172,17 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     placement: *placement,
                     hidden: def.hidden,
                 }),
-                SessionEvent::PaneClosed(key) => Some(PaneFollowUp::Closed(*key)),
+                SessionEvent::PaneClosed(key) => {
+                    retire_pane_commands(
+                        smudgy,
+                        PaneRef {
+                            session_id,
+                            key: *key,
+                        },
+                    );
+                    Some(PaneFollowUp::Closed(*key))
+                }
+                SessionEvent::PaneClosedOrdered(_) => None,
                 SessionEvent::PaneUpdated(def) => Some(PaneFollowUp::DefSync {
                     key: def.key,
                     hidden: def.hidden,
@@ -2304,7 +2368,12 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 if presence_edge {
                     refresh_discord_presence(smudgy);
                 }
-                Task::batch([task, pane_task, scope_task])
+                Task::batch([
+                    task,
+                    pane_task,
+                    scope_task,
+                    drain_pending_pane_commands(smudgy),
+                ])
             } else {
                 // The session was torn down (its store entry goes first) with
                 // this event already in flight; dropping the event here is
@@ -2833,6 +2902,7 @@ fn close_session(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Message> {
     if !smudgy.sessions.shutdown_and_remove(session_id) {
         return Task::none();
     }
+    forget_session_pane_commands(smudgy, session_id);
     log::info!("Closed session {session_id}");
     smudgy.restore.forget_session(session_id);
     smudgy.workspace.forget_session(session_id);
@@ -2977,6 +3047,369 @@ fn close_emptied_windows(smudgy: &mut Smudgy, emptied: Vec<window::Id>) -> Task<
         }
     }
     Task::batch(tasks)
+}
+
+/// Accept one command from the shared runtime -> daemon sequencer. Channel
+/// order is authoritative; the per-origin stamp is an assertion/diagnostic,
+/// not a second ordering mechanism.
+fn handle_ui_command(smudgy: &mut Smudgy, envelope: UiCommandEnvelope) -> Task<Message> {
+    let expected = smudgy
+        .last_ui_command_seq
+        .entry(envelope.origin)
+        .or_insert(0);
+    if envelope.origin_seq != *expected {
+        log::warn!(
+            "UI command sequence gap for {}: expected {}, received {}",
+            envelope.origin,
+            *expected,
+            envelope.origin_seq
+        );
+    }
+    *expected = (*expected).max(envelope.origin_seq.saturating_add(1));
+
+    match envelope.command {
+        UiCommand::Pane(command) => queue_pane_command(smudgy, command),
+    }
+}
+
+fn pane_command_dependencies(command: &PaneCommand) -> Vec<PaneRef> {
+    match command {
+        // Open creates readiness; Close terminates it and is valid even if a
+        // stale layout no longer hosts the pane.
+        PaneCommand::Open { .. } | PaneCommand::Close { .. } => Vec::new(),
+        PaneCommand::Resize {
+            session_id, key, ..
+        }
+        | PaneCommand::Select { session_id, key }
+        | PaneCommand::TearOut {
+            session_id, key, ..
+        } => vec![PaneRef {
+            session_id: *session_id,
+            key: *key,
+        }],
+        PaneCommand::Relocate {
+            session_id,
+            key,
+            reference,
+            ..
+        } => vec![
+            PaneRef {
+                session_id: *session_id,
+                key: *key,
+            },
+            PaneRef {
+                session_id: *session_id,
+                key: *reference,
+            },
+        ],
+        PaneCommand::GroupWith {
+            session_id,
+            key,
+            reference_session,
+            reference,
+            ..
+        } => vec![
+            PaneRef {
+                session_id: *session_id,
+                key: *key,
+            },
+            PaneRef {
+                session_id: *reference_session,
+                key: *reference,
+            },
+        ],
+        PaneCommand::Swap {
+            session_id,
+            key,
+            other_session,
+            other_key,
+        } => vec![
+            PaneRef {
+                session_id: *session_id,
+                key: *key,
+            },
+            PaneRef {
+                session_id: *other_session,
+                key: *other_key,
+            },
+        ],
+    }
+}
+
+fn pane_is_hosted(smudgy: &Smudgy, pane: PaneRef) -> bool {
+    smudgy
+        .smudgy_windows
+        .values()
+        .any(|window| window.hosts_pane(pane.session_id, pane.key))
+}
+
+fn pane_command_ready(smudgy: &Smudgy, command: &PaneCommand) -> bool {
+    pane_command_dependencies(command)
+        .into_iter()
+        .all(|pane| pane_is_hosted(smudgy, pane))
+}
+
+fn pane_command_retired(smudgy: &Smudgy, command: &PaneCommand) -> bool {
+    let lifecycle_pane = match command {
+        PaneCommand::Open {
+            session_id, def, ..
+        } => Some(PaneRef {
+            session_id: *session_id,
+            key: def.key,
+        }),
+        PaneCommand::Close { session_id, key } => Some(PaneRef {
+            session_id: *session_id,
+            key: *key,
+        }),
+        _ => None,
+    };
+    if lifecycle_pane.is_some_and(|pane| smudgy.retired_panes.contains(&pane)) {
+        return true;
+    }
+    pane_command_dependencies(command)
+        .into_iter()
+        .any(|pane| smudgy.retired_panes.contains(&pane))
+}
+
+fn pane_command_has_closed_session(smudgy: &Smudgy, command: &PaneCommand) -> bool {
+    let closed = |session_id| smudgy.sessions.get(session_id).is_none();
+    match command {
+        PaneCommand::Open { session_id, .. }
+        | PaneCommand::Close { session_id, .. }
+        | PaneCommand::Resize { session_id, .. }
+        | PaneCommand::Relocate { session_id, .. }
+        | PaneCommand::Select { session_id, .. }
+        | PaneCommand::TearOut { session_id, .. } => closed(*session_id),
+        PaneCommand::GroupWith {
+            session_id,
+            reference_session,
+            ..
+        } => closed(*session_id) || closed(*reference_session),
+        PaneCommand::Swap {
+            session_id,
+            other_session,
+            ..
+        } => closed(*session_id) || closed(*other_session),
+    }
+}
+
+/// Preserve bus order for commands that unexpectedly arrive before a pane is
+/// hosted. Lifecycle edges are allowed through: Open makes a pane ready and
+/// Close retires any stale commands waiting on it. Under the registry-lock
+/// publication invariant this queue is normally empty; keeping it makes a
+/// missing host recoverable instead of a permanent warn-and-drop.
+fn queue_pane_command(smudgy: &mut Smudgy, command: PaneCommand) -> Task<Message> {
+    if pane_command_has_closed_session(smudgy, &command) {
+        log::debug!("Dropping UI pane command for a closed session");
+        return Task::none();
+    }
+    if pane_command_retired(smudgy, &command) {
+        log::warn!("Dropping UI pane command that references a retired pane");
+        return Task::none();
+    }
+
+    let is_lifecycle_edge = matches!(
+        command,
+        PaneCommand::Open { .. } | PaneCommand::Close { .. }
+    );
+    let mut tasks = Vec::new();
+    if is_lifecycle_edge
+        || (smudgy.pending_pane_commands.is_empty() && pane_command_ready(smudgy, &command))
+    {
+        tasks.push(apply_pane_command(smudgy, command));
+    } else {
+        smudgy.pending_pane_commands.push_back(command);
+    }
+    tasks.push(drain_pending_pane_commands(smudgy));
+    Task::batch(tasks)
+}
+
+fn drain_pending_pane_commands(smudgy: &mut Smudgy) -> Task<Message> {
+    let mut tasks = Vec::new();
+    while let Some(front) = smudgy.pending_pane_commands.front() {
+        if pane_command_has_closed_session(smudgy, front) {
+            smudgy.pending_pane_commands.pop_front();
+            continue;
+        }
+        if pane_command_retired(smudgy, front) {
+            smudgy.pending_pane_commands.pop_front();
+            continue;
+        }
+        if !pane_command_ready(smudgy, front) {
+            break;
+        }
+        let command = smudgy
+            .pending_pane_commands
+            .pop_front()
+            .expect("front checked above");
+        tasks.push(apply_pane_command(smudgy, command));
+    }
+    Task::batch(tasks)
+}
+
+fn retire_pane_commands(smudgy: &mut Smudgy, pane: PaneRef) {
+    smudgy.retired_panes.insert(pane);
+    smudgy.pending_pane_commands.retain(|command| {
+        !pane_command_dependencies(command)
+            .into_iter()
+            .any(|dependency| dependency == pane)
+    });
+}
+
+fn pane_command_mentions_session(command: &PaneCommand, session_id: SessionId) -> bool {
+    match command {
+        PaneCommand::Open {
+            session_id: target, ..
+        }
+        | PaneCommand::Resize {
+            session_id: target, ..
+        }
+        | PaneCommand::Close {
+            session_id: target, ..
+        }
+        | PaneCommand::Relocate {
+            session_id: target, ..
+        }
+        | PaneCommand::Select {
+            session_id: target, ..
+        }
+        | PaneCommand::TearOut {
+            session_id: target, ..
+        } => *target == session_id,
+        PaneCommand::GroupWith {
+            session_id: target,
+            reference_session,
+            ..
+        } => *target == session_id || *reference_session == session_id,
+        PaneCommand::Swap {
+            session_id: target,
+            other_session,
+            ..
+        } => *target == session_id || *other_session == session_id,
+    }
+}
+
+fn forget_session_pane_commands(smudgy: &mut Smudgy, session_id: SessionId) {
+    smudgy
+        .pending_pane_commands
+        .retain(|command| !pane_command_mentions_session(command, session_id));
+    smudgy
+        .retired_panes
+        .retain(|pane| pane.session_id != session_id);
+    smudgy
+        .pending_ordered_pane_closes
+        .retain(|pane| pane.session_id != session_id);
+    smudgy.last_ui_command_seq.remove(&session_id);
+}
+
+fn apply_pane_command(smudgy: &mut Smudgy, command: PaneCommand) -> Task<Message> {
+    match command {
+        PaneCommand::Open {
+            session_id,
+            def,
+            placement,
+        } => {
+            let key = def.key;
+            let hidden = def.hidden;
+            let Some(session) = smudgy.sessions.get_mut(session_id) else {
+                log::debug!("Dropping pane Open for closed session {session_id}");
+                return Task::none();
+            };
+            // The owning session event repeats this materialization ahead of
+            // AppendTo; `open_pane` is deliberately idempotent by key.
+            session.open_pane(def);
+            let placed = place_pane_in_windows(smudgy, session_id, key, placement);
+            if hidden {
+                sync_pane_hidden(smudgy, PaneRef { session_id, key }, true);
+            }
+            let select = if placed && matches!(placement, PanePlacement::Tab { selected: true, .. })
+            {
+                select_script_pane(smudgy, PaneRef { session_id, key })
+            } else {
+                Task::none()
+            };
+            Task::batch([select, report_pane_sizes(smudgy)])
+        }
+        PaneCommand::Close { session_id, key } => {
+            let pane = PaneRef { session_id, key };
+            retire_pane_commands(smudgy, pane);
+            let remove = remove_pane_from_windows(smudgy, session_id, key);
+            let retire_display = if smudgy.pending_ordered_pane_closes.remove(&pane) {
+                if let Some(session) = smudgy.sessions.get_mut(session_id) {
+                    session
+                        .update(session_store::Message::SessionEvent(
+                            SessionEvent::PaneClosedOrdered(key),
+                        ))
+                        .map(move |msg| Message::SessionAction(session_id, msg))
+                } else {
+                    Task::none()
+                }
+            } else {
+                Task::none()
+            };
+            Task::batch([remove, retire_display])
+        }
+        PaneCommand::Resize {
+            session_id,
+            key,
+            width,
+            height,
+        } => {
+            let slot = PaneRef { session_id, key };
+            for window in smudgy.smudgy_windows.values_mut() {
+                if window.hosts_pane(session_id, key) {
+                    window.resize_pane_slot(slot, width, height);
+                }
+            }
+            report_pane_sizes(smudgy)
+        }
+        PaneCommand::Relocate {
+            session_id,
+            key,
+            reference,
+            direction,
+            size_px,
+        } => relocate_script_pane(smudgy, session_id, key, reference, direction, size_px),
+        PaneCommand::GroupWith {
+            session_id,
+            key,
+            reference_session,
+            reference,
+            position,
+            selected,
+        } => group_script_pane(
+            smudgy,
+            PaneRef { session_id, key },
+            PaneRef {
+                session_id: reference_session,
+                key: reference,
+            },
+            position,
+            selected,
+        ),
+        PaneCommand::Select { session_id, key } => {
+            select_script_pane(smudgy, PaneRef { session_id, key })
+        }
+        PaneCommand::TearOut {
+            session_id,
+            key,
+            width,
+            height,
+        } => tear_out_script_pane(smudgy, session_id, key, width, height),
+        PaneCommand::Swap {
+            session_id,
+            key,
+            other_session,
+            other_key,
+        } => swap_script_panes(
+            smudgy,
+            PaneRef { session_id, key },
+            PaneRef {
+                session_id: other_session,
+                key: other_key,
+            },
+        ),
+    }
 }
 
 /// Place a freshly opened script pane into the window hosting its reference
@@ -3559,6 +3992,16 @@ fn place_pane_in_windows(
     key: PaneKey,
     placement: PanePlacement,
 ) -> bool {
+    // Open also travels the owning session stream to order display-state
+    // materialization before AppendTo. Whichever path reaches the daemon
+    // second must not duplicate a pane that a later bus command already moved.
+    if smudgy
+        .smudgy_windows
+        .values()
+        .any(|window| window.hosts_pane(session_id, key))
+    {
+        return false;
+    }
     // A placeholder staged for this pane (a template restore or an adopted
     // vacancy) wins over the script's placement request: the pane binds in
     // place, in its stored position, and its stored eyeball preference

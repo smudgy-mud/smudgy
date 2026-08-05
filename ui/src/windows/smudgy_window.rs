@@ -237,6 +237,24 @@ pub struct PaneRef {
     pub key: PaneKey,
 }
 
+/// Identify the one input a tab selection displaced. Script selection only
+/// blurs a pane actually obscured by the tab change; an ordinary chrome
+/// re-selection also releases the prior focus group when activation moves.
+fn displaced_input_for_selection(
+    request_focus: bool,
+    rendered: Option<PaneRef>,
+    previously_rendered: Option<PaneRef>,
+    previously_focused: Option<PaneRef>,
+) -> Option<PaneRef> {
+    if rendered != previously_rendered {
+        previously_rendered
+    } else if request_focus {
+        previously_focused
+    } else {
+        None
+    }
+}
+
 /// One group's rendered pane before and after a pane payload exchange —
 /// `None` on either side when the group rendered nothing (every member tab
 /// hidden under a collapsed toolbar, or unbound).
@@ -1710,6 +1728,7 @@ impl SmudgyWindow {
             return Task::none();
         };
         let slot = self.layout.tab(tab).and_then(|t| t.binding().copied());
+        let previously_focused = self.focus_group.and_then(|group| self.rendered_slot(group));
         // The slot rendered before this selection — the pane the switch is
         // about to obscure.
         let previously_rendered = self.rendered_slot(group);
@@ -1755,16 +1774,31 @@ impl SmudgyWindow {
                 // holds focus — the stock focus operation would move its
                 // caret to the end.
                 focus_task = components::session_input::focus_target(session.input.input_id());
-            } else if rendered != previously_rendered {
-                // The newly rendered pane offers no main input to hand focus
-                // to. Release focus everywhere instead: without this, the
-                // previously rendered tab's input would keep keyboard focus
-                // while obscured, sending keystrokes into an invisible
-                // widget. (The host routes operations through every mounted
-                // subtree, so the release reaches the obscured input.)
-                focus_task = iced::advanced::widget::operate(
-                    iced::advanced::widget::operation::focusable::unfocus(),
+            } else {
+                // Release only the input this selection displaced. Iced runs
+                // widget operations through every application window, so the
+                // stock blanket `unfocus()` would let a script selecting a tab
+                // in a background window clear (and potentially erase) the
+                // user's foreground input.
+                //
+                // A changed tab displaces that group's previously rendered
+                // pane. An ordinary re-selection of an already-selected
+                // non-main tab instead displaces the prior focus group's
+                // input; retaining this second case prevents keystrokes from
+                // staying attached to another session after activation moves.
+                let displaced = displaced_input_for_selection(
+                    request_focus,
+                    rendered,
+                    previously_rendered,
+                    previously_focused,
                 );
+                if let Some(input_id) = displaced.and_then(|pane| {
+                    sessions
+                        .get(pane.session_id)
+                        .and_then(|session| session.pane_input_id(pane.key))
+                }) {
+                    focus_task = components::session_input::unfocus_target(input_id);
+                }
             }
             // The newly rendered pane occupies the group's existing region;
             // report that size before its first paint.
@@ -4019,6 +4053,29 @@ mod tests {
         assert_eq!(window.rendered_slot(group), Some(main));
         assert!(window.pane_hidden(hidden));
         assert_eq!(window.active_session_id(), Some(hidden.session_id));
+    }
+
+    #[test]
+    fn selection_blurs_only_the_input_it_displaced() {
+        let old_tab = main_pane(1);
+        let new_tab = main_pane(2);
+        let other_group = main_pane(3);
+
+        assert_eq!(
+            displaced_input_for_selection(false, Some(new_tab), Some(old_tab), Some(other_group),),
+            Some(old_tab),
+            "script selection blurs the pane it actually obscured"
+        );
+        assert_eq!(
+            displaced_input_for_selection(false, Some(new_tab), Some(new_tab), Some(other_group),),
+            None,
+            "an unchanged background tab must not disturb another focus group/window"
+        );
+        assert_eq!(
+            displaced_input_for_selection(true, Some(new_tab), Some(new_tab), Some(other_group),),
+            Some(other_group),
+            "ordinary re-selection still releases the previous focus group"
+        );
     }
 
     #[test]
