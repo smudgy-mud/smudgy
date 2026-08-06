@@ -67,7 +67,7 @@ impl<T> Operation<T> for UnfocusTarget {
 }
 
 /// A [`Task`] running [`UnfocusTarget`] against `target`.
-fn unfocus_target<T: Send + 'static>(target: Id) -> Task<T> {
+pub fn unfocus_target<T: Send + 'static>(target: Id) -> Task<T> {
     iced::advanced::widget::operate(UnfocusTarget { target })
 }
 
@@ -962,8 +962,12 @@ impl SessionInput {
         }
     }
 
-    /// Render the component
-    pub fn view(&self) -> Element<'_, Message> {
+    /// Render the component at the terminal pane's effective font size.
+    ///
+    /// `font_size` is the pane-local override when this input is attached to
+    /// a terminal. Inputs on widgets-only panes pass `None` and follow the
+    /// global terminal preference.
+    pub fn view(&self, font_size: Option<f32>) -> Element<'_, Message> {
         let prefs = crate::prefs::current();
 
         let input = HotkeyMatchingInput::<Message, crate::theme::Theme, iced::Renderer>::new(
@@ -972,7 +976,7 @@ impl SessionInput {
             &self.value,
         )
         .font(prefs.font)
-        .size(prefs.font_size)
+        .size(font_size.unwrap_or(prefs.font_size))
         .id(self.input_id.clone())
         .secure(self.masked && !self.masked_reveal)
         .suppress_clipboard_writes(self.masked)

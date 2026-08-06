@@ -13,7 +13,7 @@ use iced::{
 use smudgy_cloud::{AreaId, Mapper};
 use smudgy_core::session::SessionId;
 use smudgy_core::session::runtime::pane::{
-    MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection, TitleBarPolicy,
+    MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection, TabPosition, TitleBarPolicy,
 };
 
 use rustc_hash::FxHashMap;
@@ -235,6 +235,24 @@ pub enum Event {
 pub struct PaneRef {
     pub session_id: SessionId,
     pub key: PaneKey,
+}
+
+/// Identify the one input a tab selection displaced. Script selection only
+/// blurs a pane actually obscured by the tab change; an ordinary chrome
+/// re-selection also releases the prior focus group when activation moves.
+fn displaced_input_for_selection(
+    request_focus: bool,
+    rendered: Option<PaneRef>,
+    previously_rendered: Option<PaneRef>,
+    previously_focused: Option<PaneRef>,
+) -> Option<PaneRef> {
+    if rendered != previously_rendered {
+        previously_rendered
+    } else if request_focus {
+        previously_focused
+    } else {
+        None
+    }
 }
 
 /// One group's rendered pane before and after a pane payload exchange —
@@ -1680,6 +1698,28 @@ impl SmudgyWindow {
     /// content only — the grid configuration carries group ids and is not
     /// rebuilt.
     pub fn select_tab(&mut self, tab: TabId, sessions: &mut SessionStore) -> Task<Message> {
+        self.select_tab_with_focus(tab, sessions, true)
+    }
+
+    /// Script-facing selection: update durable selection and activation but
+    /// never pull keyboard focus into the newly shown pane.
+    pub fn select_pane_without_focus(
+        &mut self,
+        slot: PaneRef,
+        sessions: &mut SessionStore,
+    ) -> Task<Message> {
+        let Some(tab) = self.tab_of(slot) else {
+            return Task::none();
+        };
+        self.select_tab_with_focus(tab, sessions, false)
+    }
+
+    fn select_tab_with_focus(
+        &mut self,
+        tab: TabId,
+        sessions: &mut SessionStore,
+        request_focus: bool,
+    ) -> Task<Message> {
         // Selection is the landing step of drops and adoptions that just
         // mutated the model: settle the pending rebuild so the synchronous
         // size report below measures the grid the pane will paint into.
@@ -1688,15 +1728,19 @@ impl SmudgyWindow {
             return Task::none();
         };
         let slot = self.layout.tab(tab).and_then(|t| t.binding().copied());
+        let previously_focused = self.focus_group.and_then(|group| self.rendered_slot(group));
         // The slot rendered before this selection — the pane the switch is
         // about to obscure.
         let previously_rendered = self.rendered_slot(group);
+        let selection_changed = self.layout.selected(group) != Some(tab);
         if !self.layout.select(tab) {
             return Task::none();
         }
-        // Durable selection is persisted per group.
-        self.mark_workspace_dirty();
+        if selection_changed {
+            self.mark_workspace_dirty();
+        }
         self.focus_group = Some(group);
+        let newly_rendered = self.rendered_slot(group);
 
         // The obscured pane's subtree stays mounted behind the new tab, and
         // the focus transfer below blurs its input — a blur the widget
@@ -1706,7 +1750,7 @@ impl SmudgyWindow {
         // clear-on-blur behavior must not consume in-progress text across a
         // tab switch.
         if let Some(previous) = previously_rendered
-            && self.rendered_slot(group) != Some(previous)
+            && newly_rendered != Some(previous)
             && let Some(session) = sessions.get_mut(previous.session_id)
         {
             session.note_pane_input_obscured(previous.key);
@@ -1717,9 +1761,11 @@ impl SmudgyWindow {
             if self.active_session_id != Some(slot.session_id) {
                 self.previous_active_session_id = self.active_session_id;
                 self.active_session_id = Some(slot.session_id);
+                self.mark_workspace_dirty();
             }
-            let rendered = self.rendered_slot(group);
-            if rendered == Some(slot)
+            let rendered = newly_rendered;
+            if request_focus
+                && rendered == Some(slot)
                 && slot.key == MAIN_PANE_KEY
                 && let Some(session) = sessions.get(slot.session_id)
             {
@@ -1728,16 +1774,31 @@ impl SmudgyWindow {
                 // holds focus — the stock focus operation would move its
                 // caret to the end.
                 focus_task = components::session_input::focus_target(session.input.input_id());
-            } else if rendered.is_none_or(|slot| slot.key != MAIN_PANE_KEY) {
-                // The newly rendered pane offers no main input to hand focus
-                // to. Release focus everywhere instead: without this, the
-                // previously rendered tab's input would keep keyboard focus
-                // while obscured, sending keystrokes into an invisible
-                // widget. (The host routes operations through every mounted
-                // subtree, so the release reaches the obscured input.)
-                focus_task = iced::advanced::widget::operate(
-                    iced::advanced::widget::operation::focusable::unfocus(),
+            } else {
+                // Release only the input this selection displaced. Iced runs
+                // widget operations through every application window, so the
+                // stock blanket `unfocus()` would let a script selecting a tab
+                // in a background window clear (and potentially erase) the
+                // user's foreground input.
+                //
+                // A changed tab displaces that group's previously rendered
+                // pane. An ordinary re-selection of an already-selected
+                // non-main tab instead displaces the prior focus group's
+                // input; retaining this second case prevents keystrokes from
+                // staying attached to another session after activation moves.
+                let displaced = displaced_input_for_selection(
+                    request_focus,
+                    rendered,
+                    previously_rendered,
+                    previously_focused,
                 );
+                if let Some(input_id) = displaced.and_then(|pane| {
+                    sessions
+                        .get(pane.session_id)
+                        .and_then(|session| session.pane_input_id(pane.key))
+                }) {
+                    focus_task = components::session_input::unfocus_target(input_id);
+                }
             }
             // The newly rendered pane occupies the group's existing region;
             // report that size before its first paint.
@@ -1838,19 +1899,93 @@ impl SmudgyWindow {
         if self.bindings.contains_key(&slot) {
             return;
         }
-        let (axis, new_first) = direction_axis(placement.direction);
-        let sizing = placement
-            .size_px
-            .map_or(SplitSizing::Ratio(0.5), |px| SplitSizing::Px {
-                px,
-                sized_first: new_first,
-            });
-        let reference = PaneRef {
-            session_id,
-            key: placement.reference,
-        };
-        self.host_tab_beside(Tab::bound(slot), reference, axis, new_first, sizing);
+        match placement {
+            PanePlacement::Split {
+                reference,
+                direction,
+                size_px,
+            } => {
+                let (axis, new_first) = direction_axis(direction);
+                let sizing = size_px.map_or(SplitSizing::Ratio(0.5), |px| SplitSizing::Px {
+                    px,
+                    sized_first: new_first,
+                });
+                let reference = PaneRef {
+                    session_id,
+                    key: reference,
+                };
+                self.host_tab_beside(Tab::bound(slot), reference, axis, new_first, sizing);
+            }
+            PanePlacement::Tab {
+                reference,
+                position,
+                ..
+            } => {
+                let reference = PaneRef {
+                    session_id,
+                    key: reference,
+                };
+                let mut tab = Tab::bound(slot);
+                if let Some((group, insertion_slot)) = self.tab_merge_target(reference, position) {
+                    let id = tab.id();
+                    match self.layout.insert_tab(group, insertion_slot, tab) {
+                        Ok(()) => {
+                            self.bindings.insert(slot, id);
+                            self.mark_grid_dirty();
+                            return;
+                        }
+                        Err(rejected) => tab = rejected,
+                    }
+                }
+                self.host_as_cluster(tab);
+            }
+        }
         self.mark_grid_dirty();
+    }
+
+    /// Resolve a member-counted insertion slot in the reference's current
+    /// group, matching `GroupLayout::merge_tab`.
+    pub fn tab_merge_target(
+        &self,
+        reference: PaneRef,
+        position: TabPosition,
+    ) -> Option<(GroupId, usize)> {
+        let tab = self.tab_of(reference)?;
+        let group = self.layout.group_of(tab)?;
+        let tabs = self.layout.tabs(group)?;
+        let reference_index = tabs.iter().position(|member| member.id() == tab)?;
+        let insertion_slot = match position {
+            TabPosition::Before => reference_index,
+            TabPosition::After => reference_index + 1,
+            TabPosition::End => tabs.len(),
+        };
+        Some((group, insertion_slot))
+    }
+
+    /// Move or reorder one hosted pane into a reference's group without
+    /// changing selection. Returns false if either side went stale.
+    pub fn group_pane_with(
+        &mut self,
+        slot: PaneRef,
+        reference: PaneRef,
+        position: TabPosition,
+    ) -> bool {
+        let Some(tab) = self.tab_of(slot) else {
+            return false;
+        };
+        let Some((target_group, insertion_slot)) = self.tab_merge_target(reference, position) else {
+            return false;
+        };
+        let source_group = self.layout.group_of(tab);
+        if !self.layout.merge_tab(tab, target_group, insertion_slot) {
+            return false;
+        }
+        if source_group == Some(target_group) {
+            self.mark_workspace_dirty();
+        } else {
+            self.mark_grid_dirty();
+        }
+        true
     }
 
     /// Drop one pane's slot from this window's layout. Returns `true` when
@@ -3784,7 +3919,7 @@ mod tests {
         window.place_session_pane(
             slot.session_id,
             slot.key,
-            PanePlacement {
+            PanePlacement::Split {
                 reference,
                 direction: SplitDirection::Right,
                 size_px: None,
@@ -3842,6 +3977,105 @@ mod tests {
         // mark even though the grid configuration needs no rebuild.
         assert!(window.take_workspace_dirty());
         assert!(!window.grid_dirty, "a reorder never re-derives the grid");
+    }
+
+    #[test]
+    fn scripted_tab_creation_inserts_after_reference_without_selecting() {
+        let mut window = test_window();
+        let main = main_pane(1);
+        let script = script_panes_for(1, 1)[0];
+        host_cluster(&mut window, main);
+
+        window.place_session_pane(
+            script.session_id,
+            script.key,
+            PanePlacement::Tab {
+                reference: MAIN_PANE_KEY,
+                position: TabPosition::After,
+                selected: false,
+            },
+        );
+
+        let group = window.group_of_slot(main).expect("main hosted");
+        let tabs = window.layout.tabs(group).expect("group exists");
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].binding(), Some(&main));
+        assert_eq!(tabs[1].binding(), Some(&script));
+        assert_eq!(window.layout.selected(group), Some(tabs[0].id()));
+    }
+
+    #[test]
+    fn scripted_grouping_reorders_main_panes() {
+        let mut window = test_window();
+        let first = main_pane(1);
+        let second = main_pane(2);
+        host_cluster(&mut window, first);
+        host_cluster(&mut window, second);
+
+        assert!(window.group_pane_with(first, second, TabPosition::After));
+        let group = window.group_of_slot(second).expect("target hosted");
+        let tabs = window.layout.tabs(group).expect("group exists");
+        assert_eq!(
+            tabs.iter()
+                .filter_map(|tab| tab.binding().copied())
+                .collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        assert_eq!(window.layout.groups_depth_first().len(), 1);
+
+        assert!(window.group_pane_with(first, second, TabPosition::Before));
+        let tabs = window.layout.tabs(group).expect("group exists");
+        assert_eq!(
+            tabs.iter()
+                .filter_map(|tab| tab.binding().copied())
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn script_select_keeps_hidden_pane_hidden_but_activates_its_session() {
+        let mut window = test_window();
+        let mut sessions = SessionStore::new(crate::cloud_account::test_handles());
+        let main = main_pane(1);
+        let hidden = script_panes_for(2, 1)[0];
+        host_cluster(&mut window, main);
+        host_cluster(&mut window, hidden);
+        merge_into_group(&mut window, hidden, main, 1);
+        window.set_toolbar_expanded(false);
+        window.set_pane_hidden(hidden, true);
+
+        let group = window.group_of_slot(main).expect("group exists");
+        let hidden_tab = window.tab_of(hidden).expect("hidden pane hosted");
+        let _ = window.select_pane_without_focus(hidden, &mut sessions);
+
+        assert_eq!(window.layout.selected(group), Some(hidden_tab));
+        assert_eq!(window.rendered_slot(group), Some(main));
+        assert!(window.pane_hidden(hidden));
+        assert_eq!(window.active_session_id(), Some(hidden.session_id));
+    }
+
+    #[test]
+    fn selection_blurs_only_the_input_it_displaced() {
+        let old_tab = main_pane(1);
+        let new_tab = main_pane(2);
+        let other_group = main_pane(3);
+
+        assert_eq!(
+            displaced_input_for_selection(false, Some(new_tab), Some(old_tab), Some(other_group),),
+            Some(old_tab),
+            "script selection blurs the pane it actually obscured"
+        );
+        assert_eq!(
+            displaced_input_for_selection(false, Some(new_tab), Some(new_tab), Some(other_group),),
+            None,
+            "an unchanged background tab must not disturb another focus group/window"
+        );
+        assert_eq!(
+            displaced_input_for_selection(true, Some(new_tab), Some(new_tab), Some(other_group),),
+            Some(other_group),
+            "ordinary re-selection still releases the previous focus group"
+        );
     }
 
     #[test]
@@ -4539,7 +4773,7 @@ mod tests {
         window.place_session_pane(
             SessionId::from(1),
             script1.key,
-            PanePlacement {
+            PanePlacement::Split {
                 reference: MAIN_PANE_KEY,
                 direction: SplitDirection::Right,
                 size_px: Some(200.0),

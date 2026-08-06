@@ -20,7 +20,9 @@ use crate::session::{HotkeyId, SessionId};
 use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
-use super::pane::{PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection};
+use super::pane::{
+    PaneDef, PaneKey, PaneNamespace, PanePlacement, SplitDirection, TabPosition,
+};
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
@@ -328,11 +330,13 @@ pub enum RuntimeAction {
         /// own-runtime opens must preserve their historical open/close order.
         reconcile_registry: bool,
     },
-    /// Emit `SessionEvent::PaneClosed` for a pane the close op already
-    /// retired from the registry. The dispatch handler flushes buffered
-    /// updates first, so the event trails every `AppendTo` that preceded it.
+    /// Finish closing a pane the op already retired from the registry. The
+    /// dispatch handler flushes buffered updates first, then emits either the
+    /// legacy close event or the ordered-bus display-retirement marker.
     PaneClosed {
         key: PaneKey,
+        /// The command bus already owns layout removal for this close.
+        ui_command_published: bool,
     },
     /// Emit `SessionEvent::PaneUpdated` for a def the queuing op already
     /// mutated in place (an explicit def-state field — `titleBar`, `hidden`,
@@ -355,6 +359,8 @@ pub enum RuntimeAction {
     PaneCloseRemote {
         namespace: PaneNamespace,
         name: Arc<str>,
+        /// The issuing runtime already published the resolved pane key.
+        ui_command_published: bool,
     },
     /// Cross-session `hide()`/`show()`, resolved by name on the target.
     /// Own-session calls never ride an action for the mutation itself — the
@@ -397,6 +403,16 @@ pub enum RuntimeAction {
         direction: SplitDirection,
         size_px: Option<f32>,
     },
+    /// Move or reorder a pane into another pane's current tab group.
+    PaneGroupWith {
+        key: PaneKey,
+        reference_session: SessionId,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    /// Select a pane's tab without requesting keyboard focus.
+    PaneSelect { key: PaneKey },
     /// Forward `pane.tearOut` to the UI as `SessionEvent::PaneTearOut`.
     PaneTearOut {
         key: PaneKey,

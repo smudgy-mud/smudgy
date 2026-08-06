@@ -9,6 +9,7 @@ use futures::SinkExt;
 
 use crate::models::ScriptLang;
 use crate::session::connection::Connection;
+use crate::session::ui_command::{PaneCommand, UiCommand};
 use crate::session::{BufferUpdate, SessionEvent, TaggedSessionEvent};
 
 use super::pane::{MAIN_PANE_KEY, PaneError, PaneKey, PaneKind, PaneNamespace};
@@ -28,16 +29,21 @@ fn prepare_pane_open(
 
     let registry = registry.lock().unwrap();
     let def = registry.get(def.key)?.clone();
-    let placement = super::pane::PanePlacement {
-        reference: if registry.is_live(placement.reference) {
-            placement.reference
-        } else {
-            super::pane::MAIN_PANE_KEY
-        },
-        direction: placement.direction,
-        size_px: placement.size_px,
-    };
+    let reference = placement.reference();
+    let placement = placement.with_reference(if registry.is_live(reference) {
+        reference
+    } else {
+        super::pane::MAIN_PANE_KEY
+    });
     Some((def, placement))
+}
+
+fn pane_closed_event(key: PaneKey, ui_command_published: bool) -> SessionEvent {
+    if ui_command_published {
+        SessionEvent::PaneClosedOrdered(key)
+    } else {
+        SessionEvent::PaneClosed(key)
+    }
 }
 
 impl Inner<'_> {
@@ -1324,7 +1330,10 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
-            RuntimeAction::PaneClosed { key } => {
+            RuntimeAction::PaneClosed {
+                key,
+                ui_command_published,
+            } => {
                 // Flush first: buffered updates may hold `AppendTo`s for this key, and the
                 // dangling-sink rule promises the UI that `PaneClosed` arrives behind them.
                 // The closed pane's mirrored size dies with it (keys are never reused).
@@ -1335,7 +1344,7 @@ impl Inner<'_> {
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
-                        event: SessionEvent::PaneClosed(key),
+                        event: pane_closed_event(key, ui_command_published),
                     })
                     .await?;
                 Ok(ActionResult::None)
@@ -1372,12 +1381,28 @@ impl Inner<'_> {
                 // behind the load's own actions, so a pane the reloading scripts
                 // echoed into before abandoning still shows those lines before it
                 // closes; the flush upholds the AppendTo-before-PaneClosed promise.
-                let swept = self.pane_registry.lock().unwrap().sweep_unclaimed();
+                let ui_command_producer = self.ui_command_producer.clone();
+                let swept = {
+                    let mut registry = self.pane_registry.lock().unwrap();
+                    registry
+                        .sweep_unclaimed()
+                        .into_iter()
+                        .map(|key| {
+                            let published = ui_command_producer.as_ref().is_some_and(|producer| {
+                                producer.send(UiCommand::Pane(PaneCommand::Close {
+                                    session_id: self.session_id,
+                                    key,
+                                }))
+                            });
+                            (key, published)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 if !swept.is_empty() {
                     if let Some(fut) = self.flush_buffer_updates()? {
                         fut.await?;
                     }
-                    for key in swept {
+                    for (key, ui_command_published) in swept {
                         // The swept pane's input state dies with it, exactly
                         // as on an explicit close.
                         super::input::purge_pane_input_state(
@@ -1390,15 +1415,35 @@ impl Inner<'_> {
                         self.ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
-                                event: SessionEvent::PaneClosed(key),
+                                event: pane_closed_event(key, ui_command_published),
                             })
                             .await?;
                     }
                 }
                 Ok(ActionResult::None)
             }
-            RuntimeAction::PaneCloseRemote { namespace, name } => {
-                let closed = self.pane_registry.lock().unwrap().close(&namespace, &name);
+            RuntimeAction::PaneCloseRemote {
+                namespace,
+                name,
+                ui_command_published,
+            } => {
+                let (closed, ui_command_published) = {
+                    let mut registry = self.pane_registry.lock().unwrap();
+                    let closed = registry.close(&namespace, &name);
+                    let published = match &closed {
+                        Ok(key) if !ui_command_published => {
+                            self.ui_command_producer.as_ref().is_some_and(|producer| {
+                                producer.send(UiCommand::Pane(PaneCommand::Close {
+                                    session_id: self.session_id,
+                                    key: *key,
+                                }))
+                            })
+                        }
+                        Ok(_) => ui_command_published,
+                        Err(_) => false,
+                    };
+                    (closed, published)
+                };
                 match closed {
                     Ok(key) => {
                         // The closed pane's input state dies with it, like the
@@ -1416,7 +1461,7 @@ impl Inner<'_> {
                         self.ui_tx
                             .send(TaggedSessionEvent {
                                 session_id: self.session_id,
-                                event: SessionEvent::PaneClosed(key),
+                                event: pane_closed_event(key, ui_command_published),
                             })
                             .await?;
                     }
@@ -1538,6 +1583,36 @@ impl Inner<'_> {
                             direction,
                             size_px,
                         },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneGroupWith {
+                key,
+                reference_session,
+                reference,
+                position,
+                selected,
+            } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneGroupWith {
+                            key,
+                            reference_session,
+                            reference,
+                            position,
+                            selected,
+                        },
+                    })
+                    .await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::PaneSelect { key } => {
+                self.ui_tx
+                    .send(TaggedSessionEvent {
+                        session_id: self.session_id,
+                        event: SessionEvent::PaneSelect { key },
                     })
                     .await?;
                 Ok(ActionResult::None)
@@ -1974,7 +2049,7 @@ mod tests {
             )
             .unwrap()
             .def;
-        let placement = PanePlacement {
+        let placement = PanePlacement::Split {
             reference: MAIN_PANE_KEY,
             direction: SplitDirection::Right,
             size_px: None,
@@ -2032,7 +2107,7 @@ mod tests {
         let prepared = prepare_pane_open(
             &registry,
             original,
-            PanePlacement {
+            PanePlacement::Split {
                 reference: reference.key,
                 direction: SplitDirection::Left,
                 size_px: Some(240.0),
@@ -2041,8 +2116,13 @@ mod tests {
         )
         .expect("the foreign target remains live");
         assert!(prepared.0.hidden);
-        assert_eq!(prepared.1.reference, MAIN_PANE_KEY);
-        assert_eq!(prepared.1.direction, SplitDirection::Left);
-        assert_eq!(prepared.1.size_px, Some(240.0));
+        assert_eq!(
+            prepared.1,
+            PanePlacement::Split {
+                reference: MAIN_PANE_KEY,
+                direction: SplitDirection::Left,
+                size_px: Some(240.0),
+            }
+        );
     }
 }

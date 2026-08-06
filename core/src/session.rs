@@ -15,7 +15,9 @@ use crate::{
     models::hotkeys::HotkeyDefinition,
     session::runtime::input::InputOp,
     session::runtime::line_operation::LineOperation,
-    session::runtime::pane::{PaneDef, PaneKey, PanePlacement, SplitDirection},
+    session::runtime::pane::{
+        PaneDef, PaneKey, PanePlacement, SplitDirection, TabPosition,
+    },
 };
 
 pub mod config;
@@ -23,6 +25,7 @@ pub mod connection;
 pub mod registry;
 pub mod runtime;
 pub mod styled_line;
+pub mod ui_command;
 
 #[derive(From, Into, Display, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Add)]
 #[repr(transparent)]
@@ -72,6 +75,9 @@ pub enum SessionEvent {
     /// it arrives behind every `AppendTo` that preceded it — a UI-side
     /// `AppendTo` miss is therefore a bug (warn and drop), never a race.
     PaneClosed(PaneKey),
+    /// The ordered UI command already removed this pane from its layout. This
+    /// event trails every preceding `AppendTo` and retires display state.
+    PaneClosedOrdered(PaneKey),
     /// An existing pane's def changed in place — a def-state field
     /// (`title_bar`, `hidden`, `font_size`) via a `split()` naming an
     /// existing pane with an explicit field, the `hide`/`show`/`setFontSize`
@@ -102,6 +108,14 @@ pub enum SessionEvent {
         direction: SplitDirection,
         size_px: Option<f32>,
     },
+    PaneGroupWith {
+        key: PaneKey,
+        reference_session: SessionId,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    PaneSelect { key: PaneKey },
     /// A script asked to move a pane into a fresh dedicated window
     /// (`pane.tearOut`): the drag tear-out flow minus the drag. `width`/
     /// `height` size the new window (floored by the window minimum); omitted
@@ -282,7 +296,7 @@ pub enum BufferUpdate {
 }
 
 pub fn spawn(params: Arc<SessionParams>) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, None)
+    spawn_inner(params, None, None)
 }
 
 /// Like [`spawn`], but resolves `smudgy://` packages through `package_provider` instead of
@@ -293,12 +307,24 @@ pub fn spawn_with_package_provider(
     params: Arc<SessionParams>,
     package_provider: PackageProviderFactory,
 ) -> impl Stream<Item = TaggedSessionEvent> {
-    spawn_inner(params, Some(package_provider))
+    spawn_inner(params, Some(package_provider), None)
+}
+
+/// Spawn a session attached to the UI daemon's ordered command bus.
+///
+/// Headless embedders and existing integration tests may keep using [`spawn`];
+/// their pane placement commands continue to arrive as `SessionEvent`s.
+pub fn spawn_with_ui_commands(
+    params: Arc<SessionParams>,
+    ui_commands: ui_command::UiCommandBus,
+) -> impl Stream<Item = TaggedSessionEvent> {
+    spawn_inner(params, None, Some(ui_commands))
 }
 
 fn spawn_inner(
     params: Arc<SessionParams>,
     package_provider_override: Option<PackageProviderFactory>,
+    ui_commands: Option<ui_command::UiCommandBus>,
 ) -> impl Stream<Item = TaggedSessionEvent> {
     let (mut ui_tx, ui_rx) = futures::channel::mpsc::channel::<TaggedSessionEvent>(1024);
 
@@ -322,6 +348,7 @@ fn spawn_inner(
         params.extra_script_extensions.clone(),
         params.on_engine_rebuild.clone(),
         ui_tx,
+        ui_commands,
     );
     let shutdown_tx = runtime.tx();
 

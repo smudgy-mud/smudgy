@@ -40,6 +40,7 @@ use crate::{
             trigger::{Manager, MatchCapture, SharedAutomationRegistry},
         },
         styled_line::StyledLine,
+        ui_command::{PaneCommand, UiCommand, UiCommandProducer},
     },
 };
 
@@ -112,6 +113,7 @@ pub struct ScriptEngineParams<'a> {
     pub session_id: SessionId,
     pub server_name: &'a Arc<String>,
     pub ui_tx: Sender<TaggedSessionEvent>,
+    pub(crate) ui_command_producer: Option<UiCommandProducer>,
     pub spawned_actions: super::ActionQueue,
     pub pending_line_operations: &'a Rc<RefCell<Vec<LineOperation>>>,
     pub emitted_line_count: std::rc::Weak<Cell<usize>>,
@@ -959,6 +961,7 @@ impl<'a> ScriptEngine<'a> {
         let broadcast_channel =
             crate::session::registry::broadcast_channel_for_server(server_name.as_str());
         let spawned_actions = params.spawned_actions.clone();
+        let ui_command_producer = params.ui_command_producer.clone();
         let pending_ops = params.pending_line_operations.clone();
         let emitted_line_count = params.emitted_line_count.clone();
         // The same ring `Rc` is bound into every isolate's read ops.
@@ -1086,6 +1089,7 @@ impl<'a> ScriptEngine<'a> {
                     Arc::clone(&server_name),
                     script_functions.clone(),
                     spawned_actions.clone(),
+                    ui_command_producer.clone(),
                     pending_ops.clone(),
                     current_line_for_ext.clone(),
                     emitted_line_count.clone(),
@@ -1727,17 +1731,31 @@ impl<'a> ScriptEngine<'a> {
                                 .map(|def| (def.name.clone(), def.key))
                                 .collect();
                             for (name, key) in doomed {
-                                if pane_registry.lock().unwrap().close(&namespace, &name).is_ok() {
-                                    super::input::purge_pane_input_state(
-                                        &input_mirror,
-                                        &input_word_sets,
-                                        &pane_input_callbacks,
+                                let ui_command_published = {
+                                    let mut registry = pane_registry.lock().unwrap();
+                                    if registry.close(&namespace, &name).is_ok() {
+                                        ui_command_producer.as_ref().is_some_and(|producer| {
+                                            producer.send(UiCommand::Pane(PaneCommand::Close {
+                                                session_id: params.session_id,
+                                                key,
+                                            }))
+                                        })
+                                    } else {
+                                        continue;
+                                    }
+                                };
+                                super::input::purge_pane_input_state(
+                                    &input_mirror,
+                                    &input_word_sets,
+                                    &pane_input_callbacks,
+                                    key,
+                                );
+                                spawned_actions.borrow_mut().push_back(
+                                    super::RuntimeAction::PaneClosed {
                                         key,
-                                    );
-                                    spawned_actions
-                                        .borrow_mut()
-                                        .push_back(super::RuntimeAction::PaneClosed { key });
-                                }
+                                        ui_command_published,
+                                    },
+                                );
                             }
                         }
                         // Completion word-set contributions land synchronously (the registry
