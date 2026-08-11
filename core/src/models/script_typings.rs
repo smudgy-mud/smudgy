@@ -1469,7 +1469,7 @@ export function make() { return createEvent('dynamic'); }
         }
     }
 
-    /// The Phase-5 typed split spec (`PaneSpec<D>`): the initial size is keyed to the split
+    /// The typed pane creation specs: a split's initial size is keyed to the split
     /// axis, so `width` on a `left`/`right` split (and `height` on `top`/`bottom`) compiles,
     /// while the off-axis dimension is a compile error (`never` on the wrong key). Also
     /// exercises `titleBar` round-tripping through the contract.
@@ -1485,7 +1485,7 @@ export function make() { return createEvent('dynamic'); }
         );
 
         let good = "import { session } from \"smudgy:core\";\n\
-             import type { TitleBarSpec, InputHandle } from \"smudgy:core\";\n\
+             import type { TitleBarSpec, InputHandle, GroupWithOptions } from \"smudgy:core\";\n\
              export function wire() {\n\
                const pinned: TitleBarSpec = \"always-show\";\n\
                const chat = session.mainPane.split(\"right\", { name: \"chat\", width: 300, titleBar: pinned,\n\
@@ -1495,6 +1495,10 @@ export function make() { return createEvent('dynamic'); }
                chat.split(\"bottom\", { name: \"log\", height: 120, terminal: false, titleBar: \"normal\" });\n\
                session.mainPane.split(\"top\", { name: \"status\", height: 80 });\n\
                session.mainPane.split(\"left\", { name: \"map\" });\n\
+               const tab = chat.addTab({ name: \"alerts\", selected: true });\n\
+               const grouping: GroupWithOptions = { position: \"before\", selected: false };\n\
+               tab.groupWith(session.mainPane, grouping);\n\
+               tab.select();\n\
              }\n";
         let mut sources = BTreeMap::new();
         sources.insert("consumer.ts".to_string(), good.to_string());
@@ -1512,6 +1516,8 @@ export function make() { return createEvent('dynamic'); }
              export function wire() {\n\
                session.mainPane.split(\"right\", { name: \"chat\", height: 300 });\n\
                session.mainPane.split(\"bottom\", { name: \"log\", width: 120 });\n\
+               session.mainPane.addTab({ name: \"tab\", width: 120 });\n\
+               session.mainPane.groupWith(session.mainPane, { position: \"middle\" });\n\
              }\n";
         let mut sources = BTreeMap::new();
         sources.insert("consumer.ts".to_string(), bad.to_string());

@@ -67,7 +67,7 @@ impl<T> Operation<T> for UnfocusTarget {
 }
 
 /// A [`Task`] running [`UnfocusTarget`] against `target`.
-fn unfocus_target<T: Send + 'static>(target: Id) -> Task<T> {
+pub fn unfocus_target<T: Send + 'static>(target: Id) -> Task<T> {
     iced::advanced::widget::operate(UnfocusTarget { target })
 }
 

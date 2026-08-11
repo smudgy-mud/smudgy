@@ -1033,8 +1033,8 @@ declare module "smudgy:core" {
     /** Default `true`. Pass `false` for a widgets-only pane with no terminal;
      *  `echo`/`clear` throw on it. Every pane can host widgets either way. */
     terminal?: boolean;
-    /** Default `'normal'`. Also applies to an **existing** pane: `split()`
-     *  naming an existing pane (including `'main'`) with an explicit
+    /** Default `'normal'`. Also applies to an **existing** pane: either
+     *  creation call naming it (including `'main'`) with an explicit
      *  `titleBar` updates its policy. */
     titleBar?: TitleBarSpec;
     /** Start the pane hidden — the title-bar eyeball's toggle, pre-set — so
@@ -1050,10 +1050,10 @@ declare module "smudgy:core" {
      *  setting. */
     fontSize?: number;
     /** Give the pane its own input line (see {@link PaneInputSpec}). Part of
-     *  what the pane is, like `terminal`: `split()` naming an existing pane
+     *  what the pane is, like `terminal`: a creation call naming an existing pane
      *  that has no input while asking for one throws (close it first). Works
      *  on either pane kind, including a same-server session reached through
-     *  `sessions`. Re-splitting with the same spec re-registers `onSubmit`,
+     *  `sessions`. Re-claiming with the same spec re-registers `onSubmit`,
      *  which is also how a handler comes back after your script reloads. */
     input?: PaneInputSpec;
   }
@@ -1068,6 +1068,22 @@ declare module "smudgy:core" {
       ? { width?: number; height?: never }
       : { height?: number; width?: never });
 
+  /** The spec for {@link Pane.addTab}. */
+  export type TabPaneSpec = PaneSpecBase & {
+    selected?: boolean;
+    width?: never;
+    height?: never;
+  };
+
+  export type TabPosition = "before" | "after" | "end";
+
+  export interface GroupWithOptions {
+    /** Default `"after"`. `"end"` appends to the reference's group. */
+    position?: TabPosition;
+    /** Default `false`. Select the moved pane after grouping it. */
+    selected?: boolean;
+  }
+
   /** The optional extent for {@link Pane.relocate}, keyed to the split axis
    *  exactly like a split's initial size. */
   export type RelocateSize<D extends SplitDirection> = D extends "left" | "right"
@@ -1075,16 +1091,17 @@ declare module "smudgy:core" {
     : { height?: number; width?: never };
 
   /**
-   * A handle to one session pane. Panes are keyed by name: `split()` with an
-   * existing name returns that pane. Most of the spec is then ignored, with
+   * A handle to one session pane. Panes are keyed by name: `split()` or
+   * `addTab()` with an existing name returns that pane. Most of the spec is
+   * then ignored, with
    * two exceptions. An explicit `titleBar` updates the pane's policy. And
    * `input` is part of what the pane is: asking for one on an existing pane
    * that has none throws (close it first), while re-splitting a pane that
    * has one re-registers its `onSubmit` (placeholder changes are ignored).
    * A pane closes when `close()` is called, when the session ends, or when no
-   * script re-claims it during a reload; any `split()` naming it during the
-   * reload keeps it, placement untouched. A later `split()` with the same
-   * name recreates the pane and re-attaches its widgets.
+   * script re-claims it during a reload; either creation call naming it during
+   * the reload keeps it, placement untouched. A later creation call with the
+   * same name recreates the pane and re-attaches its widgets.
    *
    * ```ts
    * import { session, createTrigger, line } from "smudgy:core";
@@ -1122,6 +1139,10 @@ declare module "smudgy:core" {
      *  def-state field — `titleBar`, `hidden`, `fontSize` — also updates an
      *  existing pane, `titleBar`/`fontSize` including main's). */
     split<D extends SplitDirection>(direction: D, spec: PaneSpec<D>): Pane;
+    /** Create a pane as a tab in this pane's current group (get-or-create by
+     *  name). New panes are inserted immediately after this pane and start
+     *  unselected by default. Existing panes keep their placement. */
+    addTab(spec: TabPaneSpec): Pane;
     /** Hide this pane — the title-bar eyeball, scripted. A soft display
      *  state: the pane keeps running, widgets stay mounted, and routed lines
      *  keep landing in its scrollback. Throws on main (the user's eyeball
@@ -1164,6 +1185,12 @@ declare module "smudgy:core" {
       reference?: Pane | string,
       size?: RelocateSize<D>,
     ): void;
+    /** Move or reorder this pane as a tab in `reference`'s group. Main panes
+     *  and same-server foreign-session references are allowed. */
+    groupWith(reference: Pane, options?: GroupWithOptions): void;
+    /** Select this pane's tab and make its session active without requesting
+     *  keyboard focus. Selecting a hidden pane does not reveal it. */
+    select(): void;
     /** Move this pane into a fresh window of its own — the drag tear-out,
      *  scripted. Windows stay anonymous: there is no window handle, the
      *  window closes when its last pane leaves it, and re-docking is a

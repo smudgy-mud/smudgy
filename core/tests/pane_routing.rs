@@ -17,10 +17,13 @@ use std::time::Duration;
 use futures::StreamExt;
 use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::runtime::pane::{
-    MAIN_PANE_KEY, PaneKey, PaneNameId, PanePlacement, SplitDirection,
+    MAIN_PANE_KEY, PaneKey, PaneNameId, PanePlacement, SplitDirection, TabPosition,
 };
 use smudgy_core::session::styled_line::StyledLine;
-use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
+use smudgy_core::session::ui_command::{PaneCommand, UiCommand};
+use smudgy_core::session::{
+    BufferUpdate, SessionEvent, SessionId, SessionParams, spawn, spawn_with_ui_commands,
+};
 
 const PANES_TS: &str = r#"
 import { createTrigger, echo, line, session, vars } from "smudgy:core";
@@ -28,6 +31,9 @@ import { createTrigger, echo, line, session, vars } from "smudgy:core";
 const chat = session.mainPane.split("right", { name: "Chat", width: 300 });
 const again = session.mainPane.split("right", { name: "chat" });
 const info = chat.split("bottom", { name: "info", height: 120 });
+const alerts = chat.addTab({ name: "alerts", selected: true });
+alerts.groupWith(session.mainPane, { position: "end", selected: true });
+alerts.select();
 echo("SETUP created=" + chat.created
     + " again=" + again.created
     + " display=" + again.name
@@ -99,6 +105,13 @@ enum Seen {
         placement: PanePlacement,
     },
     Closed(PaneKey),
+    Grouped {
+        key: PaneKey,
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+    Selected(PaneKey),
 }
 
 // One end-to-end scenario deliberately drives the whole routing matrix through
@@ -184,6 +197,19 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
                 });
             }
             SessionEvent::PaneClosed(key) => seen.push(Seen::Closed(key)),
+            SessionEvent::PaneGroupWith {
+                key,
+                reference,
+                position,
+                selected,
+                ..
+            } => seen.push(Seen::Grouped {
+                key,
+                reference,
+                position,
+                selected,
+            }),
+            SessionEvent::PaneSelect { key } => seen.push(Seen::Selected(key)),
             _ => {}
         }
 
@@ -325,12 +351,12 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
             && setups[0].contains("kind=terminal")
             && setups[0].contains("exists=true")
             && setups[0].contains("dot=true")
-            && setups[0].contains("count=3"),
+            && setups[0].contains("count=4"),
         "get-or-create + case folding + dot access on first load: {}\n{transcript}",
         setups[0]
     );
     // After the reload the registry persisted: every split is a
-    // get-or-create hit and all panes (chat/INFO/fresh + the 13 cap panes +
+    // get-or-create hit and all panes (chat/INFO/fresh/alerts + 12 cap panes +
     // main) are still there.
     assert!(
         setups[1].contains("created=false") && setups[1].contains("count=17"),
@@ -356,12 +382,44 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
     };
     let chat = find_opened("Chat");
     let info = find_opened("info");
-    assert_eq!(chat.3.reference, MAIN_PANE_KEY, "Chat splits off main");
-    assert!(matches!(chat.3.direction, SplitDirection::Right));
-    assert_eq!(chat.3.size_px, Some(300.0), "width honored on a right split");
-    assert_eq!(info.3.reference, chat.1, "info splits off Chat");
-    assert!(matches!(info.3.direction, SplitDirection::Bottom));
-    assert_eq!(info.3.size_px, Some(120.0), "height honored on a bottom split");
+    let alerts = find_opened("alerts");
+    assert_eq!(
+        chat.3,
+        PanePlacement::Split {
+            reference: MAIN_PANE_KEY,
+            direction: SplitDirection::Right,
+            size_px: Some(300.0),
+        },
+        "Chat splits off main"
+    );
+    assert_eq!(
+        info.3,
+        PanePlacement::Split {
+            reference: chat.1,
+            direction: SplitDirection::Bottom,
+            size_px: Some(120.0),
+        },
+        "info splits off Chat"
+    );
+    assert_eq!(
+        alerts.3,
+        PanePlacement::Tab {
+            reference: chat.1,
+            position: TabPosition::After,
+            selected: true,
+        },
+        "alerts starts as a selected tab after Chat"
+    );
+    assert!(seen.iter().any(|event| matches!(
+        event,
+        Seen::Grouped {
+            key,
+            reference,
+            position: TabPosition::End,
+            selected: true,
+        } if *key == alerts.1 && *reference == MAIN_PANE_KEY
+    )));
+    assert!(seen.iter().any(|event| matches!(event, Seen::Selected(key) if *key == alerts.1)));
     let chat_key = chat.1;
     let info_key = info.1;
 
@@ -381,8 +439,8 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
     );
 
     // ---- Reload sweep -------------------------------------------------------
-    // The reloaded module re-splits Chat and info at top level (re-claiming
-    // them); 'fresh' and the cap panes were trigger-created mid-session, so
+    // The reloaded module re-claims Chat, info, and alerts at top level;
+    // 'fresh' and the cap panes were trigger-created mid-session, so
     // the sweep behind the reload must close exactly those.
     let closed: Vec<PaneKey> = seen
         .iter()
@@ -396,7 +454,7 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
         closed.contains(&fresh_key),
         "the reload sweep must close the unclaimed 'fresh' pane.\n{transcript}"
     );
-    for i in 0..13 {
+    for i in 0..12 {
         let cap_key = find_opened(&format!("cap{i}")).1;
         assert!(
             closed.contains(&cap_key),
@@ -411,11 +469,11 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
         !closed.contains(&recreated.1),
         "the re-claimed INFO pane must survive the sweep.\n{transcript}"
     );
-    // The post-sweep probe sees only main + the two re-claimed panes.
+    // The post-sweep probe sees main + the three re-claimed panes.
     assert!(
         seen.iter()
-            .any(|s| matches!(s, Seen::Append(text) if text.as_str() == "COUNT=3")),
-        "post-sweep registry must hold main + Chat + info only.\n{transcript}"
+            .any(|s| matches!(s, Seen::Append(text) if text.as_str() == "COUNT=4")),
+        "post-sweep registry must hold main + Chat + info + alerts only.\n{transcript}"
     );
 
     // ---- The routing matrix -------------------------------------------------
@@ -597,6 +655,7 @@ createTrigger("^ECHOCLOSE$", () => {
 "#;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -621,7 +680,8 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
         on_engine_rebuild: None,
     });
 
-    let mut events = Box::pin(spawn(params));
+    let (bus, mut commands) = smudgy_core::session::ui_command::channel();
+    let mut events = Box::pin(spawn_with_ui_commands(params, bus));
     let mut seen: Vec<Seen> = Vec::new();
     let mut tx = None;
     let mut log_key: Option<PaneKey> = None;
@@ -662,7 +722,7 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
                     log_key = Some(def.key);
                 }
             }
-            SessionEvent::PaneClosed(key) => seen.push(Seen::Closed(key)),
+            SessionEvent::PaneClosedOrdered(key) => seen.push(Seen::Closed(key)),
             _ => {}
         }
 
@@ -729,4 +789,171 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
         echo_idx < close_idx,
         "the pre-close echo must arrive before the PaneClosed.\n{transcript}"
     );
+
+    let mut command_kinds = Vec::new();
+    for expected_seq in 0..3 {
+        let envelope = tokio::time::timeout(Duration::from_secs(5), commands.next())
+            .await
+            .expect("timed out waiting for ordered pane command")
+            .expect("UI command stream ended unexpectedly");
+        assert_eq!(envelope.origin, SessionId::from(7200));
+        assert_eq!(envelope.origin_seq, expected_seq);
+        command_kinds.push(envelope.command);
+    }
+    assert!(matches!(
+        &command_kinds[0],
+        UiCommand::Pane(PaneCommand::Open { .. })
+    ));
+    assert!(matches!(
+        &command_kinds[1],
+        UiCommand::Pane(PaneCommand::Open { .. })
+    ));
+    assert!(matches!(
+        &command_kinds[2],
+        UiCommand::Pane(PaneCommand::Close { key, .. }) if *key == log_key
+    ));
+}
+
+const CROSS_RUNTIME_PANE_ORDER_TS: &str = r#"
+import { byName, createAlias, session } from "smudgy:core";
+
+createAlias("^order-panes$", () => {
+  if (session.profile.name !== "Origin") return;
+  const target = byName("Target");
+  if (!target) throw new Error("missing target session");
+  const reference = target.mainPane.addTab({ name: "remote-reference" });
+  session.mainPane.groupWith(reference);
+});
+"#;
+
+/// A foreign Open must enter the process-wide UI order at the issuing runtime,
+/// not after the target runtime eventually relays it. Saturating the target's
+/// UI event channel pins that distinction deterministically: its `PaneOpened`
+/// is stuck behind the flood, while the bus must still yield `Open` then
+/// `GroupWith`.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn ui_command_bus_orders_foreign_open_before_cross_session_group() {
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let home_path = smudgy_core::get_smudgy_home().expect("smudgy home");
+
+    let server = "PaneUiCommandOrdering";
+    let modules_dir = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules_dir).unwrap();
+    std::fs::create_dir_all(home_path.join(server).join("logs")).unwrap();
+    std::fs::write(
+        modules_dir.join("pane-order.ts"),
+        CROSS_RUNTIME_PANE_ORDER_TS,
+    )
+    .unwrap();
+
+    let params = |id, profile: &str| {
+        Arc::new(SessionParams {
+            session_id: SessionId::from(id),
+            server_name: Arc::new(server.to_string()),
+            profile_name: Arc::new(profile.to_string()),
+            profile_subtext: Arc::new(String::new()),
+            mapper: None,
+            package_client: None,
+            extra_script_extensions: Arc::new(Vec::new),
+            on_engine_rebuild: None,
+        })
+    };
+
+    let target_id = SessionId::from(7300);
+    let origin_id = SessionId::from(7301);
+    let (bus, mut commands) = smudgy_core::session::ui_command::channel();
+    let mut target_events = Box::pin(spawn_with_ui_commands(params(7300, "Target"), bus.clone()));
+    let target_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), target_events.next())
+            .await
+            .expect("timed out waiting for Target RuntimeReady")
+            .expect("Target event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    let mut origin_events = Box::pin(spawn_with_ui_commands(params(7301, "Origin"), bus));
+    let origin_tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), origin_events.next())
+            .await
+            .expect("timed out waiting for Origin RuntimeReady")
+            .expect("Origin event stream ended before RuntimeReady");
+        if let SessionEvent::RuntimeReady(tx) = event.event {
+            break tx;
+        }
+    };
+
+    // Stop polling Target and fill its bounded UI stream. Its runtime blocks
+    // in a send before it can dispatch the foreign PaneOpened queued below.
+    for _ in 0..2048 {
+        target_tx.send(RuntimeAction::PaneMirrorInterest).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    origin_tx
+        .send(RuntimeAction::Send(Arc::new("order-panes".to_string())))
+        .unwrap();
+
+    let open = tokio::time::timeout(Duration::from_secs(5), commands.next())
+        .await
+        .expect("timed out waiting for UI Open")
+        .expect("UI command stream ended before Open");
+    let (reference_key, placement) = match open.command {
+        UiCommand::Pane(PaneCommand::Open {
+            session_id,
+            def,
+            placement,
+        }) => {
+            assert_eq!(session_id, target_id);
+            assert_eq!(def.name.as_ref(), "remote-reference");
+            (def.key, placement)
+        }
+        other @ UiCommand::Pane(_) => panic!("expected Open first, got {other:?}"),
+    };
+    assert_eq!(open.origin, origin_id);
+    assert_eq!(open.origin_seq, 0);
+    assert!(matches!(
+        placement,
+        PanePlacement::Tab {
+            reference: MAIN_PANE_KEY,
+            position: TabPosition::After,
+            selected: false,
+        }
+    ));
+
+    let group = tokio::time::timeout(Duration::from_secs(5), commands.next())
+        .await
+        .expect("timed out waiting for UI GroupWith")
+        .expect("UI command stream ended before GroupWith");
+    match group.command {
+        UiCommand::Pane(PaneCommand::GroupWith {
+            session_id,
+            key,
+            reference_session,
+            reference,
+            position,
+            selected,
+        }) => {
+            assert_eq!(session_id, origin_id);
+            assert_eq!(key, MAIN_PANE_KEY);
+            assert_eq!(reference_session, target_id);
+            assert_eq!(reference, reference_key);
+            assert_eq!(position, TabPosition::After);
+            assert!(!selected);
+        }
+        other @ UiCommand::Pane(_) => panic!("expected GroupWith second, got {other:?}"),
+    }
+    assert_eq!(group.origin, origin_id);
+    assert_eq!(group.origin_seq, 1);
+
+    // Closing Target's receiver releases its blocked event send so both
+    // runtime threads can drain to Shutdown cleanly.
+    drop(target_events);
+    target_tx.send(RuntimeAction::Shutdown).ok();
+    origin_tx.send(RuntimeAction::Shutdown).ok();
 }

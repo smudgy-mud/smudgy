@@ -192,15 +192,74 @@ impl SplitDirection {
     }
 }
 
-/// Where the UI should place a freshly created pane: split off `reference`
-/// toward `direction`, with an optional initial extent in pixels along the
-/// split axis (converted to a ratio against the reference pane's measured
-/// extent at placement time; `None` ⇒ an even 0.5 split).
-#[derive(Debug, Clone, Copy)]
-pub struct PanePlacement {
-    pub reference: PaneKey,
-    pub direction: SplitDirection,
-    pub size_px: Option<f32>,
+/// Where a pane moved into a tab group lands relative to its reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabPosition {
+    Before,
+    After,
+    End,
+}
+
+impl TabPosition {
+    /// Parse the script-facing string union (`'before'|'after'|'end'`).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "before" => Some(Self::Before),
+            "after" => Some(Self::After),
+            "end" => Some(Self::End),
+            _ => None,
+        }
+    }
+}
+
+/// Where the UI should place a freshly created pane: either split beside a
+/// reference group or insert into the reference's current tab group.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PanePlacement {
+    Split {
+        reference: PaneKey,
+        direction: SplitDirection,
+        size_px: Option<f32>,
+    },
+    Tab {
+        reference: PaneKey,
+        position: TabPosition,
+        selected: bool,
+    },
+}
+
+impl PanePlacement {
+    #[must_use]
+    pub fn reference(self) -> PaneKey {
+        match self {
+            Self::Split { reference, .. } | Self::Tab { reference, .. } => reference,
+        }
+    }
+
+    #[must_use]
+    pub fn with_reference(self, reference: PaneKey) -> Self {
+        match self {
+            Self::Split {
+                direction,
+                size_px,
+                ..
+            } => Self::Split {
+                reference,
+                direction,
+                size_px,
+            },
+            Self::Tab {
+                position,
+                selected,
+                ..
+            } => Self::Tab {
+                reference,
+                position,
+                selected,
+            },
+        }
+    }
 }
 
 /// Why a registry mutation was refused. Surfaced to scripts as a thrown error

@@ -40,6 +40,7 @@ use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
 use smudgy_core::session::styled_line::{
     InvisiblePolicy, LinkAction, LinkTooltipCallback, escape_invisible_text,
 };
+use smudgy_core::session::ui_command::UiCommandBus;
 use smudgy_core::session::{self, SessionEvent, SessionId};
 use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
 use smudgy_map_widget::map_view;
@@ -61,6 +62,7 @@ use tokio::sync::mpsc::{self};
 /// torn down — late events and actions for it are dropped by the daemon.
 pub struct SessionStore {
     cloud: CloudHandles,
+    ui_commands: Option<UiCommandBus>,
     sessions: BTreeMap<SessionId, ManagedSession>,
     next_session_id: SessionId,
 }
@@ -69,9 +71,18 @@ impl SessionStore {
     pub fn new(cloud: CloudHandles) -> Self {
         Self {
             cloud,
+            ui_commands: None,
             sessions: BTreeMap::new(),
             next_session_id: 0.into(),
         }
+    }
+
+    /// Construct the production store attached to the daemon's one ordered
+    /// command bus. Tests that only exercise local UI state use [`Self::new`].
+    pub fn with_ui_commands(cloud: CloudHandles, ui_commands: UiCommandBus) -> Self {
+        let mut store = Self::new(cloud);
+        store.ui_commands = Some(ui_commands);
+        store
     }
 
     /// Allocates an id and creates the session state. Giving the session a
@@ -92,6 +103,7 @@ impl SessionStore {
             self.cloud.credentials.clone(),
             self.cloud.base_url.as_str(),
             auto_connect,
+            self.ui_commands.clone(),
         );
         self.sessions.insert(session_id, session);
         session_id
@@ -166,6 +178,7 @@ pub struct ManagedSession {
     pub input: session_input::SessionInput,
 
     pub session_params: Arc<SessionParams>,
+    ui_commands: Option<UiCommandBus>,
 
     pub mapper: Option<Mapper>,
 
@@ -700,6 +713,7 @@ impl ManagedSession {
         credentials: CredentialSource,
         base_url: &str,
         auto_connect: bool,
+        ui_commands: Option<UiCommandBus>,
     ) -> Self {
         let settings = load_settings();
 
@@ -826,6 +840,7 @@ impl ManagedSession {
                 extra_script_extensions,
                 on_engine_rebuild,
             }),
+            ui_commands,
             server_config: Rc::new(RefCell::new(load_server(&server_name).map_or_else(
                 |e| {
                     // Sessions can outlive an on-disk rename; a fallback
@@ -1413,6 +1428,14 @@ impl ManagedSession {
         }
     }
 
+    /// The exact widget id for the input hosted by `key`, if any. Window
+    /// chrome uses it to blur only the pane it obscured; iced widget
+    /// operations otherwise traverse every application window.
+    pub fn pane_input_id(&self, key: PaneKey) -> Option<iced::widget::Id> {
+        self.input_for(key)
+            .map(session_input::SessionInput::input_id)
+    }
+
     /// Arm the obscured-blur mark on the input behind `key` (see
     /// [`session_input::SessionInput::note_obscured`]): the tab switch about
     /// to obscure the pane must not let the blur it inflicts clear the
@@ -1518,9 +1541,18 @@ impl ManagedSession {
     }
 
     pub fn session_subscription(&self) -> Subscription<TaggedSessionEvent> {
-        Subscription::run_with(self.session_params.clone(), |params| {
-            session::spawn(params.clone())
-        })
+        if let Some(ui_commands) = &self.ui_commands {
+            Subscription::run_with(
+                (self.session_params.clone(), ui_commands.clone()),
+                |(params, ui_commands)| {
+                    session::spawn_with_ui_commands(params.clone(), ui_commands.clone())
+                },
+            )
+        } else {
+            Subscription::run_with(self.session_params.clone(), |params| {
+                session::spawn(params.clone())
+            })
+        }
     }
 
     /// Handle session-specific messages
@@ -1710,7 +1742,7 @@ impl ManagedSession {
                         self.open_pane(def);
                         Task::none()
                     }
-                    SessionEvent::PaneClosed(key) => {
+                    SessionEvent::PaneClosed(key) | SessionEvent::PaneClosedOrdered(key) => {
                         self.panes.remove(&key);
                         // The feeds' per-key records die with the pane's input
                         // (keys are never reused; the runtime purges its side
@@ -1780,6 +1812,8 @@ impl ManagedSession {
                     // forward; no session-store state is involved.
                     SessionEvent::PaneResize { .. }
                     | SessionEvent::PaneRelocate { .. }
+                    | SessionEvent::PaneGroupWith { .. }
+                    | SessionEvent::PaneSelect { .. }
                     | SessionEvent::PaneTearOut { .. }
                     | SessionEvent::PaneSwap { .. }
                     | SessionEvent::LayoutSave { .. }
