@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_core"
-version = "0.5.3-rc"
+version = "0.5.3-rc2"
 edition = "2024"
 
 [dependencies]
