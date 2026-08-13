@@ -28,6 +28,18 @@ pub enum RelocationMode {
     Move,
 }
 
+/// Name marker a replay-populated relocation destination carries while its
+/// content is being copied. Destinations are created bearing it and shed
+/// it only once fully populated, so a crash mid-copy strands areas that
+/// are visibly in-progress debris instead of twins indistinguishable from
+/// the originals. [`Mapper::abandoned_relocation_areas`] lists survivors
+/// and startup logs them; they are never swept automatically, because on
+/// the cloud tier the marker may belong to another client's relocation
+/// still legitimately in flight. (Server-side clones skip the marker: the
+/// server creates them complete in one transaction, leaving no
+/// half-populated window.)
+pub const RELOCATION_IN_PROGRESS_SUFFIX: &str = " (relocating)";
+
 /// The result of relocating one or more areas, in source order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapRelocation {
@@ -244,8 +256,14 @@ impl Mapper {
                 }
                 continue;
             }
+            // Replay-populated destinations carry the in-progress name
+            // marker from creation until fully populated (see
+            // RELOCATION_IN_PROGRESS_SUFFIX).
             match self
-                .create_area_at(snapshot.area.name.clone(), destination)
+                .create_area_at(
+                    format!("{}{RELOCATION_IN_PROGRESS_SUFFIX}", snapshot.area.name),
+                    destination,
+                )
                 .await
             {
                 Ok(id) => copy_destination_ids.push(id),
@@ -264,6 +282,10 @@ impl Mapper {
                 .zip(copy_destination_ids.iter().copied()),
         );
         let destination_ids: Vec<AreaId> = source_ids.iter().map(|id| id_map[id]).collect();
+        let final_names: Vec<String> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.area.name.clone())
+            .collect();
         // Server-copied members are already complete; everything else is
         // freshened and replayed. In-set links from replayed members into a
         // server-copied sibling still remap correctly through `id_map`,
@@ -297,6 +319,24 @@ impl Mapper {
             destination_ids: destination_ids.clone(),
             destination,
         };
+
+        // Fully populated destinations shed the in-progress marker. A
+        // rename failure leaves a complete copy under the marker name —
+        // recoverable, so it carries the completed result.
+        for (index, final_name) in final_names.iter().enumerate() {
+            if server_copied[index] {
+                continue;
+            }
+            if let Err(error) = self
+                .rename_area_and_wait(copy_destination_ids[index], final_name)
+                .await
+            {
+                return Err(RelocationError {
+                    error,
+                    completed: Some(completed()),
+                });
+            }
+        }
 
         // Kept members' links into copied members follow the fresh ids
         // before any source disappears, so no dangling window opens. The
@@ -1635,6 +1675,69 @@ mod tests {
             }
         }
         assert_eq!(total_ops, 300, "every operation lands exactly once");
+    }
+
+    /// C4: relocation destinations are visibly marked while in flight and
+    /// shed the marker on completion, so a crash mid-copy strands
+    /// reviewable debris rather than an indistinguishable twin. The
+    /// reconcile surface lists exactly the still-marked areas.
+    #[tokio::test]
+    async fn in_flight_marker_is_shed_on_completion_and_surfaced_when_stranded() {
+        let (mapper, root) = mapper("marker").await;
+        let source = mapper
+            .create_area_at(
+                "Catacombs".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .expect("create source");
+        wait(
+            &mapper,
+            mapper
+                .upsert_room(RoomKey::new(source, RoomNumber(1)), RoomUpdates::default())
+                .expect("enqueue room"),
+        )
+        .await;
+
+        let copied = mapper
+            .relocate_areas(
+                vec![source],
+                MapDestination::loose(MapStorage::Cloud),
+                RelocationMode::Copy,
+            )
+            .await
+            .expect("copy");
+        let atlas = mapper.get_current_atlas();
+        let destination_name = atlas
+            .get_area(&copied.destination_ids[0])
+            .expect("destination present")
+            .get_name()
+            .to_string();
+        assert_eq!(
+            destination_name, "Catacombs",
+            "a finished destination bears the final name, not the marker"
+        );
+        assert!(
+            mapper.abandoned_relocation_areas().is_empty(),
+            "a completed relocation leaves no marked debris"
+        );
+
+        // A destination whose populate never finished keeps the marker —
+        // exactly what a crash mid-copy strands — and the reconcile
+        // surface reports it.
+        let stranded = mapper
+            .create_area_at(
+                format!("Catacombs{RELOCATION_IN_PROGRESS_SUFFIX}"),
+                MapDestination::loose(MapStorage::Cloud),
+            )
+            .await
+            .expect("create stranded twin");
+        let abandoned = mapper.abandoned_relocation_areas();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].0, stranded);
+        assert!(abandoned[0].1.ends_with(RELOCATION_IN_PROGRESS_SUFFIX));
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// C5: a mixed-tier move copies only the cross-tier members. Same-tier

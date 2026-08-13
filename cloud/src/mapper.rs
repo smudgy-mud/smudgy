@@ -1377,6 +1377,25 @@ impl Mapper {
         Ok(true)
     }
 
+    /// Areas still bearing the relocation in-progress name marker:
+    /// destinations stranded by a crash mid-copy, or another client's
+    /// relocation still running. Surfaced for review and manual cleanup;
+    /// never swept automatically (see
+    /// [`crate::relocation::RELOCATION_IN_PROGRESS_SUFFIX`]).
+    #[must_use]
+    pub fn abandoned_relocation_areas(&self) -> Vec<(AreaId, String)> {
+        self.inner
+            .atlas_cache
+            .load()
+            .areas()
+            .filter(|area| {
+                area.get_name()
+                    .ends_with(crate::relocation::RELOCATION_IN_PROGRESS_SUFFIX)
+            })
+            .map(|area| (*area.get_id(), area.get_name().to_string()))
+            .collect()
+    }
+
     /// Requests a server-side clone of a cloud area (see
     /// [`MapperBackend::copy_cloud_area`]); `Ok(None)` when the backend has
     /// no server-side copy for this area and the caller must replay content.
@@ -2048,7 +2067,36 @@ impl Inner {
         // Open the initial-load gate either way: presence-checked imports wait
         // on it, and distinguish success from failure by the flag's value.
         self.initial_load.send_replace(Some(result.is_ok()));
+        if result.is_ok() {
+            self.report_abandoned_relocations();
+        }
         result
+    }
+
+    /// Surfaces relocation destinations still bearing the in-progress name
+    /// marker — debris of a crash mid-copy, indistinguishable from real
+    /// maps but for the marker. Reported, never swept: on the cloud tier
+    /// the marker may belong to another client's relocation legitimately
+    /// still in flight.
+    fn report_abandoned_relocations(&self) {
+        let stranded: Vec<String> = self
+            .atlas_cache
+            .load()
+            .areas()
+            .filter(|area| {
+                area.get_name()
+                    .ends_with(crate::relocation::RELOCATION_IN_PROGRESS_SUFFIX)
+            })
+            .map(|area| format!("'{}' ({})", area.get_name(), area.get_id()))
+            .collect();
+        if !stranded.is_empty() {
+            warn!(
+                "{} map(s) look like unfinished relocation copies: {}. A copy or move never \
+                 completed; review them and delete the stranded destinations",
+                stranded.len(),
+                stranded.join(", ")
+            );
+        }
     }
 
     async fn load_all_areas_inner(&self) -> CloudResult<LoadMapsSummary> {
