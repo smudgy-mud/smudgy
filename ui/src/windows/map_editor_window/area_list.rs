@@ -985,7 +985,11 @@ fn folder_header<'a>(
                 tooltip::Position::Bottom,
             ));
             let atlas_is_local = window.local_atlas_ids.contains(&atlas_id);
-            if !atlas_is_local || window.cloud.snapshot.get().signed_in {
+            // An atlas move always crosses the local/cloud boundary, so both
+            // directions need the cloud side: signed out, a local source has
+            // no destination and a cloud source's delete would fail after the
+            // copy (a recoverable duplicate, but an error all the same).
+            if window.cloud.snapshot.get().signed_in {
                 header = header.push(text_button(
                     crate::i18n::ts!("area-list-move-action"),
                     Message::MoveAtlasStorageRequested(atlas_id),

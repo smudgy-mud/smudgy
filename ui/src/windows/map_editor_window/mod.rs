@@ -3655,6 +3655,12 @@ impl MapEditorWindow {
                     Ok(area_id) => {
                         let assoc = self.associate_new_area(area_id);
                         let mut update = self.update(Message::AreaSelected(area_id));
+                        // A same-tier re-file keeps the destination id equal to
+                        // the viewed area's, so `AreaSelected` no-ops; the move
+                        // still bumped the area rev, which must not read as an
+                        // external edit on the next tick. Resync unconditionally.
+                        self.refresh_seen_rev();
+                        self.inspector.resync(&self.mapper, &self.editor);
                         update.event = assoc.or(update.event);
                         return update;
                     }

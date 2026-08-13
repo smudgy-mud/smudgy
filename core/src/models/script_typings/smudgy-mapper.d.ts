@@ -421,6 +421,12 @@ interface Room {
  */
 interface Area {
     readonly id: AreaId;
+    /**
+     * The area id as its canonical hyphenated lowercase UUID string: the
+     * JSON-safe spelling of `id`, as carried by the `map:room` event's
+     * `areaId` field and accepted by MapView apply-area scoping.
+     */
+    readonly uuid: string;
     readonly name: string;
     readonly room_numbers: RoomNumber[];
     /**
@@ -451,21 +457,22 @@ interface Area {
 
 /** Options for {@link Mapper.createArea}. */
 interface CreateAreaOptions {
-    /** Select the authoritative storage tier explicitly. */
-    storage: MapStorage;
-    /** Optionally create the area inside this atlas. Its storage must match. */
+    /**
+     * The authoritative storage tier. When omitted, the area is durable in
+     * the default tier: cloud when signed in, local otherwise (or the
+     * atlas's tier when `atlas` is given).
+     */
+    storage?: MapStorage;
+    /**
+     * Optionally create the area inside this atlas. The atlas determines the
+     * storage tier when `storage` is omitted; when both are given they must
+     * match.
+     */
     atlas?: Atlas | AtlasId;
-    ephemeral?: never;
-}
-
-/** Options accepted only for the pre-storage-model creation API. */
-interface LegacyCreateAreaOptions {
-    storage?: never;
-    atlas?: never;
     /**
      * Create a session map: it lives only for this session, is never saved
-     * or synced, and is discarded when the session closes. Use this for maps
-     * built automatically from server data.
+     * or synced, and is discarded when the session closes. Mutually
+     * exclusive with `storage`, which wins if both are supplied.
      * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
      * Use `storage: "session"` instead.
      */
@@ -496,14 +503,12 @@ interface CreateAtlasOptions {
  * location; changes to persistent areas sync to the cloud in the background.
  */
 interface Mapper {
-    /** Create a new area in an explicit storage tier and return its handle. */
-    createArea(name: string, options: CreateAreaOptions): Promise<Area>;
     /**
-     * Create using the old implicit default tier or `ephemeral` flag.
-     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
-     * Pass a {@link CreateAreaOptions} object with explicit `storage` instead.
+     * Create a new area and return its handle. Without an explicit `storage`
+     * (or an `atlas` to inherit a tier from), the area is durable in the
+     * default tier: cloud when signed in, local otherwise.
      */
-    createArea(name: string, options?: LegacyCreateAreaOptions): Promise<Area>;
+    createArea(name: string, options?: CreateAreaOptions): Promise<Area>;
     /** List local and cloud atlases. */
     listAtlases(): Promise<Atlas[]>;
     /** Create a durable atlas in an explicit storage tier. */

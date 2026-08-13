@@ -1108,10 +1108,14 @@ impl Mapper {
             .rcu(|cache| Arc::new(cache.with_scope_exclusions(atlases.clone(), areas.clone())));
     }
 
-    #[deprecated(
-        since = "0.5.3",
-        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.5.x and removed in 0.6.0"
-    )]
+    /// Create an area in the default durable tier — cloud when signed in,
+    /// local otherwise — filed into the current recording target when one is
+    /// set. This is the storage-less creation surface behind scripts'
+    /// `createArea(name)`; callers that need a specific tier or folder use
+    /// [`Self::create_area_at`].
+    ///
+    /// # Errors
+    /// Propagates the backend's create error (e.g. unauthorized, network).
     pub fn create_area(&self, name: String) -> impl Future<Output = CloudResult<AreaId>> {
         self.inner.create_area(name)
     }
@@ -1135,9 +1139,10 @@ impl Mapper {
 
     /// Create an area at an explicit storage + folder destination.
     ///
-    /// This is the canonical creation surface. The deprecated `create_area*`
-    /// compatibility helpers delegate here only through 0.5.x and are removed
-    /// in 0.6.0.
+    /// This is the canonical creation surface for explicit destinations; the
+    /// storage-less [`Self::create_area`] covers the default durable tier.
+    /// The deprecated [`Self::create_area_ephemeral`] delegates here only
+    /// through 0.5.x and is removed in 0.6.0.
     pub fn create_area_at(
         &self,
         name: String,
@@ -1258,10 +1263,6 @@ impl Mapper {
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
-    #[deprecated(
-        since = "0.5.3",
-        note = "use create_area_at with an explicit MapDestination; supported through Smudgy 0.5.x and removed in 0.6.0"
-    )]
     pub fn create_area_in(
         &self,
         name: String,
@@ -1414,14 +1415,12 @@ impl Mapper {
         async move { backend.list_areas().await }
     }
 
-    /// Create an empty atlas (folder), routed to the backend's default tier.
+    /// Create an empty atlas (folder), routed to the backend's default
+    /// durable tier — cloud when signed in, local otherwise. Callers that
+    /// need a specific tier use `create_atlas_at`.
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
-    #[deprecated(
-        since = "0.5.3",
-        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.5.x and removed in 0.6.0"
-    )]
     pub fn create_atlas(&self, name: String) -> impl Future<Output = CloudResult<Atlas>> {
         let backend = self.inner.backend.clone();
         async move { backend.create_atlas(&name).await }
@@ -1433,10 +1432,6 @@ impl Mapper {
     ///
     /// # Errors
     /// Propagates the backend's create error (e.g. unauthorized, network).
-    #[deprecated(
-        since = "0.5.3",
-        note = "use create_atlas_at with an explicit MapStorage; supported through Smudgy 0.5.x and removed in 0.6.0"
-    )]
     pub fn create_atlas_in(
         &self,
         name: String,
