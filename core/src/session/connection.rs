@@ -753,10 +753,13 @@ pub struct Connection {
     runtime_tx: UnboundedSender<RuntimeAction>,
     ui_tx: mpsc::Sender<TaggedSessionEvent>,
     socket_tx: Arc<RwLock<Option<WeakSender<OutboundFrame>>>>,
-    on_connect: Option<Box<dyn FnOnce() + Send>>,
     /// Monotonic session-local id used to reject late packet markers from a
     /// socket that was replaced by a reconnect.
     generation: u64,
+    /// The runtime's "a deferred profile send is pending" bit; each connect
+    /// task hands it to its [`VtProcessor`] so packet-completion markers stop
+    /// once the send releases (see `set_marker_armed_flag`).
+    marker_armed: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The trigger manager's "any trigger has a raw pattern" flag; each connect
     /// task hands it to its [`VtProcessor`] so per-line raw capture only runs
     /// while something can match on it.
@@ -788,7 +791,6 @@ impl std::fmt::Debug for Connection {
             .field("runtime_tx", &self.runtime_tx)
             .field("ui_tx", &self.ui_tx)
             .field("socket_tx", &self.socket_tx)
-            .field("on_connect", &self.on_connect.is_some())
             .field("generation", &self.generation)
             .field("raw_wanted", &self.raw_wanted)
             .field("window_size", &self.window_size)
@@ -821,8 +823,8 @@ impl Connection {
             runtime_tx,
             ui_tx,
             socket_tx: Arc::new(RwLock::new(None)),
-            on_connect: None,
             generation,
+            marker_armed: None,
             raw_wanted,
             window_size,
             write_stall_timeout: WRITE_STALL_TIMEOUT,
@@ -940,8 +942,8 @@ impl Connection {
         self.socket_tx = Arc::new(RwLock::new(None));
         let socket_tx = self.socket_tx.clone();
 
-        let on_connect = self.on_connect.take();
         let generation = self.generation;
+        let marker_armed = self.marker_armed.clone();
         let raw_wanted = self.raw_wanted.clone();
         let window_size = self.window_size.clone();
         let write_stall_timeout = self.write_stall_timeout;
@@ -951,6 +953,9 @@ impl Connection {
             let mut vt_processor =
                 VtProcessor::with_connection_generation(runtime_tx.clone(), generation);
             vt_processor.set_raw_wanted_flag(raw_wanted);
+            if let Some(marker_armed) = marker_armed {
+                vt_processor.set_marker_armed_flag(marker_armed);
+            }
             // Telnet/IAC preprocessor: consumes negotiation + prompt markers so the VT parser only
             // ever sees pure game text. Persists across reads (a sequence may straddle a read).
             let mut telnet = telnet::TelnetParser::new();
@@ -1010,10 +1015,6 @@ impl Connection {
                             .send(RuntimeAction::Echo(Arc::new("Connected.".to_string())))
                             .ok();
                         info!("Connected");
-
-                        if let Some(on_connect) = on_connect {
-                            on_connect();
-                        }
 
                         {
                             let Ok(mut sender) = socket_tx.write() else {
@@ -1474,8 +1475,12 @@ impl Connection {
         }
     }
 
-    pub fn on_connect(&mut self, on_connect: impl FnOnce() + Send + 'static) {
-        self.on_connect = Some(Box::new(on_connect));
+    /// Ties this connection's packet-completion markers to the runtime's
+    /// "a deferred profile send is pending" bit. Set before [`Self::connect`];
+    /// the connect task hands it to its [`VtProcessor`]. Without one, markers
+    /// are emitted on every read batch.
+    pub(crate) fn set_marker_armed_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.marker_armed = Some(flag);
     }
 }
 

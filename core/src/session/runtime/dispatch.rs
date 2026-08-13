@@ -351,6 +351,13 @@ impl Inner<'_> {
                         }
                     }
                 });
+                // Arm the packet-marker gate before the socket task spawns:
+                // the new connection's VtProcessor reads this cell, and the
+                // marker's whole purpose is releasing the pending send.
+                self.send_on_connect_armed.store(
+                    self.pending_send_on_connect.is_some(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
 
                 let mut connection = Connection::with_generation(
                     self.session_runtime_tx.clone(),
@@ -359,6 +366,7 @@ impl Inner<'_> {
                     self.window_size.clone(),
                     connection_generation,
                 );
+                connection.set_marker_armed_flag(self.send_on_connect_armed.clone());
 
                 // Resolve the configured encoding label; an unresolvable one falls back
                 // to UTF-8 loudly — in the session view, not just the log, since the
@@ -419,6 +427,8 @@ impl Inner<'_> {
                     connection.disconnect();
                 }
                 self.pending_send_on_connect = None;
+                self.send_on_connect_armed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 Ok(ActionResult::None)
             }
             RuntimeAction::HandleIncomingLine(line) => {
@@ -481,6 +491,10 @@ impl Inner<'_> {
                 if connection_generation != self.connection_generation || !has_displayable_text {
                     return Ok(ActionResult::None);
                 }
+                // Released (or nothing was pending): disarm so the socket
+                // task stops emitting markers for the rest of the connection.
+                self.send_on_connect_armed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 match self.pending_send_on_connect.take() {
                     Some(action) => Ok(ActionResult::Run(vec![action])),
                     None => Ok(ActionResult::None),
@@ -1137,6 +1151,8 @@ impl Inner<'_> {
                 // first displayable packet releases it.
                 if connection_generation == self.connection_generation {
                     self.pending_send_on_connect = None;
+                    self.send_on_connect_armed
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 if self
                     .connected

@@ -600,6 +600,7 @@ impl Runtime {
                 connection: None,
                 connection_generation: 0,
                 pending_send_on_connect: None,
+                send_on_connect_armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 window_size: Arc::new(std::sync::atomic::AtomicU32::new(
                     super::connection::responders::pack_dims(
                         super::connection::responders::DEFAULT_DIMS.0,
@@ -672,6 +673,11 @@ impl Runtime {
                 let old_connection = inner.connection.take();
                 let old_connection_generation = inner.connection_generation;
                 let old_pending_send_on_connect = inner.pending_send_on_connect.take();
+                // The surviving connection's VtProcessor holds a clone of this
+                // exact cell (like the raw-wanted flag below); the rebuilt
+                // Inner must keep writing to it, and the pending send it
+                // mirrors survives the reload untouched.
+                let old_send_on_connect_armed = inner.send_on_connect_armed.clone();
                 // The window-size cell is session-lifetime like the connection: the
                 // surviving connection's socket task was seeded from this cell, and
                 // the UI only re-reports on actual grid changes.
@@ -895,6 +901,7 @@ impl Runtime {
                     connection: old_connection, // Preserve the connection
                     connection_generation: old_connection_generation,
                     pending_send_on_connect: old_pending_send_on_connect,
+                    send_on_connect_armed: old_send_on_connect_armed,
                     window_size: old_window_size,
                     pending_buffer_updates: Vec::new(),
                     pending_line_operations: pending_line_operations.clone(), // Preserve the shared operations
@@ -1045,6 +1052,12 @@ struct Inner<'a> {
     /// Profile text held until the current connection's first fully processed
     /// inbound packet containing non-empty terminal text.
     pending_send_on_connect: Option<RuntimeAction>,
+    /// Mirror of `pending_send_on_connect.is_some()`, shared with each
+    /// connection's `VtProcessor` so packet-completion markers are only
+    /// emitted while a deferred send could consume one. Session-lifetime like
+    /// the connection: the live socket task holds a clone of this exact cell,
+    /// so a reload must carry it over rather than mint a fresh one.
+    send_on_connect_armed: Arc<std::sync::atomic::AtomicBool>,
     /// The session's current main-pane character grid, packed with
     /// `connection::responders::pack_dims`. Updated by
     /// `RuntimeAction::WindowSizeChanged` and handed to every [`Connection`] this
