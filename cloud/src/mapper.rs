@@ -98,6 +98,12 @@ impl AreaMutationBatch {
         }
     }
 
+    /// The staged operations, exposed for envelope-boundary assertions.
+    #[cfg(test)]
+    pub(crate) fn operations(&self) -> &[AreaMutation] {
+        &self.operations
+    }
+
     /// Allows a real one-sided traversal topology edit to explicitly split
     /// its paired connection before applying the update.
     #[must_use]
@@ -2306,84 +2312,22 @@ impl Inner {
             validate_import_document(details)?;
         }
 
-        // Mint every new id first, so cross-area exits can be remapped in the pass below.
-        let mut id_map: HashMap<AreaId, AreaId> = HashMap::with_capacity(areas.len());
-        for details in &areas {
-            id_map.insert(details.area.id, AreaId(Uuid::new_v4()));
-        }
-
-        for details in &mut areas {
-            details.area.id = id_map[&details.area.id];
-            details.area.rev = 1;
-            details.area.user_id = None;
-            details.area.atlas_id = None;
-            details.area.access = Some(AreaAccess::OWNER);
-            details.area.owner_nickname = None;
-            details.area.copied_from_area_id = None;
-            details.area.copied_from_rev = None;
-            details.area.copied_at = None;
-            details.area.family_token = None;
-            details.content_hash = None;
-            details.linked_areas.clear();
-
-            for label in &mut details.labels {
-                label.id = LabelId(Uuid::new_v4());
-                label.is_secret = false;
-            }
-            for shape in &mut details.shapes {
-                shape.id = ShapeId(Uuid::new_v4());
-                shape.is_secret = false;
-            }
-            // Fresh Connection identities, keeping the exits' membership
-            // references consistent (validated above, so the lookups below
-            // cannot miss).
-            let connection_map: HashMap<crate::ConnectionId, crate::ConnectionId> = details
-                .connections
-                .iter()
-                .map(|connection| (connection.id, crate::ConnectionId::new()))
-                .collect();
-            for connection in &mut details.connections {
-                connection.id = connection_map[&connection.id];
-            }
-            for room in &mut details.rooms {
-                room.is_secret = false;
-                for exit in &mut room.exits {
-                    exit.id = ExitId(Uuid::new_v4());
-                    exit.connection_id = connection_map[&exit.connection_id];
-                    exit.is_secret = false;
-                    exit.to_unknown = false;
-                    exit.to_area_token = None;
-                    exit.to_area_id = match exit.to_area_id {
-                        Some(old) if id_map.contains_key(&old) => Some(id_map[&old]),
-                        Some(_) => {
-                            // Target is outside the imported set: drop the dangling cross-area link.
-                            exit.to_room_number = None;
-                            exit.to_direction = None;
-                            None
-                        }
-                        None => None,
-                    };
-                }
-            }
-            // Dropped cross-area links (and cleared `to_unknown` markers)
-            // can leave an External Connection with no member that still
-            // leaves the area: it becomes Dangling, exactly as a live edit
-            // would convert it.
-            let leaves_area: HashSet<crate::ConnectionId> = details
-                .rooms
-                .iter()
-                .flat_map(|room| room.exits.iter())
-                .filter(|exit| exit.to_area_id.is_some_and(|to| to != details.area.id))
-                .map(|exit| exit.connection_id)
-                .collect();
-            for connection in &mut details.connections {
-                if connection.kind == crate::ConnectionKind::External
-                    && !leaves_area.contains(&connection.id)
-                {
-                    connection.kind = crate::ConnectionKind::Dangling;
-                }
-            }
-        }
+        // Mint every new id first, then hand the set to the shared
+        // freshener (also used by relocation): fresh entity identities,
+        // in-set cross-area remap, out-of-set link drops, and the
+        // External→Dangling demotion, plus the import-specific secrecy
+        // scrub that resets foreign metadata to a locally-owned area.
+        let id_map: HashMap<AreaId, AreaId> = areas
+            .iter()
+            .map(|details| (details.area.id, AreaId(Uuid::new_v4())))
+            .collect();
+        crate::relocation::freshen_documents(
+            &mut areas,
+            &id_map,
+            &crate::relocation::FreshenOptions {
+                scrub_secrets: true,
+            },
+        );
 
         for details in &areas {
             self.backend.import_local_area(details.clone()).await?;

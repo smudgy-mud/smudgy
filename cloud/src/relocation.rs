@@ -238,14 +238,22 @@ impl Mapper {
         // Server-copied members are already complete; everything else is
         // freshened and replayed. In-set links from replayed members into a
         // server-copied sibling still remap correctly through `id_map`,
-        // because the server clone preserves room numbers.
-        let documents: Vec<_> = snapshots
+        // because the server clone preserves room numbers. Secrecy markings
+        // ride the copy untouched — the snapshot already is the viewer's
+        // projection.
+        let mut documents: Vec<_> = snapshots
             .into_iter()
-            .zip(destination_ids.iter().copied())
             .zip(server_copied.iter().copied())
             .filter(|&(_, copied)| !copied)
-            .map(|((document, destination_id), _)| freshen(document, destination_id, &id_map))
+            .map(|(document, _)| document)
             .collect();
+        freshen_documents(
+            &mut documents,
+            &id_map,
+            &FreshenOptions {
+                scrub_secrets: false,
+            },
+        );
 
         if let Err(error) = self.populate_documents(&documents).await {
             cleanup_areas(self, &destination_ids).await;
@@ -706,68 +714,104 @@ fn connection_batches(document: &AreaWithDetails) -> Vec<AreaMutationBatch> {
     batches
 }
 
-fn freshen(
-    mut document: AreaWithDetails,
-    destination_id: AreaId,
-    id_map: &HashMap<AreaId, AreaId>,
-) -> AreaWithDetails {
-    document.area.id = destination_id;
-    document.area.atlas_id = None;
-    document.area.atlas_name = None;
-    document.area.user_id = None;
-    document.area.rev = 1;
-    document.area.copied_from_area_id = None;
-    document.area.copied_from_rev = None;
-    document.area.copied_at = None;
-    document.area.family_token = None;
-    document.content_hash = None;
-    document.linked_areas.clear();
+/// How [`freshen_documents`] treats viewer-only markings.
+pub(crate) struct FreshenOptions {
+    /// Strip every `is_secret` marking and stamp locally-owned access — the
+    /// JSON-import contract, which resets foreign metadata to a
+    /// locally-owned area. Relocation keeps markings: a copy of one's own
+    /// map preserves the viewer's projection verbatim.
+    pub scrub_secrets: bool,
+}
 
-    for label in &mut document.labels {
-        label.id = LabelId(uuid::Uuid::new_v4());
-    }
-    for shape in &mut document.shapes {
-        shape.id = ShapeId(uuid::Uuid::new_v4());
-    }
-    let connection_map: HashMap<ConnectionId, ConnectionId> = document
-        .connections
-        .iter()
-        .map(|connection| (connection.id, ConnectionId::new()))
-        .collect();
-    for connection in &mut document.connections {
-        connection.id = connection_map[&connection.id];
-    }
-    for room in &mut document.rooms {
-        for exit in &mut room.exits {
-            exit.id = ExitId::new();
-            exit.connection_id = connection_map[&exit.connection_id];
-            exit.to_unknown = false;
-            exit.to_area_token = None;
-            exit.to_area_id = match exit.to_area_id {
-                Some(old) if id_map.contains_key(&old) => Some(id_map[&old]),
-                Some(_) => {
-                    exit.to_room_number = None;
-                    exit.to_direction = None;
-                    None
+/// The shared identity freshener behind relocation and the §8.4 JSON
+/// import. For every document: stamps the new area id from `id_map` (which
+/// must cover every document in the set), resets viewer/cloud metadata to
+/// that of a fresh unsynced area, mints fresh label/shape/connection/exit
+/// identities (keeping exit→Connection membership consistent), remaps
+/// cross-area exit targets that stay within the set, drops targets that
+/// leave it, and demotes External Connections that no longer leave their
+/// area to Dangling — exactly as a live edit would convert them.
+pub(crate) fn freshen_documents(
+    documents: &mut [AreaWithDetails],
+    id_map: &HashMap<AreaId, AreaId>,
+    options: &FreshenOptions,
+) {
+    for document in documents {
+        document.area.id = id_map[&document.area.id];
+        document.area.atlas_id = None;
+        document.area.atlas_name = None;
+        document.area.user_id = None;
+        document.area.rev = 1;
+        document.area.copied_from_area_id = None;
+        document.area.copied_from_rev = None;
+        document.area.copied_at = None;
+        document.area.family_token = None;
+        document.content_hash = None;
+        document.linked_areas.clear();
+        if options.scrub_secrets {
+            document.area.access = Some(crate::AreaAccess::OWNER);
+            document.area.owner_nickname = None;
+        }
+
+        for label in &mut document.labels {
+            label.id = LabelId(uuid::Uuid::new_v4());
+            if options.scrub_secrets {
+                label.is_secret = false;
+            }
+        }
+        for shape in &mut document.shapes {
+            shape.id = ShapeId(uuid::Uuid::new_v4());
+            if options.scrub_secrets {
+                shape.is_secret = false;
+            }
+        }
+        let connection_map: HashMap<ConnectionId, ConnectionId> = document
+            .connections
+            .iter()
+            .map(|connection| (connection.id, ConnectionId::new()))
+            .collect();
+        for connection in &mut document.connections {
+            connection.id = connection_map[&connection.id];
+        }
+        let area_id = document.area.id;
+        for room in &mut document.rooms {
+            if options.scrub_secrets {
+                room.is_secret = false;
+            }
+            for exit in &mut room.exits {
+                exit.id = ExitId::new();
+                exit.connection_id = connection_map[&exit.connection_id];
+                if options.scrub_secrets {
+                    exit.is_secret = false;
                 }
-                None => None,
-            };
+                exit.to_unknown = false;
+                exit.to_area_token = None;
+                exit.to_area_id = match exit.to_area_id {
+                    Some(old) if id_map.contains_key(&old) => Some(id_map[&old]),
+                    Some(_) => {
+                        exit.to_room_number = None;
+                        exit.to_direction = None;
+                        None
+                    }
+                    None => None,
+                };
+            }
+        }
+        let leaves_area: HashSet<ConnectionId> = document
+            .rooms
+            .iter()
+            .flat_map(|room| room.exits.iter())
+            .filter(|exit| exit.to_area_id.is_some_and(|target| target != area_id))
+            .map(|exit| exit.connection_id)
+            .collect();
+        for connection in &mut document.connections {
+            if connection.kind == ConnectionKind::External && !leaves_area.contains(&connection.id)
+            {
+                connection.kind = ConnectionKind::Dangling;
+                connection.endpoint_b = None;
+            }
         }
     }
-    let leaves_area: HashSet<ConnectionId> = document
-        .rooms
-        .iter()
-        .flat_map(|room| room.exits.iter())
-        .filter(|exit| exit.to_area_id.is_some_and(|id| id != destination_id))
-        .map(|exit| exit.connection_id)
-        .collect();
-    for connection in &mut document.connections {
-        if connection.kind == ConnectionKind::External && !leaves_area.contains(&connection.id) {
-            connection.kind = ConnectionKind::Dangling;
-            connection.endpoint_b = None;
-        }
-    }
-    document
 }
 
 async fn cleanup_areas(mapper: &Mapper, area_ids: &[AreaId]) {
@@ -1229,6 +1273,391 @@ mod tests {
         let _submission = stale
             .upsert_room(RoomKey::new(source, RoomNumber(3)), RoomUpdates::default())
             .expect("source reopened after the refusal");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn blank_document(area_id: AreaId, name: &str) -> AreaWithDetails {
+        AreaWithDetails {
+            area: crate::Area {
+                id: area_id,
+                user_id: None,
+                atlas_id: None,
+                atlas_name: None,
+                name: name.to_string(),
+                created_at: chrono::Utc::now(),
+                rev: 1,
+                access: None,
+                owner_nickname: None,
+                copied_from_area_id: None,
+                copied_from_rev: None,
+                copied_at: None,
+                family_token: None,
+            },
+            format_version: crate::AREA_FORMAT_VERSION,
+            content_hash: None,
+            properties: Vec::new(),
+            rooms: Vec::new(),
+            labels: Vec::new(),
+            shapes: Vec::new(),
+            connections: Vec::new(),
+            linked_areas: Vec::new(),
+        }
+    }
+
+    fn plain_room(number: i32) -> crate::RoomWithDetails {
+        crate::RoomWithDetails {
+            room_number: RoomNumber(number),
+            title: String::new(),
+            description: String::new(),
+            level: 0,
+            x: 0.0,
+            y: 0.0,
+            color: String::new(),
+            properties: Vec::new(),
+            exits: Vec::new(),
+            tags: std::collections::BTreeSet::default(),
+            is_secret: false,
+            external_id: None,
+        }
+    }
+
+    fn member_exit(
+        connection_id: ConnectionId,
+        from_direction: crate::ExitDirection,
+        to: Option<(AreaId, i32)>,
+    ) -> Exit {
+        Exit {
+            id: ExitId::new(),
+            from_direction,
+            to_area_id: to.map(|(area, _)| area),
+            to_room_number: to.map(|(_, room)| RoomNumber(room)),
+            to_direction: None,
+            path: String::new(),
+            is_hidden: false,
+            is_closed: false,
+            is_locked: false,
+            weight: 1.0,
+            command: String::new(),
+            connection_id,
+            to_unknown: false,
+            to_area_token: None,
+            is_secret: false,
+        }
+    }
+
+    fn plain_connection(
+        id: ConnectionId,
+        a_room: i32,
+        b_room: Option<i32>,
+        kind: ConnectionKind,
+    ) -> crate::Connection {
+        let endpoint = |room: i32, side: crate::RoomSide| crate::ConnectionEndpoint {
+            room_number: RoomNumber(room),
+            side,
+            port_offset: 0.5,
+            port_mode: crate::PortMode::AutoPinned,
+        };
+        crate::Connection {
+            id,
+            endpoint_a: endpoint(a_room, crate::RoomSide::East),
+            endpoint_b: b_room.map(|room| endpoint(room, crate::RoomSide::West)),
+            kind,
+            routing: crate::ConnectionRouting::Simple,
+            segment_shape: crate::SegmentShape::Direct,
+            corner: crate::CornerStyle::Sharp,
+            route_points: Vec::new(),
+            dash: crate::ConnectionDash::Solid,
+            color: crate::DEFAULT_CONNECTION_COLOR.to_string(),
+            thickness: crate::DEFAULT_CONNECTION_THICKNESS,
+        }
+    }
+
+    /// C6: the shared freshener remaps in-set cross-area targets across the
+    /// whole document set, drops out-of-set targets, demotes their External
+    /// Connections to Dangling exactly as a live edit would, and treats
+    /// secrecy per caller contract — preserved for relocation, scrubbed to
+    /// a locally-owned area for import.
+    #[test]
+    fn freshener_remaps_in_set_links_and_demotes_the_rest() {
+        let a = AreaId(Uuid::new_v4());
+        let b = AreaId(Uuid::new_v4());
+        let outside = AreaId(Uuid::new_v4());
+        let build = || {
+            let to_b = ConnectionId::new();
+            let to_outside = ConnectionId::new();
+            let mut doc_a = blank_document(a, "A");
+            let mut room = plain_room(1);
+            room.is_secret = true;
+            let mut in_set = member_exit(to_b, crate::ExitDirection::East, Some((b, 5)));
+            in_set.is_secret = true;
+            room.exits.push(in_set);
+            room.exits.push(member_exit(
+                to_outside,
+                crate::ExitDirection::West,
+                Some((outside, 9)),
+            ));
+            doc_a.rooms.push(room);
+            doc_a
+                .connections
+                .push(plain_connection(to_b, 1, None, ConnectionKind::External));
+            doc_a.connections.push(plain_connection(
+                to_outside,
+                1,
+                None,
+                ConnectionKind::External,
+            ));
+            let mut doc_b = blank_document(b, "B");
+            doc_b.rooms.push(plain_room(5));
+            vec![doc_a, doc_b]
+        };
+        let id_map: HashMap<AreaId, AreaId> = [
+            (a, AreaId(Uuid::new_v4())),
+            (b, AreaId(Uuid::new_v4())),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut preserved = build();
+        freshen_documents(
+            &mut preserved,
+            &id_map,
+            &FreshenOptions {
+                scrub_secrets: false,
+            },
+        );
+        assert_eq!(preserved[0].area.id, id_map[&a]);
+        assert_eq!(preserved[1].area.id, id_map[&b]);
+        let room = &preserved[0].rooms[0];
+        let in_set = &room.exits[0];
+        assert_eq!(
+            in_set.to_area_id,
+            Some(id_map[&b]),
+            "in-set targets remap to the destination sibling"
+        );
+        assert_eq!(in_set.to_room_number, Some(RoomNumber(5)));
+        let kept_external = preserved[0]
+            .connections
+            .iter()
+            .find(|connection| connection.id == in_set.connection_id)
+            .expect("in-set connection survives");
+        assert_eq!(
+            kept_external.kind,
+            ConnectionKind::External,
+            "a remapped link still leaves its area"
+        );
+        let dangled = &room.exits[1];
+        assert_eq!(dangled.to_area_id, None, "out-of-set targets are dropped");
+        assert_eq!(dangled.to_room_number, None);
+        let demoted = preserved[0]
+            .connections
+            .iter()
+            .find(|connection| connection.id == dangled.connection_id)
+            .expect("demoted connection survives");
+        assert_eq!(demoted.kind, ConnectionKind::Dangling);
+        assert_eq!(demoted.endpoint_b, None);
+        assert!(
+            room.is_secret && room.exits[0].is_secret,
+            "relocation preserves the viewer's secrecy markings"
+        );
+        assert!(preserved[0].area.access.is_none(), "access left untouched");
+
+        let mut scrubbed = build();
+        freshen_documents(
+            &mut scrubbed,
+            &id_map,
+            &FreshenOptions {
+                scrub_secrets: true,
+            },
+        );
+        let room = &scrubbed[0].rooms[0];
+        assert!(
+            !room.is_secret && room.exits.iter().all(|exit| !exit.is_secret),
+            "import scrubs secrecy markings"
+        );
+        assert_eq!(
+            scrubbed[0].area.access,
+            Some(crate::AreaAccess::OWNER),
+            "import stamps locally-owned access"
+        );
+    }
+
+    /// C6: connection groups (one CreateConnection plus its member exits)
+    /// never straddle a 256-operation envelope boundary — a connection
+    /// without members is structurally invalid at any boundary the server
+    /// could observe.
+    #[test]
+    fn connection_groups_never_split_across_envelopes() {
+        let area_id = AreaId(Uuid::new_v4());
+        let mut document = blank_document(area_id, "Chunked");
+        // 100 paired connections at 3 operations per group: 300 operations,
+        // which cannot pack evenly into 256-op envelopes.
+        for index in 0..100 {
+            let connection_id = ConnectionId::new();
+            let a_room = index * 2 + 1;
+            let b_room = index * 2 + 2;
+            let mut room_a = plain_room(a_room);
+            room_a.exits.push(member_exit(
+                connection_id,
+                crate::ExitDirection::East,
+                Some((area_id, b_room)),
+            ));
+            let mut room_b = plain_room(b_room);
+            room_b.exits.push(member_exit(
+                connection_id,
+                crate::ExitDirection::West,
+                Some((area_id, a_room)),
+            ));
+            document.rooms.push(room_a);
+            document.rooms.push(room_b);
+            document.connections.push(plain_connection(
+                connection_id,
+                a_room,
+                Some(b_room),
+                ConnectionKind::Internal,
+            ));
+        }
+
+        let batches = connection_batches(&document);
+        assert!(batches.len() > 1, "the set must overflow one envelope");
+        let mut total_ops = 0;
+        for batch in &batches {
+            let operations = batch.operations();
+            assert!(operations.len() <= MAX_MUTATION_OPERATIONS);
+            total_ops += operations.len();
+            let mut created: HashSet<ConnectionId> = HashSet::new();
+            for operation in operations {
+                match operation {
+                    AreaMutation::CreateConnection { body } => {
+                        created.insert(body.id);
+                    }
+                    AreaMutation::CreateExit { body, .. } => {
+                        let member_of = body
+                            .connection_id
+                            .expect("copied exits carry explicit membership");
+                        assert!(
+                            created.contains(&member_of),
+                            "an exit landed in a different envelope than its connection"
+                        );
+                    }
+                    other => panic!("unexpected operation in a connection batch: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(total_ops, 300, "every operation lands exactly once");
+    }
+
+    /// C6: destination cleanup after a failed relocation deletes every
+    /// partially created area, newest first.
+    #[tokio::test]
+    async fn cleanup_deletes_partially_created_destinations() {
+        let (mapper, root) = mapper("cleanup").await;
+        let first = mapper
+            .create_area_at(
+                "Half copied".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .expect("create first");
+        let second = mapper
+            .create_area_at(
+                "Never populated".to_string(),
+                MapDestination::loose(MapStorage::Cloud),
+            )
+            .await
+            .expect("create second");
+
+        cleanup_areas(&mapper, &[first, second]).await;
+        let atlas = mapper.get_current_atlas();
+        assert!(atlas.get_area(&first).is_none());
+        assert!(atlas.get_area(&second).is_none());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C6: copying a set with cross-area links between members keeps those
+    /// links, remapped onto the destination siblings, while the sources
+    /// stay linked to each other.
+    #[tokio::test]
+    async fn copy_set_remaps_cross_area_links_between_members() {
+        let (mapper, root) = mapper("cross-remap").await;
+        let a = mapper
+            .create_area_at(
+                "Docks".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .expect("create A");
+        let b = mapper
+            .create_area_at(
+                "Warrens".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .expect("create B");
+        for (area, number) in [(a, 1), (b, 2)] {
+            wait(
+                &mapper,
+                mapper
+                    .upsert_room(RoomKey::new(area, RoomNumber(number)), RoomUpdates::default())
+                    .expect("enqueue room"),
+            )
+            .await;
+        }
+        let (_, submission) = mapper
+            .create_exit_tracked(
+                RoomKey::new(a, RoomNumber(1)),
+                ExitArgs {
+                    from_direction: crate::ExitDirection::East,
+                    to_area_id: Some(b),
+                    to_room_number: Some(RoomNumber(2)),
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            )
+            .expect("create cross-area exit");
+        wait(&mapper, submission).await;
+
+        let copied = mapper
+            .relocate_areas(
+                vec![a, b],
+                MapDestination::loose(MapStorage::Cloud),
+                RelocationMode::Copy,
+            )
+            .await
+            .expect("copy the linked set");
+        let a_copy = copied.destination_ids[0];
+        let b_copy = copied.destination_ids[1];
+
+        let atlas = mapper.get_current_atlas();
+        let copied_exit = atlas
+            .get_room(&RoomKey::new(a_copy, RoomNumber(1)))
+            .expect("copied room")
+            .to_details()
+            .exits
+            .first()
+            .cloned()
+            .expect("copied exit");
+        assert_eq!(
+            copied_exit.to_area_id,
+            Some(b_copy),
+            "the in-set link re-anchors onto the copied sibling"
+        );
+        assert_eq!(copied_exit.to_room_number, Some(RoomNumber(2)));
+
+        let source_exit = atlas
+            .get_room(&RoomKey::new(a, RoomNumber(1)))
+            .expect("source room survives a copy")
+            .to_details()
+            .exits
+            .first()
+            .cloned()
+            .expect("source exit");
+        assert_eq!(
+            source_exit.to_area_id,
+            Some(b),
+            "the source set keeps its own linkage"
+        );
 
         std::fs::remove_dir_all(root).ok();
     }
