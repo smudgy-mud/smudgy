@@ -357,6 +357,45 @@ impl MapperBackend for CompositeBackend {
         result
     }
 
+    // The expected-rev forms forward to the owning tier's backend — the
+    // trait default would silently drop the precondition before it could
+    // reach a cloud backend that enforces it. A refused delete leaves the
+    // tier index untouched.
+    async fn delete_area_expecting(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
+        let result = self
+            .area_backend(*area_id)
+            .await
+            .delete_area_expecting(area_id, expected_rev)
+            .await;
+        if result.is_ok() {
+            self.ephemeral_areas.write().remove(area_id);
+            self.local_areas.write().remove(area_id);
+        }
+        result
+    }
+
+    async fn delete_area_expecting_at_generation(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let result = self
+            .area_backend(*area_id)
+            .await
+            .delete_area_expecting_at_generation(area_id, expected_rev, auth_generation)
+            .await;
+        if result.is_ok() {
+            self.ephemeral_areas.write().remove(area_id);
+            self.local_areas.write().remove(area_id);
+        }
+        result
+    }
+
     // ===== VERSIONED MUTATIONS =====
 
     async fn execute_mutation(

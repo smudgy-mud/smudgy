@@ -777,6 +777,20 @@ impl AreaDeleteFence {
         self.armed = false;
     }
 
+    /// A definitive backend refusal (the DELETE's revision precondition
+    /// failed): the server proved it did not delete, so the intent aborts
+    /// and the source reopens — exactly the pre-request compare-then-delete
+    /// outcome, with no ambiguous tombstone to reconcile.
+    fn refuse(mut self) {
+        self.armed = false;
+        if let Err(error) = self.pending.abort_delete(self.area_id) {
+            warn!(
+                "failed to durably abort refused delete for area {}: {error}; keeping the area fenced",
+                self.area_id
+            );
+        }
+    }
+
     fn commit(mut self) -> CloudResult<Vec<PendingEnvelope>> {
         match self.pending.commit_delete(self.area_id) {
             Ok(removed) => {
@@ -2575,13 +2589,17 @@ impl Inner {
     ) -> CloudResult<()> {
         self.pending.wait_until_delete_quiescent(area_id).await;
         if let Some(expected_rev) = expected_rev {
-            // Compare-then-delete: the backend's DELETE carries no revision
-            // precondition, so the strongest available guard is re-reading the
-            // authoritative revision immediately before deleting and refusing
-            // on drift. Returning before `prepare()` drops the still-armed
-            // fence, which aborts the delete intent and reopens the source. A
-            // TOCTOU window remains between this read and the DELETE below;
-            // closing it needs a server-side expected-rev delete precondition.
+            // Compare-then-delete, kept even though the DELETE below also
+            // carries the revision as a server-side precondition
+            // (`?expected_rev=`). This client check remains the enforcement
+            // FLOOR: a server predating the precondition silently ignores
+            // the unknown query parameter and deletes unconditionally, so
+            // only this read-and-refuse guards against drift there — server
+            // acceptance must never be mistaken for enforcement. On an
+            // updated server the precondition closes the remaining TOCTOU
+            // window between this read and the DELETE. Returning before
+            // `prepare()` drops the still-armed fence, which aborts the
+            // delete intent and reopens the source.
             let current = if let Some(auth_generation) = auth_generation {
                 self.backend
                     .get_area_at_generation(&area_id, auth_generation)
@@ -2613,19 +2631,33 @@ impl Inner {
             self.pending_by_area.clone(),
             self.sync_stats.clone(),
         );
+        // The expected revision rides the DELETE itself; the backend (or the
+        // server behind it) refuses with a RevisionConflict when the area
+        // moved past it, atomically with the delete.
         let result = if let Some(auth_generation) = auth_generation {
             self.backend
-                .delete_area_at_generation(&area_id, auth_generation)
+                .delete_area_expecting_at_generation(&area_id, expected_rev, auth_generation)
                 .await
         } else {
-            self.backend.delete_area(&area_id).await
+            self.backend
+                .delete_area_expecting(&area_id, expected_rev)
+                .await
         };
         if let Err(error) = result {
             tracking.settle(false);
-            // A transport error or cancelled response is not proof that the
-            // server did not commit the DELETE. Keep the durable intent frozen
-            // and let the sync engine resolve it with a point GET.
-            delete_fence.reconcile();
+            if matches!(error, CloudError::RevisionConflict { .. }) {
+                // The server-side precondition refused the DELETE: a
+                // definitive verdict that nothing was deleted. Abort the
+                // intent so the source reopens, matching the pre-request
+                // compare failure above.
+                delete_fence.refuse();
+            } else {
+                // A transport error or cancelled response is not proof that
+                // the server did not commit the DELETE. Keep the durable
+                // intent frozen and let the sync engine resolve it with a
+                // point GET.
+                delete_fence.reconcile();
+            }
             self.sync_notify.notify_one();
             return Err(error);
         }
@@ -4088,6 +4120,13 @@ mod tests {
         /// When set, every received envelope fails with this error instead
         /// of applying (scripted server verdicts / outages).
         fail_with: Mutex<Option<CloudError>>,
+        /// The `expected_rev` of every received area delete, in arrival
+        /// order (`None` = an unconditioned delete).
+        deletes: Mutex<Vec<Option<i64>>>,
+        /// When set, area deletes refuse with a `RevisionConflict` (the
+        /// server-side expected-rev precondition's verdict) instead of
+        /// applying.
+        refuse_deletes: Mutex<bool>,
     }
 
     impl FixedBackend {
@@ -4097,6 +4136,8 @@ mod tests {
                 omit_from_list: Mutex::new(HashSet::new()),
                 mutations: Mutex::new(Vec::new()),
                 fail_with: Mutex::new(None),
+                deletes: Mutex::new(Vec::new()),
+                refuse_deletes: Mutex::new(false),
             }
         }
 
@@ -4106,6 +4147,10 @@ mod tests {
 
         fn omit_from_list(&self, area_id: AreaId) {
             self.omit_from_list.lock().insert(area_id);
+        }
+
+        fn refuse_deletes_with_conflict(&self, refuse: bool) {
+            *self.refuse_deletes.lock() = refuse;
         }
     }
 
@@ -4143,7 +4188,29 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_area(&self, _area_id: &AreaId) -> CloudResult<()> {
+        async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
+            self.delete_area_expecting(area_id, None).await
+        }
+
+        async fn delete_area_expecting(
+            &self,
+            area_id: &AreaId,
+            expected_rev: Option<i64>,
+        ) -> CloudResult<()> {
+            self.deletes.lock().push(expected_rev);
+            if *self.refuse_deletes.lock() {
+                let current = self
+                    .areas
+                    .lock()
+                    .get(area_id)
+                    .map_or(0, |details| details.area.rev);
+                return Err(CloudError::RevisionConflict {
+                    id: area_id.0,
+                    expected_rev: expected_rev.unwrap_or(0),
+                    current_rev: current + 1,
+                });
+            }
+            self.areas.lock().remove(area_id);
             Ok(())
         }
 
@@ -4214,6 +4281,64 @@ mod tests {
 
     fn temp_cache_dir() -> PathBuf {
         std::env::temp_dir().join(format!("smudgy-mapper-test-{}", Uuid::new_v4()))
+    }
+
+    /// A relocation-commit delete carries the move snapshot's revision to the
+    /// backend as the DELETE's own precondition (belt to the compare's
+    /// braces), and an accepted delete removes the area.
+    #[tokio::test]
+    async fn move_commit_sends_the_expected_rev_with_the_delete() {
+        let area_id = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(area_id, "movable")]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+
+        let mut fences = mapper.begin_area_move(&[area_id]).expect("fence");
+        let fence = fences.pop().expect("one fence");
+        mapper
+            .commit_area_move(fence, Some(1))
+            .await
+            .expect("matching rev deletes");
+        assert_eq!(
+            backend.deletes.lock().clone(),
+            vec![Some(1)],
+            "the DELETE itself carried the snapshot revision"
+        );
+    }
+
+    /// The pure TOCTOU shape: the pre-delete compare passes (the client's
+    /// read still shows the snapshot revision) but the SERVER's expected-rev
+    /// precondition refuses. The refusal is a definitive not-deleted
+    /// verdict, so the delete intent aborts and the source reopens for
+    /// edits — no ambiguous tombstone.
+    #[tokio::test]
+    async fn server_refused_delete_precondition_aborts_and_reopens_the_source() {
+        let area_id = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(area_id, "contested")]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+        backend.refuse_deletes_with_conflict(true);
+
+        let mut fences = mapper.begin_area_move(&[area_id]).expect("fence");
+        let fence = fences.pop().expect("one fence");
+        let refusal = mapper
+            .commit_area_move(fence, Some(1))
+            .await
+            .expect_err("the server-side precondition refuses");
+        assert!(
+            matches!(refusal, CloudError::RevisionConflict { .. }),
+            "the refusal surfaces as the revision conflict, got {refusal:?}"
+        );
+
+        // The area survives in the cache and the source reopens: a fenced or
+        // tombstoned area would refuse this enqueue outright.
+        assert!(
+            mapper.get_current_atlas().get_area(&area_id).is_some(),
+            "a refused delete removes nothing"
+        );
+        let _submission = mapper
+            .upsert_room(RoomKey::new(area_id, RoomNumber(2)), RoomUpdates::default())
+            .expect("source reopened after the refusal");
     }
 
     #[tokio::test]

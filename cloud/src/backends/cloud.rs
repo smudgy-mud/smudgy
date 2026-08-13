@@ -427,6 +427,20 @@ impl CloudMapper {
     }
 }
 
+/// `DELETE /areas/{id}` path, carrying the optional `?expected_rev=N`
+/// precondition. On a smudgy-web release that knows the parameter, a
+/// mismatch answers 409 `revision_conflict` (mapped to
+/// [`crate::CloudError::RevisionConflict`] by the shared error path); an
+/// OLDER server silently ignores the query string and deletes
+/// unconditionally, which is why callers keep the client-side
+/// compare-then-delete as the enforcement floor.
+fn delete_area_path(area_id: &AreaId, expected_rev: Option<i64>) -> String {
+    match expected_rev {
+        Some(rev) => format!("/areas/{area_id}?expected_rev={rev}"),
+        None => format!("/areas/{area_id}"),
+    }
+}
+
 #[async_trait]
 impl MapperBackend for CloudMapper {
     // ===== AREA OPERATIONS =====
@@ -541,6 +555,14 @@ impl MapperBackend for CloudMapper {
         self.delete(&format!("/areas/{area_id}")).await
     }
 
+    async fn delete_area_expecting(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
+        self.delete(&delete_area_path(area_id, expected_rev)).await
+    }
+
     async fn copy_cloud_area(
         &self,
         source: &AreaId,
@@ -562,6 +584,17 @@ impl MapperBackend for CloudMapper {
     ) -> CloudResult<()> {
         let credential = self.credentials.credential_at_generation(auth_generation)?;
         self.delete_with_credential(&format!("/areas/{area_id}"), &credential)
+            .await
+    }
+
+    async fn delete_area_expecting_at_generation(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let credential = self.credentials.credential_at_generation(auth_generation)?;
+        self.delete_with_credential(&delete_area_path(area_id, expected_rev), &credential)
             .await
     }
 
