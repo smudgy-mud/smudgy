@@ -2709,13 +2709,17 @@ impl PendingQueue {
         self.abort_delete_intents(area_id, &snapshot)?;
         let changed = {
             let mut state = self.state.lock();
-            let changed = state.deleting.remove(&area_id) || state.delete_intents.remove(&area_id);
+            // Both flags must clear (no short-circuit): an abort after
+            // `prepare_delete` holds the fence AND the durable intent, and a
+            // surviving intent would keep the area fenced forever.
+            let removed_fence = state.deleting.remove(&area_id);
+            let removed_intent = state.delete_intents.remove(&area_id);
             if let Some(area) = state.areas.get_mut(&area_id) {
                 for envelope in &mut area.queue {
                     envelope.delete_intent = false;
                 }
             }
-            changed
+            removed_fence || removed_intent
         };
         if changed {
             self.emit(MapperEvent::AreaStatusChanged { area_id });
