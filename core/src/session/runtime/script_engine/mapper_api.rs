@@ -235,7 +235,6 @@ fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<(u64, u64)>
 
 #[op2(async(lazy))]
 #[cppgc]
-#[allow(deprecated)] // Implements the documented createArea compatibility overload through 0.5.x.
 async fn op_smudgy_mapper_create_area(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
@@ -249,22 +248,24 @@ async fn op_smudgy_mapper_create_area(
     };
 
     if let Some(mapper) = mapper {
-        // The legacy creation surface (an `ephemeral` flag or the implicit
-        // no-storage default) works through 0.5.x; teach the replacement once
-        // per isolate.
-        if options.storage.is_none() {
-            warn_legacy_create_area_once(&state);
+        // The deprecated `ephemeral` flag works through 0.5.x; teach the
+        // replacement once per isolate. Omitting `storage` altogether is the
+        // supported default and draws no notice.
+        if options.ephemeral.is_some() {
+            warn_ephemeral_create_area_once(&state);
         }
         let atlas_id = options
             .atlas_id
             .map(|(hi, lo)| AtlasId(Uuid::from_u64_pair(hi, lo)));
-        let storage = resolve_compat_create_storage(options.storage, options.ephemeral)
+        let storage = resolve_create_storage(options.storage, options.ephemeral)
             .or_else(|| atlas_id.map(|id| mapper.atlas_storage(&id)));
         let id = if let Some(storage) = storage {
             mapper
                 .create_area_at(name, MapDestination { storage, atlas_id })
                 .await
         } else {
+            // No tier was requested: create durable in the default tier —
+            // cloud when signed in, local otherwise.
             mapper.create_area(name).await
         }
         .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
@@ -298,47 +299,56 @@ struct JsCreateAreaOptions {
     storage: Option<MapStorage>,
     #[serde(default)]
     atlas_id: Option<(u64, u64)>,
+    /// `Some` only when the caller actually supplied the deprecated flag;
+    /// the fully supported storage-less default arrives as `None`.
     #[serde(default)]
-    ephemeral: bool,
+    ephemeral: Option<bool>,
 }
 
-/// Per-isolate latch for the legacy `createArea` deprecation notice.
-struct LegacyCreateAreaWarnIssued;
+/// Per-isolate latch for the `ephemeral`-option deprecation notice.
+struct EphemeralCreateAreaWarnIssued;
 
-/// Echo the legacy-`createArea` deprecation notice to the session, once per
-/// isolate. First-party packages still use the legacy surface deliberately
-/// through 0.5.x, so the note is informational — it teaches the replacement
-/// and never repeats within an isolate's lifetime.
-fn warn_legacy_create_area_once(state: &Rc<RefCell<OpState>>) {
+/// Echo the `ephemeral`-option deprecation notice to the session, once per
+/// isolate. First-party packages still pass the flag deliberately through
+/// 0.5.x, so the note is informational — it teaches the replacement and
+/// never repeats within an isolate's lifetime.
+fn warn_ephemeral_create_area_once(state: &Rc<RefCell<OpState>>) {
     let mut state = state.borrow_mut();
-    if state.try_borrow::<LegacyCreateAreaWarnIssued>().is_some() {
+    if state.try_borrow::<EphemeralCreateAreaWarnIssued>().is_some() {
         return;
     }
-    state.put(LegacyCreateAreaWarnIssued);
+    state.put(EphemeralCreateAreaWarnIssued);
     log::warn!(
-        "smudgy: mapper.createArea was called without an explicit storage tier (legacy form, supported through 0.5.x)"
+        "smudgy: mapper.createArea was called with the deprecated ephemeral option (supported through 0.5.x; use storage: \"session\")"
     );
     state
         .borrow::<ActionQueue>()
         .borrow_mut()
         .push_back(RuntimeAction::Echo(Arc::new(
-            "[mapper] A script called createArea without an explicit storage tier (the \
-             pre-0.5.3 form, including the ephemeral flag). Maps were created normally; this \
-             form keeps working through Smudgy 0.5.x. Scripts should pass { storage: \
-             \"session\" | \"local\" | \"cloud\" } before 0.6."
+            "[mapper] A script passed the deprecated ephemeral option to createArea. Maps \
+             were created normally; the option keeps working through Smudgy 0.5.x. Scripts \
+             should select the session tier with { storage: \"session\" } instead before 0.6."
                 .to_string(),
         )));
 }
 
-/// Resolve the two pre-storage-model creation forms. `None` deliberately
-/// preserves the old recording-target default. This compatibility branch is
-/// supported through 0.5.x and must be removed in 0.6.0 along with the legacy
-/// TypeScript overload.
-fn resolve_compat_create_storage(
+/// Resolve the storage tier requested by a `createArea` call: an explicit
+/// `storage` wins, then the deprecated `ephemeral` flag's mapping. `None`
+/// means no tier was requested; the caller falls through to the atlas's tier
+/// or the supported default (durable: cloud when signed in, local otherwise).
+fn resolve_create_storage(
     explicit: Option<MapStorage>,
-    ephemeral: bool,
+    ephemeral: Option<bool>,
 ) -> Option<MapStorage> {
-    explicit.or_else(|| ephemeral.then_some(MapStorage::Session))
+    explicit.or_else(|| compat_ephemeral_storage(ephemeral))
+}
+
+/// Map the deprecated `ephemeral` creation flag onto the storage model:
+/// `true` selects the session tier, `false` requests nothing. This
+/// compatibility mapping is supported through 0.5.x and must be removed in
+/// 0.6.0 along with the flag itself.
+fn compat_ephemeral_storage(ephemeral: Option<bool>) -> Option<MapStorage> {
+    (ephemeral == Some(true)).then_some(MapStorage::Session)
 }
 
 #[derive(Debug, Serialize)]
@@ -2853,22 +2863,32 @@ fn op_smudgy_mapper_find_nearest_room_in_area(
 mod compatibility_tests {
     use super::{
         AreaMutation, JSAreaBatchOperation, JSRoomParams, MAX_MUTATION_OPERATIONS, MapStorage,
-        pack_area_batch_operations, resolve_compat_create_storage,
+        compat_ephemeral_storage, pack_area_batch_operations, resolve_create_storage,
     };
     use deno_core::{FastString, JsRuntime, RuntimeOptions};
     use serde_json::json;
 
     #[test]
-    fn legacy_create_area_options_remain_pinned_through_0_5() {
-        assert_eq!(resolve_compat_create_storage(None, false), None);
+    fn ephemeral_flag_stays_pinned_to_session_through_0_5() {
+        assert_eq!(compat_ephemeral_storage(None), None);
         assert_eq!(
-            resolve_compat_create_storage(None, true),
+            compat_ephemeral_storage(Some(false)),
+            None,
+            "an explicit `ephemeral: false` requests no tier, exactly like omitting the flag"
+        );
+        assert_eq!(
+            compat_ephemeral_storage(Some(true)),
             Some(MapStorage::Session)
         );
         assert_eq!(
-            resolve_compat_create_storage(Some(MapStorage::Local), true),
+            resolve_create_storage(Some(MapStorage::Local), Some(true)),
             Some(MapStorage::Local),
             "the canonical explicit storage value wins over the compatibility flag"
+        );
+        assert_eq!(
+            resolve_create_storage(None, None),
+            None,
+            "the storage-less default requests no tier: durable, cloud when signed in, local otherwise"
         );
     }
 

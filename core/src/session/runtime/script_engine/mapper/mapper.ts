@@ -135,22 +135,16 @@ interface CreateRoomParams {
 type UpdateRoomParams = CreateRoomParams;
 
 interface CreateAreaOptions {
-    storage: MapStorage;
+    /** Omitted storage selects the default durable tier: cloud when signed
+     * in, local otherwise (or the atlas's tier when `atlas` is given). */
+    storage?: MapStorage;
     atlas?: Atlas | AtlasId;
-    ephemeral?: never;
-}
-
-interface LegacyCreateAreaOptions {
-    storage?: never;
-    atlas?: never;
     /**
      * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
      * Use `storage: "session"` instead.
      */
     ephemeral?: boolean;
 }
-
-type AnyCreateAreaOptions = CreateAreaOptions | LegacyCreateAreaOptions;
 
 type MapStorage = "session" | "local" | "cloud";
 
@@ -206,11 +200,14 @@ function destinationForOp(destination: MapDestination) {
 }
 
 const mapper = {
-    async createArea(name: string, options?: AnyCreateAreaOptions) {
+    async createArea(name: string, options?: CreateAreaOptions) {
+        // The deprecated ephemeral flag is forwarded only when the caller
+        // actually supplied it, so the runtime can tell "flag passed" from
+        // the fully supported storage-less default.
         const id = await op_smudgy_mapper_create_area(name, {
             storage: options?.storage,
             atlas_id: atlasIdOf(options?.atlas),
-            ephemeral: options?.ephemeral === true,
+            ephemeral: options?.ephemeral,
         });
         return new Area(id);
     },
