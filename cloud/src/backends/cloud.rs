@@ -541,6 +541,20 @@ impl MapperBackend for CloudMapper {
         self.delete(&format!("/areas/{area_id}")).await
     }
 
+    async fn copy_cloud_area(
+        &self,
+        source: &AreaId,
+        name: &str,
+        atlas_id: Option<AtlasId>,
+    ) -> CloudResult<Option<Area>> {
+        let request = crate::cloud_api::CopyAreaRequest {
+            name: Some(name.to_string()),
+            atlas_id,
+        };
+        let area: Area = self.post(&format!("/areas/{source}/copy"), &request).await?;
+        Ok(Some(area))
+    }
+
     async fn delete_area_at_generation(
         &self,
         area_id: &AreaId,

@@ -186,7 +186,38 @@ impl Mapper {
             .map(|(id, snapshot)| self.confirmed_area_rev(*id).unwrap_or(snapshot.area.rev))
             .collect();
         let mut destination_ids = Vec::with_capacity(snapshots.len());
-        for snapshot in &snapshots {
+        let mut server_copied = vec![false; snapshots.len()];
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            let source_id = snapshot.area.id;
+            let copied = if server_copy_applies(
+                snapshot,
+                self.area_storage(&source_id),
+                destination.storage,
+                mode,
+                self.confirmed_area_rev(source_id),
+            ) {
+                match self
+                    .copy_cloud_area(source_id, &snapshot.area.name, destination.atlas_id)
+                    .await
+                {
+                    Ok(copied) => copied,
+                    Err(error) => {
+                        cleanup_areas(self, &destination_ids).await;
+                        return Err(error.into());
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(area) = copied {
+                destination_ids.push(area.id);
+                server_copied[index] = true;
+                if let Err(error) = self.adopt_cloud_copy(area.id).await {
+                    cleanup_areas(self, &destination_ids).await;
+                    return Err(error.into());
+                }
+                continue;
+            }
             match self
                 .create_area_at(snapshot.area.name.clone(), destination)
                 .await
@@ -204,10 +235,16 @@ impl Mapper {
             .copied()
             .zip(destination_ids.iter().copied())
             .collect();
+        // Server-copied members are already complete; everything else is
+        // freshened and replayed. In-set links from replayed members into a
+        // server-copied sibling still remap correctly through `id_map`,
+        // because the server clone preserves room numbers.
         let documents: Vec<_> = snapshots
             .into_iter()
             .zip(destination_ids.iter().copied())
-            .map(|(document, destination_id)| freshen(document, destination_id, &id_map))
+            .zip(server_copied.iter().copied())
+            .filter(|&(_, copied)| !copied)
+            .map(|((document, destination_id), _)| freshen(document, destination_id, &id_map))
             .collect();
 
         if let Err(error) = self.populate_documents(&documents).await {
@@ -386,7 +423,23 @@ impl Mapper {
 
     /// Populate several already-created empty area headers in dependency
     /// order. All rooms across the set land before any cross-area exits.
+    ///
+    /// Local-tier destinations take the wholesale write: the freshened
+    /// document already is the final content, so one atomic durable file
+    /// write per area replaces thousands of per-envelope rewrite cycles.
+    /// Every destination of one relocation shares a tier, so a set either
+    /// bulk-writes entirely or replays envelopes entirely; in-set cross-area
+    /// exits between bulk-written siblings are plain stored references the
+    /// local tier never foreign-key-checks, making write order free.
     async fn populate_documents(&self, documents: &[AreaWithDetails]) -> CloudResult<()> {
+        let mut envelope_fed = Vec::with_capacity(documents.len());
+        for document in documents {
+            if !self.bulk_populate_local_area(document.clone()).await? {
+                envelope_fed.push(document);
+            }
+        }
+        let documents = envelope_fed;
+
         let room_batches = documents
             .iter()
             .flat_map(|document| {
@@ -446,7 +499,10 @@ impl Mapper {
                 .collect();
         self.stage_and_wait(metadata_batches).await?;
 
-        let connection_batches = documents.iter().flat_map(connection_batches).collect();
+        let connection_batches = documents
+            .iter()
+            .flat_map(|document| connection_batches(document))
+            .collect();
         self.stage_and_wait(connection_batches).await?;
 
         let decoration_batches = documents
@@ -515,6 +571,48 @@ impl Mapper {
         }
         Ok(())
     }
+}
+
+/// Whether one source can take the server-side cloud clone
+/// (`POST /areas/{id}/copy`) instead of freshen-and-replay. The gate is
+/// deliberately narrow because the server clone's semantics diverge from
+/// the freshen contract outside it:
+///
+/// - the server preserves live outbound cross-area links to visible areas,
+///   where relocation demotes every link leaving the set to dangling — so
+///   only an area with **no cross-area exits at all** (in-set links from
+///   siblings are inbound and unaffected) is eligible;
+/// - the server copies its own state, where relocation copies the local
+///   optimistic snapshot — so eligibility requires the backend-acknowledged
+///   revision to match the snapshot (no queued edits the server has not
+///   seen);
+/// - both paths mint fresh area/connection/exit identities and preserve
+///   room numbers, so in-set inbound remaps hold either way.
+///
+/// The clone additionally records `copied_from` provenance, which the
+/// replay path clears; accepted, since provenance is owner-only metadata
+/// and truthful for a copy.
+fn server_copy_applies(
+    snapshot: &AreaWithDetails,
+    source_storage: MapStorage,
+    destination_storage: MapStorage,
+    mode: RelocationMode,
+    confirmed_rev: Option<i64>,
+) -> bool {
+    mode == RelocationMode::Copy
+        && source_storage == MapStorage::Cloud
+        && destination_storage == MapStorage::Cloud
+        && confirmed_rev == Some(snapshot.area.rev)
+        && snapshot
+            .rooms
+            .iter()
+            .flat_map(|room| &room.exits)
+            .all(|exit| {
+                !exit.to_unknown
+                    && exit
+                        .to_area_id
+                        .is_none_or(|target| target == snapshot.area.id)
+            })
 }
 
 fn chunk_ops(
@@ -766,6 +864,199 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// C3: a local-tier destination is populated by the wholesale write
+    /// path (one atomic file write), not envelope replay. The copy must
+    /// carry the full document — rooms, linked exits and their connection,
+    /// decorations, properties, tags — persist it durably (read back
+    /// through the backend, not the cache), and the destination must accept
+    /// ordinary envelope edits afterward.
+    #[tokio::test]
+    async fn move_to_local_bulk_writes_the_full_document() {
+        let (mapper, root) = mapper("bulk-local").await;
+        let source = mapper
+            .create_area_at(
+                "Deep Halls".to_string(),
+                MapDestination::loose(MapStorage::Cloud),
+            )
+            .await
+            .expect("create cloud source");
+        for (number, title, x) in [(1, "Gate", 0.0), (2, "Vault", 4.0)] {
+            wait(
+                &mapper,
+                mapper
+                    .upsert_room(
+                        RoomKey::new(source, RoomNumber(number)),
+                        RoomUpdates {
+                            title: Some(title.to_string()),
+                            x: Some(x),
+                            y: Some(0.0),
+                            ..RoomUpdates::default()
+                        },
+                    )
+                    .expect("enqueue room"),
+            )
+            .await;
+        }
+        let (_, submission) = mapper
+            .create_exit_tracked(
+                RoomKey::new(source, RoomNumber(1)),
+                ExitArgs {
+                    from_direction: crate::ExitDirection::East,
+                    to_area_id: Some(source),
+                    to_room_number: Some(RoomNumber(2)),
+                    to_direction: Some(crate::ExitDirection::West),
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            )
+            .expect("create exit");
+        wait(&mapper, submission).await;
+        let (_, submission) = mapper
+            .create_label_tracked(
+                source,
+                LabelArgs {
+                    text: "Armory".to_string(),
+                    width: 10.0,
+                    height: 4.0,
+                    color: "#ffffff".to_string(),
+                    font_size: 12,
+                    font_weight: 400,
+                    ..LabelArgs::default()
+                },
+            )
+            .expect("create label");
+        wait(&mapper, submission).await;
+        let (_, submission) = mapper
+            .create_shape_tracked(
+                source,
+                ShapeArgs {
+                    width: 8.0,
+                    height: 8.0,
+                    ..ShapeArgs::default()
+                },
+            )
+            .expect("create shape");
+        wait(&mapper, submission).await;
+        wait(
+            &mapper,
+            mapper
+                .set_area_property(source, "climate".to_string(), "damp".to_string())
+                .expect("area property"),
+        )
+        .await;
+        wait(
+            &mapper,
+            mapper
+                .set_room_property(
+                    RoomKey::new(source, RoomNumber(1)),
+                    "terrain".to_string(),
+                    "stone".to_string(),
+                )
+                .expect("room property"),
+        )
+        .await;
+        wait(
+            &mapper,
+            mapper
+                .add_room_tag(RoomKey::new(source, RoomNumber(2)), "vault".to_string())
+                .expect("room tag"),
+        )
+        .await;
+
+        let moved = mapper
+            .relocate_areas(
+                vec![source],
+                MapDestination::loose(MapStorage::Local),
+                RelocationMode::Move,
+            )
+            .await
+            .expect("move to local");
+        let destination = moved.destination_ids[0];
+        assert_eq!(mapper.area_storage(&destination), MapStorage::Local);
+        assert!(mapper.get_current_atlas().get_area(&source).is_none());
+
+        let details = mapper
+            .export_area(destination)
+            .await
+            .expect("read the persisted destination document");
+        assert_eq!(details.rooms.len(), 2);
+        let gate = details
+            .rooms
+            .iter()
+            .find(|room| room.room_number == RoomNumber(1))
+            .expect("room 1 copied");
+        assert_eq!(gate.title, "Gate");
+        assert_eq!(
+            gate.properties
+                .iter()
+                .find(|property| property.name == "terrain")
+                .map(|property| property.value.as_str()),
+            Some("stone")
+        );
+        let exit = gate.exits.first().expect("exit copied");
+        assert_eq!(
+            exit.to_area_id,
+            Some(destination),
+            "in-set exit target remapped to the destination id"
+        );
+        assert_eq!(exit.to_room_number, Some(RoomNumber(2)));
+        assert!(
+            details
+                .connections
+                .iter()
+                .any(|connection| connection.id == exit.connection_id),
+            "the exit's connection travelled with it"
+        );
+        assert!(
+            details
+                .rooms
+                .iter()
+                .find(|room| room.room_number == RoomNumber(2))
+                // Tags are stored normalized to uppercase.
+                .is_some_and(|room| room.tags.contains("VAULT"))
+        );
+        assert_eq!(details.labels.len(), 1);
+        assert_eq!(details.labels[0].text, "Armory");
+        assert_eq!(details.shapes.len(), 1);
+        assert_eq!(
+            details
+                .properties
+                .iter()
+                .find(|property| property.name == "climate")
+                .map(|property| property.value.as_str()),
+            Some("damp")
+        );
+
+        // The bulk write and the CAS pipeline agree on the revision: an
+        // ordinary envelope edit lands on the populated destination.
+        wait(
+            &mapper,
+            mapper
+                .upsert_room(
+                    RoomKey::new(destination, RoomNumber(9)),
+                    RoomUpdates {
+                        title: Some("Annex".to_string()),
+                        ..RoomUpdates::default()
+                    },
+                )
+                .expect("post-move edit accepted"),
+        )
+        .await;
+        let after = mapper
+            .export_area(destination)
+            .await
+            .expect("re-read destination");
+        assert!(
+            after
+                .rooms
+                .iter()
+                .any(|room| room.room_number == RoomNumber(9)),
+            "the envelope edit persisted on top of the bulk write"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn atlas_copy_keeps_source_and_files_members_in_new_tier() {
         let (mapper, root) = mapper("atlas-copy").await;
@@ -940,6 +1231,158 @@ mod tests {
             .expect("source reopened after the refusal");
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C3: the server-side cloud clone applies only to a self-contained,
+    /// fully acknowledged cloud→cloud copy — every other combination must
+    /// take the freshen-and-replay path whose semantics the relocation
+    /// contract documents.
+    #[test]
+    fn server_copy_gate_is_narrow() {
+        let area_id = AreaId(Uuid::new_v4());
+        let snapshot = |cross_area: bool, to_unknown: bool| {
+            let connection_id = ConnectionId::new();
+            let exit = Exit {
+                id: ExitId::new(),
+                from_direction: crate::ExitDirection::North,
+                to_area_id: if cross_area {
+                    Some(AreaId(Uuid::new_v4()))
+                } else {
+                    Some(area_id)
+                },
+                to_room_number: Some(RoomNumber(2)),
+                to_direction: None,
+                path: String::new(),
+                is_hidden: false,
+                is_closed: false,
+                is_locked: false,
+                weight: 1.0,
+                command: String::new(),
+                connection_id,
+                to_unknown,
+                to_area_token: None,
+                is_secret: false,
+            };
+            AreaWithDetails {
+                area: crate::Area {
+                    id: area_id,
+                    user_id: None,
+                    atlas_id: None,
+                    atlas_name: None,
+                    name: "Gated".to_string(),
+                    created_at: chrono::Utc::now(),
+                    rev: 4,
+                    access: None,
+                    owner_nickname: None,
+                    copied_from_area_id: None,
+                    copied_from_rev: None,
+                    copied_at: None,
+                    family_token: None,
+                },
+                format_version: crate::AREA_FORMAT_VERSION,
+                content_hash: None,
+                properties: Vec::new(),
+                rooms: vec![crate::RoomWithDetails {
+                    room_number: RoomNumber(1),
+                    title: String::new(),
+                    description: String::new(),
+                    level: 0,
+                    x: 0.0,
+                    y: 0.0,
+                    color: String::new(),
+                    properties: Vec::new(),
+                    exits: vec![exit],
+                    tags: std::collections::BTreeSet::default(),
+                    is_secret: false,
+                    external_id: None,
+                }],
+                labels: Vec::new(),
+                shapes: Vec::new(),
+                connections: Vec::new(),
+                linked_areas: Vec::new(),
+            }
+        };
+
+        let eligible = snapshot(false, false);
+        assert!(server_copy_applies(
+            &eligible,
+            MapStorage::Cloud,
+            MapStorage::Cloud,
+            RelocationMode::Copy,
+            Some(4),
+        ));
+
+        // Any single condition failing must force the replay path.
+        assert!(
+            !server_copy_applies(
+                &eligible,
+                MapStorage::Cloud,
+                MapStorage::Cloud,
+                RelocationMode::Move,
+                Some(4),
+            ),
+            "moves never take the server clone"
+        );
+        assert!(
+            !server_copy_applies(
+                &eligible,
+                MapStorage::Local,
+                MapStorage::Cloud,
+                RelocationMode::Copy,
+                Some(4),
+            ),
+            "only a cloud source has a server-side copy"
+        );
+        assert!(
+            !server_copy_applies(
+                &eligible,
+                MapStorage::Cloud,
+                MapStorage::Local,
+                RelocationMode::Copy,
+                Some(4),
+            ),
+            "a cross-tier destination needs the freshen contract"
+        );
+        assert!(
+            !server_copy_applies(
+                &eligible,
+                MapStorage::Cloud,
+                MapStorage::Cloud,
+                RelocationMode::Copy,
+                Some(3),
+            ),
+            "queued unacknowledged edits would be missing from a server clone"
+        );
+        assert!(
+            !server_copy_applies(
+                &eligible,
+                MapStorage::Cloud,
+                MapStorage::Cloud,
+                RelocationMode::Copy,
+                None,
+            ),
+            "an unknown acknowledged revision is not proof of quiescence"
+        );
+        assert!(
+            !server_copy_applies(
+                &snapshot(true, false),
+                MapStorage::Cloud,
+                MapStorage::Cloud,
+                RelocationMode::Copy,
+                Some(4),
+            ),
+            "outbound cross-area links would survive a server clone but must dangle"
+        );
+        assert!(
+            !server_copy_applies(
+                &snapshot(false, true),
+                MapStorage::Cloud,
+                MapStorage::Cloud,
+                RelocationMode::Copy,
+                Some(4),
+            ),
+            "redacted destinations mark links that leave the area"
+        );
     }
 
     #[tokio::test]

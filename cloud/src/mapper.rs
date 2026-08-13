@@ -1324,6 +1324,82 @@ impl Mapper {
             .collect()
     }
 
+    /// Populates a freshly created **local-tier** destination with a fully
+    /// freshened document in one atomic, durable file write — the relocation
+    /// counterpart of [`Mapper::import_areas`]'s wholesale persistence.
+    /// Replaying the same content as CAS envelopes would load, apply, and
+    /// fsync-rewrite the whole (growing, multi-megabyte) area file once per
+    /// 256-operation envelope; the interactive single-envelope path keeps
+    /// those semantics untouched.
+    ///
+    /// Returns `Ok(false)` without writing when the area is not served by a
+    /// local tier — the caller falls back to the envelope path, which every
+    /// tier supports. The created destination header (name, atlas placement,
+    /// access, creation time) is backend truth and is preserved verbatim;
+    /// the copied content lands under it with exactly one revision bump, and
+    /// the graph is validated once before the write so the bulk path admits
+    /// nothing the envelope path would have refused.
+    pub(crate) async fn bulk_populate_local_area(
+        &self,
+        mut document: AreaWithDetails,
+    ) -> CloudResult<bool> {
+        let area_id = document.area.id;
+        if !self.inner.backend.local_area_ids().contains(&area_id) {
+            return Ok(false);
+        }
+        let header = {
+            let cache = self.inner.atlas_cache.load();
+            cache
+                .get_area(&area_id)
+                .ok_or(CloudError::AreaNotFound(area_id))?
+                .to_details()
+                .area
+        };
+        document.area = header;
+        document.area.rev += 1;
+        crate::backends::area_edits::validate_connection_graph(&mut document)?;
+        self.inner.backend.import_local_area(document.clone()).await?;
+        self.inner.pending.note_confirmed_rev(
+            area_id,
+            document.area.rev,
+            document.area.access.map(|access| access.fingerprint()),
+        );
+        let populated = Arc::new(AreaCache::new_with_area(document));
+        self.inner.atlas_cache.rcu(|cache| {
+            Arc::new(cache.with_areas_updated(vec![(area_id, populated.clone())]))
+        });
+        Ok(true)
+    }
+
+    /// Requests a server-side clone of a cloud area (see
+    /// [`MapperBackend::copy_cloud_area`]); `Ok(None)` when the backend has
+    /// no server-side copy for this area and the caller must replay content.
+    pub(crate) async fn copy_cloud_area(
+        &self,
+        source: AreaId,
+        name: &str,
+        atlas_id: Option<AtlasId>,
+    ) -> CloudResult<Option<Area>> {
+        self.inner.backend.copy_cloud_area(&source, name, atlas_id).await
+    }
+
+    /// Registers a fresh server-side cloud copy in the live cache: one
+    /// full-document fetch stands in for the per-envelope replay a
+    /// client-side copy would have staged.
+    pub(crate) async fn adopt_cloud_copy(&self, area_id: AreaId) -> CloudResult<()> {
+        let details = self.inner.backend.get_area(&area_id).await?;
+        self.inner.pending.note_confirmed_rev(
+            area_id,
+            details.area.rev,
+            details.area.access.map(|access| access.fingerprint()),
+        );
+        let adopted = Arc::new(AreaCache::new_with_area(details));
+        self.inner
+            .atlas_cache
+            .rcu(|cache| Arc::new(cache.add_area(area_id, adopted.clone())));
+        Ok(())
+    }
+
     /// Freeze source content before a move snapshot. The fence is deliberately
     /// not durable yet: a crash during destination copy must leave the source
     /// and its WAL usable. Existing in-flight content writes are allowed to

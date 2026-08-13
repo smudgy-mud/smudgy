@@ -62,6 +62,23 @@ pub trait MapperBackend: Send + Sync {
         ))
     }
 
+    /// Server-side clone of one **cloud-tier** area into a new cloud area
+    /// (`POST /areas/{id}/copy`): one transaction on the server instead of
+    /// replaying the content as serial CAS envelopes. The server mints fresh
+    /// area/connection/exit identities, preserves room numbers, and records
+    /// `copied_from_*` provenance. `Ok(None)` means no server-side copy is
+    /// available for this area (not cloud-tier, signed out, or no server
+    /// behind the backend); callers fall back to content replay, which every
+    /// tier supports.
+    async fn copy_cloud_area(
+        &self,
+        _source: &AreaId,
+        _name: &str,
+        _atlas_id: Option<AtlasId>,
+    ) -> CloudResult<Option<Area>> {
+        Ok(None)
+    }
+
     // ===== SYNC / IDENTITY =====
 
     /// One row per viewable area: shared revision + access fingerprint.
