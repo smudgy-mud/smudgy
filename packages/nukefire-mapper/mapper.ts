@@ -51,6 +51,7 @@ import {
   verticalMapLinks,
   type VerticalExitObservation,
 } from "./room-info.ts";
+import { stackVerticalTraversals } from "./vertical-levels.ts";
 import { reflowPolicy } from "./reflow-policy.ts";
 
 const AREA_SOURCE_PROPERTY = "nukefire.mapper";
@@ -958,7 +959,7 @@ export class NukeFireMapper {
         };
       } else {
         stats.plannedAreas += 1;
-        const nodes: LayoutNode[] = group.map((assignment) => ({
+        const chartNodes: LayoutNode[] = group.map((assignment) => ({
           id: assignmentIds.get(assignment.source.vnum) as string,
           relative: roundedPosition(
             assignment.source.x - centerSource.x,
@@ -1001,6 +1002,17 @@ export class NukeFireMapper {
         }
 
         const centerId = assignmentIds.get(snapshot.center);
+        const establishedLevels = new Map<string, number>();
+        for (const assignment of group) {
+          if (!assignment.room) continue;
+          establishedLevels.set(
+            assignmentIds.get(assignment.source.vnum) as string,
+            assignment.room.position.level,
+          );
+        }
+        // NukeFire may flow an up/down destination on its source's z plane;
+        // this mapper always stacks vertical traversals across map levels.
+        const nodes = stackVerticalTraversals(chartNodes, edges, establishedLevels, centerId);
         const trace: LayoutTraceEvent[] | undefined = this.#decisionLogger.path ? [] : undefined;
         const diagnosticContext = trace ? {
           area: {
