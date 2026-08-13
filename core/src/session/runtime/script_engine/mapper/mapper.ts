@@ -702,6 +702,7 @@ interface LinkCreateArgs extends ConnectionUpdates {
 
 type AreaBatchOperation =
     | { upsert_room: { room_number: RoomNumber; body: CreateRoomParams } }
+    | { create_room: { room_number: RoomNumber; body: CreateRoomParams } }
     | { delete_room: { room_number: RoomNumber } }
     | { upsert_room_property: { room_number: RoomNumber; name: string; value: string } }
     | { upsert_area_property: { name: string; value: string } }
@@ -748,8 +749,13 @@ class AreaMutator {
             this.#areaId,
             this.#token,
         );
+        // Create-only submission: if this number exists by submission time
+        // (another client won the race), the envelope is refused with
+        // `room_number_exists` and surfaces through mutateArea's thrown
+        // error (committedOperations carries any acknowledged prefix),
+        // never a silent merge into the other client's room.
         this.#record({
-            upsert_room: { room_number: roomNumber, body: { ...params } },
+            create_room: { room_number: roomNumber, body: { ...params } },
         });
         return roomNumber;
     }

@@ -86,6 +86,20 @@ pub enum AreaMutation {
         room_number: RoomNumber,
         body: RoomUpdates,
     },
+    /// Must-not-exist room creation. The server refuses an occupied number
+    /// with a 409 `structural_conflict` (`room_number_exists`) instead of
+    /// silently merging two logical rooms; local and ephemeral backends
+    /// mirror the refusal in `area_edits`.
+    ///
+    /// SERVER FLOOR: `create_room` requires a smudgy-web release that knows
+    /// the variant. An older server refuses the WHOLE envelope as a 400
+    /// (serde rejects the unknown `op` tag before anything applies) — a
+    /// clean rejection, never corruption — so the accepted
+    /// server-ships-before-client deployment order applies.
+    CreateRoom {
+        room_number: RoomNumber,
+        body: RoomUpdates,
+    },
     DeleteRoom {
         room_number: RoomNumber,
     },
@@ -187,6 +201,7 @@ impl AreaMutation {
     pub fn room_number(&self) -> Option<RoomNumber> {
         match self {
             AreaMutation::UpsertRoom { room_number, .. }
+            | AreaMutation::CreateRoom { room_number, .. }
             | AreaMutation::DeleteRoom { room_number }
             | AreaMutation::UpsertRoomProperty { room_number, .. }
             | AreaMutation::DeleteRoomProperty { room_number, .. }
@@ -290,6 +305,14 @@ mod tests {
         let json = serde_json::to_value(&tag).expect("serializes");
         assert_eq!(json["op"], "add_room_tag");
         assert_eq!(json["tag"], "inn");
+
+        let create = AreaMutation::CreateRoom {
+            room_number: RoomNumber(7),
+            body: crate::RoomUpdates::default(),
+        };
+        let json = serde_json::to_value(&create).expect("serializes");
+        assert_eq!(json["op"], "create_room");
+        assert_eq!(json["room_number"], 7);
     }
 
     #[test]

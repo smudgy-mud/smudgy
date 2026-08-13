@@ -697,6 +697,39 @@ where
         Ok(())
     }
 
+    // Expected-rev forms forward so the precondition reaches the enforcing
+    // backend; the cache is invalidated only after an accepted delete (a
+    // revision-conflict refusal leaves the area — and its cache entry —
+    // standing).
+    async fn delete_area_expecting(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
+        self.inner
+            .delete_area_expecting(area_id, expected_rev)
+            .await?;
+        self.invalidate_area(area_id).await;
+        Ok(())
+    }
+
+    async fn delete_area_expecting_at_generation(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.inner
+            .delete_area_expecting_at_generation(area_id, expected_rev, auth_generation)
+            .await?;
+        if self.inner.auth_generation() == auth_generation {
+            self.invalidate_area(area_id).await;
+        } else {
+            self.check_auth_generation();
+        }
+        Ok(())
+    }
+
     async fn execute_mutation(
         &self,
         area_id: &AreaId,

@@ -1270,8 +1270,12 @@ async fn op_smudgy_mapper_create_room(
             return Err(MapperError::AreaNotFound);
         };
 
+        // Create-only submission: a cross-client race on this number is
+        // refused (`room_number_exists`) instead of silently merging two
+        // logical rooms. Server floor: requires the smudgy-web release that
+        // knows `create_room` (server-ships-before-client).
         let submission = mapper
-            .upsert_room(
+            .create_room(
                 RoomKey {
                     area_id,
                     room_number,
@@ -1649,6 +1653,13 @@ enum JSAreaBatchOperation {
         room_number: i32,
         body: JSRoomParams,
     },
+    /// `AreaMutator.createRoom` drafts: must-not-exist creation, so a
+    /// number that raced into existence between draft and submission is
+    /// refused (`room_number_exists`) instead of merging.
+    CreateRoom {
+        room_number: i32,
+        body: JSRoomParams,
+    },
     DeleteRoom {
         room_number: i32,
     },
@@ -1741,6 +1752,10 @@ impl JSAreaBatchOperation {
     fn into_group(self) -> Vec<AreaMutation> {
         match self {
             Self::UpsertRoom { room_number, body } => vec![AreaMutation::UpsertRoom {
+                room_number: RoomNumber(room_number),
+                body: body.into(),
+            }],
+            Self::CreateRoom { room_number, body } => vec![AreaMutation::CreateRoom {
                 room_number: RoomNumber(room_number),
                 body: body.into(),
             }],
