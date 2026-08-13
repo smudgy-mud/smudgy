@@ -2,7 +2,7 @@
 name = "smudgy_script"
 description = "Smudgy's embedded JS/TS scripting runtime"
 edition = "2021"
-version = "0.5.3-rc"
+version = "0.5.3-rc4"
 publish = false
 
 # Greenfield rewrite (branch feat/greenfield-script-runtime). Thin runtime built

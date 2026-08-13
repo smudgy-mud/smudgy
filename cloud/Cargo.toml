@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_cloud"
-version = "0.5.3-rc"
+version = "0.5.3-rc4"
 edition = "2024"
 
 [dependencies]
