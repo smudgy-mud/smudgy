@@ -378,7 +378,6 @@ impl Mapper {
                 }
             }
         }
-        drop(completed);
 
         Ok(MapRelocation {
             source_ids,
@@ -536,6 +535,11 @@ impl Mapper {
     /// bulk-writes entirely or replays envelopes entirely; in-set cross-area
     /// exits between bulk-written siblings are plain stored references the
     /// local tier never foreign-key-checks, making write order free.
+    ///
+    /// Cloud and session destinations replay envelopes: neither has a bulk
+    /// content-upload path (eligible cloud→cloud copies take the
+    /// server-side clone before reaching here), so a large relocation into
+    /// those tiers remains bounded by sequential envelope application.
     async fn populate_documents(&self, documents: &[AreaWithDetails]) -> CloudResult<()> {
         let mut envelope_fed = Vec::with_capacity(documents.len());
         for document in documents {
