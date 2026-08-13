@@ -15,8 +15,8 @@ use log::warn;
 
 use crate::{
     AreaId, AreaWithDetails, AtlasId, CloudError, CloudResult, ConnectionArgs, ConnectionId,
-    ConnectionKind, ExitArgs, ExitId, LabelArgs, LabelId, MapDestination, MapStorage, Mapper,
-    RoomUpdates, ShapeArgs, ShapeId,
+    ConnectionKind, Exit, ExitArgs, ExitId, LabelArgs, LabelId, MapDestination, MapStorage, Mapper,
+    RoomNumber, RoomUpdates, ShapeArgs, ShapeId,
     mapper::{AreaMutationBatch, MutationSubmission, validate_import_document},
     mutation::{AreaMutation, MAX_MUTATION_OPERATIONS},
 };
@@ -172,10 +172,7 @@ impl Mapper {
             None
         };
 
-        let snapshots: Vec<_> = source_ids
-            .iter()
-            .map(|id| self.snapshot_area(*id))
-            .collect::<CloudResult<_>>()?;
+        let snapshots = self.snapshot_areas(&source_ids)?;
         for snapshot in &snapshots {
             validate_import_document(snapshot)?;
         }
@@ -547,18 +544,33 @@ fn chunk_ops(
 /// envelope; a connection without members is structurally invalid at an
 /// envelope boundary.
 fn connection_batches(document: &AreaWithDetails) -> Vec<AreaMutationBatch> {
+    // One pass over every exit builds the member index; scanning every
+    // room's exits per connection would be quadratic in area size.
+    let mut members: HashMap<ConnectionId, Vec<(RoomNumber, &Exit)>> =
+        HashMap::with_capacity(document.connections.len());
+    for room in &document.rooms {
+        for exit in &room.exits {
+            members
+                .entry(exit.connection_id)
+                .or_default()
+                .push((room.room_number, exit));
+        }
+    }
+
     let mut batches = Vec::new();
     let mut current = Vec::with_capacity(MAX_MUTATION_OPERATIONS);
     for connection in &document.connections {
         let mut group = vec![AreaMutation::CreateConnection {
             body: ConnectionArgs::from(connection),
         }];
-        group.extend(document.rooms.iter().flat_map(|room| {
-            room.exits
+        group.extend(
+            members
+                .get(&connection.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
                 .iter()
-                .filter(|exit| exit.connection_id == connection.id)
-                .map(|exit| AreaMutation::CreateExit {
-                    room_number: room.room_number,
+                .map(|&(room_number, exit)| AreaMutation::CreateExit {
+                    room_number,
                     body: ExitArgs {
                         id: Some(exit.id),
                         connection_id: Some(exit.connection_id),
@@ -575,8 +587,8 @@ fn connection_batches(document: &AreaWithDetails) -> Vec<AreaMutationBatch> {
                         command: Some(exit.command.clone()),
                         is_secret: Some(exit.is_secret),
                     },
-                })
-        }));
+                }),
+        );
         if current.len() + group.len() > MAX_MUTATION_OPERATIONS && !current.is_empty() {
             batches.push(AreaMutationBatch::strict(
                 document.area.id,

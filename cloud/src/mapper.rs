@@ -225,18 +225,22 @@ fn exit_topology_changed(current: &Exit, updated: &ExitCache) -> bool {
         || current.to_unknown != updated.to_unknown
 }
 
-/// Compiles ordered mapper operations against a scratch document. Exit
-/// updates become sparse, and pair splitting is either rejected or expanded
-/// into an explicit `Unlink + UpdateExit` according to the high-level
-/// gesture's policy. Applying each compiled operation to the scratch document
-/// keeps later decisions faithful to earlier operations in the same envelope;
-/// final graph validation remains the whole-envelope applier's job.
+/// Compiles ordered mapper operations, applying each one to `details` as it
+/// lands. Exit updates become sparse, and pair splitting is either rejected
+/// or expanded into an explicit `Unlink + UpdateExit` according to the
+/// high-level gesture's policy. Applying each compiled operation as it is
+/// emitted keeps later decisions faithful to earlier operations in the same
+/// envelope; final graph validation remains the caller's job.
+///
+/// On error `details` is left partially applied — the caller must discard
+/// it. Compiling in place (rather than against a scratch clone) is what
+/// keeps relocation-scale batch staging from copying the whole document per
+/// envelope.
 fn compile_area_mutations(
-    details: &AreaWithDetails,
+    details: &mut AreaWithDetails,
     operations: Vec<AreaMutation>,
     paired_policy: PairedExitPolicy,
 ) -> CloudResult<Vec<AreaMutation>> {
-    let mut scratch = details.clone();
     let mut compiled = Vec::with_capacity(operations.len());
 
     for operation in operations {
@@ -253,7 +257,7 @@ fn compile_area_mutations(
                     // the optimistic base, then persist that exact decision.
                     // The server must never independently mint the identity
                     // of a Connection the durable client already references.
-                    let mut preview = scratch.clone();
+                    let mut preview = details.clone();
                     area_edits::apply_mutation(
                         &mut preview,
                         &AreaMutation::CreateExit {
@@ -268,7 +272,7 @@ fn compile_area_mutations(
                         .find(|exit| exit.id == exit_id)
                         .map(|exit| exit.connection_id)
                         .ok_or(CloudError::ExitNotFound(exit_id))?;
-                    if scratch
+                    if details
                         .connections
                         .iter()
                         .any(|connection| connection.id == resolved_connection_id)
@@ -282,7 +286,7 @@ fn compile_area_mutations(
                 vec![AreaMutation::CreateExit { room_number, body }]
             }
             AreaMutation::UpdateExit { exit_id, body } => {
-                let current = scratch
+                let current = details
                     .rooms
                     .iter()
                     .flat_map(|room| room.exits.iter())
@@ -295,7 +299,7 @@ fn compile_area_mutations(
                 } else {
                     let updated = body.clone().apply(&ExitCache::from(current.clone()));
                     let topology_changed = exit_topology_changed(&current, &updated);
-                    let member_count = scratch
+                    let member_count = details
                         .rooms
                         .iter()
                         .flat_map(|room| room.exits.iter())
@@ -325,7 +329,7 @@ fn compile_area_mutations(
         };
 
         for operation in expanded {
-            area_edits::apply_mutation(&mut scratch, &operation)?;
+            area_edits::apply_mutation(details, &operation)?;
             compiled.push(operation);
         }
     }
@@ -1301,17 +1305,23 @@ impl Mapper {
         self.inner.export_area(area_id).await
     }
 
-    /// Snapshot the displayed area, including durably-journaled optimistic
+    /// Snapshot displayed areas, including durably-journaled optimistic
     /// edits that have not reached their backend yet. Relocation uses this
     /// rather than a backend export so moving a map can never omit edits the
-    /// user can already see.
-    pub(crate) fn snapshot_area(&self, area_id: AreaId) -> CloudResult<AreaWithDetails> {
-        self.inner
-            .atlas_cache
-            .load()
-            .get_area(&area_id)
-            .map(|area| area.to_details())
-            .ok_or(CloudError::AreaNotFound(area_id))
+    /// user can already see. The whole set is read from one atlas view:
+    /// per-area loads could interleave with concurrent edits and produce a
+    /// mutually inconsistent snapshot set.
+    pub(crate) fn snapshot_areas(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaWithDetails>> {
+        let cache = self.inner.atlas_cache.load();
+        area_ids
+            .iter()
+            .map(|area_id| {
+                cache
+                    .get_area(area_id)
+                    .map(|area| area.to_details())
+                    .ok_or(CloudError::AreaNotFound(*area_id))
+            })
+            .collect()
     }
 
     /// Freeze source content before a move snapshot. The fence is deliberately
@@ -3288,21 +3298,35 @@ impl Inner {
                 )));
             }
 
-            let mut details = if let Some(details) = working.get(&area_id) {
-                details.clone()
+            // The working document is taken by value and mutated in place —
+            // cloning a relocation-scale document per envelope would make
+            // batch staging quadratic. Any error below discards `working`
+            // wholesale, so a partially applied document can never publish.
+            let from_working = working.contains_key(&area_id);
+            let mut details = if let Some(details) = working.remove(&area_id) {
+                details
             } else {
                 cache
                     .get_area(&area_id)
                     .ok_or(CloudError::AreaNotFound(area_id))?
                     .to_details()
             };
-            let operations = compile_area_mutations(&details, operations, paired_policy)?;
+            // Structural preconditions and route maintenance both compare
+            // against the pre-envelope document; capture before compilation
+            // applies anything.
+            let existing_rooms: HashSet<_> =
+                details.rooms.iter().map(|room| room.room_number).collect();
+            let room_moves = area_edits::capture_room_moves(&details, &operations);
+            let operations = compile_area_mutations(&mut details, operations, paired_policy)?;
             if operations.len() > MAX_MUTATION_OPERATIONS {
                 return Err(CloudError::InvalidInput(format!(
                     "the compiled mutation may contain at most {MAX_MUTATION_OPERATIONS} operations"
                 )));
             }
             if operations.is_empty() {
+                if from_working {
+                    working.insert(area_id, details);
+                }
                 submissions.push(MutationSubmission::NoChange);
                 continue;
             }
@@ -3314,8 +3338,6 @@ impl Inner {
                 }
             }));
 
-            let existing_rooms: HashSet<_> =
-                details.rooms.iter().map(|room| room.room_number).collect();
             let structural_preconditions = operations
                 .iter()
                 .filter_map(|operation| match operation {
@@ -3333,17 +3355,14 @@ impl Inner {
                 .collect();
 
             let operation_id = Uuid::new_v4();
-            let validation_envelope = MutationEnvelope {
-                operation_id,
-                preconditions: vec![Precondition {
-                    resource: ResourceKind::Area,
-                    id: area_id.0,
-                    expected_rev: details.area.rev,
-                    access_fingerprint: details.area.access.map(|access| access.fingerprint()),
-                }],
-                payload: operations.clone(),
-            };
-            area_edits::apply_envelope(&mut details, area_id, &validation_envelope)?;
+            // The envelope-level finish the CAS appliers perform, minus the
+            // re-application compilation already did: route maintenance,
+            // whole-graph validation, exactly one revision bump. (The
+            // revision precondition is vacuously true here — the envelope is
+            // built on this very document.)
+            area_edits::maintain_routes_after_room_moves(&room_moves, &mut details);
+            area_edits::validate_connection_graph(&mut details)?;
+            details.area.rev += 1;
 
             let local_area = self.backend.local_area_ids().contains(&area_id);
             let ephemeral_area = self.backend.ephemeral_area_ids().contains(&area_id);
@@ -4347,10 +4366,10 @@ mod tests {
     #[test]
     fn exit_compiler_strips_redundant_full_snapshot_on_pair() {
         let area_id = AreaId(Uuid::new_v4());
-        let details = sample_v2_document(area_id, AreaId(Uuid::new_v4()));
+        let mut details = sample_v2_document(area_id, AreaId(Uuid::new_v4()));
 
         let compiled = compile_area_mutations(
-            &details,
+            &mut details,
             vec![AreaMutation::UpdateExit {
                 exit_id: ExitId(Uuid::from_u128(1)),
                 body: ExitUpdates {
@@ -4380,8 +4399,11 @@ mod tests {
         let area_id = AreaId(Uuid::new_v4());
         let details = sample_area(area_id, "Origin");
 
+        // Compilation applies in place; compile against a scratch copy so the
+        // envelope below replays onto the pristine document.
+        let mut scratch = details.clone();
         let compiled = compile_area_mutations(
-            &details,
+            &mut scratch,
             vec![AreaMutation::CreateExit {
                 room_number: RoomNumber(1),
                 body: ExitArgs {
@@ -4431,8 +4453,9 @@ mod tests {
         let pair_id = details.rooms[0].exits[0].connection_id;
         details.rooms[1].exits.clear();
 
+        let mut scratch = details.clone();
         let compiled = compile_area_mutations(
-            &details,
+            &mut scratch,
             vec![AreaMutation::CreateExit {
                 room_number: RoomNumber(2),
                 body: ExitArgs {
@@ -4491,16 +4514,20 @@ mod tests {
             },
         };
 
-        let rejected =
-            compile_area_mutations(&details, vec![update.clone()], PairedExitPolicy::Reject)
-                .expect_err("generic update must not silently split a pair");
+        let rejected = compile_area_mutations(
+            &mut details.clone(),
+            vec![update.clone()],
+            PairedExitPolicy::Reject,
+        )
+        .expect_err("generic update must not silently split a pair");
         assert!(matches!(
             rejected,
             CloudError::StructuralConflict(ref reason) if reason == "unlink_before_edit"
         ));
 
-        let compiled = compile_area_mutations(&details, vec![update], PairedExitPolicy::Split)
-            .expect("the explicit structural gesture may split");
+        let compiled =
+            compile_area_mutations(&mut details.clone(), vec![update], PairedExitPolicy::Split)
+                .expect("the explicit structural gesture may split");
         assert!(matches!(compiled[0], AreaMutation::Unlink { .. }));
         assert!(matches!(compiled[1], AreaMutation::UpdateExit { .. }));
 
@@ -4528,7 +4555,7 @@ mod tests {
 
         let raw = merge_room_operations(&details, RoomNumber(1), RoomNumber(2))
             .expect("same-area merge plan");
-        let compiled = compile_area_mutations(&details, raw, PairedExitPolicy::Split)
+        let compiled = compile_area_mutations(&mut details.clone(), raw, PairedExitPolicy::Split)
             .expect("paired topology is split explicitly");
         assert!(compiled.len() <= MAX_MUTATION_OPERATIONS);
         assert!(matches!(
