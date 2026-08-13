@@ -98,6 +98,12 @@ impl AreaMutationBatch {
         }
     }
 
+    /// The staged operations, exposed for envelope-boundary assertions.
+    #[cfg(test)]
+    pub(crate) fn operations(&self) -> &[AreaMutation] {
+        &self.operations
+    }
+
     /// Allows a real one-sided traversal topology edit to explicitly split
     /// its paired connection before applying the update.
     #[must_use]
@@ -225,18 +231,22 @@ fn exit_topology_changed(current: &Exit, updated: &ExitCache) -> bool {
         || current.to_unknown != updated.to_unknown
 }
 
-/// Compiles ordered mapper operations against a scratch document. Exit
-/// updates become sparse, and pair splitting is either rejected or expanded
-/// into an explicit `Unlink + UpdateExit` according to the high-level
-/// gesture's policy. Applying each compiled operation to the scratch document
-/// keeps later decisions faithful to earlier operations in the same envelope;
-/// final graph validation remains the whole-envelope applier's job.
+/// Compiles ordered mapper operations, applying each one to `details` as it
+/// lands. Exit updates become sparse, and pair splitting is either rejected
+/// or expanded into an explicit `Unlink + UpdateExit` according to the
+/// high-level gesture's policy. Applying each compiled operation as it is
+/// emitted keeps later decisions faithful to earlier operations in the same
+/// envelope; final graph validation remains the caller's job.
+///
+/// On error `details` is left partially applied — the caller must discard
+/// it. Compiling in place (rather than against a scratch clone) is what
+/// keeps relocation-scale batch staging from copying the whole document per
+/// envelope.
 fn compile_area_mutations(
-    details: &AreaWithDetails,
+    details: &mut AreaWithDetails,
     operations: Vec<AreaMutation>,
     paired_policy: PairedExitPolicy,
 ) -> CloudResult<Vec<AreaMutation>> {
-    let mut scratch = details.clone();
     let mut compiled = Vec::with_capacity(operations.len());
 
     for operation in operations {
@@ -253,7 +263,7 @@ fn compile_area_mutations(
                     // the optimistic base, then persist that exact decision.
                     // The server must never independently mint the identity
                     // of a Connection the durable client already references.
-                    let mut preview = scratch.clone();
+                    let mut preview = details.clone();
                     area_edits::apply_mutation(
                         &mut preview,
                         &AreaMutation::CreateExit {
@@ -268,7 +278,7 @@ fn compile_area_mutations(
                         .find(|exit| exit.id == exit_id)
                         .map(|exit| exit.connection_id)
                         .ok_or(CloudError::ExitNotFound(exit_id))?;
-                    if scratch
+                    if details
                         .connections
                         .iter()
                         .any(|connection| connection.id == resolved_connection_id)
@@ -282,7 +292,7 @@ fn compile_area_mutations(
                 vec![AreaMutation::CreateExit { room_number, body }]
             }
             AreaMutation::UpdateExit { exit_id, body } => {
-                let current = scratch
+                let current = details
                     .rooms
                     .iter()
                     .flat_map(|room| room.exits.iter())
@@ -295,7 +305,7 @@ fn compile_area_mutations(
                 } else {
                     let updated = body.clone().apply(&ExitCache::from(current.clone()));
                     let topology_changed = exit_topology_changed(&current, &updated);
-                    let member_count = scratch
+                    let member_count = details
                         .rooms
                         .iter()
                         .flat_map(|room| room.exits.iter())
@@ -325,7 +335,7 @@ fn compile_area_mutations(
         };
 
         for operation in expanded {
-            area_edits::apply_mutation(&mut scratch, &operation)?;
+            area_edits::apply_mutation(details, &operation)?;
             compiled.push(operation);
         }
     }
@@ -1302,17 +1312,118 @@ impl Mapper {
         self.inner.export_area(area_id).await
     }
 
-    /// Snapshot the displayed area, including durably-journaled optimistic
+    /// Snapshot displayed areas, including durably-journaled optimistic
     /// edits that have not reached their backend yet. Relocation uses this
     /// rather than a backend export so moving a map can never omit edits the
-    /// user can already see.
-    pub(crate) fn snapshot_area(&self, area_id: AreaId) -> CloudResult<AreaWithDetails> {
+    /// user can already see. The whole set is read from one atlas view:
+    /// per-area loads could interleave with concurrent edits and produce a
+    /// mutually inconsistent snapshot set.
+    pub(crate) fn snapshot_areas(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaWithDetails>> {
+        let cache = self.inner.atlas_cache.load();
+        area_ids
+            .iter()
+            .map(|area_id| {
+                cache
+                    .get_area(area_id)
+                    .map(|area| area.to_details())
+                    .ok_or(CloudError::AreaNotFound(*area_id))
+            })
+            .collect()
+    }
+
+    /// Populates a freshly created **local-tier** destination with a fully
+    /// freshened document in one atomic, durable file write — the relocation
+    /// counterpart of [`Mapper::import_areas`]'s wholesale persistence.
+    /// Replaying the same content as CAS envelopes would load, apply, and
+    /// fsync-rewrite the whole (growing, multi-megabyte) area file once per
+    /// 256-operation envelope; the interactive single-envelope path keeps
+    /// those semantics untouched.
+    ///
+    /// Returns `Ok(false)` without writing when the area is not served by a
+    /// local tier — the caller falls back to the envelope path, which every
+    /// tier supports. The created destination header (name, atlas placement,
+    /// access, creation time) is backend truth and is preserved verbatim;
+    /// the copied content lands under it with exactly one revision bump, and
+    /// the graph is validated once before the write so the bulk path admits
+    /// nothing the envelope path would have refused.
+    pub(crate) async fn bulk_populate_local_area(
+        &self,
+        mut document: AreaWithDetails,
+    ) -> CloudResult<bool> {
+        let area_id = document.area.id;
+        if !self.inner.backend.local_area_ids().contains(&area_id) {
+            return Ok(false);
+        }
+        let header = {
+            let cache = self.inner.atlas_cache.load();
+            cache
+                .get_area(&area_id)
+                .ok_or(CloudError::AreaNotFound(area_id))?
+                .to_details()
+                .area
+        };
+        document.area = header;
+        document.area.rev += 1;
+        crate::backends::area_edits::validate_connection_graph(&mut document)?;
+        self.inner.backend.import_local_area(document.clone()).await?;
+        self.inner.pending.note_confirmed_rev(
+            area_id,
+            document.area.rev,
+            document.area.access.map(|access| access.fingerprint()),
+        );
+        let populated = Arc::new(AreaCache::new_with_area(document));
+        self.inner.atlas_cache.rcu(|cache| {
+            Arc::new(cache.with_areas_updated(vec![(area_id, populated.clone())]))
+        });
+        Ok(true)
+    }
+
+    /// Areas still bearing the relocation in-progress name marker:
+    /// destinations stranded by a crash mid-copy, or another client's
+    /// relocation still running. Surfaced for review and manual cleanup;
+    /// never swept automatically (see
+    /// [`crate::relocation::RELOCATION_IN_PROGRESS_SUFFIX`]).
+    #[must_use]
+    pub fn abandoned_relocation_areas(&self) -> Vec<(AreaId, String)> {
         self.inner
             .atlas_cache
             .load()
-            .get_area(&area_id)
-            .map(|area| area.to_details())
-            .ok_or(CloudError::AreaNotFound(area_id))
+            .areas()
+            .filter(|area| {
+                area.get_name()
+                    .ends_with(crate::relocation::RELOCATION_IN_PROGRESS_SUFFIX)
+            })
+            .map(|area| (*area.get_id(), area.get_name().to_string()))
+            .collect()
+    }
+
+    /// Requests a server-side clone of a cloud area (see
+    /// [`MapperBackend::copy_cloud_area`]); `Ok(None)` when the backend has
+    /// no server-side copy for this area and the caller must replay content.
+    pub(crate) async fn copy_cloud_area(
+        &self,
+        source: AreaId,
+        name: &str,
+        atlas_id: Option<AtlasId>,
+    ) -> CloudResult<Option<Area>> {
+        self.inner.backend.copy_cloud_area(&source, name, atlas_id).await
+    }
+
+    /// Registers a fresh server-side cloud copy in the live cache: one
+    /// full-document fetch stands in for the per-envelope replay a
+    /// client-side copy would have staged.
+    pub(crate) async fn adopt_cloud_copy(&self, area_id: AreaId) -> CloudResult<()> {
+        let details = self.inner.backend.get_area(&area_id).await?;
+        self.inner.pending.note_confirmed_rev(
+            area_id,
+            details.area.rev,
+            details.area.access.map(|access| access.fingerprint()),
+        );
+        let adopted = Arc::new(AreaCache::new_with_area(details));
+        self.inner
+            .atlas_cache
+            .rcu(|cache| Arc::new(cache.add_area(area_id, adopted.clone())));
+        Ok(())
     }
 
     /// Freeze source content before a move snapshot. The fence is deliberately
@@ -1951,7 +2062,36 @@ impl Inner {
         // Open the initial-load gate either way: presence-checked imports wait
         // on it, and distinguish success from failure by the flag's value.
         self.initial_load.send_replace(Some(result.is_ok()));
+        if result.is_ok() {
+            self.report_abandoned_relocations();
+        }
         result
+    }
+
+    /// Surfaces relocation destinations still bearing the in-progress name
+    /// marker — debris of a crash mid-copy, indistinguishable from real
+    /// maps but for the marker. Reported, never swept: on the cloud tier
+    /// the marker may belong to another client's relocation legitimately
+    /// still in flight.
+    fn report_abandoned_relocations(&self) {
+        let stranded: Vec<String> = self
+            .atlas_cache
+            .load()
+            .areas()
+            .filter(|area| {
+                area.get_name()
+                    .ends_with(crate::relocation::RELOCATION_IN_PROGRESS_SUFFIX)
+            })
+            .map(|area| format!("'{}' ({})", area.get_name(), area.get_id()))
+            .collect();
+        if !stranded.is_empty() {
+            warn!(
+                "{} map(s) look like unfinished relocation copies: {}. A copy or move never \
+                 completed; review them and delete the stranded destinations",
+                stranded.len(),
+                stranded.join(", ")
+            );
+        }
     }
 
     async fn load_all_areas_inner(&self) -> CloudResult<LoadMapsSummary> {
@@ -2215,84 +2355,22 @@ impl Inner {
             validate_import_document(details)?;
         }
 
-        // Mint every new id first, so cross-area exits can be remapped in the pass below.
-        let mut id_map: HashMap<AreaId, AreaId> = HashMap::with_capacity(areas.len());
-        for details in &areas {
-            id_map.insert(details.area.id, AreaId(Uuid::new_v4()));
-        }
-
-        for details in &mut areas {
-            details.area.id = id_map[&details.area.id];
-            details.area.rev = 1;
-            details.area.user_id = None;
-            details.area.atlas_id = None;
-            details.area.access = Some(AreaAccess::OWNER);
-            details.area.owner_nickname = None;
-            details.area.copied_from_area_id = None;
-            details.area.copied_from_rev = None;
-            details.area.copied_at = None;
-            details.area.family_token = None;
-            details.content_hash = None;
-            details.linked_areas.clear();
-
-            for label in &mut details.labels {
-                label.id = LabelId(Uuid::new_v4());
-                label.is_secret = false;
-            }
-            for shape in &mut details.shapes {
-                shape.id = ShapeId(Uuid::new_v4());
-                shape.is_secret = false;
-            }
-            // Fresh Connection identities, keeping the exits' membership
-            // references consistent (validated above, so the lookups below
-            // cannot miss).
-            let connection_map: HashMap<crate::ConnectionId, crate::ConnectionId> = details
-                .connections
-                .iter()
-                .map(|connection| (connection.id, crate::ConnectionId::new()))
-                .collect();
-            for connection in &mut details.connections {
-                connection.id = connection_map[&connection.id];
-            }
-            for room in &mut details.rooms {
-                room.is_secret = false;
-                for exit in &mut room.exits {
-                    exit.id = ExitId(Uuid::new_v4());
-                    exit.connection_id = connection_map[&exit.connection_id];
-                    exit.is_secret = false;
-                    exit.to_unknown = false;
-                    exit.to_area_token = None;
-                    exit.to_area_id = match exit.to_area_id {
-                        Some(old) if id_map.contains_key(&old) => Some(id_map[&old]),
-                        Some(_) => {
-                            // Target is outside the imported set: drop the dangling cross-area link.
-                            exit.to_room_number = None;
-                            exit.to_direction = None;
-                            None
-                        }
-                        None => None,
-                    };
-                }
-            }
-            // Dropped cross-area links (and cleared `to_unknown` markers)
-            // can leave an External Connection with no member that still
-            // leaves the area: it becomes Dangling, exactly as a live edit
-            // would convert it.
-            let leaves_area: HashSet<crate::ConnectionId> = details
-                .rooms
-                .iter()
-                .flat_map(|room| room.exits.iter())
-                .filter(|exit| exit.to_area_id.is_some_and(|to| to != details.area.id))
-                .map(|exit| exit.connection_id)
-                .collect();
-            for connection in &mut details.connections {
-                if connection.kind == crate::ConnectionKind::External
-                    && !leaves_area.contains(&connection.id)
-                {
-                    connection.kind = crate::ConnectionKind::Dangling;
-                }
-            }
-        }
+        // Mint every new id first, then hand the set to the shared
+        // freshener (also used by relocation): fresh entity identities,
+        // in-set cross-area remap, out-of-set link drops, and the
+        // External→Dangling demotion, plus the import-specific secrecy
+        // scrub that resets foreign metadata to a locally-owned area.
+        let id_map: HashMap<AreaId, AreaId> = areas
+            .iter()
+            .map(|details| (details.area.id, AreaId(Uuid::new_v4())))
+            .collect();
+        crate::relocation::freshen_documents(
+            &mut areas,
+            &id_map,
+            &crate::relocation::FreshenOptions {
+                scrub_secrets: true,
+            },
+        );
 
         for details in &areas {
             self.backend.import_local_area(details.clone()).await?;
@@ -3283,21 +3361,35 @@ impl Inner {
                 )));
             }
 
-            let mut details = if let Some(details) = working.get(&area_id) {
-                details.clone()
+            // The working document is taken by value and mutated in place —
+            // cloning a relocation-scale document per envelope would make
+            // batch staging quadratic. Any error below discards `working`
+            // wholesale, so a partially applied document can never publish.
+            let from_working = working.contains_key(&area_id);
+            let mut details = if let Some(details) = working.remove(&area_id) {
+                details
             } else {
                 cache
                     .get_area(&area_id)
                     .ok_or(CloudError::AreaNotFound(area_id))?
                     .to_details()
             };
-            let operations = compile_area_mutations(&details, operations, paired_policy)?;
+            // Structural preconditions and route maintenance both compare
+            // against the pre-envelope document; capture before compilation
+            // applies anything.
+            let existing_rooms: HashSet<_> =
+                details.rooms.iter().map(|room| room.room_number).collect();
+            let room_moves = area_edits::capture_room_moves(&details, &operations);
+            let operations = compile_area_mutations(&mut details, operations, paired_policy)?;
             if operations.len() > MAX_MUTATION_OPERATIONS {
                 return Err(CloudError::InvalidInput(format!(
                     "the compiled mutation may contain at most {MAX_MUTATION_OPERATIONS} operations"
                 )));
             }
             if operations.is_empty() {
+                if from_working {
+                    working.insert(area_id, details);
+                }
                 submissions.push(MutationSubmission::NoChange);
                 continue;
             }
@@ -3309,8 +3401,6 @@ impl Inner {
                 }
             }));
 
-            let existing_rooms: HashSet<_> =
-                details.rooms.iter().map(|room| room.room_number).collect();
             let structural_preconditions = operations
                 .iter()
                 .filter_map(|operation| match operation {
@@ -3328,17 +3418,14 @@ impl Inner {
                 .collect();
 
             let operation_id = Uuid::new_v4();
-            let validation_envelope = MutationEnvelope {
-                operation_id,
-                preconditions: vec![Precondition {
-                    resource: ResourceKind::Area,
-                    id: area_id.0,
-                    expected_rev: details.area.rev,
-                    access_fingerprint: details.area.access.map(|access| access.fingerprint()),
-                }],
-                payload: operations.clone(),
-            };
-            area_edits::apply_envelope(&mut details, area_id, &validation_envelope)?;
+            // The envelope-level finish the CAS appliers perform, minus the
+            // re-application compilation already did: route maintenance,
+            // whole-graph validation, exactly one revision bump. (The
+            // revision precondition is vacuously true here — the envelope is
+            // built on this very document.)
+            area_edits::maintain_routes_after_room_moves(&room_moves, &mut details);
+            area_edits::validate_connection_graph(&mut details)?;
+            details.area.rev += 1;
 
             let local_area = self.backend.local_area_ids().contains(&area_id);
             let ephemeral_area = self.backend.ephemeral_area_ids().contains(&area_id);
@@ -4342,10 +4429,10 @@ mod tests {
     #[test]
     fn exit_compiler_strips_redundant_full_snapshot_on_pair() {
         let area_id = AreaId(Uuid::new_v4());
-        let details = sample_v2_document(area_id, AreaId(Uuid::new_v4()));
+        let mut details = sample_v2_document(area_id, AreaId(Uuid::new_v4()));
 
         let compiled = compile_area_mutations(
-            &details,
+            &mut details,
             vec![AreaMutation::UpdateExit {
                 exit_id: ExitId(Uuid::from_u128(1)),
                 body: ExitUpdates {
@@ -4375,8 +4462,11 @@ mod tests {
         let area_id = AreaId(Uuid::new_v4());
         let details = sample_area(area_id, "Origin");
 
+        // Compilation applies in place; compile against a scratch copy so the
+        // envelope below replays onto the pristine document.
+        let mut scratch = details.clone();
         let compiled = compile_area_mutations(
-            &details,
+            &mut scratch,
             vec![AreaMutation::CreateExit {
                 room_number: RoomNumber(1),
                 body: ExitArgs {
@@ -4426,8 +4516,9 @@ mod tests {
         let pair_id = details.rooms[0].exits[0].connection_id;
         details.rooms[1].exits.clear();
 
+        let mut scratch = details.clone();
         let compiled = compile_area_mutations(
-            &details,
+            &mut scratch,
             vec![AreaMutation::CreateExit {
                 room_number: RoomNumber(2),
                 body: ExitArgs {
@@ -4486,16 +4577,20 @@ mod tests {
             },
         };
 
-        let rejected =
-            compile_area_mutations(&details, vec![update.clone()], PairedExitPolicy::Reject)
-                .expect_err("generic update must not silently split a pair");
+        let rejected = compile_area_mutations(
+            &mut details.clone(),
+            vec![update.clone()],
+            PairedExitPolicy::Reject,
+        )
+        .expect_err("generic update must not silently split a pair");
         assert!(matches!(
             rejected,
             CloudError::StructuralConflict(ref reason) if reason == "unlink_before_edit"
         ));
 
-        let compiled = compile_area_mutations(&details, vec![update], PairedExitPolicy::Split)
-            .expect("the explicit structural gesture may split");
+        let compiled =
+            compile_area_mutations(&mut details.clone(), vec![update], PairedExitPolicy::Split)
+                .expect("the explicit structural gesture may split");
         assert!(matches!(compiled[0], AreaMutation::Unlink { .. }));
         assert!(matches!(compiled[1], AreaMutation::UpdateExit { .. }));
 
@@ -4523,7 +4618,7 @@ mod tests {
 
         let raw = merge_room_operations(&details, RoomNumber(1), RoomNumber(2))
             .expect("same-area merge plan");
-        let compiled = compile_area_mutations(&details, raw, PairedExitPolicy::Split)
+        let compiled = compile_area_mutations(&mut details.clone(), raw, PairedExitPolicy::Split)
             .expect("paired topology is split explicitly");
         assert!(compiled.len() <= MAX_MUTATION_OPERATIONS);
         assert!(matches!(

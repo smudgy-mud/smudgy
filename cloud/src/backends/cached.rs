@@ -498,6 +498,19 @@ where
         Ok(area)
     }
 
+    async fn copy_cloud_area(
+        &self,
+        source: &AreaId,
+        name: &str,
+        atlas_id: Option<AtlasId>,
+    ) -> CloudResult<Option<Area>> {
+        let copied = self.inner.copy_cloud_area(source, name, atlas_id).await?;
+        if let Some(area) = &copied {
+            self.invalidate_area(&area.id).await;
+        }
+        Ok(copied)
+    }
+
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
         let auth_generation = self.inner.auth_generation();
         self.check_auth_generation();

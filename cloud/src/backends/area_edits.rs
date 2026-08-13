@@ -304,9 +304,15 @@ pub(super) fn create_room_exit(
         return Err(invalid_connection("duplicate_connection"));
     }
     let connection_id = if let Some(connection_id) = exit_data.connection_id {
-        let member_count = exit_topologies(area, None)
+        // Counted directly off the stored exits (capped at the pair limit)
+        // rather than materializing every exit topology per created exit —
+        // bulk copies create exits by the hundred thousand.
+        let member_count = area
+            .rooms
             .iter()
+            .flat_map(|room| &room.exits)
             .filter(|exit| exit.connection_id == connection_id)
+            .take(2)
             .count();
         if member_count >= 2 || !area.connections.iter().any(|c| c.id == connection_id) {
             return Err(invalid_connection(if member_count >= 2 {
@@ -474,10 +480,20 @@ fn members_are_reciprocal(a: &ExitTopology, b: &ExitTopology) -> bool {
             .is_none_or(|direction| direction == a.from_direction)
 }
 
+/// The raw destination fields of one stored exit, indexed by
+/// [`validate_connection_graph`] so anchored-endpoint checks need no exit
+/// scan per member.
+struct ExitDestination {
+    to_unknown: bool,
+    to_area_id: Option<AreaId>,
+    to_room_number: Option<RoomNumber>,
+}
+
 fn member_matches_endpoints(
-    details: &AreaWithDetails,
+    area_id: AreaId,
     connection: &Connection,
     member: &ExitTopology,
+    destinations: &std::collections::HashMap<ExitId, ExitDestination>,
 ) -> bool {
     let endpoint_a = connection.endpoint_a.room_number;
     match connection.endpoint_b {
@@ -499,18 +515,15 @@ fn member_matches_endpoints(
                 && member.to_room_in_area == expected_destination
         }
         None => {
-            let exit = details
-                .rooms
-                .iter()
-                .flat_map(|room| &room.exits)
-                .find(|exit| exit.id == member.id)
+            let exit = destinations
+                .get(&member.id)
                 .expect("member topology came from a stored exit");
             let dangling =
                 !exit.to_unknown && exit.to_area_id.is_none() && exit.to_room_number.is_none();
             let known_external = !exit.to_unknown
                 && exit
                     .to_area_id
-                    .is_some_and(|area_id| area_id != details.area.id)
+                    .is_some_and(|to_area| to_area != area_id)
                 && exit.to_room_number.is_some();
             let redacted_external =
                 exit.to_unknown && exit.to_area_id.is_none() && exit.to_room_number.is_none();
@@ -519,8 +532,17 @@ fn member_matches_endpoints(
     }
 }
 
-fn refresh_kind(details: &AreaWithDetails, connection: &Connection) -> CloudResult<ConnectionKind> {
-    let members = connection_members(details, connection.id);
+fn refresh_kind(
+    connection: &Connection,
+    members: &[ExitTopology],
+    sites: &std::collections::HashMap<RoomNumber, RoomSite>,
+) -> CloudResult<ConnectionKind> {
+    let level = |number: RoomNumber| -> CloudResult<i32> {
+        sites
+            .get(&number)
+            .map(|site| site.level)
+            .ok_or_else(|| invalid_connection("invalid_endpoint"))
+    };
     let kind = match connection.endpoint_b {
         None => {
             if members.iter().any(|member| member.leaves_area) {
@@ -533,9 +555,7 @@ fn refresh_kind(details: &AreaWithDetails, connection: &Connection) -> CloudResu
             ConnectionKind::SelfLoop
         }
         Some(endpoint_b) => {
-            if room_level(details, endpoint_b.room_number)?
-                == room_level(details, connection.endpoint_a.room_number)?
-            {
+            if level(endpoint_b.room_number)? == level(connection.endpoint_a.room_number)? {
                 ConnectionKind::Internal
             } else {
                 ConnectionKind::CrossLevel
@@ -545,22 +565,61 @@ fn refresh_kind(details: &AreaWithDetails, connection: &Connection) -> CloudResu
     Ok(kind)
 }
 
-fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
+pub(crate) fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
+    let area_id = details.area.id;
     let ids: std::collections::HashSet<_> = details.connections.iter().map(|c| c.id).collect();
     if ids.len() != details.connections.len() {
         return Err(invalid_connection("duplicate_connection"));
     }
+
+    // One pass over every exit builds the membership and destination
+    // indexes, and one pass over rooms the placement index; per-connection
+    // scans of the whole document would make this validator quadratic in
+    // area size, and it runs once per envelope.
+    let mut members_by_connection: std::collections::HashMap<ConnectionId, Vec<ExitTopology>> =
+        std::collections::HashMap::with_capacity(details.connections.len());
+    let mut destinations: std::collections::HashMap<ExitId, ExitDestination> =
+        std::collections::HashMap::new();
     for room in &details.rooms {
         for exit in &room.exits {
             if !ids.contains(&exit.connection_id) {
                 return Err(invalid_connection("connection_not_found"));
             }
+            members_by_connection
+                .entry(exit.connection_id)
+                .or_default()
+                .push(exit_topology(area_id, room.room_number, exit));
+            destinations.insert(
+                exit.id,
+                ExitDestination {
+                    to_unknown: exit.to_unknown,
+                    to_area_id: exit.to_area_id,
+                    to_room_number: exit.to_room_number,
+                },
+            );
         }
     }
+    let sites: std::collections::HashMap<RoomNumber, RoomSite> = details
+        .rooms
+        .iter()
+        .map(|room| {
+            (
+                room.room_number,
+                RoomSite {
+                    x: room.x,
+                    y: room.y,
+                    level: room.level,
+                },
+            )
+        })
+        .collect();
 
     for index in 0..details.connections.len() {
         let mut connection = details.connections[index].clone();
-        let members = connection_members(details, connection.id);
+        let members = members_by_connection
+            .get(&connection.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if !(1..=2).contains(&members.len()) {
             return Err(invalid_connection(if members.is_empty() {
                 "no_members"
@@ -568,7 +627,7 @@ fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
                 "too_many_members"
             }));
         }
-        connection.kind = refresh_kind(details, &connection)?;
+        connection.kind = refresh_kind(&connection, members, &sites)?;
         normalize_connection(&mut connection)?;
         if !connection.kind.allows_routing(connection.routing) {
             return Err(invalid_connection("invalid_routing"));
@@ -581,8 +640,8 @@ fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
         {
             return Err(invalid_connection("invalid_membership"));
         }
-        for member in &members {
-            if !member_matches_endpoints(details, &connection, member) {
+        for member in members {
+            if !member_matches_endpoints(area_id, &connection, member, &destinations) {
                 return Err(invalid_connection("invalid_endpoint"));
             }
         }
@@ -592,20 +651,14 @@ fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
                 ConnectionRouting::Manual | ConnectionRouting::Automatic
             )
         {
-            let room_a = details
-                .rooms
-                .iter()
-                .find(|room| room.room_number == connection.endpoint_a.room_number)
+            let room_a = sites
+                .get(&connection.endpoint_a.room_number)
                 .expect("endpoint validated");
-            let endpoint_b =
+            let endpoint_b = connection.endpoint_b.zip(
                 connection
                     .endpoint_b
-                    .zip(connection.endpoint_b.and_then(|endpoint| {
-                        details
-                            .rooms
-                            .iter()
-                            .find(|room| room.room_number == endpoint.room_number)
-                    }));
+                    .and_then(|endpoint| sites.get(&endpoint.room_number)),
+            );
             let geometry = connection_geometry::resolve(&connection_geometry::GeometryInput {
                 kind: connection.kind,
                 routing: connection.routing,
@@ -643,63 +696,123 @@ fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
     Ok(())
 }
 
-fn endpoint_tip(
-    details: &AreaWithDetails,
-    endpoint: crate::ConnectionEndpoint,
-) -> Option<MapPoint> {
-    let room = details
-        .rooms
-        .iter()
-        .find(|room| room.room_number == endpoint.room_number)?;
-    let port = crate::connection_geometry::port_position(
-        MapPoint::new(room.x, room.y),
-        endpoint.side,
-        endpoint.port_offset,
-    );
-    Some(crate::connection_geometry::stub_tip(port, endpoint.side))
+fn endpoint_tip_at(room_center: MapPoint, endpoint: crate::ConnectionEndpoint) -> MapPoint {
+    let port =
+        crate::connection_geometry::port_position(room_center, endpoint.side, endpoint.port_offset);
+    crate::connection_geometry::stub_tip(port, endpoint.side)
 }
 
-/// Preserves stored geometry across a compound room move. A shared delta
-/// translates every stored point; otherwise Orthogonal routed endpoints
-/// repair only their adjacent legs and insert the minimum endpoint elbow
-/// when a fixed interior vertex can no longer meet the moved stub tip.
+/// What [`maintain_routes_after_room_moves`] needs from the pre-envelope
+/// document, captured up front so the applier never copies the whole
+/// document per envelope. Empty (the cheap common case) whenever the
+/// payload carries no explicit room coordinate.
+pub(crate) struct RoomMoveCapture {
+    /// Pre-envelope positions of exactly the rooms the payload may move.
+    moved: std::collections::HashMap<RoomNumber, MapPoint>,
+    /// Every room number present before the envelope. A connection whose
+    /// endpoint room the envelope itself created keeps its authored route.
+    preexisting: std::collections::HashSet<RoomNumber>,
+}
+
+impl RoomMoveCapture {
+    fn is_empty(&self) -> bool {
+        self.moved.is_empty()
+    }
+}
+
+/// Captures the pre-application state room-move maintenance depends on: the
+/// old positions of every `UpsertRoom` target carrying an explicit
+/// coordinate, plus the pre-envelope room-number set. Rooms the envelope
+/// creates are naturally absent from both — they had no position to
+/// preserve.
+pub(crate) fn capture_room_moves(
+    details: &AreaWithDetails,
+    payload: &[AreaMutation],
+) -> RoomMoveCapture {
+    let targets: std::collections::HashSet<RoomNumber> = payload
+        .iter()
+        .filter_map(|op| match op {
+            AreaMutation::UpsertRoom { room_number, body }
+                if body.x.is_some() || body.y.is_some() =>
+            {
+                Some(*room_number)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut capture = RoomMoveCapture {
+        moved: std::collections::HashMap::new(),
+        preexisting: std::collections::HashSet::new(),
+    };
+    if targets.is_empty() {
+        return capture;
+    }
+    for room in &details.rooms {
+        capture.preexisting.insert(room.room_number);
+        if targets.contains(&room.room_number) {
+            capture
+                .moved
+                .insert(room.room_number, MapPoint::new(room.x, room.y));
+        }
+    }
+    capture
+}
+
+/// Preserves stored geometry across a compound room move. `capture` holds
+/// the pre-envelope positions of exactly the rooms the envelope could have
+/// moved (see [`capture_room_moves`]); every other surviving room is
+/// stationary by construction. A shared delta translates every stored
+/// point; otherwise Orthogonal routed endpoints repair only their adjacent
+/// legs and insert the minimum endpoint elbow when a fixed interior vertex
+/// can no longer meet the moved stub tip.
 #[allow(clippy::too_many_lines)]
-fn maintain_routes_after_room_moves(before: &AreaWithDetails, after: &mut AreaWithDetails) {
+pub(crate) fn maintain_routes_after_room_moves(
+    capture: &RoomMoveCapture,
+    after: &mut AreaWithDetails,
+) {
+    if capture.is_empty() {
+        return;
+    }
+    let moved_before = &capture.moved;
+    let positions: std::collections::HashMap<RoomNumber, MapPoint> = after
+        .rooms
+        .iter()
+        .map(|room| (room.room_number, MapPoint::new(room.x, room.y)))
+        .collect();
+    // A preexisting room absent from `moved_before` kept its position: its
+    // delta is zero and its old center is its current one. A moved room
+    // that no longer exists yields `None`, matching the old skip of
+    // connections whose endpoint room vanished.
+    let delta_for = |number: RoomNumber| -> Option<MapPoint> {
+        match moved_before.get(&number) {
+            None => Some(MapPoint::default()),
+            Some(old) => positions
+                .get(&number)
+                .map(|new| MapPoint::new(new.x - old.x, new.y - old.y)),
+        }
+    };
+    let old_position = |number: RoomNumber| -> Option<MapPoint> {
+        moved_before
+            .get(&number)
+            .copied()
+            .or_else(|| positions.get(&number).copied())
+    };
     for index in 0..after.connections.len() {
         let mut connection = after.connections[index].clone();
         let Some(endpoint_b) = connection.endpoint_b else {
             continue;
         };
-        let Some(old_a) = before
-            .rooms
-            .iter()
-            .find(|room| room.room_number == connection.endpoint_a.room_number)
-        else {
+        if !capture.preexisting.contains(&connection.endpoint_a.room_number)
+            || !capture.preexisting.contains(&endpoint_b.room_number)
+        {
+            continue;
+        }
+        let (Some(delta_a), Some(delta_b)) = (
+            delta_for(connection.endpoint_a.room_number),
+            delta_for(endpoint_b.room_number),
+        ) else {
             continue;
         };
-        let Some(new_a) = after
-            .rooms
-            .iter()
-            .find(|room| room.room_number == connection.endpoint_a.room_number)
-        else {
-            continue;
-        };
-        let Some(old_b) = before
-            .rooms
-            .iter()
-            .find(|room| room.room_number == endpoint_b.room_number)
-        else {
-            continue;
-        };
-        let Some(new_b) = after
-            .rooms
-            .iter()
-            .find(|room| room.room_number == endpoint_b.room_number)
-        else {
-            continue;
-        };
-        let delta_a = MapPoint::new(new_a.x - old_a.x, new_a.y - old_a.y);
-        let delta_b = MapPoint::new(new_b.x - old_b.x, new_b.y - old_b.y);
         if delta_a == MapPoint::default() && delta_b == MapPoint::default() {
             continue;
         }
@@ -718,18 +831,22 @@ fn maintain_routes_after_room_moves(before: &AreaWithDetails, after: &mut AreaWi
         {
             continue;
         }
-        let Some(old_tip_a) = endpoint_tip(before, connection.endpoint_a) else {
+        let Some(old_center_a) = old_position(connection.endpoint_a.room_number) else {
             continue;
         };
-        let Some(old_tip_b) = endpoint_tip(before, endpoint_b) else {
+        let Some(old_center_b) = old_position(endpoint_b.room_number) else {
             continue;
         };
-        let Some(new_tip_a) = endpoint_tip(after, connection.endpoint_a) else {
+        let Some(new_center_a) = positions.get(&connection.endpoint_a.room_number).copied() else {
             continue;
         };
-        let Some(new_tip_b) = endpoint_tip(after, endpoint_b) else {
+        let Some(new_center_b) = positions.get(&endpoint_b.room_number).copied() else {
             continue;
         };
+        let old_tip_a = endpoint_tip_at(old_center_a, connection.endpoint_a);
+        let old_tip_b = endpoint_tip_at(old_center_b, endpoint_b);
+        let new_tip_a = endpoint_tip_at(new_center_a, connection.endpoint_a);
+        let new_tip_b = endpoint_tip_at(new_center_b, endpoint_b);
         if connection.route_points.is_empty() {
             if (new_tip_a.x - new_tip_b.x).abs() > f32::EPSILON
                 && (new_tip_a.y - new_tip_b.y).abs() > f32::EPSILON
@@ -1290,12 +1407,12 @@ pub(crate) fn apply_envelope(
     envelope: &MutationEnvelope,
 ) -> CloudResult<MutationResult> {
     validate_preconditions(details, area_id, &envelope.preconditions)?;
-    let before = details.clone();
+    let room_moves = capture_room_moves(details, &envelope.payload);
     let mut data = Vec::with_capacity(envelope.payload.len());
     for op in &envelope.payload {
         data.push(apply_mutation(details, op)?);
     }
-    maintain_routes_after_room_moves(&before, details);
+    maintain_routes_after_room_moves(&room_moves, details);
     validate_connection_graph(details)?;
     details.area.rev += 1;
     Ok(MutationResult {
