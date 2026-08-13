@@ -1,4 +1,6 @@
 import {
+  compareLayoutQuality,
+  directionalViolationEdges,
   planIntegralLayout,
   type GridPosition,
   type LayoutDirection,
@@ -11,6 +13,7 @@ import {
 
 export type LayoutRoomKey = string | number;
 export type ElevationPreference = "auto" | "levels" | "projected";
+export type LayoutSearchEffort = "standard" | "thorough";
 
 export interface LayoutModelRoom {
   id: string;
@@ -56,6 +59,8 @@ export interface PlanLayoutOptions {
   allowExistingMoves?: boolean;
   fixedRooms?: readonly LayoutRoomKey[];
   defaultElevation?: Exclude<ElevationPreference, "auto">;
+  /** `thorough` runs a bounded multi-anchor, fixed-point tournament for reflows. */
+  effort?: LayoutSearchEffort;
   trace?: (event: LayoutTraceEvent) => void;
 }
 
@@ -82,7 +87,19 @@ export interface PlannedLayout {
   patch: LayoutPatch;
   positions: ReadonlyMap<string, GridPosition>;
   quality: Readonly<LayoutQuality>;
+  /** Present when an opt-in thorough reflow tournament was run. */
+  search?: Readonly<{
+    effort: "thorough";
+    anchorsTried: readonly (string | null)[];
+    planningPasses: number;
+    selectedAnchor: string | null;
+    /** Quality from the ordinary single pass at the requested anchor. */
+    baselineQuality: Readonly<LayoutQuality>;
+  }>;
 }
+
+const THOROUGH_ANCHOR_LIMIT = 8;
+const THOROUGH_FIXED_POINT_PASSES = 4;
 
 const DIRECTION_VECTORS: Partial<Record<LayoutDirection, GridPosition>> = {
   North: { x: 0, y: -1, level: 0 },
@@ -381,8 +398,8 @@ function edgesForDirectionalConnection(
   return { edges, relative };
 }
 
-/** Plan one change against an already materialized layout snapshot. */
-export function planLayoutModel(
+/** Run the existing deterministic planner once. */
+function planLayoutModelOnce(
   input: LayoutModel,
   change: LayoutChange,
   options: PlanLayoutOptions = {},
@@ -467,6 +484,198 @@ export function planLayoutModel(
     positions: plan.positions,
     quality: plan.quality,
   };
+}
+
+function changedRoomCount(
+  original: LayoutModel,
+  positions: ReadonlyMap<string, GridPosition>,
+): number {
+  let result = 0;
+  for (const room of original.rooms) {
+    const next = positions.get(room.id);
+    if (next && !samePosition(room.position, next)) result += 1;
+  }
+  return result;
+}
+
+/** Positive means `a` is the better tournament result. */
+function comparePlannedLayouts(a: PlannedLayout, b: PlannedLayout, original: LayoutModel): number {
+  const quality = compareLayoutQuality(a.quality, b.quality);
+  if (quality !== 0) return quality;
+  return changedRoomCount(original, b.positions) - changedRoomCount(original, a.positions);
+}
+
+/** Rebase a later fixed-point pass into one declarative patch from the live snapshot. */
+function rebaseReflowPlan(original: LayoutModel, plan: PlannedLayout): PlannedLayout {
+  const moves: LayoutMove[] = [];
+  const rooms = original.rooms.map((room) => {
+    const next = plan.positions.get(room.id) ?? room.position;
+    if (!samePosition(room.position, next)) {
+      moves.push({
+        id: room.id,
+        roomNumber: room.roomNumber,
+        from: room.position,
+        to: next,
+      });
+    }
+    return { ...room, position: next };
+  });
+  const after = createLayoutModel({
+    areaId: original.areaId,
+    rooms,
+    edges: original.edges,
+  });
+  return {
+    before: original,
+    after,
+    patch: { moves, placements: [] },
+    positions: new Map(after.rooms.map((room) => [room.id, room.position])),
+    quality: plan.quality,
+  };
+}
+
+function thoroughReflowAnchors(
+  model: LayoutModel,
+  requestedAnchor: string | undefined,
+  baseline: PlannedLayout,
+  options: PlanLayoutOptions,
+): (string | undefined)[] {
+  const adjacency = new Map(model.rooms.map((room) => [room.id, new Set<string>()]));
+  for (const edge of model.edges) {
+    if (edge.from === edge.to || !adjacency.has(edge.from) || !adjacency.has(edge.to)) continue;
+    adjacency.get(edge.from)?.add(edge.to);
+    adjacency.get(edge.to)?.add(edge.from);
+  }
+
+  const directViolations = new Map<string, number>();
+  const nearbyViolations = new Map<string, number>();
+  for (const edge of directionalViolationEdges(baseline.positions, model.edges)) {
+    for (const endpoint of [edge.from, edge.to]) {
+      directViolations.set(endpoint, (directViolations.get(endpoint) ?? 0) + 1);
+      for (const neighbor of adjacency.get(endpoint) ?? []) {
+        if (neighbor !== edge.from && neighbor !== edge.to) {
+          nearbyViolations.set(neighbor, (nearbyViolations.get(neighbor) ?? 0) + 1);
+        }
+      }
+    }
+  }
+
+  const explicitlyFixed = new Set((options.fixedRooms ?? []).map(key));
+  const ranked = model.rooms
+    .filter((room) => room.movable && !explicitlyFixed.has(room.id))
+    .map((room) => ({
+      id: room.id,
+      direct: directViolations.get(room.id) ?? 0,
+      nearby: nearbyViolations.get(room.id) ?? 0,
+      degree: adjacency.get(room.id)?.size ?? 0,
+    }))
+    .sort((a, b) =>
+      b.direct - a.direct ||
+      b.nearby - a.nearby ||
+      b.degree - a.degree ||
+      a.id.localeCompare(b.id)
+  );
+
+  const result: (string | undefined)[] = [];
+  const seen = new Set<string | undefined>();
+  const add = (anchor: string | undefined): void => {
+    if (seen.has(anchor) || result.length >= THOROUGH_ANCHOR_LIMIT) return;
+    seen.add(anchor);
+    result.push(anchor);
+  };
+
+  // Preserve the user's point of reference first. Rooms incident to unresolved
+  // constraints, then their immediate neighbors, consume the scarce anchor
+  // slots before generic high-degree structural anchors.
+  add(requestedAnchor);
+  for (const candidate of ranked) {
+    if (candidate.direct === 0 && candidate.nearby === 0) break;
+    // Always reserve one slot for the unrestricted whole-area candidate.
+    if (result.length >= THOROUGH_ANCHOR_LIMIT - 1) break;
+    add(candidate.id);
+  }
+  add(undefined);
+  for (const candidate of ranked) {
+    if (candidate.degree === 0) continue;
+    add(candidate.id);
+  }
+  return result;
+}
+
+function reflowToFixedPoint(
+  original: LayoutModel,
+  anchor: string | undefined,
+  options: PlanLayoutOptions,
+): { plan: PlannedLayout; passes: number; initialQuality: Readonly<LayoutQuality> } {
+  const change: ReflowLayoutChange = { type: "reflow", anchor };
+  let current = planLayoutModelOnce(original, change, options);
+  const initialQuality = { ...current.quality };
+  let best = rebaseReflowPlan(original, current);
+  let passes = 1;
+
+  for (let pass = 1; pass < THOROUGH_FIXED_POINT_PASSES; pass += 1) {
+    const next = planLayoutModelOnce(current.after, change, options);
+    passes += 1;
+    // The unchanged layout is always a candidate, so a strict geometry gain
+    // is the only useful reason to continue. This also prevents equal-quality
+    // coordinate drift and makes the bounded search deterministic.
+    if (compareLayoutQuality(next.quality, current.quality) <= 0) break;
+    current = next;
+    const rebased = rebaseReflowPlan(original, current);
+    if (comparePlannedLayouts(rebased, best, original) > 0) best = rebased;
+  }
+  return { plan: best, passes, initialQuality };
+}
+
+function planThoroughReflow(
+  input: LayoutModel,
+  change: ReflowLayoutChange,
+  options: PlanLayoutOptions,
+): PlannedLayout {
+  const original = createLayoutModel(input);
+  const requestedAnchor = change.anchor === undefined ? undefined : key(change.anchor);
+  if (requestedAnchor && !original.rooms.some((room) => room.id === requestedAnchor)) {
+    throw new Error(`layout anchor room ${requestedAnchor} does not exist`);
+  }
+
+  const baseline = reflowToFixedPoint(original, requestedAnchor, options);
+  const anchors = thoroughReflowAnchors(original, requestedAnchor, baseline.plan, options);
+  let winner = baseline.plan;
+  let selectedAnchor = requestedAnchor;
+  let planningPasses = baseline.passes;
+
+  for (const anchor of anchors.slice(1)) {
+    const candidate = reflowToFixedPoint(original, anchor, options);
+    planningPasses += candidate.passes;
+    if (comparePlannedLayouts(candidate.plan, winner, original) > 0) {
+      winner = candidate.plan;
+      selectedAnchor = anchor;
+    }
+  }
+
+  return {
+    ...winner,
+    search: {
+      effort: "thorough",
+      anchorsTried: anchors.map((anchor) => anchor ?? null),
+      planningPasses,
+      selectedAnchor: selectedAnchor ?? null,
+      baselineQuality: baseline.initialQuality,
+    },
+  };
+}
+
+/** Plan one change against an already materialized layout snapshot. */
+export function planLayoutModel(
+  input: LayoutModel,
+  change: LayoutChange,
+  options: PlanLayoutOptions = {},
+): PlannedLayout {
+  if (options.effort === "thorough" && change.type === "reflow" &&
+    options.allowExistingMoves !== false) {
+    return planThoroughReflow(input, change, options);
+  }
+  return planLayoutModelOnce(input, change, options);
 }
 
 /** Optional retained-snapshot API for consumers which map continuously. */

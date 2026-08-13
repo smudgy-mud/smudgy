@@ -5121,7 +5121,7 @@ fn associate_created_atlas(
     let Some(mapper) = session.mapper.as_ref() else {
         return Task::none();
     };
-    if mapper.atlas_storage(&atlas_id) != smudgy_cloud::MapStorage::Cloud {
+    if mapper.atlas_storage(&atlas_id) != Some(smudgy_cloud::MapStorage::Cloud) {
         return Task::none();
     }
     let server_name = session.server_name.clone();

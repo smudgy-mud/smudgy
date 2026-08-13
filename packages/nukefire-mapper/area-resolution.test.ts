@@ -45,11 +45,11 @@ test("area identity matching prefers the configured storage tier", () => {
   assert.equal(findAreaByNukeFireId([cloud, local], "local", 42), local);
 });
 
-test("an existing cloud area is adopted when the configured storage is local", () => {
+test("an existing cloud area is not adopted when the configured storage is local", () => {
   const cloud = candidate("cloud", "Central Plaza", "cloud", 42);
 
-  assert.equal(findAreaByNukeFireId([cloud], "local", 42), cloud);
-  assert.equal(findCompatibleAreaByName([cloud], "local", 42, "Central Plaza"), cloud);
+  assert.equal(findAreaByNukeFireId([cloud], "local", 42), undefined);
+  assert.equal(findCompatibleAreaByName([cloud], "local", 42, "Central Plaza"), undefined);
 });
 
 test("session areas are never adopted by a durable-storage mapper", () => {
@@ -63,6 +63,14 @@ test("a session-storage mapper only pairs with session areas", () => {
   assert.equal(isAdoptableStorage("session", "session"), true);
   assert.equal(isAdoptableStorage("local", "session"), false);
   assert.equal(isAdoptableStorage("cloud", "session"), false);
+});
+
+test("a cloud-configured mapper never adopts a local area", () => {
+  const local = candidate("local", "Central Plaza", "local", 42);
+
+  assert.equal(isAdoptableStorage("local", "cloud"), false);
+  assert.equal(findAreaByNukeFireId([local], "cloud", 42), undefined);
+  assert.equal(findCompatibleAreaByName([local], "cloud", 42, "Central Plaza"), undefined);
 });
 
 test("name fallback does not reuse an area tagged for another identity", () => {

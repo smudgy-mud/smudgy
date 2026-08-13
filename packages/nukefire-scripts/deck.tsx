@@ -173,7 +173,8 @@ function mount(): void {
 }
 
 export function open(): void {
-  session.mainPane.split("bottom", {
+  const parent = session.panes.get("Affects") ?? session.mainPane;
+  parent.split("bottom", {
     name: PANE,
     height: widgetMetric(185),
     terminal: false,

@@ -17,6 +17,7 @@
 //  which panels load and whether later sessions stack right or share tabs.
 
 import { createState } from "smudgy:core";
+import "./commands.ts";
 import "./session-routing.ts";
 import { startPanes } from "./panes.ts";
 import * as vitals from "./vitals.tsx";

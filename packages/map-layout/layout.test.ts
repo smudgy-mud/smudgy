@@ -98,6 +98,33 @@ test("reflows a down-exit destination onto the level below its source", () => {
   assert.equal(result.movedExisting.has("lower"), true);
 });
 
+test("keeps a same-level vertical flow the chart requested when moves are disallowed", () => {
+  // Level policy belongs to callers: a chart may deliberately flow an up/down
+  // destination on its source's plane, and stable placement preserves that.
+  const result = planIntegralLayout({
+    centerId: "a",
+    allowExistingMoves: false,
+    residents: [resident("a", 0, 0)],
+    nodes: [node("a", 0, 0), node("b", 1, 0)],
+    edges: [edge("a", "b", "Up")],
+  });
+
+  assert.deepEqual(result.positions.get("b"), at(1, 0));
+});
+
+test("satisfies a cross-level chart's vertical ray without reflowing existing rooms", () => {
+  const result = planIntegralLayout({
+    centerId: "a",
+    allowExistingMoves: false,
+    residents: [resident("a", 2, 3, true, 5)],
+    nodes: [node("a", 0, 0), node("b", 1, 0, 1)],
+    edges: [edge("a", "b", "Up")],
+  });
+
+  assert.deepEqual(result.positions.get("b"), at(2, 3, 6));
+  assert.equal(result.quality.cardinalRayViolations, 0);
+});
+
 test("moves an isolated blocker when that preserves exact cardinal adjacency", () => {
   const result = plan({
     centerId: "a",

@@ -37,7 +37,9 @@ pub use package_api::{
     ResolvedDependency, ResolvedModuleWire, ResolvedPackageWire, SearchCategory, ShareClosureItem,
     StaleDependencyView, VersionListItem, highest_satisfying_version,
 };
-pub use relocation::{AtlasRelocation, MapRelocation, RelocationError, RelocationMode};
+pub use relocation::{
+    AtlasRelocation, MapRelocation, PartialRelocation, RelocationError, RelocationMode,
+};
 pub use store_bindings::{StoreBindingCell, StoreBindings};
 pub use store_node::{ArrayNode, Node, ObjectNode, Usage};
 
@@ -127,13 +129,16 @@ impl MapDestination {
 /// it to its `MIN_CLIENT_VERSION` floor and replies 426 to anything older.
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Final release line that carries the pre-storage-model mapper compatibility
-/// shims. They are intentionally unavailable starting with 0.6.0.
+/// Final release line that carries the mapper's ephemeral compatibility shims
+/// (the pre-storage-model way to request and observe the session tier). They
+/// are intentionally unavailable starting with 0.6.0. Storage-less creation
+/// is not a shim: it is the supported default (durable, cloud when signed in,
+/// local otherwise) and stays past 0.6.
 pub const MAP_STORAGE_COMPATIBILITY_LAST_RELEASE: &str = "0.5.x";
 
-/// First release in which the pre-storage-model mapper compatibility shims
-/// must be removed. A test below trips as soon as the crate reaches this
-/// version, preventing an accidental extra compatibility cycle.
+/// First release in which the mapper's ephemeral compatibility shims must be
+/// removed. A test below trips as soon as the crate reaches this version,
+/// preventing an accidental extra compatibility cycle.
 pub const MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION: &str = "0.6.0";
 
 /// Header carrying [`CLIENT_VERSION`] on every cloud request.
@@ -1031,7 +1036,7 @@ mod tests {
             .expect("the removal milestone is valid semver");
         assert!(
             (running.major, running.minor) < (removal.major, removal.minor),
-            "remove the map-storage compatibility shims before releasing {running}; \
+            "remove the mapper's ephemeral compatibility shims before releasing {running}; \
              they are supported only through 0.5.x"
         );
 
@@ -1039,10 +1044,9 @@ mod tests {
         let mapper_source = include_str!("mapper.rs");
         assert_eq!(
             mapper_source.matches(RUST_DEPRECATION).count(),
-            7,
+            3,
             "the Rust compatibility catalog must stay explicitly deprecated: \
-             create_area, create_area_ephemeral, create_area_in, is_ephemeral, \
-             ephemeral_area_ids, create_atlas, and create_atlas_in"
+             create_area_ephemeral, is_ephemeral, and ephemeral_area_ids"
         );
     }
 }

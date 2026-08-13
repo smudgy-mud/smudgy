@@ -29,8 +29,10 @@
 //! error naming the file.
 //!
 //! An area's atlas membership lives in its own `atlas_id` field, so moving an
-//! area between folders is a single-file rewrite and folder deletion just
-//! clears the member areas' `atlas_id`.
+//! area between folders is a single-file rewrite. Folder deletion journals
+//! every member document before clearing the ids; reopening rolls a prepared
+//! transaction back or a committed one forward, so a crash cannot leave only
+//! part of the folder detached.
 //!
 //! A lightweight in-memory index of area/atlas metadata is loaded once,
 //! lazily, off the construction hot path (the first async call triggers the
@@ -62,6 +64,7 @@ use crate::{
 };
 
 const LOCAL_OPERATION_RECEIPT_LIMIT: usize = 1024;
+const ATLAS_DELETE_TRANSACTION_PREFIX: &str = "atlas-delete-";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalMutationReceipt {
@@ -112,6 +115,17 @@ impl LocalAreaDocument {
             self.applied_operations.drain(..overflow);
         }
     }
+}
+
+/// Crash-recovery journal for a gentle atlas delete. `committed = false`
+/// restores membership while preserving any newer document content; `true`
+/// finishes the detach/delete if the process stopped after committing but
+/// before removing the journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalAtlasDeleteTransaction {
+    atlas: Atlas,
+    members: Vec<LocalAreaDocument>,
+    committed: bool,
 }
 
 /// On-disk authoritative map store. Cheaply shareable behind an `Arc`.
@@ -173,6 +187,16 @@ impl LocalBackend {
         self.root.join("atlases")
     }
 
+    fn transactions_dir(&self) -> PathBuf {
+        self.root.join("transactions")
+    }
+
+    fn atlas_delete_transaction_path(&self, transaction_id: Uuid) -> PathBuf {
+        self.transactions_dir().join(format!(
+            "{ATLAS_DELETE_TRANSACTION_PREFIX}{transaction_id}.json"
+        ))
+    }
+
     fn area_path(&self, id: AreaId) -> PathBuf {
         self.areas_dir().join(format!("{id}.json"))
     }
@@ -198,11 +222,14 @@ impl LocalBackend {
     /// another session's `LocalBackend` writing to the same shared local
     /// directory; the index alone would otherwise be a stale one-shot snapshot.
     async fn reload(&self) {
+        let _guard = self.write_lock.lock().await;
         let areas_dir = self.areas_dir();
         let legacy_dir = self.legacy_areas_dir();
         let backup_dir = self.backup_dir();
         let atlases_dir = self.atlases_dir();
+        let transactions_dir = self.transactions_dir();
         match task::spawn_blocking(move || {
+            recover_atlas_delete_transactions(&transactions_dir, &areas_dir, &atlases_dir);
             (
                 scan_areas(&areas_dir, &legacy_dir, &backup_dir),
                 scan_atlases(&atlases_dir),
@@ -332,6 +359,135 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// Resolve any atlas-delete journal before rebuilding the in-memory index.
+/// Prepared transactions roll back; committed transactions roll forward.
+/// A journal is removed only after the selected recovery direction succeeds.
+fn recover_atlas_delete_transactions(transactions: &Path, areas: &Path, atlases: &Path) {
+    let entries = match fs::read_dir(transactions) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            log::warn!(
+                "could not scan local map transactions {}: {error}",
+                transactions.display()
+            );
+            return;
+        }
+    };
+    let mut journals = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_transaction = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with(ATLAS_DELETE_TRANSACTION_PREFIX) && name.ends_with(".json")
+            });
+        if !is_transaction {
+            continue;
+        }
+        let transaction: LocalAtlasDeleteTransaction = match fs::read(&path)
+            .map_err(CloudError::from)
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(CloudError::from))
+        {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                log::warn!(
+                    "could not read local atlas-delete transaction {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        journals.push((path, transaction));
+    }
+    // Multiple app processes can race the same atlas delete. Once any journal
+    // for an atlas reached commit, every sibling journal must roll forward;
+    // recovery order must never let an older prepared record resurrect it.
+    let committed_atlases: HashSet<AtlasId> = journals
+        .iter()
+        .filter(|(_, transaction)| transaction.committed)
+        .map(|(_, transaction)| transaction.atlas.id)
+        .collect();
+    for (path, transaction) in journals {
+        let committed = committed_atlases.contains(&transaction.atlas.id);
+        let recover = || -> CloudResult<()> {
+            fs::create_dir_all(areas)?;
+            fs::create_dir_all(atlases)?;
+            for original in &transaction.members {
+                let area_path = areas.join(format!("{}.json", original.details.area.id));
+                let mut document = match fs::read(&area_path) {
+                    Ok(bytes) => parse_v2_document(&bytes, &area_path)?,
+                    // Atlas deletion never removes member areas. A missing
+                    // document therefore reflects a newer, independent area
+                    // delete and must not be resurrected from the journal.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let membership = document.details.area.atlas_id;
+                let target = if committed && membership == Some(transaction.atlas.id) {
+                    Some(None)
+                } else if !committed && membership.is_none() {
+                    Some(Some(transaction.atlas.id))
+                } else {
+                    None
+                };
+                // Only undo/finish the membership transition made by this
+                // transaction. A later move to another atlas wins, as do all
+                // newer room/content edits already present in `document`.
+                if let Some(target) = target {
+                    document.details.area.atlas_id = target;
+                    document.details.area.rev += 1;
+                    write_atomic(&area_path, &serde_json::to_vec_pretty(&document)?)?;
+                }
+            }
+            let atlas_path = atlases.join(format!("{}.json", transaction.atlas.id));
+            if committed {
+                match fs::remove_file(&atlas_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                write_atomic(&atlas_path, &serde_json::to_vec_pretty(&transaction.atlas)?)?;
+            }
+            fs::remove_file(&path)?;
+            Ok(())
+        };
+        if let Err(error) = recover() {
+            log::warn!(
+                "could not recover local atlas-delete transaction {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+async fn store_atlas_delete_transaction(
+    path: PathBuf,
+    transaction: LocalAtlasDeleteTransaction,
+) -> CloudResult<()> {
+    task::spawn_blocking(move || -> CloudResult<()> {
+        if let Some(directory) = path.parent() {
+            fs::create_dir_all(directory)?;
+        }
+        write_atomic(&path, &serde_json::to_vec_pretty(&transaction)?)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| CloudError::InternalError(error.to_string()))?
+}
+
+async fn remove_transaction_file(path: PathBuf) -> CloudResult<()> {
+    task::spawn_blocking(move || match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    })
+    .await
+    .map_err(|error| CloudError::InternalError(error.to_string()))?
 }
 
 /// Serde probe for the version dispatch: documents that predate the field
@@ -755,6 +911,7 @@ impl MapperBackend for LocalBackend {
 
     async fn create_atlas(&self, name: &str) -> CloudResult<Atlas> {
         self.ensure_loaded().await;
+        let _guard = self.write_lock.lock().await;
         let atlas = Atlas {
             id: AtlasId(Uuid::new_v4()),
             user_id: None,
@@ -777,6 +934,7 @@ impl MapperBackend for LocalBackend {
 
     async fn rename_atlas(&self, atlas_id: &AtlasId, name: &str) -> CloudResult<Atlas> {
         self.reload().await;
+        let _guard = self.write_lock.lock().await;
         let mut atlas = self
             .atlases
             .read()
@@ -791,6 +949,13 @@ impl MapperBackend for LocalBackend {
 
     async fn delete_atlas(&self, atlas_id: &AtlasId) -> CloudResult<()> {
         self.reload().await;
+        let _guard = self.write_lock.lock().await;
+        let atlas = self
+            .atlases
+            .read()
+            .get(atlas_id)
+            .cloned()
+            .ok_or(CloudError::NotFoundOrNoAccess)?;
         // Gentle delete: member areas survive and become loose.
         let members: Vec<AreaId> = self
             .areas
@@ -799,26 +964,80 @@ impl MapperBackend for LocalBackend {
             .filter(|area| area.atlas_id == Some(*atlas_id))
             .map(|area| area.id)
             .collect();
-        // Detach every member first, all-or-nothing: if any fails we leave the
-        // atlas in place (and propagate) rather than removing it while areas
-        // still point at it on disk.
+        let mut originals = Vec::with_capacity(members.len());
         for area_id in members {
-            self.mutate_area(area_id, |area| {
-                area.area.atlas_id = None;
-                Ok(())
-            })
-            .await?;
+            originals.push(self.load_area_document(area_id).await?);
         }
 
-        let path = self.atlas_path(*atlas_id);
-        task::spawn_blocking(move || match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(CloudError::from(err)),
-        })
-        .await
-        .map_err(|err| CloudError::InternalError(err.to_string()))??;
+        let transaction_path = self.atlas_delete_transaction_path(Uuid::new_v4());
+        let mut transaction = LocalAtlasDeleteTransaction {
+            atlas,
+            members: originals,
+            committed: false,
+        };
+        store_atlas_delete_transaction(transaction_path.clone(), transaction.clone()).await?;
+
+        let mutation_result = async {
+            for original in &transaction.members {
+                let mut detached = original.clone();
+                detached.details.area.atlas_id = None;
+                detached.details.area.rev += 1;
+                self.store_area_document(detached).await?;
+            }
+
+            let path = self.atlas_path(*atlas_id);
+            task::spawn_blocking(move || match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(CloudError::from(err)),
+            })
+            .await
+            .map_err(|err| CloudError::InternalError(err.to_string()))??;
+
+            transaction.committed = true;
+            store_atlas_delete_transaction(transaction_path.clone(), transaction.clone()).await
+        }
+        .await;
+
+        if let Err(error) = mutation_result {
+            let rollback_result = async {
+                for original in &transaction.members {
+                    let mut current = match self.load_area_document(original.details.area.id).await
+                    {
+                        Ok(current) => current,
+                        // Another writer may have deleted the area while this
+                        // transaction was in flight. Gentle atlas deletion
+                        // never owns that deletion, so rollback must preserve it.
+                        Err(CloudError::NotFoundOrNoAccess) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    // Preserve newer document content and any later move to a
+                    // different atlas. Only our detached (loose) state rolls
+                    // back to the source atlas.
+                    if current.details.area.atlas_id.is_none() {
+                        current.details.area.atlas_id = Some(transaction.atlas.id);
+                        current.details.area.rev += 1;
+                        self.store_area_document(current).await?;
+                    }
+                }
+                self.store_atlas(transaction.atlas.clone()).await?;
+                remove_transaction_file(transaction_path.clone()).await
+            }
+            .await;
+            return match rollback_result {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(CloudError::InternalError(format!(
+                    "atlas delete failed: {error}; rollback remains journaled after: {rollback_error}"
+                ))),
+            };
+        }
+
         self.atlases.write().remove(atlas_id);
+        if let Err(error) = remove_transaction_file(transaction_path).await {
+            // The committed marker makes this safe: the next reload rolls the
+            // delete forward and removes the leftover journal.
+            log::warn!("could not remove committed atlas-delete journal: {error}");
+        }
         Ok(())
     }
 
@@ -935,6 +1154,199 @@ mod tests {
         assert!(backend.list_atlases().await.expect("list").is_empty());
         let details = backend.get_area(&area.id).await.expect("get");
         assert_eq!(details.area.atlas_id, None, "member became loose");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn prepared_atlas_delete_journal_rolls_back_on_reopen() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let atlas = backend.create_atlas("Old Roads").await.expect("atlas");
+        let area = backend
+            .create_area(new_area_request("A", Some(atlas.id)))
+            .await
+            .expect("area");
+        let original = backend
+            .load_area_document(area.id)
+            .await
+            .expect("original document");
+        let transaction = LocalAtlasDeleteTransaction {
+            atlas: atlas.clone(),
+            members: vec![original.clone()],
+            committed: false,
+        };
+        let transaction_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
+        store_atlas_delete_transaction(transaction_path.clone(), transaction)
+            .await
+            .expect("prepared journal");
+
+        // Simulate a crash after the member was detached and the atlas file
+        // removed, but before the transaction's commit marker was durable.
+        let mut detached = original.clone();
+        detached.details.area.atlas_id = None;
+        detached.details.area.name = "Edited while recovery was pending".to_string();
+        detached.details.area.rev += 1;
+        backend
+            .store_area_document(detached)
+            .await
+            .expect("partial detach");
+        fs::remove_file(backend.atlas_path(atlas.id)).expect("partial atlas delete");
+        drop(backend);
+
+        let reopened = LocalBackend::new(&root);
+        let atlases = reopened.list_atlases().await.expect("recover and list");
+        assert_eq!(atlases.len(), 1);
+        assert_eq!(atlases[0].id, atlas.id);
+        let recovered = reopened.get_area(&area.id).await.expect("recovered area");
+        assert_eq!(recovered.area.atlas_id, Some(atlas.id));
+        assert_eq!(recovered.area.name, "Edited while recovery was pending");
+        assert_eq!(recovered.area.rev, original.details.area.rev + 2);
+        assert!(!transaction_path.exists(), "recovery retires the journal");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn committed_atlas_delete_journal_rolls_forward_on_reopen() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let atlas = backend.create_atlas("Old Roads").await.expect("atlas");
+        let area = backend
+            .create_area(new_area_request("A", Some(atlas.id)))
+            .await
+            .expect("area");
+        let original = backend
+            .load_area_document(area.id)
+            .await
+            .expect("original document");
+        let transaction = LocalAtlasDeleteTransaction {
+            atlas: atlas.clone(),
+            members: vec![original.clone()],
+            committed: true,
+        };
+        let transaction_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
+        store_atlas_delete_transaction(transaction_path.clone(), transaction)
+            .await
+            .expect("committed journal");
+        drop(backend);
+
+        // Even if the process stopped immediately after the commit marker,
+        // reopening deterministically finishes every member detach and delete.
+        let reopened = LocalBackend::new(&root);
+        assert!(
+            reopened
+                .list_atlases()
+                .await
+                .expect("recover and list")
+                .is_empty()
+        );
+        let recovered = reopened.get_area(&area.id).await.expect("surviving area");
+        assert_eq!(recovered.area.atlas_id, None);
+        assert_eq!(recovered.area.rev, original.details.area.rev + 1);
+        assert!(!transaction_path.exists(), "recovery retires the journal");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn atlas_delete_recovery_preserves_a_newer_move_to_another_atlas() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let source = backend
+            .create_atlas("Old Roads")
+            .await
+            .expect("source atlas");
+        let destination = backend
+            .create_atlas("New Roads")
+            .await
+            .expect("destination atlas");
+        let area = backend
+            .create_area(new_area_request("A", Some(source.id)))
+            .await
+            .expect("area");
+        let original = backend
+            .load_area_document(area.id)
+            .await
+            .expect("original document");
+        let transaction = LocalAtlasDeleteTransaction {
+            atlas: source.clone(),
+            members: vec![original.clone()],
+            committed: false,
+        };
+        let transaction_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
+        store_atlas_delete_transaction(transaction_path.clone(), transaction)
+            .await
+            .expect("prepared journal");
+
+        // A different writer moves the member after the delete began. The
+        // prepared rollback owns only the None -> source transition, not this
+        // newer placement, and must not overwrite it with the journal copy.
+        let mut moved = original;
+        moved.details.area.atlas_id = Some(destination.id);
+        moved.details.area.name = "Moved and edited".to_string();
+        moved.details.area.rev += 1;
+        backend
+            .store_area_document(moved)
+            .await
+            .expect("newer move");
+        fs::remove_file(backend.atlas_path(source.id)).expect("partial atlas delete");
+        drop(backend);
+
+        let reopened = LocalBackend::new(&root);
+        reopened.list_atlases().await.expect("recover and list");
+        let recovered = reopened.get_area(&area.id).await.expect("surviving area");
+        assert_eq!(recovered.area.atlas_id, Some(destination.id));
+        assert_eq!(recovered.area.name, "Moved and edited");
+        assert!(!transaction_path.exists(), "recovery retires the journal");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn committed_sibling_forces_a_prepared_atlas_delete_forward() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let atlas = backend.create_atlas("Old Roads").await.expect("atlas");
+        let area = backend
+            .create_area(new_area_request("A", Some(atlas.id)))
+            .await
+            .expect("area");
+        let original = backend
+            .load_area_document(area.id)
+            .await
+            .expect("original document");
+        let prepared_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
+        let committed_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
+        for (path, committed) in [(&prepared_path, false), (&committed_path, true)] {
+            store_atlas_delete_transaction(
+                path.to_path_buf(),
+                LocalAtlasDeleteTransaction {
+                    atlas: atlas.clone(),
+                    members: vec![original.clone()],
+                    committed,
+                },
+            )
+            .await
+            .expect("journal");
+        }
+        drop(backend);
+
+        // Recovery order is filesystem-dependent. The committed sibling is
+        // collected first so an older prepared record can never resurrect the
+        // atlas regardless of which journal is visited first.
+        let reopened = LocalBackend::new(&root);
+        assert!(
+            reopened
+                .list_atlases()
+                .await
+                .expect("recover and list")
+                .is_empty()
+        );
+        let recovered = reopened.get_area(&area.id).await.expect("surviving area");
+        assert_eq!(recovered.area.atlas_id, None);
+        assert!(!prepared_path.exists());
+        assert!(!committed_path.exists());
 
         fs::remove_dir_all(&root).ok();
     }
@@ -1636,6 +2048,93 @@ mod tests {
             backend.get_area(&area_id).await.is_err(),
             "the area is gone for good"
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn create_room_refuses_an_occupied_number_and_applies_to_a_vacant_one() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("CreateOnly", None))
+            .await
+            .expect("area");
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(1),
+                        body: RoomUpdates {
+                            title: Some("Original".to_string()),
+                            ..RoomUpdates::default()
+                        },
+                    }],
+                ),
+            )
+            .await
+            .expect("seed room 1");
+
+        // Occupied number: the whole envelope refuses (a leading op that
+        // would apply proves atomicity), nothing changes, no rev moves.
+        let refused = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![
+                        AreaMutation::UpsertAreaProperty {
+                            name: "climate".to_string(),
+                            value: "arid".to_string(),
+                            is_secret: None,
+                        },
+                        AreaMutation::CreateRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates {
+                                title: Some("Usurper".to_string()),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                    ],
+                ),
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(CloudError::StructuralConflict(ref reason)) if reason == "room_number_exists"
+            ),
+            "an occupied number is a structural conflict, got {refused:?}"
+        );
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.area.rev, 2, "the refused envelope moved no rev");
+        assert!(details.properties.is_empty(), "the leading op rolled back");
+        assert_eq!(details.rooms[0].title, "Original", "no silent merge");
+
+        // Vacant number: create_room applies like an upsert.
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![AreaMutation::CreateRoom {
+                        room_number: RoomNumber(2),
+                        body: RoomUpdates {
+                            title: Some("Fresh".to_string()),
+                            ..RoomUpdates::default()
+                        },
+                    }],
+                ),
+            )
+            .await
+            .expect("vacant create applies");
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.rooms.len(), 2);
 
         fs::remove_dir_all(&root).ok();
     }

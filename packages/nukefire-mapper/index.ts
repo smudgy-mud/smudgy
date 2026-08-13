@@ -15,6 +15,7 @@ import { ownsSharedMapping } from "./ownership.ts";
 export * from "./model.ts";
 export * from "./layout.ts";
 export * from "./routing.ts";
+export * from "./atlas-resolution.ts";
 export * from "./area-resolution.ts";
 export * from "./decision-log.ts";
 export * from "./location-follow.ts";

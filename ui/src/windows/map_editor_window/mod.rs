@@ -3375,7 +3375,9 @@ impl MapEditorWindow {
                 Update::none()
             }
             Message::MoveAtlasStorageRequested(atlas_id) => {
-                let storage = self.mapper.atlas_storage(&atlas_id);
+                let Some(storage) = self.mapper.atlas_storage(&atlas_id) else {
+                    return Update::with_task(self.fetch_atlases());
+                };
                 let destination = match storage {
                     MapStorage::Local if self.cloud.snapshot.get().signed_in => MapStorage::Cloud,
                     MapStorage::Cloud => MapStorage::Local,
@@ -3417,7 +3419,7 @@ impl MapEditorWindow {
                                     "error" => display_error(&failure.error),
                                     "name" => completed.destination_atlas_name.clone()
                                 ),
-                                None => display_error(&failure.error),
+                                None => failure.to_string(),
                             })
                     },
                     Message::MoveAtlasStorageCompleted,
@@ -3528,11 +3530,14 @@ impl MapEditorWindow {
                 Update::none()
             }
             Message::NewAreaInAtlas(atlas_id) => {
+                let Some(storage) = self.mapper.atlas_storage(&atlas_id) else {
+                    return Update::with_task(self.fetch_atlases());
+                };
                 self.modal = Some(modals::Modal::CreateArea {
                     name: String::new(),
                     error: None,
                     atlas_id: Some(atlas_id),
-                    storage: self.mapper.atlas_storage(&atlas_id),
+                    storage,
                     storage_selectable: false,
                     cloud_available: self.cloud.snapshot.get().signed_in,
                 });
@@ -3559,9 +3564,9 @@ impl MapEditorWindow {
                 let mut targets: Vec<(MapDestination, String)> = self
                     .atlases
                     .iter()
-                    .map(|atlas| {
-                        let storage = self.mapper.atlas_storage(&atlas.id);
-                        (
+                    .filter_map(|atlas| {
+                        let storage = self.mapper.atlas_storage(&atlas.id)?;
+                        Some((
                             MapDestination::in_atlas(storage, atlas.id),
                             format!(
                                 "{} — {}",
@@ -3572,7 +3577,7 @@ impl MapEditorWindow {
                                     MapStorage::Session => unreachable!("atlases are durable"),
                                 }
                             ),
-                        )
+                        ))
                     })
                     .collect();
                 targets.push((
@@ -3626,7 +3631,7 @@ impl MapEditorWindow {
                                 // The copy at the destination is complete: name
                                 // it, so the user resolves the duplicate rather
                                 // than retrying (which would mint another copy).
-                                Err(failure) => Err(match failure.completed {
+                                Err(failure) => Err(match &failure.completed {
                                     Some(completed) => {
                                         let atlas = mapper.get_current_atlas();
                                         let name = completed
@@ -3641,7 +3646,7 @@ impl MapEditorWindow {
                                             "name" => name
                                         )
                                     }
-                                    None => display_error(&failure.error),
+                                    None => failure.to_string(),
                                 }),
                             }
                         },
@@ -3655,6 +3660,12 @@ impl MapEditorWindow {
                     Ok(area_id) => {
                         let assoc = self.associate_new_area(area_id);
                         let mut update = self.update(Message::AreaSelected(area_id));
+                        // A same-tier re-file keeps the destination id equal to
+                        // the viewed area's, so `AreaSelected` no-ops; the move
+                        // still bumped the area rev, which must not read as an
+                        // external edit on the next tick. Resync unconditionally.
+                        self.refresh_seen_rev();
+                        self.inspector.resync(&self.mapper, &self.editor);
                         update.event = assoc.or(update.event);
                         return update;
                     }

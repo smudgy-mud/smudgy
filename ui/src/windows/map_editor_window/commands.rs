@@ -3557,8 +3557,12 @@ mod tests {
         async fn create_area_at(
             &self,
             request: CreateAreaRequest,
-            _storage: MapStorage,
+            storage: MapStorage,
         ) -> CloudResult<Area> {
+            // The command tests only route cloud-tier creates here; honoring
+            // the trait's "prove or reject" contract keeps a silently
+            // mis-tiered request from passing.
+            assert_eq!(storage, MapStorage::Cloud);
             self.create_area(request).await
         }
 

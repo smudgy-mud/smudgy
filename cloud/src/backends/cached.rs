@@ -498,6 +498,19 @@ where
         Ok(area)
     }
 
+    async fn copy_cloud_area(
+        &self,
+        source: &AreaId,
+        name: &str,
+        atlas_id: Option<AtlasId>,
+    ) -> CloudResult<Option<Area>> {
+        let copied = self.inner.copy_cloud_area(source, name, atlas_id).await?;
+        if let Some(area) = &copied {
+            self.invalidate_area(&area.id).await;
+        }
+        Ok(copied)
+    }
+
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
         let auth_generation = self.inner.auth_generation();
         self.check_auth_generation();
@@ -675,6 +688,39 @@ where
     ) -> CloudResult<()> {
         self.inner
             .delete_area_at_generation(area_id, auth_generation)
+            .await?;
+        if self.inner.auth_generation() == auth_generation {
+            self.invalidate_area(area_id).await;
+        } else {
+            self.check_auth_generation();
+        }
+        Ok(())
+    }
+
+    // Expected-rev forms forward so the precondition reaches the enforcing
+    // backend; the cache is invalidated only after an accepted delete (a
+    // revision-conflict refusal leaves the area — and its cache entry —
+    // standing).
+    async fn delete_area_expecting(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
+        self.inner
+            .delete_area_expecting(area_id, expected_rev)
+            .await?;
+        self.invalidate_area(area_id).await;
+        Ok(())
+    }
+
+    async fn delete_area_expecting_at_generation(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.inner
+            .delete_area_expecting_at_generation(area_id, expected_rev, auth_generation)
             .await?;
         if self.inner.auth_generation() == auth_generation {
             self.invalidate_area(area_id).await;

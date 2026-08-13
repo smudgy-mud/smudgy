@@ -27,8 +27,10 @@ deno_core::extension!(
   smudgy_mapper,
   ops = [
       op_smudgy_mapper_list_area_ids,
+      op_smudgy_mapper_refresh_areas,
       op_smudgy_mapper_create_area,
       op_smudgy_mapper_get_area_storage,
+      op_smudgy_mapper_get_atlas_storage,
       op_smudgy_mapper_list_atlases,
       op_smudgy_mapper_create_atlas,
       op_smudgy_mapper_relocate_areas,
@@ -42,6 +44,7 @@ deno_core::extension!(
       op_smudgy_mapper_get_area_by_id,
       op_smudgy_mapper_get_area_name,
       op_smudgy_mapper_get_area_id,
+      op_smudgy_mapper_get_area_uuid,
       op_smudgy_mapper_rename_area,
       op_smudgy_mapper_list_area_room_numbers,
       op_smudgy_mapper_list_rooms_by_title_and_description,
@@ -125,8 +128,21 @@ pub enum MapperError {
     #[error("Area not found")]
     AreaNotFound,
     #[class(generic)]
+    #[error("Atlas not found")]
+    AtlasNotFound,
+    #[class(generic)]
     #[error("Failed to create map: {0}")]
     FailedToCreate(String),
+    /// A non-creation mapper operation failed. `operation` is the
+    /// author-facing verb phrase ("delete area", "mutate area", ...), so the
+    /// script-visible message names what actually failed; creation paths keep
+    /// [`Self::FailedToCreate`]'s established text.
+    #[class(generic)]
+    #[error("Failed to {operation}: {message}")]
+    OperationFailed {
+        operation: &'static str,
+        message: String,
+    },
     /// A capability gate denied a mapper op (see `PACKAGE-ISOLATES-OP-CAPABILITIES.md`).
     /// Same `NotCapable`-style message + generic class as the `smudgy_ops` gate, so author
     /// debugging is uniform.
@@ -158,6 +174,14 @@ fn ensure_mapper(state: &OpState, write: bool) -> Result<(), MapperError> {
     }
 }
 
+/// Build a [`MapperError::OperationFailed`] mapper for a named operation.
+fn operation_failed<E: std::fmt::Display>(operation: &'static str) -> impl Fn(E) -> MapperError {
+    move |error| MapperError::OperationFailed {
+        operation,
+        message: error.to_string(),
+    }
+}
+
 async fn await_mapper_submission(
     mapper: &Mapper,
     submission: MutationSubmission,
@@ -168,7 +192,7 @@ async fn await_mapper_submission(
     mapper
         .wait_for_mutation(operation_id)
         .await
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("commit map changes"))?;
     Ok(Some(operation_id.as_u64_pair()))
 }
 
@@ -212,9 +236,29 @@ fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<(u64, u64)>
     }
 }
 
+/// Refresh the mapper's complete area projection from its authoritative
+/// backends. Package entry points use this before presence-based upserts so
+/// startup order or a mapping-owner handoff cannot make a resident map look
+/// absent in a stale per-session cache.
+#[op2(async(lazy), fast)]
+async fn op_smudgy_mapper_refresh_areas(state: Rc<RefCell<OpState>>) -> Result<(), MapperError> {
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, false)?;
+        state
+            .try_borrow::<Mapper>()
+            .cloned()
+            .ok_or(MapperError::MapperNotEnabled)?
+    };
+    mapper
+        .load_all_areas()
+        .await
+        .map(|_| ())
+        .map_err(operation_failed("refresh areas"))
+}
+
 #[op2(async(lazy))]
 #[cppgc]
-#[allow(deprecated)] // Implements the documented createArea compatibility overload through 0.5.x.
 async fn op_smudgy_mapper_create_area(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
@@ -228,16 +272,35 @@ async fn op_smudgy_mapper_create_area(
     };
 
     if let Some(mapper) = mapper {
+        // The deprecated `ephemeral` flag works through 0.5.x; teach the
+        // replacement once per isolate. Omitting `storage` altogether is the
+        // supported default and draws no notice.
+        if options.ephemeral.is_some() {
+            warn_ephemeral_create_area_once(&state);
+        }
         let atlas_id = options
             .atlas_id
             .map(|(hi, lo)| AtlasId(Uuid::from_u64_pair(hi, lo)));
-        let storage = resolve_compat_create_storage(options.storage, options.ephemeral)
-            .or_else(|| atlas_id.map(|id| mapper.atlas_storage(&id)));
+        if let Some(atlas_id) = atlas_id
+            && mapper.atlas_storage(&atlas_id).is_none()
+        {
+            mapper
+                .list_atlases()
+                .await
+                .map_err(operation_failed("validate destination atlas"))?;
+            if mapper.atlas_storage(&atlas_id).is_none() {
+                return Err(MapperError::AtlasNotFound);
+            }
+        }
+        let storage = resolve_create_storage(options.storage, options.ephemeral)
+            .or_else(|| atlas_id.and_then(|id| mapper.atlas_storage(&id)));
         let id = if let Some(storage) = storage {
             mapper
                 .create_area_at(name, MapDestination { storage, atlas_id })
                 .await
         } else {
+            // No tier was requested: create durable in the default tier —
+            // cloud when signed in, local otherwise.
             mapper.create_area(name).await
         }
         .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
@@ -271,19 +334,59 @@ struct JsCreateAreaOptions {
     storage: Option<MapStorage>,
     #[serde(default)]
     atlas_id: Option<(u64, u64)>,
+    /// `Some` only when the caller actually supplied the deprecated flag;
+    /// the fully supported storage-less default arrives as `None`.
     #[serde(default)]
-    ephemeral: bool,
+    ephemeral: Option<bool>,
 }
 
-/// Resolve the two pre-storage-model creation forms. `None` deliberately
-/// preserves the old recording-target default. This compatibility branch is
-/// supported through 0.5.x and must be removed in 0.6.0 along with the legacy
-/// TypeScript overload.
-fn resolve_compat_create_storage(
+/// Per-isolate latch for the `ephemeral`-option deprecation notice.
+struct EphemeralCreateAreaWarnIssued;
+
+/// Echo the `ephemeral`-option deprecation notice to the session, once per
+/// isolate. First-party packages still pass the flag deliberately through
+/// 0.5.x, so the note is informational — it teaches the replacement and
+/// never repeats within an isolate's lifetime.
+fn warn_ephemeral_create_area_once(state: &Rc<RefCell<OpState>>) {
+    let mut state = state.borrow_mut();
+    if state
+        .try_borrow::<EphemeralCreateAreaWarnIssued>()
+        .is_some()
+    {
+        return;
+    }
+    state.put(EphemeralCreateAreaWarnIssued);
+    log::warn!(
+        "smudgy: mapper.createArea was called with the deprecated ephemeral option (supported through 0.5.x; use storage: \"session\")"
+    );
+    state
+        .borrow::<ActionQueue>()
+        .borrow_mut()
+        .push_back(RuntimeAction::Echo(Arc::new(
+            "[mapper] A script passed the deprecated ephemeral option to createArea. Maps \
+             were created normally; the option keeps working through Smudgy 0.5.x. Scripts \
+             should select the session tier with { storage: \"session\" } instead before 0.6."
+                .to_string(),
+        )));
+}
+
+/// Resolve the storage tier requested by a `createArea` call: an explicit
+/// `storage` wins, then the deprecated `ephemeral` flag's mapping. `None`
+/// means no tier was requested; the caller falls through to the atlas's tier
+/// or the supported default (durable: cloud when signed in, local otherwise).
+fn resolve_create_storage(
     explicit: Option<MapStorage>,
-    ephemeral: bool,
+    ephemeral: Option<bool>,
 ) -> Option<MapStorage> {
-    explicit.or_else(|| ephemeral.then_some(MapStorage::Session))
+    explicit.or_else(|| compat_ephemeral_storage(ephemeral))
+}
+
+/// Map the deprecated `ephemeral` creation flag onto the storage model:
+/// `true` selects the session tier, `false` requests nothing. This
+/// compatibility mapping is supported through 0.5.x and must be removed in
+/// 0.6.0 along with the flag itself.
+fn compat_ephemeral_storage(ephemeral: Option<bool>) -> Option<MapStorage> {
+    (ephemeral == Some(true)).then_some(MapStorage::Session)
 }
 
 #[derive(Debug, Serialize)]
@@ -311,21 +414,52 @@ impl JsMapDestination {
     }
 }
 
+/// The serialized name of a storage tier, as the `MapStorage` string union.
+fn storage_str(storage: MapStorage) -> &'static str {
+    match storage {
+        MapStorage::Session => "session",
+        MapStorage::Local => "local",
+        MapStorage::Cloud => "cloud",
+    }
+}
+
+/// Live tier read backing `Area.storage`. An absent mapper or an id the
+/// current atlas no longer holds (a deleted area's stale handle) errors like
+/// the other area ops, rather than defaulting to a tier the area is not in.
 #[op2]
 #[string]
 fn op_smudgy_mapper_get_area_storage(
     state: &OpState,
     #[cppgc] area_wrapper: &JSArea,
-) -> &'static str {
-    match state
+) -> Result<&'static str, MapperError> {
+    let mapper = state
         .try_borrow::<Mapper>()
-        .map_or(MapStorage::Cloud, |mapper| {
-            mapper.area_storage(area_wrapper.0.get_id())
-        }) {
-        MapStorage::Session => "session",
-        MapStorage::Local => "local",
-        MapStorage::Cloud => "cloud",
+        .ok_or(MapperError::MapperNotEnabled)?;
+    let area_id = area_wrapper.0.get_id();
+    if mapper.get_current_atlas().get_area(area_id).is_none() {
+        return Err(MapperError::AreaNotFound);
     }
+    Ok(storage_str(mapper.area_storage(area_id)))
+}
+
+/// Live tier read backing `Atlas.storage`. A relocation mints a new atlas id,
+/// so a stale source handle errors after a move instead of lying that every
+/// unknown id is cloud-owned; callers use the `Atlas` returned by `moveAtlas`.
+#[op2]
+#[string]
+fn op_smudgy_mapper_get_atlas_storage(
+    state: &OpState,
+    #[serde] atlas_id: (u64, u64),
+) -> Result<&'static str, MapperError> {
+    ensure_mapper(state, false)?;
+    let mapper = state
+        .try_borrow::<Mapper>()
+        .ok_or(MapperError::MapperNotEnabled)?;
+    let atlas_id = AtlasId(Uuid::from_u64_pair(atlas_id.0, atlas_id.1));
+    mapper
+        .atlas_storage(&atlas_id)
+        .map(storage_str)
+        .ok_or(MapperError::AtlasNotFound)
 }
 
 #[op2(async(lazy), fast)]
@@ -344,13 +478,15 @@ async fn op_smudgy_mapper_list_atlases(
     let atlases = mapper
         .list_atlases()
         .await
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("list atlases"))?;
     Ok(atlases
         .into_iter()
         .map(|atlas| JsAtlas {
             id: atlas.id.0.as_u64_pair(),
             name: atlas.name,
-            storage: mapper.atlas_storage(&atlas.id),
+            storage: mapper
+                .atlas_storage(&atlas.id)
+                .expect("list_atlases records every returned atlas tier"),
         })
         .collect())
 }
@@ -373,7 +509,7 @@ async fn op_smudgy_mapper_create_atlas(
     let atlas = mapper
         .create_atlas_at(name, storage)
         .await
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("create atlas"))?;
     if storage == MapStorage::Cloud {
         state
             .borrow()
@@ -418,7 +554,11 @@ async fn op_smudgy_mapper_relocate_areas(
             },
         )
         .await
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed(if move_source {
+            "move areas"
+        } else {
+            "copy areas"
+        }))?;
     if result.destination.storage == MapStorage::Cloud {
         let state = state.borrow();
         let mut queue = state.borrow::<ActionQueue>().borrow_mut();
@@ -460,7 +600,11 @@ async fn op_smudgy_mapper_relocate_atlas(
             },
         )
         .await
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed(if move_source {
+            "move atlas"
+        } else {
+            "copy atlas"
+        }))?;
     if storage == MapStorage::Cloud {
         state
             .borrow()
@@ -538,7 +682,7 @@ async fn op_smudgy_mapper_delete_area(
     mapper
         .delete_area_and_wait(id)
         .await
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))
+        .map_err(operation_failed("delete area"))
 }
 
 #[op2(async(lazy))]
@@ -559,7 +703,7 @@ async fn op_smudgy_mapper_rename_area(
     mapper
         .rename_area_and_wait(id, name.as_str())
         .await
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))
+        .map_err(operation_failed("rename area"))
 }
 
 /// AREA WRAPPER METHODS
@@ -577,6 +721,16 @@ fn op_smudgy_mapper_get_area_name<'a>(
 #[serde]
 fn op_smudgy_mapper_get_area_id(#[cppgc] area_wrapper: &JSArea) -> (u64, u64) {
     area_wrapper.0.get_id().0.as_u64_pair()
+}
+
+/// `area.uuid`: the area id as its canonical hyphenated lowercase UUID
+/// string -- the JSON-safe spelling of `area.id`, matching the `map:room`
+/// event's `areaId` field and the spelling MapView apply-area scoping
+/// accepts. Wrapper accessor on a `JSArea` handle -- not gated.
+#[op2]
+#[string]
+fn op_smudgy_mapper_get_area_uuid(#[cppgc] area_wrapper: &JSArea) -> String {
+    area_wrapper.0.get_id().to_string()
 }
 
 /// `area.isEphemeral`: whether the area lives in the session-lifetime
@@ -683,7 +837,10 @@ fn op_smudgy_mapper_get_area_next_room_number(
     state
         .try_borrow::<Mapper>()
         .and_then(|mapper| mapper.next_room_number(area_wrapper.0.get_id()))
-        .map_or_else(|| area_wrapper.0.get_max_room_number().0 + 1, |number| number.0)
+        .map_or_else(
+            || area_wrapper.0.get_max_room_number().0 + 1,
+            |number| number.0,
+        )
 }
 
 /// Reserve the next free room number for an open scripted mutator. Ambient
@@ -913,7 +1070,7 @@ fn submit_room_update(
             },
             updates,
         )
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("update room"))?;
     Ok((mapper, submission))
 }
 
@@ -1166,7 +1323,7 @@ async fn op_smudgy_mapper_set_room_property(
                 name,
                 value,
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("update room"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -1188,7 +1345,7 @@ async fn op_smudgy_mapper_set_area_property(
         let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
         let submission = mapper
             .set_area_property(area_id, name, value)
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("update area"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -1216,7 +1373,7 @@ async fn op_smudgy_mapper_add_room_tag(
                 },
                 tag,
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("add room tag"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -1244,7 +1401,7 @@ async fn op_smudgy_mapper_remove_room_tag(
                 },
                 tag,
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("remove room tag"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -1270,8 +1427,12 @@ async fn op_smudgy_mapper_create_room(
             return Err(MapperError::AreaNotFound);
         };
 
+        // Create-only submission: a cross-client race on this number is
+        // refused (`room_number_exists`) instead of silently merging two
+        // logical rooms. Server floor: requires the smudgy-web release that
+        // knows `create_room` (server-ships-before-client).
         let submission = mapper
-            .upsert_room(
+            .create_room(
                 RoomKey {
                     area_id,
                     room_number,
@@ -1310,7 +1471,7 @@ async fn op_smudgy_mapper_update_room(
                 },
                 params.into(),
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("update room"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -1338,7 +1499,7 @@ async fn op_smudgy_mapper_update_rooms(
             .collect();
         let submissions = mapper
             .upsert_rooms(area_id, updates)
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("update rooms"))?;
         drop(state);
         let mut operation_ids = Vec::new();
         for submission in submissions {
@@ -1438,7 +1599,7 @@ async fn op_smudgy_mapper_set_room_exit(
                     clear_to: None,
                 },
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("update exit"))?;
         await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
@@ -1463,7 +1624,7 @@ async fn op_smudgy_mapper_merge_rooms(
                 RoomNumber(keep_room_number),
                 RoomNumber(remove_room_number),
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("merge rooms"))?;
         await_mapper_submission(&mapper, submission).await
     } else {
         Err(MapperError::MapperNotEnabled)
@@ -1485,7 +1646,7 @@ async fn op_smudgy_mapper_delete_room(
                 area_id: AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
                 room_number: RoomNumber(room_number),
             })
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("delete room"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -1512,7 +1673,7 @@ async fn op_smudgy_mapper_delete_room_exit(
                 },
                 ExitId(Uuid::from_u64_pair(exit_id.0, exit_id.1)),
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("delete exit"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -1649,6 +1810,13 @@ enum JSAreaBatchOperation {
         room_number: i32,
         body: JSRoomParams,
     },
+    /// `AreaMutator.createRoom` drafts: must-not-exist creation, so a
+    /// number that raced into existence between draft and submission is
+    /// refused (`room_number_exists`) instead of merging.
+    CreateRoom {
+        room_number: i32,
+        body: JSRoomParams,
+    },
     DeleteRoom {
         room_number: i32,
     },
@@ -1741,6 +1909,10 @@ impl JSAreaBatchOperation {
     fn into_group(self) -> Vec<AreaMutation> {
         match self {
             Self::UpsertRoom { room_number, body } => vec![AreaMutation::UpsertRoom {
+                room_number: RoomNumber(room_number),
+                body: body.into(),
+            }],
+            Self::CreateRoom { room_number, body } => vec![AreaMutation::CreateRoom {
                 room_number: RoomNumber(room_number),
                 body: body.into(),
             }],
@@ -1838,10 +2010,13 @@ fn pack_area_batch_operations(
     let mut current = Vec::<AreaMutation>::new();
     for group in operations.into_iter().map(JSAreaBatchOperation::into_group) {
         if group.len() > MAX_MUTATION_OPERATIONS {
-            return Err(MapperError::FailedToCreate(format!(
-                "one scripted mapper operation expands to {} mutations; the limit is {MAX_MUTATION_OPERATIONS}",
-                group.len()
-            )));
+            return Err(MapperError::OperationFailed {
+                operation: "mutate area",
+                message: format!(
+                    "one scripted mapper operation expands to {} mutations; the limit is {MAX_MUTATION_OPERATIONS}",
+                    group.len()
+                ),
+            });
         }
         if !current.is_empty() && current.len() + group.len() > MAX_MUTATION_OPERATIONS {
             chunks.push(std::mem::take(&mut current));
@@ -1914,7 +2089,7 @@ async fn op_smudgy_mapper_mutate_area(
         .collect();
     let submissions = mapper
         .mutate_batches(batches)
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("mutate area"))?;
 
     let mut committed = Vec::with_capacity(chunk_count);
     for submission in submissions {
@@ -2033,7 +2208,7 @@ async fn op_smudgy_mapper_set_connection(
             }],
             "Update scripted connection",
         )
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("update connection"))?;
     drop(state);
     await_mapper_submission(&mapper, submission).await
 }
@@ -2061,7 +2236,7 @@ async fn op_smudgy_mapper_unlink_exit(
             }],
             "Unlink scripted traversal",
         )
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("unlink exit"))?;
     drop(state);
     await_mapper_submission(&mapper, submission).await?;
     Ok(connection_id.0.as_u64_pair())
@@ -2096,7 +2271,7 @@ async fn op_smudgy_mapper_pair_connections(
             }],
             "Pair scripted connections",
         )
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("pair connections"))?;
     drop(state);
     await_mapper_submission(&mapper, submission).await
 }
@@ -2122,7 +2297,7 @@ async fn op_smudgy_mapper_delete_link(
             }],
             "Delete scripted link",
         )
-        .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+        .map_err(operation_failed("delete link"))?;
     drop(state);
     await_mapper_submission(&mapper, submission).await
 }
@@ -2451,7 +2626,7 @@ async fn op_smudgy_mapper_delete_label(
                 AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
                 LabelId(Uuid::from_u64_pair(label_id.0, label_id.1)),
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("delete label"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -2475,7 +2650,7 @@ async fn op_smudgy_mapper_delete_shape(
                 AreaId(Uuid::from_u64_pair(area_id.0, area_id.1)),
                 ShapeId(Uuid::from_u64_pair(shape_id.0, shape_id.1)),
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("delete shape"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -2502,7 +2677,7 @@ async fn op_smudgy_mapper_set_label(
                 LabelId(Uuid::from_u64_pair(label_id.0, label_id.1)),
                 params.into(),
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("update label"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -2529,7 +2704,7 @@ async fn op_smudgy_mapper_set_shape(
                 ShapeId(Uuid::from_u64_pair(shape_id.0, shape_id.1)),
                 params.into(),
             )
-            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
+            .map_err(operation_failed("update shape"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
     } else {
@@ -2565,7 +2740,7 @@ async fn op_smudgy_mapper_import_areas(
                     .collect(),
             )
             .await
-            .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
+            .map_err(operation_failed("import areas"))?;
         Ok(ids.into_iter().map(|id| id.0.as_u64_pair()).collect())
     } else {
         Err(MapperError::MapperNotEnabled)
@@ -2604,7 +2779,7 @@ async fn op_smudgy_mapper_import_areas_if_absent(
                     .collect(),
             )
             .await
-            .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
+            .map_err(operation_failed("import areas"))?;
         Ok(JsAreasImportedIfAbsent {
             added: outcome
                 .added
@@ -2644,7 +2819,7 @@ async fn op_smudgy_mapper_export_area(
     mapper
         .export_area(area_id)
         .await
-        .map_err(|e| MapperError::FailedToCreate(e.to_string()))
+        .map_err(operation_failed("export area"))
 }
 
 #[op2]
@@ -2759,22 +2934,32 @@ fn op_smudgy_mapper_find_nearest_room_in_area(
 mod compatibility_tests {
     use super::{
         AreaMutation, JSAreaBatchOperation, JSRoomParams, MAX_MUTATION_OPERATIONS, MapStorage,
-        pack_area_batch_operations, resolve_compat_create_storage,
+        compat_ephemeral_storage, pack_area_batch_operations, resolve_create_storage,
     };
     use deno_core::{FastString, JsRuntime, RuntimeOptions};
     use serde_json::json;
 
     #[test]
-    fn legacy_create_area_options_remain_pinned_through_0_7() {
-        assert_eq!(resolve_compat_create_storage(None, false), None);
+    fn ephemeral_flag_stays_pinned_to_session_through_0_5() {
+        assert_eq!(compat_ephemeral_storage(None), None);
         assert_eq!(
-            resolve_compat_create_storage(None, true),
+            compat_ephemeral_storage(Some(false)),
+            None,
+            "an explicit `ephemeral: false` requests no tier, exactly like omitting the flag"
+        );
+        assert_eq!(
+            compat_ephemeral_storage(Some(true)),
             Some(MapStorage::Session)
         );
         assert_eq!(
-            resolve_compat_create_storage(Some(MapStorage::Local), true),
+            resolve_create_storage(Some(MapStorage::Local), Some(true)),
             Some(MapStorage::Local),
             "the canonical explicit storage value wins over the compatibility flag"
+        );
+        assert_eq!(
+            resolve_create_storage(None, None),
+            None,
+            "the storage-less default requests no tier: durable, cloud when signed in, local otherwise"
         );
     }
 

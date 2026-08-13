@@ -8,11 +8,13 @@ import {
     op_smudgy_mapper_set_current_location,
     op_smudgy_mapper_get_current_location,
     op_smudgy_mapper_list_area_ids,
+    op_smudgy_mapper_refresh_areas,
     op_smudgy_mapper_list_area_room_numbers,
     op_smudgy_mapper_list_rooms_by_title_and_description,
     op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
     op_smudgy_mapper_create_area,
     op_smudgy_mapper_get_area_storage,
+    op_smudgy_mapper_get_atlas_storage,
     op_smudgy_mapper_list_atlases,
     op_smudgy_mapper_create_atlas,
     op_smudgy_mapper_relocate_areas,
@@ -23,6 +25,7 @@ import {
     op_smudgy_mapper_get_area_by_id,
     op_smudgy_mapper_get_area_name,
     op_smudgy_mapper_get_area_id,
+    op_smudgy_mapper_get_area_uuid,
     op_smudgy_mapper_get_area_room_by_number,
     op_smudgy_mapper_get_area_property,
     op_smudgy_mapper_get_area_next_room_number,
@@ -134,22 +137,16 @@ interface CreateRoomParams {
 type UpdateRoomParams = CreateRoomParams;
 
 interface CreateAreaOptions {
-    storage: MapStorage;
+    /** Omitted storage selects the default durable tier: cloud when signed
+     * in, local otherwise (or the atlas's tier when `atlas` is given). */
+    storage?: MapStorage;
     atlas?: Atlas | AtlasId;
-    ephemeral?: never;
-}
-
-interface LegacyCreateAreaOptions {
-    storage?: never;
-    atlas?: never;
     /**
      * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
      * Use `storage: "session"` instead.
      */
     ephemeral?: boolean;
 }
-
-type AnyCreateAreaOptions = CreateAreaOptions | LegacyCreateAreaOptions;
 
 type MapStorage = "session" | "local" | "cloud";
 
@@ -166,8 +163,31 @@ interface MutateAreaOptions {
     description?: string;
 }
 
+/** An opaque id pair as the ops accept it: a 2-element array of numbers
+ * (a UUID's 64-bit halves). */
+function isIdPair(value: unknown): value is readonly [number, number] {
+    return (
+        Array.isArray(value) &&
+        value.length === 2 &&
+        typeof value[0] === "number" &&
+        typeof value[1] === "number"
+    );
+}
+
+/** Unwrap an atlas argument structurally. The contract `Atlas` type is an
+ * interface, so callers may legitimately hold plain objects (a spread or a
+ * JSON round-trip of a handle) rather than this module's class; anything
+ * carrying a valid id pair is accepted, and anything else fails here with a
+ * clear TypeError instead of an opaque serde error inside the op. */
 function atlasIdOf(atlas: Atlas | AtlasId | undefined): AtlasId | undefined {
-    return atlas instanceof Atlas ? atlas.id : atlas;
+    if (atlas === undefined) return undefined;
+    if (atlas instanceof Atlas) return atlas.id;
+    if (isIdPair(atlas)) return atlas;
+    const id = (atlas as Atlas).id;
+    if (isIdPair(id)) return id;
+    throw new TypeError(
+        "expected an Atlas handle or an AtlasId [hi, lo] pair",
+    );
 }
 
 function areaIdOf(area: Area | AreaId): AreaId {
@@ -182,25 +202,35 @@ function destinationForOp(destination: MapDestination) {
 }
 
 const mapper = {
-    async createArea(name: string, options?: AnyCreateAreaOptions) {
+    /** Refresh every visible area from durable storage. Use this before a
+     * presence-based package upsert that can run during startup or after a
+     * mapping-owner handoff. Requires `mapper:read`. */
+    refreshAreas(): Promise<void> {
+        return op_smudgy_mapper_refresh_areas();
+    },
+
+    async createArea(name: string, options?: CreateAreaOptions) {
+        // The deprecated ephemeral flag is forwarded only when the caller
+        // actually supplied it, so the runtime can tell "flag passed" from
+        // the fully supported storage-less default.
         const id = await op_smudgy_mapper_create_area(name, {
             storage: options?.storage,
             atlas_id: atlasIdOf(options?.atlas),
-            ephemeral: options?.ephemeral === true,
+            ephemeral: options?.ephemeral,
         });
         return new Area(id);
     },
 
     async listAtlases(): Promise<Atlas[]> {
         const atlases = await op_smudgy_mapper_list_atlases();
-        return atlases.map((atlas: { id: AtlasId; name: string; storage: MapStorage }) =>
-            new Atlas(atlas.id, atlas.name, atlas.storage)
+        return atlases.map((atlas: { id: AtlasId; name: string }) =>
+            new Atlas(atlas.id, atlas.name)
         );
     },
 
     async createAtlas(name: string, options: CreateAtlasOptions): Promise<Atlas> {
         const atlas = await op_smudgy_mapper_create_atlas(name, options.storage);
-        return new Atlas(atlas.id, atlas.name, atlas.storage);
+        return new Atlas(atlas.id, atlas.name);
     },
 
     async copyAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]> {
@@ -231,12 +261,12 @@ const mapper = {
 
     async copyAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas> {
         const copied = await op_smudgy_mapper_relocate_atlas(atlasIdOf(atlas), storage, false);
-        return new Atlas(copied.id, copied.name, copied.storage);
+        return new Atlas(copied.id, copied.name);
     },
 
     async moveAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas> {
         const moved = await op_smudgy_mapper_relocate_atlas(atlasIdOf(atlas), storage, true);
-        return new Atlas(moved.id, moved.name, moved.storage);
+        return new Atlas(moved.id, moved.name);
     },
 
     setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber) {
@@ -702,6 +732,7 @@ interface LinkCreateArgs extends ConnectionUpdates {
 
 type AreaBatchOperation =
     | { upsert_room: { room_number: RoomNumber; body: CreateRoomParams } }
+    | { create_room: { room_number: RoomNumber; body: CreateRoomParams } }
     | { delete_room: { room_number: RoomNumber } }
     | { upsert_room_property: { room_number: RoomNumber; name: string; value: string } }
     | { upsert_area_property: { name: string; value: string } }
@@ -748,8 +779,13 @@ class AreaMutator {
             this.#areaId,
             this.#token,
         );
+        // Create-only submission: if this number exists by submission time
+        // (another client won the race), the envelope is refused with
+        // `room_number_exists` and surfaces through mutateArea's thrown
+        // error (committedOperations carries any acknowledged prefix),
+        // never a silent merge into the other client's room.
         this.#record({
-            upsert_room: { room_number: roomNumber, body: { ...params } },
+            create_room: { room_number: roomNumber, body: { ...params } },
         });
         return roomNumber;
     }
@@ -1009,8 +1045,13 @@ class Atlas {
     constructor(
         readonly id: AtlasId,
         readonly name: string,
-        readonly storage: MapStorage,
     ) {}
+
+    /** Live tier read. `moveAtlas` replaces the atlas with a new id, so the
+     * old source handle becomes invalid; use the handle returned by the move. */
+    get storage(): MapStorage {
+        return op_smudgy_mapper_get_atlas_storage(this.id);
+    }
 
     toString() {
         return this.name;
@@ -1026,6 +1067,11 @@ class Area {
 
     get id(): AreaId {
         return op_smudgy_mapper_get_area_id(this.#obj);
+    }
+
+    /** The area id as its canonical hyphenated lowercase UUID string. */
+    get uuid(): string {
+        return op_smudgy_mapper_get_area_uuid(this.#obj);
     }
 
     get name(): string {

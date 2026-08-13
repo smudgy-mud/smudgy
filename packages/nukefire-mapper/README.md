@@ -4,10 +4,12 @@
 automatically builds the map shown in Smudgy's map widget.
 
 As you explore, it adds rooms, exits, terrain, doors, and vertical connections.
-It also follows your current location and displays GPS routes. New maps are
-saved locally, survive restarts, and are not synced to the cloud; a NukeFire
-map you already keep in the cloud is adopted and stays there rather than being
-duplicated into a local copy.
+A room you reach by going up or down is always mapped one level above or below
+the room you left, even when the game charts both on the same plane. It also
+follows your current location and displays GPS routes. New maps are saved in a
+local `Nukefire` atlas, survive restarts, and are not synced to the cloud.
+Automatic mapping only adopts local areas. Existing cloud maps are left
+untouched; moving a NukeFire map to cloud storage is always a user action.
 
 ## Setup
 
@@ -17,3 +19,8 @@ the complete map and radar interface, also enable
 
 Disable `smudgy://official/auto-mapper` while using this package. Running both
 mappers can cause conflicting room and exit updates.
+
+For troubleshooting, enable **Log mapping decisions (debug)** in the package
+parameters. The JSONL log records every mapper mutation before drafting, after
+drafting, and after acknowledgement, including results, durations, failures,
+and any partially committed operation IDs.

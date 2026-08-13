@@ -1,5 +1,5 @@
 {
-  "version": "0.17.1",
+  "version": "0.17.2",
   "description": "Maps NukeFire from its rich NukeFire.Map.Local GMCP snapshots.",
   "entry": "index.ts",
   "min_smudgy_version": "0.5.3",

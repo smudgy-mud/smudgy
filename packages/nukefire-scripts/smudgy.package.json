@@ -1,10 +1,11 @@
 {
-  "version": "0.3.2",
-  "description": "NukeFire command deck: vitals HUD, Navigator (MapView + live BIGMAP radar), GPS atlas, context deck, comms, affects, and Knowledge codex panes.",
+  "version": "0.4.2",
+  "description": "NukeFire widgets deck: vitals, maps + GPS, comms and more",
   "entry": "index.ts",
   "min_smudgy_version": "0.5.3",
   "dependencies": [
-    "smudgy://kapusniak/nukefire-gmcp"
+    "smudgy://kapusniak/nukefire-gmcp",
+    "smudgy://kapusniak/map-layout@^0.2.0"
   ],
   "requires": [
     "smudgy://kapusniak/nukefire-gmcp",
@@ -110,7 +111,7 @@
       "key": "sessionVitalsLayout",
       "label": "Tabbed-session vitals style",
       "type": "dropdown",
-      "default": "compact",
+      "default": "wide",
       "options": [
         {
           "value": "compact",
@@ -138,7 +139,7 @@
         "reach-others"
       ],
       "mapper": [
-        "read"
+        "write"
       ],
       "display": [
         "change"

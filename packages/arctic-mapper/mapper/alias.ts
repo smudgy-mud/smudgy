@@ -671,7 +671,7 @@ const commands = {
         echo("  move <direction> - Move the selection along an existing exit");
         echo("  path <from> <to> - Show the path between two rooms (tags: <number> or <area>#<number>)");
         echo("  push <direction> - Shift the selected room and connected rooms in a direction");
-        echo("  reflow - Recompute the complete current-area layout");
+        echo("  reflow - Thoroughly search and reflow the complete current area");
         echo("  z [auto|levels|projected] - Show or set new U/D room placement style");
         echo("  refresh - Refresh the current room (will send a `look` command)");
         echo("  send_link [n] - Run the nth link in the current room's notes (default 1; same as CTRL+ENTER)");
@@ -752,14 +752,23 @@ const commands = {
             echo("No area selected");
             return;
         }
+        echo("Searching violation-prioritized anchors for a better layout…");
         const result = await planAreaChange(state.area.id, {
             type: "reflow",
             anchor: state.room?.room_number,
+        }, {
+            effort: "thorough",
         });
         await applyLayoutMoves(state.area.id, result);
         state.refreshRoomAndArea();
-        echo(`Reflowed ${result.patch.moves.length} room${result.patch.moves.length === 1 ? "" : "s"}; ` +
-            `${result.quality.cardinalRayViolations} directional violation${result.quality.cardinalRayViolations === 1 ? "" : "s"} remain.`);
+        const search = result.search;
+        const searchText = search
+            ? ` Tried ${search.anchorsTried.length} anchors across ${search.planningPasses} passes; ` +
+                `selected ${search.selectedAnchor === null ? "the unanchored result" : `room ${search.selectedAnchor} as anchor`}.`
+            : "";
+        echo(`Thoroughly reflowed ${result.patch.moves.length} room${result.patch.moves.length === 1 ? "" : "s"}; ` +
+            `${result.quality.cardinalRayViolations} directional violation${result.quality.cardinalRayViolations === 1 ? "" : "s"} remain.` +
+            searchText);
     },
     z: (mode?: string) => {
         const normalized = mode?.toLowerCase();

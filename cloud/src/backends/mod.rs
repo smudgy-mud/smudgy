@@ -62,6 +62,23 @@ pub trait MapperBackend: Send + Sync {
         ))
     }
 
+    /// Server-side clone of one **cloud-tier** area into a new cloud area
+    /// (`POST /areas/{id}/copy`): one transaction on the server instead of
+    /// replaying the content as serial CAS envelopes. The server mints fresh
+    /// area/connection/exit identities, preserves room numbers, and records
+    /// `copied_from_*` provenance. `Ok(None)` means no server-side copy is
+    /// available for this area (not cloud-tier, signed out, or no server
+    /// behind the backend); callers fall back to content replay, which every
+    /// tier supports.
+    async fn copy_cloud_area(
+        &self,
+        _source: &AreaId,
+        _name: &str,
+        _atlas_id: Option<AtlasId>,
+    ) -> CloudResult<Option<Area>> {
+        Ok(None)
+    }
+
     // ===== SYNC / IDENTITY =====
 
     /// One row per viewable area: shared revision + access fingerprint.
@@ -133,6 +150,27 @@ pub trait MapperBackend: Send + Sync {
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()>;
 
+    /// Delete an area only while its authoritative revision still equals
+    /// `expected_rev` (`None` = unconditional, exactly [`Self::delete_area`]).
+    /// A mismatch is [`CloudError::RevisionConflict`] carrying the current
+    /// revision, and the area survives.
+    ///
+    /// The default IGNORES the precondition and deletes unconditionally —
+    /// the behavior of any backend (or remote server) that predates the
+    /// feature. Callers MUST therefore keep their own compare-then-delete
+    /// check as the enforcement floor and treat this as belt-and-braces:
+    /// only a backend that actually implements the precondition (the cloud
+    /// backend against a smudgy-web release with the expected-rev DELETE)
+    /// closes the remaining TOCTOU window.
+    async fn delete_area_expecting(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
+        let _ = expected_rev;
+        self.delete_area(area_id).await
+    }
+
     /// Read an area using the exact credential generation captured by the
     /// caller, rejecting a response that straddled a credential change.
     async fn get_area_at_generation(
@@ -172,6 +210,20 @@ pub trait MapperBackend: Send + Sync {
             return Err(CloudError::CredentialChanged);
         }
         self.delete_area(area_id).await
+    }
+
+    /// [`Self::delete_area_expecting`] bound to a captured credential
+    /// generation; same default-ignores-the-precondition caveat.
+    async fn delete_area_expecting_at_generation(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        if self.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        self.delete_area_expecting(area_id, expected_rev).await
     }
 
     // ===== VERSIONED MUTATIONS (the CAS envelope) =====

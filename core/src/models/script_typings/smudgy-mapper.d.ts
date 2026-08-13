@@ -375,6 +375,11 @@ interface AreaMutator {
      * provisional (the room exists only once the mutation commits), and the
      * reservation is released when the callback finishes or aborts, so an
      * aborted draft's numbers become available again.
+     *
+     * The draft submits as a must-not-exist create: if the number is taken
+     * by submission time (another client raced it in), the mutation is
+     * rejected (`mutateArea` throws with `room_number_exists` in the
+     * message) rather than silently merging two logical rooms.
      */
     createRoom(params: CreateRoomParams): Promise<RoomNumber>;
     updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void>;
@@ -436,6 +441,12 @@ interface Room {
  */
 interface Area {
     readonly id: AreaId;
+    /**
+     * The area id as its canonical hyphenated lowercase UUID string: the
+     * JSON-safe spelling of `id`, as carried by the `map:room` event's
+     * `areaId` field and accepted by MapView apply-area scoping.
+     */
+    readonly uuid: string;
     readonly name: string;
     readonly room_numbers: RoomNumber[];
     /**
@@ -466,21 +477,22 @@ interface Area {
 
 /** Options for {@link Mapper.createArea}. */
 interface CreateAreaOptions {
-    /** Select the authoritative storage tier explicitly. */
-    storage: MapStorage;
-    /** Optionally create the area inside this atlas. Its storage must match. */
+    /**
+     * The authoritative storage tier. When omitted, the area is durable in
+     * the default tier: cloud when signed in, local otherwise (or the
+     * atlas's tier when `atlas` is given).
+     */
+    storage?: MapStorage;
+    /**
+     * Optionally create the area inside this atlas. The atlas determines the
+     * storage tier when `storage` is omitted; when both are given they must
+     * match.
+     */
     atlas?: Atlas | AtlasId;
-    ephemeral?: never;
-}
-
-/** Options accepted only for the pre-storage-model creation API. */
-interface LegacyCreateAreaOptions {
-    storage?: never;
-    atlas?: never;
     /**
      * Create a session map: it lives only for this session, is never saved
-     * or synced, and is discarded when the session closes. Use this for maps
-     * built automatically from server data.
+     * or synced, and is discarded when the session closes. Mutually
+     * exclusive with `storage`, which wins if both are supplied.
      * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
      * Use `storage: "session"` instead.
      */
@@ -491,6 +503,10 @@ interface LegacyCreateAreaOptions {
 interface Atlas {
     readonly id: AtlasId;
     readonly name: string;
+    /**
+     * The atlas's live tier. Moving an atlas creates a new id and invalidates
+     * the source handle; use the `Atlas` returned by `moveAtlas` afterward.
+     */
     readonly storage: MapStorage;
     toString(): string;
 }
@@ -511,14 +527,18 @@ interface CreateAtlasOptions {
  * location; changes to persistent areas sync to the cloud in the background.
  */
 interface Mapper {
-    /** Create a new area in an explicit storage tier and return its handle. */
-    createArea(name: string, options: CreateAreaOptions): Promise<Area>;
     /**
-     * Create using the old implicit default tier or `ephemeral` flag.
-     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
-     * Pass a {@link CreateAreaOptions} object with explicit `storage` instead.
+     * Refresh every visible area from durable storage. Package entry points
+     * should await this before a presence-based upsert that can run during
+     * startup or after mapping ownership moves between sessions.
      */
-    createArea(name: string, options?: LegacyCreateAreaOptions): Promise<Area>;
+    refreshAreas(): Promise<void>;
+    /**
+     * Create a new area and return its handle. Without an explicit `storage`
+     * (or an `atlas` to inherit a tier from), the area is durable in the
+     * default tier: cloud when signed in, local otherwise.
+     */
+    createArea(name: string, options?: CreateAreaOptions): Promise<Area>;
     /** List local and cloud atlases. */
     listAtlases(): Promise<Atlas[]>;
     /** Create a durable atlas in an explicit storage tier. */
@@ -631,7 +651,12 @@ interface Mapper {
     rescueRoomByExternalId(externalId: string): boolean;
     /** Bind (or, with an empty string, clear) a room's server-global room id. */
     setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): Promise<OperationId | null>;
-    /** Create a room and return its new room number. */
+    /**
+     * Create a room and return its new room number. The write is a
+     * must-not-exist create: if the allocated number is taken by the time
+     * the write lands (another client raced it in), it rejects with
+     * `room_number_exists` instead of silently merging into that room.
+     */
     createRoom(area: Area | AreaId, params: CreateRoomParams): Promise<RoomNumber>;
     /** Update multiple fields of a room in one cache update; only present fields change. */
     updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null>;

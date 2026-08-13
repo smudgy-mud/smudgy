@@ -6,21 +6,15 @@ export interface NukeFireAreaCandidate {
   data(key: string): string | undefined;
 }
 
-/**
- * Whether an existing area may be adopted by a mapper configured for
- * `configured` storage. Durable NukeFire maps are adopted from either durable
- * tier — a cloud map kept by an earlier install must not be shadowed by a
- * fresh local duplicate carrying the same externalIds — while session areas
- * and session-configured mappers only ever pair with each other. New areas
- * are still created in the configured tier.
- */
+/** Whether an existing area belongs to the mapper's configured storage tier. */
 export function isAdoptableStorage(candidate: MapStorage, configured: MapStorage): boolean {
-  return configured === "session" ? candidate === "session" : candidate !== "session";
+  return candidate === configured;
 }
 
 /**
- * Find the area already tagged with NukeFire's area identity. An area in the
- * configured storage tier wins over an adoptable area in another tier.
+ * Find the area already tagged with NukeFire's area identity in the configured
+ * storage tier. Moving a NukeFire area between tiers is an explicit user
+ * action; automatic mapping must never adopt or write through another tier.
  */
 export function findAreaByNukeFireId<T extends NukeFireAreaCandidate>(
   areas: readonly T[],
@@ -32,13 +26,13 @@ export function findAreaByNukeFireId<T extends NukeFireAreaCandidate>(
     isAdoptableStorage(candidate.storage, storage) &&
     candidate.data(NUKEFIRE_AREA_ID_PROPERTY) === expected
   );
-  return matches.find((candidate) => candidate.storage === storage) ?? matches[0];
+  return matches[0];
 }
 
 /**
  * Fall back to a display-name match only when it is unclaimed or already
- * carries the requested NukeFire area identity. The configured storage tier
- * wins over an adoptable area in another tier.
+ * carries the requested NukeFire area identity. Only the configured storage
+ * tier participates in this fallback.
  */
 export function findCompatibleAreaByName<T extends NukeFireAreaCandidate>(
   areas: readonly T[],
@@ -53,7 +47,7 @@ export function findCompatibleAreaByName<T extends NukeFireAreaCandidate>(
     return (candidateAreaId === undefined || candidateAreaId === expected) &&
       candidate.name.localeCompare(name, undefined, { sensitivity: "accent" }) === 0;
   });
-  return matches.find((candidate) => candidate.storage === storage) ?? matches[0];
+  return matches[0];
 }
 
 /**

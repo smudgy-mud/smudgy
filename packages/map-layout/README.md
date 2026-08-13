@@ -35,6 +35,25 @@ const result = await planAreaChange(areaId, {
 });
 ```
 
+Manual tools can opt into a bounded thorough search. It repeats each candidate
+to a fixed point and compares the requested anchor, an unrestricted reflow,
+rooms incident to remaining directional violations, their immediate neighbors,
+and high-degree structural rooms. The winning layout is returned as one patch;
+locked rooms remain fixed.
+
+```ts
+const result = await planAreaChange(areaId, {
+  type: "reflow",
+  anchor: currentRoomNumber,
+}, {
+  effort: "thorough",
+});
+```
+
+`result.search` describes the anchors and planning passes considered. Thorough
+search is opt-in so latency-sensitive automatic mapping retains the standard
+single-pass behavior.
+
 Two existing rooms can be connected while planning the reflow required by the
 new topology:
 

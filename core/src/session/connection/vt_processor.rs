@@ -773,6 +773,14 @@ pub struct VtProcessor {
     /// Whether the current read batch produced any non-empty terminal text.
     /// Telnet-only traffic and empty line terminators do not qualify.
     packet_has_displayable_text: bool,
+    /// Whether the runtime still wants packet-completion markers — set while
+    /// a deferred profile send awaits this connection's first displayable
+    /// packet, cleared when it releases (or the connection ends). Owned by
+    /// the runtime on the session thread and read here from the socket
+    /// runtime; `None` (tests, benches) means always emit. The marker's
+    /// useful lifetime ends at the release, so gating it here keeps
+    /// steady-state batches off the runtime channel entirely.
+    marker_armed: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Whether any trigger currently carries a raw pattern — the only consumer
     /// of `StyledLine::raw`. Owned by the trigger manager on the session thread
     /// and read here from the socket runtime; `None` (tests, benches) means
@@ -815,11 +823,21 @@ impl VtProcessor {
             session_runtime_tx,
             connection_generation,
             packet_has_displayable_text: false,
+            marker_armed: None,
             raw_wanted: None,
             capture_raw: true,
             link_presets: HashMap::new(),
             link_preset_overflow_logged: false,
         }
+    }
+
+    /// Ties packet-completion markers to the given flag (the runtime's
+    /// "a deferred profile send is pending" bit). While the flag is clear the
+    /// batch boundary emits no marker; a marker skipped this way is never
+    /// owed later, because the flag only rises when a new connection (with a
+    /// fresh processor) installs a pending send.
+    pub(super) fn set_marker_armed_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.marker_armed = Some(flag);
     }
 
     /// Ties raw capture to the given flag (the trigger manager's "any raw
@@ -961,12 +979,22 @@ impl VtProcessor {
         self.session_runtime_tx
             .send(RuntimeAction::RequestRepaint)
             .ok();
-        self.session_runtime_tx
-            .send(RuntimeAction::IncomingPacketProcessed {
-                connection_generation: self.connection_generation,
-                has_displayable_text: std::mem::take(&mut self.packet_has_displayable_text),
-            })
-            .ok();
+        // The packet-completion marker exists only to release a deferred
+        // profile send; once the runtime disarms the flag (send released, or
+        // no send was pending), steady-state batches skip the channel send.
+        let has_displayable_text = std::mem::take(&mut self.packet_has_displayable_text);
+        if self
+            .marker_armed
+            .as_ref()
+            .is_none_or(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            self.session_runtime_tx
+                .send(RuntimeAction::IncomingPacketProcessed {
+                    connection_generation: self.connection_generation,
+                    has_displayable_text,
+                })
+                .ok();
+        }
         // The batch boundary is the one place capture may RISE: no parse run is
         // in flight (the reader calls this between batches) and the line buffers
         // are empty, so the next batch starts a fresh line under the new value
@@ -1168,6 +1196,7 @@ mod tests {
     };
     use crate::models::server::link_url_host;
     use crate::session::runtime::RuntimeAction;
+    use std::sync::Arc;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use vtparse::VTParser;
 
@@ -1274,6 +1303,32 @@ mod tests {
                 has_displayable_text: true,
             }
         )));
+    }
+
+    #[test]
+    fn packet_marker_stops_flowing_once_disarmed() {
+        let mut h = harness();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        h.processor.set_marker_armed_flag(armed.clone());
+
+        h.feed(b"Welcome\r\n");
+        h.processor.notify_end_of_buffer();
+        assert!(
+            h.actions()
+                .iter()
+                .any(|action| matches!(action, RuntimeAction::IncomingPacketProcessed { .. }))
+        );
+
+        // The runtime disarms after releasing the deferred send; from then on
+        // batch boundaries stay off the marker channel entirely.
+        armed.store(false, std::sync::atomic::Ordering::Relaxed);
+        h.feed(b"steady state\r\n");
+        h.processor.notify_end_of_buffer();
+        assert!(
+            !h.actions()
+                .iter()
+                .any(|action| matches!(action, RuntimeAction::IncomingPacketProcessed { .. }))
+        );
     }
 
     #[test]

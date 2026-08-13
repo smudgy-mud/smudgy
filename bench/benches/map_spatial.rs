@@ -310,13 +310,16 @@ fn rebuild_sanity(loaded: &LoadedArea) {
     let rev = before.get_rev();
     let connections = before.get_room_connections().len();
 
-    loaded.mapper.upsert_room(
-        RoomKey::new(loaded.area_id, RoomNumber(1)),
-        RoomUpdates {
-            title: Some("Sanity Landmark".to_string()),
-            ..RoomUpdates::default()
-        },
-    );
+    loaded
+        .mapper
+        .upsert_room(
+            RoomKey::new(loaded.area_id, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("Sanity Landmark".to_string()),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("sanity room edit must stage");
 
     let after = loaded
         .mapper
@@ -463,7 +466,10 @@ fn rebuild_group(c: &mut Criterion, sizes: &[(&str, &LoadedArea)]) {
                 // `upsert_room` takes its arguments by value; these clones
                 // (a 24-byte key and one small String) are nanoseconds
                 // against the ms-scale rebuild being measured.
-                loaded.mapper.upsert_room(key.clone(), updates.clone());
+                loaded
+                    .mapper
+                    .upsert_room(key.clone(), updates.clone())
+                    .expect("benchmark room edit must stage");
                 black_box(loaded.mapper.get_current_atlas());
             });
         });

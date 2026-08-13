@@ -11731,6 +11731,7 @@ SOFTWARE.
 
 Used by:
 
+- deno_permissions 0.101.0
 - iced_graphics 0.14.0
 - aead-gcm-stream 0.4.0
 - asn1-rs-derive 0.4.0
@@ -11778,7 +11779,6 @@ Used by:
 - deno_ops 0.271.0
 - deno_os 0.59.0
 - deno_package_json 0.44.0
-- deno_permissions 0.101.0
 - deno_process 0.57.0
 - deno_resolver 0.73.0
 - deno_runtime 0.250.0

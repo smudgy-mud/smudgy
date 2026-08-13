@@ -127,6 +127,26 @@ export interface LayoutQuality {
   footprintPerimeter: number;
 }
 
+const QUALITY_FIELDS: readonly (keyof LayoutQuality)[] = [
+  "cardinalRayViolations",
+  "roomObstructions",
+  "linkCrossings",
+  "cardinalSlack",
+  "footprintArea",
+  "footprintPerimeter",
+];
+
+/**
+ * Compare two public quality tuples using the planner's exact lexicographic
+ * ordering. Positive means `a` is better, zero means geometrically tied.
+ */
+export function compareLayoutQuality(a: LayoutQuality, b: LayoutQuality): number {
+  for (const field of QUALITY_FIELDS) {
+    if (a[field] !== b[field]) return b[field] - a[field];
+  }
+  return 0;
+}
+
 export interface LayoutTraceCandidate {
   quality: LayoutQuality;
   movedExisting: string[];
@@ -733,6 +753,14 @@ function edgeRayQuality(
   return distance === undefined
     ? { cardinalRayViolations: 1, cardinalSlack: 0 }
     : { cardinalRayViolations: 0, cardinalSlack: Math.max(0, distance - 1) };
+}
+
+/** Protected directional constraints which are off their required ray. */
+export function directionalViolationEdges(
+  positions: ReadonlyMap<string, GridPosition>,
+  edges: readonly LayoutEdge[],
+): LayoutEdge[] {
+  return edges.filter((edge) => edgeRayQuality(positions, edge).cardinalRayViolations > 0);
 }
 
 function fullRayQuality(

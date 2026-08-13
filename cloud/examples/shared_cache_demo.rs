@@ -46,8 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Created area: {area_id}");
 
     // Set some area properties
-    mapper.set_area_property(area_id, "theme".to_string(), "dark".to_string());
-    mapper.set_area_property(area_id, "difficulty".to_string(), "hard".to_string());
+    mapper.set_area_property(area_id, "theme".to_string(), "dark".to_string())?;
+    mapper.set_area_property(area_id, "difficulty".to_string(), "hard".to_string())?;
 
     // Create some rooms
     println!("\n🏠 Creating rooms...");
@@ -69,8 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             room_number: RoomNumber(i),
         };
 
-        mapper.upsert_room(room_key.clone(), room_updates);
-        mapper.set_room_property(room_key, "visited".to_string(), "false".to_string());
+        mapper.upsert_room(room_key.clone(), room_updates)?;
+        mapper.set_room_property(room_key, "visited".to_string(), "false".to_string())?;
     }
 
     // Create some exits

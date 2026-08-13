@@ -27,3 +27,14 @@ directly on the terminal-theme background without an extra panel tint.
 
 F1–F4 select and focus a session. Ctrl+F1–F4 magnifies stacked sessions or
 selects the corresponding shared tab.
+
+The primary session shows a dismissible first-run welcome with the same
+multi-session controls. Reopen it at any time with `nf welcome`.
+
+## Utilities
+
+| Command | Action |
+| --- | --- |
+| `nf help` | Show the NukeFire Scripts utility and routing reference. |
+| `nf welcome` | Reopen the welcome and multi-session guide. |
+| `nf reflow` | Thoroughly reflow the current area across multiple violation-prioritized anchors. |

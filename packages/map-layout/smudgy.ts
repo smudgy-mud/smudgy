@@ -15,7 +15,7 @@ export interface LoadLayoutModelOptions {
 }
 
 /** Stateless façade result: the temporary layout model stays private. */
-export type AreaChangePlan = Pick<PlannedLayout, "patch" | "positions" | "quality">;
+export type AreaChangePlan = Pick<PlannedLayout, "patch" | "positions" | "quality" | "search">;
 
 function idsMatch(a: AreaId | null, b: AreaId | null): boolean {
   return !!a && !!b && a[0] === b[0] && a[1] === b[1];
@@ -99,6 +99,6 @@ export async function planAreaChange(
   options: PlanLayoutOptions & LoadLayoutModelOptions = {},
 ): Promise<AreaChangePlan> {
   const model = loadLayoutModel(area, options);
-  const { patch, positions, quality } = planLayoutModel(model, change, options);
-  return { patch, positions, quality };
+  const { patch, positions, quality, search } = planLayoutModel(model, change, options);
+  return { patch, positions, quality, search };
 }

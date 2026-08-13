@@ -252,6 +252,24 @@ impl MapperBackend for CompositeBackend {
         Ok(())
     }
 
+    async fn copy_cloud_area(
+        &self,
+        source: &AreaId,
+        name: &str,
+        atlas_id: Option<AtlasId>,
+    ) -> CloudResult<Option<Area>> {
+        // Server-side copy exists only on the cloud tier; a local or
+        // ephemeral source reports "unavailable" so the caller replays.
+        self.ensure_routing_seeded().await;
+        if self.is_ephemeral_area(*source)
+            || self.is_local_area(*source)
+            || !self.cloud.has_credential()
+        {
+            return Ok(None);
+        }
+        self.cloud.copy_cloud_area(source, name, atlas_id).await
+    }
+
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
         // Ephemeral and local always; cloud only when signed in. A cloud
         // failure must not sink the other tiers — the sync engine surfaces
@@ -331,6 +349,45 @@ impl MapperBackend for CompositeBackend {
             .area_backend(*area_id)
             .await
             .delete_area_at_generation(area_id, auth_generation)
+            .await;
+        if result.is_ok() {
+            self.ephemeral_areas.write().remove(area_id);
+            self.local_areas.write().remove(area_id);
+        }
+        result
+    }
+
+    // The expected-rev forms forward to the owning tier's backend — the
+    // trait default would silently drop the precondition before it could
+    // reach a cloud backend that enforces it. A refused delete leaves the
+    // tier index untouched.
+    async fn delete_area_expecting(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+    ) -> CloudResult<()> {
+        let result = self
+            .area_backend(*area_id)
+            .await
+            .delete_area_expecting(area_id, expected_rev)
+            .await;
+        if result.is_ok() {
+            self.ephemeral_areas.write().remove(area_id);
+            self.local_areas.write().remove(area_id);
+        }
+        result
+    }
+
+    async fn delete_area_expecting_at_generation(
+        &self,
+        area_id: &AreaId,
+        expected_rev: Option<i64>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let result = self
+            .area_backend(*area_id)
+            .await
+            .delete_area_expecting_at_generation(area_id, expected_rev, auth_generation)
             .await;
         if result.is_ok() {
             self.ephemeral_areas.write().remove(area_id);

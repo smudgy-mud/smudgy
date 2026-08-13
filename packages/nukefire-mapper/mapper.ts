@@ -38,6 +38,7 @@ import {
   isAdoptableStorage,
   NUKEFIRE_AREA_ID_PROPERTY,
 } from "./area-resolution.ts";
+import { upsertLocalNukeFireAtlas } from "./atlas-resolution.ts";
 import {
   directRoomObstructions,
   routeAroundRooms,
@@ -51,6 +52,7 @@ import {
   verticalMapLinks,
   type VerticalExitObservation,
 } from "./room-info.ts";
+import { stackVerticalTraversals } from "./vertical-levels.ts";
 import { reflowPolicy } from "./reflow-policy.ts";
 
 const AREA_SOURCE_PROPERTY = "nukefire.mapper";
@@ -361,11 +363,16 @@ export class NukeFireMapper {
   readonly #deferredReflowAreas = new Set<string>();
   /** Numeric Room.Info vertical exits waiting for their destination room. */
   readonly #pendingVerticalLinks = new Map<string, NukeFireMapLink>();
+  #localAtlasUpsert: Promise<Atlas> | undefined;
+  #areasReady = false;
+  #areaRefresh: Promise<void> | undefined;
+  #refreshGeneration = 0;
   #running = false;
   #started = false;
   #currentLocation = "";
   #lastError = "";
   #lastDecisionLogError = "";
+  #mutationSequence = 0;
 
   constructor(options: NukeFireMapperOptions = {}) {
     this.#options = {
@@ -468,6 +475,60 @@ export class NukeFireMapper {
     echo(`[nukefire-mapper] ${error}`);
   }
 
+  #mutationError(error: unknown): Record<string, unknown> {
+    const committedOperations = typeof error === "object" && error !== null
+      ? (error as { committedOperations?: unknown }).committedOperations
+      : undefined;
+    return {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      ...(Array.isArray(committedOperations) ? { committedOperations } : {}),
+    };
+  }
+
+  async #directMutation<T>(
+    areaId: AreaId | undefined,
+    api: string,
+    description: string,
+    callback: () => Promise<T>,
+    summarize: (result: T) => unknown = (result) => result,
+  ): Promise<T> {
+    const mutationId = ++this.#mutationSequence;
+    const startedAt = performance.now();
+    this.#logDecision({
+      kind: "mutation-start",
+      mutationId,
+      api,
+      areaId,
+      description,
+      queuedSnapshots: this.#pending.length,
+    });
+    try {
+      const result = await callback();
+      this.#logDecision({
+        kind: "mutation-complete",
+        mutationId,
+        api,
+        areaId,
+        description,
+        result: summarize(result),
+        durationMs: performance.now() - startedAt,
+      });
+      return result;
+    } catch (error) {
+      this.#logDecision({
+        kind: "mutation-error",
+        mutationId,
+        api,
+        areaId,
+        description,
+        error: this.#mutationError(error),
+        durationMs: performance.now() - startedAt,
+      });
+      throw error;
+    }
+  }
+
   /**
    * Draft callbacks update the VM-owned mirror so later writes in the same batch
    * see their predecessors. If submission fails (including after an oversized
@@ -479,15 +540,102 @@ export class NukeFireMapper {
     callback: (mutation: AreaMutator) => void | Promise<void>,
     description: string,
   ): Promise<void> {
+    const mutationId = ++this.#mutationSequence;
+    const startedAt = performance.now();
+    let draftCompleted = false;
+    this.#logDecision({
+      kind: "mutation-start",
+      mutationId,
+      api: "mutateArea",
+      areaId,
+      description,
+      queuedSnapshots: this.#pending.length,
+    });
     try {
-      await mapper.mutateArea(areaId, callback, { description });
+      const operationIds = await mapper.mutateArea(areaId, async (mutation) => {
+        await callback(mutation);
+        draftCompleted = true;
+        this.#logDecision({
+          kind: "mutation-draft-complete",
+          mutationId,
+          api: "mutateArea",
+          areaId,
+          description,
+          durationMs: performance.now() - startedAt,
+        });
+      }, { description });
+      this.#logDecision({
+        kind: "mutation-complete",
+        mutationId,
+        api: "mutateArea",
+        areaId,
+        description,
+        operationIds,
+        durationMs: performance.now() - startedAt,
+      });
     } catch (error) {
+      this.#logDecision({
+        kind: "mutation-error",
+        mutationId,
+        api: "mutateArea",
+        areaId,
+        description,
+        phase: draftCompleted ? "submission" : "draft",
+        error: this.#mutationError(error),
+        durationMs: performance.now() - startedAt,
+      });
       try {
         this.#hydrateArea(mapper.getAreaById(areaId), true);
       } catch {
         // Preserve the original mutation failure if recovery itself cannot read.
       }
       throw error;
+    }
+  }
+
+  async #ensureLocalAtlas(): Promise<Atlas | undefined> {
+    if (this.#options.storage !== "local") return undefined;
+
+    const upsert = this.#localAtlasUpsert ??= upsertLocalNukeFireAtlas({
+      listAtlases: () => mapper.listAtlases(),
+      createAtlas: (name, options) => this.#directMutation(
+        undefined,
+        "createAtlas",
+        `Create local atlas ${name}`,
+        () => mapper.createAtlas(name, options),
+        (atlas) => ({ atlasId: atlas.id, name: atlas.name, storage: atlas.storage }),
+      ),
+    });
+    try {
+      return await upsert;
+    } finally {
+      if (this.#localAtlasUpsert === upsert) this.#localAtlasUpsert = undefined;
+    }
+  }
+
+  async #refreshAreaProjection(): Promise<void> {
+    const refreshable = mapper as Mapper & { refreshAreas?: () => Promise<void> };
+    if (typeof refreshable.refreshAreas === "function") {
+      await refreshable.refreshAreas();
+    } else {
+      // Older 0.5.3 builds lack refreshAreas, but this empty presence-checked
+      // import still supplies their initial-load barrier. Ownership handoff
+      // refreshes become fully authoritative once the new op is available.
+      await mapper.importAreasIfAbsent([]);
+    }
+  }
+
+  async #ensureFreshAreas(): Promise<void> {
+    if (this.#areasReady) return;
+    const generation = this.#refreshGeneration;
+    const refresh = this.#areaRefresh ??= (
+      this.#refreshAreaProjection()
+    );
+    try {
+      await refresh;
+      if (this.#refreshGeneration === generation) this.#areasReady = true;
+    } finally {
+      if (this.#areaRefresh === refresh) this.#areaRefresh = undefined;
     }
   }
 
@@ -502,6 +650,22 @@ export class NukeFireMapper {
     if (this.#decisionLogger.path) {
       echo(`[nukefire-mapper] mapping decisions: ${this.#decisionLogger.path}`);
     }
+
+    // A package can start before the session's initial durable-map load, and
+    // a successor session can inherit mapping ownership with an older cache.
+    // Refresh before any presence-based zone resolution to avoid duplicates.
+    void this.#ensureFreshAreas().catch((caught) => {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      echo(`[nukefire-mapper] failed to refresh existing maps: ${message}`);
+    });
+
+    // The atlas is part of mapper initialization, rather than a side effect of
+    // receiving the first Map.Local snapshot. Area creation below awaits this
+    // same in-flight upsert, so startup and mapping cannot create duplicates.
+    void this.#ensureLocalAtlas().catch((caught) => {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      echo(`[nukefire-mapper] failed to create local atlas: ${message}`);
+    });
 
     this.#subscriptions.push(
       watchMessage("Room.Info", (info) => {
@@ -539,6 +703,9 @@ export class NukeFireMapper {
     this.#deferredReflowAreas.clear();
     this.#pendingVerticalLinks.clear();
     this.#currentLocation = "";
+    this.#refreshGeneration += 1;
+    this.#areasReady = false;
+    this.#areaRefresh = undefined;
     this.#started = false;
   }
 
@@ -592,6 +759,7 @@ export class NukeFireMapper {
   }
 
   async #syncSnapshot(snapshot: NukeFireMapLocal, allowExistingReflow: boolean): Promise<void> {
+    await this.#ensureFreshAreas();
     const startedAt = performance.now();
     if (!isUsableVnum(snapshot.center)) {
       throw new Error(`ignored Map.Local with invalid center ${snapshot.center}`);
@@ -656,7 +824,7 @@ export class NukeFireMapper {
       }
     }
     // The global external-id index returns one of potentially several maps. If
-    // it chose the other storage mode, scan matching areas once and mirror them.
+    // it chose another storage tier, scan configured-tier areas once instead.
     if (existing.size < sources.length) {
       const wanted = new Set(sources.map((source) => source.vnum));
       for (const hostArea of mapper.areas) {
@@ -742,6 +910,12 @@ export class NukeFireMapper {
       if (key !== this.#currentLocation) {
         mapper.setCurrentLocation(current.areaId, current.roomNumber);
         this.#currentLocation = key;
+        this.#logDecision({
+          kind: "current-location",
+          areaId: current.areaId,
+          roomNumber: current.roomNumber,
+          vnum: snapshot.center,
+        });
       }
     }
 
@@ -810,9 +984,38 @@ export class NukeFireMapper {
       if (source) area = this.#hydrateArea(source);
     }
     if (!area) {
-      const source = await mapper.createArea(
-        preferredName || `${this.#options.areaPrefix} ${zone}`,
-        { storage: this.#options.storage },
+      // Re-read durable storage at the decision boundary too. Another mapper
+      // instance may have created this zone since our ownership-start refresh.
+      await this.#refreshAreaProjection();
+      const refreshedExact = findAreaByNukeFireId(
+        mapper.areas,
+        this.#options.storage,
+        areaId,
+      );
+      if (refreshedExact) area = this.#hydrateArea(refreshedExact);
+      if (!area && preferredName) {
+        const refreshedByName = findCompatibleAreaByName(
+          mapper.areas,
+          this.#options.storage,
+          areaId,
+          preferredName,
+        );
+        if (refreshedByName) area = this.#hydrateArea(refreshedByName);
+      }
+    }
+    if (!area) {
+      const atlas = await this.#ensureLocalAtlas();
+      const areaName = preferredName || `${this.#options.areaPrefix} ${zone}`;
+      const source = await this.#directMutation(
+        undefined,
+        "createArea",
+        `Create NukeFire area ${areaName}`,
+        () => mapper.createArea(areaName, { storage: this.#options.storage, atlas }),
+        (created) => ({
+          areaId: created.id,
+          name: created.name,
+          storage: created.storage,
+        }),
       );
       area = this.#registerArea({
         id: source.id,
@@ -839,7 +1042,12 @@ export class NukeFireMapper {
 
     const placeholder = `${this.#options.areaPrefix} ${zone}`;
     if (preferredName && area.name === placeholder && area.name !== preferredName) {
-      await mapper.renameArea(area.id, preferredName);
+      await this.#directMutation(
+        area.id,
+        "renameArea",
+        `Rename NukeFire area ${area.name} to ${preferredName}`,
+        () => mapper.renameArea(area.id, preferredName),
+      );
       area.name = preferredName;
     }
     return area;
@@ -958,7 +1166,7 @@ export class NukeFireMapper {
         };
       } else {
         stats.plannedAreas += 1;
-        const nodes: LayoutNode[] = group.map((assignment) => ({
+        const chartNodes: LayoutNode[] = group.map((assignment) => ({
           id: assignmentIds.get(assignment.source.vnum) as string,
           relative: roundedPosition(
             assignment.source.x - centerSource.x,
@@ -1001,6 +1209,17 @@ export class NukeFireMapper {
         }
 
         const centerId = assignmentIds.get(snapshot.center);
+        const establishedLevels = new Map<string, number>();
+        for (const assignment of group) {
+          if (!assignment.room) continue;
+          establishedLevels.set(
+            assignmentIds.get(assignment.source.vnum) as string,
+            assignment.room.position.level,
+          );
+        }
+        // NukeFire may flow an up/down destination on its source's z plane;
+        // this mapper always stacks vertical traversals across map levels.
+        const nodes = stackVerticalTraversals(chartNodes, edges, establishedLevels, centerId);
         const trace: LayoutTraceEvent[] | undefined = this.#decisionLogger.path ? [] : undefined;
         const diagnosticContext = trace ? {
           area: {
@@ -1263,7 +1482,14 @@ export class NukeFireMapper {
         route_points: connection.routePoints.map((point) => ({ ...point })),
       };
       if (mutation) await mutation.setConnection(connection.id, desired);
-      else await mapper.setConnection(area.id, connection.id, desired);
+      else {
+        await this.#directMutation(
+          area.id,
+          "setConnection",
+          `Update NukeFire connection ${String(connection.id)}`,
+          () => mapper.setConnection(area.id, connection.id, desired),
+        );
+      }
       connection.endpointA = copyEndpoint(desired.endpoint_a);
       connection.endpointB = copyEndpoint(desired.endpoint_b);
       connection.routing = desired.routing;
@@ -1574,10 +1800,15 @@ export class NukeFireMapper {
         ...geometry,
         traversals,
       })
-      : await mapper.createLink(from.areaId, {
-        ...geometry,
-        traversals,
-      });
+      : await this.#directMutation(
+        from.areaId,
+        "createLink",
+        `Create NukeFire link from room ${from.roomNumber}`,
+        () => mapper.createLink(from.areaId, {
+          ...geometry,
+          traversals,
+        }),
+      );
     area.connections.set(connectionMirrorKey(connectionId), {
       id: connectionId,
       endpointA: copyEndpoint(geometry.endpoint_a),
@@ -1631,12 +1862,24 @@ export class NukeFireMapper {
         existing.id = hostExit.id;
       }
       if (mutation) await mutation.setRoomExit(from.roomNumber, existing.id, fields);
-      else await mapper.setRoomExit(from.areaId, from.roomNumber, existing.id, fields);
+      else {
+        await this.#directMutation(
+          from.areaId,
+          "setRoomExit",
+          `Update NukeFire ${mapped.command} exit from room ${from.roomNumber}`,
+          () => mapper.setRoomExit(from.areaId, from.roomNumber, existing.id as ExitId, fields),
+        );
+      }
       applyExitFields(existing, fields);
     } else {
       const id = mutation
         ? await mutation.createRoomExit(from.roomNumber, fields)
-        : await mapper.createRoomExit(from.areaId, from.roomNumber, fields);
+        : await this.#directMutation(
+          from.areaId,
+          "createRoomExit",
+          `Create NukeFire ${mapped.command} exit from room ${from.roomNumber}`,
+          () => mapper.createRoomExit(from.areaId, from.roomNumber, fields),
+        );
       from.exits.push(exitFromFields(fields, id));
     }
   }

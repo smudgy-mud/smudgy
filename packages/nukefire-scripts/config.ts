@@ -74,6 +74,6 @@ export const sessionLayout: SessionLayout = stringParam("sessionLayout") === "st
   ? "stacked-right"
   : "tabbed";
 
-export const sessionVitalsLayout: SessionVitalsLayout = stringParam("sessionVitalsLayout") === "wide"
-  ? "wide"
-  : "compact";
+export const sessionVitalsLayout: SessionVitalsLayout = stringParam("sessionVitalsLayout") === "compact"
+  ? "compact"
+  : "wide";

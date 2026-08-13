@@ -460,6 +460,7 @@ impl Engine {
 fn clear_cloud_projection(inner: &Inner) {
     let local = inner.backend.local_area_ids();
     let ephemeral = inner.backend.ephemeral_area_ids();
+    let local_atlases = inner.backend.local_atlas_ids();
     inner.atlas_cache.rcu(|cache| {
         let retained = cache
             .areas()
@@ -471,6 +472,10 @@ fn clear_cloud_projection(inner: &Inner) {
             .collect();
         Arc::new(cache.rebuild_with_areas(retained))
     });
+    inner
+        .atlas_storage_by_id
+        .lock()
+        .retain(|atlas_id, _| local_atlases.contains(atlas_id));
     inner.sync_revision.fetch_add(1, Ordering::AcqRel);
     inner
         .auth_projection_revision

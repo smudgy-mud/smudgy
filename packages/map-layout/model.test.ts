@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { compareLayoutQuality } from "./layout.ts";
 import {
   createLayoutModel,
   createLayoutWorkspace,
@@ -175,4 +176,92 @@ test("reflows two existing rooms into an exact new directional connection", () =
   assert.equal(result.patch.placements.length, 0);
   assert.equal(result.quality.cardinalRayViolations, 0);
   assert.equal(result.quality.cardinalSlack, 0);
+});
+
+test("thorough reflow prioritizes violation neighborhoods and beats one anchored pass", () => {
+  const model = createLayoutModel({
+    rooms: [
+      { id: "0", position: at(3, -2), movable: true },
+      { id: "1", position: at(1, 4), movable: true },
+      { id: "2", position: at(5, -1), movable: true },
+      { id: "3", position: at(-6, 3), movable: true },
+      { id: "4", position: at(0, -4), movable: true },
+      { id: "5", position: at(-4, -2), movable: true },
+      { id: "6", position: at(4, -5), movable: true },
+      { id: "7", position: at(1, 3), movable: true },
+      { id: "8", position: at(1, 0), movable: true },
+    ],
+    edges: [
+      { from: "0", to: "1", direction: "North" },
+      { from: "1", to: "0", direction: "South" },
+      { from: "0", to: "2", direction: "West" },
+      { from: "2", to: "0", direction: "East" },
+      { from: "0", to: "3", direction: "East" },
+      { from: "3", to: "0", direction: "West" },
+      { from: "1", to: "4", direction: "East" },
+      { from: "4", to: "1", direction: "West" },
+      { from: "4", to: "5", direction: "West" },
+      { from: "5", to: "4", direction: "East" },
+      { from: "1", to: "6", direction: "North" },
+      { from: "6", to: "1", direction: "South" },
+      { from: "0", to: "7", direction: "West" },
+      { from: "7", to: "0", direction: "East" },
+      { from: "2", to: "8", direction: "East" },
+      { from: "8", to: "2", direction: "West" },
+      { from: "6", to: "0", direction: "West" },
+      { from: "0", to: "6", direction: "East" },
+      // This contradictory pair makes an exact golden embedding impossible,
+      // leaving enough local structure for anchor choice to matter.
+      { from: "6", to: "0", direction: "South" },
+      { from: "0", to: "6", direction: "North" },
+    ],
+  });
+
+  const standard = planLayoutModel(model, { type: "reflow", anchor: "8" });
+  const thorough = planLayoutModel(
+    model,
+    { type: "reflow", anchor: "8" },
+    { effort: "thorough" },
+  );
+
+  assert.ok(compareLayoutQuality(thorough.quality, standard.quality) > 0);
+  assert.equal(standard.quality.cardinalRayViolations, 4);
+  assert.equal(thorough.quality.cardinalRayViolations, 2);
+  assert.deepEqual(thorough.search?.baselineQuality, standard.quality);
+  assert.deepEqual(
+    thorough.search?.anchorsTried.slice(0, 4),
+    ["8", "0", "2", "6"],
+    "the requested anchor is followed by endpoints of its remaining directional violations",
+  );
+  assert.equal(thorough.search?.selectedAnchor, null);
+  assert.ok((thorough.search?.planningPasses ?? 0) > (thorough.search?.anchorsTried.length ?? 0));
+  for (const move of thorough.patch.moves) {
+    assert.deepEqual(move.from, model.rooms.find((room) => room.id === move.id)?.position);
+    assert.deepEqual(move.to, thorough.positions.get(move.id));
+  }
+});
+
+test("thorough reflow preserves locked rooms and excludes them from derived anchors", () => {
+  const model = createLayoutModel({
+    rooms: [
+      { id: "locked", position: at(10, 10), movable: false },
+      { id: "middle", position: at(0, 0), movable: true },
+      { id: "east", position: at(-4, 3), movable: true },
+    ],
+    edges: [
+      { from: "locked", to: "middle", direction: "East" },
+      { from: "middle", to: "locked", direction: "West" },
+      { from: "middle", to: "east", direction: "East" },
+      { from: "east", to: "middle", direction: "West" },
+    ],
+  });
+
+  const result = planLayoutModel(
+    model,
+    { type: "reflow", anchor: "middle" },
+    { effort: "thorough" },
+  );
+
+  assert.deepEqual(result.positions.get("locked"), at(10, 10));
+  assert.equal(result.search?.anchorsTried.includes("locked"), false);
 });

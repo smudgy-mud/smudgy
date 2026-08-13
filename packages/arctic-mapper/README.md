@@ -47,7 +47,7 @@ map rooms                        List rooms in the selected area
 map move <direction>             Move the selection along an existing exit
 map path <from> <to>             Path between two rooms (tags: <number> or <area>#<number>)
 map push <direction>             Shift the selected room and everything connected, one step
-map reflow                       Recompute the complete current-area layout
+map reflow                       Thoroughly search and reflow the current area
 map z [auto|levels|projected]    Show or change the live U/D creation preference
 map refresh                      Re-look and re-capture the current room
 map debug [on|off]               Toggle diagnostic logging of capture/tracking decisions
@@ -70,10 +70,13 @@ map exit <dir> closed|hidden|locked [true|false]   Set exit flags
 ```
 
 When recording creates a room, the mapper snapshots the area and runs the
-same integral-grid reflow used by `map reflow`. Correct directional lines are
-protected before crossings, link length, or compactness are considered. The
-snapshot exists only for that operation; ordinary movement does not maintain
-or recompute a shadow map.
+standard integral-grid layout pass. Correct directional lines are protected
+before crossings, link length, or compactness are considered. `map reflow`
+adds the bounded thorough tournament: it compares the selected room, an
+unanchored result, rooms around remaining directional violations, and other
+structural anchors before applying one winning patch. The snapshot exists
+only for that operation; ordinary movement does not maintain or recompute a
+shadow map.
 
 Before creating a look-alike room, recording checks the current area for an
 exact title/description match with an unconnected exit back toward the room

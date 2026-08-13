@@ -313,15 +313,17 @@ fn sanity_write_paths(m: &ScaledMapper) {
     // upsert of a NEW room: count + 1, resolvable by key and via the rebuilt
     // identification index.
     let new_key = RoomKey::new(area0, number(m.area0_rooms + 1));
-    m.mapper.upsert_room(
-        new_key.clone(),
-        RoomUpdates {
-            title: Some("Sanity Room".to_owned()),
-            x: Some(-8.0),
-            y: Some(-8.0),
-            ..RoomUpdates::default()
-        },
-    );
+    m.mapper
+        .upsert_room(
+            new_key.clone(),
+            RoomUpdates {
+                title: Some("Sanity Room".to_owned()),
+                x: Some(-8.0),
+                y: Some(-8.0),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("sanity room create must stage");
     let atlas = m.mapper.get_current_atlas();
     let total_after: usize = atlas.areas().map(|a| a.room_count()).sum();
     assert_eq!(
@@ -343,16 +345,18 @@ fn sanity_write_paths(m: &ScaledMapper) {
     );
 
     // Batch path lands edits too.
-    m.mapper.upsert_rooms(
-        area0,
-        vec![(
-            RoomNumber(1),
-            RoomUpdates {
-                title: Some("Sanity Batch".to_owned()),
-                ..RoomUpdates::default()
-            },
-        )],
-    );
+    m.mapper
+        .upsert_rooms(
+            area0,
+            vec![(
+                RoomNumber(1),
+                RoomUpdates {
+                    title: Some("Sanity Batch".to_owned()),
+                    ..RoomUpdates::default()
+                },
+            )],
+        )
+        .expect("sanity room batch must stage");
     let atlas = m.mapper.get_current_atlas();
     assert_eq!(
         atlas
@@ -363,14 +367,18 @@ fn sanity_write_paths(m: &ScaledMapper) {
     );
 
     // Restore the generated state.
-    m.mapper.delete_room(new_key.clone());
-    m.mapper.upsert_room(
-        room1_key.clone(),
-        RoomUpdates {
-            title: Some(room1_title.clone()),
-            ..RoomUpdates::default()
-        },
-    );
+    m.mapper
+        .delete_room(new_key.clone())
+        .expect("sanity room delete must stage");
+    m.mapper
+        .upsert_room(
+            room1_key.clone(),
+            RoomUpdates {
+                title: Some(room1_title.clone()),
+                ..RoomUpdates::default()
+            },
+        )
+        .expect("sanity room restore must stage");
     let atlas = m.mapper.get_current_atlas();
     assert!(
         atlas.get_room(&new_key).is_none(),
@@ -589,7 +597,11 @@ fn mapper_scale(c: &mut Criterion) {
                     seq += 1;
                     (key.clone(), room_edit(seq))
                 },
-                |(key, updates)| m.mapper.upsert_room(key, updates),
+                |(key, updates)| {
+                    m.mapper
+                        .upsert_room(key, updates)
+                        .expect("benchmark room edit must stage")
+                },
                 BatchSize::SmallInput,
             );
         });
@@ -616,7 +628,12 @@ fn mapper_scale(c: &mut Criterion) {
                         .map(|n| (number(n), room_edit(seq)))
                         .collect::<Vec<_>>()
                 },
-                |updates| med_mapper.mapper.upsert_rooms(batch_area, updates),
+                |updates| {
+                    med_mapper
+                        .mapper
+                        .upsert_rooms(batch_area, updates)
+                        .expect("benchmark room batch must stage")
+                },
                 BatchSize::SmallInput,
             );
         });

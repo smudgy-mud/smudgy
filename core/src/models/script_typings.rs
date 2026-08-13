@@ -1892,10 +1892,14 @@ export function make() { return createEvent('dynamic'); }
         );
     }
 
-    /// The compatibility catalog is deliberately finite. These assertions do
-    /// three jobs together: old scripts still type-check during 0.5.x, every
+    /// The compatibility catalog is deliberately finite: the `ephemeral`
+    /// creation flag and the `isEphemeral` read. These assertions do three
+    /// jobs together: old scripts still type-check during 0.5.x, every
     /// compatibility member carries an editor-visible deprecation, and the
     /// test itself blocks the first 0.6 build until the shims are removed.
+    /// Creating with no storage choice at all is NOT in the catalog: it is
+    /// the supported default (durable, cloud when signed in, local
+    /// otherwise) and stays past 0.6.
     #[test]
     fn map_storage_compatibility_is_deprecated_and_expires_in_0_6() {
         use std::collections::BTreeMap;
@@ -1914,15 +1918,15 @@ export function make() { return createEvent('dynamic'); }
             .expect("Cargo package versions are valid semver");
         assert!(
             (running.major, running.minor) < (0, 6),
-            "remove the legacy mapper creation overload, `ephemeral`, and `isEphemeral` \
+            "remove the mapper's `ephemeral` creation flag and `isEphemeral` \
              before building the 0.6 release line"
         );
 
         assert_eq!(
             SMUDGY_MAPPER_DTS.matches(DEPRECATION).count(),
-            3,
-            "the compatibility catalog is exactly: omitted-storage createArea, \
-             LegacyCreateAreaOptions.ephemeral, and Area.isEphemeral"
+            2,
+            "the compatibility catalog is exactly: CreateAreaOptions.ephemeral \
+             and Area.isEphemeral"
         );
         assert_eq!(
             SMUDGY_MAPPER_TS.matches(DEPRECATION).count(),
@@ -1935,10 +1939,10 @@ export function make() { return createEvent('dynamic'); }
             1,
             "the first-party NukeFire mapper's ephemeral option is part of the same finite window"
         );
-        // Arctic deliberately uses the deprecated implicit durable destination so
-        // signed-in sessions prefer cloud and signed-out sessions fall back to local.
-        // The 0.6 release-version guard above, rather than a first-party source
-        // assertion, owns removal of that compatibility path.
+        // Arctic deliberately omits `storage` so signed-in sessions prefer cloud
+        // and signed-out sessions fall back to local. That is the supported
+        // default, not part of this compatibility window, so no first-party
+        // source assertion covers it.
 
         let mut ambient = BTreeMap::new();
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
@@ -1951,17 +1955,19 @@ export function make() { return createEvent('dynamic'); }
             "compatibility-consumer.ts".to_string(),
             "import { mapper } from \"smudgy:core\";\n\
              declare const area: Area;\n\
-             export const oldDefault = mapper.createArea(\"old default\");\n\
+             // The storage-less forms are the supported default, not compatibility.\n\
+             export const implicitDefault = mapper.createArea(\"implicit default\");\n\
+             export const implicitEmpty = mapper.createArea(\"implicit empty\", {});\n\
              export const oldSession = mapper.createArea(\"old session\", { ephemeral: true });\n\
              export const oldPredicate: boolean = area.isEphemeral;\n\
              export const canonical = mapper.createArea(\"canonical\", { storage: \"local\" });\n"
                 .to_string(),
         );
         let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
-            .expect("compile legacy and canonical mapper creation forms");
+            .expect("compile supported, compatibility, and canonical mapper creation forms");
         assert!(
             out.diagnostics.is_empty(),
-            "0.5 compatibility forms or their canonical replacements stopped type-checking:\n{:#?}",
+            "a supported creation form or a 0.5 compatibility form stopped type-checking:\n{:#?}",
             out.diagnostics
         );
     }
@@ -2056,12 +2062,13 @@ export function make() { return createEvent('dynamic'); }
             }
             function useArea(area: Area): void {
               const id: AreaId = area.id;
+              const uuid: string = area.uuid;
               const name: string = area.name;
               const nums: RoomNumber[] = area.room_numbers;
               const next: RoomNumber = area.next_room_number;
               const r: Room | undefined = area.room(1);
               const p: string | undefined = area.data("notes");
-              void id; void name; void nums; void next; void r; void p;
+              void id; void uuid; void name; void nums; void next; void r; void p;
             }
             function useExit(e: Exit): void {
               const id: ExitId = e.id;

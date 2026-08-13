@@ -13,22 +13,24 @@ import * as map from "./map.tsx";
 import { getMagnifiedSession, startMultiSessionSupport } from "./multi.ts";
 import * as radar from "./radar.tsx";
 import * as vitals from "./vitals.tsx";
+import * as welcome from "./welcome.tsx";
 
 interface Panel {
   key: PanelKey;
   module: { open(): void; close(): void };
 }
 
-// Parents precede children. Atlas joins Map's tab group before Radar is split
-// beneath it; closing runs in reverse order.
+// Parents precede children. Deck is split beneath Affects; Atlas joins Map's
+// tab group before Comms and Radar are split beneath it. Closing runs in
+// reverse order.
 const PANELS: readonly Panel[] = [
   { key: "hud", module: hud },
   { key: "affects", module: affects },
-  { key: "comms", module: comms },
+  { key: "deck", module: deck },
   { key: "map", module: map },
   { key: "atlas", module: atlas },
+  { key: "comms", module: comms },
   { key: "radar", module: radar },
-  { key: "deck", module: deck },
   { key: "codex", module: codex },
 ];
 
@@ -78,6 +80,7 @@ function applySessionRole(isPrimary: boolean): void {
   primaryRole = isPrimary;
 
   if (!isPrimary) {
+    welcome.close();
     for (const panel of [...PANELS].reverse()) panel.module.close();
     syncHudForDisplay(true);
     return;
@@ -92,6 +95,7 @@ function applySessionRole(isPrimary: boolean): void {
     if (panel.key !== "hud" && panelVisibility[panel.key]) panel.module.open();
   }
   syncHudForDisplay(true);
+  welcome.showFirstRun();
 }
 
 let started = false;

@@ -407,7 +407,7 @@ function speak(text: string): void {
 }
 
 export function open(): void {
-  const parent = session.panes.get("Affects") ?? session.mainPane;
+  const parent = session.panes.get("Map") ?? session.panes.get("Atlas") ?? session.mainPane;
 
   // `terminal` is immutable after a pane is created. Replace the old
   // widgets-only Comms pane when this version first loads.
