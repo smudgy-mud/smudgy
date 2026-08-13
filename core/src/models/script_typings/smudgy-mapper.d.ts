@@ -421,6 +421,12 @@ interface Room {
  */
 interface Area {
     readonly id: AreaId;
+    /**
+     * The area id as its canonical hyphenated lowercase UUID string: the
+     * JSON-safe spelling of `id`, as carried by the `map:room` event's
+     * `areaId` field and accepted by MapView apply-area scoping.
+     */
+    readonly uuid: string;
     readonly name: string;
     readonly room_numbers: RoomNumber[];
     /**

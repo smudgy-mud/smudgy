@@ -43,6 +43,7 @@ deno_core::extension!(
       op_smudgy_mapper_get_area_by_id,
       op_smudgy_mapper_get_area_name,
       op_smudgy_mapper_get_area_id,
+      op_smudgy_mapper_get_area_uuid,
       op_smudgy_mapper_rename_area,
       op_smudgy_mapper_list_area_room_numbers,
       op_smudgy_mapper_list_rooms_by_title_and_description,
@@ -678,6 +679,16 @@ fn op_smudgy_mapper_get_area_name<'a>(
 #[serde]
 fn op_smudgy_mapper_get_area_id(#[cppgc] area_wrapper: &JSArea) -> (u64, u64) {
     area_wrapper.0.get_id().0.as_u64_pair()
+}
+
+/// `area.uuid`: the area id as its canonical hyphenated lowercase UUID
+/// string -- the JSON-safe spelling of `area.id`, matching the `map:room`
+/// event's `areaId` field and the spelling MapView apply-area scoping
+/// accepts. Wrapper accessor on a `JSArea` handle -- not gated.
+#[op2]
+#[string]
+fn op_smudgy_mapper_get_area_uuid(#[cppgc] area_wrapper: &JSArea) -> String {
+    area_wrapper.0.get_id().to_string()
 }
 
 /// `area.isEphemeral`: whether the area lives in the session-lifetime

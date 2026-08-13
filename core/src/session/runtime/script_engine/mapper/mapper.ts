@@ -24,6 +24,7 @@ import {
     op_smudgy_mapper_get_area_by_id,
     op_smudgy_mapper_get_area_name,
     op_smudgy_mapper_get_area_id,
+    op_smudgy_mapper_get_area_uuid,
     op_smudgy_mapper_get_area_room_by_number,
     op_smudgy_mapper_get_area_property,
     op_smudgy_mapper_get_area_next_room_number,
@@ -1053,6 +1054,11 @@ class Area {
 
     get id(): AreaId {
         return op_smudgy_mapper_get_area_id(this.#obj);
+    }
+
+    /** The area id as its canonical hyphenated lowercase UUID string. */
+    get uuid(): string {
+        return op_smudgy_mapper_get_area_uuid(this.#obj);
     }
 
     get name(): string {

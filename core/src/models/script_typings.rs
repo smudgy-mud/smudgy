@@ -2048,12 +2048,13 @@ export function make() { return createEvent('dynamic'); }
             }
             function useArea(area: Area): void {
               const id: AreaId = area.id;
+              const uuid: string = area.uuid;
               const name: string = area.name;
               const nums: RoomNumber[] = area.room_numbers;
               const next: RoomNumber = area.next_room_number;
               const r: Room | undefined = area.room(1);
               const p: string | undefined = area.data("notes");
-              void id; void name; void nums; void next; void r; void p;
+              void id; void uuid; void name; void nums; void next; void r; void p;
             }
             function useExit(e: Exit): void {
               const id: ExitId = e.id;
