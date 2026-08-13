@@ -86,8 +86,10 @@ impl<T: std::fmt::Debug> std::error::Error for RelocationError<T> {}
 impl Mapper {
     /// Copy or move a set of areas to one explicit storage/folder destination.
     /// Cross-area exits whose targets are also in `source_ids` are remapped to
-    /// the corresponding destination areas. Links leaving the set become
-    /// dangling, matching portable import semantics.
+    /// the corresponding destination areas. For copied members, links leaving
+    /// the set become dangling, matching portable import semantics; a moved
+    /// member already in the destination tier keeps its id (and therefore
+    /// its outside links) and is merely re-filed.
     pub async fn relocate_areas(
         &self,
         source_ids: Vec<AreaId>,
@@ -146,13 +148,34 @@ impl Mapper {
             }
         }
 
-        // A same-tier move is merely a folder change. Preserve ids and avoid
-        // copying bytes; this is the fast path the old move API exposed.
-        if mode == RelocationMode::Move
-            && source_ids
+        // Move mode partitions the set: a member already sitting in the
+        // destination tier is merely re-filed — its id, content, and links
+        // to areas outside the set all survive — while cross-tier members
+        // are copied under fresh ids and their sources deleted. Copies mint
+        // fresh ids for every member. In-set exits remap as one group
+        // either way: kept members map to themselves in the id map, so a
+        // copied member's link into a kept sibling holds without
+        // rewriting, and a kept member's link into a copied sibling is
+        // retargeted once the copy lands.
+        let copied_ids: Vec<AreaId> = if mode == RelocationMode::Move {
+            source_ids
                 .iter()
-                .all(|id| self.area_storage(id) == destination.storage)
-        {
+                .copied()
+                .filter(|id| self.area_storage(id) != destination.storage)
+                .collect()
+        } else {
+            source_ids.clone()
+        };
+        let kept_ids: Vec<AreaId> = source_ids
+            .iter()
+            .copied()
+            .filter(|id| !copied_ids.contains(id))
+            .collect();
+
+        // Every member already sits in the destination tier: the move is
+        // merely a folder change. Preserve ids and avoid copying bytes;
+        // this is the fast path the old move API exposed.
+        if copied_ids.is_empty() {
             for source_id in &source_ids {
                 self.move_area_to_atlas(*source_id, destination.atlas_id)
                     .await?;
@@ -164,15 +187,18 @@ impl Mapper {
             });
         }
 
+        // Only members whose sources get deleted need the move fence; kept
+        // members stay editable throughout and are merely re-filed and
+        // relinked at the end.
         let mut move_fences = if mode == RelocationMode::Move {
-            let fences = self.begin_area_move(&source_ids)?;
+            let fences = self.begin_area_move(&copied_ids)?;
             self.wait_area_move_quiescent(&fences).await;
             Some(fences)
         } else {
             None
         };
 
-        let snapshots = self.snapshot_areas(&source_ids)?;
+        let snapshots = self.snapshot_areas(&copied_ids)?;
         for snapshot in &snapshots {
             validate_import_document(snapshot)?;
         }
@@ -180,12 +206,12 @@ impl Mapper {
         // acknowledged revision when one is known, else the cached document
         // revision (queued-but-unsent optimistic bumps ride the copy and are
         // discarded with the source, so they must not inflate the guard).
-        let expected_revs: Vec<i64> = source_ids
+        let expected_revs: Vec<i64> = copied_ids
             .iter()
             .zip(&snapshots)
             .map(|(id, snapshot)| self.confirmed_area_rev(*id).unwrap_or(snapshot.area.rev))
             .collect();
-        let mut destination_ids = Vec::with_capacity(snapshots.len());
+        let mut copy_destination_ids = Vec::with_capacity(snapshots.len());
         let mut server_copied = vec![false; snapshots.len()];
         for (index, snapshot) in snapshots.iter().enumerate() {
             let source_id = snapshot.area.id;
@@ -202,7 +228,7 @@ impl Mapper {
                 {
                     Ok(copied) => copied,
                     Err(error) => {
-                        cleanup_areas(self, &destination_ids).await;
+                        cleanup_areas(self, &copy_destination_ids).await;
                         return Err(error.into());
                     }
                 }
@@ -210,10 +236,10 @@ impl Mapper {
                 None
             };
             if let Some(area) = copied {
-                destination_ids.push(area.id);
+                copy_destination_ids.push(area.id);
                 server_copied[index] = true;
                 if let Err(error) = self.adopt_cloud_copy(area.id).await {
-                    cleanup_areas(self, &destination_ids).await;
+                    cleanup_areas(self, &copy_destination_ids).await;
                     return Err(error.into());
                 }
                 continue;
@@ -222,19 +248,22 @@ impl Mapper {
                 .create_area_at(snapshot.area.name.clone(), destination)
                 .await
             {
-                Ok(id) => destination_ids.push(id),
+                Ok(id) => copy_destination_ids.push(id),
                 Err(error) => {
-                    cleanup_areas(self, &destination_ids).await;
+                    cleanup_areas(self, &copy_destination_ids).await;
                     return Err(error.into());
                 }
             }
         }
 
-        let id_map: HashMap<_, _> = source_ids
-            .iter()
-            .copied()
-            .zip(destination_ids.iter().copied())
-            .collect();
+        let mut id_map: HashMap<_, _> = kept_ids.iter().map(|id| (*id, *id)).collect();
+        id_map.extend(
+            copied_ids
+                .iter()
+                .copied()
+                .zip(copy_destination_ids.iter().copied()),
+        );
+        let destination_ids: Vec<AreaId> = source_ids.iter().map(|id| id_map[id]).collect();
         // Server-copied members are already complete; everything else is
         // freshened and replayed. In-set links from replayed members into a
         // server-copied sibling still remap correctly through `id_map`,
@@ -256,8 +285,39 @@ impl Mapper {
         );
 
         if let Err(error) = self.populate_documents(&documents).await {
-            cleanup_areas(self, &destination_ids).await;
+            cleanup_areas(self, &copy_destination_ids).await;
             return Err(error.into());
+        }
+
+        // From here every destination copy is complete: later failures carry
+        // the completed result so callers point at the existing copies
+        // instead of retrying into duplicates.
+        let completed = || MapRelocation {
+            source_ids: source_ids.clone(),
+            destination_ids: destination_ids.clone(),
+            destination,
+        };
+
+        // Kept members' links into copied members follow the fresh ids
+        // before any source disappears, so no dangling window opens. The
+        // live documents are read rather than the pre-copy view, so a link
+        // formed while the copy ran is caught too.
+        if let Err(error) = self.retarget_exits_to_copies(&kept_ids, &id_map).await {
+            return Err(RelocationError {
+                error,
+                completed: Some(completed()),
+            });
+        }
+        for kept_id in &kept_ids {
+            if let Err(error) = self
+                .move_area_to_atlas(*kept_id, destination.atlas_id)
+                .await
+            {
+                return Err(RelocationError {
+                    error,
+                    completed: Some(completed()),
+                });
+            }
         }
 
         if mode == RelocationMode::Move {
@@ -273,15 +333,12 @@ impl Mapper {
                 if let Err(error) = self.commit_area_move(fence, Some(expected_rev)).await {
                     return Err(RelocationError {
                         error,
-                        completed: Some(MapRelocation {
-                            source_ids: source_ids.clone(),
-                            destination_ids: destination_ids.clone(),
-                            destination,
-                        }),
+                        completed: Some(completed()),
                     });
                 }
             }
         }
+        drop(completed);
 
         Ok(MapRelocation {
             source_ids,
@@ -564,6 +621,39 @@ impl Mapper {
             })
             .collect();
         self.stage_and_wait(decoration_batches).await
+    }
+
+    /// Retargets, in the kept members of a mixed-tier move, every exit
+    /// aimed at a copied member: same room numbers, fresh area id. Reads
+    /// the live documents and stages ordinary envelope batches, chunked at
+    /// the envelope cap.
+    async fn retarget_exits_to_copies(
+        &self,
+        kept_ids: &[AreaId],
+        id_map: &HashMap<AreaId, AreaId>,
+    ) -> CloudResult<()> {
+        let documents = self.snapshot_areas(kept_ids)?;
+        let mut batches = Vec::new();
+        for document in &documents {
+            let retargets = document
+                .rooms
+                .iter()
+                .flat_map(|room| room.exits.iter())
+                .filter_map(|exit| {
+                    let target = exit.to_area_id?;
+                    let remapped = *id_map.get(&target)?;
+                    (remapped != target).then_some(AreaMutation::UpdateExit {
+                        exit_id: exit.id,
+                        body: crate::ExitUpdates {
+                            to_area_id: Some(remapped),
+                            ..crate::ExitUpdates::default()
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+            batches.extend(chunk_ops(document.area.id, retargets, "Relink moved maps"));
+        }
+        self.stage_and_wait(batches).await
     }
 
     async fn stage_and_wait(&self, batches: Vec<AreaMutationBatch>) -> CloudResult<()> {
@@ -1545,6 +1635,123 @@ mod tests {
             }
         }
         assert_eq!(total_ops, 300, "every operation lands exactly once");
+    }
+
+    /// C5: a mixed-tier move copies only the cross-tier members. Same-tier
+    /// members keep their ids (bookmarks, scripts, and outside links stay
+    /// valid), and links between the two groups survive in both
+    /// directions: the copied member's exit remaps onto the kept member's
+    /// unchanged id, and the kept member's exit is retargeted onto the
+    /// copied member's fresh id.
+    #[tokio::test]
+    async fn mixed_tier_move_keeps_same_tier_ids_and_relinks_the_set() {
+        let (mapper, root) = mapper("mixed-move").await;
+        let local_member = mapper
+            .create_area_at(
+                "Sewers".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .expect("create local member");
+        let cloud_member = mapper
+            .create_area_at(
+                "Spires".to_string(),
+                MapDestination::loose(MapStorage::Cloud),
+            )
+            .await
+            .expect("create cloud member");
+        for (area, number) in [(local_member, 1), (cloud_member, 2)] {
+            wait(
+                &mapper,
+                mapper
+                    .upsert_room(
+                        RoomKey::new(area, RoomNumber(number)),
+                        RoomUpdates::default(),
+                    )
+                    .expect("enqueue room"),
+            )
+            .await;
+        }
+        // A link in each direction across the tier boundary.
+        let (_, submission) = mapper
+            .create_exit_tracked(
+                RoomKey::new(local_member, RoomNumber(1)),
+                ExitArgs {
+                    from_direction: crate::ExitDirection::East,
+                    to_area_id: Some(cloud_member),
+                    to_room_number: Some(RoomNumber(2)),
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            )
+            .expect("link local to cloud");
+        wait(&mapper, submission).await;
+        let (_, submission) = mapper
+            .create_exit_tracked(
+                RoomKey::new(cloud_member, RoomNumber(2)),
+                ExitArgs {
+                    from_direction: crate::ExitDirection::West,
+                    to_area_id: Some(local_member),
+                    to_room_number: Some(RoomNumber(1)),
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            )
+            .expect("link cloud to local");
+        wait(&mapper, submission).await;
+
+        let moved = mapper
+            .relocate_areas(
+                vec![local_member, cloud_member],
+                MapDestination::loose(MapStorage::Cloud),
+                RelocationMode::Move,
+            )
+            .await
+            .expect("mixed-tier move");
+        assert_eq!(
+            moved.destination_ids[1], cloud_member,
+            "the same-tier member keeps its id"
+        );
+        let local_copy = moved.destination_ids[0];
+        assert_ne!(local_copy, local_member, "cross-tier members mint fresh ids");
+        assert_eq!(mapper.area_storage(&local_copy), MapStorage::Cloud);
+
+        let atlas = mapper.get_current_atlas();
+        assert!(
+            atlas.get_area(&local_member).is_none(),
+            "only the cross-tier source is deleted"
+        );
+        assert!(atlas.get_area(&cloud_member).is_some());
+
+        let copied_exit = atlas
+            .get_room(&RoomKey::new(local_copy, RoomNumber(1)))
+            .expect("copied room")
+            .to_details()
+            .exits
+            .first()
+            .cloned()
+            .expect("copied exit");
+        assert_eq!(
+            copied_exit.to_area_id,
+            Some(cloud_member),
+            "the copied member's link lands on the kept member's unchanged id"
+        );
+        let kept_exit = atlas
+            .get_room(&RoomKey::new(cloud_member, RoomNumber(2)))
+            .expect("kept room")
+            .to_details()
+            .exits
+            .first()
+            .cloned()
+            .expect("kept exit");
+        assert_eq!(
+            kept_exit.to_area_id,
+            Some(local_copy),
+            "the kept member's link is retargeted onto the fresh id"
+        );
+        assert_eq!(kept_exit.to_room_number, Some(RoomNumber(1)));
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// C6: destination cleanup after a failed relocation deletes every
