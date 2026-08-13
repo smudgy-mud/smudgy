@@ -360,6 +360,11 @@ interface AreaMutator {
      * provisional (the room exists only once the mutation commits), and the
      * reservation is released when the callback finishes or aborts, so an
      * aborted draft's numbers become available again.
+     *
+     * The draft submits as a must-not-exist create: if the number is taken
+     * by submission time (another client raced it in), the mutation is
+     * rejected (`mutateArea` throws with `room_number_exists` in the
+     * message) rather than silently merging two logical rooms.
      */
     createRoom(params: CreateRoomParams): Promise<RoomNumber>;
     updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void>;
@@ -616,7 +621,12 @@ interface Mapper {
     rescueRoomByExternalId(externalId: string): boolean;
     /** Bind (or, with an empty string, clear) a room's server-global room id. */
     setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): Promise<OperationId | null>;
-    /** Create a room and return its new room number. */
+    /**
+     * Create a room and return its new room number. The write is a
+     * must-not-exist create: if the allocated number is taken by the time
+     * the write lands (another client raced it in), it rejects with
+     * `room_number_exists` instead of silently merging into that room.
+     */
     createRoom(area: Area | AreaId, params: CreateRoomParams): Promise<RoomNumber>;
     /** Update multiple fields of a room in one cache update; only present fields change. */
     updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null>;

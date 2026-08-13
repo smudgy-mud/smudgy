@@ -966,6 +966,18 @@ pub(crate) fn apply_mutation(
             let room = upsert_room_details(details, *room_number, body);
             Ok(OpResult::Room { room: room.clone() })
         }
+        AreaMutation::CreateRoom { room_number, body } => {
+            // Must-not-exist creation, mirroring the server's refusal so
+            // tier behavior cannot drift: an occupied number is a
+            // structural conflict, never a silent merge.
+            if details.rooms.iter().any(|r| r.room_number == *room_number) {
+                return Err(CloudError::StructuralConflict(
+                    "room_number_exists".to_string(),
+                ));
+            }
+            let room = upsert_room_details(details, *room_number, body);
+            Ok(OpResult::Room { room: room.clone() })
+        }
         AreaMutation::DeleteRoom { room_number } => {
             if !details.rooms.iter().any(|r| r.room_number == *room_number) {
                 return Err(CloudError::RoomNotFound(RoomKey::new(

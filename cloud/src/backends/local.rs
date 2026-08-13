@@ -1641,6 +1641,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_room_refuses_an_occupied_number_and_applies_to_a_vacant_one() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("CreateOnly", None))
+            .await
+            .expect("area");
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    1,
+                    vec![AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(1),
+                        body: RoomUpdates {
+                            title: Some("Original".to_string()),
+                            ..RoomUpdates::default()
+                        },
+                    }],
+                ),
+            )
+            .await
+            .expect("seed room 1");
+
+        // Occupied number: the whole envelope refuses (a leading op that
+        // would apply proves atomicity), nothing changes, no rev moves.
+        let refused = backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![
+                        AreaMutation::UpsertAreaProperty {
+                            name: "climate".to_string(),
+                            value: "arid".to_string(),
+                            is_secret: None,
+                        },
+                        AreaMutation::CreateRoom {
+                            room_number: RoomNumber(1),
+                            body: RoomUpdates {
+                                title: Some("Usurper".to_string()),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                    ],
+                ),
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(CloudError::StructuralConflict(ref reason)) if reason == "room_number_exists"
+            ),
+            "an occupied number is a structural conflict, got {refused:?}"
+        );
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.area.rev, 2, "the refused envelope moved no rev");
+        assert!(details.properties.is_empty(), "the leading op rolled back");
+        assert_eq!(details.rooms[0].title, "Original", "no silent merge");
+
+        // Vacant number: create_room applies like an upsert.
+        backend
+            .execute_mutation(
+                &area.id,
+                &envelope(
+                    area.id,
+                    2,
+                    vec![AreaMutation::CreateRoom {
+                        room_number: RoomNumber(2),
+                        body: RoomUpdates {
+                            title: Some("Fresh".to_string()),
+                            ..RoomUpdates::default()
+                        },
+                    }],
+                ),
+            )
+            .await
+            .expect("vacant create applies");
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.rooms.len(), 2);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn execute_mutation_replays_persisted_receipt_exactly_once() {
         let root = temp_root();
         let area_id;

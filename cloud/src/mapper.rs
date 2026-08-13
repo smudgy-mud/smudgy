@@ -1643,6 +1643,17 @@ impl Mapper {
         self.inner.upsert_room(room_key, updates)
     }
 
+    /// Create-only room write: refused (never merged) when the number is
+    /// occupied, locally and at the backend. See the inner method for the
+    /// full contract, including the smudgy-web release floor.
+    pub fn create_room(
+        &self,
+        room_key: RoomKey,
+        updates: RoomUpdates,
+    ) -> CloudResult<MutationSubmission> {
+        self.inner.create_room(room_key, updates)
+    }
+
     /// Upserts a batch of rooms in one cache update (one index rebuild).
     pub fn upsert_rooms(
         &self,
@@ -2872,6 +2883,41 @@ impl Inner {
         )
     }
 
+    /// Create-only room write: the number must be vacant everywhere — in the
+    /// optimistic base at compile time, on every conflict rebase (the
+    /// `RoomAbsent` structural precondition), and at the backend itself
+    /// (`create_room` refuses an occupied number with `room_number_exists`),
+    /// so two clients racing the same number can never silently merge
+    /// logical rooms. Requires a smudgy-web release that knows the variant;
+    /// an older server cleanly refuses the whole envelope as a 400
+    /// (server-ships-before-client).
+    #[allow(clippy::needless_pass_by_value)] // matches the upsert_room signature
+    pub fn create_room(
+        &self,
+        room_key: RoomKey,
+        updates: RoomUpdates,
+    ) -> CloudResult<MutationSubmission> {
+        let RoomKey {
+            area_id,
+            room_number,
+        } = room_key;
+        if self.over_ephemeral_cap(area_id, std::slice::from_ref(&room_number)) {
+            return Err(CloudError::PendingOperations(format!(
+                "ephemeral map tier is limited to {EPHEMERAL_ROOM_CAP} rooms"
+            )));
+        }
+        let description = format!("Create room {room_number}");
+        self.mutate_area(
+            area_id,
+            vec![AreaMutation::CreateRoom {
+                room_number,
+                body: updates,
+            }],
+            description,
+            PairedExitPolicy::Reject,
+        )
+    }
+
     pub fn upsert_rooms(
         &self,
         area_id: AreaId,
@@ -3447,6 +3493,13 @@ impl Inner {
                         } else {
                             StructuralPrecondition::RoomAbsent(*room_number)
                         })
+                    }
+                    // A create-only op compiled against the optimistic base,
+                    // so the number was vacant there; the rebase sanity check
+                    // must keep proving vacancy against every refetched
+                    // document (the server enforces the same on its side).
+                    AreaMutation::CreateRoom { room_number, .. } => {
+                        Some(StructuralPrecondition::RoomAbsent(*room_number))
                     }
                     _ => None,
                 })

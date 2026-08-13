@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use smudgy_cloud::{
     AREA_FORMAT_VERSION, Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, CloudError,
     CloudResult, CreateAreaRequest, MapStorage, Mapper, MapperBackend, Uuid,
-    mutation::{MutationEnvelope, MutationResult, ResourceKind, VersionInfo},
+    mutation::{AreaMutation, MutationEnvelope, MutationResult, ResourceKind, VersionInfo},
 };
 use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
@@ -30,6 +30,10 @@ const QUIET_PERIOD: Duration = Duration::from_millis(900);
 struct BudgetedBackend {
     areas: Mutex<Vec<Area>>,
     allowed_mutations: AtomicUsize,
+    /// When set, any envelope carrying a `create_room` op is refused with
+    /// the server's must-not-exist verdict (409 `structural_conflict`,
+    /// `room_number_exists`) — the cross-client collision shape.
+    refuse_create_rooms: bool,
 }
 
 impl BudgetedBackend {
@@ -37,6 +41,14 @@ impl BudgetedBackend {
         Self {
             areas: Mutex::new(Vec::new()),
             allowed_mutations: AtomicUsize::new(allowed_mutations),
+            refuse_create_rooms: false,
+        }
+    }
+
+    fn refusing_create_rooms() -> Self {
+        Self {
+            refuse_create_rooms: true,
+            ..Self::new(usize::MAX)
         }
     }
 }
@@ -123,6 +135,16 @@ impl MapperBackend for BudgetedBackend {
                 "scripted verdict: no further envelopes".to_string(),
             ));
         }
+        if self.refuse_create_rooms
+            && envelope
+                .payload
+                .iter()
+                .any(|op| matches!(op, AreaMutation::CreateRoom { .. }))
+        {
+            return Err(CloudError::StructuralConflict(
+                "room_number_exists".to_string(),
+            ));
+        }
         self.allowed_mutations.store(remaining - 1, Ordering::SeqCst);
         let rev = {
             let mut areas = self.areas.lock().unwrap();
@@ -155,6 +177,16 @@ fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
 }
 
 async fn run_module(server: &str, session: u32, module: &str, command: &str) -> Vec<String> {
+    run_module_on(BudgetedBackend::new(1), server, session, module, command).await
+}
+
+async fn run_module_on(
+    backend: BudgetedBackend,
+    server: &str,
+    session: u32,
+    module: &str,
+    command: &str,
+) -> Vec<String> {
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
     std::mem::forget(home);
@@ -168,7 +200,7 @@ async fn run_module(server: &str, session: u32, module: &str, command: &str) -> 
     )
     .unwrap();
 
-    let backend: Arc<dyn MapperBackend + Send + Sync> = Arc::new(BudgetedBackend::new(1));
+    let backend: Arc<dyn MapperBackend + Send + Sync> = Arc::new(backend);
     let mapper = Mapper::new(backend, smudgy_home.join("map-cache"));
 
     let params = Arc::new(SessionParams {
@@ -281,5 +313,51 @@ createAlias("^gostage$", async () => {
             .iter()
             .any(|line| line == "STAGE_ERR rooms=0 committed=missing"),
         "an invalid op in the second envelope must publish neither envelope.\n{transcript}"
+    );
+}
+
+/// A `createRoom` draft whose number the backend refuses as already taken
+/// (the server-side must-not-exist verdict, i.e. another client won the
+/// race): the envelope rejection surfaces through the ordinary
+/// `mutateArea` failure — a thrown error naming `room_number_exists` with
+/// an empty `committedOperations` prefix — never a silent merge.
+#[tokio::test]
+async fn create_room_collision_verdict_surfaces_through_the_thrown_error() {
+    const MODULE: &str = r#"
+import { createAlias, echo, mapper } from "smudgy:core";
+
+createAlias("^gocollide$", async () => {
+    try {
+        const area = await mapper.createArea("Collideland", { storage: "local" });
+        try {
+            await mapper.mutateArea(area, async (m) => {
+                await m.createRoom({ title: "contested" });
+            });
+            echo("COLLIDE_OK");
+        } catch (error) {
+            const committed = (error as any).committedOperations;
+            const named = String(error).includes("room_number_exists");
+            echo("COLLIDE_ERR named=" + named + " committed=" +
+                (Array.isArray(committed) ? committed.length : "missing"));
+        }
+    } catch (error) {
+        echo("COLLIDE_SETUP_FAIL " + error);
+    }
+});
+"#;
+    let lines = run_module_on(
+        BudgetedBackend::refusing_create_rooms(),
+        "MutateCollideTest",
+        9403,
+        MODULE,
+        "gocollide",
+    )
+    .await;
+    let transcript = lines.join("\n");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "COLLIDE_ERR named=true committed=0"),
+        "the refusal must read as the room-number collision with no committed prefix.\n{transcript}"
     );
 }
