@@ -138,13 +138,9 @@ fn responders_answer_ttype_and_naws_over_a_live_socket() {
     // reply must be the next bytes on the wire, with no NAWS frame before it.
     connection.notify_window_size();
     sock.write_all(&send).expect("send sentinel TTYPE SEND");
-    let end = read_until(
-        &mut sock,
-        &mut rx,
-        &ttype_is("MTTS 269"),
-        "sentinel IS reply",
-    );
-    let before_sentinel = &rx[..end - ttype_is("MTTS 269").len()];
+    let sentinel = ttype_is(&format!("MTTS {}", responders::mtts::bitvector(false)));
+    let end = read_until(&mut sock, &mut rx, &sentinel, "sentinel IS reply");
+    let before_sentinel = &rx[..end - sentinel.len()];
     assert!(
         !before_sentinel
             .windows(3)

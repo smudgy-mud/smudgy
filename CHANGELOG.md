@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   something — a server with a manual encoding set — what you type is held for the
   moment the negotiation takes, so it goes out in the encoding both sides agreed on
   rather than the one it started in.
+- **256-color and truecolor come back on MNES servers.** Servers that ask about the
+  client through NEW-ENVIRON (the MNES convention) rather than the classic
+  terminal-type cycle were getting silence: smudgy accepted the option (for its OSC 8
+  link capabilities, new in 0.5.3) but answered only those, so such servers concluded
+  "no terminal type, no color support" and dropped the whole session to the base ANSI
+  palette. Smudgy now answers the MNES identity questions — client name and version,
+  terminal type, the charset in use, and the MTTS capability list (256-color,
+  truecolor, UTF-8, TLS) — and claims the MNES bit in its terminal-type cycle too.
 
 ## [0.5.4] - 2026-08-18
 

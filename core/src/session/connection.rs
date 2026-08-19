@@ -185,10 +185,16 @@ mod ingest {
                 return;
             }
             if option == telnet::option::NEW_ENVIRON {
-                // RFC 1572 / Mudlet capability convention: answer SEND with the
-                // small set of OSC 8 features Smudgy truthfully implements.
+                // RFC 1572: answer SEND with the MNES identity variables (the
+                // NEW-ENVIRON replacement for TTYPE cycling — servers that see
+                // this option accepted query terminal type and MTTS here) and
+                // the OSC 8 features Smudgy truthfully implements.
                 if let Some((&responders::new_environ::SEND, requested)) = payload.split_first() {
-                    responders::new_environ::answer_send(requested, self.replies);
+                    self.protocol.on_new_environ_send(
+                        requested,
+                        self.transcode.encoding().name(),
+                        self.replies,
+                    );
                 }
                 return;
             }
@@ -1987,7 +1993,12 @@ mod tests {
         let (replies, actions) = ingest_buffer(&input);
         assert!(actions.is_empty());
         let mut expected = vec![command::IAC, command::WILL, option];
-        responders::new_environ::answer_send(&requested[1..], &mut expected);
+        responders::new_environ::answer_send(
+            &requested[1..],
+            responders::mtts::bitvector(false),
+            "UTF-8",
+            &mut expected,
+        );
         assert_eq!(replies, expected);
         assert!(
             replies
@@ -1999,6 +2010,53 @@ mod tests {
                 .windows(b"OSC_HYPERLINKS_TOOLTIP_SGR".len())
                 .any(|window| window == b"OSC_HYPERLINKS_TOOLTIP_SGR")
         );
+    }
+
+    /// MNES end to end: a server that queries identity through NEW-ENVIRON
+    /// `VAR`s (skipping TTYPE entirely, as MNES allows) gets the terminal type
+    /// and MTTS bitvector, with `CHARSET` reflecting the active wire encoding
+    /// rather than the UTF-8 default.
+    #[test]
+    fn new_environ_answers_mnes_identity_end_to_end() {
+        let option = telnet::option::NEW_ENVIRON;
+        let requested = [
+            &[responders::new_environ::SEND, 0][..],
+            b"TERMINAL_TYPE",
+            &[0][..],
+            b"MTTS",
+            &[0][..],
+            b"CHARSET",
+        ]
+        .concat();
+        let mut input = vec![command::IAC, command::DO, option];
+        telnet::frame_subnegotiation(option, &requested, &mut input);
+
+        let mut protocol = responders::ProtocolState::with_fixed_dims(responders::DEFAULT_DIMS);
+        let mut transcode = transcode::Transcode::new(encoding_rs::WINDOWS_1252);
+        let (replies, actions) = ingest_buffer_with(&input, &mut protocol, &mut transcode);
+        assert!(actions.is_empty());
+
+        let mut expected = vec![command::IAC, command::WILL, option];
+        telnet::frame_subnegotiation(
+            option,
+            &[
+                &[responders::new_environ::IS, 0][..],
+                b"TERMINAL_TYPE",
+                &[1][..],
+                responders::TERMINAL_TYPE.as_bytes(),
+                &[0][..],
+                b"MTTS",
+                &[1][..],
+                responders::mtts::bitvector(false).to_string().as_bytes(),
+                &[0][..],
+                b"CHARSET",
+                &[1][..],
+                b"windows-1252",
+            ]
+            .concat(),
+            &mut expected,
+        );
+        assert_eq!(replies, expected);
     }
 
     /// `DO NAWS` is accepted and immediately answered with the current window
