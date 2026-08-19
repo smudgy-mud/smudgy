@@ -7,9 +7,10 @@
 //  with no build step. Two HARD constraints:
 //    1. Source must be 7-bit ASCII (deno_core's extension load asserts this). Use
 //       \uXXXX escapes for any non-ASCII *runtime* string; keep comments ASCII.
-//    2. The only importable module is "ext:core/ops" (deno's global op module). Any
-//       `import type` is erased at transpile, so it is safe, but we keep this file
-//       self-contained (no cross-file imports) to stay robust.
+//    2. No module imports. Ops are captured from `Deno.core.ops` (see the note at the
+//       capture site below; "ext:core/ops" is frozen into the startup snapshot and
+//       excludes this extension's ops). Any `import type` is erased at transpile, so
+//       it is safe, but we keep this file self-contained (no cross-file imports).
 //
 //  The AUTHOR-FACING contract (what `import ... from "smudgy:core"` resolves to in an
 //  editor) is the hand-authored ambient `script_typings/smudgy-core.d.ts`. This impl is
@@ -23,8 +24,14 @@
 //    - inline alias/trigger bodies: run inside `with (globalThis.__smudgy_user_api) {...}`.
 // =============================================================================
 
-// @ts-ignore - ext:core/ops is a deno virtual module with no type decls
-import * as __smudgy_ops from "ext:core/ops";
+// Ops are captured from `Deno.core.ops` at module-eval time -- NOT imported
+// from "ext:core/ops": that synthetic module's exports are frozen into the V8
+// startup snapshot (which bakes only the deno_runtime base set), so the ops of
+// this extension -- initialized per isolate OUTSIDE the snapshot -- never
+// appear there. `Deno.core.ops` is (re)bound with the full op table at every
+// runtime init, snapshot or not, and extension ESM evaluates after that
+// binding but before bootstrap scrubs `core` off the public `Deno` surface.
+const __smudgy_ops = (globalThis as any).Deno.core.ops;
 
 // Ops are an untyped FFI boundary; treat the table as `any`. Type-checking value lives in
 // the public surface below (Session/Line/the api object), not in the op calls.

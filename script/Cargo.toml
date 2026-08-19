@@ -15,18 +15,18 @@ doctest = false
 [dependencies]
 deno_core = { workspace = true }
 deno_error = { workspace = true }
-# NB: do NOT enable "hmr" here. hmr pulls in deno_core's
-# `include_js_files_for_snapshotting`, which flips every extension's JS from
-# `include_str!`-baked-into-the-binary to read-from-disk-at-runtime, using paths
-# baked from CARGO_MANIFEST_DIR (e.g. the build machine's ~/.cargo/registry). We
-# ship no startup snapshot, so deno_core loads each extension source at boot; with
-# hmr those reads target build-machine paths that don't exist on any other machine
-# (or an installed copy), so JsRuntime init panics with os error 3 ("cannot find
-# the path specified"). release-full is the profile the installer packages/ships,
-# which is why it surfaced there.
+# The runtime boots from a real V8 startup snapshot: build.rs bakes the
+# deno_runtime base extension set (deno_core 0.410 records every extension JS
+# source as an absolute build-machine path — `LoadedFromFsDuringSnapshot` — so
+# without a snapshot, a distributed binary fails every JsRuntime::new with
+# os error 3; the v0.5.4 hotfix patched the sources back to embedded instead).
+# smudgy's own extensions (smudgy_ops / smudgy_mapper / smudgy_widgets) stay
+# OUTSIDE the snapshot — they carry per-session state and live above this
+# crate — and embed their ESM via each `extension!`'s customizer.
 #
-# `snapshot` (here = just `transpile`/deno_ast) stays on; a real startup snapshot
-# was tried and reverted (it panics on load without smudgy's own ops baked in).
+# NB: still do NOT enable "hmr" here: it flips lazy sources back to
+# disk-at-runtime paths. `snapshot` gates both `transpile` and the
+# `deno_runtime::snapshot` module build.rs uses.
 deno_runtime = { version = "0.265", features = ["snapshot"] }
 # `cjs` (+ its implied `utils`) powers npm CJS->ESM interop: analyze_cjs names a
 # CommonJS module's exports so they surface as ESM named exports, and
@@ -61,3 +61,13 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# build.rs creates the V8 startup snapshot (deno_runtime base extension set) at
+# compile time and emits the residual lazy-source table; see build.rs. Resolved
+# for the HOST (resolver 2 keeps its features separate from the target graph).
+[build-dependencies]
+deno_runtime = { version = "0.265", features = ["snapshot"] }
+# deno_runtime declares deno_core with default-features = false and leaves the
+# engine-backend choice to the embedder (the workspace's direct deno_core dep
+# does that for the target graph). Default features here = the V8 backend.
+deno_core = "0.410"

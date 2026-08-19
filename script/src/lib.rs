@@ -53,24 +53,20 @@ pub use package_resolver::{
 /// Publish-time TypeScript `.d.ts` generation via the vendored, embedded tsc.
 pub mod dts;
 
-// deno_runtime's `op_snapshot_options` (called from the bootstrap JS at startup)
-// does `state.take::<SnapshotOptions>()`, which panics with "required type
-// deno_runtime::ops::bootstrap::SnapshotOptions is not present in GothamState
-// container" when the value was never inserted. `deno_bootstrap` only inserts it
-// when a V8 startup snapshot is loaded (`has_snapshot = startup_snapshot.is_some()`
-// in deno_runtime's worker.rs); we ship no snapshot, so it's absent. This shim inserts
-// the default `SnapshotOptions`, so the op succeeds instead of panicking.
-//
-// A V8 startup snapshot would remove this shim (and the whole
-// run-bootstrap-JS-at-startup path), but the snapshot must be built *with* smudgy's
-// custom ops (smudgy_ops / smudgy_mapper / smudgy_widgets): a snapshot whose captured
-// extension/op set doesn't match the runtime panics on load.
-deno_core::extension!(
-    smudgy_snapshot_options_shim,
-    state = |state| {
-        state.put(deno_runtime::ops::bootstrap::SnapshotOptions::default());
-    },
-);
+// The V8 startup snapshot build.rs bakes at compile time (the deno_runtime BASE
+// extension set — see build.rs). Booting from it means extension JS never loads
+// from disk at runtime (deno_core 0.410 records those sources as absolute
+// build-machine paths), and skips re-evaluating the base extensions per
+// isolate. smudgy's own extensions are appended per isolate on top of the
+// snapshot; deno_core matches the snapshotted prefix by name and initializes
+// the rest fresh (`extensions_in_snapshot` in deno_core's extension_set).
+static STARTUP_SNAPSHOT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/SMUDGY_RUNTIME_SNAPSHOT.bin"));
+
+// `RESIDUAL_LAZY_JS_SOURCES` / `RESIDUAL_LAZY_ESM_SOURCES`: lazy_loaded_*
+// sources the snapshot did not consume, embedded here (generated — see
+// build.rs) and registered via `WorkerOptions::residual_lazy_*_sources`.
+include!(concat!(env!("OUT_DIR"), "/residual_lazy_sources.rs"));
 
 #[derive(Debug, Clone, Default)]
 pub struct ModulePolicy {
@@ -335,13 +331,14 @@ impl ScriptRuntime {
             (None, None)
         };
 
-        // Append the SnapshotOptions shim (see its definition above) so the
-        // bootstrap op finds the value it `take()`s, instead of panicking.
-        let mut extensions = options.extensions;
-        extensions.push(smudgy_snapshot_options_shim::init());
-
         let mut worker_options = WorkerOptions {
-            extensions,
+            extensions: options.extensions,
+            // Boot from the baked base-runtime snapshot (see STARTUP_SNAPSHOT
+            // above). `deno_bootstrap` inserts `SnapshotOptions` itself when a
+            // snapshot is present, so no shim is needed for the bootstrap op.
+            startup_snapshot: Some(STARTUP_SNAPSHOT),
+            residual_lazy_js_sources: RESIDUAL_LAZY_JS_SOURCES,
+            residual_lazy_esm_sources: RESIDUAL_LAZY_ESM_SOURCES,
             origin_storage_dir: Some(origin_storage_dir),
             cache_storage_dir: Some(cache_storage_dir),
             ..Default::default()

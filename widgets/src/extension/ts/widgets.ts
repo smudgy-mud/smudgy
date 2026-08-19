@@ -1,6 +1,11 @@
-// Ops come from the global op module "ext:core/ops" (deno's convention; runtime-
-// registered extension ops are NOT on Deno.core.ops). Extension source must be
-// 7-bit ASCII (deno_core extensions.rs check) -- no non-ASCII chars below.
+// Ops are captured from `Deno.core.ops` at module-eval time -- NOT imported
+// from "ext:core/ops": that synthetic module's exports are frozen into the V8
+// startup snapshot (which bakes only the deno_runtime base set), so the ops of
+// this extension -- initialized per isolate OUTSIDE the snapshot -- never
+// appear there. `Deno.core.ops` is (re)bound with the full op table at every
+// runtime init, snapshot or not (see smudgy.ts for the long form). Extension
+// source must be 7-bit ASCII (deno_core extensions.rs check) -- no non-ASCII
+// chars below.
 //
 // This is the `smudgy_widgets` extension's ESM entrypoint. It does NOT install
 // anything on `globalThis` except the `__smudgy_make_widgets` hook (mirroring how
@@ -11,10 +16,11 @@
 //   - inline alias/trigger bodies: we augment `globalThis.__smudgy_user_api` (built by
 //     `smudgy.js`, which runs before this extension) so `with (...)` injection exposes
 //     bare `createWidget`/`Column`/... with zero extra wiring.
-// The op imports live HERE (not in `smudgy.js`) because these ops only exist when this
+// The op captures live HERE (not in `smudgy.js`) because these ops only exist when this
 // leaf extension is loaded; `smudgy.js` lives in `core` and runs in headless test
-// runtimes that don't load this extension.
-import {
+// runtimes that don't load this extension. (Cross-extension captures below are safe:
+// the full op table is bound to `Deno.core.ops` before ANY extension ESM evaluates.)
+const {
     op_smudgy_widget_create,
     op_smudgy_widget_remove,
     op_smudgy_widget_build_element_list,
@@ -47,8 +53,8 @@ import {
     op_smudgy_session_send,
     op_smudgy_get_current_session,
     op_smudgy_pane_resolve,
-    // @ts-ignore - ext:core/ops is a deno virtual module with no type decls
-} from "ext:core/ops";
+    // (untyped: Deno.core is deno's private bootstrap namespace, no type decls)
+} = (globalThis as any).Deno.core.ops;
 
 // Normalize any children value -- a bare child, an array (jsxs / inline), nested
 // Fragment arrays, or undefined -- into one flat, filtered array. `jsx`/`jsxs` pass a

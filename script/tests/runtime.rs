@@ -63,6 +63,66 @@ fn script_runtime_with_broadcast(
     Ok((tokio, runtime))
 }
 
+#[deno_core::op2(fast)]
+fn op_layering_double(x: u32) -> u32 {
+    x * 2
+}
+
+// Mirrors the shape of smudgy's production extensions (smudgy_ops etc.): ops +
+// an embedded ESM entry point, appended per runtime on TOP of the baked base
+// startup snapshot rather than baked into it.
+deno_core::extension!(
+    smudgy_snapshot_layering_test,
+    ops = [op_layering_double],
+    customizer = |ext: &mut deno_core::Extension| {
+        ext.esm_files = std::borrow::Cow::Borrowed(LAYERING_TEST_ESM);
+        ext.esm_entry_point = Some("ext:smudgy_snapshot_layering_test/entry.js");
+    },
+);
+
+static LAYERING_TEST_ESM: &[deno_core::ExtensionFileSource] =
+    &[deno_core::ExtensionFileSource::new(
+        "ext:smudgy_snapshot_layering_test/entry.js",
+        // NOT `import ... from "ext:core/ops"`: that synthetic module's named
+        // exports are frozen into the startup snapshot (deno_core executes it
+        // only in InitMode::New), so runtime-added ops never appear there.
+        // Runtime-added ops ARE (re)bound onto `Deno.core.ops` whenever
+        // `skip_op_registration` is false — capture from there at eval time.
+        deno_core::ascii_str!(
+            "globalThis.__layeringDouble = Deno.core.ops.op_layering_double;\n"
+        ),
+    )];
+
+/// The runtime boots from a startup snapshot holding only the deno_runtime base
+/// extension set; smudgy's own extensions are appended at runtime. This guards
+/// the layering contract: a non-snapshotted extension's ops register and its
+/// ESM entry point evaluates on top of the snapshot.
+#[test]
+fn custom_extension_layers_on_startup_snapshot() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let tokio = tokio_runtime();
+    let mut runtime = ScriptRuntime::new(ScriptRuntimeOptions {
+        extensions: vec![smudgy_snapshot_layering_test::init()],
+        data_dir: temp.path().to_path_buf(),
+        webstorage_dir: None,
+        module_policy: ModulePolicy {
+            allow_https: true,
+            import_policy: ImportPolicy::Any,
+        },
+        inspector: None,
+        tokio: tokio.clone(),
+        package_provider: None,
+        permissions: None,
+        broadcast_channel: None,
+    })?;
+    assert!(eval_bool_in_tokio(
+        &tokio,
+        &mut runtime,
+        "__layeringDouble(21) === 42",
+    )?);
+    Ok(())
+}
+
 #[test]
 fn broadcast_channel_backend_is_shared_only_when_explicitly_reused() -> Result<()> {
     let temp = tempfile::tempdir()?;

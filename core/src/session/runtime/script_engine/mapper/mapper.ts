@@ -1,10 +1,11 @@
-// Ops are imported from the global op module "ext:core/ops" (deno's modern
-// convention; its own extensions do the same, e.g. 40_process.ts imports
-// op_create_worker from here). Deno.core.ops is built at bootstrap and does
-// NOT include runtime-registered extension ops like ours, so importing from
-// "ext:core/ops" (generated from the full op table) is the correct path.
+// Ops are captured from `Deno.core.ops` at module-eval time -- NOT imported
+// from "ext:core/ops": that synthetic module's exports are frozen into the V8
+// startup snapshot (which bakes only the deno_runtime base set), so the ops of
+// this extension -- initialized per isolate OUTSIDE the snapshot -- never
+// appear there. `Deno.core.ops` is (re)bound with the full op table at every
+// runtime init, snapshot or not (see smudgy.ts for the long form).
 // NOTE: extension source must be 7-bit ASCII (deno_core extensions.rs check).
-import {
+const {
     op_smudgy_mapper_set_current_location,
     op_smudgy_mapper_get_current_location,
     op_smudgy_mapper_list_area_ids,
@@ -87,8 +88,8 @@ import {
     op_smudgy_mapper_import_areas_if_absent,
     op_smudgy_mapper_export_area,
     op_smudgy_mapper_get_path_between_rooms,
-    // @ts-ignore - ext:core/ops is a deno virtual module with no type decls
-} from "ext:core/ops";
+    // (untyped: Deno.core is deno's private bootstrap namespace, no type decls)
+} = (globalThis as any).Deno.core.ops;
 
 // These declarations MIRROR the published author-facing contract in
 // `core/src/models/script_typings/smudgy-mapper.d.ts` (the global ambient map types). The

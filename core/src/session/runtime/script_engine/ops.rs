@@ -345,7 +345,24 @@ deno_core::extension!(
         PendingLinkTooltips::default(),
     )));
   },
+  customizer = |ext: &mut deno_core::Extension| {
+    // deno_core 0.410 records `esm = [...]` sources as absolute build-machine
+    // paths (its snapshot-first design). This extension initializes per isolate
+    // OUTSIDE the startup snapshot (script/build.rs bakes only the deno_runtime
+    // base set), so the source must ship in the binary: swap the path-based
+    // entry for the embedded bytes. The specifier must match `esm_entry_point`.
+    ext.esm_files = std::borrow::Cow::Borrowed(SMUDGY_OPS_EMBEDDED_ESM);
+  },
 );
+
+/// `smudgy.ts` embedded for runtime (non-snapshot) extension init — see the
+/// `customizer` on [`smudgy_ops`]. 7-bit ASCII enforced by the contract drift
+/// test (`ascii_str_include!` requires it).
+static SMUDGY_OPS_EMBEDDED_ESM: &[deno_core::ExtensionFileSource] =
+    &[deno_core::ExtensionFileSource::new(
+        "ext:smudgy_ops/smudgy.ts",
+        deno_core::ascii_str_include!("../js/smudgy.ts"),
+    )];
 
 /// `gmcp.enabled` (`docs/gmcp.md` §3.4): whether GMCP is negotiated on for the live
 /// connection. Gated by `interop:read` like every other read of the `gmcp` producer — the

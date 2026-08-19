@@ -117,7 +117,24 @@ deno_core::extension!(
         state.put::<Mapper>(mapper);
     }
   },
+  customizer = |ext: &mut deno_core::Extension| {
+    // deno_core 0.410 records `esm = [...]` sources as absolute build-machine
+    // paths (its snapshot-first design). This extension initializes per isolate
+    // OUTSIDE the startup snapshot (script/build.rs bakes only the deno_runtime
+    // base set), so the source must ship in the binary: swap the path-based
+    // entry for the embedded bytes. The specifier must match `esm_entry_point`.
+    ext.esm_files = std::borrow::Cow::Borrowed(SMUDGY_MAPPER_EMBEDDED_ESM);
+  },
 );
+
+/// `mapper.ts` embedded for runtime (non-snapshot) extension init — see the
+/// `customizer` on [`smudgy_mapper`]. 7-bit ASCII by contract
+/// (`ascii_str_include!` requires it).
+static SMUDGY_MAPPER_EMBEDDED_ESM: &[deno_core::ExtensionFileSource] =
+    &[deno_core::ExtensionFileSource::new(
+        "ext:smudgy_mapper/mapper.ts",
+        deno_core::ascii_str_include!("mapper/mapper.ts"),
+    )];
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum MapperError {

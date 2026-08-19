@@ -138,7 +138,25 @@ deno_core::extension!(
     // isolate build, so tokens never collide across isolates.
     state.put::<RefCell<ImageRegistry>>(RefCell::new(ImageRegistry::default()));
   },
+  customizer = |ext: &mut deno_core::Extension| {
+    // deno_core 0.410 records `esm = [...]` sources as absolute build-machine
+    // paths (its snapshot-first design). This extension initializes per isolate
+    // OUTSIDE the startup snapshot (smudgy_script's build.rs bakes only the
+    // deno_runtime base set), so the source must ship in the binary: swap the
+    // path-based entry for the embedded bytes. The specifier must match
+    // `esm_entry_point`.
+    ext.esm_files = std::borrow::Cow::Borrowed(SMUDGY_WIDGETS_EMBEDDED_ESM);
+  },
 );
+
+/// `widgets.ts` embedded for runtime (non-snapshot) extension init — see the
+/// `customizer` on [`smudgy_widgets`]. 7-bit ASCII by contract
+/// (`ascii_str_include!` requires it).
+static SMUDGY_WIDGETS_EMBEDDED_ESM: &[deno_core::ExtensionFileSource] =
+    &[deno_core::ExtensionFileSource::new(
+        "ext:smudgy_widgets/widgets.ts",
+        deno_core::ascii_str_include!("extension/ts/widgets.ts"),
+    )];
 
 macro_rules! get_number_prop {
     ($scope:ident, $obj:ident, $name:expr) => {{
