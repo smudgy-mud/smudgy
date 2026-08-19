@@ -86,9 +86,12 @@ smudgy_i18n = { path = "./i18n" }
 tokio = { version = "1.44.2", features = ["full"] }
 parking_lot = "0.12.1"
 pretty_env_logger = "0.5.0"
-# `max_level_info` statically strips `debug!`/`trace!` (and any work gated on
-# `log_enabled!(Debug)`) from every build, dev and release alike — info and above only.
-log = { version = "0.4.27", features = ["max_level_info"] }
+# `release_max_level_info` statically strips `debug!`/`trace!` (and any work gated on
+# `log_enabled!(Debug)`, e.g. the per-line trigger-match timers) from release and bench
+# builds — info and above only. Dev builds keep every level and filter at runtime:
+# `SMUDGY_LOG` defaults to `debug` there, so the telnet negotiation transcript and the
+# trigger timing lines print to the dev console; `SMUDGY_LOG=info` quiets them.
+log = { version = "0.4.27", features = ["release_max_level_info"] }
 vtparse = "0.7.0"
 # Embedded Deno v2.9.5 crate family, frozen from the official latest-stable endpoint on
 # 2026-08-16. deno_core is workspace-wide because core + smudgy_widgets also use it directly
