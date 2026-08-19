@@ -141,6 +141,66 @@ pub enum Side {
     Remote,
 }
 
+/// The verb for a negotiation command byte, for debug logs.
+const fn negotiation_verb(command: u8) -> &'static str {
+    match command {
+        command::WILL => "WILL",
+        command::WONT => "WONT",
+        command::DO => "DO",
+        command::DONT => "DONT",
+        _ => "?",
+    }
+}
+
+/// The name of a well-known option code, for debug logs. Unknown options print
+/// as `?` beside their numeric code, which every log line carries.
+const fn option_name(option: u8) -> &'static str {
+    match option {
+        option::ECHO => "ECHO",
+        option::SGA => "SGA",
+        option::TTYPE => "TTYPE",
+        option::EOR => "EOR",
+        option::NAWS => "NAWS",
+        option::NEW_ENVIRON => "NEW-ENVIRON",
+        option::CHARSET => "CHARSET",
+        option::MSDP => "MSDP",
+        option::MSSP => "MSSP",
+        option::MCCP2 => "MCCP2",
+        option::MCCP3 => "MCCP3",
+        option::MCCPX => "MCCPX",
+        option::MXP => "MXP",
+        option::ATCP => "ATCP",
+        option::GMCP => "GMCP",
+        _ => "?",
+    }
+}
+
+/// Lazy debug-log rendering of a subnegotiation payload: printable ASCII
+/// as-is, everything else as `\xNN`, capped at [`Self::MAX`] bytes.
+/// Constructing one is free — all work happens in `Display`, which runs only
+/// when an enabled `debug!` record is actually formatted.
+struct PayloadPreview<'a>(&'a [u8]);
+
+impl PayloadPreview<'_> {
+    const MAX: usize = 64;
+}
+
+impl std::fmt::Display for PayloadPreview<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for &byte in self.0.iter().take(Self::MAX) {
+            if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
+                std::fmt::Write::write_char(f, byte as char)?;
+            } else {
+                write!(f, "\\x{byte:02x}")?;
+            }
+        }
+        if self.0.len() > Self::MAX {
+            write!(f, " (+{} bytes)", self.0.len() - Self::MAX)?;
+        }
+        Ok(())
+    }
+}
+
 /// Append `payload` to `into` with every literal `0xFF` doubled (`IAC IAC`) — the telnet
 /// escaping rule, shared by subnegotiation framing and the outbound charset encoder (whose
 /// legacy encodings can produce a raw `0xFF`, e.g. Latin-1 `ÿ`).
@@ -159,6 +219,15 @@ pub fn double_iac_into(payload: &[u8], into: &mut Vec<u8>) {
 /// subnegotiation extraction; the write path for GMCP sends and the NAWS/TTYPE/CHARSET
 /// responders.
 pub fn frame_subnegotiation(option: u8, payload: &[u8], into: &mut Vec<u8>) {
+    // `debug!` evaluates its arguments only after the level check passes, so a
+    // disabled level costs one atomic load — the preview is never built.
+    log::debug!(
+        "telnet -> SB {}({}) {}B: {}",
+        option_name(option),
+        option,
+        payload.len(),
+        PayloadPreview(payload)
+    );
     into.reserve(payload.len() + 5);
     into.extend_from_slice(&[command::IAC, command::SB, option]);
     double_iac_into(payload, into);
@@ -570,6 +639,13 @@ impl TelnetParser {
     fn step_sub_iac(&mut self, b: u8, sink: &mut impl TelnetSink) -> bool {
         match b {
             command::SE => {
+                log::debug!(
+                    "telnet <- SB {}({}) {}B: {}",
+                    option_name(self.sub_option),
+                    self.sub_option,
+                    self.sub_buf.len(),
+                    PayloadPreview(&self.sub_buf)
+                );
                 sink.on_subnegotiation(self.sub_option, &self.sub_buf);
                 self.state = State::Data;
                 // A marker for a negotiated compression option starts a stream (and arms the
@@ -605,6 +681,12 @@ impl TelnetParser {
     /// loop is broken at the "no state change ⇒ no reply" rule). It does not implement the full
     /// RFC 1143 "Q method", which also covers simultaneous client/server initiation.
     fn handle_negotiation(&mut self, command: u8, option: u8, sink: &mut impl TelnetSink) {
+        log::debug!(
+            "telnet <- {} {}({})",
+            negotiation_verb(command),
+            option_name(option),
+            option
+        );
         let opt = usize::from(option);
         match command {
             command::WILL => {
@@ -617,10 +699,10 @@ impl TelnetParser {
                     if option == option::MCCP2 || option == option::MCCPX {
                         self.compression_claimed = true;
                     }
-                    sink.on_send(&[command::IAC, command::DO, option]);
+                    send_negotiation(sink, command::DO, option);
                     sink.on_option(Side::Remote, option, true);
                 } else {
-                    sink.on_send(&[command::IAC, command::DONT, option]);
+                    send_negotiation(sink, command::DONT, option);
                 }
             }
             command::WONT => {
@@ -632,7 +714,7 @@ impl TelnetParser {
                     if option == option::MCCP2 || option == option::MCCPX {
                         self.compression_claimed = false;
                     }
-                    sink.on_send(&[command::IAC, command::DONT, option]);
+                    send_negotiation(sink, command::DONT, option);
                     sink.on_option(Side::Remote, option, false);
                 }
             }
@@ -641,22 +723,35 @@ impl TelnetParser {
                     // Already on — no reply.
                 } else if accept_local(option) {
                     self.local_enabled[opt] = true;
-                    sink.on_send(&[command::IAC, command::WILL, option]);
+                    send_negotiation(sink, command::WILL, option);
                     sink.on_option(Side::Local, option, true);
                 } else {
-                    sink.on_send(&[command::IAC, command::WONT, option]);
+                    send_negotiation(sink, command::WONT, option);
                 }
             }
             command::DONT => {
                 if self.local_enabled[opt] {
                     self.local_enabled[opt] = false;
-                    sink.on_send(&[command::IAC, command::WONT, option]);
+                    send_negotiation(sink, command::WONT, option);
                     sink.on_option(Side::Local, option, false);
                 }
             }
             _ => unreachable!("handle_negotiation only receives WILL/WONT/DO/DONT"),
         }
     }
+}
+
+/// Emit one `IAC <command> <option>` negotiation answer, debug-logged. The
+/// level check guards all argument evaluation, so a disabled `debug` level
+/// costs one atomic load on this already-cold path.
+fn send_negotiation(sink: &mut impl TelnetSink, command: u8, option: u8) {
+    log::debug!(
+        "telnet -> {} {}({})",
+        negotiation_verb(command),
+        option_name(option),
+        option
+    );
+    sink.on_send(&[command::IAC, command, option]);
 }
 
 #[cfg(test)]
