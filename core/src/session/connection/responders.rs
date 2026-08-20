@@ -133,26 +133,48 @@ pub mod new_environ {
         payload.extend_from_slice(value);
     }
 
+    /// Append the MNES identity variables, in the spec's order.
+    fn push_identity(payload: &mut Vec<u8>, kind: u8, mtts: u16, charset: &str) {
+        for &name in MNES_NAMES {
+            if let Some((canonical, value)) = mnes_value(name, mtts, charset) {
+                push_entry(payload, kind, canonical, value.as_bytes());
+            }
+        }
+    }
+
+    /// Append the OSC 8 capability catalogue.
+    fn push_capabilities(payload: &mut Vec<u8>, kind: u8) {
+        for &(name, value) in CAPABILITIES {
+            push_entry(payload, kind, name, value);
+        }
+    }
+
     /// Answer a NEW-ENVIRON `SEND`. An empty request gets everything: the MNES
     /// identity as `VAR`s, then the capability catalogue as `USERVAR`s. A
     /// selective request is answered per recognized name in request order,
     /// echoing the type byte the server used (so its own table lookup matches
     /// however it typed the query) with the name's canonical spelling.
     /// Unrecognized names are omitted.
+    ///
+    /// A type byte carrying no name asks for every variable of that type (RFC 1572:
+    /// "all variables of that type"), which is the form MNES documents for requesting
+    /// the identity block. It is answered like the matching half of an empty request —
+    /// omitting it would return the empty `IS` a server reads as "no terminal type, no
+    /// color support", the very downgrade this responder exists to prevent.
     pub fn answer_send(request: &[u8], mtts: u16, charset: &str, replies: &mut Vec<u8>) {
         let mut payload = vec![IS];
         if request.is_empty() {
-            for &name in MNES_NAMES {
-                if let Some((canonical, value)) = mnes_value(name, mtts, charset) {
-                    push_entry(&mut payload, VAR, canonical, value.as_bytes());
-                }
-            }
-            for &(name, value) in CAPABILITIES {
-                push_entry(&mut payload, USERVAR, name, value);
-            }
+            push_identity(&mut payload, VAR, mtts, charset);
+            push_capabilities(&mut payload, USERVAR);
         } else {
             for (kind, name) in requested_vars(request) {
-                if let Some((canonical, value)) = mnes_value(&name, mtts, charset) {
+                if name.is_empty() {
+                    if kind == VAR {
+                        push_identity(&mut payload, VAR, mtts, charset);
+                    } else {
+                        push_capabilities(&mut payload, USERVAR);
+                    }
+                } else if let Some((canonical, value)) = mnes_value(&name, mtts, charset) {
                     push_entry(&mut payload, kind, canonical, value.as_bytes());
                 } else if let Some((canonical, value)) = CAPABILITIES
                     .iter()
@@ -657,6 +679,51 @@ mod tests {
                     .any(|window| window == capability)
             );
         }
+    }
+
+    /// RFC 1572 reads a type byte with no name as "all variables of that type", and MNES
+    /// documents `SEND VAR` as the way to ask for the identity block. Answering it with an
+    /// empty `IS` is exactly the "no terminal type, no color support" downgrade this
+    /// responder exists to prevent.
+    #[test]
+    fn new_environ_send_var_with_no_name_returns_the_identity_block() {
+        let mut all = Vec::new();
+        new_environ::answer_send(&[], mtts::bitvector(false), "UTF-8", &mut all);
+        let (_, everything) = unframe(&all);
+
+        let mut replies = Vec::new();
+        new_environ::answer_send(&[0], mtts::bitvector(false), "UTF-8", &mut replies);
+        let (_, payload) = unframe(&replies);
+
+        assert!(
+            payload.len() > 1,
+            "a bare SEND VAR must not be answered with an empty IS"
+        );
+        assert!(
+            everything.starts_with(&payload),
+            "it answers the VAR half of an empty request, verbatim"
+        );
+        assert!(payload.windows(11).any(|w| w == b"CLIENT_NAME"));
+        assert!(payload.windows(4).any(|w| w == b"MTTS"));
+    }
+
+    /// The USERVAR half of the same rule: a bare `SEND USERVAR` gets the capability
+    /// catalogue rather than silence.
+    #[test]
+    fn new_environ_send_uservar_with_no_name_returns_the_capabilities() {
+        let mut replies = Vec::new();
+        new_environ::answer_send(
+            &[3],
+            mtts::bitvector(false),
+            "UTF-8",
+            &mut replies,
+        );
+        let (_, payload) = unframe(&replies);
+        assert!(payload.windows(14).any(|w| w == b"OSC_HYPERLINKS"));
+        assert!(
+            !payload.windows(11).any(|w| w == b"CLIENT_NAME"),
+            "identity is VAR-typed and does not belong in a USERVAR answer"
+        );
     }
 
     #[test]
