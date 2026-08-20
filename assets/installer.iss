@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "smudgy"
-#define MyAppVersion "0.5.4"
+#define MyAppVersion "0.5.5-rc"
 #define MyAppPublisher "walter.dev"
 #define MyAppURL "https://smudgy.org"
 #define MyAppExeName "smudgy.exe"

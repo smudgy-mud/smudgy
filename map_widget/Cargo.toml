@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_map_widget"
-version = "0.5.4"
+version = "0.5.5-rc"
 edition = "2024"
 
 [dependencies]

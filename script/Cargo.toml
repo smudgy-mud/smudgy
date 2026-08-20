@@ -2,7 +2,7 @@
 name = "smudgy_script"
 description = "Smudgy's embedded JS/TS scripting runtime"
 edition = "2021"
-version = "0.5.4"
+version = "0.5.5-rc"
 publish = false
 
 # Thin runtime built directly on the Deno v2.9.5 crate family, targeting Deno parity
