@@ -1,3 +1,5 @@
+import { planIntegralLayoutInWorker } from "./worker-client.ts";
+
 /** An integral cell in Smudgy's map grid. */
 export interface GridPosition {
   x: number;
@@ -3136,4 +3138,11 @@ export function planIntegralLayout(request: IntegralLayoutRequest): IntegralLayo
     movedExisting: candidateMovedExisting(selected),
     quality: candidateQuality(selected),
   };
+}
+
+/** Run the deterministic integral planner in map-layout's shared background Worker. */
+export function planIntegralLayoutAsync(
+  request: IntegralLayoutRequest,
+): Promise<IntegralLayoutPlan> {
+  return planIntegralLayoutInWorker(request);
 }

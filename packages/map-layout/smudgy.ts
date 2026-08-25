@@ -2,13 +2,18 @@ import { mapper } from "smudgy:core";
 import type { LayoutDirection, LayoutEdge } from "./layout.ts";
 import {
   createLayoutModel,
-  planLayoutModel,
   resolveElevationGeometry,
   type LayoutChange,
   type LayoutModel,
   type PlanLayoutOptions,
   type PlannedLayout,
 } from "./model.ts";
+import {
+  planStableLayoutSnapshot,
+  StaleLayoutSnapshotError,
+} from "./stable-snapshot.ts";
+
+export { StaleLayoutSnapshotError };
 
 export interface LoadLayoutModelOptions {
   isRoomMovable?: (room: Room) => boolean;
@@ -98,7 +103,23 @@ export async function planAreaChange(
   change: LayoutChange,
   options: PlanLayoutOptions & LoadLayoutModelOptions = {},
 ): Promise<AreaChangePlan> {
-  const model = loadLayoutModel(area, options);
-  const { patch, positions, quality, search } = planLayoutModel(model, change, options);
+  // Always re-resolve a host wrapper by ID. An Area supplied by the caller may
+  // itself be an immutable snapshot and cannot validate a later Worker result.
+  const liveArea: AreaId = "room_numbers" in area
+    ? [area.id[0], area.id[1]]
+    : [area[0], area[1]];
+  const planOptions: PlanLayoutOptions = {
+    allowExistingMoves: options.allowExistingMoves,
+    fixedRooms: options.fixedRooms,
+    defaultElevation: options.defaultElevation,
+    effort: options.effort,
+    trace: options.trace,
+  };
+  const result = await planStableLayoutSnapshot(
+    () => loadLayoutModel(liveArea, { isRoomMovable: options.isRoomMovable }),
+    change,
+    planOptions,
+  );
+  const { patch, positions, quality, search } = result;
   return { patch, positions, quality, search };
 }

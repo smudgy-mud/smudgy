@@ -1,11 +1,11 @@
 {
-  "version": "0.17.3",
+  "version": "0.17.4",
   "description": "Maps NukeFire from its rich NukeFire.Map.Local GMCP snapshots.",
   "entry": "index.ts",
-  "min_smudgy_version": "0.5.3",
+  "min_smudgy_version": "0.5.5",
   "dependencies": [
     "smudgy://kapusniak/nukefire-gmcp",
-    "smudgy://kapusniak/map-layout"
+    "smudgy://kapusniak/map-layout@^0.2.1"
   ],
   "requires": [
     "smudgy://kapusniak/nukefire-gmcp"
@@ -38,6 +38,9 @@
       ],
       "gmcp": [
         "send"
+      ],
+      "workers": [
+        "spawn"
       ]
     }
   }

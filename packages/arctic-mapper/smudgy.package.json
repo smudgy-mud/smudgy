@@ -1,10 +1,10 @@
 {
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "An auto-mapper for ArcticMUD",
   "entry": "index.ts",
-  "min_smudgy_version": "0.5.3",
+  "min_smudgy_version": "0.5.5",
   "dependencies": [
-    "smudgy://kapusniak/map-layout@^0.2.0"
+    "smudgy://kapusniak/map-layout@^0.2.1"
   ],
   "requires": [
     "smudgy://kapusniak/arctic-prompt"
@@ -122,6 +122,9 @@
       ],
       "panes": [
         "create"
+      ],
+      "workers": [
+        "spawn"
       ]
     }
   }

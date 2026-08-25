@@ -33,3 +33,16 @@ test("coordinate locking never creates deferred movement work", () => {
     deferExistingReflow: false,
   });
 });
+
+test("a superseded full reflow preserves discoveries and defers existing moves", () => {
+  assert.deepEqual(reflowPolicy(true, false, true, true), {
+    runPlanner: true,
+    moveExisting: true,
+    deferExistingReflow: false,
+  });
+  assert.deepEqual(reflowPolicy(true, false, false, true), {
+    runPlanner: true,
+    moveExisting: false,
+    deferExistingReflow: true,
+  });
+});

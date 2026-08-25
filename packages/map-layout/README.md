@@ -10,7 +10,8 @@ mapper; every operation returns a declarative patch.
 
 `planAreaChange` is the normal API for mappers which only reflow when topology
 grows. It snapshots the Smudgy area into ordinary V8 data immediately before
-planning and does not retain that model afterward.
+planning and does not retain that model afterward. CPU-intensive planning runs
+in one lazily created background Worker shared by this package instance.
 
 ```ts
 const result = await planAreaChange(areaId, {
@@ -54,6 +55,14 @@ const result = await planAreaChange(areaId, {
 search is opt-in so latency-sensitive automatic mapping retains the standard
 single-pass behavior.
 
+Because Worker planning introduces a real asynchronous gap, `planAreaChange`
+reloads the area before returning. It discards one stale result and retries
+once; a second concurrent change rejects with `StaleLayoutSnapshotError`
+instead of returning a patch for obsolete coordinates or topology. Room
+movability callbacks always run while snapshotting in the caller realm. Trace
+events are collected in the Worker and replayed in order after the accepted
+result, so callbacks and other non-cloneable values never cross the boundary.
+
 Two existing rooms can be connected while planning the reflow required by the
 new topology:
 
@@ -72,13 +81,17 @@ High-frequency consumers may explicitly retain a model instead:
 
 ```ts
 const workspace = createLayoutWorkspace(loadLayoutModel(areaId));
-const result = workspace.plan(change);
+const result = await workspace.planAsync(change);
 await apply(result.patch);
 workspace.accept(result);
 ```
 
-`createLayoutModel` and `planLayoutModel` are host-independent and are used by
-tests, decision-log replay, and mappers which already keep their own mirrors.
+`planLayoutModelAsync` and `planIntegralLayoutAsync` use the same shared Worker
+for host-independent models and low-level requests. Their synchronous
+counterparts remain available for deterministic tests, decision-log replay,
+and explicitly synchronous tools. A retained workspace also keeps its original
+`plan` method; an async result cannot be accepted if another result changed the
+workspace while its Worker request was in flight.
 
 ## Elevation
 

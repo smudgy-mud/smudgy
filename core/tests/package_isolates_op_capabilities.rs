@@ -954,10 +954,10 @@ async fn workers_capability_gates_worker_construction() {
     );
 }
 
-/// Every constructor alias reaches deno_runtime's native quota gate: the public
+/// Every constructor alias reaches `deno_runtime`'s native quota gate: the public
 /// relative-specifier facade, its recoverable native superclass, and
-/// node:worker_threads. The small-limit rejection itself is covered in
-/// smudgy_script without allocating 129 OS threads/V8 isolates.
+/// `node:worker_threads`. The small-limit rejection itself is covered in
+/// `smudgy_script` without allocating 129 OS threads/V8 isolates.
 #[tokio::test]
 async fn worker_constructor_aliases_share_the_native_host_path() {
     let src = r#"
@@ -1088,25 +1088,106 @@ async fn worker_relative_specifier_resolves_against_the_calling_module() {
 /// immutable source snapshot published after the parent graph load. The worker entry is not
 /// imported by the parent graph, and it imports another package-relative TypeScript module, so
 /// this covers the full fetched archive rather than only modules V8 already instantiated.
+///
+/// The request/reply shape mirrors an async layout planner: request IDs correlate multiple jobs
+/// sent to one persistent worker, and model-like `Map`/`Set`/`bigint` values survive structured
+/// clone in both directions without sharing mutations with the parent copy. Explicit termination
+/// followed by the harness's clean runtime join covers the package worker teardown path.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn sandboxed_package_worker_loads_relative_package_modules() {
+async fn sandboxed_package_worker_preserves_layout_protocol_values_across_requests() {
     let package_src = r#"
         import { echo } from "smudgy:core";
         const worker = new Worker("./workers/worker.ts", { type: "module" });
         const keepalive = setInterval(() => echo("WAITING"), 200);
-        const done = () => clearInterval(keepalive);
-        setTimeout(done, 15000);
+        const pending = new Map();
+        let nextRequestId = 1;
+
+        const done = () => {
+            clearInterval(keepalive);
+            clearTimeout(deadline);
+        };
+        const failPending = (error) => {
+            for (const request of pending.values()) request.reject(error);
+            pending.clear();
+        };
+
         worker.onmessage = (e) => {
-            done();
-            echo("PKG_WORKER_REPLY:" + e.data);
-            worker.terminate();
+            const reply = e.data;
+            const request = pending.get(reply.id);
+            if (!request) return;
+            pending.delete(reply.id);
+            if (reply.ok) request.resolve(reply);
+            else request.reject(new Error(reply.error));
         };
         worker.onerror = (e) => {
             e.preventDefault();
-            done();
-            echo("PKG_WORKER_ERROR:" + e.message);
+            failPending(new Error("worker error: " + e.message));
         };
-        worker.postMessage("ping");
+
+        const deadline = setTimeout(
+            () => failPending(new Error("worker timed out")),
+            15000,
+        );
+        const plan = (model) => new Promise((resolve, reject) => {
+            const id = nextRequestId++;
+            pending.set(id, { resolve, reject });
+            worker.postMessage({ id, kind: "plan", model });
+        });
+
+        const firstModel = {
+            rooms: new Map([["alpha", { x: 1, y: 2 }]]),
+            visited: new Set(["alpha"]),
+            seed: 40n,
+        };
+        const secondModel = {
+            rooms: new Map([
+                ["beta", { x: 3, y: 4 }],
+                ["gamma", { x: 5, y: 6 }],
+            ]),
+            visited: new Set(["beta", "gamma"]),
+            seed: 100n,
+        };
+
+        try {
+            const [first, second] = await Promise.all([
+                plan(firstModel),
+                plan(secondModel),
+            ]);
+            const cloneTypesSurvive =
+                first.result.positions instanceof Map &&
+                first.result.visited instanceof Set &&
+                typeof first.result.score === "bigint" &&
+                second.result.positions instanceof Map &&
+                second.result.visited instanceof Set &&
+                typeof second.result.score === "bigint";
+            const valuesSurvive =
+                first.result.positions.get("alpha").x === 1 &&
+                first.result.positions.get("worker").x === 0 &&
+                first.result.visited.has("worker") &&
+                first.result.score === 41n &&
+                second.result.positions.get("gamma").y === 6 &&
+                second.result.positions.get("worker").x === 0 &&
+                second.result.visited.has("worker") &&
+                second.result.score === 102n;
+            const copiesStayIsolated =
+                firstModel.rooms.size === 1 &&
+                !firstModel.rooms.has("worker") &&
+                !firstModel.visited.has("worker") &&
+                first.result.positions.get("alpha") !== firstModel.rooms.get("alpha");
+            const oneWorkerHandledBoth = first.handled === 1 && second.handled === 2;
+            echo(
+                "PKG_LAYOUT_PROTOCOL_OK:" +
+                [cloneTypesSurvive, valuesSurvive, copiesStayIsolated, oneWorkerHandledBoth]
+                    .join(":"),
+            );
+        } catch (e) {
+            echo("PKG_LAYOUT_PROTOCOL_ERROR:" + (e?.message ?? String(e)));
+        } finally {
+            done();
+            worker.terminate();
+            echo("PKG_LAYOUT_WORKER_TERMINATED");
+        }
     "#;
     let mut package = make_package_declaring(
         "wbk",
@@ -1119,14 +1200,52 @@ async fn sandboxed_package_worker_loads_relative_package_modules() {
         PackageModuleSource {
             subpath: "workers/worker.ts".to_string(),
             text: r#"
-                import { reply } from "./reply.ts";
-                onmessage = (e: MessageEvent<string>) => postMessage(reply(e.data));
+                import { plan } from "./planner.ts";
+
+                let handled = 0;
+                onmessage = (e: MessageEvent) => {
+                    const { id, kind, model } = e.data;
+                    try {
+                        if (kind !== "plan") throw new Error(`unknown request: ${kind}`);
+                        handled += 1;
+                        postMessage({ id, ok: true, result: plan(model), handled });
+                    } catch (error) {
+                        postMessage({
+                            id,
+                            ok: false,
+                            error: error instanceof Error ? error.message : String(error),
+                        });
+                    }
+                };
             "#
             .to_string(),
         },
         PackageModuleSource {
-            subpath: "workers/reply.ts".to_string(),
-            text: "export const reply = (value: string): string => `pong:${value}`;\n".to_string(),
+            subpath: "workers/planner.ts".to_string(),
+            text: r#"
+                interface LayoutModel {
+                    rooms: Map<string, { x: number; y: number }>;
+                    visited: Set<string>;
+                    seed: bigint;
+                }
+
+                export function plan(model: LayoutModel) {
+                    if (!(model.rooms instanceof Map)) throw new Error("rooms lost Map type");
+                    if (!(model.visited instanceof Set)) throw new Error("visited lost Set type");
+                    if (typeof model.seed !== "bigint") throw new Error("seed lost bigint type");
+
+                    const positions = new Map(model.rooms);
+                    positions.set("worker", { x: Number(model.seed % 10n), y: model.rooms.size });
+                    const visited = new Set(model.visited);
+                    visited.add("worker");
+                    return {
+                        positions,
+                        visited,
+                        score: model.seed + BigInt(model.rooms.size),
+                    };
+                }
+            "#
+            .to_string(),
         },
     ]);
 
@@ -1140,11 +1259,12 @@ async fn sandboxed_package_worker_loads_relative_package_modules() {
     .await;
 
     assert!(
-        has_line(&lines, "PKG_WORKER_REPLY:pong:ping"),
-        "a sandboxed package worker loads its entry and relative dependency from the source snapshot; transcript:\n{lines:#?}"
+        has_line(&lines, "PKG_LAYOUT_PROTOCOL_OK:true:true:true:true"),
+        "a sandboxed package worker should clone layout values and serve two correlated requests from one persistent realm; transcript:\n{lines:#?}"
     );
     assert!(
-        !has_line(&lines, "PKG_WORKER_ERROR:"),
-        "no package worker load error; transcript:\n{lines:#?}"
+        !has_line(&lines, "PKG_LAYOUT_PROTOCOL_ERROR:")
+            && has_line(&lines, "PKG_LAYOUT_WORKER_TERMINATED"),
+        "the package worker should terminate explicitly without a protocol error; transcript:\n{lines:#?}"
     );
 }

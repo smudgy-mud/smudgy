@@ -1,10 +1,10 @@
 {
     "name": "auto-mapper",
-    "version": "0.3.5",
+    "version": "0.3.6",
     "description": "Follows your position from GMCP or MSDP room data and auto-draws durable local maps as you explore.",
-    "min_smudgy_version": "0.5.3",
+    "min_smudgy_version": "0.5.5",
     "dependencies": [
-        "smudgy://kapusniak/map-layout@^0.2.0"
+        "smudgy://kapusniak/map-layout@^0.2.1"
     ],
     "permissions": {
         "smudgy": {
@@ -12,7 +12,8 @@
             "mapper": ["write"],
             "automations": ["aliases"],
             "session": ["echo"],
-            "gmcp": ["send"]
+            "gmcp": ["send"],
+            "workers": ["spawn"]
         }
     }
 }

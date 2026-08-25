@@ -10,6 +10,7 @@ import {
   type LayoutResident,
   type LayoutTraceEvent,
 } from "./layout.ts";
+import { planLayoutModelInWorker } from "./worker-client.ts";
 
 export type LayoutRoomKey = string | number;
 export type ElevationPreference = "auto" | "levels" | "projected";
@@ -678,10 +679,20 @@ export function planLayoutModel(
   return planLayoutModelOnce(input, change, options);
 }
 
+/** Plan one change in map-layout's shared background Worker. */
+export function planLayoutModelAsync(
+  input: LayoutModel,
+  change: LayoutChange,
+  options: PlanLayoutOptions = {},
+): Promise<PlannedLayout> {
+  return planLayoutModelInWorker(input, change, options);
+}
+
 /** Optional retained-snapshot API for consumers which map continuously. */
 export class LayoutWorkspace {
   #model: LayoutModel;
   #pending = new WeakSet<PlannedLayout>();
+  #generation = 0;
 
   constructor(model: LayoutModel) {
     this.#model = createLayoutModel(model);
@@ -697,12 +708,26 @@ export class LayoutWorkspace {
     return result;
   }
 
+  async planAsync(
+    change: LayoutChange,
+    options?: PlanLayoutOptions,
+  ): Promise<PlannedLayout> {
+    const generation = this.#generation;
+    const result = await planLayoutModelAsync(this.#model, change, options);
+    if (generation !== this.#generation) {
+      throw new Error("layout workspace changed while Worker planning was in progress");
+    }
+    this.#pending.add(result);
+    return result;
+  }
+
   accept(result: PlannedLayout): void {
     if (!this.#pending.has(result)) {
       throw new Error("cannot accept a layout planned from a different snapshot");
     }
     this.#model = result.after;
     this.#pending = new WeakSet();
+    this.#generation += 1;
   }
 }
 
