@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_widgets"
-version = "0.5.7-ptb"
+version = "0.5.7-ptb2"
 edition = "2024"
 
 [dependencies]
