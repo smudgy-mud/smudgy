@@ -90,6 +90,20 @@ fn splice_style_at(line: &StyledLine, position: usize) -> Style {
 }
 
 impl LineOperation {
+    /// Whether applying this operation leaves all text before `boundary` byte-for-byte in
+    /// place. Style-only edits keep source offsets stable; text edits are safe only when
+    /// their splice begins at or after the boundary.
+    #[must_use]
+    pub(crate) fn preserves_text_before(&self, boundary: usize) -> bool {
+        match self {
+            Self::Highlight { .. } => true,
+            Self::Insert { begin, .. }
+            | Self::Replace { begin, .. }
+            | Self::Remove { begin, .. }
+            | Self::Splice { begin, .. } => *begin >= boundary,
+        }
+    }
+
     #[must_use]
     pub fn apply(&self, line: &Arc<StyledLine>) -> Arc<StyledLine> {
         match self {
