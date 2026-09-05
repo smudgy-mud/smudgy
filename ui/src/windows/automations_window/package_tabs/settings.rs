@@ -1,6 +1,5 @@
 //! Settings-tab activation scope and runtime parameter controls.
 
-use super::super::editors::activation_profile_label;
 use super::super::packages::{ProfileChoice, is_secret_string, secret_field_row};
 use super::super::param_values::{self, ParamTarget};
 use super::*;
@@ -90,11 +89,7 @@ impl AutomationsWindow {
                 .iter()
                 .map(|profile| ProfileChoice {
                     key: profile.clone(),
-                    label: activation_profile_label(
-                        profile,
-                        &self.profile_names,
-                        &self.profile_captions,
-                    ),
+                    label: profile.clone(),
                 })
                 .collect::<Vec<_>>();
             let selected_profile = profile_choices
@@ -114,18 +109,13 @@ impl AutomationsWindow {
                 .align_y(Vertical::Center),
             );
             if self.confirm_global_parameter_source {
-                let source_label = activation_profile_label(
-                    &self.parameter_profile,
-                    &self.profile_names,
-                    &self.profile_captions,
-                );
                 control = control.push(
                     container(
                         column![
                             text(crate::i18n::t!("package-global-source-needed")).size(12.0),
                             text(crate::i18n::t!(
                                 "package-global-source-selected",
-                                "profile" => &source_label
+                                "profile" => &self.parameter_profile
                             ))
                             .size(12.0)
                             .style(common::muted),
@@ -189,15 +179,10 @@ impl AutomationsWindow {
                 }
                 for (profile, missing) in problems {
                     let selected = profile == &self.parameter_profile;
-                    let profile_label = activation_profile_label(
-                        profile,
-                        &self.profile_names,
-                        &self.profile_captions,
-                    );
                     control = control.push(
                         button(
                             row![
-                                text(profile_label).size(12.0).width(Length::Fill),
+                                text(profile.clone()).size(12.0).width(Length::Fill),
                                 text(crate::i18n::t!(
                                     "package-parameter-missing",
                                     "params" => missing.join(", ")
