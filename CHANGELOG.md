@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Less work per line on the way in.** Color and attribute escape sequences are
+  parsed without allocating, a prompt row glued to the text that completes it no
+  longer copies the row on either side, regex triggers no longer allocate working
+  memory for every line they rule out, and `buffer.line(n)` reads back exactly
+  the row the terminal shows, joining a prompt to what followed it only when a
+  script asks.
 - **Disconnect notices report the connection time.** A dropped or closed
   connection now reads `Connection lost after 01:23:46.1234` or
   `Disconnected after 01:23:46.1234`. The clock is the session's own: it runs

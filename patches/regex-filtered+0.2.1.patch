@@ -1,0 +1,218 @@
+diff --git a/src/int_set.rs b/src/int_set.rs
+index 7153d65..f96518b 100644
+--- a/src/int_set.rs
++++ b/src/int_set.rs
+@@ -1,14 +1,21 @@
++#[derive(Debug, Default)]
+ pub struct IntSet {
+     sparse: Vec<usize>,
+     dense: Vec<usize>,
+ }
+ 
+ impl IntSet {
+-    pub fn new(capacity: usize) -> Self {
+-        Self {
+-            sparse: vec![usize::MAX; capacity],
+-            dense: Vec::with_capacity(capacity),
++    /// Empty the set and size it for values in `0..capacity`, keeping
++    /// the existing buffers when they already fit. Stale `sparse`
++    /// slots are harmless: `insert` trusts a slot only when `dense`
++    /// confirms it, and `dense` is cleared here.
++    pub fn reset(&mut self, capacity: usize) {
++        if self.sparse.len() < capacity {
++            self.sparse.clear();
++            self.sparse.resize(capacity, usize::MAX);
++            self.dense.reserve(capacity);
+         }
++        self.dense.clear();
+     }
+ 
+     pub fn insert(&mut self, value: usize) -> bool {
+diff --git a/src/lib.rs b/src/lib.rs
+index 5e7905e..aea795b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2,6 +2,8 @@
+ #![deny(unsafe_code)]
+ #![warn(missing_docs)]
+ 
++use std::sync::{Mutex, PoisonError};
++
+ use aho_corasick::AhoCorasick;
+ 
+ mod int_set;
+@@ -249,6 +251,7 @@ impl Builder {
+             regexes,
+             mapper,
+             prefilter,
++            scratch: Mutex::default(),
+         })
+     }
+ }
+@@ -265,6 +268,11 @@ pub struct Regexes {
+     regexes: Vec<regex::Regex>,
+     mapper: mapper::Mapper,
+     prefilter: AhoCorasick,
++    /// Working memory for the mapper plus the candidate list it fills,
++    /// reused across calls so a haystack that no regex could match is
++    /// checked without allocating. Sharing through a lock keeps the
++    /// set `Sync`; the lock is uncontended in single-threaded use.
++    scratch: Mutex<(mapper::Scratch, Vec<usize>)>,
+ }
+ 
+ impl Regexes {
+@@ -281,9 +289,21 @@ impl Regexes {
+             .map(|m| m.pattern().as_usize())
+     }
+ 
++    /// The indices of the regexes the prefilter cannot rule out for
++    /// `haystack`, ascending. Allocates only when there are some: the
++    /// common no-candidate outcome hands back an empty iterator.
+     #[inline]
+     fn prefiltered(&self, haystack: &str) -> impl Iterator<Item = usize> + use<> {
+-        self.mapper.atom_to_re(self.prefilter(haystack)).into_iter()
++        let mut guard = self.scratch.lock().unwrap_or_else(PoisonError::into_inner);
++        let (scratch, candidates) = &mut *guard;
++        self.mapper
++            .atom_to_re_into(self.prefilter(haystack), scratch, candidates);
++        if candidates.is_empty() {
++            Vec::new()
++        } else {
++            candidates.clone()
++        }
++        .into_iter()
+     }
+ 
+     /// Returns *whether* any regex in the set matches the haystack.
+diff --git a/src/mapper.rs b/src/mapper.rs
+index 1324481..1b9ea17 100644
+--- a/src/mapper.rs
++++ b/src/mapper.rs
+@@ -183,11 +183,15 @@ impl Builder {
+ impl Display for Mapper {
+     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+         writeln!(f, "#Unique Atoms: {}", self.atom_to_entry.len())?;
++        let mut scratch = Scratch::new();
++        let mut regexps = Vec::new();
+         for (i, e) in self.atom_to_entry.iter().copied().enumerate() {
+             writeln!(f, "\tatom {i} -> entry {e}")?;
+-            let mut s = IntSet::new(self.entries.len());
+-            s.insert(e);
+-            for r in self.propagate_match(&mut s) {
++            scratch.reset(self.entries.len());
++            scratch.work.insert(e);
++            regexps.clear();
++            self.propagate_match(&mut scratch, &mut regexps);
++            for r in &regexps {
+                 writeln!(f, "\t\tregex {r}")?;
+             }
+         }
+@@ -244,24 +248,66 @@ pub struct Mapper {
+     /// Atom index to entry id mapping
+     atom_to_entry: Vec<usize>,
+ }
++/// Working memory for [`Mapper::atom_to_re_into`], sized by the mapper's
++/// entry count on first use and reused across calls so that matching a
++/// haystack allocates nothing. Every call clears it before use, so one
++/// instance can serve any number of mappers.
++#[derive(Debug, Default)]
++pub struct Scratch {
++    /// Entries triggered so far, in trigger order (the propagation
++    /// work list).
++    work: IntSet,
++    /// Per-entry count of triggered children, for AND nodes that
++    /// fire only once all their children have.
++    count: Vec<usize>,
++}
++
++impl Scratch {
++    /// An empty scratch; it grows to fit on first use.
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    fn reset(&mut self, entries: usize) {
++        self.work.reset(entries);
++        self.count.clear();
++        self.count.resize(entries, 0);
++    }
++}
++
+ impl Mapper {
+     // name is shit and also needs to see if we can generate stuff on the fly
+     pub fn atom_to_re(&self, atoms: impl IntoIterator<Item = usize>) -> Vec<usize> {
+-        let mut matched_atom_ids = IntSet::new(self.entries.len());
+-        matched_atom_ids.extend(atoms.into_iter().map(|idx| self.atom_to_entry[idx]));
++        let mut regexps = Vec::new();
++        self.atom_to_re_into(atoms, &mut Scratch::new(), &mut regexps);
++        regexps
++    }
+ 
+-        let mut regexps = self.propagate_match(&mut matched_atom_ids);
++    /// [`Mapper::atom_to_re`] writing into `regexps` (cleared first) and
++    /// working in `scratch`, so a caller that keeps both around matches
++    /// without allocating. The result is sorted ascending.
++    pub fn atom_to_re_into(
++        &self,
++        atoms: impl IntoIterator<Item = usize>,
++        scratch: &mut Scratch,
++        regexps: &mut Vec<usize>,
++    ) {
++        scratch.reset(self.entries.len());
++        scratch
++            .work
++            .extend(atoms.into_iter().map(|idx| self.atom_to_entry[idx]));
++
++        regexps.clear();
++        regexps.reserve(self.regexp_count);
++        self.propagate_match(scratch, regexps);
+ 
+         regexps.extend(&self.unfiltered);
+ 
+         regexps.sort_unstable();
+-        regexps
+     }
+ 
+-    fn propagate_match(&self, work: &mut IntSet) -> Vec<usize> {
+-        let mut count = vec![0; self.entries.len()];
+-
+-        let mut regexps = Vec::with_capacity(self.regexp_count);
++    fn propagate_match(&self, scratch: &mut Scratch, regexps: &mut Vec<usize>) {
++        let Scratch { work, count } = scratch;
+ 
+         let mut i = 0;
+         while i < work.len() {
+@@ -285,8 +331,6 @@ impl Mapper {
+                 work.insert(j);
+             }
+         }
+-
+-        regexps
+     }
+ }
+ 
+@@ -330,12 +374,18 @@ mod test {
+ 
+         assert_eq!(m.entries.len(), 3);
+         assert_eq!(&m.atom_to_entry, &[0, 1]);
+-        let mut s = IntSet::new(3);
+-        s.insert(0);
+-        assert_eq!(m.propagate_match(&mut s), vec![0]);
+-        let mut s = IntSet::new(3);
+-        s.insert(1);
+-        assert_eq!(m.propagate_match(&mut s), vec![0]);
++        // One scratch serves both calls: reset clears the previous work.
++        let mut scratch = Scratch::new();
++        let mut regexps = Vec::new();
++        scratch.reset(3);
++        scratch.work.insert(0);
++        m.propagate_match(&mut scratch, &mut regexps);
++        assert_eq!(regexps, vec![0]);
++        regexps.clear();
++        scratch.reset(3);
++        scratch.work.insert(1);
++        m.propagate_match(&mut scratch, &mut regexps);
++        assert_eq!(regexps, vec![0]);
+     }
+ 
+     #[test]
