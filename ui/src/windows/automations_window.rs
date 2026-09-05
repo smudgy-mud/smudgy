@@ -940,9 +940,6 @@ pub struct AutomationsWindow {
     /// False when the profile directory could not be read as one complete inventory. Per-profile
     /// edits stay disabled in that state so a partial list cannot erase hidden profile keys.
     pub(super) profile_inventory_complete: bool,
-    /// Display captions keyed by the stable profile directory name. Activation persists the key
-    /// but labels the checklist with the user-facing caption.
-    pub(super) profile_captions: HashMap<String, String>,
     pub(super) parameter_profile: String,
     /// Window-local fence for authenticated reads, including nickname changes that retain the
     /// same session credential.
@@ -1318,23 +1315,16 @@ fn catalogue_stream(session_id: SessionId) -> impl iced::futures::Stream<Item = 
 }
 
 impl AutomationsWindow {
-    fn load_profile_choices(
-        server_name: &str,
-    ) -> Result<(Vec<String>, HashMap<String, String>), String> {
-        let mut profiles = smudgy_core::models::profile::list_profiles_strict(server_name)
-            .map_err(|error| error.to_string())?;
-        profiles.sort_by(|left, right| {
-            left.config
-                .caption
-                .cmp(&right.config.caption)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        let captions = profiles
-            .iter()
-            .map(|profile| (profile.name.clone(), profile.config.caption.clone()))
-            .collect();
-        let names = profiles.into_iter().map(|profile| profile.name).collect();
-        Ok((names, captions))
+    /// Profile directory names for the server, sorted by name. Every profile control in this
+    /// window labels a profile by this name; the profile caption is a Connect-dialog detail.
+    fn load_profile_choices(server_name: &str) -> Result<Vec<String>, String> {
+        let mut names = smudgy_core::models::profile::list_profiles_strict(server_name)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok(names)
     }
 
     #[cfg(test)]
@@ -1344,7 +1334,7 @@ impl AutomationsWindow {
         cloud: CloudHandles,
         session_id: SessionId,
     ) -> Self {
-        let (profile_names, _) = Self::load_profile_choices(&server_name).unwrap_or_default();
+        let profile_names = Self::load_profile_choices(&server_name).unwrap_or_default();
         let profile_name = profile_names.first().cloned().unwrap_or_default();
         Self::new_for_profile(window_id, server_name, cloud, session_id, profile_name)
     }
@@ -1363,10 +1353,9 @@ impl AutomationsWindow {
             smudgy_core::models::settings::load_settings().advanced_scripting_features;
         let profile_choices = Self::load_profile_choices(&server_name);
         let mut profile_inventory_complete = profile_choices.is_ok();
-        let (mut profile_names, mut profile_captions) = profile_choices.unwrap_or_default();
+        let mut profile_names = profile_choices.unwrap_or_default();
         if profile_names.is_empty() && !profile_name.is_empty() {
             profile_names.push(profile_name.clone());
-            profile_captions.insert(profile_name.clone(), profile_name.clone());
             profile_inventory_complete = false;
         }
         Self {
@@ -1382,7 +1371,6 @@ impl AutomationsWindow {
             copy_settings_prompt: None,
             profile_names,
             profile_inventory_complete,
-            profile_captions,
             mud_host,
             advanced_features,
             scripts: BTreeMap::new(),
