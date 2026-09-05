@@ -24,6 +24,7 @@ pub mod gmcp;
 pub mod inflow;
 pub mod msdp;
 pub mod mssp;
+pub mod plain_run;
 pub mod responders;
 pub mod telnet;
 pub mod transcode;
@@ -40,6 +41,7 @@ mod ingest {
     use vtparse::VTParser;
 
     use super::super::runtime::RuntimeAction;
+    use super::plain_run::{Utf8Trust, printable_run};
     use super::responders::{self, ProtocolState};
     use super::transcode::Transcode;
     use super::vt_processor::VtProcessor;
@@ -73,30 +75,61 @@ mod ingest {
         pub transcode: &'a mut Transcode,
     }
 
-    /// Feed one run of UTF-8 application bytes through the VT parser and the raw-capture
-    /// path. Free-standing so `on_data` can call it with a slice borrowed from the
-    /// transcode buffer (a disjoint field) without aliasing `&mut self` — and so the
-    /// connect loop's teardown can feed the decoder's end-of-stream flush.
+    /// Feed one run of UTF-8 application bytes straight off the wire through the VT parser
+    /// and the raw-capture path. Free-standing so `on_data` can call it without aliasing
+    /// `&mut self`.
     pub fn feed_utf8(vt_parser: &mut VTParser, vt_processor: &mut VtProcessor, data: &[u8]) {
-        // The capture decision is hoisted out of the byte loop. The trigger
-        // manager flips the underlying flag from the session thread while
-        // this runs on the socket runtime, but `capture_raw` can only FALL
-        // mid-run (rises latch at batch boundaries, between runs), and a
-        // fall is safe under either branch: the per-byte push re-checks it,
-        // and a fallen line commits with its raw form absent, never torn.
-        if vt_processor.capture_raw() {
-            for &b in data {
-                // CR/LF drive line breaks in the VT parser but are kept out
-                // of `StyledLine::raw`.
-                if b != b'\n' && b != b'\r' {
-                    vt_processor.push_raw_incoming_byte(b);
+        feed(vt_parser, vt_processor, data, Utf8Trust::Unverified);
+    }
+
+    /// [`feed_utf8`] for text the transcoder decoded: valid UTF-8 by construction, so bulk
+    /// runs skip validation. Takes `&str` so that promise is the type's, not the caller's.
+    pub fn feed_str(vt_parser: &mut VTParser, vt_processor: &mut VtProcessor, text: &str) {
+        feed(
+            vt_parser,
+            vt_processor,
+            text.as_bytes(),
+            Utf8Trust::Verified,
+        );
+    }
+
+    /// The byte loop. Whenever the parser is in Ground, the leading run it would only print
+    /// (see [`plain_run`](super::plain_run)) is handed over whole — one raw-capture append,
+    /// one `push_str` — and only the byte that ends a run goes through the state machine,
+    /// one byte at a time until the parser is back in Ground.
+    ///
+    /// Raw capture follows `capture_raw`, which the processor changes only at line and batch
+    /// boundaries (a fall applies at the next line, a rise at the next batch), so a line's raw
+    /// form is complete-or-absent whichever path its bytes took.
+    fn feed(
+        vt_parser: &mut VTParser,
+        vt_processor: &mut VtProcessor,
+        data: &[u8],
+        trust: Utf8Trust,
+    ) {
+        let mut rest = data;
+        while let Some((&byte, tail)) = rest.split_first() {
+            if vt_parser.is_ground() {
+                // Verified text stays on a character boundary here: the parser leaves its
+                // UTF-8 state exactly at the end of a code point, never inside one.
+                debug_assert!(
+                    trust == Utf8Trust::Unverified || !(0x80..=0xBF).contains(&byte),
+                    "verified text fed from inside a UTF-8 sequence"
+                );
+                let run = printable_run(rest, trust);
+                if !run.is_empty() {
+                    vt_processor.push_raw_incoming_run(run);
+                    vt_processor.print_run(run);
+                    rest = &rest[run.len()..];
+                    continue;
                 }
-                vt_parser.parse_byte(b, vt_processor);
             }
-        } else {
-            for &b in data {
-                vt_parser.parse_byte(b, vt_processor);
+            // CR/LF drive line breaks in the VT parser but are kept out of `StyledLine::raw`.
+            if byte != b'\n' && byte != b'\r' {
+                vt_processor.push_raw_incoming_byte(byte);
             }
+            vt_parser.parse_byte(byte, vt_processor);
+            rest = tail;
         }
     }
 
@@ -164,7 +197,7 @@ mod ingest {
                 // Decode to UTF-8 first; `StyledLine::raw` and raw-pattern triggers
                 // therefore see decoded text, not wire bytes.
                 let utf8 = self.transcode.decode(data);
-                feed_utf8(self.vt_parser, self.vt_processor, utf8.as_bytes());
+                feed_str(self.vt_parser, self.vt_processor, utf8);
             }
         }
 
@@ -1833,6 +1866,146 @@ mod tests {
             ),
             runtime_rx,
         )
+    }
+
+    /// The pre-bulk-path byte loop, kept as the reference the Ground-state fast path must
+    /// match action for action.
+    fn feed_bytewise(parser: &mut VTParser, processor: &mut VtProcessor, data: &[u8]) {
+        for &b in data {
+            if b != b'\n' && b != b'\r' {
+                processor.push_raw_incoming_byte(b);
+            }
+            parser.parse_byte(b, processor);
+        }
+    }
+
+    /// Everything line-shaped the processor emitted, rendered so two feeders compare whole:
+    /// text, spans, links, and raw alike.
+    fn line_transcript(rx: &mut tokio_mpsc::UnboundedReceiver<RuntimeAction>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(action) = rx.try_recv() {
+            match action {
+                RuntimeAction::HandleIncomingLine(line) => out.push(format!("line {line:?}")),
+                RuntimeAction::HandleIncomingFragmentedLine {
+                    line,
+                    completion_fragment,
+                } => out.push(format!("fragmented {line:?} + {completion_fragment:?}")),
+                RuntimeAction::HandleIncomingPartialLine(line) => {
+                    out.push(format!("partial {line:?}"));
+                }
+                RuntimeAction::RetractIncomingPartialLine => out.push("retract".into()),
+                RuntimeAction::PromptBoundary => out.push("prompt".into()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Wire shapes that exercise every edge the bulk path has: SGR, overprint, multibyte
+    /// text, encoded C1 controls (`C2 9B` is CSI), invalid and truncated UTF-8, DEL and other
+    /// C0 controls, OSC 8 links with and without deceptive invisibles, and a run long enough
+    /// to span many scanner words.
+    fn fast_path_cases() -> Vec<Vec<u8>> {
+        let mut cases: Vec<Vec<u8>> = vec![
+            b"plain ascii line\n".to_vec(),
+            b"\x1b[31mred\x1b[0m and \x1b[1;32mbold green\x1b[0m\n".to_vec(),
+            b"\x1b[31mold\rnew\n".to_vec(),
+            "h\u{e9}llo w\u{f6}rld \u{2014} \u{2713} \u{4f60}\u{597d} \u{1f642}\n".into(),
+            "latin-1 range \u{a0}\u{bf}\u{c0}\u{ff}\n".into(),
+            "C1 NEL\u{85}after\n".into(),
+            "C1 CSI \u{9b}31mred\u{9b}0m plain\n".into(),
+            b"invalid \xff\xfe bytes\n".to_vec(),
+            b"overlong \xc0\x80 surrogate \xed\xa0\x80 lead \xf5 tail\n".to_vec(),
+            b"lone continuation \x80\xbf x\n".to_vec(),
+            b"truncated tail \xe4\xbd".to_vec(),
+            b"del\x7fbel\x07tab\tfeed\x0cnul\x00end\n".to_vec(),
+            b"\x1b]8;;http://example.com/\x1b\\link\x1b]8;;\x1b\\ after\n".to_vec(),
+            "\x1b]8;;http://example.com/\x1b\\li\u{200b}nk \u{ad}x\x1b]8;;\x1b\\\n".into(),
+            "\x1b]8;;http://example.com/\u{fc}\x1b\\\u{fc}\x1b]8;;\x1b\\\n".into(),
+            b"no newline at all".to_vec(),
+            b"\r\n\r\n".to_vec(),
+            b"\x1b[2J\x1b[H\x1b(B\x1bM x\n".to_vec(),
+            b"prompt> ".to_vec(),
+        ];
+        let mut long = vec![b'x'; 1000];
+        long[500] = 0x1b;
+        long.extend_from_slice(b"[1mrest\n");
+        cases.push(long);
+        let everything = cases.concat();
+        cases.push(everything);
+        cases
+    }
+
+    #[test]
+    fn bulk_path_matches_the_bytewise_loop_at_every_chunking() {
+        for (case_index, case) in fast_path_cases().iter().enumerate() {
+            for chunk_len in [1, 2, 3, 5, 7, 8, 9, 13, 16, 64, usize::MAX] {
+                for flush_between_chunks in [false, true] {
+                    let (fast_tx, mut fast_rx) = tokio_mpsc::unbounded_channel();
+                    let (reference_tx, mut reference_rx) = tokio_mpsc::unbounded_channel();
+                    let mut fast = (VTParser::new(), VtProcessor::new(fast_tx));
+                    let mut reference = (VTParser::new(), VtProcessor::new(reference_tx));
+                    for chunk in case.chunks(chunk_len.min(case.len()).max(1)) {
+                        ingest::feed_utf8(&mut fast.0, &mut fast.1, chunk);
+                        feed_bytewise(&mut reference.0, &mut reference.1, chunk);
+                        if flush_between_chunks {
+                            fast.1.notify_end_of_buffer();
+                            reference.1.notify_end_of_buffer();
+                        }
+                    }
+                    fast.1.notify_end_of_buffer();
+                    reference.1.notify_end_of_buffer();
+                    assert_eq!(
+                        line_transcript(&mut fast_rx),
+                        line_transcript(&mut reference_rx),
+                        "case {case_index}, chunk {chunk_len}, flush {flush_between_chunks}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcoded_text_matches_the_bytewise_loop_and_keeps_c1_controls_visible() {
+        // ISO-8859-15: 0xE9 decodes to a printable, 0x85 to U+0085 (NEL), which the parser
+        // must still see as a control even though the text arrives pre-validated.
+        let mut transcode = transcode::Transcode::new(encoding_rs::ISO_8859_15);
+        let decoded = transcode
+            .decode(b"caf\xe9\x85\x1b[31mx\x1b[0m\n plain\n")
+            .to_owned();
+        assert!(decoded.contains("caf\u{e9}\u{85}"));
+
+        let (fast_tx, mut fast_rx) = tokio_mpsc::unbounded_channel();
+        let (reference_tx, mut reference_rx) = tokio_mpsc::unbounded_channel();
+        let mut fast = (VTParser::new(), VtProcessor::new(fast_tx));
+        let mut reference = (VTParser::new(), VtProcessor::new(reference_tx));
+        ingest::feed_str(&mut fast.0, &mut fast.1, &decoded);
+        feed_bytewise(&mut reference.0, &mut reference.1, decoded.as_bytes());
+        let fast_lines = line_transcript(&mut fast_rx);
+        assert_eq!(fast_lines, line_transcript(&mut reference_rx));
+        assert!(fast_lines[0].contains("caf\u{e9}x"), "{fast_lines:?}");
+    }
+
+    #[test]
+    fn raw_capture_skips_revalidation_only_for_verified_bytes() {
+        let (tx, mut rx) = tokio_mpsc::unbounded_channel();
+        let mut parser = VTParser::new();
+        let mut processor = VtProcessor::new(tx);
+        ingest::feed_utf8(&mut parser, &mut processor, "h\u{e9}llo\n".as_bytes());
+        ingest::feed_utf8(&mut parser, &mut processor, b"h\xffi\n");
+        ingest::feed_utf8(&mut parser, &mut processor, b"back to ascii\n");
+        let mut lines = Vec::new();
+        while let Ok(action) = rx.try_recv() {
+            if let RuntimeAction::HandleIncomingLine(line) = action {
+                lines.push(line);
+            }
+        }
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].raw(), Some("h\u{e9}llo"));
+        // The per-byte path pushed a high byte: the lossy re-decode applies, as it always has.
+        assert_eq!(lines[1].raw(), Some("h\u{fffd}i"));
+        // The doubt does not outlive the line that raised it.
+        assert_eq!(lines[2].raw(), Some("back to ascii"));
     }
 
     #[test]

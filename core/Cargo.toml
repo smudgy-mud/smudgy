@@ -26,6 +26,10 @@ aho-corasick = { workspace = true }
 # SIMD byte search for the telnet preprocessor's IAC scan (the inbound hot path). Already in the
 # tree transitively via regex/aho-corasick, so this pins no new download.
 memchr = "2"
+# UTF-8 validation for the Ground-state bulk ingest path (`connection::plain_run`): a run
+# with high bytes is checked with SIMD before it is printed whole. Already in the tree
+# transitively, so this pins no new download.
+simdutf8 = "0.1"
 # Charset transcoding for non-UTF-8 MUDs (docs/telnet.md): the WHATWG
 # Encoding Standard label set behind streaming decoders/encoders that carry partial multibyte
 # sequences across socket reads. UTF-8 connections bypass it entirely.

@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Incoming text is ingested in bulk.** Ordinary text between color codes is copied
+  whole instead of parsed one byte at a time, so bursts such as decompressed map dumps
+  and raw-pattern trigger capture cost noticeably less. What triggers and the display
+  see is unchanged.
 - **A selected-profile item is off everywhere in an older smudgy.** Activation is
   stored beside the old `enabled` flag, which is written true only for "every
   profile", so a build without profile scoping fails closed instead of running an

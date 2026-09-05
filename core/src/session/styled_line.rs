@@ -932,6 +932,18 @@ impl StyledLine {
         }
     }
 
+    /// [`Self::new_with_raw`] for raw text already known to be UTF-8: a plain copy, no lossy
+    /// re-decode.
+    #[must_use]
+    pub fn new_with_raw_text(text: &str, span_info: Vec<VtSpan>, raw: Option<&str>) -> Self {
+        Self {
+            text: String::from(text),
+            spans: span_info,
+            links: Vec::new(),
+            raw: raw.map(String::from),
+        }
+    }
+
     #[must_use]
     pub fn append(&self, other_line: &StyledLine) -> Self {
         Self {
