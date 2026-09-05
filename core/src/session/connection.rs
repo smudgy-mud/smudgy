@@ -41,7 +41,7 @@ mod ingest {
     use vtparse::VTParser;
 
     use super::super::runtime::RuntimeAction;
-    use super::plain_run::{Utf8Trust, printable_run};
+    use super::plain_run::PlainRuns;
     use super::responders::{self, ProtocolState};
     use super::transcode::Transcode;
     use super::vt_processor::VtProcessor;
@@ -79,18 +79,13 @@ mod ingest {
     /// and the raw-capture path. Free-standing so `on_data` can call it without aliasing
     /// `&mut self`.
     pub fn feed_utf8(vt_parser: &mut VTParser, vt_processor: &mut VtProcessor, data: &[u8]) {
-        feed(vt_parser, vt_processor, data, Utf8Trust::Unverified);
+        feed(vt_parser, vt_processor, PlainRuns::new(data));
     }
 
     /// [`feed_utf8`] for text the transcoder decoded: valid UTF-8 by construction, so bulk
     /// runs skip validation. Takes `&str` so that promise is the type's, not the caller's.
     pub fn feed_str(vt_parser: &mut VTParser, vt_processor: &mut VtProcessor, text: &str) {
-        feed(
-            vt_parser,
-            vt_processor,
-            text.as_bytes(),
-            Utf8Trust::Verified,
-        );
+        feed(vt_parser, vt_processor, PlainRuns::from_text(text));
     }
 
     /// The byte loop. Whenever the parser is in Ground, the leading run it would only print
@@ -101,35 +96,29 @@ mod ingest {
     /// Raw capture follows `capture_raw`, which the processor changes only at line and batch
     /// boundaries (a fall applies at the next line, a rise at the next batch), so a line's raw
     /// form is complete-or-absent whichever path its bytes took.
-    fn feed(
-        vt_parser: &mut VTParser,
-        vt_processor: &mut VtProcessor,
-        data: &[u8],
-        trust: Utf8Trust,
-    ) {
-        let mut rest = data;
-        while let Some((&byte, tail)) = rest.split_first() {
+    fn feed(vt_parser: &mut VTParser, vt_processor: &mut VtProcessor, mut runs: PlainRuns<'_>) {
+        let data = runs.bytes();
+        let mut offset = 0;
+        while offset < data.len() {
             if vt_parser.is_ground() {
-                // Verified text stays on a character boundary here: the parser leaves its
-                // UTF-8 state exactly at the end of a code point, never inside one.
-                debug_assert!(
-                    trust == Utf8Trust::Unverified || !(0x80..=0xBF).contains(&byte),
-                    "verified text fed from inside a UTF-8 sequence"
-                );
-                let run = printable_run(rest, trust);
+                let run = runs.at(offset);
                 if !run.is_empty() {
                     vt_processor.push_raw_incoming_run(run);
                     vt_processor.print_run(run);
-                    rest = &rest[run.len()..];
-                    continue;
+                    offset += run.len();
+                    if offset == data.len() {
+                        break;
+                    }
                 }
             }
+            // Consume the known stopping byte immediately, without another empty run scan.
+            let byte = data[offset];
             // CR/LF drive line breaks in the VT parser but are kept out of `StyledLine::raw`.
             if byte != b'\n' && byte != b'\r' {
                 vt_processor.push_raw_incoming_byte(byte);
             }
             vt_parser.parse_byte(byte, vt_processor);
-            rest = tail;
+            offset += 1;
         }
     }
 
@@ -2006,6 +1995,36 @@ mod tests {
         assert_eq!(lines[1].raw(), Some("h\u{fffd}i"));
         // The doubt does not outlive the line that raised it.
         assert_eq!(lines[2].raw(), Some("back to ascii"));
+    }
+
+    #[test]
+    fn bulk_fallback_matches_bytewise_on_large_adversarial_inputs() {
+        for seed in [
+            &b"\xfe"[..],
+            &b"x\xfe"[..],
+            &b"\xc2\x85"[..],
+            &b"x\xc2\x85"[..],
+        ] {
+            let mut data = seed.repeat(65_536 / seed.len());
+            data.extend_from_slice(b"\nrecovered\n");
+            for raw in [false, true] {
+                let (fast_tx, mut fast_rx) = tokio_mpsc::unbounded_channel();
+                let (reference_tx, mut reference_rx) = tokio_mpsc::unbounded_channel();
+                let mut fast = (VTParser::new(), VtProcessor::new(fast_tx));
+                let mut reference = (VTParser::new(), VtProcessor::new(reference_tx));
+                let flag = Arc::new(std::sync::atomic::AtomicBool::new(raw));
+                fast.1.set_raw_wanted_flag(flag.clone());
+                reference.1.set_raw_wanted_flag(flag);
+                for chunk in data.chunks(16_384) {
+                    ingest::feed_utf8(&mut fast.0, &mut fast.1, chunk);
+                    feed_bytewise(&mut reference.0, &mut reference.1, chunk);
+                }
+                assert_eq!(
+                    line_transcript(&mut fast_rx),
+                    line_transcript(&mut reference_rx)
+                );
+            }
+        }
     }
 
     #[test]

@@ -988,7 +988,7 @@ impl VtProcessor {
         self.close_link_range(true);
         let spans = self.span_info.drain(..).collect();
         let mut line = if self.capture_raw {
-            StyledLine::new_with_raw_text(&self.buf, spans, Some(&self.raw_text()))
+            StyledLine::new_with_raw_text(&self.buf, spans, Some(self.raw_text()))
         } else {
             StyledLine::new(&self.buf, spans)
         };

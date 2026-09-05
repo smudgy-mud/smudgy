@@ -160,6 +160,43 @@ The JS-driven suites are pinned to the **public scripting surface** (handles,
 `line.*`, `echo`), never op names or signatures, precisely so the identical
 bench runs unchanged on both sides of an op-layer rework.
 
+## Ingest diagnostics
+
+`ingest_scaling` in the `ingest` suite measures 1–64 KiB application buffers
+containing plain text, Unicode, malformed UTF-8, and encoded C1 controls,
+with raw capture on and off. The complete buffer is fed at once so read
+chunking cannot conceal repeated suffix scanning.
+
+The standalone driver adds configurable read/batch sizes and a consumer
+thread that receives, observes, and drops real runtime actions:
+
+```powershell
+cargo run -p smudgy_bench --release --example ingest_diagnostic -- `
+  --case heavy --mode concurrent --raw off --lines 30000 --passes 20 `
+  --read 16384 --batch 524288
+cargo run -p smudgy_bench --release --example ingest_diagnostic -- --help
+```
+
+Compare `--mode queued` with `--mode concurrent`, and both raw modes.
+The driver reports JSON lines with total time, producer time, remaining
+drain/wait time, and output counts after two warmup passes. Producer time
+already overlaps the consumer in concurrent mode. This isolates channel
+contention and object lifetime; it does not run scripts, render, or perform
+socket I/O. `--layer vt` excludes telnet decoding from the timed pass.
+
+Use a **separate build** with `--features ingest-allocations` for whole-process
+allocation counts. Its atomic counters perturb timing, particularly with a
+concurrent consumer. Do not compare its wall time with the normal build.
+For allocation counts confined to SGR interpretation:
+
+```powershell
+cargo run -p smudgy_bench --release --example sgr_allocations
+```
+
+Keep timings and profiler output outside the public repository. Build both
+revisions before measuring, alternate their executables in balanced blocks,
+and compare output counts as well as times.
+
 ## Suite map
 
 Matching & dispatch:

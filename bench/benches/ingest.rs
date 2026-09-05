@@ -635,6 +635,43 @@ fn bench_ingest_pipeline(c: &mut Criterion, lines: &[String]) {
     group.finish();
 }
 
+/// Scaling cases for long Ground runs and parser fallbacks. Each size is one application
+/// buffer so a read-size cap cannot hide repeated suffix scanning. Keep both raw modes.
+fn bench_ingest_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ingest_scaling");
+    group.sample_size(20);
+    for (name, seed) in [
+        ("plain", &b"x"[..]),
+        ("unicode", "你好".as_bytes()),
+        ("invalid", &b"\xfe"[..]),
+        ("mixed_invalid", &b"x\xfe"[..]),
+        ("encoded_c1", &b"\xc2\x85"[..]),
+    ] {
+        for size in [1024, 4096, 16_384, 65_536] {
+            let mut data = seed.repeat(size / seed.len());
+            data.push(b'\n');
+            for raw in [false, true] {
+                let mut pipeline = Pipeline::new();
+                pipeline
+                    .vt_processor
+                    .set_raw_wanted_flag(Arc::new(std::sync::atomic::AtomicBool::new(raw)));
+                let chunks = [data.as_slice()];
+                pipeline.feed(&chunks);
+                assert_eq!(pipeline.drain_counts().0, 1);
+                group.throughput(Throughput::Bytes(data.len() as u64));
+                let mode = if raw { "raw" } else { "no_raw" };
+                group.bench_function(BenchmarkId::new(format!("{name}/{mode}"), size), |b| {
+                    b.iter(|| {
+                        pipeline.feed(&chunks);
+                        black_box(pipeline.drain_counts())
+                    });
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 /// `StyledLine::new_with_raw` over representative single lines. This is the
 /// per-committed-line constant: it copies `text`, re-validates `buf_raw` via
 /// `from_utf8_lossy`, and (in the shipped flow) receives a freshly collected
@@ -677,6 +714,16 @@ fn bench_styled_line(c: &mut Criterion) {
                     black_box(text),
                     spans.clone(),
                     Some(raw),
+                ))
+            });
+        });
+        let raw_text = std::str::from_utf8(raw).expect("synthetic raw is UTF-8");
+        group.bench_function(BenchmarkId::new("new_with_raw_text", *name), |b| {
+            b.iter(|| {
+                black_box(StyledLine::new_with_raw_text(
+                    black_box(text),
+                    spans.clone(),
+                    Some(std::borrow::Cow::Borrowed(raw_text)),
                 ))
             });
         });
@@ -740,6 +787,7 @@ fn ingest(c: &mut Criterion) {
 
     bench_telnet_receive(c, &lines);
     bench_ingest_pipeline(c, &lines);
+    bench_ingest_scaling(c);
     bench_styled_line(c);
     bench_sgr(c);
 }
