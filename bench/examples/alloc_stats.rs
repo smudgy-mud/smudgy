@@ -10,8 +10,9 @@
 //! twice after a warmup pass and the run warns when the two passes disagree —
 //! a nondeterministic count can never be a ceiling.
 //!
-//! Workloads, each normalized per line of the shared log corpus (the first
-//! log in `bench/logs/`, name-sorted, via the crate loaders):
+//! Workloads, each normalized per line of the shared log corpus
+//! (`SMUDGY_BENCH_CORPUS=<path>`, else the first log in `bench/logs/`,
+//! name-sorted, via the crate loaders):
 //! - `ingest`: the full inbound socket pipeline — telnet preprocessor →
 //!   `vtparse` → `VtProcessor` → `StyledLine` — composed exactly as the
 //!   connect loop does (`feed_inbound` then `notify_end_of_buffer` per read;
@@ -36,7 +37,8 @@
 //!   it; that outcome naming makes the candidate-bitset allocation visible
 //!   without pretending `Noop` actions disappear before dispatch.
 //!
-//! Env vars: `SMUDGY_BENCH_LINES=n` truncates the corpus (shared loaders);
+//! Env vars: `SMUDGY_BENCH_CORPUS=<path>` selects the corpus and
+//! `SMUDGY_BENCH_LINES=n` truncates it (shared loaders);
 //! `SMUDGY_BENCH_SKIP_SANITY=1` skips the sanity checks that pin each
 //! workload to the real path (exact allocator accounting, line-count and
 //! text round-trips through ingest and the scrollback glue, a trigger that
@@ -51,7 +53,7 @@ use std::{
     },
 };
 
-use smudgy_bench::{REGEX_TRIGGERS, load_item_names_10k, log_corpora, wire};
+use smudgy_bench::{REGEX_TRIGGERS, default_corpus, load_item_names_10k, wire};
 use smudgy_core::models::matchers::{
     MatcherColor, MatcherColorMatch, MatcherRole, MatcherSyntax, TriggerMatcherSource,
 };
@@ -567,11 +569,53 @@ fn sanity_allocator() {
     eprintln!("sanity: allocator counts a 4096-byte Vec as exactly (1 alloc, 4096 bytes)");
 }
 
+/// The printable text a corpus line displays as: CSI (`ESC [ … final`) and
+/// OSC (`ESC ] … BEL|ST`) sequences removed, then control characters dropped —
+/// what the VT parser routes away from the line text. A corpus may carry its
+/// own escapes (a captured session, an OSC 8 feature log) on top of the wire
+/// dressing.
+fn display_text(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if !c.is_control() {
+                out.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // Parameter/intermediate bytes, then one final byte in 0x40..=0x7E.
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // Runs to BEL or ST (`ESC \`).
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Any other escape is ESC plus one byte.
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Pins the ingest workload to the real pipeline: every corpus line must come
 /// back out as a committed `HandleIncomingLine` whose text matches the
-/// original (modulo control characters, which the VT parser routes away from
-/// printable text), and the `AnsiLight` prompts must surface as exactly one
-/// partial-line flush per 20 lines.
+/// original's display text (see [`display_text`]), and the `AnsiLight`
+/// prompts must surface as exactly one partial-line flush per 20 lines.
 fn sanity_ingest(styled: &[Arc<StyledLine>], partials: usize, lines: &[String]) {
     assert_eq!(
         styled.len(),
@@ -579,7 +623,7 @@ fn sanity_ingest(styled: &[Arc<StyledLine>], partials: usize, lines: &[String]) 
         "ingest sanity: committed-line count must match the corpus"
     );
     for (produced, original) in styled.iter().zip(lines) {
-        let expected: String = original.chars().filter(|c| !c.is_control()).collect();
+        let expected = display_text(original);
         assert_eq!(
             produced.text, expected,
             "ingest sanity: line text corrupted in the pipeline"
@@ -746,12 +790,10 @@ fn print_table(rows: &[Row]) {
 #[allow(clippy::too_many_lines)]
 fn main() {
     let skip_sanity = std::env::var("SMUDGY_BENCH_SKIP_SANITY").is_ok();
-    // First log in `bench/logs/` (name-sorted, so deterministic), matching
-    // the criterion benches; `SMUDGY_BENCH_LINES` is honored by the loader.
-    let (corpus_name, lines) = log_corpora()
-        .into_iter()
-        .next()
-        .expect("bench/logs has at least one log file");
+    // `SMUDGY_BENCH_CORPUS=<path>`, else the first log in `bench/logs/`
+    // (name-sorted, so deterministic), matching the criterion benches;
+    // `SMUDGY_BENCH_LINES` is honored by the loader.
+    let (corpus_name, lines) = default_corpus();
     assert!(!lines.is_empty(), "empty corpus (SMUDGY_BENCH_LINES=0?)");
     let corpus_bytes: usize = lines.iter().map(String::len).sum();
 

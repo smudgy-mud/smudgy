@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 use vtparse::CsiParam;
 
 use crate::session::styled_line::{Blink, Style, Underline};
@@ -40,36 +41,69 @@ pub enum Color {
     DefaultBackground,
 }
 
-/// One semicolon-delimited SGR parameter together with its colon
-/// sub-parameters, in order. `None` is an empty position, which ECMA-48
-/// defines as the parameter's default (0).
-type Slot = Vec<Option<i64>>;
+/// Inline capacity for one SGR sequence's parameter positions. `vtparse` caps
+/// a CSI at 32 parameters (integers and separators combined), so even the
+/// worst case — 32 separators yielding 33 empty positions — fits without
+/// spilling; a larger stream falls back to the heap rather than truncating.
+const INLINE_POSITIONS: usize = 40;
 
-/// Split a CSI parameter stream into [`Slot`]s: `;` separates slots, `:`
+/// One SGR parameter list split into semicolon-delimited slots, each holding
+/// its colon sub-parameters in order. Positions are stored flat with a
+/// per-slot end offset, so splitting a sequence allocates nothing on the
+/// inbound parse path. `None` is an empty position, which ECMA-48 defines as
+/// the parameter's default (0).
+struct Slots {
+    positions: SmallVec<[Option<i64>; INLINE_POSITIONS]>,
+    /// Exclusive end offset of each slot into `positions`.
+    ends: SmallVec<[usize; INLINE_POSITIONS]>,
+}
+
+impl Slots {
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Slot `index`'s positions: the parameter first, then its sub-parameters.
+    fn slot(&self, index: usize) -> &[Option<i64>] {
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.positions[start..self.ends[index]]
+    }
+
+    /// Slot `index`'s parameter value, when the slot exists and is non-empty.
+    fn value(&self, index: usize) -> Option<i64> {
+        (index < self.len())
+            .then(|| self.slot(index))
+            .and_then(|slot| slot.first().copied().flatten())
+    }
+}
+
+/// Split a CSI parameter stream into [`Slots`]: `;` separates slots, `:`
 /// separates sub-parameters within a slot, and an integer fills the current
 /// position. An empty stream yields one empty slot, so `CSI m` naturally
 /// means `CSI 0 m`. Returns `None` for streams carrying parameter bytes that
 /// are not SGR separators (private-marker sequences are not SGR).
-fn split_slots(params: &[CsiParam]) -> Option<Vec<Slot>> {
-    let mut slots: Vec<Slot> = Vec::new();
-    let mut current: Slot = Vec::new();
+fn split_slots(params: &[CsiParam]) -> Option<Slots> {
+    let mut slots = Slots {
+        positions: SmallVec::new(),
+        ends: SmallVec::new(),
+    };
     let mut position_filled = false;
     for param in params {
         match param {
             CsiParam::Integer(n) => {
-                current.push(Some(*n));
+                slots.positions.push(Some(*n));
                 position_filled = true;
             }
             CsiParam::P(b';') => {
                 if !position_filled {
-                    current.push(None);
+                    slots.positions.push(None);
                 }
-                slots.push(std::mem::take(&mut current));
+                slots.ends.push(slots.positions.len());
                 position_filled = false;
             }
             CsiParam::P(b':') => {
                 if !position_filled {
-                    current.push(None);
+                    slots.positions.push(None);
                 }
                 position_filled = false;
             }
@@ -77,9 +111,9 @@ fn split_slots(params: &[CsiParam]) -> Option<Vec<Slot>> {
         }
     }
     if !position_filled {
-        current.push(None);
+        slots.positions.push(None);
     }
-    slots.push(current);
+    slots.ends.push(slots.positions.len());
     Some(slots)
 }
 
@@ -163,15 +197,12 @@ fn extended_color_from_subparams(sub: &[Option<i64>]) -> Option<Color> {
 }
 
 /// Decode a semicolon-form extended color (`38;5;n`, `38;2;r;g;b`) from the
-/// slots following the 38/48 introducer. Returns the color (if the mode is
-/// recognized) and how many following slots the directive consumed; a
-/// truncated tail reads missing components as 0, matching common client
-/// behavior.
-fn extended_color_from_slots(rest: &[Slot]) -> (Option<Color>, usize) {
-    let value = |idx: usize| {
-        rest.get(idx)
-            .and_then(|slot| slot.first().copied().flatten())
-    };
+/// slots following the 38/48 introducer at `slots[from..]`. Returns the color
+/// (if the mode is recognized) and how many following slots the directive
+/// consumed; a truncated tail reads missing components as 0, matching common
+/// client behavior.
+fn extended_color_from_slots(slots: &Slots, from: usize) -> (Option<Color>, usize) {
+    let value = |idx: usize| slots.value(from + idx);
     match value(0) {
         Some(5) => (Some(color_256(value(1).unwrap_or(0))), 2),
         Some(2) => (
@@ -203,7 +234,7 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
     let mut style = initial_style;
     let mut i = 0;
     while i < slots.len() {
-        let slot = &slots[i];
+        let slot = slots.slot(i);
         let code = slot.first().copied().flatten().unwrap_or(0);
 
         if slot.len() > 1 {
@@ -264,7 +295,7 @@ pub fn process(initial_style: Style, params: &[CsiParam]) -> Style {
                 };
             }
             38 | 48 => {
-                let (color, consumed) = extended_color_from_slots(&slots[i + 1..]);
+                let (color, consumed) = extended_color_from_slots(&slots, i + 1);
                 if let Some(color) = color {
                     if code == 38 {
                         style.fg = color;
