@@ -44,6 +44,7 @@ mod msdp;
 mod mssp;
 pub mod pane;
 mod remote_interop;
+mod row_ledger;
 mod script_action;
 mod script_engine;
 mod store;
@@ -59,6 +60,7 @@ use message_bus::MessageBus;
 pub(crate) use message_bus::SharedMessageBus;
 use pane::{MAIN_PANE_KEY, PaneKey, PaneRegistry};
 pub(crate) use remote_interop::SharedRemoteStateRegistry;
+pub(crate) use row_ledger::{RecentLines, RowLedger};
 
 pub use script_action::ScriptAction;
 pub use script_engine::layout_fold;
@@ -118,16 +120,6 @@ pub use origin::{
 /// than looping forever.
 pub(crate) const MAX_EVENT_DEPTH: u32 = 64;
 
-/// How many of the most-recently-emitted lines the session
-/// keeps a readable copy of, in [`Inner::recent_lines`]. This is a deliberate, documented
-/// bound — `buffer.line(n)` reads (text + styles) and write-through resolve within this
-/// window only; a line number older than the window reads as `undefined` from script. The
-/// stored copies are the *same* `Arc<StyledLine>` already handed to the UI, so the window
-/// costs one `Arc` clone + a `VecDeque` push/pop per emit (no data duplication, no silent
-/// unlimited scrollback). 1000 covers any realistic "edit a line I just saw" use without
-/// pinning the whole UI scrollback (10k) on the session thread.
-const RECENT_LINES: usize = 1000;
-
 /// Echo arms append display updates without flushing; the run loop delivers them
 /// coalesced — at the drain point (before parking) and, during a long dispatch
 /// cascade, whenever this many updates have accumulated. Bounds both the number of
@@ -135,13 +127,6 @@ const RECENT_LINES: usize = 1000;
 /// 100k) and the size of any single event. Two updates per line (`Append` +
 /// `EnsureNewLine`), so this is ~2k lines per batch.
 const PENDING_UPDATE_FLUSH_THRESHOLD: usize = 4096;
-
-/// The session-side bounded ring of recently-emitted lines. Each entry is the UI
-/// line number paired with the same `Arc<StyledLine>` the UI holds. Shared (the same `Rc`)
-/// into every isolate's ops so `op_smudgy_buffer_get_text`/`_styles` read it, and written by
-/// [`Inner::record_emitted_line`] / the `buffer` write-through at emit time. Bounded to
-/// [`RECENT_LINES`]; oldest entries are popped off the front.
-pub(crate) type RecentLines = Rc<RefCell<VecDeque<(usize, Arc<StyledLine>)>>>;
 
 /// The session's last-known mapper location backing `getCurrentLocation`. `setCurrentLocation`
 /// is otherwise write-only (it fans out a UI marker), so the runtime mirrors the most recent
@@ -202,6 +187,46 @@ pub(crate) type SharedLineRouting = Rc<RefCell<LineRouting>>;
 /// Fixed-width mask substituted for each redacted secret in echoed/logged output.
 /// Fixed width so it doesn't leak the secret's length.
 const REDACTION_MASK: &str = "********";
+
+/// What the main pane currently contains from a fragmented inbound logical line.
+///
+/// The row ledger describes the terminal's physical tail. This state describes the
+/// server line that can span that tail, committed rows, and local output. The distinction
+/// lets a completion append only unseen server text after local output commits its prefix.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum MainPrefixDisposition {
+    /// No fragmented inbound line is active.
+    #[default]
+    None,
+    /// Main contains every partial fragment in one open row that can still be replaced.
+    Replaceable,
+    /// Main contains every partial fragment, but local output committed at least one row.
+    Committed,
+    /// Main has an immutable source prefix, followed by at least one undisplayed fragment.
+    /// Later partials stay deferred so completion can restore the remaining source in order.
+    CommittedGap,
+    /// Main does not contain every partial fragment, so completion needs the assembled whole.
+    Incomplete,
+}
+
+impl MainPrefixDisposition {
+    fn note_visible_partial(&mut self) {
+        if matches!(self, Self::None) {
+            *self = Self::Replaceable;
+        }
+    }
+
+    fn note_hidden_partial(&mut self) {
+        *self = match self {
+            Self::Committed | Self::CommittedGap => Self::CommittedGap,
+            Self::None | Self::Replaceable | Self::Incomplete => Self::Incomplete,
+        };
+    }
+
+    fn defers_partial_main(self) -> bool {
+        matches!(self, Self::CommittedGap | Self::Incomplete)
+    }
+}
 
 /// Replaces every (non-empty) literal `redactions` substring in `text` with
 /// [`REDACTION_MASK`]. Used to keep secrets (e.g. a substituted `$PASSWORD`) out of
@@ -1623,8 +1648,21 @@ impl Runtime {
                 )),
                 pending_buffer_updates: Vec::new(),
                 pending_line_operations: pending_line_operations.clone(),
-                emitted_line_count: emitted_line_count.clone(),
-                recent_lines: recent_lines.clone(),
+                ledger: {
+                    let mut ledger =
+                        RowLedger::new(emitted_line_count.clone(), recent_lines.clone());
+                    // The spawn-time "Loading session..." append left the main
+                    // buffer's tail line open — unless an engine-construction
+                    // session notice (emitted directly on ui_tx, each ending in
+                    // EnsureNewLine) already committed it, which the notice's
+                    // count bump records.
+                    if emitted_line_count.get() == 0 {
+                        ledger.seed_open_row(Arc::new(StyledLine::from_echo_str(
+                            "Loading session...",
+                        )));
+                    }
+                    ledger
+                },
                 current_location: current_location.clone(),
                 pane_registry: pane_registry.clone(),
                 line_routing: line_routing.clone(),
@@ -1640,14 +1678,13 @@ impl Runtime {
                 gmcp: gmcp::GmcpProducer::new(gmcp_enabled.clone()),
                 msdp: msdp::MsdpProducer::new(),
                 mssp: mssp::MsspProducer::new(),
-                // The spawn-time "Loading session..." append left the main
-                // buffer's tail line open — unless an engine-construction
-                // session notice (emitted directly on ui_tx, each ending in
-                // EnsureNewLine) already committed it, which the notice's
-                // count bump records.
-                main_open_line: emitted_line_count.get() == 0,
+                main_prefix_disposition: MainPrefixDisposition::None,
+                main_partial_source_len: 0,
+                main_committed_source_len: 0,
+                main_deferred_fragments: LineFragments::None,
                 replacing_main_open_line: false,
                 fragmented_completion_in_flight: false,
+                partial_line_in_flight: None,
                 open_line: LineFragments::None,
                 log_open_line: Vec::new(),
                 log_committed_len: 0,
@@ -1683,7 +1720,15 @@ impl Runtime {
                 // (a reload can land mid-server-line). An active carriage-return replacement
                 // does not survive: `run` aborts it before returning `Reload`, because the
                 // completion action belonged to the discarded action stack.
-                let old_main_open_line = inner.main_open_line;
+                let mut old_ledger = std::mem::replace(
+                    &mut inner.ledger,
+                    RowLedger::new(emitted_line_count.clone(), recent_lines.clone()),
+                );
+                let old_main_prefix_disposition = inner.main_prefix_disposition;
+                let old_main_partial_source_len = inner.main_partial_source_len;
+                let old_main_committed_source_len = inner.main_committed_source_len;
+                let old_main_deferred_fragments =
+                    std::mem::take(&mut inner.main_deferred_fragments);
                 debug_assert!(!inner.replacing_main_open_line);
                 let old_open_line = std::mem::take(&mut inner.open_line);
                 let old_connection = inner.connection.take();
@@ -1939,6 +1984,9 @@ impl Runtime {
                 *settings_snapshot.borrow_mut() =
                     crate::models::settings::ScriptSettings::from(&settings);
                 let command_separator = Arc::new(settings.command_separator);
+                if emitted_line_count.get() != count_before_rebuild {
+                    old_ledger.close_row();
+                }
 
                 let mut new_trigger_manager = Manager::new(
                     spawned_actions.clone(),
@@ -1982,8 +2030,7 @@ impl Runtime {
                     window_size: old_window_size,
                     pending_buffer_updates: Vec::new(),
                     pending_line_operations: pending_line_operations.clone(), // Preserve the shared operations
-                    emitted_line_count: emitted_line_count.clone(),
-                    recent_lines: recent_lines.clone(), // Preserve the recent-lines ring across reload
+                    ledger: old_ledger, // Count + recent-lines ring + open row survive reload
                     current_location: current_location.clone(), // Preserve current location across reload
                     pane_registry: pane_registry.clone(),       // Panes survive script reloads
                     line_routing: line_routing.clone(),
@@ -1999,10 +2046,13 @@ impl Runtime {
                     gmcp: old_gmcp, // Session-scoped: enabled tracks the surviving connection
                     msdp: old_msdp, // Same: server facts, no engine facts
                     mssp: old_mssp_producer, // Same
-                    main_open_line: old_main_open_line
-                        && emitted_line_count.get() == count_before_rebuild,
+                    main_prefix_disposition: old_main_prefix_disposition,
+                    main_partial_source_len: old_main_partial_source_len,
+                    main_committed_source_len: old_main_committed_source_len,
+                    main_deferred_fragments: old_main_deferred_fragments,
                     replacing_main_open_line: false,
                     fragmented_completion_in_flight: false,
+                    partial_line_in_flight: None,
                     open_line: old_open_line,
                     log_open_line: Vec::new(), // The reload flushed the old log; the new file starts a fresh line
                     log_committed_len: 0,      // A new log file is opened on reconnect
@@ -2200,11 +2250,11 @@ struct Inner<'a> {
     /// When the session log was last flushed; see [`LOG_FLUSH_INTERVAL`].
     last_log_flush: Instant,
     pending_line_operations: Rc<RefCell<Vec<LineOperation>>>,
-    emitted_line_count: Rc<Cell<usize>>,
-    /// Bounded ring of recently-emitted lines (UI line number + the same `Arc` the UI
-    /// holds), shared into every isolate's read ops. Written by [`Self::record_emitted_line`]
-    /// at emit time and by the `buffer` write-through; bounded to [`RECENT_LINES`].
-    recent_lines: RecentLines,
+    /// Core's fold over the main pane's update stream: the committed-row count and the
+    /// recent-lines ring (both shared into every isolate's ops) plus the open tail row.
+    /// Every main-pane update reaches the UI through [`Self::queue_update`], which folds
+    /// it here first.
+    ledger: RowLedger,
     /// `getCurrentLocation`: the last location pushed via `SetCurrentLocation`, mirrored on
     /// the session thread and shared (the same `Rc`) into every isolate's read op. Preserved
     /// across a reload like the recent-lines ring, so a script can still read where it is after a reload.
@@ -2259,11 +2309,19 @@ struct Inner<'a> {
     /// The host-side MSSP producer, driven by the `MsspVariables` dispatch arm (and reset
     /// by `Connect`). Session-scoped like the snapshot it writes; no engine facts.
     mssp: mssp::MsspProducer,
-    /// Whether the main buffer's tail line is open (an uncommitted partial). Replaces the
-    /// old `pending_buffer_updates.last()` peek — which `AppendTo` entries would confuse —
-    /// and, unlike the peek, survives a flush. Drives the echo commit-first rule and
-    /// `RetractOpenLine` emission; never touched by pane deliveries.
-    main_open_line: bool,
+    /// Whether main has a complete, replaceable, committed, or incomplete view of the
+    /// current fragmented inbound logical line. (Whether the tail row itself is open is the
+    /// ledger's to say: [`Self::main_open_line`].)
+    main_prefix_disposition: MainPrefixDisposition,
+    /// Source-text bytes in partial callbacks that reached their routing step. This is
+    /// independent of rendered length because a prompt trigger can transform a fragment.
+    main_partial_source_len: usize,
+    /// Contiguous source-text bytes represented by immutable main rows. Completion can use
+    /// this boundary to recover an undisplayed tail without replaying the committed prefix.
+    main_committed_source_len: usize,
+    /// Main-routed fragments after a gap. They stay hidden until completion so local output
+    /// cannot commit them out of source order; a prompt boundary releases the visible tail.
+    main_deferred_fragments: LineFragments,
     /// A carriage-return replacement retired the prior main open line and is
     /// moving through triggers. Kept independently of pending UI batches so
     /// the exact transformed replacement can finish the transaction after a
@@ -2274,6 +2332,9 @@ struct Inner<'a> {
     /// local completion frame, so its abort path must retract that prefix just
     /// as it closes a carriage-return replacement transaction.
     fragmented_completion_in_flight: bool,
+    /// A partial callback has queued, but not yet reached, its routing step. A reload routes
+    /// this retained source before discarding the old engine's action stack.
+    partial_line_in_flight: Option<Arc<StyledLine>>,
     /// The in-flight server line's transformed fragments, accumulated so a non-main sink can
     /// receive one WHOLE line at routing time (complete-line events only carry the remainder
     /// since the last partial flush). Cleared when the line completes; consumed early when a
@@ -2383,20 +2444,56 @@ impl Inner<'_> {
         }
     }
 
-    /// Record a freshly-emitted complete line in the recent-lines ring under its UI line number.
-    /// Call this for each `BufferUpdate::Append` of a *complete* line, AFTER bumping
-    /// `emitted_line_count` (its post-bump value is the line's UI number — the same number
-    /// `op_smudgy_get_current_line_number` reported for it while it was in flight, and the
-    /// number the UI's `TerminalBuffer` assigns). Keeps the ring bounded to [`RECENT_LINES`]
-    /// by popping the oldest entry. Cost: one `Arc` clone (the bytes are shared with the UI)
-    /// plus a `VecDeque` push/pop — no data duplication.
-    fn record_emitted_line(&self, line: &Arc<StyledLine>) {
-        let line_number = self.emitted_line_count.get();
-        let mut ring = self.recent_lines.borrow_mut();
-        ring.push_back((line_number, line.clone()));
-        while ring.len() > RECENT_LINES {
-            ring.pop_front();
+    /// Queue one display update for the UI, folding it through the row ledger first so
+    /// core's row count, open-row flag, and recent-lines ring track the main pane exactly
+    /// as the UI will when it folds the same update. Every main-pane update goes through
+    /// here; pane (`AppendTo`) and non-main `Clear` updates pass the ledger untouched.
+    #[inline]
+    fn queue_update(&mut self, update: BufferUpdate) {
+        self.ledger.observe(&update);
+        self.pending_buffer_updates.push(update);
+    }
+
+    /// Whether the main buffer's tail line is open (an uncommitted partial). Survives a
+    /// flush and is never touched by pane deliveries. Drives the echo commit-first rule
+    /// and `RetractOpenLine` emission.
+    #[inline]
+    fn main_open_line(&self) -> bool {
+        self.ledger.row_open()
+    }
+
+    fn reset_main_prefix_state(&mut self) {
+        self.main_prefix_disposition = MainPrefixDisposition::None;
+        self.main_partial_source_len = 0;
+        self.main_committed_source_len = 0;
+    }
+
+    fn note_local_main_commit(&mut self) {
+        if matches!(
+            self.main_prefix_disposition,
+            MainPrefixDisposition::Replaceable | MainPrefixDisposition::Committed
+        ) {
+            self.main_prefix_disposition = MainPrefixDisposition::Committed;
+            self.main_committed_source_len = self.main_partial_source_len;
         }
+    }
+
+    #[cold]
+    fn suffix_after_source_prefix(line: &Arc<StyledLine>, prefix_len: usize) -> Arc<StyledLine> {
+        if prefix_len == 0 {
+            line.clone()
+        } else {
+            Arc::new(line.remove(0, prefix_len))
+        }
+    }
+
+    fn route_prompt_boundary(&mut self) {
+        if let Some(deferred) = self.main_deferred_fragments.take_joined() {
+            self.queue_update(BufferUpdate::Append(deferred));
+        }
+        self.reset_main_prefix_state();
+        self.open_line.clear();
+        self.queue_update(BufferUpdate::PromptBoundary);
     }
 
     /// Applies all pending line **transforms** to the given line and clears the queue.
@@ -2475,9 +2572,9 @@ impl Inner<'_> {
     /// sink, and the transformed fragment to main (unless gagged/redirected — then retract
     /// any partial prefix already flushed to main, so neither buffer corrupts).
     ///
-    /// Numbering parity is sacred here: `emitted_line_count`/`record_emitted_line` count
-    /// main appends only — a redirected line is "gagged from main" (not counted, not in
-    /// `recent_lines`), and `RetractOpenLine` affects only the uncommitted line.
+    /// Numbering parity is sacred here: the row ledger counts main appends only — a
+    /// redirected line is "gagged from main" (not counted, not in the recent-lines ring),
+    /// and `RetractOpenLine` affects only the uncommitted line.
     fn route_complete_line(&mut self, processed: Arc<StyledLine>, routing: &LineRouting) {
         let replacing_open_line = std::mem::take(&mut self.replacing_main_open_line);
         let (main_included, sinks) = if routing.is_default() {
@@ -2494,50 +2591,84 @@ impl Inner<'_> {
                 .take_joined_with(&processed)
                 .unwrap_or_else(|| processed.clone());
             for key in &sinks {
-                self.pending_buffer_updates
-                    .push(BufferUpdate::AppendTo(*key, whole.clone()));
+                self.queue_update(BufferUpdate::AppendTo(*key, whole.clone()));
             }
         }
 
         if main_included {
-            self.main_open_line = false;
-            self.emitted_line_count
-                .set(self.emitted_line_count.get() + 1);
-            self.record_emitted_line(&processed);
-            self.pending_buffer_updates.push(if replacing_open_line {
+            self.queue_update(if replacing_open_line {
                 BufferUpdate::FinishOpenLineReplacement(Some(processed))
             } else {
                 BufferUpdate::Append(processed)
             });
-            self.pending_buffer_updates
-                .push(BufferUpdate::EnsureNewLine);
+            self.queue_update(BufferUpdate::EnsureNewLine);
         } else if replacing_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::FinishOpenLineReplacement(None));
-        } else if self.main_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::RetractOpenLine);
-            self.main_open_line = false;
+            self.queue_update(BufferUpdate::FinishOpenLineReplacement(None));
+        } else if self.main_open_line() {
+            self.queue_update(BufferUpdate::RetractOpenLine);
         }
 
+        self.reset_main_prefix_state();
+        self.main_deferred_fragments.clear();
         self.open_line.clear();
     }
 
-    /// Route a complete logical line whose prefix was already displayed at a
-    /// transport-batch boundary. Normal triggers ran against `processed` (the
-    /// assembled whole); when they left it untouched, main needs only the
-    /// unseen `completion_fragment`. A transform instead replaces the
-    /// provisional open UI line atomically so edits anywhere in the assembled
-    /// text — including across the old batch boundary — are visible.
+    /// Replace an open main tail, or append a new row, with one assembled whole line.
+    fn emit_fragmented_whole_on_main(
+        &mut self,
+        processed: Arc<StyledLine>,
+        replacing_open_line: bool,
+    ) {
+        if replacing_open_line {
+            self.queue_update(BufferUpdate::FinishOpenLineReplacement(Some(processed)));
+        } else if self.main_open_line() {
+            self.queue_update(BufferUpdate::BeginOpenLineReplacement);
+            self.queue_update(BufferUpdate::FinishOpenLineReplacement(Some(processed)));
+        } else {
+            self.queue_update(BufferUpdate::Append(processed));
+        }
+        self.queue_update(BufferUpdate::EnsureNewLine);
+    }
+
+    /// Append a completion fragment to the current physical main row and commit that row.
+    fn finish_fragmented_main_tail(&mut self, completion_fragment: Arc<StyledLine>) {
+        self.queue_update(BufferUpdate::Append(completion_fragment));
+        self.queue_update(BufferUpdate::EnsureNewLine);
+    }
+
+    /// Replace any provisional post-commit tail with the complete unseen source remainder.
+    fn emit_fragmented_remainder_on_main(
+        &mut self,
+        remainder: Arc<StyledLine>,
+        replacing_open_line: bool,
+    ) {
+        if remainder.text.is_empty() {
+            if replacing_open_line {
+                self.queue_update(BufferUpdate::FinishOpenLineReplacement(None));
+            } else if self.main_open_line() {
+                self.queue_update(BufferUpdate::RetractOpenLine);
+            }
+            return;
+        }
+
+        self.emit_fragmented_whole_on_main(remainder, replacing_open_line);
+    }
+
+    /// Route a complete logical line whose prefix was already displayed at one or more
+    /// transport-batch boundaries. Normal triggers receive `processed`, the assembled whole.
+    /// Main receives only unseen text when all prior fragments remain visible.
     #[cold]
     fn route_fragmented_complete_line(
         &mut self,
+        original: Arc<StyledLine>,
         processed: Arc<StyledLine>,
         completion_fragment: Arc<StyledLine>,
         transformed: bool,
+        preserves_committed_prefix: bool,
         routing: &LineRouting,
     ) {
         let replacing_open_line = std::mem::take(&mut self.replacing_main_open_line);
+        let disposition = std::mem::take(&mut self.main_prefix_disposition);
         let (main_included, sinks) = if routing.is_default() {
             (true, Vec::new())
         } else {
@@ -2549,47 +2680,54 @@ impl Inner<'_> {
         // neither folds immutable lines nor depends on the optional routing
         // accumulator.
         for key in &sinks {
-            self.pending_buffer_updates
-                .push(BufferUpdate::AppendTo(*key, processed.clone()));
+            self.queue_update(BufferUpdate::AppendTo(*key, processed.clone()));
         }
 
         if main_included {
-            self.emitted_line_count
-                .set(self.emitted_line_count.get() + 1);
-            self.record_emitted_line(&processed);
-
-            if replacing_open_line {
-                self.pending_buffer_updates
-                    .push(BufferUpdate::FinishOpenLineReplacement(Some(processed)));
-            } else if transformed && self.main_open_line {
-                self.pending_buffer_updates
-                    .push(BufferUpdate::BeginOpenLineReplacement);
-                self.pending_buffer_updates
-                    .push(BufferUpdate::FinishOpenLineReplacement(Some(processed)));
-            } else if self.main_open_line {
-                // Zero-transform fast path for a fragmented line: the prefix
-                // is already in the UI and log, so send only the new suffix.
-                self.pending_buffer_updates
-                    .push(BufferUpdate::Append(completion_fragment));
-            } else {
-                // A partial-line trigger may have routed/gagged the provisional
-                // prefix. If complete-line routing includes main again, deliver
-                // the complete result rather than silently losing that prefix.
-                self.pending_buffer_updates
-                    .push(BufferUpdate::Append(processed));
+            match disposition {
+                MainPrefixDisposition::Replaceable
+                    if !transformed && self.main_open_line() && !replacing_open_line =>
+                {
+                    self.finish_fragmented_main_tail(completion_fragment);
+                }
+                MainPrefixDisposition::Committed if !transformed => {
+                    if self.main_open_line() {
+                        self.finish_fragmented_main_tail(completion_fragment);
+                    } else {
+                        self.emit_fragmented_remainder_on_main(
+                            completion_fragment,
+                            replacing_open_line,
+                        );
+                    }
+                }
+                MainPrefixDisposition::Committed | MainPrefixDisposition::CommittedGap => {
+                    // Rows before this source boundary are immutable. If a whole-line transform
+                    // preserved that source prefix, its transformed suffix is safe to show.
+                    // Otherwise use the original suffix: never replay committed terminal rows.
+                    let committed_len = self.main_committed_source_len;
+                    let remainder = if transformed && preserves_committed_prefix {
+                        Self::suffix_after_source_prefix(&processed, committed_len)
+                    } else {
+                        Self::suffix_after_source_prefix(&original, committed_len)
+                    };
+                    self.emit_fragmented_remainder_on_main(remainder, replacing_open_line);
+                }
+                // A whole-line transform needs the assembled source. An incomplete prefix
+                // needs the same fallback so main does not silently lose server text.
+                MainPrefixDisposition::None
+                | MainPrefixDisposition::Replaceable
+                | MainPrefixDisposition::Incomplete => {
+                    self.emit_fragmented_whole_on_main(processed, replacing_open_line);
+                }
             }
-            self.pending_buffer_updates
-                .push(BufferUpdate::EnsureNewLine);
-            self.main_open_line = false;
         } else if replacing_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::FinishOpenLineReplacement(None));
-        } else if self.main_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::RetractOpenLine);
-            self.main_open_line = false;
+            self.queue_update(BufferUpdate::FinishOpenLineReplacement(None));
+        } else if self.main_open_line() {
+            self.queue_update(BufferUpdate::RetractOpenLine);
         }
 
+        self.reset_main_prefix_state();
+        self.main_deferred_fragments.clear();
         self.open_line.clear();
     }
 
@@ -2597,7 +2735,25 @@ impl Inner<'_> {
     /// the line-so-far the same way a complete line would; delivering to a pane consumes the
     /// accumulator, so a later routing on the same line's completion delivers only the
     /// remainder (never duplicated text).
-    fn route_partial_line(&mut self, processed: Arc<StyledLine>, routing: &LineRouting) {
+    fn finish_partial_line_before_reload(&mut self) {
+        let Some(line) = self.partial_line_in_flight.take() else {
+            return;
+        };
+
+        self.script_engine.set_current_line(None);
+        let source_len = line.text.len();
+        let processed = self.apply_pending_line_operations(line);
+        let routing = self.line_routing.borrow_mut().take();
+        self.route_partial_line(processed, source_len, &routing);
+    }
+
+    fn route_partial_line(
+        &mut self,
+        processed: Arc<StyledLine>,
+        source_len: usize,
+        routing: &LineRouting,
+    ) {
+        self.main_partial_source_len += source_len;
         let replacing_open_line = std::mem::take(&mut self.replacing_main_open_line);
         if routing.is_default() {
             // Fast path: no routing on this fragment. The whole-line
@@ -2611,12 +2767,25 @@ impl Inner<'_> {
             } else {
                 self.open_line.clear();
             }
-            self.pending_buffer_updates.push(if replacing_open_line {
+
+            // Once routing hides a source fragment, showing later partials could let local
+            // output commit them ahead of that gap. Defer them until the logical line ends.
+            if self.main_prefix_disposition.defers_partial_main() {
+                self.main_deferred_fragments.push(processed);
+                if replacing_open_line {
+                    self.queue_update(BufferUpdate::FinishOpenLineReplacement(None));
+                } else if self.main_open_line() {
+                    self.queue_update(BufferUpdate::RetractOpenLine);
+                }
+                return;
+            }
+
+            self.main_prefix_disposition.note_visible_partial();
+            self.queue_update(if replacing_open_line {
                 BufferUpdate::FinishOpenLineReplacement(Some(processed))
             } else {
                 BufferUpdate::Append(processed)
             });
-            self.main_open_line = true;
             return;
         }
 
@@ -2634,27 +2803,34 @@ impl Inner<'_> {
             self.open_line.push(accumulated);
         } else {
             for key in &sinks {
-                self.pending_buffer_updates
-                    .push(BufferUpdate::AppendTo(*key, accumulated.clone()));
+                self.queue_update(BufferUpdate::AppendTo(*key, accumulated.clone()));
             }
             // Consumed: the delivered prefix never re-routes.
             self.open_line.clear();
         }
 
-        if main_included {
-            self.pending_buffer_updates.push(if replacing_open_line {
+        if main_included && !self.main_prefix_disposition.defers_partial_main() {
+            self.main_prefix_disposition.note_visible_partial();
+            self.queue_update(if replacing_open_line {
                 BufferUpdate::FinishOpenLineReplacement(Some(processed))
             } else {
                 BufferUpdate::Append(processed)
             });
-            self.main_open_line = true;
-        } else if replacing_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::FinishOpenLineReplacement(None));
-        } else if self.main_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::RetractOpenLine);
-            self.main_open_line = false;
+        } else if main_included {
+            self.main_deferred_fragments.push(processed);
+            if replacing_open_line {
+                self.queue_update(BufferUpdate::FinishOpenLineReplacement(None));
+            } else if self.main_open_line() {
+                self.queue_update(BufferUpdate::RetractOpenLine);
+            }
+        } else {
+            self.main_deferred_fragments.clear();
+            self.main_prefix_disposition.note_hidden_partial();
+            if replacing_open_line {
+                self.queue_update(BufferUpdate::FinishOpenLineReplacement(None));
+            } else if self.main_open_line() {
+                self.queue_update(BufferUpdate::RetractOpenLine);
+            }
         }
     }
 
@@ -2665,12 +2841,12 @@ impl Inner<'_> {
     /// routing accumulator is cleared so the stale frame never re-routes or
     /// reaches a pane sink. A no-op when nothing is open.
     pub(crate) fn retract_incoming_open_line_sync(&mut self) {
-        if self.main_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::BeginOpenLineReplacement);
-            self.main_open_line = false;
+        if self.main_open_line() {
+            self.queue_update(BufferUpdate::BeginOpenLineReplacement);
             self.replacing_main_open_line = true;
         }
+        self.reset_main_prefix_state();
+        self.main_deferred_fragments.clear();
         self.open_line.clear();
     }
 
@@ -2688,14 +2864,14 @@ impl Inner<'_> {
         self.pending_line_operations.borrow_mut().clear();
         self.line_routing.borrow_mut().take();
         self.open_line.clear();
-        if std::mem::take(&mut self.fragmented_completion_in_flight) && self.main_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::RetractOpenLine);
-            self.main_open_line = false;
+        self.partial_line_in_flight.take();
+        self.reset_main_prefix_state();
+        self.main_deferred_fragments.clear();
+        if std::mem::take(&mut self.fragmented_completion_in_flight) && self.main_open_line() {
+            self.queue_update(BufferUpdate::RetractOpenLine);
         }
         if std::mem::take(&mut self.replacing_main_open_line) {
-            self.pending_buffer_updates
-                .push(BufferUpdate::FinishOpenLineReplacement(None));
+            self.queue_update(BufferUpdate::FinishOpenLineReplacement(None));
         }
     }
 
@@ -2705,27 +2881,18 @@ impl Inner<'_> {
     /// gluing onto the prompt is classic MUD-client behavior).
     #[inline]
     fn commit_open_main_line(&mut self) {
-        if self.main_open_line {
-            self.pending_buffer_updates
-                .push(BufferUpdate::EnsureNewLine);
-            self.emitted_line_count
-                .set(self.emitted_line_count.get() + 1);
-            self.main_open_line = false;
+        if self.main_open_line() {
+            self.queue_update(BufferUpdate::EnsureNewLine);
+            self.note_local_main_commit();
         }
     }
 
-    /// Append one whole line to the main buffer with the numbering bookkeeping every
-    /// counted echo path shares: the Append + EnsureNewLine pair, the emitted-line
-    /// count, and the recent-lines ring record.
+    /// Append one whole line to the main buffer: the Append + EnsureNewLine pair every
+    /// counted echo path shares (the ledger counts and records it as they are queued).
     #[inline]
     fn append_counted_line(&mut self, styled_line: Arc<StyledLine>) {
-        self.pending_buffer_updates
-            .push(BufferUpdate::Append(styled_line.clone()));
-        self.pending_buffer_updates
-            .push(BufferUpdate::EnsureNewLine);
-        self.emitted_line_count
-            .set(self.emitted_line_count.get() + 1);
-        self.record_emitted_line(&styled_line);
+        self.queue_update(BufferUpdate::Append(styled_line));
+        self.queue_update(BufferUpdate::EnsureNewLine);
     }
 
     #[inline]
@@ -2795,15 +2962,10 @@ impl Inner<'_> {
         // Deliberately no commit-first: an echoed command gluing onto an open
         // prompt line is classic MUD-client behavior. The EnsureNewLine below
         // commits whatever line it lands on.
-        self.pending_buffer_updates
-            .push(BufferUpdate::Append(styled_line.clone()));
-        self.pending_buffer_updates
-            .push(BufferUpdate::EnsureNewLine);
-        self.main_open_line = false;
-
-        self.emitted_line_count
-            .set(self.emitted_line_count.get() + 1);
-        self.record_emitted_line(&styled_line);
+        if self.main_open_line() {
+            self.note_local_main_commit();
+        }
+        self.append_counted_line(styled_line);
 
         if let Some(future) = self.flush_buffer_updates()? {
             future.await?;
@@ -2837,15 +2999,10 @@ impl Inner<'_> {
         let display = redact(line, redactions);
         let styled_line = Arc::new(StyledLine::from_output_str(&display));
 
-        self.pending_buffer_updates
-            .push(BufferUpdate::Append(styled_line.clone()));
-        self.pending_buffer_updates
-            .push(BufferUpdate::EnsureNewLine);
-        self.main_open_line = false;
-
-        self.emitted_line_count
-            .set(self.emitted_line_count.get() + 1);
-        self.record_emitted_line(&styled_line);
+        if self.main_open_line() {
+            self.note_local_main_commit();
+        }
+        self.append_counted_line(styled_line);
 
         if let Some(future) = self.flush_buffer_updates()? {
             future.await?;
@@ -3355,6 +3512,7 @@ impl Inner<'_> {
                         // trigger queued Reload ahead of its line-completion action,
                         // close the replacement transaction now rather than letting
                         // the rebuilt runtime finish the next unrelated server line.
+                        self.finish_partial_line_before_reload();
                         if self.replacing_main_open_line || self.fragmented_completion_in_flight {
                             self.abort_incoming_line_sync();
                         }

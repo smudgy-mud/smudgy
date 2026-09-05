@@ -5,7 +5,9 @@
 //! the same corpora and share the [`REGEX_TRIGGERS`] set, so keeping that here
 //! (rather than copied into each bench) stops the two from drifting.
 //!
-//! Env var honored by the loaders: `SMUDGY_BENCH_LINES=n` truncates a corpus.
+//! Env vars honored by the loaders: `SMUDGY_BENCH_LINES=n` truncates a corpus;
+//! `SMUDGY_BENCH_CORPUS=<path>` selects the single-corpus workloads' input
+//! (see [`default_corpus`]).
 
 // These are bench-support helpers; panicking on missing/garbled corpora is the
 // desired behavior and not worth a `# Panics` section on each one.
@@ -73,6 +75,26 @@ pub fn read_lines(path: &Path) -> Vec<String> {
 #[must_use]
 pub fn load_log_lines() -> Vec<String> {
     read_lines(&data_path("logs/synthetic-long-session.log"))
+}
+
+/// The corpus a single-corpus workload runs against: `SMUDGY_BENCH_CORPUS=<path>`
+/// when set (any log file, e.g. a private one outside this tree), otherwise the
+/// first file in `logs/` by name — the same pick the criterion benches make.
+/// `SMUDGY_BENCH_LINES` applies either way.
+#[must_use]
+pub fn default_corpus() -> (String, Vec<String>) {
+    if let Ok(path) = std::env::var("SMUDGY_BENCH_CORPUS") {
+        let path = PathBuf::from(path);
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        return (name, read_lines(&path));
+    }
+    log_corpora()
+        .into_iter()
+        .next()
+        .expect("bench/logs has at least one log file")
 }
 
 /// Every file in `logs/`, as `(file_name, lines)`, sorted by name. Each entry

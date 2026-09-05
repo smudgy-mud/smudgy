@@ -14,7 +14,7 @@ use crate::session::{BufferUpdate, SessionEvent, TaggedSessionEvent};
 
 use super::pane::{MAIN_PANE_KEY, PaneError, PaneKey, PaneKind, PaneNamespace};
 use super::trigger::{self, PushTriggerParams};
-use super::{ActionResult, Inner, IsolateId, RuntimeAction, ScriptAction};
+use super::{ActionResult, Inner, IsolateId, MainPrefixDisposition, RuntimeAction, ScriptAction};
 use crate::session::styled_line::StyledLine;
 
 /// Forward a lazy tooltip request while preserving a terminal failure path.
@@ -575,6 +575,7 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::HandleIncomingPartialLine(line) => {
+                self.partial_line_in_flight = Some(line.clone());
                 self.script_engine
                     .set_current_line(Some(Arc::downgrade(&line)));
                 match self.trigger_manager.process_partial_line(line) {
@@ -588,8 +589,7 @@ impl Inner<'_> {
                 }
             }
             RuntimeAction::PromptBoundary => {
-                self.pending_buffer_updates
-                    .push(BufferUpdate::PromptBoundary);
+                self.route_prompt_boundary();
                 Ok(ActionResult::None)
             }
             RuntimeAction::RetractIncomingPartialLine => {
@@ -654,22 +654,35 @@ impl Inner<'_> {
             } => {
                 self.fragmented_completion_in_flight = false;
                 self.script_engine.set_current_line(None);
-                let transformed = !self.pending_line_operations.borrow().is_empty();
+                let (transformed, preserves_committed_prefix) = {
+                    let operations = self.pending_line_operations.borrow();
+                    (
+                        !operations.is_empty(),
+                        operations.iter().all(|operation| {
+                            operation.preserves_text_before(self.main_committed_source_len)
+                        }),
+                    )
+                };
+                let original_line = line.clone();
                 let processed_line = self.apply_pending_line_operations(line);
                 let routing = self.line_routing.borrow_mut().take();
                 self.route_fragmented_complete_line(
+                    original_line,
                     processed_line,
                     completion_fragment,
                     transformed,
+                    preserves_committed_prefix,
                     &routing,
                 );
                 Ok(ActionResult::None)
             }
             RuntimeAction::PartialLineTriggersProcessed(line) => {
+                self.partial_line_in_flight.take();
                 self.script_engine.set_current_line(None);
+                let source_len = line.text.len();
                 let processed_line = self.apply_pending_line_operations(line);
                 let routing = self.line_routing.borrow_mut().take();
-                self.route_partial_line(processed_line, &routing);
+                self.route_partial_line(processed_line, source_len, &routing);
                 Ok(ActionResult::None)
             }
             RuntimeAction::Send(line) => self.dispatch_send(line, 0, None).await,
@@ -1682,12 +1695,9 @@ impl Inner<'_> {
                 // Both sides apply `LineOperation::apply`, so the ring and the on-screen buffer
                 // stay identical. A line number outside the window is a no-op on the ring
                 // (still forwarded to the UI, which holds the larger 10k scrollback).
-                {
-                    let mut ring = self.recent_lines.borrow_mut();
-                    if let Some(entry) = ring.iter_mut().find(|(n, _)| *n == line_number) {
-                        entry.1 = operation.apply(&entry.1);
-                    }
-                }
+                super::row_ledger::edit_ring_row(self.ledger.ring(), line_number, |row| {
+                    operation.apply(row)
+                });
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
@@ -2123,9 +2133,9 @@ impl Inner<'_> {
                 name,
                 text,
             } => {
-                // Pane echoes are whole lines by construction and skip
-                // emitted_line_count / record_emitted_line and the main
-                // open-line heuristic entirely.
+                // Pane echoes are whole lines by construction and pass the
+                // row ledger (main's count, ring, and open-line state)
+                // untouched.
                 match self.resolve_pane_target(key, &namespace, &name) {
                     // `pane.echo` on the main pane IS a normal echo: it takes
                     // the counted Append path (numbering parity), never an
@@ -2136,7 +2146,7 @@ impl Inner<'_> {
                     }
                     Some((key, PaneKind::Terminal, _)) => {
                         for line in text.split('\n') {
-                            self.pending_buffer_updates.push(BufferUpdate::AppendTo(
+                            self.queue_update(BufferUpdate::AppendTo(
                                 key,
                                 Arc::new(StyledLine::from_echo_str(line)),
                             ));
@@ -2164,8 +2174,7 @@ impl Inner<'_> {
                     }
                     Some((key, PaneKind::Terminal, _)) => {
                         for line in &lines {
-                            self.pending_buffer_updates
-                                .push(BufferUpdate::AppendTo(key, line.clone()));
+                            self.queue_update(BufferUpdate::AppendTo(key, line.clone()));
                         }
                     }
                     Some((_, PaneKind::Widgets, _)) => {
@@ -2182,15 +2191,18 @@ impl Inner<'_> {
             } => {
                 match self.resolve_pane_target(key, &namespace, &name) {
                     Some((key, PaneKind::Terminal, is_main)) => {
-                        if is_main && self.main_open_line {
-                            // The open partial vanishes with the clear; account for it as
-                            // committed-then-cleared so core's count stays in step with the
-                            // UI's (which consumed a number when the partial started).
-                            self.emitted_line_count
-                                .set(self.emitted_line_count.get() + 1);
-                            self.main_open_line = false;
+                        if is_main {
+                            // The open partial vanishes with the clear; the row ledger
+                            // accounts for it as committed-then-cleared when the `Clear`
+                            // is queued below.
+                            self.main_deferred_fragments.clear();
+                            if !matches!(self.main_prefix_disposition, MainPrefixDisposition::None)
+                            {
+                                self.main_prefix_disposition = MainPrefixDisposition::Incomplete;
+                                self.main_committed_source_len = 0;
+                            }
                         }
-                        self.pending_buffer_updates.push(BufferUpdate::Clear(key));
+                        self.queue_update(BufferUpdate::Clear(key));
                         if let Some(fut) = self.flush_buffer_updates()? {
                             fut.await?;
                         }

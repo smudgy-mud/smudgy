@@ -822,29 +822,46 @@ pub struct StyledLine {
     raw: Option<String>,
 }
 
-/// Cold-path accumulator for a logical line provisionally emitted in pieces.
-/// One fragment reuses its existing `Arc`; only a second fragment allocates a
-/// side vector. Joining precomputes every destination capacity and copies each
-/// byte/span/link exactly once.
+/// Accumulator for a line provisionally emitted in pieces — a logical line
+/// split at read-batch boundaries, or a physical main row a prompt left open.
+/// Warm, not cold: every prompt row passes through here, so the common shapes
+/// allocate nothing. One or two fragments reuse their existing `Arc`s; only a
+/// third allocates a side vector. A blank fragment (see
+/// [`StyledLine::is_blank_fragment`]) contributes nothing to a join, so it is
+/// never kept beside a real one: a bare prompt boundary followed by a real
+/// line, or a prompt row completed by a bare line end, hands back the real
+/// side's `Arc` untouched. Joining precomputes every destination capacity and
+/// copies each byte/span/link exactly once.
 #[derive(Debug, Default)]
 pub(crate) enum LineFragments {
     #[default]
     None,
     One(Arc<StyledLine>),
+    Two(Arc<StyledLine>, Arc<StyledLine>),
     Many(Vec<Arc<StyledLine>>),
 }
 
 impl LineFragments {
-    #[cold]
     pub(crate) fn push(&mut self, fragment: Arc<StyledLine>) {
         match self {
             Self::None => *self = Self::One(fragment),
+            // A blank adds nothing to what is already here.
+            _ if fragment.is_blank_fragment() => {}
+            // A lone blank is superseded by the first real fragment.
+            Self::One(first) if first.is_blank_fragment() => *self = Self::One(fragment),
             Self::One(_) => {
                 let Self::One(first) = std::mem::take(self) else {
                     unreachable!();
                 };
+                *self = Self::Two(first, fragment);
+            }
+            Self::Two(..) => {
+                let Self::Two(first, second) = std::mem::take(self) else {
+                    unreachable!();
+                };
                 let mut fragments = Vec::with_capacity(4);
                 fragments.push(first);
+                fragments.push(second);
                 fragments.push(fragment);
                 *self = Self::Many(fragments);
             }
@@ -854,11 +871,13 @@ impl LineFragments {
 
     /// Consume all accumulated fragments. A single fragment is returned
     /// unchanged; multiple fragments are flattened once.
-    #[cold]
     pub(crate) fn take_joined(&mut self) -> Option<Arc<StyledLine>> {
         match std::mem::take(self) {
             Self::None => None,
             Self::One(line) => Some(line),
+            Self::Two(first, second) => Some(Arc::new(StyledLine::concatenate_parts(
+                [first.as_ref(), second.as_ref()].into_iter(),
+            ))),
             Self::Many(fragments) => Some(Arc::new(StyledLine::concatenate_fragments(
                 &fragments, None,
             ))),
@@ -867,17 +886,23 @@ impl LineFragments {
 
     /// Consume the provisional prefix and concatenate it with `completion` in
     /// one exact-capacity pass. Returns `None` for the ordinary unfragmented
-    /// path.
-    #[cold]
+    /// path. A blank side contributes nothing to the join, so the other
+    /// side's `Arc` is returned as-is.
     pub(crate) fn take_joined_with(
         &mut self,
         completion: &Arc<StyledLine>,
     ) -> Option<Arc<StyledLine>> {
+        if completion.is_blank_fragment() {
+            return self.take_joined();
+        }
         match std::mem::take(self) {
             Self::None => None,
-            Self::One(prefix) => Some(Arc::new(StyledLine::concatenate_fragments(
-                &[prefix],
-                Some(completion),
+            Self::One(prefix) if prefix.is_blank_fragment() => Some(completion.clone()),
+            Self::One(prefix) => Some(Arc::new(StyledLine::concatenate_parts(
+                [prefix.as_ref(), completion.as_ref()].into_iter(),
+            ))),
+            Self::Two(first, second) => Some(Arc::new(StyledLine::concatenate_parts(
+                [first.as_ref(), second.as_ref(), completion.as_ref()].into_iter(),
             ))),
             Self::Many(fragments) => Some(Arc::new(StyledLine::concatenate_fragments(
                 &fragments,
@@ -886,13 +911,24 @@ impl LineFragments {
         }
     }
 
+    /// The fragments as one line, joined on first call and memoised: a later
+    /// call hands back the same `Arc`. `None` when there are no fragments.
+    pub(crate) fn joined(&mut self) -> Option<Arc<StyledLine>> {
+        if let Self::One(line) = self {
+            return Some(line.clone());
+        }
+        let line = self.take_joined()?;
+        *self = Self::One(line.clone());
+        Some(line)
+    }
+
     pub(crate) fn clear(&mut self) {
         *self = Self::None;
     }
 
     #[inline]
     pub(crate) fn has_fragments(&self) -> bool {
-        matches!(self, Self::One(_) | Self::Many(_))
+        !matches!(self, Self::None)
     }
 }
 
@@ -912,6 +948,18 @@ pub fn floor_char_boundary(text: &str, pos: usize) -> usize {
 }
 
 impl StyledLine {
+    /// Whether gluing this fragment onto another line changes nothing visible
+    /// or matchable: no text (so, by the span-tiling invariant, only
+    /// zero-width spans), no links, and no raw bytes. An SGR-only prompt
+    /// flush that captured raw escape bytes is NOT blank — raw triggers see
+    /// those bytes in the joined line.
+    #[must_use]
+    pub fn is_blank_fragment(&self) -> bool {
+        self.text.is_empty()
+            && self.links.is_empty()
+            && self.raw.as_ref().is_none_or(String::is_empty)
+    }
+
     #[must_use]
     pub fn new(text: &str, span_info: Vec<VtSpan>) -> Self {
         Self {
@@ -948,68 +996,42 @@ impl StyledLine {
         }
     }
 
+    /// `self` followed by `other_line`, in one exact-capacity pass: the
+    /// scrollback glues every fragment of an open row through here, once per
+    /// prompt and once per line on a server that ends each line in a prompt
+    /// boundary, so it sizes each destination once and copies each
+    /// byte/span/link once. `raw` is the union: present when either side is.
     #[must_use]
     pub fn append(&self, other_line: &StyledLine) -> Self {
-        Self {
-            text: format!("{}{}", self.text, other_line.text),
-            spans: self
-                .spans
-                .clone()
-                .into_iter()
-                .chain(other_line.spans.iter().map(|span| VtSpan {
-                    style: span.style,
-                    begin_pos: span.begin_pos + self.text.len(),
-                    end_pos: span.end_pos + self.text.len(),
-                }))
-                .collect(),
-            links: self
-                .links
-                .iter()
-                .cloned()
-                .chain(other_line.links.iter().map(|link| LinkSpan {
-                    begin_pos: link.begin_pos + self.text.len(),
-                    end_pos: link.end_pos + self.text.len(),
-                    action: link.action.clone(),
-                    tooltip: link.tooltip.clone(),
-                    style: link.style.clone(),
-                }))
-                .collect(),
-            raw: match self.raw {
-                Some(ref raw) => {
-                    let mut combined = raw.clone();
-                    match other_line.raw {
-                        Some(ref other_raw) => {
-                            combined.push_str(other_raw);
-                            Some(combined)
-                        }
-                        None => Some(combined),
-                    }
-                }
-                None => other_line.raw.clone(),
-            },
-        }
+        Self::concatenate_parts([self, other_line].into_iter())
     }
 
     /// Concatenate a fragmented logical line after one metadata-only sizing
-    /// pass. This is the cold-path sibling of [`Self::append`]: transport-batch
-    /// fragments may be numerous, so folding `append` over them would repeatedly
-    /// copy the complete prefix and become quadratic.
+    /// pass. Transport-batch fragments may be numerous, so folding
+    /// [`Self::append`] over them would repeatedly copy the complete prefix and
+    /// become quadratic; this flattens them once.
     ///
     /// `has_raw` follows `append`'s union semantics. The VT producer keeps raw
     /// capture latched across an open logical line, so production fragments are
     /// in practice either all raw or all cooked.
     #[cold]
     fn concatenate_fragments(fragments: &[Arc<Self>], completion: Option<&Arc<Self>>) -> Self {
+        Self::concatenate_parts(
+            fragments
+                .iter()
+                .map(Arc::as_ref)
+                .chain(completion.map(Arc::as_ref)),
+        )
+    }
+
+    /// Concatenate `parts` in order: one sizing pass, then one copy pass.
+    fn concatenate_parts<'a>(parts: impl Iterator<Item = &'a Self> + Clone) -> Self {
         let mut text_len = 0;
         let mut span_len = 0;
         let mut link_len = 0;
         let mut raw_len = 0;
         let mut has_raw = false;
-        for fragment in fragments
-            .iter()
-            .map(Arc::as_ref)
-            .chain(completion.map(Arc::as_ref))
-        {
+        for fragment in parts.clone() {
             text_len += fragment.text.len();
             span_len += fragment.spans.len();
             link_len += fragment.links.len();
@@ -1024,11 +1046,7 @@ impl StyledLine {
             raw: has_raw.then(|| String::with_capacity(raw_len)),
         };
 
-        for fragment in fragments
-            .iter()
-            .map(Arc::as_ref)
-            .chain(completion.map(Arc::as_ref))
-        {
+        for fragment in parts {
             let offset = combined.text.len();
             combined.text.push_str(&fragment.text);
             combined

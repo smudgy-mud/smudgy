@@ -1,7 +1,7 @@
 //! The script editors (alias / trigger / hotkey), the folder editor, and the
 //! module pane — both the update-side logic and the views.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use iced::alignment::Vertical;
@@ -107,39 +107,6 @@ fn action_tab_key_action(
             script_language
         })
     })
-}
-
-fn activation_profile_order(profile_names: &[String]) -> Vec<&str> {
-    // `load_profile_names` already sorts by display caption and then storage
-    // name. Keep that stable order here; the Current badge is enough emphasis
-    // without making every session switch reshuffle the checklist.
-    profile_names.iter().map(String::as_str).collect()
-}
-
-pub(super) fn activation_profile_label(
-    profile_name: &str,
-    profile_names: &[String],
-    captions: &HashMap<String, String>,
-) -> String {
-    let caption = captions
-        .get(profile_name)
-        .map(|caption| caption.trim())
-        .filter(|caption| !caption.is_empty())
-        .unwrap_or(profile_name);
-    let duplicate = profile_names.iter().any(|other| {
-        other != profile_name
-            && captions
-                .get(other)
-                .map(|other_caption| other_caption.trim())
-                .filter(|other_caption| !other_caption.is_empty())
-                .unwrap_or(other)
-                .eq_ignore_ascii_case(caption)
-    });
-    if duplicate && caption != profile_name {
-        format!("{caption} ({profile_name})")
-    } else {
-        caption.to_string()
-    }
 }
 
 fn activation_control_key_action(key: &Key, repeat: bool, message: Message) -> KeyAction<Message> {
@@ -800,9 +767,8 @@ impl AutomationsWindow {
     /// kept for display but marked incomplete so no activation write canonicalizes against it.
     pub(super) fn refresh_profile_inventory(&mut self) -> Result<(), String> {
         match Self::load_profile_choices(&self.server_name) {
-            Ok((profile_names, profile_captions)) => {
+            Ok(profile_names) => {
                 self.profile_names = profile_names;
-                self.profile_captions = profile_captions;
                 self.profile_inventory_complete = true;
                 Ok(())
             }
@@ -3550,18 +3516,16 @@ impl AutomationsWindow {
                     .style(common::danger),
             );
         }
-        for profile_name in activation_profile_order(&self.profile_names) {
+        for profile_name in self.profile_names.iter().map(String::as_str) {
             let name = profile_name.to_string();
             let pointer_name = name.clone();
             let current = profile_name == self.profile_name;
-            let label =
-                activation_profile_label(profile_name, &self.profile_names, &self.profile_captions);
             let profile_enabled = activation.is_enabled_for(profile_name);
             let can_toggle_profile = storage_available
                 && self.profile_inventory_complete
                 && (profile_enabled || enable_block_reason.is_none());
             let profile_checkbox = checkbox(profile_enabled)
-                .label(label)
+                .label(name.clone())
                 .size(14.0)
                 .text_size(13.0);
             let profile_checkbox: Elem<'a> = if can_toggle_profile {
@@ -5947,21 +5911,6 @@ mod tests {
             to_text,
             KeyAction::Publish(Message::SetBehavior(ScriptLang::Plaintext))
         ));
-    }
-
-    #[test]
-    fn activation_profiles_preserve_caption_order() {
-        let profiles = vec![
-            "Testing".to_string(),
-            "Builder".to_string(),
-            "Main".to_string(),
-            "healer".to_string(),
-        ];
-
-        assert_eq!(
-            activation_profile_order(&profiles),
-            vec!["Testing", "Builder", "Main", "healer"]
-        );
     }
 
     #[test]

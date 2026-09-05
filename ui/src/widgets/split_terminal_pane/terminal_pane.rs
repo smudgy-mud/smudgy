@@ -32,7 +32,7 @@ use smudgy_core::session::styled_line::{
 
 mod spans;
 
-use crate::terminal_buffer::selection::{BufferPosition, LineSelection, Selection};
+use crate::terminal_buffer::selection::{BufferPosition, LineSelection, Selection, word_span_at};
 use spans::Spans;
 
 type Link = SpanMetadata;
@@ -1086,6 +1086,11 @@ pub(super) struct State<P: text::Paragraph> {
     /// release first and flips `Selecting` → `Selected`, so selection state alone
     /// cannot tell this pane a click just ended on it.
     pub pressed_cell: Option<BufferPosition>,
+    /// The most recent left click. `mouse::Click::new` compares the next press
+    /// against it: a press at the same spot within iced's click window is a
+    /// double click (select word) or a triple click (select line). The
+    /// titlebar's "double click to maximize" gesture uses the same primitive.
+    previous_click: Option<mouse::Click>,
     /// The terminal-owned OSC/script link context menu, anchored where it was
     /// opened. Actions are cloned with the scrollback so the popup remains
     /// valid even if new output arrives before a choice is clicked.
@@ -1124,6 +1129,7 @@ impl<P: text::Paragraph> Default for State<P> {
             advance: None,
             modifiers: keyboard::Modifiers::default(),
             pressed_cell: None,
+            previous_click: None,
             menu_popup: None,
             link_tooltip_hover: None,
             link_tooltip_paragraph: RefCell::new(None),
@@ -1298,6 +1304,24 @@ impl<P: text::Paragraph> State<P> {
             }
         }
         None
+    }
+
+    /// The rendered text of absolute line `line_number` and its offset map,
+    /// or `None` if the line is not in the paragraph cache (scrolled out of
+    /// view, or hidden). The text is joined from the shaped spans, so byte
+    /// offsets into it match the cursors that `Paragraph::hit_test` returns.
+    pub(super) fn rendered_line(&self, line_number: usize) -> Option<(String, &RenderedOffsets)> {
+        let line = self
+            .cache
+            .iter()
+            .find(|line| line.line_number == line_number)?;
+        let text = line
+            .spans
+            .spans()
+            .iter()
+            .map(|span| span.text.as_ref())
+            .collect::<String>();
+        Some((text, &line.offsets))
     }
 
     fn link_tooltip_anchor(
@@ -2344,6 +2368,17 @@ where
                 let mut selection = self.selection.borrow_mut();
 
                 if let Some(click_position) = cursor.position_in(layout.bounds()) {
+                    // Classify this press against the previous one. A press at
+                    // the same spot within iced's click window is a double or
+                    // triple click. Those select a word or a line instead of
+                    // starting a drag.
+                    let click = mouse::Click::new(
+                        click_position,
+                        mouse::Button::Left,
+                        state.previous_click,
+                    );
+                    state.previous_click = Some(click);
+
                     if let Some(position) = state.hit_test(layout.bounds(), click_position) {
                         if let Some((key, link)) =
                             self.available_link_at(state, position.line, position.column)
@@ -2356,12 +2391,70 @@ where
                             }
                             state.invalidate_link_styles();
                         }
-                        state.pressed_cell = Some(position.clone());
-                        *selection = Selection::Selecting {
-                            origin: position.clone(),
-                            from: position.clone(),
-                            to: position,
+
+                        // A double click selects the word under the caret. A
+                        // triple click selects the line. Both apply at once,
+                        // with no drag. A double click inside whitespace falls
+                        // back to the single-click path below.
+                        //
+                        // The word is found in the rendered text, which is
+                        // what the user sees. A concealed link renders as
+                        // spaces, so a double click on it selects nothing.
+                        // The result is mapped back to source offsets, which
+                        // is what `Selection` stores.
+                        let word_or_line = match click.kind() {
+                            mouse::click::Kind::Double => state
+                                .rendered_line(position.line)
+                                .and_then(|(text, offsets)| {
+                                    let column = offsets.source_to_rendered(position.column);
+                                    word_span_at(&text, column).map(|(start, end)| {
+                                        (
+                                            offsets.rendered_to_source(start),
+                                            offsets.rendered_to_source(end),
+                                        )
+                                    })
+                                })
+                                .map(|(start, end)| {
+                                    (
+                                        BufferPosition {
+                                            line: position.line,
+                                            column: start,
+                                        },
+                                        BufferPosition {
+                                            line: position.line,
+                                            column: end,
+                                        },
+                                    )
+                                }),
+                            mouse::click::Kind::Triple => Some((
+                                BufferPosition {
+                                    line: position.line,
+                                    column: 0,
+                                },
+                                BufferPosition {
+                                    line: position.line,
+                                    column: usize::MAX,
+                                },
+                            )),
+                            mouse::click::Kind::Single => None,
                         };
+
+                        if let Some((from, to)) = word_or_line {
+                            // `pressed_cell` stays `None` on purpose. The
+                            // release handler reads it to decide whether a
+                            // plain click activated a link. The first press of
+                            // a double click already took the single-click path
+                            // and fired any link under the word on its release.
+                            // The second press must not fire it again.
+                            *selection = Selection::Selected { from, to };
+                        } else {
+                            state.pressed_cell = Some(position.clone());
+                            *selection = Selection::Selecting {
+                                origin: position.clone(),
+                                from: position.clone(),
+                                to: position,
+                            };
+                        }
                         // The press hands the shared selection to the user:
                         // search no longer owns it, so the search styling
                         // must not apply and dismissing search must not

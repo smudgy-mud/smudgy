@@ -2169,18 +2169,13 @@ impl AutomationsWindow {
                 ));
             }
         }
-        let label = super::editors::activation_profile_label(
-            &destination,
-            &self.profile_names,
-            &self.profile_captions,
-        );
         let event = self
             .configuration_change_affects_running(&prompt.specifier, Some(&destination))
             .then(|| Event::ScriptsChanged {
                 server_name: self.server_name.clone(),
             });
         Update::new(
-            self.show_toast(crate::i18n::t!("package-settings-copied", "profile" => &label)),
+            self.show_toast(crate::i18n::t!("package-settings-copied", "profile" => &destination)),
             event,
         )
     }
@@ -2203,22 +2198,13 @@ impl AutomationsWindow {
         )
         .on_press(Message::CancelCopySettings);
 
-        let source_label = super::editors::activation_profile_label(
-            &prompt.source,
-            &self.profile_names,
-            &self.profile_captions,
-        );
         let choices = self
             .profile_names
             .iter()
             .filter(|profile| **profile != prompt.source)
             .map(|profile| ProfileChoice {
                 key: profile.clone(),
-                label: super::editors::activation_profile_label(
-                    profile,
-                    &self.profile_names,
-                    &self.profile_captions,
-                ),
+                label: profile.clone(),
             })
             .collect::<Vec<_>>();
         let selected = choices
@@ -2230,7 +2216,7 @@ impl AutomationsWindow {
                 text(crate::i18n::t!("package-copy-settings-title")).size(14.0),
                 text(crate::i18n::t!(
                     "package-copy-settings-help",
-                    "profile" => &source_label
+                    "profile" => &prompt.source
                 ))
                 .size(12.0)
                 .style(common::muted),
