@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Double click selects a word, triple click selects a line.** In a terminal
+  pane, a double click selects the whitespace-delimited word under the pointer
+  and a triple click selects the whole line, ready to copy. A double click on a
+  link still activates the link once, on the first click.
 - **Automations can run in some profiles and not others.** Folders, modules, and
   packages each carry an activation of every profile, no profiles, or a chosen set,
   edited from one checklist with Enable everywhere and Disable everywhere actions.
