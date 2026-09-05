@@ -1724,10 +1724,24 @@ impl TerminalBuffer {
             let line: BufferLine = line_in.into();
             self.note_added(self.last_line_number, &line);
             self.lines.push_back(line);
+        } else if line_in.is_blank_fragment() && !self.lines.is_empty() {
+            // Nothing to glue: a bare prompt boundary's empty flush, or a
+            // line end arriving on an open prompt row. The row stays open
+            // and untouched — and, on a server that ends every line in a
+            // prompt boundary, the copy this would otherwise make per line
+            // is skipped. (An empty buffer has no open row to leave alone:
+            // the fragment opens row 1 below, blank or not.)
         } else {
             match self.lines.pop_back() {
                 Some(line) => {
-                    let joined: BufferLine = Arc::new(line.styled_line.append(&line_in)).into();
+                    // An open row that is itself blank (a bare prompt
+                    // boundary opened it) takes the new fragment's `Arc`
+                    // outright rather than copying it into a join.
+                    let joined: BufferLine = if line.styled_line.is_blank_fragment() {
+                        line_in.into()
+                    } else {
+                        Arc::new(line.styled_line.append(&line_in)).into()
+                    };
                     let had_links = !line.styled_line.links.is_empty();
                     let has_links = !joined.styled_line.links.is_empty();
                     if has_links && !had_links {
@@ -2441,6 +2455,44 @@ mod tests {
         assert_eq!(buffer2.len(), 1);
         assert_eq!(buffer2.last_line_number, 1); // Incremented
         assert!(!buffer2.line_terminated);
+    }
+
+    /// Blank fragments (a bare prompt boundary's empty flush, a line end
+    /// landing on an open prompt row) consume a line number exactly when a
+    /// real fragment would, but never copy the row they land on.
+    #[test]
+    fn blank_fragments_open_rows_but_never_glue() {
+        // A blank on an empty, never-terminated buffer opens row 1, like any
+        // first fragment (a corpus starting with an empty line relies on it).
+        let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(10).unwrap());
+        buffer.extend_line(sl(""));
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.last_line_number, 1);
+        assert!(!buffer.line_terminated);
+
+        // A real fragment onto that blank open row takes its `Arc` outright:
+        // same row, same number, no join.
+        let real = sl("HP:10> ");
+        buffer.extend_line(real.clone());
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.last_line_number, 1);
+        let tail = buffer.iter_rev().next().unwrap();
+        assert!(Arc::ptr_eq(&tail.styled_line, &real));
+
+        // A blank onto an open real row leaves it untouched and still open.
+        buffer.extend_line(sl(""));
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.last_line_number, 1);
+        assert!(!buffer.line_terminated);
+        let tail = buffer.iter_rev().next().unwrap();
+        assert!(Arc::ptr_eq(&tail.styled_line, &real));
+
+        // Once the row is committed, a blank opens the next row as before.
+        buffer.commit_current_line();
+        buffer.extend_line(sl(""));
+        assert_eq!(buffer.len(), 2);
+        assert_eq!(buffer.last_line_number, 2);
+        assert!(!buffer.line_terminated);
     }
 
     #[test]

@@ -7806,15 +7806,14 @@ fn op_smudgy_get_current_line_styles<'s>(
     v8::Array::new(scope, 0)
 }
 
-/// Find a line by its UI line number in the recent-lines ring (`buffer.line(n)`). The ring is at most
-/// `RECENT_LINES` entries, so this linear scan is bounded and cheap.
+/// Find a row by its UI line number in the recent-lines ring (`buffer.line(n)`): a
+/// binary search over the ring's ascending numbers, joining the row's fragments on
+/// first read.
 fn ring_line(state: &OpState, line_number: usize) -> Option<Arc<StyledLine>> {
-    state
-        .borrow::<crate::session::runtime::RecentLines>()
-        .borrow()
-        .iter()
-        .find(|(n, _)| *n == line_number)
-        .map(|(_, line)| line.clone())
+    crate::session::runtime::row_ledger::ring_row(
+        state.borrow::<crate::session::runtime::RecentLines>(),
+        line_number,
+    )
 }
 
 /// `buffer.line(n).text`: the text of the emitted line `line_number`, or `undefined`

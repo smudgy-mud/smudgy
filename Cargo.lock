@@ -10040,8 +10040,6 @@ dependencies = [
 [[package]]
 name = "regex-filtered"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac5f7b31fbef748cc46643c1f9ba17f6d5c7c6f0ba5e372fc9c48d31ad1c8612"
 dependencies = [
  "aho-corasick",
  "itertools 0.14.0",
@@ -11421,6 +11419,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "simplelog",
+ "smallvec",
  "smudgy_audio",
  "smudgy_audio_web",
  "smudgy_cloud",

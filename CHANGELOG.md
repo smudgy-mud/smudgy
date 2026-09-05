@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Double click selects a word, triple click selects a line.** In a terminal
+  pane, a double click selects the whitespace-delimited word under the pointer
+  and a triple click selects the whole line, ready to copy. A double click on a
+  link still activates the link once, on the first click.
 - **Automations can run in some profiles and not others.** Folders, modules, and
   packages each carry an activation of every profile, no profiles, or a chosen set,
   edited from one checklist with Enable everywhere and Disable everywhere actions.
@@ -55,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Less work per line on the way in.** Color and attribute escape sequences are
+  parsed without allocating, a prompt row glued to the text that completes it no
+  longer copies the row on either side, regex triggers no longer allocate working
+  memory for every line they rule out, and `buffer.line(n)` reads back exactly
+  the row the terminal shows, joining a prompt to what followed it only when a
+  script asks.
 - **Disconnect notices report the connection time.** A dropped or closed
   connection now reads `Connection lost after 01:23:46.1234` or
   `Disconnected after 01:23:46.1234`. The clock is the session's own: it runs

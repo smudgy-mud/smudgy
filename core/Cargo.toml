@@ -13,6 +13,9 @@ serde = { workspace = true }
 # Insertion-ordered maps for the completion word-set registries (merge order
 # is first-contribution order, and in-place casing updates keep position).
 indexmap = { workspace = true }
+# Inline-capacity vectors for per-sequence parse scratch (SGR parameter slots)
+# that must not allocate on the inbound hot path.
+smallvec = "1"
 smudgy_cloud = { workspace = true }
 serde_json = { workspace = true }
 validator = { workspace = true }

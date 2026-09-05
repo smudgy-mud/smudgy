@@ -172,6 +172,7 @@ crates = [
     "deno_permissions",
     "deno_runtime",
     "deno_core",
+    "regex-filtered",
 ]
 
 [patch.crates-io]
@@ -183,6 +184,7 @@ vtparse = { path = "./target/patch/vtparse-0.7.0" }
 deno_permissions = { path = "./target/patch/deno_permissions-0.116.0" }
 deno_runtime = { path = "./target/patch/deno_runtime-0.265.0" }
 deno_core = { path = "./target/patch/deno_core-0.410.0" }
+regex-filtered = { path = "./target/patch/regex-filtered-0.2.1" }
 
 # Define workspace-wide lints
 [workspace.lints.clippy]
