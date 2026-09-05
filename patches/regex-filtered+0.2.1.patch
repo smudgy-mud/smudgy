@@ -1,8 +1,8 @@
 diff --git a/src/int_set.rs b/src/int_set.rs
-index 7153d65..f96518b 100644
+index 7153d65..7548498 100644
 --- a/src/int_set.rs
 +++ b/src/int_set.rs
-@@ -1,14 +1,21 @@
+@@ -1,16 +1,32 @@
 +#[derive(Debug, Default)]
  pub struct IntSet {
      sparse: Vec<usize>,
@@ -11,9 +11,17 @@ index 7153d65..f96518b 100644
  
  impl IntSet {
 -    pub fn new(capacity: usize) -> Self {
--        Self {
++    /// An empty set that accepts no values until [`IntSet::reset`]
++    /// sizes it.
++    pub const fn new() -> Self {
+         Self {
 -            sparse: vec![usize::MAX; capacity],
 -            dense: Vec::with_capacity(capacity),
++            sparse: Vec::new(),
++            dense: Vec::new(),
+         }
+     }
+ 
 +    /// Empty the set and size it for values in `0..capacity`, keeping
 +    /// the existing buffers when they already fit. Stale `sparse`
 +    /// slots are harmless: `insert` trusts a slot only when `dense`
@@ -23,69 +31,158 @@ index 7153d65..f96518b 100644
 +            self.sparse.clear();
 +            self.sparse.resize(capacity, usize::MAX);
 +            self.dense.reserve(capacity);
-         }
++        }
 +        self.dense.clear();
-     }
- 
++    }
++
      pub fn insert(&mut self, value: usize) -> bool {
+         let idx = self.sparse[value];
+         if self.dense.get(idx) != Some(&value) {
 diff --git a/src/lib.rs b/src/lib.rs
-index 5e7905e..aea795b 100644
+index 5e7905e..937fd2a 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -2,6 +2,8 @@
+@@ -2,6 +2,9 @@
  #![deny(unsafe_code)]
  #![warn(missing_docs)]
  
-+use std::sync::{Mutex, PoisonError};
++use std::cell::RefCell;
++use std::mem;
 +
  use aho_corasick::AhoCorasick;
  
  mod int_set;
-@@ -249,6 +251,7 @@ impl Builder {
-             regexes,
-             mapper,
-             prefilter,
-+            scratch: Mutex::default(),
-         })
-     }
- }
-@@ -265,6 +268,11 @@ pub struct Regexes {
-     regexes: Vec<regex::Regex>,
-     mapper: mapper::Mapper,
+@@ -267,6 +270,59 @@ pub struct Regexes {
      prefilter: AhoCorasick,
-+    /// Working memory for the mapper plus the candidate list it fills,
-+    /// reused across calls so a haystack that no regex could match is
-+    /// checked without allocating. Sharing through a lock keeps the
-+    /// set `Sync`; the lock is uncontended in single-threaded use.
-+    scratch: Mutex<(mapper::Scratch, Vec<usize>)>,
  }
  
++thread_local! {
++    /// The idle working buffers of this thread: the mapper scratch plus
++    /// the candidate list it fills. A match takes them out, works in
++    /// them, and hands them back when its [`Candidates`] drops, so steady
++    /// state matching allocates nothing. The slot is empty while a match
++    /// is in flight; a nested or overlapping match on the same thread
++    /// then starts from fresh (empty) buffers, and whichever finishes
++    /// last leaves its buffers behind. Any number of sets share the
++    /// slot, as the buffers are resized for the mapper on every use.
++    static SCRATCH: RefCell<(mapper::Scratch, Vec<usize>)> =
++        const { RefCell::new((mapper::Scratch::new(), Vec::new())) };
++}
++
++/// The indices of the regexes the prefilter could not rule out for one
++/// haystack, ascending. Owns the buffers it was computed in and returns
++/// them to the pool of the thread it is dropped on.
++struct Candidates {
++    scratch: mapper::Scratch,
++    candidates: Vec<usize>,
++    next: usize,
++}
++
++impl Iterator for Candidates {
++    type Item = usize;
++
++    #[inline]
++    fn next(&mut self) -> Option<usize> {
++        let idx = *self.candidates.get(self.next)?;
++        self.next += 1;
++        Some(idx)
++    }
++
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        let n = self.candidates.len() - self.next;
++        (n, Some(n))
++    }
++}
++
++impl ExactSizeIterator for Candidates {}
++
++impl Drop for Candidates {
++    fn drop(&mut self) {
++        // Unreachable only while the thread's locals are being torn
++        // down; the buffers are then simply freed.
++        let _ = SCRATCH.try_with(|slot| {
++            *slot.borrow_mut() = (
++                mem::take(&mut self.scratch),
++                mem::take(&mut self.candidates),
++            );
++        });
++    }
++}
++
  impl Regexes {
-@@ -281,9 +289,21 @@ impl Regexes {
+     // TODO:
+     // - number of tokens (prefilter.patterns_len())
+@@ -281,9 +337,21 @@ impl Regexes {
              .map(|m| m.pattern().as_usize())
      }
  
 +    /// The indices of the regexes the prefilter cannot rule out for
-+    /// `haystack`, ascending. Allocates only when there are some: the
-+    /// common no-candidate outcome hands back an empty iterator.
++    /// `haystack`, ascending, computed in the thread's pooled buffers
++    /// (see [`SCRATCH`]) so that repeated matching does not allocate.
      #[inline]
-     fn prefiltered(&self, haystack: &str) -> impl Iterator<Item = usize> + use<> {
+-    fn prefiltered(&self, haystack: &str) -> impl Iterator<Item = usize> + use<> {
 -        self.mapper.atom_to_re(self.prefilter(haystack)).into_iter()
-+        let mut guard = self.scratch.lock().unwrap_or_else(PoisonError::into_inner);
-+        let (scratch, candidates) = &mut *guard;
++    fn prefiltered(&self, haystack: &str) -> Candidates {
++        let (mut scratch, mut candidates) = SCRATCH
++            .try_with(|slot| slot.take())
++            .unwrap_or_default();
 +        self.mapper
-+            .atom_to_re_into(self.prefilter(haystack), scratch, candidates);
-+        if candidates.is_empty() {
-+            Vec::new()
-+        } else {
-+            candidates.clone()
++            .atom_to_re_into(self.prefilter(haystack), &mut scratch, &mut candidates);
++        Candidates {
++            scratch,
++            candidates,
++            next: 0,
 +        }
-+        .into_iter()
      }
  
      /// Returns *whether* any regex in the set matches the haystack.
+@@ -317,6 +385,44 @@ mod test {
+     use super::*;
+     use itertools::Itertools;
+ 
++    #[test]
++    fn matching_reuses_the_thread_pool() {
++        let f = Builder::new().push("abc.*xyz").unwrap().build().unwrap();
++        assert!(f.is_match("abc123xyz"));
++        let first = SCRATCH.with(|slot| {
++            let (_, candidates) = &*slot.borrow();
++            (candidates.as_ptr(), candidates.capacity())
++        });
++        assert!(first.1 > 0, "a finished match leaves its buffers in the pool");
++
++        assert!(f.is_match("abc123xyz"));
++        let second = SCRATCH.with(|slot| slot.borrow().1.as_ptr());
++        assert_eq!(first.0, second, "the next match takes the same buffers back out");
++    }
++
++    #[test]
++    fn nested_matching_is_independent() {
++        let f = Builder::new()
++            .push("abc.*xyz")
++            .unwrap()
++            .push("foo")
++            .unwrap()
++            .build()
++            .unwrap();
++        // The outer iterator holds the pooled buffers for its whole life;
++        // the inner matches run on fresh ones and must not disturb it.
++        let outer = f
++            .matching("abc123xyz foo")
++            .map(|(idx, _)| {
++                assert_eq!(f.matching("foo").map(|(i, _)| i).collect_vec(), vec![1]);
++                assert!(f.is_match("abc-xyz"));
++                assert!(!f.is_match("nothing"));
++                idx
++            })
++            .collect_vec();
++        assert_eq!(outer, vec![0, 1]);
++    }
++
+     #[test]
+     fn empty_filter() {
+         let f = Builder::new().build().unwrap();
 diff --git a/src/mapper.rs b/src/mapper.rs
-index 1324481..1b9ea17 100644
+index 1324481..c2b5583 100644
 --- a/src/mapper.rs
 +++ b/src/mapper.rs
 @@ -183,11 +183,15 @@ impl Builder {
@@ -107,7 +204,7 @@ index 1324481..1b9ea17 100644
                  writeln!(f, "\t\tregex {r}")?;
              }
          }
-@@ -244,24 +248,66 @@ pub struct Mapper {
+@@ -244,24 +248,69 @@ pub struct Mapper {
      /// Atom index to entry id mapping
      atom_to_entry: Vec<usize>,
  }
@@ -127,8 +224,11 @@ index 1324481..1b9ea17 100644
 +
 +impl Scratch {
 +    /// An empty scratch; it grows to fit on first use.
-+    pub fn new() -> Self {
-+        Self::default()
++    pub const fn new() -> Self {
++        Self {
++            work: IntSet::new(),
++            count: Vec::new(),
++        }
 +    }
 +
 +    fn reset(&mut self, entries: usize) {
@@ -182,7 +282,7 @@ index 1324481..1b9ea17 100644
  
          let mut i = 0;
          while i < work.len() {
-@@ -285,8 +331,6 @@ impl Mapper {
+@@ -285,8 +334,6 @@ impl Mapper {
                  work.insert(j);
              }
          }
@@ -191,7 +291,7 @@ index 1324481..1b9ea17 100644
      }
  }
  
-@@ -330,12 +374,18 @@ mod test {
+@@ -330,12 +377,18 @@ mod test {
  
          assert_eq!(m.entries.len(), 3);
          assert_eq!(&m.atom_to_entry, &[0, 1]);
