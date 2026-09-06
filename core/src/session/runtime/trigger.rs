@@ -2061,23 +2061,22 @@ impl Manager {
         } else {
             &self.triggers
         };
-        let index = match identity.cached_slot(self.registry_generation) {
-            Some(index) => index,
-            None => {
-                let indices = if identity.is_alias {
-                    &self.alias_indices
-                } else {
-                    &self.trigger_indices
-                };
-                let Some(&index) = indices
-                    .get(&(identity.isolate.clone(), identity.origin.clone()))
-                    .and_then(|namespace| namespace.get(identity.name.as_str()))
-                else {
-                    return;
-                };
-                identity.cache_slot(self.registry_generation, index);
-                index
-            }
+        let index = if let Some(index) = identity.cached_slot(self.registry_generation) {
+            index
+        } else {
+            let indices = if identity.is_alias {
+                &self.alias_indices
+            } else {
+                &self.trigger_indices
+            };
+            let Some(&index) = indices
+                .get(&(identity.isolate.clone(), identity.origin.clone()))
+                .and_then(|namespace| namespace.get(identity.name.as_str()))
+            else {
+                return;
+            };
+            identity.cache_slot(self.registry_generation, index);
+            index
         };
         let Some(item) = items.get(index) else {
             return;

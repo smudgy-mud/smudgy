@@ -3399,29 +3399,6 @@ impl<'a> ScriptEngine<'a> {
         self.isolate_mut(isolate)
             .is_ok_and(|bundle| bundle.call_state.captured.get())
     }
-
-    /// Enter a synchronous alias/trigger function handler with its declarative default.
-    pub fn begin_fallthrough(&mut self, isolate: &IsolateId, value: bool) {
-        debug_assert!(
-            self.isolates.contains_key(isolate),
-            "begin_fallthrough on unknown isolate {isolate:?}"
-        );
-        if let Ok(bundle) = self.isolate_mut(isolate) {
-            bundle.call_state.fallthrough.set(Some(value));
-        }
-    }
-
-    /// Leave the current function handler and return its final fallthrough decision. Clearing the
-    /// slot is what makes calls from top-level or later async continuations throw.
-    pub fn end_fallthrough(&mut self, isolate: &IsolateId) -> bool {
-        debug_assert!(
-            self.isolates.contains_key(isolate),
-            "end_fallthrough on unknown isolate {isolate:?}"
-        );
-        self.isolate_mut(isolate).map_or(true, |bundle| {
-            bundle.call_state.fallthrough.take().unwrap_or(true)
-        })
-    }
 }
 
 /// Which registry entry a `RunAutomation` delivery runs (see [`ScriptEngine::run_automation`]).

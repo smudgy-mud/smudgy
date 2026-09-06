@@ -152,6 +152,7 @@ impl PatternSet {
 
     /// Return each matching pattern once, in original pattern order. Repeated
     /// literal occurrences retain the earliest start, matching `Regex::captures`.
+    #[cfg(test)]
     #[must_use]
     pub fn matches(&self, haystack: &str) -> Vec<PatternMatch> {
         let mut out = Vec::new();
