@@ -20,7 +20,7 @@ use crate::models::matchers::{
 use super::{
     ActionQueue, ScriptAction,
     captures::{CapturePattern, CapturePayload, CaptureView},
-    matcher::PatternSet,
+    matcher::{PatternMatch, PatternSet},
     origin::{
         AutomationBody, AutomationDelta, AutomationKind, AutomationSummary, IsolateId, Origin,
     },
@@ -155,6 +155,16 @@ impl FallthroughScopes {
     }
 }
 
+/// Per-line working storage the incoming-line paths reuse across lines: the pattern-set
+/// hits and the fired-trigger list. Taken out of the `Manager` for one line's matching and
+/// put back before it returns, so no handler runs while it is borrowed; the containers keep
+/// their capacity, so a steady stream of lines allocates nothing here.
+#[derive(Debug, Default)]
+struct LineScratch {
+    matches: Vec<PatternMatch>,
+    fired: Vec<usize>,
+}
+
 /// The identity of the alias whose expansion produced the line currently being matched.
 /// Carried through every nested outgoing-line pass so that alias's own sent text is
 /// excluded from re-matching it (unless the alias opts in via `allow_self_match`), and so
@@ -216,6 +226,8 @@ pub struct Manager {
     // via upsert.
     trigger_indices: HashMap<(IsolateId, Origin), HashMap<String, usize>>,
     alias_indices: HashMap<(IsolateId, Origin), HashMap<String, usize>>,
+    /// Reused per-line matching storage (see [`LineScratch`]).
+    line_scratch: LineScratch,
     /// Interned `(IsolateId, Origin)` namespaces (see [`NamespaceId`]). Grows only at
     /// registration; a namespace keeps its id for the manager's life.
     namespaces: HashMap<(IsolateId, Origin), NamespaceId>,
@@ -924,6 +936,7 @@ impl Manager {
             triggers,
             alias_indices,
             trigger_indices,
+            line_scratch: LineScratch::default(),
             namespaces: HashMap::new(),
             registry_generation: next_registry_generation(),
             line_limited_triggers: Vec::new(),
@@ -1789,7 +1802,8 @@ impl Manager {
     /// `RunAutomation` for the current line. The incoming-line paths share one list across
     /// their raw and normal passes, so an automation matching in both fires **once per
     /// line** — raw first, which is the documented precedence — rather than once per pass.
-    /// Each automation queued here is recorded into the list.
+    /// Each automation queued here is recorded into the list. `matches` is the caller's
+    /// scratch for the pattern-set hits; it is overwritten here.
     #[allow(clippy::too_many_arguments)]
     fn process_line_inner(
         &self,
@@ -1805,6 +1819,7 @@ impl Manager {
         is_captured: Option<Arc<AtomicBool>>,
         fallthrough_scopes: &mut FallthroughScopes,
         fired: &mut Vec<usize>,
+        matches: &mut Vec<PatternMatch>,
     ) -> Result<()> {
         if depth > 100 {
             match sender {
@@ -1821,7 +1836,7 @@ impl Manager {
         // const-folds to `false` under `release_max_level_info` (release/bench), so the timer is
         // a dead `None` and the whole block — both clock reads — is optimized away.
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
-        let matches = pattern_set.matches(line);
+        pattern_set.matches_into(line, matches);
         if let Some(start) = timer {
             debug!("Time to test pattern matches: {:?}", start.elapsed());
         }
@@ -1989,6 +2004,7 @@ impl Manager {
         // Aliases evaluate in a single pass, so the fired list is inert here; it exists
         // for the two-pass incoming paths.
         let mut fired = Vec::new();
+        let mut matches = Vec::new();
 
         self.process_line_inner(
             line,
@@ -2003,6 +2019,7 @@ impl Manager {
             Some(is_captured.clone()),
             &mut fallthrough_scopes,
             &mut fired,
+            &mut matches,
         )?;
 
         self.spawned_actions
@@ -2090,7 +2107,34 @@ impl Manager {
         let mut fallthrough_scopes = FallthroughScopes::new();
         // Shared across the raw and normal passes (the same per-line lifetime as
         // `fallthrough_scopes`): a trigger matching in both fires once, on the raw pass.
-        let mut fired = Vec::new();
+        // The scratch is taken out for this line and returned below, before any handler runs.
+        let mut scratch = std::mem::take(&mut self.line_scratch);
+        scratch.fired.clear();
+        let result = self.process_incoming_line_with(line, &mut fallthrough_scopes, &mut scratch);
+        self.line_scratch = scratch;
+        result?;
+
+        // Self-limit: one tested-line tick per incoming complete line for every
+        // `lineLimit` trigger (no-op for the common unlimited case).
+        self.count_tested_lines();
+
+        if let Some(start) = timer {
+            debug!(
+                "Time to match and dispatch triggers on incoming line: {:?}",
+                start.elapsed()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The raw-then-normal passes of [`Self::process_incoming_line`] over the caller's scratch.
+    fn process_incoming_line_with(
+        &self,
+        line: &Arc<StyledLine>,
+        fallthrough_scopes: &mut FallthroughScopes,
+        scratch: &mut LineScratch,
+    ) -> Result<()> {
         if let Some(raw) = line.raw() {
             debug!("Processing raw line: {raw:?}");
             self.process_line_inner(
@@ -2104,8 +2148,9 @@ impl Manager {
                 &self.raw_trigger_regex_patterns_map,
                 TriggerMatchType::Raw,
                 None,
-                &mut fallthrough_scopes,
-                &mut fired,
+                fallthrough_scopes,
+                &mut scratch.fired,
+                &mut scratch.matches,
             )?;
         }
 
@@ -2120,22 +2165,10 @@ impl Manager {
             &self.trigger_regex_patterns_map,
             TriggerMatchType::Normal,
             None,
-            &mut fallthrough_scopes,
-            &mut fired,
-        )?;
-
-        // Self-limit: one tested-line tick per incoming complete line for every
-        // `lineLimit` trigger (no-op for the common unlimited case).
-        self.count_tested_lines();
-
-        if let Some(start) = timer {
-            debug!(
-                "Time to match and dispatch triggers on incoming line: {:?}",
-                start.elapsed()
-            );
-        }
-
-        Ok(())
+            fallthrough_scopes,
+            &mut scratch.fired,
+            &mut scratch.matches,
+        )
     }
 
     pub fn process_partial_line(&mut self, line: Arc<StyledLine>) -> Result<()> {
@@ -2154,40 +2187,13 @@ impl Manager {
 
         let mut fallthrough_scopes = FallthroughScopes::new();
         // The prompt path has the same two-pass shape as `process_incoming_line` and gets
-        // the same one-fire-per-line treatment. Each call owns its list, so a partial
+        // the same one-fire-per-line treatment. Each call starts its list empty, so a partial
         // line and its later completed line count as different lines.
-        let mut fired = Vec::new();
-        if let Some(raw) = line.raw() {
-            self.process_line_inner(
-                raw,
-                Some(&line),
-                0,
-                None,
-                &self.prompt_raw_trigger_regex_set,
-                &self.triggers,
-                &self.prompt_raw_trigger_regex_set_map,
-                &self.prompt_raw_trigger_regex_patterns_map,
-                TriggerMatchType::Raw,
-                None,
-                &mut fallthrough_scopes,
-                &mut fired,
-            )?;
-        }
-
-        self.process_line_inner(
-            &line,
-            Some(&line),
-            0,
-            None,
-            &self.prompt_trigger_regex_set,
-            &self.triggers,
-            &self.prompt_trigger_regex_set_map,
-            &self.prompt_trigger_regex_patterns_map,
-            TriggerMatchType::Normal,
-            None,
-            &mut fallthrough_scopes,
-            &mut fired,
-        )?;
+        let mut scratch = std::mem::take(&mut self.line_scratch);
+        scratch.fired.clear();
+        let result = self.process_partial_line_with(&line, &mut fallthrough_scopes, &mut scratch);
+        self.line_scratch = scratch;
+        result?;
 
         if let Some(start) = timer {
             debug!(
@@ -2200,6 +2206,51 @@ impl Manager {
             .borrow_mut()
             .push_back(RuntimeAction::PartialLineTriggersProcessed(line));
         Ok(())
+    }
+}
+
+impl Manager {
+    /// The raw-then-normal prompt passes of [`Self::process_partial_line`] over the caller's
+    /// scratch.
+    fn process_partial_line_with(
+        &self,
+        line: &Arc<StyledLine>,
+        fallthrough_scopes: &mut FallthroughScopes,
+        scratch: &mut LineScratch,
+    ) -> Result<()> {
+        if let Some(raw) = line.raw() {
+            self.process_line_inner(
+                raw,
+                Some(line),
+                0,
+                None,
+                &self.prompt_raw_trigger_regex_set,
+                &self.triggers,
+                &self.prompt_raw_trigger_regex_set_map,
+                &self.prompt_raw_trigger_regex_patterns_map,
+                TriggerMatchType::Raw,
+                None,
+                fallthrough_scopes,
+                &mut scratch.fired,
+                &mut scratch.matches,
+            )?;
+        }
+
+        self.process_line_inner(
+            line,
+            Some(line),
+            0,
+            None,
+            &self.prompt_trigger_regex_set,
+            &self.triggers,
+            &self.prompt_trigger_regex_set_map,
+            &self.prompt_trigger_regex_patterns_map,
+            TriggerMatchType::Normal,
+            None,
+            fallthrough_scopes,
+            &mut scratch.fired,
+            &mut scratch.matches,
+        )
     }
 }
 
@@ -2266,7 +2317,9 @@ impl Trigger {
         styled_line: Option<&StyledLine>,
         bold_is_bright: bool,
     ) -> bool {
-        if self.anti_patterns.is_match(subject) {
+        // Most automations declare no anti-patterns; an empty set still costs a search
+        // dispatch, so answer it here.
+        if !self.anti_patterns.is_empty() && self.anti_patterns.is_match(subject) {
             return true;
         }
         let Some(colored_anti_pattern_set) = &self.colored_anti_pattern_set else {

@@ -154,14 +154,24 @@ impl PatternSet {
     /// literal occurrences retain the earliest start, matching `Regex::captures`.
     #[must_use]
     pub fn matches(&self, haystack: &str) -> Vec<PatternMatch> {
-        let mut out: Vec<_> = self
-            .always_match_indices
-            .iter()
-            .map(|&index| PatternMatch {
-                index,
-                literal: None,
-            })
-            .collect();
+        let mut out = Vec::new();
+        self.matches_into(haystack, &mut out);
+        out
+    }
+
+    /// [`Self::matches`] into a caller-owned vector, so a per-line caller reuses one
+    /// allocation across lines. `out` is cleared first; on return it holds exactly what
+    /// `matches` would have returned.
+    pub fn matches_into(&self, haystack: &str, out: &mut Vec<PatternMatch>) {
+        out.clear();
+        out.extend(
+            self.always_match_indices
+                .iter()
+                .map(|&index| PatternMatch {
+                    index,
+                    literal: None,
+                }),
+        );
         if !self.literal_indices.is_empty() {
             out.extend(
                 self.literals
@@ -195,7 +205,6 @@ impl PatternSet {
             (hit.index, hit.literal.as_ref().map_or(0, |span| span.start))
         });
         out.dedup_by_key(|hit| hit.index);
-        out
     }
 
     #[cfg(test)]
