@@ -980,6 +980,22 @@ impl StyledLine {
         }
     }
 
+    /// [`Self::new_with_raw`] for valid raw text. Borrowed text is copied; an owned lossy
+    /// decode is moved into the line without a second allocation or copy.
+    #[must_use]
+    pub fn new_with_raw_text(
+        text: &str,
+        span_info: Vec<VtSpan>,
+        raw: Option<Cow<'_, str>>,
+    ) -> Self {
+        Self {
+            text: String::from(text),
+            spans: span_info,
+            links: Vec::new(),
+            raw: raw.map(Cow::into_owned),
+        }
+    }
+
     /// `self` followed by `other_line`, in one exact-capacity pass: the
     /// scrollback glues every fragment of an open row through here, once per
     /// prompt and once per line on a server that ends each line in a prompt
@@ -1615,6 +1631,20 @@ impl std::ops::Deref for StyledLine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_text_constructor_keeps_the_owned_decode_allocation() {
+        let raw = String::from_utf8_lossy(b"raw\xfe text").into_owned();
+        let allocation = raw.as_ptr();
+        let line = super::StyledLine::new_with_raw_text(
+            "display",
+            Vec::new(),
+            Some(std::borrow::Cow::Owned(raw)),
+        );
+        let captured = line.raw().expect("raw capture");
+        assert_eq!(captured, "raw\u{fffd} text");
+        assert_eq!(captured.as_ptr(), allocation);
+    }
+
     use super::*;
     use crate::session::connection::vt_processor::AnsiColor;
 

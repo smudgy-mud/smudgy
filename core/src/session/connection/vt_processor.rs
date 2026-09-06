@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -819,6 +820,12 @@ pub struct VtProcessor {
     /// though the flag flips concurrently with an in-flight parse run (see
     /// [`Self::refresh_capture_raw`]).
     capture_raw: bool,
+    /// Whether `buf_raw` may hold bytes that are not valid UTF-8. Runs from the Ground-state
+    /// bulk path arrive validated (or transcoder-decoded), so only the per-byte path can
+    /// introduce doubt, and only with a high byte: an invalid sequence, or a valid one the
+    /// state machine consumed itself (an OSC payload, an encoded C1). While this is false the
+    /// committed line's raw text is taken from the buffer without a validation pass.
+    raw_unverified: bool,
     /// Mudlet-compatible OSC 8 presets live for exactly one connection/
     /// processor lifetime and are never shared across sessions.
     link_presets: HashMap<String, serde_json::Value>,
@@ -854,6 +861,7 @@ impl VtProcessor {
             marker_armed: None,
             raw_wanted: None,
             capture_raw: true,
+            raw_unverified: false,
             link_presets: HashMap::new(),
             link_preset_overflow_logged: false,
         }
@@ -978,11 +986,12 @@ impl VtProcessor {
         // A link still open at the boundary contributes its range so far and
         // stays active: its next range begins at 0 on the next line.
         self.close_link_range(true);
-        let mut line = StyledLine::new_with_raw(
-            &self.buf,
-            self.span_info.drain(..).collect(),
-            self.capture_raw.then_some(self.buf_raw.as_slice()),
-        );
+        let spans = self.span_info.drain(..).collect();
+        let mut line = if self.capture_raw {
+            StyledLine::new_with_raw_text(&self.buf, spans, Some(self.raw_text()))
+        } else {
+            StyledLine::new(&self.buf, spans)
+        };
         line.links = self.link_info.drain(..).collect();
         self.link_open_pos = 0;
         line
@@ -1013,7 +1022,7 @@ impl VtProcessor {
                 .send(RuntimeAction::HandleIncomingPartialLine(pending_line))
                 .ok();
             self.buf.clear();
-            self.buf_raw.clear();
+            self.clear_raw();
             self.buf.shrink_to(INPUT_BUFFER_CAPACITY);
             self.buf_raw.shrink_to(INPUT_BUFFER_CAPACITY);
             // The frame a pending `\r` marked was just flushed upstream as a
@@ -1095,7 +1104,7 @@ impl VtProcessor {
         // become the prefix of the next normal trigger line.
         self.open_logical_line.clear();
         self.buf.clear();
-        self.buf_raw.clear();
+        self.clear_raw();
         self.buf.shrink_to(INPUT_BUFFER_CAPACITY);
         self.buf_raw.shrink_to(INPUT_BUFFER_CAPACITY);
         self.refresh_capture_raw();
@@ -1123,7 +1132,7 @@ impl VtProcessor {
                 .ok();
         }
         self.buf.clear();
-        self.buf_raw.clear();
+        self.clear_raw();
         self.refresh_capture_raw();
     }
 
@@ -1131,10 +1140,56 @@ impl VtProcessor {
         self.buf.push(ch);
     }
 
+    /// The Ground-state bulk `print`: one `push_str` for a run the byte loop already proved
+    /// the parser would print unchanged (see `connection::plain_run`). Equivalent to `print`
+    /// per character, including the overprint restart a pending `\r` demands and the
+    /// per-character escaping of deceptive invisibles inside an open link.
+    pub fn print_run(&mut self, run: &str) {
+        if let Some(raw_mark) = self.pending_cr.take() {
+            self.restart_open_line(raw_mark);
+        }
+        if self.cursor_link.is_some() && !run.is_ascii() {
+            for c in run.chars() {
+                self.print(c);
+            }
+        } else {
+            self.buf.push_str(run);
+        }
+    }
+
     pub fn push_raw_incoming_byte(&mut self, byte: u8) {
         if self.capture_raw {
             self.buf_raw.push(byte);
+            self.raw_unverified |= byte >= 0x80;
         }
+    }
+
+    /// Raw capture for a run the bulk path validated as UTF-8. A run carries no CR/LF (those
+    /// are controls, which end a run), so nothing needs filtering out.
+    pub fn push_raw_incoming_run(&mut self, run: &str) {
+        if self.capture_raw {
+            self.buf_raw.extend_from_slice(run.as_bytes());
+        }
+    }
+
+    /// The pending raw bytes as text: borrowed straight from the buffer when every byte
+    /// arrived verified, lossily re-decoded only when the per-byte path pushed a high byte.
+    fn raw_text(&self) -> Cow<'_, str> {
+        if self.raw_unverified {
+            String::from_utf8_lossy(&self.buf_raw)
+        } else {
+            debug_assert!(std::str::from_utf8(&self.buf_raw).is_ok());
+            // SAFETY: `raw_unverified` is set by every push of a byte >= 0x80 that did not
+            // come through a validated run and is cleared only with the buffer, so while it
+            // is false the buffer holds nothing but ASCII and validated UTF-8 runs.
+            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&self.buf_raw) })
+        }
+    }
+
+    /// Empty the raw buffer for the next line; nothing unverified remains.
+    fn clear_raw(&mut self) {
+        self.buf_raw.clear();
+        self.raw_unverified = false;
     }
 }
 
