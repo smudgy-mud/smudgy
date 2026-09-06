@@ -2913,7 +2913,10 @@ impl<'a> ScriptEngine<'a> {
         // rather than cloned and dropped once per pump.
         {
             let mut parent = self.parent.lock().expect("parent slot poisoned");
-            if !parent.as_ref().is_some_and(|stored| stored.will_wake(cx.waker())) {
+            if !parent
+                .as_ref()
+                .is_some_and(|stored| stored.will_wake(cx.waker()))
+            {
                 *parent = Some(cx.waker().clone());
             }
         }

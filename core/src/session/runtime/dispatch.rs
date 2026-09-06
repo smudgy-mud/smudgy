@@ -818,7 +818,9 @@ impl Inner<'_> {
                             sender,
                             fallthrough,
                         );
-                        if outcome.captured && let Some(is_captured) = &is_captured {
+                        if outcome.captured
+                            && let Some(is_captured) = &is_captured
+                        {
                             is_captured.store(true, Ordering::Relaxed);
                         }
                         continue_matching = outcome.continue_matching;
@@ -834,7 +836,9 @@ impl Inner<'_> {
                             sender,
                             fallthrough,
                         );
-                        if outcome.captured && let Some(is_captured) = &is_captured {
+                        if outcome.captured
+                            && let Some(is_captured) = &is_captured
+                        {
                             is_captured.store(true, Ordering::Relaxed);
                         }
                         continue_matching = outcome.continue_matching;

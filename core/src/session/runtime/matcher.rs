@@ -164,14 +164,10 @@ impl PatternSet {
     /// `matches` would have returned.
     pub fn matches_into(&self, haystack: &str, out: &mut Vec<PatternMatch>) {
         out.clear();
-        out.extend(
-            self.always_match_indices
-                .iter()
-                .map(|&index| PatternMatch {
-                    index,
-                    literal: None,
-                }),
-        );
+        out.extend(self.always_match_indices.iter().map(|&index| PatternMatch {
+            index,
+            literal: None,
+        }));
         if !self.literal_indices.is_empty() {
             out.extend(
                 self.literals

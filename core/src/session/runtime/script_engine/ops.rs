@@ -1129,7 +1129,6 @@ fn op_smudgy_validate_name(#[string] name: &str) -> Option<String> {
 // lives in the runtime module: the session store's watch dispatch shares it, since both ride
 // the same host-routed delivery mechanism.
 
-
 /// One event subscriber: which isolate registered the handler and its `FunctionId` in that
 /// isolate's `script_functions`. Cloned out before queueing so the registry borrow is released.
 #[derive(Clone)]
