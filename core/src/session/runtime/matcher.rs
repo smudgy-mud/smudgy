@@ -160,9 +160,9 @@ impl PatternSet {
         out
     }
 
-    /// [`Self::matches`] into a caller-owned vector, so a per-line caller reuses one
-    /// allocation across lines. `out` is cleared first; on return it holds exactly what
-    /// `matches` would have returned.
+    /// [`Self::matches`] into a vector that the caller owns, so a per-line caller reuses one
+    /// allocation from line to line. The function clears `out` first. On return, `out` holds
+    /// exactly what `matches` returns.
     pub fn matches_into(&self, haystack: &str, out: &mut Vec<PatternMatch>) {
         out.clear();
         out.extend(self.always_match_indices.iter().map(|&index| PatternMatch {

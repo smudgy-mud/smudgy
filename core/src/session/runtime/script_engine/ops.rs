@@ -354,8 +354,8 @@ deno_core::extension!(
     state.put::<smudgy_cloud::StoreBindings>(options.store_bindings);
     state.put::<PackageDataDir>(PackageDataDir(options.data_dir));
     state.put::<smudgy_cloud::image_source::ImageSourcePolicy>(options.image_policy);
-    // The isolate's call context (see [`CallState`]); the engine fetches this same `Rc` once
-    // at bundle construction so dispatch never looks it up again.
+    // The call context of this isolate, see [`CallState`]. The engine takes a clone of this
+    // `Rc` when it builds the isolate bundle, so dispatch does not look it up again.
     state.put::<SharedCallState>(Rc::new(CallState::default()));
     // The per-isolate interop identity table (`docs/interop.md` §3): interned
     // creators/roots/events, resolved once at handle construction, addressed by id per call.
@@ -652,24 +652,24 @@ fn ensure_session_target(
     Ok(())
 }
 
-/// The per-isolate synchronous call context: everything the host stamps around a handler
-/// call and the ops read back while that handler runs. One instance lives for the isolate's
-/// whole life, shared (`Rc`) between the engine's isolate bundle — which reads and writes it
-/// directly, without an `OpState` lookup — and this isolate's `OpState`, where the ops find
-/// it. Fields are replaced in place; nothing is re-`put` per call.
+/// The call context of one isolate. The host sets these fields around a handler call. The
+/// ops read them while the handler runs. One instance lives as long as the isolate. The
+/// engine's isolate bundle and the isolate's `OpState` share it through one `Rc`. The engine
+/// reads and writes the fields directly. The ops find the `Rc` in `OpState`. A call replaces
+/// field values in place. It does not put new values into `OpState`.
 ///
-/// - `depth`: the current event-delivery depth, stamped by `call_javascript_function` /
-///   `run_script` before running a handler so a re-emit from inside it queues its
-///   subscribers one level deeper and the chain terminates at [`MAX_EVENT_DEPTH`].
-///   Saved and restored around each call: leaving a handler's depth behind would make async
-///   continuations and the next dispatch on this isolate journal at the wrong depth.
-/// - `alias`: the alias whose dispatch is currently running — `None` outside an alias
-///   handler. Same save/restore bracket as `depth`; `op_smudgy_session_send` stamps it onto
-///   its queued action so an alias's own sent text is excluded from re-matching it.
-/// - `captured`: the `capture()` flag for the automation currently running.
-/// - `fallthrough`: the current function automation's fallthrough decision. `None` outside an
-///   alias/trigger handler makes accidental async or top-level calls fail instead of
-///   mutating a future frame.
+/// - `depth`: the current event-delivery depth. `call_javascript_function` and `run_script`
+///   set it before a handler runs. An emit inside the handler queues its subscribers one
+///   level deeper, and the chain stops at [`MAX_EVENT_DEPTH`]. Each call saves and restores
+///   the value. A stale depth would make async continuations and the next dispatch journal
+///   at the wrong depth.
+/// - `alias`: the alias whose handler is running, or `None` outside an alias handler. Each
+///   call saves and restores it with `depth`. `op_smudgy_session_send` copies it onto the
+///   queued action, so the text an alias sends does not match that alias again.
+/// - `captured`: the `capture()` flag of the automation that is running.
+/// - `fallthrough`: the fallthrough decision of the function automation that is running.
+///   It is `None` outside an alias or trigger handler. A call from a top-level script or
+///   from an async continuation then fails instead of changing a future frame.
 #[derive(Default)]
 pub struct CallState {
     pub depth: Cell<u32>,
@@ -679,16 +679,16 @@ pub struct CallState {
 }
 
 impl CallState {
-    /// Stamp a top-level dispatch (widget/link/pane callbacks): depth 0 and no alias, the
-    /// between-dispatch baseline the save/restore in the automation paths returns to. No
-    /// restore is needed after such a call.
+    /// Set the state for a top-level dispatch, such as a widget, link, or pane callback:
+    /// depth 0 and no alias. This is the state between dispatches, which the automation
+    /// paths restore after each call. A top-level call needs no restore.
     pub fn enter_top_level(&self) {
         self.depth.set(0);
         drop(self.alias.replace(None));
     }
 }
 
-/// The shared handle to an isolate's [`CallState`].
+/// The shared handle to the [`CallState`] of one isolate.
 pub type SharedCallState = Rc<CallState>;
 
 #[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]

@@ -187,8 +187,8 @@ pub enum RuntimeAction {
     /// One matched alias/trigger, deferred so an earlier invocation in the same dispatch frame
     /// can prevent it from running. `stopped` is shared only by automations of the same kind and
     /// `(isolate, origin)`; nested sends create fresh frames. `identity` names the automation
-    /// (isolate, origin, name, kind) through the registration-time handle it shares with the
-    /// registry entry and every other action it queued.
+    /// by isolate, origin, name, and kind. It is the handle assigned at registration, shared
+    /// with the registry entry and with every other action the automation queued.
     RunAutomation {
         identity: Arc<AutomationIdentity>,
         script: ScriptAction,

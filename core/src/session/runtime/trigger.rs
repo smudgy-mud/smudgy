@@ -42,43 +42,43 @@ pub struct AutomationEntry {
 /// `name -> entry` within one `(IsolateId, Origin)` namespace.
 type AutomationNamespace = HashMap<String, AutomationEntry>;
 
-/// A registration-time handle for one `(IsolateId, Origin)` automation namespace. The
-/// `Manager` interns each distinct pair once; per-line work then compares and hashes this
-/// small copyable id instead of the owned isolate/origin values.
+/// The handle of one `(IsolateId, Origin)` automation namespace, assigned at registration.
+/// The `Manager` interns each distinct pair once. Per-line work then compares and hashes
+/// this small copyable id instead of the owned isolate and origin values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NamespaceId(u32);
 
-/// The immutable identity of one registered automation, created when it is registered and
-/// shared (`Arc`) by its registry entry, by every action it queues, and by the fire
-/// accounting those actions perform. Queuing a fire copies one `Arc` rather than the
-/// isolate, origin, and name separately.
+/// The immutable identity of one registered automation. The `Manager` creates it at
+/// registration. The registry entry, every action the automation queues, and the fire
+/// accounting of those actions share it through one `Arc`. A queued fire therefore copies
+/// one `Arc` and not the isolate, the origin, and the name.
 ///
-/// `slot` caches where the fire counter lives in the registry: the `(generation, index)` of
-/// the last successful lookup. A fire whose cached generation matches the registry's current
-/// generation reads the counter at that index directly; any registry mutation (add, replace,
-/// remove) bumps the generation, so a stale slot falls back to the name lookup — which is
-/// what keeps the existing dispatch-time semantics after a replacement or removal: a queued
-/// fire charges whatever definition holds the name when it runs, not the definition that
-/// queued it.
+/// The slot fields cache where the fire counter lives in the registry: the generation and
+/// the index of the last successful lookup. When the cached generation equals the current
+/// registry generation, a fire reads the counter at that index. Each registry mutation, an
+/// add, a replace, or a remove, changes the generation. A stale slot then falls back to the
+/// name lookup. This keeps the dispatch-time rule after a replacement or a removal: a queued
+/// fire charges the definition that holds the name when the fire runs, not the definition
+/// that queued it.
 #[derive(Debug)]
 pub struct AutomationIdentity {
     pub isolate: IsolateId,
     pub origin: Origin,
     pub name: Arc<String>,
-    /// Whether the entry lives in the alias `Vec` (matched on outgoing input) vs the trigger
-    /// `Vec` (matched on incoming lines).
+    /// Whether the entry lives in the alias `Vec`, matched on outgoing input, or in the
+    /// trigger `Vec`, matched on incoming lines.
     pub is_alias: bool,
     pub namespace: NamespaceId,
     slot_generation: AtomicU64,
     slot_index: AtomicUsize,
 }
 
-/// The registry generation no slot cache can ever hold: a fresh identity always looks up.
+/// The registry generation that no slot cache can hold. A fresh identity always looks up.
 const NO_GENERATION: u64 = 0;
 
-/// Process-wide source of registry generations, so a generation is never reused across
-/// `Manager` instances (an engine rebuild replaces the manager while queued actions from the
-/// old one may still hold cached slots).
+/// The process-wide source of registry generations. No two `Manager` instances share a
+/// generation. An engine rebuild replaces the manager while queued actions from the old
+/// manager can still hold cached slots.
 static NEXT_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_registry_generation() -> u64 {
@@ -105,7 +105,7 @@ impl AutomationIdentity {
     }
 
     /// The cached registry index, if it was recorded under `generation`. Only the session
-    /// thread touches the slot, so the two reads cannot tear.
+    /// thread touches the slot, so the two reads are consistent.
     fn cached_slot(&self, generation: u64) -> Option<usize> {
         (self.slot_generation.load(Ordering::Relaxed) == generation)
             .then(|| self.slot_index.load(Ordering::Relaxed))
@@ -117,10 +117,10 @@ impl AutomationIdentity {
     }
 }
 
-/// Stop state for one alias/trigger dispatch, partitioned by creator namespace so one package
-/// cannot suppress another package's (or the user's) automations. Nearly every line fires
-/// into a single namespace, so the first scope is stored inline; only a second namespace on
-/// the same line touches the heap for the overflow list.
+/// The stop state of one alias or trigger dispatch, split by creator namespace, so one
+/// package cannot suppress the automations of another package or of the user. Nearly every
+/// line fires into one namespace, so the first scope is stored inline. Only a second
+/// namespace on the same line allocates the overflow list.
 #[derive(Default)]
 struct FallthroughScopes {
     first: Option<(NamespaceId, Arc<AtomicBool>)>,
@@ -132,9 +132,9 @@ impl FallthroughScopes {
         Self::default()
     }
 
-    /// The stop flag shared by every automation of `namespace` on this line, created on
-    /// first use. Each logical line owns fresh flags: a queued action retains its line's flag,
-    /// so flags are never reset and reused across lines.
+    /// The stop flag that every automation of `namespace` shares on this line. The first
+    /// use creates it. Each logical line owns fresh flags. A queued action keeps the flag of
+    /// its line, so no flag is reset and reused for a later line.
     fn scope(&mut self, namespace: NamespaceId) -> Arc<AtomicBool> {
         match &self.first {
             None => {
@@ -155,10 +155,10 @@ impl FallthroughScopes {
     }
 }
 
-/// Per-line working storage the incoming-line paths reuse across lines: the pattern-set
-/// hits and the fired-trigger list. Taken out of the `Manager` for one line's matching and
-/// put back before it returns, so no handler runs while it is borrowed; the containers keep
-/// their capacity, so a steady stream of lines allocates nothing here.
+/// The working storage that the incoming-line paths reuse from line to line: the pattern-set
+/// hits and the fired-trigger list. The `Manager` lends it out for the matching of one line
+/// and takes it back before the call returns, so no handler runs while it is borrowed. The
+/// containers keep their capacity, so a steady stream of lines allocates nothing here.
 #[derive(Debug, Default)]
 struct LineScratch {
     matches: Vec<PatternMatch>,
@@ -226,14 +226,14 @@ pub struct Manager {
     // via upsert.
     trigger_indices: HashMap<(IsolateId, Origin), HashMap<String, usize>>,
     alias_indices: HashMap<(IsolateId, Origin), HashMap<String, usize>>,
-    /// Reused per-line matching storage (see [`LineScratch`]).
+    /// The reused per-line matching storage, see [`LineScratch`].
     line_scratch: LineScratch,
-    /// Interned `(IsolateId, Origin)` namespaces (see [`NamespaceId`]). Grows only at
-    /// registration; a namespace keeps its id for the manager's life.
+    /// The interned `(IsolateId, Origin)` namespaces, see [`NamespaceId`]. The map grows only
+    /// at registration. A namespace keeps its id for the life of the manager.
     namespaces: HashMap<(IsolateId, Origin), NamespaceId>,
-    /// The registry generation (see [`AutomationIdentity`]): bumped on every mutation of
-    /// `triggers`/`aliases` or their index maps, so cached fire-counter slots taken under an
-    /// older generation fall back to the name lookup.
+    /// The registry generation, see [`AutomationIdentity`]. Each mutation of `triggers`, of
+    /// `aliases`, or of their index maps changes it, so a fire-counter slot cached under an
+    /// older generation falls back to the name lookup.
     registry_generation: u64,
     /// Indices into `triggers` of every trigger that declares a `line_limit`. A side list so the
     /// per-incoming-line `count_tested_lines` self-limit tick visits only the (rare) line-limited
@@ -1188,8 +1188,8 @@ impl Manager {
         }
     }
 
-    /// Give a registering automation its shared identity (see [`AutomationIdentity`]),
-    /// interning its `(isolate, origin)` namespace on first sight.
+    /// Give an automation its shared identity at registration, see [`AutomationIdentity`].
+    /// The first automation of an `(isolate, origin)` pair interns that namespace.
     fn assign_identity(&mut self, item: &mut Trigger) {
         let key = (item.isolate.clone(), item.origin.clone());
         let next = NamespaceId(u32::try_from(self.namespaces.len()).expect("namespace count"));
@@ -1802,8 +1802,8 @@ impl Manager {
     /// `RunAutomation` for the current line. The incoming-line paths share one list across
     /// their raw and normal passes, so an automation matching in both fires **once per
     /// line** — raw first, which is the documented precedence — rather than once per pass.
-    /// Each automation queued here is recorded into the list. `matches` is the caller's
-    /// scratch for the pattern-set hits; it is overwritten here.
+    /// Each automation queued here is recorded into the list. `matches` is the scratch of the
+    /// caller for the pattern-set hits. This function overwrites it.
     #[allow(clippy::too_many_arguments)]
     fn process_line_inner(
         &self,
@@ -2052,9 +2052,9 @@ impl Manager {
     /// Count an invocation only after it actually begins running. A match skipped by an earlier
     /// `fallthrough(false)` therefore consumes neither `fireLimit` nor its one-shot lifetime.
     ///
-    /// The counter is found through the identity's cached slot when the registry has not
-    /// changed since it was cached; otherwise by the `(isolate, origin, name)` lookup, whose
-    /// result is cached for the next fire.
+    /// The cached slot of the identity finds the counter when the registry has not changed
+    /// since the slot was cached. Otherwise the `(isolate, origin, name)` lookup finds it,
+    /// and its result is cached for the next fire.
     pub(crate) fn record_fire(&self, identity: &AutomationIdentity) {
         let items = if identity.is_alias {
             &self.aliases
@@ -2106,7 +2106,7 @@ impl Manager {
         let mut fallthrough_scopes = FallthroughScopes::new();
         // Shared across the raw and normal passes (the same per-line lifetime as
         // `fallthrough_scopes`): a trigger matching in both fires once, on the raw pass.
-        // The scratch is taken out for this line and returned below, before any handler runs.
+        // The scratch is lent out for this line and returned below, before any handler runs.
         let mut scratch = std::mem::take(&mut self.line_scratch);
         scratch.fired.clear();
         let result = self.process_incoming_line_with(line, &mut fallthrough_scopes, &mut scratch);
@@ -2127,7 +2127,8 @@ impl Manager {
         Ok(())
     }
 
-    /// The raw-then-normal passes of [`Self::process_incoming_line`] over the caller's scratch.
+    /// The raw pass and then the normal pass of [`Self::process_incoming_line`], over the
+    /// scratch of the caller.
     fn process_incoming_line_with(
         &self,
         line: &Arc<StyledLine>,
@@ -2186,7 +2187,7 @@ impl Manager {
 
         let mut fallthrough_scopes = FallthroughScopes::new();
         // The prompt path has the same two-pass shape as `process_incoming_line` and gets
-        // the same one-fire-per-line treatment. Each call starts its list empty, so a partial
+        // the same one-fire-per-line rule. Each call starts its list empty, so a partial
         // line and its later completed line count as different lines.
         let mut scratch = std::mem::take(&mut self.line_scratch);
         scratch.fired.clear();
@@ -2209,8 +2210,8 @@ impl Manager {
 }
 
 impl Manager {
-    /// The raw-then-normal prompt passes of [`Self::process_partial_line`] over the caller's
-    /// scratch.
+    /// The raw pass and then the normal pass of [`Self::process_partial_line`], over the
+    /// scratch of the caller.
     fn process_partial_line_with(
         &self,
         line: &Arc<StyledLine>,
@@ -2262,8 +2263,8 @@ struct Trigger {
     isolate: IsolateId,
     origin: Origin,
     name: String,
-    /// The shared identity every queued action carries (see [`AutomationIdentity`]).
-    /// Assigned by the `Manager` at registration; every entry in its registries has one.
+    /// The shared identity that every queued action carries, see [`AutomationIdentity`].
+    /// The `Manager` assigns it at registration. Every entry in its registries has one.
     identity: Option<Arc<AutomationIdentity>>,
     patterns: Vec<CapturePattern>,
     pattern_colors: Vec<Option<CompiledColorMatch>>,
@@ -2316,8 +2317,8 @@ impl Trigger {
         styled_line: Option<&StyledLine>,
         bold_is_bright: bool,
     ) -> bool {
-        // Most automations declare no anti-patterns; an empty set still costs a search
-        // dispatch, so answer it here.
+        // Most automations declare no anti-patterns. A search over an empty set still costs
+        // a dispatch, so answer the empty case here.
         if !self.anti_patterns.is_empty() && self.anti_patterns.is_match(subject) {
             return true;
         }
@@ -2714,7 +2715,7 @@ impl Trigger {
     }
 
     /// The shared identity assigned at registration. Only registered entries are matched, so
-    /// a missing identity is a registration-path bug.
+    /// a missing identity is a bug in the registration path.
     fn identity(&self) -> &Arc<AutomationIdentity> {
         self.identity
             .as_ref()

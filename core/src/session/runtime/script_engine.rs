@@ -293,9 +293,9 @@ struct Isolate {
     instance: u64,
     script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>>,
     compiled_scripts: Vec<v8::Global<v8::Script>>,
-    /// This isolate's synchronous call context (`ops::CallState`): the same `Rc` its
-    /// `OpState` holds, kept here so the dispatch bracket reads and writes it directly
-    /// instead of looking it up through `OpState` on every call.
+    /// The call context of this isolate, see `ops::CallState`. This is the `Rc` its
+    /// `OpState` holds. The dispatch bracket reads and writes it here directly. It does not
+    /// look it up through `OpState` on each call.
     call_state: SharedCallState,
     /// This isolate's `DemuxWaker`, built once at insert (`EVENT-LOOP-READINESS-DEMUX.md`).
     /// `poll_event_loop` polls the isolate through a `Context` built from this, so `deno_core`
@@ -303,12 +303,12 @@ struct Isolate {
     /// isolate. `Send + Sync` itself, which is fine on an otherwise non-`Send` `Isolate`; drops
     /// with the isolate.
     waker: Waker,
-    /// Session-thread readiness seed: set when synchronous JS ran on this isolate (alias /
-    /// trigger / hotkey / callback dispatch) so the next pump polls it (see
-    /// [`ScriptEngine::mark_isolate_ready`]). The thread-safe `ready` set stays the path for
-    /// cross-thread wakes; this flag records the far more frequent same-thread seed without a
-    /// lock or a hash. It lives on the bundle, so a torn-down isolate's seed dies with it and a
-    /// rebuilt isolate starts unseeded; the merge in `poll_event_loop` clears it.
+    /// The readiness seed of this isolate. A synchronous dispatch on this isolate sets it, so
+    /// the next pump polls the isolate, see [`ScriptEngine::mark_isolate_ready`]. The
+    /// thread-safe `ready` set remains the path for wakes from other threads. This flag
+    /// records the same-thread seed, which is far more frequent, without a lock or a hash.
+    /// The flag lives on the bundle. A torn-down isolate takes its seed with it, and a rebuilt
+    /// isolate starts with the flag clear. The merge in `poll_event_loop` clears the flag.
     seeded: Cell<bool>,
 }
 
@@ -598,8 +598,8 @@ pub struct ScriptEngine<'a> {
     /// Latest session-task waker, refreshed every pump; the per-isolate `DemuxWaker`s re-arm the
     /// session task through this slot when their isolate makes progress.
     parent: ParentSlot,
-    /// The ids drained for one pump (`poll_event_loop`), kept between pumps so the per-action
-    /// pump does not allocate.
+    /// The ids that one pump drains, see `poll_event_loop`. The vector stays allocated
+    /// between pumps, so the pump after each action does not allocate.
     ready_scratch: Vec<IsolateId>,
 }
 
@@ -2907,10 +2907,10 @@ impl<'a> ScriptEngine<'a> {
     /// surfaces the first isolate error after re-queueing the un-polled remainder. With one
     /// isolate this is equivalent to polling it directly.
     pub fn poll_event_loop(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
-        // Refresh `parent` to THIS poll's task waker first — the task identity can
-        // change across polls, and a `DemuxWaker` re-arms the task through this slot. The
-        // common case is the same task pumping again (`will_wake`): the stored waker is kept
-        // rather than cloned and dropped once per pump.
+        // Set `parent` to the task waker of this poll first. The task identity can change
+        // between polls, and a `DemuxWaker` re-arms the task through this slot. In the common
+        // case the same task pumps again, and `will_wake` says so. The slot then keeps the
+        // stored waker instead of a clone and a drop on each pump.
         {
             let mut parent = self.parent.lock().expect("parent slot poisoned");
             if !parent
@@ -2921,11 +2921,11 @@ impl<'a> ScriptEngine<'a> {
             }
         }
 
-        // Drain the ready-set BEFORE polling (lost-wake safety): a wake landing *during* a
-        // poll re-inserts its id (and re-wakes `parent`), so it survives to the next pump. The
-        // drain fills one vector reused across pumps, and the lock is released before any
-        // isolate is entered. Same-thread seeds (`mark_isolate_ready`) merge in after the
-        // drain: a seed raised while an isolate is being polled stays set for the next pump.
+        // Drain the ready-set BEFORE polling, so no wake is lost: a wake that lands during a
+        // poll inserts its id again and wakes `parent` again, so it survives to the next
+        // pump. The drain fills one vector that all pumps reuse. The lock is released before
+        // any isolate is entered. Same-thread seeds from `mark_isolate_ready` merge in after
+        // the drain. A seed set while an isolate is polled stays set for the next pump.
         let mut todo = std::mem::take(&mut self.ready_scratch);
         todo.clear();
         {
@@ -2950,9 +2950,9 @@ impl<'a> ScriptEngine<'a> {
             // unchanged and per *polled* isolate.
             let Isolate { runtime, waker, .. } = isolate;
             let _entered = EnteredIsolate::enter(runtime.deno_runtime());
-            // Poll with the isolate's OWN waker so deno_core registers the `DemuxWaker` against
-            // its pending ops, NOT the session-task waker. That is what makes the next completion
-            // re-enter ONLY this isolate.
+            // Poll with the waker of this isolate, so deno_core registers the `DemuxWaker`
+            // with the pending ops and not the session-task waker. The next completion then
+            // re-enters only this isolate.
             let mut isolate_cx = Context::from_waker(waker);
             match runtime.poll_event_loop(&mut isolate_cx) {
                 Poll::Ready(Ok(())) => any_ready = true,
@@ -2987,15 +2987,14 @@ impl<'a> ScriptEngine<'a> {
         }
     }
 
-    /// Seed `id` so the next `poll_event_loop` polls it. Called when synchronous JS runs on an
-    /// isolate (alias/trigger/hotkey dispatch), because that JS can schedule async work (timers,
-    /// promise continuations) WITHOUT a pump to arm the isolate's own waker — so the demux must
-    /// be told to poll it, or the work is stranded (purely trusting the demux for the dispatch
-    /// isolate is unsafe). The seed is the bundle's own flag (`Isolate::seeded`), not the
-    /// thread-safe ready-set: dispatch runs on the session thread, so no lock or hash is
-    /// needed, and no parent-wake either — the run loop is active, and its next Phase 1 pump
-    /// merges this seed before parking. An unknown id is a no-op, as a stale id in the
-    /// ready-set was.
+    /// Seed `id`, so the next `poll_event_loop` polls it. Dispatch calls this when synchronous
+    /// JS runs on an isolate, for an alias, a trigger, or a hotkey. That JS can schedule async
+    /// work, such as a timer or a promise continuation, without a pump that arms the waker
+    /// of the isolate. The demux must poll the isolate, or the work is stranded. The seed is
+    /// the flag on the bundle, `Isolate::seeded`, and not the thread-safe ready-set. Dispatch
+    /// runs on the session thread, so it needs no lock, no hash, and no parent wake: the run
+    /// loop is active, and its next Phase 1 pump merges the seed before it parks. An unknown
+    /// id does nothing, like a stale id in the ready-set.
     fn mark_isolate_ready(&self, id: &IsolateId) {
         if let Some(isolate) = self.isolates.get(id) {
             isolate.seeded.set(true);
@@ -3011,15 +3010,13 @@ impl<'a> ScriptEngine<'a> {
             .ok_or_else(|| anyhow!("Isolate {isolate:?} not found"))
     }
 
-    /// Deliver one function/script automation (`RunAutomation` dispatch): the
-    /// fallthrough/capture bracket around the call, with the target isolate resolved once for
-    /// the whole bracket. The bracket is the same as the separate `begin_fallthrough` /
-    /// `set_is_captured` / call / `get_is_captured` / `end_fallthrough` sequence: the
-    /// fallthrough slot holds the declarative default while the handler runs and is cleared
-    /// afterwards (so later async calls throw), and the capture flag is primed `true` — a
-    /// handler opts out by calling `capture(false)`. An unknown isolate — a routing bug, never
-    /// a live action — reports the error the way a failed call does and leaves the line's
-    /// stop state untouched.
+    /// Deliver one function or script automation for a `RunAutomation` dispatch. This is the
+    /// fallthrough and capture bracket around the call. It resolves the target isolate once.
+    /// The fallthrough slot holds the declared default while the handler runs. The bracket
+    /// clears the slot afterwards, so a later async call throws. The capture flag starts as
+    /// `true`, and a handler opts out with `capture(false)`. An unknown isolate is a routing
+    /// bug and never a live action. It reports the error like a failed call and leaves the
+    /// stop state of the line unchanged.
     pub fn run_automation(
         &mut self,
         trigger_manager: &Manager,
@@ -3044,7 +3041,7 @@ impl<'a> ScriptEngine<'a> {
                 };
             }
         };
-        // Demux seed: see `call_javascript_function` / `mark_isolate_ready`.
+        // Demux seed, see `call_javascript_function` and `mark_isolate_ready`.
         bundle.seeded.set(true);
         bundle.call_state.fallthrough.set(Some(fallthrough));
         bundle.call_state.captured.set(true);
@@ -3115,10 +3112,10 @@ impl<'a> ScriptEngine<'a> {
         // isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
         let bundle = self.isolate_mut(isolate_id)?;
-        // A widget/hotkey callback is a top-level dispatch (depth 0); stamp it so a store `set`
-        // inside the callback journals at depth 0 rather than inheriting a stale depth
-        // from an earlier handler on this isolate. No restore needed — 0 is the between-dispatch
-        // baseline the save/restore in the other dispatch paths returns to.
+        // A widget or hotkey callback is a top-level dispatch at depth 0. Set that state, so a
+        // store `set` inside the callback journals at depth 0 and does not inherit a stale
+        // depth from an earlier handler on this isolate. No restore is needed: depth 0 is the
+        // state between dispatches, which the other dispatch paths restore.
         bundle.call_state.enter_top_level();
         let deno = bundle.runtime.deno_runtime();
         // Make the target isolate current for this callback (Model B), released after the scope.
@@ -3375,11 +3372,11 @@ impl<'a> ScriptEngine<'a> {
     }
 
     pub fn set_is_captured(&mut self, isolate: &IsolateId, value: bool) {
-        // The capture flag is per-isolate call state: `op_smudgy_capture` writes the *calling*
-        // isolate's flag, so the get/set bracket in dispatch must target the isolate that
-        // ran the script. A missing isolate never happens for a live action (the only ids
-        // that reach here came from a constructed isolate); the `debug_assert` makes a
-        // future routing/lifecycle bug fail loud in tests instead of silently no-op'ing.
+        // The capture flag is call state of one isolate. `op_smudgy_capture` writes the flag
+        // of the calling isolate, so the get and set bracket in dispatch must target the
+        // isolate that ran the script. A live action never names a missing isolate: the only
+        // ids that reach here come from a constructed isolate. The `debug_assert` makes a
+        // routing or lifecycle bug fail loudly in tests instead of doing nothing.
         debug_assert!(
             self.isolates.contains_key(isolate),
             "set_is_captured on unknown isolate {isolate:?}"
@@ -3401,7 +3398,8 @@ impl<'a> ScriptEngine<'a> {
     }
 }
 
-/// Which registry entry a `RunAutomation` delivery runs (see [`ScriptEngine::run_automation`]).
+/// The registry entry that a `RunAutomation` delivery runs, see
+/// [`ScriptEngine::run_automation`].
 #[derive(Clone, Copy, Debug)]
 pub enum AutomationCall {
     Function(FunctionId),
@@ -3409,8 +3407,8 @@ pub enum AutomationCall {
 }
 
 impl AutomationCall {
-    /// The echoed text for a delivery that failed before or during the call, in the wording
-    /// each delivery kind has always used.
+    /// The text to echo for a delivery that failed before or during the call. Each delivery
+    /// kind has its own wording.
     fn error_echo(self, err: &anyhow::Error) -> String {
         match self {
             Self::Function(_) => format!("Error in Javascript Function: {err:?}"),
@@ -3419,17 +3417,18 @@ impl AutomationCall {
     }
 }
 
-/// What one automation delivery produced (see [`ScriptEngine::run_automation`]).
+/// The result of one automation delivery, see [`ScriptEngine::run_automation`].
 pub struct AutomationOutcome {
     pub result: ActionResult,
-    /// The capture flag as the handler left it: `true` unless it called `capture(false)`.
+    /// The capture flag when the handler returned. It is `true` unless the handler called
+    /// `capture(false)`.
     pub captured: bool,
     /// The handler's final fallthrough decision.
     pub continue_matching: bool,
 }
 
-/// Fetch the [`ops::CallState`] handle an isolate's `OpState` was constructed with, so the
-/// bundle can share it (see [`Isolate::call_state`]).
+/// Get the [`ops::CallState`] handle that the `OpState` of an isolate was built with, so the
+/// bundle can share it, see [`Isolate::call_state`].
 fn shared_call_state(runtime: &mut deno_core::JsRuntime) -> SharedCallState {
     runtime
         .op_state()
@@ -3438,28 +3437,29 @@ fn shared_call_state(runtime: &mut deno_core::JsRuntime) -> SharedCallState {
         .clone()
 }
 
-/// What a synchronous handler call produced, carried out of the v8 scopes so the call
-/// state is restored before any follow-up work (nested send expansion) runs.
+/// The result of one synchronous handler call. It leaves the v8 scopes before any follow-up
+/// work, such as a nested send, so the call state is restored first.
 enum CallOutcome {
-    /// The handler threw; the exception's string form is echoed.
+    /// The handler threw. The text of the exception is echoed.
     Threw(String),
-    /// The handler completed with a string value, which is sent as a nested command line.
+    /// The handler returned a string. The string is sent as a nested command line.
     Returned(String),
     /// Completed with nothing to send.
     Done,
-    /// No registered function/script at the requested id.
+    /// No function or script is registered at the requested id.
     Missing,
 }
 
-/// Call `function_id` of `bundle` with a fresh `matches` object (`call_javascript_function`
-/// with the isolate already resolved). The function is materialized as a `Local` from the
-/// registry entry, rooted by this call's handle scope — no persistent handle is created or
-/// released per call — and the registry borrow ends before user JS can run (a handler that
-/// synchronously registers another automation `borrow_mut`s that same registry).
+/// Call `function_id` of `bundle` with a fresh `matches` object. This is
+/// `call_javascript_function` with the isolate already resolved. The function becomes a
+/// `Local` from the registry entry, rooted by the handle scope of this call. No call creates
+/// or releases a persistent handle. The registry borrow ends before user JS can run, because
+/// a handler that registers another automation borrows that same registry mutably.
 ///
-/// The delivery depth and alias identity are stamped into the isolate's call state around the
-/// call and restored afterwards — before the returned-string send, which runs no JS — so an
-/// exception or a nested send never leaves this handler's context behind.
+/// The call sets the delivery depth and the alias identity in the call state of the isolate.
+/// It restores them after the call and before the send of a returned string, which runs no
+/// JS. An exception or a nested send therefore never leaves the context of this handler
+/// behind.
 fn call_function_in(
     bundle: &mut Isolate,
     trigger_manager: &Manager,
@@ -3468,8 +3468,8 @@ fn call_function_in(
     depth: u32,
     sender: Option<AliasSender>,
 ) -> Result<ActionResult> {
-    // Per-line timing is TRACE-only; skip the clock entirely above TRACE so the
-    // hot path pays just a level check (compiled out when TRACE is statically off).
+    // Per-line timing is TRACE only. Above TRACE the hot path pays one level check and does
+    // not read the clock. The check compiles out when TRACE is statically off.
     let started = log_enabled!(log::Level::Trace).then(Instant::now);
     let Isolate {
         matches_keys,
@@ -3479,8 +3479,8 @@ fn call_function_in(
         ..
     } = bundle;
     let deno = runtime.deno_runtime();
-    // Make the owning isolate current for this call (it usually isn't — Model B leaves the
-    // enter-stack empty between ops); released after the scope on the way out.
+    // Make the owning isolate current for this call. It usually is not current, because
+    // Model B leaves the enter stack empty between ops. The guard releases it after the scope.
     let _entered = EnteredIsolate::enter(deno);
     let context = deno.main_context();
     let isolate = deno.v8_isolate();
@@ -3506,7 +3506,8 @@ fn call_function_in(
             None => CallOutcome::Missing,
         }
     };
-    // Restore the enclosing depth (0 at the outermost dispatch) now the handler has returned.
+    // The handler has returned. Restore the enclosing depth, which is 0 at the outermost
+    // dispatch.
     call_state.depth.set(prior_depth);
     let sender = call_state.alias.replace(prior_sender);
 
@@ -3523,10 +3524,10 @@ fn call_function_in(
     }
 }
 
-/// Run compiled classic script `script_id` of `bundle` with a fresh global `matches` object
-/// (`run_script` with the isolate already resolved). Same call-state bracket and handle
-/// discipline as [`call_function_in`]; the script handle is borrowed straight from the
-/// bundle's registry for the scope's lifetime.
+/// Run the compiled classic script `script_id` of `bundle` with a fresh global `matches`
+/// object. This is `run_script` with the isolate already resolved. It uses the same call-state
+/// bracket and handle rules as [`call_function_in`]. The script handle is borrowed from the
+/// registry of the bundle for the lifetime of the scope.
 fn run_script_in(
     bundle: &mut Isolate,
     trigger_manager: &Manager,
@@ -3544,17 +3545,18 @@ fn run_script_in(
         ..
     } = bundle;
     let deno = runtime.deno_runtime();
-    // Make the owning isolate current for this eval (Model B), released after the scope.
+    // Make the owning isolate current for this eval, see Model B. The guard releases it after
+    // the scope.
     let _entered = EnteredIsolate::enter(deno);
     let context = deno.main_context();
     let isolate = deno.v8_isolate();
     v8::scope_with_context!(let scope, isolate, context);
 
-    // Stamp this eval's dispatch depth: an inline trigger/alias script's store `set` must
-    // journal at its own depth, not the stale depth a previous function dispatch left in this
-    // isolate. Without this an ordinary trigger-driven write loop would ratchet watch deliveries
-    // to the cap with no real recursion, and a genuinely nested eval would write at a stale
-    // (often 0) depth, defeating the cap it should inherit.
+    // Set the dispatch depth of this eval. A store `set` in an inline trigger or alias script
+    // must journal at its own depth and not at a stale depth from an earlier function
+    // dispatch on this isolate. Without this, an ordinary trigger-driven write loop would
+    // push watch deliveries to the cap with no real recursion, and a nested eval would write
+    // at a stale depth, often 0, and escape the cap it must inherit.
     let prior_depth = call_state.depth.replace(depth);
     let prior_sender = call_state.alias.replace(sender);
     let outcome = {
@@ -3575,7 +3577,7 @@ fn run_script_in(
             None => CallOutcome::Missing,
         }
     };
-    // Restore the enclosing depth now the eval has returned (see the save above).
+    // The eval has returned. Restore the enclosing depth that the call saved above.
     call_state.depth.set(prior_depth);
     let sender = call_state.alias.replace(prior_sender);
 
@@ -3592,8 +3594,8 @@ fn run_script_in(
     }
 }
 
-/// Classify a completed call while its `TryCatch` scope is still open: an exception (string
-/// form), a string completion value, or nothing to send.
+/// Classify a completed call while its `TryCatch` scope is open: an exception as text, a
+/// string completion value, or nothing to send.
 fn call_outcome(
     try_catch: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     result: Option<v8::Local<v8::Value>>,
@@ -3612,8 +3614,8 @@ fn call_outcome(
     }
 }
 
-/// Turn a call's outcome into its `ActionResult`: an exception is echoed; a returned string is
-/// expanded as a nested outgoing line one level deeper, attributed to `sender`.
+/// Turn the outcome of a call into its `ActionResult`. An exception is echoed. A returned
+/// string is expanded as a nested outgoing line one level deeper, attributed to `sender`.
 fn finish_call(
     outcome: CallOutcome,
     trigger_manager: &Manager,
