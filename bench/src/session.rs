@@ -180,6 +180,16 @@ impl BenchSession {
             .expect("session runtime channel closed");
     }
 
+    /// Queue a host action, for example a persisted JavaScript automation.
+    ///
+    /// # Panics
+    /// Panics if the session runtime has closed its action channel.
+    pub fn dispatch(&self, action: RuntimeAction) {
+        self.tx
+            .send(action)
+            .expect("session runtime channel closed");
+    }
+
     /// Drain until a displayed line's text CONTAINS `marker`, collecting every
     /// appended line (notices included). Returns `false` on timeout so the
     /// caller owns the panic and can print the transcript. Setup/sanity side —

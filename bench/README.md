@@ -23,6 +23,39 @@ Env vars honored where a bench says so: `SMUDGY_BENCH_LINES=n` (truncate-only
 corpus/pass cap), `SMUDGY_BENCH_SKIP_SANITY=1` (skip the warmup assertions
 that prove the measured machinery does what the bench claims).
 
+## Trigger capture diagnostics
+
+The `capture_delivery` example compares function arguments, compiled classic
+scripts, and interpolated text. Inputs are synthetic. Each run checks capture
+values or outgoing text before reporting timings as JSON lines.
+
+```powershell
+cargo run --release -p smudgy_bench --example capture_delivery -- function groups 8 25000
+cargo run --release -p smudgy_bench --example capture_delivery -- script groups 8 25000
+cargo run --release -p smudgy_bench --example capture_delivery -- template groups 8 25000
+```
+
+Use `literal` for a whole-match capture or `wide` for 40 named groups.
+The examples run two warmup passes before the requested measured passes.
+Discard timing rows whose `pass` is less than 2. Add
+`--features ingest-allocations` to collect Rust allocation counts in a separate
+run. Instrumented timings are not suitable for speed comparisons.
+
+The `replay_diagnostic` example accepts an external newline-terminated log:
+
+```text
+replay_diagnostic <ingest|manager|session> <wire-log> <spec-or-module> <passes>
+```
+
+`manager` accepts TSV rows containing a name, an optional ANSI foreground index,
+and one or more regex patterns. Use `10k` instead of a TSV path for the existing
+engine benchmark population. It queues the full corpus before clearing actions.
+`session` accepts a JS/TS module that echoes `ZZREPLAYREADY` on `ZZREPLAYCHECK`
+and `ZZREPLAYDONE` on `ZZREPLAYEND`. It also feeds BEGIN and END measurement
+markers around each pass. Session timing includes actual handler execution,
+dispatch, logging, and output draining. It excludes input parsing, sockets,
+partial-line display, and GUI rendering. `ingest` measures parsing separately.
+
 ## Continuous benchmark history
 
 The public repository's trusted `Benchmarks` workflow runs this full suite
