@@ -303,6 +303,13 @@ struct Isolate {
     /// isolate. `Send + Sync` itself, which is fine on an otherwise non-`Send` `Isolate`; drops
     /// with the isolate.
     waker: Waker,
+    /// Session-thread readiness seed: set when synchronous JS ran on this isolate (alias /
+    /// trigger / hotkey / callback dispatch) so the next pump polls it (see
+    /// [`ScriptEngine::mark_isolate_ready`]). The thread-safe `ready` set stays the path for
+    /// cross-thread wakes; this flag records the far more frequent same-thread seed without a
+    /// lock or a hash. It lives on the bundle, so a torn-down isolate's seed dies with it and a
+    /// rebuilt isolate starts unseeded; the merge in `poll_event_loop` clears it.
+    seeded: Cell<bool>,
 }
 
 /// The auto-load set partitioned by target isolate (`build_isolate_plan`): the main isolate's
@@ -591,6 +598,9 @@ pub struct ScriptEngine<'a> {
     /// Latest session-task waker, refreshed every pump; the per-isolate `DemuxWaker`s re-arm the
     /// session task through this slot when their isolate makes progress.
     parent: ParentSlot,
+    /// The ids drained for one pump (`poll_event_loop`), kept between pumps so the per-action
+    /// pump does not allocate.
+    ready_scratch: Vec<IsolateId>,
 }
 
 /// The shared (`Arc`) catalogue key strings for one platform event, resolved once on its
@@ -1868,6 +1878,7 @@ impl<'a> ScriptEngine<'a> {
                 compiled_scripts: Vec::new(),
                 call_state: main_call_state,
                 waker: main_waker,
+                seeded: Cell::new(false),
             },
         );
         // Seed: arm `Main` on the first pump. At construction `parent` is still
@@ -2449,6 +2460,7 @@ impl<'a> ScriptEngine<'a> {
                         compiled_scripts: Vec::new(),
                         call_state,
                         waker: package_waker,
+                        seeded: Cell::new(false),
                     },
                 );
                 // Hold the concrete provider so its per-isolate notices can be drained after load.
@@ -2648,6 +2660,7 @@ impl<'a> ScriptEngine<'a> {
             audio_lifecycle_owner,
             ready,
             parent,
+            ready_scratch: Vec::new(),
         }
     }
 
@@ -2895,34 +2908,50 @@ impl<'a> ScriptEngine<'a> {
     /// isolate this is equivalent to polling it directly.
     pub fn poll_event_loop(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
         // Refresh `parent` to THIS poll's task waker first — the task identity can
-        // change across polls, and a `DemuxWaker` re-arms the task through this slot.
-        *self.parent.lock().expect("parent slot poisoned") = Some(cx.waker().clone());
+        // change across polls, and a `DemuxWaker` re-arms the task through this slot. The
+        // common case is the same task pumping again (`will_wake`): the stored waker is kept
+        // rather than cloned and dropped once per pump.
+        {
+            let mut parent = self.parent.lock().expect("parent slot poisoned");
+            if !parent.as_ref().is_some_and(|stored| stored.will_wake(cx.waker())) {
+                *parent = Some(cx.waker().clone());
+            }
+        }
 
         // Drain the ready-set BEFORE polling (lost-wake safety): a wake landing *during* a
-        // poll re-inserts its id (and re-wakes `parent`), so it survives to the next pump.
-        let todo: Vec<IsolateId> = {
+        // poll re-inserts its id (and re-wakes `parent`), so it survives to the next pump. The
+        // drain fills one vector reused across pumps, and the lock is released before any
+        // isolate is entered. Same-thread seeds (`mark_isolate_ready`) merge in after the
+        // drain: a seed raised while an isolate is being polled stays set for the next pump.
+        let mut todo = std::mem::take(&mut self.ready_scratch);
+        todo.clear();
+        {
             let mut ready = self.ready.lock().expect("ready-set poisoned");
-            ready.drain().collect()
-        };
+            todo.extend(ready.drain());
+        }
+        for (id, isolate) in &self.isolates {
+            if isolate.seeded.replace(false) && !todo.contains(id) {
+                todo.push(id.clone());
+            }
+        }
 
         let mut any_ready = false;
         let mut first_err: Option<CoreError> = None;
-        for id in todo {
+        for id in &todo {
             // A queued id can be stale if its isolate was torn down after queueing; skip it.
-            let Some(isolate) = self.isolates.get_mut(&id) else {
+            let Some(isolate) = self.isolates.get_mut(id) else {
                 continue;
             };
             // Make this isolate current while its loop is pumped (Model B), then release it (RAII
             // exit). The demux changes *which* isolates are polled, never *how* — the bracket is
             // unchanged and per *polled* isolate.
-            let _entered = EnteredIsolate::enter(isolate.runtime.deno_runtime());
-            // Poll with the isolate's OWN waker (cloned — building the `Context` from
-            // `&isolate.waker` would hold that borrow across `&mut isolate.runtime`)
-            // so deno_core registers the `DemuxWaker` against its pending ops, NOT the session-task
-            // waker. That is what makes the next completion re-enter ONLY this isolate.
-            let w = isolate.waker.clone();
-            let mut isolate_cx = Context::from_waker(&w);
-            match isolate.runtime.poll_event_loop(&mut isolate_cx) {
+            let Isolate { runtime, waker, .. } = isolate;
+            let _entered = EnteredIsolate::enter(runtime.deno_runtime());
+            // Poll with the isolate's OWN waker so deno_core registers the `DemuxWaker` against
+            // its pending ops, NOT the session-task waker. That is what makes the next completion
+            // re-enter ONLY this isolate.
+            let mut isolate_cx = Context::from_waker(waker);
+            match runtime.poll_event_loop(&mut isolate_cx) {
                 Poll::Ready(Ok(())) => any_ready = true,
                 Poll::Ready(Err(err)) => {
                     // Poll EVERY queued isolate this pass — do NOT early-return — so a
@@ -2939,6 +2968,8 @@ impl<'a> ScriptEngine<'a> {
                 Poll::Pending => {}
             }
         }
+        todo.clear();
+        self.ready_scratch = todo;
 
         // Surface the first error (the run loop's `Ready(Err)` arm in `runtime.rs` warns/echoes and
         // keeps the session alive); else report progress so the caller drains again,
@@ -2953,18 +2984,19 @@ impl<'a> ScriptEngine<'a> {
         }
     }
 
-    /// Seed `id` into the demux ready-set so the next `poll_event_loop` polls it. Called when
-    /// synchronous JS runs on an isolate (alias/trigger/hotkey dispatch), because that JS can
-    /// schedule async work (timers, promise continuations) WITHOUT a pump to arm the isolate's own
-    /// waker — so the demux must be told to poll it, or the work is stranded (purely trusting the
-    /// demux for the dispatch isolate is unsafe).
-    /// No parent-wake: dispatch runs on the session thread with the run loop active, so the next
-    /// Phase 1 pump drains this seed before parking.
+    /// Seed `id` so the next `poll_event_loop` polls it. Called when synchronous JS runs on an
+    /// isolate (alias/trigger/hotkey dispatch), because that JS can schedule async work (timers,
+    /// promise continuations) WITHOUT a pump to arm the isolate's own waker — so the demux must
+    /// be told to poll it, or the work is stranded (purely trusting the demux for the dispatch
+    /// isolate is unsafe). The seed is the bundle's own flag (`Isolate::seeded`), not the
+    /// thread-safe ready-set: dispatch runs on the session thread, so no lock or hash is
+    /// needed, and no parent-wake either — the run loop is active, and its next Phase 1 pump
+    /// merges this seed before parking. An unknown id is a no-op, as a stale id in the
+    /// ready-set was.
     fn mark_isolate_ready(&self, id: &IsolateId) {
-        self.ready
-            .lock()
-            .expect("ready-set poisoned")
-            .insert(id.clone());
+        if let Some(isolate) = self.isolates.get(id) {
+            isolate.seeded.set(true);
+        }
     }
 
     /// Mutable access to one isolate's bundle. Errors if the id isn't present, which is a
@@ -2999,8 +3031,6 @@ impl<'a> ScriptEngine<'a> {
             self.isolates.contains_key(isolate),
             "run_automation on unknown isolate {isolate:?}"
         );
-        // Demux seed: see `call_javascript_function`.
-        self.mark_isolate_ready(isolate);
         let bundle = match self.isolate_mut(isolate) {
             Ok(bundle) => bundle,
             Err(err) => {
@@ -3011,6 +3041,8 @@ impl<'a> ScriptEngine<'a> {
                 };
             }
         };
+        // Demux seed: see `call_javascript_function` / `mark_isolate_ready`.
+        bundle.seeded.set(true);
         bundle.call_state.fallthrough.set(Some(fallthrough));
         bundle.call_state.captured.set(true);
         let result = match call {
