@@ -2976,6 +2976,59 @@ impl<'a> ScriptEngine<'a> {
             .ok_or_else(|| anyhow!("Isolate {isolate:?} not found"))
     }
 
+    /// Deliver one function/script automation (`RunAutomation` dispatch): the
+    /// fallthrough/capture bracket around the call, with the target isolate resolved once for
+    /// the whole bracket. The bracket is the same as the separate `begin_fallthrough` /
+    /// `set_is_captured` / call / `get_is_captured` / `end_fallthrough` sequence: the
+    /// fallthrough slot holds the declarative default while the handler runs and is cleared
+    /// afterwards (so later async calls throw), and the capture flag is primed `true` — a
+    /// handler opts out by calling `capture(false)`. An unknown isolate — a routing bug, never
+    /// a live action — reports the error the way a failed call does and leaves the line's
+    /// stop state untouched.
+    pub fn run_automation(
+        &mut self,
+        trigger_manager: &Manager,
+        isolate: &IsolateId,
+        call: AutomationCall,
+        matches: CaptureView<'_>,
+        depth: u32,
+        sender: Option<AliasSender>,
+        fallthrough: bool,
+    ) -> AutomationOutcome {
+        debug_assert!(
+            self.isolates.contains_key(isolate),
+            "run_automation on unknown isolate {isolate:?}"
+        );
+        // Demux seed: see `call_javascript_function`.
+        self.mark_isolate_ready(isolate);
+        let bundle = match self.isolate_mut(isolate) {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                return AutomationOutcome {
+                    result: ActionResult::Echo(call.error_echo(&err)),
+                    captured: false,
+                    continue_matching: true,
+                };
+            }
+        };
+        bundle.call_state.fallthrough.set(Some(fallthrough));
+        bundle.call_state.captured.set(true);
+        let result = match call {
+            AutomationCall::Function(id) => {
+                call_function_in(bundle, trigger_manager, id, matches, depth, sender)
+            }
+            AutomationCall::Script(id) => {
+                run_script_in(bundle, trigger_manager, id, matches, depth, sender)
+            }
+        }
+        .unwrap_or_else(|err| ActionResult::Echo(call.error_echo(&err)));
+        AutomationOutcome {
+            result,
+            captured: bundle.call_state.captured.get(),
+            continue_matching: bundle.call_state.fallthrough.take().unwrap_or(true),
+        }
+    }
+
     #[inline]
     pub fn call_javascript_function(
         &mut self,
@@ -3334,6 +3387,33 @@ impl<'a> ScriptEngine<'a> {
             bundle.call_state.fallthrough.take().unwrap_or(true)
         })
     }
+}
+
+/// Which registry entry a `RunAutomation` delivery runs (see [`ScriptEngine::run_automation`]).
+#[derive(Clone, Copy, Debug)]
+pub enum AutomationCall {
+    Function(FunctionId),
+    Script(ScriptId),
+}
+
+impl AutomationCall {
+    /// The echoed text for a delivery that failed before or during the call, in the wording
+    /// each delivery kind has always used.
+    fn error_echo(self, err: &anyhow::Error) -> String {
+        match self {
+            Self::Function(_) => format!("Error in Javascript Function: {err:?}"),
+            Self::Script(_) => format!("JavaScript Error: {err:?}"),
+        }
+    }
+}
+
+/// What one automation delivery produced (see [`ScriptEngine::run_automation`]).
+pub struct AutomationOutcome {
+    pub result: ActionResult,
+    /// The capture flag as the handler left it: `true` unless it called `capture(false)`.
+    pub captured: bool,
+    /// The handler's final fallthrough decision.
+    pub continue_matching: bool,
 }
 
 /// Fetch the [`ops::CallState`] handle an isolate's `OpState` was constructed with, so the

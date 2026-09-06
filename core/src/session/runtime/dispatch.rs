@@ -13,6 +13,7 @@ use crate::session::ui_command::{PaneCommand, UiCommand};
 use crate::session::{BufferUpdate, SessionEvent, TaggedSessionEvent};
 
 use super::pane::{MAIN_PANE_KEY, PaneError, PaneKey, PaneKind, PaneNamespace};
+use super::script_engine::AutomationCall;
 use super::trigger::{self, PushTriggerParams};
 use super::{ActionResult, Inner, IsolateId, MainPrefixDisposition, RuntimeAction, ScriptAction};
 use crate::session::styled_line::StyledLine;
@@ -780,16 +781,13 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::RunAutomation {
-                isolate,
-                origin,
-                name,
+                identity,
                 script,
                 matches,
                 depth,
                 is_captured,
                 stopped,
                 fallthrough,
-                is_alias,
             } => {
                 if stopped.load(Ordering::Relaxed) {
                     return Ok(ActionResult::None);
@@ -798,66 +796,49 @@ impl Inner<'_> {
                 // Count the invocation before entering user code. Besides matching the old
                 // fire-limit timing, this ensures a handler that replaces itself cannot charge
                 // the new definition for the old definition's fire.
-                self.trigger_manager
-                    .record_fire(&isolate, &origin, &name, is_alias);
+                self.trigger_manager.record_fire(&identity);
 
                 // A running alias is the sender of everything its body sends; that identity
                 // rides every nested outgoing pass so its own output cannot re-match it.
-                let sender = is_alias.then(|| trigger::AliasSender {
-                    isolate: isolate.clone(),
-                    origin: origin.clone(),
-                    name: name.clone(),
+                let sender = identity.is_alias.then(|| trigger::AliasSender {
+                    isolate: identity.isolate.clone(),
+                    origin: identity.origin.clone(),
+                    name: identity.name.clone(),
                 });
 
                 let mut continue_matching = fallthrough;
                 let result = match script {
                     ScriptAction::EvalJavascript(id) => {
-                        self.script_engine.begin_fallthrough(&isolate, fallthrough);
-                        self.script_engine.set_is_captured(&isolate, true);
-                        let result = self
-                            .script_engine
-                            .run_script(
-                                &self.trigger_manager,
-                                &isolate,
-                                id,
-                                matches.view(),
-                                depth,
-                                sender,
-                            )
-                            .unwrap_or_else(|err| {
-                                ActionResult::Echo(format!("JavaScript Error: {err:?}"))
-                            });
-                        if self.script_engine.get_is_captured(&isolate)
-                            && let Some(is_captured) = &is_captured
-                        {
+                        let outcome = self.script_engine.run_automation(
+                            &self.trigger_manager,
+                            &identity.isolate,
+                            AutomationCall::Script(id),
+                            matches.view(),
+                            depth,
+                            sender,
+                            fallthrough,
+                        );
+                        if outcome.captured && let Some(is_captured) = &is_captured {
                             is_captured.store(true, Ordering::Relaxed);
                         }
-                        continue_matching = self.script_engine.end_fallthrough(&isolate);
-                        result
+                        continue_matching = outcome.continue_matching;
+                        outcome.result
                     }
                     ScriptAction::CallJavascriptFunction(id) => {
-                        self.script_engine.begin_fallthrough(&isolate, fallthrough);
-                        self.script_engine.set_is_captured(&isolate, true);
-                        let result = self
-                            .script_engine
-                            .call_javascript_function(
-                                &self.trigger_manager,
-                                &isolate,
-                                id,
-                                matches.view(),
-                                depth,
-                                sender,
-                            )
-                            .unwrap_or_else(|err| {
-                                ActionResult::Echo(format!("Error in Javascript Function: {err:?}"))
-                            });
-                        if self.script_engine.get_is_captured(&isolate)
-                            && let Some(is_captured) = &is_captured
-                        {
+                        let outcome = self.script_engine.run_automation(
+                            &self.trigger_manager,
+                            &identity.isolate,
+                            AutomationCall::Function(id),
+                            matches.view(),
+                            depth,
+                            sender,
+                            fallthrough,
+                        );
+                        if outcome.captured && let Some(is_captured) = &is_captured {
                             is_captured.store(true, Ordering::Relaxed);
                         }
-                        continue_matching = self.script_engine.end_fallthrough(&isolate);
-                        result
+                        continue_matching = outcome.continue_matching;
+                        outcome.result
                     }
                     ScriptAction::SendSimple(script) => {
                         if let Some(is_captured) = &is_captured {

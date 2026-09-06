@@ -1,10 +1,10 @@
 use std::{
-    cell::{Cell, OnceCell, RefCell},
+    cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -42,9 +42,118 @@ pub struct AutomationEntry {
 /// `name -> entry` within one `(IsolateId, Origin)` namespace.
 type AutomationNamespace = HashMap<String, AutomationEntry>;
 
-/// Stop state for one alias/trigger dispatch, partitioned by creator so one package cannot
-/// suppress another package's (or the user's) automations.
-type FallthroughScopes = HashMap<(IsolateId, Origin), Arc<AtomicBool>>;
+/// A registration-time handle for one `(IsolateId, Origin)` automation namespace. The
+/// `Manager` interns each distinct pair once; per-line work then compares and hashes this
+/// small copyable id instead of the owned isolate/origin values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NamespaceId(u32);
+
+/// The immutable identity of one registered automation, created when it is registered and
+/// shared (`Arc`) by its registry entry, by every action it queues, and by the fire
+/// accounting those actions perform. Queuing a fire copies one `Arc` rather than the
+/// isolate, origin, and name separately.
+///
+/// `slot` caches where the fire counter lives in the registry: the `(generation, index)` of
+/// the last successful lookup. A fire whose cached generation matches the registry's current
+/// generation reads the counter at that index directly; any registry mutation (add, replace,
+/// remove) bumps the generation, so a stale slot falls back to the name lookup — which is
+/// what keeps the existing dispatch-time semantics after a replacement or removal: a queued
+/// fire charges whatever definition holds the name when it runs, not the definition that
+/// queued it.
+#[derive(Debug)]
+pub struct AutomationIdentity {
+    pub isolate: IsolateId,
+    pub origin: Origin,
+    pub name: Arc<String>,
+    /// Whether the entry lives in the alias `Vec` (matched on outgoing input) vs the trigger
+    /// `Vec` (matched on incoming lines).
+    pub is_alias: bool,
+    pub namespace: NamespaceId,
+    slot_generation: AtomicU64,
+    slot_index: AtomicUsize,
+}
+
+/// The registry generation no slot cache can ever hold: a fresh identity always looks up.
+const NO_GENERATION: u64 = 0;
+
+/// Process-wide source of registry generations, so a generation is never reused across
+/// `Manager` instances (an engine rebuild replaces the manager while queued actions from the
+/// old one may still hold cached slots).
+static NEXT_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_registry_generation() -> u64 {
+    NEXT_REGISTRY_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+impl AutomationIdentity {
+    fn new(
+        isolate: IsolateId,
+        origin: Origin,
+        name: &str,
+        is_alias: bool,
+        namespace: NamespaceId,
+    ) -> Self {
+        Self {
+            isolate,
+            origin,
+            name: Arc::new(name.to_owned()),
+            is_alias,
+            namespace,
+            slot_generation: AtomicU64::new(NO_GENERATION),
+            slot_index: AtomicUsize::new(0),
+        }
+    }
+
+    /// The cached registry index, if it was recorded under `generation`. Only the session
+    /// thread touches the slot, so the two reads cannot tear.
+    fn cached_slot(&self, generation: u64) -> Option<usize> {
+        (self.slot_generation.load(Ordering::Relaxed) == generation)
+            .then(|| self.slot_index.load(Ordering::Relaxed))
+    }
+
+    fn cache_slot(&self, generation: u64, index: usize) {
+        self.slot_index.store(index, Ordering::Relaxed);
+        self.slot_generation.store(generation, Ordering::Relaxed);
+    }
+}
+
+/// Stop state for one alias/trigger dispatch, partitioned by creator namespace so one package
+/// cannot suppress another package's (or the user's) automations. Nearly every line fires
+/// into a single namespace, so the first scope is stored inline; only a second namespace on
+/// the same line touches the heap for the overflow list.
+#[derive(Default)]
+struct FallthroughScopes {
+    first: Option<(NamespaceId, Arc<AtomicBool>)>,
+    rest: Vec<(NamespaceId, Arc<AtomicBool>)>,
+}
+
+impl FallthroughScopes {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The stop flag shared by every automation of `namespace` on this line, created on
+    /// first use. Each logical line owns fresh flags: a queued action retains its line's flag,
+    /// so flags are never reset and reused across lines.
+    fn scope(&mut self, namespace: NamespaceId) -> Arc<AtomicBool> {
+        match &self.first {
+            None => {
+                let stopped = Arc::new(AtomicBool::new(false));
+                self.first = Some((namespace, stopped.clone()));
+                stopped
+            }
+            Some((id, stopped)) if *id == namespace => stopped.clone(),
+            Some(_) => {
+                if let Some((_, stopped)) = self.rest.iter().find(|(id, _)| *id == namespace) {
+                    return stopped.clone();
+                }
+                let stopped = Arc::new(AtomicBool::new(false));
+                self.rest.push((namespace, stopped.clone()));
+                stopped
+            }
+        }
+    }
+}
 
 /// The identity of the alias whose expansion produced the line currently being matched.
 /// Carried through every nested outgoing-line pass so that alias's own sent text is
@@ -107,6 +216,13 @@ pub struct Manager {
     // via upsert.
     trigger_indices: HashMap<(IsolateId, Origin), HashMap<String, usize>>,
     alias_indices: HashMap<(IsolateId, Origin), HashMap<String, usize>>,
+    /// Interned `(IsolateId, Origin)` namespaces (see [`NamespaceId`]). Grows only at
+    /// registration; a namespace keeps its id for the manager's life.
+    namespaces: HashMap<(IsolateId, Origin), NamespaceId>,
+    /// The registry generation (see [`AutomationIdentity`]): bumped on every mutation of
+    /// `triggers`/`aliases` or their index maps, so cached fire-counter slots taken under an
+    /// older generation fall back to the name lookup.
+    registry_generation: u64,
     /// Indices into `triggers` of every trigger that declares a `line_limit`. A side list so the
     /// per-incoming-line `count_tested_lines` self-limit tick visits only the (rare) line-limited
     /// triggers instead of scanning all of them — keeping the common no-line-limit profile O(1)
@@ -808,6 +924,8 @@ impl Manager {
             triggers,
             alias_indices,
             trigger_indices,
+            namespaces: HashMap::new(),
+            registry_generation: next_registry_generation(),
             line_limited_triggers: Vec::new(),
             spawned_actions,
             trigger_regex_set_dirty: true,
@@ -1057,11 +1175,27 @@ impl Manager {
         }
     }
 
-    fn add_or_update_alias(&mut self, alias: Trigger) {
+    /// Give a registering automation its shared identity (see [`AutomationIdentity`]),
+    /// interning its `(isolate, origin)` namespace on first sight.
+    fn assign_identity(&mut self, item: &mut Trigger) {
+        let key = (item.isolate.clone(), item.origin.clone());
+        let next = NamespaceId(u32::try_from(self.namespaces.len()).expect("namespace count"));
+        let namespace = *self.namespaces.entry(key).or_insert(next);
+        item.identity = Some(Arc::new(AutomationIdentity::new(
+            item.isolate.clone(),
+            item.origin.clone(),
+            &item.name,
+            item.is_alias,
+            namespace,
+        )));
+    }
+
+    fn add_or_update_alias(&mut self, mut alias: Trigger) {
         debug!(
             "Adding or updating alias: {:?}, {:?}, {:?}",
             alias.origin, alias.name, alias.patterns
         );
+        self.assign_identity(&mut alias);
         self.registry_upsert(AutomationKind::Alias, &alias);
         let delta = (self.is_watched() && alias.origin != Origin::User)
             .then(|| AutomationDelta::Upserted(Self::summary(AutomationKind::Alias, &alias)));
@@ -1084,6 +1218,7 @@ impl Manager {
                 .insert(alias.name.clone(), index);
             self.aliases.push(alias);
         }
+        self.registry_generation = next_registry_generation();
         // Defer the (expensive) PatternSet rebuild to the next outgoing line,
         // exactly like triggers do via `trigger_regex_set_dirty`. Rebuilding
         // eagerly on every insert made loading N aliases O(N²) — and since each
@@ -1097,11 +1232,12 @@ impl Manager {
         }
     }
 
-    fn add_or_update_trigger(&mut self, trigger: Trigger) {
+    fn add_or_update_trigger(&mut self, mut trigger: Trigger) {
         trace!(
             "Adding or updating trigger: {:?}, {:?}",
             trigger.name, trigger.patterns
         );
+        self.assign_identity(&mut trigger);
         self.registry_upsert(AutomationKind::Trigger, &trigger);
         let delta = (self.is_watched() && trigger.origin != Origin::User)
             .then(|| AutomationDelta::Upserted(Self::summary(AutomationKind::Trigger, &trigger)));
@@ -1121,6 +1257,7 @@ impl Manager {
                 .insert(trigger.name.clone(), index);
             self.triggers.push(trigger);
         }
+        self.registry_generation = next_registry_generation();
 
         self.trigger_regex_set_dirty = true;
         self.refresh_raw_wanted();
@@ -1375,6 +1512,7 @@ impl Manager {
             origin,
             name,
         ) {
+            self.registry_generation = next_registry_generation();
             self.alias_regex_set_dirty = true;
             self.command_names_dirty = true;
             self.registry_remove(AutomationKind::Alias, isolate, origin, name);
@@ -1399,6 +1537,7 @@ impl Manager {
             origin,
             name,
         ) {
+            self.registry_generation = next_registry_generation();
             self.trigger_regex_set_dirty = true;
             self.refresh_raw_wanted();
             self.registry_remove(AutomationKind::Trigger, isolate, origin, name);
@@ -1756,10 +1895,7 @@ impl Manager {
                     pattern_set.patterns().get(hit.index).unwrap()
                 );
 
-                let stopped = fallthrough_scopes
-                    .entry((trigger.isolate.clone(), trigger.origin.clone()))
-                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                    .clone();
+                let stopped = fallthrough_scopes.scope(trigger.identity().namespace);
                 trigger.run(
                     line,
                     styled_line,
@@ -1898,28 +2034,33 @@ impl Manager {
 
     /// Count an invocation only after it actually begins running. A match skipped by an earlier
     /// `fallthrough(false)` therefore consumes neither `fireLimit` nor its one-shot lifetime.
-    pub(crate) fn record_fire(
-        &self,
-        isolate: &IsolateId,
-        origin: &Origin,
-        name: &str,
-        is_alias: bool,
-    ) {
-        let indices = if is_alias {
-            &self.alias_indices
-        } else {
-            &self.trigger_indices
-        };
-        let items = if is_alias {
+    ///
+    /// The counter is found through the identity's cached slot when the registry has not
+    /// changed since it was cached; otherwise by the `(isolate, origin, name)` lookup, whose
+    /// result is cached for the next fire.
+    pub(crate) fn record_fire(&self, identity: &AutomationIdentity) {
+        let items = if identity.is_alias {
             &self.aliases
         } else {
             &self.triggers
         };
-        let Some(&index) = indices
-            .get(&(isolate.clone(), origin.clone()))
-            .and_then(|namespace| namespace.get(name))
-        else {
-            return;
+        let index = match identity.cached_slot(self.registry_generation) {
+            Some(index) => index,
+            None => {
+                let indices = if identity.is_alias {
+                    &self.alias_indices
+                } else {
+                    &self.trigger_indices
+                };
+                let Some(&index) = indices
+                    .get(&(identity.isolate.clone(), identity.origin.clone()))
+                    .and_then(|namespace| namespace.get(identity.name.as_str()))
+                else {
+                    return;
+                };
+                identity.cache_slot(self.registry_generation, index);
+                index
+            }
         };
         let Some(item) = items.get(index) else {
             return;
@@ -2071,7 +2212,9 @@ struct Trigger {
     isolate: IsolateId,
     origin: Origin,
     name: String,
-    shared_name: OnceCell<Arc<String>>,
+    /// The shared identity every queued action carries (see [`AutomationIdentity`]).
+    /// Assigned by the `Manager` at registration; every entry in its registries has one.
+    identity: Option<Arc<AutomationIdentity>>,
     patterns: Vec<CapturePattern>,
     pattern_colors: Vec<Option<CompiledColorMatch>>,
     raw_patterns: Vec<CapturePattern>,
@@ -2298,7 +2441,7 @@ impl Trigger {
         let patterns = patterns.into_iter().map(CapturePattern::new).collect();
         let raw_patterns = raw_patterns.into_iter().map(CapturePattern::new).collect();
         Self {
-            shared_name: OnceCell::new(),
+            identity: None,
             isolate,
             origin,
             name,
@@ -2446,19 +2589,13 @@ impl Trigger {
         spawned_actions
             .borrow_mut()
             .push_back(RuntimeAction::RunAutomation {
-                isolate: self.isolate.clone(),
-                origin: self.origin.clone(),
-                name: self
-                    .shared_name
-                    .get_or_init(|| Arc::new(self.name.clone()))
-                    .clone(),
+                identity: self.identity().clone(),
                 script: self.script.clone(),
                 matches: captures,
                 depth,
                 is_captured: is_captured.clone(),
                 stopped,
                 fallthrough: self.fallthrough,
-                is_alias: self.is_alias,
             });
         Ok(())
     }
@@ -2497,16 +2634,13 @@ impl Trigger {
                 spawned_actions
                     .borrow_mut()
                     .push_back(RuntimeAction::RunAutomation {
-                        isolate: self.isolate.clone(),
-                        origin: self.origin.clone(),
-                        name: Arc::new(self.name.clone()),
+                        identity: self.identity().clone(),
                         script: self.script.clone(),
                         matches: CapturePayload::Owned(Arc::new(captures)),
                         depth,
                         is_captured: is_captured.clone(),
                         stopped,
                         fallthrough: self.fallthrough,
-                        is_alias: self.is_alias,
                     });
             }
             CommandOutcome::NotFired(CommandMiss::MissingRequired { .. }) => {
@@ -2525,6 +2659,14 @@ impl Trigger {
             CommandOutcome::NotFired(_) => {}
         }
         Ok(())
+    }
+
+    /// The shared identity assigned at registration. Only registered entries are matched, so
+    /// a missing identity is a registration-path bug.
+    fn identity(&self) -> &Arc<AutomationIdentity> {
+        self.identity
+            .as_ref()
+            .expect("an automation in the registry has its identity assigned")
     }
 
     pub fn name(&self) -> &str {
