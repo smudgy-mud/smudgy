@@ -1567,7 +1567,7 @@ impl SettingsWindow {
         );
         col = col.push(pref_input(
             t!("preferences-max-history"),
-            "100",
+            "1000",
             &self.max_history_input,
             max_history_valid,
             Some(t!("preferences-max-history-help")),

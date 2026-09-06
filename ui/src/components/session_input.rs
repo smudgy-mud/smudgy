@@ -2156,15 +2156,16 @@ mod tests {
     #[test]
     fn loaded_history_is_sanitized_capped_and_not_a_new_mutation() {
         let mut entries = vec!["newest".to_string(), " ".to_string(), "newest".to_string()];
-        entries.extend((0..110).map(|i| format!("command-{i}")));
+        entries.extend((0..1010).map(|i| format!("command-{i}")));
 
         let input = SessionInput::new().with_history(entries);
 
         let loaded = history_entries(&input);
-        assert_eq!(loaded.len(), 100);
+        assert_eq!(loaded.len(), 1000);
         assert_eq!(loaded[0], "newest");
         assert_eq!(loaded[1], "command-0");
         assert_eq!(loaded[99], "command-98");
+        assert_eq!(loaded[999], "command-998");
         assert_eq!(input.history_revision(), 0);
         assert!(input.history_index.is_none());
     }
@@ -2200,13 +2201,13 @@ mod tests {
         assert_eq!(input.history_revision(), rev);
         assert_eq!(history_entries(&input), vec!["kill rat", "drink potion"]);
 
-        // Cap parity: history holds at most 100 entries, oldest falling off.
-        for i in 0..150 {
+        // Cap parity: history holds at most 1000 entries, oldest falling off.
+        for i in 0..1050 {
             let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new(format!("cmd{i}"))));
         }
         let entries = history_entries(&input);
-        assert_eq!(entries.len(), 100, "the cap applies to pushed entries too");
-        assert_eq!(entries[0], "cmd149", "newest first after the burst");
+        assert_eq!(entries.len(), 1000, "the cap applies to pushed entries too");
+        assert_eq!(entries[0], "cmd1049", "newest first after the burst");
         assert!(
             !entries.iter().any(|e| e == "kill rat"),
             "the oldest entries fell off the back"
@@ -2215,7 +2216,7 @@ mod tests {
         // A pushed entry is recallable exactly like a typed one.
         let _ = input.update(Message::InputChanged(String::new()));
         let _ = input.update(Message::NavigateHistoryUp);
-        assert_eq!(input.value, "cmd149", "Up recalls the pushed entry");
+        assert_eq!(input.value, "cmd1049", "Up recalls the pushed entry");
     }
 
     /// Apply `settings` to the global `crate::prefs` snapshot for the duration

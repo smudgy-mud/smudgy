@@ -831,7 +831,7 @@ fn default_scrollback_length() -> usize {
 }
 
 fn default_max_history() -> usize {
-    100
+    1000
 }
 
 fn default_terminal_font_family() -> String {
@@ -1666,12 +1666,12 @@ mod tests {
     }
 
     #[test]
-    fn max_history_defaults_to_100_and_round_trips_zero_for_unlimited() {
-        // A settings file predating the field deserializes to the same 100
-        // that session_input.rs used to hardcode, not an error.
+    fn max_history_defaults_to_1000_and_round_trips_zero_for_unlimited() {
+        // A settings file predating the field deserializes to the new default
+        // of 1000, not an error.
         let existing = r#"{ "scrollback_length": 5000 }"#;
         let settings: Settings = serde_json::from_str(existing).expect("parse");
-        assert_eq!(settings.max_history, 100);
+        assert_eq!(settings.max_history, 1000);
 
         let unlimited = Settings {
             max_history: 0,
