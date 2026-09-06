@@ -38,7 +38,7 @@ use crate::{
             ActionResult, IsolateId, SingletonRegistry,
             captures::CaptureView,
             line_operation::LineOperation,
-            script_engine::ops::{Capture, Fallthrough},
+            script_engine::ops::SharedCallState,
             trigger::{AliasSender, Manager, MatchCapture, SharedAutomationRegistry},
         },
         styled_line::StyledLine,
@@ -293,6 +293,10 @@ struct Isolate {
     instance: u64,
     script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>>,
     compiled_scripts: Vec<v8::Global<v8::Script>>,
+    /// This isolate's synchronous call context (`ops::CallState`): the same `Rc` its
+    /// `OpState` holds, kept here so the dispatch bracket reads and writes it directly
+    /// instead of looking it up through `OpState` on every call.
+    call_state: SharedCallState,
     /// This isolate's `DemuxWaker`, built once at insert (`EVENT-LOOP-READINESS-DEMUX.md`).
     /// `poll_event_loop` polls the isolate through a `Context` built from this, so `deno_core`
     /// registers it against the isolate's pending ops — a completion then re-enters only this
@@ -1852,6 +1856,7 @@ impl<'a> ScriptEngine<'a> {
             );
         }
         let main_waker = build_demux_waker(IsolateId::Main, &ready, &parent);
+        let main_call_state = shared_call_state(main_runtime.deno_runtime());
         isolates.insert(
             IsolateId::Main,
             Isolate {
@@ -1861,6 +1866,7 @@ impl<'a> ScriptEngine<'a> {
                 instance: main_instance,
                 script_functions: main_script_functions,
                 compiled_scripts: Vec::new(),
+                call_state: main_call_state,
                 waker: main_waker,
             },
         );
@@ -2431,6 +2437,7 @@ impl<'a> ScriptEngine<'a> {
                     .lock()
                     .expect("ready-set poisoned")
                     .insert(isolate_id.clone());
+                let call_state = shared_call_state(runtime.deno_runtime());
                 isolates.insert(
                     isolate_id,
                     Isolate {
@@ -2440,6 +2447,7 @@ impl<'a> ScriptEngine<'a> {
                         instance,
                         script_functions,
                         compiled_scripts: Vec::new(),
+                        call_state,
                         waker: package_waker,
                     },
                 );
@@ -2978,10 +2986,6 @@ impl<'a> ScriptEngine<'a> {
         depth: u32,
         sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
-        // Per-line timing is TRACE-only; skip the clock entirely above TRACE so the
-        // hot path pays just a level check (compiled out when TRACE is statically off).
-        let started = log_enabled!(log::Level::Trace).then(Instant::now);
-
         // Demux: this isolate is about to run JS synchronously. Async work it schedules without a
         // `poll_event_loop` pass must still be serviced — a microtask (`Promise.then`) in
         // particular does NOT wake the runtime on its own (unlike a `setTimeout`, whose timer op
@@ -2989,99 +2993,8 @@ impl<'a> ScriptEngine<'a> {
         // pump polls it and runs/arms that work (proven by the `demux_async_dispatch`
         // integration test, which strands the continuation if this seed is removed).
         self.mark_isolate_ready(isolate);
-
         let bundle = self.isolate_mut(isolate)?;
-        // Clone the `v8::Global` out and drop the registry `Ref` *before* the v8 call.
-        // `script_functions` is the same `Rc<RefCell<…>>` this isolate's create ops
-        // (`op_smudgy_create_javascript_function_*`) `borrow_mut` to register new
-        // functions, so holding the `Ref` across `f.call(…)` would panic if the called
-        // handler synchronously registers another automation (a `createAlias`/
-        // `createTrigger` whose action is a function — a normal scripting pattern).
-        // Cloning a `Global` is just a handle ref-count bump; it also releases the
-        // `&mut bundle` borrow so `bundle.runtime` can be taken below.
-        let f = {
-            let script_functions = bundle.script_functions.borrow();
-            match script_functions.get(usize::from(function_id)) {
-                Some(f) => f.clone(),
-                None => bail!("Function {} not found", function_id),
-            }
-        };
-
-        let deno = bundle.runtime.deno_runtime();
-        // Record this delivery's depth so an `emit` (or store `set`) from inside the handler
-        // queues its subscribers/watchers one level deeper, terminating cycles at the cap
-        // (`PACKAGE-EVENTS.md`). `EventDepth` is per-isolate `OpState` shared by everything that
-        // later runs in this isolate, so it is SAVED and RESTORED around the call: leaving this
-        // handler's depth behind would make async continuations (timers, resolved promises) and
-        // the next dispatch on this isolate journal store writes at the wrong depth, ratcheting
-        // watch deliveries to the cap with no real recursion. The `Rc` is cloned so it outlives
-        // the v8 borrows of `deno` below.
-        let op_state = deno.op_state();
-        let prior_depth = op_state
-            .borrow()
-            .try_borrow::<ops::EventDepth>()
-            .map_or(0, |d| d.0);
-        op_state.borrow_mut().put(ops::EventDepth(depth));
-        // The alias identity rides beside the depth (same save/restore bracket): a `send()`
-        // issued inside this handler stamps both onto its queued action, so the sent text is
-        // excluded from re-matching the sending alias.
-        let prior_sender = op_state
-            .borrow()
-            .try_borrow::<ops::AliasContext>()
-            .and_then(|context| context.0.clone());
-        op_state.borrow_mut().put(ops::AliasContext(sender.clone()));
-        // Make the owning isolate current for this call (it usually isn't — Model B leaves the
-        // enter-stack empty between ops); released after the scope on the way out.
-        let _entered = EnteredIsolate::enter(deno);
-        let context = deno.main_context();
-        let isolate = deno.v8_isolate();
-        v8::scope_with_context!(let scope, isolate, context);
-
-        let result = {
-            v8::tc_scope!(let try_catch, scope);
-
-            let matches_object = materialize_matches(try_catch, matches, &mut bundle.matches_keys);
-
-            let f = v8::Local::new(try_catch, &f);
-            let f_this = v8::undefined(try_catch).into();
-
-            let result = f.call(try_catch, f_this, &[matches_object.into()]);
-
-            if try_catch.has_caught() {
-                let ex = try_catch.exception().unwrap();
-                let exc = ex.to_string(try_catch).unwrap();
-                let exc = exc.to_rust_string_lossy(try_catch);
-                Ok(ActionResult::Echo(exc))
-            } else if let Some(value) = result {
-                if value.is_string() {
-                    let output = value.to_rust_string_lossy(try_catch);
-                    trigger_manager.process_nested_outgoing_line(
-                        output.as_str(),
-                        depth + 1,
-                        sender.as_ref(),
-                    )?;
-                    Ok(ActionResult::None)
-                } else {
-                    Ok(ActionResult::None)
-                }
-            } else {
-                Ok(ActionResult::None)
-            }
-        };
-
-        // Restore the enclosing depth (0 at the outermost dispatch) now the handler has returned.
-        op_state.borrow_mut().put(ops::EventDepth(prior_depth));
-        op_state.borrow_mut().put(ops::AliasContext(prior_sender));
-
-        if let Some(started) = started {
-            trace!(
-                "Script execution on {} took {:?}",
-                matches.get(0).map_or("unknown", |c| c.value),
-                started.elapsed()
-            );
-        }
-
-        result
+        call_function_in(bundle, trigger_manager, function_id, matches, depth, sender)
     }
 
     pub fn execute_javascript_function(
@@ -3113,13 +3026,13 @@ impl<'a> ScriptEngine<'a> {
         // Demux: a widget/hotkey callback can schedule async work synchronously; seed the target
         // isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
-        let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
+        let bundle = self.isolate_mut(isolate_id)?;
         // A widget/hotkey callback is a top-level dispatch (depth 0); stamp it so a store `set`
-        // inside the callback journals at depth 0 rather than inheriting a stale `EventDepth`
+        // inside the callback journals at depth 0 rather than inheriting a stale depth
         // from an earlier handler on this isolate. No restore needed — 0 is the between-dispatch
         // baseline the save/restore in the other dispatch paths returns to.
-        deno.op_state().borrow_mut().put(ops::EventDepth(0));
-        deno.op_state().borrow_mut().put(ops::AliasContext(None));
+        bundle.call_state.enter_top_level();
+        let deno = bundle.runtime.deno_runtime();
         // Make the target isolate current for this callback (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
@@ -3188,7 +3101,8 @@ impl<'a> ScriptEngine<'a> {
         // Demux: a link callback can schedule async work synchronously; seed the
         // target isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
-        let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
+        let bundle = self.isolate_mut(isolate_id)?;
+        let deno = bundle.runtime.deno_runtime();
         let function = {
             let op_state = deno.op_state();
             let op_state = op_state.borrow();
@@ -3200,8 +3114,7 @@ impl<'a> ScriptEngine<'a> {
             return Ok(ActionResult::None);
         };
         // Top-level dispatch (depth 0), like a widget callback.
-        deno.op_state().borrow_mut().put(ops::EventDepth(0));
-        deno.op_state().borrow_mut().put(ops::AliasContext(None));
+        bundle.call_state.enter_top_level();
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
@@ -3252,7 +3165,8 @@ impl<'a> ScriptEngine<'a> {
             return Ok(ActionResult::None);
         }
         self.mark_isolate_ready(isolate_id);
-        let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
+        let bundle = self.isolate_mut(isolate_id)?;
+        let deno = bundle.runtime.deno_runtime();
         let function = {
             let op_state = deno.op_state();
             let op_state = op_state.borrow();
@@ -3272,8 +3186,7 @@ impl<'a> ScriptEngine<'a> {
                 .clone()
         };
         let request_id = pending.borrow_mut().insert(state);
-        deno.op_state().borrow_mut().put(ops::EventDepth(0));
-        deno.op_state().borrow_mut().put(ops::AliasContext(None));
+        bundle.call_state.enter_top_level();
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
@@ -3349,97 +3262,11 @@ impl<'a> ScriptEngine<'a> {
         depth: u32,
         sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
-        // Per-line timing is TRACE-only; skip the clock entirely above TRACE so the
-        // hot path pays just a level check (compiled out when TRACE is statically off).
-        let started = log_enabled!(log::Level::Trace).then(Instant::now);
-
         // Demux: see `call_javascript_function` — string-script dispatch can also schedule async
         // work synchronously, so seed this isolate for the next pump.
         self.mark_isolate_ready(isolate);
-
         let bundle = self.isolate_mut(isolate)?;
-        // Get the script before creating the mutable scope to avoid borrowing conflicts
-        let script = bundle
-            .compiled_scripts
-            .get(usize::from(script_id))
-            .ok_or_else(|| anyhow::anyhow!("Script {} not found", script_id))?
-            .clone();
-
-        let deno = bundle.runtime.deno_runtime();
-        // Stamp this eval's dispatch depth (save/restore like `call_javascript_function`): an
-        // inline trigger/alias script's store `set` must journal at its own depth, not the stale
-        // `EventDepth` a previous function dispatch left in this isolate's `OpState`. Without this
-        // an ordinary trigger-driven write loop would ratchet watch deliveries to the cap with no
-        // real recursion, and a genuinely nested eval would write at a stale (often 0) depth,
-        // defeating the cap it should inherit.
-        let op_state = deno.op_state();
-        let prior_depth = op_state
-            .borrow()
-            .try_borrow::<ops::EventDepth>()
-            .map_or(0, |d| d.0);
-        op_state.borrow_mut().put(ops::EventDepth(depth));
-        // Alias identity beside the depth, same save/restore bracket as
-        // `call_javascript_function` (see the comment there).
-        let prior_sender = op_state
-            .borrow()
-            .try_borrow::<ops::AliasContext>()
-            .and_then(|context| context.0.clone());
-        op_state.borrow_mut().put(ops::AliasContext(sender.clone()));
-        // Make the owning isolate current for this eval (Model B), released after the scope.
-        let _entered = EnteredIsolate::enter(deno);
-        let context = deno.main_context();
-        let isolate = deno.v8_isolate();
-        v8::scope_with_context!(let scope, isolate, context);
-        let result = {
-            v8::tc_scope!(let try_catch, scope);
-
-            let matches_object = materialize_matches(try_catch, matches, &mut bundle.matches_keys);
-
-            let matches_name = bundle.matches_keys.script_name(try_catch);
-
-            try_catch.get_current_context().global(try_catch).set(
-                try_catch,
-                matches_name.into(),
-                matches_object.into(),
-            );
-
-            let result = v8::Local::new(try_catch, script).run(try_catch);
-
-            if try_catch.has_caught() {
-                let ex = try_catch.exception().unwrap();
-                let exc = ex.to_string(try_catch).unwrap();
-                let exc = exc.to_rust_string_lossy(try_catch);
-                Ok(ActionResult::Echo(exc))
-            } else if let Some(value) = result {
-                if value.is_string() {
-                    let output = value.to_rust_string_lossy(try_catch);
-                    trigger_manager.process_nested_outgoing_line(
-                        output.as_str(),
-                        depth + 1,
-                        sender.as_ref(),
-                    )?;
-
-                    Ok(ActionResult::None)
-                } else {
-                    Ok(ActionResult::None)
-                }
-            } else {
-                Ok(ActionResult::None)
-            }
-        };
-
-        // Restore the enclosing depth now the eval has returned (see the save above).
-        op_state.borrow_mut().put(ops::EventDepth(prior_depth));
-        op_state.borrow_mut().put(ops::AliasContext(prior_sender));
-
-        if let Some(started) = started {
-            trace!(
-                "Script execution on {} took {:?}",
-                matches.get(0).map_or("unknown", |c| c.value),
-                started.elapsed()
-            );
-        }
-        result
+        run_script_in(bundle, trigger_manager, script_id, matches, depth, sender)
     }
 
     pub fn add_script(&mut self, isolate: &IsolateId, source: &str) -> Result<ScriptId> {
@@ -3460,7 +3287,7 @@ impl<'a> ScriptEngine<'a> {
     }
 
     pub fn set_is_captured(&mut self, isolate: &IsolateId, value: bool) {
-        // `Capture` is per-isolate `OpState`: `op_smudgy_capture` writes the *calling*
+        // The capture flag is per-isolate call state: `op_smudgy_capture` writes the *calling*
         // isolate's flag, so the get/set bracket in dispatch must target the isolate that
         // ran the script. A missing isolate never happens for a live action (the only ids
         // that reach here came from a constructed isolate); the `debug_assert` makes a
@@ -3469,13 +3296,9 @@ impl<'a> ScriptEngine<'a> {
             self.isolates.contains_key(isolate),
             "set_is_captured on unknown isolate {isolate:?}"
         );
-        let Ok(bundle) = self.isolate_mut(isolate) else {
-            return;
-        };
-        let state = bundle.runtime.deno_runtime().op_state();
-        let mut guard = state.borrow_mut();
-        let captured = guard.borrow_mut::<Capture>();
-        captured.0 = value;
+        if let Ok(bundle) = self.isolate_mut(isolate) {
+            bundle.call_state.captured.set(value);
+        }
     }
 
     pub fn get_is_captured(&mut self, isolate: &IsolateId) -> bool {
@@ -3485,13 +3308,8 @@ impl<'a> ScriptEngine<'a> {
             self.isolates.contains_key(isolate),
             "get_is_captured on unknown isolate {isolate:?}"
         );
-        let Ok(bundle) = self.isolate_mut(isolate) else {
-            return false;
-        };
-        let state = bundle.runtime.deno_runtime().op_state();
-        let guard = state.borrow();
-        let captured = guard.borrow::<Capture>();
-        captured.0
+        self.isolate_mut(isolate)
+            .is_ok_and(|bundle| bundle.call_state.captured.get())
     }
 
     /// Enter a synchronous alias/trigger function handler with its declarative default.
@@ -3500,11 +3318,9 @@ impl<'a> ScriptEngine<'a> {
             self.isolates.contains_key(isolate),
             "begin_fallthrough on unknown isolate {isolate:?}"
         );
-        let Ok(bundle) = self.isolate_mut(isolate) else {
-            return;
-        };
-        let state = bundle.runtime.deno_runtime().op_state();
-        state.borrow_mut().borrow_mut::<Fallthrough>().0 = Some(value);
+        if let Ok(bundle) = self.isolate_mut(isolate) {
+            bundle.call_state.fallthrough.set(Some(value));
+        }
     }
 
     /// Leave the current function handler and return its final fallthrough decision. Clearing the
@@ -3514,16 +3330,211 @@ impl<'a> ScriptEngine<'a> {
             self.isolates.contains_key(isolate),
             "end_fallthrough on unknown isolate {isolate:?}"
         );
-        let Ok(bundle) = self.isolate_mut(isolate) else {
-            return true;
+        self.isolate_mut(isolate).map_or(true, |bundle| {
+            bundle.call_state.fallthrough.take().unwrap_or(true)
+        })
+    }
+}
+
+/// Fetch the [`ops::CallState`] handle an isolate's `OpState` was constructed with, so the
+/// bundle can share it (see [`Isolate::call_state`]).
+fn shared_call_state(runtime: &mut deno_core::JsRuntime) -> SharedCallState {
+    runtime
+        .op_state()
+        .borrow()
+        .borrow::<SharedCallState>()
+        .clone()
+}
+
+/// What a synchronous handler call produced, carried out of the v8 scopes so the call
+/// state is restored before any follow-up work (nested send expansion) runs.
+enum CallOutcome {
+    /// The handler threw; the exception's string form is echoed.
+    Threw(String),
+    /// The handler completed with a string value, which is sent as a nested command line.
+    Returned(String),
+    /// Completed with nothing to send.
+    Done,
+    /// No registered function/script at the requested id.
+    Missing,
+}
+
+/// Call `function_id` of `bundle` with a fresh `matches` object (`call_javascript_function`
+/// with the isolate already resolved). The function is materialized as a `Local` from the
+/// registry entry, rooted by this call's handle scope — no persistent handle is created or
+/// released per call — and the registry borrow ends before user JS can run (a handler that
+/// synchronously registers another automation `borrow_mut`s that same registry).
+///
+/// The delivery depth and alias identity are stamped into the isolate's call state around the
+/// call and restored afterwards — before the returned-string send, which runs no JS — so an
+/// exception or a nested send never leaves this handler's context behind.
+fn call_function_in(
+    bundle: &mut Isolate,
+    trigger_manager: &Manager,
+    function_id: FunctionId,
+    matches: CaptureView<'_>,
+    depth: u32,
+    sender: Option<AliasSender>,
+) -> Result<ActionResult> {
+    // Per-line timing is TRACE-only; skip the clock entirely above TRACE so the
+    // hot path pays just a level check (compiled out when TRACE is statically off).
+    let started = log_enabled!(log::Level::Trace).then(Instant::now);
+    let Isolate {
+        matches_keys,
+        runtime,
+        script_functions,
+        call_state,
+        ..
+    } = bundle;
+    let deno = runtime.deno_runtime();
+    // Make the owning isolate current for this call (it usually isn't — Model B leaves the
+    // enter-stack empty between ops); released after the scope on the way out.
+    let _entered = EnteredIsolate::enter(deno);
+    let context = deno.main_context();
+    let isolate = deno.v8_isolate();
+    v8::scope_with_context!(let scope, isolate, context);
+
+    let prior_depth = call_state.depth.replace(depth);
+    let prior_sender = call_state.alias.replace(sender);
+    let outcome = {
+        v8::tc_scope!(let try_catch, scope);
+        let f = {
+            let script_functions = script_functions.borrow();
+            script_functions
+                .get(usize::from(function_id))
+                .map(|f| v8::Local::new(try_catch, f))
         };
-        let state = bundle.runtime.deno_runtime().op_state();
-        state
-            .borrow_mut()
-            .borrow_mut::<Fallthrough>()
-            .0
-            .take()
-            .unwrap_or(true)
+        match f {
+            Some(f) => {
+                let matches_object = materialize_matches(try_catch, matches, matches_keys);
+                let f_this = v8::undefined(try_catch).into();
+                let result = f.call(try_catch, f_this, &[matches_object.into()]);
+                call_outcome(try_catch, result)
+            }
+            None => CallOutcome::Missing,
+        }
+    };
+    // Restore the enclosing depth (0 at the outermost dispatch) now the handler has returned.
+    call_state.depth.set(prior_depth);
+    let sender = call_state.alias.replace(prior_sender);
+
+    if let Some(started) = started {
+        trace!(
+            "Script execution on {} took {:?}",
+            matches.get(0).map_or("unknown", |c| c.value),
+            started.elapsed()
+        );
+    }
+    match outcome {
+        CallOutcome::Missing => bail!("Function {} not found", function_id),
+        outcome => finish_call(outcome, trigger_manager, depth, sender.as_ref()),
+    }
+}
+
+/// Run compiled classic script `script_id` of `bundle` with a fresh global `matches` object
+/// (`run_script` with the isolate already resolved). Same call-state bracket and handle
+/// discipline as [`call_function_in`]; the script handle is borrowed straight from the
+/// bundle's registry for the scope's lifetime.
+fn run_script_in(
+    bundle: &mut Isolate,
+    trigger_manager: &Manager,
+    script_id: ScriptId,
+    matches: CaptureView<'_>,
+    depth: u32,
+    sender: Option<AliasSender>,
+) -> Result<ActionResult> {
+    let started = log_enabled!(log::Level::Trace).then(Instant::now);
+    let Isolate {
+        matches_keys,
+        runtime,
+        compiled_scripts,
+        call_state,
+        ..
+    } = bundle;
+    let deno = runtime.deno_runtime();
+    // Make the owning isolate current for this eval (Model B), released after the scope.
+    let _entered = EnteredIsolate::enter(deno);
+    let context = deno.main_context();
+    let isolate = deno.v8_isolate();
+    v8::scope_with_context!(let scope, isolate, context);
+
+    // Stamp this eval's dispatch depth: an inline trigger/alias script's store `set` must
+    // journal at its own depth, not the stale depth a previous function dispatch left in this
+    // isolate. Without this an ordinary trigger-driven write loop would ratchet watch deliveries
+    // to the cap with no real recursion, and a genuinely nested eval would write at a stale
+    // (often 0) depth, defeating the cap it should inherit.
+    let prior_depth = call_state.depth.replace(depth);
+    let prior_sender = call_state.alias.replace(sender);
+    let outcome = {
+        v8::tc_scope!(let try_catch, scope);
+        match compiled_scripts.get(usize::from(script_id)) {
+            Some(script) => {
+                let script = v8::Local::new(try_catch, script);
+                let matches_object = materialize_matches(try_catch, matches, matches_keys);
+                let matches_name = matches_keys.script_name(try_catch);
+                try_catch.get_current_context().global(try_catch).set(
+                    try_catch,
+                    matches_name.into(),
+                    matches_object.into(),
+                );
+                let result = script.run(try_catch);
+                call_outcome(try_catch, result)
+            }
+            None => CallOutcome::Missing,
+        }
+    };
+    // Restore the enclosing depth now the eval has returned (see the save above).
+    call_state.depth.set(prior_depth);
+    let sender = call_state.alias.replace(prior_sender);
+
+    if let Some(started) = started {
+        trace!(
+            "Script execution on {} took {:?}",
+            matches.get(0).map_or("unknown", |c| c.value),
+            started.elapsed()
+        );
+    }
+    match outcome {
+        CallOutcome::Missing => bail!("Script {} not found", script_id),
+        outcome => finish_call(outcome, trigger_manager, depth, sender.as_ref()),
+    }
+}
+
+/// Classify a completed call while its `TryCatch` scope is still open: an exception (string
+/// form), a string completion value, or nothing to send.
+fn call_outcome(
+    try_catch: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    result: Option<v8::Local<v8::Value>>,
+) -> CallOutcome {
+    if try_catch.has_caught() {
+        let ex = try_catch.exception().unwrap();
+        let exc = ex.to_string(try_catch).unwrap();
+        CallOutcome::Threw(exc.to_rust_string_lossy(try_catch))
+    } else {
+        match result {
+            Some(value) if value.is_string() => {
+                CallOutcome::Returned(value.to_rust_string_lossy(try_catch))
+            }
+            _ => CallOutcome::Done,
+        }
+    }
+}
+
+/// Turn a call's outcome into its `ActionResult`: an exception is echoed; a returned string is
+/// expanded as a nested outgoing line one level deeper, attributed to `sender`.
+fn finish_call(
+    outcome: CallOutcome,
+    trigger_manager: &Manager,
+    depth: u32,
+    sender: Option<&AliasSender>,
+) -> Result<ActionResult> {
+    match outcome {
+        CallOutcome::Threw(exc) => Ok(ActionResult::Echo(exc)),
+        CallOutcome::Returned(output) => {
+            trigger_manager.process_nested_outgoing_line(output.as_str(), depth + 1, sender)?;
+            Ok(ActionResult::None)
+        }
+        CallOutcome::Done | CallOutcome::Missing => Ok(ActionResult::None),
     }
 }
 

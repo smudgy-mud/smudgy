@@ -354,8 +354,9 @@ deno_core::extension!(
     state.put::<smudgy_cloud::StoreBindings>(options.store_bindings);
     state.put::<PackageDataDir>(PackageDataDir(options.data_dir));
     state.put::<smudgy_cloud::image_source::ImageSourcePolicy>(options.image_policy);
-    state.put::<Capture>(Capture(false));
-    state.put::<Fallthrough>(Fallthrough(None));
+    // The isolate's call context (see [`CallState`]); the engine fetches this same `Rc` once
+    // at bundle construction so dispatch never looks it up again.
+    state.put::<SharedCallState>(Rc::new(CallState::default()));
     // The per-isolate interop identity table (`docs/interop.md` §3): interned
     // creators/roots/events, resolved once at handle construction, addressed by id per call.
     state.put::<InteropIdentities>(InteropIdentities::default());
@@ -651,11 +652,44 @@ fn ensure_session_target(
     Ok(())
 }
 
-pub struct Capture(pub bool);
+/// The per-isolate synchronous call context: everything the host stamps around a handler
+/// call and the ops read back while that handler runs. One instance lives for the isolate's
+/// whole life, shared (`Rc`) between the engine's isolate bundle — which reads and writes it
+/// directly, without an `OpState` lookup — and this isolate's `OpState`, where the ops find
+/// it. Fields are replaced in place; nothing is re-`put` per call.
+///
+/// - `depth`: the current event-delivery depth, stamped by `call_javascript_function` /
+///   `run_script` before running a handler so a re-emit from inside it queues its
+///   subscribers one level deeper and the chain terminates at [`MAX_EVENT_DEPTH`].
+///   Saved and restored around each call: leaving a handler's depth behind would make async
+///   continuations and the next dispatch on this isolate journal at the wrong depth.
+/// - `alias`: the alias whose dispatch is currently running — `None` outside an alias
+///   handler. Same save/restore bracket as `depth`; `op_smudgy_session_send` stamps it onto
+///   its queued action so an alias's own sent text is excluded from re-matching it.
+/// - `captured`: the `capture()` flag for the automation currently running.
+/// - `fallthrough`: the current function automation's fallthrough decision. `None` outside an
+///   alias/trigger handler makes accidental async or top-level calls fail instead of
+///   mutating a future frame.
+#[derive(Default)]
+pub struct CallState {
+    pub depth: Cell<u32>,
+    pub alias: RefCell<Option<AliasSender>>,
+    pub captured: Cell<bool>,
+    pub fallthrough: Cell<Option<bool>>,
+}
 
-/// The current function automation's fallthrough decision. `None` outside an alias/trigger
-/// handler makes accidental async or top-level calls fail instead of mutating a future frame.
-pub struct Fallthrough(pub Option<bool>);
+impl CallState {
+    /// Stamp a top-level dispatch (widget/link/pane callbacks): depth 0 and no alias, the
+    /// between-dispatch baseline the save/restore in the automation paths returns to. No
+    /// restore is needed after such a call.
+    pub fn enter_top_level(&self) {
+        self.depth.set(0);
+        drop(self.alias.replace(None));
+    }
+}
+
+/// The shared handle to an isolate's [`CallState`].
+pub type SharedCallState = Rc<CallState>;
 
 #[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
 #[class(generic)]
@@ -1095,18 +1129,6 @@ fn op_smudgy_validate_name(#[string] name: &str) -> Option<String> {
 // lives in the runtime module: the session store's watch dispatch shares it, since both ride
 // the same host-routed delivery mechanism.
 
-/// The current event-delivery depth, stashed into an isolate's `OpState` by
-/// `call_javascript_function` before it runs a handler, so a re-emit from inside the handler queues
-/// its subscribers one level deeper and the chain terminates at [`MAX_EVENT_DEPTH`].
-#[derive(Clone, Copy, Default)]
-pub struct EventDepth(pub u32);
-
-/// The alias whose dispatch is currently running in this isolate — `None` outside an alias
-/// handler. Stashed into `OpState` beside [`EventDepth`] (same save/restore bracket) by
-/// `call_javascript_function`/`run_script`, and stamped by `op_smudgy_session_send` onto its
-/// queued action so an alias's own sent text is excluded from re-matching it.
-#[derive(Clone, Default)]
-pub struct AliasContext(pub Option<AliasSender>);
 
 /// One event subscriber: which isolate registered the handler and its `FunctionId` in that
 /// isolate's `script_functions`. Cloned out before queueing so the registry borrow is released.
@@ -1333,7 +1355,7 @@ fn op_smudgy_emit(
             &event.producer_spec,
             payload_json,
         );
-    let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
+    let depth = state.borrow::<SharedCallState>().depth.get();
     if depth >= MAX_EVENT_DEPTH {
         log::warn!(
             "smudgy: event recursion limit reached emitting {}; dropping",
@@ -1938,7 +1960,7 @@ fn op_smudgy_store_set(
         }
     }
     let isolate = current_isolate(state);
-    let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
+    let depth = state.borrow::<SharedCallState>().depth.get();
     let outcome = state
         .borrow::<crate::session::runtime::SharedSessionStore>()
         .borrow_mut()
@@ -2452,7 +2474,7 @@ fn op_smudgy_procedure_on<'s>(
     // Deliver the buffered posts on later pumps, in post order. They left their original
     // turns behind while buffered, so they run at the registration's own depth + 1 — still
     // inside the cycle cap if the registration itself happened deep in a handler chain.
-    let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
+    let depth = state.borrow::<SharedCallState>().depth.get();
     if depth < MAX_EVENT_DEPTH {
         for post in drained {
             let matches = Arc::new(vec![
@@ -2533,7 +2555,7 @@ fn op_smudgy_procedure_post(
             &caller_origin,
             payload_json,
         );
-    let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
+    let depth = state.borrow::<SharedCallState>().depth.get();
     if depth >= MAX_EVENT_DEPTH {
         log::warn!(
             "smudgy: message recursion limit reached posting to {}#{name}; dropping",
@@ -4382,10 +4404,8 @@ fn op_smudgy_session_send(
         // is excluded (or, opted in, still bounded by the depth limit) instead
         // of restarting at depth zero forever. A cross-session send lands on
         // the other runtime like fresh input.
-        let depth = state.try_borrow::<EventDepth>().map_or(0, |d| d.0);
-        let sender = state
-            .try_borrow::<AliasContext>()
-            .and_then(|context| context.0.clone());
+        let depth = state.borrow::<SharedCallState>().depth.get();
+        let sender = state.borrow::<SharedCallState>().alias.borrow().clone();
         RuntimeAction::SendScripted {
             text: Arc::new(line.to_string()),
             depth: depth + 1,
@@ -8037,18 +8057,17 @@ fn op_smudgy_mapper_get_current_location(
 }
 
 #[op2(fast)]
-fn op_smudgy_capture(state: &mut OpState, value: bool) {
-    let captured = state.borrow_mut::<Capture>();
-    captured.0 = value;
+fn op_smudgy_capture(state: &OpState, value: bool) {
+    state.borrow::<SharedCallState>().captured.set(value);
 }
 
 #[op2(fast)]
-fn op_smudgy_fallthrough(state: &mut OpState, value: bool) -> Result<(), FallthroughContextError> {
-    let fallthrough = state.borrow_mut::<Fallthrough>();
-    let Some(current) = fallthrough.0.as_mut() else {
+fn op_smudgy_fallthrough(state: &OpState, value: bool) -> Result<(), FallthroughContextError> {
+    let fallthrough = &state.borrow::<SharedCallState>().fallthrough;
+    if fallthrough.get().is_none() {
         return Err(FallthroughContextError);
-    };
-    *current = value;
+    }
+    fallthrough.set(Some(value));
     Ok(())
 }
 
