@@ -4637,6 +4637,223 @@ mod tests {
         }
     }
 
+    mod dispatch_identity {
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use super::super::{
+            ActionQueue, AutomationIdentity, FallthroughScopes, Manager, NamespaceId,
+            PushTriggerParams, ScriptAction,
+        };
+        use crate::session::runtime::RuntimeAction;
+        use crate::session::runtime::origin::{IsolateId, Origin};
+        use crate::session::styled_line::StyledLine;
+
+        fn manager() -> (Manager, ActionQueue) {
+            let queue: ActionQueue = Rc::default();
+            (
+                Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default()),
+                queue,
+            )
+        }
+
+        fn push(manager: &mut Manager, origin: Origin, name: &str, fire_limit: Option<u32>) {
+            manager
+                .push_trigger(PushTriggerParams {
+                    isolate: IsolateId::Main,
+                    origin,
+                    name: &Arc::new(name.to_string()),
+                    patterns: &Arc::new(vec!["hit".to_string()]),
+                    raw_patterns: &Arc::new(Vec::new()),
+                    anti_patterns: &Arc::new(Vec::new()),
+                    matchers: None,
+                    action: ScriptAction::Noop,
+                    prompt: false,
+                    enabled: true,
+                    priority: 0,
+                    fallthrough: true,
+                    fire_limit,
+                    line_limit: None,
+                    source: None,
+                })
+                .unwrap();
+        }
+
+        fn module() -> Origin {
+            Origin::Module {
+                subpath: "combat.ts".to_string(),
+            }
+        }
+
+        /// Match one line and return the queued fires in queue order.
+        fn fire_line(manager: &mut Manager, queue: &ActionQueue) -> Vec<RuntimeAction> {
+            manager
+                .process_incoming_line(&Arc::new(StyledLine::new("hit", Vec::new())))
+                .unwrap();
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|action| matches!(action, RuntimeAction::RunAutomation { .. }))
+                .collect()
+        }
+
+        fn identity(action: &RuntimeAction) -> Arc<AutomationIdentity> {
+            let RuntimeAction::RunAutomation { identity, .. } = action else {
+                panic!("expected a queued automation, got {action:?}");
+            };
+            identity.clone()
+        }
+
+        fn stop_flag(action: &RuntimeAction) -> Arc<std::sync::atomic::AtomicBool> {
+            let RuntimeAction::RunAutomation { stopped, .. } = action else {
+                panic!("expected a queued automation, got {action:?}");
+            };
+            stopped.clone()
+        }
+
+        fn fires(manager: &Manager, name: &str) -> u32 {
+            manager
+                .triggers
+                .iter()
+                .find(|trigger| trigger.name == name)
+                .unwrap_or_else(|| panic!("no trigger named {name}"))
+                .fires
+                .get()
+        }
+
+        /// Take the queued self-removals, so each check sees only what the last fire queued.
+        fn queued_removals(queue: &ActionQueue) -> usize {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|action| matches!(action, RuntimeAction::RemoveTrigger(..)))
+                .count()
+        }
+
+        #[test]
+        fn queued_fire_charges_the_definition_that_holds_the_name_when_it_runs() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, module(), "hp", None);
+            let identity = identity(&fire_line(&mut manager, &queue)[0]);
+
+            // The first fire looks the counter up; the second reads the cached slot.
+            manager.record_fire(&identity);
+            manager.record_fire(&identity);
+            assert_eq!(fires(&manager, "hp"), 2);
+
+            // A replacement with the same key takes over the name. A fire queued by the
+            // old definition charges the replacement, as a name lookup would.
+            push(&mut manager, module(), "hp", None);
+            assert_eq!(manager.triggers.len(), 1);
+            assert_eq!(fires(&manager, "hp"), 0);
+            manager.record_fire(&identity);
+            assert_eq!(fires(&manager, "hp"), 1);
+
+            // A removed name charges nothing and does not panic on the stale slot.
+            manager.remove_trigger(&IsolateId::Main, &module(), "hp");
+            manager.record_fire(&identity);
+            assert!(manager.triggers.is_empty());
+        }
+
+        #[test]
+        fn cached_fire_slot_follows_index_shifts() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, Origin::User, "first", None);
+            push(&mut manager, Origin::User, "second", None);
+            let fires_queued = fire_line(&mut manager, &queue);
+            let second = identity(&fires_queued[1]);
+            assert_eq!(*second.name, "second");
+
+            manager.record_fire(&second);
+            assert_eq!(fires(&manager, "second"), 1);
+
+            // Removing the earlier entry shifts `second` to index 0 and bumps the
+            // generation, so the cached index 1 is discarded rather than trusted.
+            manager.remove_trigger(&IsolateId::Main, &Origin::User, "first");
+            assert_eq!(manager.triggers.len(), 1);
+            manager.record_fire(&second);
+            manager.record_fire(&second);
+            assert_eq!(fires(&manager, "second"), 3);
+        }
+
+        #[test]
+        fn fire_limit_reached_through_the_cached_slot_queues_removal() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, Origin::User, "twice", Some(2));
+            let identity = identity(&fire_line(&mut manager, &queue)[0]);
+
+            manager.record_fire(&identity);
+            assert_eq!(queued_removals(&queue), 0);
+            manager.record_fire(&identity);
+            assert_eq!(queued_removals(&queue), 1);
+        }
+
+        #[test]
+        fn every_registry_mutation_changes_the_generation() {
+            let (mut first, _queue) = manager();
+            let start = first.registry_generation;
+            push(&mut first, Origin::User, "a", None);
+            let after_add = first.registry_generation;
+            push(&mut first, Origin::User, "a", None);
+            let after_replace = first.registry_generation;
+            first.remove_trigger(&IsolateId::Main, &Origin::User, "a");
+            let after_remove = first.registry_generation;
+            assert!(start < after_add && after_add < after_replace);
+            assert!(after_replace < after_remove);
+
+            // A second manager never shares a generation with the first.
+            let (second, _queue) = manager();
+            assert!(second.registry_generation > after_remove);
+        }
+
+        #[test]
+        fn stop_scopes_are_shared_within_a_namespace_and_separate_across() {
+            let mut scopes = FallthroughScopes::new();
+            let inline = scopes.scope(NamespaceId(0));
+            assert!(Arc::ptr_eq(&inline, &scopes.scope(NamespaceId(0))));
+
+            let second = scopes.scope(NamespaceId(1));
+            let third = scopes.scope(NamespaceId(2));
+            assert!(!Arc::ptr_eq(&inline, &second));
+            assert!(!Arc::ptr_eq(&second, &third));
+            assert!(Arc::ptr_eq(&second, &scopes.scope(NamespaceId(1))));
+            assert!(Arc::ptr_eq(&third, &scopes.scope(NamespaceId(2))));
+            assert_eq!(scopes.rest.len(), 2);
+        }
+
+        #[test]
+        fn one_line_gives_each_namespace_its_own_stop_flag() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, Origin::User, "user-a", None);
+            push(&mut manager, module(), "module-a", None);
+            push(&mut manager, Origin::User, "user-b", None);
+
+            let first_line = fire_line(&mut manager, &queue);
+            assert_eq!(first_line.len(), 3);
+            let by_name = |name: &str| {
+                first_line
+                    .iter()
+                    .find(|action| *identity(action).name == name)
+                    .unwrap_or_else(|| panic!("{name} did not fire"))
+            };
+            let user_a = by_name("user-a");
+            let user_b = by_name("user-b");
+            let module_a = by_name("module-a");
+
+            assert_eq!(identity(user_a).namespace, identity(user_b).namespace);
+            assert_ne!(identity(user_a).namespace, identity(module_a).namespace);
+            assert!(Arc::ptr_eq(&stop_flag(user_a), &stop_flag(user_b)));
+            assert!(!Arc::ptr_eq(&stop_flag(user_a), &stop_flag(module_a)));
+
+            // The next line gets fresh flags; a queued action keeps its own line's flag.
+            let second_line = fire_line(&mut manager, &queue);
+            assert!(!Arc::ptr_eq(
+                &stop_flag(user_a),
+                &stop_flag(&second_line[0])
+            ));
+        }
+    }
+
     mod empty_trigger_patterns {
         use std::rc::Rc;
         use std::sync::Arc;
