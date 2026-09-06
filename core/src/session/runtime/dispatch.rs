@@ -820,7 +820,7 @@ impl Inner<'_> {
                                 &self.trigger_manager,
                                 &isolate,
                                 id,
-                                &matches,
+                                matches.view(),
                                 depth,
                                 sender,
                             )
@@ -844,7 +844,7 @@ impl Inner<'_> {
                                 &self.trigger_manager,
                                 &isolate,
                                 id,
-                                &matches,
+                                matches.view(),
                                 depth,
                                 sender,
                             )
@@ -865,7 +865,7 @@ impl Inner<'_> {
                         }
                         self.trigger_manager.run_simple_automation(
                             &script,
-                            &matches,
+                            matches.view(),
                             depth,
                             sender.as_ref(),
                         )?;
@@ -916,7 +916,14 @@ impl Inner<'_> {
 
                 let result = self
                     .script_engine
-                    .run_script(&self.trigger_manager, &isolate, id, &matches, depth, None)
+                    .run_script(
+                        &self.trigger_manager,
+                        &isolate,
+                        id,
+                        (&matches).into(),
+                        depth,
+                        None,
+                    )
                     .unwrap_or_else(|err| ActionResult::Echo(format!("JavaScript Error: {err:?}")));
 
                 if self.script_engine.get_is_captured(&isolate)
@@ -942,7 +949,7 @@ impl Inner<'_> {
                         &self.trigger_manager,
                         &isolate,
                         id,
-                        &matches,
+                        (&matches).into(),
                         depth,
                         None,
                     )
@@ -1152,7 +1159,7 @@ impl Inner<'_> {
                                     &self.trigger_manager,
                                     &isolate,
                                     *script_id,
-                                    &Arc::new(vec![]),
+                                    super::captures::CaptureView::Owned(&[]),
                                     0,
                                     None,
                                 )
@@ -1171,7 +1178,7 @@ impl Inner<'_> {
                                     &self.trigger_manager,
                                     &isolate,
                                     *function_id,
-                                    &Arc::new(vec![]),
+                                    super::captures::CaptureView::Owned(&[]),
                                     0,
                                     None,
                                 )

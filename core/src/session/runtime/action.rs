@@ -17,6 +17,7 @@ use crate::models::triggers::TriggerDefinition;
 use crate::session::styled_line::StyledLine;
 use crate::session::{HotkeyId, SessionId};
 
+use super::captures::CapturePayload;
 use super::input::{InputOp, InputSnapshot, InputSource};
 use super::line_operation::LineOperation;
 use super::origin::{IsolateId, Origin};
@@ -189,7 +190,7 @@ pub enum RuntimeAction {
         origin: Origin,
         name: Arc<String>,
         script: ScriptAction,
-        matches: Arc<Vec<MatchCapture>>,
+        matches: CapturePayload,
         depth: u32,
         is_captured: Option<Arc<AtomicBool>>,
         stopped: Arc<AtomicBool>,

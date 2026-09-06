@@ -21,6 +21,7 @@ use tokio::{
     },
 };
 
+mod captures;
 mod matcher;
 mod trigger;
 #[cfg(not(feature = "bench-api"))]
