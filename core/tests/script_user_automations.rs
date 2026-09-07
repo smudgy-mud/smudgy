@@ -16,7 +16,7 @@ use smudgy_core::models::triggers::load_triggers;
 use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::{SessionEvent, SessionId, SessionParams, spawn};
 
-const EVENT_QUIET_PERIOD: Duration = Duration::from_millis(900);
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A module exposing two controller aliases. "makeauto" saves an alias + a trigger via the
 /// registry, edits the alias through its handle (`update`), reads it back (`get().def()`), and
@@ -55,14 +55,18 @@ createAlias("^delauto$", () => {
 });
 "#;
 
-async fn drain_until_quiet(
+/// Commands and their synchronous descendants finish before the next queued echo. Wait for that
+/// marker even across quiet gaps, collecting rebuild events and output for the assertions below.
+async fn collect_through_marker(
     events: &mut std::pin::Pin<
         Box<impl futures::Stream<Item = smudgy_core::session::TaggedSessionEvent>>,
     >,
+    marker: &str,
 ) -> (Vec<String>, usize) {
     let mut lines = Vec::new();
     let mut runtime_ready = 0;
-    while let Ok(Some(event)) = tokio::time::timeout(EVENT_QUIET_PERIOD, events.next()).await {
+    let deadline = tokio::time::Instant::now() + COMPLETION_TIMEOUT;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
         match event.event {
             SessionEvent::UpdateBuffer(updates) => {
                 for update in updates.iter() {
@@ -74,8 +78,39 @@ async fn drain_until_quiet(
             SessionEvent::RuntimeReady(_) => runtime_ready += 1,
             _ => {}
         }
+        if lines.iter().any(|line| line == marker) {
+            return (lines, runtime_ready);
+        }
     }
-    (lines, runtime_ready)
+    panic!(
+        "session ended or timed out before {marker}: output={lines:?}, rebuilds={runtime_ready}"
+    );
+}
+
+#[tokio::test]
+async fn completion_wait_survives_a_gap_between_events() {
+    use smudgy_core::session::styled_line::StyledLine;
+    use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let ready = TaggedSessionEvent {
+        session_id: SessionId::from(9403u32),
+        event: SessionEvent::RuntimeReady(tx),
+    };
+    let delayed = futures::stream::once(async {
+        // A busy runner can legitimately pause longer than the old 900 ms quiet period.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        TaggedSessionEvent {
+            session_id: SessionId::from(9403u32),
+            event: SessionEvent::UpdateBuffer(Arc::new(vec![BufferUpdate::Append(Arc::new(
+                StyledLine::from_echo_str("COMMAND_DONE"),
+            ))])),
+        }
+    });
+    let mut events = Box::pin(futures::stream::iter([ready]).chain(delayed));
+    let (lines, runtime_ready) = collect_through_marker(&mut events, "COMMAND_DONE").await;
+    assert_eq!(lines, ["COMMAND_DONE"]);
+    assert_eq!(runtime_ready, 1);
 }
 
 #[tokio::test]
@@ -139,7 +174,9 @@ async fn script_crud_persisted_user_automations() {
     // not reloaded, so the controller aliases stay registered for the delete step below).
     tx.send(RuntimeAction::Send(Arc::new("makeauto".to_string())))
         .unwrap();
-    let (made, own_reloads) = drain_until_quiet(&mut events).await;
+    tx.send(RuntimeAction::Echo(Arc::new("MAKE_DONE".to_string())))
+        .unwrap();
+    let (made, own_reloads) = collect_through_marker(&mut events, "MAKE_DONE").await;
     assert!(
         made.iter().any(|l| l
             == "MADE lang=true upd=true disabled=true rt=true list=cmdlike,greet,live trig=true"),
@@ -150,27 +187,33 @@ async fn script_crud_persisted_user_automations() {
         "user automation changes rebuilt the calling runtime"
     );
 
-    // The same persisted snapshot reaches another live session without a RuntimeReady/rebuild.
-    let (_, other_reloads) = drain_until_quiet(&mut other_events).await;
-    assert_eq!(
-        other_reloads, 0,
-        "user automation changes rebuilt another runtime"
-    );
+    // Saves queue the other session's sync actions before MAKE_DONE. The next command therefore
+    // observes that snapshot, without a sleep or an explicit sync that could hide broken fan-out.
     other_tx
         .send(RuntimeAction::Send(Arc::new("ping".to_string())))
         .unwrap();
-    let (other_ping, other_reloads) = drain_until_quiet(&mut other_events).await;
+    other_tx
+        .send(RuntimeAction::Echo(Arc::new("PING_DONE".to_string())))
+        .unwrap();
+    let (other_ping, other_reloads) = collect_through_marker(&mut other_events, "PING_DONE").await;
     assert!(
         other_ping.iter().any(|line| line == "PONG"),
         "new alias was not synchronized to the other session: {other_ping:?}"
     );
-    assert_eq!(other_reloads, 0);
+    assert_eq!(
+        other_reloads, 0,
+        "user automation changes rebuilt another runtime"
+    );
 
     // The disabled alias is absent from both live matchers.
     other_tx
         .send(RuntimeAction::Send(Arc::new("hi".to_string())))
         .unwrap();
-    let (disabled, other_reloads) = drain_until_quiet(&mut other_events).await;
+    other_tx
+        .send(RuntimeAction::Echo(Arc::new("DISABLED_DONE".to_string())))
+        .unwrap();
+    let (disabled, other_reloads) =
+        collect_through_marker(&mut other_events, "DISABLED_DONE").await;
     assert!(!disabled.iter().any(|line| line == "WAVE"));
     assert_eq!(other_reloads, 0);
 
@@ -221,22 +264,28 @@ async fn script_crud_persisted_user_automations() {
         Some(&["TICK".to_string()][..])
     );
 
-    // Fire the delete controller and settle.
+    // Fire the delete controller and wait for its complete action frame.
     tx.send(RuntimeAction::Send(Arc::new("delauto".to_string())))
         .unwrap();
-    let (deleted, own_reloads) = drain_until_quiet(&mut events).await;
+    tx.send(RuntimeAction::Echo(Arc::new("DELETE_DONE".to_string())))
+        .unwrap();
+    let (deleted, own_reloads) = collect_through_marker(&mut events, "DELETE_DONE").await;
     assert!(
         deleted.iter().any(|l| l == "DEL removed=true"),
         "delete controller did not report success: {deleted:?}"
     );
     assert_eq!(own_reloads, 0);
 
-    let (_, other_reloads) = drain_until_quiet(&mut other_events).await;
-    assert_eq!(other_reloads, 0);
     other_tx
         .send(RuntimeAction::Send(Arc::new("ping".to_string())))
         .unwrap();
-    let (after_delete, other_reloads) = drain_until_quiet(&mut other_events).await;
+    other_tx
+        .send(RuntimeAction::Echo(Arc::new(
+            "DELETED_PING_DONE".to_string(),
+        )))
+        .unwrap();
+    let (after_delete, other_reloads) =
+        collect_through_marker(&mut other_events, "DELETED_PING_DONE").await;
     assert!(
         !after_delete.iter().any(|line| line == "PONG"),
         "deleted alias remained live in the other session: {after_delete:?}"

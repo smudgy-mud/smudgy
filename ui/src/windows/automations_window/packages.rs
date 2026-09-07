@@ -1891,7 +1891,7 @@ impl AutomationsWindow {
         (fence, credentials)
     }
 
-    fn frozen_package_client(&self) -> (AccountReadFence, PackageApiClient) {
+    pub(super) fn frozen_package_client(&self) -> (AccountReadFence, PackageApiClient) {
         let (fence, credentials) = self.frozen_cloud_credentials();
         (
             fence,
@@ -4824,6 +4824,7 @@ impl AutomationsWindow {
     /// as opening the pane so the new version, first-publish sharing controls, and visibility all
     /// repaint from server truth as soon as the upload completes.
     pub(super) fn load_owned_share(&mut self, name: String) -> Task<Message> {
+        self.share_content = super::sharing_status::PublishedContent::Unknown;
         self.share_seq.bump();
         let seq = self.share_seq;
         let account_epoch = self.account_epoch;
@@ -4911,6 +4912,7 @@ impl AutomationsWindow {
                 self.share_friends = friends;
                 self.share_grants = grants;
                 self.share_versions = versions;
+                return Update::with_task(self.compare_owned_published_content());
             }
             // A not-yet-published package simply has no cloud state.
             Err(CloudError::NotFoundOrNoAccess) => {
