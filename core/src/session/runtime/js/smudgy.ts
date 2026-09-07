@@ -118,6 +118,7 @@ const {
     op_smudgy_capture,
     op_smudgy_fallthrough,
     op_smudgy_param_get,
+    op_smudgy_param_set,
     op_smudgy_get_settings,
     op_smudgy_gmcp_enabled,
     op_smudgy_gmcp_send,
