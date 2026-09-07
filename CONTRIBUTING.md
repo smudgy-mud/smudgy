@@ -33,20 +33,25 @@ explore an idea.
 ## Building Smudgy
 
 Smudgy pins its stable Rust toolchain in `rust-toolchain.toml`; rustup selects
-and installs it automatically. From the repository root:
+and installs it automatically. The workspace patches a few dependencies from
+[patches/](patches/), and Cargo reads those patches from `target/patch/`, so
+materialize them before the first build (and again after `cargo clean`). From
+the repository root:
 
 ```sh
+cargo install patch-crate
+cargo patch-crate
 cargo run
 ```
 
 The first build may take some time because Smudgy has a large Rust dependency
 graph, including its embedded scripting runtime.
 
-On Debian or Ubuntu, all-workspace builds also require the WebKitGTK
-development package:
+On Debian or Ubuntu, the desktop build needs the ALSA development package for
+audio output, and all-workspace builds also require WebKitGTK:
 
 ```sh
-sudo apt-get install libwebkit2gtk-4.1-dev
+sudo apt-get install libasound2-dev libwebkit2gtk-4.1-dev
 ```
 
 ## Checking a change
