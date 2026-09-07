@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::HashMap,
     rc::Rc,
     sync::{
@@ -19,6 +19,7 @@ use crate::models::matchers::{
 
 use super::{
     ActionQueue, ScriptAction,
+    captures::{CapturePattern, CapturePayload, CaptureView},
     matcher::PatternSet,
     origin::{
         AutomationBody, AutomationDelta, AutomationKind, AutomationSummary, IsolateId, Origin,
@@ -179,9 +180,9 @@ impl BenchActionQueue {
 ///
 /// `MatchCapture` also carries host-routed interop deliveries (event/watch/procedure
 /// captures), whose names are the fixed literals `event`/`payload`/`path`/`snapshot`/
-/// `sender`. `name` is a `Cow` to serve both producers: trigger captures own their
+/// `sender`. `name` is a `Cow` to serve both producers: regex aliases own their
 /// dynamic, author-written group names; interop deliveries borrow their literals with no
-/// per-delivery allocation.
+/// per-delivery allocation. Incoming triggers use source ranges instead.
 #[derive(Debug, Clone)]
 pub struct MatchCapture {
     /// The named-group name (`(?<name>…)`) or an interop capture's literal name; `None`
@@ -191,7 +192,7 @@ pub struct MatchCapture {
     pub value: String,
 }
 
-/// Expands a bash-style inline template against an ordered list of [`MatchCapture`]s in a
+/// Expands a bash-style inline template against borrowed capture values in a
 /// single left-to-right tokenizing pass.
 ///
 /// Grammar (see the `JSDoc` in `js/smudgy.js` for the user-facing contract):
@@ -205,13 +206,13 @@ pub struct MatchCapture {
 ///
 /// Unknown / empty / non-participating groups expand to the empty string.
 #[must_use]
-pub fn expand_template(template: &str, captures: &[MatchCapture]) -> String {
-    let lookup_index = |idx: usize| -> &str { captures.get(idx).map_or("", |c| c.value.as_str()) };
+pub(crate) fn expand_template_view(template: &str, captures: CaptureView<'_>) -> String {
+    let lookup_index = |idx: usize| -> &str { captures.get(idx).map_or("", |c| c.value) };
     let lookup_name = |name: &str| -> &str {
         captures
             .iter()
-            .find(|c| c.name.as_deref() == Some(name))
-            .map_or("", |c| c.value.as_str())
+            .find(|c| c.name == Some(name))
+            .map_or("", |c| c.value)
     };
 
     let mut out = String::with_capacity(template.len());
@@ -277,6 +278,11 @@ pub fn expand_template(template: &str, captures: &[MatchCapture]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+fn expand_template(template: &str, captures: &[MatchCapture]) -> String {
+    expand_template_view(template, CaptureView::Owned(captures))
 }
 
 /// Splits an outgoing chunk into commands: always on '\n', additionally on
@@ -1452,11 +1458,12 @@ impl Manager {
         // `sort_by` is stable: equal-priority automations retain their registration order.
         priority_order.sort_by(|&a, &b| self.triggers[b].priority.cmp(&self.triggers[a].priority));
 
-        self.trigger_regex_set = PatternSet::build(
-            priority_order
+        self.trigger_regex_set = PatternSet::build(priority_order.iter().flat_map(|&i| {
+            self.triggers[i]
+                .patterns
                 .iter()
-                .flat_map(|&i| self.triggers[i].patterns.iter().map(regex::Regex::as_str)),
-        )
+                .map(|pattern| pattern.as_str())
+        }))
         .unwrap();
 
         self.trigger_regex_set_map = priority_order
@@ -1485,7 +1492,7 @@ impl Manager {
             self.triggers[i]
                 .raw_patterns
                 .iter()
-                .map(regex::Regex::as_str)
+                .map(|pattern| pattern.as_str())
         }))
         .unwrap();
         self.raw_trigger_regex_set_map = priority_order
@@ -1514,7 +1521,12 @@ impl Manager {
             priority_order
                 .iter()
                 .filter(|&&i| self.triggers[i].fire_on_prompts())
-                .flat_map(|&i| self.triggers[i].patterns.iter().map(regex::Regex::as_str)),
+                .flat_map(|&i| {
+                    self.triggers[i]
+                        .patterns
+                        .iter()
+                        .map(|pattern| pattern.as_str())
+                }),
         )
         .unwrap();
         self.prompt_trigger_regex_set_map = priority_order
@@ -1549,7 +1561,7 @@ impl Manager {
                     self.triggers[i]
                         .raw_patterns
                         .iter()
-                        .map(regex::Regex::as_str)
+                        .map(|pattern| pattern.as_str())
                 }),
         )
         .unwrap();
@@ -1601,11 +1613,12 @@ impl Manager {
         let mut priority_order: Vec<usize> = (0..self.aliases.len()).collect();
         priority_order.sort_by(|&a, &b| self.aliases[b].priority.cmp(&self.aliases[a].priority));
 
-        self.alias_regex_set = PatternSet::build(
-            priority_order
+        self.alias_regex_set = PatternSet::build(priority_order.iter().flat_map(|&i| {
+            self.aliases[i]
+                .patterns
                 .iter()
-                .flat_map(|&i| self.aliases[i].patterns.iter().map(regex::Regex::as_str)),
-        )
+                .map(|pattern| pattern.as_str())
+        }))
         .unwrap();
         self.alias_regex_set_map = priority_order
             .iter()
@@ -1642,7 +1655,7 @@ impl Manager {
     fn process_line_inner(
         &self,
         line: &str,
-        styled_line: Option<&StyledLine>,
+        styled_line: Option<&Arc<StyledLine>>,
         depth: u32,
         sender: Option<&AliasSender>,
         pattern_set: &PatternSet,
@@ -1669,29 +1682,29 @@ impl Manager {
         // const-folds to `false` under `release_max_level_info` (release/bench), so the timer is
         // a dead `None` and the whole block — both clock reads — is optimized away.
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
-        let matches = pattern_set.matched_indices(line);
+        let matches = pattern_set.matches(line);
         if let Some(start) = timer {
             debug!("Time to test pattern matches: {:?}", start.elapsed());
         }
 
         if !matches.is_empty() {
             for match_indices in matches.chunk_by(|a, b| {
-                regex_set_to_triggers_map.get(*a).unwrap()
-                    == regex_set_to_triggers_map.get(*b).unwrap()
+                regex_set_to_triggers_map.get(a.index).unwrap()
+                    == regex_set_to_triggers_map.get(b.index).unwrap()
             }) {
-                let first_match_idx = match_indices[0];
+                let first_match_idx = match_indices[0].index;
                 let trigger_idx = *regex_set_to_triggers_map.get(first_match_idx).unwrap();
                 let trigger = triggers.get(trigger_idx).unwrap();
 
                 if !trigger.enabled
                     || fired.contains(&trigger_idx)
-                    || trigger.anti_matches(line, styled_line, self.bold_is_bright)
+                    || trigger.anti_matches(line, styled_line.map(Arc::as_ref), self.bold_is_bright)
                 {
                     continue;
                 }
 
                 // Preserve the fast path for unfiltered triggers. It reads only
-                // the first RegexSet match index. A candidate with a color
+                // the first matching pattern. A candidate with a color
                 // filter can inspect later regex matches and their styled spans.
                 let qualified_match = if matches!(match_type, TriggerMatchType::Raw)
                     || trigger.pattern_colors.is_empty()
@@ -1699,26 +1712,27 @@ impl Manager {
                     regex_set_to_patterns_map
                         .get(first_match_idx)
                         .copied()
-                        .map(|pattern_idx| (first_match_idx, pattern_idx, None))
+                        .map(|pattern_idx| (&match_indices[0], pattern_idx, None))
                 } else {
-                    match_indices.iter().find_map(|&match_idx| {
+                    match_indices.iter().find_map(|hit| {
+                        let match_idx = hit.index;
                         let pattern_idx = *regex_set_to_patterns_map.get(match_idx)?;
                         trigger
                             .pattern_color_match_start(
                                 line,
-                                styled_line,
+                                styled_line.map(Arc::as_ref),
                                 pattern_idx,
                                 self.bold_is_bright,
                             )
                             .map(|qualification| match qualification {
-                                ColorQualification::Unfiltered => (match_idx, pattern_idx, None),
+                                ColorQualification::Unfiltered => (hit, pattern_idx, None),
                                 ColorQualification::Matched(start) => {
-                                    (match_idx, pattern_idx, Some(start))
+                                    (hit, pattern_idx, Some(start))
                                 }
                             })
                     })
                 };
-                let Some((match_idx, pattern_idx, match_start)) = qualified_match else {
+                let Some((hit, pattern_idx, match_start)) = qualified_match else {
                     continue;
                 };
 
@@ -1739,7 +1753,7 @@ impl Manager {
                 debug!(
                     "Trigger matched: {:?}, /{}/",
                     trigger.name(),
-                    pattern_set.patterns().get(match_idx).unwrap()
+                    pattern_set.patterns().get(hit.index).unwrap()
                 );
 
                 let stopped = fallthrough_scopes
@@ -1748,9 +1762,11 @@ impl Manager {
                     .clone();
                 trigger.run(
                     line,
+                    styled_line,
                     match_type,
                     pattern_idx,
                     match_start,
+                    hit.literal.clone().filter(|_| match_start.is_none()),
                     &is_captured,
                     stopped,
                     &self.spawned_actions,
@@ -1869,11 +1885,11 @@ impl Manager {
     pub(crate) fn run_simple_automation(
         &self,
         script: &str,
-        captures: &[MatchCapture],
+        captures: CaptureView<'_>,
         depth: u32,
         sender: Option<&AliasSender>,
     ) -> Result<()> {
-        let evaluated = expand_template(script, captures);
+        let evaluated = expand_template_view(script, captures);
         for line in split_commands(&evaluated, &self.command_separator) {
             self.process_nested_outgoing_line(line, depth, sender)?;
         }
@@ -2055,9 +2071,10 @@ struct Trigger {
     isolate: IsolateId,
     origin: Origin,
     name: String,
-    patterns: Vec<Regex>,
+    shared_name: OnceCell<Arc<String>>,
+    patterns: Vec<CapturePattern>,
     pattern_colors: Vec<Option<CompiledColorMatch>>,
-    raw_patterns: Vec<Regex>,
+    raw_patterns: Vec<CapturePattern>,
     anti_patterns: RegexSet,
     colored_anti_pattern_set: Option<RegexSet>,
     colored_anti_patterns: Vec<(Regex, CompiledColorMatch)>,
@@ -2278,7 +2295,10 @@ impl Trigger {
             colored_anti_patterns,
         } = prepared;
 
+        let patterns = patterns.into_iter().map(CapturePattern::new).collect();
+        let raw_patterns = raw_patterns.into_iter().map(CapturePattern::new).collect();
         Self {
+            shared_name: OnceCell::new(),
             isolate,
             origin,
             name,
@@ -2366,9 +2386,11 @@ impl Trigger {
     pub fn run(
         &self,
         line: &str,
+        styled_line: Option<&Arc<StyledLine>>,
         match_type: TriggerMatchType,
         pattern_idx: usize,
         match_start: Option<usize>,
+        literal_range: Option<std::ops::Range<usize>>,
         is_captured: &Option<Arc<AtomicBool>>,
         stopped: Arc<AtomicBool>,
         spawned_actions: &ActionQueue,
@@ -2384,38 +2406,52 @@ impl Trigger {
             TriggerMatchType::Normal => self.patterns.get(pattern_idx).unwrap(),
             TriggerMatchType::Raw => self.raw_patterns.get(pattern_idx).unwrap(),
         };
-        // Ordered captures: position is the group number (index 0 = whole match), `name` set
-        // only for named groups. The list is shared by the JS handlers (numeric/named
-        // `matches` object) and the inline `SendSimple` template expansion.
-        let captures = match_start.map_or_else(
-            || pattern.captures(line),
-            |start| {
+        let captures = if let Some(styled_line) = styled_line {
+            pattern.capture_line(
+                styled_line,
+                matches!(match_type, TriggerMatchType::Raw),
+                match_start,
+                literal_range,
+            )
+        } else {
+            // Ordered captures: position is the group number (index 0 = whole match), `name` set
+            // only for named groups. The list is shared by the JS handlers (numeric/named
+            // `matches` object) and the inline `SendSimple` template expansion.
+            let captures = match_start.map_or_else(
+                || pattern.captures(line),
+                |start| {
+                    pattern.captures_at(line, start).filter(|captures| {
+                        captures.get(0).is_some_and(|whole| whole.start() == start)
+                    })
+                },
+            );
+            let captures: Arc<Vec<MatchCapture>> = Arc::new(
                 pattern
-                    .captures_at(line, start)
-                    .filter(|captures| captures.get(0).is_some_and(|whole| whole.start() == start))
-            },
-        );
-        let captures: Arc<Vec<MatchCapture>> = Arc::new(
-            pattern
-                .capture_names()
-                .zip(
-                    captures
-                        .expect("a selected trigger match must still capture")
-                        .iter(),
-                )
-                .map(|(name, value)| MatchCapture {
-                    name: name.map(|n| std::borrow::Cow::Owned(n.to_string())),
-                    value: value.map_or_else(String::new, |m| m.as_str().to_string()),
-                })
-                .collect(),
-        );
+                    .capture_names()
+                    .zip(
+                        captures
+                            .expect("a selected trigger match must still capture")
+                            .iter(),
+                    )
+                    .map(|(name, value)| MatchCapture {
+                        name: name.map(|n| std::borrow::Cow::Owned(n.to_string())),
+                        value: value.map_or_else(String::new, |m| m.as_str().to_string()),
+                    })
+                    .collect(),
+            );
+
+            CapturePayload::Owned(captures)
+        };
 
         spawned_actions
             .borrow_mut()
             .push_back(RuntimeAction::RunAutomation {
                 isolate: self.isolate.clone(),
                 origin: self.origin.clone(),
-                name: Arc::new(self.name.clone()),
+                name: self
+                    .shared_name
+                    .get_or_init(|| Arc::new(self.name.clone()))
+                    .clone(),
                 script: self.script.clone(),
                 matches: captures,
                 depth,
@@ -2465,7 +2501,7 @@ impl Trigger {
                         origin: self.origin.clone(),
                         name: Arc::new(self.name.clone()),
                         script: self.script.clone(),
-                        matches: Arc::new(captures),
+                        matches: CapturePayload::Owned(Arc::new(captures)),
                         depth,
                         is_captured: is_captured.clone(),
                         stopped,
@@ -3713,8 +3749,8 @@ mod tests {
                     _ => None,
                 })
                 .expect("colored trigger should fire");
-            assert_eq!(captures[0].value, "red2");
-            assert_eq!(captures[1].value, "red2");
+            assert_eq!(captures.get(0).unwrap().value, "red2");
+            assert_eq!(captures.get(1).unwrap().value, "red2");
         }
 
         #[test]
@@ -3776,7 +3812,7 @@ mod tests {
                 })
                 .expect("color-only trigger should fire");
             assert_eq!(captures.len(), 1);
-            assert_eq!(captures[0].value, "");
+            assert_eq!(captures.get(0).unwrap().value, "");
         }
     }
 
@@ -3935,9 +3971,7 @@ mod tests {
             let RuntimeAction::RunAutomation { matches, .. } = action else {
                 return false;
             };
-            matches
-                .iter()
-                .any(|capture| capture.name.as_deref() == Some("hp"))
+            matches.iter().any(|capture| capture.name == Some("hp"))
         }
 
         #[test]
@@ -4071,11 +4105,11 @@ mod tests {
                     _ => None,
                 })
                 .expect("the (?i:) alias fires on differently-cased input");
-            assert_eq!(captures[0].value, "NUM One Two");
-            assert_eq!(captures[1].value, "One");
-            assert!(captures[1].name.is_none());
-            assert_eq!(captures[2].name.as_deref(), Some("who"));
-            assert_eq!(captures[2].value, "Two");
+            assert_eq!(captures.get(0).unwrap().value, "NUM One Two");
+            assert_eq!(captures.get(1).unwrap().value, "One");
+            assert!(captures.get(1).unwrap().name.is_none());
+            assert_eq!(captures.get(2).unwrap().name, Some("who"));
+            assert_eq!(captures.get(2).unwrap().value, "Two");
         }
 
         #[test]
@@ -4170,9 +4204,9 @@ mod tests {
                     _ => None,
                 })
                 .expect("the command fires");
-            assert_eq!(matches[0].value, r#"greet "big ugly troll""#);
-            assert_eq!(matches[1].name.as_deref(), Some("person"));
-            assert_eq!(matches[1].value, "big ugly troll");
+            assert_eq!(matches.get(0).unwrap().value, r#"greet "big ugly troll""#);
+            assert_eq!(matches.get(1).unwrap().name, Some("person"));
+            assert_eq!(matches.get(1).unwrap().value, "big ugly troll");
         }
 
         #[test]

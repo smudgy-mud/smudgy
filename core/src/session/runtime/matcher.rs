@@ -18,15 +18,24 @@
 //! thousand times faster than `RegexSet`. See `bench/benches/trigger_matching.rs`,
 //! which mirrors this tiering, for the comparison numbers.
 
+use std::ops::Range;
+
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{Context, Result};
 use regex::Regex;
 use regex_syntax::hir::HirKind;
 
+/// One matching pattern; pure literals also retain their earliest byte span.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PatternMatch {
+    pub index: usize,
+    pub literal: Option<Range<usize>>,
+}
+
 /// A compiled set of patterns answering one question per line: *which
 /// patterns match anywhere in this haystack?*
 ///
-/// Indices returned by [`Self::matched_indices`] are positions in the
+/// Pattern indices in [`Self::matches`] are positions in the
 /// original pattern list passed to [`Self::build`], ascending and
 /// deduplicated — the same contract as `RegexSet::matches`.
 pub struct PatternSet {
@@ -141,37 +150,63 @@ impl PatternSet {
         })
     }
 
-    /// Returns the indices of every pattern matching anywhere in `haystack`,
-    /// ascending and deduplicated.
+    /// Return each matching pattern once, in original pattern order. Repeated
+    /// literal occurrences retain the earliest start, matching `Regex::captures`.
     #[must_use]
-    pub fn matched_indices(&self, haystack: &str) -> Vec<usize> {
-        let mut out = self.always_match_indices.clone();
+    pub fn matches(&self, haystack: &str) -> Vec<PatternMatch> {
+        let mut out: Vec<_> = self
+            .always_match_indices
+            .iter()
+            .map(|&index| PatternMatch {
+                index,
+                literal: None,
+            })
+            .collect();
         if !self.literal_indices.is_empty() {
             out.extend(
                 self.literals
                     .find_overlapping_iter(haystack)
-                    .map(|m| self.literal_indices[m.pattern().as_usize()]),
+                    .map(|hit| PatternMatch {
+                        index: self.literal_indices[hit.pattern().as_usize()],
+                        literal: Some(hit.start()..hit.end()),
+                    }),
             );
         }
         if !self.filtered_indices.is_empty() {
             out.extend(
                 self.filtered
                     .matching(haystack)
-                    .map(|(id, _)| self.filtered_indices[id]),
+                    .map(|(id, _)| PatternMatch {
+                        index: self.filtered_indices[id],
+                        literal: None,
+                    }),
             );
         }
         out.extend(
             self.unfiltered
                 .iter()
                 .filter(|(_, regex)| regex.is_match(haystack))
-                .map(|(idx, _)| *idx),
+                .map(|&(index, _)| PatternMatch {
+                    index,
+                    literal: None,
+                }),
         );
-        out.sort_unstable();
-        out.dedup();
+        out.sort_unstable_by_key(|hit| {
+            (hit.index, hit.literal.as_ref().map_or(0, |span| span.start))
+        });
+        out.dedup_by_key(|hit| hit.index);
         out
     }
 
-    /// The original pattern strings, indexed as in [`Self::matched_indices`].
+    #[cfg(test)]
+    fn matched_indices(&self, haystack: &str) -> Vec<usize> {
+        self.matches(haystack)
+            .into_iter()
+            .map(|hit| hit.index)
+            .collect()
+    }
+
+    /// The original pattern strings, indexed as in [`Self::matches`].
     #[must_use]
     pub fn patterns(&self) -> &[String] {
         &self.patterns
@@ -290,6 +325,32 @@ mod tests {
         let set = PatternSet::build(["(?i)dargaroth"]).unwrap();
         assert_eq!(set.matched_indices("DARGAROTH snarls."), vec![0]);
         assert_eq!(set.matched_indices("dargaroth snarls."), vec![0]);
+    }
+
+    #[test]
+    fn literal_spans_preserve_duplicates_overlaps_and_utf8_offsets() {
+        let set = PatternSet::build(["aba", "ba", "aba", "(?<word>aba)", "^aba"]).unwrap();
+        assert_eq!(
+            set.matches("éababa"),
+            vec![
+                PatternMatch {
+                    index: 0,
+                    literal: Some(2..5)
+                },
+                PatternMatch {
+                    index: 1,
+                    literal: Some(3..5)
+                },
+                PatternMatch {
+                    index: 2,
+                    literal: Some(2..5)
+                },
+                PatternMatch {
+                    index: 3,
+                    literal: None
+                },
+            ]
+        );
     }
 
     #[test]

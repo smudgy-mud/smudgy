@@ -36,6 +36,7 @@ use crate::{
         TaggedSessionEvent,
         runtime::{
             ActionResult, IsolateId, SingletonRegistry,
+            captures::CaptureView,
             line_operation::LineOperation,
             script_engine::ops::{Capture, Fallthrough},
             trigger::{AliasSender, Manager, MatchCapture, SharedAutomationRegistry},
@@ -49,6 +50,8 @@ use anyhow::{Result, anyhow, bail};
 use deno_core::url::Url;
 
 mod mapper_api;
+mod matches;
+use matches::{MatchesKeys, materialize_matches};
 mod ops;
 pub mod package_cache;
 mod package_provider;
@@ -276,6 +279,8 @@ type PackageAudioBinding = ();
 /// own restricted `PermissionsContainer` + `SmudgyGrants`. The isolation boundary is the
 /// separate heap + registries.
 struct Isolate {
+    // Drop isolate-bound cached handles before disposing their owning runtime.
+    matches_keys: MatchesKeys,
     runtime: ScriptRuntime,
     /// Exact package-audio lease for a successfully loaded sandbox root.
     /// Main and mixer-free unavailable sessions retain no such authority.
@@ -1850,6 +1855,7 @@ impl<'a> ScriptEngine<'a> {
         isolates.insert(
             IsolateId::Main,
             Isolate {
+                matches_keys: MatchesKeys::default(),
                 runtime: main_runtime,
                 _package_audio_binding: main_package_audio_binding,
                 instance: main_instance,
@@ -2428,6 +2434,7 @@ impl<'a> ScriptEngine<'a> {
                 isolates.insert(
                     isolate_id,
                     Isolate {
+                        matches_keys: MatchesKeys::default(),
                         runtime,
                         _package_audio_binding: package_audio_binding,
                         instance,
@@ -2967,7 +2974,7 @@ impl<'a> ScriptEngine<'a> {
         trigger_manager: &Manager,
         isolate: &IsolateId,
         function_id: FunctionId,
-        matches: &Arc<Vec<MatchCapture>>,
+        matches: CaptureView<'_>,
         depth: u32,
         sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
@@ -3033,28 +3040,7 @@ impl<'a> ScriptEngine<'a> {
         let result = {
             v8::tc_scope!(let try_catch, scope);
 
-            // Numeric/named `matches` object: integer keys `0..n` (0 = whole match, 1.. =
-            // groups in pattern order) plus a property per named group. No `"$0"`/`"$1"`
-            // string keys (so `matches["$1"]` is `undefined`).
-            //
-            // This is an ordinary object with the normal `Object.prototype` — named groups
-            // are own data properties, so `m.toString === "b"` reads the capture (own props
-            // shadow inherited ones). A group named after an `Object.prototype` member only
-            // matters when that group is ABSENT for a given match: then `m.toString` reads
-            // back the inherited method instead of `undefined`. That edge is accepted in
-            // exchange for the object behaving like a plain record (inspectable, methods, etc.).
-            let matches_object = v8::Object::new(try_catch);
-            for (index, capture) in matches.iter().enumerate() {
-                let value = v8::String::new(try_catch, &capture.value).unwrap();
-                // A numeric-string key (`"0"`, `"1"`, …) is stored by V8 as an array-index
-                // property, so it reads back as `matches[0]` / `matches[1]` from JS.
-                let key = v8::String::new(try_catch, &index.to_string()).unwrap();
-                matches_object.create_data_property(try_catch, key.into(), value.into());
-                if let Some(name) = &capture.name {
-                    let name_key = v8::String::new(try_catch, name).unwrap();
-                    matches_object.create_data_property(try_catch, name_key.into(), value.into());
-                }
-            }
+            let matches_object = materialize_matches(try_catch, matches, &mut bundle.matches_keys);
 
             let f = v8::Local::new(try_catch, &f);
             let f_this = v8::undefined(try_catch).into();
@@ -3090,7 +3076,7 @@ impl<'a> ScriptEngine<'a> {
         if let Some(started) = started {
             trace!(
                 "Script execution on {} took {:?}",
-                matches.first().map_or("unknown", |c| c.value.as_str()),
+                matches.get(0).map_or("unknown", |c| c.value),
                 started.elapsed()
             );
         }
@@ -3359,7 +3345,7 @@ impl<'a> ScriptEngine<'a> {
         trigger_manager: &Manager,
         isolate: &IsolateId,
         script_id: ScriptId,
-        matches: &Arc<Vec<MatchCapture>>,
+        matches: CaptureView<'_>,
         depth: u32,
         sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
@@ -3407,24 +3393,9 @@ impl<'a> ScriptEngine<'a> {
         let result = {
             v8::tc_scope!(let try_catch, scope);
 
-            // Numeric/named `matches` object (same shape as the function-handler path):
-            // integer keys + named-group properties, no `"$0"`/`"$1"` string keys. An ordinary
-            // object with the normal `Object.prototype` — see the comment in
-            // `call_javascript_function` for the named-group/prototype interaction.
-            let matches_object = v8::Object::new(try_catch);
-            for (index, capture) in matches.iter().enumerate() {
-                let value = v8::String::new(try_catch, &capture.value).unwrap();
-                // A numeric-string key (`"0"`, `"1"`, …) is stored by V8 as an array-index
-                // property, so it reads back as `matches[0]` / `matches[1]` from JS.
-                let key = v8::String::new(try_catch, &index.to_string()).unwrap();
-                matches_object.create_data_property(try_catch, key.into(), value.into());
-                if let Some(name) = &capture.name {
-                    let name_key = v8::String::new(try_catch, name).unwrap();
-                    matches_object.create_data_property(try_catch, name_key.into(), value.into());
-                }
-            }
+            let matches_object = materialize_matches(try_catch, matches, &mut bundle.matches_keys);
 
-            let matches_name = v8::String::new(try_catch, "matches").unwrap();
+            let matches_name = bundle.matches_keys.script_name(try_catch);
 
             try_catch.get_current_context().global(try_catch).set(
                 try_catch,
@@ -3464,7 +3435,7 @@ impl<'a> ScriptEngine<'a> {
         if let Some(started) = started {
             trace!(
                 "Script execution on {} took {:?}",
-                matches.first().map_or("unknown", |c| c.value.as_str()),
+                matches.get(0).map_or("unknown", |c| c.value),
                 started.elapsed()
             );
         }
