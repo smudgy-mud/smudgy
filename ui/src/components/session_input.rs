@@ -2153,19 +2153,26 @@ mod tests {
 
     #[test]
     fn loaded_history_is_sanitized_capped_and_not_a_new_mutation() {
-        let mut entries = vec!["newest".to_string(), " ".to_string(), "newest".to_string()];
-        entries.extend((0..1010).map(|i| format!("command-{i}")));
+        use smudgy_core::models::settings::Settings;
 
-        let input = SessionInput::new().with_history(entries);
+        // The cap is the process-global `max_history` preference, which the cap tests swap
+        // under the prefs lock; hold the same lock against the default so a concurrent
+        // swap cannot change the count this test observes.
+        with_prefs(Settings::default(), || {
+            let mut entries = vec!["newest".to_string(), " ".to_string(), "newest".to_string()];
+            entries.extend((0..1010).map(|i| format!("command-{i}")));
 
-        let loaded = history_entries(&input);
-        assert_eq!(loaded.len(), 1000);
-        assert_eq!(loaded[0], "newest");
-        assert_eq!(loaded[1], "command-0");
-        assert_eq!(loaded[99], "command-98");
-        assert_eq!(loaded[999], "command-998");
-        assert_eq!(input.history_revision(), 0);
-        assert!(input.history_index.is_none());
+            let input = SessionInput::new().with_history(entries);
+
+            let loaded = history_entries(&input);
+            assert_eq!(loaded.len(), 1000);
+            assert_eq!(loaded[0], "newest");
+            assert_eq!(loaded[1], "command-0");
+            assert_eq!(loaded[99], "command-98");
+            assert_eq!(loaded[999], "command-998");
+            assert_eq!(input.history_revision(), 0);
+            assert!(input.history_index.is_none());
+        });
     }
 
     /// A scripted `history.push()` and a typed submission share
@@ -2173,48 +2180,55 @@ mod tests {
     /// behave identically — and the pushed entry is recallable with Up.
     #[test]
     fn scripted_history_push_matches_typed_submission_semantics() {
-        let mut input = SessionInput::new();
-        submit_unmasked(&mut input, "kill rat");
-        let value_before = input.value.clone();
+        use smudgy_core::models::settings::Settings;
 
-        let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new("drink potion".to_string())));
-        assert_eq!(
-            history_entries(&input),
-            vec!["drink potion", "kill rat"],
-            "a pushed entry becomes the newest"
-        );
-        assert_eq!(
-            input.value, value_before,
-            "push touches history only, never the buffer"
-        );
+        // The cap is the process-global `max_history` preference, which the cap tests swap
+        // under the prefs lock; hold the same lock against the default for the whole test.
+        with_prefs(Settings::default(), || {
+            let mut input = SessionInput::new();
+            submit_unmasked(&mut input, "kill rat");
+            let value_before = input.value.clone();
 
-        // Dedup parity: pushing an existing entry moves it, no duplicate.
-        let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new("kill rat".to_string())));
-        assert_eq!(history_entries(&input), vec!["kill rat", "drink potion"]);
+            let _ =
+                input.apply_script_op(&InputOp::HistoryPush(Arc::new("drink potion".to_string())));
+            assert_eq!(
+                history_entries(&input),
+                vec!["drink potion", "kill rat"],
+                "a pushed entry becomes the newest"
+            );
+            assert_eq!(
+                input.value, value_before,
+                "push touches history only, never the buffer"
+            );
 
-        // Whitespace-only parity: dropped silently, exactly like a typed
-        // whitespace submission (the op layer already rejects empty strings).
-        let rev = input.history_revision();
-        let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new("   ".to_string())));
-        assert_eq!(input.history_revision(), rev);
-        assert_eq!(history_entries(&input), vec!["kill rat", "drink potion"]);
+            // Dedup parity: pushing an existing entry moves it, no duplicate.
+            let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new("kill rat".to_string())));
+            assert_eq!(history_entries(&input), vec!["kill rat", "drink potion"]);
 
-        // Cap parity: history holds at most 1000 entries, oldest falling off.
-        for i in 0..1050 {
-            let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new(format!("cmd{i}"))));
-        }
-        let entries = history_entries(&input);
-        assert_eq!(entries.len(), 1000, "the cap applies to pushed entries too");
-        assert_eq!(entries[0], "cmd1049", "newest first after the burst");
-        assert!(
-            !entries.iter().any(|e| e == "kill rat"),
-            "the oldest entries fell off the back"
-        );
+            // Whitespace-only parity: dropped silently, exactly like a typed
+            // whitespace submission (the op layer already rejects empty strings).
+            let rev = input.history_revision();
+            let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new("   ".to_string())));
+            assert_eq!(input.history_revision(), rev);
+            assert_eq!(history_entries(&input), vec!["kill rat", "drink potion"]);
 
-        // A pushed entry is recallable exactly like a typed one.
-        let _ = input.update(Message::InputChanged(String::new()));
-        let _ = input.update(Message::NavigateHistoryUp);
-        assert_eq!(input.value, "cmd1049", "Up recalls the pushed entry");
+            // Cap parity: history holds at most 1000 entries, oldest falling off.
+            for i in 0..1050 {
+                let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new(format!("cmd{i}"))));
+            }
+            let entries = history_entries(&input);
+            assert_eq!(entries.len(), 1000, "the cap applies to pushed entries too");
+            assert_eq!(entries[0], "cmd1049", "newest first after the burst");
+            assert!(
+                !entries.iter().any(|e| e == "kill rat"),
+                "the oldest entries fell off the back"
+            );
+
+            // A pushed entry is recallable exactly like a typed one.
+            let _ = input.update(Message::InputChanged(String::new()));
+            let _ = input.update(Message::NavigateHistoryUp);
+            assert_eq!(input.value, "cmd1049", "Up recalls the pushed entry");
+        });
     }
 
     /// Apply `settings` to the global `crate::prefs` snapshot for the duration
