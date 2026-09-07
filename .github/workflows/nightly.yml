@@ -1,10 +1,11 @@
 name: Nightly
 
 # GitHub runs this schedule from the default branch. 10:23 UTC is 03:23 PDT /
-# 02:23 PST. Only the coordinator runs when main has not changed.
+# 02:23 PST. Quarter-hour runs only recover dispatches for existing tags.
 on:
   schedule:
     - cron: '23 10 * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -26,7 +27,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       vars.NIGHTLY_ENABLED != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: ${{ github.event.schedule == '*/15 * * * *' && 5 || 30 }}
     permissions:
       contents: write # push the release-only commit and immutable tag
       actions: write # explicitly dispatch Release; token pushes do not trigger it
@@ -40,7 +41,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      - name: Recover interrupted dispatches (up to 24 hours)
+        if: github.event.schedule == '*/15 * * * *'
+        run: python bin/nightly-release.py recover
       - name: Inspect source and previous nightlies
+        if: github.event.schedule != '*/15 * * * *'
         id: plan
         run: python bin/nightly-release.py plan --plan "$RUNNER_TEMP/nightly-plan.json"
       - name: Materialize dependency patches
@@ -57,5 +62,5 @@ jobs:
         if: steps.plan.outputs.action == 'create' && !inputs.dry_run
         run: python bin/nightly-release.py prepare --plan "$RUNNER_TEMP/nightly-plan.json"
       - name: Dispatch Release on the tag
-        if: steps.plan.outputs.action != 'skip' && !inputs.dry_run
+        if: (steps.plan.outputs.action == 'create' || steps.plan.outputs.action == 'dispatch') && !inputs.dry_run
         run: python bin/nightly-release.py dispatch --plan "$RUNNER_TEMP/nightly-plan.json"

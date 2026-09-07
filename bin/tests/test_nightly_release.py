@@ -92,6 +92,14 @@ class RecoveryTests(unittest.TestCase):
     def test_missing_old_run_does_not_restart_forever(self):
         self.assertEqual(self.decision(now=NOW + timedelta(days=31)), "skip")
 
+    def test_dispatch_recovery_window_ends_after_24_hours(self):
+        for age in [timedelta(minutes=15), timedelta(hours=23, minutes=45), timedelta(hours=24)]:
+            with self.subTest(age=age):
+                self.assertEqual(self.decision(now=NOW + age), "dispatch")
+        for age in [timedelta(hours=24, seconds=1), timedelta(hours=25)]:
+            with self.subTest(age=age):
+                self.assertEqual(self.decision(now=NOW + age), "skip")
+
     def test_tag_annotation_must_match_commit_parent(self):
         with patch.object(nightly, "git", side_effect=[nightly.ANNOTATION + json.dumps(metadata()), "c" * 40 + " " + "b" * 40]):
             with self.assertRaisesRegex(ValueError, "sole parent"):
@@ -168,6 +176,39 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotIn("--force", [argument for call in calls for argument in call])
         annotation = json.loads(calls[-2][-1].removeprefix(nightly.ANNOTATION))
         self.assertEqual(annotation["source_sha"], SOURCE)
+
+
+class DispatchRecoveryTests(unittest.TestCase):
+    def refs(self):
+        return f"{TAG} {int(NOW.timestamp())}"
+
+    def test_recovers_old_source_without_allocating_a_new_version(self):
+        # No main version or HEAD is consulted: recovery follows the reserved
+        # tag, including after a commit or base-version change on main.
+        with patch.object(nightly, "git", return_value=self.refs()) as git, patch.object(nightly, "tag_metadata", return_value=metadata()), patch.object(nightly, "reservation_action", return_value=("dispatch", "retry")), patch.object(nightly, "dispatch") as dispatch, patch.object(nightly, "next_version") as allocate:
+            nightly.recover(NOW + timedelta(minutes=15))
+        dispatch.assert_called_once_with(TAG)
+        allocate.assert_not_called()
+        self.assertEqual(git.call_count, 1)
+
+    def test_no_recent_reservations_make_no_api_calls(self):
+        with patch.object(nightly, "git", return_value=self.refs()), patch.object(nightly, "tag_metadata") as metadata_call, patch.object(nightly, "api") as api, patch.object(nightly, "dispatch") as dispatch:
+            nightly.recover(NOW + timedelta(hours=25))
+        metadata_call.assert_not_called()
+        api.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_existing_run_stops_quarter_hour_dispatch_retries(self):
+        for existing in [run(status="queued"), run(status="in_progress"), run(attempt=3)]:
+            with self.subTest(run=existing), patch.object(nightly, "git", side_effect=[self.refs(), "c" * 40]), patch.object(nightly, "tag_metadata", return_value=metadata()), patch.object(nightly, "api", return_value=None), patch.object(nightly, "pages", return_value=[existing]), patch.object(nightly, "dispatch") as dispatch:
+                nightly.recover(NOW + timedelta(minutes=15))
+                dispatch.assert_not_called()
+
+    def test_no_tags_cannot_create_a_release(self):
+        with patch.object(nightly, "git", return_value=""), patch.object(nightly, "api") as api, patch.object(nightly, "dispatch") as dispatch:
+            nightly.recover(NOW)
+        api.assert_not_called()
+        dispatch.assert_not_called()
 
 
 class BumpTests(unittest.TestCase):

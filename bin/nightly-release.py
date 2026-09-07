@@ -114,6 +114,42 @@ def existing_action(source, tag, metadata, release, runs, now):
     return "dispatch", f"Recovering {tag}: reserved recently, but no Release run exists."
 
 
+def reservation_action(tag, metadata, now):
+    source = metadata["source_sha"]
+    release = api(f"releases/tags/{tag}", missing_ok=True)
+    release_sha = git("rev-parse", f"{tag}^{{commit}}")
+    done = release and not release["draft"] and receipt(source, tag) in (release.get("body") or "")
+    runs = [] if done else list(pages(f"actions/workflows/release.yml/runs?head_sha={release_sha}", "workflow_runs"))
+    return existing_action(source, tag, metadata, release, runs, now)
+
+
+def dispatch(tag):
+    command("gh", "workflow", "run", "release.yml", "--repo", REPOSITORY, "--ref", tag)
+    print(f"Dispatched Release on {tag}.")
+
+
+def recover(now=None):
+    """Retry existing reservations only, even when main has since advanced."""
+    now = now or datetime.now(timezone.utc)
+    # Filter by tag age locally before querying GitHub. Old tags still reserve
+    # numbers, but need no API calls on each quarter-hour recovery check.
+    refs = git("for-each-ref", "--format=%(refname:short) %(taggerdate:unix)", "refs/tags/v*-ptb*")
+    for ref in refs.splitlines():
+        fields = ref.split()
+        if len(fields) != 2 or not TAG_RE.fullmatch(fields[0]):
+            continue
+        tag, timestamp = fields
+        if now.timestamp() - int(timestamp) > timedelta(hours=24).total_seconds():
+            continue
+        metadata = tag_metadata(tag)
+        if metadata is None:
+            continue
+        action, reason = reservation_action(tag, metadata, now)
+        print(reason)
+        if action == "dispatch":
+            dispatch(tag)
+
+
 def make_plan():
     source = git("rev-parse", "HEAD")
     if source != git("rev-parse", "refs/remotes/origin/main"):
@@ -133,11 +169,7 @@ def make_plan():
     if matches:
         tag, metadata = matches[0]
         version = metadata["version"]
-        release = api(f"releases/tags/{tag}", missing_ok=True)
-        release_sha = git("rev-parse", f"{tag}^{{commit}}")
-        done = release and not release["draft"] and receipt(source, tag) in (release.get("body") or "")
-        runs = [] if done else list(pages(f"actions/workflows/release.yml/runs?head_sha={release_sha}", "workflow_runs"))
-        action, reason = existing_action(source, tag, metadata, release, runs, datetime.now(timezone.utc))
+        action, reason = reservation_action(tag, metadata, datetime.now(timezone.utc))
     else:
         tag = f"v{version}"
         action, reason = "create", f"New main source {source}; reserve {tag}."
@@ -238,10 +270,13 @@ def complete(tag):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["plan", "prepare", "dispatch", "complete"])
+    parser.add_argument("operation", choices=["plan", "prepare", "dispatch", "complete", "recover"])
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--tag")
     args = parser.parse_args()
+    if args.operation == "recover":
+        recover()
+        return
     if args.operation == "complete":
         if not args.tag:
             parser.error("complete requires --tag")
@@ -264,8 +299,7 @@ def main():
         if args.operation == "prepare":
             prepare(plan)
         elif plan["action"] in {"create", "dispatch"}:
-            command("gh", "workflow", "run", "release.yml", "--repo", REPOSITORY, "--ref", plan["tag"])
-            print(f"Dispatched Release on {plan['tag']}.")
+            dispatch(plan["tag"])
 
 
 if __name__ == "__main__":
