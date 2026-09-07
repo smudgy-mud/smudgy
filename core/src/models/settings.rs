@@ -696,17 +696,17 @@ impl Default for LoggingSettings {
 }
 
 /// What the session command input does with the just-sent text after you
-/// press Enter — and, for the default, what happens when the input loses
-/// focus with text still in it.
+/// press Enter — and, for one mode, what happens when the input loses focus
+/// with text still in it.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandInputBehavior {
     /// Select the sent text (so the next keystroke replaces it), then clear
-    /// the input entirely when it loses focus. The default.
-    #[default]
+    /// the input entirely when it loses focus.
     SelectAllClearOnBlur,
     /// Select the sent text and leave it; it persists (selected) until
-    /// replaced. Losing focus does nothing. The historical behavior.
+    /// replaced. Losing focus does nothing. The default.
+    #[default]
     SelectAll,
     /// Clear the input immediately on send.
     Clear,
@@ -1263,7 +1263,7 @@ mod tests {
         assert_eq!(script.terminal_font_size, settings.terminal_font_size);
         assert_eq!(script.theme, settings.theme);
         // The default command-input behavior maps to its camelCase script-facing tag.
-        assert_eq!(script.command_input_behavior, "selectAllClearOnBlur");
+        assert_eq!(script.command_input_behavior, "selectAll");
         // The palette is resolved by the UI crate, so it is absent in the core-side snapshot.
         assert!(script.palette.is_none());
     }
@@ -1597,13 +1597,13 @@ mod tests {
 
     #[test]
     fn command_input_behavior_defaults_and_round_trips() {
-        // A settings file predating the field deserializes to the new default
-        // (select-all + clear-on-blur), not an error.
+        // A settings file predating the field deserializes to the default
+        // (select-all), not an error.
         let existing = r#"{ "scrollback_length": 5000 }"#;
         let settings: Settings = serde_json::from_str(existing).expect("parse");
         assert_eq!(
             settings.command_input_behavior,
-            CommandInputBehavior::SelectAllClearOnBlur
+            CommandInputBehavior::SelectAll
         );
 
         // Each variant survives a serialize/deserialize round-trip via its

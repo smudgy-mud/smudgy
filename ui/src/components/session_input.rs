@@ -1159,7 +1159,7 @@ impl SessionInput {
             }
             // Both select-all modes leave the text in place but fully
             // selected, so the next keystroke overwrites it. The
-            // clear-on-blur half of the default lives in `FocusLost`.
+            // clear-on-blur half of that mode lives in `FocusLost`.
             CommandInputBehavior::SelectAll | CommandInputBehavior::SelectAllClearOnBlur => {
                 self.post_submit_selected = true;
                 self.pending_caret_echo = Some(InputSource::Other);
@@ -1992,11 +1992,6 @@ mod tests {
     /// and its next genuine blur is incorrectly excused.
     #[test]
     fn tab_round_trip_focus_settlement_restores_exactly_one_active_input() {
-        assert_eq!(
-            crate::prefs::current().command_input_behavior,
-            CommandInputBehavior::SelectAllClearOnBlur,
-            "precondition: the default preference is in force"
-        );
         let mut a = SessionInput::new();
         let mut b = SessionInput::new();
         let _ = a.update(Message::InputChanged("unfinished command".to_string()));
@@ -2024,9 +2019,7 @@ mod tests {
         assert!(a.mirror_snapshot().focused);
         assert!(!b.mirror_snapshot().focused);
 
-        // The next blur is real, so the default behavior clears the line.
-        let _ = a.update(Message::FocusLost);
-        assert_eq!(a.value(), "");
+        assert!(!a.obscured_blur_pending);
     }
 
     /// Switching tabs must preserve every input's text — TabHost keeps
@@ -2034,17 +2027,12 @@ mod tests {
     /// (ui/src/widgets/tab_host.rs module docs). The switch's focus
     /// transfer blurs the obscured tab's input, and the widget publishes
     /// that blur only once its tab is re-selected (an obscured subtree
-    /// receives no events); under the default `SelectAllClearOnBlur`
+    /// receives no events); under the `SelectAllClearOnBlur`
     /// preference a cause-blind `FocusLost` would clear the model-owned
     /// value. The tab-switch path marks the input as obscured first, and
     /// the one-shot mark rides exactly that deferred blur.
     #[test]
     fn tab_switch_blur_preserves_in_progress_text() {
-        assert_eq!(
-            crate::prefs::current().command_input_behavior,
-            CommandInputBehavior::SelectAllClearOnBlur,
-            "precondition: the default preference is in force"
-        );
         let mut input = SessionInput::new();
         let _ = input.update(Message::InputChanged("kill troll with axe".to_string()));
         // What `select_tab` does before its focus operations reach the
@@ -2062,30 +2050,40 @@ mod tests {
             "kill troll with axe",
             "a tab switch must not cost the user their in-progress command"
         );
-
-        // The mark is one-shot: it excuses exactly the blur the switch
-        // inflicted, so the next blur is genuine again.
-        let _ = input.update(Message::FocusLost);
-        assert_eq!(
-            input.value(),
-            "",
+        assert!(
+            !input.obscured_blur_pending,
             "the obscure mark must not outlive the blur it excused"
         );
     }
 
     /// A genuine blur — clicking away, with no tab switch marking the input
-    /// — still clears under the default `SelectAllClearOnBlur` preference.
+    /// — still clears under the `SelectAllClearOnBlur` preference.
     #[test]
-    fn genuine_blur_still_clears_under_the_default_preference() {
-        assert_eq!(
-            crate::prefs::current().command_input_behavior,
-            CommandInputBehavior::SelectAllClearOnBlur,
-            "precondition: the default preference is in force"
-        );
-        let mut input = SessionInput::new();
-        let _ = input.update(Message::InputChanged("kill troll with axe".to_string()));
-        let _ = input.update(Message::FocusLost);
-        assert_eq!(input.value(), "", "an unmarked blur clears the line");
+    fn genuine_blur_clears_under_the_clear_on_blur_preference() {
+        let settings = smudgy_core::models::settings::Settings {
+            command_input_behavior: CommandInputBehavior::SelectAllClearOnBlur,
+            ..Default::default()
+        };
+        with_prefs(settings, || {
+            let mut input = SessionInput::new();
+            let _ = input.update(Message::InputChanged("kill troll with axe".to_string()));
+            let _ = input.update(Message::FocusLost);
+            assert_eq!(input.value(), "", "an unmarked blur clears the line");
+        });
+    }
+
+    #[test]
+    fn genuine_blur_preserves_text_under_the_default_preference() {
+        with_prefs(Default::default(), || {
+            let mut input = SessionInput::new();
+            let _ = input.update(Message::InputChanged("kill troll with axe".to_string()));
+            let _ = input.update(Message::FocusLost);
+            assert_eq!(
+                input.value(),
+                "kill troll with axe",
+                "the default select-all mode leaves text alone on blur"
+            );
+        });
     }
 
     #[test]
@@ -3132,21 +3130,27 @@ mod tests {
 
     #[test]
     fn focus_lost_never_clears_a_masked_input() {
-        let mut input = SessionInput::new();
-        // Unmasked, the default behavior clears on blur.
-        let _ = input.update(Message::InputChanged("half a command".to_string()));
-        let _ = input.update(Message::FocusLost);
-        assert_eq!(input.value, "", "the unmasked default clears on blur");
+        let settings = smudgy_core::models::settings::Settings {
+            command_input_behavior: CommandInputBehavior::SelectAllClearOnBlur,
+            ..Default::default()
+        };
+        with_prefs(settings, || {
+            let mut input = SessionInput::new();
+            // Unmasked, this mode clears on blur.
+            let _ = input.update(Message::InputChanged("half a command".to_string()));
+            let _ = input.update(Message::FocusLost);
+            assert_eq!(input.value, "", "the unmasked input clears on blur");
 
-        // Masked, the same blur (e.g. clicking the reveal eye) keeps the
-        // secret in progress.
-        let _ = input.apply_script_op(&InputOp::SetMasked(true));
-        let _ = input.update(Message::InputChanged("hunter2".to_string()));
-        let _ = input.update(Message::FocusLost);
-        assert_eq!(
-            input.value, "hunter2",
-            "a masked input survives losing focus"
-        );
+            // Masked, the same blur (e.g. clicking the reveal eye) keeps the
+            // secret in progress.
+            let _ = input.apply_script_op(&InputOp::SetMasked(true));
+            let _ = input.update(Message::InputChanged("hunter2".to_string()));
+            let _ = input.update(Message::FocusLost);
+            assert_eq!(
+                input.value, "hunter2",
+                "a masked input survives losing focus"
+            );
+        });
     }
 
     #[test]
