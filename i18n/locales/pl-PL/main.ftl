@@ -150,6 +150,8 @@ preferences-auto-updates = Automatycznie sprawdzaj dostępność aktualizacji
 preferences-mask-password-input = Ukryj wpisywany tekst, gdy serwer prosi o hasło
 preferences-history-case-sensitive-match = Dopasowywanie historii z rozróżnianiem wielkości liter
 preferences-history-case-sensitive-match-help = Up/Down przechodzi tylko po wpisach historii zaczynających się od tekstu, który pozostał niezaznaczony. Domyślnie wyłączone — dopasowanie niezależne od wielkości liter; włącz, aby wymagać dokładnego dopasowania wielkości liter.
+preferences-max-history = Rozmiar historii poleceń
+preferences-max-history-help = Ile ostatnich poleceń zapamiętuje historia Up/Down. 0 oznacza zachowanie wszystkiego.
 preferences-invalid-value = nieprawidłowa wartość
 
 # Theme editor

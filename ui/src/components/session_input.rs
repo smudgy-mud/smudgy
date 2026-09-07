@@ -200,8 +200,6 @@ pub struct SessionInput {
     /// field before a next Up/Down press. Only `Some` while `history_index`
     /// is `Some`; see `history_search_prefix`.
     history_prefix: Option<String>,
-    /// Maximum number of history entries to keep
-    max_history: usize,
     /// Bumped on every actual history change (a submission or scripted push
     /// entering it, a scripted clear emptying it), so the parent can feed the
     /// session-thread history mirror exactly when there is something new —
@@ -434,7 +432,6 @@ impl SessionInput {
             history: VecDeque::new(),
             history_index: None,
             history_prefix: None,
-            max_history: 100,
             history_revision: 0,
             completion_state: None,
             terminal_buffer: None,
@@ -485,8 +482,9 @@ impl SessionInput {
     /// revision. The runtime-ready resync sends the complete initial snapshot
     /// unconditionally.
     pub fn with_history(mut self, entries: Vec<String>) -> Self {
+        let max_history = Self::max_history();
         for entry in entries {
-            if self.history.len() >= self.max_history {
+            if max_history.is_some_and(|max| self.history.len() >= max) {
                 break;
             }
             if entry.trim().is_empty() {
@@ -710,11 +708,23 @@ impl SessionInput {
         self.history.push_front(command);
 
         // Limit history size
-        while self.history.len() > self.max_history {
-            self.history.pop_back();
+        if let Some(max_history) = Self::max_history() {
+            while self.history.len() > max_history {
+                self.history.pop_back();
+            }
         }
 
         self.history_revision += 1;
+    }
+
+    /// The configured history cap, read live from prefs (not cached at
+    /// construction, so a settings change takes effect immediately) --
+    /// `None` means unlimited, the `0` sentinel in `TerminalPrefs::max_history`.
+    fn max_history() -> Option<usize> {
+        match crate::prefs::current().max_history {
+            0 => None,
+            n => Some(n),
+        }
     }
 
     /// Remove every history entry (the scripted `history.clear()`). Bumps the
@@ -2146,15 +2156,16 @@ mod tests {
     #[test]
     fn loaded_history_is_sanitized_capped_and_not_a_new_mutation() {
         let mut entries = vec!["newest".to_string(), " ".to_string(), "newest".to_string()];
-        entries.extend((0..110).map(|i| format!("command-{i}")));
+        entries.extend((0..1010).map(|i| format!("command-{i}")));
 
         let input = SessionInput::new().with_history(entries);
 
         let loaded = history_entries(&input);
-        assert_eq!(loaded.len(), 100);
+        assert_eq!(loaded.len(), 1000);
         assert_eq!(loaded[0], "newest");
         assert_eq!(loaded[1], "command-0");
         assert_eq!(loaded[99], "command-98");
+        assert_eq!(loaded[999], "command-998");
         assert_eq!(input.history_revision(), 0);
         assert!(input.history_index.is_none());
     }
@@ -2190,13 +2201,13 @@ mod tests {
         assert_eq!(input.history_revision(), rev);
         assert_eq!(history_entries(&input), vec!["kill rat", "drink potion"]);
 
-        // Cap parity: history holds at most 100 entries, oldest falling off.
-        for i in 0..150 {
+        // Cap parity: history holds at most 1000 entries, oldest falling off.
+        for i in 0..1050 {
             let _ = input.apply_script_op(&InputOp::HistoryPush(Arc::new(format!("cmd{i}"))));
         }
         let entries = history_entries(&input);
-        assert_eq!(entries.len(), 100, "the cap applies to pushed entries too");
-        assert_eq!(entries[0], "cmd149", "newest first after the burst");
+        assert_eq!(entries.len(), 1000, "the cap applies to pushed entries too");
+        assert_eq!(entries[0], "cmd1049", "newest first after the burst");
         assert!(
             !entries.iter().any(|e| e == "kill rat"),
             "the oldest entries fell off the back"
@@ -2205,7 +2216,7 @@ mod tests {
         // A pushed entry is recallable exactly like a typed one.
         let _ = input.update(Message::InputChanged(String::new()));
         let _ = input.update(Message::NavigateHistoryUp);
-        assert_eq!(input.value, "cmd149", "Up recalls the pushed entry");
+        assert_eq!(input.value, "cmd1049", "Up recalls the pushed entry");
     }
 
     /// Apply `settings` to the global `crate::prefs` snapshot for the duration
@@ -2434,6 +2445,58 @@ mod tests {
                 assert_eq!(
                     input.value, "GT ",
                     "case-sensitive match: no match, Up is a no-op"
+                );
+            },
+        );
+    }
+
+    /// Test for the `max_history` setting: a configured cap evicts the
+    /// oldest entry once exceeded, and `0` means unlimited -- nothing is
+    /// ever evicted.
+    #[test]
+    fn max_history_caps_by_configured_value_and_zero_means_unlimited() {
+        use smudgy_core::models::settings::Settings;
+
+        with_prefs(
+            Settings {
+                max_history: 2,
+                ..Settings::default()
+            },
+            || {
+                let mut input = SessionInput::new();
+                submit_unmasked(&mut input, "one");
+                submit_unmasked(&mut input, "two");
+                submit_unmasked(&mut input, "three");
+                assert_eq!(
+                    input.history.len(),
+                    2,
+                    "the oldest entry is evicted once the cap is exceeded"
+                );
+                assert_eq!(
+                    input.history.back().map(|entry| entry.as_str()),
+                    Some("two")
+                );
+                assert_eq!(
+                    input.history.front().map(|entry| entry.as_str()),
+                    Some("three")
+                );
+            },
+        );
+
+        with_prefs(
+            Settings {
+                max_history: 0,
+                ..Settings::default()
+            },
+            || {
+                let mut input = SessionInput::new();
+                for i in 0..250 {
+                    submit_unmasked(&mut input, &format!("command {i}"));
+                }
+                assert_eq!(
+                    input.history.len(),
+                    250,
+                    "0 means unlimited -- nothing is evicted"
                 );
             },
         );

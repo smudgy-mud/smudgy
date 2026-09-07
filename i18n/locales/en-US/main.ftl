@@ -148,6 +148,8 @@ preferences-auto-updates = Automatically check for updates
 preferences-mask-password-input = Hide typing when the server asks for a password
 preferences-history-case-sensitive-match = Case-sensitive history matching
 preferences-history-case-sensitive-match-help = Up/Down only cycles through history entries starting with the text you've left unselected. Off by default, matching regardless of letter case; turn on to require an exact case match.
+preferences-max-history = Input history size
+preferences-max-history-help = How many recent commands Up/Down history remembers. 0 keeps everything.
 preferences-invalid-value = invalid value
 
 # Theme editor

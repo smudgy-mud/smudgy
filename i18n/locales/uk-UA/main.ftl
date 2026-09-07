@@ -150,6 +150,8 @@ preferences-auto-updates = Автоматично перевіряти наяв�
 preferences-mask-password-input = Приховувати введений текст, коли сервер запитує пароль
 preferences-history-case-sensitive-match = Враховувати регістр при пошуку в історії
 preferences-history-case-sensitive-match-help = Up/Down перебирає лише записи історії, що починаються з тексту, який залишився невиділеним. Вимкнено за замовчуванням — пошук без урахування регістру; увімкніть для точного збігу регістру.
+preferences-max-history = Розмір історії вводу
+preferences-max-history-help = Скільки останніх команд запам'ятовує історія Up/Down. 0 — зберігати все.
 preferences-invalid-value = некоректне значення
 
 # Theme editor

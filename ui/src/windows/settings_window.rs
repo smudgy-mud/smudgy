@@ -161,6 +161,8 @@ pub enum Message {
     PrefThemeExtendedColorsToggled(bool),
     PrefScrollbackChanged(String),
     PrefScrollbackSubmitted,
+    PrefMaxHistoryChanged(String),
+    PrefMaxHistorySubmitted,
     PrefLinkTooltipDelayChanged(String),
     PrefLinkTooltipDelaySubmitted,
     PrefSeparatorChanged(String),
@@ -245,6 +247,7 @@ pub struct SettingsWindow {
     font_size_input: String,
     line_length_input: String,
     scrollback_input: String,
+    max_history_input: String,
     link_tooltip_delay_input: String,
     separator_input: String,
     raw_prefix_input: String,
@@ -282,6 +285,7 @@ impl SettingsWindow {
             .map(|len| len.to_string())
             .unwrap_or_default();
         let scrollback_input = settings.scrollback_length.to_string();
+        let max_history_input = settings.max_history.to_string();
         let link_tooltip_delay_input = settings.link_tooltip_delay_ms.to_string();
         let separator_input = settings.command_separator.clone();
         let raw_prefix_input = settings.raw_line_prefix.clone();
@@ -305,6 +309,7 @@ impl SettingsWindow {
             font_size_input,
             line_length_input,
             scrollback_input,
+            max_history_input,
             link_tooltip_delay_input,
             separator_input,
             raw_prefix_input,
@@ -720,6 +725,19 @@ impl SettingsWindow {
                 match self.scrollback_input.trim().parse::<usize>() {
                     Ok(lines) if (100..=10_000_000).contains(&lines) => {
                         self.settings.scrollback_length = lines;
+                        self.settings_changed()
+                    }
+                    _ => Update::none(),
+                }
+            }
+            Message::PrefMaxHistoryChanged(value) => {
+                self.max_history_input = value;
+                Update::none()
+            }
+            Message::PrefMaxHistorySubmitted => {
+                match self.max_history_input.trim().parse::<usize>() {
+                    Ok(count) if count <= 1_000_000 => {
+                        self.settings.max_history = count;
                         self.settings_changed()
                     }
                     _ => Update::none(),
@@ -1339,6 +1357,12 @@ impl SettingsWindow {
             self.scrollback_input.trim().parse::<usize>(),
             Ok(lines) if (100..=10_000_000).contains(&lines)
         );
+        // 0 is a valid value here (unlimited history), unlike scrollback's
+        // own 100-minimum -- so the accepted range starts at 0, not 100.
+        let max_history_valid = matches!(
+            self.max_history_input.trim().parse::<usize>(),
+            Ok(count) if count <= 1_000_000
+        );
         let link_tooltip_delay_valid = matches!(
             self.link_tooltip_delay_input.trim().parse::<u64>(),
             Ok(delay) if delay <= MAX_LINK_TOOLTIP_DELAY_MS
@@ -1541,6 +1565,16 @@ impl SettingsWindow {
             ]
             .spacing(2),
         );
+        col = col.push(pref_input(
+            t!("preferences-max-history"),
+            "1000",
+            &self.max_history_input,
+            max_history_valid,
+            Some(t!("preferences-max-history-help")),
+            120.0,
+            Message::PrefMaxHistoryChanged,
+            Message::PrefMaxHistorySubmitted,
+        ));
 
         col = col.push(rule::horizontal(1));
 

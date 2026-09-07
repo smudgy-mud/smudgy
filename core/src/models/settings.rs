@@ -359,6 +359,10 @@ pub struct Settings {
     /// This prefix matching can optionally be case-sensitive. Off by default.
     #[serde(default)]
     pub history_case_sensitive_match: bool,
+    /// How many recent commands the Up/Down input history remembers, per
+    /// server profile. `0` means unlimited (never evict).
+    #[serde(default = "default_max_history")]
+    pub max_history: usize,
 
     /// Hide session/pane headers (title bars) unless the window's toolbar is
     /// expanded — the distraction-free default. Off shows every header all
@@ -826,6 +830,10 @@ fn default_scrollback_length() -> usize {
     100_000
 }
 
+fn default_max_history() -> usize {
+    1000
+}
+
 fn default_terminal_font_family() -> String {
     "Geist Mono".to_string()
 }
@@ -884,6 +892,7 @@ impl Default for Settings {
             command_input_behavior: CommandInputBehavior::default(),
             mask_input_on_server_echo: true,
             history_case_sensitive_match: false,
+            max_history: default_max_history(),
             hide_pane_headers: true,
             disabled_map_areas: Vec::new(),
             map_area_prefs: Vec::new(),
@@ -1654,6 +1663,23 @@ mod tests {
         let parsed: Settings =
             serde_json::from_str(&serde_json::to_string(&opted_in).unwrap()).expect("parse");
         assert!(parsed.history_case_sensitive_match);
+    }
+
+    #[test]
+    fn max_history_defaults_to_1000_and_round_trips_zero_for_unlimited() {
+        // A settings file predating the field deserializes to the new default
+        // of 1000, not an error.
+        let existing = r#"{ "scrollback_length": 5000 }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("parse");
+        assert_eq!(settings.max_history, 1000);
+
+        let unlimited = Settings {
+            max_history: 0,
+            ..Settings::default()
+        };
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&unlimited).unwrap()).expect("parse");
+        assert_eq!(parsed.max_history, 0);
     }
 
     #[test]

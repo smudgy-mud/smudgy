@@ -323,6 +323,10 @@ pub struct TerminalPrefs {
     pub mask_input_on_server_echo: bool,
     /// Whether Up/Down history-prefix matching is case-sensitive.
     pub history_case_sensitive_match: bool,
+    /// How many recent commands the Up/Down input history remembers. `0`
+    /// means unlimited (never evict). Read live by `SessionInput`, not
+    /// cached at construction, so a change takes effect immediately.
+    pub max_history: usize,
     /// Hide pane headers unless the window's toolbar is expanded (the
     /// distraction-free rule; per-pane `always-show` overrides it). Read per
     /// frame by the pane-grid view; chrome-level, so it never bumps
@@ -393,6 +397,7 @@ impl TerminalPrefs {
             command_input_behavior: settings.command_input_behavior,
             mask_input_on_server_echo: settings.mask_input_on_server_echo,
             history_case_sensitive_match: settings.history_case_sensitive_match,
+            max_history: settings.max_history,
             hide_pane_headers: settings.hide_pane_headers,
             generation,
         }
