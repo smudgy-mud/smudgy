@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the unit tests embedded in Smudgy's patched iced crates."""
+"""Run accessibility and editor focus regressions in Smudgy's patched iced crates."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PATCH_ROOT = ROOT / "target" / "patch"
-CRATES = ("iced_runtime-0.14.0", "iced_winit-0.14.0")
+CRATES = ("iced_runtime-0.14.0", "iced_winit-0.14.0", "iced-code-editor")
 SUPPORT_PATCHES = ("cosmic-text-0.15.0", "iced_graphics-0.14.0")
 
 
@@ -30,6 +30,14 @@ def remove_unlocked_optional_edges(manifest_path: pathlib.Path) -> None:
     """Keep dependency unit tests on the application's exact Cargo.lock graph."""
     text = manifest_path.read_text(encoding="utf-8")
     replacements = {
+        "iced-code-editor": (
+            ('two-face = ["dep:two-face"]\n', 'two-face = []\n'),
+            (
+                'two-face = { version = "0.5", optional = true, default-features = false, features = ["syntect-fancy"] }\n',
+                "",
+            ),
+            ("[workspace]\n", ""),
+        ),
         "iced_runtime": (
             ('selector = ["dep:iced_selector"]\n', "selector = []\nsipper = []\n"),
             (
@@ -49,7 +57,7 @@ def remove_unlocked_optional_edges(manifest_path: pathlib.Path) -> None:
             ),
         ),
     }
-    crate = manifest_path.parent.name.rsplit("-", 1)[0]
+    crate = tomllib.loads(text)["package"]["name"]
 
     for old, new in replacements[crate]:
         if text.count(old) != 1:
@@ -102,7 +110,7 @@ def main() -> None:
         (workspace / "Cargo.toml").write_text(
             """\
 [workspace]
-members = ["iced_runtime-0.14.0", "iced_winit-0.14.0"]
+members = ["iced_runtime-0.14.0", "iced_winit-0.14.0", "iced-code-editor"]
 resolver = "2"
 
 [patch.crates-io]
@@ -127,6 +135,18 @@ iced_graphics = { path = "../iced_graphics-0.14.0" }
                 f"patch tests resolved packages outside the application lock: {unexpected}"
             )
 
+        run(
+            "cargo",
+            "test",
+            "-p",
+            "iced-code-editor",
+            "--lib",
+            "input_focus_survives_sticky_header_transitions",
+            "--locked",
+            "--",
+            "--test-threads=1",
+            cwd=workspace,
+        )
         run(
             "cargo",
             "test",
