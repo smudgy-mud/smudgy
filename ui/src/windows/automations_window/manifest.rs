@@ -877,6 +877,71 @@ fn set_cap(caps: &mut SmudgyCapabilities, cap: Cap, on: bool) {
 // ============================================================================
 
 impl AutomationsWindow {
+    /// Save only the next patch version, using the same transaction and stale-file checks as Save.
+    pub(super) fn increase_package_version(&mut self) -> Update<Message, Event> {
+        if self.authoring_busy
+            || self.share_busy
+            || self.dirty
+            || self.manifest_dirty
+            || self.consent_busy
+            || self.consent_prompt.is_some()
+            || !matches!(
+                self.published_content(),
+                super::sharing_status::PublishedContent::Compared(_, false)
+            )
+        {
+            return Update::none();
+        }
+        let Some(package) = self.local_package.as_deref() else {
+            return Update::none();
+        };
+        let Some(version) =
+            super::sharing_status::next_patch(&package.manifest.version, &self.share_versions)
+        else {
+            return Update::none();
+        };
+        let name = package.name.clone();
+        let mut manifest = package.manifest.clone();
+        manifest.version = version;
+        let Some(expected) = self.manifest_source_baseline.clone() else {
+            self.authoring_feedback = Some(crate::i18n::t!("manifest-changed-outside"));
+            return Update::none();
+        };
+        let Some(_operation) = self.reserve_package_operation(&name, false) else {
+            return Update::none();
+        };
+        let result = serde_json::to_string_pretty(&manifest)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| {
+                shared_packages::commit_local_manifest(
+                    &self.server_name,
+                    &name,
+                    &self.local_own_spec(&name),
+                    &expected,
+                    &format!("{json}\n"),
+                )
+            });
+        self.authoring_feedback = match result {
+            Ok(LocalManifestCommit::Applied) => {
+                self.apply_saved_manifest(&name, manifest);
+                return Update::new(
+                    self.show_toast(crate::i18n::t!("manifest-saved")),
+                    Some(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    }),
+                );
+            }
+            Ok(LocalManifestCommit::Stale) => Some(crate::i18n::t!("manifest-changed-outside")),
+            Ok(LocalManifestCommit::StateChanged) => {
+                Some(crate::i18n::t!("package-install-plan-changed"))
+            }
+            Err(error) => {
+                Some(crate::i18n::t!("manifest-save-failed", "error" => error.to_string()))
+            }
+        };
+        Update::none()
+    }
+
     /// Apply a field-level edit to the open manifest draft and mark it unsaved. A no-op if no
     /// draft is open (the owned-package pane isn't showing).
     pub(super) fn apply_manifest_edit(&mut self, edit: ManifestEdit) -> Update<Message, Event> {
@@ -1262,7 +1327,7 @@ impl AutomationsWindow {
         Update::none()
     }
 
-    fn reload_manifest_draft_from_disk(&mut self, name: &str) -> Result<(), String> {
+    pub(super) fn reload_manifest_draft_from_disk(&mut self, name: &str) -> Result<(), String> {
         let source =
             local_packages::read_local_file(&self.server_name, name, "smudgy.package.json")
                 .map_err(

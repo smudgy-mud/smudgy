@@ -189,7 +189,7 @@ const STARTER_ENTRY: &str = "// smudgy package entry\nexport {};\n";
 const SKIP_DIRS: [&str; 6] = ["node_modules", "target", "dist", "build", "out", "coverage"];
 
 /// A local package loaded from disk: its manifest, README, and module files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LocalPackage {
     pub name: String,
     pub manifest: PackageManifest,
@@ -200,7 +200,7 @@ pub struct LocalPackage {
 
 /// One module file within a [`LocalPackage`] (`subpath` is relative to the package dir,
 /// always forward-slashed).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalModule {
     pub subpath: String,
     /// Raw file bytes — any file in the package dir (text or binary) is publishable.
@@ -1419,6 +1419,86 @@ fn published_module_fingerprint(module: &PublishModule) -> (String, String, Stri
     )
 }
 
+/// Compare authored content with one immutable published version. Dependency declarations live
+/// in the manifest; newer remote dependency releases are not local edits. Generated declarations
+/// are reconstructed only when the remote has extra files, so they cannot hide deleted assets or
+/// hand-authored declarations. This performs no uploads and does not change the local package.
+///
+/// # Errors
+/// Returns an error when the manifest cannot be decoded or declaration generation cannot confirm
+/// the remaining remote files.
+pub async fn matches_published_content(
+    package: &LocalPackage,
+    resolved: &ResolvedPackageWire,
+) -> Result<bool> {
+    let remote_manifest = PackageManifest::parse(&resolved.manifest.to_string())?;
+    if !crate::models::naming::names_conflict(&package.name, &resolved.name)
+        || package.manifest != remote_manifest
+        || package.manifest.version != resolved.version
+        || package.readme != resolved.readme
+    {
+        return Ok(false);
+    }
+    let entry = package.manifest.entry.as_deref().unwrap_or("index.ts");
+    let authored: Vec<_> = package
+        .modules
+        .iter()
+        .map(|module| PublishModule {
+            subpath: module.subpath.clone(),
+            content: module.content.clone(),
+            media_type: media_type_for(&module.subpath).to_string(),
+            is_entry: module.subpath == entry,
+        })
+        .collect();
+    let remote: BTreeMap<_, _> = resolved
+        .modules
+        .iter()
+        .map(|module| {
+            (
+                module.subpath.as_str(),
+                (
+                    module.subpath.clone(),
+                    module
+                        .content_hash
+                        .trim_start_matches("sha256-")
+                        .to_ascii_lowercase(),
+                    module.media_type.clone(),
+                    module.byte_size,
+                    module.is_entry,
+                ),
+            )
+        })
+        .collect();
+    if remote.len() != resolved.modules.len()
+        || authored.iter().any(|module| {
+            remote.get(module.subpath.as_str()) != Some(&published_module_fingerprint(module))
+        })
+    {
+        return Ok(false);
+    }
+    if authored.len() == remote.len() {
+        return Ok(true);
+    }
+    if remote.keys().any(|subpath| {
+        !is_declaration_file(subpath) && !authored.iter().any(|module| module.subpath == *subpath)
+    }) {
+        return Ok(false);
+    }
+    let (generated, warnings) = generate_publish_typings(&package.modules).await;
+    let modules = merge_published_modules(authored, generated);
+    let matches = modules.len() == remote.len()
+        && modules.iter().all(|module| {
+            remote.get(module.subpath.as_str()) == Some(&published_module_fingerprint(module))
+        });
+    if !matches && !warnings.is_empty() {
+        bail!(
+            "could not verify published declarations: {}",
+            warnings.join("; ")
+        );
+    }
+    Ok(matches)
+}
+
 struct PublishRequestSnapshot<'a> {
     package_id: Uuid,
     owner_nickname: &'a str,
@@ -2231,6 +2311,134 @@ mod tests {
     use super::*;
     use crate::models::profile_activation::ProfileActivation;
     use crate::models::shared_packages::{UpdateMode, install_package, load_lock};
+
+    fn published_fixture(package: &LocalPackage) -> ResolvedPackageWire {
+        ResolvedPackageWire {
+            package_id: Uuid::new_v4(),
+            owner_nickname: "author".into(),
+            name: package.name.clone(),
+            version: package.manifest.version.clone(),
+            manifest: serde_json::to_value(&package.manifest).unwrap(),
+            is_public: false,
+            aligned_hosts: Vec::new(),
+            readme: package.readme.clone(),
+            modules: package
+                .modules
+                .iter()
+                .map(|module| smudgy_cloud::ResolvedModuleWire {
+                    subpath: module.subpath.clone(),
+                    content_hash: format!("{:x}", Sha256::digest(&module.content)),
+                    media_type: media_type_for(&module.subpath).into(),
+                    byte_size: i64::try_from(module.content.len()).unwrap(),
+                    is_entry: module.subpath
+                        == package.manifest.entry.as_deref().unwrap_or("index.ts"),
+                    content_url: "https://example.invalid/content".into(),
+                })
+                .collect(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sharing_content_detects_authored_changes() {
+        let package = LocalPackage {
+            name: "tools".into(),
+            manifest: PackageManifest::parse(r#"{"version":"0.1.0","entry":"index.js"}"#).unwrap(),
+            readme: Some("# Tools".into()),
+            modules: vec![
+                LocalModule {
+                    subpath: "index.js".into(),
+                    content: b"export const x = 1;".to_vec(),
+                },
+                LocalModule {
+                    subpath: "image.png".into(),
+                    content: vec![0, 255, 8],
+                },
+            ],
+        };
+        let remote = published_fixture(&package);
+        assert!(matches_published_content(&package, &remote).await.unwrap());
+        let mut prefixed = remote.clone();
+        prefixed.modules.reverse();
+        for module in &mut prefixed.modules {
+            module.content_hash = format!("sha256-{}", module.content_hash.to_uppercase());
+        }
+        assert!(
+            matches_published_content(&package, &prefixed)
+                .await
+                .unwrap()
+        );
+        for change in 0..7 {
+            let mut changed = package.clone();
+            match change {
+                0 => changed.modules[0].content.push(b' '),
+                1 => changed.modules[1].content.push(0),
+                2 => {
+                    changed.modules.pop();
+                }
+                3 => changed.modules.push(LocalModule {
+                    subpath: "new.txt".into(),
+                    content: vec![1],
+                }),
+                4 => changed.readme = None,
+                5 => changed.manifest.description = "new description".into(),
+                _ => changed
+                    .manifest
+                    .dependencies
+                    .push("smudgy://author/lib@^1.0.0".into()),
+            }
+            assert!(
+                !matches_published_content(&changed, &remote).await.unwrap(),
+                "change {change}"
+            );
+        }
+        let mut unknown_remote = remote.clone();
+        unknown_remote.manifest = serde_json::json!({"version": false});
+        assert!(
+            matches_published_content(&package, &unknown_remote)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn sharing_content_accounts_for_generated_declarations() {
+        let package = LocalPackage {
+            name: "tools".into(),
+            manifest: PackageManifest::parse(r#"{"version":"0.1.0"}"#).unwrap(),
+            readme: None,
+            modules: vec![LocalModule {
+                subpath: "index.ts".into(),
+                content: b"export const answer: number = 42;".to_vec(),
+            }],
+        };
+        let (generated, warnings) = generate_publish_typings(&package.modules).await;
+        assert!(!generated.is_empty(), "{warnings:?}");
+        let mut published = package.clone();
+        published
+            .modules
+            .extend(generated.into_iter().map(|module| LocalModule {
+                subpath: module.subpath,
+                content: module.content,
+            }));
+        let remote = published_fixture(&published);
+        assert!(matches_published_content(&package, &remote).await.unwrap());
+        let mut authored = published;
+        authored.modules[1]
+            .content
+            .extend_from_slice(b"\n// authored declaration\n");
+        let authored_remote = published_fixture(&authored);
+        assert!(
+            matches_published_content(&authored, &authored_remote)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !matches_published_content(&package, &authored_remote)
+                .await
+                .unwrap()
+        );
+    }
 
     fn use_temp_smudgy_home() {
         static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
