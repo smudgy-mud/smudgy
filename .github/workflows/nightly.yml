@@ -1,0 +1,61 @@
+name: Nightly
+
+# GitHub runs this schedule from the default branch. 10:23 UTC is 03:23 PDT /
+# 02:23 PST. Only the coordinator runs when main has not changed.
+on:
+  schedule:
+    - cron: '23 10 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Inspect the next nightly without creating a tag or release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-coordinator
+  cancel-in-progress: false
+
+jobs:
+  coordinate:
+    if: >-
+      github.repository == 'smudgy-mud/smudgy' &&
+      github.ref == 'refs/heads/main' &&
+      vars.NIGHTLY_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the release-only commit and immutable tag
+      actions: write # explicitly dispatch Release; token pushes do not trigger it
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Inspect source and previous nightlies
+        id: plan
+        run: python bin/nightly-release.py plan --plan "$RUNNER_TEMP/nightly-plan.json"
+      - name: Materialize dependency patches
+        if: steps.plan.outputs.action == 'create' && !inputs.dry_run
+        run: |
+          cargo install --locked patch-crate
+          cargo patch-crate --force
+      - name: Bump preview version
+        if: steps.plan.outputs.action == 'create' && !inputs.dry_run
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: bash bin/bump-version.sh --preview "$VERSION"
+      - name: Validate and push immutable release tag
+        if: steps.plan.outputs.action == 'create' && !inputs.dry_run
+        run: python bin/nightly-release.py prepare --plan "$RUNNER_TEMP/nightly-plan.json"
+      - name: Dispatch Release on the tag
+        if: steps.plan.outputs.action != 'skip' && !inputs.dry_run
+        run: python bin/nightly-release.py dispatch --plan "$RUNNER_TEMP/nightly-plan.json"

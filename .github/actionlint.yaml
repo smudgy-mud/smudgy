@@ -1,3 +1,7 @@
 self-hosted-runner:
   labels:
     - smudgy-benchmark
+    - smudgy-x64-spot
+    - smudgy-x64-od
+    - smudgy-arm-spot
+    - smudgy-arm-od

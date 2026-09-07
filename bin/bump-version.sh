@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Bump the smudgy version everywhere it lives.
 #
-# Usage: bin/bump-version.sh <new-version>
+# Usage: bin/bump-version.sh [--preview] <new-version>
+# --preview requires a PTB/nightly version and leaves CHANGELOG.md alone.
+# Materialize dependency patches with cargo patch-crate --force first.
 #
 # <new-version> is a full semver string: MAJOR.MINOR.PATCH with an optional
 # `-prerelease` and/or `+build` suffix (e.g. 0.3.2, 0.4.0-beta, 0.4.0-rc.1+ci).
@@ -25,7 +27,7 @@
 #
 # Updates (in the smudgy repo):
 #   - every smudgy_* crate's Cargo.toml        (lock-step [package] versions:
-#       ui core cloud script map_widget theme widgets inspector bench)
+#       discovered from top-level crate manifests)
 #   - assets/installer.iss                     (MyAppVersion)
 #   - CHANGELOG.md                             (stamps "## [<version>] - Unreleased" with today's date)
 #   - Cargo.lock                               (refreshed via cargo metadata)
@@ -41,8 +43,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+PREVIEW=false
+if [[ "${1:-}" == "--preview" ]]; then
+    PREVIEW=true
+    shift
+fi
 if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <new-version>" >&2
+    echo "Usage: $0 [--preview] <new-version>" >&2
     exit 1
 fi
 
@@ -91,6 +98,11 @@ else
     CHANNEL="prod / release"
 fi
 
+if $PREVIEW && [[ "$CHANNEL" != "public-test-build" && "$CHANNEL" != "nightly" ]]; then
+    echo "error: --preview requires a PTB or nightly version" >&2
+    exit 1
+fi
+
 # Escape a string's regex-special dots for safe use as a sed/grep BRE pattern.
 # (In BRE, '+' and '-' are literal — and GNU sed treats '\+' as a quantifier —
 # so dots are the only semver character that needs escaping.)
@@ -125,9 +137,10 @@ echo "  channel: $CHANNEL (build will default to $API_BASE_URL)"
 # nothing — no error, exit 0, no edit — so every crate stayed unbumped. awk's first-match
 # flag is portable across both. Write to a temp file then mv (rather than piping through
 # `&&`) so an awk failure trips `set -e` instead of being swallowed by the AND-list.
-for manifest in ui/Cargo.toml core/Cargo.toml cloud/Cargo.toml script/Cargo.toml \
-                map_widget/Cargo.toml theme/Cargo.toml widgets/Cargo.toml \
-                inspector/Cargo.toml bench/Cargo.toml; do
+for manifest in */Cargo.toml; do
+    # Include path-dependency crates as well as workspace members. Third-party
+    # crates are not part of the application's version series.
+    grep -q '^name = "smudgy_' "$manifest" || continue
     awk -v ver="$NEW_VERSION" '
         !bumped && /^version = ".*"/ { sub(/".*"/, "\"" ver "\""); bumped = 1 }
         { print }
@@ -143,7 +156,9 @@ echo "  assets/installer.iss"
 
 # CHANGELOG.md: stamp the unreleased section for this version, if present.
 TODAY=$(date +%Y-%m-%d)
-if grep -q "^## \[$NEW_RE\] - Unreleased" CHANGELOG.md; then
+if $PREVIEW; then
+    echo "  (leaving CHANGELOG.md unchanged for preview build)"
+elif grep -q "^## \[$NEW_RE\] - Unreleased" CHANGELOG.md; then
     sed -i.bak "s/^## \[$NEW_RE\] - Unreleased/## [$NEW_VERSION] - $TODAY/" CHANGELOG.md
     rm CHANGELOG.md.bak
     echo "  CHANGELOG.md (stamped $TODAY)"
