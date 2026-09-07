@@ -59,6 +59,7 @@ mod package_tabs;
 mod packages;
 mod palette;
 mod param_values;
+mod sharing_status;
 mod sidebar;
 mod store_inspector;
 mod topbar;
@@ -601,6 +602,13 @@ pub enum Message {
     SelectManifestTab(ManifestTab),
     ManifestBeginEdit,
     SaveManifest,
+    IncreasePackageVersion,
+    OwnedContentCompared {
+        seq: ShareSeq,
+        fence: AccountReadFence,
+        snapshot: Arc<LocalPackage>,
+        result: Result<bool, String>,
+    },
     RevertManifest,
     PublishOwned,
     PublishFinished {
@@ -1134,6 +1142,7 @@ pub struct AutomationsWindow {
     pub(super) share_friends: Vec<FriendView>,
     pub(super) share_grants: Vec<PackageGrantView>,
     pub(super) share_versions: Vec<VersionListItem>,
+    share_content: sharing_status::PublishedContent,
     pub(super) share_busy: bool,
     /// Exact sharing mutation represented by `share_busy`. Share-state loads use `share_seq` only.
     pub(super) share_operation: Option<PackageOperationId>,
@@ -1453,6 +1462,7 @@ impl AutomationsWindow {
             share_friends: Vec::new(),
             share_grants: Vec::new(),
             share_versions: Vec::new(),
+            share_content: sharing_status::PublishedContent::Unknown,
             share_busy: false,
             share_operation: None,
             share_seq: ShareSeq::default(),
@@ -2769,6 +2779,13 @@ impl AutomationsWindow {
             }
             Message::ManifestBeginEdit => self.begin_manifest_edit(),
             Message::SaveManifest => self.save_manifest(),
+            Message::IncreasePackageVersion => self.increase_package_version(),
+            Message::OwnedContentCompared {
+                seq,
+                fence,
+                snapshot,
+                result,
+            } => self.owned_content_compared(seq, fence, snapshot, result),
             Message::RevertManifest => self.revert_manifest(),
             Message::PublishOwned => self.publish_owned(),
             Message::PublishFinished {
@@ -3185,6 +3202,28 @@ impl AutomationsWindow {
             }
             Message::SelectLocalPackageTab(tab) => {
                 self.local_package_tab = tab;
+                if tab == LocalPackageTab::Sharing
+                    && self.signed_in()
+                    && !self.authoring_busy
+                    && !self.share_busy
+                    && !matches!(self.publication_status, PublicationStatus::Invalid(_))
+                {
+                    let reload = self.reconcile_owned_package_language_project_reload();
+                    if let Some(package) = self.local_package.as_deref() {
+                        let name = package.name.clone();
+                        if !self.manifest_dirty
+                            && let Err(error) = self.reload_manifest_draft_from_disk(&name)
+                        {
+                            self.share_content = sharing_status::PublishedContent::Unknown;
+                            self.authoring_feedback = Some(error);
+                            return Update::with_task(reload);
+                        }
+                        return Update::with_task(Task::batch([
+                            reload,
+                            self.load_owned_share(name),
+                        ]));
+                    }
+                }
                 Update::none()
             }
             Message::SetParameterScope(scope) => self.set_open_parameter_scope(scope),
@@ -5939,6 +5978,68 @@ mod tab_traversal_tests {
         window.param_config = None;
         let _ = window.update(Message::CancelGlobalParameterSource);
         assert!(window.profile_param_status.is_none());
+    }
+
+    #[test]
+    fn sharing_patch_button_saves_only_version_and_rejects_external_manifest_changes() {
+        use super::sharing_status::PublishedContent;
+        use smudgy_core::models::local_packages;
+
+        use_temp_smudgy_home();
+        let server_name = format!("sharing-patch-{}", Uuid::new_v4());
+        create_test_server(&server_name, &[]);
+        local_packages::scaffold_local_package_with_state(&server_name, "tools", "local").unwrap();
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            server_name.clone(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.selection = Selection::OwnedPackage("tools".into());
+        window.pane = Pane::OwnedPackage;
+        window.local_package = local_packages::load_local_package(&server_name, "tools")
+            .unwrap()
+            .map(Box::new);
+        window.reload_manifest_draft_from_disk("tools").unwrap();
+        let before = window.local_package.as_deref().unwrap().clone();
+        let expected_version =
+            super::sharing_status::next_patch(&before.manifest.version, &[]).unwrap();
+        window.share_versions = vec![VersionListItem {
+            version: before.manifest.version.clone(),
+            yanked: false,
+            deleted: false,
+            published_at: chrono::Utc::now(),
+        }];
+        window.share_content = PublishedContent::Compared(Arc::new(before.clone()), false);
+        let _ = window.update(Message::IncreasePackageVersion);
+        let mut expected = before;
+        expected.manifest.version = expected_version.clone();
+        assert_eq!(
+            local_packages::load_local_package(&server_name, "tools")
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            window.manifest_draft.as_ref().unwrap().version,
+            expected_version
+        );
+        assert!(!window.manifest_dirty);
+
+        window.share_versions[0].version = expected_version;
+        window.share_content = PublishedContent::Compared(Arc::new(expected), false);
+        let source =
+            local_packages::read_local_file(&server_name, "tools", "smudgy.package.json").unwrap();
+        let external = format!("{source}\n");
+        local_packages::write_local_file(&server_name, "tools", "smudgy.package.json", &external)
+            .unwrap();
+        let _ = window.update(Message::IncreasePackageVersion);
+        assert_eq!(
+            local_packages::read_local_file(&server_name, "tools", "smudgy.package.json").unwrap(),
+            external
+        );
+        assert!(window.authoring_feedback.is_some());
+        assert!(!window.manifest_dirty);
     }
 
     /// A process-wide temporary smudgy home for tests that write server state. Another test

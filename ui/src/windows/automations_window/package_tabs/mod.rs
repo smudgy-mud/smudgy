@@ -847,14 +847,44 @@ impl AutomationsWindow {
                     body = body.push(text(reason.clone()).size(12.0).style(common::danger));
                 }
                 PublishVerdict::AlreadyUsed => {
-                    body = body.push(
-                        text(crate::i18n::t!(
-                            "package-version-already-used",
-                            "version" => &disp_version
+                    use super::sharing_status::{PublishedContent, next_patch};
+                    let message = match self.published_content() {
+                        PublishedContent::Compared(_, true) => text(crate::i18n::t!(
+                            "package-version-up-to-date", "version" => &disp_version
                         ))
-                        .size(12.0)
+                        .style(common::success),
+                        PublishedContent::Compared(_, false) => text(crate::i18n::t!(
+                            "package-version-local-changes", "version" => &disp_version
+                        ))
                         .style(common::warning),
-                    );
+                        PublishedContent::Checking(_) => text(crate::i18n::t!(
+                            "package-version-checking", "version" => &disp_version
+                        ))
+                        .style(common::muted),
+                        PublishedContent::Unknown => text(crate::i18n::t!(
+                            "package-version-already-used", "version" => &disp_version
+                        ))
+                        .style(common::warning),
+                    };
+                    body = body.push(message.size(12.0));
+                    if matches!(
+                        self.published_content(),
+                        PublishedContent::Compared(_, false)
+                    ) {
+                        body = body.push(
+                            button(text(crate::i18n::t!("package-increase-version")).size(12.0))
+                                .style(button_style::secondary)
+                                .on_press_maybe(
+                                    (!self.authoring_busy
+                                        && !self.share_busy
+                                        && !self.consent_busy
+                                        && self.consent_prompt.is_none()
+                                        && next_patch(&disp_version, &self.share_versions)
+                                            .is_some())
+                                    .then_some(Message::IncreasePackageVersion),
+                                ),
+                        );
+                    }
                 }
                 PublishVerdict::Ready => {}
             }
