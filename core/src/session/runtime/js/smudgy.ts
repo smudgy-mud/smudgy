@@ -6149,6 +6149,10 @@ Object.defineProperty(globalThis, "__smudgy_user_api", {
 Object.defineProperty(globalThis, "__smudgy_param_get", {
     value: (spec: string, key: string) => op_smudgy_param_get(spec, key) ?? undefined,
 });
+Object.defineProperty(globalThis, "__smudgy_param_set", {
+    value: (spec: string, key: string, value: unknown): void =>
+        op_smudgy_param_set(spec, key, value),
+});
 
 // Host hooks for the session store (docs/interop.md): the internal seam the state
 // handles and the smudgy:state consumer scheme build on, like __smudgy_param_get above. Not part

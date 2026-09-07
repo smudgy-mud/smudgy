@@ -2187,6 +2187,116 @@ pub fn get_param_value_for_profile_checked(
     )
 }
 
+/// Validates a script-supplied value against one declared package parameter.
+///
+/// Lists and tables cannot contain nested containers. A table row can omit columns, but it
+/// cannot contain undeclared columns. Dropdown values must match one declared option.
+///
+/// # Errors
+/// Returns an error that identifies the first shape mismatch.
+pub fn validate_package_param_value(
+    param: &PackageParameter,
+    value: &serde_json::Value,
+) -> Result<()> {
+    fn validate_scalar(param: &PackageParameter, value: &serde_json::Value) -> Result<()> {
+        match param.kind {
+            ParamKind::String if value.is_string() => Ok(()),
+            ParamKind::Bool if value.is_boolean() => Ok(()),
+            ParamKind::Number if value.is_number() => Ok(()),
+            ParamKind::Dropdown => {
+                let Some(choice) = value.as_str() else {
+                    anyhow::bail!("parameter '{}' must be a string", param.key);
+                };
+                if param.options.iter().any(|option| option.value == choice) {
+                    Ok(())
+                } else {
+                    anyhow::bail!(
+                        "parameter '{}' does not allow the value '{}'",
+                        param.key,
+                        choice
+                    )
+                }
+            }
+            ParamKind::String => anyhow::bail!("parameter '{}' must be a string", param.key),
+            ParamKind::Bool => anyhow::bail!("parameter '{}' must be a boolean", param.key),
+            ParamKind::Number => anyhow::bail!("parameter '{}' must be a number", param.key),
+            ParamKind::List | ParamKind::Table => {
+                anyhow::bail!("parameter '{}' contains a nested container", param.key)
+            }
+        }
+    }
+
+    match param.kind {
+        ParamKind::List => {
+            let items = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("parameter '{}' must be an array", param.key))?;
+            let element = param.fields.first().ok_or_else(|| {
+                anyhow::anyhow!("list parameter '{}' has no element declaration", param.key)
+            })?;
+            for item in items {
+                validate_scalar(element, item)?;
+            }
+            Ok(())
+        }
+        ParamKind::Table => {
+            let rows = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("parameter '{}' must be an array", param.key))?;
+            for (index, row) in rows.iter().enumerate() {
+                let object = row.as_object().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "row {} of parameter '{}' must be an object",
+                        index + 1,
+                        param.key
+                    )
+                })?;
+                for (column, cell) in object {
+                    let field = param
+                        .fields
+                        .iter()
+                        .find(|field| field.key == *column)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "row {} of parameter '{}' contains undeclared column '{}'",
+                                index + 1,
+                                param.key,
+                                column
+                            )
+                        })?;
+                    validate_scalar(field, cell)?;
+                }
+            }
+            Ok(())
+        }
+        _ => validate_scalar(param, value),
+    }
+}
+
+/// Validates and saves one declared parameter in the scope configured for the active profile.
+/// Secret parameters use keyring storage. Other parameters use the JSON value store.
+///
+/// # Errors
+/// Returns an error for a shape mismatch or an unavailable settings store.
+pub fn save_package_param_for_profile(
+    server_name: &str,
+    profile_name: &str,
+    specifier: &str,
+    param: &PackageParameter,
+    value: serde_json::Value,
+) -> Result<()> {
+    validate_package_param_value(param, &value)?;
+    let scope = configured_param_scope(server_name, profile_name, specifier)?;
+    if param.secret {
+        let secret = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("secret parameter '{}' must be a string", param.key))?;
+        save_secret_param_scoped(server_name, scope, specifier, &param.key, secret)
+    } else {
+        save_param_value_scoped(server_name, scope, specifier, &param.key, value)
+    }
+}
+
 /// Copies one package's declared values between parameter scopes. With `only_missing`, existing
 /// destination values are preserved; otherwise the destination mirrors the source exactly,
 /// including clears. Secret values move through the keyring and never enter the JSON store.
@@ -3810,5 +3920,47 @@ mod tests {
         );
         floor.fold("c", Some("nope"));
         assert!(floor.refusal(&running).unwrap().contains("unusable"));
+    }
+
+    #[test]
+    fn script_param_values_must_match_the_declared_shape() {
+        let scalar = |key: &str, kind: ParamKind| PackageParameter {
+            key: key.to_string(),
+            label: None,
+            secret: false,
+            required: false,
+            kind,
+            default: None,
+            options: Vec::new(),
+            fields: Vec::new(),
+        };
+        let mut dropdown = scalar("mode", ParamKind::Dropdown);
+        dropdown.options = vec![smudgy_script::ParamOption {
+            value: "safe".to_string(),
+            label: None,
+        }];
+        let mut list = scalar("tags", ParamKind::List);
+        list.fields = vec![scalar("tag", ParamKind::String)];
+        let mut table = scalar("routes", ParamKind::Table);
+        table.fields = vec![
+            scalar("from", ParamKind::String),
+            scalar("priority", ParamKind::Number),
+        ];
+
+        assert!(validate_package_param_value(&dropdown, &serde_json::json!("safe")).is_ok());
+        assert!(validate_package_param_value(&dropdown, &serde_json::json!("fast")).is_err());
+        assert!(validate_package_param_value(&list, &serde_json::json!(["a", "b"])).is_ok());
+        assert!(validate_package_param_value(&list, &serde_json::json!(["a", 2])).is_err());
+        assert!(
+            validate_package_param_value(
+                &table,
+                &serde_json::json!([{"from": "square", "priority": 10}, {"from": "gate"}])
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_package_param_value(&table, &serde_json::json!([{"unknown": true}])).is_err()
+        );
+        assert!(validate_package_param_value(&table, &serde_json::json!([null])).is_err());
     }
 }
