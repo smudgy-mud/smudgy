@@ -162,8 +162,11 @@ unic-langid = "0.9.6"
 #   per-window announcement action used by the audio control panel.
 # - `iced_winit` (patches/iced_winit+0.14.0.patch): owns the matching bounded
 #   AccessKit live-region bridge and native-window retirement ordering.
+# - `iced-code-editor` (patches/iced-code-editor+0.5.1.patch): keeps the
+#   search input mounted when sticky headers appear or disappear on scroll.
 [workspace.metadata.patch]
 crates = [
+    "iced-code-editor",
     "iced_graphics",
     "iced_runtime",
     "iced_winit",
@@ -185,6 +188,9 @@ deno_permissions = { path = "./target/patch/deno_permissions-0.116.0" }
 deno_runtime = { path = "./target/patch/deno_runtime-0.265.0" }
 deno_core = { path = "./target/patch/deno_core-0.410.0" }
 regex-filtered = { path = "./target/patch/regex-filtered-0.2.1" }
+
+[patch."https://github.com/LuDog71FR/iced-code-editor"]
+iced-code-editor = { path = "./target/patch/iced-code-editor" }
 
 # Define workspace-wide lints
 [workspace.lints.clippy]
