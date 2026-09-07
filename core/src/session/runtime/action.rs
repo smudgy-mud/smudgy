@@ -27,7 +27,9 @@ use super::pane::{
 use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
-use super::trigger::{AliasSender, MatchCapture, PreparedScriptTriggerPatterns};
+use super::trigger::{
+    AliasSender, AutomationIdentity, MatchCapture, PreparedScriptTriggerPatterns,
+};
 
 #[derive(Clone, Debug)]
 pub enum RuntimeAction {
@@ -184,18 +186,17 @@ pub enum RuntimeAction {
     },
     /// One matched alias/trigger, deferred so an earlier invocation in the same dispatch frame
     /// can prevent it from running. `stopped` is shared only by automations of the same kind and
-    /// `(isolate, origin)`; nested sends create fresh frames.
+    /// `(isolate, origin)`; nested sends create fresh frames. `identity` names the automation
+    /// by isolate, origin, name, and kind. It is the handle assigned at registration, shared
+    /// with the registry entry and with every other action the automation queued.
     RunAutomation {
-        isolate: IsolateId,
-        origin: Origin,
-        name: Arc<String>,
+        identity: Arc<AutomationIdentity>,
         script: ScriptAction,
         matches: CapturePayload,
         depth: u32,
         is_captured: Option<Arc<AtomicBool>>,
         stopped: Arc<AtomicBool>,
         fallthrough: bool,
-        is_alias: bool,
     },
     Echo(Arc<String>),
     /// A Command alias matched its first word but a required argument was
@@ -827,7 +828,6 @@ impl RuntimeAction {
             Self::EvalJavascript { isolate, .. }
             | Self::ExecuteJavascriptFunction { isolate, .. }
             | Self::CallJavascriptFunction { isolate, .. }
-            | Self::RunAutomation { isolate, .. }
             | Self::AddHotkey { isolate, .. }
             | Self::AddAlias { isolate, .. }
             | Self::AddJavascriptFunctionAlias { isolate, .. }
@@ -838,6 +838,7 @@ impl RuntimeAction {
             | Self::EnableTrigger(isolate, ..)
             | Self::RemoveAlias(isolate, ..)
             | Self::RemoveTrigger(isolate, ..) => Some(isolate),
+            Self::RunAutomation { identity, .. } => Some(&identity.isolate),
             _ => None,
         }
     }

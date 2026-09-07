@@ -1,10 +1,10 @@
 use std::{
-    cell::{Cell, OnceCell, RefCell},
+    cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -20,7 +20,7 @@ use crate::models::matchers::{
 use super::{
     ActionQueue, ScriptAction,
     captures::{CapturePattern, CapturePayload, CaptureView},
-    matcher::PatternSet,
+    matcher::{PatternMatch, PatternSet},
     origin::{
         AutomationBody, AutomationDelta, AutomationKind, AutomationSummary, IsolateId, Origin,
     },
@@ -42,9 +42,128 @@ pub struct AutomationEntry {
 /// `name -> entry` within one `(IsolateId, Origin)` namespace.
 type AutomationNamespace = HashMap<String, AutomationEntry>;
 
-/// Stop state for one alias/trigger dispatch, partitioned by creator so one package cannot
-/// suppress another package's (or the user's) automations.
-type FallthroughScopes = HashMap<(IsolateId, Origin), Arc<AtomicBool>>;
+/// The handle of one `(IsolateId, Origin)` automation namespace, assigned at registration.
+/// The `Manager` interns each distinct pair once. Per-line work then compares and hashes
+/// this small copyable id instead of the owned isolate and origin values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NamespaceId(u32);
+
+/// The immutable identity of one registered automation. The `Manager` creates it at
+/// registration. The registry entry, every action the automation queues, and the fire
+/// accounting of those actions share it through one `Arc`. A queued fire therefore copies
+/// one `Arc` and not the isolate, the origin, and the name.
+///
+/// The slot fields cache where the fire counter lives in the registry: the generation and
+/// the index of the last successful lookup. When the cached generation equals the current
+/// registry generation, a fire reads the counter at that index. Each registry mutation, an
+/// add, a replace, or a remove, changes the generation. A stale slot then falls back to the
+/// name lookup. This keeps the dispatch-time rule after a replacement or a removal: a queued
+/// fire charges the definition that holds the name when the fire runs, not the definition
+/// that queued it.
+#[derive(Debug)]
+pub struct AutomationIdentity {
+    pub isolate: IsolateId,
+    pub origin: Origin,
+    pub name: Arc<String>,
+    /// Whether the entry lives in the alias `Vec`, matched on outgoing input, or in the
+    /// trigger `Vec`, matched on incoming lines.
+    pub is_alias: bool,
+    pub namespace: NamespaceId,
+    slot_generation: AtomicU64,
+    slot_index: AtomicUsize,
+}
+
+/// The registry generation that no slot cache can hold. A fresh identity always looks up.
+const NO_GENERATION: u64 = 0;
+
+/// The process-wide source of registry generations. No two `Manager` instances share a
+/// generation. An engine rebuild replaces the manager while queued actions from the old
+/// manager can still hold cached slots.
+static NEXT_REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_registry_generation() -> u64 {
+    NEXT_REGISTRY_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+impl AutomationIdentity {
+    fn new(
+        isolate: IsolateId,
+        origin: Origin,
+        name: &str,
+        is_alias: bool,
+        namespace: NamespaceId,
+    ) -> Self {
+        Self {
+            isolate,
+            origin,
+            name: Arc::new(name.to_owned()),
+            is_alias,
+            namespace,
+            slot_generation: AtomicU64::new(NO_GENERATION),
+            slot_index: AtomicUsize::new(0),
+        }
+    }
+
+    /// The cached registry index, if it was recorded under `generation`. Only the session
+    /// thread touches the slot, so the two reads are consistent.
+    fn cached_slot(&self, generation: u64) -> Option<usize> {
+        (self.slot_generation.load(Ordering::Relaxed) == generation)
+            .then(|| self.slot_index.load(Ordering::Relaxed))
+    }
+
+    fn cache_slot(&self, generation: u64, index: usize) {
+        self.slot_index.store(index, Ordering::Relaxed);
+        self.slot_generation.store(generation, Ordering::Relaxed);
+    }
+}
+
+/// The stop state of one alias or trigger dispatch, split by creator namespace, so one
+/// package cannot suppress the automations of another package or of the user. Nearly every
+/// line fires into one namespace, so the first scope is stored inline. Only a second
+/// namespace on the same line allocates the overflow list.
+#[derive(Default)]
+struct FallthroughScopes {
+    first: Option<(NamespaceId, Arc<AtomicBool>)>,
+    rest: Vec<(NamespaceId, Arc<AtomicBool>)>,
+}
+
+impl FallthroughScopes {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The stop flag that every automation of `namespace` shares on this line. The first
+    /// use creates it. Each logical line owns fresh flags. A queued action keeps the flag of
+    /// its line, so no flag is reset and reused for a later line.
+    fn scope(&mut self, namespace: NamespaceId) -> Arc<AtomicBool> {
+        match &self.first {
+            None => {
+                let stopped = Arc::new(AtomicBool::new(false));
+                self.first = Some((namespace, stopped.clone()));
+                stopped
+            }
+            Some((id, stopped)) if *id == namespace => stopped.clone(),
+            Some(_) => {
+                if let Some((_, stopped)) = self.rest.iter().find(|(id, _)| *id == namespace) {
+                    return stopped.clone();
+                }
+                let stopped = Arc::new(AtomicBool::new(false));
+                self.rest.push((namespace, stopped.clone()));
+                stopped
+            }
+        }
+    }
+}
+
+/// The working storage that the incoming-line paths reuse from line to line: the pattern-set
+/// hits and the fired-trigger list. The `Manager` lends it out for the matching of one line
+/// and takes it back before the call returns, so no handler runs while it is borrowed. The
+/// containers keep their capacity, so a steady stream of lines allocates nothing here.
+#[derive(Debug, Default)]
+struct LineScratch {
+    matches: Vec<PatternMatch>,
+    fired: Vec<usize>,
+}
 
 /// The identity of the alias whose expansion produced the line currently being matched.
 /// Carried through every nested outgoing-line pass so that alias's own sent text is
@@ -107,6 +226,15 @@ pub struct Manager {
     // via upsert.
     trigger_indices: HashMap<(IsolateId, Origin), HashMap<String, usize>>,
     alias_indices: HashMap<(IsolateId, Origin), HashMap<String, usize>>,
+    /// The reused per-line matching storage, see [`LineScratch`].
+    line_scratch: LineScratch,
+    /// The interned `(IsolateId, Origin)` namespaces, see [`NamespaceId`]. The map grows only
+    /// at registration. A namespace keeps its id for the life of the manager.
+    namespaces: HashMap<(IsolateId, Origin), NamespaceId>,
+    /// The registry generation, see [`AutomationIdentity`]. Each mutation of `triggers`, of
+    /// `aliases`, or of their index maps changes it, so a fire-counter slot cached under an
+    /// older generation falls back to the name lookup.
+    registry_generation: u64,
     /// Indices into `triggers` of every trigger that declares a `line_limit`. A side list so the
     /// per-incoming-line `count_tested_lines` self-limit tick visits only the (rare) line-limited
     /// triggers instead of scanning all of them — keeping the common no-line-limit profile O(1)
@@ -808,6 +936,9 @@ impl Manager {
             triggers,
             alias_indices,
             trigger_indices,
+            line_scratch: LineScratch::default(),
+            namespaces: HashMap::new(),
+            registry_generation: next_registry_generation(),
             line_limited_triggers: Vec::new(),
             spawned_actions,
             trigger_regex_set_dirty: true,
@@ -1057,11 +1188,27 @@ impl Manager {
         }
     }
 
-    fn add_or_update_alias(&mut self, alias: Trigger) {
+    /// Give an automation its shared identity at registration, see [`AutomationIdentity`].
+    /// The first automation of an `(isolate, origin)` pair interns that namespace.
+    fn assign_identity(&mut self, item: &mut Trigger) {
+        let key = (item.isolate.clone(), item.origin.clone());
+        let next = NamespaceId(u32::try_from(self.namespaces.len()).expect("namespace count"));
+        let namespace = *self.namespaces.entry(key).or_insert(next);
+        item.identity = Some(Arc::new(AutomationIdentity::new(
+            item.isolate.clone(),
+            item.origin.clone(),
+            &item.name,
+            item.is_alias,
+            namespace,
+        )));
+    }
+
+    fn add_or_update_alias(&mut self, mut alias: Trigger) {
         debug!(
             "Adding or updating alias: {:?}, {:?}, {:?}",
             alias.origin, alias.name, alias.patterns
         );
+        self.assign_identity(&mut alias);
         self.registry_upsert(AutomationKind::Alias, &alias);
         let delta = (self.is_watched() && alias.origin != Origin::User)
             .then(|| AutomationDelta::Upserted(Self::summary(AutomationKind::Alias, &alias)));
@@ -1084,6 +1231,7 @@ impl Manager {
                 .insert(alias.name.clone(), index);
             self.aliases.push(alias);
         }
+        self.registry_generation = next_registry_generation();
         // Defer the (expensive) PatternSet rebuild to the next outgoing line,
         // exactly like triggers do via `trigger_regex_set_dirty`. Rebuilding
         // eagerly on every insert made loading N aliases O(N²) — and since each
@@ -1097,11 +1245,12 @@ impl Manager {
         }
     }
 
-    fn add_or_update_trigger(&mut self, trigger: Trigger) {
+    fn add_or_update_trigger(&mut self, mut trigger: Trigger) {
         trace!(
             "Adding or updating trigger: {:?}, {:?}",
             trigger.name, trigger.patterns
         );
+        self.assign_identity(&mut trigger);
         self.registry_upsert(AutomationKind::Trigger, &trigger);
         let delta = (self.is_watched() && trigger.origin != Origin::User)
             .then(|| AutomationDelta::Upserted(Self::summary(AutomationKind::Trigger, &trigger)));
@@ -1121,6 +1270,7 @@ impl Manager {
                 .insert(trigger.name.clone(), index);
             self.triggers.push(trigger);
         }
+        self.registry_generation = next_registry_generation();
 
         self.trigger_regex_set_dirty = true;
         self.refresh_raw_wanted();
@@ -1375,6 +1525,7 @@ impl Manager {
             origin,
             name,
         ) {
+            self.registry_generation = next_registry_generation();
             self.alias_regex_set_dirty = true;
             self.command_names_dirty = true;
             self.registry_remove(AutomationKind::Alias, isolate, origin, name);
@@ -1399,6 +1550,7 @@ impl Manager {
             origin,
             name,
         ) {
+            self.registry_generation = next_registry_generation();
             self.trigger_regex_set_dirty = true;
             self.refresh_raw_wanted();
             self.registry_remove(AutomationKind::Trigger, isolate, origin, name);
@@ -1650,7 +1802,8 @@ impl Manager {
     /// `RunAutomation` for the current line. The incoming-line paths share one list across
     /// their raw and normal passes, so an automation matching in both fires **once per
     /// line** — raw first, which is the documented precedence — rather than once per pass.
-    /// Each automation queued here is recorded into the list.
+    /// Each automation queued here is recorded into the list. `matches` is the scratch of the
+    /// caller for the pattern-set hits. This function overwrites it.
     #[allow(clippy::too_many_arguments)]
     fn process_line_inner(
         &self,
@@ -1666,6 +1819,7 @@ impl Manager {
         is_captured: Option<Arc<AtomicBool>>,
         fallthrough_scopes: &mut FallthroughScopes,
         fired: &mut Vec<usize>,
+        matches: &mut Vec<PatternMatch>,
     ) -> Result<()> {
         if depth > 100 {
             match sender {
@@ -1682,7 +1836,7 @@ impl Manager {
         // const-folds to `false` under `release_max_level_info` (release/bench), so the timer is
         // a dead `None` and the whole block — both clock reads — is optimized away.
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
-        let matches = pattern_set.matches(line);
+        pattern_set.matches_into(line, matches);
         if let Some(start) = timer {
             debug!("Time to test pattern matches: {:?}", start.elapsed());
         }
@@ -1756,10 +1910,7 @@ impl Manager {
                     pattern_set.patterns().get(hit.index).unwrap()
                 );
 
-                let stopped = fallthrough_scopes
-                    .entry((trigger.isolate.clone(), trigger.origin.clone()))
-                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                    .clone();
+                let stopped = fallthrough_scopes.scope(trigger.identity().namespace);
                 trigger.run(
                     line,
                     styled_line,
@@ -1853,6 +2004,7 @@ impl Manager {
         // Aliases evaluate in a single pass, so the fired list is inert here; it exists
         // for the two-pass incoming paths.
         let mut fired = Vec::new();
+        let mut matches = Vec::new();
 
         self.process_line_inner(
             line,
@@ -1867,6 +2019,7 @@ impl Manager {
             Some(is_captured.clone()),
             &mut fallthrough_scopes,
             &mut fired,
+            &mut matches,
         )?;
 
         self.spawned_actions
@@ -1898,28 +2051,32 @@ impl Manager {
 
     /// Count an invocation only after it actually begins running. A match skipped by an earlier
     /// `fallthrough(false)` therefore consumes neither `fireLimit` nor its one-shot lifetime.
-    pub(crate) fn record_fire(
-        &self,
-        isolate: &IsolateId,
-        origin: &Origin,
-        name: &str,
-        is_alias: bool,
-    ) {
-        let indices = if is_alias {
-            &self.alias_indices
-        } else {
-            &self.trigger_indices
-        };
-        let items = if is_alias {
+    ///
+    /// The cached slot of the identity finds the counter when the registry has not changed
+    /// since the slot was cached. Otherwise the `(isolate, origin, name)` lookup finds it,
+    /// and its result is cached for the next fire.
+    pub(crate) fn record_fire(&self, identity: &AutomationIdentity) {
+        let items = if identity.is_alias {
             &self.aliases
         } else {
             &self.triggers
         };
-        let Some(&index) = indices
-            .get(&(isolate.clone(), origin.clone()))
-            .and_then(|namespace| namespace.get(name))
-        else {
-            return;
+        let index = if let Some(index) = identity.cached_slot(self.registry_generation) {
+            index
+        } else {
+            let indices = if identity.is_alias {
+                &self.alias_indices
+            } else {
+                &self.trigger_indices
+            };
+            let Some(&index) = indices
+                .get(&(identity.isolate.clone(), identity.origin.clone()))
+                .and_then(|namespace| namespace.get(identity.name.as_str()))
+            else {
+                return;
+            };
+            identity.cache_slot(self.registry_generation, index);
+            index
         };
         let Some(item) = items.get(index) else {
             return;
@@ -1949,7 +2106,35 @@ impl Manager {
         let mut fallthrough_scopes = FallthroughScopes::new();
         // Shared across the raw and normal passes (the same per-line lifetime as
         // `fallthrough_scopes`): a trigger matching in both fires once, on the raw pass.
-        let mut fired = Vec::new();
+        // The scratch is lent out for this line and returned below, before any handler runs.
+        let mut scratch = std::mem::take(&mut self.line_scratch);
+        scratch.fired.clear();
+        let result = self.process_incoming_line_with(line, &mut fallthrough_scopes, &mut scratch);
+        self.line_scratch = scratch;
+        result?;
+
+        // Self-limit: one tested-line tick per incoming complete line for every
+        // `lineLimit` trigger (no-op for the common unlimited case).
+        self.count_tested_lines();
+
+        if let Some(start) = timer {
+            debug!(
+                "Time to match and dispatch triggers on incoming line: {:?}",
+                start.elapsed()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The raw pass and then the normal pass of [`Self::process_incoming_line`], over the
+    /// scratch of the caller.
+    fn process_incoming_line_with(
+        &self,
+        line: &Arc<StyledLine>,
+        fallthrough_scopes: &mut FallthroughScopes,
+        scratch: &mut LineScratch,
+    ) -> Result<()> {
         if let Some(raw) = line.raw() {
             debug!("Processing raw line: {raw:?}");
             self.process_line_inner(
@@ -1963,8 +2148,9 @@ impl Manager {
                 &self.raw_trigger_regex_patterns_map,
                 TriggerMatchType::Raw,
                 None,
-                &mut fallthrough_scopes,
-                &mut fired,
+                fallthrough_scopes,
+                &mut scratch.fired,
+                &mut scratch.matches,
             )?;
         }
 
@@ -1979,22 +2165,10 @@ impl Manager {
             &self.trigger_regex_patterns_map,
             TriggerMatchType::Normal,
             None,
-            &mut fallthrough_scopes,
-            &mut fired,
-        )?;
-
-        // Self-limit: one tested-line tick per incoming complete line for every
-        // `lineLimit` trigger (no-op for the common unlimited case).
-        self.count_tested_lines();
-
-        if let Some(start) = timer {
-            debug!(
-                "Time to match and dispatch triggers on incoming line: {:?}",
-                start.elapsed()
-            );
-        }
-
-        Ok(())
+            fallthrough_scopes,
+            &mut scratch.fired,
+            &mut scratch.matches,
+        )
     }
 
     pub fn process_partial_line(&mut self, line: Arc<StyledLine>) -> Result<()> {
@@ -2013,40 +2187,13 @@ impl Manager {
 
         let mut fallthrough_scopes = FallthroughScopes::new();
         // The prompt path has the same two-pass shape as `process_incoming_line` and gets
-        // the same one-fire-per-line treatment. Each call owns its list, so a partial
+        // the same one-fire-per-line rule. Each call starts its list empty, so a partial
         // line and its later completed line count as different lines.
-        let mut fired = Vec::new();
-        if let Some(raw) = line.raw() {
-            self.process_line_inner(
-                raw,
-                Some(&line),
-                0,
-                None,
-                &self.prompt_raw_trigger_regex_set,
-                &self.triggers,
-                &self.prompt_raw_trigger_regex_set_map,
-                &self.prompt_raw_trigger_regex_patterns_map,
-                TriggerMatchType::Raw,
-                None,
-                &mut fallthrough_scopes,
-                &mut fired,
-            )?;
-        }
-
-        self.process_line_inner(
-            &line,
-            Some(&line),
-            0,
-            None,
-            &self.prompt_trigger_regex_set,
-            &self.triggers,
-            &self.prompt_trigger_regex_set_map,
-            &self.prompt_trigger_regex_patterns_map,
-            TriggerMatchType::Normal,
-            None,
-            &mut fallthrough_scopes,
-            &mut fired,
-        )?;
+        let mut scratch = std::mem::take(&mut self.line_scratch);
+        scratch.fired.clear();
+        let result = self.process_partial_line_with(&line, &mut fallthrough_scopes, &mut scratch);
+        self.line_scratch = scratch;
+        result?;
 
         if let Some(start) = timer {
             debug!(
@@ -2062,6 +2209,51 @@ impl Manager {
     }
 }
 
+impl Manager {
+    /// The raw pass and then the normal pass of [`Self::process_partial_line`], over the
+    /// scratch of the caller.
+    fn process_partial_line_with(
+        &self,
+        line: &Arc<StyledLine>,
+        fallthrough_scopes: &mut FallthroughScopes,
+        scratch: &mut LineScratch,
+    ) -> Result<()> {
+        if let Some(raw) = line.raw() {
+            self.process_line_inner(
+                raw,
+                Some(line),
+                0,
+                None,
+                &self.prompt_raw_trigger_regex_set,
+                &self.triggers,
+                &self.prompt_raw_trigger_regex_set_map,
+                &self.prompt_raw_trigger_regex_patterns_map,
+                TriggerMatchType::Raw,
+                None,
+                fallthrough_scopes,
+                &mut scratch.fired,
+                &mut scratch.matches,
+            )?;
+        }
+
+        self.process_line_inner(
+            line,
+            Some(line),
+            0,
+            None,
+            &self.prompt_trigger_regex_set,
+            &self.triggers,
+            &self.prompt_trigger_regex_set_map,
+            &self.prompt_trigger_regex_patterns_map,
+            TriggerMatchType::Normal,
+            None,
+            fallthrough_scopes,
+            &mut scratch.fired,
+            &mut scratch.matches,
+        )
+    }
+}
+
 #[derive(Debug)]
 struct Trigger {
     /// The isolate this automation was registered in. Source of truth for both the
@@ -2071,7 +2263,9 @@ struct Trigger {
     isolate: IsolateId,
     origin: Origin,
     name: String,
-    shared_name: OnceCell<Arc<String>>,
+    /// The shared identity that every queued action carries, see [`AutomationIdentity`].
+    /// The `Manager` assigns it at registration. Every entry in its registries has one.
+    identity: Option<Arc<AutomationIdentity>>,
     patterns: Vec<CapturePattern>,
     pattern_colors: Vec<Option<CompiledColorMatch>>,
     raw_patterns: Vec<CapturePattern>,
@@ -2123,7 +2317,9 @@ impl Trigger {
         styled_line: Option<&StyledLine>,
         bold_is_bright: bool,
     ) -> bool {
-        if self.anti_patterns.is_match(subject) {
+        // Most automations declare no anti-patterns. A search over an empty set still costs
+        // a dispatch, so answer the empty case here.
+        if !self.anti_patterns.is_empty() && self.anti_patterns.is_match(subject) {
             return true;
         }
         let Some(colored_anti_pattern_set) = &self.colored_anti_pattern_set else {
@@ -2298,7 +2494,7 @@ impl Trigger {
         let patterns = patterns.into_iter().map(CapturePattern::new).collect();
         let raw_patterns = raw_patterns.into_iter().map(CapturePattern::new).collect();
         Self {
-            shared_name: OnceCell::new(),
+            identity: None,
             isolate,
             origin,
             name,
@@ -2446,19 +2642,13 @@ impl Trigger {
         spawned_actions
             .borrow_mut()
             .push_back(RuntimeAction::RunAutomation {
-                isolate: self.isolate.clone(),
-                origin: self.origin.clone(),
-                name: self
-                    .shared_name
-                    .get_or_init(|| Arc::new(self.name.clone()))
-                    .clone(),
+                identity: self.identity().clone(),
                 script: self.script.clone(),
                 matches: captures,
                 depth,
                 is_captured: is_captured.clone(),
                 stopped,
                 fallthrough: self.fallthrough,
-                is_alias: self.is_alias,
             });
         Ok(())
     }
@@ -2497,16 +2687,13 @@ impl Trigger {
                 spawned_actions
                     .borrow_mut()
                     .push_back(RuntimeAction::RunAutomation {
-                        isolate: self.isolate.clone(),
-                        origin: self.origin.clone(),
-                        name: Arc::new(self.name.clone()),
+                        identity: self.identity().clone(),
                         script: self.script.clone(),
                         matches: CapturePayload::Owned(Arc::new(captures)),
                         depth,
                         is_captured: is_captured.clone(),
                         stopped,
                         fallthrough: self.fallthrough,
-                        is_alias: self.is_alias,
                     });
             }
             CommandOutcome::NotFired(CommandMiss::MissingRequired { .. }) => {
@@ -2525,6 +2712,14 @@ impl Trigger {
             CommandOutcome::NotFired(_) => {}
         }
         Ok(())
+    }
+
+    /// The shared identity assigned at registration. Only registered entries are matched, so
+    /// a missing identity is a bug in the registration path.
+    fn identity(&self) -> &Arc<AutomationIdentity> {
+        self.identity
+            .as_ref()
+            .expect("an automation in the registry has its identity assigned")
     }
 
     pub fn name(&self) -> &str {
@@ -4440,6 +4635,223 @@ mod tests {
                 err.to_string().contains("\"loop\""),
                 "the bail should name the alias: {err}"
             );
+        }
+    }
+
+    mod dispatch_identity {
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use super::super::{
+            ActionQueue, AutomationIdentity, FallthroughScopes, Manager, NamespaceId,
+            PushTriggerParams, ScriptAction,
+        };
+        use crate::session::runtime::RuntimeAction;
+        use crate::session::runtime::origin::{IsolateId, Origin};
+        use crate::session::styled_line::StyledLine;
+
+        fn manager() -> (Manager, ActionQueue) {
+            let queue: ActionQueue = Rc::default();
+            (
+                Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default()),
+                queue,
+            )
+        }
+
+        fn push(manager: &mut Manager, origin: Origin, name: &str, fire_limit: Option<u32>) {
+            manager
+                .push_trigger(PushTriggerParams {
+                    isolate: IsolateId::Main,
+                    origin,
+                    name: &Arc::new(name.to_string()),
+                    patterns: &Arc::new(vec!["hit".to_string()]),
+                    raw_patterns: &Arc::new(Vec::new()),
+                    anti_patterns: &Arc::new(Vec::new()),
+                    matchers: None,
+                    action: ScriptAction::Noop,
+                    prompt: false,
+                    enabled: true,
+                    priority: 0,
+                    fallthrough: true,
+                    fire_limit,
+                    line_limit: None,
+                    source: None,
+                })
+                .unwrap();
+        }
+
+        fn module() -> Origin {
+            Origin::Module {
+                subpath: "combat.ts".to_string(),
+            }
+        }
+
+        /// Match one line and return the queued fires in queue order.
+        fn fire_line(manager: &mut Manager, queue: &ActionQueue) -> Vec<RuntimeAction> {
+            manager
+                .process_incoming_line(&Arc::new(StyledLine::new("hit", Vec::new())))
+                .unwrap();
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|action| matches!(action, RuntimeAction::RunAutomation { .. }))
+                .collect()
+        }
+
+        fn identity(action: &RuntimeAction) -> Arc<AutomationIdentity> {
+            let RuntimeAction::RunAutomation { identity, .. } = action else {
+                panic!("expected a queued automation, got {action:?}");
+            };
+            identity.clone()
+        }
+
+        fn stop_flag(action: &RuntimeAction) -> Arc<std::sync::atomic::AtomicBool> {
+            let RuntimeAction::RunAutomation { stopped, .. } = action else {
+                panic!("expected a queued automation, got {action:?}");
+            };
+            stopped.clone()
+        }
+
+        fn fires(manager: &Manager, name: &str) -> u32 {
+            manager
+                .triggers
+                .iter()
+                .find(|trigger| trigger.name == name)
+                .unwrap_or_else(|| panic!("no trigger named {name}"))
+                .fires
+                .get()
+        }
+
+        /// Take the queued self-removals, so each check sees only what the last fire queued.
+        fn queued_removals(queue: &ActionQueue) -> usize {
+            queue
+                .borrow_mut()
+                .drain(..)
+                .filter(|action| matches!(action, RuntimeAction::RemoveTrigger(..)))
+                .count()
+        }
+
+        #[test]
+        fn queued_fire_charges_the_definition_that_holds_the_name_when_it_runs() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, module(), "hp", None);
+            let identity = identity(&fire_line(&mut manager, &queue)[0]);
+
+            // The first fire looks the counter up; the second reads the cached slot.
+            manager.record_fire(&identity);
+            manager.record_fire(&identity);
+            assert_eq!(fires(&manager, "hp"), 2);
+
+            // A replacement with the same key takes over the name. A fire queued by the
+            // old definition charges the replacement, as a name lookup would.
+            push(&mut manager, module(), "hp", None);
+            assert_eq!(manager.triggers.len(), 1);
+            assert_eq!(fires(&manager, "hp"), 0);
+            manager.record_fire(&identity);
+            assert_eq!(fires(&manager, "hp"), 1);
+
+            // A removed name charges nothing and does not panic on the stale slot.
+            manager.remove_trigger(&IsolateId::Main, &module(), "hp");
+            manager.record_fire(&identity);
+            assert!(manager.triggers.is_empty());
+        }
+
+        #[test]
+        fn cached_fire_slot_follows_index_shifts() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, Origin::User, "first", None);
+            push(&mut manager, Origin::User, "second", None);
+            let fires_queued = fire_line(&mut manager, &queue);
+            let second = identity(&fires_queued[1]);
+            assert_eq!(*second.name, "second");
+
+            manager.record_fire(&second);
+            assert_eq!(fires(&manager, "second"), 1);
+
+            // Removing the earlier entry shifts `second` to index 0 and bumps the
+            // generation, so the cached index 1 is discarded rather than trusted.
+            manager.remove_trigger(&IsolateId::Main, &Origin::User, "first");
+            assert_eq!(manager.triggers.len(), 1);
+            manager.record_fire(&second);
+            manager.record_fire(&second);
+            assert_eq!(fires(&manager, "second"), 3);
+        }
+
+        #[test]
+        fn fire_limit_reached_through_the_cached_slot_queues_removal() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, Origin::User, "twice", Some(2));
+            let identity = identity(&fire_line(&mut manager, &queue)[0]);
+
+            manager.record_fire(&identity);
+            assert_eq!(queued_removals(&queue), 0);
+            manager.record_fire(&identity);
+            assert_eq!(queued_removals(&queue), 1);
+        }
+
+        #[test]
+        fn every_registry_mutation_changes_the_generation() {
+            let (mut first, _queue) = manager();
+            let start = first.registry_generation;
+            push(&mut first, Origin::User, "a", None);
+            let after_add = first.registry_generation;
+            push(&mut first, Origin::User, "a", None);
+            let after_replace = first.registry_generation;
+            first.remove_trigger(&IsolateId::Main, &Origin::User, "a");
+            let after_remove = first.registry_generation;
+            assert!(start < after_add && after_add < after_replace);
+            assert!(after_replace < after_remove);
+
+            // A second manager never shares a generation with the first.
+            let (second, _queue) = manager();
+            assert!(second.registry_generation > after_remove);
+        }
+
+        #[test]
+        fn stop_scopes_are_shared_within_a_namespace_and_separate_across() {
+            let mut scopes = FallthroughScopes::new();
+            let inline = scopes.scope(NamespaceId(0));
+            assert!(Arc::ptr_eq(&inline, &scopes.scope(NamespaceId(0))));
+
+            let second = scopes.scope(NamespaceId(1));
+            let third = scopes.scope(NamespaceId(2));
+            assert!(!Arc::ptr_eq(&inline, &second));
+            assert!(!Arc::ptr_eq(&second, &third));
+            assert!(Arc::ptr_eq(&second, &scopes.scope(NamespaceId(1))));
+            assert!(Arc::ptr_eq(&third, &scopes.scope(NamespaceId(2))));
+            assert_eq!(scopes.rest.len(), 2);
+        }
+
+        #[test]
+        fn one_line_gives_each_namespace_its_own_stop_flag() {
+            let (mut manager, queue) = manager();
+            push(&mut manager, Origin::User, "user-a", None);
+            push(&mut manager, module(), "module-a", None);
+            push(&mut manager, Origin::User, "user-b", None);
+
+            let first_line = fire_line(&mut manager, &queue);
+            assert_eq!(first_line.len(), 3);
+            let by_name = |name: &str| {
+                first_line
+                    .iter()
+                    .find(|action| *identity(action).name == name)
+                    .unwrap_or_else(|| panic!("{name} did not fire"))
+            };
+            let user_a = by_name("user-a");
+            let user_b = by_name("user-b");
+            let module_a = by_name("module-a");
+
+            assert_eq!(identity(user_a).namespace, identity(user_b).namespace);
+            assert_ne!(identity(user_a).namespace, identity(module_a).namespace);
+            assert!(Arc::ptr_eq(&stop_flag(user_a), &stop_flag(user_b)));
+            assert!(!Arc::ptr_eq(&stop_flag(user_a), &stop_flag(module_a)));
+
+            // The next line gets fresh flags; a queued action keeps its own line's flag.
+            let second_line = fire_line(&mut manager, &queue);
+            assert!(!Arc::ptr_eq(
+                &stop_flag(user_a),
+                &stop_flag(&second_line[0])
+            ));
         }
     }
 

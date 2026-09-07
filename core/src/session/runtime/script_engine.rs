@@ -38,7 +38,7 @@ use crate::{
             ActionResult, IsolateId, SingletonRegistry,
             captures::CaptureView,
             line_operation::LineOperation,
-            script_engine::ops::{Capture, Fallthrough},
+            script_engine::ops::SharedCallState,
             trigger::{AliasSender, Manager, MatchCapture, SharedAutomationRegistry},
         },
         styled_line::StyledLine,
@@ -293,12 +293,23 @@ struct Isolate {
     instance: u64,
     script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>>,
     compiled_scripts: Vec<v8::Global<v8::Script>>,
+    /// The call context of this isolate, see `ops::CallState`. This is the `Rc` its
+    /// `OpState` holds. The dispatch bracket reads and writes it here directly. It does not
+    /// look it up through `OpState` on each call.
+    call_state: SharedCallState,
     /// This isolate's `DemuxWaker`, built once at insert (`EVENT-LOOP-READINESS-DEMUX.md`).
     /// `poll_event_loop` polls the isolate through a `Context` built from this, so `deno_core`
     /// registers it against the isolate's pending ops — a completion then re-enters only this
     /// isolate. `Send + Sync` itself, which is fine on an otherwise non-`Send` `Isolate`; drops
     /// with the isolate.
     waker: Waker,
+    /// The readiness seed of this isolate. A synchronous dispatch on this isolate sets it, so
+    /// the next pump polls the isolate, see [`ScriptEngine::mark_isolate_ready`]. The
+    /// thread-safe `ready` set remains the path for wakes from other threads. This flag
+    /// records the same-thread seed, which is far more frequent, without a lock or a hash.
+    /// The flag lives on the bundle. A torn-down isolate takes its seed with it, and a rebuilt
+    /// isolate starts with the flag clear. The merge in `poll_event_loop` clears the flag.
+    seeded: Cell<bool>,
 }
 
 /// The auto-load set partitioned by target isolate (`build_isolate_plan`): the main isolate's
@@ -587,6 +598,9 @@ pub struct ScriptEngine<'a> {
     /// Latest session-task waker, refreshed every pump; the per-isolate `DemuxWaker`s re-arm the
     /// session task through this slot when their isolate makes progress.
     parent: ParentSlot,
+    /// The ids that one pump drains, see `poll_event_loop`. The vector stays allocated
+    /// between pumps, so the pump after each action does not allocate.
+    ready_scratch: Vec<IsolateId>,
 }
 
 /// The shared (`Arc`) catalogue key strings for one platform event, resolved once on its
@@ -1852,6 +1866,7 @@ impl<'a> ScriptEngine<'a> {
             );
         }
         let main_waker = build_demux_waker(IsolateId::Main, &ready, &parent);
+        let main_call_state = shared_call_state(main_runtime.deno_runtime());
         isolates.insert(
             IsolateId::Main,
             Isolate {
@@ -1861,7 +1876,9 @@ impl<'a> ScriptEngine<'a> {
                 instance: main_instance,
                 script_functions: main_script_functions,
                 compiled_scripts: Vec::new(),
+                call_state: main_call_state,
                 waker: main_waker,
+                seeded: Cell::new(false),
             },
         );
         // Seed: arm `Main` on the first pump. At construction `parent` is still
@@ -2431,6 +2448,7 @@ impl<'a> ScriptEngine<'a> {
                     .lock()
                     .expect("ready-set poisoned")
                     .insert(isolate_id.clone());
+                let call_state = shared_call_state(runtime.deno_runtime());
                 isolates.insert(
                     isolate_id,
                     Isolate {
@@ -2440,7 +2458,9 @@ impl<'a> ScriptEngine<'a> {
                         instance,
                         script_functions,
                         compiled_scripts: Vec::new(),
+                        call_state,
                         waker: package_waker,
+                        seeded: Cell::new(false),
                     },
                 );
                 // Hold the concrete provider so its per-isolate notices can be drained after load.
@@ -2640,6 +2660,7 @@ impl<'a> ScriptEngine<'a> {
             audio_lifecycle_owner,
             ready,
             parent,
+            ready_scratch: Vec::new(),
         }
     }
 
@@ -2886,35 +2907,54 @@ impl<'a> ScriptEngine<'a> {
     /// surfaces the first isolate error after re-queueing the un-polled remainder. With one
     /// isolate this is equivalent to polling it directly.
     pub fn poll_event_loop(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), CoreError>> {
-        // Refresh `parent` to THIS poll's task waker first — the task identity can
-        // change across polls, and a `DemuxWaker` re-arms the task through this slot.
-        *self.parent.lock().expect("parent slot poisoned") = Some(cx.waker().clone());
+        // Set `parent` to the task waker of this poll first. The task identity can change
+        // between polls, and a `DemuxWaker` re-arms the task through this slot. In the common
+        // case the same task pumps again, and `will_wake` says so. The slot then keeps the
+        // stored waker instead of a clone and a drop on each pump.
+        {
+            let mut parent = self.parent.lock().expect("parent slot poisoned");
+            if !parent
+                .as_ref()
+                .is_some_and(|stored| stored.will_wake(cx.waker()))
+            {
+                *parent = Some(cx.waker().clone());
+            }
+        }
 
-        // Drain the ready-set BEFORE polling (lost-wake safety): a wake landing *during* a
-        // poll re-inserts its id (and re-wakes `parent`), so it survives to the next pump.
-        let todo: Vec<IsolateId> = {
+        // Drain the ready-set BEFORE polling, so no wake is lost: a wake that lands during a
+        // poll inserts its id again and wakes `parent` again, so it survives to the next
+        // pump. The drain fills one vector that all pumps reuse. The lock is released before
+        // any isolate is entered. Same-thread seeds from `mark_isolate_ready` merge in after
+        // the drain. A seed set while an isolate is polled stays set for the next pump.
+        let mut todo = std::mem::take(&mut self.ready_scratch);
+        todo.clear();
+        {
             let mut ready = self.ready.lock().expect("ready-set poisoned");
-            ready.drain().collect()
-        };
+            todo.extend(ready.drain());
+        }
+        for (id, isolate) in &self.isolates {
+            if isolate.seeded.replace(false) && !todo.contains(id) {
+                todo.push(id.clone());
+            }
+        }
 
         let mut any_ready = false;
         let mut first_err: Option<CoreError> = None;
-        for id in todo {
+        for id in &todo {
             // A queued id can be stale if its isolate was torn down after queueing; skip it.
-            let Some(isolate) = self.isolates.get_mut(&id) else {
+            let Some(isolate) = self.isolates.get_mut(id) else {
                 continue;
             };
             // Make this isolate current while its loop is pumped (Model B), then release it (RAII
             // exit). The demux changes *which* isolates are polled, never *how* — the bracket is
             // unchanged and per *polled* isolate.
-            let _entered = EnteredIsolate::enter(isolate.runtime.deno_runtime());
-            // Poll with the isolate's OWN waker (cloned — building the `Context` from
-            // `&isolate.waker` would hold that borrow across `&mut isolate.runtime`)
-            // so deno_core registers the `DemuxWaker` against its pending ops, NOT the session-task
-            // waker. That is what makes the next completion re-enter ONLY this isolate.
-            let w = isolate.waker.clone();
-            let mut isolate_cx = Context::from_waker(&w);
-            match isolate.runtime.poll_event_loop(&mut isolate_cx) {
+            let Isolate { runtime, waker, .. } = isolate;
+            let _entered = EnteredIsolate::enter(runtime.deno_runtime());
+            // Poll with the waker of this isolate, so deno_core registers the `DemuxWaker`
+            // with the pending ops and not the session-task waker. The next completion then
+            // re-enters only this isolate.
+            let mut isolate_cx = Context::from_waker(waker);
+            match runtime.poll_event_loop(&mut isolate_cx) {
                 Poll::Ready(Ok(())) => any_ready = true,
                 Poll::Ready(Err(err)) => {
                     // Poll EVERY queued isolate this pass — do NOT early-return — so a
@@ -2931,6 +2971,8 @@ impl<'a> ScriptEngine<'a> {
                 Poll::Pending => {}
             }
         }
+        todo.clear();
+        self.ready_scratch = todo;
 
         // Surface the first error (the run loop's `Ready(Err)` arm in `runtime.rs` warns/echoes and
         // keeps the session alive); else report progress so the caller drains again,
@@ -2945,18 +2987,18 @@ impl<'a> ScriptEngine<'a> {
         }
     }
 
-    /// Seed `id` into the demux ready-set so the next `poll_event_loop` polls it. Called when
-    /// synchronous JS runs on an isolate (alias/trigger/hotkey dispatch), because that JS can
-    /// schedule async work (timers, promise continuations) WITHOUT a pump to arm the isolate's own
-    /// waker — so the demux must be told to poll it, or the work is stranded (purely trusting the
-    /// demux for the dispatch isolate is unsafe).
-    /// No parent-wake: dispatch runs on the session thread with the run loop active, so the next
-    /// Phase 1 pump drains this seed before parking.
+    /// Seed `id`, so the next `poll_event_loop` polls it. Dispatch calls this when synchronous
+    /// JS runs on an isolate, for an alias, a trigger, or a hotkey. That JS can schedule async
+    /// work, such as a timer or a promise continuation, without a pump that arms the waker
+    /// of the isolate. The demux must poll the isolate, or the work is stranded. The seed is
+    /// the flag on the bundle, `Isolate::seeded`, and not the thread-safe ready-set. Dispatch
+    /// runs on the session thread, so it needs no lock, no hash, and no parent wake: the run
+    /// loop is active, and its next Phase 1 pump merges the seed before it parks. An unknown
+    /// id does nothing, like a stale id in the ready-set.
     fn mark_isolate_ready(&self, id: &IsolateId) {
-        self.ready
-            .lock()
-            .expect("ready-set poisoned")
-            .insert(id.clone());
+        if let Some(isolate) = self.isolates.get(id) {
+            isolate.seeded.set(true);
+        }
     }
 
     /// Mutable access to one isolate's bundle. Errors if the id isn't present, which is a
@@ -2966,6 +3008,57 @@ impl<'a> ScriptEngine<'a> {
         self.isolates
             .get_mut(isolate)
             .ok_or_else(|| anyhow!("Isolate {isolate:?} not found"))
+    }
+
+    /// Deliver one function or script automation for a `RunAutomation` dispatch. This is the
+    /// fallthrough and capture bracket around the call. It resolves the target isolate once.
+    /// The fallthrough slot holds the declared default while the handler runs. The bracket
+    /// clears the slot afterwards, so a later async call throws. The capture flag starts as
+    /// `true`, and a handler opts out with `capture(false)`. An unknown isolate is a routing
+    /// bug and never a live action. It reports the error like a failed call and leaves the
+    /// stop state of the line unchanged.
+    pub fn run_automation(
+        &mut self,
+        trigger_manager: &Manager,
+        isolate: &IsolateId,
+        call: AutomationCall,
+        matches: CaptureView<'_>,
+        depth: u32,
+        sender: Option<AliasSender>,
+        fallthrough: bool,
+    ) -> AutomationOutcome {
+        debug_assert!(
+            self.isolates.contains_key(isolate),
+            "run_automation on unknown isolate {isolate:?}"
+        );
+        let bundle = match self.isolate_mut(isolate) {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                return AutomationOutcome {
+                    result: ActionResult::Echo(call.error_echo(&err)),
+                    captured: false,
+                    continue_matching: true,
+                };
+            }
+        };
+        // Demux seed, see `call_javascript_function` and `mark_isolate_ready`.
+        bundle.seeded.set(true);
+        bundle.call_state.fallthrough.set(Some(fallthrough));
+        bundle.call_state.captured.set(true);
+        let result = match call {
+            AutomationCall::Function(id) => {
+                call_function_in(bundle, trigger_manager, id, matches, depth, sender)
+            }
+            AutomationCall::Script(id) => {
+                run_script_in(bundle, trigger_manager, id, matches, depth, sender)
+            }
+        }
+        .unwrap_or_else(|err| ActionResult::Echo(call.error_echo(&err)));
+        AutomationOutcome {
+            result,
+            captured: bundle.call_state.captured.get(),
+            continue_matching: bundle.call_state.fallthrough.take().unwrap_or(true),
+        }
     }
 
     #[inline]
@@ -2978,10 +3071,6 @@ impl<'a> ScriptEngine<'a> {
         depth: u32,
         sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
-        // Per-line timing is TRACE-only; skip the clock entirely above TRACE so the
-        // hot path pays just a level check (compiled out when TRACE is statically off).
-        let started = log_enabled!(log::Level::Trace).then(Instant::now);
-
         // Demux: this isolate is about to run JS synchronously. Async work it schedules without a
         // `poll_event_loop` pass must still be serviced — a microtask (`Promise.then`) in
         // particular does NOT wake the runtime on its own (unlike a `setTimeout`, whose timer op
@@ -2989,99 +3078,8 @@ impl<'a> ScriptEngine<'a> {
         // pump polls it and runs/arms that work (proven by the `demux_async_dispatch`
         // integration test, which strands the continuation if this seed is removed).
         self.mark_isolate_ready(isolate);
-
         let bundle = self.isolate_mut(isolate)?;
-        // Clone the `v8::Global` out and drop the registry `Ref` *before* the v8 call.
-        // `script_functions` is the same `Rc<RefCell<…>>` this isolate's create ops
-        // (`op_smudgy_create_javascript_function_*`) `borrow_mut` to register new
-        // functions, so holding the `Ref` across `f.call(…)` would panic if the called
-        // handler synchronously registers another automation (a `createAlias`/
-        // `createTrigger` whose action is a function — a normal scripting pattern).
-        // Cloning a `Global` is just a handle ref-count bump; it also releases the
-        // `&mut bundle` borrow so `bundle.runtime` can be taken below.
-        let f = {
-            let script_functions = bundle.script_functions.borrow();
-            match script_functions.get(usize::from(function_id)) {
-                Some(f) => f.clone(),
-                None => bail!("Function {} not found", function_id),
-            }
-        };
-
-        let deno = bundle.runtime.deno_runtime();
-        // Record this delivery's depth so an `emit` (or store `set`) from inside the handler
-        // queues its subscribers/watchers one level deeper, terminating cycles at the cap
-        // (`PACKAGE-EVENTS.md`). `EventDepth` is per-isolate `OpState` shared by everything that
-        // later runs in this isolate, so it is SAVED and RESTORED around the call: leaving this
-        // handler's depth behind would make async continuations (timers, resolved promises) and
-        // the next dispatch on this isolate journal store writes at the wrong depth, ratcheting
-        // watch deliveries to the cap with no real recursion. The `Rc` is cloned so it outlives
-        // the v8 borrows of `deno` below.
-        let op_state = deno.op_state();
-        let prior_depth = op_state
-            .borrow()
-            .try_borrow::<ops::EventDepth>()
-            .map_or(0, |d| d.0);
-        op_state.borrow_mut().put(ops::EventDepth(depth));
-        // The alias identity rides beside the depth (same save/restore bracket): a `send()`
-        // issued inside this handler stamps both onto its queued action, so the sent text is
-        // excluded from re-matching the sending alias.
-        let prior_sender = op_state
-            .borrow()
-            .try_borrow::<ops::AliasContext>()
-            .and_then(|context| context.0.clone());
-        op_state.borrow_mut().put(ops::AliasContext(sender.clone()));
-        // Make the owning isolate current for this call (it usually isn't — Model B leaves the
-        // enter-stack empty between ops); released after the scope on the way out.
-        let _entered = EnteredIsolate::enter(deno);
-        let context = deno.main_context();
-        let isolate = deno.v8_isolate();
-        v8::scope_with_context!(let scope, isolate, context);
-
-        let result = {
-            v8::tc_scope!(let try_catch, scope);
-
-            let matches_object = materialize_matches(try_catch, matches, &mut bundle.matches_keys);
-
-            let f = v8::Local::new(try_catch, &f);
-            let f_this = v8::undefined(try_catch).into();
-
-            let result = f.call(try_catch, f_this, &[matches_object.into()]);
-
-            if try_catch.has_caught() {
-                let ex = try_catch.exception().unwrap();
-                let exc = ex.to_string(try_catch).unwrap();
-                let exc = exc.to_rust_string_lossy(try_catch);
-                Ok(ActionResult::Echo(exc))
-            } else if let Some(value) = result {
-                if value.is_string() {
-                    let output = value.to_rust_string_lossy(try_catch);
-                    trigger_manager.process_nested_outgoing_line(
-                        output.as_str(),
-                        depth + 1,
-                        sender.as_ref(),
-                    )?;
-                    Ok(ActionResult::None)
-                } else {
-                    Ok(ActionResult::None)
-                }
-            } else {
-                Ok(ActionResult::None)
-            }
-        };
-
-        // Restore the enclosing depth (0 at the outermost dispatch) now the handler has returned.
-        op_state.borrow_mut().put(ops::EventDepth(prior_depth));
-        op_state.borrow_mut().put(ops::AliasContext(prior_sender));
-
-        if let Some(started) = started {
-            trace!(
-                "Script execution on {} took {:?}",
-                matches.get(0).map_or("unknown", |c| c.value),
-                started.elapsed()
-            );
-        }
-
-        result
+        call_function_in(bundle, trigger_manager, function_id, matches, depth, sender)
     }
 
     pub fn execute_javascript_function(
@@ -3113,13 +3111,13 @@ impl<'a> ScriptEngine<'a> {
         // Demux: a widget/hotkey callback can schedule async work synchronously; seed the target
         // isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
-        let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
-        // A widget/hotkey callback is a top-level dispatch (depth 0); stamp it so a store `set`
-        // inside the callback journals at depth 0 rather than inheriting a stale `EventDepth`
-        // from an earlier handler on this isolate. No restore needed — 0 is the between-dispatch
-        // baseline the save/restore in the other dispatch paths returns to.
-        deno.op_state().borrow_mut().put(ops::EventDepth(0));
-        deno.op_state().borrow_mut().put(ops::AliasContext(None));
+        let bundle = self.isolate_mut(isolate_id)?;
+        // A widget or hotkey callback is a top-level dispatch at depth 0. Set that state, so a
+        // store `set` inside the callback journals at depth 0 and does not inherit a stale
+        // depth from an earlier handler on this isolate. No restore is needed: depth 0 is the
+        // state between dispatches, which the other dispatch paths restore.
+        bundle.call_state.enter_top_level();
+        let deno = bundle.runtime.deno_runtime();
         // Make the target isolate current for this callback (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
@@ -3188,7 +3186,8 @@ impl<'a> ScriptEngine<'a> {
         // Demux: a link callback can schedule async work synchronously; seed the
         // target isolate so the next pump arms it.
         self.mark_isolate_ready(isolate_id);
-        let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
+        let bundle = self.isolate_mut(isolate_id)?;
+        let deno = bundle.runtime.deno_runtime();
         let function = {
             let op_state = deno.op_state();
             let op_state = op_state.borrow();
@@ -3200,8 +3199,7 @@ impl<'a> ScriptEngine<'a> {
             return Ok(ActionResult::None);
         };
         // Top-level dispatch (depth 0), like a widget callback.
-        deno.op_state().borrow_mut().put(ops::EventDepth(0));
-        deno.op_state().borrow_mut().put(ops::AliasContext(None));
+        bundle.call_state.enter_top_level();
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
@@ -3252,7 +3250,8 @@ impl<'a> ScriptEngine<'a> {
             return Ok(ActionResult::None);
         }
         self.mark_isolate_ready(isolate_id);
-        let deno = self.isolate_mut(isolate_id)?.runtime.deno_runtime();
+        let bundle = self.isolate_mut(isolate_id)?;
+        let deno = bundle.runtime.deno_runtime();
         let function = {
             let op_state = deno.op_state();
             let op_state = op_state.borrow();
@@ -3272,8 +3271,7 @@ impl<'a> ScriptEngine<'a> {
                 .clone()
         };
         let request_id = pending.borrow_mut().insert(state);
-        deno.op_state().borrow_mut().put(ops::EventDepth(0));
-        deno.op_state().borrow_mut().put(ops::AliasContext(None));
+        bundle.call_state.enter_top_level();
         let _entered = EnteredIsolate::enter(deno);
         let context = deno.main_context();
         let isolate = deno.v8_isolate();
@@ -3349,97 +3347,11 @@ impl<'a> ScriptEngine<'a> {
         depth: u32,
         sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
-        // Per-line timing is TRACE-only; skip the clock entirely above TRACE so the
-        // hot path pays just a level check (compiled out when TRACE is statically off).
-        let started = log_enabled!(log::Level::Trace).then(Instant::now);
-
         // Demux: see `call_javascript_function` — string-script dispatch can also schedule async
         // work synchronously, so seed this isolate for the next pump.
         self.mark_isolate_ready(isolate);
-
         let bundle = self.isolate_mut(isolate)?;
-        // Get the script before creating the mutable scope to avoid borrowing conflicts
-        let script = bundle
-            .compiled_scripts
-            .get(usize::from(script_id))
-            .ok_or_else(|| anyhow::anyhow!("Script {} not found", script_id))?
-            .clone();
-
-        let deno = bundle.runtime.deno_runtime();
-        // Stamp this eval's dispatch depth (save/restore like `call_javascript_function`): an
-        // inline trigger/alias script's store `set` must journal at its own depth, not the stale
-        // `EventDepth` a previous function dispatch left in this isolate's `OpState`. Without this
-        // an ordinary trigger-driven write loop would ratchet watch deliveries to the cap with no
-        // real recursion, and a genuinely nested eval would write at a stale (often 0) depth,
-        // defeating the cap it should inherit.
-        let op_state = deno.op_state();
-        let prior_depth = op_state
-            .borrow()
-            .try_borrow::<ops::EventDepth>()
-            .map_or(0, |d| d.0);
-        op_state.borrow_mut().put(ops::EventDepth(depth));
-        // Alias identity beside the depth, same save/restore bracket as
-        // `call_javascript_function` (see the comment there).
-        let prior_sender = op_state
-            .borrow()
-            .try_borrow::<ops::AliasContext>()
-            .and_then(|context| context.0.clone());
-        op_state.borrow_mut().put(ops::AliasContext(sender.clone()));
-        // Make the owning isolate current for this eval (Model B), released after the scope.
-        let _entered = EnteredIsolate::enter(deno);
-        let context = deno.main_context();
-        let isolate = deno.v8_isolate();
-        v8::scope_with_context!(let scope, isolate, context);
-        let result = {
-            v8::tc_scope!(let try_catch, scope);
-
-            let matches_object = materialize_matches(try_catch, matches, &mut bundle.matches_keys);
-
-            let matches_name = bundle.matches_keys.script_name(try_catch);
-
-            try_catch.get_current_context().global(try_catch).set(
-                try_catch,
-                matches_name.into(),
-                matches_object.into(),
-            );
-
-            let result = v8::Local::new(try_catch, script).run(try_catch);
-
-            if try_catch.has_caught() {
-                let ex = try_catch.exception().unwrap();
-                let exc = ex.to_string(try_catch).unwrap();
-                let exc = exc.to_rust_string_lossy(try_catch);
-                Ok(ActionResult::Echo(exc))
-            } else if let Some(value) = result {
-                if value.is_string() {
-                    let output = value.to_rust_string_lossy(try_catch);
-                    trigger_manager.process_nested_outgoing_line(
-                        output.as_str(),
-                        depth + 1,
-                        sender.as_ref(),
-                    )?;
-
-                    Ok(ActionResult::None)
-                } else {
-                    Ok(ActionResult::None)
-                }
-            } else {
-                Ok(ActionResult::None)
-            }
-        };
-
-        // Restore the enclosing depth now the eval has returned (see the save above).
-        op_state.borrow_mut().put(ops::EventDepth(prior_depth));
-        op_state.borrow_mut().put(ops::AliasContext(prior_sender));
-
-        if let Some(started) = started {
-            trace!(
-                "Script execution on {} took {:?}",
-                matches.get(0).map_or("unknown", |c| c.value),
-                started.elapsed()
-            );
-        }
-        result
+        run_script_in(bundle, trigger_manager, script_id, matches, depth, sender)
     }
 
     pub fn add_script(&mut self, isolate: &IsolateId, source: &str) -> Result<ScriptId> {
@@ -3460,22 +3372,18 @@ impl<'a> ScriptEngine<'a> {
     }
 
     pub fn set_is_captured(&mut self, isolate: &IsolateId, value: bool) {
-        // `Capture` is per-isolate `OpState`: `op_smudgy_capture` writes the *calling*
-        // isolate's flag, so the get/set bracket in dispatch must target the isolate that
-        // ran the script. A missing isolate never happens for a live action (the only ids
-        // that reach here came from a constructed isolate); the `debug_assert` makes a
-        // future routing/lifecycle bug fail loud in tests instead of silently no-op'ing.
+        // The capture flag is call state of one isolate. `op_smudgy_capture` writes the flag
+        // of the calling isolate, so the get and set bracket in dispatch must target the
+        // isolate that ran the script. A live action never names a missing isolate: the only
+        // ids that reach here come from a constructed isolate. The `debug_assert` makes a
+        // routing or lifecycle bug fail loudly in tests instead of doing nothing.
         debug_assert!(
             self.isolates.contains_key(isolate),
             "set_is_captured on unknown isolate {isolate:?}"
         );
-        let Ok(bundle) = self.isolate_mut(isolate) else {
-            return;
-        };
-        let state = bundle.runtime.deno_runtime().op_state();
-        let mut guard = state.borrow_mut();
-        let captured = guard.borrow_mut::<Capture>();
-        captured.0 = value;
+        if let Ok(bundle) = self.isolate_mut(isolate) {
+            bundle.call_state.captured.set(value);
+        }
     }
 
     pub fn get_is_captured(&mut self, isolate: &IsolateId) -> bool {
@@ -3485,45 +3393,242 @@ impl<'a> ScriptEngine<'a> {
             self.isolates.contains_key(isolate),
             "get_is_captured on unknown isolate {isolate:?}"
         );
-        let Ok(bundle) = self.isolate_mut(isolate) else {
-            return false;
-        };
-        let state = bundle.runtime.deno_runtime().op_state();
-        let guard = state.borrow();
-        let captured = guard.borrow::<Capture>();
-        captured.0
+        self.isolate_mut(isolate)
+            .is_ok_and(|bundle| bundle.call_state.captured.get())
     }
+}
 
-    /// Enter a synchronous alias/trigger function handler with its declarative default.
-    pub fn begin_fallthrough(&mut self, isolate: &IsolateId, value: bool) {
-        debug_assert!(
-            self.isolates.contains_key(isolate),
-            "begin_fallthrough on unknown isolate {isolate:?}"
-        );
-        let Ok(bundle) = self.isolate_mut(isolate) else {
-            return;
-        };
-        let state = bundle.runtime.deno_runtime().op_state();
-        state.borrow_mut().borrow_mut::<Fallthrough>().0 = Some(value);
+/// The registry entry that a `RunAutomation` delivery runs, see
+/// [`ScriptEngine::run_automation`].
+#[derive(Clone, Copy, Debug)]
+pub enum AutomationCall {
+    Function(FunctionId),
+    Script(ScriptId),
+}
+
+impl AutomationCall {
+    /// The text to echo for a delivery that failed before or during the call. Each delivery
+    /// kind has its own wording.
+    fn error_echo(self, err: &anyhow::Error) -> String {
+        match self {
+            Self::Function(_) => format!("Error in Javascript Function: {err:?}"),
+            Self::Script(_) => format!("JavaScript Error: {err:?}"),
+        }
     }
+}
 
-    /// Leave the current function handler and return its final fallthrough decision. Clearing the
-    /// slot is what makes calls from top-level or later async continuations throw.
-    pub fn end_fallthrough(&mut self, isolate: &IsolateId) -> bool {
-        debug_assert!(
-            self.isolates.contains_key(isolate),
-            "end_fallthrough on unknown isolate {isolate:?}"
-        );
-        let Ok(bundle) = self.isolate_mut(isolate) else {
-            return true;
+/// The result of one automation delivery, see [`ScriptEngine::run_automation`].
+pub struct AutomationOutcome {
+    pub result: ActionResult,
+    /// The capture flag when the handler returned. It is `true` unless the handler called
+    /// `capture(false)`.
+    pub captured: bool,
+    /// The handler's final fallthrough decision.
+    pub continue_matching: bool,
+}
+
+/// Get the [`ops::CallState`] handle that the `OpState` of an isolate was built with, so the
+/// bundle can share it, see [`Isolate::call_state`].
+fn shared_call_state(runtime: &mut deno_core::JsRuntime) -> SharedCallState {
+    runtime
+        .op_state()
+        .borrow()
+        .borrow::<SharedCallState>()
+        .clone()
+}
+
+/// The result of one synchronous handler call. It leaves the v8 scopes before any follow-up
+/// work, such as a nested send, so the call state is restored first.
+enum CallOutcome {
+    /// The handler threw. The text of the exception is echoed.
+    Threw(String),
+    /// The handler returned a string. The string is sent as a nested command line.
+    Returned(String),
+    /// Completed with nothing to send.
+    Done,
+    /// No function or script is registered at the requested id.
+    Missing,
+}
+
+/// Call `function_id` of `bundle` with a fresh `matches` object. This is
+/// `call_javascript_function` with the isolate already resolved. The function becomes a
+/// `Local` from the registry entry, rooted by the handle scope of this call. No call creates
+/// or releases a persistent handle. The registry borrow ends before user JS can run, because
+/// a handler that registers another automation borrows that same registry mutably.
+///
+/// The call sets the delivery depth and the alias identity in the call state of the isolate.
+/// It restores them after the call and before the send of a returned string, which runs no
+/// JS. An exception or a nested send therefore never leaves the context of this handler
+/// behind.
+fn call_function_in(
+    bundle: &mut Isolate,
+    trigger_manager: &Manager,
+    function_id: FunctionId,
+    matches: CaptureView<'_>,
+    depth: u32,
+    sender: Option<AliasSender>,
+) -> Result<ActionResult> {
+    // Per-line timing is TRACE only. Above TRACE the hot path pays one level check and does
+    // not read the clock. The check compiles out when TRACE is statically off.
+    let started = log_enabled!(log::Level::Trace).then(Instant::now);
+    let Isolate {
+        matches_keys,
+        runtime,
+        script_functions,
+        call_state,
+        ..
+    } = bundle;
+    let deno = runtime.deno_runtime();
+    // Make the owning isolate current for this call. It usually is not current, because
+    // Model B leaves the enter stack empty between ops. The guard releases it after the scope.
+    let _entered = EnteredIsolate::enter(deno);
+    let context = deno.main_context();
+    let isolate = deno.v8_isolate();
+    v8::scope_with_context!(let scope, isolate, context);
+
+    let prior_depth = call_state.depth.replace(depth);
+    let prior_sender = call_state.alias.replace(sender);
+    let outcome = {
+        v8::tc_scope!(let try_catch, scope);
+        let f = {
+            let script_functions = script_functions.borrow();
+            script_functions
+                .get(usize::from(function_id))
+                .map(|f| v8::Local::new(try_catch, f))
         };
-        let state = bundle.runtime.deno_runtime().op_state();
-        state
-            .borrow_mut()
-            .borrow_mut::<Fallthrough>()
-            .0
-            .take()
-            .unwrap_or(true)
+        match f {
+            Some(f) => {
+                let matches_object = materialize_matches(try_catch, matches, matches_keys);
+                let f_this = v8::undefined(try_catch).into();
+                let result = f.call(try_catch, f_this, &[matches_object.into()]);
+                call_outcome(try_catch, result)
+            }
+            None => CallOutcome::Missing,
+        }
+    };
+    // The handler has returned. Restore the enclosing depth, which is 0 at the outermost
+    // dispatch.
+    call_state.depth.set(prior_depth);
+    let sender = call_state.alias.replace(prior_sender);
+
+    if let Some(started) = started {
+        trace!(
+            "Script execution on {} took {:?}",
+            matches.get(0).map_or("unknown", |c| c.value),
+            started.elapsed()
+        );
+    }
+    match outcome {
+        CallOutcome::Missing => bail!("Function {} not found", function_id),
+        outcome => finish_call(outcome, trigger_manager, depth, sender.as_ref()),
+    }
+}
+
+/// Run the compiled classic script `script_id` of `bundle` with a fresh global `matches`
+/// object. This is `run_script` with the isolate already resolved. It uses the same call-state
+/// bracket and handle rules as [`call_function_in`]. The script handle is borrowed from the
+/// registry of the bundle for the lifetime of the scope.
+fn run_script_in(
+    bundle: &mut Isolate,
+    trigger_manager: &Manager,
+    script_id: ScriptId,
+    matches: CaptureView<'_>,
+    depth: u32,
+    sender: Option<AliasSender>,
+) -> Result<ActionResult> {
+    let started = log_enabled!(log::Level::Trace).then(Instant::now);
+    let Isolate {
+        matches_keys,
+        runtime,
+        compiled_scripts,
+        call_state,
+        ..
+    } = bundle;
+    let deno = runtime.deno_runtime();
+    // Make the owning isolate current for this eval, see Model B. The guard releases it after
+    // the scope.
+    let _entered = EnteredIsolate::enter(deno);
+    let context = deno.main_context();
+    let isolate = deno.v8_isolate();
+    v8::scope_with_context!(let scope, isolate, context);
+
+    // Set the dispatch depth of this eval. A store `set` in an inline trigger or alias script
+    // must journal at its own depth and not at a stale depth from an earlier function
+    // dispatch on this isolate. Without this, an ordinary trigger-driven write loop would
+    // push watch deliveries to the cap with no real recursion, and a nested eval would write
+    // at a stale depth, often 0, and escape the cap it must inherit.
+    let prior_depth = call_state.depth.replace(depth);
+    let prior_sender = call_state.alias.replace(sender);
+    let outcome = {
+        v8::tc_scope!(let try_catch, scope);
+        match compiled_scripts.get(usize::from(script_id)) {
+            Some(script) => {
+                let script = v8::Local::new(try_catch, script);
+                let matches_object = materialize_matches(try_catch, matches, matches_keys);
+                let matches_name = matches_keys.script_name(try_catch);
+                try_catch.get_current_context().global(try_catch).set(
+                    try_catch,
+                    matches_name.into(),
+                    matches_object.into(),
+                );
+                let result = script.run(try_catch);
+                call_outcome(try_catch, result)
+            }
+            None => CallOutcome::Missing,
+        }
+    };
+    // The eval has returned. Restore the enclosing depth that the call saved above.
+    call_state.depth.set(prior_depth);
+    let sender = call_state.alias.replace(prior_sender);
+
+    if let Some(started) = started {
+        trace!(
+            "Script execution on {} took {:?}",
+            matches.get(0).map_or("unknown", |c| c.value),
+            started.elapsed()
+        );
+    }
+    match outcome {
+        CallOutcome::Missing => bail!("Script {} not found", script_id),
+        outcome => finish_call(outcome, trigger_manager, depth, sender.as_ref()),
+    }
+}
+
+/// Classify a completed call while its `TryCatch` scope is open: an exception as text, a
+/// string completion value, or nothing to send.
+fn call_outcome(
+    try_catch: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    result: Option<v8::Local<v8::Value>>,
+) -> CallOutcome {
+    if try_catch.has_caught() {
+        let ex = try_catch.exception().unwrap();
+        let exc = ex.to_string(try_catch).unwrap();
+        CallOutcome::Threw(exc.to_rust_string_lossy(try_catch))
+    } else {
+        match result {
+            Some(value) if value.is_string() => {
+                CallOutcome::Returned(value.to_rust_string_lossy(try_catch))
+            }
+            _ => CallOutcome::Done,
+        }
+    }
+}
+
+/// Turn the outcome of a call into its `ActionResult`. An exception is echoed. A returned
+/// string is expanded as a nested outgoing line one level deeper, attributed to `sender`.
+fn finish_call(
+    outcome: CallOutcome,
+    trigger_manager: &Manager,
+    depth: u32,
+    sender: Option<&AliasSender>,
+) -> Result<ActionResult> {
+    match outcome {
+        CallOutcome::Threw(exc) => Ok(ActionResult::Echo(exc)),
+        CallOutcome::Returned(output) => {
+            trigger_manager.process_nested_outgoing_line(output.as_str(), depth + 1, sender)?;
+            Ok(ActionResult::None)
+        }
+        CallOutcome::Done | CallOutcome::Missing => Ok(ActionResult::None),
     }
 }
 
