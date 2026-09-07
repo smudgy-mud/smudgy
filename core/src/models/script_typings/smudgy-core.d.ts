@@ -889,6 +889,25 @@ declare module "smudgy:core" {
    *  code; `"plaintext"` (the default) sends it as a literal command template. */
   export type ScriptLang = "plaintext" | "js" | "ts";
 
+  /** One session-store root a saved automation reads (the editor's "What it
+   *  reads"): a platform producer (`gmcp`, `msdp`, `mssp`) or a state handle
+   *  inside `user` or a package, plus the paths beneath it. Each becomes a name
+   *  the body can use: `$name.path` in a Send text body, `name.path` in
+   *  JavaScript. Preserved verbatim across a get/save round trip; the editor is
+   *  the authoring path. */
+  export interface SavedStateExposure {
+    /** `user`, `gmcp`, `msdp`, `mssp`, or `smudgy://owner/name`. */
+    producer: string;
+    /** The state handle's name; required for `user` and package producers,
+     *  absent for platform producers. */
+    handle?: string;
+    /** The name the body uses, when it differs from the handle (or producer)
+     *  name. */
+    as?: string;
+    /** Store paths relative to the root; `""` is the root itself. */
+    paths: string[];
+  }
+
   /** A saved alias, as stored in `aliases.json` and shown in the automations
    *  window. */
   export interface SavedAlias {
@@ -914,6 +933,8 @@ declare module "smudgy:core" {
      *  or Simple pattern). Preserved verbatim across a get/save round trip —
      *  the editor authors it; carry it, don't build it. */
     matcher?: unknown;
+    /** The session-store values the alias reads; see `SavedStateExposure`. */
+    state?: SavedStateExposure[];
   }
 
   /** A saved trigger, as stored in `triggers.json` and shown in the
@@ -938,6 +959,8 @@ declare module "smudgy:core" {
     /** Defaults to `"plaintext"`. */
     language?: ScriptLang;
     package?: string;
+    /** The session-store values the trigger reads; see `SavedStateExposure`. */
+    state?: SavedStateExposure[];
   }
 
   /** A saved hotkey, as stored in `hotkeys.json` and shown in the automations
@@ -953,6 +976,8 @@ declare module "smudgy:core" {
     /** Defaults to `"plaintext"`. */
     language?: ScriptLang;
     package?: string;
+    /** The session-store values the hotkey reads; see `SavedStateExposure`. */
+    state?: SavedStateExposure[];
   }
 
   /**

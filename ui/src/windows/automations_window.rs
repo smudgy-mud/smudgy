@@ -61,6 +61,7 @@ mod palette;
 mod param_values;
 mod sharing_status;
 mod sidebar;
+mod state_values;
 mod store_inspector;
 mod topbar;
 
@@ -476,6 +477,60 @@ pub enum Message {
     TogglePrompt,
     RevealOrder,
     HideOrder,
+    /// Open/close the "What it reads" disclosure.
+    RevealState,
+    HideState,
+    /// The state browser's filter text.
+    SetStateFilter(String),
+    /// Flip one state-browser node between expanded and collapsed (keyed producer + path).
+    ToggleStateNode(String),
+    /// The browser's trailing toggle: expose `path` under the root, or stop exposing it.
+    ToggleStateExposure {
+        producer: String,
+        handle: Option<String>,
+        path: String,
+    },
+    /// The Add-a-path row's Enter: expose `path` under the root once it parses.
+    AddStatePath {
+        producer: String,
+        handle: Option<String>,
+        path: String,
+    },
+    /// The Exposed list's remove link.
+    RemoveStateExposure {
+        producer: String,
+        handle: Option<String>,
+        path: String,
+    },
+    /// Open a root's "Use a different name" field.
+    RevealStateName {
+        producer: String,
+        handle: Option<String>,
+    },
+    /// An edit in a root's name field (blank means the default name).
+    SetStateName {
+        producer: String,
+        handle: Option<String>,
+        name: String,
+    },
+    /// Open/close the Add-a-path row's producer picker.
+    OpenStateProducerPicker,
+    CloseStateProducerPicker,
+    /// Move the producer picker's keyboard cursor by a delta.
+    MoveStateProducerCursor(i32),
+    SetStateProducer(String),
+    /// Edits in the Add-a-path row's handle and path fields.
+    SetStateHandleDraft(String),
+    SetStatePathDraft(String),
+    /// Reveal the Add-a-path row (the advanced path) under the browser.
+    RevealStateAdd,
+    /// Open/close the Add-a-path row's handle picker.
+    OpenStateHandlePicker,
+    CloseStateHandlePicker,
+    /// Move the handle picker's keyboard cursor by a delta.
+    MoveStateHandleCursor(i32),
+    /// Pick a handle from the picker.
+    SetStateHandle(String),
     /// Insert a capture reference at the caret in the action body.
     InsertReference(String),
     /// Move the open script to a folder (`None` = top level). Also dispatched by
@@ -1032,6 +1087,11 @@ pub struct AutomationsWindow {
     language_project_target_context: Option<code_editor::LanguageProjectContext>,
     /// Exact in-flight graph refresh. Only its acknowledgement commits the installed context.
     pending_language_project_refresh: Option<code_editor::PendingLanguageProjectRefresh>,
+    /// The inline bridge text the newest acknowledged project refresh installed; `None` while
+    /// that project is not the inline one. The bridge is generated per automation from the open
+    /// state draft, so a draft whose bridge reads differently from the installed or in-flight
+    /// one needs another refresh (`refresh_inline_bridge`).
+    inline_bridge: Option<String>,
     /// Stable identities for saved module/package sources during this window lifetime.
     language_source_ids:
         HashMap<code_editor::LanguageSourceKey, smudgy_script::language_service::DocumentId>,
@@ -1073,6 +1133,19 @@ pub struct AutomationsWindow {
     /// Non-default values force it open regardless (and it cannot re-hide
     /// while they hold); reset when an editor opens.
     pub(super) order_revealed: bool,
+    /// The open editor's state exposures as drafted: the definition's `state` list plus each
+    /// root's rename-field visibility. Seeded when an editor opens, consumed at save.
+    pub(super) state_exposures: Vec<state_values::StateExposureDraft>,
+    /// Whether the "What it reads" module is disclosed by the user's click. Any exposure
+    /// forces it open regardless (and it cannot re-hide while one exists); reset when an
+    /// editor opens.
+    pub(super) state_revealed: bool,
+    /// The state browser's filter text.
+    pub(super) state_filter: String,
+    /// State-browser nodes whose expansion the user flipped, keyed like `store_toggled`.
+    pub(super) state_toggled: HashSet<String>,
+    /// The Add-a-path row's drafts (producer, handle, path, picker state).
+    pub(super) state_add: state_values::StateAddDraft,
     /// Whether the Try-it accordion is expanded; collapsed when an editor opens.
     pub(super) try_it_open: bool,
     /// Whether the Parsing picker's floating list is open.
@@ -1411,6 +1484,7 @@ impl AutomationsWindow {
             language_project_context: None,
             language_project_target_context: None,
             pending_language_project_refresh: None,
+            inline_bridge: None,
             language_source_ids: HashMap::new(),
             code_editor_mount_generation: 0,
             next_language_graph_generation: 2,
@@ -1428,6 +1502,11 @@ impl AutomationsWindow {
             hotkey_state: Vec::new(),
             alias_draft: model::AliasMatcherDraft::default(),
             order_revealed: false,
+            state_exposures: Vec::new(),
+            state_revealed: false,
+            state_filter: String::new(),
+            state_toggled: HashSet::new(),
+            state_add: state_values::StateAddDraft::default(),
             try_it_open: false,
             parsing_open: false,
             parsing_cursor: 0,
@@ -1647,10 +1726,11 @@ impl AutomationsWindow {
                 })
                 .map(Message::AutomationEvent),
             );
-            // The catalogue broadcast is subscribed only while the store pane is showing: the
-            // runtime builds snapshots only while receivers exist, so a closed pane costs it
-            // nothing, and re-opening gets a fresh snapshot (the new-subscriber resync).
-            if matches!(self.pane, Pane::StoreInspector) {
+            // The catalogue broadcast is subscribed only while a pane shows it (the store
+            // pane, or an editor with its "What it reads" disclosure open): the runtime builds
+            // snapshots only while receivers exist, so a closed pane costs it nothing, and
+            // re-opening gets a fresh snapshot (the new-subscriber resync).
+            if self.catalogue_subscribed() {
                 subscriptions.push(
                     Subscription::run_with(self.session_id, |session_id| {
                         catalogue_stream(*session_id)
@@ -2020,13 +2100,131 @@ impl AutomationsWindow {
                 self.order_revealed = false;
                 Update::none()
             }
+            Message::RevealState => {
+                self.state_revealed = true;
+                Update::none()
+            }
+            Message::HideState => {
+                self.state_revealed = false;
+                Update::none()
+            }
+            Message::SetStateFilter(filter) => {
+                self.state_filter = filter;
+                Update::none()
+            }
+            Message::ToggleStateNode(key) => {
+                if !self.state_toggled.remove(&key) {
+                    self.state_toggled.insert(key);
+                }
+                Update::none()
+            }
+            Message::ToggleStateExposure {
+                producer,
+                handle,
+                path,
+            } => {
+                self.toggle_state_exposure(&producer, handle.as_deref(), &path);
+                self.refresh_inline_bridge();
+                Update::none()
+            }
+            Message::AddStatePath {
+                producer,
+                handle,
+                path,
+            } => {
+                self.add_state_path(&producer, handle.as_deref(), &path);
+                self.refresh_inline_bridge();
+                Update::none()
+            }
+            Message::RemoveStateExposure {
+                producer,
+                handle,
+                path,
+            } => {
+                self.remove_state_exposure(&producer, handle.as_deref(), &path);
+                self.refresh_inline_bridge();
+                Update::none()
+            }
+            Message::RevealStateName { producer, handle } => {
+                self.reveal_state_name(&producer, handle.as_deref());
+                Update::none()
+            }
+            Message::SetStateName {
+                producer,
+                handle,
+                name,
+            } => {
+                self.set_state_name(&producer, handle.as_deref(), name);
+                self.refresh_inline_bridge();
+                Update::none()
+            }
+            Message::OpenStateProducerPicker => {
+                self.open_state_producer_picker();
+                Update::none()
+            }
+            Message::CloseStateProducerPicker => {
+                self.state_add.picker_open = false;
+                Update::none()
+            }
+            Message::MoveStateProducerCursor(delta) => {
+                self.move_state_producer_cursor(delta);
+                Update::none()
+            }
+            Message::SetStateProducer(producer) => {
+                self.set_state_producer(producer);
+                Update::none()
+            }
+            Message::SetStateHandleDraft(handle) => {
+                self.state_add.handle = handle;
+                self.state_add.error = None;
+                Update::none()
+            }
+            Message::SetStatePathDraft(path) => {
+                self.state_add.path = path;
+                self.state_add.error = None;
+                Update::none()
+            }
+            Message::RevealStateAdd => {
+                self.state_add.revealed = true;
+                Update::none()
+            }
+            Message::OpenStateHandlePicker => {
+                self.open_state_handle_picker();
+                Update::none()
+            }
+            Message::CloseStateHandlePicker => {
+                self.state_add.handle_picker_open = false;
+                Update::none()
+            }
+            Message::MoveStateHandleCursor(delta) => {
+                self.move_state_handle_cursor(delta);
+                Update::none()
+            }
+            Message::SetStateHandle(handle) => {
+                self.state_add.handle = handle;
+                self.state_add.handle_picker_open = false;
+                self.state_add.error = None;
+                Update::none()
+            }
             Message::InsertReference(reference) => {
-                // The badge inserts into whichever action tab is active.
+                // The badge inserts into whichever action tab is active: the text draft
+                // on Send text (a hotkey keeps its own buffer), the code editor otherwise.
                 if self.open_action_language() == Some(ScriptLang::Plaintext) {
-                    self.action_text_pinned = true;
-                    self.send_text_content.perform(text_editor::Action::Edit(
-                        text_editor::Edit::Paste(Arc::new(reference)),
-                    ));
+                    let paste =
+                        text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(reference)));
+                    let hotkey = matches!(
+                        &self.pane,
+                        Pane::Editor(EditorState {
+                            node: EditNode::Hotkey(_),
+                            ..
+                        })
+                    );
+                    if hotkey {
+                        self.hotkey_text_content.perform(paste);
+                    } else {
+                        self.action_text_pinned = true;
+                        self.send_text_content.perform(paste);
+                    }
                     Update::none()
                 } else {
                     self.action_script_pinned = true;
@@ -3579,6 +3777,10 @@ impl AutomationsWindow {
             | Message::SetRowExactTruecolorRgb(_, _, _)
             | Message::ToggleRowColorAttribute(_, _, _)
             | Message::InsertReference(_)
+            | Message::ToggleStateExposure { .. }
+            | Message::AddStatePath { .. }
+            | Message::RemoveStateExposure { .. }
+            | Message::SetStateName { .. }
             | Message::MarkHotkeyState(_) => true,
             _ => false,
         }
@@ -3611,13 +3813,13 @@ impl AutomationsWindow {
         }
     }
 
-    /// The action language of the open alias/trigger editor, if one is open.
+    /// The action language of the open editor (its active action tab), if one is open.
     fn open_action_language(&self) -> Option<ScriptLang> {
         match &self.pane {
             Pane::Editor(EditorState { node, .. }) => match node {
                 EditNode::Alias(alias) => Some(alias.language),
                 EditNode::Trigger { language, .. } => Some(*language),
-                EditNode::Hotkey(_) => None,
+                EditNode::Hotkey(hotkey) => Some(hotkey.language),
             },
             _ => None,
         }
@@ -4086,6 +4288,7 @@ impl AutomationsWindow {
 #[cfg(test)]
 mod tab_traversal_tests {
     use super::*;
+    use smudgy_core::models::state_exposure::StateExposure;
 
     fn window_with_foreground(
         color: smudgy_core::models::matchers::MatcherColor,
@@ -4583,6 +4786,7 @@ mod tab_traversal_tests {
                 package: None,
                 language: ScriptLang::TS,
                 enabled: true,
+                state: Vec::new(),
             }),
         );
         window.action_script_lang = ScriptLang::JS;
@@ -6192,5 +6396,607 @@ mod tab_traversal_tests {
         assert!(window.dirty);
         let _ = window.update(Message::SaveFolder);
         assert!(!window.dirty);
+    }
+
+    #[test]
+    fn saving_an_opened_trigger_keeps_its_state_exposures() {
+        use smudgy_core::models::triggers;
+
+        let _home = use_temp_smudgy_home();
+        let server_name = format!("trigger-state-round-trip-test-{}", std::process::id());
+        create_test_server(&server_name, &[]);
+        let exposures = vec![
+            StateExposure {
+                producer: "gmcp".to_string(),
+                handle: None,
+                name_override: None,
+                paths: vec!["Char.Vitals".to_string()],
+            },
+            StateExposure {
+                producer: "user".to_string(),
+                handle: Some("foo".to_string()),
+                name_override: Some("stats".to_string()),
+                paths: vec!["bar".to_string()],
+            },
+        ];
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(
+            "vitals".to_string(),
+            triggers::TriggerDefinition {
+                patterns: Some(vec!["^PROMPT$".to_string()]),
+                script: Some("say $gmcp.Char.Vitals.hp $stats.bar".to_string()),
+                state: exposures.clone(),
+                ..triggers::TriggerDefinition::default()
+            },
+        );
+        triggers::save_triggers(&server_name, &stored).unwrap();
+
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            server_name.clone(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        let loaded = window.load_scripts_message();
+        let _ = window.update(loaded);
+        let _ = window.open_script(ScriptKey {
+            folder_name: None,
+            script_name: "vitals".to_string(),
+        });
+        assert!(matches!(
+            &window.pane,
+            Pane::Editor(EditorState {
+                node: EditNode::Trigger { .. },
+                ..
+            })
+        ));
+        assert_eq!(drafted_state(&window), exposures);
+
+        // An unchanged save writes the exposures back exactly as they were loaded.
+        let _ = window.update(Message::Save);
+        let Pane::Editor(state) = &window.pane else {
+            panic!("save must keep the editor open");
+        };
+        assert_eq!(state.error, None);
+        assert!(!window.dirty);
+        let saved = triggers::load_triggers(&server_name).unwrap();
+        assert_eq!(saved["vitals"].state, exposures);
+        assert_eq!(
+            saved["vitals"].script.as_deref(),
+            Some("say $gmcp.Char.Vitals.hp $stats.bar")
+        );
+    }
+
+    fn state_exposure(
+        producer: &str,
+        handle: Option<&str>,
+        name_override: Option<&str>,
+        paths: &[&str],
+    ) -> StateExposure {
+        StateExposure {
+            producer: producer.to_string(),
+            handle: handle.map(str::to_string),
+            name_override: name_override.map(str::to_string),
+            paths: paths.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// The window's exposure draft in its persisted form.
+    fn drafted_state(window: &AutomationsWindow) -> Vec<StateExposure> {
+        window
+            .state_exposures
+            .iter()
+            .map(state_values::StateExposureDraft::to_exposure)
+            .collect()
+    }
+
+    fn state_test_window(name: &str) -> AutomationsWindow {
+        AutomationsWindow::new(
+            window::Id::unique(),
+            name.to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        )
+    }
+
+    #[test]
+    fn state_disclosure_reveals_and_hides_only_at_defaults() {
+        let mut window = state_test_window("state-disclosure-test");
+        let _ = window.new_alias();
+        assert!(!window.state_disclosure_open());
+        assert!(!window.catalogue_subscribed());
+
+        let _ = window.update(Message::RevealState);
+        assert!(window.state_disclosure_open());
+        assert!(window.catalogue_subscribed());
+        assert!(!window.dirty, "revealing is not an edit");
+
+        let _ = window.update(Message::HideState);
+        assert!(!window.state_disclosure_open());
+        assert!(!window.catalogue_subscribed());
+        assert!(!window.dirty);
+
+        // An exposure forces the module open and defeats the hide link.
+        let _ = window.update(Message::ToggleStateExposure {
+            producer: "gmcp".to_string(),
+            handle: None,
+            path: "Char.Vitals".to_string(),
+        });
+        assert!(window.dirty);
+        assert!(window.state_disclosure_open());
+        let _ = window.update(Message::HideState);
+        assert!(window.state_disclosure_open());
+        assert!(window.catalogue_subscribed());
+
+        // The store pane subscribes on its own; opening another editor resets the draft.
+        window.pane = Pane::StoreInspector;
+        assert!(window.catalogue_subscribed());
+        let _ = window.new_hotkey();
+        assert!(window.state_exposures.is_empty());
+        assert!(!window.state_disclosure_open());
+        assert!(!window.catalogue_subscribed());
+    }
+
+    #[test]
+    fn opening_an_automation_with_exposures_reveals_the_disclosure() {
+        let _home = use_temp_smudgy_home();
+        let server_name = format!("state-auto-reveal-test-{}", std::process::id());
+        create_test_server(&server_name, &[]);
+        let exposures = vec![
+            state_exposure("gmcp", None, None, &["Char.Vitals"]),
+            state_exposure("user", Some("foo"), Some("stats"), &["bar", ""]),
+        ];
+        let mut stored_aliases = std::collections::HashMap::new();
+        stored_aliases.insert(
+            "hp".to_string(),
+            aliases::AliasDefinition {
+                pattern: "^hp$".to_string(),
+                script: Some("say $gmcp.Char.Vitals.hp".to_string()),
+                package: None,
+                enabled: true,
+                priority: 0,
+                fallthrough: true,
+                allow_self_match: false,
+                language: ScriptLang::Plaintext,
+                matcher: None,
+                state: exposures.clone(),
+            },
+        );
+        aliases::save_aliases(&server_name, &stored_aliases).unwrap();
+        let mut stored_hotkeys = std::collections::HashMap::new();
+        stored_hotkeys.insert(
+            "heal".to_string(),
+            hotkeys::HotkeyDefinition {
+                key: "Enter".to_string(),
+                modifiers: vec![],
+                script: Some("cast heal $stats.bar".to_string()),
+                package: None,
+                language: ScriptLang::Plaintext,
+                enabled: true,
+                state: exposures[1..].to_vec(),
+            },
+        );
+        hotkeys::save_hotkeys(&server_name, &stored_hotkeys).unwrap();
+
+        let mut window = state_test_window(&server_name);
+        let loaded = window.load_scripts_message();
+        let _ = window.update(loaded);
+        let _ = window.open_script(ScriptKey {
+            folder_name: None,
+            script_name: "hp".to_string(),
+        });
+        assert!(
+            window.state_disclosure_open(),
+            "exposures force the disclosure open"
+        );
+        assert!(window.catalogue_subscribed());
+        assert_eq!(drafted_state(&window), exposures);
+        // A saved override opens as a filled name field; a default name keeps its link.
+        assert_eq!(window.state_exposures[0].name_field, None);
+        assert_eq!(
+            window.state_exposures[1].name_field.as_deref(),
+            Some("stats")
+        );
+        let _ = window.update(Message::HideState);
+        assert!(window.state_disclosure_open());
+        assert!(!window.dirty);
+
+        // The hotkey editor loads the same draft and saves it back unchanged.
+        let _ = window.open_script(ScriptKey {
+            folder_name: None,
+            script_name: "heal".to_string(),
+        });
+        assert_eq!(drafted_state(&window), exposures[1..].to_vec());
+        let _ = window.update(Message::Save);
+        let Pane::Editor(state) = &window.pane else {
+            panic!("save must keep the editor open");
+        };
+        assert_eq!(state.error, None);
+        assert!(!window.dirty);
+        let saved = hotkeys::load_hotkeys(&server_name).unwrap();
+        assert_eq!(saved["heal"].state, exposures[1..].to_vec());
+        assert_eq!(
+            saved["heal"].script.as_deref(),
+            Some("cast heal $stats.bar")
+        );
+    }
+
+    #[test]
+    fn browser_toggles_and_the_add_row_edit_the_exposure_draft() {
+        let mut window = state_test_window("state-toggle-test");
+        let _ = window.new_trigger();
+        let gmcp = |path: &str| Message::ToggleStateExposure {
+            producer: "gmcp".to_string(),
+            handle: None,
+            path: path.to_string(),
+        };
+
+        let _ = window.update(gmcp("Char.Vitals"));
+        assert!(window.dirty);
+        assert_eq!(
+            drafted_state(&window),
+            vec![state_exposure("gmcp", None, None, &["Char.Vitals"])]
+        );
+        let _ = window.update(gmcp("Room.Info"));
+        // A toggle finds the path under the store's fold: another spelling removes it.
+        let _ = window.update(gmcp("char.VITALS"));
+        assert_eq!(
+            drafted_state(&window),
+            vec![state_exposure("gmcp", None, None, &["Room.Info"])]
+        );
+
+        // Add a path: a handle root, added once however often it is submitted.
+        let add = |path: &str| Message::AddStatePath {
+            producer: "user".to_string(),
+            handle: Some("foo".to_string()),
+            path: path.to_string(),
+        };
+        let _ = window.update(Message::SetStatePathDraft("bar".to_string()));
+        let _ = window.update(add("bar"));
+        let _ = window.update(add("bar"));
+        assert_eq!(
+            drafted_state(&window),
+            vec![
+                state_exposure("gmcp", None, None, &["Room.Info"]),
+                state_exposure("user", Some("foo"), None, &["bar"]),
+            ]
+        );
+        assert_eq!(window.state_add.error, None);
+        assert_eq!(
+            window.state_add.path, "",
+            "an accepted path clears the field"
+        );
+
+        // A malformed path is refused with its message and leaves the draft alone.
+        let _ = window.update(Message::SetStatePathDraft("Char..Vitals".to_string()));
+        let _ = window.update(add("Char..Vitals"));
+        let expected = crate::i18n::t!("editor-state-bad-path", "path" => "Char..Vitals");
+        assert_eq!(window.state_add.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(window.state_add.path, "Char..Vitals");
+        assert_eq!(drafted_state(&window).len(), 2);
+        // A producer that reads through a handle adds nothing without one.
+        let _ = window.update(Message::AddStatePath {
+            producer: "user".to_string(),
+            handle: None,
+            path: "baz".to_string(),
+        });
+        assert_eq!(drafted_state(&window).len(), 2);
+        // The root itself is a path (`""`).
+        let _ = window.update(gmcp(""));
+        assert_eq!(
+            drafted_state(&window)[0].paths,
+            vec!["Room.Info".to_string(), String::new()]
+        );
+
+        // Removing the last path removes its root; removing every root closes the module.
+        let _ = window.update(Message::RemoveStateExposure {
+            producer: "GMCP".to_string(),
+            handle: None,
+            path: "room.info".to_string(),
+        });
+        let _ = window.update(Message::RemoveStateExposure {
+            producer: "gmcp".to_string(),
+            handle: None,
+            path: String::new(),
+        });
+        assert_eq!(
+            drafted_state(&window),
+            vec![state_exposure("user", Some("foo"), None, &["bar"])]
+        );
+        let _ = window.update(Message::RemoveStateExposure {
+            producer: "user".to_string(),
+            handle: Some("FOO".to_string()),
+            path: "bar".to_string(),
+        });
+        assert!(window.state_exposures.is_empty());
+        assert!(!window.state_disclosure_open());
+    }
+
+    #[test]
+    fn renaming_an_exposure_reports_collisions_and_notes() {
+        use state_values::StateNote;
+
+        let mut window = state_test_window("state-rename-test");
+        let _ = window.new_alias();
+        // A Command argument named `target` is a matched value.
+        let _ = window.update(Message::AddArg);
+        let _ = window.update(Message::SetArgName(0, "target".to_string()));
+
+        let _ = window.update(Message::ToggleStateExposure {
+            producer: "gmcp".to_string(),
+            handle: None,
+            path: String::new(),
+        });
+        let _ = window.update(Message::AddStatePath {
+            producer: "user".to_string(),
+            handle: Some("foo".to_string()),
+            path: "bar".to_string(),
+        });
+        // A Send text body cannot see the shadowed `gmcp` control object: no note. A script
+        // body can, so exposing GMCP under its default name is noted there.
+        assert_eq!(window.state_notes(), vec![vec![], vec![]]);
+        let set_language = |window: &mut AutomationsWindow, language: ScriptLang| {
+            if let Pane::Editor(EditorState {
+                node: EditNode::Alias(alias),
+                ..
+            }) = &mut window.pane
+            {
+                alias.language = language;
+            }
+        };
+        set_language(&mut window, ScriptLang::JS);
+        assert_eq!(
+            window.state_notes(),
+            vec![vec![StateNote::ShadowsSmudgy("gmcp".to_string())], vec![]]
+        );
+
+        let _ = window.update(Message::RevealStateName {
+            producer: "user".to_string(),
+            handle: Some("foo".to_string()),
+        });
+        assert_eq!(window.state_exposures[1].name_field.as_deref(), Some(""));
+        assert_eq!(
+            window.state_exposures[1].name(),
+            "foo",
+            "a revealed, blank field is not an override"
+        );
+
+        let rename = |name: &str| Message::SetStateName {
+            producer: "user".to_string(),
+            handle: Some("foo".to_string()),
+            name: name.to_string(),
+        };
+        let _ = window.update(rename("gmcp"));
+        assert_eq!(
+            window.state_notes()[1],
+            vec![
+                StateNote::NameTaken("gmcp".to_string()),
+                StateNote::ShadowsSmudgy("gmcp".to_string()),
+            ]
+        );
+        let taken = crate::i18n::t!("editor-state-name-taken", "name" => "gmcp");
+        assert_eq!(window.validate_state_exposures(), Err(taken));
+
+        // The capture collision is Send text's: `$target` alone means the match there,
+        // while a script body has no such collision.
+        let _ = window.update(rename("target"));
+        assert!(window.state_notes()[1].is_empty());
+        set_language(&mut window, ScriptLang::Plaintext);
+        assert_eq!(
+            window.state_notes()[1],
+            vec![StateNote::ShadowsCapture("target".to_string())]
+        );
+        assert!(window.validate_state_exposures().is_ok());
+
+        let _ = window.update(rename("not a name"));
+        assert_eq!(
+            window.state_notes()[1],
+            vec![StateNote::BadName("not a name".to_string())]
+        );
+        let bad = crate::i18n::t!("editor-state-bad-name", "name" => "not a name");
+        assert_eq!(window.validate_state_exposures(), Err(bad));
+
+        let _ = window.update(rename("   "));
+        assert_eq!(window.state_exposures[1].name(), "foo");
+        assert!(window.state_notes()[1].is_empty());
+        assert_eq!(
+            window.validate_state_exposures().unwrap()[1].name_override,
+            None
+        );
+        // The default name typed back is not an override either: `as` is omitted when it
+        // equals the default.
+        let _ = window.update(rename("foo"));
+        assert_eq!(window.state_exposures[1].name(), "foo");
+        assert_eq!(
+            window.validate_state_exposures().unwrap()[1].name_override,
+            None
+        );
+        let _ = window.update(rename("stats"));
+        assert_eq!(
+            window.validate_state_exposures().unwrap()[1]
+                .name_override
+                .as_deref(),
+            Some("stats")
+        );
+    }
+
+    #[test]
+    fn saving_writes_the_drafted_exposures_and_blocks_duplicate_names() {
+        let _home = use_temp_smudgy_home();
+        let server_name = format!("state-save-test-{}", std::process::id());
+        create_test_server(&server_name, &[]);
+        let mut window = state_test_window(&server_name);
+        let loaded = window.load_scripts_message();
+        let _ = window.update(loaded);
+        let _ = window.new_alias();
+        let _ = window.update(Message::SetName("hp".to_string()));
+        let _ = window.update(Message::ToggleStateExposure {
+            producer: "gmcp".to_string(),
+            handle: None,
+            path: "Char.Vitals".to_string(),
+        });
+        let _ = window.update(Message::AddStatePath {
+            producer: "user".to_string(),
+            handle: Some("foo".to_string()),
+            path: "bar".to_string(),
+        });
+        let rename = |name: &str| Message::SetStateName {
+            producer: "user".to_string(),
+            handle: Some("foo".to_string()),
+            name: name.to_string(),
+        };
+        let _ = window.update(rename("GMCP"));
+
+        // A folded duplicate blocks the save in the error bar and leaves the draft dirty.
+        let _ = window.update(Message::Save);
+        let Pane::Editor(state) = &window.pane else {
+            panic!("a refused save keeps the editor open");
+        };
+        let expected = crate::i18n::t!("editor-state-name-taken", "name" => "GMCP");
+        assert_eq!(state.error.as_deref(), Some(expected.as_str()));
+        assert!(window.dirty);
+        assert!(
+            !aliases::load_aliases(&server_name)
+                .map(|stored| stored.contains_key("hp"))
+                .unwrap_or(false)
+        );
+
+        let _ = window.update(rename("stats"));
+        let _ = window.update(Message::Save);
+        let Pane::Editor(state) = &window.pane else {
+            panic!("save must keep the editor open");
+        };
+        assert_eq!(state.error, None);
+        assert!(!window.dirty);
+        let saved = aliases::load_aliases(&server_name).unwrap();
+        assert_eq!(
+            saved["hp"].state,
+            vec![
+                state_exposure("gmcp", None, None, &["Char.Vitals"]),
+                state_exposure("user", Some("foo"), Some("stats"), &["bar"]),
+            ]
+        );
+        // Re-opening reads the saved list back into the draft.
+        let _ = window.open_script(ScriptKey {
+            folder_name: None,
+            script_name: "hp".to_string(),
+        });
+        assert_eq!(drafted_state(&window), saved["hp"].state);
+        assert!(window.state_disclosure_open());
+    }
+
+    #[test]
+    fn unusable_exposures_from_disk_are_dropped_or_reported_in_catalog_words() {
+        use smudgy_core::models::state_exposure::StateExposureError;
+
+        let _home = use_temp_smudgy_home();
+        let server_name = format!("state-unusable-test-{}", std::process::id());
+        create_test_server(&server_name, &[]);
+        let mut stored = std::collections::HashMap::new();
+        stored.insert(
+            "hp".to_string(),
+            aliases::AliasDefinition {
+                pattern: "^hp$".to_string(),
+                script: Some("say $gmcp.Char.Vitals.hp".to_string()),
+                package: None,
+                enabled: true,
+                priority: 0,
+                fallthrough: true,
+                allow_self_match: false,
+                language: ScriptLang::Plaintext,
+                matcher: None,
+                state: vec![
+                    state_exposure("gmcp", None, None, &["Char.Vitals"]),
+                    // Entries only a hand edit produces: a producer no client knows, and one
+                    // with no paths.
+                    state_exposure("nope://x", None, None, &["a"]),
+                    state_exposure("msdp", None, None, &[]),
+                ],
+            },
+        );
+        aliases::save_aliases(&server_name, &stored).unwrap();
+
+        let mut window = state_test_window(&server_name);
+        let loaded = window.load_scripts_message();
+        let _ = window.update(loaded);
+        let _ = window.open_script(ScriptKey {
+            folder_name: None,
+            script_name: "hp".to_string(),
+        });
+        // The path-less entry exposes nothing and has no row to remove it by, so opening
+        // drops it; the unknown producer keeps its row so the author can see and remove it.
+        assert_eq!(
+            drafted_state(&window),
+            vec![
+                state_exposure("gmcp", None, None, &["Char.Vitals"]),
+                state_exposure("nope://x", None, None, &["a"]),
+            ]
+        );
+
+        // Its save-time failure reads in the catalog's words around the runtime's detail.
+        let _ = window.update(Message::Save);
+        let Pane::Editor(state) = &window.pane else {
+            panic!("a refused save keeps the editor open");
+        };
+        let detail = StateExposureError::UnknownProducer {
+            producer: "nope://x".to_string(),
+        }
+        .to_string();
+        let expected = crate::i18n::t!("editor-state-invalid", "error" => detail.as_str());
+        assert_eq!(state.error.as_deref(), Some(expected.as_str()));
+
+        // Removing its only path removes the entry, and the save goes through.
+        let _ = window.update(Message::RemoveStateExposure {
+            producer: "nope://x".to_string(),
+            handle: None,
+            path: "a".to_string(),
+        });
+        let _ = window.update(Message::Save);
+        let Pane::Editor(state) = &window.pane else {
+            panic!("save must keep the editor open");
+        };
+        assert_eq!(state.error, None);
+        let saved = aliases::load_aliases(&server_name).unwrap();
+        assert_eq!(
+            saved["hp"].state,
+            vec![state_exposure("gmcp", None, None, &["Char.Vitals"])]
+        );
+    }
+
+    #[test]
+    fn badge_inserts_land_in_the_active_tab_of_every_editor() {
+        let mut window = state_test_window("insert-reference-routing-test");
+
+        // Alias: Send text pastes into the text draft and pins it; JavaScript into the
+        // code editor, leaving the text draft alone.
+        let _ = window.new_alias();
+        let _ = window.update(Message::InsertReference("$stats.hp".to_string()));
+        assert!(window.send_text_content.text().contains("$stats.hp"));
+        assert!(window.action_text_pinned);
+        let _ = window.update(Message::SetBehavior(ScriptLang::JS));
+        let _ = window.update(Message::InsertReference("stats.mp".to_string()));
+        assert!(window.code_editor_text().contains("stats.mp"));
+        assert!(!window.send_text_content.text().contains("stats.mp"));
+
+        // Trigger: the same two drafts.
+        let _ = window.new_trigger();
+        let _ = window.update(Message::InsertReference("$stats.hp".to_string()));
+        assert!(window.send_text_content.text().contains("$stats.hp"));
+        let _ = window.update(Message::SetBehavior(ScriptLang::JS));
+        let _ = window.update(Message::InsertReference("stats.mp".to_string()));
+        assert!(window.code_editor_text().contains("stats.mp"));
+
+        // Hotkey: Send text is its own buffer, and the single body carries the inserts
+        // across the tabs.
+        let _ = window.new_hotkey();
+        let _ = window.update(Message::InsertReference("$stats.hp".to_string()));
+        assert_eq!(window.hotkey_text_content.text(), "$stats.hp");
+        let _ = window.update(Message::SetBehavior(ScriptLang::JS));
+        assert_eq!(window.code_editor_text(), "$stats.hp");
+        let _ = window.update(Message::InsertReference("stats.mp".to_string()));
+        assert!(window.code_editor_text().contains("stats.mp"));
+        let _ = window.update(Message::SetBehavior(ScriptLang::Plaintext));
+        assert!(window.hotkey_text_content.text().contains("stats.mp"));
+        assert!(window.hotkey_text_content.text().contains("$stats.hp"));
     }
 }

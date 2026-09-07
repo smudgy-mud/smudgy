@@ -16,6 +16,7 @@ use crate::models::matchers::{
     MatcherColor, MatcherColorMatch, MatcherHsv, MatcherHsvRange, MatcherRole,
     MatcherTextAttribute, TriggerMatcherSource,
 };
+use crate::models::state_exposure::{dotted_tail_len, identifier_len};
 
 use super::{
     ActionQueue, ScriptAction,
@@ -24,6 +25,7 @@ use super::{
     origin::{
         AutomationBody, AutomationDelta, AutomationKind, AutomationSummary, IsolateId, Origin,
     },
+    state_exposure::ExposedState,
 };
 
 /// One automation's introspectable state for the `session.triggers`/`session.aliases`
@@ -69,6 +71,10 @@ pub struct AutomationIdentity {
     /// trigger `Vec`, matched on incoming lines.
     pub is_alias: bool,
     pub namespace: NamespaceId,
+    /// The state exposures bound for this automation at registration, read at fire time by
+    /// Send text expansion and the inline-script wrapper. `None` for an automation that
+    /// exposes nothing, whose fire path checks this once and does nothing more.
+    pub(crate) exposure: Option<Arc<ExposedState>>,
     slot_generation: AtomicU64,
     slot_index: AtomicUsize,
 }
@@ -92,6 +98,7 @@ impl AutomationIdentity {
         name: &str,
         is_alias: bool,
         namespace: NamespaceId,
+        exposure: Option<Arc<ExposedState>>,
     ) -> Self {
         Self {
             isolate,
@@ -99,9 +106,15 @@ impl AutomationIdentity {
             name: Arc::new(name.to_owned()),
             is_alias,
             namespace,
+            exposure,
             slot_generation: AtomicU64::new(NO_GENERATION),
             slot_index: AtomicUsize::new(0),
         }
+    }
+
+    /// The state exposures bound for this automation, `None` when it exposes nothing.
+    pub(crate) fn exposure(&self) -> Option<&ExposedState> {
+        self.exposure.as_deref()
     }
 
     /// The cached registry index, if it was recorded under `generation`. Only the session
@@ -333,8 +346,26 @@ pub struct MatchCapture {
 /// - A `$` not starting any of the above is emitted literally.
 ///
 /// Unknown / empty / non-participating groups expand to the empty string.
+///
+/// With `state` (the automation's bound exposures) the same pass also resolves state
+/// references, whose first segment is an exposed name:
+/// - `$name.path` — a bare reference: the identifier plus a dotted tail of identifiers
+///   (a trailing `.` with nothing after it stays literal);
+/// - `${name.path}` / `${name["key"].path}` — a braced reference in the store's path grammar;
+/// - a bare or braced `$name` with no tail is the exposed root, unless a capture group of that
+///   name exists, which wins. A dotted tail always means the state.
+///
+/// A reference above every exposed path of its name, an absent or `null` value, and a name
+/// that is not exposed expand to the empty string (a non-exposed name is a capture reference
+/// and its tail literal text, exactly as without `state`). Values render as strings verbatim,
+/// numbers and booleans in JSON spelling, objects and arrays as compact JSON. Without `state`
+/// the pass is the capture grammar above and nothing else.
 #[must_use]
-pub(crate) fn expand_template_view(template: &str, captures: CaptureView<'_>) -> String {
+pub(crate) fn expand_template_view(
+    template: &str,
+    captures: CaptureView<'_>,
+    state: Option<&ExposedState>,
+) -> String {
     let lookup_index = |idx: usize| -> &str { captures.get(idx).map_or("", |c| c.value) };
     let lookup_name = |name: &str| -> &str {
         captures
@@ -342,6 +373,9 @@ pub(crate) fn expand_template_view(template: &str, captures: CaptureView<'_>) ->
             .find(|c| c.name == Some(name))
             .map_or("", |c| c.value)
     };
+    // Whether a group named `name` exists at all (it may not have participated): the
+    // capture-wins rule for a bare reference that is both a group and an exposed name.
+    let has_capture = |name: &str| captures.iter().any(|c| c.name == Some(name));
 
     let mut out = String::with_capacity(template.len());
     let bytes = template.as_bytes();
@@ -369,6 +403,17 @@ pub(crate) fn expand_template_view(template: &str, captures: CaptureView<'_>) ->
                         if let Ok(idx) = inner.parse::<usize>() {
                             out.push_str(lookup_index(idx));
                         }
+                    } else if let Some(state) = state {
+                        // A braced reference whose leading identifier is an exposed name is
+                        // a state reference (a bare group name that is also exposed means the
+                        // group); only an exposing automation scans for the identifier.
+                        let (name, tail) = inner.split_at(identifier_len(inner));
+                        match state.name(name) {
+                            Some(exposed) if !tail.is_empty() || !has_capture(name) => {
+                                exposed.write_reference(tail, &mut out);
+                            }
+                            _ => out.push_str(lookup_name(inner)),
+                        }
                     } else {
                         out.push_str(lookup_name(inner));
                     }
@@ -395,8 +440,20 @@ pub(crate) fn expand_template_view(template: &str, captures: CaptureView<'_>) ->
                     end += 1;
                 }
                 let name = &template[start..end];
-                out.push_str(lookup_name(name));
-                i = end;
+                if let Some(exposed) = state.and_then(|state| state.name(name)) {
+                    // An exposed name: the dotted tail, if any, is part of the reference.
+                    // Without one, a same-named capture group wins.
+                    let tail = &template[end..end + dotted_tail_len(&template[end..])];
+                    if tail.is_empty() && has_capture(name) {
+                        out.push_str(lookup_name(name));
+                    } else {
+                        exposed.write_reference(tail, &mut out);
+                    }
+                    i = end + tail.len();
+                } else {
+                    out.push_str(lookup_name(name));
+                    i = end;
+                }
             }
             _ => {
                 // Lone `$` (end of string or followed by something inert): literal.
@@ -410,7 +467,16 @@ pub(crate) fn expand_template_view(template: &str, captures: CaptureView<'_>) ->
 
 #[cfg(test)]
 fn expand_template(template: &str, captures: &[MatchCapture]) -> String {
-    expand_template_view(template, CaptureView::Owned(captures))
+    expand_template_view(template, CaptureView::Owned(captures), None)
+}
+
+#[cfg(test)]
+fn expand_template_with(
+    template: &str,
+    captures: &[MatchCapture],
+    state: Option<&ExposedState>,
+) -> String {
+    expand_template_view(template, CaptureView::Owned(captures), state)
 }
 
 /// Splits an outgoing chunk into commands: always on '\n', additionally on
@@ -1200,6 +1266,7 @@ impl Manager {
             &item.name,
             item.is_alias,
             namespace,
+            item.exposure.take(),
         )));
     }
 
@@ -1293,6 +1360,7 @@ impl Manager {
         fire_limit: Option<u32>,
         source: Option<Arc<str>>,
         command: Option<crate::models::matchers::CommandSpec>,
+        exposure: Option<Arc<ExposedState>>,
     ) -> Result<()> {
         self.add_or_update_alias(
             Trigger::new_alias(
@@ -1307,12 +1375,26 @@ impl Manager {
             )?
             .with_source(source)
             .with_command(command)
-            .with_allow_self_match(allow_self_match),
+            .with_allow_self_match(allow_self_match)
+            .with_exposure(exposure),
         );
         Ok(())
     }
 
+    /// Register a trigger that exposes no session-store values. The dispatcher registers
+    /// through [`Self::push_trigger_with_exposure`]; this is the entry benches and tests use.
+    #[cfg_attr(not(any(test, feature = "bench-api")), allow(dead_code))]
     pub fn push_trigger(&mut self, params: PushTriggerParams) -> Result<()> {
+        self.push_trigger_with_exposure(params, None)
+    }
+
+    /// [`Self::push_trigger`] for a trigger whose definition exposes session-store values:
+    /// the exposures were bound by the caller and ride the registration.
+    pub fn push_trigger_with_exposure(
+        &mut self,
+        params: PushTriggerParams,
+        exposure: Option<Arc<ExposedState>>,
+    ) -> Result<()> {
         self.add_or_update_trigger(
             Trigger::new(
                 params.isolate,
@@ -1330,7 +1412,8 @@ impl Manager {
                 params.fire_limit,
                 params.line_limit,
             )?
-            .with_source(params.source),
+            .with_source(params.source)
+            .with_exposure(exposure),
         );
         Ok(())
     }
@@ -1417,6 +1500,7 @@ impl Manager {
         allow_self_match: bool,
         fire_limit: Option<u32>,
         command: Option<crate::models::matchers::CommandSpec>,
+        exposure: Option<Arc<ExposedState>>,
     ) -> Result<()> {
         self.add_or_update_alias(
             Trigger::new_alias(
@@ -1430,7 +1514,8 @@ impl Manager {
                 fire_limit,
             )?
             .with_command(command)
-            .with_allow_self_match(allow_self_match),
+            .with_allow_self_match(allow_self_match)
+            .with_exposure(exposure),
         );
         Ok(())
     }
@@ -2034,15 +2119,17 @@ impl Manager {
     /// Execute a matched plaintext command template. This happens at dispatch time (rather than
     /// match-discovery time) so a prior automation can stop this invocation before it captures or
     /// sends anything. Each separated command begins its own alias frame; `sender` is the alias
-    /// whose body is being expanded (`None` for a trigger body).
+    /// whose body is being expanded (`None` for a trigger body). `state` is the automation's
+    /// bound exposures, the source of `$name.path` references (`None` when it exposes nothing).
     pub(crate) fn run_simple_automation(
         &self,
         script: &str,
         captures: CaptureView<'_>,
         depth: u32,
         sender: Option<&AliasSender>,
+        state: Option<&ExposedState>,
     ) -> Result<()> {
-        let evaluated = expand_template_view(script, captures);
+        let evaluated = expand_template_view(script, captures, state);
         for line in split_commands(&evaluated, &self.command_separator) {
             self.process_nested_outgoing_line(line, depth, sender)?;
         }
@@ -2308,6 +2395,9 @@ struct Trigger {
     /// set, the stored regex is only a prefilter: [`Trigger::run`] hands the line to the
     /// parser, which decides firing and produces the captures.
     command: Option<crate::models::matchers::CommandSpec>,
+    /// The state exposures bound for this automation, held only until registration moves
+    /// them into the shared [`AutomationIdentity`] (see [`Manager::assign_identity`]).
+    exposure: Option<Arc<ExposedState>>,
 }
 
 impl Trigger {
@@ -2517,6 +2607,7 @@ impl Trigger {
             lines_tested: Cell::new(0),
             source: None,
             command: None,
+            exposure: None,
         }
     }
 
@@ -2575,6 +2666,13 @@ impl Trigger {
     #[must_use]
     fn with_allow_self_match(mut self, allow_self_match: bool) -> Self {
         self.allow_self_match = allow_self_match;
+        self
+    }
+
+    /// Attaches the bound state exposures (see [`Trigger::exposure`]).
+    #[must_use]
+    fn with_exposure(mut self, exposure: Option<Arc<ExposedState>>) -> Self {
+        self.exposure = exposure;
         self
     }
 
@@ -4283,6 +4381,7 @@ mod tests {
                     false,
                     None,
                     None,
+                    None,
                 )
                 .unwrap();
 
@@ -4357,6 +4456,7 @@ mod tests {
                     false,
                     None,
                     Some(spec),
+                    None,
                 )
                 .unwrap();
             (manager, queue)
@@ -4488,6 +4588,7 @@ mod tests {
                     false,
                     None,
                     Some(greet_spec(ArgKind::Optional)),
+                    None,
                 )
                 .unwrap();
             manager.process_outgoing_line("greetz hi", 0, None).unwrap();
@@ -4528,6 +4629,7 @@ mod tests {
                     0,
                     true,
                     allow_self_match,
+                    None,
                     None,
                     None,
                 )
@@ -4703,6 +4805,80 @@ mod tests {
                 panic!("expected a queued automation, got {action:?}");
             };
             identity.clone()
+        }
+
+        #[test]
+        fn exposures_ride_the_identity_and_absence_reaches_the_fire_site_as_none() {
+            use crate::models::state_exposure::StateExposure;
+            use crate::session::runtime::ExposedState;
+            use crate::session::runtime::store::SessionStore;
+
+            let (mut manager, queue) = manager();
+            push(&mut manager, Origin::User, "plain", None);
+            let mut store = SessionStore::new();
+            let bound = ExposedState::bind(
+                &mut store,
+                &[StateExposure {
+                    producer: "gmcp".to_string(),
+                    handle: None,
+                    name_override: None,
+                    paths: vec!["Char.Vitals".to_string()],
+                }],
+            )
+            .state
+            .expect("a usable exposure binds");
+            manager
+                .push_trigger_with_exposure(
+                    PushTriggerParams {
+                        isolate: IsolateId::Main,
+                        origin: Origin::User,
+                        name: &Arc::new("exposing".to_string()),
+                        patterns: &Arc::new(vec!["hit".to_string()]),
+                        raw_patterns: &Arc::new(Vec::new()),
+                        anti_patterns: &Arc::new(Vec::new()),
+                        matchers: None,
+                        action: ScriptAction::Noop,
+                        prompt: false,
+                        enabled: true,
+                        priority: 0,
+                        fallthrough: true,
+                        fire_limit: None,
+                        line_limit: None,
+                        source: None,
+                    },
+                    Some(bound.clone()),
+                )
+                .unwrap();
+
+            let fired = fire_line(&mut manager, &queue);
+            assert_eq!(fired.len(), 2);
+            let by_name = |name: &str| {
+                fired
+                    .iter()
+                    .map(identity)
+                    .find(|identity| identity.name.as_str() == name)
+                    .unwrap_or_else(|| panic!("{name} did not fire"))
+            };
+            assert!(
+                by_name("plain").exposure().is_none(),
+                "a plain automation reaches the fire site with None"
+            );
+            assert!(
+                by_name("exposing")
+                    .exposure
+                    .as_ref()
+                    .is_some_and(|exposure| Arc::ptr_eq(exposure, &bound)),
+                "the bound set rides the identity by Arc"
+            );
+
+            // A replacing registration without exposures drops them.
+            push(&mut manager, Origin::User, "exposing", None);
+            let fired = fire_line(&mut manager, &queue);
+            assert!(
+                fired
+                    .iter()
+                    .all(|action| identity(action).exposure().is_none())
+            );
         }
 
         fn stop_flag(action: &RuntimeAction) -> Arc<std::sync::atomic::AtomicBool> {
@@ -5073,6 +5249,105 @@ mod tests {
         assert_eq!(
             split_commands("north\nsouth;east", ";"),
             vec!["north", "south", "east"]
+        );
+    }
+
+    #[test]
+    fn template_state_references_resolve_through_exposures() {
+        use super::expand_template_with;
+        use crate::models::state_exposure::StateExposure;
+        use crate::session::runtime::store::SessionStore;
+        use crate::session::runtime::{
+            ExposedState, IsolateId, PlatformProducer, ProducerKey, StorePath,
+        };
+
+        let mut store = SessionStore::new();
+        let gmcp = ProducerKey::Platform(PlatformProducer::Gmcp);
+        for (producer, path, value) in [
+            (
+                gmcp,
+                "Char.Vitals",
+                serde_json::json!({ "hp": 100, "maxhp": 120 }),
+            ),
+            (
+                ProducerKey::User,
+                "foo.bar",
+                serde_json::json!({ "deep": "baz" }),
+            ),
+        ] {
+            store
+                .set(
+                    producer,
+                    StorePath::parse(path).unwrap(),
+                    value,
+                    IsolateId::Main,
+                    0,
+                )
+                .unwrap();
+        }
+        store.flush();
+        let exposure = |producer: &str, handle: Option<&str>, rename: Option<&str>, path: &str| {
+            StateExposure {
+                producer: producer.to_string(),
+                handle: handle.map(str::to_string),
+                name_override: rename.map(str::to_string),
+                paths: vec![path.to_string()],
+            }
+        };
+        let bound = ExposedState::bind(
+            &mut store,
+            &[
+                exposure("gmcp", None, None, "Char.Vitals"),
+                exposure("user", Some("foo"), Some("stats"), "bar"),
+            ],
+        )
+        .state
+        .unwrap();
+        let state = Some(&*bound);
+        let captures = caps(&[
+            (None, "WHOLE"),
+            (Some("gmcp"), "CAPTURED"),
+            (Some("who"), "Bob"),
+        ]);
+        let expand = |template: &str| expand_template_with(template, &captures, state);
+
+        // Bare and braced references, folded segments, quoted bracket keys.
+        assert_eq!(expand("hp $gmcp.char.vitals.hp!"), "hp 100!");
+        assert_eq!(
+            expand("${gmcp.Char.Vitals.hp}/${gmcp[\"Char\"].Vitals.maxhp}"),
+            "100/120"
+        );
+        assert_eq!(expand("$GMCP.CHAR.VITALS.HP"), "100");
+        // A trailing dot is literal; an object renders as compact JSON.
+        assert_eq!(expand("$gmcp.Char.Vitals.hp."), "100.");
+        assert_eq!(
+            expand("say $gmcp.Char.Vitals"),
+            r#"say {"hp":100,"maxhp":120}"#
+        );
+        // Above the exposed path, absent below it, a name that is not exposed (a capture
+        // reference with literal tail), and a sibling of the exposed path.
+        assert_eq!(
+            expand("[$gmcp.Char][$gmcp.Char.Vitals.nope][$nothing.x][${gmcp.Room.Info}]"),
+            "[][][.x][]"
+        );
+        // A bare name that is also a group means the group, braced or not; a dotted tail
+        // always means the state; `$$` stays a literal dollar.
+        assert_eq!(
+            expand("$gmcp ${gmcp} $gmcp.Char.Vitals.hp $$ $who"),
+            "CAPTURED CAPTURED 100 $ Bob"
+        );
+        // The renamed handle answers to its new name only, relative to the handle root.
+        assert_eq!(
+            expand("$stats.bar.deep|$stats.BAR|$foo.bar.deep"),
+            r#"baz|{"deep":"baz"}|.bar.deep"#
+        );
+        // Without exposures the same templates keep the capture-only grammar.
+        assert_eq!(
+            expand_template(
+                "$gmcp.Char.Vitals.hp ${gmcp.Char.Vitals.hp} $stats.bar",
+                &captures
+            ),
+            "CAPTURED.Char.Vitals.hp  .bar"
         );
     }
 }

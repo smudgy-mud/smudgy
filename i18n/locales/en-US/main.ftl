@@ -1292,6 +1292,35 @@ editor-continue-aliases = Let other matching aliases run too
 editor-continue-triggers = Let other matching triggers run too
 editor-allow-self-match = Allow this alias's sent text to match itself
 
+# What it reads (state exposures)
+editor-reveal-state = Read state from GMCP or a package
+editor-hide-state = Hide state options
+editor-what-it-reads = What it reads
+editor-state-values = State values
+editor-state-exposed = Exposed
+editor-state-browse = Browse
+editor-state-filter-placeholder = Filter paths
+editor-state-add-path = Add a path
+editor-state-add-reveal = Manually expose a state path (advanced)
+editor-state-handle = Handle
+editor-state-remove = Remove
+editor-state-rename = Use a different name…
+editor-state-name = Name
+editor-state-expose-tooltip = Expose { $path }
+editor-state-unexpose-tooltip = Stop exposing { $path }
+editor-state-insert-tooltip = Insert { $reference }
+editor-state-not-exposed = { $reference } isn't exposed to this { $kind }
+editor-state-name-taken = Another exposed value already uses the name { $name }
+editor-state-name-shadows-smudgy = smudgy's { $name } will not be accessible in this script.
+editor-state-name-shadows-javascript = JavaScript's { $name } will not be accessible in this script.
+editor-state-name-shadows-deno = Deno's { $name } will not be accessible in this script.
+editor-state-name-shadows-capture = { $name } is also a matched value; ${ $name } alone means the match
+editor-state-bad-name = { $name } isn't a valid name
+editor-state-reserved-name = { $name } is a JavaScript keyword and can't be a name
+editor-state-bad-path = { $path } isn't a valid path
+editor-state-empty = The Store is currently empty.
+editor-state-invalid = An exposed value can't be used: { $error }
+
 # The action module: tabs and generated-until-edited bodies
 editor-tab-send-text = Send text
 editor-tab-run-js = Run JavaScript

@@ -4844,6 +4844,7 @@ fn op_smudgy_create_simple_alias(
         allow_self_match: true,
         language: ScriptLang::Plaintext,
         matcher: None,
+        state: Vec::new(),
     };
     if let Some(spec) = command {
         // A `command` tag alias: the prefilter regex is derived host-side from the
@@ -4866,7 +4867,7 @@ fn op_smudgy_create_simple_alias(
             isolate,
             origin,
             name: Arc::new(name),
-            alias: alias_def,
+            alias: Box::new(alias_def),
             fire_limit: self_limit(fire_limit),
         },
     );
@@ -5198,6 +5199,7 @@ fn op_smudgy_create_hotkey<'s>(
         package: None,
         language: ScriptLang::JS,
         enabled: true,
+        state: Vec::new(),
     };
 
     let isolate = current_isolate(state);
@@ -5207,7 +5209,7 @@ fn op_smudgy_create_hotkey<'s>(
             isolate,
             origin,
             name: Arc::new(name),
-            hotkey,
+            hotkey: Box::new(hotkey),
             function_id: Some(function_id),
         },
     );

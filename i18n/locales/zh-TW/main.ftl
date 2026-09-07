@@ -1281,6 +1281,35 @@ editor-continue-aliases = 也讓其他相符的別名執行
 editor-continue-triggers = 也讓其他相符的觸發器執行
 editor-allow-self-match = 允許此別名送出的文字與它自己相符
 
+# 讀取內容（公開的狀態）
+editor-reveal-state = 從 GMCP 或套件讀取狀態
+editor-hide-state = 隱藏狀態選項
+editor-what-it-reads = 讀取內容
+editor-state-values = 狀態值
+editor-state-exposed = 已公開
+editor-state-browse = 瀏覽
+editor-state-filter-placeholder = 篩選路徑
+editor-state-add-path = 新增路徑
+editor-state-add-reveal = 手動公開狀態路徑（進階）
+editor-state-handle = 控制代碼
+editor-state-remove = 移除
+editor-state-rename = 使用其他名稱…
+editor-state-name = 名稱
+editor-state-expose-tooltip = 公開 { $path }
+editor-state-unexpose-tooltip = 停止公開 { $path }
+editor-state-insert-tooltip = 插入 { $reference }
+editor-state-not-exposed = { $reference } 未公開給此{ $kind }
+editor-state-name-taken = 另一個已公開的值已使用名稱 { $name }
+editor-state-name-shadows-smudgy = 此腳本中將無法使用 smudgy 的 { $name }。
+editor-state-name-shadows-javascript = 此腳本中將無法使用 JavaScript 的 { $name }。
+editor-state-name-shadows-deno = 此腳本中將無法使用 Deno 的 { $name }。
+editor-state-name-shadows-capture = { $name } 也是相符值；單獨的 ${ $name } 代表相符結果
+editor-state-bad-name = { $name } 不是有效的名稱
+editor-state-reserved-name = { $name } 是 JavaScript 關鍵字，不能作為名稱
+editor-state-bad-path = { $path } 不是有效的路徑
+editor-state-empty = 儲存區目前是空的。
+editor-state-invalid = 有一個已公開的值無法使用：{ $error }
+
 # 動作模組：分頁與編輯前自動產生的內容
 editor-tab-send-text = 傳送文字
 editor-tab-run-js = 執行 JavaScript

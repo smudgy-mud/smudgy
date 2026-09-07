@@ -8,8 +8,8 @@ use iced::alignment::Vertical;
 use iced::keyboard::Key;
 use iced::widget::Id;
 use iced::widget::{
-    Column, Space, button, checkbox, column, container, pick_list, radio, row, text, text_editor,
-    text_input,
+    Column, Row, Space, button, checkbox, column, container, pick_list, radio, row, text,
+    text_editor, text_input,
 };
 use iced::{Element, Font, Length, Padding, Task};
 
@@ -128,6 +128,14 @@ fn keyboard_activation_control<'a>(content: Elem<'a>, id: Id, message: Message) 
 // Update-side: open / create / save / delete
 // ============================================================================
 
+/// The order disclosure as the reads section mounts it: hidden behind its bare reveal
+/// link (which then shares a row with the state link), or open as the "When it runs"
+/// module. The hotkey editor has none.
+pub(super) struct OrderSlot<'a> {
+    pub hidden: bool,
+    pub content: Elem<'a>,
+}
+
 impl AutomationsWindow {
     pub(super) fn open_script(&mut self, key: ScriptKey) -> Update<Message, Event> {
         let Some(script) = self.find_script(&key) else {
@@ -139,6 +147,14 @@ impl AutomationsWindow {
         self.order_revealed = false;
         self.try_it_open = false;
         self.parsing_open = false;
+        // The state draft seeds before the action buffers bind the code editor: the inline
+        // bridge the binding installs declares the draft's exposures.
+        match &script {
+            Script::Alias(a) => self.reset_state_draft(&a.state),
+            Script::Trigger(t) => self.reset_state_draft(&t.state),
+            Script::Hotkey(h) => self.reset_state_draft(&h.state),
+            Script::Folder(_, _) => return Update::none(),
+        }
 
         let editor_task = match &script {
             Script::Alias(a) => self.seed_action_buffers(
@@ -337,6 +353,7 @@ impl AutomationsWindow {
         self.order_revealed = false;
         self.try_it_open = false;
         self.parsing_open = false;
+        self.reset_state_draft(&[]);
         // Command is the default kind for new aliases.
         self.alias_draft = AliasMatcherDraft::default();
         self.alias_pattern_content = text_editor::Content::new();
@@ -355,6 +372,7 @@ impl AutomationsWindow {
                 allow_self_match: false,
                 language: ScriptLang::Plaintext,
                 matcher: None,
+                state: Vec::new(),
             }),
             error: None,
         });
@@ -369,6 +387,7 @@ impl AutomationsWindow {
         self.order_revealed = false;
         self.try_it_open = false;
         self.parsing_open = false;
+        self.reset_state_draft(&[]);
         // No rows yet: the pane opens at the unselected-cards state.
         self.trigger_row_contents = Vec::new();
         self.pane = Pane::Editor(EditorState {
@@ -395,6 +414,7 @@ impl AutomationsWindow {
         self.action_script_lang = ScriptLang::JS;
         self.hotkey_text_content = text_editor::Content::new();
         self.hotkey_state.clear();
+        self.reset_state_draft(&[]);
         self.pane = Pane::Editor(EditorState {
             mode: EditorMode::Create,
             original_name: None,
@@ -406,6 +426,7 @@ impl AutomationsWindow {
                 package: self.current_folder(),
                 language: ScriptLang::Plaintext,
                 enabled: true,
+                state: Vec::new(),
             }),
             error: None,
         });
@@ -1046,6 +1067,18 @@ impl AutomationsWindow {
             None
         };
 
+        // The exposures persist from the draft, validated as the runtime validates
+        // them (§4 of the plan); the first failure blocks the save with its message.
+        let exposures = match self.validate_state_exposures() {
+            Ok(exposures) => exposures,
+            Err(message) => {
+                if let Pane::Editor(state) = &mut self.pane {
+                    state.error = Some(message);
+                }
+                return Update::none();
+            }
+        };
+
         // The body comes from whichever action tab is active: the send-text
         // draft for a Plaintext action, the script draft otherwise. Hotkeys
         // use their dedicated plaintext buffer when applicable. Every JS/TS
@@ -1117,6 +1150,7 @@ impl AutomationsWindow {
                         script: persisted_script,
                         pattern,
                         matcher,
+                        state: exposures.clone(),
                         ..a.clone()
                     })
                 }
@@ -1130,6 +1164,7 @@ impl AutomationsWindow {
                     }
                     Script::Hotkey(hotkeys::HotkeyDefinition {
                         script: persisted_script,
+                        state: exposures.clone(),
                         ..h
                     })
                 }
@@ -1154,6 +1189,7 @@ impl AutomationsWindow {
                         priority: *priority,
                         fallthrough: *fallthrough,
                         matchers: None,
+                        state: exposures.clone(),
                     };
                     if let Err((i, message)) = rows_into_trigger(rows, &mut t) {
                         let message = crate::i18n::t!(
@@ -1313,6 +1349,9 @@ impl AutomationsWindow {
         }
         self.dirty = false;
         self.clear_code_editor();
+        // The editor is gone with its automation, so the inline bridge the refresh below
+        // installs declares no exposures.
+        self.reset_state_draft(&[]);
         if self.language_project_context_matches(&code_editor::LanguageProjectContext::Inline) {
             self.language_project_target_context =
                 Some(code_editor::LanguageProjectContext::Inline);
@@ -1902,6 +1941,48 @@ impl AutomationsWindow {
     /// (its grid label rendered empty) until clicked, forced open — and not
     /// re-hideable — while any value is non-default (`prompt` included), with
     /// a hide link when open on pure defaults.
+    /// Whether every "When it runs" control is at its default, which is when the module
+    /// can hide behind its link.
+    fn order_at_defaults(
+        priority: i32,
+        fallthrough: bool,
+        prompt: Option<bool>,
+        allow_self_match: Option<bool>,
+    ) -> bool {
+        priority == 0 && fallthrough && prompt != Some(true) && allow_self_match != Some(true)
+    }
+
+    /// The order disclosure's reveal link on its own.
+    fn order_reveal_link<'a>(&self, trigger: bool) -> Elem<'a> {
+        let label = if trigger {
+            crate::i18n::t!("editor-reveal-order-triggers")
+        } else {
+            crate::i18n::t!("editor-reveal-order-aliases")
+        };
+        text_link(label, Message::RevealOrder)
+    }
+
+    /// The order disclosure as the reads section mounts it: its bare reveal link while
+    /// hidden (the section puts it on the row it shares with the state link), the "When it
+    /// runs" module otherwise.
+    fn order_slot<'a>(
+        &'a self,
+        priority: i32,
+        fallthrough: bool,
+        prompt: Option<bool>,
+        allow_self_match: Option<bool>,
+        trigger: bool,
+    ) -> OrderSlot<'a> {
+        let hidden = Self::order_at_defaults(priority, fallthrough, prompt, allow_self_match)
+            && !self.order_revealed;
+        let content = if hidden {
+            self.order_reveal_link(trigger)
+        } else {
+            self.order_module(priority, fallthrough, prompt, allow_self_match, trigger)
+        };
+        OrderSlot { hidden, content }
+    }
+
     fn order_module<'a>(
         &self,
         priority: i32,
@@ -1910,15 +1991,9 @@ impl AutomationsWindow {
         allow_self_match: Option<bool>,
         trigger: bool,
     ) -> Elem<'a> {
-        let non_default =
-            priority != 0 || !fallthrough || prompt == Some(true) || allow_self_match == Some(true);
+        let non_default = !Self::order_at_defaults(priority, fallthrough, prompt, allow_self_match);
         if !non_default && !self.order_revealed {
-            let label = if trigger {
-                crate::i18n::t!("editor-reveal-order-triggers")
-            } else {
-                crate::i18n::t!("editor-reveal-order-aliases")
-            };
-            return field_row("", text_link(label, Message::RevealOrder));
+            return field_row("", self.order_reveal_link(trigger));
         }
 
         // The priority stepper: a collapsed-border [-|value|+] segment.
@@ -2018,41 +2093,95 @@ impl AutomationsWindow {
         field_row(crate::i18n::ts!("editor-when-it-runs"), inner.into())
     }
 
-    /// The Matched-values rail: one clickable badge per capture the current
-    /// matcher provides, inserting its reference at the caret in the action
-    /// body. Absent entirely when nothing is captured.
-    fn matched_values_rail<'a>(&self, references: Vec<String>) -> Option<Elem<'a>> {
-        if references.is_empty() {
-            return None;
-        }
-        let mut rail = row![].spacing(6.0).align_y(Vertical::Center);
-        for reference in references {
-            rail = rail.push(
-                button(
-                    text(reference.clone())
-                        .size(12.0)
-                        .font(fonts::GEIST_MONO_VF),
-                )
-                .style(capture_badge_style)
-                .on_press(Message::InsertReference(reference))
-                .padding([3, 8]),
-            );
-        }
-        Some(
-            column![
-                common::section_label(crate::i18n::ts!("editor-matched-values")),
-                rail,
+    /// The "What it reads" module with the values rail beneath it, as one body child.
+    ///
+    /// The rail is one row of two labeled groups, `[Matched values][State values]`: one
+    /// clickable badge per capture the current matcher provides, then one per exposed
+    /// state path, each inserting its reference at the caret of the active action tab, with
+    /// a rule between the groups when both have content. The row and both group slots stay
+    /// mounted whatever is captured or exposed, so the pane's tree keeps its shape as
+    /// values come and go. The rail carries its own gap above only while it has badges,
+    /// which is why it shares a body child with the module: a bare empty row would still
+    /// collect the body column's spacing on both sides.
+    fn reads_and_values_section<'a>(
+        &'a self,
+        matched: Vec<String>,
+        language: ScriptLang,
+        order: Option<OrderSlot<'a>>,
+    ) -> Elem<'a> {
+        // The disclosures: one row holding both reveal links while both are hidden, else
+        // the order module (or its link) above the state module (or its link). The hotkey
+        // editor has no order disclosure.
+        let disclosures: Elem<'a> = match order {
+            Some(OrderSlot {
+                hidden: true,
+                content: order_link,
+            }) if !self.state_disclosure_open() => field_row(
+                "",
+                row![order_link, self.state_reveal_link()]
+                    .spacing(16.0)
+                    .align_y(Vertical::Center)
+                    .into(),
+            ),
+            Some(OrderSlot { hidden, content }) => column![
+                if hidden {
+                    field_row("", content)
+                } else {
+                    content
+                },
+                self.state_module(),
             ]
-            .spacing(4.0)
             .into(),
-        )
+            None => self.state_module(),
+        };
+        let matched = values_group(
+            crate::i18n::ts!("editor-matched-values"),
+            matched
+                .into_iter()
+                .map(|reference| reference_badge(reference, None, capture_badge_style))
+                .collect(),
+        );
+        let state = values_group(
+            crate::i18n::ts!("editor-state-values"),
+            self.state_rail_entries(language)
+                .into_iter()
+                .map(|(reference, value)| {
+                    let style = if value.is_some() {
+                        state_badge_style
+                    } else {
+                        absent_badge_style
+                    };
+                    reference_badge(reference, value, style)
+                })
+                .collect(),
+        );
+        let gap = if matched.is_some() || state.is_some() {
+            16.0
+        } else {
+            0.0
+        };
+        column![
+            disclosures,
+            container(values_rail_row(matched, state)).padding(Padding {
+                top: gap,
+                ..Padding::ZERO
+            }),
+        ]
+        .width(Length::Fill)
+        .into()
     }
 
     /// The capture references the open alias's draft provides, rendered in the
     /// action language's vocabulary (`$name` for text, `matches.name` for JS).
     fn alias_capture_references(&self, language: ScriptLang) -> Vec<String> {
+        render_references(&self.alias_captures(), language)
+    }
+
+    /// The captures the open alias's draft provides, in group order: a name for
+    /// a Command argument or a named group, `None` for a positional group.
+    pub(super) fn alias_captures(&self) -> Vec<Option<String>> {
         let draft = &self.alias_draft;
-        let captures: Vec<Option<String>> = match draft.kind {
+        match draft.kind {
             AliasKind::Command => draft
                 .args
                 .iter()
@@ -2078,13 +2207,18 @@ impl AutomationsWindow {
                         .collect()
                 })
                 .unwrap_or_default(),
-        };
-        render_references(&captures, language)
+        }
     }
 
     /// The capture references a trigger's Match/Raw rows provide (the union,
     /// in row order).
     fn trigger_capture_references(rows: &[TriggerRow], language: ScriptLang) -> Vec<String> {
+        render_references(&Self::trigger_captures(rows), language)
+    }
+
+    /// The captures a trigger's Match/Raw rows provide: the union in row order,
+    /// a named group once, positional groups as `None`.
+    pub(super) fn trigger_captures(rows: &[TriggerRow]) -> Vec<Option<String>> {
         let mut captures: Vec<Option<String>> = Vec::new();
         for row in rows {
             if row.role == PatternKind::Anti || row.source.trim().is_empty() {
@@ -2102,7 +2236,7 @@ impl AutomationsWindow {
                 captures.push(name);
             }
         }
-        render_references(&captures, language)
+        captures
     }
 
     /// The "Folder" control in a script editor: a `pick_list` of every folder
@@ -2175,34 +2309,39 @@ impl AutomationsWindow {
         &'a self,
         language: ScriptLang,
         references: Vec<String>,
+        kind: AutomationKind,
         control_name: &'static str,
     ) -> Elem<'a> {
         let text_active = language == ScriptLang::Plaintext;
         let strip = self.action_tab_strip(language, control_name);
 
-        let editor: Elem<'a> = if text_active {
+        let (editor, note): (Elem<'a>, Elem<'a>) = if text_active {
             let mut known = references;
             known.push("$0".to_string());
-            text_editor(&self.send_text_content)
-                .highlight_with::<highlight::PatternHighlighter>(
-                    highlight::FieldSyntax::SendText { known },
-                    token_format,
-                )
+            let syntax = highlight::FieldSyntax::SendText {
+                known,
+                exposed: self.exposed_paths(),
+            };
+            let note = unexposed_note(&self.send_text_content, &syntax, kind);
+            let editor = text_editor(&self.send_text_content)
+                .highlight_with::<highlight::PatternHighlighter>(syntax, token_format)
                 .font(fonts::GEIST_MONO_VF)
                 .size(13.0)
                 .padding(10.0)
                 .on_action(Message::SendTextAction)
                 .height(Length::Fill)
                 .min_height(120.0)
-                .into()
+                .into();
+            (editor, note)
         } else {
-            self.code_editor_view(Length::Fill)
+            (self.code_editor_view(Length::Fill), empty_slot())
         };
         column![
             strip,
             container(editor)
                 .height(Length::Fill)
-                .style(common::code_surface_style)
+                .style(common::code_surface_style),
+            note,
         ]
         .spacing(0.0)
         .into()
@@ -2211,23 +2350,39 @@ impl AutomationsWindow {
     /// The hotkey action editor uses the same tab contract as aliases and triggers.
     fn hotkey_action_module<'a>(&'a self, language: ScriptLang) -> Elem<'a> {
         let strip = self.action_tab_strip(language, "hotkey");
-        let editor: Elem<'a> = if language == ScriptLang::Plaintext {
-            text_editor(&self.hotkey_text_content)
+        let (editor, note): (Elem<'a>, Elem<'a>) = if language == ScriptLang::Plaintext {
+            // A hotkey captures nothing, and its text is expanded only when it exposes
+            // state (otherwise it is sent as written), so the reference grammar applies
+            // only then. Both syntaxes share the highlighter, so the field keeps its
+            // widget state across the switch.
+            let syntax = if self.state_exposures.is_empty() {
+                highlight::FieldSyntax::Plain
+            } else {
+                highlight::FieldSyntax::SendText {
+                    known: Vec::new(),
+                    exposed: self.exposed_paths(),
+                }
+            };
+            let note = unexposed_note(&self.hotkey_text_content, &syntax, AutomationKind::Hotkey);
+            let editor = text_editor(&self.hotkey_text_content)
+                .highlight_with::<highlight::PatternHighlighter>(syntax, token_format)
                 .font(fonts::GEIST_MONO_VF)
                 .size(13.0)
                 .padding(10.0)
                 .on_action(Message::HotkeyTextAction)
                 .height(Length::Fill)
                 .min_height(120.0)
-                .into()
+                .into();
+            (editor, note)
         } else {
-            self.code_editor_view(Length::Fill)
+            (self.code_editor_view(Length::Fill), empty_slot())
         };
         column![
             strip,
             container(editor)
                 .height(Length::Fill)
-                .style(common::code_surface_style)
+                .style(common::code_surface_style),
+            note,
         ]
         .spacing(0.0)
         .into()
@@ -2417,18 +2572,20 @@ impl AutomationsWindow {
             }
         }
         body = body.push(self.tester_box(true, false));
-        body = body.push(self.order_module(
+        let references = self.alias_capture_references(alias.language);
+        let order = self.order_slot(
             alias.priority,
             alias.fallthrough,
             None,
             Some(alias.allow_self_match),
             false,
+        );
+        body = body.push(self.reads_and_values_section(
+            references.clone(),
+            alias.language,
+            Some(order),
         ));
-        let references = self.alias_capture_references(alias.language);
-        if let Some(rail) = self.matched_values_rail(references.clone()) {
-            body = body.push(rail);
-        }
-        let editor = self.action_module(alias.language, references, "alias");
+        let editor = self.action_module(alias.language, references, AutomationKind::Alias, "alias");
         let bar = self.save_bar(
             create,
             !create,
@@ -2493,6 +2650,7 @@ impl AutomationsWindow {
                     .on_action(Message::MarkHotkeyState),
             ),
         ));
+        body = body.push(self.reads_and_values_section(Vec::new(), hotkey.language, None));
         let editor = self.hotkey_action_module(hotkey.language);
         let bar = self.save_bar(
             create,
@@ -2725,12 +2883,10 @@ impl AutomationsWindow {
             .iter()
             .any(|row| row.role == PatternKind::Raw && !row.source.trim().is_empty());
         body = body.push(self.tester_box(false, has_raw));
-        body = body.push(self.order_module(priority, fallthrough, Some(prompt), None, true));
         let references = Self::trigger_capture_references(rows, language);
-        if let Some(rail) = self.matched_values_rail(references.clone()) {
-            body = body.push(rail);
-        }
-        let editor = self.action_module(language, references, "trigger");
+        let order = self.order_slot(priority, fallthrough, Some(prompt), None, true);
+        body = body.push(self.reads_and_values_section(references.clone(), language, Some(order)));
+        let editor = self.action_module(language, references, AutomationKind::Trigger, "trigger");
         let bar = self.save_bar(
             create,
             !create,
@@ -4143,7 +4299,7 @@ fn trigger_package(state: &EditorState) -> Option<&str> {
     }
 }
 
-fn field_row<'a>(label: &str, control: Elem<'a>) -> Elem<'a> {
+pub(super) fn field_row<'a>(label: &str, control: Elem<'a>) -> Elem<'a> {
     row![AutomationsWindow::field_label(label), control]
         .spacing(12.0)
         .align_y(Vertical::Center)
@@ -4153,7 +4309,7 @@ fn field_row<'a>(label: &str, control: Elem<'a>) -> Elem<'a> {
 /// An underlined text link (D8): quiet at rest, full-strength on hover. The
 /// underline rule and both colors come from the theme crate so every link in
 /// these panes reads the same.
-fn text_link<'a>(label: String, message: Message) -> Elem<'a> {
+pub(super) fn text_link<'a>(label: String, message: Message) -> Elem<'a> {
     button(button_style::underlined(text(label).size(12.0)))
         .style(button_style::quiet_link)
         .padding(0)
@@ -4211,12 +4367,15 @@ fn regex_loose_sides(source: &str) -> (bool, bool) {
 }
 
 /// A small tooltip chip.
-fn tip<'a>(content: Elem<'a>, label: String) -> Elem<'a> {
+pub(super) fn tip<'a>(content: Elem<'a>, label: String) -> Elem<'a> {
     iced::widget::tooltip(
         content,
+        // The theme's tooltip surface: the overlay material at a fixed alpha, so the label
+        // reads over whatever it floats above whatever the palette's background alpha is.
+        // (The banner wash is a 4% tint, and the modal card inherits the palette's alpha.)
         container(text(label).size(11.0))
             .padding(6.0)
-            .style(common::banner_style),
+            .style(crate::theme::builtins::container::tooltip),
         iced::widget::tooltip::Position::Top,
     )
     .into()
@@ -4278,7 +4437,7 @@ fn token_format(
         Token::Hole | Token::GroupOpen | Token::Escape | Token::KnownRef => common::KIND_PATTERN,
         Token::Wildcard => common::KIND_PATTERN.scale_alpha(0.65),
         Token::Island => common::KIND_REGEX,
-        Token::UnknownRef => theme.styles.text.error,
+        Token::UnknownRef | Token::UnexposedRef => theme.styles.text.error,
     };
     iced::advanced::text::highlighter::Format {
         color: Some(color),
@@ -5697,6 +5856,211 @@ fn capture_badge_style(
     }
 }
 
+/// A rail badge's button style.
+type BadgeStyle = fn(&Theme, iced::widget::button::Status) -> iced::widget::button::Style;
+
+/// The State values badge: the capture badge composite in the [`common::KIND_PATTERN`]
+/// hue, the accent known `$ref` runs already take, so "a value the automation reads"
+/// reads the same in the rail and in the body; the violet capture badge stays "a value
+/// the pattern captured".
+fn state_badge_style(
+    theme: &Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    let hue = common::KIND_PATTERN;
+    let hovered = matches!(
+        status,
+        iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed
+    );
+    iced::widget::button::Style {
+        background: Some(iced::Background::Color(hue.scale_alpha(if hovered {
+            0.3
+        } else {
+            0.14
+        }))),
+        border: iced::Border {
+            color: common::darken(hue, 0.35),
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        text_color: theme.styles.text.normal,
+        ..Default::default()
+    }
+}
+
+/// A State values badge whose value the session has not provided (no snapshot, or nothing
+/// at the path yet): the visual contract's "not provided" treatment, an outline at half
+/// strength with no fill and the ink dimmed. It still inserts.
+fn absent_badge_style(
+    theme: &Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    let hovered = matches!(
+        status,
+        iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed
+    );
+    iced::widget::button::Style {
+        background: hovered
+            .then(|| iced::Background::Color(theme.styles.text.normal.scale_alpha(0.06))),
+        border: iced::Border {
+            color: common::KIND_PATTERN.scale_alpha(0.5),
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        text_color: theme.styles.text.normal.scale_alpha(0.4),
+        ..Default::default()
+    }
+}
+
+/// One rail badge: the reference in mono, the live value beside it in the muted ink when
+/// one is known, the whole a button inserting the reference at the caret of the active
+/// action tab, under an `Insert …` tooltip.
+fn reference_badge<'a>(reference: String, value: Option<String>, style: BadgeStyle) -> Elem<'a> {
+    let mut content = row![
+        text(reference.clone())
+            .size(12.0)
+            .font(fonts::GEIST_MONO_VF)
+    ]
+    .spacing(6.0)
+    .align_y(Vertical::Center);
+    if let Some(value) = value {
+        content = content.push(
+            text(value)
+                .size(11.0)
+                .font(fonts::GEIST_MONO_VF)
+                .style(common::muted),
+        );
+    }
+    let tooltip = crate::i18n::t!("editor-state-insert-tooltip", "reference" => reference.as_str());
+    tip(
+        button(content)
+            .style(style)
+            .on_press(Message::InsertReference(reference))
+            .padding([3, 8])
+            .into(),
+        tooltip,
+    )
+}
+
+/// Badges per rail row (D6): a count-based chunk is deterministic and testable.
+const BADGES_PER_ROW: usize = 8;
+
+/// One labeled group of the values rail: the section label over the badges, chunked into
+/// rows of at most [`BADGES_PER_ROW`], as a Shrink-width column so two groups sit side by
+/// side. `None` with no badges; the row mounts an empty slot in its place.
+fn values_group<'a>(label: &str, badges: Vec<Elem<'a>>) -> Option<Elem<'a>> {
+    if badges.is_empty() {
+        return None;
+    }
+    let mut rows = Column::new().spacing(6.0);
+    let mut badges = badges.into_iter();
+    loop {
+        let chunk: Vec<Elem<'a>> = badges.by_ref().take(BADGES_PER_ROW).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        rows = rows.push(
+            Row::with_children(chunk)
+                .spacing(6.0)
+                .align_y(Vertical::Center),
+        );
+    }
+    Some(
+        column![common::section_label(label), rows]
+            .spacing(4.0)
+            .width(Length::Shrink)
+            .into(),
+    )
+}
+
+/// The values rail's row: the matched slot, the rule slot, and the state slot, every one
+/// mounted whether or not it has content, so nothing beneath the row moves when a group
+/// appears. A group stands alone when the other is empty; the rule shows only between two.
+/// Width Fill, height pinned to Shrink: the rule is Fill-height inside the row (it
+/// stretches to the taller group), and `Row::push` would otherwise let that fluidity leak
+/// into the row's own hint and the rail measure against nothing.
+fn values_rail_row<'a>(matched: Option<Elem<'a>>, state: Option<Elem<'a>>) -> Elem<'a> {
+    let rule: Elem<'a> = if matched.is_some() && state.is_some() {
+        container(iced::widget::rule::vertical(1))
+            .padding(Padding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 16.0,
+                right: 16.0,
+            })
+            .into()
+    } else {
+        empty_slot()
+    };
+    row![rail_slot(matched), rule, rail_slot(state)]
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .into()
+}
+
+/// A rail group's slot: the group, or an empty container holding its place.
+fn rail_slot<'a>(group: Option<Elem<'a>>) -> Elem<'a> {
+    match group {
+        Some(group) => container(group).into(),
+        None => empty_slot(),
+    }
+}
+
+/// An always-mounted placeholder that lays out to nothing. A container, not a bare
+/// zero-height `Space`: `Row::push` and `Column::push` drop a child whose size hint is
+/// void, and a container reports only fluid hints.
+fn empty_slot<'a>() -> Elem<'a> {
+    container(Space::new()).into()
+}
+
+/// How many uncovered state references the note under a text body names.
+const UNEXPOSED_NOTE_CAP: usize = 3;
+
+/// The line under a text body naming the state references its exposures do not cover, in
+/// the catalog's words: the tooltip a highlighted run cannot carry. An always-mounted
+/// slot, empty and costing nothing while every reference resolves, or while the syntax
+/// has no references to resolve.
+fn unexposed_note<'a>(
+    content: &text_editor::Content,
+    syntax: &highlight::FieldSyntax,
+    kind: AutomationKind,
+) -> Elem<'a> {
+    // Only a send-text body carries state references; every other syntax returns before
+    // the buffer is read. (`Content::line` hands out owned text, so the copy below is
+    // iced's own, paid once per view by the one body that has references to resolve.)
+    if !matches!(syntax, highlight::FieldSyntax::SendText { .. }) {
+        return empty_slot();
+    }
+    let lines: Vec<String> = content.lines().map(|line| line.text.into_owned()).collect();
+    let unexposed = highlight::unexposed_references(lines.iter().map(String::as_str), syntax);
+    if unexposed.is_empty() {
+        return empty_slot();
+    }
+    let kind = match kind {
+        AutomationKind::Alias => crate::i18n::ts!("package-kind-alias"),
+        AutomationKind::Trigger => crate::i18n::ts!("package-kind-trigger"),
+        AutomationKind::Hotkey => crate::i18n::ts!("package-kind-hotkey"),
+    };
+    let mut notes = Column::new().spacing(2.0);
+    for reference in unexposed.iter().take(UNEXPOSED_NOTE_CAP) {
+        notes = notes.push(
+            text(crate::i18n::t!(
+                "editor-state-not-exposed",
+                "reference" => reference.as_str(),
+                "kind" => kind
+            ))
+            .size(12.0)
+            .style(common::danger),
+        );
+    }
+    container(notes)
+        .padding(Padding {
+            top: 6.0,
+            ..Padding::ZERO
+        })
+        .into()
+}
+
 /// Which generated example a pane shows (`matching-logic.md` §8).
 #[derive(Clone, Copy)]
 enum ExampleKind {
@@ -6254,6 +6618,224 @@ mod tests {
         );
         assert_eq!(shapes[1], shapes[2]);
         assert_eq!(shapes[2], shapes[3]);
+    }
+
+    /// The rail row reports `(Fill, Shrink)` whatever its groups hold: the rule between
+    /// two groups is Fill-height inside it, and that fluidity must stay internal, or the
+    /// rail measures against nothing in the body column. Its three slots are always there.
+    #[test]
+    fn values_rail_row_is_fill_wide_and_shrink_tall_in_every_state() {
+        let group = || {
+            values_group(
+                "State values",
+                vec![reference_badge(
+                    "$gmcp.Char.Vitals.hp".to_string(),
+                    Some("100".to_string()),
+                    state_badge_style,
+                )],
+            )
+        };
+        for (matched, state) in [
+            (None, None),
+            (group(), None),
+            (None, group()),
+            (group(), group()),
+        ] {
+            let rail = values_rail_row(matched, state);
+            assert_eq!(
+                rail.as_widget().size(),
+                iced::Size::new(Length::Fill, Length::Shrink)
+            );
+            assert_eq!(Tree::new(rail.as_widget()).children.len(), 3);
+        }
+    }
+
+    /// Nine badges chunk into two rows, eight then one (D6).
+    #[test]
+    fn rail_groups_chunk_badges_into_rows_of_eight() {
+        let badges = |count: usize| -> Vec<Elem<'static>> {
+            (0..count)
+                .map(|i| reference_badge(format!("${i}"), None, capture_badge_style))
+                .collect()
+        };
+        let rows_of = |count: usize| -> Vec<usize> {
+            let group = values_group("Matched values", badges(count)).expect("badges make a group");
+            let tree = Tree::new(group.as_widget());
+            // `[section label, rows]`; each row's children are its badges.
+            tree.children[1]
+                .children
+                .iter()
+                .map(|row| row.children.len())
+                .collect()
+        };
+        assert_eq!(rows_of(1), vec![1]);
+        assert_eq!(rows_of(8), vec![8]);
+        assert_eq!(rows_of(9), vec![8, 1]);
+        assert_eq!(rows_of(17), vec![8, 8, 1]);
+        assert!(values_group("Matched values", Vec::new()).is_none());
+    }
+
+    /// The values rail and the "What it reads" disclosure change shape as exposures come
+    /// and go. iced diffs children positionally, so a widget whose tree path ran through
+    /// them would lose its state — focus included — on the very click that exposed a
+    /// value. The action editor is kept out of their way by construction: it is the body
+    /// column's sibling in the pane's `GrowColumn`, never a body child, and the editor-path
+    /// assertions pin that placement. Within the body, the section holds its shape at the
+    /// levels a sibling diffs against: the module and the rail are always its two children,
+    /// and the rail row always holds its three slots (matched, rule, state).
+    #[test]
+    fn action_editor_keeps_its_tree_path_across_rail_and_disclosure_states() {
+        use iced::advanced::widget::tree::Tag;
+        use smudgy_core::session::SessionId;
+
+        fn editor_paths(tree: &Tree, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+            if tree.tag == Tag::of::<text_editor::State<highlight::PatternHighlighter>>() {
+                out.push(path.clone());
+            }
+            for (index, child) in tree.children.iter().enumerate() {
+                path.push(index);
+                editor_paths(child, path, out);
+                path.pop();
+            }
+        }
+
+        /// The tree path of the action editor: the last highlighted text editor in the
+        /// pane (matcher fields sit above it).
+        fn action_editor_path(window: &AutomationsWindow) -> Vec<usize> {
+            let Pane::Editor(state) = &window.pane else {
+                panic!("an editor is open");
+            };
+            let view = window.view_editor(state, 800.0);
+            let tree = Tree::new(view.as_widget());
+            let mut paths = Vec::new();
+            editor_paths(&tree, &mut Vec::new(), &mut paths);
+            paths.pop().expect("the pane holds the action editor")
+        }
+
+        /// The section's child count (the module, then the rail) and the rail row's slot
+        /// count, both fixed whatever the draft exposes or reveals.
+        const SECTION_SHAPE: (usize, usize) = (2, 3);
+
+        /// The shape of the body's "What it reads" section as the open draft builds it.
+        fn section_shape(window: &AutomationsWindow, matched: &[String]) -> (usize, usize) {
+            let section =
+                window.reads_and_values_section(matched.to_vec(), ScriptLang::Plaintext, None);
+            let tree = Tree::new(section.as_widget());
+            // `[module, rail row]`: a container is transparent in the tree (its node is
+            // its content's), so the second child is the row and its children the slots.
+            let rail_row = &tree.children[1];
+            (tree.children.len(), rail_row.children.len())
+        }
+
+        /// After `step`, the action editor still sits at `baseline` and the section still
+        /// has its shape.
+        fn assert_stable(
+            window: &AutomationsWindow,
+            baseline: &[usize],
+            matched: &[String],
+            step: &str,
+        ) {
+            assert_eq!(action_editor_path(window), baseline, "{step}");
+            assert_eq!(section_shape(window, matched), SECTION_SHAPE, "{step}");
+        }
+
+        let expose = |path: &str| Message::ToggleStateExposure {
+            producer: "gmcp".to_string(),
+            handle: None,
+            path: path.to_string(),
+        };
+        let mut window = AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "rail-topology-test".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        for kind in [
+            AutomationKind::Alias,
+            AutomationKind::Trigger,
+            AutomationKind::Hotkey,
+        ] {
+            match kind {
+                AutomationKind::Alias => {
+                    let _ = window.new_alias();
+                }
+                AutomationKind::Trigger => {
+                    let _ = window.new_trigger();
+                }
+                AutomationKind::Hotkey => {
+                    let _ = window.new_hotkey();
+                }
+            }
+            let baseline = action_editor_path(&window);
+            assert_stable(&window, &baseline, &[], &format!("{kind:?}: at rest"));
+            let _ = window.update(Message::RevealState);
+            assert_stable(
+                &window,
+                &baseline,
+                &[],
+                &format!("{kind:?}: revealing the disclosure"),
+            );
+            // The order link shares a row with the state link only while both hide; opening
+            // either splits them, and the editor below must not move.
+            let _ = window.update(Message::RevealOrder);
+            assert_stable(
+                &window,
+                &baseline,
+                &[],
+                &format!("{kind:?}: revealing the order disclosure beside it"),
+            );
+            let _ = window.update(expose("Char.Vitals"));
+            assert_stable(
+                &window,
+                &baseline,
+                &[],
+                &format!("{kind:?}: mounting the State values group"),
+            );
+            let _ = window.update(expose("Room.Info"));
+            assert_stable(
+                &window,
+                &baseline,
+                &[],
+                &format!("{kind:?}: a second badge"),
+            );
+            let _ = window.update(expose("Char.Vitals"));
+            let _ = window.update(expose("Room.Info"));
+            assert!(window.state_exposures.is_empty());
+            assert_stable(
+                &window,
+                &baseline,
+                &[],
+                &format!("{kind:?}: unmounting the State values group"),
+            );
+            let _ = window.update(Message::HideState);
+            assert_stable(
+                &window,
+                &baseline,
+                &[],
+                &format!("{kind:?}: hiding the disclosure"),
+            );
+        }
+
+        // Both groups at once: a Command argument mounts Matched values beside State values.
+        let _ = window.new_alias();
+        let baseline = action_editor_path(&window);
+        let _ = window.update(Message::AddArg);
+        let _ = window.update(Message::SetArgName(0, "target".to_string()));
+        let matched = window.alias_capture_references(ScriptLang::Plaintext);
+        assert_eq!(matched, ["$target"]);
+        assert_stable(
+            &window,
+            &baseline,
+            &matched,
+            "mounting the Matched values group",
+        );
+        let _ = window.update(expose("Char.Vitals"));
+        assert_stable(
+            &window,
+            &baseline,
+            &matched,
+            "mounting both groups and the rule",
+        );
     }
 
     /// Enter never reaches a one-line buffer, and pasted newlines flatten.

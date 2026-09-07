@@ -73,7 +73,7 @@ async fn raw_prefix_bypasses_splitting_and_alias_matching() {
         isolate: IsolateId::Main,
         origin: Origin::User,
         name: Arc::new("test_alias".to_string()),
-        alias: AliasDefinition {
+        alias: Box::new(AliasDefinition {
             pattern: "^alias_name".to_string(),
             script: Some("alias_fired".to_string()),
             package: None,
@@ -83,7 +83,8 @@ async fn raw_prefix_bypasses_splitting_and_alias_matching() {
             allow_self_match: false,
             language: ScriptLang::Plaintext,
             matcher: None,
-        },
+            state: Vec::new(),
+        }),
         fire_limit: None,
     })
     .unwrap();

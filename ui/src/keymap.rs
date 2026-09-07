@@ -934,6 +934,7 @@ mod tests {
             package: None,
             language: smudgy_core::models::ScriptLang::Plaintext,
             enabled: true,
+            state: Vec::new(),
         };
 
         let keys = vec![
@@ -957,6 +958,7 @@ mod tests {
             package: None,
             language: smudgy_core::models::ScriptLang::Plaintext,
             enabled: true,
+            state: Vec::new(),
         };
 
         let maybe_key = hotkey_to_maybe_physical_key(&hotkey);
@@ -978,6 +980,7 @@ mod tests {
             package: None,
             language: smudgy_core::models::ScriptLang::Plaintext,
             enabled: true,
+            state: Vec::new(),
         };
 
         let hotkey_keys: HotkeyKeys = hotkey.into();
@@ -1005,6 +1008,7 @@ mod tests {
             package: None,
             language: smudgy_core::models::ScriptLang::Plaintext,
             enabled: true,
+            state: Vec::new(),
         };
 
         let maybe_key = hotkey_to_maybe_physical_key(&hotkey);
@@ -1026,6 +1030,7 @@ mod tests {
             package: None,
             language: smudgy_core::models::ScriptLang::Plaintext,
             enabled: true,
+            state: Vec::new(),
         };
 
         let hotkey_keys: HotkeyKeys = hotkey.into();
@@ -1045,6 +1050,7 @@ mod tests {
             package: None,
             language: smudgy_core::models::ScriptLang::Plaintext,
             enabled: true,
+            state: Vec::new(),
         };
 
         let maybe_key = hotkey_to_maybe_physical_key(&hotkey);
@@ -1068,6 +1074,7 @@ mod tests {
             package: None,
             language: smudgy_core::models::ScriptLang::Plaintext,
             enabled: true,
+            state: Vec::new(),
         };
 
         let maybe_key = hotkey_to_maybe_physical_key(&hotkey);
@@ -1089,6 +1096,7 @@ mod tests {
             package: None,
             language: smudgy_core::models::ScriptLang::Plaintext,
             enabled: true,
+            state: Vec::new(),
         };
 
         let maybe_key = hotkey_to_maybe_physical_key(&hotkey);

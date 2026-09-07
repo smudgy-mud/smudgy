@@ -339,7 +339,7 @@ fn labeled<'a, M: Clone + 'static>(
         control,
         container(text(label).size(11))
             .padding([2, 6])
-            .style(theme::builtins::container::modal_card),
+            .style(theme::builtins::container::tooltip),
         tooltip::Position::Bottom,
     )
     .into()

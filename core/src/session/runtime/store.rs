@@ -607,12 +607,17 @@ struct Watcher {
     cadence: WatchCadence,
 }
 
-/// One registered widget binding: the addressed path plus the shared cell the UI reads.
+/// One registered host binding: the addressed path plus the shared cell its readers load.
 /// Bindings have no JS side — invalidation writes the cell and never dispatches a function.
 struct HostBinding {
     producer: ProducerKey,
     path: StorePath,
     cell: Arc<StoreBindingCell>,
+    /// Whether a flush that rewrites this cell must wake the UI. Widget bindings read their
+    /// cells from render closures, so they do; an automation's state exposures read theirs at
+    /// fire time and never repaint anything. One cell serves both kinds of reader (bindings
+    /// dedupe per folded path), so the bit is the OR of every registration.
+    wakes_ui: bool,
 }
 
 /// One node of a producer's binding path trie, keyed by ASCII-folded segment. `ids` are the
@@ -1161,6 +1166,24 @@ impl SessionStore {
     /// per folded path: a remount re-calling `bind` gets the same cell, so cells are bounded
     /// by the number of distinct bound paths per engine run.
     pub fn bind(&mut self, producer: ProducerKey, path: StorePath) -> u32 {
+        self.bind_with(producer, path, true)
+    }
+
+    /// Bind `(producer, path)` for an automation's state exposure: the same deduped cell a
+    /// widget binding of that path would get, updated at the same flushes, but a flush that
+    /// rewrites only exposure-bound cells does not wake the UI (nothing renders them). The
+    /// cell is returned directly: the reader is host code holding the `Arc`, not a script
+    /// token.
+    pub fn bind_exposure(
+        &mut self,
+        producer: ProducerKey,
+        path: StorePath,
+    ) -> Arc<StoreBindingCell> {
+        let id = self.bind_with(producer, path, false);
+        self.bindings[&id].cell.clone()
+    }
+
+    fn bind_with(&mut self, producer: ProducerKey, path: StorePath, wakes_ui: bool) -> u32 {
         let folded: Vec<String> = path
             .segments()
             .iter()
@@ -1168,6 +1191,9 @@ impl SessionStore {
             .collect();
         let key = (producer.clone(), folded.clone());
         if let Some(id) = self.binding_ids.get(&key) {
+            if wakes_ui && let Some(binding) = self.bindings.get_mut(id) {
+                binding.wakes_ui = true;
+            }
             return *id;
         }
         let seed = self
@@ -1187,6 +1213,7 @@ impl SessionStore {
                 producer,
                 path,
                 cell,
+                wakes_ui,
             },
         );
         self.binding_ids.insert(key, id);
@@ -1405,6 +1432,7 @@ impl SessionStore {
                 node.collect_subtree(&mut dirty);
             }
         }
+        let mut wake_ui = false;
         for id in &dirty {
             if let Some(binding) = self.bindings.get(id) {
                 // A shallow clone: the cell pins the committed subtree by `Arc`, sharing its
@@ -1414,9 +1442,10 @@ impl SessionStore {
                     .cloned()
                     .unwrap_or(Node::Null);
                 binding.cell.set(snapshot);
+                wake_ui |= binding.wakes_ui;
             }
         }
-        self.bindings_changed |= !dirty.is_empty();
+        self.bindings_changed |= wake_ui;
     }
 
     /// One-time gate for the non-home write diagnostic: `true` exactly once per
@@ -2327,6 +2356,49 @@ mod tests {
         user_set(&mut store, "anything", json!(1));
         store.flush();
         assert!(!store.take_bindings_changed());
+    }
+
+    #[test]
+    fn exposure_bindings_update_their_cells_without_waking_the_ui() {
+        let mut store = SessionStore::new();
+        user_set(&mut store, "a.b", json!(1));
+        store.flush();
+        let exposure = store.bind_exposure(ProducerKey::User, StorePath::parse("a.b").unwrap());
+        assert_eq!(*exposure.load(), json!(1), "seeded from the committed tree");
+        let same = store.bind_exposure(ProducerKey::User, StorePath::parse("A.B").unwrap());
+        assert!(
+            Arc::ptr_eq(&exposure, &same),
+            "deduped per folded path like widget bindings"
+        );
+
+        user_set(&mut store, "a.b", json!(2));
+        store.flush();
+        assert_eq!(*exposure.load(), json!(2), "the flush rewrote the cell");
+        assert!(
+            !store.take_bindings_changed(),
+            "an exposure-only flush does not wake the UI"
+        );
+
+        // A widget binding of an unrelated path still wakes on its own writes only.
+        let widget = store.bind(ProducerKey::User, StorePath::parse("w").unwrap());
+        user_set(&mut store, "a.b", json!(3));
+        store.flush();
+        assert!(!store.take_bindings_changed());
+        user_set(&mut store, "w", json!(1));
+        store.flush();
+        assert!(store.take_bindings_changed());
+        assert_eq!(*store.bindings().cell(widget).unwrap().load(), json!(1));
+
+        // A widget binding of the exposure's path shares its cell and upgrades it to waking.
+        let shared = store.bind(ProducerKey::User, StorePath::parse("a.b").unwrap());
+        assert!(Arc::ptr_eq(
+            &exposure,
+            &store.bindings().cell(shared).unwrap()
+        ));
+        user_set(&mut store, "a.b", json!(4));
+        store.flush();
+        assert!(store.take_bindings_changed());
+        assert_eq!(*exposure.load(), json!(4));
     }
 
     #[test]

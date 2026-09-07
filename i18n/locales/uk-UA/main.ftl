@@ -1356,6 +1356,35 @@ editor-continue-aliases = Також дозволити спрацювати і�
 editor-continue-triggers = Також дозволити спрацювати іншим відповідним тригерам
 editor-allow-self-match = Дозволити тексту, який надсилає цей аліас, збігатися з ним самим
 
+# Що зчитує (відкритий стан)
+editor-reveal-state = Зчитувати стан із GMCP або пакунка
+editor-hide-state = Сховати параметри стану
+editor-what-it-reads = Що зчитує
+editor-state-values = Значення стану
+editor-state-exposed = Відкрито
+editor-state-browse = Огляд
+editor-state-filter-placeholder = Фільтрувати шляхи
+editor-state-add-path = Додати шлях
+editor-state-add-reveal = Вручну відкрити шлях стану (розширено)
+editor-state-handle = Дескриптор
+editor-state-remove = Вилучити
+editor-state-rename = Використати іншу назву…
+editor-state-name = Назва
+editor-state-expose-tooltip = Відкрити { $path }
+editor-state-unexpose-tooltip = Припинити відкривати { $path }
+editor-state-insert-tooltip = Вставити { $reference }
+editor-state-not-exposed = { $reference } не відкрито для цього елемента ({ $kind })
+editor-state-name-taken = Інше відкрите значення вже використовує назву { $name }
+editor-state-name-shadows-smudgy = { $name } зі smudgy буде недоступним у цьому скрипті.
+editor-state-name-shadows-javascript = { $name } із JavaScript буде недоступним у цьому скрипті.
+editor-state-name-shadows-deno = { $name } із Deno буде недоступним у цьому скрипті.
+editor-state-name-shadows-capture = { $name } також є зіставленим значенням; саме лише ${ $name } означає збіг
+editor-state-bad-name = { $name } не є припустимою назвою
+editor-state-reserved-name = { $name } є ключовим словом JavaScript і не може бути назвою
+editor-state-bad-path = { $path } не є припустимим шляхом
+editor-state-empty = Сховище наразі порожнє.
+editor-state-invalid = Не вдається використати відкрите значення: { $error }
+
 # Модуль дії
 editor-tab-send-text = Надіслати текст
 editor-tab-run-js = Запустити JavaScript

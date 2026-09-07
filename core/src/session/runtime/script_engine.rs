@@ -49,8 +49,11 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use deno_core::url::Url;
 
+mod fire_state;
 mod mapper_api;
 mod matches;
+use super::state_exposure::ExposedState;
+use fire_state::FireStateCache;
 use matches::{MatchesKeys, materialize_matches};
 mod ops;
 pub mod package_cache;
@@ -281,6 +284,8 @@ type PackageAudioBinding = ();
 struct Isolate {
     // Drop isolate-bound cached handles before disposing their owning runtime.
     matches_keys: MatchesKeys,
+    /// The frozen state objects exposing inline bodies read, see `fire_state`.
+    fire_state: FireStateCache,
     runtime: ScriptRuntime,
     /// Exact package-audio lease for a successfully loaded sandbox root.
     /// Main and mixer-free unavailable sessions retain no such authority.
@@ -1880,6 +1885,7 @@ impl<'a> ScriptEngine<'a> {
             IsolateId::Main,
             Isolate {
                 matches_keys: MatchesKeys::default(),
+                fire_state: FireStateCache::default(),
                 runtime: main_runtime,
                 _package_audio_binding: main_package_audio_binding,
                 instance: main_instance,
@@ -2465,6 +2471,7 @@ impl<'a> ScriptEngine<'a> {
                     isolate_id,
                     Isolate {
                         matches_keys: MatchesKeys::default(),
+                        fire_state: FireStateCache::default(),
                         runtime,
                         _package_audio_binding: package_audio_binding,
                         instance,
@@ -3029,6 +3036,7 @@ impl<'a> ScriptEngine<'a> {
     /// `true`, and a handler opts out with `capture(false)`. An unknown isolate is a routing
     /// bug and never a live action. It reports the error like a failed call and leaves the
     /// stop state of the line unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_automation(
         &mut self,
         trigger_manager: &Manager,
@@ -3038,6 +3046,7 @@ impl<'a> ScriptEngine<'a> {
         depth: u32,
         sender: Option<AliasSender>,
         fallthrough: bool,
+        exposed: Option<&ExposedState>,
     ) -> AutomationOutcome {
         debug_assert!(
             self.isolates.contains_key(isolate),
@@ -3062,7 +3071,7 @@ impl<'a> ScriptEngine<'a> {
                 call_function_in(bundle, trigger_manager, id, matches, depth, sender)
             }
             AutomationCall::Script(id) => {
-                run_script_in(bundle, trigger_manager, id, matches, depth, sender)
+                run_script_in(bundle, trigger_manager, id, matches, depth, sender, exposed)
             }
         }
         .unwrap_or_else(|err| ActionResult::Echo(call.error_echo(&err)));
@@ -3350,6 +3359,7 @@ impl<'a> ScriptEngine<'a> {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn run_script(
         &mut self,
         trigger_manager: &Manager,
@@ -3358,15 +3368,33 @@ impl<'a> ScriptEngine<'a> {
         matches: CaptureView<'_>,
         depth: u32,
         sender: Option<AliasSender>,
+        exposed: Option<&ExposedState>,
     ) -> Result<ActionResult> {
         // Demux: see `call_javascript_function` — string-script dispatch can also schedule async
         // work synchronously, so seed this isolate for the next pump.
         self.mark_isolate_ready(isolate);
         let bundle = self.isolate_mut(isolate)?;
-        run_script_in(bundle, trigger_manager, script_id, matches, depth, sender)
+        run_script_in(
+            bundle,
+            trigger_manager,
+            script_id,
+            matches,
+            depth,
+            sender,
+            exposed,
+        )
     }
 
-    pub fn add_script(&mut self, isolate: &IsolateId, source: &str) -> Result<ScriptId> {
+    /// Compile an inline automation body. `exposes` says whether the automation carries
+    /// state exposures: only then does the wrapper grow the inner scope that puts each
+    /// exposed name in the body's scope (see `fire_state`); a body without exposures compiles
+    /// exactly as it always has.
+    pub fn add_script(
+        &mut self,
+        isolate: &IsolateId,
+        source: &str,
+        exposes: bool,
+    ) -> Result<ScriptId> {
         // Inline alias/trigger scripts (disk-authored JS) are classic scripts that run in
         // the shared global scope. The creation functions are not globals (ESM modules import
         // them from `smudgy:core`), so inject the user-bound creation API as a lexical scope via
@@ -3375,7 +3403,18 @@ impl<'a> ScriptEngine<'a> {
         // `globalThis`, and (unlike a function wrapper) preserves the script's completion
         // value, which `run_script` forwards as auto-sent output. Compiled into (and indexed
         // by) the target isolate's own `compiled_scripts`.
-        let wrapped = format!("with (globalThis.__smudgy_user_api) {{\n{source}\n}}");
+        //
+        // An exposing body gets a second, inner `with` over the per-fire state object, so an
+        // exposed name outranks a same-named API member inside that body only: `with` scopes
+        // are lexical to the compiled script, and nothing lands on `globalThis`. The object is
+        // read at every entry, so each fire sees the cells as they were at that fire.
+        let wrapped = if exposes {
+            format!(
+                "with (globalThis.__smudgy_user_api) with (globalThis.__smudgy_fire_state) {{\n{source}\n}}"
+            )
+        } else {
+            format!("with (globalThis.__smudgy_user_api) {{\n{source}\n}}")
+        };
         let bundle = self.isolate_mut(isolate)?;
         let script = compile_javascript(bundle.runtime.deno_runtime(), &wrapped)?;
         let script_id = ScriptId(bundle.compiled_scripts.len());
@@ -3539,7 +3578,10 @@ fn call_function_in(
 /// Run the compiled classic script `script_id` of `bundle` with a fresh global `matches`
 /// object. This is `run_script` with the isolate already resolved. It uses the same call-state
 /// bracket and handle rules as [`call_function_in`]. The script handle is borrowed from the
-/// registry of the bundle for the lifetime of the scope.
+/// registry of the bundle for the lifetime of the scope. `exposed` is the automation's bound
+/// state exposures: when present, the `__smudgy_fire_state` global the exposing wrapper reads
+/// is set beside `matches` before the run (see `fire_state`); a script compiled without
+/// exposures never reads it.
 fn run_script_in(
     bundle: &mut Isolate,
     trigger_manager: &Manager,
@@ -3547,10 +3589,12 @@ fn run_script_in(
     matches: CaptureView<'_>,
     depth: u32,
     sender: Option<AliasSender>,
+    exposed: Option<&ExposedState>,
 ) -> Result<ActionResult> {
     let started = log_enabled!(log::Level::Trace).then(Instant::now);
     let Isolate {
         matches_keys,
+        fire_state,
         runtime,
         compiled_scripts,
         call_state,
@@ -3578,11 +3622,13 @@ fn run_script_in(
                 let script = v8::Local::new(try_catch, script);
                 let matches_object = materialize_matches(try_catch, matches, matches_keys);
                 let matches_name = matches_keys.script_name(try_catch);
-                try_catch.get_current_context().global(try_catch).set(
-                    try_catch,
-                    matches_name.into(),
-                    matches_object.into(),
-                );
+                let global = try_catch.get_current_context().global(try_catch);
+                global.set(try_catch, matches_name.into(), matches_object.into());
+                if let Some(exposed) = exposed {
+                    let state = fire_state.state_object(try_catch, script_id, exposed);
+                    let state_name = fire_state.key(try_catch);
+                    global.set(try_catch, state_name.into(), state.into());
+                }
                 let result = script.run(try_catch);
                 call_outcome(try_catch, result)
             }

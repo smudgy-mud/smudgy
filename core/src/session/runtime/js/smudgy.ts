@@ -1707,6 +1707,23 @@ interface ScriptTriggerPatternsWire {
  *  command template unless this is `"js"`/`"ts"`. Defaults to `"plaintext"`. */
 type ScriptLang = "plaintext" | "js" | "ts";
 
+/** One session-store root a saved automation reads (the editor's "What it reads"): a
+ *  platform producer (`gmcp`, `msdp`, `mssp`) or a state handle inside `user` or a package,
+ *  plus the paths beneath it. Each becomes a name the body can use: `$name.path` in a
+ *  Send text body, `name.path` in JavaScript. Preserved verbatim across a get/save round
+ *  trip; the editor is the authoring path. */
+interface SavedStateExposure {
+    /** `user`, `gmcp`, `msdp`, `mssp`, or `smudgy://owner/name`. */
+    producer: string;
+    /** The state handle's name; required for `user` and package producers, absent for
+     *  platform producers. */
+    handle?: string;
+    /** The name the body uses, when it differs from the handle (or producer) name. */
+    as?: string;
+    /** Store paths relative to the root; `""` is the root itself. */
+    paths: string[];
+}
+
 /** A persisted user-side alias (the shape saved in `aliases.json`). */
 interface SavedAlias {
     /** Regex matched against the input line. */
@@ -1728,6 +1745,8 @@ interface SavedAlias {
     /** The editor's authoring sidecar, preserved verbatim across a get/save
      *  round trip. The editor authors it; scripts should carry it, not build it. */
     matcher?: unknown;
+    /** The session-store values the alias reads; see `SavedStateExposure`. */
+    state?: SavedStateExposure[];
 }
 
 /** A persisted user-side trigger (the shape saved in `triggers.json`). */
@@ -1750,6 +1769,8 @@ interface SavedTrigger {
     /** Defaults to "plaintext". */
     language?: ScriptLang;
     package?: string;
+    /** The session-store values the trigger reads; see `SavedStateExposure`. */
+    state?: SavedStateExposure[];
 }
 
 /** A persisted user-side hotkey (the shape saved in `hotkeys.json`). */
@@ -1764,6 +1785,8 @@ interface SavedHotkey {
     /** Defaults to "plaintext". */
     language?: ScriptLang;
     package?: string;
+    /** The session-store values the hotkey reads; see `SavedStateExposure`. */
+    state?: SavedStateExposure[];
 }
 
 /**
@@ -4790,6 +4813,9 @@ const aliasToWire = (def: SavedAlias) => ({
     // The editor's authoring sidecar rides verbatim, so a get/save round trip
     // cannot strip it (the save op validates the shape on deserialization).
     ...(def.matcher !== undefined && def.matcher !== null ? { matcher: def.matcher } : {}),
+    // State exposures ride verbatim too (the save op validates the shape on
+    // deserialization; the runtime validates the addresses at registration).
+    ...(def.state !== undefined && def.state !== null ? { state: def.state } : {}),
 });
 const triggerToWire = (def: SavedTrigger) => {
     for (const role of ["patterns", "rawPatterns", "antiPatterns"] as const) {
@@ -4815,6 +4841,7 @@ const triggerToWire = (def: SavedTrigger) => {
         ...(def.antiPatterns !== undefined ? { anti_patterns: def.antiPatterns } : {}),
         ...(def.script !== undefined ? { script: String(def.script) } : {}),
         ...(def.package !== undefined ? { package: String(def.package) } : {}),
+        ...(def.state !== undefined && def.state !== null ? { state: def.state } : {}),
     };
 };
 const hotkeyToWire = (def: SavedHotkey) => ({
@@ -4824,6 +4851,7 @@ const hotkeyToWire = (def: SavedHotkey) => ({
     language: langToWire(def.language),
     ...(def.script !== undefined ? { script: String(def.script) } : {}),
     ...(def.package !== undefined ? { package: String(def.package) } : {}),
+    ...(def.state !== undefined && def.state !== null ? { state: def.state } : {}),
 });
 
 // The wire def a get op returns -> the camelCase author shape.
@@ -4837,6 +4865,7 @@ const aliasFromWire = (w: any): SavedAlias => ({
     language: langFromWire(w.language),
     package: w.package ?? undefined,
     matcher: w.matcher ?? undefined,
+    state: w.state ?? undefined,
 });
 const triggerFromWire = (w: any): SavedTrigger => ({
     patterns: patternArray(w.pattern, w.patterns),
@@ -4849,6 +4878,7 @@ const triggerFromWire = (w: any): SavedTrigger => ({
     fallthrough: w.fallthrough ?? true,
     language: langFromWire(w.language),
     package: w.package ?? undefined,
+    state: w.state ?? undefined,
 });
 const hotkeyFromWire = (w: any): SavedHotkey => ({
     key: w.key,
@@ -4857,6 +4887,7 @@ const hotkeyFromWire = (w: any): SavedHotkey => ({
     enabled: w.enabled,
     language: langFromWire(w.language),
     package: w.package ?? undefined,
+    state: w.state ?? undefined,
 });
 
 // One kind's bridge to its ops + translation. `read` returns the camelCase def or undefined.

@@ -94,11 +94,11 @@ async fn profile_text_waits_for_first_processed_display_packet() {
         isolate: IsolateId::Main,
         origin: Origin::User,
         name: Arc::new("send_before_profile".to_string()),
-        trigger: TriggerDefinition {
+        trigger: Box::new(TriggerDefinition {
             patterns: Some(vec!["^Welcome$".to_string()]),
             script: Some("triggered".to_string()),
             ..TriggerDefinition::default()
-        },
+        }),
         fire_limit: None,
         line_limit: None,
     })

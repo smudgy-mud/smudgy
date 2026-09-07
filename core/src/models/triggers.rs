@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
-use super::{ScriptLang, persistence::write_atomic};
+use super::{ScriptLang, persistence::write_atomic, state_exposure::StateExposure};
 
 // Helper function for serde to default boolean fields to true.
 fn default_true() -> bool {
@@ -44,6 +44,10 @@ pub struct TriggerDefinition {
     /// ([`super::matchers::trigger_patterns`]). Absent means every row is a
     /// hand-written regex shown verbatim — the pre-sidecar behavior.
     pub matchers: Option<Vec<super::matchers::TriggerMatcherSource>>,
+    /// The session-store roots this trigger reads (`$name.path` in Send text, `name.path`
+    /// in JavaScript). Empty for the common case, which serializes nothing and pays nothing
+    /// at fire time. Carried by hand through both serde halves below.
+    pub state: Vec<StateExposure>,
     // TODO: Add other trigger-specific fields like sound file, highlighting, etc.
 }
 
@@ -61,6 +65,7 @@ impl Default for TriggerDefinition {
             priority: 0,
             fallthrough: true,
             matchers: None,
+            state: Vec::new(),
         }
     }
 }
@@ -136,6 +141,9 @@ impl Serialize for TriggerDefinition {
             }
             _ => {}
         }
+        if !self.state.is_empty() {
+            map.serialize_entry("state", &self.state)?;
+        }
 
         map.end()
     }
@@ -177,6 +185,8 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
             fallthrough: bool,
             #[serde(default)]
             matchers: Option<Vec<crate::models::matchers::TriggerMatcherSource>>,
+            #[serde(default)]
+            state: Vec<StateExposure>,
         }
 
         let helper = TriggerHelper::deserialize(deserializer)?;
@@ -245,6 +255,7 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
             fallthrough: helper.fallthrough,
             // An empty list carries no authoring intent; normalize to absent.
             matchers: helper.matchers.filter(|matchers| !matchers.is_empty()),
+            state: helper.state,
         })
     }
 }
@@ -566,6 +577,54 @@ mod tests {
         let empty: TriggerDefinition =
             serde_json::from_str(r#"{"pattern":"^x$","matchers":[]}"#).unwrap();
         assert!(empty.matchers.is_none());
+    }
+
+    #[test]
+    fn state_exposures_ride_both_hand_written_serde_halves() {
+        use crate::models::state_exposure::StateExposure;
+
+        // A capture-only trigger serializes exactly what it did before the field existed,
+        // and an older file (no `state` key) loads with an empty list.
+        let capture_only = TriggerDefinition {
+            patterns: Some(vec![r"^(?<who>\w+) says".to_string()]),
+            script: Some("say $who".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&capture_only).unwrap(),
+            r#"{"pattern":"^(?<who>\\w+) says","script":"say $who"}"#
+        );
+        let old: TriggerDefinition =
+            serde_json::from_str(r#"{"pattern":"^x$","script":"y"}"#).unwrap();
+        assert!(old.state.is_empty());
+        let empty: TriggerDefinition =
+            serde_json::from_str(r#"{"pattern":"^x$","state":[]}"#).unwrap();
+        assert!(empty.state.is_empty());
+        assert!(!serde_json::to_string(&empty).unwrap().contains("state"));
+
+        let exposing = TriggerDefinition {
+            state: vec![
+                StateExposure {
+                    producer: "gmcp".to_string(),
+                    handle: None,
+                    name_override: None,
+                    paths: vec!["Char.Vitals".to_string()],
+                },
+                StateExposure {
+                    producer: "smudgy://kapusniak/arctic-prompt".to_string(),
+                    handle: Some("prompt".to_string()),
+                    name_override: None,
+                    paths: vec![String::new()],
+                },
+            ],
+            ..capture_only.clone()
+        };
+        let json = serde_json::to_string(&exposing).unwrap();
+        assert!(json.ends_with(
+            r#""state":[{"producer":"gmcp","paths":["Char.Vitals"]},{"producer":"smudgy://kapusniak/arctic-prompt","handle":"prompt","paths":[""]}]}"#
+        ), "{json}");
+        let back: TriggerDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, exposing);
     }
 
     #[test]

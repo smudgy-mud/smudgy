@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
-use super::{ScriptLang, persistence::write_atomic};
+use super::{ScriptLang, persistence::write_atomic, state_exposure::StateExposure};
 
 /// Helper function for serde to default boolean fields to true.
 fn default_true() -> bool {
@@ -68,6 +68,11 @@ pub struct AliasDefinition {
     /// [`matchers::AliasMatcherSource::command_spec`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matcher: Option<super::matchers::AliasMatcherSource>,
+    /// The session-store roots this alias reads (`$name.path` in Send text, `name.path` in
+    /// JavaScript). Empty for the common case, which serializes nothing and pays nothing at
+    /// fire time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state: Vec<StateExposure>,
 }
 
 impl AliasDefinition {
@@ -244,11 +249,57 @@ mod tests {
                 anchor_start: true,
                 anchor_end: true,
             }),
+            state: Vec::new(),
         };
         let json = serde_json::to_string(&alias).unwrap();
         assert!(json.contains("\"matcher\""));
         let back: AliasDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(back, alias);
+    }
+
+    #[test]
+    fn state_exposures_round_trip_and_stay_absent_for_capture_only_aliases() {
+        use crate::models::state_exposure::StateExposure;
+
+        let capture_only: AliasDefinition =
+            serde_json::from_str(r#"{"pattern":"^say (?<what>.*)$","script":"say $what"}"#)
+                .unwrap();
+        assert!(
+            capture_only.state.is_empty(),
+            "older files load with no exposures"
+        );
+        let json = serde_json::to_string(&capture_only).unwrap();
+        assert!(
+            !json.contains("state"),
+            "a capture-only alias serializes no state key: {json}"
+        );
+        // Byte-identical to the serialization the field's absence produced before it existed.
+        assert_eq!(
+            json,
+            r#"{"pattern":"^say (?<what>.*)$","script":"say $what","package":null,"enabled":true,"language":"Plaintext"}"#
+        );
+
+        let mut exposing = capture_only.clone();
+        exposing.state = vec![
+            StateExposure {
+                producer: "gmcp".to_string(),
+                handle: None,
+                name_override: None,
+                paths: vec!["Char.Vitals".to_string(), "Room.Info.name".to_string()],
+            },
+            StateExposure {
+                producer: "user".to_string(),
+                handle: Some("foo".to_string()),
+                name_override: Some("stats".to_string()),
+                paths: vec!["bar".to_string()],
+            },
+        ];
+        let json = serde_json::to_string(&exposing).unwrap();
+        assert!(json.contains(
+            r#""state":[{"producer":"gmcp","paths":["Char.Vitals","Room.Info.name"]},{"producer":"user","handle":"foo","as":"stats","paths":["bar"]}]"#
+        ));
+        let back: AliasDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, exposing);
     }
 
     #[test]
