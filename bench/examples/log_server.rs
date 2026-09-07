@@ -79,7 +79,7 @@ fn serve(mut stream: &TcpStream, data: &[u8], times: u16) {
     }
 
     let start = Instant::now();
-    if let Err(err) = stream.write_all("BEGIN MEASURING\r\n".as_bytes()) {
+    if let Err(err) = stream.write_all("--- BEGIN MEASURING ---\r\n".as_bytes()) {
         eprintln!("[{peer}] write failed after {:?}: {err}", start.elapsed());
         return;
     }
@@ -89,7 +89,7 @@ fn serve(mut stream: &TcpStream, data: &[u8], times: u16) {
             return;
         }
     }
-    if let Err(err) = stream.write_all("END MEASURING\r\n".as_bytes()) {
+    if let Err(err) = stream.write_all("--- END MEASURING ---\r\n".as_bytes()) {
         eprintln!("[{peer}] write failed after {:?}: {err}", start.elapsed());
         return;
     }
@@ -97,7 +97,7 @@ fn serve(mut stream: &TcpStream, data: &[u8], times: u16) {
 
     let elapsed = start.elapsed();
     #[allow(clippy::cast_precision_loss)]
-    let mib_per_sec = ("BEGIN MEASURING\r\nEND MEASURING\r\n".len()
+    let mib_per_sec = ("--- BEGIN MEASURING ---\r\n--- END MEASURING ---\r\n".len()
         + ((times as usize) * data.len())) as f64
         / (1024.0 * 1024.0)
         / elapsed.as_secs_f64();
