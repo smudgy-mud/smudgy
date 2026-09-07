@@ -128,6 +128,7 @@ deno_core::extension!(
     op_smudgy_capture,
     op_smudgy_fallthrough,
     op_smudgy_param_get,
+    op_smudgy_param_set,
     op_smudgy_get_settings,
     op_smudgy_save_user_alias,
     op_smudgy_save_user_trigger,
@@ -186,6 +187,7 @@ deno_core::extension!(
     profile_name: Arc<String>,
     local_package_names: Arc<std::collections::HashMap<String, String>>,
     local_catalog_error: Option<Arc<str>>,
+    declared_package_params: Rc<RefCell<HashMap<String, Vec<smudgy_script::PackageParameter>>>>,
     script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>>,
     spawned_actions: ActionQueue,
     ui_command_producer: Option<crate::session::ui_command::UiCommandProducer>,
@@ -307,6 +309,7 @@ deno_core::extension!(
       names: options.local_package_names,
       error: options.local_catalog_error,
     });
+    state.put::<DeclaredPackageParams>(DeclaredPackageParams(options.declared_package_params));
     state.put::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>(options.script_functions);
     state.put::<ActionQueue>(options.spawned_actions);
     state.put::<Option<crate::session::ui_command::UiCommandProducer>>(
@@ -717,6 +720,49 @@ pub struct LocalPackageInventory {
     error: Option<Arc<str>>,
 }
 
+/// The active manifests' parameter declarations, keyed by their durable state specifier.
+pub struct DeclaredPackageParams(
+    Rc<RefCell<HashMap<String, Vec<smudgy_script::PackageParameter>>>>,
+);
+
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+#[class(type)]
+#[error("smudgy:params.set: {0}")]
+struct ParamSetError(String);
+
+fn param_state_specifier(
+    state: &OpState,
+    isolate: &IsolateId,
+    specifier: String,
+) -> Result<String, ParamSetError> {
+    if !param_read_allowed(isolate, &specifier) {
+        return Err(ParamSetError(
+            "a package can change only its own parameters".to_string(),
+        ));
+    }
+    let local_inventory = state.borrow::<LocalPackageInventory>();
+    if local_inventory.error.is_some() && !matches!(isolate, IsolateId::Main) {
+        return Err(ParamSetError(
+            "the local package inventory is unavailable".to_string(),
+        ));
+    }
+    Ok(smudgy_script::SmudgySpecifier::parse(&specifier)
+        .ok()
+        .and_then(|parsed| {
+            local_inventory
+                .names
+                .get(&parsed.name.to_ascii_lowercase())
+                .cloned()
+        })
+        .map_or(specifier, |local_name| {
+            format!(
+                "smudgy://{}/{}",
+                crate::models::local_packages::LOCAL_OWNER,
+                local_name
+            )
+        }))
+}
+
 /// Read a package's param value by its specifier (`smudgy://owner/name`) and key.
 /// Non-secret values come from `smudgy.params.json`, secrets from the OS keyring.
 /// Returns null when the key is unset.
@@ -783,6 +829,36 @@ fn op_smudgy_param_get(
         &state_specifier,
         &key,
     )
+}
+
+/// Validate and save one parameter declared by the calling package's active manifest.
+#[op2]
+fn op_smudgy_param_set(
+    state: &mut OpState,
+    #[string] specifier: String,
+    #[string] key: String,
+    #[serde] value: serde_json::Value,
+) -> Result<(), ParamSetError> {
+    let isolate = current_isolate(state);
+    let state_specifier = param_state_specifier(state, &isolate, specifier)?;
+    let declared = state.borrow::<DeclaredPackageParams>().0.borrow();
+    let param = declared
+        .get(&state_specifier)
+        .and_then(|params| params.iter().find(|param| param.key == key))
+        .ok_or_else(|| ParamSetError(format!("parameter '{key}' is not declared")))?
+        .clone();
+    drop(declared);
+
+    let server = state.borrow::<ServerName>().0.clone();
+    let profile = state.borrow::<ProfileName>().0.clone();
+    crate::models::shared_packages::save_package_param_for_profile(
+        &server,
+        &profile,
+        &state_specifier,
+        &param,
+        value,
+    )
+    .map_err(|error| ParamSetError(format!("{error:#}")))
 }
 
 /// Whether the `isolate` making an [`op_smudgy_param_get`] call may read `specifier`'s params.

@@ -118,6 +118,7 @@ const {
     op_smudgy_capture,
     op_smudgy_fallthrough,
     op_smudgy_param_get,
+    op_smudgy_param_set,
     op_smudgy_get_settings,
     op_smudgy_gmcp_enabled,
     op_smudgy_gmcp_send,
@@ -6148,6 +6149,10 @@ Object.defineProperty(globalThis, "__smudgy_user_api", {
 // to the importing package's specifier and bridges here.
 Object.defineProperty(globalThis, "__smudgy_param_get", {
     value: (spec: string, key: string) => op_smudgy_param_get(spec, key) ?? undefined,
+});
+Object.defineProperty(globalThis, "__smudgy_param_set", {
+    value: (spec: string, key: string, value: unknown): void =>
+        op_smudgy_param_set(spec, key, value),
 });
 
 // Host hooks for the session store (docs/interop.md): the internal seam the state

@@ -1893,9 +1893,9 @@ pub(crate) async fn load_canonical_module(
 }
 
 /// `load()`'s handler for a [`PARAMS_SCHEME`] URL: synthesize the per-importer
-/// `smudgy:params` module. `get(key)` is bound to the importing package's specifier
-/// (baked in at synthesis) and bridges to the host via the `globalThis.__smudgy_param_get`
-/// hook the smudgy ops extension installs. A no-package module's `get` returns `undefined`.
+/// `smudgy:params` module. `get(key)` and `set(key, value)` are bound to the importing
+/// package's specifier (baked in at synthesis) and bridge to host hooks installed by the
+/// smudgy ops extension. A no-package module's `get` returns `undefined`; its `set` throws.
 ///
 /// Scoping here is an ergonomic correctness feature, not a security boundary — the shared
 /// isolate is allow-all (`DESIGN.md`), so a script can already reach anything; binding
@@ -1916,7 +1916,11 @@ pub(crate) fn load_params_module(url: &ModuleSpecifier) -> Result<ModuleSource, 
          export function get(key) {{\n\
          \x20 return __spec ? globalThis.__smudgy_param_get(__spec, key) : undefined;\n\
          }}\n\
-         export default {{ get }};\n"
+         export function set(key, value) {{\n\
+         \x20 if (!__spec) throw new TypeError(\"smudgy:params.set is available only to packages\");\n\
+         \x20 globalThis.__smudgy_param_set(__spec, key, value);\n\
+         }}\n\
+         export default {{ get, set }};\n"
     );
     Ok(ModuleSource::new(
         deno_core::ModuleType::JavaScript,
@@ -3357,15 +3361,18 @@ mod tests {
             panic!("expected string module source");
         };
         let code = code.as_str();
-        // The importer's specifier is baked in, and get bridges to the host hook.
+        // The importer's specifier is baked in, and both functions bridge to host hooks.
         assert!(
             code.contains("\"smudgy://wbk/app\""),
             "binds the caller's spec: {code}"
         );
         assert!(code.contains("globalThis.__smudgy_param_get"));
+        assert!(code.contains("globalThis.__smudgy_param_set"));
         assert!(code.contains("export function get(key)"));
+        assert!(code.contains("export function set(key, value)"));
+        assert!(code.contains("export default { get, set }"));
 
-        // A no-package module's get short-circuits to undefined (empty spec is falsy).
+        // A no-package module's get returns undefined and set has an explicit error path.
         let none = load_params_module(&params_module_url(None)).expect("synthesizes");
         let ModuleSourceCode::String(code) = none.code else {
             panic!("expected string module source");
@@ -3374,6 +3381,7 @@ mod tests {
             code.as_str().contains("const __spec = \"\""),
             "no package -> empty spec"
         );
+        assert!(code.as_str().contains("available only to packages"));
     }
 
     #[test]
