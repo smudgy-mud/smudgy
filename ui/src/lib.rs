@@ -604,6 +604,13 @@ enum Message {
     /// The quit path's awaited write completed (or the writer is
     /// unavailable): the deferred `iced::exit()` may run.
     WorkspaceQuitFlushed,
+    /// Fresh geometry sampled before the native window is allowed to close.
+    RememberWindowAndClose {
+        id: window::Id,
+        geometry: workspace::dto::Geometry,
+        normal_geometry: Option<workspace::dto::Geometry>,
+        maximized: bool,
+    },
 }
 
 /// The application id, matching the Linux desktop-entry / Flatpak app id
@@ -821,15 +828,33 @@ fn init(
         workspace::writer::init_global();
     }
 
-    // Startup is always the clean no-active-sessions view: nothing restores
-    // at launch. Each server's last arrangement waits in its own
-    // last-session snapshot, offered per server on the connect surface.
+    // Reopen the main window at its last placement. Profiles remain an explicit
+    // choice on the connect surface; opening one restores its saved pane layout.
     let workspace_mirror = workspace::autosave::Mirror::default();
     let restore_state = workspace::restore::RestoreState::default();
-    let smudgy_windows: BTreeMap<window::Id, SmudgyWindow> = BTreeMap::new();
-    let mut open_tasks: Vec<Task<Message>> = Vec::new();
-    let (id, open) = window::open(smudgy_window_settings());
-    open_tasks.push(open.map(Message::NewSmudgyWindow));
+    let preferences = if workspace_enabled {
+        workspace::preferences::load()
+    } else {
+        Default::default()
+    };
+    let mut window_settings = smudgy_window_settings();
+    if let Some(geometry) = &preferences.geometry {
+        let (position, size) = workspace::restore::clamp_geometry(
+            geometry,
+            workspace::restore::virtual_screen_bounds(),
+            Size::new(640.0, 400.0),
+        );
+        window_settings.size = size;
+        if let Some(position) = position {
+            window_settings.position = window::Position::Specific(position);
+        }
+    }
+    window_settings.maximized = preferences.maximized;
+    let (id, open) = window::open(window_settings);
+    let mut initial = SmudgyWindow::new(id, account.handles());
+    initial.seed_maximized(preferences.maximized);
+    let smudgy_windows = BTreeMap::from([(id, initial)]);
+    let open_tasks = vec![open.map(Message::NewSmudgyWindow)];
     #[cfg(feature = "web-audio-cpal")]
     let audio_output_failure_task = audio_output_failure_task(audio_output_failures);
 
@@ -2137,7 +2162,7 @@ fn begin_workspace_poll(smudgy: &mut Smudgy) -> Task<Message> {
     let ids: Vec<window::Id> = smudgy.smudgy_windows.keys().copied().collect();
     if ids.is_empty() {
         if smudgy.workspace.schedule.is_dirty() && !smudgy.workspace.schedule.is_shutting_down() {
-            publish_workspace_snapshot(smudgy, None);
+            publish_workspace_snapshot(smudgy, None, None);
         }
         return Task::none();
     }
@@ -2169,6 +2194,43 @@ fn begin_workspace_poll(smudgy: &mut Smudgy) -> Task<Message> {
     Task::batch(tasks)
 }
 
+/// Query while the native window still exists. This catches move/resize then
+/// immediate quit, without adding per-pixel move events to the idle subscription.
+fn remember_and_close_window(id: window::Id) -> Task<Message> {
+    window::position(id).then(move |position| {
+        window::size(id).then(move |size| {
+            window::scale_factor(id).then(move |scale| {
+                window::is_maximized(id).then(move |maximized| {
+                    let geometry = workspace::dto::Geometry {
+                        x: position.map_or(0.0, |point| point.x),
+                        y: position.map_or(0.0, |point| point.y),
+                        width: size.width,
+                        height: size.height,
+                        scale,
+                    };
+                    #[cfg(windows)]
+                    let normal = window::raw_id::<Message>(id)
+                        .map(move |raw| workspace::preferences::native_normal_geometry(raw, scale));
+                    #[cfg(not(windows))]
+                    let normal = Task::done(None);
+                    normal.map(move |normal| {
+                        let (normal_geometry, maximized) = normal
+                            .map_or((None, maximized), |(geometry, maximized)| {
+                                (Some(geometry), maximized)
+                            });
+                        Message::RememberWindowAndClose {
+                            id,
+                            geometry: geometry.clone(),
+                            normal_geometry,
+                            maximized,
+                        }
+                    })
+                })
+            })
+        })
+    })
+}
+
 /// The server owning the active session right now: the most recently
 /// focused smudgy window hosting a live active session answers, windows
 /// never yet focused trail in creation order. `None` with no active session
@@ -2191,8 +2253,8 @@ fn active_server_name(smudgy: &Smudgy) -> Option<String> {
         .or_else(|| smudgy.smudgy_windows.keys().filter_map(of_window).next())
 }
 
-/// Serialize the active session's server's footprint and hand it to the
-/// writer worker as that server's last-session snapshot — how each server
+/// Serialize a server's footprint (the active server unless explicitly supplied)
+/// and hand it to the writer worker as that server's last-session snapshot — how each server
 /// comes to hold the most recent arrangement in which it was active. With
 /// no active session (or nothing captured for it) the snapshot is settled
 /// as taken and nothing is written: the files on disk keep their
@@ -2202,7 +2264,11 @@ fn active_server_name(smudgy: &Smudgy) -> Option<String> {
 /// `ack` makes the write awaited (the quit flush); it is always resolved —
 /// on publish, on every skip, and on every failure path — so a waiter can
 /// never hang. Returns whether new bytes were actually published.
-fn publish_workspace_snapshot(smudgy: &mut Smudgy, ack: Option<workspace::writer::Ack>) -> bool {
+fn publish_workspace_snapshot(
+    smudgy: &mut Smudgy,
+    server: Option<&str>,
+    ack: Option<workspace::writer::Ack>,
+) -> bool {
     // Snapshots read the layout model at a settled point: flush any rebuild
     // marks first (idempotent, and cheap when already settled).
     for window in smudgy.smudgy_windows.values_mut() {
@@ -2211,10 +2277,24 @@ fn publish_workspace_snapshot(smudgy: &mut Smudgy, ack: Option<workspace::writer
     let force = ack.is_some();
     let resolve = |ack: Option<workspace::writer::Ack>| {
         if let Some(ack) = ack {
-            let _ = ack.send(());
+            if let Some(writer) = workspace::writer::global() {
+                writer.flush(ack);
+            } else {
+                let _ = ack.send(());
+            }
         }
     };
-    let Some((path, snapshot)) = active_server_name(smudgy).and_then(|server| {
+    if let Some((id, _)) = smudgy.workspace.window_entries().next()
+        && let Some(win) = smudgy.smudgy_windows.get(&id)
+        && !win.is_fullscreen()
+        && let Some(geometry) = smudgy.workspace.geometry_of(id)
+    {
+        workspace::preferences::remember_window(geometry, win.is_maximized());
+    }
+    let server = server
+        .map(str::to_owned)
+        .or_else(|| active_server_name(smudgy));
+    let Some((path, snapshot)) = server.and_then(|server| {
         let path = workspace::last_session::path(&server)?;
         let (snapshot, _notes) = capture_server_footprint(smudgy, &server)?;
         Some((path, snapshot))
@@ -2453,47 +2533,49 @@ fn build_live_workspace(smudgy: &Smudgy) -> workspace::apply::LiveWorkspace {
         let Some(win) = smudgy.smudgy_windows.get(&window_id) else {
             continue;
         };
-        let layout = win.layout();
-        let mut groups = Vec::new();
-        // Visual emptiness counts every tab, bound or placeholder: a
-        // window showing placeholder tabs is showing content and must not
-        // be adopted, even though no bound pane below survives into its
-        // groups.
-        let mut has_tabs = false;
-        for gid in layout.groups_depth_first() {
-            let Some(tabs) = layout.tabs(gid) else {
-                continue;
-            };
-            has_tabs |= !tabs.is_empty();
-            let mut group = Vec::with_capacity(tabs.len());
-            for tab in tabs {
-                let Some(&pane) = tab.binding() else {
-                    continue;
-                };
-                let descriptor = if pane.key == MAIN_PANE_KEY {
-                    None
-                } else {
-                    smudgy
-                        .sessions
-                        .get(pane.session_id)
-                        .and_then(|session| session.pane_def(pane.key))
-                        .map(|def| workspace::restore::descriptor_key(&def.namespace, &def.name))
-                };
-                group.push(workspace::apply::LivePane {
-                    pane,
-                    descriptor,
-                    hidden: win.pane_hidden(pane),
-                });
-            }
-            groups.push(group);
-        }
-        live.windows.push(workspace::apply::LiveWindow {
-            stable_id,
-            empty: !has_tabs,
-            groups,
-        });
+        live.windows
+            .push(build_live_window(win, &smudgy.sessions, stable_id));
     }
     live
+}
+
+fn build_live_window(
+    win: &SmudgyWindow,
+    sessions: &SessionStore,
+    stable_id: u64,
+) -> workspace::apply::LiveWindow {
+    let layout = win.layout();
+    let mut groups = Vec::new();
+    for gid in layout.groups_depth_first() {
+        let Some(tabs) = layout.tabs(gid) else {
+            continue;
+        };
+        let mut group = Vec::with_capacity(tabs.len());
+        for tab in tabs {
+            let Some(&pane) = tab.binding() else {
+                continue;
+            };
+            let descriptor = if pane.key == MAIN_PANE_KEY {
+                None
+            } else {
+                sessions
+                    .get(pane.session_id)
+                    .and_then(|session| session.pane_def(pane.key))
+                    .map(|def| workspace::restore::descriptor_key(&def.namespace, &def.name))
+            };
+            group.push(workspace::apply::LivePane {
+                pane,
+                descriptor,
+                hidden: win.pane_hidden(pane),
+            });
+        }
+        groups.push(group);
+    }
+    workspace::apply::LiveWindow {
+        stable_id,
+        empty: win.is_visually_empty(),
+        groups,
+    }
 }
 
 /// Execute a validated apply plan: strip template-claimed panes out of
@@ -2781,6 +2863,34 @@ fn open_layout_spawn_batch(
     Ok(spawned)
 }
 
+/// Restore only the newly opened profile; never spawn the other saved sessions.
+fn restore_profile_layout(smudgy: &mut Smudgy, session_id: SessionId) -> Task<Message> {
+    let live = build_live_workspace(smudgy);
+    let Some(session) = live
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+    else {
+        return Task::none();
+    };
+    let Some(template) = workspace::last_session::read(&session.server) else {
+        return Task::none();
+    };
+    let template = workspace::apply::for_opened_profile(&template, session);
+    let mode = workspace::apply::ApplyMode::User { initiating: None };
+    let Ok(plan) = workspace::apply::plan_apply(&template, &live, mode, &HashMap::new()) else {
+        return Task::none();
+    };
+    if !plan.is_executable() || !plan.close_sessions.is_empty() {
+        return Task::none();
+    }
+    if let Err(error) = workspace::apply::validate_conservation(&template, &live, mode, &plan) {
+        log::warn!("[workspace] cannot automatically restore profile layout: {error}");
+        return Task::none();
+    }
+    execute_layout_apply(smudgy, &plan)
+}
+
 /// Apply a stored template of `server`'s — a named layout or the server's
 /// last-session snapshot — as a user restore: project the plan, route
 /// unanswered keep-or-close questions back to the initiating window, spawn
@@ -2890,6 +3000,7 @@ fn apply_workspace_template(
         rollback_spawned_sessions(&mut smudgy.sessions, &mut batch_spawned);
         return Task::none();
     }
+    workspace::preferences::remember_server(server);
     execute_layout_apply(smudgy, &plan)
 }
 
@@ -2992,7 +3103,7 @@ fn begin_workspace_quit_flush(smudgy: &mut Smudgy) -> Option<Task<Message>> {
     // awaited task below always completes — and the await is bounded
     // besides, so a wedged disk write cannot hold the exit hostage (the
     // last completed write stands; the atomic replace cannot tear).
-    let _ = publish_workspace_snapshot(smudgy, Some(ack));
+    let _ = publish_workspace_snapshot(smudgy, None, Some(ack));
     Some(Task::perform(
         workspace::writer::await_ack_bounded(done, workspace::writer::QUIT_FLUSH_TIMEOUT),
         |()| Message::WorkspaceQuitFlushed,
@@ -3434,10 +3545,13 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     if let Some(opening) = smudgy.automations_window_opening.take() {
                         // No Automations state exists yet, so there is no draft to confirm. Close
                         // the pending native tool window before allowing the last main to exit.
-                        return Task::batch([window::close(opening.id), window::close(id)]);
+                        return Task::batch([
+                            window::close(opening.id),
+                            remember_and_close_window(id),
+                        ]);
                     }
                 }
-                return window::close(id);
+                return remember_and_close_window(id);
             }
             if smudgy.opening_smudgy_windows.remove(&id) {
                 // As with the Automations singleton, a native close may arrive before the open
@@ -3455,6 +3569,61 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             // Other tool windows retain the default native close behavior; their `CloseWindow`
             // event performs model cleanup below.
             Task::none()
+        }
+        Message::RememberWindowAndClose {
+            id,
+            geometry,
+            normal_geometry,
+            maximized,
+        } => {
+            if let Some(win) = smudgy.smudgy_windows.get_mut(&id) {
+                let fullscreen = win.is_fullscreen();
+                win.seed_maximized(maximized);
+                let stored_geometry = normal_geometry.as_ref().unwrap_or(&geometry);
+                for sample in [
+                    workspace::autosave::GeometrySample::Position(Some(iced::Point::new(
+                        stored_geometry.x,
+                        stored_geometry.y,
+                    ))),
+                    workspace::autosave::GeometrySample::Size(Size::new(
+                        stored_geometry.width,
+                        stored_geometry.height,
+                    )),
+                    workspace::autosave::GeometrySample::Scale(stored_geometry.scale),
+                ] {
+                    smudgy.workspace.record_sample(None, id, sample);
+                }
+                if smudgy
+                    .workspace
+                    .window_entries()
+                    .next()
+                    .is_some_and(|(first, _)| first == id)
+                    && !fullscreen
+                {
+                    workspace::preferences::remember_window(&geometry, maximized);
+                    if let Some(normal) = normal_geometry {
+                        workspace::preferences::remember_normal_geometry(normal);
+                    }
+                }
+            }
+            // Closing a main window can cascade through detached pane windows.
+            // Preserve each affected server before that cascade removes its panes.
+            let servers: std::collections::BTreeSet<_> = smudgy
+                .smudgy_windows
+                .get(&id)
+                .into_iter()
+                .flat_map(SmudgyWindow::hosted_main_sessions)
+                .filter_map(|session| {
+                    smudgy
+                        .sessions
+                        .get(session)
+                        .map(|session| session.server_name.clone())
+                })
+                .collect();
+            for server in servers {
+                publish_workspace_snapshot(smudgy, Some(&server), None);
+            }
+            window::close(id)
         }
         Message::CloseWindow(id) => {
             smudgy.window_tracker.remove(id);
@@ -3644,6 +3813,15 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     ])
                 }
                 Some(SmudgyWindowEvent::CloseSession(session_id)) => {
+                    // Preserve edits made immediately before closing the profile,
+                    // before vacating its panes can make them disappear from capture.
+                    if let Some(server) = smudgy
+                        .sessions
+                        .get(session_id)
+                        .map(|session| session.server_name.clone())
+                    {
+                        publish_workspace_snapshot(smudgy, Some(&server), None);
+                    }
                     Task::batch([task, close_session(smudgy, session_id)])
                 }
                 #[cfg(feature = "web-audio-cpal")]
@@ -3904,6 +4082,9 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     );
                     Task::batch([task, apply])
                 }
+                Some(SmudgyWindowEvent::RestoreProfileLayout { session }) => {
+                    Task::batch([task, restore_profile_layout(smudgy, session)])
+                }
                 Some(SmudgyWindowEvent::RestoreLastSession { server }) => {
                     let apply = apply_workspace_template(
                         smudgy,
@@ -3979,7 +4160,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 && smudgy.workspace.schedule.is_dirty()
                 && !smudgy.workspace.schedule.is_shutting_down()
             {
-                publish_workspace_snapshot(smudgy, None);
+                publish_workspace_snapshot(smudgy, None, None);
             }
             Task::none()
         }
@@ -4641,7 +4822,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     let close_main = smudgy
                         .main_window_close_after_automations
                         .take()
-                        .map(window::close);
+                        .map(remember_and_close_window);
                     Task::batch(
                         [Some(update.task), Some(window::close(id)), close_main]
                             .into_iter()

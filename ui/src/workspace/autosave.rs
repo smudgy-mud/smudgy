@@ -44,11 +44,9 @@ pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Dirty/churn/shutdown state — the entire cost of a mutation lives here.
 ///
-/// There is deliberately no publish-arming latch: nothing before the first
-/// genuine arrangement can reach disk anyway, because the publish path
-/// writes only the active session's server, and with no active session it
-/// clears the dirty flag and skips. Startup (always the clean
-/// no-active-sessions view) therefore publishes nothing by construction.
+/// There is no publish-arming latch: per-server layouts are written only
+/// while a session is active. The empty connect surface saves window
+/// preferences separately and leaves the per-server layouts intact.
 #[derive(Debug, Default)]
 pub struct Schedule {
     /// The live workspace differs (or may differ) from the newest snapshot.

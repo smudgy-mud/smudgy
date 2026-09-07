@@ -441,7 +441,7 @@ impl Workspace {
 impl Geometry {
     /// Repair non-finite or degenerate values. Restore-time display clamping
     /// is separate; this only guarantees the numbers are usable at all.
-    fn sanitized(self, window_id: u64) -> Self {
+    pub(super) fn sanitized(self, window_id: u64) -> Self {
         let mut geometry = self;
         if !geometry.x.is_finite() || !geometry.y.is_finite() {
             log::warn!("[workspace] window {window_id} position is not finite; using the origin");

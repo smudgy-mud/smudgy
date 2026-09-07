@@ -860,3 +860,15 @@ fn compare_and_swap_conflicts_are_reported_in_translated_text() {
         )
     );
 }
+
+#[test]
+fn opening_prefers_recent_server_and_falls_back_if_it_was_removed() {
+    let servers = [server("Alpha"), server("Zulu")];
+    assert_eq!(initial_server(&servers, Some("Zulu")).unwrap().name, "Zulu");
+    assert_eq!(
+        initial_server(&servers, Some("Removed")).unwrap().name,
+        "Alpha"
+    );
+    assert_eq!(initial_server(&servers, None).unwrap().name, "Alpha");
+    assert!(initial_server(&[], Some("Zulu")).is_none());
+}
