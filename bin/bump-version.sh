@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Bump the smudgy version everywhere it lives.
 #
-# Usage: bin/bump-version.sh <new-version>
+# Usage: bin/bump-version.sh [--preview] [--force] <new-version>
+# Normal bumps keep source at X.Y.Z-ptb. --preview stamps X.Y.Z-ptb.N
+# for the current base and leaves CHANGELOG.md alone. --force permits other
+# version conventions (including a stable release); it does not skip validation.
+# Materialize dependency patches with cargo patch-crate --force first.
 #
 # <new-version> is a full semver string: MAJOR.MINOR.PATCH with an optional
 # `-prerelease` and/or `+build` suffix (e.g. 0.3.2, 0.4.0-beta, 0.4.0-rc.1+ci).
@@ -25,7 +29,7 @@
 #
 # Updates (in the smudgy repo):
 #   - every smudgy_* crate's Cargo.toml        (lock-step [package] versions:
-#       ui core cloud script map_widget theme widgets inspector bench)
+#       discovered from top-level crate manifests)
 #   - assets/installer.iss                     (MyAppVersion)
 #   - CHANGELOG.md                             (stamps "## [<version>] - Unreleased" with today's date)
 #   - Cargo.lock                               (refreshed via cargo metadata)
@@ -41,8 +45,26 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+PREVIEW=false
+FORCE=false
+usage() {
+    echo "Usage: $0 [--preview] [--force] <new-version>"
+    echo "  <X.Y.Z-ptb>               change the source version"
+    echo "  --preview <X.Y.Z-ptb.N>   stamp a build of the current source version"
+    echo "  --force <version>         allow another convention, e.g. a stable release"
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --preview) PREVIEW=true ;;
+        --force) FORCE=true ;;
+        --help|-h) usage; exit 0 ;;
+        --*) usage >&2; exit 1 ;;
+        *) break ;;
+    esac
+    shift
+done
 if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <new-version>" >&2
+    usage >&2
     exit 1
 fi
 
@@ -91,6 +113,11 @@ else
     CHANNEL="prod / release"
 fi
 
+if $PREVIEW && [[ "$CHANNEL" != "public-test-build" && "$CHANNEL" != "nightly" ]]; then
+    echo "error: --preview requires a PTB or nightly version" >&2
+    exit 1
+fi
+
 # Escape a string's regex-special dots for safe use as a sed/grep BRE pattern.
 # (In BRE, '+' and '-' are literal — and GNU sed treats '\+' as a quantifier —
 # so dots are the only semver character that needs escaping.)
@@ -106,6 +133,22 @@ fi
 if [[ "$NEW_VERSION" == "$CURRENT_VERSION" ]]; then
     echo "error: version is already $CURRENT_VERSION" >&2
     exit 1
+fi
+
+# Fail before touching files. Numbered builds are an explicit operation;
+# ordinary source bumps must leave main eligible for the nightly coordinator.
+BASE_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-ptb$'
+if ! $FORCE; then
+    if $PREVIEW; then
+        NUMBERED_RE="^$(escape_re "$CURRENT_VERSION")\\.[1-9][0-9]*$"
+        if ! [[ "$CURRENT_VERSION" =~ $BASE_RE && "$NEW_VERSION" =~ $NUMBERED_RE ]]; then
+            echo "error: --preview requires $CURRENT_VERSION.N from an unnumbered X.Y.Z-ptb source; use --force to override the convention" >&2
+            exit 1
+        fi
+    elif ! [[ "$NEW_VERSION" =~ $BASE_RE ]]; then
+        echo "error: source versions must use X.Y.Z-ptb; use --preview for a numbered build or --force for another convention" >&2
+        exit 1
+    fi
 fi
 
 NEW_RE=$(escape_re "$NEW_VERSION")
@@ -125,9 +168,10 @@ echo "  channel: $CHANNEL (build will default to $API_BASE_URL)"
 # nothing — no error, exit 0, no edit — so every crate stayed unbumped. awk's first-match
 # flag is portable across both. Write to a temp file then mv (rather than piping through
 # `&&`) so an awk failure trips `set -e` instead of being swallowed by the AND-list.
-for manifest in ui/Cargo.toml core/Cargo.toml cloud/Cargo.toml script/Cargo.toml \
-                map_widget/Cargo.toml theme/Cargo.toml widgets/Cargo.toml \
-                inspector/Cargo.toml bench/Cargo.toml; do
+for manifest in */Cargo.toml; do
+    # Include path-dependency crates as well as workspace members. Third-party
+    # crates are not part of the application's version series.
+    grep -q '^name = "smudgy_' "$manifest" || continue
     awk -v ver="$NEW_VERSION" '
         !bumped && /^version = ".*"/ { sub(/".*"/, "\"" ver "\""); bumped = 1 }
         { print }
@@ -143,7 +187,9 @@ echo "  assets/installer.iss"
 
 # CHANGELOG.md: stamp the unreleased section for this version, if present.
 TODAY=$(date +%Y-%m-%d)
-if grep -q "^## \[$NEW_RE\] - Unreleased" CHANGELOG.md; then
+if $PREVIEW; then
+    echo "  (leaving CHANGELOG.md unchanged for preview build)"
+elif grep -q "^## \[$NEW_RE\] - Unreleased" CHANGELOG.md; then
     sed -i.bak "s/^## \[$NEW_RE\] - Unreleased/## [$NEW_VERSION] - $TODAY/" CHANGELOG.md
     rm CHANGELOG.md.bak
     echo "  CHANGELOG.md (stamped $TODAY)"

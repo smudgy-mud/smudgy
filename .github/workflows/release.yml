@@ -8,7 +8,7 @@ name: Release
 #
 # The artifact version comes from ui/Cargo.toml; the tag is only the trigger and
 # must match it (the verify-version job enforces this), so:
-#     bin/bump-version.sh <x.y.z>   # bumps the crates + installer + changelog
+#     bin/bump-version.sh --force <x.y.z>   # explicit stable-release bump
 #     git commit -am "chore: bump version to x.y.z" && git push
 #     git tag v<x.y.z> && git push origin v<x.y.z>    # <-- this fires the build
 #
@@ -30,9 +30,15 @@ name: Release
 #     (optional SMUDGY_WIKI_SSH_PORT, SMUDGY_WIKI_URL)
 
 on:
+  # Nightly pushes with GITHUB_TOKEN, then dispatches explicitly on its tag.
+  workflow_dispatch:
   push:
     tags:
       - 'v*'        # e.g. v0.5.0
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 # Wiki media namespace the artifacts are uploaded into:
 #   <WIKI_NAMESPACE>:smudgy-v<version>-<...>  (+ .asc + the signing key on Linux)
@@ -53,10 +59,15 @@ jobs:
       - name: Audit smudgy_ui/web-audio-cpal release wiring
         run: python bin/check-web-audio-wiring.py
       - id: v
+        name: Verify release version
         run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "::error::Release must run on an immutable version tag"
+            exit 1
+          fi
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' ui/Cargo.toml | head -1)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match ui/Cargo.toml version v$version — run bin/bump-version.sh and re-tag"
+            echo "::error::tag $GITHUB_REF_NAME does not match ui/Cargo.toml version v$version — bump the version and create a new matching tag; do not move this tag"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -134,6 +145,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: smudgy-${{ matrix.arch }}-flatpak
+          overwrite: true # a failed attempt may already have uploaded files
           path: |
             dist/*.flatpak
             dist/*.asc
@@ -209,6 +221,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: smudgy-windows-setup
+          overwrite: true
           path: dist/*.exe
           if-no-files-found: warn
 
@@ -272,6 +285,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: smudgy-macos-dmg
+          overwrite: true
           path: dist/*.dmg
           if-no-files-found: warn
 
@@ -289,6 +303,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # completion validates the annotated tag and its parent
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
       - uses: actions/download-artifact@v7
         with:
           path: dist
@@ -328,3 +347,10 @@ jobs:
             [ -f "$f" ] || continue
             bin/dokuwiki-upload.sh "$f" "$WIKI_NAMESPACE:$(basename "$f")"
           done
+
+      # Last publication step: the nightly coordinator must not consider a
+      # release complete merely because its GitHub page already exists.
+      - name: Record completed nightly source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python bin/nightly-release.py complete --tag "$GITHUB_REF_NAME"
