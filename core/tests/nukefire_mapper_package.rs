@@ -562,10 +562,32 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
         (room301.get_x() - room300.get_x() - 1.0).abs() < f32::EPSILON,
         "progressive reflow compacted the stretched corridor"
     );
-    // The coordinate mutation becomes host-visible just before the package
-    // appends its decision record. Do not supersede that callback with the next
-    // synthetic area in the narrow post-commit interval this test observes.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Coordinates become host-visible before the progressive callback resumes.
+    // Switching areas can abort that callback before it logs the applied layout,
+    // so wait for the record itself before sending the next synthetic area.
+    let decision_log = find_file(&smudgy_home.join(SERVER), "mapping-decisions.jsonl")
+        .expect("debug decision log was created");
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            std::fs::read(&decision_log)
+                .expect("read mapper decision log")
+                .split_inclusive(|byte| *byte == b'\n')
+                // The asynchronous writer may still be appending the last record.
+                .filter(|line| line.ends_with(b"\n"))
+                .map(|line| {
+                    serde_json::from_slice::<serde_json::Value>(line)
+                        .expect("valid decision record")
+                })
+                .any(|record| {
+                    record["kind"] == "layout-progress-applied"
+                        && record["area"]["name"] == "Progressive Test"
+                        && record["movedRooms"].as_u64().is_some_and(|count| count > 0)
+                })
+        })
+        .await,
+        "timed out waiting for the progressive reflow decision record:\n{}",
+        lines.join("\n")
+    );
 
     // A reciprocal west-wall connection keeps its semantic midpoint while
     // two one-way arrivals fan into the neighboring canonical port lanes.
@@ -748,8 +770,6 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
         Some("true"),
         "a context-relative fixed point must preserve area-wide polish eligibility"
     );
-    let decision_log = find_file(&smudgy_home.join(SERVER), "mapping-decisions.jsonl")
-        .expect("debug decision log was created");
     let records: Vec<serde_json::Value> = std::fs::read_to_string(decision_log)
         .expect("read mapper decision log")
         .lines()
