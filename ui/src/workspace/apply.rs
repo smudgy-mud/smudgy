@@ -97,11 +97,9 @@ pub struct LivePane {
 #[derive(Debug, Clone)]
 pub struct LiveWindow {
     pub stable_id: u64,
-    /// Whether the window is visually empty: it hosts no tabs at all —
-    /// bound or placeholder — and shows only its connect surface. Only
-    /// such windows may be adopted by a user restore; a window whose tabs
-    /// are all placeholders hosts no bound panes yet is showing content,
-    /// so it is not empty.
+    /// Whether the window shows only the connect surface: no bound panes
+    /// or pending panes of live sessions. Invisible vacancies left by closed
+    /// sessions do not prevent adoption.
     pub empty: bool,
     pub groups: Vec<Vec<LivePane>>,
 }
@@ -347,6 +345,65 @@ fn scope<'a>(
         participating,
         in_scope,
     })
+}
+
+fn has_main(node: &dto::Node) -> bool {
+    match node {
+        dto::Node::Group(group) => group
+            .tabs
+            .iter()
+            .any(|pane| matches!(pane.id, dto::PaneIdentity::Main)),
+        dto::Node::Split(split) => has_main(&split.a) || has_main(&split.b),
+    }
+}
+
+/// Limit automatic restore to the profile the user actually opened. Matching
+/// uses the usual exact-profile then same-server fallback. Other saved profiles
+/// and their windows are removed before planning, so automatic restore can never
+/// open a session or displace another server's panes.
+#[must_use]
+pub fn for_opened_profile(template: &dto::Workspace, session: &LiveSessionInfo) -> dto::Workspace {
+    let slots: Vec<_> = template
+        .sessions
+        .iter()
+        .map(|slot| binding::SlotDescriptor {
+            server: &slot.server,
+            profile: &slot.profile,
+        })
+        .collect();
+    let bound = binding::bind(
+        &slots,
+        &[binding::LiveSession {
+            id: session.id,
+            server: &session.server,
+            profile: &session.profile,
+        }],
+    );
+    let mut projected = template.clone();
+    projected.sessions = template
+        .sessions
+        .iter()
+        .zip(bound)
+        .filter_map(|(slot, bound)| {
+            bound.map(|_| dto::SessionSlot {
+                profile: session.profile.clone(),
+                ..slot.clone()
+            })
+        })
+        .collect();
+    let mut projected = projected.sanitized();
+    // The main pane must stay in the window where the user opened it, even
+    // when the saved window creation order put a detached script pane first.
+    if let Some(index) = projected.windows.iter().position(|window| {
+        window
+            .clusters
+            .iter()
+            .any(|cluster| has_main(&cluster.root))
+    }) {
+        let main = projected.windows.remove(index);
+        projected.windows.insert(0, main);
+    }
+    projected
 }
 
 /// Project the complete mutation plan. Pure: no window, store, or disk
@@ -1402,6 +1459,76 @@ mod tests {
 
     fn no_answers() -> HashMap<SessionId, OmittedAnswer> {
         HashMap::new()
+    }
+
+    #[test]
+    fn automatic_restore_only_uses_the_opened_profile_and_keeps_its_main_window() {
+        let stored = template(
+            vec![
+                slot(1, "Arctic", "alt"),
+                slot(2, "Arctic", "main"),
+                slot(3, "Other", "foreign"),
+            ],
+            vec![
+                t_window(1, vec![t_group(vec![t_script(2, "chat")])]),
+                t_window(2, vec![t_group(vec![t_main(1)])]),
+                t_window(3, vec![t_group(vec![t_main(2)])]),
+                t_window(4, vec![t_group(vec![t_main(3)])]),
+            ],
+        );
+        let opened = session(7, "Arctic", "main");
+        let projected = for_opened_profile(&stored, &opened);
+        assert_eq!(projected.sessions.len(), 1);
+        assert_eq!(projected.sessions[0].id, 2);
+        assert_eq!(
+            projected
+                .windows
+                .iter()
+                .map(|window| window.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        let live = LiveWorkspace {
+            sessions: vec![opened, session(8, "Other", "foreign")],
+            windows: vec![
+                live_window(20, vec![vec![main_pane(7)]]),
+                live_window(21, vec![vec![main_pane(8)]]),
+            ],
+        };
+        let plan = plan_apply(&projected, &live, user_mode(), &no_answers()).unwrap();
+        assert!(plan.is_executable());
+        assert!(plan.close_sessions.is_empty());
+        assert!(plan.removals.is_empty());
+        assert_eq!(
+            plan.windows[0].target,
+            WindowTarget::Existing { stable_id: 20 }
+        );
+        assert!(matches!(plan.windows[1].target, WindowTarget::New { .. }));
+        validate_conservation(&projected, &live, user_mode(), &plan).unwrap();
+        assert_eq!(bound_panes(&plan), vec![main_pane(7).pane]);
+    }
+
+    #[test]
+    fn automatic_restore_falls_back_for_a_new_profile_but_never_another_server() {
+        let stored = template(
+            vec![slot(1, "Arctic", "old")],
+            vec![t_window(1, vec![t_group(vec![t_main(1)])])],
+        );
+        let opened = session(7, "Arctic", "new");
+        let projected = for_opened_profile(&stored, &opened);
+        assert_eq!(projected.sessions[0].profile, "new");
+        let live = LiveWorkspace {
+            sessions: vec![opened],
+            windows: vec![live_window(20, vec![vec![main_pane(7)]])],
+        };
+        assert!(
+            plan_apply(&projected, &live, user_mode(), &no_answers())
+                .unwrap()
+                .is_executable()
+        );
+        let foreign = for_opened_profile(&stored, &session(8, "Other", "old"));
+        assert!(foreign.sessions.is_empty());
+        assert!(foreign.windows.is_empty());
     }
 
     /// Every planned Bound pane, in tree order.

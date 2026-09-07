@@ -599,9 +599,16 @@ impl std::fmt::Debug for State {
     }
 }
 
+fn initial_server<'a>(servers: &'a [Server], recent: Option<&str>) -> Option<&'a Server> {
+    servers
+        .iter()
+        .find(|server| Some(server.name.as_str()) == recent)
+        .or_else(|| servers.first())
+}
+
 impl State {
-    /// Builds the modal already populated with the server list and the first
-    /// server's profiles, read synchronously. These are small local-disk reads, so
+    /// Populates the server list and the most recently used server's profiles,
+    /// falling back to the first server. These are small local-disk reads, so
     /// doing them up front lets the modal render fully populated on the very first
     /// frame — no "Loading servers…/profiles…" flash. Reads that fail fall back to
     /// an empty (welcome) state.
@@ -612,7 +619,8 @@ impl State {
             warn!("Failed to load servers for the connect modal: {e}");
             Vec::new()
         });
-        if let Some(first) = servers.first() {
+        let recent = crate::workspace::preferences::load().last_server;
+        if let Some(first) = initial_server(&servers, recent.as_deref()) {
             let name = first.name.clone();
             let profiles = with_server_if_unchanged(first, |current| {
                 smudgy_core::models::profile::list_profiles(&current.name)

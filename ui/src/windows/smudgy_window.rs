@@ -263,6 +263,10 @@ pub enum Event {
         server: String,
         name: String,
     },
+    /// A first profile was explicitly opened in a fresh window.
+    RestoreProfileLayout {
+        session: SessionId,
+    },
     /// Restore `server`'s last-session snapshot (the connect surface's
     /// per-server affordance) — the same full user flow a named-layout
     /// apply runs, reading the template from `<server>/last-session.json`.
@@ -2714,6 +2718,35 @@ impl SmudgyWindow {
         focus_task
     }
 
+    fn open_from_connect(
+        &mut self,
+        server: String,
+        profile: String,
+        connect: bool,
+        sessions: &mut SessionStore,
+    ) -> Update<Message, Event> {
+        let restore = self.is_visually_empty()
+            && !sessions
+                .iter()
+                .any(|(_, session)| session.server_name == server);
+        let previous = self.active_session_id();
+        let task = self.open_session(server.clone(), profile, connect, sessions);
+        // Failed opens retain the previous active session and do not change history.
+        let opened = self
+            .active_session_id()
+            .filter(|session| Some(*session) != previous);
+        if let Some(session) = opened {
+            crate::workspace::preferences::remember_server(&server);
+            if restore {
+                return Update {
+                    task,
+                    event: Some(Event::RestoreProfileLayout { session }),
+                };
+            }
+        }
+        Update::with_task(task)
+    }
+
     /// QA hook (debug builds only): opens an offline session in this window
     /// without the connect modal — the `SMUDGY_SPIKE_AUTOSESSION` startup
     /// path the scripted drag matrix drives (`bin/drag-matrix.ps1`).
@@ -2900,21 +2933,11 @@ impl SmudgyWindow {
                     }
                     modal::ConnectEvent::Connect(server_name, profile_name) => {
                         log::info!("Connect requested for {profile_name} on {server_name}");
-                        Update::with_task(self.open_session(
-                            server_name,
-                            profile_name,
-                            true,
-                            sessions,
-                        ))
+                        self.open_from_connect(server_name, profile_name, true, sessions)
                     }
                     modal::ConnectEvent::OpenOffline(server_name, profile_name) => {
                         log::info!("Open offline requested for {profile_name} on {server_name}");
-                        Update::with_task(self.open_session(
-                            server_name,
-                            profile_name,
-                            false,
-                            sessions,
-                        ))
+                        self.open_from_connect(server_name, profile_name, false, sessions)
                     }
                     modal::ConnectEvent::RestoreLastSession(server_name) => {
                         log::info!("Last-session restore requested for {server_name}");
@@ -5287,6 +5310,65 @@ mod tests {
         );
         assert!(homed.is_visually_empty(), "and invisible to the user");
         assert!(homed.adopt_vacancy(SessionId::from(9), "Arctic", "imm"));
+    }
+
+    #[test]
+    fn restore_adopts_a_window_after_its_last_session_was_closed() {
+        use crate::workspace::{apply, dto};
+        let mut window = test_window();
+        host_cluster(&mut window, main_pane(1));
+        window.flush_grid_rebuild();
+        assert!(window.vacate_session(
+            SessionId::from(1),
+            "Arctic",
+            "main",
+            &Default::default(),
+            0
+        ));
+        window.flush_grid_rebuild();
+        assert!(!window.layout().is_empty());
+        let sessions = SessionStore::new(crate::cloud_account::test_handles());
+        let live_window = crate::build_live_window(&window, &sessions, 42);
+        assert!(live_window.empty);
+        let template = dto::Workspace {
+            sessions: vec![dto::SessionSlot {
+                id: 1,
+                server: "Arctic".into(),
+                profile: "main".into(),
+                connect: false,
+            }],
+            windows: vec![dto::Window {
+                id: 1,
+                geometry: Default::default(),
+                maximized: false,
+                active_slot: Some(1),
+                clusters: vec![dto::Cluster {
+                    weight: 1.0,
+                    root: dto::Node::Group(dto::Group {
+                        selected: 0,
+                        tabs: vec![dto::Pane {
+                            slot: 1,
+                            id: dto::PaneIdentity::Main,
+                            hidden: false,
+                        }],
+                    }),
+                }],
+            }],
+            ..Default::default()
+        };
+        let live = apply::LiveWorkspace {
+            sessions: vec![],
+            windows: vec![live_window],
+        };
+        let mode = apply::ApplyMode::User {
+            initiating: Some(42),
+        };
+        let preview = apply::plan_apply(&template, &live, mode, &Default::default()).unwrap();
+        assert!(matches!(
+            preview.windows[0].target,
+            apply::WindowTarget::Adopted { stable_id: 42, .. }
+        ));
+        apply::validate_conservation(&template, &live, mode, &preview).unwrap();
     }
 
     #[test]

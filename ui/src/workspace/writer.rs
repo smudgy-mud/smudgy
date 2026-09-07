@@ -13,7 +13,7 @@
 //! - the Windows session-end hook ([`end_session_flush`]) writes the cell
 //!   synchronously when the event loop can no longer be serviced.
 //!
-//! Destinations are the per-server `last-session.json` files. Only one
+//! Destinations include window preferences and per-server `last-session.json` files. Only one
 //! server's file updates per snapshot (the one owning the active session),
 //! but a switch of active server mid-flight must not lose the previous
 //! server's pending write — hence per-destination cells rather than one.
@@ -121,9 +121,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn snapshot_is_empty(bytes: &[u8]) -> bool {
     #[derive(serde::Deserialize)]
     struct Probe {
-        #[serde(default)]
         sessions: Vec<serde::de::IgnoredAny>,
-        #[serde(default)]
         windows: Vec<serde::de::IgnoredAny>,
     }
     serde_json::from_slice::<Probe>(bytes)
@@ -192,6 +190,11 @@ impl Writer {
             // flush them.
             log::warn!("[workspace] the writer worker is not running; snapshot held in memory");
         }
+    }
+
+    /// Acknowledge only after all pending destinations have been drained.
+    pub fn flush(&self, ack: Ack) {
+        let _ = self.requests.send(Some(ack));
     }
 
     /// Publish without waking the worker — the snapshot lands in the cell
@@ -455,6 +458,21 @@ mod tests {
         let repopulated = br#"{"version":1,"sessions":[],"windows":[{"id":1}]}"#;
         publish_and_wait(&writer, 4, &path, repopulated);
         assert_eq!(fs::read(&path).unwrap(), repopulated);
+    }
+
+    #[test]
+    fn preferences_are_not_mistaken_for_an_empty_workspace() {
+        let (_dir, path, writer) = setup();
+        publish_and_wait(&writer, 1, &path, br#"{"last_server":"Arctic"}"#);
+        writer.publish_unscheduled(
+            2,
+            path.clone(),
+            Arc::from(&br#"{"last_server":"Other"}"#[..]),
+        );
+        let (ack, done) = tokio::sync::oneshot::channel();
+        writer.flush(ack);
+        done.blocking_recv().unwrap();
+        assert_eq!(fs::read(path).unwrap(), br#"{"last_server":"Other"}"#);
     }
 
     #[test]

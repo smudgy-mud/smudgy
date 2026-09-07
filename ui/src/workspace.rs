@@ -7,8 +7,10 @@
 //! pipeline settles a snapshot, the server owning the active session gets
 //! its window footprint captured and written, so every server retains the
 //! most recent arrangement in which it was active. The connect surface
-//! offers "Restore last session" per server, driving the same user-restore
-//! flow named layouts use. A snapshot is a *template*, not a dump of the
+//! automatically restores the chosen profile's panes when its first session
+//! opens in a fresh window. The explicit "Restore last session" action restores
+//! all saved profiles, driving the same flow named layouts use.
+//! A snapshot is a *template*, not a dump of the
 //! live model: it stores stable descriptors (server/profile names, pane
 //! namespace + folded name) and structural facts (split trees, tab order,
 //! selection), never runtime ids — `SessionId`, `PaneKey`,
@@ -40,6 +42,7 @@ pub mod dto;
 pub mod file;
 pub mod last_session;
 pub mod layouts;
+pub mod preferences;
 pub mod restore;
 pub mod snapshot;
 pub mod writer;
