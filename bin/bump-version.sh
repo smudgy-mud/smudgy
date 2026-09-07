@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Bump the smudgy version everywhere it lives.
 #
-# Usage: bin/bump-version.sh [--preview] <new-version>
-# --preview requires a PTB/nightly version and leaves CHANGELOG.md alone.
+# Usage: bin/bump-version.sh [--preview] [--force] <new-version>
+# Normal bumps keep source at X.Y.Z-ptb. --preview stamps X.Y.Z-ptb.N
+# for the current base and leaves CHANGELOG.md alone. --force permits other
+# version conventions (including a stable release); it does not skip validation.
 # Materialize dependency patches with cargo patch-crate --force first.
 #
 # <new-version> is a full semver string: MAJOR.MINOR.PATCH with an optional
@@ -44,12 +46,25 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PREVIEW=false
-if [[ "${1:-}" == "--preview" ]]; then
-    PREVIEW=true
+FORCE=false
+usage() {
+    echo "Usage: $0 [--preview] [--force] <new-version>"
+    echo "  <X.Y.Z-ptb>               change the source version"
+    echo "  --preview <X.Y.Z-ptb.N>   stamp a build of the current source version"
+    echo "  --force <version>         allow another convention, e.g. a stable release"
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --preview) PREVIEW=true ;;
+        --force) FORCE=true ;;
+        --help|-h) usage; exit 0 ;;
+        --*) usage >&2; exit 1 ;;
+        *) break ;;
+    esac
     shift
-fi
+done
 if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 [--preview] <new-version>" >&2
+    usage >&2
     exit 1
 fi
 
@@ -118,6 +133,22 @@ fi
 if [[ "$NEW_VERSION" == "$CURRENT_VERSION" ]]; then
     echo "error: version is already $CURRENT_VERSION" >&2
     exit 1
+fi
+
+# Fail before touching files. Numbered builds are an explicit operation;
+# ordinary source bumps must leave main eligible for the nightly coordinator.
+BASE_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-ptb$'
+if ! $FORCE; then
+    if $PREVIEW; then
+        NUMBERED_RE="^$(escape_re "$CURRENT_VERSION")\\.[1-9][0-9]*$"
+        if ! [[ "$CURRENT_VERSION" =~ $BASE_RE && "$NEW_VERSION" =~ $NUMBERED_RE ]]; then
+            echo "error: --preview requires $CURRENT_VERSION.N from an unnumbered X.Y.Z-ptb source; use --force to override the convention" >&2
+            exit 1
+        fi
+    elif ! [[ "$NEW_VERSION" =~ $BASE_RE ]]; then
+        echo "error: source versions must use X.Y.Z-ptb; use --preview for a numbered build or --force for another convention" >&2
+        exit 1
+    fi
 fi
 
 NEW_RE=$(escape_re "$NEW_VERSION")

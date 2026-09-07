@@ -181,14 +181,64 @@ class BumpTests(unittest.TestCase):
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, target)
+            if relative.as_posix() == "ui/Cargo.toml":
+                # Keep the fixture's source base stable when the real main
+                # version advances; preview guards compare against this file.
+                text = target.read_text(encoding="utf-8")
+                text = re.sub(r'^version = "[^"]+"', 'version = "0.5.7-ptb"', text, count=1, flags=re.M)
+                target.write_text(text, encoding="utf-8")
             self.original[relative.as_posix()] = target.read_text(encoding="utf-8").strip()
 
-    def bump(self, version=VERSION):
+    def bump(self, version=VERSION, flags=("--preview",)):
         # Isolate the shell script from Cargo/network. Lockfile validation is
         # tested separately against the real tracked lockfile structure below.
         return subprocess.run(["bash", "-c",
-                               'cargo() { printf "%s\\n" "$*" > cargo-invocation.txt; }; export -f cargo; bash bin/bump-version.sh --preview "$1"',
-                               "test", version], cwd=self.root, text=True, capture_output=True)
+                               'cargo() { printf "%s\\n" "$*" > cargo-invocation.txt; }; export -f cargo; bash bin/bump-version.sh "$@"',
+                               "test", *flags, version], cwd=self.root, text=True, capture_output=True,
+                              env={**os.environ, "SMUDGY_WEB_DIR": str(self.root / "missing-web")})
+
+    def assert_no_edits(self):
+        for path, before in self.original.items():
+            self.assertEqual((self.root / path).read_text(encoding="utf-8").strip(), before, path)
+        self.assertFalse((self.root / "cargo-invocation.txt").exists())
+
+    def test_normal_bump_keeps_source_unnumbered(self):
+        result = self.bump("0.5.8-ptb", flags=())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = tomllib.loads((self.root / "ui/Cargo.toml").read_text(encoding="utf-8"))
+        self.assertEqual(data["package"]["version"], "0.5.8-ptb")
+
+    def test_convention_breaking_source_bumps_require_force(self):
+        for version in [VERSION, "0.5.8", "0.5.8-rc.1", "0.5.8-ptb10", "0.5.8-ptb-10"]:
+            with self.subTest(version=version):
+                result = self.bump(version, flags=())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--force", result.stderr)
+                self.assert_no_edits()
+
+    def test_preview_requires_current_base_and_dotted_positive_number(self):
+        for version in ["0.5.8-ptb.1", "0.5.7-ptb5", "0.5.7-ptb-5", "0.5.7-ptb.0", "0.5.7-ptb.05"]:
+            with self.subTest(version=version):
+                result = self.bump(version)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--force", result.stderr)
+                self.assert_no_edits()
+
+    def test_force_allows_explicit_stable_release(self):
+        result = self.bump("0.5.8", flags=("--force",))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = tomllib.loads((self.root / "ui/Cargo.toml").read_text(encoding="utf-8"))
+        self.assertEqual(data["package"]["version"], "0.5.8")
+
+    def test_force_does_not_allow_invalid_version(self):
+        result = self.bump("not-a-version", flags=("--force",))
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_no_edits()
+
+    def test_force_preview_allows_explicit_alternate_convention(self):
+        result = self.bump("0.5.8-nightly.1", flags=("--force", "--preview"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "CHANGELOG.md").read_text(encoding="utf-8").strip(), self.original["CHANGELOG.md"])
 
     def test_preview_bumps_every_owned_crate_and_preserves_changelog(self):
         result = self.bump()

@@ -8,7 +8,7 @@ name: Release
 #
 # The artifact version comes from ui/Cargo.toml; the tag is only the trigger and
 # must match it (the verify-version job enforces this), so:
-#     bin/bump-version.sh <x.y.z>   # bumps the crates + installer + changelog
+#     bin/bump-version.sh --force <x.y.z>   # explicit stable-release bump
 #     git commit -am "chore: bump version to x.y.z" && git push
 #     git tag v<x.y.z> && git push origin v<x.y.z>    # <-- this fires the build
 #
