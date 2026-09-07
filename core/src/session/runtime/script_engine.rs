@@ -1418,6 +1418,11 @@ impl<'a> ScriptEngine<'a> {
         let local_package_names = Arc::clone(&plan.local_names);
         let local_package_snapshots = Rc::clone(&plan.local_snapshots);
         let local_catalog_error = plan.local_catalog_error.clone();
+        // Active manifest declarations back `smudgy:params.set`. Providers fill this map during
+        // their per-isolate closure solves, before any package module evaluates.
+        let declared_package_params: Rc<
+            RefCell<HashMap<String, Vec<smudgy_script::PackageParameter>>>,
+        > = Rc::new(RefCell::new(HashMap::new()));
         let local_owner = plan.local_owner.clone();
         let authority_lock = plan.lock.clone();
         let home_registry: crate::session::runtime::store::HomeRegistry =
@@ -1542,6 +1547,7 @@ impl<'a> ScriptEngine<'a> {
                         Arc::clone(&profile_name),
                         Arc::clone(&local_package_names),
                         local_catalog_error.clone(),
+                        declared_package_params.clone(),
                         script_functions.clone(),
                         spawned_actions.clone(),
                         ui_command_producer.clone(),
@@ -1673,6 +1679,9 @@ impl<'a> ScriptEngine<'a> {
             params.tokio_runtime.block_on(async {
                 provider.solve_closure(&main_set.packages).await;
             });
+            declared_package_params
+                .borrow_mut()
+                .extend(provider.installed_params());
             // Drop any trusted install whose required params are unset (it must not run
             // misconfigured); a notice naming the keys is emitted by the gate.
             let mut blocked = Self::blocked_by_required_params(
@@ -2026,6 +2035,9 @@ impl<'a> ScriptEngine<'a> {
                         // The root itself is blocked (its notice is already emitted); skip it.
                         continue;
                     }
+                    declared_package_params
+                        .borrow_mut()
+                        .extend(provider.installed_params());
                 }
 
                 // Resolve the root's version via THIS isolate's provider for its isolate id.
