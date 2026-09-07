@@ -20,6 +20,7 @@ pub mod script_typings;
 pub mod server;
 pub mod settings;
 pub mod shared_packages;
+pub mod state_exposure;
 pub(crate) mod state_lock;
 pub mod triggers;
 

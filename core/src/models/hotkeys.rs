@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
-use super::{ScriptLang, persistence::write_atomic};
+use super::{ScriptLang, persistence::write_atomic, state_exposure::StateExposure};
 
 // Helper function for serde to default boolean fields to true.
 fn default_true() -> bool {
@@ -36,6 +36,11 @@ pub struct HotkeyDefinition {
     /// Whether this specific hotkey is enabled. Defaults to true.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// The session-store roots this hotkey reads (`$name.path` in Send text, `name.path` in
+    /// JavaScript). Empty for the common case, which serializes nothing and pays nothing at
+    /// fire time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state: Vec<StateExposure>,
 }
 
 impl HotkeyDefinition {
@@ -182,4 +187,38 @@ pub fn save_hotkeys(server_name: &str, hotkeys: &HashMap<String, HotkeyDefinitio
     ))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HotkeyDefinition;
+    use crate::models::state_exposure::StateExposure;
+
+    #[test]
+    fn state_exposures_round_trip_and_stay_absent_for_plain_hotkeys() {
+        let plain: HotkeyDefinition =
+            serde_json::from_str(r#"{"key":"F1","script":"score"}"#).unwrap();
+        assert!(plain.state.is_empty(), "older files load with no exposures");
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !json.contains("state"),
+            "no state key for a plain hotkey: {json}"
+        );
+        assert_eq!(
+            json,
+            r#"{"key":"F1","modifiers":[],"script":"score","package":null,"language":"Plaintext","enabled":true}"#
+        );
+
+        let mut exposing = plain.clone();
+        exposing.state = vec![StateExposure {
+            producer: "gmcp".to_string(),
+            handle: None,
+            name_override: None,
+            paths: vec!["Char.Vitals".to_string()],
+        }];
+        let json = serde_json::to_string(&exposing).unwrap();
+        assert!(json.contains(r#""state":[{"producer":"gmcp","paths":["Char.Vitals"]}]"#));
+        let back: HotkeyDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, exposing);
+    }
 }

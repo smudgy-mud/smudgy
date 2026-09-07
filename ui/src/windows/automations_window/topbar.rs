@@ -219,7 +219,9 @@ fn inspect_button() -> Elem<'static> {
             left: 9.0,
             right: 9.0,
         }),
-        crate::i18n::ts!("automations-inspect-help"),
+        container(text(crate::i18n::ts!("automations-inspect-help")).size(11.0))
+            .padding(6.0)
+            .style(crate::theme::builtins::container::tooltip),
         tooltip::Position::Bottom,
     )
     .into()

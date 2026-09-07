@@ -15,7 +15,11 @@ use crate::session::{BufferUpdate, SessionEvent, TaggedSessionEvent};
 use super::pane::{MAIN_PANE_KEY, PaneError, PaneKey, PaneKind, PaneNamespace};
 use super::script_engine::AutomationCall;
 use super::trigger::{self, PushTriggerParams};
-use super::{ActionResult, Inner, IsolateId, MainPrefixDisposition, RuntimeAction, ScriptAction};
+use super::{
+    ActionResult, ExposedState, Inner, IsolateId, MainPrefixDisposition, RuntimeAction,
+    ScriptAction,
+};
+use crate::models::state_exposure::StateExposure;
 use crate::session::styled_line::StyledLine;
 
 /// Forward a lazy tooltip request while preserving a terminal failure path.
@@ -252,6 +256,29 @@ impl Inner<'_> {
                     .collect(),
             ))
         }
+    }
+
+    /// Bind a definition's state exposures at registration (the store dedupes cells per
+    /// path, so re-registration and reload rebind for free) and echo one warning per entry
+    /// the runtime had to drop. `None` when the definition exposes nothing usable, which is
+    /// the fire path's fast case.
+    async fn bind_state_exposures(
+        &mut self,
+        kind: &str,
+        name: &str,
+        exposures: &[StateExposure],
+    ) -> anyhow::Result<Option<Arc<ExposedState>>> {
+        if exposures.is_empty() {
+            return Ok(None);
+        }
+        let bound = ExposedState::bind(&mut self.session_store.borrow_mut(), exposures);
+        for warning in bound.warnings {
+            // The flush hands back the send future; it must be driven for the line to leave.
+            if let Some(sent) = self.echo_warn_str(&format!("{kind} '{name}': {warning}"))? {
+                sent.await?;
+            }
+        }
+        Ok(bound.state)
     }
 
     #[allow(clippy::unused_async)]
@@ -809,6 +836,8 @@ impl Inner<'_> {
                 let mut continue_matching = fallthrough;
                 let result = match script {
                     ScriptAction::EvalJavascript(id) => {
+                        // The one place a fire consults its exposures: `None` for an
+                        // automation that exposes nothing, which then runs exactly as before.
                         let outcome = self.script_engine.run_automation(
                             &self.trigger_manager,
                             &identity.isolate,
@@ -817,6 +846,7 @@ impl Inner<'_> {
                             depth,
                             sender,
                             fallthrough,
+                            identity.exposure(),
                         );
                         if outcome.captured
                             && let Some(is_captured) = &is_captured
@@ -827,6 +857,8 @@ impl Inner<'_> {
                         outcome.result
                     }
                     ScriptAction::CallJavascriptFunction(id) => {
+                        // Function handlers are module code with `smudgy:state/*` imports of
+                        // their own; exposures never reach them.
                         let outcome = self.script_engine.run_automation(
                             &self.trigger_manager,
                             &identity.isolate,
@@ -835,6 +867,7 @@ impl Inner<'_> {
                             depth,
                             sender,
                             fallthrough,
+                            None,
                         );
                         if outcome.captured
                             && let Some(is_captured) = &is_captured
@@ -853,6 +886,7 @@ impl Inner<'_> {
                             matches.view(),
                             depth,
                             sender.as_ref(),
+                            identity.exposure(),
                         )?;
                         ActionResult::None
                     }
@@ -907,6 +941,7 @@ impl Inner<'_> {
                         id,
                         (&matches).into(),
                         depth,
+                        None,
                         None,
                     )
                     .unwrap_or_else(|err| ActionResult::Echo(format!("JavaScript Error: {err:?}")));
@@ -1051,6 +1086,7 @@ impl Inner<'_> {
                 hotkey,
                 function_id,
             } => {
+                let hotkey = *hotkey;
                 // Upsert by `(isolate, origin, name)`: if this key already has a binding, drop
                 // and unregister the old one first so a redefine replaces it.
                 let key = (isolate.clone(), origin, name);
@@ -1066,11 +1102,15 @@ impl Inner<'_> {
 
                 let hotkey_id = self.next_hotkey_id;
                 self.next_hotkey_id.0 = self.next_hotkey_id.0.add(1);
+                let mut exposure = None;
                 let action = if let Some(function_id) = function_id {
                     // `createHotkey(.., handler)`: the handler is a function already registered
                     // in the creating isolate's `script_functions`; fire it there.
                     ScriptAction::CallJavascriptFunction(function_id)
                 } else {
+                    exposure = self
+                        .bind_state_exposures("hotkey", &key.2, &hotkey.state)
+                        .await?;
                     match hotkey.language {
                         ScriptLang::Plaintext => ScriptAction::SendSimple(
                             hotkey.script.clone().unwrap_or_default().into(),
@@ -1081,6 +1121,7 @@ impl Inner<'_> {
                             match self.script_engine.add_script(
                                 &IsolateId::Main,
                                 hotkey.script.as_ref().map_or("", |s| s.as_str()),
+                                exposure.is_some(),
                             ) {
                                 Ok(script_id) => ScriptAction::EvalJavascript(script_id),
                                 Err(err) => {
@@ -1093,7 +1134,7 @@ impl Inner<'_> {
                         }
                     }
                 };
-                self.hotkeys.insert(hotkey_id, (isolate, action));
+                self.hotkeys.insert(hotkey_id, (isolate, action, exposure));
                 self.hotkey_ids.insert(key, hotkey_id);
                 self.ui_tx
                     .send(TaggedSessionEvent {
@@ -1119,26 +1160,40 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::ExecHotkey { id } => {
-                if let Some((isolate, action)) = self.hotkeys.get(&id) {
+                if let Some((isolate, action, exposure)) = self.hotkeys.get(&id) {
                     match action {
                         ScriptAction::SendRaw(script) => {
                             self.send(script.clone().as_str()).await?;
                             Ok(ActionResult::None)
                         }
-                        ScriptAction::SendSimple(script) => Ok(ActionResult::Run(
-                            trigger::split_commands(script, &self.command_separator)
-                                .into_iter()
-                                .map(|line| RuntimeAction::ProcessOutgoingLine {
-                                    line: Arc::new(line.to_string()),
-                                    depth: 0,
-                                    sender: None,
-                                })
-                                .collect(),
-                        )),
+                        ScriptAction::SendSimple(script) => {
+                            // A hotkey has no captures; its Send text is expanded only when
+                            // it exposes state (`$name.path` references), and is otherwise
+                            // sent as written.
+                            let expanded = exposure.as_deref().map(|state| {
+                                trigger::expand_template_view(
+                                    script,
+                                    super::captures::CaptureView::Owned(&[]),
+                                    Some(state),
+                                )
+                            });
+                            let text = expanded.as_deref().unwrap_or(script.as_str());
+                            Ok(ActionResult::Run(
+                                trigger::split_commands(text, &self.command_separator)
+                                    .into_iter()
+                                    .map(|line| RuntimeAction::ProcessOutgoingLine {
+                                        line: Arc::new(line.to_string()),
+                                        depth: 0,
+                                        sender: None,
+                                    })
+                                    .collect(),
+                            ))
+                        }
                         ScriptAction::EvalJavascript(script_id) => {
                             // Disk/inline-string hotkeys compile into the main isolate; a
                             // script-created function hotkey runs in its creating isolate.
                             let isolate = isolate.clone();
+                            let exposure = exposure.clone();
                             self.script_engine
                                 .run_script(
                                     &self.trigger_manager,
@@ -1147,6 +1202,7 @@ impl Inner<'_> {
                                     super::captures::CaptureView::Owned(&[]),
                                     0,
                                     None,
+                                    exposure.as_deref(),
                                 )
                                 .unwrap_or_else(|err| {
                                     ActionResult::Echo(format!(
@@ -1188,6 +1244,7 @@ impl Inner<'_> {
                 alias,
                 fire_limit,
             } => {
+                let alias = *alias;
                 // The one place the runtime reads authoring state: a Command
                 // sidecar's parser spec rides into the matcher at load time.
                 // The alias name resolves the command word unless the sidecar
@@ -1196,6 +1253,9 @@ impl Inner<'_> {
                     .matcher
                     .as_ref()
                     .and_then(|matcher| matcher.command_spec(name.as_str()));
+                let exposure = self
+                    .bind_state_exposures("alias", &name, &alias.state)
+                    .await?;
                 match alias.language {
                     ScriptLang::Plaintext => {
                         self.trigger_manager.push_simple_alias(
@@ -1209,11 +1269,16 @@ impl Inner<'_> {
                             alias.allow_self_match,
                             fire_limit,
                             command,
+                            exposure,
                         )?;
                     }
                     ScriptLang::JS | ScriptLang::TS => {
                         let src = alias.script.unwrap_or_default();
-                        let script_id = self.script_engine.add_script(&isolate, src.as_str())?;
+                        let script_id = self.script_engine.add_script(
+                            &isolate,
+                            src.as_str(),
+                            exposure.is_some(),
+                        )?;
                         self.trigger_manager.push_javascript_alias(
                             isolate,
                             origin,
@@ -1226,6 +1291,7 @@ impl Inner<'_> {
                             fire_limit,
                             Some(Arc::from(src)),
                             command,
+                            exposure,
                         )?;
                     }
                 }
@@ -1272,38 +1338,49 @@ impl Inner<'_> {
                 fire_limit,
                 line_limit,
             } => {
+                let trigger = *trigger;
                 // Capture the JS/TS eval source for the read-only detail pane; plaintext
                 // bodies are recovered from the `ScriptAction` itself, so they carry no source.
                 let mut source: Option<Arc<str>> = None;
+                let exposure = self
+                    .bind_state_exposures("trigger", &name, &trigger.state)
+                    .await?;
                 let action = match trigger.language {
                     ScriptLang::Plaintext => {
                         ScriptAction::SendSimple(trigger.script.unwrap_or_default().into())
                     }
                     ScriptLang::JS | ScriptLang::TS => {
                         let src = trigger.script.unwrap_or_default();
-                        let script_id = self.script_engine.add_script(&isolate, src.as_str())?;
+                        let script_id = self.script_engine.add_script(
+                            &isolate,
+                            src.as_str(),
+                            exposure.is_some(),
+                        )?;
                         source = Some(Arc::from(src));
                         ScriptAction::EvalJavascript(script_id)
                     }
                 };
 
-                self.trigger_manager.push_trigger(PushTriggerParams {
-                    isolate,
-                    origin,
-                    name: &name,
-                    patterns: &Arc::new(trigger.patterns.unwrap_or_default()),
-                    raw_patterns: &Arc::new(trigger.raw_patterns.unwrap_or_default()),
-                    anti_patterns: &Arc::new(trigger.anti_patterns.unwrap_or_default()),
-                    matchers: trigger.matchers.as_deref(),
-                    action,
-                    enabled: trigger.enabled,
-                    priority: trigger.priority,
-                    fallthrough: trigger.fallthrough,
-                    prompt: trigger.prompt,
-                    fire_limit,
-                    line_limit,
-                    source,
-                })?;
+                self.trigger_manager.push_trigger_with_exposure(
+                    PushTriggerParams {
+                        isolate,
+                        origin,
+                        name: &name,
+                        patterns: &Arc::new(trigger.patterns.unwrap_or_default()),
+                        raw_patterns: &Arc::new(trigger.raw_patterns.unwrap_or_default()),
+                        anti_patterns: &Arc::new(trigger.anti_patterns.unwrap_or_default()),
+                        matchers: trigger.matchers.as_deref(),
+                        action,
+                        enabled: trigger.enabled,
+                        priority: trigger.priority,
+                        fallthrough: trigger.fallthrough,
+                        prompt: trigger.prompt,
+                        fire_limit,
+                        line_limit,
+                        source,
+                    },
+                    exposure,
+                )?;
                 Ok(ActionResult::None)
             }
             RuntimeAction::AddScriptTrigger {

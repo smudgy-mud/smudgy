@@ -179,7 +179,7 @@ fn reconcile_alias_actions(
                 isolate: IsolateId::Main,
                 origin: Origin::User,
                 name: Arc::new(name.clone()),
-                alias: new,
+                alias: Box::new(new),
                 fire_limit: None,
             });
         }
@@ -227,7 +227,7 @@ fn reconcile_trigger_actions(
                 isolate: IsolateId::Main,
                 origin: Origin::User,
                 name: Arc::new(name.clone()),
-                trigger: new,
+                trigger: Box::new(new),
                 fire_limit: None,
                 line_limit: None,
             });
@@ -276,7 +276,7 @@ fn reconcile_hotkey_actions(
                 isolate: IsolateId::Main,
                 origin: Origin::User,
                 name: Arc::new(name.clone()),
-                hotkey: new,
+                hotkey: Box::new(new),
                 function_id: None,
             });
         }
@@ -325,6 +325,7 @@ mod tests {
             allow_self_match: false,
             language: ScriptLang::Plaintext,
             matcher: None,
+            state: Vec::new(),
         }
     }
 
@@ -346,6 +347,7 @@ mod tests {
             package: package.map(str::to_string),
             language: ScriptLang::Plaintext,
             enabled,
+            state: Vec::new(),
         }
     }
 

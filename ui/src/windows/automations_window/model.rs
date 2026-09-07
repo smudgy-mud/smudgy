@@ -1543,6 +1543,7 @@ mod tests {
                 allow_self_match: false,
                 language: smudgy_core::models::ScriptLang::Plaintext,
                 matcher,
+                state: Vec::new(),
             }
         }
 

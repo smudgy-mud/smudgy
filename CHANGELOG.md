@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installs, dependencies, requires links, and imports of any author's copy resolve
   to the local folder while it exists; the published install stays on disk and
   comes back when the local folder is removed.
+- **Aliases, triggers, and hotkeys can read GMCP and package state.** Choose
+  Read state from GMCP or a package in the editor and expose values from the
+  browser: a GMCP, MSDP, or MSSP path, state a package publishes, or one of your
+  own createState handles. Each exposed value is a name the action can use:
+  `$gmcp.Char.Vitals.hp` in Send text, `gmcp.Char.Vitals.hp` in JavaScript. The
+  State values rail beside Matched values lists what is exposed with its live
+  value and inserts a reference on click. Values are read when the automation
+  fires; an automation that exposes nothing runs, and is saved, exactly as before.
 
 ### Changed
 

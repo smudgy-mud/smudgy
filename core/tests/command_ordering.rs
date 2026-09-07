@@ -108,7 +108,7 @@ async fn run_scenario_multi(
             isolate: spec.isolate,
             origin: spec.origin,
             name: Arc::new(spec.name),
-            alias: spec.alias,
+            alias: Box::new(spec.alias),
             fire_limit: None,
         })
         .unwrap();
@@ -165,6 +165,7 @@ fn plaintext_alias(pattern: &str, script: &str) -> AliasDefinition {
         allow_self_match: false,
         language: ScriptLang::Plaintext,
         matcher: None,
+        state: Vec::new(),
     }
 }
 
@@ -180,6 +181,7 @@ async fn plaintext_alias_expansion_preserves_command_order() {
         allow_self_match: false,
         language: ScriptLang::Plaintext,
         matcher: None,
+        state: Vec::new(),
     };
 
     let seen = run_scenario(
@@ -205,6 +207,7 @@ async fn script_alias_sends_preserve_command_order() {
         allow_self_match: false,
         language: ScriptLang::JS,
         matcher: None,
+        state: Vec::new(),
     };
 
     let seen = run_scenario(
@@ -316,6 +319,7 @@ async fn js_alias_send_of_own_pattern_falls_through_by_default() {
         allow_self_match: false,
         language: ScriptLang::JS,
         matcher: None,
+        state: Vec::new(),
     };
 
     let seen = run_scenario(9006, alias, "jsself", &["jsself", "jsdone"]).await;

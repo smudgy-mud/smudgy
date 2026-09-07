@@ -3256,6 +3256,7 @@ mod tests {
                 package: None,
                 language: smudgy_core::models::ScriptLang::Plaintext,
                 enabled: true,
+                state: Vec::new(),
             },
         );
 

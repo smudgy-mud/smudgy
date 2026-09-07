@@ -298,7 +298,11 @@ pub enum RuntimeAction {
         isolate: IsolateId,
         origin: Origin,
         name: Arc<String>,
-        hotkey: HotkeyDefinition,
+        /// Boxed: the definition is the largest payload any action carries, and every
+        /// queued action moves by value, so an inline definition sets the enum's size for
+        /// the hot-path actions too. The box keeps `RuntimeAction` at the size the dispatch
+        /// work measured (see the size test) for one allocation per registration.
+        hotkey: Box<HotkeyDefinition>,
         function_id: Option<FunctionId>,
     },
     /// Remove a script-created hotkey by its `(isolate, origin, name)` key (`delete()`),
@@ -308,7 +312,11 @@ pub enum RuntimeAction {
         isolate: IsolateId,
         origin: Origin,
         name: Arc<String>,
-        alias: AliasDefinition,
+        /// Boxed: the definition is the largest payload any action carries, and every
+        /// queued action moves by value, so an inline definition sets the enum's size for
+        /// the hot-path actions too. The box keeps `RuntimeAction` at the size the dispatch
+        /// work measured (see the size test) for one allocation per registration.
+        alias: Box<AliasDefinition>,
         /// Self-limit: auto-remove after this many fires. `None` ⇒ no limit;
         /// `Some(1)` ⇒ one-shot. Aliases ignore `line_limit` (they match input, not
         /// server lines), so only `fire_limit` is carried here.
@@ -334,7 +342,11 @@ pub enum RuntimeAction {
         isolate: IsolateId,
         origin: Origin,
         name: Arc<String>,
-        trigger: TriggerDefinition,
+        /// Boxed: the definition is the largest payload any action carries, and every
+        /// queued action moves by value, so an inline definition sets the enum's size for
+        /// the hot-path actions too. The box keeps `RuntimeAction` at the size the dispatch
+        /// work measured (see the size test) for one allocation per registration.
+        trigger: Box<TriggerDefinition>,
         /// Self-limits: auto-remove after `fire_limit` fires OR `line_limit`
         /// tested lines, whichever comes first. `None` ⇒ that limit is unbounded.
         fire_limit: Option<u32>,
@@ -1022,5 +1034,17 @@ mod tests {
         };
 
         assert!(action.references_engine_state());
+    }
+
+    /// Every queued action moves by value through the runtime channel, so the enum's
+    /// size is a per-action cost on the hot path. The dispatch optimization measured 296
+    /// bytes; the automation definitions are boxed in their add actions to keep it there.
+    #[test]
+    fn runtime_action_stays_within_its_measured_size() {
+        assert!(
+            std::mem::size_of::<RuntimeAction>() <= 296,
+            "RuntimeAction grew to {} bytes",
+            std::mem::size_of::<RuntimeAction>()
+        );
     }
 }

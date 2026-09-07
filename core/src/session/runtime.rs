@@ -48,6 +48,7 @@ mod remote_interop;
 mod row_ledger;
 mod script_action;
 mod script_engine;
+mod state_exposure;
 mod store;
 
 pub(crate) use catalogue::SharedCatalogue;
@@ -62,6 +63,7 @@ pub(crate) use message_bus::SharedMessageBus;
 use pane::{MAIN_PANE_KEY, PaneKey, PaneRegistry};
 pub(crate) use remote_interop::SharedRemoteStateRegistry;
 pub(crate) use row_ledger::{RecentLines, RowLedger};
+pub use state_exposure::ExposedState;
 
 pub use script_action::ScriptAction;
 pub use script_engine::layout_fold;
@@ -84,10 +86,11 @@ use store::SessionStore;
 pub use script_engine::FunctionId;
 pub(crate) use store::SharedSessionStore;
 #[cfg(feature = "bench-api")]
-pub use store::{
-    BudgetExceeded, PathError, PlatformProducer, ProducerKey, SessionStore, SetOutcome,
-    StoreBudgets, StorePath, Usage, WatchCadence,
-};
+pub use store::{BudgetExceeded, SessionStore, SetOutcome, StoreBudgets, Usage, WatchCadence};
+// The store's address types are ordinary public API: state exposures
+// (`models::state_exposure`) validate a definition's producer and paths with them, in the
+// core model and in the automations editor alike.
+pub use store::{PathError, PlatformProducer, ProducerKey, StorePath};
 
 use crate::get_smudgy_home;
 use crate::models::settings::load_settings;
@@ -2238,7 +2241,9 @@ struct Inner<'a> {
     /// the real size. Session-lifetime (survives reloads, like the connection).
     window_size: Arc<std::sync::atomic::AtomicU32>,
     pending_buffer_updates: Vec<BufferUpdate>,
-    hotkeys: BTreeMap<HotkeyId, (IsolateId, ScriptAction)>,
+    /// Registered hotkeys: the isolate that runs the action, the action, and the state
+    /// exposures bound for it (`None` for the common no-exposure case).
+    hotkeys: BTreeMap<HotkeyId, (IsolateId, ScriptAction, Option<Arc<ExposedState>>)>,
     next_hotkey_id: HotkeyId,
     /// Name index for script-created/disk hotkeys: maps a hotkey's `(isolate, origin, name)`
     /// key to its assigned [`HotkeyId`], so a re-`AddHotkey` upserts (unregistering the prior

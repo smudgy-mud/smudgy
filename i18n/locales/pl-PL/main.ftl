@@ -1357,6 +1357,35 @@ editor-continue-aliases = Uruchom także inne pasujące aliasy
 editor-continue-triggers = Uruchom także inne pasujące wyzwalacze
 editor-allow-self-match = Pozwól, aby tekst wysłany przez ten alias pasował do niego samego
 
+# Co odczytuje (udostępniony stan)
+editor-reveal-state = Odczytuj stan z GMCP lub pakietu
+editor-hide-state = Ukryj opcje stanu
+editor-what-it-reads = Co odczytuje
+editor-state-values = Wartości stanu
+editor-state-exposed = Udostępnione
+editor-state-browse = Przeglądaj
+editor-state-filter-placeholder = Filtruj ścieżki
+editor-state-add-path = Dodaj ścieżkę
+editor-state-add-reveal = Ręcznie udostępnij ścieżkę stanu (zaawansowane)
+editor-state-handle = Uchwyt
+editor-state-remove = Usuń
+editor-state-rename = Użyj innej nazwy…
+editor-state-name = Nazwa
+editor-state-expose-tooltip = Udostępnij { $path }
+editor-state-unexpose-tooltip = Przestań udostępniać { $path }
+editor-state-insert-tooltip = Wstaw { $reference }
+editor-state-not-exposed = { $reference } nie jest udostępnione dla tego elementu ({ $kind })
+editor-state-name-taken = Inna udostępniona wartość już używa nazwy { $name }
+editor-state-name-shadows-smudgy = { $name } ze smudgy nie będzie dostępne w tym skrypcie.
+editor-state-name-shadows-javascript = { $name } z JavaScript nie będzie dostępne w tym skrypcie.
+editor-state-name-shadows-deno = { $name } z Deno nie będzie dostępne w tym skrypcie.
+editor-state-name-shadows-capture = { $name } jest też dopasowaną wartością; samo ${ $name } oznacza dopasowanie
+editor-state-bad-name = { $name } nie jest poprawną nazwą
+editor-state-reserved-name = { $name } to słowo kluczowe JavaScript i nie może być nazwą
+editor-state-bad-path = { $path } nie jest poprawną ścieżką
+editor-state-empty = Magazyn jest obecnie pusty.
+editor-state-invalid = Nie można użyć udostępnionej wartości: { $error }
+
 # Moduł akcji
 editor-tab-send-text = Wyślij tekst
 editor-tab-run-js = Uruchom JavaScript

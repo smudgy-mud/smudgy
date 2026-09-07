@@ -243,6 +243,9 @@ pub(super) struct PendingLanguageProjectRefresh {
     graph_generation: GraphGeneration,
     command_sequence: CommandSequence,
     retries_remaining: u8,
+    /// The inline bridge the refresh carries, recorded as installed by the same
+    /// acknowledgement; `None` outside the inline context.
+    inline_bridge: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +260,13 @@ struct PendingProjectSource {
     language: Language,
     kind: DocumentKind,
     text: String,
+}
+
+/// The sources one project refresh installs, with the inline bridge among them.
+struct LanguageProjectSources {
+    sources: Vec<ProjectSource>,
+    /// The bridge text the inline context's sources carry; `None` for the other contexts.
+    inline_bridge: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2483,8 +2493,9 @@ impl super::AutomationsWindow {
         let context = language_project_context(self, kind);
         let context_changed = self.language_project_target_context.as_ref() != Some(&context);
         self.language_project_target_context = Some(context.clone());
-        let refresh_needed =
-            needs_service && !self.language_project_is_installed_or_pending(&context);
+        let refresh_needed = needs_service
+            && (!self.language_project_is_installed_or_pending(&context)
+                || (context == LanguageProjectContext::Inline && self.inline_bridge_is_stale()));
         let bound_with_service = self
             .code_editor
             .as_ref()
@@ -3442,6 +3453,47 @@ impl super::AutomationsWindow {
         self.install_language_project(context, &client);
     }
 
+    /// The inline bridge for the open state draft: the fixed inline declarations, reshaped per
+    /// automation so each exposed name is declared and the user-API member it shadows is not.
+    fn inline_bridge_text(&self) -> String {
+        let exposures = self
+            .state_exposures
+            .iter()
+            .map(super::state_values::StateExposureDraft::to_exposure)
+            .collect::<Vec<_>>();
+        smudgy_core::models::script_typings::language_service_inline_bridge_for(&exposures)
+            .into_owned()
+    }
+
+    /// The inline bridge the worker holds or is installing: the in-flight refresh's while one
+    /// is pending (its acknowledgement records it, and a retry is rebuilt from the draft), else
+    /// the newest acknowledged one; `None` while that project is not the inline one.
+    fn installed_inline_bridge(&self) -> Option<&str> {
+        self.pending_language_project_refresh.as_ref().map_or_else(
+            || self.inline_bridge.as_deref(),
+            |pending| pending.inline_bridge.as_deref(),
+        )
+    }
+
+    /// Whether the open draft's bridge differs from the installed or in-flight one.
+    pub(super) fn inline_bridge_is_stale(&self) -> bool {
+        self.installed_inline_bridge() != Some(self.inline_bridge_text().as_str())
+    }
+
+    /// Re-installs the inline project after an exposure edit changed the open draft's bridge,
+    /// so the body's diagnostics and completions follow the names it can use. Nothing happens
+    /// while another context is targeted, or while the installed or in-flight bridge reads the
+    /// same.
+    pub(super) fn refresh_inline_bridge(&mut self) {
+        if !self.language_project_context_matches(&LanguageProjectContext::Inline)
+            || !self.inline_bridge_is_stale()
+        {
+            return;
+        }
+        self.language_project_target_context = Some(LanguageProjectContext::Inline);
+        self.refresh_language_project();
+    }
+
     fn install_language_project(
         &mut self,
         context: LanguageProjectContext,
@@ -3456,7 +3508,10 @@ impl super::AutomationsWindow {
         client: &LanguageServiceClient,
         retries_remaining: u8,
     ) {
-        let sources = self.language_project_sources(&context);
+        let LanguageProjectSources {
+            sources,
+            inline_bridge,
+        } = self.language_project_sources(&context);
         let graph_generation =
             next_wire_value::<GraphGeneration>(&mut self.next_language_graph_generation);
         match client.send(Command::RefreshProject(RefreshProject {
@@ -3470,9 +3525,12 @@ impl super::AutomationsWindow {
                     graph_generation,
                     command_sequence,
                     retries_remaining,
+                    inline_bridge,
                 });
             }
             Err(error) => {
+                // The installed bridge is unchanged, so an inline draft still reads as stale
+                // and the next editor binding or exposure edit sends the refresh again.
                 log::warn!("Failed to refresh Automations language-service project: {error}");
             }
         }
@@ -3500,9 +3558,12 @@ impl super::AutomationsWindow {
                 }
                 let pending = self.pending_language_project_refresh.take()?;
                 self.language_project_context = Some(pending.context);
+                self.inline_bridge = pending.inline_bridge;
                 None
             }
             Event::RequestFailed(failure) => {
+                // The refresh installed nothing: the acknowledged bridge stands, and a draft
+                // whose bridge differs from it reads as stale until a later refresh carries it.
                 let pending = self.pending_language_project_refresh.take()?;
                 (failure.retryable
                     && pending.retries_remaining > 0
@@ -3671,18 +3732,24 @@ impl super::AutomationsWindow {
         }
     }
 
-    fn language_project_sources(&mut self, context: &LanguageProjectContext) -> Vec<ProjectSource> {
+    fn language_project_sources(
+        &mut self,
+        context: &LanguageProjectContext,
+    ) -> LanguageProjectSources {
         let mut pending = Vec::new();
         let mut total_bytes = 0_usize;
+        let mut inline_bridge = None;
         match context {
             // Inline automations are isolated lexical bodies in one shared main-isolate global
             // context. Install every saved inline body so globalThis and inferred vars state can
             // cross aliases/triggers/hotkeys, while keeping the graph separate from modules and
             // packages. Absolute ambient modules such as node: and smudgy: still come from the
-            // managed declarations.
+            // managed declarations. The bridge is the open automation's: its state exposures
+            // are declared as the names its body can use, in place of the user-API members
+            // they shadow. It counts as installed once the refresh carrying it is acknowledged.
             LanguageProjectContext::Inline => {
-                let bridge = smudgy_core::models::script_typings::language_service_inline_bridge()
-                    .to_owned();
+                let bridge = self.inline_bridge_text();
+                inline_bridge = Some(bridge.clone());
                 total_bytes = bridge.len();
                 pending.push(PendingProjectSource {
                     key: LanguageSourceKey::InlineBridge,
@@ -3801,7 +3868,10 @@ impl super::AutomationsWindow {
                 text: source.text,
             });
         }
-        sources
+        LanguageProjectSources {
+            sources,
+            inline_bridge,
+        }
     }
 
     fn code_document_descriptor(
@@ -6903,7 +6973,9 @@ mod tests {
             subpath: "must-not-join-inline.ts".to_owned(),
             path: std::path::PathBuf::from("must-not-join-inline.ts"),
         }];
-        let sources = window.language_project_sources(&LanguageProjectContext::Inline);
+        let sources = window
+            .language_project_sources(&LanguageProjectContext::Inline)
+            .sources;
         assert_eq!(sources.len(), 1);
         assert_eq!(
             sources[0].uri, "smudgy-project:///inline/context.d.ts",
@@ -6976,6 +7048,7 @@ mod tests {
         assert!(
             window
                 .language_project_sources(&LanguageProjectContext::Modules)
+                .sources
                 .is_empty(),
             "per-file graph cap must be applied from metadata before reading the file"
         );
@@ -7163,6 +7236,7 @@ mod tests {
             graph_generation,
             command_sequence,
             retries_remaining: 1,
+            inline_bridge: None,
         });
 
         let project = ProjectStateIdentity {
@@ -7212,6 +7286,7 @@ mod tests {
             graph_generation,
             command_sequence: retry_sequence,
             retries_remaining: retry.retries_remaining,
+            inline_bridge: None,
         });
         let acknowledged = EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
@@ -7230,6 +7305,8 @@ mod tests {
 
 #[cfg(test)]
 mod inline_project_tests {
+    use smudgy_script::language_service::{PROTOCOL_VERSION, RequestFailure};
+
     use super::*;
 
     #[test]
@@ -7254,6 +7331,7 @@ mod inline_project_tests {
                 allow_self_match: false,
                 language: ScriptLang::JS,
                 matcher: None,
+                state: Vec::new(),
             }),
         );
         let mut children = std::collections::BTreeMap::new();
@@ -7271,7 +7349,9 @@ mod inline_project_tests {
             super::super::model::Script::Folder(true, children),
         );
 
-        let sources = window.language_project_sources(&LanguageProjectContext::Inline);
+        let sources = window
+            .language_project_sources(&LanguageProjectContext::Inline)
+            .sources;
         assert_eq!(sources.len(), 3);
         let alias = sources
             .iter()
@@ -7297,5 +7377,465 @@ mod inline_project_tests {
         let descriptor = window.code_document_descriptor(Language::JavaScript, CodeDocument::Alias);
         assert_eq!(descriptor.document.key.document_id, alias.document_id);
         assert_eq!(descriptor.uri, alias.uri);
+    }
+
+    fn state_exposure(
+        producer: &str,
+        handle: Option<&str>,
+        name_override: Option<&str>,
+        paths: &[&str],
+    ) -> smudgy_core::models::state_exposure::StateExposure {
+        smudgy_core::models::state_exposure::StateExposure {
+            producer: producer.to_owned(),
+            handle: handle.map(str::to_owned),
+            name_override: name_override.map(str::to_owned),
+            paths: paths.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn wire<T>(value: u64) -> T
+    where
+        T: TryFrom<u64>,
+        T::Error: std::fmt::Debug,
+    {
+        T::try_from(value).expect("valid test wire value")
+    }
+
+    fn alias(
+        script: &str,
+        state: Vec<smudgy_core::models::state_exposure::StateExposure>,
+    ) -> super::super::model::Script {
+        use smudgy_core::models::{ScriptLang, aliases};
+
+        super::super::model::Script::Alias(aliases::AliasDefinition {
+            pattern: "^hp$".to_owned(),
+            script: Some(script.to_owned()),
+            package: None,
+            enabled: true,
+            priority: 0,
+            fallthrough: true,
+            allow_self_match: false,
+            language: ScriptLang::TS,
+            matcher: None,
+            state,
+        })
+    }
+
+    fn script_key(name: &str) -> super::super::model::ScriptKey {
+        super::super::model::ScriptKey {
+            folder_name: None,
+            script_name: name.to_owned(),
+        }
+    }
+
+    /// Delivers the exact acknowledgement of the in-flight refresh, as the worker would.
+    fn acknowledge_pending_refresh(window: &mut super::super::AutomationsWindow) {
+        let pending = window
+            .pending_language_project_refresh
+            .clone()
+            .expect("a project refresh is in flight");
+        let acknowledged = EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            command_sequence: pending.command_sequence,
+            event: Event::StateAcknowledged(AcknowledgedState::ProjectRefreshed(
+                ProjectStateIdentity {
+                    project: language_service_project(),
+                    graph_generation: pending.graph_generation,
+                    service_generation: wire(1),
+                    worker_generation: wire(1),
+                },
+            )),
+        };
+        assert!(
+            window
+                .observe_language_project_event(&acknowledged)
+                .is_none()
+        );
+        assert!(window.pending_language_project_refresh.is_none());
+    }
+
+    /// Records an inline refresh carrying `inline_bridge` as in flight at `sequence` and
+    /// acknowledges it.
+    fn acknowledge_inline_refresh(
+        window: &mut super::super::AutomationsWindow,
+        inline_bridge: Option<String>,
+        sequence: u64,
+    ) {
+        window.pending_language_project_refresh = Some(PendingLanguageProjectRefresh {
+            context: LanguageProjectContext::Inline,
+            graph_generation: wire(sequence),
+            command_sequence: wire(sequence),
+            retries_remaining: 0,
+            inline_bridge,
+        });
+        acknowledge_pending_refresh(window);
+    }
+
+    /// The inline project's bridge is the open draft's: each exposed name declared in place of
+    /// the user-API member it shadows, and a draft edit makes the installed bridge stale until
+    /// a refresh carrying the new one is acknowledged.
+    #[test]
+    fn inline_project_bridge_declares_the_open_drafts_exposures() {
+        use smudgy_core::models::script_typings::{
+            language_service_inline_bridge, language_service_inline_bridge_for,
+        };
+
+        let mut window = super::super::AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "inline-bridge-exposures-test".to_owned(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        let exposures = vec![
+            state_exposure("gmcp", None, None, &["Char.Vitals"]),
+            state_exposure("user", Some("foo"), Some("stats"), &["bar"]),
+        ];
+        window.reset_state_draft(&exposures);
+        assert!(
+            window.inline_bridge_is_stale(),
+            "no inline refresh has carried a bridge yet"
+        );
+
+        let project = window.language_project_sources(&LanguageProjectContext::Inline);
+        let bridge = project
+            .sources
+            .iter()
+            .find(|source| source.uri == "smudgy-project:///inline/context.d.ts")
+            .expect("inline bridge source");
+        assert_eq!(bridge.kind, DocumentKind::Generated);
+        assert_eq!(bridge.text, language_service_inline_bridge_for(&exposures));
+        assert_eq!(project.inline_bridge.as_deref(), Some(bridge.text.as_str()));
+        assert!(bridge.text.contains(
+            "  const gmcp: { Char: { Vitals: SmudgyStateHop<SmudgyStateHop<GmcpTree, \"Char\">, \
+             \"Vitals\"> | undefined } };\n"
+        ));
+        assert!(bridge.text.contains("  const stats: any;\n"));
+        assert!(!bridge.text.contains("const gmcp: SmudgyApi[\"gmcp\"];"));
+        assert!(bridge.text.contains("const send: SmudgyApi[\"send\"];"));
+        assert!(
+            window.inline_bridge_is_stale(),
+            "building the refresh's sources installs nothing"
+        );
+        acknowledge_inline_refresh(&mut window, project.inline_bridge, 40);
+        assert!(
+            !window.inline_bridge_is_stale(),
+            "the acknowledged refresh carries this draft's bridge"
+        );
+
+        // An exposure edit changes the bridge; clearing the draft restores the fixed text.
+        window.toggle_state_exposure("gmcp", None, "Room.Info");
+        assert!(window.inline_bridge_is_stale());
+        let project = window.language_project_sources(&LanguageProjectContext::Inline);
+        assert!(
+            project.sources[0]
+                .text
+                .contains("Room: { Info: SmudgyStateHop")
+        );
+        acknowledge_inline_refresh(&mut window, project.inline_bridge, 41);
+        assert!(!window.inline_bridge_is_stale());
+        window.reset_state_draft(&[]);
+        assert!(window.inline_bridge_is_stale());
+        let project = window.language_project_sources(&LanguageProjectContext::Inline);
+        assert_eq!(project.sources[0].text, language_service_inline_bridge());
+        acknowledge_inline_refresh(&mut window, project.inline_bridge, 42);
+        assert!(!window.inline_bridge_is_stale());
+    }
+
+    /// The installed bridge follows the worker: a refresh's bridge is recorded by that
+    /// refresh's acknowledgement alone, the in-flight one is what a draft is measured against
+    /// until it fails, and a failed refresh leaves the draft stale, so the next editor binding
+    /// or exposure edit sends it again.
+    #[test]
+    fn inline_bridge_commits_only_on_its_refresh_ack() {
+        use smudgy_core::models::script_typings::{
+            language_service_inline_bridge, language_service_inline_bridge_for,
+        };
+
+        let mut window = super::super::AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "inline-bridge-commit-test".to_owned(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        let exposures = vec![state_exposure("gmcp", None, None, &["Char.Vitals"])];
+        let exposing = language_service_inline_bridge_for(&exposures).into_owned();
+
+        acknowledge_inline_refresh(
+            &mut window,
+            Some(language_service_inline_bridge().to_owned()),
+            50,
+        );
+        assert_eq!(
+            window.language_project_context,
+            Some(LanguageProjectContext::Inline)
+        );
+        assert!(!window.inline_bridge_is_stale());
+        window.reset_state_draft(&exposures);
+        assert!(window.inline_bridge_is_stale());
+
+        let project = window.language_project_sources(&LanguageProjectContext::Inline);
+        assert_eq!(project.inline_bridge.as_deref(), Some(exposing.as_str()));
+        assert!(
+            window.inline_bridge_is_stale(),
+            "building the refresh's sources installs nothing"
+        );
+        let pending = PendingLanguageProjectRefresh {
+            context: LanguageProjectContext::Inline,
+            graph_generation: wire(51),
+            command_sequence: wire(51),
+            retries_remaining: 0,
+            inline_bridge: project.inline_bridge,
+        };
+        window.pending_language_project_refresh = Some(pending.clone());
+        assert!(
+            !window.inline_bridge_is_stale(),
+            "the in-flight refresh carries the draft's bridge"
+        );
+        window.reset_state_draft(&[]);
+        assert!(
+            window.inline_bridge_is_stale(),
+            "the draft no longer matches the in-flight bridge"
+        );
+        window.reset_state_draft(&exposures);
+
+        let failed = EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            command_sequence: pending.command_sequence,
+            event: Event::RequestFailed(RequestFailure {
+                scope: FailureScope::Project(ProjectStateIdentity {
+                    project: language_service_project(),
+                    graph_generation: wire(50),
+                    service_generation: wire(1),
+                    worker_generation: wire(1),
+                }),
+                code: "fixture".to_owned(),
+                retryable: false,
+                user_message: "failed".to_owned(),
+                log_detail: None,
+            }),
+        };
+        assert!(window.observe_language_project_event(&failed).is_none());
+        assert!(window.pending_language_project_refresh.is_none());
+        assert_eq!(
+            window.inline_bridge.as_deref(),
+            Some(language_service_inline_bridge()),
+            "a failed refresh installs nothing"
+        );
+        assert!(window.inline_bridge_is_stale());
+
+        window.pending_language_project_refresh = Some(PendingLanguageProjectRefresh {
+            graph_generation: wire(52),
+            command_sequence: wire(52),
+            ..pending
+        });
+        acknowledge_pending_refresh(&mut window);
+        assert_eq!(window.inline_bridge.as_deref(), Some(exposing.as_str()));
+        assert!(!window.inline_bridge_is_stale());
+    }
+
+    /// A refresh of another context installs no inline bridge.
+    #[test]
+    fn another_contexts_refresh_carries_no_inline_bridge() {
+        let mut window = super::super::AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "inline-bridge-other-context-test".to_owned(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        acknowledge_inline_refresh(
+            &mut window,
+            Some(smudgy_core::models::script_typings::language_service_inline_bridge().to_owned()),
+            60,
+        );
+        assert!(window.inline_bridge.is_some());
+
+        window.pending_language_project_refresh = Some(PendingLanguageProjectRefresh {
+            context: LanguageProjectContext::Modules,
+            graph_generation: wire(61),
+            command_sequence: wire(61),
+            retries_remaining: 0,
+            inline_bridge: None,
+        });
+        assert_eq!(window.installed_inline_bridge(), None);
+        acknowledge_pending_refresh(&mut window);
+        assert_eq!(
+            window.language_project_context,
+            Some(LanguageProjectContext::Modules)
+        );
+        assert_eq!(window.inline_bridge, None);
+    }
+
+    /// Binding the editor to another automation re-installs the inline project whenever the
+    /// installed bridge is not that automation's: an exposing alias, one exposing nothing, the
+    /// first again, and a new alias each send their own bridge, while reopening the automation
+    /// whose bridge is installed sends nothing.
+    #[test]
+    fn binding_another_automation_reinstalls_the_inline_bridge_it_needs() {
+        use smudgy_core::models::script_typings::{
+            language_service_inline_bridge, language_service_inline_bridge_for,
+        };
+
+        let mut window = super::super::AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "inline-bridge-rebind-test".to_owned(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        let exposures = vec![state_exposure("gmcp", None, None, &["Char.Vitals"])];
+        let exposing = language_service_inline_bridge_for(&exposures).into_owned();
+        let fixed = language_service_inline_bridge();
+        window.scripts.insert(
+            "Vitals".to_owned(),
+            alias("void gmcp.Char.Vitals;\n", exposures),
+        );
+        window
+            .scripts
+            .insert("Plain".to_owned(), alias("send(\"hello\");\n", Vec::new()));
+
+        for (name, bridge) in [
+            ("Vitals", exposing.as_str()),
+            ("Plain", fixed),
+            ("Vitals", exposing.as_str()),
+        ] {
+            let _ = window.open_script(script_key(name));
+            let pending = window
+                .pending_language_project_refresh
+                .as_ref()
+                .unwrap_or_else(|| panic!("opening {name} must install its bridge"));
+            assert_eq!(pending.context, LanguageProjectContext::Inline);
+            assert_eq!(pending.inline_bridge.as_deref(), Some(bridge), "{name}");
+            assert!(!window.inline_bridge_is_stale());
+            acknowledge_pending_refresh(&mut window);
+            assert_eq!(window.inline_bridge.as_deref(), Some(bridge), "{name}");
+        }
+
+        let _ = window.open_script(script_key("Vitals"));
+        assert!(
+            window.pending_language_project_refresh.is_none(),
+            "the installed bridge is already this automation's"
+        );
+
+        let _ = window.new_alias();
+        let pending = window
+            .pending_language_project_refresh
+            .as_ref()
+            .expect("a new alias needs the fixed bridge");
+        assert_eq!(pending.inline_bridge.as_deref(), Some(fixed));
+    }
+
+    /// Opening an automation installs its own bridge before its body is analyzed, and an
+    /// exposure edit re-installs it: the body reading `gmcp.Char.Vitals` is clean while the
+    /// path is exposed, fails against the control object once the exposure is removed, and
+    /// is clean again once it is back.
+    #[test]
+    fn exposure_edits_retype_the_open_body() {
+        use smudgy_core::models::{ScriptLang, aliases};
+        use smudgy_script::language_service::DiagnosticSeverity;
+
+        fn poll_until(
+            window: &mut super::super::AutomationsWindow,
+            what: &str,
+            mut done: impl FnMut(&[Diagnostic]) -> bool,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let _ = window.poll_language_service();
+                let analyzed = window.code_editor.as_ref().is_some_and(|editor| {
+                    editor.service_state.is_some()
+                        && editor.outstanding.diagnostics.is_none()
+                        && editor.service_status() == ServiceStatus::Ready
+                        && done(&editor.results().diagnostics)
+                });
+                if analyzed {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{what} timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn has_error(diagnostics: &[Diagnostic], code: i64) -> bool {
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Some(DiagnosticCode::Number(code)))
+        }
+
+        let mut window = super::super::AutomationsWindow::new(
+            iced::window::Id::unique(),
+            "inline-bridge-retype-test".to_owned(),
+            crate::cloud_account::test_handles(),
+            smudgy_core::session::SessionId::from(1),
+        );
+        window.scripts.insert(
+            "Vitals".to_owned(),
+            super::super::model::Script::Alias(aliases::AliasDefinition {
+                pattern: "^hp$".to_owned(),
+                script: Some(
+                    "const hp: number | undefined = gmcp.Char.Vitals?.hp;\nvoid hp;\n".to_owned(),
+                ),
+                package: None,
+                enabled: true,
+                priority: 0,
+                fallthrough: true,
+                allow_self_match: false,
+                language: ScriptLang::TS,
+                matcher: None,
+                state: vec![state_exposure("gmcp", None, None, &["Char.Vitals"])],
+            }),
+        );
+        let _ = window.open_script(super::super::model::ScriptKey {
+            folder_name: None,
+            script_name: "Vitals".to_owned(),
+        });
+        poll_until(&mut window, "first analysis", |_| true);
+        let diagnostics = window
+            .code_editor
+            .as_ref()
+            .unwrap()
+            .results()
+            .diagnostics
+            .clone();
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error),
+            "the exposed path must type-check on open: {diagnostics:?}"
+        );
+
+        let remove = super::super::Message::RemoveStateExposure {
+            producer: "gmcp".to_owned(),
+            handle: None,
+            path: "Char.Vitals".to_owned(),
+        };
+        let _ = window.update(remove);
+        assert!(window.state_exposures.is_empty());
+        poll_until(
+            &mut window,
+            "analysis without the exposure",
+            |diagnostics| has_error(diagnostics, 2339),
+        );
+        let diagnostics = window
+            .code_editor
+            .as_ref()
+            .unwrap()
+            .results()
+            .diagnostics
+            .clone();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("'Char'")),
+            "`gmcp` must be the control object again: {diagnostics:?}"
+        );
+
+        let _ = window.update(super::super::Message::ToggleStateExposure {
+            producer: "gmcp".to_owned(),
+            handle: None,
+            path: "Char.Vitals".to_owned(),
+        });
+        poll_until(
+            &mut window,
+            "analysis with the exposure back",
+            |diagnostics| !has_error(diagnostics, 2339),
+        );
     }
 }

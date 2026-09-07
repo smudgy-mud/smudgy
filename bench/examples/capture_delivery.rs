@@ -105,7 +105,7 @@ createTrigger("^ZZCAPTUREEND$", () => {{
             isolate: IsolateId::Main,
             origin: Origin::User,
             name: Arc::new("capture delivery".to_string()),
-            trigger: TriggerDefinition {
+            trigger: Box::new(TriggerDefinition {
                 patterns: Some(vec![pattern]),
                 language: if consumer == "script" {
                     ScriptLang::JS
@@ -118,7 +118,7 @@ createTrigger("^ZZCAPTUREEND$", () => {{
                     template.to_string()
                 }),
                 ..TriggerDefinition::default()
-            },
+            }),
             fire_limit: None,
             line_limit: None,
         });

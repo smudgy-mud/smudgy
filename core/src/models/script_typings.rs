@@ -28,9 +28,11 @@
 //! the author added to their own config.
 
 use crate::get_smudgy_home;
+use crate::models::state_exposure::{BoundPath, KnownGlobal, ResolvedExposure, StateExposure};
+use crate::session::runtime::{PlatformProducer, ProducerKey};
 use anyhow::{Context, Result};
-use include_dir::{Dir, DirEntry, include_dir};
-use std::{fs, path::Path};
+use include_dir::{Dir, DirEntry, File, include_dir};
+use std::{borrow::Cow, fs, path::Path, sync::LazyLock};
 
 /// The managed ambient declarations for the `smudgy:core` module. Embedded at build
 /// time, rewritten into each server's `.smudgy/types/` on session start.
@@ -75,6 +77,192 @@ pub const fn language_service_inline_bridge() -> &'static str {
     SMUDGY_INLINE_DTS
 }
 
+/// The helper type the generated bridge hops an exposed platform path with: the member `K`
+/// of `T` once `T` is known to be present, `unknown` where the declared tree has no such
+/// member (an undeclared message, or a hop into a scalar), so a path outside the curated
+/// shapes reads as `unknown`, as it does through `smudgy:state/gmcp`, instead of failing
+/// the declaration.
+const STATE_HOP_TYPE: &str = "type SmudgyStateHop<T, K extends string> = \
+    K extends keyof NonNullable<T> ? NonNullable<T>[K] : unknown;\n";
+
+/// The comment above the generated bridge's exposure declarations.
+const STATE_DECLARATIONS_DOC: &str = "\
+/**
+ * The state values this automation reads (its \"What it reads\" list), one name each: a
+ * platform tree typed along its exposed paths, a package or user handle as `any`. A name
+ * that takes a user-API member replaces that member's declaration above, so inside this
+ * body the name means the value.
+ */
+";
+
+/// Returns the inline-automation ambient bridge for one automation: the fixed
+/// [`language_service_inline_bridge`] text when `exposures` is empty, else that text minus
+/// every global whose name an exposure takes, plus a `declare global` block declaring each
+/// exposed name. Removing the shadowed global is what makes the redeclaration legal and the
+/// completions truthful: a body exposing `gmcp` sees the state tree, not the protocol
+/// control object, exactly as its inner `with` scope does at fire time.
+///
+/// A platform producer's name is typed along its exposed paths by indexed access from the
+/// declared tree (`GmcpTree`, `MsdpTree`, `MsspVariables`): every intermediate is an object,
+/// the exposed node is the tree's member there or `undefined`, and exposing the root is the
+/// tree itself or `undefined`. A package or `user` handle is `any`. Exposures that do not
+/// resolve, or whose name repeats an earlier entry's, are left out, as the runtime leaves
+/// them unbound; a reserved-word name never resolves
+/// ([`super::state_exposure::JS_RESERVED_NAMES`]), so no declaration is attempted for it.
+/// A name the embedded libs declare as a global ([`lib_global_collides`]) is left
+/// undeclared too: the redeclaration would error inside the bridge.
+#[must_use]
+pub fn language_service_inline_bridge_for(exposures: &[StateExposure]) -> Cow<'static, str> {
+    use std::fmt::Write as _;
+
+    let mut exposed: Vec<ResolvedExposure> = Vec::with_capacity(exposures.len());
+    for exposure in exposures {
+        let Ok(resolved) = exposure.resolve() else {
+            continue;
+        };
+        if lib_global_collides(&resolved.name)
+            || exposed
+                .iter()
+                .any(|kept| kept.name.eq_ignore_ascii_case(&resolved.name))
+        {
+            continue;
+        }
+        exposed.push(resolved);
+    }
+    if exposed.is_empty() {
+        return Cow::Borrowed(SMUDGY_INLINE_DTS);
+    }
+
+    let mut declarations = String::new();
+    let mut trees: Vec<&'static str> = Vec::new();
+    let mut hops = false;
+    for exposure in &exposed {
+        let _ = write!(declarations, "  const {}: ", exposure.name);
+        match &exposure.producer {
+            ProducerKey::Platform(producer) => {
+                let tree = platform_tree_type(*producer);
+                if !trees.contains(&tree) {
+                    trees.push(tree);
+                }
+                let mut paths = exposure.bound_paths();
+                paths.sort_by(|a, b| a.segments.cmp(&b.segments));
+                hops |= paths.iter().any(|path| !path.segments.is_empty());
+                write_state_shape(&mut declarations, tree, 0, &paths);
+            }
+            ProducerKey::User | ProducerKey::Package { .. } => declarations.push_str("any"),
+        }
+        declarations.push_str(";\n");
+    }
+    trees.sort_unstable();
+
+    let mut bridge = String::with_capacity(SMUDGY_INLINE_DTS.len() + declarations.len() + 1024);
+    let mut placed = false;
+    let place = |bridge: &mut String| {
+        if hops {
+            bridge.push_str(STATE_HOP_TYPE);
+            bridge.push('\n');
+        }
+        bridge.push_str(STATE_DECLARATIONS_DOC);
+        bridge.push_str("declare global {\n");
+        bridge.push_str(&declarations);
+        bridge.push_str("}\n\n");
+    };
+    for line in SMUDGY_INLINE_DTS.lines() {
+        if let Some(name) = inline_bridge_global(line)
+            && exposed.iter().any(|kept| kept.name == name)
+        {
+            continue;
+        }
+        if line == "export {};" && !placed {
+            place(&mut bridge);
+            placed = true;
+        }
+        bridge.push_str(line);
+        bridge.push('\n');
+        if line.starts_with("import type ") && !trees.is_empty() {
+            let _ = writeln!(
+                bridge,
+                "import type {{ {} }} from \"smudgy:core\";",
+                trees.join(", ")
+            );
+        }
+    }
+    if !placed {
+        bridge.push('\n');
+        place(&mut bridge);
+    }
+    Cow::Owned(bridge)
+}
+
+/// The name a line of the fixed bridge declares as a global (`const send: …;`), if any.
+fn inline_bridge_global(line: &str) -> Option<&str> {
+    let declaration = line.trim().strip_prefix("const ")?;
+    let (name, _) = declaration.split_once(':')?;
+    Some(name.trim())
+}
+
+/// The `smudgy:core` interface describing a platform producer's tree.
+const fn platform_tree_type(producer: PlatformProducer) -> &'static str {
+    match producer {
+        PlatformProducer::Gmcp => "GmcpTree",
+        PlatformProducer::Msdp => "MsdpTree",
+        PlatformProducer::Mssp => "MsspVariables",
+    }
+}
+
+/// Writes the type of one exposed platform name from `paths`, sorted by segments, all
+/// sharing their first `depth` segments, none a prefix of another: the node's own type where
+/// the one remaining path ends, else an object literal with one member per next segment.
+/// The node's type hops from the tree along the path with [`STATE_HOP_TYPE`] and admits
+/// `undefined`, which the exposed node is while the store holds nothing there.
+fn write_state_shape(out: &mut String, tree: &str, depth: usize, paths: &[BoundPath]) {
+    use std::fmt::Write as _;
+
+    if let [path] = paths
+        && path.segments.len() == depth
+    {
+        out.push_str(&"SmudgyStateHop<".repeat(path.segments.len()));
+        out.push_str(tree);
+        for segment in &path.segments {
+            let _ = write!(out, ", {}>", ts_string(segment));
+        }
+        out.push_str(" | undefined");
+        return;
+    }
+    out.push_str("{ ");
+    let mut start = 0;
+    let mut first = true;
+    while start < paths.len() {
+        let Some(key) = paths[start].segments.get(depth) else {
+            start += 1;
+            continue;
+        };
+        let end = start
+            + paths[start..]
+                .iter()
+                .take_while(|path| path.segments.get(depth) == Some(key))
+                .count();
+        if !first {
+            out.push_str("; ");
+        }
+        first = false;
+        if StateExposure::is_identifier(key) {
+            out.push_str(key);
+        } else {
+            out.push_str(&ts_string(key));
+        }
+        out.push_str(": ");
+        write_state_shape(out, tree, depth + 1, &paths[start..end]);
+        start = end;
+    }
+    out.push_str(" }");
+}
+
+/// `text` as a double-quoted TypeScript string literal (JSON escaping is a subset of it).
+fn ts_string(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"))
+}
+
 /// The vendored Deno runtime lib (`Deno` namespace + web globals like `fetch`/`Response`),
 /// with the `/// <reference>` directives stripped so they're plain ambient declarations,
 /// and the global `Worker` declarations trimmed — the sibling `smudgy-workers.d.ts`
@@ -85,6 +273,94 @@ pub const fn language_service_inline_bridge() -> &'static str {
 /// `.smudgy/types/**` include).
 static DENO_LIB: Dir =
     include_dir!("$CARGO_MANIFEST_DIR/src/models/script_typings/vendor/deno-lib");
+
+/// The vendored window lib, the one file the embedded snapshot rewrites.
+const WINDOW_LIB_FILE: &str = "lib.deno.window.d.ts";
+
+/// Window-scope declarations left out of the embedded window lib: the blocking stdin
+/// dialogs (`alert`, `confirm`, `prompt`) and `location`, which the smudgy runtime does not
+/// serve. An ambient bridge declaration cannot shadow a lib global (TypeScript rejects the
+/// redeclaration), so leaving these out lets a state handle take the name; `prompt` is the
+/// plan's own example. Every other lib global keeps its declaration, and an exposure under
+/// such a name is left undeclared by the bridge instead ([`lib_global_collides`]).
+const WINDOW_LIB_OMITTED: &[&str] = &["alert", "confirm", "location", "prompt"];
+
+/// The embedded window lib with [`WINDOW_LIB_OMITTED`] removed: each single-line
+/// `declare function`/`declare var` for those names, with the doc comment directly above it.
+static WINDOW_LIB_TEXT: LazyLock<String> = LazyLock::new(|| {
+    let text = DENO_LIB
+        .get_file(WINDOW_LIB_FILE)
+        .and_then(File::contents_utf8)
+        .expect("the vendored Deno lib ships its window declarations");
+    strip_global_declarations(text, WINDOW_LIB_OMITTED)
+});
+
+/// Removes the single-line `declare function NAME(` / `declare var NAME:` declarations for
+/// `names` from a lib text, each with the `/** … */` block directly above it. A multi-line
+/// declaration is never touched, so a name whose declaration spans lines stays declared.
+fn strip_global_declarations(text: &str, names: &[&str]) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut keep = vec![true; lines.len()];
+    for (index, line) in lines.iter().enumerate() {
+        let Some(rest) = line
+            .strip_prefix("declare function ")
+            .or_else(|| line.strip_prefix("declare var "))
+        else {
+            continue;
+        };
+        let name_len = rest
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$')
+            .count();
+        let (name, after) = rest.split_at(name_len);
+        let terminated = matches!(after.as_bytes().first(), Some(b'(' | b':'));
+        if !terminated || !names.contains(&name) || !line.trim_end().ends_with(';') {
+            continue;
+        }
+        keep[index] = false;
+        // The doc block directly above: ` * …` lines up to and including the `/**` line.
+        let mut above = index;
+        while above > 0 && lines[above - 1].trim_start().starts_with('*') {
+            above -= 1;
+        }
+        if above > 0 && lines[above - 1].trim_start().starts_with("/**") {
+            for slot in &mut keep[above - 1..index] {
+                *slot = false;
+            }
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    for (line, keep) in lines.iter().zip(keep) {
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A vendored declaration file's text as the language service and the external-editor
+/// materialization see it: verbatim, except the window lib, which drops
+/// [`WINDOW_LIB_OMITTED`].
+fn embedded_type_text(file: &'static File<'static>) -> &'static str {
+    if file.path() == Path::new(WINDOW_LIB_FILE) {
+        return WINDOW_LIB_TEXT.as_str();
+    }
+    file.contents_utf8()
+        .expect("embedded script declarations must be UTF-8")
+}
+
+/// Whether an exposure named `name` would collide with a global the embedded libs still
+/// declare (an ECMAScript or Deno global the window lib keeps): the ambient redeclaration
+/// would be a TypeScript error inside the bridge, so the bridge leaves the name undeclared
+/// and the body sees the lib's type, as the editor's note warns. The names the window lib
+/// drops are free to declare.
+fn lib_global_collides(name: &str) -> bool {
+    matches!(
+        StateExposure::known_global(name),
+        Some(KnownGlobal::JavaScript | KnownGlobal::Deno)
+    ) && !WINDOW_LIB_OMITTED.contains(&name)
+}
 
 /// The vendored `@types/node` tree (types `node:events`, `node:path`, … + Node globals),
 /// resolved by the base tsconfig's `types`/`typeRoots`. Materialized to
@@ -204,9 +480,7 @@ fn append_embedded_type_dir_filtered(
             } else {
                 format!("{prefix}/{relative}")
             },
-            contents: file
-                .contents_utf8()
-                .expect("embedded script declarations must be UTF-8"),
+            contents: embedded_type_text(file),
             is_root: is_root(path),
         });
     }
@@ -844,11 +1118,17 @@ fn write_embedded_dir(target: &Path, dir: &Dir<'_>) -> Result<()> {
                     fs::create_dir_all(parent)
                         .with_context(|| format!("create {}", parent.display()))?;
                 }
-                if fs::read(&path).is_ok_and(|existing| existing == file.contents()) {
+                // The window lib is written as the in-app service sees it, so the two
+                // editors agree on which globals exist.
+                let contents: &[u8] = if file.path() == Path::new(WINDOW_LIB_FILE) {
+                    WINDOW_LIB_TEXT.as_bytes()
+                } else {
+                    file.contents()
+                };
+                if fs::read(&path).is_ok_and(|existing| existing == contents) {
                     continue;
                 }
-                fs::write(&path, file.contents())
-                    .with_context(|| format!("write {}", path.display()))?;
+                fs::write(&path, contents).with_context(|| format!("write {}", path.display()))?;
             }
         }
     }
@@ -2843,21 +3123,89 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
         );
     }
 
-    #[test]
-    fn in_memory_language_service_bundle_types_runtime_and_inline_surfaces() {
+    /// The in-process language service driven the way the automations window drives it:
+    /// spawned on the embedded declarations, commands down one channel, events drained by
+    /// polling.
+    mod service_harness {
         use std::thread;
         use std::time::{Duration, Instant};
 
         use smudgy_script::language_service::{
-            AcknowledgedState, AnalysisContextId, AutomationKind, ClientId, Command,
-            DiagnosticCode, DiagnosticSeverity, DiskRevision, DocumentDescriptor, DocumentId,
-            DocumentKey, DocumentKind, DocumentRef, DocumentResultIdentity, DocumentVersion, Event,
-            EventEnvelope, GraphGeneration, Language, LanguageServiceLibrary, OpenDocument,
-            OpenProject, ProjectId, ProjectScope, ProjectSource, RefreshProject, RequestId,
+            AcknowledgedState, AnalysisContextId, AutomationKind, ClientId, Command, Diagnostic,
+            DiskRevision, DocumentDescriptor, DocumentId, DocumentKey, DocumentKind, DocumentRef,
+            DocumentRequest, DocumentResultIdentity, DocumentVersion, Event, EventEnvelope,
+            GraphGeneration, Language, LanguageServiceLibrary, OpenDocument, OpenProject,
+            ProjectId, ProjectScope, ProjectSource, RefreshProject, RequestId,
         };
-        use smudgy_script::language_service_worker::LanguageServiceHost;
+        use smudgy_script::language_service_worker::{LanguageServiceClient, LanguageServiceHost};
 
-        fn wire<T>(value: u64) -> T
+        /// Spawns the service on the embedded declarations and opens one project.
+        pub(super) fn open_project(
+            client_id: u64,
+            project_id: u64,
+        ) -> (LanguageServiceHost, LanguageServiceClient, ProjectScope) {
+            let libraries = crate::models::script_typings::embedded_language_service_types()
+                .into_iter()
+                .map(|file| LanguageServiceLibrary {
+                    file_name: file.virtual_path,
+                    text: file.contents.into(),
+                    is_root: file.is_root,
+                })
+                .collect();
+            let mut host = LanguageServiceHost::try_spawn_with_libraries(libraries)
+                .expect("spawn language service with Smudgy's embedded declarations");
+            let client = host.client();
+            let project = ProjectScope {
+                client_id: wire::<ClientId>(client_id),
+                project_id: wire::<ProjectId>(project_id),
+            };
+            client
+                .send(Command::OpenProject(OpenProject { project }))
+                .expect("queue project open");
+            wait_for(&mut host, |event| {
+                matches!(
+                    event,
+                    Event::StateAcknowledged(AcknowledgedState::ProjectOpened(state))
+                        if state.project == project
+                )
+            });
+            (host, client, project)
+        }
+
+        /// Installs `bridge` as the project's inline context at graph generation `generation`
+        /// (an opened project sits at 1, so a first refresh is 2) and waits for the ack.
+        pub(super) fn install_inline_bridge(
+            host: &mut LanguageServiceHost,
+            client: &LanguageServiceClient,
+            project: ProjectScope,
+            generation: u64,
+            bridge: String,
+        ) {
+            let graph_generation = wire::<GraphGeneration>(generation);
+            client
+                .send(Command::RefreshProject(RefreshProject {
+                    project,
+                    graph_generation,
+                    sources: vec![ProjectSource {
+                        document_id: DocumentId::try_from([76; 16])
+                            .expect("non-nil inline-context document ID"),
+                        uri: "smudgy-project:///inline/context.d.ts".to_owned(),
+                        language: Language::TypeScript,
+                        kind: DocumentKind::Generated,
+                        text: bridge,
+                    }],
+                }))
+                .expect("queue inline-context refresh");
+            wait_for(host, |event| {
+                matches!(
+                    event,
+                    Event::StateAcknowledged(AcknowledgedState::ProjectRefreshed(state))
+                        if state.project == project && state.graph_generation == graph_generation
+                )
+            });
+        }
+
+        pub(super) fn wire<T>(value: u64) -> T
         where
             T: TryFrom<u64>,
             T::Error: std::fmt::Debug,
@@ -2865,7 +3213,7 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
             T::try_from(value).expect("valid test wire value")
         }
 
-        fn wait_for(
+        pub(super) fn wait_for(
             host: &mut LanguageServiceHost,
             predicate: impl Fn(&Event) -> bool,
         ) -> EventEnvelope {
@@ -2887,7 +3235,7 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
             }
         }
 
-        fn descriptor(
+        pub(super) fn descriptor(
             project: ProjectScope,
             document_id: DocumentId,
             uri: &str,
@@ -2910,6 +3258,73 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
                 disk_revision: Some(wire::<DiskRevision>(1)),
             }
         }
+
+        /// Opens `text` as an inline alias body (ids and the request derived from `seed`,
+        /// distinct per call) and returns its diagnostics.
+        pub(super) fn inline_diagnostics(
+            host: &mut LanguageServiceHost,
+            client: &LanguageServiceClient,
+            project: ProjectScope,
+            seed: u8,
+            uri: &str,
+            text: &str,
+        ) -> Vec<Diagnostic> {
+            let document_id = DocumentId::try_from([seed; 16]).expect("non-nil document ID");
+            client
+                .send(Command::OpenDocument(OpenDocument {
+                    descriptor: descriptor(
+                        project,
+                        document_id,
+                        uri,
+                        DocumentKind::InlineAutomation {
+                            automation_kind: AutomationKind::Alias,
+                        },
+                        u64::from(seed),
+                    ),
+                    text: text.to_owned(),
+                }))
+                .expect("queue inline document open");
+            let opened = wait_for(host, |event| {
+                matches!(
+                    event,
+                    Event::StateAcknowledged(AcknowledgedState::DocumentOpened(state))
+                        if state.document.key.document_id == document_id
+                )
+            });
+            let Event::StateAcknowledged(AcknowledgedState::DocumentOpened(state)) = opened.event
+            else {
+                unreachable!();
+            };
+            let request_id = wire::<RequestId>(u64::from(seed));
+            client
+                .send(Command::RequestDiagnostics(DocumentRequest {
+                    identity: DocumentResultIdentity { state, request_id },
+                }))
+                .expect("queue inline diagnostics");
+            let diagnostics = wait_for(host, |event| {
+                matches!(
+                    event,
+                    Event::Diagnostics(result) if result.identity.request_id == request_id
+                )
+            });
+            let Event::Diagnostics(diagnostics) = diagnostics.event else {
+                unreachable!();
+            };
+            diagnostics.result.items
+        }
+    }
+
+    #[test]
+    fn in_memory_language_service_bundle_types_runtime_and_inline_surfaces() {
+        use smudgy_script::language_service::{
+            AcknowledgedState, AutomationKind, ClientId, Command, DiagnosticCode,
+            DiagnosticSeverity, DocumentId, DocumentKind, DocumentResultIdentity, Event,
+            GraphGeneration, Language, LanguageServiceLibrary, OpenDocument, OpenProject,
+            ProjectId, ProjectScope, ProjectSource, RefreshProject, RequestId,
+        };
+        use smudgy_script::language_service_worker::LanguageServiceHost;
+
+        use service_harness::{descriptor, wait_for, wire};
 
         let libraries = embedded_language_service_types()
             .into_iter()
@@ -3185,6 +3600,358 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
             .collect::<BTreeSet<_>>();
         assert!(bridge_members.remove("matches"));
         assert_eq!(bridge_members, api_members);
+    }
+
+    fn state_exposure(
+        producer: &str,
+        handle: Option<&str>,
+        name_override: Option<&str>,
+        paths: &[&str],
+    ) -> StateExposure {
+        StateExposure {
+            producer: producer.to_owned(),
+            handle: handle.map(str::to_owned),
+            name_override: name_override.map(str::to_owned),
+            paths: paths.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// The per-automation bridge: the fixed text while nothing usable is exposed; otherwise
+    /// the shadowed globals go, and every exposed name is declared once, platform trees
+    /// typed along their bound paths (covered paths dropped, shared prefixes unified, keys
+    /// outside the identifier grammar quoted), handles as `any`.
+    #[test]
+    fn inline_bridge_for_exposures_replaces_shadowed_globals_and_declares_names() {
+        let fixed = language_service_inline_bridge_for(&[]);
+        assert!(matches!(fixed, Cow::Borrowed(_)));
+        assert_eq!(fixed, language_service_inline_bridge());
+        let unusable = language_service_inline_bridge_for(&[
+            state_exposure("user", None, None, &[""]),
+            state_exposure("gmcp", None, None, &[]),
+            state_exposure("nope://x", None, None, &[""]),
+        ]);
+        assert_eq!(unusable, language_service_inline_bridge());
+
+        let bridge = language_service_inline_bridge_for(&[
+            state_exposure(
+                "gmcp",
+                None,
+                None,
+                &[
+                    "Char.Vitals",
+                    "char.Status",
+                    "Room.Info.name",
+                    "Char.Vitals.hp",
+                    "[\"Some-Pkg\"].Msg",
+                ],
+            ),
+            state_exposure("user", Some("foo"), Some("stats"), &["bar"]),
+            state_exposure(
+                "smudgy://kapusniak/arctic-prompt",
+                Some("prompt"),
+                None,
+                &["groupies[\"Mr. Foo\"].hp"],
+            ),
+            state_exposure("mssp", None, None, &[""]),
+            state_exposure("msdp", None, Some("vars"), &["ROOM.VNUM", "ROOM_NAME"]),
+            // A folded duplicate of `gmcp`, an unresolvable entry: both left out.
+            state_exposure("user", Some("GMCP"), None, &[""]),
+            state_exposure("nope://x", None, None, &[""]),
+            // A name that takes the per-fire `matches` global.
+            state_exposure("user", Some("m"), Some("matches"), &[""]),
+        ]);
+        for shadowed in [
+            "const gmcp: SmudgyApi[\"gmcp\"];",
+            "const vars: SmudgyUserVars;",
+            "const matches: Matches;",
+        ] {
+            assert!(!bridge.contains(shadowed), "{shadowed} must go:\n{bridge}");
+        }
+        for kept in [
+            "import type { Matches, SmudgyApi } from \"smudgy:core\";\n\
+             import type { GmcpTree, MsdpTree, MsspVariables } from \"smudgy:core\";\n",
+            "interface SmudgyUserVars {",
+            "  const send: SmudgyApi[\"send\"];\n",
+            "  const id: SmudgyApi[\"id\"];\n",
+            STATE_HOP_TYPE,
+            "  const gmcp: { Char: { \
+             Status: SmudgyStateHop<SmudgyStateHop<GmcpTree, \"Char\">, \"Status\"> | undefined; \
+             Vitals: SmudgyStateHop<SmudgyStateHop<GmcpTree, \"Char\">, \"Vitals\"> | undefined }; \
+             Room: { Info: { name: SmudgyStateHop<SmudgyStateHop<SmudgyStateHop<GmcpTree, \
+             \"Room\">, \"Info\">, \"name\"> | undefined } }; \
+             \"Some-Pkg\": { Msg: SmudgyStateHop<SmudgyStateHop<GmcpTree, \"Some-Pkg\">, \"Msg\"> \
+             | undefined } };\n",
+            "  const stats: any;\n",
+            "  const prompt: any;\n",
+            "  const mssp: MsspVariables | undefined;\n",
+            "  const vars: { ROOM: { VNUM: SmudgyStateHop<SmudgyStateHop<MsdpTree, \"ROOM\">, \
+             \"VNUM\"> | undefined }; ROOM_NAME: SmudgyStateHop<MsdpTree, \"ROOM_NAME\"> | \
+             undefined };\n",
+            "  const matches: any;\n",
+        ] {
+            assert!(bridge.contains(kept), "{kept} missing:\n{bridge}");
+        }
+        assert!(!bridge.contains("const GMCP"));
+        assert_eq!(bridge.matches("declare global {").count(), 2);
+        assert!(bridge.ends_with("}\n\nexport {};\n"), "{bridge}");
+
+        // A root-only platform exposure needs no hop helper; a handle-only list no tree import.
+        let root = language_service_inline_bridge_for(&[state_exposure("gmcp", None, None, &[""])]);
+        assert!(root.contains("  const gmcp: GmcpTree | undefined;\n"));
+        assert!(!root.contains("SmudgyStateHop"));
+        assert!(root.contains("import type { GmcpTree } from \"smudgy:core\";\n"));
+        let handle =
+            language_service_inline_bridge_for(&[state_exposure("user", Some("foo"), None, &[""])]);
+        assert!(handle.contains("  const foo: any;\n"));
+        assert_eq!(handle.matches("import type").count(), 1);
+    }
+
+    /// A name JavaScript cannot bind is left undeclared, so the bridge stays parse-clean: the
+    /// other exposures are declared as before, a contextual keyword is an ordinary name, and a
+    /// list with nothing else usable is the fixed text.
+    #[test]
+    fn inline_bridge_leaves_out_names_javascript_cannot_bind() {
+        let bridge = language_service_inline_bridge_for(&[
+            state_exposure("user", Some("if"), None, &[""]),
+            state_exposure("user", Some("kind"), Some("class"), &["hp"]),
+            state_exposure("gmcp", None, Some("let"), &["Char.Vitals"]),
+            state_exposure("user", Some("e"), Some("eval"), &[""]),
+            state_exposure("user", Some("a"), Some("arguments"), &[""]),
+            state_exposure("user", Some("i"), Some("in"), &[""]),
+            state_exposure("user", Some("stats"), None, &["bar"]),
+        ]);
+        for unbindable in ["if", "class", "let", "eval", "arguments", "in"] {
+            assert!(
+                !bridge.contains(&format!("const {unbindable}:")),
+                "{unbindable} must stay undeclared:\n{bridge}"
+            );
+        }
+        // A handle that is itself a reserved word defaults to its `_` form and is declared.
+        assert!(bridge.contains("  const if_: any;\n"), "{bridge}");
+        assert!(bridge.contains("  const stats: any;\n"), "{bridge}");
+        assert!(
+            bridge.contains("const gmcp: SmudgyApi[\"gmcp\"];"),
+            "a `gmcp` exposure under another name shadows nothing:\n{bridge}"
+        );
+        assert_eq!(bridge.matches("declare global {").count(), 2);
+
+        let contextual = language_service_inline_bridge_for(&[
+            state_exposure("user", Some("type"), None, &[""]),
+            state_exposure("user", Some("async"), None, &[""]),
+        ]);
+        assert!(contextual.contains("  const type: any;\n"), "{contextual}");
+        assert!(contextual.contains("  const async: any;\n"), "{contextual}");
+
+        let nothing_else = language_service_inline_bridge_for(&[state_exposure(
+            "user",
+            Some("kind"),
+            Some("new"),
+            &[""],
+        )]);
+        assert!(matches!(nothing_else, Cow::Borrowed(_)));
+        assert_eq!(nothing_else, language_service_inline_bridge());
+    }
+
+    /// The embedded window lib drops the dialog functions and `location`, each with its doc
+    /// block, so a state handle may take those names; the vendored file itself still carries
+    /// them, and the rest of the lib is untouched.
+    #[test]
+    fn embedded_window_lib_omits_the_dialogs_and_location() {
+        let vendored = DENO_LIB
+            .get_file(WINDOW_LIB_FILE)
+            .and_then(File::contents_utf8)
+            .expect("vendored window lib");
+        for name in WINDOW_LIB_OMITTED {
+            assert!(
+                vendored.contains(&format!("declare function {name}("))
+                    || vendored.contains(&format!("declare var {name}:")),
+                "the vendored lib declares {name}"
+            );
+        }
+        let window = embedded_language_service_types()
+            .into_iter()
+            .find(|file| file.virtual_path == WINDOW_LIB_FILE)
+            .expect("the snapshot carries the window lib");
+        for name in WINDOW_LIB_OMITTED {
+            assert!(
+                !window
+                    .contents
+                    .contains(&format!("declare function {name}("))
+                    && !window.contents.contains(&format!("declare var {name}:")),
+                "{name} must be gone: {}",
+                window.contents
+            );
+        }
+        assert!(window.contents.contains("declare var window:"));
+        assert!(
+            window.contents.contains("declare var Location:"),
+            "the Location constructor type stays; only the `location` value goes"
+        );
+        let kept = vendored.lines().count() - window.contents.lines().count();
+        assert!(
+            kept > WINDOW_LIB_OMITTED.len(),
+            "each dropped declaration takes its doc block with it ({kept} lines dropped)"
+        );
+
+        let sample = concat!(
+            "/** One.\n",
+            " * @category X\n",
+            " */\n",
+            "declare function alert(message?: string): void;\n",
+            "declare var keep: number;\n",
+            "/** Two. */\n",
+            "declare var location: Location;\n",
+            "declare var onunhandledrejection:\n",
+            "  | ((this: Window, ev: PromiseRejectionEvent) => any)\n",
+            "  | null;\n",
+        );
+        assert_eq!(
+            strip_global_declarations(sample, &["alert", "location", "onunhandledrejection"]),
+            concat!(
+                "declare var keep: number;\n",
+                "declare var onunhandledrejection:\n",
+                "  | ((this: Window, ev: PromiseRejectionEvent) => any)\n",
+                "  | null;\n",
+            ),
+            "single-line declarations go with their doc blocks; a multi-line one stays"
+        );
+    }
+
+    /// A name the libs still declare as a global is left out of the bridge (an ambient
+    /// redeclaration would error), while a name the window lib drops is declared.
+    #[test]
+    fn inline_bridge_declares_dropped_window_names_and_skips_lib_globals() {
+        let bridge = language_service_inline_bridge_for(&[
+            state_exposure("user", Some("prompt"), None, &[""]),
+            state_exposure("user", Some("location"), None, &["room"]),
+            state_exposure("user", Some("console"), None, &[""]),
+            state_exposure("user", Some("kind"), Some("Math"), &["hp"]),
+        ]);
+        assert!(bridge.contains("  const prompt: any;\n"), "{bridge}");
+        assert!(bridge.contains("  const location: any;\n"), "{bridge}");
+        assert!(!bridge.contains("const console:"), "{bridge}");
+        assert!(!bridge.contains("const Math:"), "{bridge}");
+    }
+
+    /// A handle named `prompt` (the plan's own example) types in the in-app editor: the
+    /// window lib no longer declares the dialog, so the bridge's declaration stands, while a
+    /// handle named `console` leaves the lib's `console` in place.
+    #[test]
+    fn in_memory_language_service_types_a_prompt_handle() {
+        use service_harness::{inline_diagnostics, install_inline_bridge, open_project};
+
+        let (mut host, client, project) = open_project(91, 92);
+        let exposures = [
+            state_exposure("user", Some("prompt"), None, &[""]),
+            state_exposure("user", Some("console"), None, &[""]),
+        ];
+        install_inline_bridge(
+            &mut host,
+            &client,
+            project,
+            2,
+            language_service_inline_bridge_for(&exposures).into_owned(),
+        );
+        let clean = inline_diagnostics(
+            &mut host,
+            &client,
+            project,
+            94,
+            "smudgy-inline:///aliases/prompt-handle.ts",
+            concat!(
+                "const hp: unknown = prompt.hp;\n",
+                "console.log(String(hp));\n",
+                "send(`hp ${hp}`);\n",
+            ),
+        );
+        assert!(
+            clean.is_empty(),
+            "a body reading a `prompt` handle must type-check: {clean:?}"
+        );
+        host.shutdown().expect("the language service shuts down");
+    }
+
+    /// An exposing body type-checks against the per-automation bridge: the exposed names
+    /// resolve, the platform name carries the declared shape along its exposed paths, and
+    /// the `gmcp` it sees is the state value, so the control object's members are errors.
+    #[test]
+    fn in_memory_language_service_types_exposed_state_names() {
+        use smudgy_script::language_service::DiagnosticCode;
+
+        use service_harness::{inline_diagnostics, install_inline_bridge, open_project};
+
+        let (mut host, client, project) = open_project(81, 82);
+        let exposures = [
+            state_exposure("gmcp", None, None, &["Char.Vitals"]),
+            state_exposure("user", Some("foo"), Some("stats"), &["bar"]),
+        ];
+        install_inline_bridge(
+            &mut host,
+            &client,
+            project,
+            2,
+            language_service_inline_bridge_for(&exposures).into_owned(),
+        );
+
+        let clean = inline_diagnostics(
+            &mut host,
+            &client,
+            project,
+            84,
+            "smudgy-inline:///aliases/state-values.ts",
+            concat!(
+                "const hp: number | undefined = gmcp.Char.Vitals?.hp;\n",
+                "const maxhp: number | undefined = gmcp.Char.Vitals?.maxhp;\n",
+                "const bar: unknown = stats.bar;\n",
+                "send(`hp ${hp}/${maxhp} ${bar} ${matches[1]}`);\n",
+            ),
+        );
+        assert!(
+            clean.is_empty(),
+            "a body reading its exposed names must type-check: {clean:?}"
+        );
+
+        let shadowed = inline_diagnostics(
+            &mut host,
+            &client,
+            project,
+            85,
+            "smudgy-inline:///aliases/state-shadow.ts",
+            concat!(
+                "gmcp.send(\"Char.Items.Inv\");\n",
+                "const wrong: string = gmcp.Char.Vitals?.hp;\n",
+                "const room = gmcp.Room;\n",
+                "void wrong; void room;\n",
+            ),
+        );
+        let codes = shadowed
+            .iter()
+            .map(|item| item.code.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes.len(),
+            3,
+            "the control object's member, the mistyped leaf, and the unexposed path: {shadowed:?}"
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == Some(DiagnosticCode::Number(2339)))
+                .count(),
+            2,
+            "`gmcp.send` and `gmcp.Room` must not exist on the exposed shape: {shadowed:?}"
+        );
+        assert!(
+            codes.contains(&Some(DiagnosticCode::Number(2322))),
+            "`gmcp.Char.Vitals.hp` must be typed as the declared number: {shadowed:?}"
+        );
+        assert!(
+            shadowed.iter().any(|item| item.message.contains("'send'")),
+            "the shadowed `gmcp` must reject `send`: {shadowed:?}"
+        );
+
+        host.shutdown()
+            .expect("language-service worker must shut down cleanly");
     }
 
     #[test]

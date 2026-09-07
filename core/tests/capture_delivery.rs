@@ -192,12 +192,12 @@ async fn functions_scripts_and_templates_preserve_capture_delivery() {
             isolate: IsolateId::Main,
             origin: Origin::User,
             name: Arc::new(name.to_string()),
-            trigger: TriggerDefinition {
+            trigger: Box::new(TriggerDefinition {
                 patterns: Some(vec![pattern.to_string()]),
                 script: Some(body.to_string()),
                 language,
                 ..TriggerDefinition::default()
-            },
+            }),
             fire_limit: None,
             line_limit: None,
         })
