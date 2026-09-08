@@ -92,9 +92,9 @@ smudgy_audio = { path = "./audio" }
 smudgy_audio_web = { path = "./audio_web" }
 kira = { version = "0.12.3", default-features = false }
 cpal = { version = "=0.18.2", default-features = false }
-# Published Web Audio extension. Keep the revision immutable: this is the exact
+# Web Audio extension. Keep the revision immutable: this is the exact
 # reviewed alpha that matches the workspace's Deno 2.9.5 crate tuple.
-deno_audio = { git = "https://github.com/smudgy-mud/deno_audio.git", rev = "80b57870008d09e029b4e79b42c9467686a560ba", default-features = false }
+deno_audio = { git = "https://github.com/smudgy-mud/deno_audio.git", rev = "ccc327d25f0f358509dd735cf8fce7db710b2b40", default-features = false }
 tokio = { version = "1.44.2", features = ["full"] }
 parking_lot = "0.12.1"
 pretty_env_logger = "0.5.0"

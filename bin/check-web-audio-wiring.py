@@ -9,8 +9,8 @@ import tomllib
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DENO_AUDIO_REV = "80b57870008d09e029b4e79b42c9467686a560ba"
-WEB_AUDIO_API_REV = "13ffdcd0f6c3472526653516f52a9320ef77a893"
+DENO_AUDIO_REV = "ccc327d25f0f358509dd735cf8fce7db710b2b40"
+WEB_AUDIO_API_REV = "75dfdeb992f9ae8e63a76e3fcf471ac56f31836d"
 RELEASE_FEATURE = "smudgy_ui/web-audio-cpal"
 CARGO_ABOUT_VERSION = "0.9.0"
 CARGO_BUNDLE_VERSION = "0.7.0"
@@ -246,7 +246,7 @@ def main() -> None:
         {"dep:cpal", "dep:rtrb"},
         crate="smudgy_audio",
     )
-    require_feature(script, "web-audio", {"dep:deno_audio"}, crate="smudgy_script")
+    require_feature(script, "web-audio", {"dep:deno_audio", "dep:libc"}, crate="smudgy_script")
     require_feature(
         core,
         "web-audio",

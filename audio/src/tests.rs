@@ -3011,6 +3011,53 @@ fn reclaim_retained_slot(shutdown: &mut MixerInputShutdown) -> Arc<InputSlot> {
 }
 
 #[test]
+fn output_retirement_between_close_and_submission_keeps_the_exact_receipt() {
+    for finish_before_submission in [false, true] {
+        let (commands, _commands) = mpsc::sync_channel(1);
+        let (retirements, requests) = mpsc::sync_channel(1);
+        let control = test_control(commands, retirements);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (running, slot, generation) = standalone_running(&control, Arc::clone(&drops));
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let release = Arc::new(Barrier::new(2));
+        *lock_recover(&running.session.input_closed_hook) = Some(Arc::new(RetirementScanHook {
+            entered,
+            release: Arc::clone(&release),
+            armed: AtomicBool::new(true),
+        }));
+        let close = thread::spawn(move || running.shutdown());
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(slot.close_after_output_failure(generation, MixerOutputFailure::BackendFailure));
+        let (retired_generation, mut prepared) = slot.prepare_forced_terminal(false).unwrap();
+        assert_eq!(retired_generation, generation);
+        if finish_before_submission {
+            drop(prepared.source.take());
+            slot.finish_terminal(generation, prepared.result).unwrap();
+        }
+        release.wait();
+        let mut shutdown = close.join().unwrap();
+        let waker = Waker::from(Arc::new(WakeProbe::default()));
+        let mut cx = Context::from_waker(&waker);
+        if !finish_before_submission {
+            assert!(Pin::new(&mut shutdown).poll(&mut cx).is_pending());
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            drop(prepared.source.take());
+            slot.finish_terminal(generation, prepared.result).unwrap();
+        }
+        let receipt = block_on(shutdown).expect("concurrent retirement retains its receipt");
+        assert_eq!(
+            receipt.output_failure,
+            Some(MixerOutputFailure::BackendFailure)
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[test]
 fn retirement_queue_full_and_disconnect_retain_exact_strong_authority() {
     for disconnected in [false, true] {
         let (commands, _command_receiver) = mpsc::sync_channel(1);

@@ -2397,6 +2397,8 @@ struct SessionControl {
     cleanup_finish_hook: Mutex<Option<Arc<RetirementScanHook>>>,
     #[cfg(test)]
     request_enqueued_hook: Mutex<Option<Arc<RetirementScanHook>>>,
+    #[cfg(test)]
+    input_closed_hook: Mutex<Option<Arc<RetirementScanHook>>>,
 }
 
 impl SessionControl {
@@ -2415,6 +2417,8 @@ impl SessionControl {
             cleanup_finish_hook: Mutex::new(None),
             #[cfg(test)]
             request_enqueued_hook: Mutex::new(None),
+            #[cfg(test)]
+            input_closed_hook: Mutex::new(None),
         }
     }
 
@@ -2899,6 +2903,24 @@ impl Future for MixerInputShutdown {
     }
 }
 
+fn terminal_shutdown_receipt(
+    slot: &Arc<InputSlot>,
+    generation: u64,
+    word: u64,
+) -> Option<MixerInputShutdown> {
+    (slot_generation(word) == generation
+        && matches!(
+            slot_phase(word),
+            SlotPhase::Retiring | SlotPhase::ForcedClean | SlotPhase::Quarantined
+        ))
+    .then(|| MixerInputShutdown {
+        state: ShutdownState::Forced {
+            slot: ManuallyDrop::new(Arc::clone(slot)),
+            generation,
+        },
+    })
+}
+
 fn submit_shutdown(
     slot: Arc<InputSlot>,
     generation: u64,
@@ -2916,18 +2938,8 @@ fn submit_shutdown(
         };
     };
     let initial = slot.word.load(Ordering::Acquire);
-    if slot_generation(initial) == generation
-        && matches!(
-            slot_phase(initial),
-            SlotPhase::Retiring | SlotPhase::ForcedClean | SlotPhase::Quarantined
-        )
-    {
-        return MixerInputShutdown {
-            state: ShutdownState::Forced {
-                slot: ManuallyDrop::new(slot),
-                generation,
-            },
-        };
+    if let Some(shutdown) = terminal_shutdown_receipt(&slot, generation, initial) {
+        return shutdown;
     }
     let failure = retained_driver_status
         .and_then(DriverStatus::failure)
@@ -2957,7 +2969,18 @@ fn submit_shutdown(
             },
         };
     }
+    #[cfg(test)]
+    if let Some(hook) = lock_recover(&session.input_closed_hook).take() {
+        let _ = hook.entered.send(());
+        hook.release.wait();
+    }
     let word = slot.word.load(Ordering::Acquire);
+    // Output-death cleanup can advance this exact slot after the initial
+    // snapshot or close CAS. Join its existing terminal receipt instead of
+    // rejecting that valid transition or submitting a second retirement.
+    if let Some(shutdown) = terminal_shutdown_receipt(&slot, generation, word) {
+        return shutdown;
+    }
     if slot_generation(word) != generation || slot_phase(word) != SlotPhase::Closing {
         return MixerInputShutdown {
             state: ShutdownState::RetainedError {

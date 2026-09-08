@@ -1,5 +1,7 @@
 //! Thin JS/TS scripting runtime for smudgy.
 
+#[cfg(feature = "web-audio")]
+pub mod audio_file;
 pub mod interop_extract;
 pub mod language_service;
 mod language_service_engine;
@@ -548,6 +550,11 @@ impl ScriptRuntime {
         // Evaluate deno_audio only after deno_runtime installs the URL and Event globals.
         // The matching runtime extension registered native state before bootstrap.
         if initialize_web_audio {
+            #[cfg(feature = "web-audio")]
+            deno_audio::install_audio_file_resolver(
+                &mut worker.js_runtime.op_state().borrow_mut(),
+                Arc::new(audio_file::SmudgyAudioFileResolver),
+            );
             let specifier = ModuleSpecifier::parse("file:///__smudgy_web_audio_bootstrap.js")
                 .context("failed to parse the Web Audio bootstrap module")?;
             let module_id = options
@@ -561,6 +568,24 @@ impl ScriptRuntime {
                 .tokio
                 .block_on(worker.evaluate_module(module_id))
                 .context("failed to initialize the Web Audio extension")?;
+            // This module owns Smudgy's custom file-source API. Load from trusted
+            // embedded source before user modules; its ext: imports stay private.
+            #[cfg(feature = "web-audio")]
+            {
+                let media = ModuleSpecifier::parse("smudgy-media:main")?;
+                let module_id = options
+                    .tokio
+                    .block_on(
+                        worker
+                            .js_runtime
+                            .load_side_es_module_from_code(&media, include_str!("media.js")),
+                    )
+                    .context("failed to load smudgy:media")?;
+                options
+                    .tokio
+                    .block_on(worker.evaluate_module(module_id))
+                    .context("failed to initialize smudgy:media")?;
+            }
         }
 
         Ok(Self {

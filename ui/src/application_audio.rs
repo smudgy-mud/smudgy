@@ -2689,6 +2689,7 @@ fn production_limits() -> AudioHostLimits {
         .max_queued_control_commands(Some(1_024))
         .max_queued_events(Some(1_024))
         .max_decode_jobs(Some(4))
+        .max_streaming_jobs(Some(8))
         .max_offline_render_jobs(Some(2))
 }
 

@@ -61,6 +61,161 @@ oscillator.stop(context.currentTime + 0.02);
 // test binary; their internal trusted/package isolates still run concurrently.
 static AUDIO_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+fn audio_file_fixture() -> Vec<u8> {
+    // A 200 ms, mono 0.25-amplitude signal. It exceeds the 2048-frame queue,
+    // so success requires decoder backpressure and refilling during playback.
+    let frames = 9_600_u32;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&48_000_u32.to_le_bytes());
+    wav.extend_from_slice(&96_000_u32.to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(frames * 2).to_le_bytes());
+    for _ in 0..frames {
+        wav.extend_from_slice(&8192_i16.to_le_bytes());
+    }
+    wav
+}
+
+const AUDIO_FILE_PLAYER_TS: &str = r#"
+        import { echo } from "smudgy:core";
+        import { Audio } from "smudgy:media";
+        (async () => {
+        const audio = new Audio(new URL("./cue with space.wav", import.meta.url));
+        audio.volume = 0.5;
+        audio.onerror = () => echo(`FILE_ERROR:${audio.error}`);
+        const ended = new Promise(resolve => { audio.onended = resolve; });
+        await audio.play();
+        await new Promise(resolve => setTimeout(resolve, 70));
+        audio.pause();
+        // Allow the suspend operation and already-submitted mixer blocks to drain.
+        await new Promise(resolve => setTimeout(resolve, 50));
+        Deno.writeTextFileSync(new URL('./phase.txt', import.meta.url), 'paused');
+        await new Promise(resolve => setTimeout(resolve, 250));
+        Deno.writeTextFileSync(new URL('./phase.txt', import.meta.url), 'resuming');
+        await audio.play();
+        await ended;
+        await audio.close();
+        echo("FILE_MIXER_OK");
+        })().catch(error => echo(`FILE_ERROR:${error}`));
+    "#;
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "Serialize process-global registries across independent test runtimes"
+)]
+async fn local_audio_file_reaches_the_smudgy_session_mixer() {
+    let _guard = AUDIO_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let home = tempfile::tempdir().unwrap();
+    smudgy_core::set_smudgy_home(home.path());
+    let home_path = smudgy_core::get_smudgy_home().unwrap();
+    std::mem::forget(home);
+    let server = "AudioFileMixer";
+    let modules = home_path.join(server).join("modules");
+    std::fs::create_dir_all(&modules).unwrap();
+    std::fs::create_dir_all(home_path.join(server).join("logs")).unwrap();
+    std::fs::write(modules.join("cue with space.wav"), audio_file_fixture()).unwrap();
+    std::fs::write(modules.join("file.ts"), AUDIO_FILE_PLAYER_TS).unwrap();
+    let session_id = 7_409;
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(session_id),
+        server_name: Arc::new(server.to_owned()),
+        profile_name: Arc::new("Test".to_owned()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+    let (service, probe) = start_test_mixer(48_000, TestDriverConfig::default()).unwrap();
+    let application = ApplicationAudioOwner::new(deno_audio::AudioHostLimits::unlimited());
+    let registration = application
+        .registrar()
+        .register_session(
+            service
+                .add_session(AudioSessionId(u64::from(session_id)))
+                .unwrap(),
+        )
+        .unwrap();
+    let mut events = Box::pin(spawn_with_audio(params, registration.scope()).unwrap());
+    let mut tx = None;
+    let mut transcript = Vec::new();
+    let mut audible_samples = 0;
+    let mut peak = 0_f32;
+    let mut paused = false;
+    let mut paused_blocks = 0;
+    let mut interval = tokio::time::interval(Duration::from_millis(5));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Initial module loading buffers session echo events until
+                    // the event loop drains. Observe the trusted fixture's phase
+                    // marker directly so silence is checked during the pause.
+                    match std::fs::read_to_string(modules.join("phase.txt")).as_deref() {
+                        Ok("paused") => paused = true,
+                        Ok("resuming") => paused = false,
+                        _ => {}
+                    }
+                    let mut output = [0_f32; 480];
+                    probe.render(&mut output, 2).unwrap();
+                    if paused && matches!(std::fs::read_to_string(modules.join("phase.txt")).as_deref(), Ok("paused")) {
+                        paused_blocks += 1;
+                        assert!(output.iter().all(|sample| sample.abs() < 0.000_001),
+                            "paused player emitted audio in block {paused_blocks}, after {audible_samples} samples: {}", output[0]);
+                    }
+                    for sample in output {
+                        assert!(sample.is_finite());
+                        peak = peak.max(sample.abs());
+                        audible_samples += usize::from(sample.abs() > 0.01);
+                    }
+                }
+                event = events.next() => {
+                    match event.expect("file playback session stays live").event {
+                        SessionEvent::RuntimeReady(sender) => tx = Some(sender),
+                        SessionEvent::UpdateBuffer(updates) => {
+                            for update in updates.iter() {
+                                if let BufferUpdate::Append(line) = update {
+                                    transcript.push(line.text.clone());
+                                    assert!(!line.text.starts_with("FILE_ERROR:"), "{transcript:?}");
+                                    if line.text == "FILE_MIXER_OK" { return; }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }).await.unwrap_or_else(|_| panic!("file playback timed out: {transcript:?}"));
+    assert!(
+        (17_000..=19_200).contains(&audible_samples),
+        "pause/resume lost or replayed file samples: {audible_samples}"
+    );
+    assert!(paused_blocks > 20, "pause interval was not exercised");
+    assert!(
+        (0.05..=0.126).contains(&peak),
+        "file gain was not applied: {peak}"
+    );
+    assert_eq!(application.usage().streaming_jobs(), 0);
+    assert_eq!(application.usage().online_contexts(), 0);
+    tx.unwrap().send(RuntimeAction::Shutdown).ok();
+    drop(events);
+    join_runtime_threads();
+    drop(registration);
+    assert!(service.shutdown().clean);
+}
+
 fn audio_registration(
     session_id: u32,
 ) -> (

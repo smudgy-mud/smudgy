@@ -91,6 +91,65 @@ declare var AudioContext: {
   new(contextOptions?: AudioContextOptions): AudioContext;
 };
 
+/** Smudgy-specific sources live in a module, leaving Web Audio globals standard. */
+declare module "smudgy:media" {
+  /** Local streaming player; a subset of HTML Audio behavior, not an HTML element.
+   * Sources preload a bounded queue without autoplay. No global Audio is installed.
+   */
+  export class Audio extends EventTarget {
+    constructor(source?: string | URL);
+    /** Local path or file: URL. Relative paths use the process working directory.
+     * Assignment cancels playback and preloads the replacement; empty releases it.
+     */
+    get src(): string;
+    set src(value: string | URL);
+    readonly paused: boolean;
+    readonly ended: boolean;
+    /** Load/playback error, otherwise null. This is an Error, not a MediaError. */
+    readonly error: Error | null;
+    /** Linear volume from 0 through 1, initially 1. */
+    volume: number;
+    muted: boolean;
+    /** Restart loading the current source; cancels pending play promises. */
+    load(): void;
+    /** Resolve when playback starts/resumes, not when it ends. Replays after EOF.
+     * Rejects with AbortError if interrupted by pause, load, source change, or close.
+     */
+    play(): Promise<void>;
+    /** Preserve the playback position and bounded decoder queue. */
+    pause(): void;
+    /** Smudgy helper: release resources and await decoder shutdown.
+     * Keeps src/volume/muted; a later play() reopens the file from its beginning.
+     */
+    close(): Promise<void>;
+    onloadstart: ((this: Audio, event: Event) => unknown) | null;
+    oncanplay: ((this: Audio, event: Event) => unknown) | null;
+    onplay: ((this: Audio, event: Event) => unknown) | null;
+    onplaying: ((this: Audio, event: Event) => unknown) | null;
+    onpause: ((this: Audio, event: Event) => unknown) | null;
+    onended: ((this: Audio, event: Event) => unknown) | null;
+    onerror: ((this: Audio, event: Event) => unknown) | null;
+    onvolumechange: ((this: Audio, event: Event) => unknown) | null;
+  }
+
+  /** Stream a local file. Requires this isolate's read permission. */
+  export function createFileSource(context: AudioContext, source: string | URL): Promise<AudioFileSourceNode>;
+
+  /** A paused file source returned by createFileSource; cannot be directly constructed. */
+  export interface AudioFileSourceNode extends AudioNode {
+    /** Decoder failure after loading, otherwise null. Load failures reject createFileSource. */
+    readonly error: Error | null;
+    onerror: ((this: AudioFileSourceNode, event: Event) => unknown) | null;
+    onended: ((this: AudioFileSourceNode, event: Event) => unknown) | null;
+    /** Start once, immediately. Scheduling, seeking, and looping are not supported. */
+    start(): void;
+    /** Silence and cancel permanently. Context.close waits for decoder shutdown. */
+    stop(): void;
+  }
+
+  export const AudioFileSourceNode: { readonly prototype: AudioFileSourceNode };
+}
+
 interface GainNode extends AudioNode {
   readonly gain: AudioParam;
 }

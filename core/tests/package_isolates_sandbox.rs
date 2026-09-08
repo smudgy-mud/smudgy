@@ -634,6 +634,13 @@ async fn sandboxed_package_can_render_web_audio() {
     let constant_source = |label: &str| {
         r#"
         import { echo } from "smudgy:core";
+        import { createFileSource, AudioFileSourceNode } from "smudgy:media";
+        if (typeof createFileSource !== "function" || typeof AudioFileSourceNode !== "function") {
+          throw new Error("Smudgy media module missing in package isolate");
+        }
+        if ("createFileSource" in AudioContext.prototype || "AudioFileSourceNode" in globalThis) {
+          throw new Error("Smudgy media extended Web Audio globals");
+        }
         const context = new AudioContext({ sampleRate: 48_000, sinkId: "" });
         const buffer = context.createBuffer(2, 128, 48_000);
         buffer.getChannelData(0).fill(0.1);
