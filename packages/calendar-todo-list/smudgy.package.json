@@ -1,0 +1,15 @@
+{
+  "version": "0.1.0",
+  "description": "To-do items and dated events kept in a Mudlet-compatible database: todo, done, reset done, event, delevent, recycle events.",
+  "entry": "index.ts",
+  "min_smudgy_version": "0.5.5",
+  "dependencies": ["smudgy://official/mudlet-db"],
+  "permissions": {
+    "read": ["$DATA"],
+    "write": ["$DATA"],
+    "smudgy": {
+      "automations": ["aliases"],
+      "session": ["echo"]
+    }
+  }
+}
