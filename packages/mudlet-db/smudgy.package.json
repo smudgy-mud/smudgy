@@ -1,0 +1,6 @@
+{
+  "version": "0.1.0",
+  "description": "Mudlet's db sheet/query interface over the same SQLite files: open a Database_*.db, fetch with eq/like/and, add/update/delete rows by _row_id.",
+  "entry": "index.ts",
+  "min_smudgy_version": "0.5.5"
+}
