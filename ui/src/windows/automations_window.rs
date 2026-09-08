@@ -243,6 +243,10 @@ pub enum EditNode {
         package: Option<String>,
         /// The unified, ordered matcher row list (role + syntax per row).
         rows: Vec<model::TriggerRow>,
+        /// The trigger this one is inside, if any.
+        outer: Option<String>,
+        /// How it watches after its outer fires; inert for a top-level trigger.
+        reach: smudgy_core::models::triggers::InnerReach,
     },
 }
 
@@ -475,6 +479,22 @@ pub enum Message {
     ToggleAnchorStart,
     ToggleAnchorEnd,
     TogglePrompt,
+    /// Place the open trigger inside another trigger, or move it out (`None`).
+    SetOuter(Option<String>),
+    /// The inner trigger's range field: a line count, or blank for no limit.
+    SetWithinLines(String),
+    ToggleSameLine,
+    ToggleUntilPrompt,
+    ToggleOnce,
+    SetOverlap(smudgy_core::models::triggers::Overlap),
+    ToggleOuterValues,
+    /// Open a create pane for a trigger inside the open trigger.
+    NewInnerTrigger,
+    /// Reveal the outer picker on a top-level trigger.
+    RevealMoveInside,
+    RequestDeleteOuter,
+    CancelDeleteOuter,
+    ConfirmDeleteOuter(bool),
     RevealOrder,
     HideOrder,
     /// Open/close the "What it reads" disclosure.
@@ -1160,6 +1180,10 @@ pub struct AutomationsWindow {
     /// actions carry this value so a click from an older frame cannot affect a newer request.
     pending_nav_revision: u64,
     pub(super) confirm_folder_delete: bool,
+    /// The delete confirmation of a trigger with triggers inside it.
+    pub(super) confirm_outer_delete: bool,
+    /// The outer picker of a top-level trigger was revealed from its link.
+    pub(super) move_inside_revealed: bool,
 
     // ---- package dependency graph ------------------------------------------
     pub(super) graph: PackageGraph,
@@ -1515,6 +1539,8 @@ impl AutomationsWindow {
             pending_nav: None,
             pending_nav_revision: 0,
             confirm_folder_delete: false,
+            confirm_outer_delete: false,
+            move_inside_revealed: false,
             graph: PackageGraph::default(),
             blocked_updates: HashSet::new(),
             graph_seq: GraphSeq::default(),
@@ -2092,6 +2118,52 @@ impl AutomationsWindow {
                 }
                 Update::none()
             }
+            Message::SetOuter(outer) => self.set_outer(outer),
+            Message::SetWithinLines(value) => {
+                self.set_within_lines(&value);
+                Update::none()
+            }
+            Message::ToggleSameLine => {
+                self.edit_reach(|reach| reach.same_line = !reach.same_line);
+                Update::none()
+            }
+            Message::ToggleUntilPrompt => {
+                self.edit_reach(|reach| reach.until_prompt = !reach.until_prompt);
+                Update::none()
+            }
+            Message::ToggleOnce => {
+                self.edit_reach(|reach| reach.once = !reach.once);
+                Update::none()
+            }
+            Message::SetOverlap(overlap) => {
+                self.edit_reach(|reach| reach.overlap = overlap);
+                Update::none()
+            }
+            Message::ToggleOuterValues => {
+                use smudgy_core::models::triggers::InnerInput;
+                self.edit_reach(|reach| {
+                    reach.input = if reach.input == InnerInput::Line {
+                        InnerInput::OuterValues
+                    } else {
+                        InnerInput::Line
+                    };
+                });
+                Update::none()
+            }
+            Message::NewInnerTrigger => self.new_inner_trigger(),
+            Message::RevealMoveInside => {
+                self.move_inside_revealed = true;
+                Update::none()
+            }
+            Message::RequestDeleteOuter => {
+                self.confirm_outer_delete = true;
+                Update::none()
+            }
+            Message::CancelDeleteOuter => {
+                self.confirm_outer_delete = false;
+                Update::none()
+            }
+            Message::ConfirmDeleteOuter(delete_inner) => self.delete_outer(delete_inner),
             Message::RevealOrder => {
                 self.order_revealed = true;
                 Update::none()
@@ -3753,6 +3825,12 @@ impl AutomationsWindow {
             | Message::ToggleAnchorStart
             | Message::ToggleAnchorEnd
             | Message::TogglePrompt
+            | Message::SetWithinLines(_)
+            | Message::ToggleSameLine
+            | Message::ToggleUntilPrompt
+            | Message::ToggleOnce
+            | Message::SetOverlap(_)
+            | Message::ToggleOuterValues
             | Message::SetBehavior(_)
             | Message::AdjustPriority(_)
             | Message::ToggleFallthrough
@@ -3830,6 +3908,7 @@ impl AutomationsWindow {
             message,
             Message::SwitchContext { .. }
                 | Message::SelectScript(_)
+                | Message::NewInnerTrigger
                 | Message::SelectFolder(_)
                 | Message::SelectModule(_)
                 | Message::SelectOwnedPackage(_)
@@ -4029,6 +4108,8 @@ impl AutomationsWindow {
         self.clear_code_editor();
         self.new_menu_open = false;
         self.confirm_folder_delete = false;
+        self.confirm_outer_delete = false;
+        self.move_inside_revealed = false;
         self.confirm_delete_local = false;
         self.confirm_uninstall = false;
         self.uninstall_expected_lock = None;
@@ -4317,6 +4398,8 @@ mod tab_traversal_tests {
                     }),
                     ..model::TriggerRow::new(PatternKind::Match)
                 }],
+                outer: None,
+                reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
             },
             error: None,
         });

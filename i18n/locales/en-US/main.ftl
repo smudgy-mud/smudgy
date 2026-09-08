@@ -1265,6 +1265,37 @@ editor-row-error = Row { $row }: { $error }
 editor-reveal-order-aliases = Adjust priority or prevent other aliases from firing
 editor-reveal-order-triggers = Adjust priority or prevent other triggers from firing
 editor-hide-order = Hide priority options
+# Inner triggers: triggers inside other triggers
+editor-kind-inside = { $kind } · inside { $outer }
+editor-inside = Inside
+editor-inside-reach-line = this line only
+editor-inside-reach-lines = within { $count } lines
+editor-inside-reach-unlimited = no line limit
+editor-inside-reach-prompt = until the prompt
+editor-inside-reach-once = once
+editor-add-inside = Add a trigger inside this one
+editor-move-inside = Move inside another trigger…
+editor-inside-picker = Inside
+editor-no-trigger = (no trigger)
+editor-no-limit = no limit
+editor-within = Within
+editor-lines-after = lines after
+editor-may-same-line = May fire on the same line as { $outer }
+editor-may-repeat = May fire more than once in this range
+editor-may-after-prompt = May fire after a prompt is seen
+editor-match-outer-values = Match { $outer }'s matched values instead of the whole line
+editor-never-fires = This trigger can never fire. Allow the same line, or give it a range.
+editor-overlap = If { $outer } fires again while watching
+editor-overlap-restart = Start over
+editor-overlap-each = Watch each separately
+editor-verdict-inside-suffix = when inside { $outer }
+editor-folder-from-outer = Folder · { $folder } (from { $outer })
+editor-delete-outer-question = Delete this trigger and the { $count } triggers inside it?
+editor-move-inside-out = Move them out
+editor-delete-inside-too = Delete them too
+palette-move-inside = Move { $subject } inside { $outer }
+palette-move-outside = Move { $subject } out of { $outer }
+
 editor-matched-values = Matched values
 
 # Try it (the collapsed accordion) and its verdicts

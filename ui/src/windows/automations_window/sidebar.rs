@@ -483,38 +483,97 @@ impl AutomationsWindow {
                 self.build_script_rows(children, indent + 1, &path, searching, out);
             }
         }
-        // Leaves.
+        // Leaves. An inner trigger renders under the trigger it is inside, not here.
         for (name, script) in scripts {
+            if let Script::Trigger(t) = script
+                && t.outer.is_some()
+            {
+                continue;
+            }
             let icon = match script {
                 Script::Alias(_) => bootstrap_icons::AT,
                 Script::Trigger(_) => bootstrap_icons::LIGHTNING,
                 Script::Hotkey(_) => bootstrap_icons::DPAD,
                 Script::Folder(_, _) => continue,
             };
-            if !self.leaf_passes_chip(script) || !self.name_matches(name) {
+            if !self.leaf_passes_chip(script)
+                || !(self.name_matches(name) || self.inner_trigger_matches(scripts, name))
+            {
                 continue;
             }
             let leaf_only = matches!(self.chip, Chip::Aliases | Chip::Triggers | Chip::Hotkeys);
-            let key = ScriptKey {
-                folder_name: script.folder_name().map(str::to_string),
-                script_name: name.clone(),
-            };
-            let selected = self.selection == Selection::Script(key.clone());
-            out.push(tree_row(
-                // A leaf sits at the SAME indent as its sibling folders, not one
-                // deeper: the recursion already increments `indent` when it
-                // descends into a folder's children, so adding +1 here pushed
-                // root-level leaves in under a (possibly collapsed) root folder.
-                if leaf_only { 0 } else { indent },
-                None,
-                self.script_status(script),
-                icon,
-                name,
-                selected,
-                Message::SelectScript(key),
-                None,
-            ));
+            // A leaf sits at the SAME indent as its sibling folders, not one
+            // deeper: the recursion already increments `indent` when it
+            // descends into a folder's children, so adding +1 here pushed
+            // root-level leaves in under a (possibly collapsed) root folder.
+            let leaf_indent = if leaf_only { 0 } else { indent };
+            self.build_trigger_leaf_rows(scripts, name, script, icon, leaf_indent, searching, out);
         }
+    }
+
+    /// One leaf row, then, for a trigger, the rows of the triggers inside it, nested one
+    /// level deeper behind a twisty keyed `trigger:<name>` in the collapsed set.
+    #[allow(clippy::too_many_arguments)]
+    fn build_trigger_leaf_rows<'a>(
+        &'a self,
+        scripts: &'a BTreeMap<String, Script>,
+        name: &'a str,
+        script: &'a Script,
+        icon: &'static str,
+        indent: usize,
+        searching: bool,
+        out: &mut Vec<Elem<'a>>,
+    ) {
+        let key = ScriptKey {
+            folder_name: script.folder_name().map(str::to_string),
+            script_name: name.to_string(),
+        };
+        let selected = self.selection == Selection::Script(key.clone());
+        let inner: Vec<(&'a String, &'a Script)> = scripts
+            .iter()
+            .filter(|(_, candidate)| {
+                matches!(candidate, Script::Trigger(t) if t.outer.as_deref() == Some(name))
+            })
+            .collect();
+        let twisty_key = format!("trigger:{name}");
+        let collapsed = !searching && self.collapsed_folders.contains(&twisty_key);
+        out.push(tree_row(
+            indent,
+            (!inner.is_empty()).then_some((collapsed, twisty_key)),
+            self.script_status(script),
+            icon,
+            name,
+            selected,
+            Message::SelectScript(key),
+            None,
+        ));
+        if collapsed {
+            return;
+        }
+        for (inner_name, inner_script) in inner {
+            if !(self.name_matches(inner_name) || self.inner_trigger_matches(scripts, inner_name)) {
+                continue;
+            }
+            self.build_trigger_leaf_rows(
+                scripts,
+                inner_name,
+                inner_script,
+                bootstrap_icons::LIGHTNING,
+                indent + 1,
+                searching,
+                out,
+            );
+        }
+    }
+
+    /// Whether any trigger inside `name` (at any depth, within the same folder) matches
+    /// the search, so its outer stays visible.
+    fn inner_trigger_matches(&self, scripts: &BTreeMap<String, Script>, name: &str) -> bool {
+        scripts.iter().any(|(inner_name, candidate)| {
+            matches!(candidate, Script::Trigger(t) if t.outer.as_deref() == Some(name))
+                && (self.name_matches(inner_name)
+                    || self.inner_trigger_matches(scripts, inner_name))
+        })
     }
 
     fn build_package_rows<'a>(&'a self, out: &mut Vec<Elem<'a>>) {

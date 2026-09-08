@@ -1098,9 +1098,9 @@ impl AutomationsWindow {
             .clone()
             .into_iter()
             .map(|(name, hotkey)| (name, Script::Hotkey(hotkey)));
-        let triggers = snapshot
-            .triggers
-            .clone()
+        // Inner triggers are saved nested under their outer; the tree holds them as leaves
+        // beside it, each carrying `outer` and the root's folder, and re-nests them on save.
+        let triggers = flatten_inner_triggers(snapshot.triggers.clone())
             .into_iter()
             .map(|(name, trigger)| (name, Script::Trigger(trigger)));
 
@@ -1306,10 +1306,153 @@ impl AutomationsWindow {
         if !script.own_enabled() || !folder_enabled {
             return NodeStatus::Disabled;
         }
+        if let Script::Trigger(t) = script {
+            // The reach cannot cover anything: a saved trigger that never fires.
+            if t.outer.is_some() && !t.reach.can_fire() {
+                return NodeStatus::Error;
+            }
+            if self
+                .outer_chain(t.outer.as_deref())
+                .iter()
+                .any(|outer| !outer.enabled)
+            {
+                return NodeStatus::Disabled;
+            }
+        }
         if script_has_error(script) {
             return NodeStatus::Error;
         }
         NodeStatus::Ok
+    }
+
+    /// The stored definition of the trigger named `name`, wherever it sits in the tree.
+    pub(super) fn trigger_definition(
+        &self,
+        name: &str,
+    ) -> Option<models::triggers::TriggerDefinition> {
+        match self.find_script(&ScriptKey {
+            folder_name: None,
+            script_name: name.to_string(),
+        }) {
+            Some(Script::Trigger(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The triggers `name` is inside, nearest first, starting from `outer` (a trigger's
+    /// own `outer` field). Stops at a missing link or the depth limit.
+    pub(super) fn outer_chain(
+        &self,
+        outer: Option<&str>,
+    ) -> Vec<models::triggers::TriggerDefinition> {
+        let mut chain = Vec::new();
+        let mut at = outer.map(str::to_string);
+        while let Some(name) = at.take() {
+            let Some(definition) = self.trigger_definition(&name) else {
+                break;
+            };
+            at = definition.outer.clone();
+            chain.push(definition);
+            if chain.len() > models::triggers::MAX_INNER_DEPTH {
+                break;
+            }
+        }
+        chain
+    }
+
+    /// The names of the triggers this one is inside, nearest first.
+    pub(super) fn outer_names(&self, outer: Option<&str>) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut at = outer.map(str::to_string);
+        while let Some(name) = at.take() {
+            at = self.trigger_definition(&name).and_then(|t| t.outer);
+            names.push(name);
+            if names.len() > models::triggers::MAX_INNER_DEPTH {
+                break;
+            }
+        }
+        names
+    }
+
+    /// The triggers directly inside `name`, in dispatch order: priority first, then name.
+    pub(super) fn inner_triggers_of(
+        &self,
+        name: &str,
+    ) -> Vec<(String, models::triggers::TriggerDefinition)> {
+        fn rec(
+            scripts: &BTreeMap<String, Script>,
+            outer: &str,
+            out: &mut Vec<(String, models::triggers::TriggerDefinition)>,
+        ) {
+            for (script_name, script) in scripts {
+                match script {
+                    Script::Trigger(t) if t.outer.as_deref() == Some(outer) => {
+                        out.push((script_name.clone(), t.clone()));
+                    }
+                    Script::Folder(_, children) => rec(children, outer, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        rec(&self.scripts, name, &mut out);
+        out.sort_by(|a, b| b.1.priority.cmp(&a.1.priority).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// Every trigger inside `name`, at any depth.
+    pub(super) fn triggers_inside(&self, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut pending = vec![name.to_string()];
+        while let Some(outer) = pending.pop() {
+            for (inner, _) in self.inner_triggers_of(&outer) {
+                if !out.contains(&inner) {
+                    out.push(inner.clone());
+                    pending.push(inner);
+                }
+            }
+        }
+        out
+    }
+
+    /// Update every trigger directly inside `old` to sit inside `new`, and give the whole
+    /// subtree the folder `package`: what a rename or a folder move of an outer needs.
+    pub(super) fn retarget_inner_triggers(&mut self, old: &str, new: &str, package: Option<&str>) {
+        let inside = self.triggers_inside(old);
+        fn rec(
+            scripts: &mut BTreeMap<String, Script>,
+            old: &str,
+            new: &str,
+            inside: &[String],
+            package: Option<&str>,
+        ) {
+            for (script_name, script) in scripts.iter_mut() {
+                match script {
+                    Script::Trigger(t) if inside.contains(script_name) => {
+                        if t.outer.as_deref() == Some(old) {
+                            t.outer = Some(new.to_string());
+                        }
+                        t.package = package.map(str::to_string);
+                    }
+                    Script::Folder(_, children) => rec(children, old, new, inside, package),
+                    _ => {}
+                }
+            }
+        }
+        rec(&mut self.scripts, old, new, &inside, package);
+        // Folder placement lives in the tree structure too: re-home the moved subtree.
+        for name in inside {
+            let key = ScriptKey {
+                folder_name: None,
+                script_name: name.clone(),
+            };
+            if let Some(script) = self.find_script(&key) {
+                self.remove_script_by_name(&name);
+                if let Ok(folder) = upsert_script_folder(&mut self.scripts, script.folder_name()) {
+                    folder.insert(name, script);
+                }
+            }
+        }
     }
 }
 
@@ -1332,27 +1475,127 @@ pub fn script_has_error(script: &Script) -> bool {
     }
 }
 
-/// Walks the tree collecting leaves of each type into flat maps for serialization.
+/// Walks the tree collecting leaves of each type into flat maps for serialization. Inner
+/// triggers come out nested under their outer, the shape the file keeps.
 fn collect_scripts(
     scripts: &BTreeMap<String, Script>,
     aliases: &mut std::collections::HashMap<String, models::aliases::AliasDefinition>,
     hotkeys: &mut std::collections::HashMap<String, models::hotkeys::HotkeyDefinition>,
     triggers: &mut std::collections::HashMap<String, models::triggers::TriggerDefinition>,
 ) {
-    for (name, script) in scripts {
-        match script {
-            Script::Alias(a) => {
-                aliases.insert(name.clone(), a.clone());
+    fn walk(
+        scripts: &BTreeMap<String, Script>,
+        aliases: &mut std::collections::HashMap<String, models::aliases::AliasDefinition>,
+        hotkeys: &mut std::collections::HashMap<String, models::hotkeys::HotkeyDefinition>,
+        triggers: &mut std::collections::HashMap<String, models::triggers::TriggerDefinition>,
+    ) {
+        for (name, script) in scripts {
+            match script {
+                Script::Alias(a) => {
+                    aliases.insert(name.clone(), a.clone());
+                }
+                Script::Hotkey(h) => {
+                    hotkeys.insert(name.clone(), h.clone());
+                }
+                Script::Trigger(t) => {
+                    triggers.insert(name.clone(), t.clone());
+                }
+                Script::Folder(_, children) => walk(children, aliases, hotkeys, triggers),
             }
-            Script::Hotkey(h) => {
-                hotkeys.insert(name.clone(), h.clone());
-            }
-            Script::Trigger(t) => {
-                triggers.insert(name.clone(), t.clone());
-            }
-            Script::Folder(_, children) => collect_scripts(children, aliases, hotkeys, triggers),
         }
     }
+    walk(scripts, aliases, hotkeys, triggers);
+    let flat = std::mem::take(triggers);
+    *triggers = nest_inner_triggers(flat);
+}
+
+/// Unpack every trigger's `inner` map into flat entries beside it: each inner trigger
+/// carries `outer` and the root's folder, so the folder tree places it where its root is.
+pub fn flatten_inner_triggers(
+    triggers: std::collections::HashMap<String, models::triggers::TriggerDefinition>,
+) -> std::collections::HashMap<String, models::triggers::TriggerDefinition> {
+    fn visit(
+        name: String,
+        mut definition: models::triggers::TriggerDefinition,
+        outer: Option<&str>,
+        package: Option<&str>,
+        out: &mut std::collections::HashMap<String, models::triggers::TriggerDefinition>,
+    ) {
+        let inner = definition.inner.take();
+        if outer.is_some() {
+            definition.outer = outer.map(str::to_string);
+            definition.package = package.map(str::to_string);
+        }
+        let package = definition.package.clone();
+        // A name used twice keeps the entry seen first; the loader drops the same one.
+        if out.contains_key(&name) {
+            return;
+        }
+        out.insert(name.clone(), definition);
+        for (inner_name, inner_definition) in inner.into_iter().flatten() {
+            visit(
+                inner_name,
+                inner_definition,
+                Some(&name),
+                package.as_deref(),
+                out,
+            );
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for (name, definition) in triggers {
+        visit(name, definition, None, None, &mut out);
+    }
+    out
+}
+
+/// The inverse of [`flatten_inner_triggers`]: move every entry with an `outer` into that
+/// trigger's `inner` map, innermost first, clearing the runtime-only fields the file does
+/// not keep. An entry whose outer is missing stays top-level rather than vanishing.
+pub fn nest_inner_triggers(
+    mut flat: std::collections::HashMap<String, models::triggers::TriggerDefinition>,
+) -> std::collections::HashMap<String, models::triggers::TriggerDefinition> {
+    fn depth(
+        flat: &std::collections::HashMap<String, models::triggers::TriggerDefinition>,
+        name: &str,
+    ) -> usize {
+        let mut depth = 0;
+        let mut at = flat.get(name).and_then(|t| t.outer.as_deref());
+        while let Some(outer) = at {
+            depth += 1;
+            if depth > models::triggers::MAX_INNER_DEPTH + 1 {
+                break;
+            }
+            at = flat.get(outer).and_then(|t| t.outer.as_deref());
+        }
+        depth
+    }
+    let mut order: Vec<(usize, String)> = flat
+        .iter()
+        .filter(|(_, t)| t.outer.is_some())
+        .map(|(name, _)| (depth(&flat, name), name.clone()))
+        .collect();
+    // Deepest first, so a moved entry already holds its own inner map.
+    order.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, name) in order {
+        let Some(mut definition) = flat.remove(&name) else {
+            continue;
+        };
+        let outer = definition.outer.take().unwrap_or_default();
+        definition.package = None;
+        match flat.get_mut(&outer) {
+            Some(outer_definition) => {
+                outer_definition
+                    .inner
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(name, definition);
+            }
+            None => {
+                flat.insert(name, definition);
+            }
+        }
+    }
+    flat
 }
 
 /// Ensures the folder chain `folder_name` exists in `scripts`, returning the
@@ -2119,5 +2362,66 @@ mod tests {
         install(&mut graph, "worker", true);
         assert!(graph.effectively_enabled("worker"));
         assert!(graph.controllable("worker"));
+    }
+
+    mod inner_triggers {
+        use std::collections::{BTreeMap, HashMap};
+
+        use smudgy_core::models::triggers::{InnerReach, LineReach, TriggerDefinition};
+
+        use super::super::{flatten_inner_triggers, nest_inner_triggers};
+
+        fn trigger(pattern: &str) -> TriggerDefinition {
+            TriggerDefinition {
+                patterns: Some(vec![pattern.to_string()]),
+                ..TriggerDefinition::default()
+            }
+        }
+
+        #[test]
+        fn nested_file_flattens_to_leaves_and_nests_back_unchanged() {
+            let mut deeper = BTreeMap::new();
+            deeper.insert("deep".to_string(), trigger("^deep$"));
+            let mut inner = BTreeMap::new();
+            let mut item = trigger("^ item$");
+            item.reach.within_lines = LineReach::Lines(40);
+            item.inner = Some(deeper);
+            inner.insert("item".to_string(), item);
+            let mut heading = trigger("^Items:$");
+            heading.package = Some("inventory".to_string());
+            heading.inner = Some(inner);
+            let mut file = HashMap::new();
+            file.insert("heading".to_string(), heading.clone());
+            file.insert("other".to_string(), trigger("^other$"));
+
+            let flat = flatten_inner_triggers(file.clone());
+            assert_eq!(flat.len(), 4);
+            let item = &flat["item"];
+            assert_eq!(item.outer.as_deref(), Some("heading"));
+            assert_eq!(
+                item.package.as_deref(),
+                Some("inventory"),
+                "inherits the root's folder"
+            );
+            assert!(item.inner.is_none());
+            assert_eq!(flat["deep"].outer.as_deref(), Some("item"));
+            assert_eq!(flat["deep"].package.as_deref(), Some("inventory"));
+            assert!(flat["heading"].outer.is_none());
+            assert!(flat["heading"].inner.is_none());
+
+            let nested = nest_inner_triggers(flat);
+            assert_eq!(nested, file, "the round trip is exact");
+        }
+
+        #[test]
+        fn a_leaf_whose_outer_is_gone_stays_top_level() {
+            let mut orphan = trigger("^x$");
+            orphan.outer = Some("nobody".to_string());
+            let mut flat = HashMap::new();
+            flat.insert("orphan".to_string(), orphan);
+            let nested = nest_inner_triggers(flat);
+            assert!(nested["orphan"].outer.is_none());
+            assert_eq!(nested["orphan"].reach, InnerReach::DEFAULT);
+        }
     }
 }

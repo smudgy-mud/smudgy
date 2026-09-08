@@ -181,6 +181,38 @@ impl AutomationsWindow {
                     message: Message::SetScriptFolder(Some(path)),
                 });
             }
+            // A trigger can also move inside another trigger, or back out.
+            if let Some(Script::Trigger(trigger)) = self.find_script(key) {
+                if let Some(outer) = &trigger.outer {
+                    items.push(Item {
+                        group: crate::i18n::ts!("palette-group-move"),
+                        label: crate::i18n::t!(
+                            "palette-move-outside",
+                            "subject" => subject,
+                            "outer" => outer
+                        ),
+                        status: None,
+                        kind: Some(crate::i18n::ts!("automation-trigger")),
+                        message: Message::SetOuter(None),
+                    });
+                }
+                for candidate in self.outer_candidates(subject) {
+                    if trigger.outer.as_deref() == Some(candidate.as_str()) {
+                        continue;
+                    }
+                    items.push(Item {
+                        group: crate::i18n::ts!("palette-group-move"),
+                        label: crate::i18n::t!(
+                            "palette-move-inside",
+                            "subject" => subject,
+                            "outer" => &candidate
+                        ),
+                        status: None,
+                        kind: Some(crate::i18n::ts!("automation-trigger")),
+                        message: Message::SetOuter(Some(candidate)),
+                    });
+                }
+            }
         }
 
         // Jump to: scripts + folders + packages.
