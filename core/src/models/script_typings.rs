@@ -2658,9 +2658,9 @@ style.red(style.blue(/danger/));
 "#,
             ),
             (
-                "missing-trigger-body.ts",
+                "non-body-trigger-argument.ts",
                 r#"import { createTrigger, style } from "smudgy:core";
-createTrigger(style.red(/danger/));
+createTrigger(style.red(/danger/), 42);
 "#,
             ),
             (
@@ -3599,6 +3599,8 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
             .filter_map(|declaration| declaration.split_once(':').map(|(name, _)| name))
             .collect::<BTreeSet<_>>();
         assert!(bridge_members.remove("matches"));
+        // Like `matches`, `outer` is a per-fire global, not an API member.
+        assert!(bridge_members.remove("outer"));
         assert_eq!(bridge_members, api_members);
     }
 

@@ -1561,6 +1561,7 @@ impl Runtime {
             // `exists` ops (via `OpState`) and written by the `Manager`. A fresh one per engine,
             // so a reload (which rebuilds both below) starts with an empty registry.
             let automation_registry: trigger::SharedAutomationRegistry = Rc::default();
+            let input_sequence: trigger::SharedInputSequence = Rc::new(Cell::new(0));
 
             // Embedder state coupled to an engine generation is reset before EVERY engine
             // build, this initial one included: the session's widget root outlives the
@@ -1599,6 +1600,7 @@ impl Runtime {
                 extra_script_extensions: extra_script_extensions.clone(),
                 tokio_runtime: runtime.clone(),
                 automation_registry: automation_registry.clone(),
+                input_sequence: input_sequence.clone(),
                 audio_scope: audio_scope.clone(),
             });
 
@@ -1607,10 +1609,11 @@ impl Runtime {
             let settings = load_settings();
             let command_separator = Arc::new(settings.command_separator);
 
-            let mut trigger_manager = Manager::new(
+            let mut trigger_manager = Manager::with_input_sequence(
                 spawned_actions.clone(),
                 command_separator.clone(),
                 automation_registry,
+                input_sequence,
             );
             trigger_manager.set_bold_is_bright(settings.terminal_bold_mode.uses_bright_palette());
 
@@ -1916,6 +1919,7 @@ impl Runtime {
                 // This avoids any V8 isolate replacement issues
                 // Fresh introspection mirror for the rebuilt engine (clears every entry).
                 let automation_registry: trigger::SharedAutomationRegistry = Rc::default();
+                let input_sequence: trigger::SharedInputSequence = Rc::new(Cell::new(0));
 
                 // Engine-construction session notices commit the main open
                 // line behind Inner's back (they end in EnsureNewLine and
@@ -1959,6 +1963,7 @@ impl Runtime {
                     extra_script_extensions: extra_script_extensions.clone(),
                     tokio_runtime: runtime.clone(),
                     automation_registry: automation_registry.clone(),
+                    input_sequence: input_sequence.clone(),
                     audio_scope: audio_scope.clone(),
                 });
 
@@ -1992,10 +1997,11 @@ impl Runtime {
                     old_ledger.close_row();
                 }
 
-                let mut new_trigger_manager = Manager::new(
+                let mut new_trigger_manager = Manager::with_input_sequence(
                     spawned_actions.clone(),
                     command_separator.clone(),
                     automation_registry,
+                    input_sequence,
                 );
                 new_trigger_manager
                     .set_bold_is_bright(settings.terminal_bold_mode.uses_bright_palette());

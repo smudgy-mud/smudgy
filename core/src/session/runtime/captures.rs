@@ -25,6 +25,51 @@ impl CapturePayload {
         }
     }
 
+    /// The byte range of capture `index` within its source line, when the captures range
+    /// into one. Owned captures have no source position.
+    pub fn range(&self, index: usize) -> Option<Range<usize>> {
+        match self {
+            Self::Owned(_) => None,
+            Self::Ranged(values) => values.ranges.get(index).flatten(),
+        }
+    }
+}
+
+/// The matched values of the triggers one inner trigger is inside: the nearest outer's own
+/// captures, then the chain above it. This is what an inner trigger's body reads as `outer`:
+/// numbered values from `own`, named values from every level.
+#[derive(Debug)]
+pub struct OuterCaptures {
+    pub own: CapturePayload,
+    pub above: Option<Arc<OuterCaptures>>,
+}
+
+impl OuterCaptures {
+    /// The named value `name` from the nearest level that captures it.
+    pub fn named(&self, name: &str) -> Option<&str> {
+        let mut at = Some(self);
+        while let Some(level) = at {
+            if let Some(found) = level
+                .own
+                .view()
+                .iter()
+                .find(|capture| capture.name == Some(name))
+            {
+                return Some(found.value);
+            }
+            at = level.above.as_deref();
+        }
+        None
+    }
+
+    /// Every level's captures, nearest first.
+    pub fn levels(&self) -> impl Iterator<Item = CaptureView<'_>> {
+        std::iter::successors(Some(self), |level| level.above.as_deref())
+            .map(|level| level.own.view())
+    }
+}
+
+impl CapturePayload {
     #[cfg(test)]
     pub fn get(&self, index: usize) -> Option<CaptureRef<'_>> {
         self.view().get(index)
@@ -248,6 +293,66 @@ impl CapturePattern {
             raw,
             schema,
             ranges: CaptureRanges::from_locations(locations),
+        }))
+    }
+}
+
+impl CapturePattern {
+    /// Capture a match of this pattern within `range` of `line`, a slice such as one of an
+    /// outer trigger's matched values. Anchors bind to the slice; the recorded ranges are
+    /// offset back to line coordinates so styles and edits keep addressing the whole line.
+    pub fn capture_slice(
+        &self,
+        line: &Arc<StyledLine>,
+        range: Range<usize>,
+        start: Option<usize>,
+    ) -> CapturePayload {
+        let subject = &line.text[range.clone()];
+        let base = range.start;
+        if self.regex.captures_len() == 1 {
+            let whole = self
+                .regex
+                .find_at(subject, start.unwrap_or(0))
+                .expect("a selected trigger match must still capture");
+            return CapturePayload::Ranged(Arc::new(RangedCaptures {
+                line: line.clone(),
+                raw: false,
+                schema: None,
+                ranges: CaptureRanges::Whole(base + whole.start()..base + whole.end()),
+            }));
+        }
+        let mut scratch = self.locations.borrow_mut();
+        let locations = scratch.get_or_insert_with(|| Box::new(self.regex.capture_locations()));
+        self.regex
+            .captures_read_at(locations, subject, start.unwrap_or(0))
+            .expect("a selected trigger match must still capture");
+        let schema = (locations.len() > 1).then(|| {
+            self.schema
+                .get_or_init(|| {
+                    Arc::new(CaptureSchema {
+                        names: self
+                            .regex
+                            .capture_names()
+                            .map(|name| name.map(Into::into))
+                            .collect(),
+                    })
+                })
+                .clone()
+        });
+        let ranges = CaptureRanges::Groups(
+            (0..locations.len())
+                .map(|index| {
+                    locations
+                        .get(index)
+                        .map(|(group_start, end)| base + group_start..base + end)
+                })
+                .collect(),
+        );
+        CapturePayload::Ranged(Arc::new(RangedCaptures {
+            line: line.clone(),
+            raw: false,
+            schema,
+            ranges,
         }))
     }
 }

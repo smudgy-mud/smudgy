@@ -28,8 +28,9 @@ use super::script_action::ScriptAction;
 use super::script_engine::{FunctionId, ScriptId};
 use super::store::{PublishedStore, PublishedWrite};
 use super::trigger::{
-    AliasSender, AutomationIdentity, MatchCapture, PreparedScriptTriggerPatterns,
+    AliasSender, AutomationIdentity, FiringContext, MatchCapture, PreparedScriptTriggerPatterns,
 };
+use crate::models::triggers::InnerReach;
 
 #[derive(Clone, Debug)]
 pub enum RuntimeAction {
@@ -197,6 +198,10 @@ pub enum RuntimeAction {
         is_captured: Option<Arc<AtomicBool>>,
         stopped: Arc<AtomicBool>,
         fallthrough: bool,
+        /// The firing this automation runs under and the one it opened, with the matched
+        /// values of the triggers it is inside. All `None` for an alias and for a top-level
+        /// trigger with nothing inside it.
+        firing: FiringContext,
     },
     Echo(Arc<String>),
     /// A Command alias matched its first word but a required argument was
@@ -370,6 +375,9 @@ pub enum RuntimeAction {
         /// The handler's `toString()`, passed in good faith from JS-land for the read-only
         /// detail pane. `None` when the caller supplied no source. Display-only.
         script_source: Option<Arc<str>>,
+        /// The trigger this one is inside, and how it watches after that one fires.
+        outer: Option<Arc<String>>,
+        reach: InnerReach,
     },
     EnableAlias(IsolateId, Origin, Arc<String>, bool),
     EnableTrigger(IsolateId, Origin, Arc<String>, bool),
@@ -1031,6 +1039,8 @@ mod tests {
             fire_limit: None,
             line_limit: None,
             script_source: None,
+            outer: None,
+            reach: InnerReach::DEFAULT,
         };
 
         assert!(action.references_engine_state());

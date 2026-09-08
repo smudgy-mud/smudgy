@@ -159,8 +159,8 @@ pub const JS_RESERVED_NAMES: &[&str] = &[
 ];
 
 /// The names the inline `with` scope provides to every alias, trigger, and hotkey body: the
-/// `const` globals of the language-service bridge (`smudgy-inline.d.ts`), minus `matches`,
-/// which is a per-fire global with no collision. An exposure under one of these names shadows
+/// `const` globals of the language-service bridge (`smudgy-inline.d.ts`), minus `matches` and
+/// `outer`, which are per-fire globals with no collision. An exposure under one of these names shadows
 /// that member inside its own body only. The bridge's drift test pins this list to the
 /// declarations. Kept alphabetical (ASCII order) for binary search.
 pub const INLINE_SCOPE_NAMES: &[&str] = &[
@@ -200,6 +200,8 @@ pub const INLINE_SCOPE_NAMES: &[&str] = &[
     "send",
     "sendRaw",
     "session",
+    "skipInner",
+    "stopWatching",
     "style",
     "submission",
     "timers",
@@ -676,7 +678,7 @@ mod tests {
                 .lines()
                 .filter_map(|line| line.trim().strip_prefix("const "))
                 .filter_map(|declaration| declaration.split_once(':').map(|(name, _)| name.trim()))
-                .filter(|name| *name != "matches")
+                .filter(|name| *name != "matches" && *name != "outer")
                 .collect();
         declared.sort_unstable();
         assert_eq!(declared, INLINE_SCOPE_NAMES);

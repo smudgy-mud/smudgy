@@ -17,7 +17,7 @@ use crate::models::{
     packages::{PackageTree, load_packages},
     profile::{Profile, load_profile},
     server::{Server, load_server},
-    triggers::{TriggerDefinition, load_triggers},
+    triggers::{MAX_INNER_DEPTH, TriggerDefinition, load_triggers},
 };
 
 use super::runtime::{IsolateId, Origin, RuntimeAction};
@@ -129,6 +129,87 @@ fn runtime_hotkey(definition: &HotkeyDefinition, snapshot: &UserAutomations) -> 
     runtime
 }
 
+/// One trigger as the runtime registers it, flattened out of the nested file: `outer`
+/// names the trigger it is inside, `inner` is cleared (the triggers inside register on
+/// their own), `enabled` is the effective value, and `depth` orders registration.
+#[derive(Clone, Debug, PartialEq)]
+struct FlatTrigger {
+    definition: TriggerDefinition,
+    depth: usize,
+}
+
+/// Flatten the nested trigger tree into the registrations the runtime makes. An inner
+/// trigger is effectively enabled only when every trigger above it and the root's folder
+/// are; it inherits the root's folder and never carries one of its own. A name used twice
+/// anywhere in the file, or a trigger nested past [`MAX_INNER_DEPTH`], is left out with a
+/// warning: registering it as a top-level trigger would make it fire unconditionally.
+fn flatten_triggers(snapshot: &UserAutomations) -> HashMap<String, FlatTrigger> {
+    fn visit(
+        name: &str,
+        definition: &TriggerDefinition,
+        outer: Option<&str>,
+        depth: usize,
+        ancestors_enabled: bool,
+        snapshot: &UserAutomations,
+        out: &mut HashMap<String, FlatTrigger>,
+    ) {
+        if out.contains_key(name) {
+            log::warn!(
+                "[automations] Two triggers are named {name:?}; the nested one was not loaded"
+            );
+            return;
+        }
+        if depth > MAX_INNER_DEPTH {
+            log::warn!(
+                "[automations] Trigger {name:?} is nested more than {MAX_INNER_DEPTH} deep and was not loaded"
+            );
+            return;
+        }
+        let mut runtime = definition.clone();
+        // Only the root's folder counts; it was resolved into `ancestors_enabled` above.
+        runtime.enabled = if depth == 0 {
+            enabled_for_profile(definition.enabled, definition.package.as_deref(), snapshot)
+        } else {
+            ancestors_enabled && definition.enabled
+        };
+        runtime.package = None;
+        runtime.inner = None;
+        runtime.outer = outer.map(str::to_string);
+        let enabled = runtime.enabled;
+        out.insert(
+            name.to_string(),
+            FlatTrigger {
+                definition: runtime,
+                depth,
+            },
+        );
+        if let Some(inner) = &definition.inner {
+            for (inner_name, inner_definition) in inner {
+                visit(
+                    inner_name,
+                    inner_definition,
+                    Some(name),
+                    depth + 1,
+                    enabled,
+                    snapshot,
+                    out,
+                );
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    // Deterministic visiting order, so a duplicate name always resolves the same way.
+    let mut roots: Vec<_> = snapshot.triggers.iter().collect();
+    roots.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, definition) in roots {
+        visit(name, definition, None, 0, true, snapshot, &mut out);
+    }
+    out
+}
+
+/// The effective runtime definitions of every trigger, flattened; test seam.
+#[cfg(test)]
 fn runtime_trigger(
     definition: &TriggerDefinition,
     snapshot: &UserAutomations,
@@ -138,6 +219,84 @@ fn runtime_trigger(
         enabled_for_profile(definition.enabled, definition.package.as_deref(), snapshot);
     runtime.package = None;
     runtime
+}
+
+fn reconcile_trigger_actions(
+    previous: &UserAutomations,
+    desired: &UserAutomations,
+) -> Vec<RuntimeAction> {
+    let old_flat = flatten_triggers(previous);
+    let new_flat = flatten_triggers(desired);
+
+    // Removals: every registered trigger that is gone, disabled, or changed. Removing an
+    // outer takes everything inside it with it in the runtime, so those come back below.
+    let mut removed: HashMap<&str, usize> = HashMap::new();
+    for (name, old) in &old_flat {
+        if !old.definition.enabled {
+            continue;
+        }
+        let changed = new_flat
+            .get(name)
+            .is_none_or(|new| !new.definition.enabled || new.definition != old.definition);
+        if changed {
+            removed.insert(name.as_str(), old.depth);
+        }
+    }
+    // Cascade: anything registered inside a removed trigger is removed with it.
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (name, old) in &old_flat {
+            if removed.contains_key(name.as_str()) || !old.definition.enabled {
+                continue;
+            }
+            if old
+                .definition
+                .outer
+                .as_deref()
+                .is_some_and(|outer| removed.contains_key(outer))
+            {
+                removed.insert(name.as_str(), old.depth);
+                grew = true;
+            }
+        }
+    }
+    let mut removals: Vec<(&str, usize)> = removed.iter().map(|(n, d)| (*n, *d)).collect();
+    // Innermost first, then by name, so the order is stable.
+    removals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let mut actions: Vec<RuntimeAction> = removals
+        .into_iter()
+        .map(|(name, _)| {
+            RuntimeAction::RemoveTrigger(IsolateId::Main, Origin::User, Arc::new(name.to_string()))
+        })
+        .collect();
+
+    // Additions: enabled triggers that are new, changed, or were removed by the cascade.
+    let mut additions: Vec<(&str, &FlatTrigger)> = new_flat
+        .iter()
+        .filter(|(name, new)| {
+            new.definition.enabled
+                && (removed.contains_key(name.as_str())
+                    || old_flat.get(name.as_str()).is_none_or(|old| {
+                        !old.definition.enabled || old.definition != new.definition
+                    }))
+        })
+        .map(|(name, new)| (name.as_str(), new))
+        .collect();
+    // Outers first, then by name: registration order is what breaks priority ties.
+    additions.sort_by(|a, b| a.1.depth.cmp(&b.1.depth).then_with(|| a.0.cmp(b.0)));
+    for (name, new) in additions {
+        actions.push(RuntimeAction::AddTrigger {
+            isolate: IsolateId::Main,
+            origin: Origin::User,
+            name: Arc::new(name.to_string()),
+            trigger: Box::new(new.definition.clone()),
+            fire_limit: None,
+            line_limit: None,
+        });
+    }
+
+    actions
 }
 
 fn reconcile_alias_actions(
@@ -181,55 +340,6 @@ fn reconcile_alias_actions(
                 name: Arc::new(name.clone()),
                 alias: Box::new(new),
                 fire_limit: None,
-            });
-        }
-    }
-
-    actions
-}
-
-fn reconcile_trigger_actions(
-    previous: &UserAutomations,
-    desired: &UserAutomations,
-) -> Vec<RuntimeAction> {
-    let mut actions = Vec::new();
-
-    for (name, definition) in &previous.triggers {
-        let old = runtime_trigger(definition, previous);
-        let new = desired
-            .triggers
-            .get(name)
-            .map(|definition| runtime_trigger(definition, desired));
-        if old.enabled
-            && new
-                .as_ref()
-                .is_none_or(|definition| !definition.enabled || definition != &old)
-        {
-            actions.push(RuntimeAction::RemoveTrigger(
-                IsolateId::Main,
-                Origin::User,
-                Arc::new(name.clone()),
-            ));
-        }
-    }
-    for (name, definition) in &desired.triggers {
-        let new = runtime_trigger(definition, desired);
-        if !new.enabled {
-            continue;
-        }
-        let unchanged = previous
-            .triggers
-            .get(name)
-            .map(|definition| runtime_trigger(definition, previous))
-            .is_some_and(|old| old == new);
-        if !unchanged {
-            actions.push(RuntimeAction::AddTrigger {
-                isolate: IsolateId::Main,
-                origin: Origin::User,
-                name: Arc::new(name.clone()),
-                trigger: Box::new(new),
-                fire_limit: None,
-                line_limit: None,
             });
         }
     }
@@ -610,6 +720,142 @@ mod tests {
             &actions[0],
             RuntimeAction::AddAlias { name, .. } if name.as_str() == "free"
         ));
+    }
+    fn nested(outer_enabled: bool, inner_enabled: bool) -> TriggerDefinition {
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert(
+            "item".to_string(),
+            TriggerDefinition {
+                patterns: Some(vec!["^ ".to_string()]),
+                enabled: inner_enabled,
+                ..TriggerDefinition::default()
+            },
+        );
+        TriggerDefinition {
+            patterns: Some(vec!["^Items:$".to_string()]),
+            enabled: outer_enabled,
+            inner: Some(inner),
+            ..TriggerDefinition::default()
+        }
+    }
+
+    fn names(actions: &[RuntimeAction]) -> Vec<String> {
+        actions
+            .iter()
+            .map(|action| match action {
+                RuntimeAction::RemoveTrigger(_, _, name) => format!("-{name}"),
+                RuntimeAction::AddTrigger { name, .. } => format!("+{name}"),
+                _ => "?".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inner_triggers_register_after_their_outer_with_outer_set_and_no_folder() {
+        let mut outer = nested(true, true);
+        outer.package = Some("combat".to_string());
+        let desired = UserAutomations {
+            triggers: HashMap::from([("heading".to_string(), outer)]),
+            packages: folder(true),
+            profile_name: "main".to_string(),
+            ..UserAutomations::default()
+        };
+
+        let actions = reconcile_trigger_actions(&UserAutomations::default(), &desired);
+        assert_eq!(names(&actions), ["+heading", "+item"]);
+        let RuntimeAction::AddTrigger { trigger, .. } = &actions[1] else {
+            panic!("inner add");
+        };
+        assert_eq!(trigger.outer.as_deref(), Some("heading"));
+        assert!(trigger.package.is_none());
+        assert!(trigger.inner.is_none());
+        assert!(trigger.enabled);
+    }
+
+    #[test]
+    fn a_disabled_outer_or_folder_registers_nothing_inside_it() {
+        let desired = UserAutomations {
+            triggers: HashMap::from([("heading".to_string(), nested(false, true))]),
+            ..UserAutomations::default()
+        };
+        assert!(reconcile_trigger_actions(&UserAutomations::default(), &desired).is_empty());
+
+        let mut outer = nested(true, true);
+        outer.package = Some("combat".to_string());
+        let desired = UserAutomations {
+            triggers: HashMap::from([("heading".to_string(), outer)]),
+            packages: folder(false),
+            profile_name: "main".to_string(),
+            ..UserAutomations::default()
+        };
+        assert!(reconcile_trigger_actions(&UserAutomations::default(), &desired).is_empty());
+    }
+
+    #[test]
+    fn changing_an_outer_re_registers_its_subtree_innermost_removal_first() {
+        let previous = UserAutomations {
+            triggers: HashMap::from([("heading".to_string(), nested(true, true))]),
+            ..UserAutomations::default()
+        };
+        let mut changed = nested(true, true);
+        changed.patterns = Some(vec!["^Inventory:$".to_string()]);
+        let desired = UserAutomations {
+            triggers: HashMap::from([("heading".to_string(), changed)]),
+            ..UserAutomations::default()
+        };
+
+        let actions = reconcile_trigger_actions(&previous, &desired);
+        assert_eq!(names(&actions), ["-item", "-heading", "+heading", "+item"]);
+    }
+
+    #[test]
+    fn a_reach_change_on_an_inner_trigger_replaces_only_that_trigger() {
+        let previous = UserAutomations {
+            triggers: HashMap::from([("heading".to_string(), nested(true, true))]),
+            ..UserAutomations::default()
+        };
+        let mut changed = nested(true, true);
+        changed
+            .inner
+            .as_mut()
+            .unwrap()
+            .get_mut("item")
+            .unwrap()
+            .reach
+            .once = true;
+        let desired = UserAutomations {
+            triggers: HashMap::from([("heading".to_string(), changed)]),
+            ..UserAutomations::default()
+        };
+
+        assert_eq!(
+            names(&reconcile_trigger_actions(&previous, &desired)),
+            ["-item", "+item"]
+        );
+        assert!(reconcile_trigger_actions(&desired, &desired).is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_name_is_dropped_rather_than_registered_flat() {
+        let mut outer = nested(true, true);
+        outer.inner.as_mut().unwrap().insert(
+            "heading".to_string(),
+            TriggerDefinition {
+                patterns: Some(vec!["dup".to_string()]),
+                ..TriggerDefinition::default()
+            },
+        );
+        let desired = UserAutomations {
+            triggers: HashMap::from([("heading".to_string(), outer)]),
+            ..UserAutomations::default()
+        };
+        assert_eq!(
+            names(&reconcile_trigger_actions(
+                &UserAutomations::default(),
+                &desired
+            )),
+            ["+heading", "+item"]
+        );
     }
 }
 

@@ -208,6 +208,9 @@ pub struct AutomationSummary {
     /// What the automation does, for read-only display. Carried only for the script-created
     /// (`Module`/`Package`) origins that are actually streamed — never the user/disk set.
     pub body: AutomationBody,
+    /// The name of the trigger this one is inside, so the tree can nest it. `None` for a
+    /// top-level automation and for every alias.
+    pub outer: Option<String>,
 }
 
 /// The body of a script-created automation, captured once at creation for the read-only

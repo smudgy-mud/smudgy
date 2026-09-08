@@ -1,13 +1,172 @@
 use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::HashMap, fs, io, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs, io,
+    path::PathBuf,
+};
 
 use super::{ScriptLang, persistence::write_atomic, state_exposure::StateExposure};
 
 // Helper function for serde to default boolean fields to true.
 fn default_true() -> bool {
     true
+}
+
+/// The deepest an inner trigger can sit below a top-level trigger.
+pub const MAX_INNER_DEPTH: usize = 8;
+
+/// How many lines after its outer trigger's line an inner trigger may still match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineReach {
+    /// No lines after the outer trigger's line.
+    #[default]
+    None,
+    /// This many lines after the outer trigger's line.
+    Lines(u32),
+    /// No line limit: the watch ends only by `stopWatching()`, a restart, or a reset.
+    Unlimited,
+}
+
+impl LineReach {
+    /// The count form: `None` reads as `0`, `Unlimited` as `None`.
+    #[must_use]
+    pub fn lines(self) -> Option<u32> {
+        match self {
+            Self::None => Some(0),
+            Self::Lines(count) => Some(count),
+            Self::Unlimited => None,
+        }
+    }
+
+    /// The reach for a count: `0` is `None`.
+    #[must_use]
+    pub fn from_lines(count: u32) -> Self {
+        if count == 0 {
+            Self::None
+        } else {
+            Self::Lines(count)
+        }
+    }
+
+    /// Whether an input `after` lines past the outer trigger's line is within reach.
+    #[must_use]
+    pub fn covers(self, after: u64) -> bool {
+        match self {
+            Self::None => false,
+            Self::Lines(count) => after <= u64::from(count),
+            Self::Unlimited => true,
+        }
+    }
+
+    /// The looser of two reaches.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unlimited, _) | (_, Self::Unlimited) => Self::Unlimited,
+            (Self::None, other) | (other, Self::None) => other,
+            (Self::Lines(a), Self::Lines(b)) => Self::Lines(a.max(b)),
+        }
+    }
+}
+
+impl Serialize for LineReach {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::None => serializer.serialize_u32(0),
+            Self::Lines(count) => serializer.serialize_u32(*count),
+            Self::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LineReach {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Count(u32),
+            Word(String),
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Count(count) => Ok(Self::from_lines(count)),
+            Wire::Word(word) if word == "unlimited" => Ok(Self::Unlimited),
+            Wire::Word(word) => Err(serde::de::Error::custom(format!(
+                "within_lines must be a line count or \"unlimited\", not {word:?}"
+            ))),
+        }
+    }
+}
+
+/// What an inner trigger does when its outer trigger fires again while it is still watching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Overlap {
+    /// Watch again from the new line; the earlier firing is forgotten.
+    #[default]
+    Restart,
+    /// Watch each firing separately.
+    Each,
+}
+
+/// What an inner trigger matches against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InnerInput {
+    /// The line itself.
+    #[default]
+    Line,
+    /// Each matched value of the outer trigger, one at a time, on the outer's own line.
+    OuterValues,
+}
+
+/// How far, and how, an inner trigger watches after its outer trigger fires. Every field is
+/// at its default for a top-level trigger, where the whole struct is inert.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InnerReach {
+    pub within_lines: LineReach,
+    /// Whether the trigger may fire on the outer trigger's own line. Default true.
+    pub same_line: bool,
+    /// Stop watching at the next prompt.
+    pub until_prompt: bool,
+    /// Fire at most once each time the outer trigger fires.
+    pub once: bool,
+    pub overlap: Overlap,
+    pub input: InnerInput,
+}
+
+impl InnerReach {
+    /// The reach of a top-level trigger, and of an inner trigger that watches nothing beyond
+    /// the outer's own line.
+    pub const DEFAULT: Self = Self {
+        within_lines: LineReach::None,
+        same_line: true,
+        until_prompt: false,
+        once: false,
+        overlap: Overlap::Restart,
+        input: InnerInput::Line,
+    };
+
+    /// Whether every field is at its default, so nothing needs saving.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::DEFAULT
+    }
+
+    /// Whether the trigger can match anything at all: no lines after the outer's line with
+    /// that line excluded can never fire.
+    #[must_use]
+    pub fn can_fire(&self) -> bool {
+        self.same_line || self.within_lines != LineReach::None
+    }
+}
+
+impl Default for InnerReach {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// Represents the definition of a single trigger.
@@ -48,6 +207,16 @@ pub struct TriggerDefinition {
     /// in JavaScript). Empty for the common case, which serializes nothing and pays nothing
     /// at fire time. Carried by hand through both serde halves below.
     pub state: Vec<StateExposure>,
+    /// How this trigger watches after its outer trigger fires. Inert (all defaults) for a
+    /// top-level trigger. Saved sparsely: only the non-default fields appear.
+    pub reach: InnerReach,
+    /// The triggers inside this one, by name. Saved nested under this entry so an older
+    /// client, which does not know the key, loads none of them.
+    pub inner: Option<BTreeMap<String, TriggerDefinition>>,
+    /// The name of the trigger this one is inside. Runtime-only: the file expresses it by
+    /// nesting, so it is never read from or written to JSON. The loader sets it while
+    /// flattening the tree into registrations.
+    pub outer: Option<String>,
     // TODO: Add other trigger-specific fields like sound file, highlighting, etc.
 }
 
@@ -66,12 +235,16 @@ impl Default for TriggerDefinition {
             fallthrough: true,
             matchers: None,
             state: Vec::new(),
+            reach: InnerReach::DEFAULT,
+            inner: None,
+            outer: None,
         }
     }
 }
 
 // Custom Serialize implementation
 impl Serialize for TriggerDefinition {
+    #[allow(clippy::too_many_lines)]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -144,6 +317,30 @@ impl Serialize for TriggerDefinition {
         if !self.state.is_empty() {
             map.serialize_entry("state", &self.state)?;
         }
+        if self.reach.within_lines != LineReach::None {
+            map.serialize_entry("within_lines", &self.reach.within_lines)?;
+        }
+        if !self.reach.same_line {
+            map.serialize_entry("same_line", &false)?;
+        }
+        if self.reach.until_prompt {
+            map.serialize_entry("until_prompt", &true)?;
+        }
+        if self.reach.once {
+            map.serialize_entry("once", &true)?;
+        }
+        if self.reach.overlap != Overlap::Restart {
+            map.serialize_entry("overlap", &self.reach.overlap)?;
+        }
+        if self.reach.input != InnerInput::Line {
+            map.serialize_entry("input", &self.reach.input)?;
+        }
+        match &self.inner {
+            Some(inner) if !inner.is_empty() => {
+                map.serialize_entry("inner", inner)?;
+            }
+            _ => {}
+        }
 
         map.end()
     }
@@ -155,6 +352,8 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
     where
         D: Deserializer<'de>,
     {
+        // The saved flags are independent switches, not an encodable state machine.
+        #[allow(clippy::struct_excessive_bools)]
         #[derive(Deserialize)]
         struct TriggerHelper {
             #[serde(default)]
@@ -187,6 +386,20 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
             matchers: Option<Vec<crate::models::matchers::TriggerMatcherSource>>,
             #[serde(default)]
             state: Vec<StateExposure>,
+            #[serde(default)]
+            within_lines: LineReach,
+            #[serde(default = "default_true")]
+            same_line: bool,
+            #[serde(default)]
+            until_prompt: bool,
+            #[serde(default)]
+            once: bool,
+            #[serde(default)]
+            overlap: Overlap,
+            #[serde(default)]
+            input: InnerInput,
+            #[serde(default)]
+            inner: Option<BTreeMap<String, TriggerDefinition>>,
         }
 
         let helper = TriggerHelper::deserialize(deserializer)?;
@@ -256,6 +469,17 @@ impl<'de> Deserialize<'de> for TriggerDefinition {
             // An empty list carries no authoring intent; normalize to absent.
             matchers: helper.matchers.filter(|matchers| !matchers.is_empty()),
             state: helper.state,
+            reach: InnerReach {
+                within_lines: helper.within_lines,
+                same_line: helper.same_line,
+                until_prompt: helper.until_prompt,
+                once: helper.once,
+                overlap: helper.overlap,
+                input: helper.input,
+            },
+            // An empty map carries nothing; normalize to absent.
+            inner: helper.inner.filter(|inner| !inner.is_empty()),
+            outer: None,
         })
     }
 }
@@ -668,5 +892,115 @@ mod tests {
         assert_eq!(original, deserialized);
         assert!(json.contains("\"priority\":42"));
         assert!(json.contains("\"fallthrough\":false"));
+    }
+
+    #[test]
+    fn inner_triggers_nest_under_their_outer_and_stay_sparse() {
+        let mut inner = BTreeMap::new();
+        inner.insert(
+            "item line".to_string(),
+            TriggerDefinition {
+                patterns: Some(vec!["^ (?<item>.+)$".to_string()]),
+                script: Some("note".to_string()),
+                reach: InnerReach {
+                    within_lines: LineReach::Lines(40),
+                    until_prompt: true,
+                    ..InnerReach::DEFAULT
+                },
+                ..Default::default()
+            },
+        );
+        inner.insert(
+            "forever".to_string(),
+            TriggerDefinition {
+                patterns: Some(vec!["^x$".to_string()]),
+                reach: InnerReach {
+                    within_lines: LineReach::Unlimited,
+                    same_line: false,
+                    once: true,
+                    overlap: Overlap::Each,
+                    input: InnerInput::OuterValues,
+                    ..InnerReach::DEFAULT
+                },
+                ..Default::default()
+            },
+        );
+        let outer = TriggerDefinition {
+            patterns: Some(vec!["^You are carrying:$".to_string()]),
+            package: Some("inventory".to_string()),
+            inner: Some(inner),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string_pretty(&outer).unwrap();
+        assert!(json.contains("\"inner\": {"));
+        assert!(json.contains("\"within_lines\": 40"));
+        assert!(json.contains("\"until_prompt\": true"));
+        assert!(json.contains("\"within_lines\": \"unlimited\""));
+        assert!(json.contains("\"same_line\": false"));
+        assert!(json.contains("\"once\": true"));
+        assert!(json.contains("\"overlap\": \"each\""));
+        assert!(json.contains("\"input\": \"outerValues\""));
+        // The outer itself is at every default: nothing about reach appears at its level.
+        let top_level_lines: Vec<&str> = json
+            .lines()
+            .take_while(|l| !l.contains("\"inner\""))
+            .collect();
+        assert!(top_level_lines.iter().all(|l| !l.contains("within_lines")));
+        assert!(
+            !json.contains("\"outer\""),
+            "placement is expressed by nesting, never stored"
+        );
+
+        let back: TriggerDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, outer);
+        assert_eq!(back.inner.as_ref().unwrap().len(), 2);
+        assert!(back.outer.is_none());
+    }
+
+    #[test]
+    fn a_file_without_inner_triggers_loads_flat_and_an_empty_inner_map_is_absent() {
+        let flat: TriggerDefinition = serde_json::from_str(r#"{"pattern": "x"}"#).unwrap();
+        assert!(flat.inner.is_none());
+        assert!(flat.reach.is_default());
+        let emptied: TriggerDefinition =
+            serde_json::from_str(r#"{"pattern": "x", "inner": {}}"#).unwrap();
+        assert!(emptied.inner.is_none());
+        let bad = serde_json::from_str::<TriggerDefinition>(
+            r#"{"pattern": "x", "within_lines": "lots"}"#,
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn reach_helpers() {
+        assert_eq!(LineReach::from_lines(0), LineReach::None);
+        assert!(LineReach::Lines(3).covers(3));
+        assert!(!LineReach::Lines(3).covers(4));
+        assert!(!LineReach::None.covers(1));
+        assert!(LineReach::Unlimited.covers(u64::MAX));
+        assert_eq!(
+            LineReach::Lines(2).max(LineReach::Lines(5)),
+            LineReach::Lines(5)
+        );
+        assert_eq!(
+            LineReach::Lines(2).max(LineReach::Unlimited),
+            LineReach::Unlimited
+        );
+        assert!(
+            !InnerReach {
+                same_line: false,
+                ..InnerReach::DEFAULT
+            }
+            .can_fire()
+        );
+        assert!(
+            InnerReach {
+                same_line: false,
+                within_lines: LineReach::Lines(1),
+                ..InnerReach::DEFAULT
+            }
+            .can_fire()
+        );
     }
 }

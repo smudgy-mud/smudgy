@@ -125,6 +125,8 @@ fn push_one_trigger(
         fire_limit: None,
         line_limit: None,
         source: None,
+        outer: None,
+        reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
     })
     .expect("push_trigger");
 }

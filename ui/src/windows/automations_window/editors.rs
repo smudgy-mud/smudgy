@@ -1190,6 +1190,9 @@ impl AutomationsWindow {
                         fallthrough: *fallthrough,
                         matchers: None,
                         state: exposures.clone(),
+                        reach: triggers::InnerReach::DEFAULT,
+                        inner: None,
+                        outer: None,
                     };
                     if let Err((i, message)) = rows_into_trigger(rows, &mut t) {
                         let message = crate::i18n::t!(

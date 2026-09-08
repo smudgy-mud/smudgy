@@ -107,6 +107,8 @@ fn push(manager: &mut Manager, name: &str, patterns: Vec<String>, color: Option<
             fire_limit: None,
             line_limit: None,
             source: None,
+            outer: None,
+            reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
         })
         .expect("register trigger");
 }

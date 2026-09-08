@@ -1,10 +1,10 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -17,10 +17,11 @@ use crate::models::matchers::{
     MatcherTextAttribute, TriggerMatcherSource,
 };
 use crate::models::state_exposure::{dotted_tail_len, identifier_len};
+use crate::models::triggers::{InnerInput, InnerReach, LineReach, MAX_INNER_DEPTH, Overlap};
 
 use super::{
     ActionQueue, ScriptAction,
-    captures::{CapturePattern, CapturePayload, CaptureView},
+    captures::{CapturePattern, CapturePayload, CaptureView, OuterCaptures},
     matcher::{PatternMatch, PatternSet},
     origin::{
         AutomationBody, AutomationDelta, AutomationKind, AutomationSummary, IsolateId, Origin,
@@ -39,6 +40,211 @@ pub struct AutomationEntry {
     pub pattern: String,
     pub priority: i32,
     pub fallthrough: bool,
+    /// The name of the trigger this one is inside, if any.
+    pub outer: Option<String>,
+    /// The names of the triggers inside this one, in registration order.
+    pub inner: Vec<String>,
+    /// The input number of the last fire, or `-1`. Shared with the registered trigger, so a
+    /// fire writes it once without a registry lookup.
+    pub last_fired: Arc<AtomicI64>,
+    /// A runtime condition worth showing beside the trigger, such as dropped firings.
+    pub warning: Option<Arc<str>>,
+}
+
+/// The number of the input being matched, shared with the script ops as `line.sequence`.
+/// Complete lines count up from one; a prompt fragment reports the number its completed line
+/// will get.
+pub type SharedInputSequence = Rc<Cell<u64>>;
+
+/// The per-firing flags the ambient `skipInner()` and `stopWatching()` verbs set from a body.
+/// Every action queued under one firing shares them, so the dispatcher can skip the inner
+/// actions of a skipped firing, and the [`Manager`] drops a stopped or skipped firing at the
+/// next input.
+#[derive(Debug, Default)]
+pub struct FiringFlags {
+    /// The outer's body called `skipInner()`: this firing opens nothing.
+    pub skipped: AtomicBool,
+    /// An inner body called `stopWatching()`: this firing ends after the current input.
+    pub stopped: AtomicBool,
+}
+
+/// The firing and capture context one queued automation runs under.
+#[derive(Clone, Debug, Default)]
+pub struct FiringContext {
+    /// The firing this automation runs under, when it is an inner trigger.
+    pub under: Option<Arc<FiringFlags>>,
+    /// The firing this automation opened, when it has inner triggers.
+    pub opened: Option<Arc<FiringFlags>>,
+    /// The matched values of the triggers this one is inside, for `outer`.
+    pub outer: Option<Arc<OuterCaptures>>,
+}
+
+/// One firing of an outer trigger: the input it fired on, its captures for the `outer`
+/// argument, and what the inner triggers have done with it so far.
+#[derive(Debug)]
+struct Firing {
+    sequence: u64,
+    captures: Arc<OuterCaptures>,
+    flags: Arc<FiringFlags>,
+    /// A prompt fragment arrived after the firing opened.
+    prompt_seen: bool,
+    /// The inner triggers that already fired once for this firing (`once`). Identities are
+    /// stable across index shifts, unlike positions.
+    fired_once: Vec<Arc<AutomationIdentity>>,
+}
+
+/// The most firings one outer keeps alive. Past this the oldest is dropped.
+const MAX_LIVE_FIRINGS: usize = 128;
+
+/// One matching tier: a [`PatternSet`] plus the maps from its pattern positions back to the
+/// trigger and pattern indices they came from.
+#[derive(Debug)]
+struct Tier {
+    set: PatternSet,
+    /// Pattern position in `set` → index into the trigger `Vec`.
+    triggers: Vec<usize>,
+    /// Pattern position in `set` → index into that trigger's pattern list.
+    patterns: Vec<usize>,
+}
+
+impl Tier {
+    fn empty() -> Self {
+        Self {
+            set: PatternSet::empty(),
+            triggers: Vec::new(),
+            patterns: Vec::new(),
+        }
+    }
+
+    /// Build one tier over `order` (already in dispatch order): the raw or the displayed
+    /// patterns, of every trigger or only the prompt-eligible ones.
+    fn build(items: &[Trigger], order: &[usize], raw: bool, prompt_only: bool) -> Self {
+        let selected = order
+            .iter()
+            .copied()
+            .filter(|&i| !prompt_only || items[i].fire_on_prompts());
+        let sources = |i: usize| -> &[CapturePattern] {
+            if raw {
+                &items[i].raw_patterns
+            } else {
+                &items[i].patterns
+            }
+        };
+        let set = PatternSet::build(
+            selected
+                .clone()
+                .flat_map(|i| sources(i).iter().map(|pattern| pattern.as_str())),
+        )
+        .expect("registered patterns compiled once already");
+        let mut triggers = Vec::new();
+        let mut patterns = Vec::new();
+        for i in selected {
+            for (pattern_idx, _) in sources(i).iter().enumerate() {
+                triggers.push(i);
+                patterns.push(pattern_idx);
+            }
+        }
+        Self {
+            set,
+            triggers,
+            patterns,
+        }
+    }
+}
+
+/// The four tiers one input can be matched against: displayed text and raw bytes, each for
+/// every trigger and for the prompt-eligible subset.
+#[derive(Debug)]
+struct TierSets {
+    text: Tier,
+    raw: Tier,
+    prompt_text: Tier,
+    prompt_raw: Tier,
+}
+
+impl TierSets {
+    fn empty() -> Self {
+        Self {
+            text: Tier::empty(),
+            raw: Tier::empty(),
+            prompt_text: Tier::empty(),
+            prompt_raw: Tier::empty(),
+        }
+    }
+
+    fn build(items: &[Trigger], order: &[usize]) -> Self {
+        Self {
+            text: Tier::build(items, order, false, false),
+            raw: Tier::build(items, order, true, false),
+            prompt_text: Tier::build(items, order, false, true),
+            prompt_raw: Tier::build(items, order, true, true),
+        }
+    }
+
+    fn tier(&self, raw: bool, partial: bool) -> &Tier {
+        match (raw, partial) {
+            (false, false) => &self.text,
+            (true, false) => &self.raw,
+            (false, true) => &self.prompt_text,
+            (true, true) => &self.prompt_raw,
+        }
+    }
+}
+
+/// What a trigger keeps for the triggers inside it: their indices, the tiers that match
+/// them, and the live firings they watch from. Created when the first inner trigger
+/// registers; a trigger with nothing inside carries `None` and pays one check per hit.
+#[derive(Debug)]
+struct InnerNode {
+    /// Indices into the trigger `Vec`, in registration order. Recomputed by the global
+    /// rebuild after any removal (which shifts indices); appended to on registration.
+    indices: Vec<usize>,
+    /// The tiers over `indices`, rebuilt lazily on the next input that reaches this node.
+    sets: RefCell<TierSets>,
+    dirty: Cell<bool>,
+    firings: RefCell<VecDeque<Firing>>,
+    /// The loosest reach among the inner triggers: a firing older than this is dead.
+    max_reach: Cell<LineReach>,
+    /// Whether any inner trigger watches each firing separately. Otherwise only the newest
+    /// firing can matter and older ones are dropped as soon as a newer one opens.
+    any_each: Cell<bool>,
+    /// The overflow warning was already echoed for this trigger.
+    overflow_reported: Cell<bool>,
+}
+
+impl InnerNode {
+    fn new() -> Self {
+        Self {
+            indices: Vec::new(),
+            sets: RefCell::new(TierSets::empty()),
+            dirty: Cell::new(true),
+            firings: RefCell::new(VecDeque::new()),
+            max_reach: Cell::new(LineReach::None),
+            any_each: Cell::new(false),
+            overflow_reported: Cell::new(false),
+        }
+    }
+
+    /// Recompute the per-node summaries from the inner triggers themselves.
+    fn refresh_reach(&self, items: &[Trigger]) {
+        let mut max_reach = LineReach::None;
+        let mut any_each = false;
+        for &i in &self.indices {
+            let reach = &items[i].reach;
+            max_reach = max_reach.max(reach.within_lines);
+            any_each |= reach.overlap == Overlap::Each;
+        }
+        self.max_reach.set(max_reach);
+        self.any_each.set(any_each);
+    }
+}
+
+/// Scratch for one inner evaluation: pooled per nesting level so a live outer costs no
+/// allocation per line.
+#[derive(Debug, Default)]
+struct InnerScratch {
+    matches: Vec<PatternMatch>,
+    fired: Vec<usize>,
 }
 
 /// `name -> entry` within one `(IsolateId, Origin)` namespace.
@@ -218,21 +424,20 @@ pub struct Manager {
     spawned_actions: ActionQueue,
     triggers: Vec<Trigger>,
     aliases: Vec<Trigger>,
-    trigger_regex_set_map: Vec<usize>, // Maps index in PatternSet to index in triggers
-    trigger_regex_patterns_map: Vec<usize>,
-    trigger_regex_set: PatternSet,
-    raw_trigger_regex_set_map: Vec<usize>,
-    raw_trigger_regex_patterns_map: Vec<usize>,
-    raw_trigger_regex_set: PatternSet,
-    prompt_trigger_regex_set_map: Vec<usize>,
-    prompt_trigger_regex_patterns_map: Vec<usize>,
-    prompt_trigger_regex_set: PatternSet,
-    prompt_raw_trigger_regex_set_map: Vec<usize>,
-    prompt_raw_trigger_regex_patterns_map: Vec<usize>,
-    prompt_raw_trigger_regex_set: PatternSet,
-    alias_regex_set_map: Vec<usize>,
-    alias_regex_patterns_map: Vec<usize>,
-    alias_regex_set: PatternSet,
+    /// The tiers over every top-level trigger. Inner triggers are matched only through
+    /// their outer's [`InnerNode`], never here.
+    global: TierSets,
+    /// The number of the input being matched, see [`SharedInputSequence`].
+    input_sequence: SharedInputSequence,
+    /// Complete lines matched so far; the next complete line gets this plus one.
+    complete_lines: u64,
+    /// Indices of the outer triggers with at least one live firing. Empty for a flat profile,
+    /// which is the check the per-line path makes before doing any inner work.
+    live_outers: RefCell<Vec<usize>>,
+    /// Pooled scratch for inner evaluation, one entry per nesting level in use.
+    inner_scratch: RefCell<Vec<InnerScratch>>,
+    /// The tier over every alias, matched on outgoing input.
+    alias_tier: Tier,
     // Keyed by `(IsolateId, Origin)`: the isolate dimension (see `PACKAGE-ISOLATES.md`) lets
     // the *same* `(origin, name)` automation coexist across isolates — e.g. a package loaded
     // both in `Main` and in its own sandbox registers two namespaces instead of clobbering
@@ -361,9 +566,11 @@ pub struct MatchCapture {
 /// numbers and booleans in JSON spelling, objects and arrays as compact JSON. Without `state`
 /// the pass is the capture grammar above and nothing else.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn expand_template_view(
     template: &str,
     captures: CaptureView<'_>,
+    outer: Option<&OuterCaptures>,
     state: Option<&ExposedState>,
 ) -> String {
     let lookup_index = |idx: usize| -> &str { captures.get(idx).map_or("", |c| c.value) };
@@ -372,6 +579,20 @@ pub(crate) fn expand_template_view(
             .iter()
             .find(|c| c.name == Some(name))
             .map_or("", |c| c.value)
+    };
+    // `$outer.name` / `$outer.1`: the matched values of the triggers this one is inside.
+    // Only an inner trigger's body resolves them; elsewhere `$outer` is a capture reference.
+    let lookup_outer = |reference: &str| -> Option<&str> {
+        let outer = outer?;
+        let tail = reference.strip_prefix("outer.")?;
+        Some(if tail.chars().all(|c| c.is_ascii_digit()) {
+            tail.parse::<usize>()
+                .ok()
+                .and_then(|idx| outer.own.view().get(idx))
+                .map_or("", |c| c.value)
+        } else {
+            outer.named(tail).unwrap_or("")
+        })
     };
     // Whether a group named `name` exists at all (it may not have participated): the
     // capture-wins rule for a bare reference that is both a group and an exposed name.
@@ -403,6 +624,8 @@ pub(crate) fn expand_template_view(
                         if let Ok(idx) = inner.parse::<usize>() {
                             out.push_str(lookup_index(idx));
                         }
+                    } else if let Some(value) = lookup_outer(inner) {
+                        out.push_str(value);
                     } else if let Some(state) = state {
                         // A braced reference whose leading identifier is an exposed name is
                         // a state reference (a bare group name that is also exposed means the
@@ -440,7 +663,20 @@ pub(crate) fn expand_template_view(
                     end += 1;
                 }
                 let name = &template[start..end];
-                if let Some(exposed) = state.and_then(|state| state.name(name)) {
+                if outer.is_some() && name == "outer" && template[end..].starts_with('.') {
+                    // `$outer.` followed by a group name or number.
+                    let tail_start = end + 1;
+                    let mut tail_end = tail_start;
+                    while tail_end < bytes.len()
+                        && (bytes[tail_end] == b'_' || bytes[tail_end].is_ascii_alphanumeric())
+                    {
+                        tail_end += 1;
+                    }
+                    if let Some(value) = lookup_outer(&template[start..tail_end]) {
+                        out.push_str(value);
+                    }
+                    i = tail_end;
+                } else if let Some(exposed) = state.and_then(|state| state.name(name)) {
                     // An exposed name: the dotted tail, if any, is part of the reference.
                     // Without one, a same-named capture group wins.
                     let tail = &template[end..end + dotted_tail_len(&template[end..])];
@@ -467,7 +703,7 @@ pub(crate) fn expand_template_view(
 
 #[cfg(test)]
 fn expand_template(template: &str, captures: &[MatchCapture]) -> String {
-    expand_template_view(template, CaptureView::Owned(captures), None)
+    expand_template_view(template, CaptureView::Owned(captures), None, None)
 }
 
 #[cfg(test)]
@@ -476,7 +712,7 @@ fn expand_template_with(
     captures: &[MatchCapture],
     state: Option<&ExposedState>,
 ) -> String {
-    expand_template_view(template, CaptureView::Owned(captures), state)
+    expand_template_view(template, CaptureView::Owned(captures), None, state)
 }
 
 /// Splits an outgoing chunk into commands: always on '\n', additionally on
@@ -770,12 +1006,16 @@ fn style_matches(style: Style, matcher: CompiledColorMatch, bold_is_bright: bool
 /// single monotonic span cursor keeps the search at O(matches + spans). An
 /// empty regex defines a color-only matcher. It scans spans directly and
 /// avoids a regex match at each character boundary.
+/// `base` is the subject's byte offset within `line`: zero for the line itself, the value's
+/// start when the subject is one of an outer trigger's matched values. The returned start is
+/// relative to the subject.
 fn color_matched_start(
     regex: &Regex,
     subject: &str,
     line: &StyledLine,
     matcher: CompiledColorMatch,
     bold_is_bright: bool,
+    base: usize,
 ) -> Option<usize> {
     // An empty regex requires no text search. Scan the spans directly in
     // O(spans). This avoids a regex match at each character boundary.
@@ -790,6 +1030,7 @@ fn color_matched_start(
                 .filter(|span| style_matches(span.style, matcher, bold_is_bright))
                 .map(|_| 0);
         }
+        let end = base + subject.len();
         return line
             .spans
             .iter()
@@ -798,9 +1039,12 @@ fn color_matched_start(
             // preserves cursor history but contains no text. Ignore it so a
             // color-only matcher checks only styles that apply to text.
             .find(|span| {
-                span.begin_pos < span.end_pos && style_matches(span.style, matcher, bold_is_bright)
+                span.begin_pos < span.end_pos
+                    && span.end_pos > base
+                    && span.begin_pos < end
+                    && style_matches(span.style, matcher, bold_is_bright)
             })
-            .map(|span| span.begin_pos.min(subject.len()));
+            .map(|span| span.begin_pos.max(base).min(end) - base);
     }
 
     let mut span_index = 0;
@@ -808,15 +1052,16 @@ fn color_matched_start(
     let mut cached_style_matches = false;
     regex.find_iter(subject).find_map(|matched| {
         let start = matched.start();
+        let at = start + base;
         while line
             .spans
             .get(span_index)
-            .is_some_and(|span| span.end_pos <= start)
+            .is_some_and(|span| span.end_pos <= at)
         {
             span_index += 1;
         }
         let span = line.spans.get(span_index)?;
-        if span.begin_pos > start || start >= span.end_pos {
+        if span.begin_pos > at || at >= span.end_pos {
             return None;
         }
         if cached_span_index != span_index {
@@ -942,6 +1187,17 @@ impl PreparedScriptTriggerPatterns {
     }
 }
 
+/// The firing role the matcher works out for one accepted hit, threaded into
+/// [`Trigger::run`] so the queued action carries it.
+struct RunContext<'a> {
+    firing: FiringContext,
+    /// The byte offset of the haystack within the styled line, non-zero when the haystack is
+    /// one of the outer's matched values.
+    base: usize,
+    /// The styled line the captures range into; `None` for the alias path.
+    styled_line: Option<&'a Arc<StyledLine>>,
+}
+
 pub struct PushTriggerParams<'a> {
     pub isolate: IsolateId,
     pub origin: Origin,
@@ -964,40 +1220,47 @@ pub struct PushTriggerParams<'a> {
     /// function's `toString()`. `None` for plaintext (the command is recoverable from
     /// `action`) or when no source was supplied.
     pub source: Option<Arc<str>>,
+    /// The name of the trigger this one is inside, in the same `(isolate, origin)`.
+    pub outer: Option<Arc<String>>,
+    /// How this trigger watches after its outer fires. Inert for a top-level trigger.
+    pub reach: InnerReach,
 }
 
 impl Manager {
+    /// A manager with its own input counter; the runtime shares one through
+    /// [`Self::with_input_sequence`].
+    #[cfg_attr(not(any(test, feature = "bench-api")), allow(dead_code))]
     pub(crate) fn new(
         spawned_actions: ActionQueue,
         command_separator: Arc<String>,
         automation_registry: SharedAutomationRegistry,
     ) -> Self {
+        Self::with_input_sequence(
+            spawned_actions,
+            command_separator,
+            automation_registry,
+            Rc::new(Cell::new(0)),
+        )
+    }
+
+    /// [`Self::new`] sharing the input counter the script ops read as `line.sequence`.
+    pub(crate) fn with_input_sequence(
+        spawned_actions: ActionQueue,
+        command_separator: Arc<String>,
+        automation_registry: SharedAutomationRegistry,
+        input_sequence: SharedInputSequence,
+    ) -> Self {
         let triggers = Vec::new();
         let aliases = Vec::new();
         let trigger_indices = HashMap::new();
         let alias_indices = HashMap::new();
-        let trigger_regex_set = PatternSet::empty();
-        let raw_trigger_regex_set = PatternSet::empty();
-        let prompt_trigger_regex_set = PatternSet::empty();
-        let prompt_raw_trigger_regex_set = PatternSet::empty();
-        let alias_regex_set = PatternSet::empty();
-
         Self {
-            alias_regex_set,
-            trigger_regex_set,
-            raw_trigger_regex_set,
-            prompt_trigger_regex_set,
-            prompt_raw_trigger_regex_set,
-            alias_regex_set_map: Vec::new(),
-            trigger_regex_set_map: Vec::new(),
-            raw_trigger_regex_set_map: Vec::new(),
-            prompt_trigger_regex_set_map: Vec::new(),
-            prompt_raw_trigger_regex_set_map: Vec::new(),
-            alias_regex_patterns_map: Vec::new(),
-            trigger_regex_patterns_map: Vec::new(),
-            raw_trigger_regex_patterns_map: Vec::new(),
-            prompt_trigger_regex_patterns_map: Vec::new(),
-            prompt_raw_trigger_regex_patterns_map: Vec::new(),
+            alias_tier: Tier::empty(),
+            global: TierSets::empty(),
+            input_sequence,
+            complete_lines: 0,
+            live_outers: RefCell::new(Vec::new()),
+            inner_scratch: RefCell::new(Vec::new()),
             aliases,
             triggers,
             alias_indices,
@@ -1066,6 +1329,24 @@ impl Manager {
     #[must_use]
     pub fn raw_wanted_flag(&self) -> Arc<AtomicBool> {
         self.raw_wanted.clone()
+    }
+
+    /// The number of the input being matched, see [`SharedInputSequence`].
+    #[cfg_attr(not(any(test, feature = "bench-api")), allow(dead_code))]
+    #[must_use]
+    pub fn input_sequence(&self) -> u64 {
+        self.input_sequence.get()
+    }
+
+    /// Forget every live firing: the input stream restarted (disconnect), so nothing an
+    /// outer opened earlier can still be watched.
+    pub fn reset_watching(&mut self) {
+        for &index in self.live_outers.borrow().iter() {
+            if let Some(node) = self.triggers.get(index).and_then(|t| t.inner.as_deref()) {
+                node.firings.borrow_mut().clear();
+            }
+        }
+        self.live_outers.borrow_mut().clear();
     }
 
     /// Continue writing to a predecessor manager's flag cell instead of this
@@ -1139,6 +1420,7 @@ impl Manager {
             enabled: item.enabled,
             pattern: Self::pattern_display(item),
             body: Self::body_display(item),
+            outer: item.outer.as_deref().cloned(),
         }
     }
 
@@ -1194,11 +1476,21 @@ impl Manager {
     /// Mirror one automation into the shared introspection registry. `kind` selects the
     /// alias/trigger map; the entry is keyed by `(isolate, origin)` then name.
     fn registry_upsert(&self, kind: AutomationKind, item: &Trigger) {
+        let inner = item.inner.as_deref().map_or_else(Vec::new, |node| {
+            node.indices
+                .iter()
+                .filter_map(|&i| self.triggers.get(i).map(|t| t.name.clone()))
+                .collect()
+        });
         let entry = AutomationEntry {
             enabled: item.enabled,
             pattern: Self::pattern_of(item),
             priority: item.priority,
             fallthrough: item.fallthrough,
+            outer: item.outer.as_deref().cloned(),
+            inner,
+            last_fired: item.last_fired.clone(),
+            warning: item.warning.borrow().clone(),
         };
         let key = (item.isolate.clone(), item.origin.clone());
         let mut registry = self.automation_registry.borrow_mut();
@@ -1317,18 +1609,43 @@ impl Manager {
             "Adding or updating trigger: {:?}, {:?}",
             trigger.name, trigger.patterns
         );
-        self.assign_identity(&mut trigger);
-        self.registry_upsert(AutomationKind::Trigger, &trigger);
-        let delta = (self.is_watched() && trigger.origin != Origin::User)
-            .then(|| AutomationDelta::Upserted(Self::summary(AutomationKind::Trigger, &trigger)));
         let key = (trigger.isolate.clone(), trigger.origin.clone());
-        if let Some(index) = self
+        let existing = self
             .trigger_indices
             .get(&key)
             .and_then(|by_name| by_name.get(&trigger.name))
-            .copied()
-        {
+            .copied();
+        // An inner trigger needs its outer registered first, in the same namespace, within
+        // the depth limit, and with compatible patterns. A failed check drops the trigger and
+        // says why, instead of registering it as a top-level trigger that would fire
+        // unconditionally.
+        let outer_index = match self.resolve_outer(&trigger, existing) {
+            Ok(outer) => outer,
+            Err(reason) => {
+                self.echo(format!(
+                    "Trigger \"{}\" was not created: {reason}",
+                    trigger.name
+                ));
+                return;
+            }
+        };
+        self.assign_identity(&mut trigger);
+        // A replaced outer keeps the triggers inside it; its node moves to the new definition.
+        if let Some(index) = existing {
+            let old = &mut self.triggers[index];
+            if let Some(node) = old.inner.take() {
+                node.firings.borrow_mut().clear();
+                trigger.inner = Some(node);
+            }
+        }
+        let delta = (self.is_watched() && trigger.origin != Origin::User)
+            .then(|| AutomationDelta::Upserted(Self::summary(AutomationKind::Trigger, &trigger)));
+        let index = if let Some(index) = existing {
             *self.triggers.get_mut(index).unwrap() = trigger;
+            // A replacement can move between outers; the global rebuild recomputes every
+            // node's index list from the `outer` names.
+            self.trigger_regex_set_dirty = true;
+            index
         } else {
             let index = self.triggers.len();
             self.trigger_indices
@@ -1336,14 +1653,112 @@ impl Manager {
                 .or_default()
                 .insert(trigger.name.clone(), index);
             self.triggers.push(trigger);
+            match outer_index {
+                Some(outer) => {
+                    // Registration appends, so the outer's index list stays valid and only
+                    // its own tiers need rebuilding; the global tiers are untouched.
+                    let items = &mut self.triggers;
+                    let node = items[outer]
+                        .inner
+                        .get_or_insert_with(|| Box::new(InnerNode::new()));
+                    node.indices.push(index);
+                    node.dirty.set(true);
+                    let node = &items[outer].inner.as_deref().unwrap();
+                    node.refresh_reach(items);
+                }
+                None => self.trigger_regex_set_dirty = true,
+            }
+            index
+        };
+        self.registry_upsert(AutomationKind::Trigger, &self.triggers[index]);
+        if let Some(outer) = outer_index {
+            self.registry_upsert(AutomationKind::Trigger, &self.triggers[outer]);
         }
         self.registry_generation = next_registry_generation();
-
-        self.trigger_regex_set_dirty = true;
         self.refresh_raw_wanted();
         if let Some(delta) = delta {
             self.automation_deltas.push(delta);
         }
+    }
+
+    /// Queue an echo line for the session; the way registration reports a dropped trigger.
+    fn echo(&self, text: String) {
+        self.spawned_actions
+            .borrow_mut()
+            .push_back(RuntimeAction::Echo(Arc::new(text)));
+    }
+
+    /// Check an inner trigger's placement and return its outer's index, or the reason it
+    /// cannot be registered. A top-level trigger resolves to `None`.
+    fn resolve_outer(
+        &self,
+        trigger: &Trigger,
+        existing: Option<usize>,
+    ) -> Result<Option<usize>, String> {
+        let Some(outer_name) = trigger.outer.as_deref() else {
+            return Ok(None);
+        };
+        if !trigger.reach.can_fire() {
+            return Err(
+                "it can never fire: allow the same line as its outer trigger, or give it a range"
+                    .to_string(),
+            );
+        }
+        if trigger.reach.input == InnerInput::OuterValues && !trigger.raw_patterns.is_empty() {
+            return Err(
+                "a raw pattern cannot match one of the outer trigger's matched values".to_string(),
+            );
+        }
+        let key = (trigger.isolate.clone(), trigger.origin.clone());
+        let Some(outer) = self
+            .trigger_indices
+            .get(&key)
+            .and_then(|by_name| by_name.get(outer_name))
+            .copied()
+        else {
+            return Err(format!(
+                "the trigger it is inside, \"{outer_name}\", does not exist"
+            ));
+        };
+        if Some(outer) == existing {
+            return Err("a trigger cannot be inside itself".to_string());
+        }
+        // Walk outward: depth, cycles through a replaced definition, and capture names.
+        let mut depth = 1;
+        let mut names: Vec<&str> = trigger.capture_names().collect();
+        if names.contains(&"outer") {
+            return Err("\"outer\" is reserved as a capture name".to_string());
+        }
+        let mut at = outer;
+        loop {
+            if Some(at) == existing {
+                return Err("a trigger cannot be inside one of the triggers inside it".to_string());
+            }
+            let ancestor = &self.triggers[at];
+            for name in ancestor.capture_names() {
+                if names.contains(&name) {
+                    return Err(format!(
+                        "{name} is already captured by \"{}\"",
+                        ancestor.name
+                    ));
+                }
+                names.push(name);
+            }
+            let Some(next) = ancestor.outer.as_deref() else {
+                break;
+            };
+            depth += 1;
+            if depth > MAX_INNER_DEPTH {
+                return Err(format!("triggers can be nested {MAX_INNER_DEPTH} deep"));
+            }
+            at = self
+                .trigger_indices
+                .get(&key)
+                .and_then(|by_name| by_name.get(next))
+                .copied()
+                .ok_or_else(|| format!("the trigger it is inside, \"{next}\", does not exist"))?;
+        }
+        Ok(Some(outer))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1413,7 +1828,8 @@ impl Manager {
                 params.line_limit,
             )?
             .with_source(params.source)
-            .with_exposure(exposure),
+            .with_exposure(exposure)
+            .with_placement(params.outer, params.reach),
         );
         Ok(())
     }
@@ -1435,6 +1851,8 @@ impl Manager {
         fire_limit: Option<u32>,
         line_limit: Option<u32>,
         source: Option<Arc<str>>,
+        outer: Option<Arc<String>>,
+        reach: InnerReach,
     ) {
         self.add_or_update_trigger(
             Trigger::from_prepared(
@@ -1450,7 +1868,8 @@ impl Manager {
                 fire_limit,
                 line_limit,
             )
-            .with_source(source),
+            .with_source(source)
+            .with_placement(outer, reach),
         );
     }
 
@@ -1581,6 +2000,10 @@ impl Manager {
                 trigger.patterns
             );
             trigger.enabled = enabled;
+            // A disabled outer stops holding lines open; re-enabling opens nothing.
+            if !enabled && let Some(node) = trigger.inner.as_deref() {
+                node.firings.borrow_mut().clear();
+            }
             changed = true;
         }
         if changed {
@@ -1628,6 +2051,31 @@ impl Manager {
     /// [`remove_alias`](Self::remove_alias). Marks every trigger `PatternSet` dirty so the slot
     /// is freed across the normal/raw/prompt tiers.
     pub fn remove_trigger(&mut self, isolate: &IsolateId, origin: &Origin, name: &str) {
+        let key = (isolate.clone(), origin.clone());
+        let Some(index) = self
+            .trigger_indices
+            .get(&key)
+            .and_then(|by_name| by_name.get(name))
+            .copied()
+        else {
+            return;
+        };
+        let outer_name = self.triggers[index].outer.clone();
+        // Everything inside goes with it, innermost first. Their removal shifts the `Vec`,
+        // so `index` is not used past this point.
+        let inner: Vec<String> = self.triggers[index]
+            .inner
+            .as_deref()
+            .map(|node| {
+                node.indices
+                    .iter()
+                    .map(|&i| self.triggers[i].name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for inner_name in inner {
+            self.remove_trigger(isolate, origin, &inner_name);
+        }
         if Self::remove_named(
             &mut self.triggers,
             &mut self.trigger_indices,
@@ -1637,6 +2085,7 @@ impl Manager {
         ) {
             self.registry_generation = next_registry_generation();
             self.trigger_regex_set_dirty = true;
+            self.live_outers.borrow_mut().clear();
             self.refresh_raw_wanted();
             self.registry_remove(AutomationKind::Trigger, isolate, origin, name);
             if self.is_watched() && *origin != Origin::User {
@@ -1646,7 +2095,69 @@ impl Manager {
                     name: name.to_string(),
                 });
             }
+            // The outer's index list is stale until the rebuild; its registry entry can be
+            // refreshed now from the names that remain.
+            if let Some(outer_name) = outer_name
+                && let Some(outer) = self
+                    .trigger_indices
+                    .get(&key)
+                    .and_then(|by_name| by_name.get(outer_name.as_str()))
+                    .copied()
+            {
+                self.rebuild_inner_indices();
+                self.registry_upsert(AutomationKind::Trigger, &self.triggers[outer]);
+            }
         }
+    }
+
+    /// Recompute every outer's index list from the `outer` names, after the trigger `Vec`
+    /// shifted. Nodes are marked dirty so their tiers rebuild on the next input, and their
+    /// live firings are kept: a removal elsewhere must not end an unrelated watch.
+    fn rebuild_inner_indices(&mut self) {
+        for trigger in &self.triggers {
+            if let Some(node) = trigger.inner.as_deref() {
+                node.dirty.set(true);
+            }
+        }
+        let mut lists: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, trigger) in self.triggers.iter().enumerate() {
+            let Some(outer_name) = trigger.outer.as_deref() else {
+                continue;
+            };
+            let key = (trigger.isolate.clone(), trigger.origin.clone());
+            if let Some(&outer) = self
+                .trigger_indices
+                .get(&key)
+                .and_then(|by_name| by_name.get(outer_name))
+            {
+                lists.entry(outer).or_default().push(i);
+            }
+        }
+        for (outer, indices) in lists {
+            let node = self.triggers[outer]
+                .inner
+                .get_or_insert_with(|| Box::new(InnerNode::new()));
+            node.indices = indices;
+        }
+        // An outer that lost its last inner trigger keeps an empty node; harmless, and it
+        // keeps a re-added inner trigger's registration cheap.
+        for trigger in &self.triggers {
+            if let Some(node) = trigger.inner.as_deref() {
+                node.refresh_reach(&self.triggers);
+            }
+        }
+        let live: Vec<usize> = self
+            .triggers
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.inner
+                    .as_deref()
+                    .is_some_and(|node| !node.firings.borrow().is_empty())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        *self.live_outers.borrow_mut() = live;
     }
 
     /// Remove `name` from a `Vec<Trigger>` + its `(isolate, origin) -> name -> index` map,
@@ -1681,156 +2192,41 @@ impl Manager {
         true
     }
 
-    ///
-    /// Builds pattern sets for triggers, raw triggers, prompt triggers, and raw prompt triggers
-    ///
-    /// This could be heavily DRY-ed up, but it just needs to create, for each type of trigger:
-    ///  - a `PatternSet` to test when that type of trigger is being tested
-    ///  - a `Vec<usize>` to map the indices of the `PatternSet` to the indices of the triggers
-    ///  - a `Vec<usize>` to map the indices of the `PatternSet` to the indices of the patterns
+    /// Rebuild the global tiers over every top-level trigger, in priority order (stable, so
+    /// equal priorities keep registration order), and recompute every outer's inner index
+    /// list, since the trigger `Vec` may have shifted. Inner triggers are left out of the
+    /// global tiers: they are matched only through their outer's node.
     fn rebuild_trigger_regex_set(&mut self) {
         let start = std::time::Instant::now();
 
-        let mut priority_order: Vec<usize> = (0..self.triggers.len()).collect();
+        self.rebuild_inner_indices();
+        let mut priority_order: Vec<usize> = (0..self.triggers.len())
+            .filter(|&i| self.triggers[i].outer.is_none())
+            .collect();
         // `sort_by` is stable: equal-priority automations retain their registration order.
         priority_order.sort_by(|&a, &b| self.triggers[b].priority.cmp(&self.triggers[a].priority));
-
-        self.trigger_regex_set = PatternSet::build(priority_order.iter().flat_map(|&i| {
-            self.triggers[i]
-                .patterns
-                .iter()
-                .map(|pattern| pattern.as_str())
-        }))
-        .unwrap();
-
-        self.trigger_regex_set_map = priority_order
-            .iter()
-            .flat_map(|&i| {
-                let trigger = &self.triggers[i];
-                let mut v = Vec::with_capacity(trigger.patterns.len());
-                for _ in 0..trigger.patterns.len() {
-                    v.push(i);
-                }
-                v
-            })
-            .collect();
-        self.trigger_regex_patterns_map = priority_order
-            .iter()
-            .flat_map(|&i| {
-                self.triggers[i]
-                    .patterns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _pattern)| i)
-            })
-            .collect();
-
-        self.raw_trigger_regex_set = PatternSet::build(priority_order.iter().flat_map(|&i| {
-            self.triggers[i]
-                .raw_patterns
-                .iter()
-                .map(|pattern| pattern.as_str())
-        }))
-        .unwrap();
-        self.raw_trigger_regex_set_map = priority_order
-            .iter()
-            .flat_map(|&i| {
-                let trigger = &self.triggers[i];
-                let mut v = Vec::with_capacity(trigger.raw_patterns.len());
-                for _ in 0..trigger.raw_patterns.len() {
-                    v.push(i);
-                }
-                v
-            })
-            .collect();
-        self.raw_trigger_regex_patterns_map = priority_order
-            .iter()
-            .flat_map(|&i| {
-                self.triggers[i]
-                    .raw_patterns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _pattern)| i)
-            })
-            .collect();
-
-        self.prompt_trigger_regex_set = PatternSet::build(
-            priority_order
-                .iter()
-                .filter(|&&i| self.triggers[i].fire_on_prompts())
-                .flat_map(|&i| {
-                    self.triggers[i]
-                        .patterns
-                        .iter()
-                        .map(|pattern| pattern.as_str())
-                }),
-        )
-        .unwrap();
-        self.prompt_trigger_regex_set_map = priority_order
-            .iter()
-            .filter(|&&i| self.triggers[i].fire_on_prompts())
-            .flat_map(|&i| {
-                let trigger = &self.triggers[i];
-                let mut v = Vec::with_capacity(trigger.patterns.len());
-                for _ in 0..trigger.patterns.len() {
-                    v.push(i);
-                }
-                v
-            })
-            .collect();
-        self.prompt_trigger_regex_patterns_map = priority_order
-            .iter()
-            .filter(|&&i| self.triggers[i].fire_on_prompts())
-            .flat_map(|&i| {
-                self.triggers[i]
-                    .patterns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _pattern)| i)
-            })
-            .collect();
-
-        self.prompt_raw_trigger_regex_set = PatternSet::build(
-            priority_order
-                .iter()
-                .filter(|&&i| self.triggers[i].fire_on_prompts())
-                .flat_map(|&i| {
-                    self.triggers[i]
-                        .raw_patterns
-                        .iter()
-                        .map(|pattern| pattern.as_str())
-                }),
-        )
-        .unwrap();
-        self.prompt_raw_trigger_regex_set_map = priority_order
-            .iter()
-            .filter(|&&i| self.triggers[i].fire_on_prompts())
-            .flat_map(|&i| {
-                let trigger = &self.triggers[i];
-                let mut v = Vec::with_capacity(trigger.raw_patterns.len());
-                for _ in 0..trigger.raw_patterns.len() {
-                    v.push(i);
-                }
-                v
-            })
-            .collect();
-        self.prompt_raw_trigger_regex_patterns_map = priority_order
-            .iter()
-            .filter(|&&i| self.triggers[i].fire_on_prompts())
-            .flat_map(|&i| {
-                self.triggers[i]
-                    .raw_patterns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _pattern)| i)
-            })
-            .collect();
+        for (rank, &i) in priority_order.iter().enumerate() {
+            self.triggers[i].walk_rank.set(rank);
+        }
+        self.global = TierSets::build(&self.triggers, &priority_order);
 
         // The only triggers `count_tested_lines` must visit per line; recomputed here, the
         // dirty-gated rebuild point, so it tracks the trigger `Vec` without per-mutation upkeep.
         self.rebuild_line_limited_triggers();
 
         debug!("Time to rebuild trigger regex sets: {:?}", start.elapsed());
+    }
+
+    /// Rebuild one outer's tiers over the triggers inside it, when a registration or the
+    /// global rebuild marked them stale. Siblings are ordered by priority, then registration.
+    fn ensure_node_sets(&self, node: &InnerNode) {
+        if !node.dirty.get() {
+            return;
+        }
+        let mut order = node.indices.clone();
+        order.sort_by(|&a, &b| self.triggers[b].priority.cmp(&self.triggers[a].priority));
+        *node.sets.borrow_mut() = TierSets::build(&self.triggers, &order);
+        node.dirty.set(false);
     }
 
     /// Recompute [`line_limited_triggers`](Self::line_limited_triggers) from the current trigger
@@ -1849,39 +2245,10 @@ impl Manager {
     fn rebuild_alias_regex_set(&mut self) {
         let mut priority_order: Vec<usize> = (0..self.aliases.len()).collect();
         priority_order.sort_by(|&a, &b| self.aliases[b].priority.cmp(&self.aliases[a].priority));
-
-        self.alias_regex_set = PatternSet::build(priority_order.iter().flat_map(|&i| {
-            self.aliases[i]
-                .patterns
-                .iter()
-                .map(|pattern| pattern.as_str())
-        }))
-        .unwrap();
-        self.alias_regex_set_map = priority_order
-            .iter()
-            .flat_map(|&i| {
-                let alias = &self.aliases[i];
-                let mut v = Vec::with_capacity(alias.patterns.len());
-                for _ in 0..alias.patterns.len() {
-                    v.push(i);
-                }
-                v
-            })
-            .collect();
-        self.alias_regex_patterns_map = priority_order
-            .iter()
-            .flat_map(|&i| {
-                self.aliases[i]
-                    .patterns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _pattern)| i)
-            })
-            .collect();
+        self.alias_tier = Tier::build(&self.aliases, &priority_order, false, false);
     }
 
-    /// Match one subject string against one `PatternSet` tier and queue the matched
-    /// automations' actions.
+    /// Match one subject string against one tier and queue the matched automations' actions.
     ///
     /// `fired` carries the indices (into `triggers`) that have already queued a
     /// `RunAutomation` for the current line. The incoming-line paths share one list across
@@ -1889,22 +2256,31 @@ impl Manager {
     /// line** — raw first, which is the documented precedence — rather than once per pass.
     /// Each automation queued here is recorded into the list. `matches` is the scratch of the
     /// caller for the pattern-set hits. This function overwrites it.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Each accepted top-level hit that holds triggers inside it opens a firing and
+    /// evaluates them at once, so a trigger's inner triggers run right after it in the
+    /// walk. With `flush_live`, outers still watching from an earlier line are evaluated
+    /// at their own priority position, as if they had matched.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value
+    )]
     fn process_line_inner(
         &self,
         line: &str,
         styled_line: Option<&Arc<StyledLine>>,
         depth: u32,
         sender: Option<&AliasSender>,
-        pattern_set: &PatternSet,
+        tier: &Tier,
         triggers: &[Trigger],
-        regex_set_to_triggers_map: &[usize],
-        regex_set_to_patterns_map: &[usize],
         match_type: TriggerMatchType,
         is_captured: Option<Arc<AtomicBool>>,
         fallthrough_scopes: &mut FallthroughScopes,
         fired: &mut Vec<usize>,
         matches: &mut Vec<PatternMatch>,
+        partial: bool,
+        flush_live: bool,
     ) -> Result<()> {
         if depth > 100 {
             match sender {
@@ -1920,20 +2296,46 @@ impl Manager {
         // Time the match only when debug logging is compiled in: `log_enabled!(Debug)`
         // const-folds to `false` under `release_max_level_info` (release/bench), so the timer is
         // a dead `None` and the whole block — both clock reads — is optimized away.
-        let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
-        pattern_set.matches_into(line, matches);
-        if let Some(start) = timer {
+        let match_timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
+        tier.set.matches_into(line, matches);
+        if let Some(start) = match_timer {
             debug!("Time to test pattern matches: {:?}", start.elapsed());
         }
 
+        // Outers watching from an earlier line, in walk order, merged in below. Empty for a
+        // flat profile, which then pays one `is_empty` check here.
+        let mut pending: Vec<usize> = Vec::new();
+        if flush_live && !self.live_outers.borrow().is_empty() {
+            pending.clone_from(&self.live_outers.borrow());
+            pending.sort_by_key(|&i| triggers[i].walk_rank.get());
+        }
+        let mut cursor = 0;
+
         if !matches.is_empty() {
             for match_indices in matches.chunk_by(|a, b| {
-                regex_set_to_triggers_map.get(a.index).unwrap()
-                    == regex_set_to_triggers_map.get(b.index).unwrap()
+                tier.triggers.get(a.index).unwrap() == tier.triggers.get(b.index).unwrap()
             }) {
                 let first_match_idx = match_indices[0].index;
-                let trigger_idx = *regex_set_to_triggers_map.get(first_match_idx).unwrap();
+                let trigger_idx = *tier.triggers.get(first_match_idx).unwrap();
                 let trigger = triggers.get(trigger_idx).unwrap();
+
+                while cursor < pending.len()
+                    && triggers[pending[cursor]].walk_rank.get() < trigger.walk_rank.get()
+                {
+                    let outer = pending[cursor];
+                    cursor += 1;
+                    if !fired.contains(&outer) {
+                        self.evaluate_inner(
+                            outer,
+                            line,
+                            styled_line,
+                            partial,
+                            fallthrough_scopes,
+                            depth,
+                            0,
+                        )?;
+                    }
+                }
 
                 if !trigger.enabled
                     || fired.contains(&trigger_idx)
@@ -1942,36 +2344,15 @@ impl Manager {
                     continue;
                 }
 
-                // Preserve the fast path for unfiltered triggers. It reads only
-                // the first matching pattern. A candidate with a color
-                // filter can inspect later regex matches and their styled spans.
-                let qualified_match = if matches!(match_type, TriggerMatchType::Raw)
-                    || trigger.pattern_colors.is_empty()
-                {
-                    regex_set_to_patterns_map
-                        .get(first_match_idx)
-                        .copied()
-                        .map(|pattern_idx| (&match_indices[0], pattern_idx, None))
-                } else {
-                    match_indices.iter().find_map(|hit| {
-                        let match_idx = hit.index;
-                        let pattern_idx = *regex_set_to_patterns_map.get(match_idx)?;
-                        trigger
-                            .pattern_color_match_start(
-                                line,
-                                styled_line.map(Arc::as_ref),
-                                pattern_idx,
-                                self.bold_is_bright,
-                            )
-                            .map(|qualification| match qualification {
-                                ColorQualification::Unfiltered => (hit, pattern_idx, None),
-                                ColorQualification::Matched(start) => {
-                                    (hit, pattern_idx, Some(start))
-                                }
-                            })
-                    })
-                };
-                let Some((hit, pattern_idx, match_start)) = qualified_match else {
+                let Some((hit, pattern_idx, match_start)) = self.qualify(
+                    trigger,
+                    match_indices,
+                    tier,
+                    line,
+                    styled_line,
+                    match_type,
+                    0,
+                ) else {
                     continue;
                 };
 
@@ -1992,13 +2373,16 @@ impl Manager {
                 debug!(
                     "Trigger matched: {:?}, /{}/",
                     trigger.name(),
-                    pattern_set.patterns().get(hit.index).unwrap()
+                    tier.set.patterns().get(hit.index).unwrap()
                 );
 
                 let stopped = fallthrough_scopes.scope(trigger.identity().namespace);
-                trigger.run(
+                let opened = trigger
+                    .inner
+                    .as_ref()
+                    .map(|_| Arc::new(FiringFlags::default()));
+                let payload = trigger.run(
                     line,
-                    styled_line,
                     match_type,
                     pattern_idx,
                     match_start,
@@ -2007,11 +2391,461 @@ impl Manager {
                     stopped,
                     &self.spawned_actions,
                     depth + 1,
+                    RunContext {
+                        firing: FiringContext {
+                            under: None,
+                            opened: opened.clone(),
+                            outer: None,
+                        },
+                        base: 0,
+                        styled_line,
+                    },
                 )?;
                 fired.push(trigger_idx);
+                if let (Some(opened), Some(payload)) = (opened, payload) {
+                    self.open_firing(trigger_idx, payload, None, opened);
+                    self.evaluate_inner(
+                        trigger_idx,
+                        line,
+                        styled_line,
+                        partial,
+                        fallthrough_scopes,
+                        depth,
+                        0,
+                    )?;
+                }
+            }
+        }
+        while cursor < pending.len() {
+            let outer = pending[cursor];
+            cursor += 1;
+            if !fired.contains(&outer) {
+                self.evaluate_inner(
+                    outer,
+                    line,
+                    styled_line,
+                    partial,
+                    fallthrough_scopes,
+                    depth,
+                    0,
+                )?;
             }
         }
         Ok(())
+    }
+
+    /// Select the pattern hit that fires `trigger`: the first one for an unfiltered
+    /// trigger, otherwise the first whose style qualifies. `base` is the haystack's byte
+    /// offset within the styled line, for a matched-value haystack.
+    #[allow(clippy::too_many_arguments)]
+    fn qualify<'m>(
+        &self,
+        trigger: &Trigger,
+        match_indices: &'m [PatternMatch],
+        tier: &Tier,
+        line: &str,
+        styled_line: Option<&Arc<StyledLine>>,
+        match_type: TriggerMatchType,
+        base: usize,
+    ) -> Option<(&'m PatternMatch, usize, Option<usize>)> {
+        // Preserve the fast path for unfiltered triggers. It reads only
+        // the first matching pattern. A candidate with a color
+        // filter can inspect later regex matches and their styled spans.
+        if matches!(match_type, TriggerMatchType::Raw) || trigger.pattern_colors.is_empty() {
+            return tier
+                .patterns
+                .get(match_indices[0].index)
+                .copied()
+                .map(|pattern_idx| (&match_indices[0], pattern_idx, None));
+        }
+        match_indices.iter().find_map(|hit| {
+            let pattern_idx = *tier.patterns.get(hit.index)?;
+            trigger
+                .pattern_color_match_start(
+                    line,
+                    styled_line.map(Arc::as_ref),
+                    pattern_idx,
+                    self.bold_is_bright,
+                    base,
+                )
+                .map(|qualification| match qualification {
+                    ColorQualification::Unfiltered => (hit, pattern_idx, None),
+                    ColorQualification::Matched(start) => (hit, pattern_idx, Some(start)),
+                })
+        })
+    }
+
+    /// Open a firing of `outer_idx`: the outer just fired with `payload` as its captures.
+    /// `above` is the captures chain of the firing the outer itself ran under.
+    fn open_firing(
+        &self,
+        outer_idx: usize,
+        payload: CapturePayload,
+        above: Option<Arc<OuterCaptures>>,
+        flags: Arc<FiringFlags>,
+    ) {
+        let outer = &self.triggers[outer_idx];
+        let Some(node) = outer.inner.as_deref() else {
+            return;
+        };
+        let mut firings = node.firings.borrow_mut();
+        if firings.len() >= MAX_LIVE_FIRINGS {
+            firings.pop_front();
+            if !node.overflow_reported.replace(true) {
+                let warning: Arc<str> = Arc::from(format!(
+                    "More than {MAX_LIVE_FIRINGS} overlapping firings; the oldest were dropped."
+                ));
+                warn!("Trigger {:?}: {warning}", outer.name);
+                self.echo(format!("[triggers] {}: {warning}", outer.name));
+                *outer.warning.borrow_mut() = Some(warning);
+                self.registry_upsert(AutomationKind::Trigger, outer);
+            }
+        }
+        firings.push_back(Firing {
+            sequence: self.input_sequence.get(),
+            captures: Arc::new(OuterCaptures {
+                own: payload,
+                above,
+            }),
+            flags,
+            prompt_seen: false,
+            fired_once: Vec::new(),
+        });
+        drop(firings);
+        let mut live = self.live_outers.borrow_mut();
+        if !live.contains(&outer_idx) {
+            live.push(outer_idx);
+        }
+    }
+
+    /// Whether `firing` still applies to `inner` on the current input.
+    fn firing_applies(inner: &Trigger, firing: &Firing, now: u64) -> bool {
+        let reach = &inner.reach;
+        let in_window = if firing.sequence >= now {
+            reach.same_line
+        } else {
+            reach.within_lines.covers(now - firing.sequence)
+                && !(reach.until_prompt && firing.prompt_seen)
+        };
+        in_window
+            && !(reach.once
+                && firing
+                    .fired_once
+                    .iter()
+                    .any(|id| Arc::ptr_eq(id, inner.identity())))
+    }
+
+    /// Evaluate the triggers inside `outer_idx` on the current input against the outer's
+    /// live firings: first the line itself for every inner trigger that watches the line,
+    /// then, when the outer fired on this very input, each of its matched values for the
+    /// inner triggers that watch those. Dead firings are dropped first.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_inner(
+        &self,
+        outer_idx: usize,
+        line: &str,
+        styled_line: Option<&Arc<StyledLine>>,
+        partial: bool,
+        fallthrough_scopes: &mut FallthroughScopes,
+        depth: u32,
+        level: usize,
+    ) -> Result<()> {
+        let outer = &self.triggers[outer_idx];
+        let Some(node) = outer.inner.as_deref() else {
+            return Ok(());
+        };
+        if !outer.enabled {
+            node.firings.borrow_mut().clear();
+            self.unlist_live(outer_idx);
+            return Ok(());
+        }
+        self.ensure_node_sets(node);
+        let now = self.input_sequence.get();
+        {
+            let mut firings = node.firings.borrow_mut();
+            let max_reach = node.max_reach.get();
+            firings.retain(|firing| {
+                !firing.flags.skipped.load(Ordering::Relaxed)
+                    && !firing.flags.stopped.load(Ordering::Relaxed)
+                    && (firing.sequence >= now || max_reach.covers(now - firing.sequence))
+            });
+            // Only the newest firing can matter when nothing watches each separately.
+            if !node.any_each.get() && firings.len() > 1 {
+                let newest = firings.pop_back().expect("checked non-empty");
+                firings.clear();
+                firings.push_back(newest);
+            }
+            if firings.is_empty() {
+                drop(firings);
+                self.unlist_live(outer_idx);
+                return Ok(());
+            }
+        }
+
+        let mut scratch = self.inner_scratch.borrow_mut().pop().unwrap_or_default();
+        scratch.fired.clear();
+        let result = self.evaluate_inner_with(
+            outer_idx,
+            node,
+            line,
+            styled_line,
+            partial,
+            fallthrough_scopes,
+            depth,
+            level,
+            now,
+            &mut scratch,
+        );
+        self.inner_scratch.borrow_mut().push(scratch);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn evaluate_inner_with(
+        &self,
+        outer_idx: usize,
+        node: &InnerNode,
+        line: &str,
+        styled_line: Option<&Arc<StyledLine>>,
+        partial: bool,
+        fallthrough_scopes: &mut FallthroughScopes,
+        depth: u32,
+        level: usize,
+        now: u64,
+        scratch: &mut InnerScratch,
+    ) -> Result<()> {
+        // The firings this pass may use, oldest first: all of them for an inner trigger
+        // that watches each separately, only the newest otherwise.
+        let firing_count = node.firings.borrow().len();
+        let sets = node.sets.borrow();
+
+        // Pass one: the line, raw tier first (the same precedence as the top level).
+        let raw_line = styled_line.and_then(|styled| styled.raw());
+        for (raw, haystack) in [(true, raw_line), (false, Some(line))] {
+            let Some(haystack) = haystack else { continue };
+            let tier = sets.tier(raw, partial);
+            if tier.triggers.is_empty() {
+                continue;
+            }
+            let match_type = if raw {
+                TriggerMatchType::Raw
+            } else {
+                TriggerMatchType::Normal
+            };
+            tier.set.matches_into(haystack, &mut scratch.matches);
+            let hits = std::mem::take(&mut scratch.matches);
+            for match_indices in
+                hits.chunk_by(|a, b| tier.triggers[a.index] == tier.triggers[b.index])
+            {
+                let inner_idx = tier.triggers[match_indices[0].index];
+                let inner = &self.triggers[inner_idx];
+                if !inner.enabled
+                    || inner.reach.input != InnerInput::Line
+                    || scratch.fired.contains(&inner_idx)
+                    || inner.anti_matches(
+                        haystack,
+                        styled_line.map(Arc::as_ref),
+                        self.bold_is_bright,
+                    )
+                {
+                    continue;
+                }
+                let Some((hit, pattern_idx, match_start)) = self.qualify(
+                    inner,
+                    match_indices,
+                    tier,
+                    haystack,
+                    styled_line,
+                    match_type,
+                    0,
+                ) else {
+                    continue;
+                };
+                let positions: Vec<usize> = if inner.reach.overlap == Overlap::Each {
+                    (0..firing_count).collect()
+                } else {
+                    vec![firing_count - 1]
+                };
+                let mut ran = false;
+                for position in positions {
+                    let (flags, captures) = {
+                        let firings = node.firings.borrow();
+                        let firing = &firings[position];
+                        if !Self::firing_applies(inner, firing, now) {
+                            continue;
+                        }
+                        (firing.flags.clone(), firing.captures.clone())
+                    };
+                    let stopped = fallthrough_scopes.scope(inner.identity().namespace);
+                    let opened = inner
+                        .inner
+                        .as_ref()
+                        .map(|_| Arc::new(FiringFlags::default()));
+                    let payload = inner.run(
+                        haystack,
+                        match_type,
+                        pattern_idx,
+                        match_start,
+                        hit.literal.clone().filter(|_| match_start.is_none()),
+                        &None,
+                        stopped,
+                        &self.spawned_actions,
+                        depth + 1,
+                        RunContext {
+                            firing: FiringContext {
+                                under: Some(flags),
+                                opened: opened.clone(),
+                                outer: Some(captures.clone()),
+                            },
+                            base: 0,
+                            styled_line,
+                        },
+                    )?;
+                    ran = true;
+                    if inner.reach.once {
+                        node.firings.borrow_mut()[position]
+                            .fired_once
+                            .push(inner.identity().clone());
+                    }
+                    if let (Some(opened), Some(payload)) = (opened, payload) {
+                        self.open_firing(inner_idx, payload, Some(captures), opened);
+                        self.evaluate_inner(
+                            inner_idx,
+                            line,
+                            styled_line,
+                            partial,
+                            fallthrough_scopes,
+                            depth,
+                            level + 1,
+                        )?;
+                    }
+                }
+                if ran {
+                    scratch.fired.push(inner_idx);
+                }
+            }
+            scratch.matches = hits;
+        }
+
+        // Pass two: the outer's matched values, only for the firing opened on this input.
+        let opened_now = {
+            let firings = node.firings.borrow();
+            firings
+                .back()
+                .filter(|firing| firing.sequence >= now && !partial)
+                .map(|firing| (firing.captures.clone(), firing_count - 1))
+        };
+        if let Some((captures, position)) = opened_now
+            && node
+                .indices
+                .iter()
+                .any(|&i| self.triggers[i].reach.input == InnerInput::OuterValues)
+        {
+            let tier = sets.tier(false, false);
+            let view = captures.own.view();
+            let group_count = view.len();
+            let groups: Vec<usize> = if group_count > 1 {
+                (1..group_count).collect()
+            } else {
+                vec![0]
+            };
+            for group in groups {
+                let Some(value) = view.get(group) else {
+                    continue;
+                };
+                if value.value.is_empty() {
+                    continue;
+                }
+                let base = captures.own.range(group).map_or(0, |range| range.start);
+                let haystack = value.value;
+                tier.set.matches_into(haystack, &mut scratch.matches);
+                let hits = std::mem::take(&mut scratch.matches);
+                let mut value_fired: Vec<usize> = Vec::new();
+                for match_indices in
+                    hits.chunk_by(|a, b| tier.triggers[a.index] == tier.triggers[b.index])
+                {
+                    let inner_idx = tier.triggers[match_indices[0].index];
+                    let inner = &self.triggers[inner_idx];
+                    if !inner.enabled
+                        || inner.reach.input != InnerInput::OuterValues
+                        || !inner.reach.same_line
+                        || value_fired.contains(&inner_idx)
+                        || inner.anti_matches(haystack, None, self.bold_is_bright)
+                    {
+                        continue;
+                    }
+                    {
+                        let firings = node.firings.borrow();
+                        if !Self::firing_applies(inner, &firings[position], now) {
+                            continue;
+                        }
+                    }
+                    let Some((hit, pattern_idx, match_start)) = self.qualify(
+                        inner,
+                        match_indices,
+                        tier,
+                        haystack,
+                        styled_line,
+                        TriggerMatchType::Normal,
+                        base,
+                    ) else {
+                        continue;
+                    };
+                    let flags = node.firings.borrow()[position].flags.clone();
+                    let stopped = fallthrough_scopes.scope(inner.identity().namespace);
+                    let opened = inner
+                        .inner
+                        .as_ref()
+                        .map(|_| Arc::new(FiringFlags::default()));
+                    let payload = inner.run(
+                        haystack,
+                        TriggerMatchType::Normal,
+                        pattern_idx,
+                        match_start,
+                        hit.literal.clone().filter(|_| match_start.is_none()),
+                        &None,
+                        stopped,
+                        &self.spawned_actions,
+                        depth + 1,
+                        RunContext {
+                            firing: FiringContext {
+                                under: Some(flags),
+                                opened: opened.clone(),
+                                outer: Some(captures.clone()),
+                            },
+                            base,
+                            styled_line,
+                        },
+                    )?;
+                    value_fired.push(inner_idx);
+                    if inner.reach.once {
+                        node.firings.borrow_mut()[position]
+                            .fired_once
+                            .push(inner.identity().clone());
+                    }
+                    if let (Some(opened), Some(payload)) = (opened, payload) {
+                        self.open_firing(inner_idx, payload, Some(captures.clone()), opened);
+                        self.evaluate_inner(
+                            inner_idx,
+                            line,
+                            styled_line,
+                            partial,
+                            fallthrough_scopes,
+                            depth,
+                            level + 1,
+                        )?;
+                    }
+                }
+                scratch.matches = hits;
+            }
+        }
+        let _ = outer_idx;
+        Ok(())
+    }
+
+    /// Drop `outer_idx` from the live list once it has no firing left.
+    fn unlist_live(&self, outer_idx: usize) {
+        self.live_outers.borrow_mut().retain(|&i| i != outer_idx);
     }
 
     /// Queue the auto-removal of a self-limited automation, routed by whether it is an alias or a
@@ -2096,15 +2930,15 @@ impl Manager {
             None,
             depth,
             sender,
-            &self.alias_regex_set,
+            &self.alias_tier,
             &self.aliases,
-            &self.alias_regex_set_map,
-            &self.alias_regex_patterns_map,
             TriggerMatchType::Normal,
             Some(is_captured.clone()),
             &mut fallthrough_scopes,
             &mut fired,
             &mut matches,
+            false,
+            false,
         )?;
 
         self.spawned_actions
@@ -2125,11 +2959,12 @@ impl Manager {
         &self,
         script: &str,
         captures: CaptureView<'_>,
+        outer: Option<&OuterCaptures>,
         depth: u32,
         sender: Option<&AliasSender>,
         state: Option<&ExposedState>,
     ) -> Result<()> {
-        let evaluated = expand_template_view(script, captures, state);
+        let evaluated = expand_template_view(script, captures, outer, state);
         for line in split_commands(&evaluated, &self.command_separator) {
             self.process_nested_outgoing_line(line, depth, sender)?;
         }
@@ -2171,6 +3006,10 @@ impl Manager {
 
         let fires = item.fires.get() + 1;
         item.fires.set(fires);
+        item.last_fired.store(
+            i64::try_from(self.input_sequence.get()).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
         if item.fire_limit.is_some_and(|limit| fires >= limit) {
             self.queue_self_removal(item);
         }
@@ -2186,6 +3025,10 @@ impl Manager {
             self.rebuild_trigger_regex_set();
             self.trigger_regex_set_dirty = false;
         }
+        // Complete lines count up from one; the number is what `line.sequence` reads and
+        // what a firing records as the input it opened on.
+        self.complete_lines += 1;
+        self.input_sequence.set(self.complete_lines);
 
         // Zero-cost unless debug logging is compiled in; see `process_line_inner`.
         let timer = log::log_enabled!(log::Level::Debug).then(Instant::now);
@@ -2229,15 +3072,15 @@ impl Manager {
                 Some(line),
                 0,
                 None,
-                &self.raw_trigger_regex_set,
+                &self.global.raw,
                 &self.triggers,
-                &self.raw_trigger_regex_set_map,
-                &self.raw_trigger_regex_patterns_map,
                 TriggerMatchType::Raw,
                 None,
                 fallthrough_scopes,
                 &mut scratch.fired,
                 &mut scratch.matches,
+                false,
+                false,
             )?;
         }
 
@@ -2246,15 +3089,15 @@ impl Manager {
             Some(line),
             0,
             None,
-            &self.trigger_regex_set,
+            &self.global.text,
             &self.triggers,
-            &self.trigger_regex_set_map,
-            &self.trigger_regex_patterns_map,
             TriggerMatchType::Normal,
             None,
             fallthrough_scopes,
             &mut scratch.fired,
             &mut scratch.matches,
+            false,
+            true,
         )
     }
 
@@ -2267,6 +3110,19 @@ impl Manager {
         if self.trigger_regex_set_dirty {
             self.rebuild_trigger_regex_set();
             self.trigger_regex_set_dirty = false;
+        }
+        // A fragment carries the number its completed line will get.
+        self.input_sequence.set(self.complete_lines + 1);
+        // The first prompt after a firing opened ends every watch that stops at a prompt.
+        // A firing opened on this very fragment (an outer with `prompt: true`) is untouched.
+        for &index in self.live_outers.borrow().iter() {
+            if let Some(node) = self.triggers.get(index).and_then(|t| t.inner.as_deref()) {
+                for firing in node.firings.borrow_mut().iter_mut() {
+                    if firing.sequence <= self.complete_lines {
+                        firing.prompt_seen = true;
+                    }
+                }
+            }
         }
 
         // Zero-cost unless debug logging is compiled in; see `process_line_inner`.
@@ -2311,15 +3167,15 @@ impl Manager {
                 Some(line),
                 0,
                 None,
-                &self.prompt_raw_trigger_regex_set,
+                &self.global.prompt_raw,
                 &self.triggers,
-                &self.prompt_raw_trigger_regex_set_map,
-                &self.prompt_raw_trigger_regex_patterns_map,
                 TriggerMatchType::Raw,
                 None,
                 fallthrough_scopes,
                 &mut scratch.fired,
                 &mut scratch.matches,
+                true,
+                false,
             )?;
         }
 
@@ -2328,15 +3184,15 @@ impl Manager {
             Some(line),
             0,
             None,
-            &self.prompt_trigger_regex_set,
+            &self.global.prompt_text,
             &self.triggers,
-            &self.prompt_trigger_regex_set_map,
-            &self.prompt_trigger_regex_patterns_map,
             TriggerMatchType::Normal,
             None,
             fallthrough_scopes,
             &mut scratch.fired,
             &mut scratch.matches,
+            true,
+            true,
         )
     }
 }
@@ -2398,9 +3254,32 @@ struct Trigger {
     /// The state exposures bound for this automation, held only until registration moves
     /// them into the shared [`AutomationIdentity`] (see [`Manager::assign_identity`]).
     exposure: Option<Arc<ExposedState>>,
+    /// The name of the trigger this one is inside, in the same `(isolate, origin)`. `None`
+    /// for a top-level trigger and for every alias.
+    outer: Option<Arc<String>>,
+    /// How this trigger watches after its outer fires. Inert for a top-level trigger.
+    reach: InnerReach,
+    /// What this trigger keeps for the triggers inside it; `None` until the first registers.
+    inner: Option<Box<InnerNode>>,
+    /// This trigger's position in the top-level walk order, set by the global rebuild. An
+    /// outer still watching from an earlier line is evaluated at this position.
+    walk_rank: Cell<usize>,
+    /// The input number of the last fire, or `-1`. Shared with the registry entry.
+    last_fired: Arc<AtomicI64>,
+    /// A runtime condition worth showing beside the trigger, mirrored into the registry.
+    warning: RefCell<Option<Arc<str>>>,
 }
 
 impl Trigger {
+    /// The named capture groups of every displayed and raw pattern, for the collision check
+    /// an inner trigger's registration runs up its outer chain.
+    fn capture_names(&self) -> impl Iterator<Item = &str> {
+        self.patterns
+            .iter()
+            .chain(self.raw_patterns.iter())
+            .flat_map(|pattern| pattern.capture_names().flatten())
+    }
+
     fn anti_matches(
         &self,
         subject: &str,
@@ -2435,6 +3314,7 @@ impl Trigger {
                     styled_line,
                     *color,
                     bold_is_bright,
+                    0,
                 )
                 .is_some()
             })
@@ -2449,6 +3329,7 @@ impl Trigger {
         styled_line: Option<&StyledLine>,
         pattern_index: usize,
         bold_is_bright: bool,
+        base: usize,
     ) -> Option<ColorQualification> {
         let Some(color) = self
             .pattern_colors
@@ -2461,7 +3342,7 @@ impl Trigger {
         self.patterns
             .get(pattern_index)
             .and_then(|regex| {
-                color_matched_start(regex, subject, styled_line, *color, bold_is_bright)
+                color_matched_start(regex, subject, styled_line, *color, bold_is_bright, base)
             })
             .map(ColorQualification::Matched)
     }
@@ -2608,7 +3489,20 @@ impl Trigger {
             source: None,
             command: None,
             exposure: None,
+            outer: None,
+            reach: InnerReach::DEFAULT,
+            inner: None,
+            walk_rank: Cell::new(0),
+            last_fired: Arc::new(AtomicI64::new(-1)),
+            warning: RefCell::new(None),
         }
+    }
+
+    /// Place the trigger inside `outer` with `reach`. A top-level trigger passes `None`.
+    fn with_placement(mut self, outer: Option<Arc<String>>, reach: InnerReach) -> Self {
+        self.outer = outer;
+        self.reach = reach;
+        self
     }
 
     pub fn new_alias<TIterPattern, TPatternStr>(
@@ -2676,11 +3570,13 @@ impl Trigger {
         self
     }
 
+    /// Queue this automation's action for a match. Returns the captures it queued, which
+    /// an outer trigger's firing then carries as `outer`; `None` when a Command alias
+    /// decided not to fire.
     #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         line: &str,
-        styled_line: Option<&Arc<StyledLine>>,
         match_type: TriggerMatchType,
         pattern_idx: usize,
         match_start: Option<usize>,
@@ -2689,24 +3585,34 @@ impl Trigger {
         stopped: Arc<AtomicBool>,
         spawned_actions: &ActionQueue,
         depth: u32,
-    ) -> Result<()> {
+        context: RunContext<'_>,
+    ) -> Result<Option<CapturePayload>> {
         // A Command alias's stored regex is only a prefilter: the parser decides
         // whether it actually fires, and produces the captures when it does.
         if let Some(command) = &self.command {
-            return self.run_command(command, line, is_captured, stopped, spawned_actions, depth);
+            self.run_command(command, line, is_captured, stopped, spawned_actions, depth)?;
+            return Ok(None);
         }
 
         let pattern = match match_type {
             TriggerMatchType::Normal => self.patterns.get(pattern_idx).unwrap(),
             TriggerMatchType::Raw => self.raw_patterns.get(pattern_idx).unwrap(),
         };
-        let captures = if let Some(styled_line) = styled_line {
-            pattern.capture_line(
-                styled_line,
-                matches!(match_type, TriggerMatchType::Raw),
-                match_start,
-                literal_range,
-            )
+        let captures = if let Some(styled_line) = context.styled_line {
+            if context.base == 0 {
+                pattern.capture_line(
+                    styled_line,
+                    matches!(match_type, TriggerMatchType::Raw),
+                    match_start,
+                    literal_range,
+                )
+            } else {
+                pattern.capture_slice(
+                    styled_line,
+                    context.base..context.base + line.len(),
+                    match_start,
+                )
+            }
         } else {
             // Ordered captures: position is the group number (index 0 = whole match), `name` set
             // only for named groups. The list is shared by the JS handlers (numeric/named
@@ -2742,13 +3648,14 @@ impl Trigger {
             .push_back(RuntimeAction::RunAutomation {
                 identity: self.identity().clone(),
                 script: self.script.clone(),
-                matches: captures,
+                matches: captures.clone(),
                 depth,
                 is_captured: is_captured.clone(),
                 stopped,
                 fallthrough: self.fallthrough,
+                firing: context.firing,
             });
-        Ok(())
+        Ok(Some(captures))
     }
 
     /// The Command path of [`Trigger::run`]: tokenize and assign per the spec.
@@ -2792,6 +3699,7 @@ impl Trigger {
                         is_captured: is_captured.clone(),
                         stopped,
                         fallthrough: self.fallthrough,
+                        firing: FiringContext::default(),
                     });
             }
             CommandOutcome::NotFired(CommandMiss::MissingRequired { .. }) => {
@@ -2887,6 +3795,7 @@ mod tests {
                 line,
                 CompiledColorMatch::compile(matcher),
                 bold_is_bright,
+                0,
             )
         }
 
@@ -3419,6 +4328,8 @@ mod tests {
                     fire_limit: None,
                     line_limit: None,
                     source: None,
+                    outer: None,
+                    reach: crate::models::triggers::InnerReach::DEFAULT,
                 })
                 .unwrap();
             let line = Arc::new(parse_ansi_fragment("\u{1b}[1;36mcyan"));
@@ -3513,6 +4424,8 @@ mod tests {
                         fire_limit: None,
                         line_limit: None,
                         source: None,
+                        outer: None,
+                        reach: crate::models::triggers::InnerReach::DEFAULT,
                     })
                     .unwrap();
                 (manager, queue)
@@ -4012,6 +4925,8 @@ mod tests {
                     fire_limit: None,
                     line_limit: None,
                     source: None,
+                    outer: None,
+                    reach: crate::models::triggers::InnerReach::DEFAULT,
                 })
                 .unwrap();
             let line = Arc::new(StyledLine::new(
@@ -4075,6 +4990,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                crate::models::triggers::InnerReach::DEFAULT,
             );
             let line = Arc::new(StyledLine::new(
                 "plain red",
@@ -4142,6 +5059,8 @@ mod tests {
                     fire_limit: None,
                     line_limit: None,
                     source: None,
+                    outer: None,
+                    reach: crate::models::triggers::InnerReach::DEFAULT,
                 })
                 .unwrap();
         }
@@ -4237,6 +5156,8 @@ mod tests {
                     fire_limit: None,
                     line_limit: None,
                     source: None,
+                    outer: None,
+                    reach: crate::models::triggers::InnerReach::DEFAULT,
                 })
                 .unwrap();
         }
@@ -4778,6 +5699,8 @@ mod tests {
                     fire_limit,
                     line_limit: None,
                     source: None,
+                    outer: None,
+                    reach: crate::models::triggers::InnerReach::DEFAULT,
                 })
                 .unwrap();
         }
@@ -4845,6 +5768,8 @@ mod tests {
                         fire_limit: None,
                         line_limit: None,
                         source: None,
+                        outer: None,
+                        reach: crate::models::triggers::InnerReach::DEFAULT,
                     },
                     Some(bound.clone()),
                 )
@@ -5072,6 +5997,8 @@ mod tests {
                     fire_limit: None,
                     line_limit: None,
                     source: None,
+                    outer: None,
+                    reach: crate::models::triggers::InnerReach::DEFAULT,
                 })
                 .unwrap();
         }
@@ -5349,5 +6276,596 @@ mod tests {
             ),
             "CAPTURED.Char.Vitals.hp  .bar"
         );
+    }
+
+    mod inner_triggers {
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        use super::super::{ActionQueue, FiringContext, Manager, PushTriggerParams, ScriptAction};
+        use crate::models::triggers::{InnerInput, InnerReach, LineReach, Overlap};
+        use crate::session::runtime::RuntimeAction;
+        use crate::session::runtime::origin::{IsolateId, Origin};
+        use crate::session::styled_line::StyledLine;
+
+        fn manager() -> (Manager, ActionQueue) {
+            let queue: ActionQueue = Rc::default();
+            (
+                Manager::new(queue.clone(), Arc::new(";".to_string()), Rc::default()),
+                queue,
+            )
+        }
+
+        struct Def<'a> {
+            name: &'a str,
+            patterns: Vec<&'a str>,
+            outer: Option<&'a str>,
+            reach: InnerReach,
+            priority: i32,
+        }
+
+        fn def<'a>(name: &'a str, pattern: &'a str) -> Def<'a> {
+            Def {
+                name,
+                patterns: vec![pattern],
+                outer: None,
+                reach: InnerReach::DEFAULT,
+                priority: 0,
+            }
+        }
+
+        fn inside<'a>(
+            name: &'a str,
+            pattern: &'a str,
+            outer: &'a str,
+            reach: InnerReach,
+        ) -> Def<'a> {
+            Def {
+                name,
+                patterns: vec![pattern],
+                outer: Some(outer),
+                reach,
+                priority: 0,
+            }
+        }
+
+        fn push(manager: &mut Manager, item: Def<'_>) {
+            manager
+                .push_trigger(PushTriggerParams {
+                    isolate: IsolateId::Main,
+                    origin: Origin::User,
+                    name: &Arc::new(item.name.to_string()),
+                    patterns: &Arc::new(item.patterns.iter().map(|p| (*p).to_string()).collect()),
+                    raw_patterns: &Arc::new(Vec::new()),
+                    anti_patterns: &Arc::new(Vec::new()),
+                    matchers: None,
+                    action: ScriptAction::Noop,
+                    prompt: false,
+                    enabled: true,
+                    priority: item.priority,
+                    fallthrough: true,
+                    fire_limit: None,
+                    line_limit: None,
+                    source: None,
+                    outer: item.outer.map(|o| Arc::new(o.to_string())),
+                    reach: item.reach,
+                })
+                .unwrap();
+        }
+
+        fn reach(within: LineReach) -> InnerReach {
+            InnerReach {
+                within_lines: within,
+                ..InnerReach::DEFAULT
+            }
+        }
+
+        struct Fire {
+            name: String,
+            captures: Vec<String>,
+            firing: FiringContext,
+        }
+
+        fn line(manager: &mut Manager, text: &str) -> Vec<Fire> {
+            manager
+                .process_incoming_line(&Arc::new(StyledLine::new(text, Vec::new())))
+                .unwrap();
+            drain(manager)
+        }
+
+        fn prompt(manager: &mut Manager, text: &str) -> Vec<Fire> {
+            manager
+                .process_partial_line(Arc::new(StyledLine::new(text, Vec::new())))
+                .unwrap();
+            drain(manager)
+        }
+
+        fn drain(manager: &Manager) -> Vec<Fire> {
+            manager
+                .spawned_actions
+                .borrow_mut()
+                .drain(..)
+                .filter_map(|action| match action {
+                    RuntimeAction::RunAutomation {
+                        identity,
+                        matches,
+                        firing,
+                        ..
+                    } => Some(Fire {
+                        name: identity.name.to_string(),
+                        captures: matches
+                            .view()
+                            .iter()
+                            .map(|capture| capture.value.to_string())
+                            .collect(),
+                        firing,
+                    }),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn echoes(manager: &Manager) -> Vec<String> {
+            manager
+                .spawned_actions
+                .borrow_mut()
+                .drain(..)
+                .filter_map(|action| match action {
+                    RuntimeAction::Echo(text) => Some(text.to_string()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn names(fires: &[Fire]) -> Vec<&str> {
+            fires.iter().map(|fire| fire.name.as_str()).collect()
+        }
+
+        #[test]
+        fn inner_trigger_runs_only_on_its_outers_line() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("you", "^You "));
+            push(
+                &mut manager,
+                inside("hit", r"hit (?<who>\w+)", "you", InnerReach::DEFAULT),
+            );
+
+            let fires = line(&mut manager, "You hit orc");
+            assert_eq!(names(&fires), ["you", "hit"]);
+            assert_eq!(fires[1].captures, ["hit orc", "orc"]);
+            assert!(fires[0].firing.opened.is_some(), "an outer opens a firing");
+            assert!(fires[0].firing.under.is_none());
+            assert!(
+                fires[1].firing.under.is_some(),
+                "an inner runs under the firing"
+            );
+            assert!(
+                fires[1].firing.outer.is_some(),
+                "an inner carries the outer's values"
+            );
+
+            let fires = line(&mut manager, "I hit orc");
+            assert!(
+                fires.is_empty(),
+                "an inner trigger is not matched at the top level"
+            );
+            assert!(
+                manager.live_outers.borrow().is_empty(),
+                "a same-line firing does not linger"
+            );
+        }
+
+        #[test]
+        fn walk_order_is_outer_then_inner_then_the_next_top_level() {
+            let (mut manager, _queue) = manager();
+            let mut outer = def("outer", "line");
+            outer.priority = 5;
+            push(&mut manager, outer);
+            push(
+                &mut manager,
+                inside("inner", "line", "outer", InnerReach::DEFAULT),
+            );
+            push(&mut manager, def("later", "line"));
+
+            let fires = line(&mut manager, "a line");
+            assert_eq!(names(&fires), ["outer", "inner", "later"]);
+        }
+
+        #[test]
+        fn watching_covers_the_following_lines_and_expires() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("heading", "^Items:$"));
+            push(
+                &mut manager,
+                inside(
+                    "item",
+                    "^ ",
+                    "heading",
+                    InnerReach {
+                        same_line: false,
+                        ..reach(LineReach::Lines(2))
+                    },
+                ),
+            );
+
+            assert_eq!(names(&line(&mut manager, "Items:")), ["heading"]);
+            assert_eq!(names(&line(&mut manager, " sword")), ["item"]);
+            assert_eq!(names(&line(&mut manager, " shield")), ["item"]);
+            assert!(line(&mut manager, " ghost").is_empty(), "the range ran out");
+            assert!(manager.live_outers.borrow().is_empty());
+        }
+
+        #[test]
+        fn a_prompt_ends_a_watch_that_stops_at_the_prompt() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("heading", "^Items:$"));
+            push(
+                &mut manager,
+                inside(
+                    "item",
+                    "^ ",
+                    "heading",
+                    InnerReach {
+                        until_prompt: true,
+                        ..reach(LineReach::Lines(10))
+                    },
+                ),
+            );
+            push(
+                &mut manager,
+                inside("any", "^ ", "heading", reach(LineReach::Lines(10))),
+            );
+
+            line(&mut manager, "Items:");
+            assert_eq!(names(&line(&mut manager, " sword")), ["item", "any"]);
+            assert!(
+                prompt(&mut manager, "> ").is_empty(),
+                "the fragment itself is not offered"
+            );
+            assert_eq!(
+                names(&line(&mut manager, " shield")),
+                ["any"],
+                "only the trigger that stops at the prompt stopped"
+            );
+        }
+
+        #[test]
+        fn once_fires_once_per_firing_and_a_restart_resets_it() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("open", "^open$"));
+            push(
+                &mut manager,
+                inside(
+                    "first",
+                    "^x$",
+                    "open",
+                    InnerReach {
+                        once: true,
+                        ..reach(LineReach::Lines(5))
+                    },
+                ),
+            );
+
+            line(&mut manager, "open");
+            assert_eq!(names(&line(&mut manager, "x")), ["first"]);
+            assert!(
+                line(&mut manager, "x").is_empty(),
+                "once means once per firing"
+            );
+            line(&mut manager, "open");
+            assert_eq!(
+                names(&line(&mut manager, "x")),
+                ["first"],
+                "a new firing starts over"
+            );
+        }
+
+        #[test]
+        fn each_fires_once_per_live_firing_with_that_firings_values() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("a", r"^A (\w+)$"));
+            push(
+                &mut manager,
+                inside(
+                    "b",
+                    "^B$",
+                    "a",
+                    InnerReach {
+                        once: true,
+                        overlap: Overlap::Each,
+                        ..reach(LineReach::Lines(3))
+                    },
+                ),
+            );
+
+            line(&mut manager, "A first");
+            line(&mut manager, "A second");
+            let fires = line(&mut manager, "B");
+            assert_eq!(
+                names(&fires),
+                ["b", "b"],
+                "one fire per live firing, oldest first"
+            );
+            let seen: Vec<&str> = fires
+                .iter()
+                .map(|fire| {
+                    fire.firing
+                        .outer
+                        .as_ref()
+                        .unwrap()
+                        .own
+                        .view()
+                        .get(1)
+                        .unwrap()
+                        .value
+                })
+                .collect();
+            assert_eq!(seen, ["first", "second"]);
+            assert!(
+                line(&mut manager, "B").is_empty(),
+                "both firings were satisfied once"
+            );
+        }
+
+        #[test]
+        fn restart_watches_only_the_newest_firing() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("a", r"^A (\w+)$"));
+            push(
+                &mut manager,
+                inside("b", "^B$", "a", reach(LineReach::Lines(3))),
+            );
+
+            line(&mut manager, "A first");
+            line(&mut manager, "A second");
+            let fires = line(&mut manager, "B");
+            assert_eq!(names(&fires), ["b"]);
+            let outer = fires[0].firing.outer.as_ref().unwrap();
+            assert_eq!(outer.own.view().get(1).unwrap().value, "second");
+            assert_eq!(
+                manager.triggers[0]
+                    .inner
+                    .as_deref()
+                    .unwrap()
+                    .firings
+                    .borrow()
+                    .len(),
+                1,
+                "only the newest firing is kept when nothing watches each separately"
+            );
+        }
+
+        #[test]
+        fn skip_inner_discards_the_firing() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("gate", "^gate$"));
+            push(
+                &mut manager,
+                inside("in", "^x$", "gate", reach(LineReach::Lines(3))),
+            );
+
+            let fires = line(&mut manager, "gate");
+            // The outer's body decides to skip: the flag is shared with the firing.
+            fires[0]
+                .firing
+                .opened
+                .as_ref()
+                .unwrap()
+                .skipped
+                .store(true, Ordering::Relaxed);
+            assert!(
+                line(&mut manager, "x").is_empty(),
+                "a skipped firing watches nothing"
+            );
+        }
+
+        #[test]
+        fn stop_watching_ends_the_firing_after_the_line() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("gate", "^gate$"));
+            push(
+                &mut manager,
+                inside("in", "^x$", "gate", reach(LineReach::Unlimited)),
+            );
+
+            line(&mut manager, "gate");
+            let fires = line(&mut manager, "x");
+            assert_eq!(names(&fires), ["in"]);
+            fires[0]
+                .firing
+                .under
+                .as_ref()
+                .unwrap()
+                .stopped
+                .store(true, Ordering::Relaxed);
+            assert!(line(&mut manager, "x").is_empty(), "the watch ended");
+            assert!(manager.live_outers.borrow().is_empty());
+        }
+
+        #[test]
+        fn unlimited_watch_survives_many_lines() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("blind", r"^(?<who>\w+) is blinded!$"));
+            push(
+                &mut manager,
+                inside(
+                    "sees",
+                    r"^(?<name>\w+) can see again$",
+                    "blind",
+                    reach(LineReach::Unlimited),
+                ),
+            );
+
+            line(&mut manager, "Frodo is blinded!");
+            for _ in 0..500 {
+                assert!(line(&mut manager, "The orc slashes you.").is_empty());
+            }
+            let fires = line(&mut manager, "Frodo can see again");
+            assert_eq!(names(&fires), ["sees"]);
+            let outer = fires[0].firing.outer.as_ref().unwrap();
+            assert_eq!(outer.named("who"), Some("Frodo"));
+        }
+
+        #[test]
+        fn outer_values_offers_each_matched_value_in_line_coordinates() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("hit", r"^hit (\w+) for (\d+)$"));
+            let values = InnerReach {
+                input: InnerInput::OuterValues,
+                ..InnerReach::DEFAULT
+            };
+            push(&mut manager, inside("word", r"^\w+$", "hit", values));
+            push(&mut manager, inside("digits", r"^\d+$", "hit", values));
+
+            let fires = line(&mut manager, "hit orc for 12");
+            assert_eq!(names(&fires), ["hit", "word", "word", "digits"]);
+            assert_eq!(fires[1].captures, ["orc"]);
+            assert_eq!(fires[2].captures, ["12"]);
+            assert_eq!(fires[3].captures, ["12"]);
+        }
+
+        #[test]
+        fn a_nested_chain_merges_named_values_outward() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("a", r"(?<x>\d)"));
+            push(
+                &mut manager,
+                inside("b", r"(?<y>\d)", "a", InnerReach::DEFAULT),
+            );
+            push(
+                &mut manager,
+                inside("c", r"(?<z>\d)", "b", InnerReach::DEFAULT),
+            );
+
+            let fires = line(&mut manager, "123");
+            assert_eq!(names(&fires), ["a", "b", "c"]);
+            let outer = fires[2].firing.outer.as_ref().unwrap();
+            assert_eq!(outer.named("y"), Some("1"), "the nearest level's own value");
+            assert_eq!(outer.named("x"), Some("1"), "a value from two levels up");
+            assert_eq!(outer.named("z"), None, "never its own");
+        }
+
+        #[test]
+        fn removing_an_outer_removes_everything_inside_it() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("outer", "^outer$"));
+            push(
+                &mut manager,
+                inside("inner", "^outer$", "outer", InnerReach::DEFAULT),
+            );
+            push(&mut manager, def("other", "^outer$"));
+
+            manager.remove_trigger(&IsolateId::Main, &Origin::User, "outer");
+            assert_eq!(manager.triggers.len(), 1);
+            assert_eq!(names(&line(&mut manager, "outer")), ["other"]);
+        }
+
+        #[test]
+        fn disabling_an_outer_ends_its_watch() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("gate", "^gate$"));
+            push(
+                &mut manager,
+                inside("in", "^x$", "gate", reach(LineReach::Lines(5))),
+            );
+
+            line(&mut manager, "gate");
+            manager.enable_trigger(&IsolateId::Main, &Origin::User, "gate", false);
+            assert!(line(&mut manager, "x").is_empty());
+        }
+
+        #[test]
+        fn registration_rejects_a_missing_outer_and_a_reserved_name() {
+            let (mut manager, _queue) = manager();
+            push(
+                &mut manager,
+                inside("orphan", "^x$", "nobody", InnerReach::DEFAULT),
+            );
+            let reported = echoes(&manager);
+            assert_eq!(reported.len(), 1);
+            assert!(reported[0].contains("does not exist"), "{reported:?}");
+            assert!(manager.triggers.is_empty());
+
+            push(&mut manager, def("gate", "^gate$"));
+            push(
+                &mut manager,
+                inside("bad", r"(?<outer>x)", "gate", InnerReach::DEFAULT),
+            );
+            let reported = echoes(&manager);
+            assert!(reported[0].contains("reserved"), "{reported:?}");
+            push(
+                &mut manager,
+                inside("dup", r"(?<who>x)", "gate", InnerReach::DEFAULT),
+            );
+            push(
+                &mut manager,
+                inside("dup2", r"(?<who>y)", "dup", InnerReach::DEFAULT),
+            );
+            let reported = echoes(&manager);
+            assert!(reported[0].contains("already captured"), "{reported:?}");
+            let registry = manager.automation_registry.borrow();
+            let namespace = registry
+                .triggers
+                .get(&(IsolateId::Main, Origin::User))
+                .unwrap();
+            assert_eq!(namespace.get("gate").unwrap().inner, ["dup"]);
+            assert_eq!(namespace.get("dup").unwrap().outer.as_deref(), Some("gate"));
+        }
+
+        #[test]
+        fn too_many_overlapping_firings_drop_the_oldest_once_with_a_warning() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("a", "^a$"));
+            push(
+                &mut manager,
+                inside(
+                    "b",
+                    "^b$",
+                    "a",
+                    InnerReach {
+                        overlap: Overlap::Each,
+                        ..reach(LineReach::Unlimited)
+                    },
+                ),
+            );
+            for _ in 0..130 {
+                line(&mut manager, "a");
+            }
+            assert_eq!(
+                manager.triggers[0]
+                    .inner
+                    .as_deref()
+                    .unwrap()
+                    .firings
+                    .borrow()
+                    .len(),
+                128
+            );
+            let fires = line(&mut manager, "b");
+            assert_eq!(fires.len(), 128);
+            let node = manager.triggers[0].inner.as_deref().unwrap();
+            assert!(node.overflow_reported.get());
+            assert_eq!(
+                manager.triggers[0]
+                    .warning
+                    .borrow()
+                    .as_deref()
+                    .map(|w| w.contains("128")),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn last_fired_sequence_follows_the_input_counter() {
+            let (mut manager, _queue) = manager();
+            push(&mut manager, def("a", "^a$"));
+            line(&mut manager, "x");
+            let fires = line(&mut manager, "a");
+            assert_eq!(manager.input_sequence(), 2);
+            manager.record_fire(&manager.triggers[0].identity().clone());
+            assert_eq!(manager.triggers[0].last_fired.load(Ordering::Relaxed), 2);
+            assert_eq!(fires.len(), 1);
+        }
     }
 }
