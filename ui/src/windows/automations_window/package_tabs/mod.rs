@@ -145,6 +145,17 @@ impl AutomationsWindow {
 
         let mut body = column![header, tabs].spacing(16.0);
 
+        if tab == InstalledPackageTab::About && locked.installed_as_requirement {
+            body = body.push(
+                button(text(crate::i18n::t!("package-install-independently")).size(12.0))
+                    .style(button_style::secondary)
+                    .on_press_maybe(
+                        self.package_state_available()
+                            .then_some(Message::PromoteInstalledDependency),
+                    ),
+            );
+        }
+
         // Context banner.
         let banner_text = if viewing_as_required {
             Some(crate::i18n::t!("package-required-managed"))

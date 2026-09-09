@@ -1906,6 +1906,7 @@ package-required-manifest-invalid = Pakiet { $name } ma nieprawidłowy manifest:
 package-install-required-unavailable = Wymagany pakiet jest niedostępny
 package-import-managed = Ten kod działa wewnątrz pakietu nadrzędnego. Pakiet nadrzędny kontroluje jego ustawienia i uprawnienia.
 package-required-managed = Inny pakiet potrzebuje tego pakietu. Działa on w tych samych profilach co pakiety, które go potrzebują.
+package-install-independently = Zainstaluj niezależnie
 package-folder-locate-failed = Nie udało się zlokalizować folderu: { $error }
 package-folder-missing = Ten folder pakietu jeszcze nie istnieje.
 package-folder-open-failed = Nie udało się otworzyć folderu: { $error }

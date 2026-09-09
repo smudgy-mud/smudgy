@@ -4127,6 +4127,32 @@ mod package_root_plan_tests {
     }
 
     #[test]
+    fn required_root_starts_in_the_requiring_profiles_even_with_no_direct_activation() {
+        let mut root = active("smudgy://publisher/mapper", false);
+        root.set_activation(ProfileActivation::Selected {
+            profiles: ["Main".into()].into(),
+        });
+        let mut required = active("smudgy://publisher/prompt", false);
+        required.set_activation(ProfileActivation::None);
+        required.installed_as_requirement = true;
+        required.requirement_lineage_known = true;
+        required.required_by.insert(root.specifier.clone());
+        let lock = SharedPackageLock {
+            packages: vec![root, required],
+        };
+        let plan = partition_package_roots(&lock, "developer", &HashMap::new(), "Main");
+        assert_eq!(
+            plan.sandboxed,
+            ["smudgy://publisher/mapper", "smudgy://publisher/prompt"]
+        );
+        assert!(
+            partition_package_roots(&lock, "developer", &HashMap::new(), "Alt")
+                .sandboxed
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn canonical_local_row_controls_trust_and_collapses_shadowed_aliases() {
         let remote = active("smudgy://publisher/tools", true);
         let local = active("smudgy://local/tools", false);

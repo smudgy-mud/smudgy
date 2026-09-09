@@ -1835,6 +1835,7 @@ package-required-manifest-invalid = Package { $name } has an invalid manifest: {
 package-install-required-unavailable = A required package is not available
 package-import-managed = This code runs inside its parent package. The parent controls its settings and permissions.
 package-required-managed = Another package needs this package. It runs for the same profiles as the packages that need it.
+package-install-independently = Install independently
 package-folder-locate-failed = Couldn't locate the folder: { $error }
 package-folder-missing = That package folder doesn't exist yet.
 package-folder-open-failed = Couldn't open the folder: { $error }

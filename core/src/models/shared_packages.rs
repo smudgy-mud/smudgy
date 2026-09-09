@@ -1010,17 +1010,17 @@ fn replace_required_links(
     Ok(())
 }
 
-/// Replaces a root's flattened requirement links only while its staged version is unchanged.
+/// Replaces a root's flattened requirement links only while the complete lock is unchanged.
 ///
-/// This is the async graph-resolver commit point: an uninstall or version change that lands while
-/// the cloud response is in flight makes the result stale instead of resurrecting old links.
+/// This is the graph-resolver commit point: an uninstall or a staged-version change to any
+/// required package makes the closure stale instead of resurrecting old links.
 ///
 /// # Errors
 /// Returns an error for a missing required row or lockfile I/O failure.
-pub fn set_required_closure_if_staged_unchanged(
+pub fn set_required_closure_if_unchanged(
     server_name: &str,
+    expected_lock: &SharedPackageLock,
     root_specifier: &str,
-    expected_staged: Option<&str>,
     required_specifiers: &[String],
 ) -> Result<RequiredClosureCommit> {
     let required = required_specifiers
@@ -1028,10 +1028,7 @@ pub fn set_required_closure_if_staged_unchanged(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     mutate_lock(server_name, |lock| {
-        let Some(root) = lock.find(root_specifier) else {
-            return Ok((RequiredClosureCommit::Stale, false));
-        };
-        if root.staged_version() != expected_staged {
+        if lock != expected_lock || lock.find(root_specifier).is_none() {
             return Ok((RequiredClosureCommit::Stale, false));
         }
         for specifier in &required {
@@ -1250,6 +1247,20 @@ pub fn reconcile_local_installs(server_name: &str) -> Result<Vec<String>> {
 // ---------------------------------------------------------------------------
 // Row settings
 // ---------------------------------------------------------------------------
+
+/// Keeps an automatic requirement as an explicit install without changing its version, grants,
+/// parameters, parent links, or activation. The user can then select its independent activation.
+///
+/// # Errors
+/// Returns an error if package state cannot be read or written.
+pub fn promote_requirement_if_unchanged(
+    server_name: &str,
+    expected: &LockedPackage,
+) -> Result<Cas> {
+    mutate_row_if_unchanged(server_name, expected, |package| {
+        package.installed_as_requirement = false;
+    })
+}
 
 /// Mutates one row only while it still equals `expected` and still governs its leaf.
 fn mutate_row_if_unchanged(
@@ -3364,6 +3375,80 @@ mod tests {
         let plan = lock.plan_removal_from_links("smudgy://a/root");
         assert!(plan.breaks.is_empty());
         assert_eq!(plan.orphans, ["smudgy://a/dep"]);
+    }
+
+    #[test]
+    fn promoting_a_requirement_preserves_its_state_and_rejects_stale_rows() {
+        let server = test_server("promote");
+        let mut package = LockedPackage::new(
+            "smudgy://a/dep",
+            UpdateMode::Pinned {
+                version: "1.2.0".into(),
+            },
+        );
+        package.set_activation(ProfileActivation::None);
+        package.installed_as_requirement = true;
+        package.requirement_lineage_known = true;
+        package.required_by.insert("smudgy://a/root".into());
+        package.consented_permissions = Some(PackagePermissions::default());
+        package.parameter_scope = ParameterScope::Profile;
+        save_lock(
+            &server,
+            &SharedPackageLock {
+                packages: vec![package.clone()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            promote_requirement_if_unchanged(&server, &package).unwrap(),
+            Cas::Applied
+        );
+        let mut expected = package.clone();
+        expected.installed_as_requirement = false;
+        let lock = load_lock(&server).unwrap();
+        assert_eq!(lock.find(&package.specifier), Some(&expected));
+        assert!(
+            lock.plan_removal_from_links("smudgy://a/root")
+                .orphans
+                .is_empty()
+        );
+        assert_eq!(
+            promote_requirement_if_unchanged(&server, &package).unwrap(),
+            Cas::StateChanged
+        );
+        assert_eq!(load_lock(&server).unwrap(), lock);
+    }
+
+    #[test]
+    fn requirement_refresh_rejects_a_changed_dependency_snapshot() {
+        let server = test_server("requirement-refresh");
+        let root = "smudgy://a/root";
+        let dependency = "smudgy://a/dep";
+        install_package(&server, root, UpdateMode::Auto, true).unwrap();
+        install_package(&server, dependency, UpdateMode::Auto, false).unwrap();
+        let expected = load_lock(&server).unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(&server, &expected, root, &[dependency.into()])
+                .unwrap(),
+            RequiredClosureCommit::Changed,
+        );
+        let expected = load_lock(&server).unwrap();
+        assert!(expected.is_effectively_enabled_for(dependency, "Main"));
+        set_update_mode_if_unchanged(
+            &server,
+            expected.find(dependency).unwrap(),
+            UpdateMode::Pinned {
+                version: "2.0.0".into(),
+            },
+        )
+        .unwrap();
+        let changed = load_lock(&server).unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(&server, &expected, root, &[]).unwrap(),
+            RequiredClosureCommit::Stale,
+        );
+        assert_eq!(load_lock(&server).unwrap(), changed);
     }
 
     #[test]
