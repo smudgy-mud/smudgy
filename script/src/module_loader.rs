@@ -439,6 +439,12 @@ impl ModuleLoader for ScriptModuleLoader {
             return Ok(crate::package_resolver::core_module_url(referrer));
         }
 
+        // Preloaded only in this isolate's audio-enabled runtime. The fixed URL
+        // shares one module instance without adding globals or file authority.
+        if specifier == "smudgy:media" || specifier == "smudgy-media:main" {
+            return Ok(ModuleSpecifier::parse("smudgy-media:main").unwrap());
+        }
+
         // `smudgy:widgets` (the script-driven UI surface) and its `smudgy:widgets/jsx-runtime`
         // (auto-appended by the automatic JSX runtime). EXACT-STRING match, placed BEFORE the
         // `smudgy://` branch and the `resolve_import` fallthrough: both specifiers parse with
@@ -650,6 +656,12 @@ impl ModuleLoader for ScriptModuleLoader {
             return ModuleLoadResponse::Sync(crate::package_resolver::load_params_module(
                 module_specifier,
             ));
+        }
+        // Enabled runtimes preload the media module; reaching load means absent.
+        if module_specifier.scheme() == "smudgy-media" {
+            return ModuleLoadResponse::Sync(Err(generic_loader_error(
+                "smudgy:media requires an audio-enabled Smudgy runtime",
+            )));
         }
         // smudgy:core virtual module → synthesize the per-importer creation API.
         if module_specifier.scheme() == crate::package_resolver::CORE_SCHEME {

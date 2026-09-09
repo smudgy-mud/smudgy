@@ -2462,7 +2462,7 @@ dependencies = [
 [[package]]
 name = "deno_audio"
 version = "0.1.0-alpha.1"
-source = "git+https://github.com/smudgy-mud/deno_audio.git?rev=80b57870008d09e029b4e79b42c9467686a560ba#80b57870008d09e029b4e79b42c9467686a560ba"
+source = "git+https://github.com/smudgy-mud/deno_audio.git?rev=ccc327d25f0f358509dd735cf8fce7db710b2b40#ccc327d25f0f358509dd735cf8fce7db710b2b40"
 dependencies = [
  "deno_core",
  "deno_error",
@@ -11490,6 +11490,8 @@ dependencies = [
  "deno_runtime",
  "deno_semver",
  "deno_web",
+ "deno_webidl",
+ "libc",
  "log",
  "node_resolver",
  "reqwest",
@@ -14209,7 +14211,7 @@ dependencies = [
 [[package]]
 name = "web-audio-api"
 version = "1.7.0"
-source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=13ffdcd0f6c3472526653516f52a9320ef77a893#13ffdcd0f6c3472526653516f52a9320ef77a893"
+source = "git+https://github.com/smudgy-mud/web-audio-api-rs?rev=75dfdeb992f9ae8e63a76e3fcf471ac56f31836d#75dfdeb992f9ae8e63a76e3fcf471ac56f31836d"
 dependencies = [
  "almost",
  "arc-swap",
@@ -14229,6 +14231,7 @@ dependencies = [
  "no_denormals",
  "num-complex",
  "realfft",
+ "rtrb",
  "rubato 0.16.2",
  "smallvec",
  "symphonia 0.6.1",

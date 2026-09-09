@@ -1266,7 +1266,9 @@ mod tests {
             "/// <reference no-default-lib=\"true\" />\n\
              /// <reference lib=\"esnext\" />\n\
              interface Event {}\n\
-             interface EventTarget {}\n"
+             interface EventTarget {}\n\
+             declare class URL { constructor(input: string, base?: string | URL); }\n\
+             interface ImportMeta { readonly url: string; }\n"
                 .to_string(),
         );
         ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
@@ -1284,6 +1286,10 @@ mod tests {
             "web_audio_a11y_package.ts".to_string(),
             include_str!("../../../examples/web_audio_a11y_package/index.ts").to_string(),
         );
+        examples.insert(
+            "web_audio_file.ts".to_string(),
+            include_str!("../../../examples/web_audio_file.ts").to_string(),
+        );
         let output = smudgy_script::dts::generate_declarations(&examples, &ambient)
             .expect("compile public examples against hosted declarations");
         assert!(
@@ -1300,6 +1306,9 @@ mod tests {
              context.createGain().gain.setValueAtTime(0.5, 0);\n\
              new OfflineAudioContext(1, 128, 48_000);\n\
              new BiquadFilterNode(context);\n\
+             context.createFileSource('cue.wav');\n\
+             new AudioFileSourceNode();\n\
+             new Audio();\n\
              context.createOscillator().type = \"custom\";\n"
                 .to_string(),
         );
@@ -1307,8 +1316,8 @@ mod tests {
             .expect("unsupported surface produces ordinary diagnostics");
         assert_eq!(
             output.diagnostics.len(),
-            5,
-            "only the five deliberate unsupported uses should diagnose: {:#?}",
+            8,
+            "only the eight deliberate unsupported uses should diagnose: {:#?}",
             output.diagnostics
         );
         for expected in [
@@ -1316,6 +1325,9 @@ mod tests {
             "Property 'setValueAtTime' does not exist on type 'AudioParam'.",
             "Cannot find name 'OfflineAudioContext'.",
             "Cannot find name 'BiquadFilterNode'.",
+            "Property 'createFileSource' does not exist on type 'AudioContext'.",
+            "Cannot find name 'AudioFileSourceNode'.",
+            "Cannot find name 'Audio'.",
             "Type '\"custom\"' is not assignable to type 'OscillatorType'.",
         ] {
             assert!(

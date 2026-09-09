@@ -13,7 +13,7 @@ smudgy_audio = { workspace = true }
 assert_no_alloc = "1.1.2"
 futures = { workspace = true }
 smudgy_audio = { workspace = true, features = ["test-support"] }
-web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "13ffdcd0f6c3472526653516f52a9320ef77a893", default-features = false }
+web-audio-api = { git = "https://github.com/smudgy-mud/web-audio-api-rs", rev = "75dfdeb992f9ae8e63a76e3fcf471ac56f31836d", default-features = false }
 
 [lints]
 workspace = true

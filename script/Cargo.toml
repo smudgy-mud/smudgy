@@ -62,14 +62,19 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 # extension sequence and, when requested, expose the Web Audio API.
 deno_audio = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# A raced FIFO must not block an audio worker before its regular-file check.
+libc = { version = "0.2", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 deno_audio = { workspace = true }
+deno_webidl = "0.257"
 
 [features]
 # Add deno_audio to this build's startup snapshot. Every isolate uses that
 # snapshot, even when a specific runtime does not expose Web Audio.
-web-audio = ["dep:deno_audio"]
+web-audio = ["dep:deno_audio", "dep:libc"]
 
 # build.rs creates the V8 startup snapshot (deno_runtime base extension set) at
 # compile time and emits the residual lazy-source tables; see build.rs. Resolved

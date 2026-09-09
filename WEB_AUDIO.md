@@ -1,7 +1,8 @@
 # Web Audio support
 
 Smudgy has a bounded, standards-shaped Web Audio integration for short
-scripted synthesis such as accessibility earcons. It is available to trusted
+scripted synthesis and local audio-file playback, including earcons and recorded
+speech. It is available to trusted
 modules and sandboxed packages through the same per-session output boundary.
 
 Official Windows, macOS, and Flatpak build paths select the physical Web Audio
@@ -153,11 +154,95 @@ online surface:
 | Connections | Exact node/parameter `connect()` and `disconnect()` forms for the hosted graph |
 
 Other node families, custom/periodic waves, `AudioParam` automation methods,
-offline rendering, decoding, worklets, media capture, and device selection are
+offline rendering, whole-buffer decoding, worklets, media capture, and device selection are
 outside this hosted compatibility promise. The pinned alpha extension may
 expose additional working symbols, but packages cannot rely on those as Smudgy
 product surface. Operations that the hosted layer rejects are validated before
 they mutate its mixer.
+
+### Local audio files
+
+For earcons and recorded speech, use the local streaming player in
+`smudgy:media`. It manages its own session output and cleanup:
+
+```ts
+import { Audio } from "smudgy:media";
+
+const audio = new Audio(new URL("./cue.wav", import.meta.url));
+audio.volume = 0.3;
+audio.onerror = () => console.error(audio.error);
+audio.onended = () => console.log("Finished");
+await audio.play(); // Resolves when playback starts, not when it finishes.
+```
+
+`new Audio()` creates an empty player; assign `audio.src` later. Construction
+with a source, source assignment, and `load()` preload a bounded PCM queue
+without autoplay. `pause()` preserves the decoder position; `play()` resumes,
+or reopens the file from the beginning after natural completion. `volume`
+ranges from 0 to 1; `muted` preserves the chosen volume. Each player has its own
+logical context, so pausing it does not pause other audio.
+
+Source replacement, `load()`, `pause()`, and `close()` reject interrupted
+`play()` promises with `AbortError`. Load and decoder failures set `error`,
+dispatch `error`, and reject pending play promises; failures do not dispatch
+`ended`. Set `src` or call `load()` to retry after an error. Natural completion
+releases the context and joins its decoder before dispatching `ended`.
+`await audio.close()` releases a preloaded or paused player and waits for its
+decoder to exit. It retains `src`, volume and mute; subsequent `play()` starts
+from the beginning. Setting `src = ""` also initiates resource release.
+
+This module exports a documented subset of HTML Audio behavior, not an
+`HTMLAudioElement`. It supports `loadstart`, `canplay`, `play`, `playing`,
+`pause`, `ended`, `error`, and `volumechange` events and their `on…` handlers.
+Events are delivered asynchronously; browser media-task ordering is not promised.
+There is no global `Audio`, DOM element, `MediaError`, readiness enum, duration,
+seek/currentTime API, looping, autoplay attribute, or network streaming. A
+preloaded or paused player retains a context and its bounded resources until
+closed, replaced, completed, or its isolate is retired. Keep such players for
+reuse, or close them explicitly rather than depending on garbage collection.
+
+For explicit Web Audio graph routing, the module also offers a lower-level
+factory. It adds no methods to `AudioContext` and no Web Audio globals:
+
+```ts
+import { createFileSource } from "smudgy:media";
+
+const context = new AudioContext();
+const source = await createFileSource(context, new URL("./cue.wav", import.meta.url));
+source.connect(context.destination);
+source.onended = () => context.close();
+source.start();
+```
+
+The module also exports `AudioFileSourceNode` for type annotations and
+`instanceof` checks. Create sources with the factory, connect them to a gain or
+destination, and call `start()` once. `stop()` is immediate and permanent.
+[The file playback example](examples/web_audio_file.ts) includes gain and cleanup.
+The API accepts local paths and `file:` URLs. Relative paths use the process
+working directory; resolve module-relative assets with `new URL` as above.
+Sandboxed packages need their existing file-read grant for the resolved asset.
+Code-import authority does not grant asset access. HTTP/data URLs, network shares,
+devices and pipes are not file sources.
+
+Supported formats are WAV, MP3, FLAC, Ogg/Vorbis, AAC-LC or ALAC in M4A, and AIFF,
+with mono/stereo audio at 8–192 kHz. The decoder reads incrementally on a worker;
+neither the complete encoded file nor the complete decoded sound is loaded into
+memory. Scheduling, seeking, looping and playback-rate changes are not supported
+by file sources in this release.
+
+Load failures reject the factory promise. A later decoder failure sets
+`source.error` and dispatches `error` before `ended`. `stop()` cancels and silences
+the source; `context.close()` additionally waits for admitted decoder workers to
+exit, including sources never started. Session reload and isolate teardown cancel
+their workers through the existing audio lifecycle.
+
+The initial policy permits encoded files up to 256 MiB and eight active decoder
+workers per isolate and application. Each worker reserves a 4 MiB working
+allowance plus a 16 KiB PCM queue from the shared 64 MiB audio budget. Worker
+charges remain until the thread is joined; graph/queue charges follow their
+physical lifetime. Codec-private and container-index allocations are not measured
+by that allowance, so it is not a hard process-memory ceiling. Packet, channel,
+rate and metadata-entry limits provide additional bounds.
 
 See [the trusted module example](examples/web_audio_earcon.ts) and [the complete
 sandboxed package example](examples/web_audio_a11y_package/). The package asks
