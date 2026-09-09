@@ -31,7 +31,7 @@ use crate::session::{
 };
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -54,6 +54,7 @@ deno_core::extension!(
     op_smudgy_session_reload,
     op_smudgy_session_send,
     op_smudgy_session_send_raw,
+    op_smudgy_session_send_bytes,
     op_smudgy_resolve_link_tooltip,
     op_smudgy_create_simple_alias,
     op_smudgy_create_simple_trigger,
@@ -4517,18 +4518,131 @@ fn op_smudgy_session_send(
 
 #[op2(fast)]
 fn op_smudgy_session_send_raw(
+    scope: &mut v8::PinScope,
     state: &mut OpState,
     session_id: u32,
     #[string] line: &str,
 ) -> Result<(), StoreOpError> {
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, grants(state).send_direct, "send-direct")?;
-    reserve_script_send(state, line)?;
-    route_session_action(
+    let append_crlf = SEND_RAW_LEGACY_TERMINATOR && !line.ends_with('\n');
+    // Charge the normalized UTF-8 payload before allocating it. Encoding and IAC
+    // escaping remain the connection's responsibility, like other text sends.
+    let extra_crs = line
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .filter(|&(index, byte)| {
+            *byte == b'\n' && (index == 0 || line.as_bytes()[index - 1] != b'\r')
+        })
+        .count();
+    reserve_script_bytes(
         state,
-        target,
-        RuntimeAction::SendRaw(Arc::new(line.to_string())),
+        line.len()
+            .saturating_add(extra_crs)
+            .saturating_add(if append_crlf { 2 } else { 0 }),
+    )?;
+    let text = normalize_raw_text(line, append_crlf);
+    if append_crlf {
+        warn_raw_terminator(scope, state);
+    }
+    route_session_action(state, target, RuntimeAction::SendRawText(Arc::new(text)));
+    Ok(())
+}
+
+// The compatibility behavior expires with the first 0.6 release, including PTBs.
+const SEND_RAW_LEGACY_TERMINATOR: bool = matches!(env!("CARGO_PKG_VERSION_MAJOR").as_bytes(), b"0")
+    && matches!(
+        env!("CARGO_PKG_VERSION_MINOR").as_bytes(),
+        b"0" | b"1" | b"2" | b"3" | b"4" | b"5"
     );
+
+const _: () = assert!(
+    SEND_RAW_LEGACY_TERMINATOR,
+    "Smudgy 0.6.0 or later: remove sendRaw's implicit final CRLF and its deprecation warning. \
+     Update the migration documentation and tests, then remove this version guard and assertion."
+);
+
+fn normalize_raw_text(text: &str, append_crlf: bool) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous = None;
+    for character in text.chars() {
+        if character == '\n' && previous != Some('\r') {
+            normalized.push('\r');
+        }
+        normalized.push(character);
+        previous = Some(character);
+    }
+    if append_crlf {
+        normalized.push_str("\r\n");
+    }
+    normalized
+}
+
+#[derive(Default)]
+struct RawTerminatorWarnings(HashSet<String>);
+
+/// Capture the calling script with V8, without invoking script-defined Error hooks.
+/// A module URL (or an inline script's resource name) is stable across call sites.
+fn warn_raw_terminator(scope: &mut v8::PinScope, state: &mut OpState) {
+    let source = v8::StackTrace::current_stack_trace(scope, 32).and_then(|stack| {
+        (0..stack.get_frame_count()).find_map(|index| {
+            let frame = stack.get_frame(scope, index)?;
+            if !frame.is_user_javascript() {
+                return None;
+            }
+            let name = frame
+                .get_script_name(scope)
+                .map(|name| name.to_rust_string_lossy(scope))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("inline script #{}", frame.get_script_id()));
+            if super::is_internal_frame(&name) {
+                return None;
+            }
+            Some((
+                name.clone(),
+                format!("{name}:{}:{}", frame.get_line_number(), frame.get_column()),
+            ))
+        })
+    });
+    let (key, location) =
+        source.unwrap_or_else(|| ("<script>".to_string(), "<script>".to_string()));
+    if !state.has::<RawTerminatorWarnings>() {
+        state.put(RawTerminatorWarnings::default());
+    }
+    if state.borrow_mut::<RawTerminatorWarnings>().0.insert(key) {
+        // This is a host diagnostic in the caller's session, not a script echo.
+        // It does not require the script's echo capability or reveal sent content.
+        let message = format!(
+            "sendRaw() warning at {location}: Smudgy added a final CRLF for compatibility. \
+             Starting in version 0.6.0, Smudgy will not add a final CRLF. \
+             Add \"\\n\" to keep sending a complete command. Binary input is already sent unchanged."
+        );
+        queue_own_action(
+            state,
+            RuntimeAction::EchoStyled(vec![Arc::new(StyledLine::from_warn_str(&message))]),
+        );
+    }
+}
+
+fn reserve_script_bytes(state: &OpState, bytes: usize) -> Result<(), StoreOpError> {
+    state
+        .borrow::<ActionQueue>()
+        .borrow_mut()
+        .reserve_script_send(bytes)
+        .map_err(|error| StoreOpError(error.to_string()))
+}
+
+#[op2(fast)]
+fn op_smudgy_session_send_bytes(
+    state: &mut OpState,
+    session_id: u32,
+    #[buffer] bytes: &[u8],
+) -> Result<(), StoreOpError> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).send_direct, "send-direct")?;
+    reserve_script_bytes(state, bytes.len())?;
+    route_session_action(state, target, RuntimeAction::SendRawBytes(Arc::from(bytes)));
     Ok(())
 }
 
@@ -8304,6 +8418,29 @@ mod tests {
         Blink, LinkAction, LinkToken, TextAttributes, TextAttributesUpdate, Underline,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn raw_text_preserves_explicit_endings_and_normalizes_only_bare_lf() {
+        for (input, normalized) in [
+            ("", ""),
+            ("look", "look"),
+            ("look\n", "look\r\n"),
+            ("look\r\n", "look\r\n"),
+            ("a\nb\r\n\n", "a\r\nb\r\n\r\n"),
+            ("\r", "\r"),
+            ("\r\r\n", "\r\r\n"),
+            ("café\0\n", "café\0\r\n"),
+        ] {
+            assert_eq!(super::normalize_raw_text(input, false), normalized);
+            let legacy = !input.ends_with('\n');
+            let expected = if legacy {
+                format!("{normalized}\r\n")
+            } else {
+                normalized.to_string()
+            };
+            assert_eq!(super::normalize_raw_text(input, legacy), expected);
+        }
+    }
 
     #[test]
     fn script_trigger_hsv_range_uses_strict_rgb_endpoints_and_native_conversion() {

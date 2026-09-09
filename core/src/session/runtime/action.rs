@@ -166,7 +166,12 @@ pub enum RuntimeAction {
     /// Constructed only by the `SubmitInput` dispatch arm; it rides the
     /// spawned-action queue, which a reload clears along with the state it consumes.
     CompleteInputSubmission,
+    /// Internal line-oriented send used by command aliases and typed input.
     SendRaw(Arc<String>),
+    /// Script `sendRaw` text, already normalized and terminated as required by the API.
+    SendRawText(Arc<String>),
+    /// Script `sendRaw` bytes, copied at the op boundary and never locally echoed.
+    SendRawBytes(Arc<[u8]>),
     /// Sends `text` to the server verbatim (split on `\n`, like `SendRaw`), but
     /// echoes the copy shown in the client's view and written to the session log
     /// with each (non-empty) literal `redactions` substring masked — so secrets
