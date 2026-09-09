@@ -4535,6 +4535,12 @@ const SEND_RAW_LEGACY_TERMINATOR: bool = matches!(env!("CARGO_PKG_VERSION_MAJOR"
         b"0" | b"1" | b"2" | b"3" | b"4" | b"5"
     );
 
+const _: () = assert!(
+    SEND_RAW_LEGACY_TERMINATOR,
+    "Smudgy 0.6.0 or later: remove sendRaw's implicit final CRLF and its deprecation warning. \
+     Update the migration documentation and tests, then remove this version guard and assertion."
+);
+
 fn normalize_raw_text(text: &str, append_crlf: bool) -> String {
     let mut normalized = String::with_capacity(text.len());
     let mut previous = None;
