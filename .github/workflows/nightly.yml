@@ -1,10 +1,10 @@
 name: Nightly
 
-# GitHub runs this schedule from the default branch. 10:23 UTC is 03:23 PDT /
-# 02:23 PST. Quarter-hour runs only recover dispatches for existing tags.
+# GitHub runs this schedule from the default branch. 08:00 UTC is 01:00 PDT /
+# 00:00 PST. Quarter-hour runs only recover dispatches for existing tags.
 on:
   schedule:
-    - cron: '23 10 * * *'
+    - cron: '0 8 * * *'
     - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
