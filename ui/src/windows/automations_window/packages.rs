@@ -1206,33 +1206,64 @@ struct PlannedRequired {
 
 type RequiredKey = (String, String);
 
-/// Reconstructs the complete installed `requires` closure from staged manifests. Missing
-/// metadata returns `None`, so callers cannot erase durable links from a partial response.
+#[derive(Debug, Default)]
+struct InstalledRequiredClosure {
+    required: BTreeSet<String>,
+    observed: BTreeSet<String>,
+    unavailable: BTreeSet<String>,
+    preserve_existing: bool,
+}
+
+/// Missing installations are reported and skipped. Missing metadata for an installed branch
+/// preserves existing links, while independently verified branches can still be repaired.
 fn installed_required_closure(
     lock: &SharedPackageLock,
     root: &str,
     manifest: &PackageManifest,
     mut load_manifest: impl FnMut(&LockedPackage) -> Option<PackageManifest>,
-) -> Option<Vec<String>> {
+) -> InstalledRequiredClosure {
     let mut visited = HashSet::from([root.to_string()]);
-    let mut required = BTreeSet::new();
+    let mut closure = InstalledRequiredClosure::default();
     let mut pending = manifest.smudgy_requires();
     while let Some(dependency) = pending.pop() {
         let requested = specifier_for(&dependency.key.owner, &dependency.key.name);
-        let governing = lock.governing_specifier(&requested)?;
+        closure.observed.insert(requested.clone());
+        let Some(governing) = lock.governing_specifier(&requested) else {
+            closure.unavailable.insert(requested);
+            continue;
+        };
         if governing == root {
             continue;
         }
-        if lock.find(&requested).is_some() {
-            required.insert(requested);
+        if let Some(fallback) = lock
+            .packages
+            .iter()
+            .find(|package| package.specifier.eq_ignore_ascii_case(&requested))
+        {
+            closure.required.insert(fallback.specifier.clone());
         }
-        required.insert(governing.to_string());
+        closure.required.insert(governing.to_string());
         if visited.insert(governing.to_string()) {
-            let package = lock.find(governing)?;
-            pending.extend(load_manifest(package)?.smudgy_requires());
+            let package = lock
+                .find(governing)
+                .expect("governing specifier belongs to the lock");
+            if let Some(manifest) = load_manifest(package) {
+                pending.extend(manifest.smudgy_requires());
+            } else {
+                closure.unavailable.insert(governing.to_string());
+                closure.preserve_existing = true;
+            }
         }
     }
-    Some(required.into_iter().collect())
+    if closure.preserve_existing {
+        closure.required.extend(
+            lock.packages
+                .iter()
+                .filter(|package| package.required_by.contains(root))
+                .map(|package| package.specifier.clone()),
+        );
+    }
+    closure
 }
 
 fn normalized_required_key(owner: &str, name: &str) -> RequiredKey {
@@ -1379,29 +1410,10 @@ fn apply_required_refusal(closure: &mut RequiredClosure, refusal: RequiredRefusa
 /// Canonical comparison key for the independent roots declared by one resolved version. Resolved
 /// versions are intentionally excluded: the declaration (target + accepted range) is the contract;
 /// a registry re-resolution within the same range does not itself change what the package requires.
-fn resolved_requires_signature(wire: &ResolvedPackageWire) -> Vec<(String, String, String)> {
-    let mut signature = wire
-        .dependencies
-        .iter()
-        .filter(|dependency| dependency.kind == DependencyKind::Requires)
-        .map(|dependency| {
-            let range = dependency.range.trim();
-            let range = if range.is_empty() {
-                String::new()
-            } else {
-                semver::VersionReq::parse(range)
-                    .map_or_else(|_| format!("invalid:{range}"), |range| range.to_string())
-            };
-            (
-                dependency.owner_nickname.to_ascii_lowercase(),
-                dependency.name.to_ascii_lowercase(),
-                range,
-            )
-        })
-        .collect::<Vec<_>>();
-    signature.sort_unstable();
-    signature.dedup();
-    signature
+fn resolved_requires_signature(
+    wire: &ResolvedPackageWire,
+) -> Option<crate::package_requirements::RequirementSignature> {
+    crate::package_requirements::wire_signature(&wire.manifest)
 }
 
 /// Strict variant used by installation. A malformed manifest cannot be treated as "requires
@@ -2545,6 +2557,19 @@ impl AutomationsWindow {
     /// Rebuilds the direct/owned sets from the current lists, preserving the
     /// async-resolved `requires`/`resolved` maps and the user's enable intent.
     pub(super) fn rebuild_graph(&mut self) {
+        let lock = SharedPackageLock {
+            packages: self.installed_packages.clone(),
+        };
+        self.graph.effective_roots = Some(
+            lock.packages
+                .iter()
+                .filter(|package| {
+                    self.governing_specifier(&package.specifier) == package.specifier
+                        && lock.is_effectively_enabled_for(&package.specifier, &self.profile_name)
+                })
+                .map(|package| package.specifier.clone())
+                .collect(),
+        );
         self.graph.direct.clear();
         self.graph.owned.clear();
         for pkg in &self.installed_packages {
@@ -2590,33 +2615,7 @@ impl AutomationsWindow {
         for name in self.local_packages.clone() {
             let spec = self.local_own_spec(&name);
             if let Ok(Some(pkg)) = local_packages::load_local_package(&self.server_name, &name) {
-                let edges = pkg
-                    .manifest
-                    .smudgy_dependencies()
-                    .into_iter()
-                    .map(|dependency| {
-                        let requested = specifier_for(&dependency.key.owner, &dependency.key.name);
-                        DepEdge {
-                            specifier: self.governing_specifier(&requested),
-                            range: dependency.range.unwrap_or_default(),
-                            kind: DependencyKind::Dependency,
-                        }
-                    })
-                    .chain(
-                        pkg.manifest
-                            .smudgy_requires()
-                            .into_iter()
-                            .map(|dependency| {
-                                let requested =
-                                    specifier_for(&dependency.key.owner, &dependency.key.name);
-                                DepEdge {
-                                    specifier: self.governing_specifier(&requested),
-                                    range: dependency.range.unwrap_or_default(),
-                                    kind: DependencyKind::Requires,
-                                }
-                            }),
-                    )
-                    .collect();
+                let edges = self.manifest_edges(&pkg.manifest);
                 self.graph.requires.insert(spec, edges);
             }
         }
@@ -2685,13 +2684,13 @@ impl AutomationsWindow {
             return Update::none();
         }
         if let Ok((resolved, union)) = result {
-            let Ok(manifest) = resolved_manifest_checked(&resolved) else {
-                return Update::none();
-            };
+            let manifest = resolved_manifest_checked(&resolved);
             let mut edges = resolved
                 .dependencies
                 .iter()
-                .filter(|dependency| dependency.kind == DependencyKind::Dependency)
+                .filter(|dependency| {
+                    manifest.is_err() || dependency.kind == DependencyKind::Dependency
+                })
                 .map(|d| {
                     let requested = specifier_for(&d.owner_nickname, &d.name);
                     DepEdge {
@@ -2703,54 +2702,78 @@ impl AutomationsWindow {
                 .collect::<Vec<_>>();
             // Older published versions can declare `requires` in their manifest without a
             // corresponding catalog edge. The manifest is also what installation resolves.
-            edges.extend(manifest.smudgy_requires().into_iter().map(|dependency| {
-                let requested = specifier_for(&dependency.key.owner, &dependency.key.name);
-                DepEdge {
-                    specifier: self.governing_specifier(&requested),
-                    range: dependency.range.unwrap_or_default(),
-                    kind: DependencyKind::Requires,
-                }
-            }));
+            if let Ok(manifest) = &manifest {
+                edges.extend(
+                    self.manifest_edges(manifest)
+                        .into_iter()
+                        .filter(|edge| edge.kind == DependencyKind::Requires),
+                );
+            }
             let lock = SharedPackageLock {
                 packages: self.installed_packages.clone(),
             };
             let cache = PackageCache::new().ok();
-            let installed_requirements =
-                installed_required_closure(&lock, spec, &manifest, |package| {
-                    let parsed = smudgy_script::SmudgySpecifier::parse(&package.specifier).ok()?;
-                    if parsed
-                        .owner
-                        .eq_ignore_ascii_case(local_packages::LOCAL_OWNER)
-                    {
-                        return local_packages::load_local_package(&self.server_name, &parsed.name)
+            let installed_requirements = manifest.as_ref().ok().map(|manifest| {
+                installed_required_closure(&lock, spec, manifest, |package| {
+                    let (owner, name) = parse_specifier(&package.specifier)?;
+                    if owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER) {
+                        return local_packages::load_local_package(&self.server_name, &name)
                             .ok()
                             .flatten()
                             .map(|package| package.manifest);
                     }
                     cache
                         .as_ref()?
-                        .read_meta(&parsed.package_key(), package.staged_version()?)
+                        .read_meta(
+                            &smudgy_script::PackageKey { owner, name },
+                            package.staged_version()?,
+                        )
                         .map(|meta| meta.manifest)
-                });
-            // Never replace a flattened closure with a partial graph. Installation has already
-            // cached every required root; an unavailable manifest leaves its durable links intact.
-            let links_changed = match installed_requirements.map(|requirements| {
+                })
+            });
+            let issue = match (&manifest, &installed_requirements) {
+                (Err(error), _) => Some(error.to_string()),
+                (_, Some(closure)) if !closure.unavailable.is_empty() => Some(
+                    closure
+                        .unavailable
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                _ => None,
+            };
+            if let Some(issue) = issue {
+                log::warn!("Package requirements for {spec} could not be fully refreshed: {issue}");
+                self.graph.requirement_issues.insert(
+                    spec.to_string(),
+                    crate::i18n::t!("package-requirements-refresh-incomplete", "error" => issue),
+                );
+            } else {
+                self.graph.requirement_issues.remove(spec);
+            }
+            // Repair verified branches and remove stale links. If an installed branch's manifest
+            // is unavailable, the closure retains existing links until that metadata returns.
+            let mut refresh_task = Task::none();
+            let links_changed = match installed_requirements.map(|closure| {
                 shared_packages::set_required_closure_if_unchanged(
                     &self.server_name,
                     &lock,
                     spec,
-                    &requirements,
+                    &closure.required.into_iter().collect::<Vec<_>>(),
+                    &closure.observed.into_iter().collect::<Vec<_>>(),
                 )
             }) {
                 Some(Ok(shared_packages::RequiredClosureCommit::Changed)) => true,
                 Some(Ok(shared_packages::RequiredClosureCommit::Unchanged)) | None => false,
                 Some(Ok(shared_packages::RequiredClosureCommit::Stale)) => {
-                    self.graph_seq.bump();
-                    return Update::with_task(Task::done(Message::LoadInstalledPackages));
+                    refresh_task = Task::done(Message::LoadInstalledPackages);
+                    false
                 }
                 Some(Err(error)) => {
                     log::warn!("Failed to persist package dependency links for {spec}: {error:#}");
-                    return Update::none();
+                    self.graph.requirement_issues.insert(spec.to_string(), crate::i18n::t!("package-requirements-refresh-incomplete", "error" => error.to_string()));
+                    false
                 }
             };
             self.graph
@@ -2788,6 +2811,7 @@ impl AutomationsWindow {
                     server_name: self.server_name.clone(),
                 });
             }
+            return Update::with_task(refresh_task);
         } else {
             self.blocked_updates.remove(spec);
         }
@@ -2821,14 +2845,41 @@ impl AutomationsWindow {
         }
         match shared_packages::promote_requirement_if_unchanged(&self.server_name, &expected) {
             Ok(Cas::Applied) => {
-                if let Err(error) = self.reload_package_lock_snapshot() {
-                    self.manage_feedback = Some(error);
-                }
+                let activation_changed = match self.reload_package_lock_snapshot() {
+                    Ok(()) => {
+                        let after = shared_packages::SharedPackageLock {
+                            packages: self.installed_packages.clone(),
+                        };
+                        let mut before = after.clone();
+                        if let Some(row) = before
+                            .packages
+                            .iter_mut()
+                            .find(|row| row.specifier == expected.specifier)
+                        {
+                            row.installed_as_requirement = true;
+                        }
+                        self.profile_names
+                            .iter()
+                            .chain(std::iter::once(&self.profile_name))
+                            .any(|profile| {
+                                before.is_effectively_enabled_for(&expected.specifier, profile)
+                                    != after
+                                        .is_effectively_enabled_for(&expected.specifier, profile)
+                            })
+                    }
+                    Err(error) => {
+                        self.manage_feedback = Some(error);
+                        true
+                    }
+                };
                 self.selection = Selection::InstalledPackage(expected.specifier);
                 self.installed_package_tab = InstalledPackageTab::Settings;
-                Update::with_event(Event::ScriptsChanged {
-                    server_name: self.server_name.clone(),
-                })
+                Update::new(
+                    Task::none(),
+                    activation_changed.then_some(Event::ScriptsChanged {
+                        server_name: self.server_name.clone(),
+                    }),
+                )
             }
             Ok(Cas::StateChanged) => {
                 self.manage_feedback = Some(crate::i18n::t!("package-settings-state-changed"));
@@ -3040,22 +3091,26 @@ impl AutomationsWindow {
                     .resolve_package(&latest_owner, &latest_name, None)
                     .await?;
                 let latest_requirements = resolved_requires_signature(&resolved);
-                let requirements_changed = if latest_requirements.is_empty()
-                    || staged_for_latest.as_deref() == Some(resolved.version.as_str())
-                {
-                    false
-                } else if let Some(staged) = staged_for_latest.as_deref() {
-                    latest_client
-                        .resolve_package(&latest_owner, &latest_name, Some(staged))
-                        .await
-                        .map(|current| resolved_requires_signature(&current) != latest_requirements)
-                        // A non-empty offered requirement set without a readable baseline must be
-                        // reviewed. Failing open here would let a new independent root bypass the
-                        // planner merely because the old metadata was temporarily unavailable.
-                        .unwrap_or(true)
-                } else {
-                    true
-                };
+                let requirements_changed =
+                    if latest_requirements.as_ref().is_some_and(Vec::is_empty)
+                        || staged_for_latest.as_deref() == Some(resolved.version.as_str())
+                    {
+                        false
+                    } else if let Some(staged) = staged_for_latest.as_deref() {
+                        latest_client
+                            .resolve_package(&latest_owner, &latest_name, Some(staged))
+                            .await
+                            .map(|current| {
+                                latest_requirements.is_none()
+                                    || resolved_requires_signature(&current) != latest_requirements
+                            })
+                            // A non-empty offered requirement set without a readable baseline must be
+                            // reviewed. Failing open here would let a new independent root bypass the
+                            // planner merely because the old metadata was temporarily unavailable.
+                            .unwrap_or(true)
+                    } else {
+                        true
+                    };
                 let closure = closure_permission_union(&latest_client, &resolved).await?;
                 Ok::<_, CloudError>(InstalledLatestComparison {
                     version: resolved.version,
@@ -7164,6 +7219,7 @@ impl AutomationsWindow {
             self.pane = Pane::Dashboard;
         }
         self.graph.requires.clear();
+        self.graph.requirement_issues.clear();
         self.graph.resolved.clear();
         self.blocked_updates.clear();
         self.rebuild_graph();
@@ -7345,12 +7401,19 @@ impl AutomationsWindow {
         self.installed_package_state_error = None;
         self.installed_packages = lock.packages;
         if let Some(specifier) = open_specifier {
-            self.installed_open = self
-                .installed_packages
-                .iter()
-                .find(|package| package.specifier == specifier)
-                .cloned()
-                .map(Box::new);
+            let inspecting_import = matches!(&self.selection, Selection::Dependency { spec, .. } if *spec == specifier)
+                && !self
+                    .installed_packages
+                    .iter()
+                    .any(|package| package.specifier == specifier);
+            if !inspecting_import {
+                self.installed_open = self
+                    .installed_packages
+                    .iter()
+                    .find(|package| package.specifier == specifier)
+                    .cloned()
+                    .map(Box::new);
+            }
         }
         if let Some(config) = self.param_config.as_mut()
             && let Some(package) = self
@@ -7849,6 +7912,7 @@ impl AutomationsWindow {
         self.installed_readme = InstalledReadmeState::Loaded(None);
         self.installed_rating = None;
         self.graph.requires.clear();
+        self.graph.requirement_issues.clear();
         self.graph.resolved.clear();
         self.blocked_updates.clear();
         self.rebuild_graph();
@@ -7969,8 +8033,35 @@ impl AutomationsWindow {
 
     /// The lock row whose activation and settings govern a package reference.
     pub(super) fn governing_specifier(&self, specifier: &str) -> String {
-        self.local_override_name(specifier)
-            .map_or_else(|| specifier.to_string(), |name| self.local_own_spec(name))
+        self.local_override_name(specifier).map_or_else(
+            || {
+                SharedPackageLock {
+                    packages: self.installed_packages.clone(),
+                }
+                .governing_specifier(specifier)
+                .map_or_else(|| specifier.to_ascii_lowercase(), str::to_string)
+            },
+            |name| self.local_own_spec(name),
+        )
+    }
+
+    fn manifest_edges(&self, manifest: &PackageManifest) -> Vec<DepEdge> {
+        [
+            (manifest.smudgy_dependencies(), DependencyKind::Dependency),
+            (manifest.smudgy_requires(), DependencyKind::Requires),
+        ]
+        .into_iter()
+        .flat_map(|(dependencies, kind)| {
+            dependencies.into_iter().map(move |dependency| DepEdge {
+                specifier: self.governing_specifier(&specifier_for(
+                    &dependency.key.owner,
+                    &dependency.key.name,
+                )),
+                range: dependency.range.unwrap_or_default(),
+                kind,
+            })
+        })
+        .collect()
     }
 
     /// The truthful status of a local package: the status of its own-specifier install (Ok/Warning
@@ -9219,7 +9310,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn required_closure_keeps_nested_requirements_and_refuses_partial_metadata() {
+    fn required_closure_keeps_nested_requirements_and_reports_partial_metadata() {
         let manifest = |requires: Vec<&str>| -> PackageManifest {
             serde_json::from_value(serde_json::json!({ "version": "1.0.0", "requires": requires }))
                 .unwrap()
@@ -9238,16 +9329,56 @@ mod tests {
         assert_eq!(
             installed_required_closure(&lock, root, &manifest(vec![child]), |package| manifests
                 .get(package.specifier.as_str())
-                .cloned()),
-            Some(vec![child.to_string(), leaf.to_string()]),
+                .cloned())
+            .required,
+            BTreeSet::from([child.to_string(), leaf.to_string()]),
         );
         assert!(
-            installed_required_closure(&lock, root, &manifest(vec![child]), |_| None).is_none()
+            installed_required_closure(&lock, root, &manifest(vec![child]), |_| None)
+                .preserve_existing
         );
         assert_eq!(
-            installed_required_closure(&lock, root, &manifest(vec![]), |_| None),
-            Some(vec![])
+            installed_required_closure(&lock, root, &manifest(vec![]), |_| None).required,
+            BTreeSet::new()
         );
+    }
+
+    #[test]
+    fn required_closure_repairs_valid_branches_despite_absent_or_ambiguous_targets() {
+        let root = "smudgy://a/root";
+        let good = "smudgy://a/good";
+        let manifest: PackageManifest = serde_json::from_value(serde_json::json!({"version": "1.0.0", "requires": [
+            "smudgy://A/GOOD", "smudgy://a/missing", "smudgy://a/conflict", "smudgy://wrong/owner"
+        ]})).unwrap();
+        let lock = SharedPackageLock {
+            packages: [
+                root,
+                good,
+                "smudgy://a/conflict",
+                "smudgy://b/conflict",
+                "smudgy://a/owner",
+            ]
+            .into_iter()
+            .map(|specifier| LockedPackage::new(specifier, UpdateMode::Auto))
+            .collect(),
+        };
+        let closure = installed_required_closure(&lock, root, &manifest, |_| {
+            Some(PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap())
+        });
+        assert_eq!(closure.required, BTreeSet::from([good.to_string()]));
+        assert_eq!(closure.unavailable.len(), 3);
+        assert!(!closure.preserve_existing);
+
+        let mut lock = lock;
+        lock.packages[1].required_by.insert(root.into());
+        let stale = "smudgy://a/old";
+        let mut old = LockedPackage::new(stale, UpdateMode::Auto);
+        old.required_by.insert(root.into());
+        lock.packages.push(old);
+        let incomplete = installed_required_closure(&lock, root, &manifest, |_| None);
+        assert!(incomplete.preserve_existing);
+        assert!(incomplete.required.contains(stale));
+        assert!(incomplete.unavailable.contains(good));
     }
 
     #[test]

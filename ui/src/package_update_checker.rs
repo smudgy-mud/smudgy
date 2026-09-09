@@ -15,10 +15,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use smudgy_cloud::CloudError;
+#[cfg(test)]
+use smudgy_cloud::DependencyKind;
 use smudgy_cloud::package_api::{
     CheckUpdatesEntry, CheckUpdatesHave, CheckUpdatesResult, PackageApiClient, UpdateCheckLatest,
 };
-use smudgy_cloud::{CloudError, DependencyKind};
 use smudgy_core::models::local_packages;
 use smudgy_core::models::package_updates::{self, PackageVersionRef, facts_key};
 use smudgy_core::models::shared_packages::{
@@ -631,7 +633,15 @@ fn latest_requires_review(
     latest: &UpdateCheckLatest,
     cached_meta: &impl Fn(&str, &str, &str) -> Option<CachedResolution>,
 ) -> bool {
-    let Some(latest_requirements) = normalized_wire_requirements(&latest.dependencies) else {
+    if latest
+        .dependencies
+        .iter()
+        .any(|dependency| !matches!(dependency.kind.as_str(), "dependency" | "requires"))
+    {
+        return true;
+    }
+    let Some(latest_requirements) = crate::package_requirements::wire_signature(&latest.manifest)
+    else {
         return true;
     };
     if latest_requirements.is_empty() {
@@ -646,57 +656,8 @@ fn latest_requires_review(
     let Some(current) = cached_meta(&owner, &name, staged) else {
         return true;
     };
-    normalized_cached_requirements(&current.dependencies)
+    crate::package_requirements::signature(&current.manifest)
         .is_none_or(|current_requirements| current_requirements != latest_requirements)
-}
-
-fn normalized_wire_requirements(
-    dependencies: &[smudgy_cloud::package_api::UpdateCheckDependency],
-) -> Option<Vec<(String, String, String)>> {
-    let mut requirements = Vec::new();
-    for dependency in dependencies {
-        match dependency.kind.as_str() {
-            "dependency" => continue,
-            "requires" => requirements.push((
-                dependency.owner.to_ascii_lowercase(),
-                dependency.name.to_ascii_lowercase(),
-                normalized_requirement_range(&dependency.range)?,
-            )),
-            _ => return None,
-        }
-    }
-    requirements.sort_unstable();
-    requirements.dedup();
-    Some(requirements)
-}
-
-fn normalized_cached_requirements(
-    dependencies: &[smudgy_cloud::ResolvedDependency],
-) -> Option<Vec<(String, String, String)>> {
-    let mut requirements = dependencies
-        .iter()
-        .filter(|dependency| dependency.kind == DependencyKind::Requires)
-        .map(|dependency| {
-            Some((
-                dependency.owner_nickname.to_ascii_lowercase(),
-                dependency.name.to_ascii_lowercase(),
-                normalized_requirement_range(&dependency.range)?,
-            ))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    requirements.sort_unstable();
-    requirements.dedup();
-    Some(requirements)
-}
-
-fn normalized_requirement_range(range: &str) -> Option<String> {
-    let range = range.trim();
-    if range.is_empty() {
-        return Some(String::new());
-    }
-    semver::VersionReq::parse(range)
-        .ok()
-        .map(|range| range.to_string())
 }
 
 /// A folded offer closure: the whole-closure permission union, the folded
@@ -1586,6 +1547,7 @@ mod tests {
         // A `requires` edge is a separately configured runtime root. Without a trusted staged
         // baseline, the background updater cannot prove that its install plan is unchanged.
         let result = ok_result(Some(UpdateCheckLatest {
+            manifest: serde_json::json!({"version": "1.3.0", "requires": ["smudgy://wbk/companion@^1"]}),
             dependencies: vec![UpdateCheckDependency {
                 owner: "wbk".into(),
                 name: "companion".into(),
@@ -1610,6 +1572,28 @@ mod tests {
     }
 
     #[test]
+    fn manifest_only_requirement_holds_trusted_and_sandboxed_updates() {
+        let mut offered = latest("1.3.0", &[]);
+        offered.manifest["requires"] = serde_json::json!(["smudgy://wbk/companion"]);
+        let result = ok_result(Some(offered));
+        let current = |_: &str, _: &str, _: &str| {
+            Some(CachedResolution {
+                version: "1.2.0".into(),
+                integrity: String::new(),
+                manifest: PackageManifest::parse(r#"{"version":"1.2.0"}"#).unwrap(),
+                modules: Vec::new(),
+                dependencies: Vec::new(),
+            })
+        };
+        for trusted in [false, true] {
+            let mut installed = entry(Some("1.2.0"));
+            installed.trusted = trusted;
+            let plan = evaluate_entry("arctic", &installed, &result, &current, &running());
+            assert!(matches!(plan.action, EntryAction::ReviewRequirements));
+        }
+    }
+
+    #[test]
     fn unchanged_requires_edges_do_not_join_the_import_closure() {
         let dependency = UpdateCheckDependency {
             owner: "wbk".into(),
@@ -1619,6 +1603,7 @@ mod tests {
             kind: "requires".into(),
         };
         let result = ok_result(Some(UpdateCheckLatest {
+            manifest: serde_json::json!({"version": "1.3.0", "requires": ["smudgy://wbk/companion@^1"]}),
             dependencies: vec![dependency],
             ..latest("1.3.0", &[])
         }));
@@ -1626,7 +1611,7 @@ mod tests {
             (owner == "wbk" && name == "mapper" && version == "1.2.0").then(|| CachedResolution {
                 version: version.into(),
                 integrity: "trusted by the injected test view".into(),
-                manifest: PackageManifest::parse(r#"{ "name": "mapper", "version": "1.2.0" }"#)
+                manifest: PackageManifest::parse(r#"{ "name": "mapper", "version": "1.2.0", "requires": ["smudgy://WBK/Companion@^1"] }"#)
                     .unwrap(),
                 modules: Vec::new(),
                 dependencies: vec![smudgy_cloud::ResolvedDependency {

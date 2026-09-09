@@ -145,17 +145,6 @@ impl AutomationsWindow {
 
         let mut body = column![header, tabs].spacing(16.0);
 
-        if tab == InstalledPackageTab::About && locked.installed_as_requirement {
-            body = body.push(
-                button(text(crate::i18n::t!("package-install-independently")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press_maybe(
-                        self.package_state_available()
-                            .then_some(Message::PromoteInstalledDependency),
-                    ),
-            );
-        }
-
         // Context banner.
         let banner_text = if viewing_as_required {
             Some(crate::i18n::t!("package-required-managed"))
@@ -279,6 +268,9 @@ impl AutomationsWindow {
 
         if let Some(feedback) = &self.manage_feedback {
             body = body.push(text(feedback.clone()).size(12.0).style(common::muted));
+        }
+        if let Some(issue) = self.graph.requirement_issues.get(specifier) {
+            body = body.push(text(issue.clone()).size(12.0).style(common::danger));
         }
 
         // An imported dependency shares its parent's isolate and grants. A `requires` target runs
@@ -464,6 +456,16 @@ impl AutomationsWindow {
         // only gates the enable *toggle* (an enabled dependent forces it on); it must NOT gate
         // fork/uninstall here, or a package installed directly *and* pulled in as a dependency
         // would lose "Edit a copy" on its own pane just because something else also needs it.
+        if tab == InstalledPackageTab::About && locked.installed_as_requirement {
+            body = body.push(
+                button(text(crate::i18n::t!("package-install-independently")).size(12.0))
+                    .style(button_style::secondary)
+                    .on_press_maybe(
+                        self.package_state_available()
+                            .then_some(Message::PromoteInstalledDependency),
+                    ),
+            );
+        }
         if tab == InstalledPackageTab::About && (dep_only || required_only) {
             body = body.push(
                 container(

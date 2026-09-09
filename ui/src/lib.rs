@@ -37,6 +37,7 @@ mod cloud_account;
 mod discord_presence;
 mod i18n;
 mod images;
+mod package_requirements;
 mod package_update_checker;
 mod pane_drag;
 mod pane_groups;

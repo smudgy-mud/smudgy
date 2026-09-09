@@ -1010,10 +1010,12 @@ fn replace_required_links(
     Ok(())
 }
 
-/// Replaces a root's flattened requirement links only while the complete lock is unchanged.
+/// Replaces a root's flattened requirement links while the relevant package identities,
+/// staged versions, and this root's existing links are unchanged.
 ///
 /// This is the graph-resolver commit point: an uninstall or a staged-version change to any
-/// required package makes the closure stale instead of resurrecting old links.
+/// required package makes the closure stale instead of resurrecting old links. Runtime integrity
+/// stamps, activation changes, other parents' links, and unrelated packages do not invalidate it.
 ///
 /// # Errors
 /// Returns an error for a missing required row or lockfile I/O failure.
@@ -1022,13 +1024,48 @@ pub fn set_required_closure_if_unchanged(
     expected_lock: &SharedPackageLock,
     root_specifier: &str,
     required_specifiers: &[String],
+    observed_specifiers: &[String],
 ) -> Result<RequiredClosureCommit> {
     let required = required_specifiers
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     mutate_lock(server_name, |lock| {
-        if lock != expected_lock || lock.find(root_specifier).is_none() {
+        let relevant_leaves = std::iter::once(root_specifier)
+            .chain(required_specifiers.iter().map(String::as_str))
+            .chain(observed_specifiers.iter().map(String::as_str))
+            .chain(
+                expected_lock
+                    .packages
+                    .iter()
+                    .filter(|package| package.required_by.contains(root_specifier))
+                    .map(|package| package.specifier.as_str()),
+            )
+            .filter_map(|specifier| smudgy_script::SmudgySpecifier::parse(specifier).ok())
+            .map(|specifier| specifier.name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let projection = |snapshot: &SharedPackageLock| {
+            snapshot
+                .packages
+                .iter()
+                .filter(|package| {
+                    package.required_by.contains(root_specifier)
+                        || smudgy_script::SmudgySpecifier::parse(&package.specifier).is_ok_and(
+                            |specifier| {
+                                relevant_leaves.contains(&specifier.name.to_ascii_lowercase())
+                            },
+                        )
+                })
+                .map(|package| {
+                    (
+                        package.specifier.clone(),
+                        package.staged_version().map(str::to_string),
+                        package.required_by.contains(root_specifier),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        if projection(lock) != projection(expected_lock) {
             return Ok((RequiredClosureCommit::Stale, false));
         }
         for specifier in &required {
@@ -3429,7 +3466,7 @@ mod tests {
         install_package(&server, dependency, UpdateMode::Auto, false).unwrap();
         let expected = load_lock(&server).unwrap();
         assert_eq!(
-            set_required_closure_if_unchanged(&server, &expected, root, &[dependency.into()])
+            set_required_closure_if_unchanged(&server, &expected, root, &[dependency.into()], &[])
                 .unwrap(),
             RequiredClosureCommit::Changed,
         );
@@ -3445,10 +3482,72 @@ mod tests {
         .unwrap();
         let changed = load_lock(&server).unwrap();
         assert_eq!(
-            set_required_closure_if_unchanged(&server, &expected, root, &[]).unwrap(),
+            set_required_closure_if_unchanged(&server, &expected, root, &[], &[]).unwrap(),
             RequiredClosureCommit::Stale,
         );
         assert_eq!(load_lock(&server).unwrap(), changed);
+    }
+
+    #[test]
+    fn requirement_refresh_ignores_unrelated_writes_but_detects_new_governing_rows() {
+        let server = test_server("requirement-projection");
+        let root = "smudgy://a/root";
+        let dep = "smudgy://a/dep";
+        let other = "smudgy://a/other";
+        for specifier in [root, dep, other] {
+            install_package(
+                &server,
+                specifier,
+                UpdateMode::Pinned {
+                    version: "1.0.0".into(),
+                },
+                true,
+            )
+            .unwrap();
+        }
+        let expected = load_lock(&server).unwrap();
+        mutate_lock(&server, |lock| {
+            lock.find_mut(root).unwrap().integrity = Some("new runtime stamp".into());
+            let package = lock.find_mut(dep).unwrap();
+            package.last_resolved_version = Some("1.0.0".into());
+            package.set_activation(ProfileActivation::None);
+            package.required_by.insert(other.into());
+            lock.find_mut(other).unwrap().mode = UpdateMode::Pinned {
+                version: "2.0.0".into(),
+            };
+            Ok(((), true))
+        })
+        .unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(&server, &expected, root, &[dep.into()], &[])
+                .unwrap(),
+            RequiredClosureCommit::Changed
+        );
+        let expected = load_lock(&server).unwrap();
+        assert_eq!(
+            expected.find(root).unwrap().integrity.as_deref(),
+            Some("new runtime stamp")
+        );
+        assert!(expected.find(dep).unwrap().required_by.contains(other));
+        install_package(&server, "smudgy://local/dep", UpdateMode::Auto, false).unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(&server, &expected, root, &[dep.into()], &[])
+                .unwrap(),
+            RequiredClosureCommit::Stale
+        );
+        let expected = load_lock(&server).unwrap();
+        install_package(&server, "smudgy://a/missing", UpdateMode::Auto, false).unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(
+                &server,
+                &expected,
+                root,
+                &[],
+                &["smudgy://a/missing".into()]
+            )
+            .unwrap(),
+            RequiredClosureCommit::Stale
+        );
     }
 
     #[test]

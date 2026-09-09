@@ -1900,6 +1900,7 @@ package-install-required-unavailable = Обов’язковий пакунок 
 package-import-managed = Цей код працює всередині батьківського пакунка. Батьківський пакунок керує його параметрами й дозволами.
 package-required-managed = Інший пакунок потребує цей пакунок. Він працює в тих самих профілях, що й пакунки, яким він потрібен.
 package-install-independently = Встановити незалежно
+package-requirements-refresh-incomplete = Не вдалося повністю оновити відомості про обов’язкові пакунки: { $error }. Перевірте, чи ці пакунки встановлено та чи доступні їхні маніфести.
 package-folder-locate-failed = Не вдалося знайти теку: { $error }
 package-folder-missing = Цієї теки пакунка ще не існує.
 package-folder-open-failed = Не вдалося відкрити теку: { $error }
