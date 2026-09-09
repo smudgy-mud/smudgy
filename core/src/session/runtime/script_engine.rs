@@ -52,9 +52,11 @@ use deno_core::url::Url;
 mod fire_state;
 mod mapper_api;
 mod matches;
+use super::captures::OuterCaptures;
 use super::state_exposure::ExposedState;
+use super::trigger::FiringContext;
 use fire_state::FireStateCache;
-use matches::{MatchesKeys, materialize_matches};
+use matches::{MatchesKeys, materialize_matches, materialize_outer};
 mod ops;
 pub mod package_cache;
 mod package_provider;
@@ -199,6 +201,9 @@ pub struct ScriptEngineParams<'a> {
     /// `OpState` so the `get`/`list`/`exists` ops read the live automation set without crossing
     /// into the (non-`OpState`) `Manager`.
     pub automation_registry: SharedAutomationRegistry,
+    /// The input counter the trigger `Manager` advances, read by `line.sequence`. Shared so
+    /// the ops never cross into the manager.
+    pub input_sequence: super::trigger::SharedInputSequence,
     /// Opaque application/session authority cloned unchanged across reloads.
     #[cfg_attr(
         not(feature = "web-audio"),
@@ -1400,6 +1405,7 @@ impl<'a> ScriptEngine<'a> {
         let current_line_for_ext = current_line.clone();
         // The same introspection mirror the `Manager` writes; bound into every isolate's ops.
         let automation_registry = params.automation_registry.clone();
+        let input_sequence = params.input_sequence.clone();
         // One session-global `singleton` reservation set, shared (the same `Rc`) into every
         // isolate's ops below so `createAlias(.., {singleton:true})` dedupes session-wide
         // regardless of which isolate the copy runs in (`PACKAGE-ISOLATES.md`). A reload
@@ -1615,6 +1621,8 @@ impl<'a> ScriptEngine<'a> {
                         singleton_registry.clone(),
                         // The introspection mirror the `get`/`list`/`exists` ops read.
                         automation_registry.clone(),
+                        // The input counter behind `line.sequence`.
+                        input_sequence.clone(),
                         // The smudgy op-capabilities this isolate may use
                         // (`PACKAGE-ISOLATES-OP-CAPABILITIES.md`). `all()` for main/trusted; the
                         // consented set for a sandbox. The gated ops read it from `OpState`, and its
@@ -3043,6 +3051,7 @@ impl<'a> ScriptEngine<'a> {
         isolate: &IsolateId,
         call: AutomationCall,
         matches: CaptureView<'_>,
+        firing: &FiringContext,
         depth: u32,
         sender: Option<AliasSender>,
         fallthrough: bool,
@@ -3066,15 +3075,29 @@ impl<'a> ScriptEngine<'a> {
         bundle.seeded.set(true);
         bundle.call_state.fallthrough.set(Some(fallthrough));
         bundle.call_state.captured.set(true);
+        // The firing verbs (`skipInner()`, `stopWatching()`) act on these for the duration
+        // of the body; cleared afterwards so an async continuation cannot reach a firing.
+        *bundle.call_state.firing_opened.borrow_mut() = firing.opened.clone();
+        *bundle.call_state.firing_under.borrow_mut() = firing.under.clone();
+        let outer = firing.outer.as_deref();
         let result = match call {
             AutomationCall::Function(id) => {
-                call_function_in(bundle, trigger_manager, id, matches, depth, sender)
+                call_function_in(bundle, trigger_manager, id, matches, outer, depth, sender)
             }
-            AutomationCall::Script(id) => {
-                run_script_in(bundle, trigger_manager, id, matches, depth, sender, exposed)
-            }
+            AutomationCall::Script(id) => run_script_in(
+                bundle,
+                trigger_manager,
+                id,
+                matches,
+                outer,
+                depth,
+                sender,
+                exposed,
+            ),
         }
         .unwrap_or_else(|err| ActionResult::Echo(call.error_echo(&err)));
+        bundle.call_state.firing_opened.borrow_mut().take();
+        bundle.call_state.firing_under.borrow_mut().take();
         AutomationOutcome {
             result,
             captured: bundle.call_state.captured.get(),
@@ -3100,7 +3123,15 @@ impl<'a> ScriptEngine<'a> {
         // integration test, which strands the continuation if this seed is removed).
         self.mark_isolate_ready(isolate);
         let bundle = self.isolate_mut(isolate)?;
-        call_function_in(bundle, trigger_manager, function_id, matches, depth, sender)
+        call_function_in(
+            bundle,
+            trigger_manager,
+            function_id,
+            matches,
+            None,
+            depth,
+            sender,
+        )
     }
 
     pub fn execute_javascript_function(
@@ -3379,6 +3410,7 @@ impl<'a> ScriptEngine<'a> {
             trigger_manager,
             script_id,
             matches,
+            None,
             depth,
             sender,
             exposed,
@@ -3516,6 +3548,7 @@ fn call_function_in(
     trigger_manager: &Manager,
     function_id: FunctionId,
     matches: CaptureView<'_>,
+    outer: Option<&OuterCaptures>,
     depth: u32,
     sender: Option<AliasSender>,
 ) -> Result<ActionResult> {
@@ -3551,7 +3584,19 @@ fn call_function_in(
             Some(f) => {
                 let matches_object = materialize_matches(try_catch, matches, matches_keys);
                 let f_this = v8::undefined(try_catch).into();
-                let result = f.call(try_catch, f_this, &[matches_object.into()]);
+                // An inner trigger's handler gets the matched values of the triggers it is
+                // inside as its second argument; every other handler gets one argument.
+                let result = match outer {
+                    Some(outer) => {
+                        let outer_object = materialize_outer(try_catch, outer, matches_keys);
+                        f.call(
+                            try_catch,
+                            f_this,
+                            &[matches_object.into(), outer_object.into()],
+                        )
+                    }
+                    None => f.call(try_catch, f_this, &[matches_object.into()]),
+                };
                 call_outcome(try_catch, result)
             }
             None => CallOutcome::Missing,
@@ -3582,11 +3627,13 @@ fn call_function_in(
 /// state exposures: when present, the `__smudgy_fire_state` global the exposing wrapper reads
 /// is set beside `matches` before the run (see `fire_state`); a script compiled without
 /// exposures never reads it.
+#[allow(clippy::too_many_arguments)]
 fn run_script_in(
     bundle: &mut Isolate,
     trigger_manager: &Manager,
     script_id: ScriptId,
     matches: CaptureView<'_>,
+    outer: Option<&OuterCaptures>,
     depth: u32,
     sender: Option<AliasSender>,
     exposed: Option<&ExposedState>,
@@ -3624,6 +3671,14 @@ fn run_script_in(
                 let matches_name = matches_keys.script_name(try_catch);
                 let global = try_catch.get_current_context().global(try_catch);
                 global.set(try_catch, matches_name.into(), matches_object.into());
+                // The `outer` global beside `matches`: the outer chain's values for an inner
+                // trigger's script, `undefined` for everything else so nothing stale remains.
+                let outer_name = matches_keys.outer_name(try_catch);
+                let outer_value: v8::Local<v8::Value> = match outer {
+                    Some(outer) => materialize_outer(try_catch, outer, matches_keys).into(),
+                    None => v8::undefined(try_catch).into(),
+                };
+                global.set(try_catch, outer_name.into(), outer_value);
                 if let Some(exposed) = exposed {
                     let state = fire_state.state_object(try_catch, script_id, exposed);
                     let state_name = fire_state.key(try_catch);

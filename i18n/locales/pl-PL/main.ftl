@@ -1330,6 +1330,37 @@ editor-row-error = Wiersz { $row }: { $error }
 editor-reveal-order-aliases = Dostosuj priorytet lub zablokuj uruchamianie innych aliasów
 editor-reveal-order-triggers = Dostosuj priorytet lub zablokuj uruchamianie innych wyzwalaczy
 editor-hide-order = Ukryj opcje priorytetu
+# Inner triggers: triggers inside other triggers
+editor-kind-inside = { $kind } · wewnątrz { $outer }
+editor-inside = Wewnątrz
+editor-inside-reach-line = tylko ten wiersz
+editor-inside-reach-lines = w ciągu { $count } wierszy
+editor-inside-reach-unlimited = bez limitu wierszy
+editor-inside-reach-prompt = do monitu
+editor-inside-reach-once = raz
+editor-add-inside = Dodaj wyzwalacz wewnątrz tego
+editor-move-inside = Przenieś do innego wyzwalacza…
+editor-inside-picker = Wewnątrz
+editor-no-trigger = (żaden)
+editor-no-limit = bez limitu
+editor-within = W ciągu
+editor-lines-after = wierszy po
+editor-may-same-line = Może zadziałać w tym samym wierszu co { $outer }
+editor-may-repeat = Może zadziałać więcej niż raz w tym zakresie
+editor-may-after-prompt = Może zadziałać po pojawieniu się monitu
+editor-match-outer-values = Dopasowuj do wartości przechwyconych przez { $outer } zamiast całego wiersza
+editor-never-fires = Ten wyzwalacz nigdy nie zadziała. Zezwól na ten sam wiersz lub ustaw zakres.
+editor-overlap = Jeśli { $outer } zadziała ponownie podczas obserwacji
+editor-overlap-restart = Zacznij od nowa
+editor-overlap-each = Obserwuj każde osobno
+editor-verdict-inside-suffix = wewnątrz { $outer }
+editor-folder-from-outer = Folder · { $folder } (z { $outer })
+editor-delete-outer-question = Usunąć ten wyzwalacz i { $count } wyzwalaczy wewnątrz niego?
+editor-move-inside-out = Przenieś je na zewnątrz
+editor-delete-inside-too = Usuń je również
+palette-move-inside = Przenieś { $subject } do wnętrza { $outer }
+palette-move-outside = Przenieś { $subject } poza { $outer }
+
 editor-matched-values = Dopasowane wartości
 
 # Wypróbuj i wyniki testu

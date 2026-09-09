@@ -815,8 +815,17 @@ impl Inner<'_> {
                 is_captured,
                 stopped,
                 fallthrough,
+                firing,
             } => {
                 if stopped.load(Ordering::Relaxed) {
+                    return Ok(ActionResult::None);
+                }
+                // An inner trigger of a firing the outer's body skipped runs nothing.
+                if firing
+                    .under
+                    .as_ref()
+                    .is_some_and(|under| under.skipped.load(Ordering::Relaxed))
+                {
                     return Ok(ActionResult::None);
                 }
 
@@ -843,6 +852,7 @@ impl Inner<'_> {
                             &identity.isolate,
                             AutomationCall::Script(id),
                             matches.view(),
+                            &firing,
                             depth,
                             sender,
                             fallthrough,
@@ -864,6 +874,7 @@ impl Inner<'_> {
                             &identity.isolate,
                             AutomationCall::Function(id),
                             matches.view(),
+                            &firing,
                             depth,
                             sender,
                             fallthrough,
@@ -884,6 +895,7 @@ impl Inner<'_> {
                         self.trigger_manager.run_simple_automation(
                             &script,
                             matches.view(),
+                            firing.outer.as_deref(),
                             depth,
                             sender.as_ref(),
                             identity.exposure(),
@@ -1174,6 +1186,7 @@ impl Inner<'_> {
                                 trigger::expand_template_view(
                                     script,
                                     super::captures::CaptureView::Owned(&[]),
+                                    None,
                                     Some(state),
                                 )
                             });
@@ -1378,6 +1391,8 @@ impl Inner<'_> {
                         fire_limit,
                         line_limit,
                         source,
+                        outer: trigger.outer.map(Arc::new),
+                        reach: trigger.reach,
                     },
                     exposure,
                 )?;
@@ -1396,6 +1411,8 @@ impl Inner<'_> {
                 fire_limit,
                 line_limit,
                 script_source,
+                outer,
+                reach,
             } => {
                 self.trigger_manager.push_script_trigger(
                     isolate,
@@ -1410,6 +1427,8 @@ impl Inner<'_> {
                     fire_limit,
                     line_limit,
                     script_source,
+                    outer,
+                    reach,
                 );
                 Ok(ActionResult::None)
             }
@@ -1483,6 +1502,8 @@ impl Inner<'_> {
                     // replaced socket's late teardown must not clear the NEW
                     // connection's guard state, hence inside this gate.
                     self.mssp.on_disconnect();
+                    // The input stream restarted: nothing an outer opened can still be watched.
+                    self.trigger_manager.reset_watching();
                 }
                 if self
                     .connected

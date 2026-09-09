@@ -1254,6 +1254,37 @@ editor-row-error = 第 { $row } 列：{ $error }
 editor-reveal-order-aliases = 調整優先順序或防止其他別名執行
 editor-reveal-order-triggers = 調整優先順序或防止其他觸發器執行
 editor-hide-order = 隱藏優先順序選項
+# Inner triggers: triggers inside other triggers
+editor-kind-inside = { $kind } · 位於 { $outer } 之內
+editor-inside = 內含
+editor-inside-reach-line = 僅限這一行
+editor-inside-reach-lines = { $count } 行以內
+editor-inside-reach-unlimited = 不限行數
+editor-inside-reach-prompt = 直到提示行
+editor-inside-reach-once = 一次
+editor-add-inside = 在此觸發器內新增觸發器
+editor-move-inside = 移入另一個觸發器…
+editor-inside-picker = 位於
+editor-no-trigger = （無）
+editor-no-limit = 不限
+editor-within = 在
+editor-lines-after = 行以內，接在
+editor-may-same-line = 可在與 { $outer } 相同的那一行觸發
+editor-may-repeat = 在此範圍內可觸發多次
+editor-may-after-prompt = 出現提示行後仍可觸發
+editor-match-outer-values = 比對 { $outer } 擷取到的值，而非整行
+editor-never-fires = 這個觸發器永遠不會觸發。請允許同一行，或設定範圍。
+editor-overlap = 若 { $outer } 在監看期間再次觸發
+editor-overlap-restart = 重新開始
+editor-overlap-each = 分別監看每一次
+editor-verdict-inside-suffix = 在 { $outer } 之內時
+editor-folder-from-outer = 資料夾 · { $folder }（承襲自 { $outer }）
+editor-delete-outer-question = 要刪除這個觸發器和其中的 { $count } 個觸發器嗎？
+editor-move-inside-out = 將它們移出
+editor-delete-inside-too = 一併刪除
+palette-move-inside = 將 { $subject } 移入 { $outer }
+palette-move-outside = 將 { $subject } 移出 { $outer }
+
 editor-matched-values = 相符值
 
 # 試用（摺疊式區段）及其結果

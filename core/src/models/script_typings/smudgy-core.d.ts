@@ -2156,6 +2156,72 @@ declare module "smudgy:core" {
     fallthrough?: boolean;
   };
 
+  /**
+   * Options for {@link Trigger.createInnerTrigger}: everything a trigger takes,
+   * plus how the inner trigger watches after the trigger it is inside fires.
+   * Watching starts on that trigger's line and, with `withinLines`, continues
+   * for the lines after it.
+   *
+   * ```ts
+   * import { createTrigger, stopWatching } from "smudgy:core";
+   * const carrying = createTrigger(/^You are carrying:$/);
+   * // Item lines count until the prompt, at most 40 lines later.
+   * carrying.createInnerTrigger(/^\s+(?<item>.+)$/, ({ item }) => note(item),
+   *   { withinLines: 40, untilPrompt: true });
+   * ```
+   */
+  export type InnerTriggerOptions = TriggerOptions & {
+    /** Lines after the outer trigger's line this trigger may still match.
+     *  Default `0`: that line only. `Infinity`: no limit. */
+    withinLines?: number;
+    /** Whether the trigger may fire on the outer trigger's own line. Default `true`. */
+    sameLine?: boolean;
+    /** Stop watching at the next prompt. Given without `withinLines`, there is
+     *  no line limit: the prompt is the boundary. */
+    untilPrompt?: boolean;
+    /** Fire at most once each time the outer trigger fires. */
+    once?: boolean;
+    /** What happens when the outer trigger fires again while this trigger is
+     *  still watching. `"restart"` (default): watch again from the new line.
+     *  `"each"`: watch each firing separately; on a matching line the trigger
+     *  fires once per firing still in range, and `outer` tells them apart. */
+    overlap?: "restart" | "each";
+    /** What to match against. `"line"` (default): the line. `"outerValues"`:
+     *  each of the outer trigger's matched values in turn, on its own line;
+     *  the matched positions and styles stay those of the line. */
+    input?: "line" | "outerValues";
+  };
+
+  /**
+   * An inner trigger's body: a command template string (`$outer.name` and
+   * `$outer.1` read the outer trigger's values), or a function called with
+   * its own {@link Matches} and then `outer`: the numbered and named values of
+   * the trigger it is inside, plus the named values of every trigger above
+   * that. A returned string is sent to the MUD as a command.
+   */
+  export type InnerScript =
+    | InlineTemplate
+    | ((matches: Matches, outer: Matches) => string | void);
+
+  /** One inner trigger in a {@link Trigger.createInnerTriggers} batch. */
+  export type InnerTriggerDef = TriggerPatterns & {
+    /** The body; absent for a trigger that only holds further triggers. */
+    script?: InnerScript;
+    prompt?: boolean;
+    enabled?: boolean;
+    singleton?: boolean;
+    fireLimit?: number;
+    lineLimit?: number;
+    priority?: number;
+    fallthrough?: boolean;
+    withinLines?: number;
+    sameLine?: boolean;
+    untilPrompt?: boolean;
+    once?: boolean;
+    overlap?: "restart" | "each";
+    input?: "line" | "outerValues";
+  };
+
   /** One trigger in a {@link createTriggers} batch: its patterns, its body,
    *  and the same options as {@link TriggerOptions} (except `name` — the
    *  batch's key is the name). */
@@ -2336,6 +2402,37 @@ declare module "smudgy:core" {
     readonly pattern: string;
     readonly priority: number;
     readonly fallthrough: boolean;
+    /** The name of the trigger this one is inside, if any. */
+    readonly outer?: string;
+    /** The names of the triggers inside this one. */
+    readonly inner: readonly string[];
+    /** The input number of this trigger's last fire (see `line.sequence`), or `-1`. */
+    readonly lastFiredSequence: number;
+    /**
+     * Create a trigger inside this one: it runs only on lines this trigger
+     * has fired on, and, with a range, on the lines after them (see
+     * {@link InnerTriggerOptions}). Its body receives its own matches and
+     * then `outer`, this trigger's matched values. Pass the options where
+     * the body would go for a trigger that only holds further triggers.
+     *
+     * ```ts
+     * import { createTrigger } from "smudgy:core";
+     * const hit = createTrigger(/^You hit (?<who>\w+)/);
+     * hit.createInnerTrigger(/for (?<dmg>\d+) damage/,
+     *   ({ dmg }, { who }) => log(`${who} took ${dmg}`));
+     * ```
+     */
+    createInnerTrigger(
+      patterns: TriggerPattern | TriggerPatterns,
+      script: InnerScript,
+      options?: InnerTriggerOptions,
+    ): Trigger;
+    createInnerTrigger(
+      patterns: TriggerPattern | TriggerPatterns,
+      options?: InnerTriggerOptions,
+    ): Trigger;
+    /** Create several triggers inside this one; the keys become their names. */
+    createInnerTriggers(triggers: Record<string, InnerTriggerDef>): Record<string, Trigger>;
     delete(): void;
   }
 
@@ -2426,6 +2523,12 @@ declare module "smudgy:core" {
   export function createTrigger(
     patterns: TriggerPattern | TriggerPatterns,
     script: AutomationScript,
+    options?: TriggerOptions,
+  ): Trigger;
+  /** A trigger with no body: it exists to hold triggers inside it (see
+   *  {@link Trigger.createInnerTrigger}). */
+  export function createTrigger(
+    patterns: TriggerPattern | TriggerPatterns,
     options?: TriggerOptions,
   ): Trigger;
   /** Create several triggers in one call: pass an object mapping each name
@@ -2691,6 +2794,10 @@ declare module "smudgy:core" {
     /** The line's number (the current line reports the number it is about to
      *  be assigned). */
     readonly number: number;
+    /** The received-input number of the current line: rises by one per
+     *  complete line the game sends, and a prompt reports the number its
+     *  completed line will get. Not the display row. A buffer line reports `0`. */
+    readonly sequence: number;
   }
 
   /** Already-printed lines, looked up by number (only roughly the most recent
@@ -2735,6 +2842,23 @@ declare module "smudgy:core" {
    */
   export function fallthrough(value: boolean): void;
 
+  /**
+   * Inside a trigger handler: this firing opens nothing for the triggers
+   * inside it. They do not run on this line and do not start watching. No
+   * effect in a trigger with nothing inside it.
+   *
+   * @throws {Error} When called outside a trigger function handler.
+   */
+  export function skipInner(): void;
+
+  /**
+   * Inside an inner trigger's handler: the triggers watching from this firing
+   * of the outer trigger stop after this line.
+   *
+   * @throws {Error} When called outside an inner trigger's function handler.
+   */
+  export function stopWatching(): void;
+
   // ---- Mapper -------------------------------------------------------------
 
   /** The current session's map API (see {@link Mapper}). */
@@ -2773,6 +2897,8 @@ declare module "smudgy:core" {
     reload(): void;
     capture(value: boolean): void;
     fallthrough(value: boolean): void;
+    skipInner(): void;
+    stopWatching(): void;
     byName(name: string): Session | undefined;
     byId(id: number): Session | undefined;
     getSessions(): Session[];

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Triggers can hold triggers inside them.** A trigger inside another runs only
+  on lines the outer trigger fired on, and can keep watching for a number of
+  lines after that, or until the next prompt, or without limit. Each inner
+  trigger sets its own reach, whether it fires more than once per firing, and
+  what happens when the outer fires again while it is still watching. Its body
+  reads the outer trigger's matched values as `outer`. Scripts create them with
+  `createInnerTrigger`, and `skipInner()` and `stopWatching()` end a firing from
+  either side. The Automations window nests them under their outer trigger and
+  puts the whole reach in one sentence in When it runs.
+
 - **Double click selects a word, triple click selects a line.** In a terminal
   pane, a double click selects the whitespace-delimited word under the pointer
   and a triple click selects the whole line, ready to copy. A double click on a

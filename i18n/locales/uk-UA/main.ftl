@@ -1329,6 +1329,37 @@ editor-row-error = Рядок { $row }: { $error }
 editor-reveal-order-aliases = Налаштувати пріоритет або заборонити спрацьовування інших аліасів
 editor-reveal-order-triggers = Налаштувати пріоритет або заборонити спрацьовування інших тригерів
 editor-hide-order = Сховати параметри пріоритету
+# Inner triggers: triggers inside other triggers
+editor-kind-inside = { $kind } · всередині { $outer }
+editor-inside = Всередині
+editor-inside-reach-line = лише цей рядок
+editor-inside-reach-lines = у межах { $count } рядків
+editor-inside-reach-unlimited = без обмеження рядків
+editor-inside-reach-prompt = до запрошення
+editor-inside-reach-once = один раз
+editor-add-inside = Додати тригер всередині цього
+editor-move-inside = Перемістити в інший тригер…
+editor-inside-picker = Всередині
+editor-no-trigger = (жодного)
+editor-no-limit = без обмеження
+editor-within = У межах
+editor-lines-after = рядків після
+editor-may-same-line = Може спрацювати в тому ж рядку, що й { $outer }
+editor-may-repeat = Може спрацювати більше одного разу в цьому діапазоні
+editor-may-after-prompt = Може спрацювати після появи запрошення
+editor-match-outer-values = Зіставляти зі значеннями, які захопив { $outer }, а не з усім рядком
+editor-never-fires = Цей тригер ніколи не спрацює. Дозвольте той самий рядок або задайте діапазон.
+editor-overlap = Якщо { $outer } спрацює знову під час спостереження
+editor-overlap-restart = Почати спочатку
+editor-overlap-each = Спостерігати за кожним окремо
+editor-verdict-inside-suffix = всередині { $outer }
+editor-folder-from-outer = Тека · { $folder } (від { $outer })
+editor-delete-outer-question = Видалити цей тригер і { $count } тригерів усередині нього?
+editor-move-inside-out = Перемістити їх назовні
+editor-delete-inside-too = Видалити і їх
+palette-move-inside = Перемістити { $subject } всередину { $outer }
+palette-move-outside = Перемістити { $subject } з { $outer }
+
 editor-matched-values = Зіставлені значення
 
 # Спробувати та результати перевірки

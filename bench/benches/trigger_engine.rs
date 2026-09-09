@@ -81,6 +81,8 @@ fn push_one_trigger(mgr: &mut Manager, name: String, pattern: String, action: Sc
         fire_limit: None,
         line_limit: None,
         source: None,
+        outer: None,
+        reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
     })
     .expect("push_trigger");
 }
@@ -123,6 +125,8 @@ fn push_colored_trigger(
             fire_limit: None,
             line_limit: None,
             source: None,
+            outer: None,
+            reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
         })
         .expect("colored trigger");
 }
@@ -193,6 +197,8 @@ fn build_colored_anti_manager(anti_sources: &[(String, MatcherColor)]) -> (Manag
             fire_limit: None,
             line_limit: None,
             source: None,
+            outer: None,
+            reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
         })
         .expect("colored anti trigger");
     (manager, queue)
@@ -222,6 +228,8 @@ fn build_plain_anti_manager(anti_source: &str) -> (Manager, Queue) {
             fire_limit: None,
             line_limit: None,
             source: None,
+            outer: None,
+            reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
         })
         .expect("plain anti trigger");
     (manager, queue)

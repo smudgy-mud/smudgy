@@ -198,6 +198,8 @@ fn build_manager(names: &[String], regexes: &[&str]) -> (Manager, Queue) {
             fire_limit: None,
             line_limit: None,
             source: None,
+            outer: None,
+            reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
         })
         .expect("push_trigger");
     };
@@ -272,6 +274,8 @@ fn build_styled_normal_manager() -> (Manager, Queue) {
             fire_limit: None,
             line_limit: None,
             source: None,
+            outer: None,
+            reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
         })
         .expect("styled normal trigger");
     (manager, queue)
@@ -324,6 +328,8 @@ fn build_styled_anti_manager() -> (Manager, Queue) {
             fire_limit: None,
             line_limit: None,
             source: None,
+            outer: None,
+            reach: smudgy_core::models::triggers::InnerReach::DEFAULT,
         })
         .expect("styled anti trigger");
     (manager, queue)

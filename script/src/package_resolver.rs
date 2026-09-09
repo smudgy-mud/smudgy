@@ -2059,6 +2059,8 @@ pub(crate) fn load_core_module(url: &ModuleSpecifier) -> Result<ModuleSource, Mo
          export const reload = __api.reload;\n\
          export const capture = __api.capture;\n\
          export const fallthrough = __api.fallthrough;\n\
+         export const skipInner = __api.skipInner;\n\
+         export const stopWatching = __api.stopWatching;\n\
          export const line = __api.line;\n\
          export const buffer = __api.buffer;\n\
          export const submission = __api.submission;\n\
@@ -3473,6 +3475,8 @@ mod tests {
             "reload",
             "capture",
             "fallthrough",
+            "skipInner",
+            "stopWatching",
             "line",
             "buffer",
             "submission",

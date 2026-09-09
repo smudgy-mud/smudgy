@@ -68,6 +68,10 @@ name = "trigger_engine"
 harness = false
 
 [[bench]]
+name = "trigger_tree"
+harness = false
+
+[[bench]]
 name = "ingest"
 harness = false
 

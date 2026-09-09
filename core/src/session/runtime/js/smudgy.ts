@@ -117,6 +117,9 @@ const {
     op_smudgy_line_remove,
     op_smudgy_capture,
     op_smudgy_fallthrough,
+    op_smudgy_skip_inner,
+    op_smudgy_stop_watching,
+    op_smudgy_get_input_sequence,
     op_smudgy_param_get,
     op_smudgy_param_set,
     op_smudgy_get_settings,
@@ -1880,6 +1883,122 @@ interface TriggerDef extends TriggerPatterns {
     fallthrough?: boolean;
 }
 
+/** How an inner trigger watches after its outer trigger fires. */
+interface InnerTriggerOptions extends TriggerOptions {
+    /** Lines after the outer trigger's line this one may still match. 0 (default): none.
+     *  `Infinity`: no limit. */
+    withinLines?: number;
+    /** Whether this trigger may fire on the outer trigger's own line. Default true. */
+    sameLine?: boolean;
+    /** Stop watching at the next prompt. Given without `withinLines`, there is no line limit. */
+    untilPrompt?: boolean;
+    /** Match at most once each time the outer trigger fires. */
+    once?: boolean;
+    /** When the outer fires again while this trigger is still watching. Default "restart". */
+    overlap?: "restart" | "each";
+    /** What to match against: the line (default), or each of the outer's matched values. */
+    input?: "line" | "outerValues";
+}
+
+/** An inner trigger's action: `outer` holds the matched values of the triggers it is inside. */
+type InnerScript = InlineTemplate | ((matches: Matches, outer: Matches) => string | void);
+
+interface InnerTriggerDef extends TriggerPatterns {
+    script?: InnerScript;
+    prompt?: boolean;
+    enabled?: boolean;
+    singleton?: boolean;
+    fireLimit?: number;
+    lineLimit?: number;
+    priority?: number;
+    fallthrough?: boolean;
+    withinLines?: number;
+    sameLine?: boolean;
+    untilPrompt?: boolean;
+    once?: boolean;
+    overlap?: "restart" | "each";
+    input?: "line" | "outerValues";
+}
+
+/** The placement of a script-created trigger, as the create ops receive it. */
+interface ScriptPlacementWire {
+    outer: string;
+    withinLines: number | null;
+    unlimited: boolean;
+    sameLine: boolean;
+    untilPrompt: boolean;
+    once: boolean;
+    each: boolean;
+    outerValues: boolean;
+}
+
+const TOP_LEVEL_PLACEMENT: ScriptPlacementWire = {
+    outer: "",
+    withinLines: null,
+    unlimited: false,
+    sameLine: true,
+    untilPrompt: false,
+    once: false,
+    each: false,
+    outerValues: false,
+};
+
+const INNER_OPTION_KEYS = ["withinLines", "sameLine", "untilPrompt", "once", "overlap", "input"];
+
+/** Validate the reach options of an inner trigger and shape them for the create ops. */
+function normalizePlacement(outer: string, options: Record<string, any>): ScriptPlacementWire {
+    let withinLines: number | null = null;
+    let unlimited = false;
+    if ("withinLines" in options && options.withinLines !== undefined) {
+        const value = options.withinLines;
+        if (value === Infinity) {
+            unlimited = true;
+        } else if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+            throw new TypeError('Option "withinLines" must be a non-negative integer or Infinity');
+        } else {
+            withinLines = value;
+        }
+    }
+    for (const key of ["sameLine", "untilPrompt", "once"]) {
+        if (key in options && options[key] !== undefined && typeof options[key] !== "boolean") {
+            throw new TypeError(`Option "${key}" must be a boolean`);
+        }
+    }
+    if ("overlap" in options && options.overlap !== undefined && options.overlap !== "restart" && options.overlap !== "each") {
+        throw new TypeError('Option "overlap" must be "restart" or "each"');
+    }
+    if ("input" in options && options.input !== undefined && options.input !== "line" && options.input !== "outerValues") {
+        throw new TypeError('Option "input" must be "line" or "outerValues"');
+    }
+    const sameLine = options.sameLine ?? true;
+    if (!sameLine && !unlimited && (withinLines ?? 0) === 0) {
+        throw new TypeError(
+            "This trigger can never fire: allow the same line as its outer trigger, or give it a range",
+        );
+    }
+    return {
+        outer,
+        withinLines,
+        unlimited,
+        sameLine,
+        untilPrompt: options.untilPrompt ?? false,
+        once: options.once ?? false,
+        each: options.overlap === "each",
+        outerValues: options.input === "outerValues",
+    };
+}
+
+/** The named capture groups a regex source declares, for the outer-chain collision check. */
+function namedCaptureGroups(source: string): string[] {
+    const names: string[] = [];
+    const pattern = /\(\?<([A-Za-z_$][\w$]*)>/g;
+    let found: RegExpExecArray | null;
+    while ((found = pattern.exec(source)) !== null) {
+        names.push(found[1]);
+    }
+    return names;
+}
+
 interface TimerOptions {
     /** Explicit identity/display name; defaults to the interval + handler source. */
     name?: string;
@@ -2995,10 +3114,60 @@ class Trigger {
     name: string;
     _creatorId: number;
     created?: boolean;
+    /** The named capture groups this handle's patterns declare, when the handle created
+     *  them; a handle from the registry knows none and leaves the check to the host. */
+    _captureNames: string[];
+    /** The handle this trigger was created inside, for the collision check up the chain. */
+    _outerHandle: Trigger | null;
 
-    constructor(name: string, creatorId: number) {
+    constructor(name: string, creatorId: number, captureNames: string[] = [], outerHandle: Trigger | null = null) {
         this.name = name;
         this._creatorId = creatorId;
+        this._captureNames = captureNames;
+        this._outerHandle = outerHandle;
+    }
+
+    /** The name of the trigger this one is inside, or undefined. */
+    get outer(): string | undefined {
+        const view = op_smudgy_get_trigger(this._creatorId, this.name);
+        return view?.outer ?? undefined;
+    }
+
+    /** The names of the triggers inside this one. */
+    get inner(): string[] {
+        const view = op_smudgy_get_trigger(this._creatorId, this.name);
+        return view ? view.inner : [];
+    }
+
+    /** The input number of this trigger's last fire, or -1. */
+    get lastFiredSequence(): number {
+        const view = op_smudgy_get_trigger(this._creatorId, this.name);
+        return view ? view.lastFiredSequence : -1;
+    }
+
+    /** Create a trigger inside this one. */
+    createInnerTrigger(
+        patterns: TriggerPattern | TriggerPatterns,
+        script?: InnerScript | InnerTriggerOptions,
+        options?: InnerTriggerOptions,
+    ): Trigger {
+        return createTrigger(this._creatorId, patterns, script as AutomationScript, options, this);
+    }
+
+    /** Create several triggers inside this one; the keys become their names. */
+    createInnerTriggers(triggers: Record<string, InnerTriggerDef>): Record<string, Trigger> {
+        return Object.fromEntries(
+            Object.entries(triggers).map(([name, def]) => {
+                const { script, patterns, rawPatterns, antiPatterns, ...rest } = def;
+                const validPatterns: TriggerPatterns = {
+                    ...(patterns !== undefined && { patterns }),
+                    ...(rawPatterns !== undefined && { rawPatterns }),
+                    ...(antiPatterns !== undefined && { antiPatterns }),
+                };
+                const options: InnerTriggerOptions = { name, ...rest };
+                return [name, this.createInnerTrigger(validPatterns, script, options)] as [string, Trigger];
+            }),
+        );
     }
 
     /** Whether the trigger is currently enabled (reads the live registry). */
@@ -3321,20 +3490,57 @@ function createTriggers(
     );
 }
 
-/** Creates a new trigger. */
+/** Creates a new trigger. A trigger with no body passes its options where the body would
+ *  go; `outerHandle` places it inside another trigger. */
 function createTrigger(
     creatorId: number,
     patterns: TriggerPattern | TriggerPatterns,
-    script: AutomationScript,
-    options: TriggerOptions = {},
+    script: AutomationScript | TriggerOptions | undefined,
+    options: TriggerOptions | undefined,
+    outerHandle: Trigger | null = null,
 ): Trigger {
-    const params = validateCreateTriggerParams(patterns, script, options);
+    // The no-body form: `createTrigger(pattern, { ...options })`.
+    if (script !== undefined && typeof script !== "string" && typeof script !== "function") {
+        if (options !== undefined) {
+            throw new TypeError("A trigger with no body takes its options as the second argument");
+        }
+        options = script as TriggerOptions;
+        script = undefined;
+    }
+    options ??= {};
+    const params = validateCreateTriggerParams(patterns, script, options, outerHandle !== null);
 
     const singleton = options.singleton ?? false;
     const fireLimit = normalizeSelfLimit(options, "fireLimit");
     const lineLimit = normalizeSelfLimit(options, "lineLimit");
     const priority = normalizePriority(options);
     const fallthrough = normalizeFallthrough(options);
+    const ownNames = [
+        ...params.descriptor.normal.flatMap((leaf) => namedCaptureGroups(leaf.source)),
+        ...params.descriptor.raw.flatMap(namedCaptureGroups),
+    ];
+    let placement = TOP_LEVEL_PLACEMENT;
+    if (outerHandle !== null) {
+        placement = normalizePlacement(outerHandle.name, options);
+        if (placement.outerValues && params.descriptor.raw.length > 0) {
+            throw new TypeError("A raw pattern cannot match one of the outer trigger's matched values");
+        }
+        // `outer` is what the body reads the outer chain's values through; a group of that
+        // name could never be reached. A name already captured up the chain would shadow.
+        if (ownNames.includes("outer")) {
+            throw new TypeError('"outer" is reserved as a capture name');
+        }
+        for (let at: Trigger | null = outerHandle; at !== null; at = at._outerHandle) {
+            for (const name of at._captureNames) {
+                if (name === "outer") {
+                    throw new TypeError(`"outer" is reserved as a capture name (used by "${at.name}")`);
+                }
+                if (ownNames.includes(name)) {
+                    throw new TypeError(`${name} is already captured by "${at.name}"`);
+                }
+            }
+        }
+    }
     let created: boolean;
     if (typeof script === "function") {
         created = op_smudgy_create_javascript_function_trigger(
@@ -3352,13 +3558,15 @@ function createTrigger(
             // Pass the handler's source (`toString()`) in good faith for the read-only detail
             // pane; the host treats it as display-only and never executes it.
             script.toString(),
+            placement,
         );
     } else {
         created = op_smudgy_create_simple_trigger(
             creatorId,
             params.name,
             params.descriptor,
-            script,
+            script ?? "",
+            script !== undefined,
             options.prompt ?? false,
             options.enabled ?? true,
             singleton,
@@ -3366,10 +3574,11 @@ function createTrigger(
             fallthrough,
             fireLimit,
             lineLimit,
+            placement,
         );
     }
 
-    const trigger = new Trigger(params.name, creatorId);
+    const trigger = new Trigger(params.name, creatorId, ownNames, outerHandle);
     trigger.created = created;
     return trigger;
 }
@@ -3382,14 +3591,15 @@ interface NormalizedTriggerPatterns {
 interface NormalizedTriggerParams {
     name: string;
     descriptor: ScriptTriggerPatternsWire;
-    script: AutomationScript;
+    script: AutomationScript | undefined;
 }
 
 /** Validates and normalizes parameters for creating a trigger. */
 function validateCreateTriggerParams(
     patterns: TriggerPattern | TriggerPatterns,
-    script: AutomationScript,
+    script: AutomationScript | undefined,
     options: TriggerOptions,
+    inner: boolean,
 ): NormalizedTriggerParams {
     if (typeof options !== "object" || options === null) {
         throw new TypeError("Options must be an object");
@@ -3417,13 +3627,14 @@ function validateCreateTriggerParams(
         "lineLimit",
         "priority",
         "fallthrough",
+        ...(inner ? INNER_OPTION_KEYS : []),
     ];
     const unexpectedOptions = Object.keys(options).filter((key) => !validOptions.includes(key));
     if (unexpectedOptions.length > 0) {
         throw new TypeError(`Unexpected option(s): ${unexpectedOptions.join(", ")}`);
     }
 
-    if (typeof script !== "string" && typeof script !== "function") {
+    if (script !== undefined && typeof script !== "string" && typeof script !== "function") {
         throw new TypeError("Script must be a string or function");
     }
 
@@ -4645,6 +4856,15 @@ class Line {
         }
         return this._lineNumber as number;
     }
+
+    /** The received-input number of the current line: rises by one per complete line the
+     *  game sends. A buffer line reports 0. */
+    get sequence(): number {
+        if (this._isCurrent) {
+            return op_smudgy_get_input_sequence();
+        }
+        return 0;
+    }
 }
 
 /** The current in-flight incoming line. */
@@ -4682,6 +4902,10 @@ const capture: (value: boolean) => void = op_smudgy_capture;
  * this from a function handler overrides it for that invocation only.
  */
 const fallthrough: (value: boolean) => void = op_smudgy_fallthrough;
+/** In an outer trigger's action: this firing opens nothing for the triggers inside it. */
+const skipInner: () => void = op_smudgy_skip_inner;
+/** In an inner trigger's action: the triggers of this firing stop watching after this line. */
+const stopWatching: () => void = op_smudgy_stop_watching;
 
 // ---- vars (server-scoped persistent store) ----------------------------------
 
@@ -5939,6 +6163,8 @@ function __smudgy_make_api(creator: { kind: string }) {
         reload,
         capture,
         fallthrough,
+        skipInner,
+        stopWatching,
         line,
         buffer,
         submission,
@@ -5959,8 +6185,11 @@ function __smudgy_make_api(creator: { kind: string }) {
         // the creator id is internal provenance and never exposed to scripts.
         createAlias: (patterns: Pattern | Pattern[] | Command, script: AutomationScript, options?: AliasOptions) =>
             createAlias(creatorId, patterns, script, options),
-        createTrigger: (patterns: TriggerPattern | TriggerPatterns, script: AutomationScript, options?: TriggerOptions) =>
-            createTrigger(creatorId, patterns, script, options),
+        createTrigger: (
+            patterns: TriggerPattern | TriggerPatterns,
+            script?: AutomationScript | TriggerOptions,
+            options?: TriggerOptions,
+        ) => createTrigger(creatorId, patterns, script, options),
         createTriggers: (triggers: Record<string, TriggerDef>) => createTriggers(creatorId, triggers),
         createTimer: timerHotkey.createTimer,
         createHotkey: timerHotkey.createHotkey,

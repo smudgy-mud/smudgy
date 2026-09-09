@@ -29,6 +29,8 @@ declare global {
   const reload: SmudgyApi["reload"];
   const capture: SmudgyApi["capture"];
   const fallthrough: SmudgyApi["fallthrough"];
+  const skipInner: SmudgyApi["skipInner"];
+  const stopWatching: SmudgyApi["stopWatching"];
   const byName: SmudgyApi["byName"];
   const byId: SmudgyApi["byId"];
   const getSessions: SmudgyApi["getSessions"];
@@ -63,6 +65,8 @@ declare global {
   const id: SmudgyApi["id"];
 
   const matches: Matches;
+  /** In a trigger inside another: the matched values of the triggers it is inside. */
+  const outer: Matches | undefined;
 }
 
 export {};

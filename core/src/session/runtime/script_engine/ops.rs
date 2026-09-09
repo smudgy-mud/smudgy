@@ -6,14 +6,15 @@ use crate::models::matchers::{
     MatcherHsvRange, MatcherTextAttribute, ParseMode, command_prefilter,
 };
 use crate::models::triggers::TriggerDefinition;
+use crate::models::triggers::{InnerInput, InnerReach, LineReach, Overlap};
 use crate::session::connection::vt_processor::{AnsiColor, parse_link_tooltip_text};
 use crate::session::runtime::line_operation::{LineOperation, LinkUpdate, SpliceRun};
 use crate::session::runtime::pane;
 use crate::session::runtime::script_engine::FunctionId;
 use crate::session::runtime::store;
 use crate::session::runtime::trigger::{
-    AliasSender, MatchCapture, PreparedScriptTriggerPatterns, ScriptTriggerPattern,
-    SharedAutomationRegistry,
+    AliasSender, FiringFlags, MatchCapture, PreparedScriptTriggerPatterns, ScriptTriggerPattern,
+    SharedAutomationRegistry, SharedInputSequence,
 };
 use crate::session::runtime::{
     ActionQueue, AutomationKind, IsolateId, MAX_EVENT_DEPTH, Origin, RuntimeAction, ScriptAction,
@@ -127,6 +128,9 @@ deno_core::extension!(
     op_smudgy_mapper_get_current_location,
     op_smudgy_capture,
     op_smudgy_fallthrough,
+    op_smudgy_skip_inner,
+    op_smudgy_stop_watching,
+    op_smudgy_get_input_sequence,
     op_smudgy_param_get,
     op_smudgy_param_set,
     op_smudgy_get_settings,
@@ -254,6 +258,8 @@ deno_core::extension!(
     // Introspection mirror, shared with the trigger `Manager` (the writer). The
     // `get`/`list`/`exists` ops read it for the caller's OWN `(isolate, origin)` namespace.
     automation_registry: SharedAutomationRegistry,
+    // The input counter the trigger manager advances, read as `line.sequence`.
+    input_sequence: SharedInputSequence,
     // The smudgy op-capabilities this isolate may use (`PACKAGE-ISOLATES-OP-CAPABILITIES.md`).
     // `all()` for the main/trusted isolate; built from the package's CONSENTED smudgy capability
     // set for a sandboxed isolate (∅ ⇒ all-false ⇒ every gated op throws `NotCapable`). The gated
@@ -343,6 +349,7 @@ deno_core::extension!(
     state.put::<IsolateId>(options.isolate_id);
     state.put::<SingletonRegistry>(options.singleton_registry);
     state.put::<SharedAutomationRegistry>(options.automation_registry);
+    state.put::<SharedInputSequence>(options.input_sequence);
     state.put::<SmudgyGrants>(options.smudgy_grants);
     // Bridge the `widgets` grant to the `smudgy_widgets` ops, which live in a leaf crate that cannot
     // name `SmudgyGrants` (`smudgy_cloud` is the crate both share — see its `WidgetsEnabled`).
@@ -679,6 +686,11 @@ pub struct CallState {
     pub alias: RefCell<Option<AliasSender>>,
     pub captured: Cell<bool>,
     pub fallthrough: Cell<Option<bool>>,
+    /// The firing the running trigger opened, for `skipInner()`. `None` outside a trigger
+    /// body or for a trigger with nothing inside it.
+    pub firing_opened: RefCell<Option<Arc<FiringFlags>>>,
+    /// The firing the running inner trigger runs under, for `stopWatching()`.
+    pub firing_under: RefCell<Option<Arc<FiringFlags>>>,
 }
 
 impl CallState {
@@ -698,6 +710,16 @@ pub type SharedCallState = Rc<CallState>;
 #[class(generic)]
 #[error("fallthrough() may only be called inside an alias or trigger handler")]
 struct FallthroughContextError;
+
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+#[class(generic)]
+#[error("skipInner() may only be called inside a trigger handler")]
+struct SkipInnerContextError;
+
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+#[class(generic)]
+#[error("stopWatching() needs a trigger inside another")]
+struct StopWatchingContextError;
 
 /// The calling isolate's instantiation nonce (`ScriptEngine`'s process-wide counter),
 /// parked in `OpState` at construction. The pane-input registration op stamps it onto
@@ -4572,6 +4594,67 @@ fn parse_command_spec(raw: &str) -> Result<Option<WireCommandSpec>, ()> {
         .map_err(|_| ())
 }
 
+/// Where a script-created trigger sits and how it watches: the outer trigger's name
+/// (empty for a top-level trigger) and the reach options, straight from the JS options
+/// object after validation there.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ScriptPlacementWire {
+    #[serde(default)]
+    outer: String,
+    /// The line count, or `null` for no limit.
+    #[serde(default)]
+    within_lines: Option<u32>,
+    #[serde(default)]
+    unlimited: bool,
+    #[serde(default = "wire_true")]
+    same_line: bool,
+    #[serde(default)]
+    until_prompt: bool,
+    #[serde(default)]
+    once: bool,
+    #[serde(default)]
+    each: bool,
+    #[serde(default)]
+    outer_values: bool,
+}
+
+fn wire_true() -> bool {
+    true
+}
+
+impl ScriptPlacementWire {
+    fn into_parts(self) -> (Option<Arc<String>>, InnerReach) {
+        let outer = (!self.outer.is_empty()).then(|| Arc::new(self.outer));
+        let within_lines = if self.unlimited {
+            LineReach::Unlimited
+        } else if self.until_prompt && self.within_lines.is_none() {
+            // `untilPrompt` alone: the prompt is the boundary, not a line count.
+            LineReach::Unlimited
+        } else {
+            LineReach::from_lines(self.within_lines.unwrap_or(0))
+        };
+        let reach = InnerReach {
+            within_lines,
+            same_line: self.same_line,
+            until_prompt: self.until_prompt,
+            once: self.once,
+            overlap: if self.each {
+                Overlap::Each
+            } else {
+                Overlap::Restart
+            },
+            input: if self.outer_values {
+                InnerInput::OuterValues
+            } else {
+                InnerInput::Line
+            },
+        };
+        (outer, reach)
+    }
+}
+
 /// Script-only trigger descriptor. It deliberately does not reuse the
 /// persisted matcher sidecar: raw script regexes stay on their direct path,
 /// while every displayed source remains paired with its style predicate.
@@ -4884,6 +4967,7 @@ fn op_smudgy_create_simple_trigger(
     #[string] name: String,
     #[serde] descriptor: ScriptTriggerPatternsWire,
     #[string] script: String,
+    has_body: bool,
     prompt: bool,
     enabled: bool,
     singleton: bool,
@@ -4891,6 +4975,7 @@ fn op_smudgy_create_simple_trigger(
     fallthrough: bool,
     fire_limit: u32,
     line_limit: u32,
+    #[serde] placement: ScriptPlacementWire,
 ) -> Result<bool, AutomationOpError> {
     ensure(grants(state).create_triggers, "triggers")?;
     let normalized = descriptor
@@ -4912,6 +4997,7 @@ fn op_smudgy_create_simple_trigger(
     }
 
     let isolate = current_isolate(state);
+    let (outer, reach) = placement.into_parts();
     queue_own_action(
         state,
         RuntimeAction::AddScriptTrigger {
@@ -4919,7 +5005,11 @@ fn op_smudgy_create_simple_trigger(
             origin,
             name: Arc::new(name),
             prepared: Arc::new(prepared),
-            script: ScriptAction::SendSimple(Arc::new(script)),
+            script: if has_body {
+                ScriptAction::SendSimple(Arc::new(script))
+            } else {
+                ScriptAction::Noop
+            },
             prompt,
             enabled,
             priority,
@@ -4927,6 +5017,8 @@ fn op_smudgy_create_simple_trigger(
             fire_limit: self_limit(fire_limit),
             line_limit: self_limit(line_limit),
             script_source: None,
+            outer,
+            reach,
         },
     );
     Ok(true)
@@ -4951,6 +5043,7 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
     fire_limit: u32,
     line_limit: u32,
     #[string] script_source: String,
+    #[serde] placement: ScriptPlacementWire,
 ) -> Result<bool, AutomationOpError> {
     ensure(grants(state).create_triggers, "triggers")?;
     let normalized = descriptor
@@ -4982,6 +5075,7 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
     };
 
     let isolate = current_isolate(state);
+    let (outer, reach) = placement.into_parts();
     queue_own_action(
         state,
         RuntimeAction::AddScriptTrigger {
@@ -4997,6 +5091,8 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
             fire_limit: self_limit(fire_limit),
             line_limit: self_limit(line_limit),
             script_source: script_source_arc(script_source),
+            outer,
+            reach,
         },
     );
     Ok(true)
@@ -5245,6 +5341,11 @@ struct AutomationView {
     enabled: bool,
     priority: i32,
     fallthrough: bool,
+    outer: Option<String>,
+    inner: Vec<String>,
+    #[serde(rename = "lastFiredSequence")]
+    last_fired_sequence: i64,
+    warning: Option<String>,
 }
 
 /// Read one alias from the introspection mirror, scoped to the caller's own `(isolate, origin)`
@@ -5357,6 +5458,10 @@ fn lookup_automation(
             enabled: entry.enabled,
             priority: entry.priority,
             fallthrough: entry.fallthrough,
+            outer: entry.outer.clone(),
+            inner: entry.inner.clone(),
+            last_fired_sequence: entry.last_fired.load(std::sync::atomic::Ordering::Relaxed),
+            warning: entry.warning.as_deref().map(str::to_string),
         }))
 }
 
@@ -8146,6 +8251,45 @@ fn op_smudgy_fallthrough(state: &OpState, value: bool) -> Result<(), Fallthrough
     }
     fallthrough.set(Some(value));
     Ok(())
+}
+
+/// `skipInner()`: the firing the running trigger opened opens nothing. A no-op for a trigger
+/// with nothing inside it; a throw outside a trigger body.
+#[op2(fast)]
+fn op_smudgy_skip_inner(state: &OpState) -> Result<(), SkipInnerContextError> {
+    let call_state = state.borrow::<SharedCallState>();
+    if call_state.fallthrough.get().is_none() {
+        return Err(SkipInnerContextError);
+    }
+    if let Some(opened) = call_state.firing_opened.borrow().as_ref() {
+        opened
+            .skipped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// `stopWatching()`: the firing the running inner trigger runs under ends after this input.
+/// A throw in a top-level trigger, so a trigger moved out shows the error instead of
+/// silently doing nothing.
+#[op2(fast)]
+fn op_smudgy_stop_watching(state: &OpState) -> Result<(), StopWatchingContextError> {
+    let call_state = state.borrow::<SharedCallState>();
+    let under = call_state.firing_under.borrow();
+    let Some(under) = under.as_ref() else {
+        return Err(StopWatchingContextError);
+    };
+    under
+        .stopped
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// `line.sequence`: the number of the input being matched, see `SharedInputSequence`.
+#[op2(fast)]
+#[number]
+fn op_smudgy_get_input_sequence(state: &OpState) -> u64 {
+    state.borrow::<SharedInputSequence>().get()
 }
 
 #[cfg(test)]

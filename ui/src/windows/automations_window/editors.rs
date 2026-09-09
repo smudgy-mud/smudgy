@@ -21,6 +21,7 @@ use smudgy_core::models::modules::ModuleFileWriteOutcome;
 use smudgy_core::models::profile_activation::ProfileActivation;
 use smudgy_core::models::server;
 use smudgy_core::models::shared_packages::LockedPackage;
+use smudgy_core::models::triggers::{InnerInput, InnerReach, LineReach, MAX_INNER_DEPTH, Overlap};
 use smudgy_core::models::{ScriptLang, aliases, hotkeys, naming, packages, triggers};
 use smudgy_core::session::runtime::AutomationKind;
 
@@ -88,6 +89,92 @@ impl std::fmt::Display for FolderChoice {
     }
 }
 
+/// A choice for the outer picker: no trigger (top level), or a trigger's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OuterChoice {
+    None,
+    Trigger(String),
+}
+
+impl OuterChoice {
+    fn into_outer(self) -> Option<String> {
+        match self {
+            OuterChoice::None => None,
+            OuterChoice::Trigger(name) => Some(name),
+        }
+    }
+}
+
+impl std::fmt::Display for OuterChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OuterChoice::None => f.write_str(&crate::i18n::t!("editor-no-trigger")),
+            OuterChoice::Trigger(name) => f.write_str(name),
+        }
+    }
+}
+
+/// The overlap picker's two answers, in the editor's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlapChoice {
+    Restart,
+    Each,
+}
+
+impl From<Overlap> for OverlapChoice {
+    fn from(overlap: Overlap) -> Self {
+        match overlap {
+            Overlap::Restart => OverlapChoice::Restart,
+            Overlap::Each => OverlapChoice::Each,
+        }
+    }
+}
+
+impl From<OverlapChoice> for Overlap {
+    fn from(choice: OverlapChoice) -> Self {
+        match choice {
+            OverlapChoice::Restart => Overlap::Restart,
+            OverlapChoice::Each => Overlap::Each,
+        }
+    }
+}
+
+impl std::fmt::Display for OverlapChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OverlapChoice::Restart => f.write_str(&crate::i18n::t!("editor-overlap-restart")),
+            OverlapChoice::Each => f.write_str(&crate::i18n::t!("editor-overlap-each")),
+        }
+    }
+}
+
+/// What the trigger editor's "When it runs" module needs to know about placement.
+struct TriggerPlacement<'a> {
+    name: &'a str,
+    outer: Option<&'a str>,
+    reach: InnerReach,
+}
+
+/// The reach of an inner trigger in a few words, for list rows.
+fn reach_summary(reach: &InnerReach) -> String {
+    let mut parts = Vec::new();
+    match reach.within_lines {
+        LineReach::None => parts.push(crate::i18n::t!("editor-inside-reach-line")),
+        LineReach::Lines(count) => parts.push(crate::i18n::t!(
+            "editor-inside-reach-lines",
+            "count" => count.to_string()
+        )),
+        LineReach::Unlimited => parts.push(crate::i18n::t!("editor-inside-reach-unlimited")),
+    }
+    if reach.until_prompt {
+        parts.push(crate::i18n::t!("editor-inside-reach-prompt"));
+    }
+    if reach.once {
+        parts.push(crate::i18n::t!("editor-inside-reach-once"));
+    }
+    parts.join(" · ")
+}
+
 /// Logs `msg` and returns an empty update (used for non-fatal save failures).
 fn warn_none(msg: String) -> Update<Message, Event> {
     log::warn!("{msg}");
@@ -147,6 +234,8 @@ impl AutomationsWindow {
         self.order_revealed = false;
         self.try_it_open = false;
         self.parsing_open = false;
+        self.move_inside_revealed = false;
+        self.confirm_outer_delete = false;
         // The state draft seeds before the action buffers bind the code editor: the inline
         // bridge the binding installs declares the draft's exposures.
         match &script {
@@ -222,6 +311,8 @@ impl AutomationsWindow {
                     fallthrough: t.fallthrough,
                     package: t.package.clone(),
                     rows,
+                    outer: t.outer.clone(),
+                    reach: t.reach,
                 }
             }
             Script::Folder(_, _) => return Update::none(),
@@ -387,6 +478,8 @@ impl AutomationsWindow {
         self.order_revealed = false;
         self.try_it_open = false;
         self.parsing_open = false;
+        self.move_inside_revealed = false;
+        self.confirm_outer_delete = false;
         self.reset_state_draft(&[]);
         // No rows yet: the pane opens at the unselected-cards state.
         self.trigger_row_contents = Vec::new();
@@ -402,10 +495,212 @@ impl AutomationsWindow {
                 fallthrough: true,
                 package: self.current_folder(),
                 rows: Vec::new(),
+                outer: None,
+                reach: InnerReach::DEFAULT,
             },
             error: None,
         });
         Update::with_task(self.refresh_generated_actions())
+    }
+
+    /// A create pane for a trigger inside the open trigger. The reach is pre-filled from
+    /// the last trigger already inside it, so the next step of a list needs only a pattern
+    /// and a body.
+    pub(super) fn new_inner_trigger(&mut self) -> Update<Message, Event> {
+        let (outer_name, package) = match &self.pane {
+            Pane::Editor(EditorState {
+                mode: EditorMode::Edit,
+                original_name: Some(name),
+                node: EditNode::Trigger { package, .. },
+                ..
+            }) => (name.clone(), package.clone()),
+            _ => return Update::none(),
+        };
+        let reach = self
+            .inner_triggers_of(&outer_name)
+            .last()
+            .map_or(InnerReach::DEFAULT, |(_, t)| t.reach);
+        let update = self.new_trigger();
+        if let Pane::Editor(state) = &mut self.pane
+            && let EditNode::Trigger {
+                outer,
+                reach: node_reach,
+                package: node_package,
+                ..
+            } = &mut state.node
+        {
+            *outer = Some(outer_name);
+            *node_reach = reach;
+            *node_package = package;
+        }
+        update
+    }
+
+    /// Place the open trigger inside `outer`, or move it out with `None`. A trigger cannot
+    /// go inside itself or anything inside it, or past the depth limit. Persisted at once
+    /// for a saved trigger, like a folder move; a draft for a new one.
+    pub(super) fn set_outer(&mut self, outer: Option<String>) -> Update<Message, Event> {
+        let (mode, original_name) = match &self.pane {
+            Pane::Editor(EditorState {
+                mode,
+                original_name,
+                node: EditNode::Trigger { .. },
+                ..
+            }) => (*mode, original_name.clone()),
+            _ => return Update::none(),
+        };
+        if let Some(target) = outer.as_deref() {
+            if Some(target) == original_name.as_deref() {
+                return Update::none();
+            }
+            if let Some(orig) = &original_name
+                && self.triggers_inside(orig).iter().any(|name| name == target)
+            {
+                return Update::none();
+            }
+            if self.outer_names(Some(target)).len() >= MAX_INNER_DEPTH {
+                return Update::none();
+            }
+        }
+        let root_package = outer
+            .as_deref()
+            .and_then(|name| self.trigger_definition(name))
+            .and_then(|t| t.package);
+        if let Pane::Editor(state) = &mut self.pane
+            && let EditNode::Trigger {
+                outer: node_outer,
+                package,
+                ..
+            } = &mut state.node
+        {
+            *node_outer = outer.clone();
+            if outer.is_some() {
+                *package = root_package.clone();
+            }
+        }
+        self.move_inside_revealed = false;
+        if mode == EditorMode::Create {
+            self.dirty = true;
+            return Update::none();
+        }
+        let Some(name) = original_name else {
+            return Update::none();
+        };
+        if outer.is_some() {
+            // The subtree follows the root's folder.
+            self.retarget_inner_triggers(&name, &name, root_package.as_deref());
+        }
+        let stored_outer = outer.clone();
+        let stored_package = root_package.clone();
+        match self.persist_script_metadata(&name, move |script| {
+            if let Script::Trigger(trigger) = script {
+                trigger.outer = stored_outer;
+                if trigger.outer.is_some() {
+                    trigger.package = stored_package;
+                }
+            }
+        }) {
+            Ok(update) => update,
+            Err(error) => {
+                if let Pane::Editor(state) = &mut self.pane {
+                    state.error = Some(error);
+                }
+                Update::none()
+            }
+        }
+    }
+
+    /// Change the open inner trigger's reach in place.
+    pub(super) fn edit_reach(&mut self, edit: impl FnOnce(&mut InnerReach)) {
+        if let Pane::Editor(EditorState {
+            node: EditNode::Trigger { reach, .. },
+            ..
+        }) = &mut self.pane
+        {
+            edit(reach);
+        }
+    }
+
+    /// The range field: a line count, or blank for no limit. Anything else is ignored so
+    /// the field keeps the last good value.
+    pub(super) fn set_within_lines(&mut self, value: &str) {
+        let value = value.trim();
+        let within = if value.is_empty() {
+            LineReach::Unlimited
+        } else if let Ok(count) = value.parse::<u32>() {
+            LineReach::from_lines(count)
+        } else {
+            return;
+        };
+        self.edit_reach(|reach| reach.within_lines = within);
+    }
+
+    /// Delete the open trigger and either delete the triggers inside it or move them out
+    /// one level, then finish through the ordinary delete path.
+    pub(super) fn delete_outer(&mut self, delete_inner: bool) -> Update<Message, Event> {
+        let (name, outer) = match &self.pane {
+            Pane::Editor(EditorState {
+                mode: EditorMode::Edit,
+                original_name: Some(name),
+                node: EditNode::Trigger { outer, .. },
+                ..
+            }) => (name.clone(), outer.clone()),
+            _ => return Update::none(),
+        };
+        self.confirm_outer_delete = false;
+        if delete_inner {
+            for inner in self.triggers_inside(&name) {
+                self.remove_script_by_name(&inner);
+            }
+        } else {
+            let direct: Vec<String> = self
+                .inner_triggers_of(&name)
+                .into_iter()
+                .map(|(inner, _)| inner)
+                .collect();
+            self.set_outer_of(&direct, outer.as_deref());
+        }
+        self.delete_open()
+    }
+
+    /// Point every trigger in `names` at `outer` (or the top level).
+    fn set_outer_of(&mut self, names: &[String], outer: Option<&str>) {
+        fn rec(scripts: &mut BTreeMap<String, Script>, names: &[String], outer: Option<&str>) {
+            for (script_name, script) in scripts.iter_mut() {
+                match script {
+                    Script::Trigger(t) if names.contains(script_name) => {
+                        t.outer = outer.map(str::to_string);
+                    }
+                    Script::Folder(_, children) => rec(children, names, outer),
+                    _ => {}
+                }
+            }
+        }
+        rec(&mut self.scripts, names, outer);
+    }
+
+    /// Every trigger that could hold `name`: not itself, nothing inside it, and nothing
+    /// already at the depth limit. Sorted by name.
+    pub(super) fn outer_candidates(&self, name: &str) -> Vec<String> {
+        fn rec(scripts: &BTreeMap<String, Script>, out: &mut Vec<String>) {
+            for (script_name, script) in scripts {
+                match script {
+                    Script::Trigger(_) => out.push(script_name.clone()),
+                    Script::Folder(_, children) => rec(children, out),
+                    _ => {}
+                }
+            }
+        }
+        let inside = self.triggers_inside(name);
+        let mut out = Vec::new();
+        rec(&self.scripts, &mut out);
+        out.retain(|candidate| {
+            candidate != name
+                && !inside.contains(candidate)
+                && self.outer_names(Some(candidate)).len() < MAX_INNER_DEPTH
+        });
+        out.sort();
+        out
     }
 
     pub(super) fn new_hotkey(&mut self) -> Update<Message, Event> {
@@ -668,6 +963,8 @@ impl AutomationsWindow {
         let Some(name) = original_name else {
             return Update::none();
         };
+        // Everything inside a trigger lives in its folder.
+        self.retarget_inner_triggers(&name, &name, folder.as_deref());
         match self.persist_script_metadata(&name, move |script| match script {
             Script::Alias(alias) => alias.package = folder.clone(),
             Script::Hotkey(hotkey) => hotkey.package = folder.clone(),
@@ -1083,6 +1380,17 @@ impl AutomationsWindow {
         // draft for a Plaintext action, the script draft otherwise. Hotkeys
         // use their dedicated plaintext buffer when applicable. Every JS/TS
         // body comes from the upstream code editor's authoritative buffer.
+        // An inner trigger lives in its root's folder, never one of its own.
+        let inner_root_package = match &self.pane {
+            Pane::Editor(EditorState {
+                node:
+                    EditNode::Trigger {
+                        outer: Some(outer), ..
+                    },
+                ..
+            }) => Some(self.trigger_definition(outer).and_then(|t| t.package)),
+            _ => None,
+        };
         let body = match &self.pane {
             Pane::Editor(EditorState {
                 node: EditNode::Alias(a),
@@ -1176,13 +1484,17 @@ impl AutomationsWindow {
                     fallthrough,
                     package,
                     rows,
+                    outer,
+                    reach,
                 } => {
                     let mut t = triggers::TriggerDefinition {
                         patterns: None,
                         raw_patterns: None,
                         anti_patterns: None,
                         script: persisted_script,
-                        package: package.clone(),
+                        package: inner_root_package
+                            .clone()
+                            .unwrap_or_else(|| package.clone()),
                         language: *language,
                         enabled: *enabled,
                         prompt: *prompt,
@@ -1190,6 +1502,9 @@ impl AutomationsWindow {
                         fallthrough: *fallthrough,
                         matchers: None,
                         state: exposures.clone(),
+                        reach: *reach,
+                        inner: None,
+                        outer: outer.clone(),
                     };
                     if let Err((i, message)) = rows_into_trigger(rows, &mut t) {
                         let message = crate::i18n::t!(
@@ -1219,6 +1534,8 @@ impl AutomationsWindow {
         {
             self.remove_script_by_name(orig);
         }
+        let final_package = final_script.folder_name().map(str::to_owned);
+        let final_is_trigger = matches!(final_script, Script::Trigger(_));
         match upsert_script_folder(&mut self.scripts, final_script.folder_name()) {
             Ok(folder) => {
                 folder.insert(name.clone(), final_script);
@@ -1230,6 +1547,13 @@ impl AutomationsWindow {
                 }
                 return Update::none();
             }
+        }
+        // The triggers inside follow a rename and a folder move of their outer.
+        if final_is_trigger
+            && mode == EditorMode::Edit
+            && let Some(orig) = &original_name
+        {
+            self.retarget_inner_triggers(orig, &name, final_package.as_deref());
         }
         match self.serialize_scripts() {
             Ok(AutomationSaveStatus::Saved) => {}
@@ -1889,6 +2213,19 @@ impl AutomationsWindow {
         save_label: &str,
         delete_link: Option<&str>,
     ) -> Option<Elem<'a>> {
+        self.save_bar_with(create, can_delete, save_label, delete_link, Message::Delete)
+    }
+
+    /// [`Self::save_bar`] with the message its delete affordance sends: a trigger with
+    /// triggers inside it asks first.
+    fn save_bar_with<'a>(
+        &self,
+        create: bool,
+        can_delete: bool,
+        save_label: &str,
+        delete_link: Option<&str>,
+        delete: Message,
+    ) -> Option<Elem<'a>> {
         if !create && !self.dirty && !can_delete {
             return None;
         }
@@ -1903,10 +2240,10 @@ impl AutomationsWindow {
             });
         if can_delete {
             bar = bar.push(match delete_link {
-                Some(label) => danger_link(label.to_string(), Message::Delete),
+                Some(label) => danger_link(label.to_string(), delete),
                 None => button(text(crate::i18n::t!("editor-delete")).size(13.0))
                     .style(button_style::secondary)
-                    .on_press(Message::Delete)
+                    .on_press(delete)
                     .into(),
             });
         }
@@ -1972,26 +2309,41 @@ impl AutomationsWindow {
         prompt: Option<bool>,
         allow_self_match: Option<bool>,
         trigger: bool,
+        placement: Option<TriggerPlacement<'a>>,
     ) -> OrderSlot<'a> {
+        // A trigger inside another keeps its module open: its placement is the point.
+        let inside = placement.as_ref().is_some_and(|p| p.outer.is_some());
         let hidden = Self::order_at_defaults(priority, fallthrough, prompt, allow_self_match)
-            && !self.order_revealed;
+            && !self.order_revealed
+            && !inside;
         let content = if hidden {
             self.order_reveal_link(trigger)
         } else {
-            self.order_module(priority, fallthrough, prompt, allow_self_match, trigger)
+            self.order_module(
+                priority,
+                fallthrough,
+                prompt,
+                allow_self_match,
+                trigger,
+                placement,
+            )
         };
         OrderSlot { hidden, content }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn order_module<'a>(
-        &self,
+        &'a self,
         priority: i32,
         fallthrough: bool,
         prompt: Option<bool>,
         allow_self_match: Option<bool>,
         trigger: bool,
+        placement: Option<TriggerPlacement<'a>>,
     ) -> Elem<'a> {
-        let non_default = !Self::order_at_defaults(priority, fallthrough, prompt, allow_self_match);
+        let inside = placement.as_ref().is_some_and(|p| p.outer.is_some());
+        let non_default =
+            !Self::order_at_defaults(priority, fallthrough, prompt, allow_self_match) || inside;
         if !non_default && !self.order_revealed {
             return field_row("", self.order_reveal_link(trigger));
         }
@@ -2051,7 +2403,11 @@ impl AutomationsWindow {
             .size(14.0)
             .text_size(13.0);
 
-        let mut inner = column![priority_row, continue_row].spacing(10.0);
+        let mut inner = column![].spacing(10.0);
+        if let Some(placement) = placement {
+            inner = inner.push(self.placement_rows(&placement));
+        }
+        inner = inner.push(priority_row).push(continue_row);
         if let Some(allow_self_match) = allow_self_match {
             inner = inner.push(
                 checkbox(allow_self_match)
@@ -2108,31 +2464,43 @@ impl AutomationsWindow {
         matched: Vec<String>,
         language: ScriptLang,
         order: Option<OrderSlot<'a>>,
+        extra_link: Option<Elem<'a>>,
     ) -> Elem<'a> {
         // The disclosures: one row holding both reveal links while both are hidden, else
         // the order module (or its link) above the state module (or its link). The hotkey
-        // editor has no order disclosure.
+        // editor has no order disclosure. A trigger's "Add a trigger inside this one" link
+        // shares the row, or follows the modules once one is open.
         let disclosures: Elem<'a> = match order {
             Some(OrderSlot {
                 hidden: true,
                 content: order_link,
-            }) if !self.state_disclosure_open() => field_row(
-                "",
-                row![order_link, self.state_reveal_link()]
+            }) if !self.state_disclosure_open() => {
+                let mut links = row![order_link, self.state_reveal_link()]
                     .spacing(16.0)
-                    .align_y(Vertical::Center)
-                    .into(),
-            ),
-            Some(OrderSlot { hidden, content }) => column![
-                if hidden {
-                    field_row("", content)
-                } else {
-                    content
-                },
-                self.state_module(),
-            ]
-            .into(),
-            None => self.state_module(),
+                    .align_y(Vertical::Center);
+                if let Some(extra) = extra_link {
+                    links = links.push(extra);
+                }
+                field_row("", links.into())
+            }
+            Some(OrderSlot { hidden, content }) => {
+                let mut stack = column![
+                    if hidden {
+                        field_row("", content)
+                    } else {
+                        content
+                    },
+                    self.state_module(),
+                ];
+                if let Some(extra) = extra_link {
+                    stack = stack.push(field_row("", extra));
+                }
+                stack.into()
+            }
+            None => match extra_link {
+                Some(extra) => column![self.state_module(), field_row("", extra)].into(),
+                None => self.state_module(),
+            },
         };
         let matched = values_group(
             crate::i18n::ts!("editor-matched-values"),
@@ -2579,11 +2947,13 @@ impl AutomationsWindow {
             None,
             Some(alias.allow_self_match),
             false,
+            None,
         );
         body = body.push(self.reads_and_values_section(
             references.clone(),
             alias.language,
             Some(order),
+            None,
         ));
         let editor = self.action_module(alias.language, references, AutomationKind::Alias, "alias");
         let bar = self.save_bar(
@@ -2650,7 +3020,7 @@ impl AutomationsWindow {
                     .on_action(Message::MarkHotkeyState),
             ),
         ));
-        body = body.push(self.reads_and_values_section(Vec::new(), hotkey.language, None));
+        body = body.push(self.reads_and_values_section(Vec::new(), hotkey.language, None, None));
         let editor = self.hotkey_action_module(hotkey.language);
         let bar = self.save_bar(
             create,
@@ -2683,15 +3053,24 @@ impl AutomationsWindow {
         } else {
             state.name.as_str()
         };
-        let subtitle = subtitle_for(
-            create,
-            crate::i18n::ts!("automation-trigger"),
-            trigger_package(state),
-        );
+        let (outer, reach) = trigger_placement(state);
+        let subtitle = match outer {
+            Some(outer) => crate::i18n::t!(
+                "editor-kind-inside",
+                "kind" => crate::i18n::ts!("automation-trigger"),
+                "outer" => outer
+            ),
+            None => subtitle_for(
+                create,
+                crate::i18n::ts!("automation-trigger"),
+                trigger_package(state),
+            ),
+        };
         let any_invalid = rows.iter().any(|row| {
             (!row.source.trim().is_empty() || row.color.is_some()) && row.compiled().is_err()
         });
-        let status = Self::editor_status(create, enabled, any_invalid);
+        let never_fires = outer.is_some() && !reach.can_fire();
+        let status = Self::editor_status(create, enabled, any_invalid || never_fires);
         let badge_label = if language == ScriptLang::Plaintext {
             crate::i18n::ts!("editor-text")
         } else {
@@ -2703,7 +3082,7 @@ impl AutomationsWindow {
             title,
             Some(subtitle),
             Some(self.header_actions(badge_label, enabled)),
-            self.folder_aside(trigger_package(state)),
+            self.trigger_aside(outer, trigger_package(state)),
         )]
         .spacing(16.0);
 
@@ -2714,7 +3093,8 @@ impl AutomationsWindow {
         let error = state
             .error
             .as_deref()
-            .or_else(|| any_invalid.then(|| crate::i18n::ts!("editor-patterns-invalid")));
+            .or_else(|| any_invalid.then(|| crate::i18n::ts!("editor-patterns-invalid")))
+            .or_else(|| never_fires.then(|| crate::i18n::ts!("editor-never-fires")));
 
         body = body.push(
             text(crate::i18n::ts!("editor-deck-trigger"))
@@ -2879,25 +3259,347 @@ impl AutomationsWindow {
             matchers.into(),
         ));
 
+        // The triggers inside this one, listed with their reach; the add link lives here
+        // once there are some, and on the reveal row until then.
+        let inner = if create {
+            Vec::new()
+        } else {
+            self.inner_triggers_of(&state.name)
+        };
+        if !inner.is_empty() {
+            body = body.push(field_row(
+                crate::i18n::ts!("editor-inside"),
+                self.inside_module(&inner),
+            ));
+        }
+
         let has_raw = rows
             .iter()
             .any(|row| row.role == PatternKind::Raw && !row.source.trim().is_empty());
         body = body.push(self.tester_box(false, has_raw));
-        let references = Self::trigger_capture_references(rows, language);
-        let order = self.order_slot(priority, fallthrough, Some(prompt), None, true);
-        body = body.push(self.reads_and_values_section(references.clone(), language, Some(order)));
-        let editor = self.action_module(language, references, AutomationKind::Trigger, "trigger");
-        let bar = self.save_bar(
-            create,
-            !create,
-            if create {
-                crate::i18n::ts!("editor-create-trigger")
-            } else {
-                crate::i18n::ts!("action-save")
-            },
-            Some(crate::i18n::ts!("editor-delete-this-trigger")),
+        let mut references = Self::trigger_capture_references(rows, language);
+        references.extend(self.outer_capture_references(outer, language));
+        let placement = TriggerPlacement {
+            name: state.original_name.as_deref().unwrap_or(""),
+            outer,
+            reach,
+        };
+        let order = self.order_slot(
+            priority,
+            fallthrough,
+            Some(prompt),
+            None,
+            true,
+            Some(placement),
         );
+        let add_inside = (!create && inner.is_empty()).then(|| {
+            text_link(
+                crate::i18n::t!("editor-add-inside"),
+                Message::NewInnerTrigger,
+            )
+        });
+        body = body.push(self.reads_and_values_section(
+            references.clone(),
+            language,
+            Some(order),
+            add_inside,
+        ));
+        let editor = self.action_module(language, references, AutomationKind::Trigger, "trigger");
+        let save_label = if create {
+            crate::i18n::ts!("editor-create-trigger")
+        } else {
+            crate::i18n::ts!("action-save")
+        };
+        let bar = if self.confirm_outer_delete {
+            Some(self.delete_outer_banner(inner.len()))
+        } else if inner.is_empty() {
+            self.save_bar(
+                create,
+                !create,
+                save_label,
+                Some(crate::i18n::ts!("editor-delete-this-trigger")),
+            )
+        } else {
+            self.save_bar_with(
+                create,
+                !create,
+                save_label,
+                Some(crate::i18n::ts!("editor-delete-this-trigger")),
+                Message::RequestDeleteOuter,
+            )
+        };
         pane_scroll_growing(body, editor, bar, ACTION_EDITOR_MIN_HEIGHT, viewport_height)
+    }
+
+    /// The header aside of a trigger: the folder picker, or, for a trigger inside another,
+    /// the folder it inherits in plain words.
+    fn trigger_aside<'a>(&self, outer: Option<&str>, folder: Option<&str>) -> Elem<'a> {
+        match (outer, folder) {
+            (Some(outer), Some(folder)) => text(crate::i18n::t!(
+                "editor-folder-from-outer",
+                "folder" => folder,
+                "outer" => outer
+            ))
+            .size(13.0)
+            .style(common::muted)
+            .into(),
+            (Some(_), None) => text("").into(),
+            (None, folder) => self.folder_aside(folder),
+        }
+    }
+
+    /// The Inside module: one row per trigger inside the open one, then the add link.
+    fn inside_module<'a>(&'a self, inner: &[(String, triggers::TriggerDefinition)]) -> Elem<'a> {
+        let mut rows_col = column![].spacing(2.0);
+        for (name, definition) in inner {
+            let status = self.script_status(&Script::Trigger(definition.clone()));
+            let pattern = definition
+                .patterns
+                .as_ref()
+                .and_then(|patterns| patterns.first())
+                .cloned()
+                .unwrap_or_default();
+            let key = ScriptKey {
+                folder_name: definition.package.clone(),
+                script_name: name.clone(),
+            };
+            let row_content = row![
+                common::status_dot(status),
+                text(bootstrap_icons::LIGHTNING)
+                    .font(fonts::BOOTSTRAP_ICONS)
+                    .size(13.0)
+                    .style(common::muted),
+                text(name.clone()).size(13.0),
+                text(pattern)
+                    .font(Font::MONOSPACE)
+                    .size(12.0)
+                    .style(common::muted),
+                iced::widget::space::horizontal(),
+                text(reach_summary(&definition.reach))
+                    .size(12.0)
+                    .style(common::muted),
+                text("\u{203A}").size(13.0).style(common::faint),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center);
+            rows_col = rows_col.push(
+                button(row_content)
+                    .style(button_style::list_item)
+                    .on_press(Message::SelectScript(key))
+                    .width(Length::Fill)
+                    .padding(Padding {
+                        top: 4.0,
+                        bottom: 4.0,
+                        left: 8.0,
+                        right: 8.0,
+                    }),
+            );
+        }
+        rows_col = rows_col.push(
+            container(text_link(
+                crate::i18n::t!("editor-add-inside"),
+                Message::NewInnerTrigger,
+            ))
+            .padding(Padding {
+                top: 6.0,
+                bottom: 4.0,
+                left: 8.0,
+                right: 8.0,
+            }),
+        );
+        container(rows_col)
+            .padding(4.0)
+            .width(Length::Fill)
+            .style(common::outline_box_style)
+            .into()
+    }
+
+    /// The placement part of "When it runs": for a trigger inside another, the sentence
+    /// `Within [n] lines after [outer]`, the three permission boxes, the overlap picker when
+    /// there is a range, and the matched-values box when the outer captures anything. For a
+    /// top-level trigger, a link that reveals the outer picker.
+    fn placement_rows<'a>(&'a self, placement: &TriggerPlacement<'a>) -> Elem<'a> {
+        let mut rows_col = column![].spacing(8.0);
+        match placement.outer {
+            Some(outer) => {
+                let range = match placement.reach.within_lines {
+                    LineReach::None => "0".to_string(),
+                    LineReach::Lines(count) => count.to_string(),
+                    LineReach::Unlimited => String::new(),
+                };
+                rows_col = rows_col.push(
+                    row![
+                        text(crate::i18n::ts!("editor-within")).size(13.0),
+                        text_input(crate::i18n::ts!("editor-no-limit"), &range)
+                            .on_input(Message::SetWithinLines)
+                            .size(13.0)
+                            .width(Length::Fixed(72.0)),
+                        text(crate::i18n::ts!("editor-lines-after")).size(13.0),
+                        self.outer_picker(Some(outer), placement.name),
+                    ]
+                    .spacing(8.0)
+                    .align_y(Vertical::Center),
+                );
+                let reach = placement.reach;
+                rows_col = rows_col.push(
+                    column![
+                        checkbox(reach.same_line)
+                            .label(crate::i18n::t!("editor-may-same-line", "outer" => outer))
+                            .on_toggle(|_| Message::ToggleSameLine)
+                            .size(14.0)
+                            .text_size(13.0),
+                        checkbox(!reach.once)
+                            .label(crate::i18n::ts!("editor-may-repeat"))
+                            .on_toggle(|_| Message::ToggleOnce)
+                            .size(14.0)
+                            .text_size(13.0),
+                        checkbox(!reach.until_prompt)
+                            .label(crate::i18n::ts!("editor-may-after-prompt"))
+                            .on_toggle(|_| Message::ToggleUntilPrompt)
+                            .size(14.0)
+                            .text_size(13.0),
+                    ]
+                    .spacing(6.0),
+                );
+                if reach.within_lines != LineReach::None {
+                    rows_col = rows_col.push(
+                        row![
+                            text(crate::i18n::t!("editor-overlap", "outer" => outer)).size(13.0),
+                            pick_list(
+                                vec![OverlapChoice::Restart, OverlapChoice::Each],
+                                Some(OverlapChoice::from(reach.overlap)),
+                                |choice: OverlapChoice| Message::SetOverlap(choice.into()),
+                            )
+                            .text_size(13.0)
+                            .padding(Padding {
+                                top: 3.0,
+                                bottom: 3.0,
+                                left: 8.0,
+                                right: 6.0,
+                            }),
+                        ]
+                        .spacing(8.0)
+                        .align_y(Vertical::Center),
+                    );
+                }
+                if self.outer_has_captures(outer) {
+                    rows_col = rows_col.push(
+                        checkbox(reach.input == InnerInput::OuterValues)
+                            .label(crate::i18n::t!("editor-match-outer-values", "outer" => outer))
+                            .on_toggle(|_| Message::ToggleOuterValues)
+                            .size(14.0)
+                            .text_size(13.0),
+                    );
+                }
+            }
+            None => {
+                if self.move_inside_revealed {
+                    rows_col = rows_col.push(
+                        row![
+                            text(crate::i18n::ts!("editor-inside-picker"))
+                                .size(13.0)
+                                .style(common::muted),
+                            self.outer_picker(None, placement.name),
+                        ]
+                        .spacing(8.0)
+                        .align_y(Vertical::Center),
+                    );
+                } else {
+                    rows_col = rows_col.push(text_link(
+                        crate::i18n::t!("editor-move-inside"),
+                        Message::RevealMoveInside,
+                    ));
+                }
+            }
+        }
+        rows_col.into()
+    }
+
+    /// The outer picker: "(no trigger)" plus every trigger that can hold this one.
+    fn outer_picker<'a>(&self, current: Option<&str>, own_name: &str) -> Elem<'a> {
+        let selected = current.map_or(OuterChoice::None, |name| {
+            OuterChoice::Trigger(name.to_string())
+        });
+        let mut options = vec![OuterChoice::None];
+        options.extend(
+            self.outer_candidates(own_name)
+                .into_iter()
+                .map(OuterChoice::Trigger),
+        );
+        if !options.contains(&selected) {
+            options.push(selected.clone());
+        }
+        pick_list(options, Some(selected), |choice: OuterChoice| {
+            Message::SetOuter(choice.into_outer())
+        })
+        .text_size(13.0)
+        .padding(Padding {
+            top: 3.0,
+            bottom: 3.0,
+            left: 8.0,
+            right: 6.0,
+        })
+        .into()
+    }
+
+    /// Whether the trigger named `outer` captures anything, so a trigger inside it can
+    /// choose to match those values.
+    fn outer_has_captures(&self, outer: &str) -> bool {
+        self.trigger_definition(outer)
+            .is_some_and(|t| !Self::trigger_captures(&trigger_rows(&t)).is_empty())
+    }
+
+    /// The `outer` references an inner trigger's body can read: the nearest outer's
+    /// numbered and named values, then the named values of every trigger above it.
+    fn outer_capture_references(&self, outer: Option<&str>, language: ScriptLang) -> Vec<String> {
+        let mut references = Vec::new();
+        for (level, definition) in self.outer_chain(outer).iter().enumerate() {
+            for (index, name) in Self::trigger_captures(&trigger_rows(definition))
+                .iter()
+                .enumerate()
+            {
+                let reference = match (name, language) {
+                    (Some(name), ScriptLang::Plaintext) => format!("$outer.{name}"),
+                    (Some(name), _) => format!("outer.{name}"),
+                    (None, _) if level > 0 => continue,
+                    (None, ScriptLang::Plaintext) => format!("$outer.{}", index + 1),
+                    (None, _) => format!("outer[{}]", index + 1),
+                };
+                if !references.contains(&reference) {
+                    references.push(reference);
+                }
+            }
+        }
+        references
+    }
+
+    /// The delete confirmation of a trigger with `count` triggers inside it.
+    fn delete_outer_banner<'a>(&self, count: usize) -> Elem<'a> {
+        container(
+            row![
+                text(crate::i18n::t!(
+                    "editor-delete-outer-question",
+                    "count" => count.to_string()
+                ))
+                .size(13.0)
+                .align_y(Vertical::Center),
+                iced::widget::space::horizontal(),
+                button(text(crate::i18n::t!("editor-move-inside-out")).size(13.0))
+                    .style(button_style::secondary)
+                    .on_press(Message::ConfirmDeleteOuter(false)),
+                button(text(crate::i18n::t!("editor-delete-inside-too")).size(13.0))
+                    .style(button_style::secondary)
+                    .on_press(Message::ConfirmDeleteOuter(true)),
+                button(text(crate::i18n::t!("action-cancel")).size(13.0))
+                    .style(button_style::secondary)
+                    .on_press(Message::CancelDeleteOuter),
+            ]
+            .spacing(10.0)
+            .align_y(Vertical::Center),
+        )
+        .padding(12.0)
+        .style(common::banner_style)
+        .into()
     }
 
     /// The three alias type cards, styled per the kind palette. Selection is
@@ -3535,6 +4237,27 @@ impl AutomationsWindow {
     /// subject, then raw rows in order, then normal rows — first hit wins,
     /// one fire per line (the runtime's semantics, told truthfully).
     fn trigger_verdict(&self) -> (String, NodeStatus) {
+        let (verdict, status) = self.trigger_verdict_own();
+        let outer = match &self.pane {
+            Pane::Editor(EditorState {
+                node:
+                    EditNode::Trigger {
+                        outer: Some(outer), ..
+                    },
+                ..
+            }) => outer,
+            _ => return (verdict, status),
+        };
+        if status == NodeStatus::Ok {
+            let suffix = crate::i18n::t!("editor-verdict-inside-suffix", "outer" => outer);
+            (format!("{verdict}, {suffix}"), status)
+        } else {
+            (verdict, status)
+        }
+    }
+
+    /// The verdict of the open trigger's own patterns against the test line.
+    fn trigger_verdict_own(&self) -> (String, NodeStatus) {
         let rows = match &self.pane {
             Pane::Editor(EditorState {
                 node: EditNode::Trigger { rows, .. },
@@ -4296,6 +5019,14 @@ fn trigger_package(state: &EditorState) -> Option<&str> {
     match &state.node {
         EditNode::Trigger { package, .. } => package.as_deref(),
         _ => None,
+    }
+}
+
+/// The open trigger's placement: the trigger it is inside and its reach.
+fn trigger_placement(state: &EditorState) -> (Option<&str>, InnerReach) {
+    match &state.node {
+        EditNode::Trigger { outer, reach, .. } => (outer.as_deref(), *reach),
+        _ => (None, InnerReach::DEFAULT),
     }
 }
 
@@ -6389,6 +7120,8 @@ mod tests {
                 fallthrough: false,
                 package: None,
                 rows: vec![row],
+                outer: None,
+                reach: InnerReach::DEFAULT,
             },
             error: None,
         });
@@ -6426,6 +7159,8 @@ mod tests {
                 fallthrough: false,
                 package: None,
                 rows: vec![row.clone()],
+                outer: None,
+                reach: InnerReach::DEFAULT,
             },
             error: None,
         });
@@ -6718,8 +7453,12 @@ mod tests {
 
         /// The shape of the body's "What it reads" section as the open draft builds it.
         fn section_shape(window: &AutomationsWindow, matched: &[String]) -> (usize, usize) {
-            let section =
-                window.reads_and_values_section(matched.to_vec(), ScriptLang::Plaintext, None);
+            let section = window.reads_and_values_section(
+                matched.to_vec(),
+                ScriptLang::Plaintext,
+                None,
+                None,
+            );
             let tree = Tree::new(section.as_widget());
             // `[module, rail row]`: a container is transparent in the tree (its node is
             // its content's), so the second child is the row and its children the slots.
