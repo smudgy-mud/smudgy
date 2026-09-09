@@ -164,11 +164,25 @@ async fn speedwalk_direct_send_burst_does_not_stall_the_runtime() {
                 }
             }
         }
-        if output.len() >= 7 {
+        // Seven command echoes and one compatibility warning from the package.
+        if output.len() >= 8 {
             break;
         }
     }
     tx.send(RuntimeAction::Shutdown).ok();
+
+    let warnings: Vec<_> = output
+        .iter()
+        .filter(|line| line.starts_with("sendRaw() warning at "))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "warn once for the package's sendRaw calls"
+    );
+    assert!(warnings[0].contains("/runtime/definitions.ts:"));
+    assert!(warnings[0].contains("Starting in version 0.6.0"));
+    output.retain(|line| !line.starts_with("sendRaw() warning at "));
 
     assert_eq!(
         output,
