@@ -950,9 +950,9 @@ pub fn shutdown_io_runtime() {
     }
 }
 
-/// One queued socket write. Text is the ordinary command path (UTF-8, written verbatim);
-/// Raw is the binary path for telnet-framed protocol messages (GMCP sends, future
-/// subnegotiation responders — `docs/gmcp.md` §6.3). One channel carries both, so a
+/// One queued socket write. Text already contains the caller's intended line endings;
+/// the connection applies its character encoding and escapes IAC bytes. Raw carries
+/// exact bytes from script `sendRaw` calls or protocol messages. One channel carries both, so a
 /// protocol frame and a user command queued in either order reach the wire in that order.
 /// `WindowSize` is a wakeup, not bytes: the current size lives in the shared size cell, and
 /// only the socket task knows whether NAWS is negotiated — so the task reads the cell and
@@ -1087,7 +1087,7 @@ impl Connection {
         self.write_frame(OutboundFrame::Text(data)).await
     }
 
-    /// Send a pre-framed binary message (a telnet subnegotiation such as a GMCP send) to
+    /// Send exact bytes (script binary input or a pre-framed protocol message) to
     /// the connected socket. Same queue as [`Self::write`], so ordering with normal sends
     /// holds by construction.
     ///

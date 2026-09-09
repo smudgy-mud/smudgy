@@ -2947,6 +2947,37 @@ impl Inner<'_> {
         }
     }
 
+    /// Write one normalized text frame, then echo only the line endings it contains.
+    async fn send_raw_text(&mut self, text: Arc<String>) -> Result<(), anyhow::Error> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if let Some(connection) = &self.connection
+            && let Err(error) = connection.write(Arc::clone(&text)).await
+        {
+            if let Some(future) = self.echo_warn_str(&format!("Send error: {error:?}"))? {
+                future.await?;
+            }
+            return Ok(());
+        }
+        for part in text.split_inclusive('\n') {
+            if let Some(line) = part.strip_suffix("\r\n") {
+                if self.main_open_line() {
+                    self.note_local_main_commit();
+                }
+                self.append_counted_line(Arc::new(StyledLine::from_output_str(line)));
+            } else {
+                self.queue_update(BufferUpdate::Append(Arc::new(StyledLine::from_output_str(
+                    part,
+                ))));
+            }
+        }
+        if let Some(future) = self.flush_buffer_updates()? {
+            future.await?;
+        }
+        Ok(())
+    }
+
     async fn send(&mut self, line: &str) -> Result<(), anyhow::Error> {
         let mut socket_str = String::with_capacity(line.len() + 2);
         socket_str.push_str(line);

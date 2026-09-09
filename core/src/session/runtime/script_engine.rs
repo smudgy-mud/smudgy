@@ -3394,6 +3394,7 @@ impl<'a> ScriptEngine<'a> {
         isolate: &IsolateId,
         source: &str,
         exposes: bool,
+        name: &str,
     ) -> Result<ScriptId> {
         // Inline alias/trigger scripts (disk-authored JS) are classic scripts that run in
         // the shared global scope. The creation functions are not globals (ESM modules import
@@ -3416,7 +3417,7 @@ impl<'a> ScriptEngine<'a> {
             format!("with (globalThis.__smudgy_user_api) {{\n{source}\n}}")
         };
         let bundle = self.isolate_mut(isolate)?;
-        let script = compile_javascript(bundle.runtime.deno_runtime(), &wrapped)?;
+        let script = compile_javascript(bundle.runtime.deno_runtime(), &wrapped, name)?;
         let script_id = ScriptId(bundle.compiled_scripts.len());
         bundle.compiled_scripts.push(script);
         Ok(script_id)
@@ -4548,6 +4549,7 @@ fn format_js_error(js: &JsError) -> String {
 fn compile_javascript(
     runtime: &mut deno_core::JsRuntime,
     source: &str,
+    name: &str,
 ) -> Result<v8::Global<v8::Script>> {
     // The target isolate usually isn't current (Model B); make it so for the compile, released
     // on return. `add_script` can run mid-session when another isolate is the last-built one.
@@ -4560,9 +4562,25 @@ fn compile_javascript(
 
     v8::tc_scope!(let try_catch, scope);
 
+    let resource_name = v8::String::new(try_catch, name)
+        .ok_or_else(|| anyhow!("Unable to allocate inline script name"))?;
+    let origin = v8::ScriptOrigin::new(
+        try_catch,
+        resource_name.into(),
+        0,
+        0,
+        false,
+        -1,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+
     if let Some(unbound_script) = v8::script_compiler::compile_unbound_script(
         try_catch,
-        &mut Source::new(v8_script_source, None),
+        &mut Source::new(v8_script_source, Some(&origin)),
         v8::script_compiler::CompileOptions::NoCompileOptions,
         v8::script_compiler::NoCacheReason::BecauseV8Extension,
     ) {

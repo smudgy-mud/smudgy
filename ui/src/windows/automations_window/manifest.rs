@@ -2817,7 +2817,7 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
                 ),
                 cap_check(
                     "sendRaw",
-                    "send straight to the game (bypasses your aliases)",
+                    "send text and raw bytes directly to the game without running aliases. Smudgy does not display the raw bytes in your output window",
                     caps.send_direct,
                     Cap::SendDirect
                 ),

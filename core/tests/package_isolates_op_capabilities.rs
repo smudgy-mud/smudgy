@@ -202,6 +202,8 @@ async fn send_granted_but_send_direct_denied() {
         catch (e) { echo("SEND_ERR:" + (e?.message ?? String(e))); }
         try { sendRaw("raw"); echo("SENDRAW_OK"); }
         catch (e) { echo("SENDRAW_DENIED:" + (e?.message ?? String(e))); }
+        try { sendRaw(Uint8Array.of(255, 241)); echo("SENDBYTES_OK"); }
+        catch (e) { echo("SENDBYTES_DENIED:" + (e?.message ?? String(e))); }
         echo("DONE");
     "#;
     let lines = run_capability_case(
@@ -222,9 +224,93 @@ async fn send_granted_but_send_direct_denied() {
         "the un-granted `sendRaw` must throw; transcript:\n{lines:#?}"
     );
     assert!(
+        !has_line(&lines, "SENDBYTES_OK") && has_line(&lines, "SENDBYTES_DENIED:"),
+        "binary sendRaw requires send-direct; transcript:\n{lines:#?}"
+    );
+    assert!(
         has_line(&lines, "send-direct"),
         "the denial must name the missing 'send-direct' capability; transcript:\n{lines:#?}"
     );
+}
+
+/// Host deprecation diagnostics do not require the script's echo permission.
+#[tokio::test]
+async fn send_raw_granted_without_echo_allows_bytes_and_warns_for_text() {
+    let lines = run_capability_case(
+        9680,
+        "pi_caps_raw_no_echo",
+        "smudgy://wbk/raw-sender",
+        Some(PackagePermissions {
+            smudgy: SmudgyCapabilities {
+                send_direct: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        make_package(
+            "wbk",
+            "raw-sender",
+            "1.0.0",
+            r#"
+            import { sendRaw } from "smudgy:core";
+            sendRaw(new TextEncoder().encode("BINARY_MUST_BE_HIDDEN"));
+            sendRaw("first");
+            sendRaw("second");
+        "#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("sendRaw() warning"))
+            .count(),
+        1,
+        "{lines:#?}"
+    );
+    assert!(!has_line(&lines, "BINARY_MUST_BE_HIDDEN"));
+    assert!(!has_line(&lines, "NotCapable"));
+    assert!(has_line(&lines, "first") && has_line(&lines, "second"));
+}
+
+#[tokio::test]
+async fn send_raw_to_another_session_requires_reach_others() {
+    let src = r#"
+        import session, { echo } from "smudgy:core";
+        const current = session.session;
+        const SessionClass = Object.getPrototypeOf(current).constructor;
+        const foreign = new SessionClass(current.id + 1);
+        for (const [name, value] of [["text", "look\n"], ["bytes", Uint8Array.of(255, 241)]]) {
+            try { foreign.sendRaw(value); echo(name + ":ALLOWED"); }
+            catch (error) { echo(name + ":DENIED:" + error.message); }
+        }
+    "#;
+    for (id, reach) in [(9681, false), (9683, true)] {
+        let lines = run_capability_case(
+            id,
+            &format!("pi_caps_raw_reach_{id}"),
+            "smudgy://wbk/raw-reach",
+            Some(consent_with(|s| {
+                s.send_direct = true;
+                s.reach_others = reach;
+            })),
+            make_package("wbk", "raw-reach", "1.0.0", src),
+        )
+        .await;
+        for name in ["text", "bytes"] {
+            if reach {
+                assert!(has_line(&lines, &format!("{name}:ALLOWED")), "{lines:#?}");
+            } else {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains(&format!("{name}:DENIED:"))
+                            && line.contains("reach-others")),
+                    "{lines:#?}"
+                );
+            }
+        }
+    }
 }
 
 /// A package with no smudgy block is denied EVERY gated op, including `echo` itself.

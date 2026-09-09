@@ -785,6 +785,20 @@ impl Inner<'_> {
                 self.send_verbatim_lines(&str).await?;
                 Ok(ActionResult::None)
             }
+            RuntimeAction::SendRawText(text) => {
+                self.send_raw_text(text).await?;
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::SendRawBytes(bytes) => {
+                if !bytes.is_empty()
+                    && let Some(connection) = &self.connection
+                    && let Err(error) = connection.write_raw(bytes).await
+                    && let Some(future) = self.echo_warn_str(&format!("Send error: {error:?}"))?
+                {
+                    future.await?;
+                }
+                Ok(ActionResult::None)
+            }
             RuntimeAction::SendWithRedactions { text, redactions } => {
                 // Verbatim to the wire (like SendRaw), but the echoed/logged copy
                 // has each secret substring masked. Masked input submissions ride
@@ -1122,6 +1136,7 @@ impl Inner<'_> {
                                 &IsolateId::Main,
                                 hotkey.script.as_ref().map_or("", |s| s.as_str()),
                                 exposure.is_some(),
+                                &format!("hotkey:{}", key.2),
                             ) {
                                 Ok(script_id) => ScriptAction::EvalJavascript(script_id),
                                 Err(err) => {
@@ -1278,6 +1293,7 @@ impl Inner<'_> {
                             &isolate,
                             src.as_str(),
                             exposure.is_some(),
+                            &format!("alias:{origin:?}/{name}"),
                         )?;
                         self.trigger_manager.push_javascript_alias(
                             isolate,
@@ -1355,6 +1371,7 @@ impl Inner<'_> {
                             &isolate,
                             src.as_str(),
                             exposure.is_some(),
+                            &format!("trigger:{origin:?}/{name}"),
                         )?;
                         source = Some(Arc::from(src));
                         ScriptAction::EvalJavascript(script_id)
