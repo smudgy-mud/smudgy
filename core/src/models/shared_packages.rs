@@ -1010,28 +1010,62 @@ fn replace_required_links(
     Ok(())
 }
 
-/// Replaces a root's flattened requirement links only while its staged version is unchanged.
+/// Replaces a root's flattened requirement links while the relevant package identities,
+/// staged versions, and this root's existing links are unchanged.
 ///
-/// This is the async graph-resolver commit point: an uninstall or version change that lands while
-/// the cloud response is in flight makes the result stale instead of resurrecting old links.
+/// This is the graph-resolver commit point: an uninstall or a staged-version change to any
+/// required package makes the closure stale instead of resurrecting old links. Runtime integrity
+/// stamps, activation changes, other parents' links, and unrelated packages do not invalidate it.
 ///
 /// # Errors
 /// Returns an error for a missing required row or lockfile I/O failure.
-pub fn set_required_closure_if_staged_unchanged(
+pub fn set_required_closure_if_unchanged(
     server_name: &str,
+    expected_lock: &SharedPackageLock,
     root_specifier: &str,
-    expected_staged: Option<&str>,
     required_specifiers: &[String],
+    observed_specifiers: &[String],
 ) -> Result<RequiredClosureCommit> {
     let required = required_specifiers
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     mutate_lock(server_name, |lock| {
-        let Some(root) = lock.find(root_specifier) else {
-            return Ok((RequiredClosureCommit::Stale, false));
+        let relevant_leaves = std::iter::once(root_specifier)
+            .chain(required_specifiers.iter().map(String::as_str))
+            .chain(observed_specifiers.iter().map(String::as_str))
+            .chain(
+                expected_lock
+                    .packages
+                    .iter()
+                    .filter(|package| package.required_by.contains(root_specifier))
+                    .map(|package| package.specifier.as_str()),
+            )
+            .filter_map(|specifier| smudgy_script::SmudgySpecifier::parse(specifier).ok())
+            .map(|specifier| specifier.name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let projection = |snapshot: &SharedPackageLock| {
+            snapshot
+                .packages
+                .iter()
+                .filter(|package| {
+                    package.required_by.contains(root_specifier)
+                        || smudgy_script::SmudgySpecifier::parse(&package.specifier).is_ok_and(
+                            |specifier| {
+                                relevant_leaves.contains(&specifier.name.to_ascii_lowercase())
+                            },
+                        )
+                })
+                .map(|package| {
+                    (
+                        package.specifier.clone(),
+                        package.staged_version().map(str::to_string),
+                        package.required_by.contains(root_specifier),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
         };
-        if root.staged_version() != expected_staged {
+        if projection(lock) != projection(expected_lock) {
             return Ok((RequiredClosureCommit::Stale, false));
         }
         for specifier in &required {
@@ -1250,6 +1284,20 @@ pub fn reconcile_local_installs(server_name: &str) -> Result<Vec<String>> {
 // ---------------------------------------------------------------------------
 // Row settings
 // ---------------------------------------------------------------------------
+
+/// Keeps an automatic requirement as an explicit install without changing its version, grants,
+/// parameters, parent links, or activation. The user can then select its independent activation.
+///
+/// # Errors
+/// Returns an error if package state cannot be read or written.
+pub fn promote_requirement_if_unchanged(
+    server_name: &str,
+    expected: &LockedPackage,
+) -> Result<Cas> {
+    mutate_row_if_unchanged(server_name, expected, |package| {
+        package.installed_as_requirement = false;
+    })
+}
 
 /// Mutates one row only while it still equals `expected` and still governs its leaf.
 fn mutate_row_if_unchanged(
@@ -3364,6 +3412,142 @@ mod tests {
         let plan = lock.plan_removal_from_links("smudgy://a/root");
         assert!(plan.breaks.is_empty());
         assert_eq!(plan.orphans, ["smudgy://a/dep"]);
+    }
+
+    #[test]
+    fn promoting_a_requirement_preserves_its_state_and_rejects_stale_rows() {
+        let server = test_server("promote");
+        let mut package = LockedPackage::new(
+            "smudgy://a/dep",
+            UpdateMode::Pinned {
+                version: "1.2.0".into(),
+            },
+        );
+        package.set_activation(ProfileActivation::None);
+        package.installed_as_requirement = true;
+        package.requirement_lineage_known = true;
+        package.required_by.insert("smudgy://a/root".into());
+        package.consented_permissions = Some(PackagePermissions::default());
+        package.parameter_scope = ParameterScope::Profile;
+        save_lock(
+            &server,
+            &SharedPackageLock {
+                packages: vec![package.clone()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            promote_requirement_if_unchanged(&server, &package).unwrap(),
+            Cas::Applied
+        );
+        let mut expected = package.clone();
+        expected.installed_as_requirement = false;
+        let lock = load_lock(&server).unwrap();
+        assert_eq!(lock.find(&package.specifier), Some(&expected));
+        assert!(
+            lock.plan_removal_from_links("smudgy://a/root")
+                .orphans
+                .is_empty()
+        );
+        assert_eq!(
+            promote_requirement_if_unchanged(&server, &package).unwrap(),
+            Cas::StateChanged
+        );
+        assert_eq!(load_lock(&server).unwrap(), lock);
+    }
+
+    #[test]
+    fn requirement_refresh_rejects_a_changed_dependency_snapshot() {
+        let server = test_server("requirement-refresh");
+        let root = "smudgy://a/root";
+        let dependency = "smudgy://a/dep";
+        install_package(&server, root, UpdateMode::Auto, true).unwrap();
+        install_package(&server, dependency, UpdateMode::Auto, false).unwrap();
+        let expected = load_lock(&server).unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(&server, &expected, root, &[dependency.into()], &[])
+                .unwrap(),
+            RequiredClosureCommit::Changed,
+        );
+        let expected = load_lock(&server).unwrap();
+        assert!(expected.is_effectively_enabled_for(dependency, "Main"));
+        set_update_mode_if_unchanged(
+            &server,
+            expected.find(dependency).unwrap(),
+            UpdateMode::Pinned {
+                version: "2.0.0".into(),
+            },
+        )
+        .unwrap();
+        let changed = load_lock(&server).unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(&server, &expected, root, &[], &[]).unwrap(),
+            RequiredClosureCommit::Stale,
+        );
+        assert_eq!(load_lock(&server).unwrap(), changed);
+    }
+
+    #[test]
+    fn requirement_refresh_ignores_unrelated_writes_but_detects_new_governing_rows() {
+        let server = test_server("requirement-projection");
+        let root = "smudgy://a/root";
+        let dep = "smudgy://a/dep";
+        let other = "smudgy://a/other";
+        for specifier in [root, dep, other] {
+            install_package(
+                &server,
+                specifier,
+                UpdateMode::Pinned {
+                    version: "1.0.0".into(),
+                },
+                true,
+            )
+            .unwrap();
+        }
+        let expected = load_lock(&server).unwrap();
+        mutate_lock(&server, |lock| {
+            lock.find_mut(root).unwrap().integrity = Some("new runtime stamp".into());
+            let package = lock.find_mut(dep).unwrap();
+            package.last_resolved_version = Some("1.0.0".into());
+            package.set_activation(ProfileActivation::None);
+            package.required_by.insert(other.into());
+            lock.find_mut(other).unwrap().mode = UpdateMode::Pinned {
+                version: "2.0.0".into(),
+            };
+            Ok(((), true))
+        })
+        .unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(&server, &expected, root, &[dep.into()], &[])
+                .unwrap(),
+            RequiredClosureCommit::Changed
+        );
+        let expected = load_lock(&server).unwrap();
+        assert_eq!(
+            expected.find(root).unwrap().integrity.as_deref(),
+            Some("new runtime stamp")
+        );
+        assert!(expected.find(dep).unwrap().required_by.contains(other));
+        install_package(&server, "smudgy://local/dep", UpdateMode::Auto, false).unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(&server, &expected, root, &[dep.into()], &[])
+                .unwrap(),
+            RequiredClosureCommit::Stale
+        );
+        let expected = load_lock(&server).unwrap();
+        install_package(&server, "smudgy://a/missing", UpdateMode::Auto, false).unwrap();
+        assert_eq!(
+            set_required_closure_if_unchanged(
+                &server,
+                &expected,
+                root,
+                &[],
+                &["smudgy://a/missing".into()]
+            )
+            .unwrap(),
+            RequiredClosureCommit::Stale
+        );
     }
 
     #[test]

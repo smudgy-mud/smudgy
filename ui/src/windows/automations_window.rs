@@ -795,6 +795,7 @@ pub enum Message {
         Result<(ResolvedPackageWire, PackagePermissions), CloudError>,
     ),
     SetInstalledUpdateMode(UpdateMode),
+    PromoteInstalledDependency,
     /// Select a source file in the open installed package.
     SelectInstalledFile(String),
     SelectInstalledPackageTab(InstalledPackageTab),
@@ -3691,6 +3692,7 @@ impl AutomationsWindow {
                 result,
             } => self.my_cloud_loaded(account_epoch, account_fence, result),
             Message::InstallShared { owner, name } => self.begin_install(owner, name),
+            Message::PromoteInstalledDependency => self.promote_installed_dependency(),
 
             // -------- top action bar ---------------------------------------
             Message::Reload => {
@@ -6374,6 +6376,278 @@ mod tab_traversal_tests {
         ProfileActivation::Selected {
             profiles: profiles.iter().map(|name| (*name).to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn catalog_refresh_repairs_manifest_only_requirement_and_allows_promotion() {
+        use smudgy_core::models::shared_packages::{
+            self, LockedPackage, PackageManifest, PackagePermissions, SharedPackageLock,
+        };
+        use smudgy_core::session::runtime::package_cache::{PackageCache, resolution_from_wire};
+
+        let _home = use_temp_smudgy_home();
+        let server_name = format!("catalog-requirement-test-{}", std::process::id());
+        create_test_server(&server_name, &["alpha", "beta"]);
+        let root_spec = "smudgy://publisher/mapper";
+        let required_spec = "smudgy://publisher/prompt";
+        let mut root = LockedPackage::new(root_spec, UpdateMode::Auto);
+        root.last_resolved_version = Some("1.0.0".into());
+        root.set_activation(selected(&["alpha"]));
+        let mut required = LockedPackage::new(required_spec, UpdateMode::Auto);
+        required.last_resolved_version = Some("1.0.0".into());
+        required.set_activation(ProfileActivation::None);
+        required.installed_as_requirement = true;
+        required.requirement_lineage_known = true;
+        // The old catalog refresh erased this parent link after installation.
+        let lock = SharedPackageLock {
+            packages: vec![root, required.clone()],
+        };
+        shared_packages::save_lock(&server_name, &lock).unwrap();
+        let manifest: PackageManifest =
+            serde_json::from_value(serde_json::json!({"version": "1.0.0"})).unwrap();
+        let key = smudgy_script::SmudgySpecifier::parse(required_spec)
+            .unwrap()
+            .package_key();
+        let cache = PackageCache::new().unwrap();
+        cache
+            .write_meta(
+                &key,
+                "1.0.0",
+                &resolution_from_wire(&key, "1.0.0", manifest, &[], &[]).unwrap(),
+            )
+            .unwrap();
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            server_name.clone(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.profile_name = "alpha".into();
+        window.installed_packages = lock.packages;
+        window.rebuild_graph();
+        let wire = serde_json::from_value(serde_json::json!({
+            "package_id": smudgy_cloud::Uuid::new_v4(),
+            "owner_nickname": "publisher", "name": "mapper", "version": "1.0.0",
+            "manifest": {"version": "1.0.0", "requires": [required_spec]},
+            "modules": [], "dependencies": [],
+        }))
+        .unwrap();
+        let update = window.installed_resolved_for_graph(
+            window.graph_seq,
+            window.account_read_fence(),
+            root_spec,
+            Some("1.0.0"),
+            Ok((wire, PackagePermissions::default())),
+        );
+        assert!(matches!(update.event, Some(Event::ScriptsChanged { .. })));
+        let repaired = shared_packages::load_lock(&server_name).unwrap();
+        assert!(repaired.is_effectively_enabled_for(required_spec, "alpha"));
+        assert!(!repaired.is_effectively_enabled_for(required_spec, "beta"));
+        assert!(window.graph.effectively_enabled(required_spec));
+        assert!(!window.graph.controllable(required_spec));
+
+        window.pane = Pane::InstalledPackage;
+        window.selection = Selection::Dependency {
+            parent: root_spec.into(),
+            spec: required_spec.into(),
+        };
+        window.installed_open = Some(Box::new(repaired.find(required_spec).unwrap().clone()));
+        let promoted = window.update(Message::PromoteInstalledDependency);
+        assert!(
+            promoted.event.is_none(),
+            "promotion does not change effective activation"
+        );
+        assert_eq!(
+            window.selection,
+            Selection::InstalledPackage(required_spec.into())
+        );
+        assert_eq!(window.installed_package_tab, InstalledPackageTab::Settings);
+        assert!(window.graph.controllable(required_spec));
+        assert!(window.graph.effectively_enabled(required_spec));
+        let promoted_lock = shared_packages::load_lock(&server_name).unwrap();
+        assert!(
+            !promoted_lock
+                .find(required_spec)
+                .unwrap()
+                .installed_as_requirement
+        );
+        assert!(
+            promoted_lock
+                .plan_removal_from_links(root_spec)
+                .orphans
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn promoting_legacy_requirement_reloads_when_it_restores_direct_activation() {
+        use smudgy_core::models::shared_packages::{self, SharedPackageLock};
+        let (mut window, _) = requirement_review_fixture("legacy-promotion");
+        let child = "smudgy://publisher/prompt-legacy-promotion";
+        window.installed_packages[0].set_activation(ProfileActivation::None);
+        window.installed_packages[1].set_activation(ProfileActivation::All);
+        shared_packages::save_lock(
+            &window.server_name,
+            &SharedPackageLock {
+                packages: window.installed_packages.clone(),
+            },
+        )
+        .unwrap();
+        window.rebuild_graph();
+        assert!(!window.graph.effectively_enabled(child));
+        window.installed_open = Some(Box::new(window.installed_packages[1].clone()));
+        let update = window.update(Message::PromoteInstalledDependency);
+        assert!(matches!(update.event, Some(Event::ScriptsChanged { .. })));
+        assert!(window.graph.effectively_enabled(child));
+    }
+
+    fn requirement_review_fixture(label: &str) -> (AutomationsWindow, ResolvedPackageWire) {
+        use smudgy_core::models::shared_packages::{self, LockedPackage, SharedPackageLock};
+        use smudgy_core::session::runtime::package_cache::{PackageCache, resolution_from_wire};
+        let _home = use_temp_smudgy_home();
+        let server_name = format!("requirement-review-{label}-{}", std::process::id());
+        create_test_server(&server_name, &["alpha"]);
+        let root = "smudgy://publisher/mapper";
+        // Package caches are process-wide, so parallel fixtures need distinct coordinates.
+        let child_name = format!("prompt-{label}");
+        let child = format!("smudgy://publisher/{child_name}");
+        let mut root_row = LockedPackage::new(root, UpdateMode::Auto);
+        root_row.last_resolved_version = Some("1.0.0".into());
+        let mut child_row = LockedPackage::new(&child, UpdateMode::Auto);
+        child_row.last_resolved_version = Some("1.0.0".into());
+        child_row.installed_as_requirement = true;
+        child_row.requirement_lineage_known = true;
+        child_row.set_activation(ProfileActivation::None);
+        let lock = SharedPackageLock {
+            packages: vec![root_row, child_row],
+        };
+        shared_packages::save_lock(&server_name, &lock).unwrap();
+        let key = smudgy_script::PackageKey {
+            owner: "publisher".into(),
+            name: child_name,
+        };
+        let cache = PackageCache::new().unwrap();
+        cache
+            .write_meta(
+                &key,
+                "1.0.0",
+                &resolution_from_wire(
+                    &key,
+                    "1.0.0",
+                    serde_json::from_value(serde_json::json!({"version":"1.0.0"})).unwrap(),
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            server_name,
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.profile_name = "alpha".into();
+        window.installed_packages = lock.packages;
+        window.rebuild_graph();
+        let wire = serde_json::from_value(serde_json::json!({
+            "package_id": smudgy_cloud::Uuid::new_v4(), "owner_nickname": "publisher", "name":"mapper", "version":"1.0.0",
+            "manifest": {"version":"1.0.0", "requires":[child]}, "modules":[], "dependencies":[]
+        })).unwrap();
+        (window, wire)
+    }
+
+    #[test]
+    fn requirement_refresh_skips_missing_targets_canonicalizes_edges_and_keeps_import_pane() {
+        use smudgy_core::models::shared_packages::{
+            self, LockedPackage, PackagePermissions, SharedPackageLock,
+        };
+        let (mut window, mut wire) = requirement_review_fixture("partial");
+        let root = "smudgy://publisher/mapper";
+        let child = "smudgy://publisher/prompt-partial";
+        let missing = "smudgy://publisher/missing";
+        let stale = "smudgy://publisher/old";
+        let mut old = LockedPackage::new(stale, UpdateMode::Auto);
+        old.installed_as_requirement = true;
+        old.requirement_lineage_known = true;
+        old.required_by.insert(root.into());
+        window.installed_packages.push(old);
+        shared_packages::save_lock(
+            &window.server_name,
+            &SharedPackageLock {
+                packages: window.installed_packages.clone(),
+            },
+        )
+        .unwrap();
+        window.rebuild_graph();
+        let import = "smudgy://publisher/imported";
+        window.selection = Selection::Dependency {
+            parent: root.into(),
+            spec: import.into(),
+        };
+        window.pane = Pane::InstalledPackage;
+        window.installed_open = Some(Box::new(LockedPackage::new(import, UpdateMode::Auto)));
+        wire.manifest["requires"] =
+            serde_json::json!(["smudgy://PUBLISHER/PROMPT-PARTIAL", missing]);
+        let result = window.installed_resolved_for_graph(
+            window.graph_seq,
+            window.account_read_fence(),
+            root,
+            Some("1.0.0"),
+            Ok((wire, PackagePermissions::default())),
+        );
+        assert!(result.event.is_some());
+        let lock = shared_packages::load_lock(&window.server_name).unwrap();
+        assert!(lock.is_effectively_enabled_for(child, "alpha"));
+        assert!(!lock.is_effectively_enabled_for(stale, "alpha"));
+        assert!(window.graph.dep_edge_active(root, child));
+        assert!(!window.graph.dep_edge_active(root, missing));
+        assert_eq!(
+            window.graph.requires[root]
+                .iter()
+                .filter(|edge| edge.specifier == child)
+                .count(),
+            1
+        );
+        assert!(window.graph.requirement_issues[root].contains(missing));
+        assert_eq!(window.installed_open.as_ref().unwrap().specifier, import);
+    }
+
+    #[test]
+    fn malformed_manifest_keeps_catalog_metadata_without_inventing_activation() {
+        use smudgy_core::models::shared_packages::{self, PackagePermissions};
+        let (mut window, mut wire) = requirement_review_fixture("malformed");
+        let root = "smudgy://publisher/mapper";
+        let child = "smudgy://publisher/prompt-malformed";
+        let before = shared_packages::load_lock(&window.server_name).unwrap();
+        wire.manifest = serde_json::json!({"version":"1.0.0", "requires":false});
+        wire.dependencies = vec![smudgy_cloud::ResolvedDependency {
+            owner_nickname: "publisher".into(),
+            name: "prompt-malformed".into(),
+            range: "*".into(),
+            resolved_version: "1.0.0".into(),
+            kind: smudgy_cloud::DependencyKind::Requires,
+        }];
+        let union: PackagePermissions =
+            serde_json::from_value(serde_json::json!({"net":["example.com"]})).unwrap();
+        let result = window.installed_resolved_for_graph(
+            window.graph_seq,
+            window.account_read_fence(),
+            root,
+            Some("1.0.0"),
+            Ok((wire, union)),
+        );
+        assert!(result.event.is_none());
+        assert_eq!(window.graph.resolved[root], "1.0.0");
+        assert_eq!(window.graph.resolved[child], "1.0.0");
+        assert_eq!(window.graph.requires[root].len(), 1);
+        assert!(!window.graph.dep_edge_active(root, child));
+        assert!(window.blocked_updates.contains(root));
+        assert!(window.graph.requirement_issues.contains_key(root));
+        assert_eq!(
+            shared_packages::load_lock(&window.server_name).unwrap(),
+            before
+        );
     }
 
     #[test]

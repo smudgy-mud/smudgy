@@ -966,6 +966,10 @@ pub struct PackageGraph {
     pub intent: HashMap<String, bool>,
     /// Resolved version per specifier (best-effort, from the last resolve).
     pub resolved: HashMap<String, String>,
+    /// Runtime-effective roots from the current lock snapshot. Catalog edges describe
+    /// relationships; they cannot activate packages that were not committed to the lock.
+    pub effective_roots: Option<HashSet<String>>,
+    pub requirement_issues: HashMap<String, String>,
 }
 
 /// One edge in the requires graph: the dependency specifier + its declared range.
@@ -1020,6 +1024,9 @@ impl PackageGraph {
     /// declares it through `requires`. Ordinary dependencies execute inside their parent's isolate
     /// and do not become roots here.
     pub fn effectively_enabled(&self, id: &str) -> bool {
+        if let Some(roots) = &self.effective_roots {
+            return roots.contains(id);
+        }
         fn visit(graph: &PackageGraph, id: &str, visiting: &mut HashSet<String>) -> bool {
             if (graph.direct.contains(id) || graph.owned.contains(id))
                 && graph.intent.get(id).copied().unwrap_or(false)
@@ -1069,8 +1076,8 @@ impl PackageGraph {
         else {
             return false;
         };
-        let _ = edge;
         self.effectively_enabled(parent)
+            && (edge.kind == DependencyKind::Dependency || self.effectively_enabled(child))
     }
 }
 
