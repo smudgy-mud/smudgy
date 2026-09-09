@@ -108,7 +108,7 @@ export function syncSpeedwalkAutomation(
           // Raw sends intentionally skip sys:send, so tell #PATH about the
           // movement explicitly before it goes to the wire.
           onDirection?.(direction);
-          sendRaw(direction);
+          sendRaw(direction + "\n");
         }
       }
     },

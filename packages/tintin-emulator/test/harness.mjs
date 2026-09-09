@@ -167,7 +167,7 @@ calls.length = 0;
 submitInput("ne2s");
 assert.deepEqual(
   calls.filter(([kind]) => kind === "sendRaw").map(([, value]) => value),
-  ["n", "e", "s", "s"],
+  ["n\n", "e\n", "s\n", "s\n"],
   "expanded steps bypass alias matching instead of recursively matching SPEEDWALK",
 );
 calls.length = 0;
@@ -177,7 +177,7 @@ calls.length = 0;
 submitInput("unde");
 assert.deepEqual(
   calls.filter(([kind]) => kind === "sendRaw").map(([, value]) => value),
-  ["u", "n", "d", "e"],
+  ["u\n", "n\n", "d\n", "e\n"],
   "all valid one-letter direction sequences are speedwalks",
 );
 assert.equal(type("NEWS"), false, "uppercase avoids speedwalking");
