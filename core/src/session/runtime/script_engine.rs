@@ -320,6 +320,13 @@ struct Isolate {
     /// The flag lives on the bundle. A torn-down isolate takes its seed with it, and a rebuilt
     /// isolate starts with the flag clear. The merge in `poll_event_loop` clears the flag.
     seeded: Cell<bool>,
+    /// This isolate's main context, held for the life of the bundle so entering it costs a
+    /// borrow rather than a handle. `JsRuntime::main_context` returns an owned
+    /// `v8::Global`, and a `Global` clone in the pinned rusty_v8 registers a new persistent
+    /// handle and resets it on drop, so reading the context per call into JavaScript spent
+    /// two handle operations before any user code ran. Dropped with the bundle, ahead of the
+    /// runtime that owns the heap, like the other cached handles above.
+    context: v8::Global<v8::Context>,
 }
 
 /// The auto-load set partitioned by target isolate (`build_isolate_plan`): the main isolate's
@@ -1889,6 +1896,7 @@ impl<'a> ScriptEngine<'a> {
         }
         let main_waker = build_demux_waker(IsolateId::Main, &ready, &parent);
         let main_call_state = shared_call_state(main_runtime.deno_runtime());
+        let main_context = main_runtime.deno_runtime().main_context();
         isolates.insert(
             IsolateId::Main,
             Isolate {
@@ -1902,6 +1910,7 @@ impl<'a> ScriptEngine<'a> {
                 call_state: main_call_state,
                 waker: main_waker,
                 seeded: Cell::new(false),
+                context: main_context,
             },
         );
         // Seed: arm `Main` on the first pump. At construction `parent` is still
@@ -2475,6 +2484,7 @@ impl<'a> ScriptEngine<'a> {
                     .expect("ready-set poisoned")
                     .insert(isolate_id.clone());
                 let call_state = shared_call_state(runtime.deno_runtime());
+                let isolate_context = runtime.deno_runtime().main_context();
                 isolates.insert(
                     isolate_id,
                     Isolate {
@@ -2488,6 +2498,7 @@ impl<'a> ScriptEngine<'a> {
                         call_state,
                         waker: package_waker,
                         seeded: Cell::new(false),
+                        context: isolate_context,
                     },
                 );
                 // Hold the concrete provider so its per-isolate notices can be drained after load.
@@ -3168,7 +3179,7 @@ impl<'a> ScriptEngine<'a> {
         let deno = bundle.runtime.deno_runtime();
         // Make the target isolate current for this callback (Model B), released after the scope.
         let _entered = EnteredIsolate::enter(deno);
-        let context = deno.main_context();
+        let context = &bundle.context;
         let isolate = deno.v8_isolate();
         v8::scope_with_context!(let scope, isolate, context);
 
@@ -3249,7 +3260,7 @@ impl<'a> ScriptEngine<'a> {
         // Top-level dispatch (depth 0), like a widget callback.
         bundle.call_state.enter_top_level();
         let _entered = EnteredIsolate::enter(deno);
-        let context = deno.main_context();
+        let context = &bundle.context;
         let isolate = deno.v8_isolate();
         v8::scope_with_context!(let scope, isolate, context);
 
@@ -3321,7 +3332,7 @@ impl<'a> ScriptEngine<'a> {
         let request_id = pending.borrow_mut().insert(state);
         bundle.call_state.enter_top_level();
         let _entered = EnteredIsolate::enter(deno);
-        let context = deno.main_context();
+        let context = &bundle.context;
         let isolate = deno.v8_isolate();
         v8::scope_with_context!(let scope, isolate, context);
 
@@ -3557,15 +3568,15 @@ fn call_function_in(
         script_functions,
         call_state,
         seeded,
+        context,
         ..
     } = bundle;
     let deno = runtime.deno_runtime();
     // Make the owning isolate current for this call. It usually is not current, because
     // Model B leaves the enter stack empty between ops. The guard releases it after the scope.
     let _entered = EnteredIsolate::enter(deno);
-    let context = deno.main_context();
     let isolate = deno.v8_isolate();
-    v8::scope_with_context!(let scope, isolate, context);
+    v8::scope_with_context!(let scope, isolate, &*context);
 
     let prior_depth = call_state.depth.replace(depth);
     let prior_sender = call_state.alias.replace(sender);
@@ -3652,15 +3663,15 @@ fn run_script_in(
         compiled_scripts,
         call_state,
         seeded,
+        context,
         ..
     } = bundle;
     let deno = runtime.deno_runtime();
     // Make the owning isolate current for this eval, see Model B. The guard releases it after
     // the scope.
     let _entered = EnteredIsolate::enter(deno);
-    let context = deno.main_context();
     let isolate = deno.v8_isolate();
-    v8::scope_with_context!(let scope, isolate, context);
+    v8::scope_with_context!(let scope, isolate, &*context);
 
     // Set the dispatch depth of this eval. A store `set` in an inline trigger or alias script
     // must journal at its own depth and not at a stale depth from an earlier function
