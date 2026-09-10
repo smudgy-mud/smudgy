@@ -69,6 +69,14 @@ fn specifier() -> ModuleSpecifier {
 /// including `this`, which at the top level of a classic script *is* that object. The body
 /// arrives without the `with` wrapper the engine compiles around it; that wrapper binds
 /// neither name and so cannot change this answer.
+///
+/// This reads one body and does not follow calls out of it, which is sound because nothing
+/// a body can call reads the global: the fire path is the only writer of `matches`, and no
+/// function in `smudgy.ts` — the whole surface the `with` wrapper puts in scope — reads it.
+/// A body therefore reaches these values only by naming a receiver in its own source. The
+/// exception is a module that deliberately parks a reader on the global object for a body
+/// to call back into by bare name, which reads whatever the last body to write it left
+/// there, exactly as it did before.
 #[must_use]
 pub fn script_can_observe_matches(source: &str) -> bool {
     let Ok(parsed) = deno_ast::parse_script(ParseParams {
@@ -182,6 +190,21 @@ mod tests {
         // argument, so it does not force one.
         assert!(!function_can_observe_matches(
             "function () { this.tick(); }"
+        ));
+    }
+
+    /// The shape the replay fixture registers 46 times (`countMatch(i)` in
+    /// `meta/smudgyvmudlet/trigger-comparison/profile-20260905/full.ts`): a counting
+    /// closure that never looks at its argument. The benchmark's whole premise is that
+    /// this elides, so pin it rather than infer it.
+    #[test]
+    fn the_replay_fixture_counting_closure_is_elided() {
+        assert!(!function_can_observe_matches(
+            "() => {
+    if (measuring) {
+      matchCounts[index]++;
+    }
+  }"
         ));
     }
 
