@@ -18,19 +18,29 @@
 // ---- Identifiers ------------------------------------------------------------
 
 /**
- * An area's identifier. Treat it as **opaque**: take it from one mapper call and
- * pass it back to another, unchanged. **Careful:** this is not the same as the
- * UUID **string** the `map:room` event delivers; mapper calls accept only the
- * pair. Real ids carry `BigInt` halves (see {@link ConnectionId}),
- * which `JSON.stringify` rejects — so mapper-issued ids cannot travel
- * session-store writes or store bindings. Where an area scope must ride JSON —
- * store-bound MapView `apply` arrays — use the UUID string spelling instead:
- * `MapStyleApplication.area` in `smudgy:widgets` accepts either form.
+ * An area's identifier: its canonical lowercase hyphenated UUID string, the
+ * same spelling the `map:room` event's `areaId` field delivers and MapView
+ * apply-area scoping accepts.
+ *
+ * It is an ordinary string, so ordinary string rules apply — compare two ids
+ * with `===`, use one as a `Map`/`Set` key, and put one through
+ * `JSON.stringify`, which means ids can travel session-store writes, store
+ * bindings and widget props like any other value.
+ *
+ * Treat the *contents* as opaque: take an id from one mapper call and pass it
+ * back to another rather than parsing it.
+ *
+ * @remarks An id used to be a 2-element `[hi, lo]` pair of the UUID's 64-bit
+ * halves. That spelling is gone: mapper calls reject it. Code that compared
+ * ids elementwise (`a[0] === b[0] && a[1] === b[1]`) or built a key from
+ * `` `${id[0]}:${id[1]}` `` must switch to `a === b` and `id` respectively —
+ * on a string those old forms compare *characters* and would report matches
+ * that are not there.
  */
-type AreaId = readonly [number, number];
+type AreaId = string;
 
-/** An atlas (map folder) identifier, opaque like {@link AreaId}. */
-type AtlasId = readonly [number, number];
+/** An atlas (map folder) identifier, spelled like {@link AreaId}. */
+type AtlasId = string;
 
 /** Where a map is stored. Session maps disappear when the session closes. */
 type MapStorage = "session" | "local" | "cloud";
@@ -38,23 +48,12 @@ type MapStorage = "session" | "local" | "cloud";
 /** A room number within an area (a 32-bit integer). */
 type RoomNumber = number;
 
-/** An exit's identifier: a 2-element `[hi, lo]` pair, like {@link AreaId}. Opaque. */
-type ExitId = readonly [number, number];
-/**
- * A Connection's identifier, opaque like {@link ExitId}.
- *
- * **Careful:** the `[hi, lo]` halves are 64-bit UUID halves. Values beyond
- * `Number.MAX_SAFE_INTEGER` (essentially always for real ids) are delivered
- * as `BigInt`, so despite this type's spelling the halves are `bigint` at
- * runtime. `JSON.stringify` throws on `BigInt`, which means these ids cannot
- * travel session-store writes or store bindings, and coercing a half with
- * `Number()` rounds it and will silently never match. Pass ids straight back
- * to mapper calls; for widget-facing selection use room + direction exit
- * refs instead (see `MapExitRef` in `smudgy:widgets`).
- */
-type ConnectionId = readonly [number, number];
-/** A queued mapper mutation's identifier, opaque like {@link ExitId}. */
-type OperationId = readonly [number, number];
+/** An exit's identifier, spelled like {@link AreaId}. */
+type ExitId = string;
+/** A Connection's identifier, spelled like {@link AreaId}. */
+type ConnectionId = string;
+/** A queued mapper mutation's identifier, spelled like {@link AreaId}. */
+type OperationId = string;
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -75,10 +74,10 @@ type ExitDirection =
 
 // ---- Labels + shapes --------------------------------------------------------
 
-/** A label's identifier: a 2-element `[hi, lo]` UUID pair, like {@link AreaId}. Opaque. */
-type LabelId = readonly [number, number];
-/** A shape's identifier: a 2-element `[hi, lo]` UUID pair, like {@link AreaId}. Opaque. */
-type ShapeId = readonly [number, number];
+/** A label's identifier, spelled like {@link AreaId}. */
+type LabelId = string;
+/** A shape's identifier, spelled like {@link AreaId}. */
+type ShapeId = string;
 
 /** Horizontal alignment of a label's text. */
 type LabelHorizontalAlign = "Left" | "Center" | "Right";
@@ -444,9 +443,8 @@ interface Room {
 interface Area {
     readonly id: AreaId;
     /**
-     * The area id as its canonical hyphenated lowercase UUID string: the
-     * JSON-safe spelling of `id`, as carried by the `map:room` event's
-     * `areaId` field and accepted by MapView apply-area scoping.
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * `id` is that string now — this is an alias for it.
      */
     readonly uuid: string;
     readonly name: string;

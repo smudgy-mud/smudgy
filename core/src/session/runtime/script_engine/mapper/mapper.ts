@@ -26,7 +26,6 @@ const {
     op_smudgy_mapper_get_area_by_id,
     op_smudgy_mapper_get_area_name,
     op_smudgy_mapper_get_area_id,
-    op_smudgy_mapper_get_area_uuid,
     op_smudgy_mapper_get_area_room_by_number,
     op_smudgy_mapper_get_area_property,
     op_smudgy_mapper_get_area_next_room_number,
@@ -96,15 +95,16 @@ const {
 // `mapper_ts_impl_conforms_to_contract` drift guard in `models/script_typings.rs` compiles
 // this impl against that contract, so the two cannot silently diverge -- edit both together.
 //
-// An `AreaId`/`ExitId` is a 2-element `[hi, lo]` pair of a UUID's 64-bit halves as plain JS
-// numbers (the ops serialize the `u64` pair to f64). It is an OPAQUE handle: pass it back to
-// mapper methods unchanged; each half exceeds 2^53, so the numbers are not exact.
-type AreaId = readonly [number, number];
-type AtlasId = readonly [number, number];
+// Every map identity is its UUID's canonical lowercase hyphenated string. Ordinary string
+// rules apply: compare with `===`, use one as a `Map`/`Set` key, and put one through
+// `JSON.stringify` -- so ids ride the session store, store bindings and widget props like any
+// other value.
+type AreaId = string;
+type AtlasId = string;
 type RoomNumber = number;
-type ExitId = readonly [number, number];
-type ConnectionId = readonly [number, number];
-type OperationId = readonly [number, number];
+type ExitId = string;
+type ConnectionId = string;
+type OperationId = string;
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -164,35 +164,36 @@ interface MutateAreaOptions {
     description?: string;
 }
 
-/** An opaque id pair as the ops accept it: a 2-element array of numbers
- * (a UUID's 64-bit halves). */
-function isIdPair(value: unknown): value is readonly [number, number] {
-    return (
-        Array.isArray(value) &&
-        value.length === 2 &&
-        typeof value[0] === "number" &&
-        typeof value[1] === "number"
-    );
+/** Accept an id argument and hand back the string the ops take. Anything else is the
+ * caller's mistake, and fails here with a clear TypeError rather than an opaque serde
+ * error inside the op. */
+function normalizeId(value: unknown, what: string): string {
+    if (typeof value === "string") return value;
+    throw new TypeError(`expected ${what} as a canonical UUID string, got ${typeof value}`);
 }
 
 /** Unwrap an atlas argument structurally. The contract `Atlas` type is an
  * interface, so callers may legitimately hold plain objects (a spread or a
  * JSON round-trip of a handle) rather than this module's class; anything
- * carrying a valid id pair is accepted, and anything else fails here with a
- * clear TypeError instead of an opaque serde error inside the op. */
+ * carrying a usable id is accepted. */
 function atlasIdOf(atlas: Atlas | AtlasId | undefined): AtlasId | undefined {
     if (atlas === undefined) return undefined;
     if (atlas instanceof Atlas) return atlas.id;
-    if (isIdPair(atlas)) return atlas;
-    const id = (atlas as Atlas).id;
-    if (isIdPair(id)) return id;
-    throw new TypeError(
-        "expected an Atlas handle or an AtlasId [hi, lo] pair",
-    );
+    const what = "an Atlas handle or an AtlasId";
+    return typeof atlas === "string"
+        ? normalizeId(atlas, what)
+        : normalizeId((atlas as Atlas)?.id, what);
 }
 
+/** Unwrap an area argument, structurally like `atlasIdOf`: a handle that came
+ * back through JSON is a plain object rather than this module's class, and
+ * anything carrying a usable id is accepted. */
 function areaIdOf(area: Area | AreaId): AreaId {
-    return area instanceof Area ? area.id : area;
+    if (area instanceof Area) return area.id;
+    const what = "an Area handle or an AreaId";
+    return typeof area === "string"
+        ? normalizeId(area, what)
+        : normalizeId((area as Area)?.id, what);
 }
 
 function destinationForOp(destination: MapDestination) {
@@ -271,7 +272,7 @@ const mapper = {
     },
 
     setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber) {
-        op_smudgy_mapper_set_current_location(areaId, roomNumber);
+        op_smudgy_mapper_set_current_location(normalizeId(areaId, "an AreaId"), roomNumber);
     },
 
     /** The session's current mapper location (the last `setCurrentLocation`), or `undefined`
@@ -292,7 +293,7 @@ const mapper = {
     },
 
     getAreaById(id: AreaId) {
-        let area = op_smudgy_mapper_get_area_by_id(id);
+        let area = op_smudgy_mapper_get_area_by_id(normalizeId(id, "an AreaId"));
         return new Area(area);
     },
 
@@ -311,7 +312,7 @@ const mapper = {
     ): Promise<OperationId[]> {
         // Always start from the current host snapshot. A script may retain an Area
         // wrapper across prior writes, including a now-stale next_room_number.
-        const target = this.getAreaById(area instanceof Area ? area.id : area);
+        const target = this.getAreaById(areaIdOf(area));
         const mutation = new AreaMutator(target);
         try {
             await callback(mutation);
@@ -352,53 +353,53 @@ const mapper = {
     },
 
     renameArea(area: Area | AreaId, name: string): Promise<void> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_rename_area(areaId, name);
     },
 
     deleteArea(area: Area | AreaId): Promise<void> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_delete_area(areaId);
     },
 
     setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_title(areaId, roomNumber, title);
     },
 
     setRoomDescription(area: Area | AreaId, room: Room | RoomNumber, description: string): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_description(areaId, roomNumber, description);
     },
 
     setRoomColor(area: Area | AreaId, room: Room | RoomNumber, color: string): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_color(areaId, roomNumber, color);
     },
 
     setRoomLevel(area: Area | AreaId, room: Room | RoomNumber, level: number): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_level(areaId, roomNumber, level);
     },
 
     setRoomX(area: Area | AreaId, room: Room | RoomNumber, x: number): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_x(areaId, roomNumber, x);
     },
 
     setRoomY(area: Area | AreaId, room: Room | RoomNumber, y: number): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_y(areaId, roomNumber, y);
     },
 
     setRoomProperty(area: Area | AreaId, room: Room | RoomNumber, name: string, value: string): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_property(areaId, roomNumber, name, value);
     },
@@ -406,21 +407,21 @@ const mapper = {
     /** Set a custom data property on an area (the write counterpart of `area.data(key)`). Pass an
      * empty value to clear it. Requires the `mapper:write` capability. */
     setAreaProperty(area: Area | AreaId, name: string, value: string): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_set_area_property(areaId, name, value);
     },
 
     /** Add a case-insensitive tag to a room. The tag is normalized to UPPERCASE;
      * re-adding an existing tag is a no-op. Requires the `mapper:write` capability. */
     addRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_add_room_tag(areaId, roomNumber, tag);
     },
 
     /** Remove a tag from a room (case-insensitive). Requires `mapper:write`. */
     removeRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_remove_room_tag(areaId, roomNumber, tag);
     },
@@ -459,7 +460,7 @@ const mapper = {
      * marked inactive), or `undefined` if no room of the area is reachable. Path
      * to it with `getPathBetweenRooms`. Requires `mapper:read`. */
     findNearestRoomInArea(from: Room, area: Area | AreaId): Room | undefined {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const ref = op_smudgy_mapper_find_nearest_room_in_area(
             from.area_id,
             from.room_number,
@@ -493,20 +494,20 @@ const mapper = {
     /** Bind (or, with an empty string, clear) a room's server-global room id.
      * Requires `mapper:write`. */
     setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_external_id(areaId, roomNumber, externalId);
     },
 
     createRoom(area: Area | AreaId, params: CreateRoomParams): Promise<RoomNumber> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_create_room(areaId, params);
     },
 
     /** Update multiple fields of an existing room in ONE cache update (one index rebuild)
      * instead of one per field. Only the fields present in `fields` change. */
     updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_update_room(areaId, roomNumber, fields);
     },
@@ -514,12 +515,12 @@ const mapper = {
     /** Batch-update many rooms of one area in a single cache update. Each entry is a
      * `[roomNumber, fields]` pair; only the present fields of each change. */
     updateRooms(area: Area | AreaId, updates: [RoomNumber, UpdateRoomParams][]): Promise<OperationId[]> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_update_rooms(areaId, updates);
     },
 
     createRoomExit(area: Area | AreaId, room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_create_room_exit(areaId, roomNumber, exit);
     },
@@ -527,7 +528,7 @@ const mapper = {
      * acknowledges the exact mutation. Equal updates resolve to `null`
      * without sending a revision-bumping no-op. */
     setRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_set_room_exit(areaId, roomNumber, exitId, exit);
     },
@@ -535,80 +536,80 @@ const mapper = {
      * room's metadata wins; traversal is deduplicated and rewired. Resolves
      * only after the backend acknowledges the exact operation. */
     mergeRooms(area: Area | AreaId, keep: Room | RoomNumber, remove: Room | RoomNumber): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const keepRoomNumber = keep instanceof Room ? keep.room_number : keep;
         const removeRoomNumber = remove instanceof Room ? remove.room_number : remove;
         return op_smudgy_mapper_merge_rooms(areaId, keepRoomNumber, removeRoomNumber);
     },
     deleteRoom(area: Area | AreaId, room: Room | RoomNumber): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_delete_room(areaId, roomNumber);
     },
     deleteRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         const roomNumber = room instanceof Room ? room.room_number : room;
         return op_smudgy_mapper_delete_room_exit(areaId, roomNumber, exitId);
     },
     /** Atomically create one Connection and its one or two member traversals. */
     createLink(area: Area | AreaId, link: LinkCreateArgs): Promise<ConnectionId> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_create_link(areaId, link);
     },
     /** Update shared Connection geometry or appearance. */
     setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_set_connection(areaId, connectionId, updates);
     },
     /** Split one traversal out of a bidirectional Connection. */
     unlinkRoomExit(area: Area | AreaId, exitId: ExitId): Promise<ConnectionId> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_unlink_exit(areaId, exitId);
     },
     /** Merge reciprocal one-way Connections, preserving `keepConnectionId`'s route. */
     pairConnections(area: Area | AreaId, keepConnectionId: ConnectionId, mergeConnectionId: ConnectionId): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_pair_connections(areaId, keepConnectionId, mergeConnectionId);
     },
     /** Delete a Connection and all of its member traversals. */
     deleteLink(area: Area | AreaId, connectionId: ConnectionId): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_delete_link(areaId, connectionId);
     },
     /** Add a text label to an area; returns its new id. Requires `mapper:write`. */
     createLabel(area: Area | AreaId, label: LabelArgs): Promise<LabelId> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_create_label(areaId, label);
     },
     /** Add a graphical shape to an area; returns its new id. Requires `mapper:write`. */
     createShape(area: Area | AreaId, shape: ShapeArgs): Promise<ShapeId> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_create_shape(areaId, shape);
     },
     /** Delete a label from an area. Requires `mapper:write`. */
     deleteLabel(area: Area | AreaId, labelId: LabelId): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_delete_label(areaId, labelId);
     },
     /** Delete a shape from an area. Requires `mapper:write`. */
     deleteShape(area: Area | AreaId, shapeId: ShapeId): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_delete_shape(areaId, shapeId);
     },
     /** Update an existing label; only present fields change. Requires `mapper:write`. */
     setLabel(area: Area | AreaId, labelId: LabelId, updates: LabelUpdates): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_set_label(areaId, labelId, updates);
     },
     /** Update an existing shape; only present fields change. Requires `mapper:write`. */
     setShape(area: Area | AreaId, shapeId: ShapeId, updates: ShapeUpdates): Promise<OperationId | null> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_set_shape(areaId, shapeId, updates);
     },
     /** Serialize an area to a portable JSON blob. Requires `mapper:read` and copy rights
      * (`can_copy`) on the area. */
     exportArea(area: Area | AreaId): Promise<AreaJson> {
-        const areaId = area instanceof Area ? area.id : area;
+        const areaId = areaIdOf(area);
         return op_smudgy_mapper_export_area(areaId);
     },
     /** Import portable area JSON as new LOCAL areas (fresh ids); cross-area exits within the set
@@ -749,7 +750,7 @@ type AreaBatchOperation =
 
 function roomNumberInArea(areaId: AreaId, room: Room | RoomNumber): RoomNumber {
     if (!(room instanceof Room)) return room;
-    if (room.area_id[0] !== areaId[0] || room.area_id[1] !== areaId[1]) {
+    if (room.area_id !== areaId) {
         throw new TypeError("mutateArea cannot edit a room from another area");
     }
     return room.room_number;
@@ -762,7 +763,7 @@ function roomNumberInArea(areaId: AreaId, room: Room | RoomNumber): RoomNumber {
  * a draft; the reservation is released when the mutator finishes or aborts. */
 class AreaMutator {
     readonly #areaId: AreaId;
-    readonly #token: readonly [number, number];
+    readonly #token: OperationId;
     #operations: AreaBatchOperation[] = [];
     #open = true;
 
@@ -938,9 +939,9 @@ class AreaMutator {
     }
 }
 
-// A label/shape id: a 2-element `[hi, lo]` UUID pair, like `AreaId`/`ExitId`. Opaque.
-type LabelId = readonly [number, number];
-type ShapeId = readonly [number, number];
+// A label/shape id: a canonical UUID string, like `AreaId`/`ExitId`.
+type LabelId = string;
+type ShapeId = string;
 
 // Text alignment of a label; a shape's kind. These mirror the cloud enums' variant names.
 type LabelHorizontalAlign = "Left" | "Center" | "Right";
@@ -1072,9 +1073,12 @@ class Area {
         return op_smudgy_mapper_get_area_id(this.#obj);
     }
 
-    /** The area id as its canonical hyphenated lowercase UUID string. */
+    /**
+     * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+     * `id` is that string now -- this is an alias for it.
+     */
     get uuid(): string {
-        return op_smudgy_mapper_get_area_uuid(this.#obj);
+        return this.id;
     }
 
     get name(): string {

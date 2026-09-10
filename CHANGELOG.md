@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connecting sends your profile's login text — and the reach-others permission
   to drive a session other than its own.
 
+### Changed
+
+- **A map id is now the area's UUID as a plain string.** `area.id`, `exit.id`,
+  a connection or label or shape id, and the id `mutateArea` hands back are all
+  the canonical lowercase spelling — `"67e55044-10b1-426f-9247-bb680e5fe0c8"` —
+  where they used to be a two-number `[hi, lo]` pair. Two ids compare with
+  `===`, one works as a `Map` or `Set` key, and `JSON.stringify` accepts it, so
+  an id can be stored in session state, bound to a widget, or saved in a
+  package's own parameters like any other value. `area.uuid` is the same string
+  as `area.id` now and is deprecated.
+
+  This is a breaking change for scripts: the pair spelling is refused rather
+  than reinterpreted, so a call that passes one fails loudly. Scripts that
+  compared ids half by half (`a[0] === b[0] && a[1] === b[1]`) or built a key
+  from `` `${id[0]}:${id[1]}` `` must switch to `a === b` and `id` — on a
+  string those older forms compare single characters and report matches that
+  are not there.
+
 ### Fixed
 
 - **The connection rule no longer flips to "Disconnected" when a connect attempt
