@@ -368,13 +368,13 @@ function zoneKey(zone: string | null): string {
     return (zone ?? FALLBACK_ZONE).trim().toLowerCase() || FALLBACK_ZONE.toLowerCase();
 }
 
-/** AreaIds are opaque `[hi, lo]` pairs; compare by value, never by reference. */
+/** Ids are canonical UUID strings, so `===` is the whole comparison. */
 function sameArea(a: AreaId, b: AreaId): boolean {
-    return a[0] === b[0] && a[1] === b[1];
+    return a === b;
 }
 
 function sameExit(a: ExitId, b: ExitId): boolean {
-    return a[0] === b[0] && a[1] === b[1];
+    return a === b;
 }
 
 async function zoneArea(zone: string | null): Promise<AreaId> {
@@ -1093,7 +1093,7 @@ async function materialize(room: Room, fix: RoomFix, dir: string | null): Promis
 }
 
 function warnUnwritable(areaId: AreaId, err: unknown) {
-    const key = `${areaId[0]}:${areaId[1]}`;
+    const key = areaId;
     if (warnedAreas.has(key)) return;
     warnedAreas.add(key);
     echo(`[auto-mapper] cannot update this zone's map (${err}) - following only.`);
@@ -1210,7 +1210,7 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
                 const room = mapper.findRoomByExternalId(reported.id);
                 if (room && !sameArea(room.area_id, areaId)) {
                     if (isUnvisited(room) && reported.terrain) {
-                        const key = `${room.area_id[0]}:${room.area_id[1]}`;
+                        const key = room.area_id;
                         const group = offAreaTerrain.get(key) ?? [];
                         group.push({
                             areaId: room.area_id,
@@ -1306,7 +1306,7 @@ async function handleNeighborhood(fix: NeighborhoodFix | null): Promise<void> {
         const room = mapper.findRoomByExternalId(reported.id);
         if (!room) continue;
         for (const [dir, dest] of Object.entries(reported.exits)) {
-            const key = `${room.area_id[0]}:${room.area_id[1]}`;
+            const key = room.area_id;
             const group = exitGroups.get(key) ?? { areaId: room.area_id, work: [] };
             group.work.push({ roomNumber: room.room_number, dir, dest });
             exitGroups.set(key, group);
