@@ -45,6 +45,7 @@ deno_core::extension!(
       op_smudgy_mapper_get_area_by_id,
       op_smudgy_mapper_get_area_name,
       op_smudgy_mapper_get_area_id,
+      op_smudgy_mapper_warn_area_uuid_once,
       op_smudgy_mapper_rename_area,
       op_smudgy_mapper_list_area_room_numbers,
       op_smudgy_mapper_list_rooms_by_title_and_description,
@@ -381,6 +382,30 @@ struct JsCreateAreaOptions {
     ephemeral: Option<bool>,
 }
 
+/// Parse one `CARGO_PKG_VERSION_*` component at compile time.
+const fn version_component(bytes: &[u8]) -> u32 {
+    let mut value = 0u32;
+    let mut index = 0;
+    while index < bytes.len() {
+        value = value * 10 + (bytes[index] - b'0') as u32;
+        index += 1;
+    }
+    value
+}
+
+const COMPAT_MAJOR: u32 = version_component(env!("CARGO_PKG_VERSION_MAJOR").as_bytes());
+const COMPAT_MINOR: u32 = version_component(env!("CARGO_PKG_VERSION_MINOR").as_bytes());
+
+/// The 0.5 compatibility shims expire at 0.6, and this refuses to BUILD past
+/// that line rather than waiting for a test run: `createArea`'s `ephemeral`
+/// option, `area.isEphemeral`, and the `area.uuid` alias (with its warn-once
+/// op) all come out together, along with this gate and the catalog test in
+/// `models/script_typings.rs`.
+const _: () = assert!(
+    COMPAT_MAJOR == 0 && COMPAT_MINOR < 6,
+    "0.6 reached: remove the mapper's 0.5 compatibility shims (createArea's `ephemeral` option, `area.isEphemeral`, the `area.uuid` alias and its warn-once op), this gate, and the catalog test in models/script_typings.rs"
+);
+
 /// Per-isolate latch for the `ephemeral`-option deprecation notice.
 struct EphemeralCreateAreaWarnIssued;
 
@@ -407,6 +432,30 @@ fn warn_ephemeral_create_area_once(state: &Rc<RefCell<OpState>>) {
             "[mapper] A script passed the deprecated ephemeral option to createArea. Maps \
              were created normally; the option keeps working through Smudgy 0.5.x. Scripts \
              should select the session tier with { storage: \"session\" } instead before 0.6."
+                .to_string(),
+        )));
+}
+
+/// Per-isolate latch for the `area.uuid` deprecation notice.
+struct AreaUuidWarnIssued;
+
+/// Echo the `area.uuid` deprecation notice to the session, once per isolate.
+/// The member still works -- it returns exactly what `area.id` returns, now
+/// that ids ARE the canonical string -- so the note teaches the replacement
+/// rather than reporting a failure. Once per isolate, because a script reading
+/// `uuid` in a loop should not paper the session with it.
+#[op2(fast)]
+fn op_smudgy_mapper_warn_area_uuid_once(state: &mut OpState) {
+    if state.try_borrow::<AreaUuidWarnIssued>().is_some() {
+        return;
+    }
+    state.put(AreaUuidWarnIssued);
+    log::warn!("smudgy: area.uuid was read (supported through 0.5.x; area.id is that same string)");
+    state
+        .borrow::<ActionQueue>()
+        .borrow_mut()
+        .push_back(RuntimeAction::Echo(Arc::new(
+            "[mapper] A script read the deprecated area.uuid. It returns exactly what              area.id returns now that ids are canonical UUID strings, and keeps working              through Smudgy 0.5.x. Scripts should read area.id instead before 0.6."
                 .to_string(),
         )));
 }
