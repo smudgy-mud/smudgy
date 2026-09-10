@@ -146,5 +146,5 @@ pub fn view(state: &State) -> Element<'_, Message> {
     );
     content = content.push(actions);
 
-    container(content).padding(20.0).into()
+    container(content).padding(20.0).width(Length::Fill).into()
 }
