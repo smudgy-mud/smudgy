@@ -105,6 +105,7 @@ impl Modal {
                 .height(Length::Fixed(34.0)),
             container(inner)
                 .style(theme::builtins::container::modal_body)
+                .width(Length::Fill)
                 .height(Length::Fill),
         ])
         .width(Length::Fixed(width))
