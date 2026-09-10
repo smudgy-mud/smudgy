@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record, and the per-line matching storage is kept from line to line. A script with
   many triggers that fire on most lines spends noticeably less time between the match
   and the handler. What handlers see, and the order they run in, is unchanged.
+- **A handler that ignores its matched values costs less to fire.** A trigger or alias
+  handler that takes no arguments, and an inline body that never names `matches` or
+  `outer`, no longer has those values assembled for it on every match. A handler that
+  does read them — including one that reaches its arguments indirectly — receives
+  exactly what it always did.
 - **Lines that fire several triggers are processed faster.** Timers and promises are
   serviced once for a whole line rather than after every handler, which removes most
   of the work between one handler and the next. An `await` or a `.then()` inside a
