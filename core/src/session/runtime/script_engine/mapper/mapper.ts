@@ -26,6 +26,7 @@ const {
     op_smudgy_mapper_get_area_by_id,
     op_smudgy_mapper_get_area_name,
     op_smudgy_mapper_get_area_id,
+    op_smudgy_mapper_warn_area_uuid_once,
     op_smudgy_mapper_get_area_room_by_number,
     op_smudgy_mapper_get_area_property,
     op_smudgy_mapper_get_area_next_room_number,
@@ -1086,9 +1087,11 @@ class Area {
 
     /**
      * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
-     * `id` is that string now -- this is an alias for it.
+     * `id` is that string now -- this is an alias for it, and reading it
+     * reports the replacement once per isolate.
      */
     get uuid(): string {
+        op_smudgy_mapper_warn_area_uuid_once();
         return this.id;
     }
 
