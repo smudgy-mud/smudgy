@@ -30,6 +30,12 @@
  * Treat the *contents* as opaque: take an id from one mapper call and pass it
  * back to another rather than parsing it.
  *
+ * The type is branded, so an id smudgy hands you carries which *kind* of id it
+ * is: assigning an {@link ExitId} to something declared `AreaId` is an error,
+ * which is why storing ids in your own typed structures is worth doing. Calls
+ * that take an id accept `AreaIdLike`, so a plain string read back from
+ * JSON, a package parameter, or your own state needs no cast.
+ *
  * @remarks An id used to be a 2-element `[hi, lo]` pair of the UUID's 64-bit
  * halves. That spelling is gone: mapper calls reject it. Code that compared
  * ids elementwise (`a[0] === b[0] && a[1] === b[1]`) or built a key from
@@ -37,10 +43,31 @@
  * on a string those old forms compare *characters* and would report matches
  * that are not there.
  */
-type AreaId = string;
+type AreaId = string & { readonly __id: "AreaId" };
 
 /** An atlas (map folder) identifier, spelled like {@link AreaId}. */
-type AtlasId = string;
+type AtlasId = string & { readonly __id: "AtlasId" };
+
+/**
+ * What a call accepts wherever it takes an id: the branded id an API handed
+ * you, or a plain string that spells one — from JSON, a package parameter,
+ * your own state — with no cast. An id of a *different* kind is refused, so
+ * passing an {@link ExitId} where an {@link AreaId} belongs is a type error
+ * rather than a lookup that quietly finds nothing.
+ */
+type AreaIdLike = AreaId | (string & { readonly __id?: undefined });
+/** What a call accepts wherever it takes an AtlasId; see {@link AreaIdLike}. */
+type AtlasIdLike = AtlasId | (string & { readonly __id?: undefined });
+/** What a call accepts wherever it takes an ExitId; see {@link AreaIdLike}. */
+type ExitIdLike = ExitId | (string & { readonly __id?: undefined });
+/** What a call accepts wherever it takes a ConnectionId; see {@link AreaIdLike}. */
+type ConnectionIdLike = ConnectionId | (string & { readonly __id?: undefined });
+/** What a call accepts wherever it takes an OperationId; see {@link AreaIdLike}. */
+type OperationIdLike = OperationId | (string & { readonly __id?: undefined });
+/** What a call accepts wherever it takes a LabelId; see {@link AreaIdLike}. */
+type LabelIdLike = LabelId | (string & { readonly __id?: undefined });
+/** What a call accepts wherever it takes a ShapeId; see {@link AreaIdLike}. */
+type ShapeIdLike = ShapeId | (string & { readonly __id?: undefined });
 
 /** Where a map is stored. Session maps disappear when the session closes. */
 type MapStorage = "session" | "local" | "cloud";
@@ -49,11 +76,11 @@ type MapStorage = "session" | "local" | "cloud";
 type RoomNumber = number;
 
 /** An exit's identifier, spelled like {@link AreaId}. */
-type ExitId = string;
+type ExitId = string & { readonly __id: "ExitId" };
 /** A Connection's identifier, spelled like {@link AreaId}. */
-type ConnectionId = string;
+type ConnectionId = string & { readonly __id: "ConnectionId" };
 /** A queued mapper mutation's identifier, spelled like {@link AreaId}. */
-type OperationId = string;
+type OperationId = string & { readonly __id: "OperationId" };
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -75,9 +102,9 @@ type ExitDirection =
 // ---- Labels + shapes --------------------------------------------------------
 
 /** A label's identifier, spelled like {@link AreaId}. */
-type LabelId = string;
+type LabelId = string & { readonly __id: "LabelId" };
 /** A shape's identifier, spelled like {@link AreaId}. */
-type ShapeId = string;
+type ShapeId = string & { readonly __id: "ShapeId" };
 
 /** Horizontal alignment of a label's text. */
 type LabelHorizontalAlign = "Left" | "Center" | "Right";
@@ -397,11 +424,11 @@ interface AreaMutator {
     addRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
     removeRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
     createRoomExit(room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
-    setRoomExit(room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<void>;
+    setRoomExit(room: Room | RoomNumber, exitId: ExitIdLike, exit: ExitUpdates): Promise<void>;
     deleteRoom(room: Room | RoomNumber): Promise<void>;
-    deleteRoomExit(room: Room | RoomNumber, exitId: ExitId): Promise<void>;
+    deleteRoomExit(room: Room | RoomNumber, exitId: ExitIdLike): Promise<void>;
     createLink(link: LinkCreateArgs): Promise<ConnectionId>;
-    setConnection(connectionId: ConnectionId, updates: ConnectionUpdates): Promise<void>;
+    setConnection(connectionId: ConnectionIdLike, updates: ConnectionUpdates): Promise<void>;
 }
 
 /** A room read from the map. Obtain one via `area.room(n)` or the `listRooms*` helpers. */
@@ -544,23 +571,23 @@ interface Mapper {
     /** Create a durable atlas in an explicit storage tier. */
     createAtlas(name: string, options: CreateAtlasOptions): Promise<Atlas>;
     /** Copy areas together, preserving links between members of the set. */
-    copyAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]>;
+    copyAreas(areas: (Area | AreaIdLike)[], destination: MapDestination): Promise<Area[]>;
     /** Move areas together. Cross-tier moves copy completely before deleting sources. */
-    moveAreas(areas: (Area | AreaId)[], destination: MapDestination): Promise<Area[]>;
-    copyArea(area: Area | AreaId, destination: MapDestination): Promise<Area>;
-    moveArea(area: Area | AreaId, destination: MapDestination): Promise<Area>;
+    moveAreas(areas: (Area | AreaIdLike)[], destination: MapDestination): Promise<Area[]>;
+    copyArea(area: Area | AreaIdLike, destination: MapDestination): Promise<Area>;
+    moveArea(area: Area | AreaIdLike, destination: MapDestination): Promise<Area>;
     /** Copy an atlas and all of its areas to another durable storage tier. */
-    copyAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas>;
+    copyAtlas(atlas: Atlas | AtlasIdLike, storage: "local" | "cloud"): Promise<Atlas>;
     /** Move an atlas and all of its areas to another durable storage tier. */
-    moveAtlas(atlas: Atlas | AtlasId, storage: "local" | "cloud"): Promise<Atlas>;
+    moveAtlas(atlas: Atlas | AtlasIdLike, storage: "local" | "cloud"): Promise<Atlas>;
     /** Set the current map location (the per-session "you are here" marker). */
-    setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber): void;
+    setCurrentLocation(areaId: AreaIdLike, roomNumber?: RoomNumber): void;
     /** The current map location, or `undefined` if none is set. `room` is absent when the
      *  location names an area without a specific room. */
     getCurrentLocation(): { area: AreaId; room?: RoomNumber } | undefined;
     /** All active areas (areas marked inactive are excluded). */
     readonly areas: Area[];
-    getAreaById(id: AreaId): Area;
+    getAreaById(id: AreaIdLike): Area;
     /**
      * Collect related writes to one area and submit them in the fewest practical ordered
      * envelopes. The whole callback is validated and durably staged before anything is
@@ -572,16 +599,16 @@ interface Mapper {
      * nothing is submitted.
      */
     mutateArea(
-        area: Area | AreaId,
+        area: Area | AreaIdLike,
         callback: (mutation: AreaMutator) => void | Promise<void>,
         options?: MutateAreaOptions,
     ): Promise<OperationId[]>;
     /** The cheapest route between two rooms, as a list of `[areaId, roomNumber]`
      *  steps (each exit's `weight` is its cost). */
     getPathBetweenRooms(
-        fromAreaId: AreaId,
+        fromAreaId: AreaIdLike,
         fromRoomNumber: RoomNumber,
-        toAreaId: AreaId,
+        toAreaId: AreaIdLike,
         toRoomNumber: RoomNumber,
     ): [AreaId, RoomNumber][];
     listRoomsByTitleAndDescription(title: string, description: string): (Room | undefined)[];
@@ -591,25 +618,25 @@ interface Mapper {
         visibleExitDirections: string[],
     ): (Room | undefined)[];
     /** Rename an area after the backend acknowledges the change. */
-    renameArea(area: Area | AreaId, name: string): Promise<void>;
+    renameArea(area: Area | AreaIdLike, name: string): Promise<void>;
     /** Delete an area and everything in it. */
-    deleteArea(area: Area | AreaId): Promise<void>;
-    setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string): Promise<OperationId | null>;
-    setRoomDescription(area: Area | AreaId, room: Room | RoomNumber, description: string): Promise<OperationId | null>;
+    deleteArea(area: Area | AreaIdLike): Promise<void>;
+    setRoomTitle(area: Area | AreaIdLike, room: Room | RoomNumber, title: string): Promise<OperationId | null>;
+    setRoomDescription(area: Area | AreaIdLike, room: Room | RoomNumber, description: string): Promise<OperationId | null>;
     /** Set a room's color to a CSS color string. */
-    setRoomColor(area: Area | AreaId, room: Room | RoomNumber, color: string): Promise<OperationId | null>;
-    setRoomLevel(area: Area | AreaId, room: Room | RoomNumber, level: number): Promise<OperationId | null>;
-    setRoomX(area: Area | AreaId, room: Room | RoomNumber, x: number): Promise<OperationId | null>;
-    setRoomY(area: Area | AreaId, room: Room | RoomNumber, y: number): Promise<OperationId | null>;
+    setRoomColor(area: Area | AreaIdLike, room: Room | RoomNumber, color: string): Promise<OperationId | null>;
+    setRoomLevel(area: Area | AreaIdLike, room: Room | RoomNumber, level: number): Promise<OperationId | null>;
+    setRoomX(area: Area | AreaIdLike, room: Room | RoomNumber, x: number): Promise<OperationId | null>;
+    setRoomY(area: Area | AreaIdLike, room: Room | RoomNumber, y: number): Promise<OperationId | null>;
     /** Set a custom room property (string key/value). */
-    setRoomProperty(area: Area | AreaId, room: Room | RoomNumber, name: string, value: string): Promise<OperationId | null>;
+    setRoomProperty(area: Area | AreaIdLike, room: Room | RoomNumber, name: string, value: string): Promise<OperationId | null>;
     /** Set a custom area property (string key/value); the write counterpart of `area.data(key)`.
      *  Pass an empty value to clear it. */
-    setAreaProperty(area: Area | AreaId, name: string, value: string): Promise<OperationId | null>;
+    setAreaProperty(area: Area | AreaIdLike, name: string, value: string): Promise<OperationId | null>;
     /** Add a case-insensitive tag to a room (normalized to UPPERCASE; re-adding is a no-op). */
-    addRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
+    addRoomTag(area: Area | AreaIdLike, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
     /** Remove a tag from a room (case-insensitive). */
-    removeRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
+    removeRoomTag(area: Area | AreaIdLike, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
     /**
      * The nearest reachable room carrying `tag` (case-insensitive) from `from`, by the same
      * weighted search as `getPathBetweenRooms` (the start room counts if it carries the tag),
@@ -633,7 +660,7 @@ interface Mapper {
      * inactive), or `undefined` if no room of the area is reachable. Path to it
      * with `getPathBetweenRooms`.
      */
-    findNearestRoomInArea(from: Room, area: Area | AreaId): Room | undefined;
+    findNearestRoomInArea(from: Room, area: Area | AreaIdLike): Room | undefined;
     /**
      * The room bound to a server-global room id (the room number games send
      * over GMCP or MSDP), or `undefined` if no loaded room carries it. When
@@ -650,60 +677,60 @@ interface Mapper {
      */
     rescueRoomByExternalId(externalId: string): boolean;
     /** Bind (or, with an empty string, clear) a room's server-global room id. */
-    setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): Promise<OperationId | null>;
+    setRoomExternalId(area: Area | AreaIdLike, room: Room | RoomNumber, externalId: string): Promise<OperationId | null>;
     /**
      * Create a room and return its new room number. The write is a
      * must-not-exist create: if the allocated number is taken by the time
      * the write lands (another client raced it in), it rejects with
      * `room_number_exists` instead of silently merging into that room.
      */
-    createRoom(area: Area | AreaId, params: CreateRoomParams): Promise<RoomNumber>;
+    createRoom(area: Area | AreaIdLike, params: CreateRoomParams): Promise<RoomNumber>;
     /** Update multiple fields of a room in one cache update; only present fields change. */
-    updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null>;
+    updateRoom(area: Area | AreaIdLike, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null>;
     /** Batch-update many rooms of one area in a single cache update. */
-    updateRooms(area: Area | AreaId, updates: [RoomNumber, UpdateRoomParams][]): Promise<OperationId[]>;
+    updateRooms(area: Area | AreaIdLike, updates: [RoomNumber, UpdateRoomParams][]): Promise<OperationId[]>;
     /** Create an exit on a room and return its new id. */
-    createRoomExit(area: Area | AreaId, room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
+    createRoomExit(area: Area | AreaIdLike, room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
     /**
      * Update an existing exit. Resolves after backend acknowledgement; equal
      * updates resolve to `null` without sending a mutation.
      */
-    setRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<OperationId | null>;
+    setRoomExit(area: Area | AreaIdLike, room: Room | RoomNumber, exitId: ExitIdLike, exit: ExitUpdates): Promise<OperationId | null>;
     /**
      * Merge `remove` into `keep` in one durable mutation. The kept room's
      * metadata wins; traversal is deduplicated and rewired. Resolves after
      * backend acknowledgement.
      */
-    mergeRooms(area: Area | AreaId, keep: Room | RoomNumber, remove: Room | RoomNumber): Promise<OperationId | null>;
+    mergeRooms(area: Area | AreaIdLike, keep: Room | RoomNumber, remove: Room | RoomNumber): Promise<OperationId | null>;
     /** Delete a room. */
-    deleteRoom(area: Area | AreaId, room: Room | RoomNumber): Promise<OperationId | null>;
+    deleteRoom(area: Area | AreaIdLike, room: Room | RoomNumber): Promise<OperationId | null>;
     /** Delete an exit from a room. */
-    deleteRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId): Promise<OperationId | null>;
+    deleteRoomExit(area: Area | AreaIdLike, room: Room | RoomNumber, exitId: ExitIdLike): Promise<OperationId | null>;
     /** Atomically create one Connection and its one or two traversals. */
-    createLink(area: Area | AreaId, link: LinkCreateArgs): Promise<ConnectionId>;
+    createLink(area: Area | AreaIdLike, link: LinkCreateArgs): Promise<ConnectionId>;
     /** Update shared Connection geometry or appearance. */
-    setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): Promise<OperationId | null>;
+    setConnection(area: Area | AreaIdLike, connectionId: ConnectionIdLike, updates: ConnectionUpdates): Promise<OperationId | null>;
     /** Split one traversal out of a bidirectional Connection. */
-    unlinkRoomExit(area: Area | AreaId, exitId: ExitId): Promise<ConnectionId>;
+    unlinkRoomExit(area: Area | AreaIdLike, exitId: ExitIdLike): Promise<ConnectionId>;
     /** Merge reciprocal one-way Connections, preserving the first one's route. */
-    pairConnections(area: Area | AreaId, keepConnectionId: ConnectionId, mergeConnectionId: ConnectionId): Promise<OperationId | null>;
+    pairConnections(area: Area | AreaIdLike, keepConnectionId: ConnectionIdLike, mergeConnectionId: ConnectionIdLike): Promise<OperationId | null>;
     /** Delete a Connection and every member traversal. */
-    deleteLink(area: Area | AreaId, connectionId: ConnectionId): Promise<OperationId | null>;
+    deleteLink(area: Area | AreaIdLike, connectionId: ConnectionIdLike): Promise<OperationId | null>;
     /** Add a text label to an area and return its new id. */
-    createLabel(area: Area | AreaId, label: LabelArgs): Promise<LabelId>;
+    createLabel(area: Area | AreaIdLike, label: LabelArgs): Promise<LabelId>;
     /** Add a graphical shape to an area and return its new id. */
-    createShape(area: Area | AreaId, shape: ShapeArgs): Promise<ShapeId>;
+    createShape(area: Area | AreaIdLike, shape: ShapeArgs): Promise<ShapeId>;
     /** Delete a label from an area. */
-    deleteLabel(area: Area | AreaId, labelId: LabelId): Promise<OperationId | null>;
+    deleteLabel(area: Area | AreaIdLike, labelId: LabelIdLike): Promise<OperationId | null>;
     /** Delete a shape from an area. */
-    deleteShape(area: Area | AreaId, shapeId: ShapeId): Promise<OperationId | null>;
+    deleteShape(area: Area | AreaIdLike, shapeId: ShapeIdLike): Promise<OperationId | null>;
     /** Update an existing label; only present fields change. */
-    setLabel(area: Area | AreaId, labelId: LabelId, updates: LabelUpdates): Promise<OperationId | null>;
+    setLabel(area: Area | AreaIdLike, labelId: LabelIdLike, updates: LabelUpdates): Promise<OperationId | null>;
     /** Update an existing shape; only present fields change. */
-    setShape(area: Area | AreaId, shapeId: ShapeId, updates: ShapeUpdates): Promise<OperationId | null>;
+    setShape(area: Area | AreaIdLike, shapeId: ShapeIdLike, updates: ShapeUpdates): Promise<OperationId | null>;
     /** Export an area as a portable {@link AreaJson}. Requires copy rights on
      *  the area. */
-    exportArea(area: Area | AreaId): Promise<AreaJson>;
+    exportArea(area: Area | AreaIdLike): Promise<AreaJson>;
     /** Import exported areas as new **local** areas (fresh ids). Exits between
      *  areas in the set are relinked to the new copies; exits pointing
      *  **outside** the set are kept but left unlinked. Returns the new area
