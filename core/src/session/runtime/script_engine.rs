@@ -278,13 +278,13 @@ type PackageAudioBinding = ();
 
 /// A registered handler plus the one thing the fire path needs to know about it that the
 /// `v8::Global` cannot answer cheaply: whether it can observe the `matches` object at all.
-/// Deciding once, here, keeps the arity read and the source scan out of the fire path
-/// entirely — a handler is registered once and fires arbitrarily often.
+/// Deciding once, here, keeps the parse that answers it out of the fire path entirely — a
+/// handler is registered once and fires arbitrarily often.
 #[derive(Clone)]
 pub(crate) struct RegisteredFunction {
     pub(crate) function: v8::Global<v8::Function>,
-    /// See `matches::function_wants_matches`. False only when the handler provably cannot
-    /// read its first argument.
+    /// See [`smudgy_script::matches_reach::function_can_observe_matches`]. False only when
+    /// the handler provably cannot read its first argument.
     pub(crate) wants_matches: bool,
 }
 
@@ -314,7 +314,7 @@ impl RegisteredFunction {
 /// A compiled classic body and the same decision, taken against the source in `add_script`.
 pub(crate) struct CompiledScript {
     pub(crate) script: v8::Global<v8::Script>,
-    /// See `matches::script_wants_matches`.
+    /// See [`smudgy_script::matches_reach::script_can_observe_matches`].
     pub(crate) wants_matches: bool,
 }
 
