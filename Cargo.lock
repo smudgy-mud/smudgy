@@ -11333,11 +11333,13 @@ version = "0.5.7-ptb"
 dependencies = [
  "aho-corasick",
  "criterion",
+ "deno_core",
  "futures",
  "gungraun",
  "regex",
  "regex-filtered",
  "regex-syntax 0.8.5",
+ "serde",
  "smudgy_cloud",
  "smudgy_core",
  "smudgy_script",
@@ -11345,6 +11347,7 @@ dependencies = [
  "smudgy_widgets",
  "tempfile",
  "tokio",
+ "uuid 1.16.0",
  "vtparse",
 ]
 
