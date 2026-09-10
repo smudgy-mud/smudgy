@@ -111,11 +111,14 @@ mod action;
 mod dispatch;
 mod origin;
 
-pub use action::RuntimeAction;
 pub(crate) use action::{ActionQueue, ActionResult, RunAction};
+pub use action::{
+    InteropEventBody, JavascriptFunctionAliasParams, ProcedurePostBody, RuntimeAction,
+    ScriptTriggerParams,
+};
 pub use origin::{
     AutomationBody, AutomationDelta, AutomationEvent, AutomationKind, AutomationSummary, IsolateId,
-    Origin, SingletonKey, SingletonOrigin, SingletonRegistry,
+    Origin, PackageIsolate, PackageOrigin, SingletonKey, SingletonOrigin, SingletonRegistry,
 };
 
 /// Cap on host-routed delivery recursion (event emit chains and session-store watch chains

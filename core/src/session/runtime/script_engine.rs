@@ -1547,14 +1547,14 @@ impl<'a> ScriptEngine<'a> {
                         .clone();
                     let options = match &isolate_id {
                         IsolateId::Main => audio_scope.extension_options(),
-                        IsolateId::Package { owner, name, .. } => {
-                            let observed_owner: Arc<str> = Arc::from(owner.to_owned());
-                            let observed_name: Arc<str> = Arc::from(name.to_owned());
+                        IsolateId::Package(pkg) => {
+                            let observed_owner: Arc<str> = Arc::clone(&pkg.owner);
+                            let observed_name: Arc<str> = Arc::clone(&pkg.name);
                             let observed_ui = params.ui_tx.clone();
                             let (options, binding) = audio_scope
                                 .extension_options_for_sandbox_root_with_usage_observer(
-                                    owner,
-                                    name,
+                                    &pkg.owner,
+                                    &pkg.name,
                                     Arc::new(move || {
                                         let mut ui = observed_ui.clone();
                                         ui.try_send(TaggedSessionEvent {
@@ -2104,11 +2104,11 @@ impl<'a> ScriptEngine<'a> {
                 };
                 let version = resolved_root.resolved_version.clone();
                 let runtime_key = resolved_root.key.clone();
-                let isolate_id = IsolateId::Package {
-                    owner: Arc::from(runtime_key.owner.as_str()),
-                    name: Arc::from(runtime_key.name.as_str()),
-                    version: Arc::from(version.as_str()),
-                };
+                let isolate_id = IsolateId::package(
+                    runtime_key.owner.as_str(),
+                    runtime_key.name.as_str(),
+                    version.as_str(),
+                );
                 // The enforced grant drives BOTH the smudgy op-capabilities and the deno permission
                 // container below. For a cloud install it's the CONSENTED closure union the user
                 // granted at install, persisted in the lockfile (∅/`None` ⇒ deny-all; an unaccepted
@@ -2344,10 +2344,10 @@ impl<'a> ScriptEngine<'a> {
                         // whose creating script is gone: a pane outlives its
                         // package until a reload's sweep or an explicit close.
                         {
-                            let namespace = super::pane::PaneNamespace::Package {
-                                owner: Arc::from(runtime_key.owner.as_str()),
-                                name: Arc::from(runtime_key.name.as_str()),
-                            };
+                            let namespace = super::pane::PaneNamespace::package(
+                                runtime_key.owner.as_str(),
+                                runtime_key.name.as_str(),
+                            );
                             let doomed: Vec<(Arc<str>, super::pane::PaneKey)> = pane_registry
                                 .lock()
                                 .unwrap()
@@ -2610,18 +2610,14 @@ impl<'a> ScriptEngine<'a> {
         let mut keep_isolate_slugs: std::collections::HashSet<String> = isolates
             .keys()
             .filter_map(|id| match id {
-                IsolateId::Package {
-                    owner,
-                    name,
-                    version,
-                } => Some(isolate_slug(owner, name, version)),
+                IsolateId::Package(pkg) => Some(isolate_slug(&pkg.owner, &pkg.name, &pkg.version)),
                 IsolateId::Main => None,
             })
             .collect();
         let mut keep_storage_slugs: std::collections::HashSet<String> = isolates
             .keys()
             .filter_map(|id| match id {
-                IsolateId::Package { owner, name, .. } => Some(sandbox_storage_slug(owner, name)),
+                IsolateId::Package(pkg) => Some(sandbox_storage_slug(&pkg.owner, &pkg.name)),
                 IsolateId::Main => None,
             })
             .collect();
@@ -2832,17 +2828,20 @@ impl<'a> ScriptEngine<'a> {
 
     /// Resolve a directed procedure post through this engine's local receiver.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn deliver_procedure_post(
         &self,
-        canonical: Arc<str>,
-        producer: Arc<str>,
-        name: Arc<str>,
-        payload: Arc<str>,
-        caller_origin: Arc<str>,
-        caller_session: &crate::session::registry::SessionSnapshot,
-        depth: u32,
+        post: &super::ProcedurePostBody,
     ) -> Vec<super::RuntimeAction> {
+        let super::ProcedurePostBody {
+            canonical,
+            producer,
+            name,
+            payload,
+            caller_origin,
+            caller_session,
+            depth,
+        } = post;
+        let depth = *depth;
         self.catalogue.borrow_mut().sample_dynamic(
             &producer,
             super::catalogue::CatalogueKind::Procedure,
@@ -3064,7 +3063,7 @@ impl<'a> ScriptEngine<'a> {
         matches: CaptureView<'_>,
         firing: &FiringContext,
         depth: u32,
-        sender: Option<AliasSender>,
+        sender: Option<Arc<AliasSender>>,
         fallthrough: bool,
         exposed: Option<&ExposedState>,
     ) -> AutomationOutcome {
@@ -3086,9 +3085,9 @@ impl<'a> ScriptEngine<'a> {
         bundle.call_state.captured.set(true);
         // The firing verbs (`skipInner()`, `stopWatching()`) act on these for the duration
         // of the body; cleared afterwards so an async continuation cannot reach a firing.
-        *bundle.call_state.firing_opened.borrow_mut() = firing.opened.clone();
-        *bundle.call_state.firing_under.borrow_mut() = firing.under.clone();
-        let outer = firing.outer.as_deref();
+        *bundle.call_state.firing_opened.borrow_mut() = firing.opened().cloned();
+        *bundle.call_state.firing_under.borrow_mut() = firing.under().cloned();
+        let outer = firing.outer();
         let result = match call {
             AutomationCall::Function(id) => {
                 call_function_in(bundle, trigger_manager, id, matches, outer, depth, sender)
@@ -3122,7 +3121,7 @@ impl<'a> ScriptEngine<'a> {
         function_id: FunctionId,
         matches: CaptureView<'_>,
         depth: u32,
-        sender: Option<AliasSender>,
+        sender: Option<Arc<AliasSender>>,
     ) -> Result<ActionResult> {
         // Demux: `call_function_in` drains this call's microtasks and seeds the isolate when
         // the event loop has work of its own left, so no seed is needed here. A microtask
@@ -3405,7 +3404,7 @@ impl<'a> ScriptEngine<'a> {
         script_id: ScriptId,
         matches: CaptureView<'_>,
         depth: u32,
-        sender: Option<AliasSender>,
+        sender: Option<Arc<AliasSender>>,
         exposed: Option<&ExposedState>,
     ) -> Result<ActionResult> {
         // Demux: see `call_javascript_function`. `run_script_in` drains this eval's
@@ -3557,7 +3556,7 @@ fn call_function_in(
     matches: CaptureView<'_>,
     outer: Option<&OuterCaptures>,
     depth: u32,
-    sender: Option<AliasSender>,
+    sender: Option<Arc<AliasSender>>,
 ) -> Result<ActionResult> {
     // Per-line timing is TRACE only. Above TRACE the hot path pays one level check and does
     // not read the clock. The check compiles out when TRACE is statically off.
@@ -3633,7 +3632,7 @@ fn call_function_in(
     }
     match outcome {
         CallOutcome::Missing => bail!("Function {} not found", function_id),
-        outcome => finish_call(outcome, trigger_manager, depth, sender.as_ref()),
+        outcome => finish_call(outcome, trigger_manager, depth, sender.as_deref()),
     }
 }
 
@@ -3652,7 +3651,7 @@ fn run_script_in(
     matches: CaptureView<'_>,
     outer: Option<&OuterCaptures>,
     depth: u32,
-    sender: Option<AliasSender>,
+    sender: Option<Arc<AliasSender>>,
     exposed: Option<&ExposedState>,
 ) -> Result<ActionResult> {
     let started = log_enabled!(log::Level::Trace).then(Instant::now);
@@ -3727,7 +3726,7 @@ fn run_script_in(
     }
     match outcome {
         CallOutcome::Missing => bail!("Script {} not found", script_id),
-        outcome => finish_call(outcome, trigger_manager, depth, sender.as_ref()),
+        outcome => finish_call(outcome, trigger_manager, depth, sender.as_deref()),
     }
 }
 
@@ -4168,11 +4167,7 @@ mod failed_isolate_registration_cleanup_tests {
     };
 
     fn isolate(name: &str) -> IsolateId {
-        IsolateId::Package {
-            owner: Arc::from("wbk"),
-            name: Arc::from(name),
-            version: Arc::from("1.0.0"),
-        }
+        IsolateId::package("wbk", name, "1.0.0")
     }
 
     fn trigger_key(name: &str) -> SingletonKey {

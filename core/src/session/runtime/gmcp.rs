@@ -696,11 +696,7 @@ mod tests {
     }
 
     fn sandbox_isolate() -> IsolateId {
-        IsolateId::Package {
-            owner: "wbk".into(),
-            name: "tracker".into(),
-            version: "1.0.0".into(),
-        }
+        IsolateId::package("wbk", "tracker", "1.0.0")
     }
 
     fn frame_text(frame: &[u8]) -> String {

@@ -2814,7 +2814,7 @@ impl ManagedSession {
                     } => {
                         self.terminal_buffer
                             .borrow_mut()
-                            .perform_line_operation(line_number, operation);
+                            .perform_line_operation(line_number, *operation);
                         Task::none()
                     }
                     SessionEvent::SetCurrentLocation(area_id, room_number) => {

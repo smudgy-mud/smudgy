@@ -51,12 +51,9 @@ pub fn descriptor_key(namespace: &PaneNamespace, name: &str) -> DescriptorKey {
     let name = pane::fold(name);
     match namespace {
         PaneNamespace::User => DescriptorKey::User { name },
-        PaneNamespace::Package {
-            owner,
-            name: package,
-        } => DescriptorKey::Package {
-            owner: owner.to_string(),
-            package: package.to_string(),
+        PaneNamespace::Package(pkg) => DescriptorKey::Package {
+            owner: pkg.owner.to_string(),
+            package: pkg.name.to_string(),
             name,
         },
     }
@@ -541,13 +538,7 @@ mod tests {
 
         // Package namespaces compare owner/name verbatim (core's key does
         // not fold them) plus the folded pane name.
-        let a = descriptor_key(
-            &PaneNamespace::Package {
-                owner: "GTanger".into(),
-                name: "mapper".into(),
-            },
-            "MiniMap",
-        );
+        let a = descriptor_key(&PaneNamespace::package("GTanger", "mapper"), "MiniMap");
         let b = descriptor_key_from_dto(
             &dto::Namespace::Package {
                 owner: "GTanger".to_string(),

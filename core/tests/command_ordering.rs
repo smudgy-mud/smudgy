@@ -44,11 +44,7 @@ impl AliasSpec {
 /// (Plaintext aliases never touch a v8 registry, so a key with no backing isolate is safe
 /// to route.)
 fn synthetic_package_isolate() -> IsolateId {
-    IsolateId::Package {
-        owner: Arc::from("wbk"),
-        name: Arc::from("mapper"),
-        version: Arc::from("1.4.0"),
-    }
+    IsolateId::package("wbk", "mapper", "1.4.0")
 }
 
 /// Spins up a headless session, registers each alias under its specified isolate, sends

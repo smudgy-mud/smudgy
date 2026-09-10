@@ -227,7 +227,7 @@ impl Inner<'_> {
         &mut self,
         line: Arc<String>,
         depth: u32,
-        sender: Option<trigger::AliasSender>,
+        sender: Option<Arc<trigger::AliasSender>>,
     ) -> Result<ActionResult, anyhow::Error> {
         if !self.raw_line_prefix.is_empty()
             && let Some(rest) = line.strip_prefix(self.raw_line_prefix.as_str())
@@ -237,7 +237,7 @@ impl Inner<'_> {
         } else if let Some(rest) = line.strip_prefix('=') {
             match self
                 .trigger_manager
-                .process_outgoing_line(rest, depth, sender.as_ref())
+                .process_outgoing_line(rest, depth, sender.as_deref())
             {
                 Ok(()) => Ok(ActionResult::None),
                 Err(err) => Ok(ActionResult::Echo(format!(
@@ -325,24 +325,12 @@ impl Inner<'_> {
                 }
                 Ok(ActionResult::Run(actions))
             }
-            RuntimeAction::FanOutInteropEvent {
-                canonical,
-                stamped,
-                payload,
-                source,
-                depth,
-            } => {
+            RuntimeAction::FanOutInteropEvent(event) => {
                 let mut local = Vec::new();
                 for runtime in
                     crate::session::registry::get_runtimes_for_server(self.server_name.as_str())
                 {
-                    let action = RuntimeAction::InteropEvent {
-                        canonical: Arc::clone(&canonical),
-                        stamped: Arc::clone(&stamped),
-                        payload: Arc::clone(&payload),
-                        source: source.clone(),
-                        depth,
-                    };
+                    let action = RuntimeAction::InteropEvent(Arc::clone(&event));
                     if runtime.session_id == self.session_id {
                         local.push(action);
                     } else if runtime.tx.send(action).is_err() {
@@ -351,17 +339,11 @@ impl Inner<'_> {
                 }
                 Ok(ActionResult::Run(local))
             }
-            RuntimeAction::InteropEvent {
-                canonical,
-                stamped,
-                payload,
-                source,
-                depth,
-            } => {
+            RuntimeAction::InteropEvent(event) => {
                 let mut actions = Vec::new();
-                if canonical.as_ref() == "sessions:destroyed" {
+                if event.canonical.as_ref() == "sessions:destroyed" {
                     let (invalidation, bindings_changed) =
-                        self.script_engine.remote_session_destroyed(source.id);
+                        self.script_engine.remote_session_destroyed(event.source.id);
                     actions.extend(invalidation);
                     if bindings_changed
                         && let Err(error) = self.ui_tx.try_send(TaggedSessionEvent {
@@ -373,41 +355,19 @@ impl Inner<'_> {
                         warn!("Failed to send destroyed-session binding wake: {error:?}");
                     }
                 }
-                actions.extend(
-                    self.script_engine
-                        .deliver_interop_event(&canonical, &stamped, &payload, &source, depth),
-                );
+                actions.extend(self.script_engine.deliver_interop_event(
+                    &event.canonical,
+                    &event.stamped,
+                    &event.payload,
+                    &event.source,
+                    event.depth,
+                ));
                 Ok(ActionResult::Run(actions))
             }
-            RuntimeAction::ProcedurePost {
-                canonical,
-                producer,
-                name,
-                payload,
-                caller_origin,
-                caller_session,
-                depth,
-            } => Ok(ActionResult::Run(
-                self.script_engine.deliver_procedure_post(
-                    canonical,
-                    producer,
-                    name,
-                    payload,
-                    caller_origin,
-                    &caller_session,
-                    depth,
-                ),
+            RuntimeAction::ProcedurePost(post) => Ok(ActionResult::Run(
+                self.script_engine.deliver_procedure_post(&post),
             )),
-            RuntimeAction::ForwardProcedurePost {
-                target,
-                canonical,
-                producer,
-                name,
-                payload,
-                caller_origin,
-                caller_session,
-                depth,
-            } => {
+            RuntimeAction::ForwardProcedurePost { target, post } => {
                 let Some(runtime) = crate::session::registry::get_runtime(target) else {
                     return Ok(ActionResult::None);
                 };
@@ -415,19 +375,7 @@ impl Inner<'_> {
                     warn!("Dropping cross-server procedure post for session {target}");
                     return Ok(ActionResult::None);
                 }
-                if runtime
-                    .tx
-                    .send(RuntimeAction::ProcedurePost {
-                        canonical,
-                        producer,
-                        name,
-                        payload,
-                        caller_origin,
-                        caller_session,
-                        depth,
-                    })
-                    .is_err()
-                {
+                if runtime.tx.send(RuntimeAction::ProcedurePost(post)).is_err() {
                     warn!("Dropping procedure post for session {target}");
                 }
                 Ok(ActionResult::None)
@@ -769,7 +717,7 @@ impl Inner<'_> {
                 match self.trigger_manager.process_outgoing_line(
                     line.as_str(),
                     depth,
-                    sender.as_ref(),
+                    sender.as_deref(),
                 ) {
                     Ok(()) => {
                         // sys:send — the command (post-alias) about to reach the game.
@@ -836,8 +784,7 @@ impl Inner<'_> {
                 }
                 // An inner trigger of a firing the outer's body skipped runs nothing.
                 if firing
-                    .under
-                    .as_ref()
+                    .under()
                     .is_some_and(|under| under.skipped.load(Ordering::Relaxed))
                 {
                     return Ok(ActionResult::None);
@@ -850,10 +797,12 @@ impl Inner<'_> {
 
                 // A running alias is the sender of everything its body sends; that identity
                 // rides every nested outgoing pass so its own output cannot re-match it.
-                let sender = identity.is_alias.then(|| trigger::AliasSender {
-                    isolate: identity.isolate.clone(),
-                    origin: identity.origin.clone(),
-                    name: identity.name.clone(),
+                let sender = identity.is_alias.then(|| {
+                    Arc::new(trigger::AliasSender {
+                        isolate: identity.isolate.clone(),
+                        origin: identity.origin.clone(),
+                        name: identity.name.clone(),
+                    })
                 });
 
                 let mut continue_matching = fallthrough;
@@ -909,9 +858,9 @@ impl Inner<'_> {
                         self.trigger_manager.run_simple_automation(
                             &script,
                             matches.view(),
-                            firing.outer.as_deref(),
+                            firing.outer(),
                             depth,
-                            sender.as_ref(),
+                            sender.as_deref(),
                             identity.exposure(),
                         )?;
                         ActionResult::None
@@ -1328,18 +1277,19 @@ impl Inner<'_> {
 
                 Ok(ActionResult::None)
             }
-            RuntimeAction::AddJavascriptFunctionAlias {
-                isolate,
-                origin,
-                name,
-                patterns,
-                function_id,
-                priority,
-                fallthrough,
-                fire_limit,
-                script_source,
-                command,
-            } => {
+            RuntimeAction::AddJavascriptFunctionAlias(params) => {
+                let super::JavascriptFunctionAliasParams {
+                    isolate,
+                    origin,
+                    name,
+                    patterns,
+                    function_id,
+                    priority,
+                    fallthrough,
+                    fire_limit,
+                    script_source,
+                    command,
+                } = *params;
                 self.trigger_manager.push_javascript_function_alias(
                     isolate,
                     origin,
@@ -1415,22 +1365,23 @@ impl Inner<'_> {
                 )?;
                 Ok(ActionResult::None)
             }
-            RuntimeAction::AddScriptTrigger {
-                isolate,
-                origin,
-                name,
-                prepared,
-                script,
-                prompt,
-                enabled,
-                priority,
-                fallthrough,
-                fire_limit,
-                line_limit,
-                script_source,
-                outer,
-                reach,
-            } => {
+            RuntimeAction::AddScriptTrigger(params) => {
+                let super::ScriptTriggerParams {
+                    isolate,
+                    origin,
+                    name,
+                    prepared,
+                    script,
+                    prompt,
+                    enabled,
+                    priority,
+                    fallthrough,
+                    fire_limit,
+                    line_limit,
+                    script_source,
+                    outer,
+                    reach,
+                } = *params;
                 self.trigger_manager.push_script_trigger(
                     isolate,
                     origin,
@@ -1888,7 +1839,7 @@ impl Inner<'_> {
                 reconcile_registry,
             } => {
                 let Some((def, placement)) =
-                    prepare_pane_open(&self.pane_registry, def, placement, reconcile_registry)
+                    prepare_pane_open(&self.pane_registry, *def, placement, reconcile_registry)
                 else {
                     // A foreign split mutates this data-only registry on its
                     // caller thread before queueing the open. Reconcile at the
@@ -1943,7 +1894,7 @@ impl Inner<'_> {
                 self.ui_tx
                     .send(TaggedSessionEvent {
                         session_id: self.session_id,
-                        event: SessionEvent::PaneUpdated(def.clone()),
+                        event: SessionEvent::PaneUpdated((*def).clone()),
                     })
                     .await?;
                 let actions = if announce_visibility {
