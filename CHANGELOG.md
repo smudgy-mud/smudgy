@@ -57,6 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record, and the per-line matching storage is kept from line to line. A script with
   many triggers that fire on most lines spends noticeably less time between the match
   and the handler. What handlers see, and the order they run in, is unchanged.
+- **Lines that fire several triggers are processed faster.** Timers and promises are
+  serviced once for a whole line rather than after every handler, which removes most
+  of the work between one handler and the next. An `await` or a `.then()` inside a
+  handler now resumes once the line's handlers have run instead of between two of
+  them; whatever it sends still reaches the queue in the same place. A script that
+  emits thousands of lines at once likewise resumes its own timers when that burst
+  finishes rather than partway through it.
 - **Incoming text is ingested in bulk.** Ordinary text between color codes is copied
   whole instead of parsed one byte at a time, so bursts such as decompressed map dumps
   and raw-pattern trigger capture cost noticeably less. What triggers and the display
