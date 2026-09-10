@@ -8,9 +8,12 @@
 //! scripts `===`, `Map`/`Set` keys and `JSON.stringify` -- so ids could not
 //! ride the session store, store bindings or widget props -- and it was not
 //! even fast, being three V8 heap objects per identity where a string is one.
-//! `bench/examples/id_wire.rs` prices the alternatives: per identity returned
-//! in bulk, the pair costs ~75 ns and the string ~18 ns, which is level with a
-//! raw `u32` handle, the ceiling no encoding can beat.
+//! `bench/examples/id_wire.rs` prices the alternatives. The figure that
+//! reproduces best there is inbound, the commonest op shape: a pair costs
+//! roughly four times what a string does. Returned in bulk the string lands
+//! level with a dense `u32` handle table -- the fastest thing that could
+//! replace an id -- though that group's absolute numbers move enough run to
+//! run to be worth re-measuring rather than quoting.
 //!
 //! [`ScriptUuid`] is that string on the Rust side, serialized straight out of
 //! a stack buffer (no `String`). It carries ids **outbound** and inside serde

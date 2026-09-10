@@ -4,7 +4,9 @@
 //! Map identities (`AreaId`, `ExitId`, `ConnectionId`, `AtlasId`) used to cross
 //! the op boundary as a `(u64, u64)` tuple, which `serde_v8` renders as a
 //! 2-element JS array whose halves become `BigInt` above
-//! `Number.MAX_SAFE_INTEGER` -- i.e. always, for real v4 UUIDs. That shape was
+//! `Number.MAX_SAFE_INTEGER`. The RFC-4122 variant bits put the LOW half above
+//! that bound always; the high half lands under it about one id in 2048 and
+//! arrives as a `Number`, so the pair was polymorphic as well. That shape was
 //! awkward in script (no `===`, no `Map` key, `JSON.stringify` throws) and it
 //! was not even cheap: every id is three V8 heap objects, two BigInts and the
 //! array holding them. This harness priced the alternatives against that
@@ -20,8 +22,12 @@
 //!
 //! Cells:
 //! - `roundtrip/*`: one id in, one id out, per call, over a 256-id corpus.
-//!   `nop_smi` is the floor -- an op crossing that carries a `u32` and does no
-//!   identity work -- so a cell's distance from it is what the encoding costs.
+//!   READ THIS GROUP WITH CARE: `nop_smi` and `smi` are `#[op2(fast)]` while the
+//!   cells that return a `v8::Local` or go through serde cannot be, and op
+//!   dispatch mode is worth tens of ns on its own. Compare only cells of the
+//!   same mode; `nop_smi` bounds the crossing, not the encoding. `pair_fast` is
+//!   a LOWER BOUND rather than a round trip -- a fast op cannot return a pair,
+//!   so it hands back one half.
 //! - `inbound only/*`: the commonest mapper op shape, a setter that takes an
 //!   id and returns a scalar (`setRoomTitle`, `createRoom`, `deleteArea`).
 //!   Only half the encoding is paid, and the op stays fast-callable if its
@@ -40,13 +46,18 @@
 //! from the serializer), `pair_fast` (the halves as declared `#[bigint]`
 //! params), `u128` (one 128-bit BigInt), `str` (canonical hyphenated string),
 //! `str_stack` (the same, reading into a stack buffer instead of a `String`),
-//! `str_interned`/`str_best` (memoized per isolate as a `v8::Global`, so a
-//! repeat id is a pointer copy), `buf` (16-byte Uint8Array), and `smi` (a
-//! dense u32 handle into a per-isolate id table -- the "raw number" ceiling no
-//! other shape can beat).
+//! `str_interned`/`str_best` (memoized per isolate as a `v8::Global` -- a hit
+//! still costs a hash and a handle, and the harness shows the memo losing to a
+//! fresh 36-byte string on the single-id path), `buf` (16-byte Uint8Array), and
+//! `smi` (a dense u32 handle into a per-isolate id table -- the fastest thing
+//! that could replace an id, though its outbound side pays a hash to intern).
+//! `str_stack` is the shape that actually shipped: stack-buffer parse in, a
+//! `Normal` one-byte string out, no memo.
 //!
 //! Every encoding is gated on a round-trip assertion before any timing runs: a
 //! cell that dropped or truncated an identity would otherwise just look fast.
+//! The gate checks one id per encoding, so it catches a wrong or truncated
+//! encoding, not a cell that returns a constant.
 //!
 //! Timing is wall-clock around `execute_script` on a warmed loop; every cell
 //! runs `WARMUP_PASSES` unmeasured passes first so V8 has tiered the loop up
@@ -417,7 +428,7 @@ fn op_id_corpus_str<'a>(
     let ids = state.borrow::<Corpus>().ids.clone();
     let elements: Vec<v8::Local<v8::Value>> = ids
         .into_iter()
-        .map(|id| new_uuid_string(scope, id, v8::NewStringType::Internalized).into())
+        .map(|id| new_uuid_string(scope, id, v8::NewStringType::Normal).into())
         .collect();
     v8::Array::new_with_elements(scope, &elements)
 }
@@ -526,23 +537,50 @@ fn op_id_bulk_str_interned<'a>(
 }
 
 #[op2]
-#[serde]
-fn op_id_bulk_buf(state: &mut OpState, #[smi] n: u32) -> Vec<Vec<u8>> {
-    let corpus = state.borrow::<Corpus>();
-    (0..n as usize)
-        .map(|i| corpus.at(i).as_bytes().to_vec())
-        .collect()
+fn op_id_bulk_buf<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    state: &mut OpState,
+    #[smi] n: u32,
+) -> v8::Local<'a, v8::Array> {
+    let ids: Vec<Uuid> = {
+        let corpus = state.borrow::<Corpus>();
+        (0..n as usize).map(|i| corpus.at(i)).collect()
+    };
+    // Real `Uint8Array`s. Through `#[serde]` a `Vec<Vec<u8>>` becomes an Array of
+    // Arrays of Numbers -- sixteen elements per id, and not the encoding named.
+    let elements: Vec<v8::Local<v8::Value>> = ids
+        .into_iter()
+        .map(|id| {
+            let store = v8::ArrayBuffer::new_backing_store_from_vec(id.as_bytes().to_vec());
+            let buffer = v8::ArrayBuffer::with_backing_store(scope, &store.make_shared());
+            v8::Uint8Array::new(scope, buffer, 0, 16)
+                .expect("16-byte view fits")
+                .into()
+        })
+        .collect();
+    v8::Array::new_with_elements(scope, &elements)
 }
 
 #[op2]
-#[serde]
-fn op_id_bulk_smi(state: &mut OpState, #[smi] n: u32) -> Vec<u32> {
+fn op_id_bulk_smi<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    state: &mut OpState,
+    #[smi] n: u32,
+) -> v8::Local<'a, v8::Array> {
     let ids: Vec<Uuid> = {
         let corpus = state.borrow::<Corpus>();
         (0..n as usize).map(|i| corpus.at(i)).collect()
     };
     let table = state.borrow_mut::<HandleTable>();
-    ids.into_iter().map(|id| table.intern(id)).collect()
+    let handles: Vec<u32> = ids.into_iter().map(|id| table.intern(id)).collect();
+    // Hand-built like every other bulk cell: routing this one through `#[serde]`
+    // while its rivals use `new_with_elements` would price the serializer, not
+    // the encoding -- and it inverted this group's ordering when it did.
+    let elements: Vec<v8::Local<v8::Value>> = handles
+        .into_iter()
+        .map(|h| v8::Integer::new_from_unsigned(scope, h).into())
+        .collect();
+    v8::Array::new_with_elements(scope, &elements)
 }
 
 deno_core::extension!(
@@ -684,6 +722,8 @@ globalThis.sanity = () => {
     if (op_id_bulk_str(4)[3] !== cStr[3]) fail("bulk_str");
     if (op_id_bulk_str_interned(4)[3] !== cStr[3]) fail("bulk_str_interned");
     if (op_id_bulk_smi(4)[3] !== cSmi[3]) fail("bulk_smi");
+    const bb = op_id_bulk_buf(4)[3];
+    if (!(bb instanceof Uint8Array) || bb.length !== 16 || bb.some((v, i) => v !== cBuf[3][i])) fail("bulk_buf");
     return "ok";
 };
 

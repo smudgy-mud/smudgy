@@ -296,7 +296,7 @@ interface Exit {
 interface ExitArgs {
     from_direction: ExitDirection;
     to_direction?: ExitDirection;
-    to_area_id?: AreaId;
+    to_area_id?: AreaIdLike;
     to_room_number?: RoomNumber;
     is_hidden?: boolean;
     is_closed?: boolean;
@@ -310,7 +310,7 @@ interface ExitArgs {
 interface ExitUpdates {
     from_direction?: ExitDirection;
     to_direction?: ExitDirection;
-    to_area_id?: AreaId;
+    to_area_id?: AreaIdLike;
     to_room_number?: RoomNumber;
     is_hidden?: boolean;
     is_closed?: boolean;
@@ -515,7 +515,7 @@ interface CreateAreaOptions {
      * storage tier when `storage` is omitted; when both are given they must
      * match.
      */
-    atlas?: Atlas | AtlasId;
+    atlas?: Atlas | AtlasIdLike;
     /**
      * Create a session map: it lives only for this session, is never saved
      * or synced, and is discarded when the session closes. Mutually
@@ -542,7 +542,7 @@ interface Atlas {
 interface MapDestination {
     storage: MapStorage;
     /** Omit to leave the area loose (outside an atlas). */
-    atlas?: Atlas | AtlasId;
+    atlas?: Atlas | AtlasIdLike;
 }
 
 interface CreateAtlasOptions {

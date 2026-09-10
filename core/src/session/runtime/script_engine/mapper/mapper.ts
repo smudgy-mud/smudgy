@@ -110,6 +110,12 @@ type RoomNumber = number;
 type ExitId = string & { readonly __id: "ExitId" };
 type ConnectionId = string & { readonly __id: "ConnectionId" };
 type OperationId = string & { readonly __id: "OperationId" };
+type AreaIdLike = AreaId | (string & { readonly __id?: undefined });
+type AtlasIdLike = AtlasId | (string & { readonly __id?: undefined });
+type ExitIdLike = ExitId | (string & { readonly __id?: undefined });
+type ConnectionIdLike = ConnectionId | (string & { readonly __id?: undefined });
+type LabelIdLike = LabelId | (string & { readonly __id?: undefined });
+type ShapeIdLike = ShapeId | (string & { readonly __id?: undefined });
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -146,7 +152,7 @@ interface CreateAreaOptions {
     /** Omitted storage selects the default durable tier: cloud when signed
      * in, local otherwise (or the atlas's tier when `atlas` is given). */
     storage?: MapStorage;
-    atlas?: Atlas | AtlasId;
+    atlas?: Atlas | AtlasIdLike;
     /**
      * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
      * Use `storage: "session"` instead.
@@ -158,7 +164,7 @@ type MapStorage = "session" | "local" | "cloud";
 
 interface MapDestination {
     storage: MapStorage;
-    atlas?: Atlas | AtlasId;
+    atlas?: Atlas | AtlasIdLike;
 }
 
 interface CreateAtlasOptions {
@@ -181,7 +187,7 @@ function normalizeId<T extends string>(value: unknown, what: string): T {
  * interface, so callers may legitimately hold plain objects (a spread or a
  * JSON round-trip of a handle) rather than this module's class; anything
  * carrying a usable id is accepted. */
-function atlasIdOf(atlas: Atlas | AtlasId | undefined): AtlasId | undefined {
+function atlasIdOf(atlas: Atlas | AtlasIdLike | undefined): AtlasId | undefined {
     if (atlas === undefined) return undefined;
     if (atlas instanceof Atlas) return atlas.id;
     const what = "an Atlas handle or an AtlasId";
@@ -661,7 +667,7 @@ interface Exit {
 interface ExitArgs {
     from_direction: ExitDirection;
     to_direction?: ExitDirection;
-    to_area_id?: AreaId;
+    to_area_id?: AreaIdLike;
     to_room_number?: RoomNumber;
     is_hidden?: boolean;
     is_closed?: boolean;
@@ -674,7 +680,7 @@ interface ExitArgs {
 interface ExitUpdates {
     from_direction?: ExitDirection;
     to_direction?: ExitDirection;
-    to_area_id?: AreaId;
+    to_area_id?: AreaIdLike;
     to_room_number?: RoomNumber;
     is_hidden?: boolean;
     is_closed?: boolean;
