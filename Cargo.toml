@@ -202,3 +202,9 @@ debug = true
 [profile.release-full]
 inherits = "release"
 lto = true
+# One codegen unit per crate, so LLVM optimizes each crate whole rather than in
+# 16 independently-optimized pieces. Fat LTO above already gives the bigger
+# prize, cross-crate inlining; this removes the partitioning that remains when
+# the merged module is emitted. It costs build time: the final codegen stops
+# being parallel within a crate, and peak memory rises.
+codegen-units = 1
