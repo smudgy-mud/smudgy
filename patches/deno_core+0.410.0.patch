@@ -278,7 +278,7 @@ index c1d2de1..226dbaf 100644
  pub use crate::external::ExternalPointer;
  pub use crate::external::Externalizable;
 diff --git a/runtime/jsruntime.rs b/runtime/jsruntime.rs
-index 0d87c12..273cdbd 100644
+index 0d87c12..71357f2 100644
 --- a/runtime/jsruntime.rs
 +++ b/runtime/jsruntime.rs
 @@ -903,7 +903,7 @@ impl JsRuntime {
@@ -300,3 +300,37 @@ index 0d87c12..273cdbd 100644
        op_metrics_factory_fn,
        op_driver.clone(),
        op_state.clone(),
+@@ -2367,6 +2368,33 @@ impl JsRuntime {
+     .await
+   }
+ 
++  /// Read the event loop's pending state from a scope, without running a turn of it.
++  ///
++  /// Returns `(has_pending_work, has_tick_scheduled)`.
++  ///
++  /// `has_pending_work` is the same condition [`Self::poll_event_loop`] uses to choose
++  /// between `Ready` and `Pending`: pending ops, timers, module evaluation, dynamic
++  /// imports, promise rejections, outstanding immediates, live uv handles, or V8
++  /// background tasks. When it is false, the event loop has nothing to service and a
++  /// poll would find nothing to do.
++  ///
++  /// `has_tick_scheduled` mirrors the guard [`Self::poll_event_loop`] applies before its
++  /// own microtask checkpoints, so an embedder that performs a checkpoint of its own can
++  /// keep `nextTick` callbacks ahead of microtasks the way the event loop does.
++  ///
++  /// Microtasks are deliberately absent from both flags. V8 exposes no way to ask whether
++  /// its microtask queue is empty, so an embedder that needs queued microtasks serviced
++  /// must run a checkpoint rather than test for them. A checkpoint can itself leave work
++  /// behind, so read this after the checkpoint, not before.
++  ///
++  /// This is a read of existing state: it enters no isolate and creates no scope, which is
++  /// what makes it usable on a path that runs per call into JavaScript.
++  pub fn pending_state_from_scope(scope: &mut v8::PinScope) -> (bool, bool) {
++    let pending = EventLoopPendingState::new_from_scope(scope);
++    let has_tick_scheduled = JsRealm::state_from_scope(scope).has_tick_scheduled();
++    (pending.is_pending(), has_tick_scheduled)
++  }
++
+   /// Runs a single tick of event loop
+   ///
+   /// If `PollEventLoopOptions.wait_for_inspector` is set to true, the event

@@ -3071,8 +3071,6 @@ impl<'a> ScriptEngine<'a> {
                 };
             }
         };
-        // Demux seed, see `call_javascript_function` and `mark_isolate_ready`.
-        bundle.seeded.set(true);
         bundle.call_state.fallthrough.set(Some(fallthrough));
         bundle.call_state.captured.set(true);
         // The firing verbs (`skipInner()`, `stopWatching()`) act on these for the duration
@@ -3115,13 +3113,11 @@ impl<'a> ScriptEngine<'a> {
         depth: u32,
         sender: Option<AliasSender>,
     ) -> Result<ActionResult> {
-        // Demux: this isolate is about to run JS synchronously. Async work it schedules without a
-        // `poll_event_loop` pass must still be serviced — a microtask (`Promise.then`) in
-        // particular does NOT wake the runtime on its own (unlike a `setTimeout`, whose timer op
-        // wakes deno's registered waker), so it would be stranded. Seed this isolate so the next
-        // pump polls it and runs/arms that work (proven by the `demux_async_dispatch`
-        // integration test, which strands the continuation if this seed is removed).
-        self.mark_isolate_ready(isolate);
+        // Demux: `call_function_in` drains this call's microtasks and seeds the isolate when
+        // the event loop has work of its own left, so no seed is needed here. A microtask
+        // (`Promise.then`) does not wake the runtime by itself, unlike a `setTimeout`, whose
+        // timer op wakes deno's registered waker; draining it in the call's own scope is what
+        // replaces the unconditional seed (`core/tests/demux_async_dispatch.rs`).
         let bundle = self.isolate_mut(isolate)?;
         call_function_in(
             bundle,
@@ -3401,9 +3397,8 @@ impl<'a> ScriptEngine<'a> {
         sender: Option<AliasSender>,
         exposed: Option<&ExposedState>,
     ) -> Result<ActionResult> {
-        // Demux: see `call_javascript_function` — string-script dispatch can also schedule async
-        // work synchronously, so seed this isolate for the next pump.
-        self.mark_isolate_ready(isolate);
+        // Demux: see `call_javascript_function`. `run_script_in` drains this eval's
+        // microtasks and seeds the isolate only if the event loop has work of its own.
         let bundle = self.isolate_mut(isolate)?;
         run_script_in(
             bundle,
@@ -3561,6 +3556,7 @@ fn call_function_in(
         runtime,
         script_functions,
         call_state,
+        seeded,
         ..
     } = bundle;
     let deno = runtime.deno_runtime();
@@ -3598,11 +3594,20 @@ fn call_function_in(
                     }
                     None => f.call(try_catch, f_this, &[matches_object.into()]),
                 };
+                drain_handler_microtasks(try_catch);
                 call_outcome(try_catch, result)
             }
             None => CallOutcome::Missing,
         }
     };
+    // Demux seed. The handler's microtasks have already run, so the isolate needs a pump
+    // only for work the event loop itself must service: a timer, an op, a module, a
+    // scheduled `nextTick`. Ask, rather than seed unconditionally, because the common
+    // handler leaves none of that behind and the pump it would earn is a whole turn of
+    // deno's loop (`EVENT-LOOP-READINESS-DEMUX.md` §5(e)).
+    if deno_core::JsRuntime::pending_state_from_scope(scope).0 {
+        seeded.set(true);
+    }
     // The handler has returned. Restore the enclosing depth, which is 0 at the outermost
     // dispatch.
     call_state.depth.set(prior_depth);
@@ -3646,6 +3651,7 @@ fn run_script_in(
         runtime,
         compiled_scripts,
         call_state,
+        seeded,
         ..
     } = bundle;
     let deno = runtime.deno_runtime();
@@ -3686,11 +3692,17 @@ fn run_script_in(
                     global.set(try_catch, state_name.into(), state.into());
                 }
                 let result = script.run(try_catch);
+                drain_handler_microtasks(try_catch);
                 call_outcome(try_catch, result)
             }
             None => CallOutcome::Missing,
         }
     };
+    // Demux seed, on the same terms as [`call_function_in`]: the script's microtasks have
+    // run, so a pump is earned only by work the event loop itself must service.
+    if deno_core::JsRuntime::pending_state_from_scope(scope).0 {
+        seeded.set(true);
+    }
     // The eval has returned. Restore the enclosing depth that the call saved above.
     call_state.depth.set(prior_depth);
     let sender = call_state.alias.replace(prior_sender);
@@ -3710,6 +3722,35 @@ fn run_script_in(
 
 /// Classify a completed call while its `TryCatch` scope is open: an exception as text, a
 /// string completion value, or nothing to send.
+/// Run the microtasks a just-returned handler queued, in the scope of the call itself.
+///
+/// A promise continuation does not wake the runtime the way a timer or an op does, so the
+/// alternative to draining it here is a full turn of the event loop after every call into
+/// JavaScript. Draining it where the isolate is already entered costs a small fraction of
+/// that turn, and runs the continuation at the same point in the sequence a turn would
+/// have: after this handler, before whatever runs next.
+///
+/// Two cases are left to the event loop instead. A handler that threw leaves its exception
+/// pending on this scope, where it belongs to the caller, and microtasks must not run under
+/// it. Scheduled `nextTick` callbacks must run *before* microtasks, so when JS has any, the
+/// whole drain belongs to the loop, which does both in order; the pending read after this
+/// call reports those ticks as work, so the isolate is seeded and the pump follows.
+///
+/// A microtask that throws leaves its exception on `try_catch`, where [`call_outcome`] reads
+/// it like a handler's own. An exception takes precedence over a string the handler
+/// returned, which is then not sent.
+fn drain_handler_microtasks(
+    try_catch: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) {
+    if try_catch.has_caught() {
+        return;
+    }
+    let (_, has_tick_scheduled) = deno_core::JsRuntime::pending_state_from_scope(try_catch);
+    if !has_tick_scheduled {
+        try_catch.perform_microtask_checkpoint();
+    }
+}
+
 fn call_outcome(
     try_catch: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     result: Option<v8::Local<v8::Value>>,
