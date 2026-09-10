@@ -497,13 +497,15 @@ impl LifecycleBroadcast {
     fn publish_one(&self, runtime: &Runtime) {
         let _ = runtime
             .tx
-            .send(super::runtime::RuntimeAction::InteropEvent {
-                canonical: Arc::clone(&self.canonical),
-                stamped: Arc::clone(&self.canonical),
-                payload: Arc::clone(&self.payload),
-                source: self.source.clone(),
-                depth: 0,
-            });
+            .send(super::runtime::RuntimeAction::InteropEvent(Arc::new(
+                super::runtime::InteropEventBody {
+                    canonical: Arc::clone(&self.canonical),
+                    stamped: Arc::clone(&self.canonical),
+                    payload: Arc::clone(&self.payload),
+                    source: self.source.clone(),
+                    depth: 0,
+                },
+            )));
     }
 
     fn publish_all(&self) -> bool {

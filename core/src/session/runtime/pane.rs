@@ -75,13 +75,33 @@ impl PaneNameId {
 }
 
 /// Which code a pane name belongs to. `Main`-isolate scripts and user inline
-/// scripts share `User`; each package isolate gets `Package { owner, name }`
+/// scripts share `User`; each package isolate gets `Package(owner, name)`
 /// — deliberately **excluding version**, so the namespace is stable across
 /// package upgrades/reloads and get-or-create cannot mint duplicates.
+/// The coordinates ride behind an `Arc` so a namespace stays one word wide in the
+/// pane actions that carry it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PaneNamespace {
     User,
-    Package { owner: Arc<str>, name: Arc<str> },
+    Package(Arc<PackagePaneNamespace>),
+}
+
+/// The versionless `owner`/`name` of a [`PaneNamespace::Package`], shared behind its `Arc`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PackagePaneNamespace {
+    pub owner: Arc<str>,
+    pub name: Arc<str>,
+}
+
+impl PaneNamespace {
+    /// The pane namespace of the package installed at `owner/name`.
+    #[must_use]
+    pub fn package(owner: impl Into<Arc<str>>, name: impl Into<Arc<str>>) -> Self {
+        Self::Package(Arc::new(PackagePaneNamespace {
+            owner: owner.into(),
+            name: name.into(),
+        }))
+    }
 }
 
 /// Whether a pane has a terminal scrollback. Every pane hosts script widget
@@ -903,10 +923,7 @@ mod tests {
     }
 
     fn pkg(owner: &str, name: &str) -> PaneNamespace {
-        PaneNamespace::Package {
-            owner: Arc::from(owner),
-            name: Arc::from(name),
-        }
+        PaneNamespace::package(owner, name)
     }
 
     #[test]

@@ -32,6 +32,76 @@ use super::trigger::{
 };
 use crate::models::triggers::InnerReach;
 
+/// The body of an interop script event: its canonical and stamped names, the JSON payload,
+/// the emitting session, and the fan-out depth. Carried behind an `Arc` so the fan-out hands
+/// each same-server runtime one refcount bump instead of copying five fields per target.
+#[derive(Clone, Debug)]
+pub struct InteropEventBody {
+    pub canonical: Arc<str>,
+    pub stamped: Arc<str>,
+    pub payload: Arc<str>,
+    pub source: crate::session::registry::SessionSnapshot,
+    pub depth: u32,
+}
+
+/// The body of a directed procedure post. Carried behind an `Arc` so forwarding it to the
+/// target runtime moves one pointer.
+#[derive(Clone, Debug)]
+pub struct ProcedurePostBody {
+    pub canonical: Arc<str>,
+    pub producer: Arc<str>,
+    pub name: Arc<str>,
+    pub payload: Arc<str>,
+    pub caller_origin: Arc<str>,
+    pub caller_session: crate::session::registry::SessionSnapshot,
+    pub depth: u32,
+}
+
+/// The registration of a `command`-tag or plain function-handler alias. Boxed in its action
+/// for the same reason the definitions are: registration is cold, and an inline payload this
+/// wide would set [`RuntimeAction`]'s size for every per-line action too.
+#[derive(Clone, Debug)]
+pub struct JavascriptFunctionAliasParams {
+    pub isolate: IsolateId,
+    pub origin: Origin,
+    pub name: Arc<String>,
+    pub patterns: Arc<Vec<String>>,
+    pub function_id: FunctionId,
+    pub priority: i32,
+    pub fallthrough: bool,
+    pub fire_limit: Option<u32>,
+    /// The handler's `toString()`, passed in good faith from JS-land for the read-only
+    /// detail pane. `None` when the caller supplied no source. Display-only.
+    pub script_source: Option<Arc<str>>,
+    /// A `command` tag alias's argument parser. When set, `patterns` holds the derived
+    /// prefilter and the spec decides firing and captures (`Trigger::run_command`).
+    pub command: Option<crate::models::matchers::CommandSpec>,
+}
+
+/// The registration of a script-created trigger whose regexes and style predicates were
+/// validated before the op performed its singleton/function side effects. Boxed in its
+/// action like [`JavascriptFunctionAliasParams`].
+#[derive(Clone, Debug)]
+pub struct ScriptTriggerParams {
+    pub isolate: IsolateId,
+    pub origin: Origin,
+    pub name: Arc<String>,
+    pub prepared: Arc<PreparedScriptTriggerPatterns>,
+    pub script: ScriptAction,
+    pub prompt: bool,
+    pub enabled: bool,
+    pub priority: i32,
+    pub fallthrough: bool,
+    pub fire_limit: Option<u32>,
+    pub line_limit: Option<u32>,
+    /// The handler's `toString()`, passed in good faith from JS-land for the read-only
+    /// detail pane. `None` when the caller supplied no source. Display-only.
+    pub script_source: Option<Arc<str>>,
+    /// The trigger this one is inside, and how it watches after that one fires.
+    pub outer: Option<Arc<String>>,
+    pub reach: InnerReach,
+}
+
 #[derive(Clone, Debug)]
 pub enum RuntimeAction {
     /// Reconcile persisted aliases, triggers, and hotkeys against this runtime's last snapshot.
@@ -47,44 +117,18 @@ pub enum RuntimeAction {
     /// A script event waiting on its source runtime's queue. The source
     /// dispatches this only after the current turn's store journal has been
     /// flushed, then fans out [`Self::InteropEvent`] to same-server runtimes.
-    FanOutInteropEvent {
-        canonical: Arc<str>,
-        stamped: Arc<str>,
-        payload: Arc<str>,
-        source: crate::session::registry::SessionSnapshot,
-        depth: u32,
-    },
+    FanOutInteropEvent(Arc<InteropEventBody>),
     /// A same-server event. The receiver resolves its own engine-local
     /// subscriptions, so no foreign V8 handle or `FunctionId` crosses threads.
-    InteropEvent {
-        canonical: Arc<str>,
-        stamped: Arc<str>,
-        payload: Arc<str>,
-        source: crate::session::registry::SessionSnapshot,
-        depth: u32,
-    },
+    InteropEvent(Arc<InteropEventBody>),
     /// A directed procedure post. The target resolves its own receiver.
-    ProcedurePost {
-        canonical: Arc<str>,
-        producer: Arc<str>,
-        name: Arc<str>,
-        payload: Arc<str>,
-        caller_origin: Arc<str>,
-        caller_session: crate::session::registry::SessionSnapshot,
-        depth: u32,
-    },
+    ProcedurePost(Arc<ProcedurePostBody>),
     /// A directed procedure post waiting on the caller runtime's queue. Like
     /// script-event fan-out, forwarding happens after the caller's store
     /// journal is flushed so the target observes preceding state writes.
     ForwardProcedurePost {
         target: SessionId,
-        canonical: Arc<str>,
-        producer: Arc<str>,
-        name: Arc<str>,
-        payload: Arc<str>,
-        caller_origin: Arc<str>,
-        caller_session: crate::session::registry::SessionSnapshot,
-        depth: u32,
+        post: Arc<ProcedurePostBody>,
     },
     Connect {
         host: Arc<String>,
@@ -135,7 +179,7 @@ pub enum RuntimeAction {
     PartialLineTriggersProcessed(Arc<StyledLine>),
     PerformLineOperation {
         line_number: usize,
-        operation: LineOperation,
+        operation: Box<LineOperation>,
     },
     Send(Arc<String>),
     /// A script-originated send (`session.send()` to the own session): the same pipeline
@@ -146,7 +190,7 @@ pub enum RuntimeAction {
     SendScripted {
         text: Arc<String>,
         depth: u32,
-        sender: Option<AliasSender>,
+        sender: Option<Arc<AliasSender>>,
     },
     /// The user's typed submission of the main input — the Enter key, or a scripted
     /// `input.submit()` (which replays the same UI submit path). Enters the identical
@@ -188,7 +232,7 @@ pub enum RuntimeAction {
     ProcessOutgoingLine {
         line: Arc<String>,
         depth: u32,
-        sender: Option<AliasSender>,
+        sender: Option<Arc<AliasSender>>,
     },
     /// One matched alias/trigger, deferred so an earlier invocation in the same dispatch frame
     /// can prevent it from running. `stopped` is shared only by automations of the same kind and
@@ -308,10 +352,9 @@ pub enum RuntimeAction {
         isolate: IsolateId,
         origin: Origin,
         name: Arc<String>,
-        /// Boxed: the definition is the largest payload any action carries, and every
-        /// queued action moves by value, so an inline definition sets the enum's size for
-        /// the hot-path actions too. The box keeps `RuntimeAction` at the size the dispatch
-        /// work measured (see the size test) for one allocation per registration.
+        /// Boxed: every queued action moves by value, so an inline definition would set the
+        /// enum's size for the hot-path actions too. The box buys that back for one
+        /// allocation per registration, which is cold (see the size test).
         hotkey: Box<HotkeyDefinition>,
         function_id: Option<FunctionId>,
     },
@@ -322,40 +365,23 @@ pub enum RuntimeAction {
         isolate: IsolateId,
         origin: Origin,
         name: Arc<String>,
-        /// Boxed: the definition is the largest payload any action carries, and every
-        /// queued action moves by value, so an inline definition sets the enum's size for
-        /// the hot-path actions too. The box keeps `RuntimeAction` at the size the dispatch
-        /// work measured (see the size test) for one allocation per registration.
+        /// Boxed: every queued action moves by value, so an inline definition would set the
+        /// enum's size for the hot-path actions too. The box buys that back for one
+        /// allocation per registration, which is cold (see the size test).
         alias: Box<AliasDefinition>,
         /// Self-limit: auto-remove after this many fires. `None` ⇒ no limit;
         /// `Some(1)` ⇒ one-shot. Aliases ignore `line_limit` (they match input, not
         /// server lines), so only `fire_limit` is carried here.
         fire_limit: Option<u32>,
     },
-    AddJavascriptFunctionAlias {
-        isolate: IsolateId,
-        origin: Origin,
-        name: Arc<String>,
-        patterns: Arc<Vec<String>>,
-        function_id: FunctionId,
-        priority: i32,
-        fallthrough: bool,
-        fire_limit: Option<u32>,
-        /// The handler's `toString()`, passed in good faith from JS-land for the read-only
-        /// detail pane. `None` when the caller supplied no source. Display-only.
-        script_source: Option<Arc<str>>,
-        /// A `command` tag alias's argument parser. When set, `patterns` holds the derived
-        /// prefilter and the spec decides firing and captures (`Trigger::run_command`).
-        command: Option<crate::models::matchers::CommandSpec>,
-    },
+    AddJavascriptFunctionAlias(Box<JavascriptFunctionAliasParams>),
     AddTrigger {
         isolate: IsolateId,
         origin: Origin,
         name: Arc<String>,
-        /// Boxed: the definition is the largest payload any action carries, and every
-        /// queued action moves by value, so an inline definition sets the enum's size for
-        /// the hot-path actions too. The box keeps `RuntimeAction` at the size the dispatch
-        /// work measured (see the size test) for one allocation per registration.
+        /// Boxed: every queued action moves by value, so an inline definition would set the
+        /// enum's size for the hot-path actions too. The box buys that back for one
+        /// allocation per registration, which is cold (see the size test).
         trigger: Box<TriggerDefinition>,
         /// Self-limits: auto-remove after `fire_limit` fires OR `line_limit`
         /// tested lines, whichever comes first. `None` ⇒ that limit is unbounded.
@@ -365,25 +391,7 @@ pub enum RuntimeAction {
     /// A script-created trigger whose regexes and style predicates were
     /// validated before the registration op performed singleton/function
     /// side effects. Shared by plaintext and function bodies.
-    AddScriptTrigger {
-        isolate: IsolateId,
-        origin: Origin,
-        name: Arc<String>,
-        prepared: Arc<PreparedScriptTriggerPatterns>,
-        script: ScriptAction,
-        prompt: bool,
-        enabled: bool,
-        priority: i32,
-        fallthrough: bool,
-        fire_limit: Option<u32>,
-        line_limit: Option<u32>,
-        /// The handler's `toString()`, passed in good faith from JS-land for the read-only
-        /// detail pane. `None` when the caller supplied no source. Display-only.
-        script_source: Option<Arc<str>>,
-        /// The trigger this one is inside, and how it watches after that one fires.
-        outer: Option<Arc<String>>,
-        reach: InnerReach,
-    },
+    AddScriptTrigger(Box<ScriptTriggerParams>),
     EnableAlias(IsolateId, Origin, Arc<String>, bool),
     EnableTrigger(IsolateId, Origin, Arc<String>, bool),
     /// Remove an alias by its `(isolate, origin, name)` key — an explicit `delete()`
@@ -424,7 +432,9 @@ pub enum RuntimeAction {
     /// created synchronously in the registry. Queued by the op so the event
     /// leaves on the ordered UI channel ahead of any `AppendTo` for the key.
     PaneOpened {
-        def: PaneDef,
+        /// Boxed like the other oversized payloads: a pane def is far larger than the
+        /// per-line actions that share this enum, and open/update are cold.
+        def: Box<PaneDef>,
         placement: PanePlacement,
         /// Foreign splits mutate the owner's shared registry from another
         /// runtime. Reconcile those opens when the owner drains its queue;
@@ -447,7 +457,7 @@ pub enum RuntimeAction {
     /// op's edge detection: the change included the hidden toggle, so the
     /// dispatch arm also fires the `pane:visibility` host event.
     PaneUpdated {
-        def: PaneDef,
+        def: Box<PaneDef>,
         announce_visibility: bool,
     },
     /// Close every pane no script re-claimed during a reload. The reload loop
@@ -838,7 +848,7 @@ impl RuntimeAction {
                 | Self::CallJavascriptFunction { .. }
                 | Self::RunAutomation { .. }
                 | Self::ExecuteJavascriptFunction { .. }
-                | Self::AddScriptTrigger { .. }
+                | Self::AddScriptTrigger(_)
         )
     }
 
@@ -855,14 +865,14 @@ impl RuntimeAction {
             | Self::CallJavascriptFunction { isolate, .. }
             | Self::AddHotkey { isolate, .. }
             | Self::AddAlias { isolate, .. }
-            | Self::AddJavascriptFunctionAlias { isolate, .. }
             | Self::AddTrigger { isolate, .. }
-            | Self::AddScriptTrigger { isolate, .. }
             | Self::RemoveHotkey(isolate, ..)
             | Self::EnableAlias(isolate, ..)
             | Self::EnableTrigger(isolate, ..)
             | Self::RemoveAlias(isolate, ..)
             | Self::RemoveTrigger(isolate, ..) => Some(isolate),
+            Self::AddJavascriptFunctionAlias(params) => Some(&params.isolate),
+            Self::AddScriptTrigger(params) => Some(&params.isolate),
             Self::RunAutomation { identity, .. } => Some(&identity.isolate),
             _ => None,
         }
@@ -1031,7 +1041,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let action = RuntimeAction::AddScriptTrigger {
+        let action = RuntimeAction::AddScriptTrigger(Box::new(ScriptTriggerParams {
             isolate: IsolateId::Main,
             origin: Origin::User,
             name: Arc::new("ready".to_string()),
@@ -1046,18 +1056,20 @@ mod tests {
             script_source: None,
             outer: None,
             reach: InnerReach::DEFAULT,
-        };
+        }));
 
         assert!(action.references_engine_state());
     }
 
-    /// Every queued action moves by value through the runtime channel, so the enum's
-    /// size is a per-action cost on the hot path. The dispatch optimization measured 296
-    /// bytes; the automation definitions are boxed in their add actions to keep it there.
+    /// Every queued action moves by value through the runtime channel, so the enum's size is
+    /// a per-action cost paid by the per-line actions too, not just the wide ones. The
+    /// oversized payloads are boxed (or shared behind an `Arc`) in their variants to hold it
+    /// at the 72 bytes measured here; [`RuntimeAction::RunAutomation`] is the widest variant
+    /// that stays inline, and it sets this ceiling.
     #[test]
     fn runtime_action_stays_within_its_measured_size() {
         assert!(
-            std::mem::size_of::<RuntimeAction>() <= 296,
+            std::mem::size_of::<RuntimeAction>() <= 72,
             "RuntimeAction grew to {} bytes",
             std::mem::size_of::<RuntimeAction>()
         );

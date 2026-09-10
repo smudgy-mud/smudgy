@@ -44,7 +44,7 @@ pub enum SessionEvent {
     UnregisterHotkey(HotkeyId),
     PerformLineOperation {
         line_number: usize,
-        operation: LineOperation,
+        operation: Box<LineOperation>,
     },
     SetCurrentLocation(AreaId, Option<i32>),
     /// A mapper navigation op resolved a destination in this area (speedwalk /

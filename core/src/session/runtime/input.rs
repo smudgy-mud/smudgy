@@ -994,9 +994,7 @@ mod tests {
         (
             SessionId::from(1),
             IsolateId::Main,
-            Origin::Module {
-                subpath: "combat/healer.ts".to_string(),
-            },
+            Origin::module("combat/healer.ts"),
         )
     }
 
@@ -1404,16 +1402,8 @@ mod tests {
         let main_creator = user_creator();
         let dead_creator = (
             SessionId::from(1),
-            IsolateId::Package {
-                owner: "wbk".into(),
-                name: "broken".into(),
-                version: "1.0.0".into(),
-            },
-            Origin::Package {
-                owner: "wbk".to_string(),
-                name: "broken".to_string(),
-                version: "1.0.0".to_string(),
-            },
+            IsolateId::package("wbk", "broken", "1.0.0"),
+            Origin::package("wbk", "broken", "1.0.0"),
         );
 
         add_words(
@@ -1492,11 +1482,7 @@ mod tests {
         assert!(callbacks.get(key).is_none());
 
         // purge_isolate drops only the failed isolate's registrations.
-        let dead = IsolateId::Package {
-            owner: "wbk".into(),
-            name: "broken".into(),
-            version: "1.0.0".into(),
-        };
+        let dead = IsolateId::package("wbk", "broken", "1.0.0");
         callbacks.register(key, main_cb.clone());
         let other = PaneKey::from_raw_for_tests(9);
         callbacks.register(

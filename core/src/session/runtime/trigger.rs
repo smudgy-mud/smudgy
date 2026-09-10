@@ -68,15 +68,60 @@ pub struct FiringFlags {
     pub stopped: AtomicBool,
 }
 
-/// The firing and capture context one queued automation runs under.
+/// The firing and capture context one queued automation runs under. A trigger with no inner
+/// triggers and none above it — the ordinary case — carries the empty context, which is a
+/// null pointer; anything linked to a firing shares one `Arc`. Either way the context is one
+/// word in every queued [`RuntimeAction::RunAutomation`].
 #[derive(Clone, Debug, Default)]
-pub struct FiringContext {
+pub struct FiringContext(Option<Arc<FiringLinks>>);
+
+/// The links a non-empty [`FiringContext`] carries.
+#[derive(Debug)]
+pub struct FiringLinks {
     /// The firing this automation runs under, when it is an inner trigger.
     pub under: Option<Arc<FiringFlags>>,
     /// The firing this automation opened, when it has inner triggers.
     pub opened: Option<Arc<FiringFlags>>,
     /// The matched values of the triggers this one is inside, for `outer`.
     pub outer: Option<Arc<OuterCaptures>>,
+}
+
+impl FiringContext {
+    /// The context for an automation linked to at least one firing. All-`None` links collapse
+    /// to the empty context, so the common case allocates nothing.
+    #[must_use]
+    pub fn new(
+        under: Option<Arc<FiringFlags>>,
+        opened: Option<Arc<FiringFlags>>,
+        outer: Option<Arc<OuterCaptures>>,
+    ) -> Self {
+        if under.is_none() && opened.is_none() && outer.is_none() {
+            return Self(None);
+        }
+        Self(Some(Arc::new(FiringLinks {
+            under,
+            opened,
+            outer,
+        })))
+    }
+
+    /// The firing this automation runs under, when it is an inner trigger.
+    #[must_use]
+    pub fn under(&self) -> Option<&Arc<FiringFlags>> {
+        self.0.as_ref().and_then(|links| links.under.as_ref())
+    }
+
+    /// The firing this automation opened, when it has inner triggers.
+    #[must_use]
+    pub fn opened(&self) -> Option<&Arc<FiringFlags>> {
+        self.0.as_ref().and_then(|links| links.opened.as_ref())
+    }
+
+    /// The matched values of the triggers this one is inside, for `outer`.
+    #[must_use]
+    pub fn outer(&self) -> Option<&OuterCaptures> {
+        self.0.as_ref().and_then(|links| links.outer.as_deref())
+    }
 }
 
 /// One firing of an outer trigger: the input it fired on, its captures for the `outer`
@@ -2392,11 +2437,7 @@ impl Manager {
                     &self.spawned_actions,
                     depth + 1,
                     RunContext {
-                        firing: FiringContext {
-                            under: None,
-                            opened: opened.clone(),
-                            outer: None,
-                        },
+                        firing: FiringContext::new(None, opened.clone(), None),
                         base: 0,
                         styled_line,
                     },
@@ -2692,11 +2733,11 @@ impl Manager {
                         &self.spawned_actions,
                         depth + 1,
                         RunContext {
-                            firing: FiringContext {
-                                under: Some(flags),
-                                opened: opened.clone(),
-                                outer: Some(captures.clone()),
-                            },
+                            firing: FiringContext::new(
+                                Some(flags),
+                                opened.clone(),
+                                Some(captures.clone()),
+                            ),
                             base: 0,
                             styled_line,
                         },
@@ -2808,11 +2849,11 @@ impl Manager {
                         &self.spawned_actions,
                         depth + 1,
                         RunContext {
-                            firing: FiringContext {
-                                under: Some(flags),
-                                opened: opened.clone(),
-                                outer: Some(captures.clone()),
-                            },
+                            firing: FiringContext::new(
+                                Some(flags),
+                                opened.clone(),
+                                Some(captures.clone()),
+                            ),
                             base,
                             styled_line,
                         },
@@ -5706,9 +5747,7 @@ mod tests {
         }
 
         fn module() -> Origin {
-            Origin::Module {
-                subpath: "combat.ts".to_string(),
-            }
+            Origin::module("combat.ts")
         }
 
         /// Match one line and return the queued fires in queue order.
@@ -6434,14 +6473,17 @@ mod tests {
             let fires = line(&mut manager, "You hit orc");
             assert_eq!(names(&fires), ["you", "hit"]);
             assert_eq!(fires[1].captures, ["hit orc", "orc"]);
-            assert!(fires[0].firing.opened.is_some(), "an outer opens a firing");
-            assert!(fires[0].firing.under.is_none());
             assert!(
-                fires[1].firing.under.is_some(),
+                fires[0].firing.opened().is_some(),
+                "an outer opens a firing"
+            );
+            assert!(fires[0].firing.under().is_none());
+            assert!(
+                fires[1].firing.under().is_some(),
                 "an inner runs under the firing"
             );
             assert!(
-                fires[1].firing.outer.is_some(),
+                fires[1].firing.outer().is_some(),
                 "an inner carries the outer's values"
             );
 
@@ -6591,8 +6633,7 @@ mod tests {
                 .iter()
                 .map(|fire| {
                     fire.firing
-                        .outer
-                        .as_ref()
+                        .outer()
                         .unwrap()
                         .own
                         .view()
@@ -6621,7 +6662,7 @@ mod tests {
             line(&mut manager, "A second");
             let fires = line(&mut manager, "B");
             assert_eq!(names(&fires), ["b"]);
-            let outer = fires[0].firing.outer.as_ref().unwrap();
+            let outer = fires[0].firing.outer().unwrap();
             assert_eq!(outer.own.view().get(1).unwrap().value, "second");
             assert_eq!(
                 manager.triggers[0]
@@ -6649,8 +6690,7 @@ mod tests {
             // The outer's body decides to skip: the flag is shared with the firing.
             fires[0]
                 .firing
-                .opened
-                .as_ref()
+                .opened()
                 .unwrap()
                 .skipped
                 .store(true, Ordering::Relaxed);
@@ -6674,8 +6714,7 @@ mod tests {
             assert_eq!(names(&fires), ["in"]);
             fires[0]
                 .firing
-                .under
-                .as_ref()
+                .under()
                 .unwrap()
                 .stopped
                 .store(true, Ordering::Relaxed);
@@ -6703,7 +6742,7 @@ mod tests {
             }
             let fires = line(&mut manager, "Frodo can see again");
             assert_eq!(names(&fires), ["sees"]);
-            let outer = fires[0].firing.outer.as_ref().unwrap();
+            let outer = fires[0].firing.outer().unwrap();
             assert_eq!(outer.named("who"), Some("Frodo"));
         }
 
@@ -6740,7 +6779,7 @@ mod tests {
 
             let fires = line(&mut manager, "123");
             assert_eq!(names(&fires), ["a", "b", "c"]);
-            let outer = fires[2].firing.outer.as_ref().unwrap();
+            let outer = fires[2].firing.outer().unwrap();
             assert_eq!(outer.named("y"), Some("1"), "the nearest level's own value");
             assert_eq!(outer.named("x"), Some("1"), "a value from two levels up");
             assert_eq!(outer.named("z"), None, "never its own");

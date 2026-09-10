@@ -2372,10 +2372,10 @@ fn describe_layout_tab(
         dto::PaneIdentity::Script {
             namespace: match &def.namespace {
                 smudgy_core::session::runtime::pane::PaneNamespace::User => dto::Namespace::User,
-                smudgy_core::session::runtime::pane::PaneNamespace::Package { owner, name } => {
+                smudgy_core::session::runtime::pane::PaneNamespace::Package(pkg) => {
                     dto::Namespace::Package {
-                        owner: owner.to_string(),
-                        name: name.to_string(),
+                        owner: pkg.owner.to_string(),
+                        name: pkg.name.to_string(),
                     }
                 }
             },

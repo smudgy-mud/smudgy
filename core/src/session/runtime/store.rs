@@ -182,12 +182,8 @@ pub(crate) fn is_home(homes: &HomeRegistry, producer: &ProducerKey, isolate: &Is
             match homes.borrow().get(&(owner.clone(), name.clone())) {
                 Some(HomeIsolate::Main) => *isolate == IsolateId::Main,
                 Some(HomeIsolate::OwnSandbox) => match isolate {
-                    IsolateId::Package {
-                        owner: iso_owner,
-                        name: iso_name,
-                        ..
-                    } => {
-                        iso_owner.eq_ignore_ascii_case(owner) && iso_name.eq_ignore_ascii_case(name)
+                    IsolateId::Package(iso) => {
+                        iso.owner.eq_ignore_ascii_case(owner) && iso.name.eq_ignore_ascii_case(name)
                     }
                     IsolateId::Main => false,
                 },
@@ -259,10 +255,10 @@ impl ProducerKey {
     #[must_use]
     pub fn from_origin(origin: &Origin) -> Self {
         match origin {
-            Origin::User | Origin::Module { .. } => Self::User,
-            Origin::Package { owner, name, .. } => Self::Package {
-                owner: owner.to_ascii_lowercase(),
-                name: name.to_ascii_lowercase(),
+            Origin::User | Origin::Module(_) => Self::User,
+            Origin::Package(pkg) => Self::Package {
+                owner: pkg.owner.to_ascii_lowercase(),
+                name: pkg.name.to_ascii_lowercase(),
             },
         }
     }
@@ -1589,11 +1585,7 @@ mod tests {
     }
 
     fn pkg_isolate(owner: &str, name: &str) -> IsolateId {
-        IsolateId::Package {
-            owner: Arc::from(owner),
-            name: Arc::from(name),
-            version: Arc::from("1.0.0"),
-        }
+        IsolateId::package(owner, name, "1.0.0")
     }
 
     fn user_set(store: &mut SessionStore, path: &str, value: Value) {

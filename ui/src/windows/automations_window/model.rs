@@ -102,9 +102,7 @@ impl LiveAutomations {
 
     /// A local module's automations, keyed by its `modules/`-relative subpath.
     pub fn module(&self, subpath: &str) -> Option<&CreatorAutomations> {
-        self.by_origin.get(&Origin::Module {
-            subpath: subpath.to_string(),
-        })
+        self.by_origin.get(&Origin::module(subpath))
     }
 
     /// An installed package's automations, matched by owner/name across any resolved version.
@@ -112,9 +110,7 @@ impl LiveAutomations {
         self.by_origin
             .iter()
             .find_map(|(origin, creator)| match origin {
-                Origin::Package {
-                    owner: o, name: n, ..
-                } if o == owner && n == name => Some(creator),
+                Origin::Package(pkg) if pkg.owner == owner && pkg.name == name => Some(creator),
                 _ => None,
             })
     }

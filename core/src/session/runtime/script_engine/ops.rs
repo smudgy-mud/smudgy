@@ -17,7 +17,8 @@ use crate::session::runtime::trigger::{
     SharedAutomationRegistry, SharedInputSequence,
 };
 use crate::session::runtime::{
-    ActionQueue, AutomationKind, IsolateId, MAX_EVENT_DEPTH, Origin, RuntimeAction, ScriptAction,
+    ActionQueue, AutomationKind, InteropEventBody, IsolateId, JavascriptFunctionAliasParams,
+    MAX_EVENT_DEPTH, Origin, ProcedurePostBody, RuntimeAction, ScriptAction, ScriptTriggerParams,
     SingletonKey, SingletonRegistry,
 };
 use crate::session::styled_line::{
@@ -684,7 +685,7 @@ fn ensure_session_target(
 #[derive(Default)]
 pub struct CallState {
     pub depth: Cell<u32>,
-    pub alias: RefCell<Option<AliasSender>>,
+    pub alias: RefCell<Option<Arc<AliasSender>>>,
     pub captured: Cell<bool>,
     pub fallthrough: Cell<Option<bool>>,
     /// The firing the running trigger opened, for `skipInner()`. `None` outside a trigger
@@ -892,7 +893,7 @@ fn op_smudgy_param_set(
 fn param_read_allowed(isolate: &IsolateId, specifier: &str) -> bool {
     match isolate {
         IsolateId::Main => true,
-        IsolateId::Package { owner, name, .. } => specifier == format!("smudgy://{owner}/{name}"),
+        IsolateId::Package(pkg) => specifier == format!("smudgy://{}/{}", pkg.owner, pkg.name),
     }
 }
 
@@ -933,7 +934,7 @@ pub struct UserAutomationError(String);
 fn ensure_user_automation_access(state: &OpState) -> Result<(), UserAutomationError> {
     match current_isolate(state) {
         IsolateId::Main => Ok(()),
-        IsolateId::Package { .. } => Err(UserAutomationError(
+        IsolateId::Package(_) => Err(UserAutomationError(
             "editing user automations is only available to your own scripts and trusted packages"
                 .to_string(),
         )),
@@ -1476,13 +1477,13 @@ fn op_smudgy_emit(
     // same-server target.
     queue_own_action(
         state,
-        RuntimeAction::FanOutInteropEvent {
+        RuntimeAction::FanOutInteropEvent(Arc::new(InteropEventBody {
             canonical,
             stamped,
             payload,
             source,
             depth: depth + 1,
-        },
+        })),
     );
     Ok(())
 }
@@ -2627,11 +2628,11 @@ fn op_smudgy_procedure_post(
     let isolate = current_isolate(state);
     let caller_origin = match &isolate {
         IsolateId::Main => "user".to_string(),
-        IsolateId::Package { owner, name, .. } => {
+        IsolateId::Package(pkg) => {
             format!(
                 "smudgy://{}/{}",
-                owner.to_ascii_lowercase(),
-                name.to_ascii_lowercase()
+                pkg.owner.to_ascii_lowercase(),
+                pkg.name.to_ascii_lowercase()
             )
         }
     };
@@ -2678,13 +2679,15 @@ fn op_smudgy_procedure_post(
         // events and local procedure deliveries.
         let action = RuntimeAction::ForwardProcedurePost {
             target,
-            canonical: Arc::from(canonical),
-            producer: Arc::clone(&root.producer_spec),
-            name: Arc::from(name),
-            payload: Arc::from(payload_json),
-            caller_origin: Arc::from(caller_origin),
-            caller_session: caller,
-            depth: depth + 1,
+            post: Arc::new(ProcedurePostBody {
+                canonical: Arc::from(canonical),
+                producer: Arc::clone(&root.producer_spec),
+                name: Arc::from(name),
+                payload: Arc::from(payload_json),
+                caller_origin: Arc::from(caller_origin),
+                caller_session: caller,
+                depth: depth + 1,
+            }),
         };
         queue_own_action(state, action);
         return Ok(());
@@ -4323,11 +4326,11 @@ fn op_smudgy_line_splice(
         state,
         RuntimeAction::PerformLineOperation {
             line_number: line_number as usize,
-            operation: LineOperation::Splice {
+            operation: Box::new(LineOperation::Splice {
                 runs,
                 begin: begin as usize,
                 end: end as usize,
-            },
+            }),
         },
     );
     Ok(())
@@ -4446,7 +4449,7 @@ fn op_smudgy_line_highlight_link<'s>(
             state,
             RuntimeAction::PerformLineOperation {
                 line_number: line_number as usize,
-                operation,
+                operation: Box::new(operation),
             },
         );
     }
@@ -5114,7 +5117,7 @@ fn op_smudgy_create_simple_trigger(
     let (outer, reach) = placement.into_parts();
     queue_own_action(
         state,
-        RuntimeAction::AddScriptTrigger {
+        RuntimeAction::AddScriptTrigger(Box::new(ScriptTriggerParams {
             isolate,
             origin,
             name: Arc::new(name),
@@ -5133,7 +5136,7 @@ fn op_smudgy_create_simple_trigger(
             script_source: None,
             outer,
             reach,
-        },
+        })),
     );
     Ok(true)
 }
@@ -5192,7 +5195,7 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
     let (outer, reach) = placement.into_parts();
     queue_own_action(
         state,
-        RuntimeAction::AddScriptTrigger {
+        RuntimeAction::AddScriptTrigger(Box::new(ScriptTriggerParams {
             isolate,
             origin,
             name: Arc::new(name),
@@ -5207,7 +5210,7 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
             script_source: script_source_arc(script_source),
             outer,
             reach,
-        },
+        })),
     );
     Ok(true)
 }
@@ -5273,7 +5276,7 @@ fn op_smudgy_create_javascript_function_alias<'s>(
     let isolate = current_isolate(state);
     queue_own_action(
         state,
-        RuntimeAction::AddJavascriptFunctionAlias {
+        RuntimeAction::AddJavascriptFunctionAlias(Box::new(JavascriptFunctionAliasParams {
             isolate,
             origin,
             name: Arc::new(name),
@@ -5284,7 +5287,7 @@ fn op_smudgy_create_javascript_function_alias<'s>(
             fire_limit: self_limit(fire_limit),
             script_source: script_source_arc(script_source),
             command,
-        },
+        })),
     );
     Ok(true)
 }
@@ -6026,10 +6029,9 @@ impl From<pane::PaneError> for PaneCallError {
 fn pane_namespace(state: &OpState) -> pane::PaneNamespace {
     match state.borrow::<IsolateId>() {
         IsolateId::Main => pane::PaneNamespace::User,
-        IsolateId::Package { owner, name, .. } => pane::PaneNamespace::Package {
-            owner: owner.clone(),
-            name: name.clone(),
-        },
+        IsolateId::Package(pkg) => {
+            pane::PaneNamespace::package(pkg.owner.clone(), pkg.name.clone())
+        }
     }
 }
 
@@ -6841,7 +6843,7 @@ fn op_smudgy_pane_split<'s>(
                 state,
                 target,
                 RuntimeAction::PaneOpened {
-                    def: outcome.def.clone(),
+                    def: Box::new(outcome.def.clone()),
                     placement,
                     reconcile_registry,
                 },
@@ -6851,7 +6853,7 @@ fn op_smudgy_pane_split<'s>(
                 state,
                 target,
                 RuntimeAction::PaneUpdated {
-                    def: outcome.def.clone(),
+                    def: Box::new(outcome.def.clone()),
                     announce_visibility: outcome.hidden_changed,
                 },
             );
@@ -6919,7 +6921,7 @@ fn op_smudgy_pane_add_tab<'s>(
             state,
             target,
             RuntimeAction::PaneOpened {
-                def: outcome.def.clone(),
+                def: Box::new(outcome.def.clone()),
                 placement,
                 reconcile_registry,
             },
@@ -6929,7 +6931,7 @@ fn op_smudgy_pane_add_tab<'s>(
             state,
             target,
             RuntimeAction::PaneUpdated {
-                def: outcome.def.clone(),
+                def: Box::new(outcome.def.clone()),
                 announce_visibility: outcome.hidden_changed,
             },
         );
@@ -7071,7 +7073,7 @@ fn op_smudgy_pane_set_hidden(
             queue_own_action(
                 state,
                 RuntimeAction::PaneUpdated {
-                    def,
+                    def: Box::new(def),
                     announce_visibility: true,
                 },
             );
@@ -7127,7 +7129,7 @@ fn op_smudgy_pane_set_font_size(
             queue_own_action(
                 state,
                 RuntimeAction::PaneUpdated {
-                    def,
+                    def: Box::new(def),
                     announce_visibility: false,
                 },
             );
@@ -8203,7 +8205,7 @@ fn op_smudgy_line_insert<'s>(
         state,
         RuntimeAction::PerformLineOperation {
             line_number: line_number as usize,
-            operation: (LineOperation::Insert {
+            operation: Box::new(LineOperation::Insert {
                 str: Arc::new(text),
                 begin: begin as usize,
                 end: end as usize,
@@ -8227,7 +8229,7 @@ fn op_smudgy_line_replace(
         state,
         RuntimeAction::PerformLineOperation {
             line_number: line_number as usize,
-            operation: (LineOperation::Replace {
+            operation: Box::new(LineOperation::Replace {
                 str: Arc::new(text),
                 begin: begin as usize,
                 end: end as usize,
@@ -8276,7 +8278,7 @@ fn op_smudgy_line_highlight<'s>(
         state,
         RuntimeAction::PerformLineOperation {
             line_number: line_number as usize,
-            operation: (LineOperation::Highlight {
+            operation: Box::new(LineOperation::Highlight {
                 begin: begin as usize,
                 end: end as usize,
                 style,
@@ -8299,7 +8301,7 @@ fn op_smudgy_line_remove(
         state,
         RuntimeAction::PerformLineOperation {
             line_number: line_number as usize,
-            operation: (LineOperation::Remove {
+            operation: Box::new(LineOperation::Remove {
                 begin: begin as usize,
                 end: end as usize,
             }),
@@ -9015,11 +9017,7 @@ mod tests {
     }
 
     fn package(owner: &str, name: &str) -> IsolateId {
-        IsolateId::Package {
-            owner: Arc::from(owner),
-            name: Arc::from(name),
-            version: Arc::from("1.0.0"),
-        }
+        IsolateId::package(owner, name, "1.0.0")
     }
 
     #[test]

@@ -20,25 +20,34 @@ use serde::Deserialize;
 /// `User` is the global-by-name namespace; `Module`/`Package` give each creator
 /// its own namespace (so `disableAlias` and idempotent re-creation stay scoped, and a
 /// package's automation can coexist with a same-named user one).
+///
+/// Both non-`User` variants hold their payload behind an `Arc`: an origin is cloned into
+/// every queued action and every namespace key, and the shared handle keeps that a refcount
+/// bump rather than one-to-three string allocations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Origin {
     /// Hand-authored on disk, or any inline alias/trigger script: the global namespace.
     User,
     /// A local `modules/` file, keyed by its `modules/`-relative subpath (e.g. `combat/healer.ts`).
-    Module { subpath: String },
+    Module(Arc<str>),
     /// An installed `smudgy://owner/name` package at a concrete resolved version. All of a
     /// package's modules share this namespace; two coexisting versions are distinct.
-    Package {
-        owner: String,
-        name: String,
-        version: String,
-    },
+    Package(Arc<PackageOrigin>),
+}
+
+/// The `owner`/`name`/`version` coordinates of a [`Origin::Package`], shared behind its `Arc`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PackageOrigin {
+    pub owner: String,
+    pub name: String,
+    pub version: String,
 }
 
 /// Which V8 isolate an automation/script/function lives in. `Main` is the trusted shared
 /// isolate (user scripts, local `modules/`, and — today — every package); a `Package`
 /// keys a sandboxed install by its *root* package. Runtime-only, like [`Origin`], and
-/// `Copy`-cheap-ish (`Arc<str>` so cloning into every action/registry key is cheap).
+/// pointer-sized: the package coordinates live behind one `Arc`, so cloning into every
+/// action/registry key is a single refcount bump.
 ///
 /// This is threaded through the trigger [`Manager`](super::trigger) keys (`(IsolateId, Origin,
 /// name)`), the per-isolate function/script registries, and the
@@ -49,11 +58,16 @@ pub enum IsolateId {
     /// The trusted, shared, allow-all isolate.
     Main,
     /// A sandboxed install, keyed by the root package that owns the isolate.
-    Package {
-        owner: Arc<str>,
-        name: Arc<str>,
-        version: Arc<str>,
-    },
+    Package(Arc<PackageIsolate>),
+}
+
+/// The resolved coordinates of a sandboxed package isolate. Shared behind the `Arc` in
+/// [`IsolateId::Package`] so an isolate id stays one word wide wherever it is carried.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PackageIsolate {
+    pub owner: Arc<str>,
+    pub name: Arc<str>,
+    pub version: Arc<str>,
 }
 
 /// The instance part of a widget token that no live isolate ever carries (instances are
@@ -62,6 +76,20 @@ pub enum IsolateId {
 pub const NO_ISOLATE_INSTANCE: u64 = 0;
 
 impl IsolateId {
+    /// The isolate of the package installed at `owner/name` at `version`.
+    #[must_use]
+    pub fn package(
+        owner: impl Into<Arc<str>>,
+        name: impl Into<Arc<str>>,
+        version: impl Into<Arc<str>>,
+    ) -> Self {
+        Self::Package(Arc::new(PackageIsolate {
+            owner: owner.into(),
+            name: name.into(),
+            version: version.into(),
+        }))
+    }
+
     /// Encode for the leaf `smudgy_widgets` crate, which cannot name this type. Round-tripped
     /// through [`smudgy_cloud::WidgetIsolate`] so a widget callback can be dispatched back to
     /// its creating isolate. The token is `<instance>\u{1f}<role>`: `instance` names the exact
@@ -74,11 +102,10 @@ impl IsolateId {
     pub fn to_widget_token(&self, instance: u64) -> String {
         match self {
             IsolateId::Main => format!("{instance}\u{1f}main"),
-            IsolateId::Package {
-                owner,
-                name,
-                version,
-            } => format!("{instance}\u{1f}pkg\u{1f}{owner}\u{1f}{name}\u{1f}{version}"),
+            IsolateId::Package(pkg) => format!(
+                "{instance}\u{1f}pkg\u{1f}{}\u{1f}{}\u{1f}{}",
+                pkg.owner, pkg.name, pkg.version
+            ),
         }
     }
 
@@ -93,11 +120,9 @@ impl IsolateId {
         let instance = instance.parse::<u64>().unwrap_or(NO_ISOLATE_INSTANCE);
         let mut parts = role.split('\u{1f}');
         let id = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some("pkg"), Some(owner), Some(name), Some(version)) => IsolateId::Package {
-                owner: Arc::from(owner),
-                name: Arc::from(name),
-                version: Arc::from(version),
-            },
+            (Some("pkg"), Some(owner), Some(name), Some(version)) => {
+                IsolateId::package(owner, name, version)
+            }
             _ => IsolateId::Main,
         };
         (id, instance)
@@ -281,6 +306,26 @@ enum Creator {
 }
 
 impl Origin {
+    /// The namespace of the local `modules/` file at `subpath`.
+    #[must_use]
+    pub fn module(subpath: impl Into<Arc<str>>) -> Self {
+        Self::Module(subpath.into())
+    }
+
+    /// The namespace of the package installed at `owner/name`, resolved to `version`.
+    #[must_use]
+    pub fn package(
+        owner: impl Into<String>,
+        name: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Self {
+        Self::Package(Arc::new(PackageOrigin {
+            owner: owner.into(),
+            name: name.into(),
+            version: version.into(),
+        }))
+    }
+
     /// Parse the JSON creator descriptor the `smudgy:core` facade passes. A malformed
     /// descriptor is an **error**: attribution is semantics — which trigger namespace an
     /// automation keys into, which producer subtree an interop write lands in, which
@@ -296,18 +341,12 @@ impl Origin {
     pub fn try_from_creator_json(json: &str) -> Result<Self, String> {
         match serde_json::from_str::<Creator>(json) {
             Ok(Creator::User) => Ok(Self::User),
-            Ok(Creator::Module { referrer }) => Ok(Self::Module {
-                subpath: module_subpath(&referrer),
-            }),
+            Ok(Creator::Module { referrer }) => Ok(Self::module(module_subpath(&referrer))),
             Ok(Creator::Package {
                 owner,
                 name,
                 version,
-            }) => Ok(Self::Package {
-                owner,
-                name,
-                version,
-            }),
+            }) => Ok(Self::package(owner, name, version)),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -319,12 +358,12 @@ impl Origin {
     pub fn singleton_origin(&self) -> SingletonOrigin {
         match self {
             Self::User => SingletonOrigin::User,
-            Self::Module { subpath } => SingletonOrigin::Module {
-                subpath: subpath.clone(),
+            Self::Module(subpath) => SingletonOrigin::Module {
+                subpath: subpath.to_string(),
             },
-            Self::Package { owner, name, .. } => SingletonOrigin::Package {
-                owner: owner.clone(),
-                name: name.clone(),
+            Self::Package(pkg) => SingletonOrigin::Package {
+                owner: pkg.owner.clone(),
+                name: pkg.name.clone(),
             },
         }
     }
@@ -353,11 +392,7 @@ mod tests {
             IsolateId::from_widget_token(&IsolateId::Main.to_widget_token(7)),
             (IsolateId::Main, 7)
         );
-        let pkg = IsolateId::Package {
-            owner: Arc::from("wbk"),
-            name: Arc::from("mapper"),
-            version: Arc::from("1.4.0"),
-        };
+        let pkg = IsolateId::package("wbk", "mapper", "1.4.0");
         assert_eq!(
             IsolateId::from_widget_token(&pkg.to_widget_token(42)),
             (pkg, 42)
@@ -390,26 +425,18 @@ mod tests {
             Origin::try_from_creator_json(
                 r#"{"kind":"package","owner":"wbk","name":"mapper","version":"1.4.0"}"#
             ),
-            Ok(Origin::Package {
-                owner: "wbk".to_string(),
-                name: "mapper".to_string(),
-                version: "1.4.0".to_string(),
-            })
+            Ok(Origin::package("wbk", "mapper", "1.4.0"))
         );
         assert_eq!(
             Origin::try_from_creator_json(
                 r#"{"kind":"module","referrer":"file:///c:/x/smudgy/srv/modules/combat/healer.ts"}"#
             ),
-            Ok(Origin::Module {
-                subpath: "combat/healer.ts".to_string(),
-            })
+            Ok(Origin::module("combat/healer.ts"))
         );
         // A referrer with no `/modules/` marker keeps the raw value (still a stable key).
         assert_eq!(
             Origin::try_from_creator_json(r#"{"kind":"module","referrer":"file:///odd/path.ts"}"#),
-            Ok(Origin::Module {
-                subpath: "file:///odd/path.ts".to_string(),
-            })
+            Ok(Origin::module("file:///odd/path.ts"))
         );
         // Malformed JSON is a loud error — attribution is semantics, never guessed.
         assert!(Origin::try_from_creator_json("not json").is_err());
@@ -417,16 +444,8 @@ mod tests {
 
     #[test]
     fn failed_isolate_cleanup_releases_only_its_singleton_wins() {
-        let winner = IsolateId::Package {
-            owner: Arc::from("wbk"),
-            name: Arc::from("winner"),
-            version: Arc::from("1.0.0"),
-        };
-        let loser = IsolateId::Package {
-            owner: Arc::from("wbk"),
-            name: Arc::from("loser"),
-            version: Arc::from("1.0.0"),
-        };
+        let winner = IsolateId::package("wbk", "winner", "1.0.0");
+        let loser = IsolateId::package("wbk", "loser", "1.0.0");
         let key = SingletonKey {
             origin: SingletonOrigin::Package {
                 owner: "wbk".to_string(),
