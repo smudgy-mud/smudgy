@@ -2475,13 +2475,12 @@ impl AutomationsWindow {
                 hidden: true,
                 content: order_link,
             }) if !self.state_disclosure_open() => {
-                let mut links = row![order_link, self.state_reveal_link()]
-                    .spacing(16.0)
-                    .align_y(Vertical::Center);
+                // Three links can outgrow a narrow pane; they wrap rather than squeeze.
+                let mut links = vec![order_link, self.state_reveal_link()];
                 if let Some(extra) = extra_link {
-                    links = links.push(extra);
+                    links.push(extra);
                 }
-                field_row("", links.into())
+                field_row("", wrap_row(links).spacing(16.0, 6.0).into())
             }
             Some(OrderSlot { hidden, content }) => {
                 let mut stack = column![
