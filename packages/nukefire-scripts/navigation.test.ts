@@ -9,8 +9,8 @@ import {
   type NavigationRoom,
 } from "./navigation.ts";
 
-const AREA = [1, 2] as const;
-const OTHER = [3, 4] as const;
+const AREA = "11111111-1111-4111-8111-111111111111";
+const OTHER = "33333333-3333-4333-8333-333333333333";
 
 function room(
   room_number: number,
@@ -22,24 +22,24 @@ function room(
 
 test("turns weighted mapper paths into explicit and directional commands", () => {
   const rooms = new Map<string, NavigationRoom>([
-    ["1:2:10", room(10, [{
+    [`${AREA}:10`, room(10, [{
       from_direction: "North",
       to_area_id: AREA,
       to_room_number: 11,
       command: "north",
     }])],
-    ["1:2:11", room(11, [{
+    [`${AREA}:11`, room(11, [{
       from_direction: "Special",
       to_area_id: OTHER,
       to_room_number: 20,
       command: "enter portal",
       is_closed: true,
     }])],
-    ["3:4:20", room(20, [], OTHER)],
+    [`${OTHER}:20`, room(20, [], OTHER)],
   ]);
   const route = buildNavigationRoute(
     [[AREA, 10], [AREA, 11], [OTHER, 20]],
-    (area, number) => rooms.get(`${area[0]}:${area[1]}:${number}`),
+    (area, number) => rooms.get(`${area}:${number}`),
   );
 
   assert.equal(route.error, undefined);

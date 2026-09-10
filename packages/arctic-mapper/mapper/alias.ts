@@ -1150,7 +1150,7 @@ function matchingRoomsWithReciprocalStub(
     const reciprocalDirection = OppositeDirection[direction];
     return mapper.listRoomsByTitleAndDescription(title, description)
         .filter((room): room is Room => !!room)
-        .filter((room) => room.area_id[0] === source.area_id[0] && room.area_id[1] === source.area_id[1] &&
+        .filter((room) => room.area_id === source.area_id &&
             room.room_number !== source.room_number)
         .filter((room) => room.exits.some((exit) =>
             exit.from_direction === reciprocalDirection && exit.to_room_number === null
