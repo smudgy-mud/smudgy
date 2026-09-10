@@ -98,13 +98,18 @@ const {
 // Every map identity is its UUID's canonical lowercase hyphenated string. Ordinary string
 // rules apply: compare with `===`, use one as a `Map`/`Set` key, and put one through
 // `JSON.stringify` -- so ids ride the session store, store bindings and widget props like any
-// other value.
-type AreaId = string;
-type AtlasId = string;
+// other value. The brand is a type-only marker (nothing exists at runtime) that keeps an
+// `ExitId` from satisfying an `AreaId` annotation. The contract's parameters take `<Id>Like`,
+// which accepts that brand or an unbranded string -- so a plain string from JSON or a package
+// parameter needs no cast, while a differently branded id is refused. The
+// public methods here declare the branded type and rely on TypeScript's bivariant method
+// parameters to satisfy that wider contract -- `normalizeId` is what actually validates.
+type AreaId = string & { readonly __id: "AreaId" };
+type AtlasId = string & { readonly __id: "AtlasId" };
 type RoomNumber = number;
-type ExitId = string;
-type ConnectionId = string;
-type OperationId = string;
+type ExitId = string & { readonly __id: "ExitId" };
+type ConnectionId = string & { readonly __id: "ConnectionId" };
+type OperationId = string & { readonly __id: "OperationId" };
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -167,8 +172,8 @@ interface MutateAreaOptions {
 /** Accept an id argument and hand back the string the ops take. Anything else is the
  * caller's mistake, and fails here with a clear TypeError rather than an opaque serde
  * error inside the op. */
-function normalizeId(value: unknown, what: string): string {
-    if (typeof value === "string") return value;
+function normalizeId<T extends string>(value: unknown, what: string): T {
+    if (typeof value === "string") return value as T;
     throw new TypeError(`expected ${what} as a canonical UUID string, got ${typeof value}`);
 }
 
@@ -181,8 +186,8 @@ function atlasIdOf(atlas: Atlas | AtlasId | undefined): AtlasId | undefined {
     if (atlas instanceof Atlas) return atlas.id;
     const what = "an Atlas handle or an AtlasId";
     return typeof atlas === "string"
-        ? normalizeId(atlas, what)
-        : normalizeId((atlas as Atlas)?.id, what);
+        ? normalizeId<AtlasId>(atlas, what)
+        : normalizeId<AtlasId>((atlas as Atlas)?.id, what);
 }
 
 /** Unwrap an area argument, structurally like `atlasIdOf`: a handle that came
@@ -192,8 +197,8 @@ function areaIdOf(area: Area | AreaId): AreaId {
     if (area instanceof Area) return area.id;
     const what = "an Area handle or an AreaId";
     return typeof area === "string"
-        ? normalizeId(area, what)
-        : normalizeId((area as Area)?.id, what);
+        ? normalizeId<AreaId>(area, what)
+        : normalizeId<AreaId>((area as Area)?.id, what);
 }
 
 function destinationForOp(destination: MapDestination) {
@@ -272,7 +277,7 @@ const mapper = {
     },
 
     setCurrentLocation(areaId: AreaId, roomNumber?: RoomNumber) {
-        op_smudgy_mapper_set_current_location(normalizeId(areaId, "an AreaId"), roomNumber);
+        op_smudgy_mapper_set_current_location(normalizeId<AreaId>(areaId, "an AreaId"), roomNumber);
     },
 
     /** The session's current mapper location (the last `setCurrentLocation`), or `undefined`
@@ -293,7 +298,7 @@ const mapper = {
     },
 
     getAreaById(id: AreaId) {
-        let area = op_smudgy_mapper_get_area_by_id(normalizeId(id, "an AreaId"));
+        let area = op_smudgy_mapper_get_area_by_id(normalizeId<AreaId>(id, "an AreaId"));
         return new Area(area);
     },
 
@@ -940,8 +945,8 @@ class AreaMutator {
 }
 
 // A label/shape id: a canonical UUID string, like `AreaId`/`ExitId`.
-type LabelId = string;
-type ShapeId = string;
+type LabelId = string & { readonly __id: "LabelId" };
+type ShapeId = string & { readonly __id: "ShapeId" };
 
 // Text alignment of a label; a shape's kind. These mirror the cloud enums' variant names.
 type LabelHorizontalAlign = "Left" | "Center" | "Right";

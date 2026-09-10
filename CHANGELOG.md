@@ -52,14 +52,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **A map id is now the area's UUID as a plain string.** `area.id`, `exit.id`,
-  a connection or label or shape id, and the id `mutateArea` hands back are all
+- **A map id is now the area's UUID as a string.** `area.id`, `exit.id`, a
+  connection or label or shape id, and the id `mutateArea` hands back are all
   the canonical lowercase spelling — `"67e55044-10b1-426f-9247-bb680e5fe0c8"` —
   where they used to be a two-number `[hi, lo]` pair. Two ids compare with
   `===`, one works as a `Map` or `Set` key, and `JSON.stringify` accepts it, so
   an id can be stored in session state, bound to a widget, or saved in a
-  package's own parameters like any other value. `area.uuid` is the same string
-  as `area.id` now and is deprecated.
+  package's own parameters like any other value. The `map:room` event's
+  `areaId` is that same id and can go straight into a mapper call. `area.uuid`
+  is the same string as `area.id` now and is deprecated.
+
+  Ids an API hands you also remember which *kind* of id they are, so passing an
+  exit's id where an area's belongs — or storing one in a field declared as the
+  other — is a type error rather than a lookup that quietly finds nothing.
+  Calls still accept a plain string, so an id read back from JSON, a package
+  parameter, or your own state needs no cast.
 
   This is a breaking change for scripts: the pair spelling is refused rather
   than reinterpreted, so a call that passes one fails loudly. Scripts that
