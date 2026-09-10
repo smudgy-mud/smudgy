@@ -2195,84 +2195,42 @@ struct MapStyleApplicationProp {
     rooms: Vec<i32>,
     #[serde(default)]
     exits: Vec<MapExitRefProp>,
-    /// Area scope in either accepted spelling (see [`MapAreaIdProp`]);
-    /// entries scoped to another area are ignored at resolution.
+    /// Area scope (see [`MapAreaIdProp`]); entries scoped to another area are
+    /// ignored at resolution.
     #[serde(default)]
     area: Option<MapAreaIdProp>,
 }
 
-/// An apply entry's `area` scope in either accepted spelling: the `[hi, lo]`
-/// u64 id halves (BigInt-carried on the static prop path) or the canonical
-/// hyphenated UUID string. The string is the JSON-safe spelling: real id
-/// halves exceed `Number.MAX_SAFE_INTEGER` and surface as `BigInt`, which
-/// `JSON.stringify` rejects, so store-bound apply arrays carry the string.
+/// An apply entry's `area` scope: the canonical hyphenated UUID string every
+/// id carries -- `area.id` and the `map:room` event both deliver it, and it
+/// rides the store-binding wire like any other string. See
+/// `script_engine::script_uuid`.
 #[derive(Clone)]
-enum MapAreaIdProp {
-    Pair(u64, u64),
-    Text(String),
-}
+struct MapAreaIdProp(String);
 
 impl<'de> Deserialize<'de> for MapAreaIdProp {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        struct AreaIdVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for AreaIdVisitor {
-            type Value = MapAreaIdProp;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("an `[hi, lo]` area id pair or a UUID string")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(MapAreaIdProp::Text(value.to_owned()))
-            }
-
-            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(MapAreaIdProp::Text(value))
-            }
-
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let hi = seq
-                    .next_element::<u64>()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let lo = seq
-                    .next_element::<u64>()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                    return Err(serde::de::Error::invalid_length(3, &self));
-                }
-                Ok(MapAreaIdProp::Pair(hi, lo))
-            }
-        }
-
-        deserializer.deserialize_any(AreaIdVisitor)
+        String::deserialize(deserializer).map(MapAreaIdProp)
     }
 }
 
 impl MapAreaIdProp {
-    /// Resolve either spelling to the internal id. A string that is not a
-    /// UUID reports once and yields `None`; the caller drops that entry —
-    /// an entry whose scope cannot be resolved must not widen to every area.
+    /// Resolve the scope to the internal id. A string that is not a UUID
+    /// reports once and yields `None`; the caller drops that entry — an entry
+    /// whose scope cannot be resolved must not widen to every area.
     fn resolve(&self) -> Option<smudgy_cloud::AreaId> {
-        match self {
-            Self::Pair(hi, lo) => Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
-                *hi, *lo,
-            ))),
-            Self::Text(text) => match text.parse::<smudgy_cloud::Uuid>() {
-                Ok(uuid) => Some(smudgy_cloud::AreaId(uuid)),
-                Err(_) => {
-                    warn_once(format!(
-                        "smudgy widgets: apply entry `area` {text:?} is not a UUID; entry skipped"
-                    ));
-                    None
-                }
-            },
+        match self.0.parse::<smudgy_cloud::Uuid>() {
+            Ok(uuid) => Some(smudgy_cloud::AreaId(uuid)),
+            Err(_) => {
+                let text = &self.0;
+                warn_once(format!(
+                    "smudgy widgets: apply entry `area` {text:?} is not a UUID; entry skipped"
+                ));
+                None
+            }
         }
     }
 }
@@ -3437,7 +3395,7 @@ mod tests {
             {
                 "style": "visited",
                 "rooms": [9],
-                "area": [1, 2],
+                "area": "67e55044-10b1-426f-9247-bb680e5fe0c8",
             }
         ])))
         .expect("apply entries parse");
@@ -3451,9 +3409,11 @@ mod tests {
         assert_eq!(apply[0].area, None);
         assert_eq!(
             apply[1].area,
-            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
-                1, 2
-            )))
+            Some(smudgy_cloud::AreaId(
+                "67e55044-10b1-426f-9247-bb680e5fe0c8"
+                    .parse()
+                    .expect("literal uuid parses")
+            ))
         );
 
         let doors = door_states_from_node(&Node::from(json!([
@@ -3489,10 +3449,10 @@ mod tests {
         );
     }
 
-    /// The `area` scope in both accepted spellings: the `[hi, lo]` pair and
-    /// the canonical UUID string resolve to the same internal id, and the
-    /// string spelling survives a JSON text round trip — the store-binding
-    /// wire, which the pair's BigInt halves cannot travel.
+    /// The `area` scope is the canonical UUID string, and it survives a JSON
+    /// text round trip — the store-binding wire, which the old pair's BigInt
+    /// halves could not travel. The pair spelling is refused outright rather
+    /// than reinterpreted.
     #[test]
     fn map_view_apply_area_accepts_uuid_string_spelling() {
         use serde_json::json;
@@ -3500,27 +3460,21 @@ mod tests {
         let id: smudgy_cloud::Uuid = "67e55044-10b1-426f-9247-bb680e5fe0c8"
             .parse()
             .expect("literal uuid parses");
-        let (hi, lo) = id.as_u64_pair();
         assert_eq!(id.to_string(), "67e55044-10b1-426f-9247-bb680e5fe0c8");
 
         let apply = style_applications_from_node(&Node::from(json!([
             { "style": "route", "rooms": [1], "area": id.to_string() },
-            { "style": "route", "rooms": [2], "area": [1, 2] },
         ])))
-        .expect("both spellings parse");
+        .expect("the string spelling parses");
         assert_eq!(apply[0].area, Some(smudgy_cloud::AreaId(id)));
-        assert_eq!(
-            apply[0].area,
-            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
-                hi, lo
-            ))),
-            "the string resolves to the same id as its own u64 halves"
-        );
-        assert_eq!(
-            apply[1].area,
-            Some(smudgy_cloud::AreaId(smudgy_cloud::Uuid::from_u64_pair(
-                1, 2
-            )))
+
+        let (hi, lo) = id.as_u64_pair();
+        assert!(
+            style_applications_from_node(&Node::from(json!([
+                { "style": "route", "rooms": [2], "area": [hi, lo] },
+            ])))
+            .is_err(),
+            "the old [hi, lo] spelling must be refused, not reinterpreted"
         );
 
         // Round trip through JSON text, simulating a store-bound apply array.

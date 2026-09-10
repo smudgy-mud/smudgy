@@ -39,7 +39,9 @@ use anyhow::{Error as AnyError, bail};
 use deno_core::OpState;
 use deno_core::op2;
 use deno_core::v8;
-use smudgy_cloud::{AreaId, Uuid, WidgetIsolate, WidgetsEnabled};
+use smudgy_cloud::{AreaId, WidgetIsolate, WidgetsEnabled};
+
+use super::script_uuid::ScriptUuid;
 use smudgy_script::SmudgyCapabilities;
 
 deno_core::extension!(
@@ -8308,16 +8310,33 @@ fn op_smudgy_line_remove(
     Ok(())
 }
 
+/// `setCurrentLocation` refusals: the capability gate, or an argument that is
+/// not a map id. Ids cross as `#[string]` params everywhere (see
+/// `script_uuid`), which needs an error type this op can carry.
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+pub enum SetCurrentLocationError {
+    #[class(generic)]
+    #[error(transparent)]
+    NotCapable(#[from] NotCapable),
+    #[class(generic)]
+    #[error("smudgy: {0:?} is not a map id (expected a canonical UUID string)")]
+    InvalidId(String),
+}
+
+// Not fast-callable: the optional room number is not a fast-path type.
 #[allow(clippy::inline_always)]
 #[op2]
 fn op_smudgy_mapper_set_current_location(
     state: &mut OpState,
-    #[serde] area_id: (u64, u64),
+    #[string] area_id: &str,
     room_number: Option<i32>,
-) -> Result<(), NotCapable> {
+) -> Result<(), SetCurrentLocationError> {
     // Setting the mapper's current location is a map mutation (→ mapper-write).
     ensure(grants(state).mapper_write, "mapper-write")?;
-    let area_id = AreaId(Uuid::from_u64_pair(area_id.0, area_id.1));
+    let area_id = AreaId(
+        smudgy_cloud::Uuid::try_parse(area_id)
+            .map_err(|_| SetCurrentLocationError::InvalidId(area_id.to_owned()))?,
+    );
     // Mirror the location on the session thread so `getCurrentLocation` can read it back
     // (the UI marker the action fans out is otherwise write-only and not readable cross-thread).
     *state
@@ -8330,15 +8349,15 @@ fn op_smudgy_mapper_set_current_location(
     Ok(())
 }
 
-/// A mapper location as serialized to JS: the area id `u64` pair plus an optional room
+/// A mapper location as serialized to JS: the area id string plus an optional room
 /// number (`None` when the location names an area without a specific room).
-type JsLocation = ((u64, u64), Option<i32>);
+type JsLocation = (ScriptUuid, Option<i32>);
 
 /// `getCurrentLocation()`: the session's last-set mapper location as `{ area, room }`, or
 /// `undefined` when none has been set. A CURRENT-session read: the value lives in
 /// this session's own shared cell (mirrored from `setCurrentLocation`), not in the `Mapper`
 /// cache, so it is never addressable cross-session. Gated on `mapper-read`. `area` is the
-/// `[u64, u64]` id pair (the same shape every other mapper op uses); `room` is `null` when the
+/// canonical UUID string (the same spelling every other mapper op uses); `room` is `null` when the
 /// location names an area without a specific room.
 #[op2]
 #[serde]
@@ -8349,7 +8368,7 @@ fn op_smudgy_mapper_get_current_location(
     Ok(state
         .borrow::<crate::session::runtime::CurrentLocation>()
         .borrow()
-        .map(|(area_id, room)| (area_id.0.as_u64_pair(), room)))
+        .map(|(area_id, room)| (ScriptUuid(area_id.0), room)))
 }
 
 #[op2(fast)]

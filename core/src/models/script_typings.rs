@@ -1994,7 +1994,7 @@ export function make() { return createEvent('dynamic'); }
                const span = line.styles?.[0];\n\
                if (span) { const raw: boolean | undefined = typeof span.fg === \"object\" && \"paletteBright\" in span.fg ? span.fg.paletteBright : span.foregroundPaletteBright; void raw; line.highlightAt(span.begin, span.end, span); }\n\
                const a = mapper.areas[0];\n\
-               if (a) { const r = a.room(1); void r; const id: readonly [number, number] = a.id; void id; }\n\
+               if (a) { const r = a.room(1); void r; const id: AreaId = a.id; void id; const same: boolean = id === a.id; void same; }\n\
              }\n"
                 .to_string(),
         );
@@ -2310,7 +2310,7 @@ export function make() { return createEvent('dynamic'); }
                                         crossAreaLabelVisibility: \"always\" },\n\
                                visited: { roomFill: \"#223\", roomBorderRadius: 0.2, doorColor: \"#f00\" } }}\n\
                      apply={[{ style: \"route\", rooms: [1, 2], exits: [{ room: 1, direction: \"North\" }] },\n\
-                             { style: \"visited\", rooms: [9], area: [1, 2] },\n\
+                             { style: \"visited\", rooms: [9], area: \"3f1a0c9e-2b47-4d18-9a55-7c2e6b901d34\" },\n\
                              { style: \"visited\", rooms: [10], area: \"67e55044-10b1-426f-9247-bb680e5fe0c8\" }]}\n\
                      doors={[{ exit: { room: 1, direction: \"North\" }, closed: true, locked: false }]}\n\
                    />\n\
@@ -2795,7 +2795,8 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
     }
 
     /// The compatibility catalog is deliberately finite: the `ephemeral`
-    /// creation flag and the `isEphemeral` read. These assertions do three
+    /// creation flag, the `isEphemeral` read, and `Area.uuid` (an alias for
+    /// `id` since ids became canonical UUID strings). These assertions do three
     /// jobs together: old scripts still type-check during 0.5.x, every
     /// compatibility member carries an editor-visible deprecation, and the
     /// test itself blocks the first 0.6 build until the shims are removed.
@@ -2820,20 +2821,21 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
             .expect("Cargo package versions are valid semver");
         assert!(
             (running.major, running.minor) < (0, 6),
-            "remove the mapper's `ephemeral` creation flag and `isEphemeral` \
-             before building the 0.6 release line"
+            "remove the mapper's `ephemeral` creation flag, `isEphemeral` and the \
+             `uuid` alias before building the 0.6 release line"
         );
 
         assert_eq!(
             SMUDGY_MAPPER_DTS.matches(DEPRECATION).count(),
-            2,
-            "the compatibility catalog is exactly: CreateAreaOptions.ephemeral \
-             and Area.isEphemeral"
+            3,
+            "the compatibility catalog is exactly: CreateAreaOptions.ephemeral, \
+             Area.isEphemeral and Area.uuid"
         );
         assert_eq!(
             SMUDGY_MAPPER_TS.matches(DEPRECATION).count(),
-            2,
-            "the runtime implementation must mark its ephemeral option and getter"
+            3,
+            "the runtime implementation must mark its ephemeral option, its \
+             ephemeral getter and the `uuid` alias"
         );
         let nukefire_mapper = include_str!("../../../packages/nukefire-mapper/mapper.ts");
         assert_eq!(

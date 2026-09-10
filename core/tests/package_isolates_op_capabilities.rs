@@ -335,7 +335,7 @@ async fn no_smudgy_block_denies_every_gated_op() {
         probe("sendraw", () => sendRaw("x"));
         probe("gag",     () => line.gag());
         probe("reach",   () => { const _ = session.getSessions().length; });
-        probe("mapper",  () => mapper.setCurrentLocation([0, 0], 1));
+        probe("mapper",  () => mapper.setCurrentLocation("67e55044-10b1-426f-9247-bb680e5fe0c8", 1));
         echo("DONE");
     "#;
     let lines = run_capability_case(
@@ -721,7 +721,7 @@ async fn mapper_write_gates_set_current_location() {
             "Area" in globalThis ||
             "__smudgy_install_mapper" in globalThis;
         echo(mapperGlobalLeak ? "MAPPER_GLOBAL_LEAK" : "MAPPER_GLOBALS_GONE");
-        try { mapper.setCurrentLocation([0, 0], 1); echo("MAPPER_OK"); }
+        try { mapper.setCurrentLocation("67e55044-10b1-426f-9247-bb680e5fe0c8", 1); echo("MAPPER_OK"); }
         catch (e) { echo("MAPPER_DENIED:" + (e?.message ?? String(e))); }
         echo("DONE");
     "#;
