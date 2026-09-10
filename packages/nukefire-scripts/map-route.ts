@@ -14,21 +14,24 @@ export type RouteDirection =
   | "Special"
   | "Other";
 
+/** An area id as the mapper spells it: a canonical UUID string. */
+export type MapRouteAreaId = string;
+
 export interface RouteExit {
   from_direction: RouteDirection;
-  to_area_id: readonly [number, number] | null;
+  to_area_id: MapRouteAreaId | null;
   to_room_number: number | null;
   command: string | null;
 }
 
 export interface RouteRoom {
-  area_id: readonly [number, number];
+  area_id: MapRouteAreaId;
   room_number: number;
   exits: readonly RouteExit[];
 }
 
 export type RouteRoomLookup = (
-  areaId: readonly [number, number],
+  areaId: MapRouteAreaId,
   roomNumber: number,
 ) => RouteRoom | undefined;
 
@@ -59,10 +62,10 @@ const DIRECTIONS: Readonly<Record<string, string>> = {
 };
 
 function sameArea(
-  left: readonly [number, number],
-  right: readonly [number, number],
+  left: MapRouteAreaId,
+  right: MapRouteAreaId,
 ): boolean {
-  return left[0] === right[0] && left[1] === right[1];
+  return left === right;
 }
 
 function normalizedCommand(command: string | null): string {

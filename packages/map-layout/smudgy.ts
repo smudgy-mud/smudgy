@@ -30,11 +30,13 @@ export interface PlanAreaChangeOptions
 export type AreaChangePlan = Pick<PlannedLayout, "patch" | "positions" | "quality" | "search">;
 
 function idsMatch(a: AreaId | null, b: AreaId | null): boolean {
-  return !!a && !!b && a[0] === b[0] && a[1] === b[1];
+  return !!a && !!b && a === b;
 }
 
 function resolveArea(area: Area | AreaId): Area {
-  return "room_numbers" in area ? area : mapper.getAreaById(area);
+  // An AreaId is a string primitive, so `in` would throw here -- discriminate
+  // on the type, not on a property probe.
+  return typeof area === "string" ? mapper.getAreaById(area) : area;
 }
 
 function defaultRoomMovable(room: Room): boolean {
@@ -50,7 +52,7 @@ export function loadLayoutModel(
   options: LoadLayoutModelOptions = {},
 ): LayoutModel {
   const area = resolveArea(source);
-  const areaId: AreaId = [area.id[0], area.id[1]];
+  const areaId: AreaId = area.id;
   const movable = options.isRoomMovable ?? defaultRoomMovable;
   // Materialize every host wrapper exactly once. All work below this point is
   // performed against these primitives rather than repeated atomic reads.
@@ -63,9 +65,7 @@ export function loadLayoutModel(
       movable: movable(room),
       exits: room.exits.map((exit) => ({
         fromDirection: exit.from_direction,
-        toAreaId: exit.to_area_id
-          ? [exit.to_area_id[0], exit.to_area_id[1]] as AreaId
-          : null,
+        toAreaId: exit.to_area_id ?? null,
         toRoomNumber: exit.to_room_number,
       })),
     }];
@@ -112,9 +112,7 @@ export async function planAreaChange(
 ): Promise<AreaChangePlan> {
   // Always re-resolve a host wrapper by ID. An Area supplied by the caller may
   // itself be an immutable snapshot and cannot validate a later Worker result.
-  const liveArea: AreaId = "room_numbers" in area
-    ? [area.id[0], area.id[1]]
-    : [area[0], area[1]];
+  const liveArea: AreaId = typeof area === "string" ? area : area.id;
   const planOptions: PlanLayoutOptions = {
     allowExistingMoves: options.allowExistingMoves,
     fixedRooms: options.fixedRooms,

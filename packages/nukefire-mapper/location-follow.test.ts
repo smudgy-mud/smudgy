@@ -34,7 +34,7 @@ function makeMapper(
     findRoomByExternalId: () => found,
     getCurrentLocation: () => current,
     getAreaById(id: AreaId): FollowArea {
-      const area = areas.find((candidate) => candidate.id[0] === id[0] && candidate.id[1] === id[1]);
+      const area = areas.find((candidate) => candidate.id === id);
       if (!area) throw new Error("unknown area");
       return area;
     },
@@ -42,9 +42,9 @@ function makeMapper(
   };
 }
 
-const CLOUD_ID: AreaId = [1, 1];
-const LOCAL_ID: AreaId = [2, 2];
-const SESSION_ID: AreaId = [3, 3];
+const CLOUD_ID: AreaId = "11111111-1111-4111-8111-111111111111";
+const LOCAL_ID: AreaId = "22222222-2222-4222-8222-222222222222";
+const SESSION_ID: AreaId = "33333333-3333-4333-8333-333333333333";
 
 test("follows the sole binding of an unambiguous room id", () => {
   const cloud = makeArea(CLOUD_ID, "cloud", [{ number: 7, externalId: "100" }]);

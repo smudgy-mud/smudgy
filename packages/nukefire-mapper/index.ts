@@ -62,7 +62,7 @@ function followRoomInfo(vnum: number | undefined): void {
   if (vnum === undefined || !isUsableVnum(vnum)) return;
   const located = resolveFollowedLocation(mapper, externalRoomId(vnum));
   if (!located) return;
-  const key = `${located.area[0]}:${located.area[1]}:${located.room}`;
+  const key = `${located.area}:${located.room}`;
   if (key === followedLocation) return;
   mapper.setCurrentLocation(located.area, located.room);
   followedLocation = key;

@@ -225,7 +225,7 @@ export function openCommandProperty(direction: Direction): string {
     return `open_${DirectionLetter[direction]}_command`;
 }
 
-export function idsMatch(id1: [BigInt, BigInt], id2: [BigInt, BigInt]) {
+export function idsMatch(id1: AreaId | undefined | null, id2: AreaId | undefined | null) {
     if (!id1 && !id2) {
         return true;
     }
@@ -234,7 +234,7 @@ export function idsMatch(id1: [BigInt, BigInt], id2: [BigInt, BigInt]) {
         return false;
     }
 
-    return id1[0] === id2[0] && id1[1] === id2[1];
+    return id1 === id2;
 }
 
 /**

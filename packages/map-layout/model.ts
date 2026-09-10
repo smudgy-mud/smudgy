@@ -28,7 +28,9 @@ export interface LayoutModelRoom {
 
 /** A complete, host-independent layout snapshot. */
 export interface LayoutModel {
-  areaId?: readonly [number, number];
+  /** The source area's id, a canonical UUID string. Absent for models the
+   * caller built by hand rather than loading from a Smudgy area. */
+  areaId?: string;
   rooms: readonly LayoutModelRoom[];
   edges: readonly LayoutEdge[];
 }
@@ -181,7 +183,7 @@ function samePosition(a: GridPosition, b: GridPosition): boolean {
 /** Clone arbitrary room/link input into a stable library-owned value. */
 export function createLayoutModel(input: LayoutModel): LayoutModel {
   return {
-    areaId: input.areaId ? [input.areaId[0], input.areaId[1]] : undefined,
+    areaId: input.areaId,
     rooms: input.rooms.map((room) => ({
       ...room,
       id: key(room.id),
