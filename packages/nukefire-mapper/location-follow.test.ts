@@ -42,9 +42,11 @@ function makeMapper(
   };
 }
 
-const CLOUD_ID: AreaId = "11111111-1111-4111-8111-111111111111";
-const LOCAL_ID: AreaId = "22222222-2222-4222-8222-222222222222";
-const SESSION_ID: AreaId = "33333333-3333-4333-8333-333333333333";
+// Minting an id from a literal is exactly what the brand is there to make
+// explicit; test fixtures are the one place that is legitimate.
+const CLOUD_ID = "11111111-1111-4111-8111-111111111111" as AreaId;
+const LOCAL_ID = "22222222-2222-4222-8222-222222222222" as AreaId;
+const SESSION_ID = "33333333-3333-4333-8333-333333333333" as AreaId;
 
 test("follows the sole binding of an unambiguous room id", () => {
   const cloud = makeArea(CLOUD_ID, "cloud", [{ number: 7, externalId: "100" }]);

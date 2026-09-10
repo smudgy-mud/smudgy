@@ -219,7 +219,7 @@ declare module "smudgy:widgets" {
          *  `area.id` and the `map:room` event's `areaId` field both deliver.
          *  An entry whose string does not parse as a UUID is skipped (with a
          *  one-time warning) rather than applied unscoped. */
-        area?: AreaId;
+        area?: AreaIdLike;
     }
 
     /** Semantic door-state override — state, not style (a door's look comes from

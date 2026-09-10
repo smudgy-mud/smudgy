@@ -2932,6 +2932,108 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
     /// from `smudgy:core` — against the shipped typings. A clean compile proves the map types stay
     /// ambient while the two values use the module surface; a regression here is the "map types no
     /// longer available" breakage.
+    /// The id-typing contract, in both directions at once.
+    ///
+    /// An id an API returns is branded with its kind (`AreaId`, `ExitId`, ...),
+    /// so storing one in a field declared as another kind is a type error. A
+    /// call that takes an id accepts `<Id>Like`, which is that brand OR an
+    /// unbranded string -- so an id read back from JSON, a package parameter or
+    /// session state needs no cast, while an id of the *wrong kind* is still
+    /// refused rather than becoming a lookup that quietly finds nothing.
+    ///
+    /// That combination is what the `(string & { readonly __id?: undefined })`
+    /// arm buys, and it is subtle enough to be worth pinning: widening a
+    /// parameter to a plain `AreaId | string` would silently accept every case
+    /// below, including the three that must fail.
+    #[test]
+    fn map_ids_accept_plain_strings_and_reject_the_wrong_id_kind() {
+        use std::collections::BTreeMap;
+
+        let mut ambient = BTreeMap::new();
+        ambient.insert("smudgy-core.d.ts".to_string(), SMUDGY_CORE_DTS.to_string());
+        ambient.insert(
+            "smudgy-mapper.d.ts".to_string(),
+            SMUDGY_MAPPER_DTS.to_string(),
+        );
+
+        const PRELUDE: &str = r#"import { mapper } from "smudgy:core";
+            declare const area: Area;
+            declare const exit: Exit;
+            declare const fromParam: string;
+            declare const fromJson: any;
+        "#;
+
+        // (case, source, must compile)
+        let cases: &[(&str, &str, bool)] = &[
+            (
+                "an id the API returned",
+                "void mapper.getAreaById(area.id);",
+                true,
+            ),
+            (
+                "a plain string",
+                "void mapper.getAreaById(fromParam);",
+                true,
+            ),
+            (
+                "a JSON round trip",
+                "void mapper.getAreaById(fromJson);",
+                true,
+            ),
+            (
+                "a literal",
+                r#"void mapper.getAreaById("67e55044-10b1-426f-9247-bb680e5fe0c8");"#,
+                true,
+            ),
+            (
+                "the map:room event's areaId",
+                r#"import { room } from "smudgy:events/map";
+                   room.on((p) => { void mapper.getAreaById(p.areaId); });"#,
+                true,
+            ),
+            (
+                "an id stored in a typed field",
+                "const kept: AreaId = area.id; void kept;",
+                true,
+            ),
+            // The three that must NOT compile.
+            (
+                "an ExitId passed as an area",
+                "void mapper.getAreaById(exit.id);",
+                false,
+            ),
+            (
+                "an ExitId in a union parameter",
+                r#"void mapper.renameArea(exit.id, "nope");"#,
+                false,
+            ),
+            (
+                "an ExitId stored as an AreaId",
+                "const bad: AreaId = exit.id; void bad;",
+                false,
+            ),
+        ];
+
+        for (case, src, must_compile) in cases {
+            let mut sources = BTreeMap::new();
+            sources.insert("consumer.ts".to_string(), format!("{PRELUDE}\n{src}\n"));
+            let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+                .expect("compile the id-typing case");
+            let compiled = out.diagnostics.is_empty();
+            assert_eq!(
+                compiled,
+                *must_compile,
+                "{case}: expected it to {}, but it did not.\n{src}\n{:#?}",
+                if *must_compile {
+                    "type-check"
+                } else {
+                    "be rejected"
+                },
+                out.diagnostics
+            );
+        }
+    }
+
     #[test]
     fn external_package_map_surface_is_typed() {
         use std::collections::BTreeMap;
