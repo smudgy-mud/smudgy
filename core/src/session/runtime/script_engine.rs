@@ -56,7 +56,10 @@ use super::captures::OuterCaptures;
 use super::state_exposure::ExposedState;
 use super::trigger::FiringContext;
 use fire_state::FireStateCache;
-use matches::{MatchesKeys, materialize_matches, materialize_outer};
+use matches::{
+    MatchesKeys, function_wants_matches, materialize_matches, materialize_outer,
+    script_wants_matches,
+};
 mod ops;
 pub mod package_cache;
 mod package_provider;
@@ -276,6 +279,41 @@ type PackageAudioBinding = Option<smudgy_audio_web::PackageAudioScopeBinding>;
 #[cfg(not(feature = "web-audio"))]
 type PackageAudioBinding = ();
 
+/// A registered handler plus the one thing the fire path needs to know about it that the
+/// `v8::Global` cannot answer cheaply: whether it can observe the `matches` object at all.
+/// Deciding once, here, keeps the arity read and the source scan out of the fire path
+/// entirely — a handler is registered once and fires arbitrarily often.
+#[derive(Clone)]
+pub(crate) struct RegisteredFunction {
+    pub(crate) function: v8::Global<v8::Function>,
+    /// See `matches::function_wants_matches`. False only when the handler provably cannot
+    /// read its first argument.
+    pub(crate) wants_matches: bool,
+}
+
+impl RegisteredFunction {
+    /// Register `f`, deciding its `matches` need while the scope that produced it is still
+    /// open. Every creation op funnels through here so no registry entry can be built
+    /// without that decision being made.
+    pub(crate) fn new<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        f: v8::Local<'s, v8::Function>,
+    ) -> Self {
+        let wants_matches = function_wants_matches(scope, f);
+        Self {
+            function: v8::Global::new(scope, f),
+            wants_matches,
+        }
+    }
+}
+
+/// A compiled classic body and the same decision, taken against the source in `add_script`.
+pub(crate) struct CompiledScript {
+    pub(crate) script: v8::Global<v8::Script>,
+    /// See `matches::script_wants_matches`.
+    pub(crate) wants_matches: bool,
+}
+
 /// One V8 isolate and everything bound to it. `v8::Global` handles are isolate-bound, so
 /// the registries that hold them (`script_functions`, `compiled_scripts`) live *here*, one
 /// set per isolate, and never leave (`PACKAGE-ISOLATES-ENGINE.md`). `script_functions`
@@ -301,8 +339,8 @@ struct Isolate {
     /// rejects a mismatch — the callback's `v8::Global` is bound to a disposed predecessor,
     /// and materializing it would abort the session thread.
     instance: u64,
-    script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>>,
-    compiled_scripts: Vec<v8::Global<v8::Script>>,
+    script_functions: Rc<RefCell<Vec<RegisteredFunction>>>,
+    compiled_scripts: Vec<CompiledScript>,
     /// The call context of this isolate, see `ops::CallState`. This is the `Rc` its
     /// `OpState` holds. The dispatch bracket reads and writes it here directly. It does not
     /// look it up through `OpState` on each call.
@@ -1525,7 +1563,7 @@ impl<'a> ScriptEngine<'a> {
              data_dir: std::path::PathBuf,
              image_policy: smudgy_cloud::image_source::ImageSourcePolicy| {
                 let instance = NEXT_ISOLATE_INSTANCE.fetch_add(1, Ordering::Relaxed);
-                let script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>> =
+                let script_functions: Rc<RefCell<Vec<RegisteredFunction>>> =
                     Rc::new(RefCell::new(Vec::new()));
                 // Must agree with the `WorkerMode` this isolate's runtime is built with
                 // below: main = TrustedComputeOnly, sandboxes = SandboxedComputeOnly only with the
@@ -3384,7 +3422,11 @@ impl<'a> ScriptEngine<'a> {
             );
             return Ok(ActionResult::None);
         }
-        let function = bundle.script_functions.borrow().get(function_id.0).cloned();
+        let function = bundle
+            .script_functions
+            .borrow()
+            .get(function_id.0)
+            .map(|entry| entry.function.clone());
         let Some(function) = function else {
             warn!(
                 "Dropping pane-input submission into {isolate_id:?}: no handler at {function_id}"
@@ -3454,10 +3496,17 @@ impl<'a> ScriptEngine<'a> {
         } else {
             format!("with (globalThis.__smudgy_user_api) {{\n{source}\n}}")
         };
+        // Decided against the body the user wrote, not the `with` wrapper above it: the
+        // wrapper binds neither `matches` nor `outer`, so it cannot make a body observe
+        // either name that could not already.
+        let wants_matches = script_wants_matches(source);
         let bundle = self.isolate_mut(isolate)?;
         let script = compile_javascript(bundle.runtime.deno_runtime(), &wrapped, name)?;
         let script_id = ScriptId(bundle.compiled_scripts.len());
-        bundle.compiled_scripts.push(script);
+        bundle.compiled_scripts.push(CompiledScript {
+            script,
+            wants_matches,
+        });
         Ok(script_id)
     }
 
@@ -3584,26 +3633,38 @@ fn call_function_in(
         v8::tc_scope!(let try_catch, scope);
         let f = {
             let script_functions = script_functions.borrow();
-            script_functions
-                .get(usize::from(function_id))
-                .map(|f| v8::Local::new(try_catch, f))
+            script_functions.get(usize::from(function_id)).map(|entry| {
+                (
+                    v8::Local::new(try_catch, &entry.function),
+                    entry.wants_matches,
+                )
+            })
         };
         match f {
-            Some(f) => {
-                let matches_object = materialize_matches(try_catch, matches, matches_keys);
+            Some((f, wants_matches)) => {
                 let f_this = v8::undefined(try_catch).into();
-                // An inner trigger's handler gets the matched values of the triggers it is
-                // inside as its second argument; every other handler gets one argument.
-                let result = match outer {
-                    Some(outer) => {
-                        let outer_object = materialize_outer(try_catch, outer, matches_keys);
-                        f.call(
-                            try_catch,
-                            f_this,
-                            &[matches_object.into(), outer_object.into()],
-                        )
+                // A handler that provably cannot read its arguments is called with none, so
+                // the capture object is never built. It is the same call either way: a JS
+                // function reads a missing argument as `undefined`, and this one cannot read
+                // it at all.
+                let result = if wants_matches {
+                    let matches_object = materialize_matches(try_catch, matches, matches_keys);
+                    // An inner trigger's handler gets the matched values of the triggers it
+                    // is inside as its second argument; every other handler gets one
+                    // argument.
+                    match outer {
+                        Some(outer) => {
+                            let outer_object = materialize_outer(try_catch, outer, matches_keys);
+                            f.call(
+                                try_catch,
+                                f_this,
+                                &[matches_object.into(), outer_object.into()],
+                            )
+                        }
+                        None => f.call(try_catch, f_this, &[matches_object.into()]),
                     }
-                    None => f.call(try_catch, f_this, &[matches_object.into()]),
+                } else {
+                    f.call(try_catch, f_this, &[])
                 };
                 drain_handler_microtasks(try_catch);
                 call_outcome(try_catch, result)
@@ -3683,20 +3744,27 @@ fn run_script_in(
     let outcome = {
         v8::tc_scope!(let try_catch, scope);
         match compiled_scripts.get(usize::from(script_id)) {
-            Some(script) => {
-                let script = v8::Local::new(try_catch, script);
-                let matches_object = materialize_matches(try_catch, matches, matches_keys);
-                let matches_name = matches_keys.script_name(try_catch);
+            Some(compiled) => {
+                let wants_matches = compiled.wants_matches;
+                let script = v8::Local::new(try_catch, &compiled.script);
                 let global = try_catch.get_current_context().global(try_catch);
-                global.set(try_catch, matches_name.into(), matches_object.into());
-                // The `outer` global beside `matches`: the outer chain's values for an inner
-                // trigger's script, `undefined` for everything else so nothing stale remains.
-                let outer_name = matches_keys.outer_name(try_catch);
-                let outer_value: v8::Local<v8::Value> = match outer {
-                    Some(outer) => materialize_outer(try_catch, outer, matches_keys).into(),
-                    None => v8::undefined(try_catch).into(),
-                };
-                global.set(try_catch, outer_name.into(), outer_value);
+                // A body that cannot name either global is not given them. Whatever an
+                // earlier fire left on the global object stays there: this body cannot read
+                // it, and the next body that can always writes both names before it runs.
+                if wants_matches {
+                    let matches_object = materialize_matches(try_catch, matches, matches_keys);
+                    let matches_name = matches_keys.script_name(try_catch);
+                    global.set(try_catch, matches_name.into(), matches_object.into());
+                    // The `outer` global beside `matches`: the outer chain's values for an
+                    // inner trigger's script, `undefined` for everything else so nothing
+                    // stale remains.
+                    let outer_name = matches_keys.outer_name(try_catch);
+                    let outer_value: v8::Local<v8::Value> = match outer {
+                        Some(outer) => materialize_outer(try_catch, outer, matches_keys).into(),
+                        None => v8::undefined(try_catch).into(),
+                    };
+                    global.set(try_catch, outer_name.into(), outer_value);
+                }
                 if let Some(exposed) = exposed {
                     let state = fire_state.state_object(try_catch, script_id, exposed);
                     let state_name = fire_state.key(try_catch);

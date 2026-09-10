@@ -10,7 +10,7 @@ use crate::models::triggers::{InnerInput, InnerReach, LineReach, Overlap};
 use crate::session::connection::vt_processor::{AnsiColor, parse_link_tooltip_text};
 use crate::session::runtime::line_operation::{LineOperation, LinkUpdate, SpliceRun};
 use crate::session::runtime::pane;
-use crate::session::runtime::script_engine::FunctionId;
+use crate::session::runtime::script_engine::{FunctionId, RegisteredFunction};
 use crate::session::runtime::store;
 use crate::session::runtime::trigger::{
     AliasSender, FiringFlags, MatchCapture, PreparedScriptTriggerPatterns, ScriptTriggerPattern,
@@ -193,7 +193,7 @@ deno_core::extension!(
     local_package_names: Arc<std::collections::HashMap<String, String>>,
     local_catalog_error: Option<Arc<str>>,
     declared_package_params: Rc<RefCell<HashMap<String, Vec<smudgy_script::PackageParameter>>>>,
-    script_functions: Rc<RefCell<Vec<v8::Global<v8::Function>>>>,
+    script_functions: Rc<RefCell<Vec<RegisteredFunction>>>,
     spawned_actions: ActionQueue,
     ui_command_producer: Option<crate::session::ui_command::UiCommandProducer>,
     pending_line_operations: Rc<RefCell<Vec<LineOperation>>>,
@@ -317,7 +317,7 @@ deno_core::extension!(
       error: options.local_catalog_error,
     });
     state.put::<DeclaredPackageParams>(DeclaredPackageParams(options.declared_package_params));
-    state.put::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>(options.script_functions);
+    state.put::<Rc<RefCell<Vec<RegisteredFunction>>>>(options.script_functions);
     state.put::<ActionQueue>(options.spawned_actions);
     state.put::<Option<crate::session::ui_command::UiCommandProducer>>(
       options.ui_command_producer
@@ -1357,10 +1357,10 @@ fn op_smudgy_on<'s>(
     if reaches_other {
         ensure(grants(state).reach_others, "reach-others")?;
     }
-    let f = v8::Global::new(scope, f);
+    let f = RegisteredFunction::new(scope, f);
     let function_id = {
         let mut script_functions = state
-            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>()
             .borrow_mut();
         let id = FunctionId(script_functions.len());
         script_functions.push(f);
@@ -2287,10 +2287,10 @@ fn op_smudgy_store_watch<'s>(
     ensure(grants(state).interop_read, "interop:read")?;
     let producer = parse_producer(producer)?;
     let path = parse_path(path)?;
-    let f = v8::Global::new(scope, f);
+    let f = RegisteredFunction::new(scope, f);
     let function_id = {
         let mut script_functions = state
-            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>()
             .borrow_mut();
         let id = FunctionId(script_functions.len());
         script_functions.push(f);
@@ -2452,10 +2452,10 @@ fn op_smudgy_store_remote_watch<'s>(
     let path = parse_path(path)?;
     let function_id = {
         let mut functions = state
-            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>()
             .borrow_mut();
         let id = FunctionId(functions.len());
-        functions.push(v8::Global::new(scope, f));
+        functions.push(RegisteredFunction::new(scope, f));
         id
     };
     let cadence = if per_write {
@@ -2548,10 +2548,10 @@ fn op_smudgy_procedure_on<'s>(
     if !gate_interop_write(state, &root, "procedure implement")? {
         return Ok(());
     }
-    let f = v8::Global::new(scope, f);
+    let f = RegisteredFunction::new(scope, f);
     let function_id = {
         let mut script_functions = state
-            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>()
             .borrow_mut();
         let id = FunctionId(script_functions.len());
         script_functions.push(f);
@@ -5177,11 +5177,11 @@ fn op_smudgy_create_javascript_function_trigger<'s>(
         return Ok(false);
     }
 
-    let f = v8::Global::new(scope, f);
+    let f = RegisteredFunction::new(scope, f);
     // Store the function and get the function_id
     let function_id = {
         let mut script_functions = state
-            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>()
             .borrow_mut();
         let function_id = FunctionId(script_functions.len());
         script_functions.push(f);
@@ -5259,11 +5259,11 @@ fn op_smudgy_create_javascript_function_alias<'s>(
         return Ok(false);
     }
 
-    let f = v8::Global::new(scope, f);
+    let f = RegisteredFunction::new(scope, f);
     // Store the function and get the function_id
     let function_id = {
         let mut script_functions = state
-            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>()
             .borrow_mut();
         let function_id = FunctionId(script_functions.len());
         script_functions.push(f);
@@ -5391,10 +5391,10 @@ fn op_smudgy_create_hotkey<'s>(
     ensure(grants(state).create_triggers, "triggers")?;
     let origin = creator_origin(state, creator_id)?;
 
-    let f = v8::Global::new(scope, f);
+    let f = RegisteredFunction::new(scope, f);
     let function_id = {
         let mut script_functions = state
-            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>()
             .borrow_mut();
         let function_id = FunctionId(script_functions.len());
         script_functions.push(f);
@@ -6944,10 +6944,10 @@ fn register_pane_input_callback<'s>(
     key: pane::PaneKey,
     f: v8::Local<'s, v8::Function>,
 ) -> Result<(), PaneCallError> {
-    let f = v8::Global::new(scope, f);
+    let f = RegisteredFunction::new(scope, f);
     let function_id = {
         let mut script_functions = state
-            .borrow::<Rc<RefCell<Vec<v8::Global<v8::Function>>>>>()
+            .borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>()
             .borrow_mut();
         let id = FunctionId(script_functions.len());
         script_functions.push(f);
