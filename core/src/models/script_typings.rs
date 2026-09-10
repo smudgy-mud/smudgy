@@ -2926,12 +2926,6 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
         assert_covered(&smudgy_cloud::ConnectionDash::ALL, "ConnectionDash");
     }
 
-    /// Coverage guard for EXTERNAL packages: compile a consumer that reaches the map the way
-    /// installed `smudgy://` package scripts do — `Room`/`Area`/`Exit`/`ExitId`/`RoomNumber`/
-    /// `AreaId` as AMBIENT GLOBALS (no type imports), with the runtime `mapper`/`Area` values imported
-    /// from `smudgy:core` — against the shipped typings. A clean compile proves the map types stay
-    /// ambient while the two values use the module surface; a regression here is the "map types no
-    /// longer available" breakage.
     /// The id-typing contract, in both directions at once.
     ///
     /// An id an API returns is branded with its kind (`AreaId`, `ExitId`, ...),
@@ -2996,6 +2990,34 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
                 "const kept: AreaId = area.id; void kept;",
                 true,
             ),
+            // Ids nested in an options/args object rather than passed directly. A widening
+            // pass over parameter *lines* cannot reach these, which is how
+            // `ExitArgs.to_area_id` and `CreateAreaOptions.atlas` first shipped branded-only.
+            (
+                "a plain string as a cross-area exit target",
+                r#"void mapper.createRoomExit(area, 1, { from_direction: "North", to_area_id: fromParam });"#,
+                true,
+            ),
+            (
+                "a plain string as an exit update target",
+                r#"void mapper.setRoomExit(area, 1, exit.id, { to_area_id: fromParam });"#,
+                true,
+            ),
+            (
+                "a plain string as a create-area atlas",
+                r#"void mapper.createArea("Town", { atlas: fromParam });"#,
+                true,
+            ),
+            (
+                "a plain string as a relocation atlas",
+                r#"void mapper.copyArea(area, { storage: "local", atlas: fromParam });"#,
+                true,
+            ),
+            (
+                "a wrong-kind id nested in an options object",
+                r#"void mapper.createRoomExit(area, 1, { from_direction: "North", to_area_id: exit.id });"#,
+                false,
+            ),
             // The three that must NOT compile.
             (
                 "an ExitId passed as an area",
@@ -3034,6 +3056,12 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
         }
     }
 
+    /// Coverage guard for EXTERNAL packages: compile a consumer that reaches the map the way
+    /// installed `smudgy://` package scripts do — `Room`/`Area`/`Exit`/`ExitId`/`RoomNumber`/
+    /// `AreaId` as AMBIENT GLOBALS (no type imports), with the runtime `mapper`/`Area` values imported
+    /// from `smudgy:core` — against the shipped typings. A clean compile proves the map types stay
+    /// ambient while the two values use the module surface; a regression here is the "map types no
+    /// longer available" breakage.
     #[test]
     fn external_package_map_surface_is_typed() {
         use std::collections::BTreeMap;
