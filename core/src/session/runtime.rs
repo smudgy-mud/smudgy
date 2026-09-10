@@ -3374,33 +3374,63 @@ impl Inner<'_> {
                 break;
             }
 
-            let mut deno_iters = 0;
-            // Phase 1: Poll script engine until no more immediate work is available
-            std::future::poll_fn(|cx| {
-                loop {
-                    match self.script_engine.poll_event_loop(cx) {
-                        Poll::Ready(Ok(())) => {
-                            deno_iters += 1;
+            // Phase 1: Poll script engine until no more immediate work is available.
+            //
+            // The pump is skipped while the current frame still holds actions, because the
+            // next thing this loop does is dispatch one of them. A pump between two actions
+            // of one expansion runs deno's whole event loop — timers, module progress, the
+            // op driver, the libuv phases, a microtask checkpoint between each — to service
+            // work that a synchronous handler has usually not created. Waiting loses none of
+            // it: `mark_isolate_ready` sets a flag that only a pump clears, a cross-thread
+            // completion accumulates in the ready-set, and a timer or op armed by a handler
+            // re-queues its own isolate through that isolate's `DemuxWaker` without any help
+            // from the seed (`EVENT-LOOP-READINESS-DEMUX.md` §5(e)). A frame always drains,
+            // so the pump still runs before the next external action and before every park.
+            //
+            // What moves is when a promise continuation runs: at the end of its line's
+            // expansion rather than between two of that line's actions. The actions such a
+            // continuation emits keep their queue position regardless — Phase 1.5 forwards
+            // them to the back of the main channel and never into the in-flight expansion
+            // (`EVENT-LOOP-READINESS.md` §5).
+            //
+            // Async work inside the isolates therefore waits out the expansion it lands in:
+            // a script emitting thousands of actions into one frame delays its own timers
+            // and continuations until that frame drains. Nothing else caps that wait, since
+            // the 500ms safety-net tick is reached only at the idle `select!`. It is a
+            // latency cost during a burst that the script itself created, not a lost wake.
+            //
+            // Scheduling of the other tasks on this runtime is unaffected either way: a pump
+            // that returns `Ready` is not a yield point, so it was never what gave the
+            // connection reader its turn — that is the readiness arm's `yield_now` below.
+            let frame_pending = action_stack.last().is_some_and(|frame| !frame.is_empty());
+            if !frame_pending {
+                let mut deno_iters = 0;
+                std::future::poll_fn(|cx| {
+                    loop {
+                        match self.script_engine.poll_event_loop(cx) {
+                            Poll::Ready(Ok(())) => {
+                                deno_iters += 1;
 
-                            if deno_iters < MAX_DENO_ITERS {
-                                continue;
+                                if deno_iters < MAX_DENO_ITERS {
+                                    continue;
+                                }
+
+                                return Poll::Ready(());
                             }
-
-                            return Poll::Ready(());
-                        }
-                        Poll::Ready(Err(err)) => {
-                            warn!("Error in script engine event loop: {err:?}");
-                            self.echo_warn_str_sync(&script_engine::format_script_error(&err));
-                            return Poll::Ready(());
-                        }
-                        Poll::Pending => {
-                            // No more work available right now, continue to action processing
-                            return Poll::Ready(());
+                            Poll::Ready(Err(err)) => {
+                                warn!("Error in script engine event loop: {err:?}");
+                                self.echo_warn_str_sync(&script_engine::format_script_error(&err));
+                                return Poll::Ready(());
+                            }
+                            Poll::Pending => {
+                                // No more work available right now, continue to action processing
+                                return Poll::Ready(());
+                            }
                         }
                     }
-                }
-            })
-            .await;
+                })
+                .await;
+            }
 
             // Phase 1.5: Anything scripts emitted from async continuations
             // (timers, resolved promises) has no position in any in-flight
