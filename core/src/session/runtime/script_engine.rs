@@ -56,10 +56,7 @@ use super::captures::OuterCaptures;
 use super::state_exposure::ExposedState;
 use super::trigger::FiringContext;
 use fire_state::FireStateCache;
-use matches::{
-    MatchesKeys, function_wants_matches, materialize_matches, materialize_outer,
-    script_wants_matches,
-};
+use matches::{MatchesKeys, materialize_matches, materialize_outer};
 mod ops;
 pub mod package_cache;
 mod package_provider;
@@ -299,7 +296,14 @@ impl RegisteredFunction {
         scope: &mut v8::PinScope<'s, '_>,
         f: v8::Local<'s, v8::Function>,
     ) -> Self {
-        let wants_matches = function_wants_matches(scope, f);
+        // `Function.prototype.toString` is the only way to the handler's source, and it is
+        // user-reachable: it can be replaced, and it can throw. A source this cannot read
+        // proves nothing about the handler, so it keeps its argument.
+        let wants_matches = f.to_string(scope).is_none_or(|source| {
+            smudgy_script::matches_reach::function_can_observe_matches(
+                &source.to_rust_string_lossy(scope),
+            )
+        });
         Self {
             function: v8::Global::new(scope, f),
             wants_matches,
@@ -3499,7 +3503,7 @@ impl<'a> ScriptEngine<'a> {
         // Decided against the body the user wrote, not the `with` wrapper above it: the
         // wrapper binds neither `matches` nor `outer`, so it cannot make a body observe
         // either name that could not already.
-        let wants_matches = script_wants_matches(source);
+        let wants_matches = smudgy_script::matches_reach::script_can_observe_matches(source);
         let bundle = self.isolate_mut(isolate)?;
         let script = compile_javascript(bundle.runtime.deno_runtime(), &wrapped, name)?;
         let script_id = ScriptId(bundle.compiled_scripts.len());

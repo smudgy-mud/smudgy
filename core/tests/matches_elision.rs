@@ -70,7 +70,7 @@ createTrigger(/^EVAL (\w+)$/, function () {
 });
 
 createTrigger("^VERIFY_ELISION$", () => {
-    check(fired === 11, "fire count: " + fired);
+    check(fired === 12, "fire count: " + fired);
     Promise.resolve().then(() => echo(
         elisionFailures.length ? "ELISION_FAIL:" + elisionFailures.join(",") : "ELISION_DONE"));
 });
@@ -109,6 +109,14 @@ const BODIES: &[(&str, &str, ScriptLang, &str)] = &[
         r"^THIS_SCRIPT (\w+)$",
         ScriptLang::JS,
         "check(this['mat' + 'ches'][1] === 'iota', 'this script lost its captures'); fired++; void 0;",
+    ),
+    // `self` is deno's global alias, and is a receiver like the two above. Probing it here
+    // proves the escape list covers whatever this runtime actually defines.
+    (
+        "self script",
+        r"^SELF_SCRIPT (\w+)$",
+        ScriptLang::JS,
+        "check(self['mat' + 'ches'][1] === 'kappa', 'self script lost its captures'); fired++; void 0;",
     ),
 ];
 
@@ -197,6 +205,7 @@ async fn handlers_that_cannot_observe_matches_are_not_given_one() {
         "READING_SCRIPT zeta",
         "DYNAMIC_SCRIPT eta",
         "THIS_SCRIPT iota",
+        "SELF_SCRIPT kappa",
         "VERIFY_ELISION",
     ] {
         tx.send(RuntimeAction::HandleIncomingLine(Arc::new(

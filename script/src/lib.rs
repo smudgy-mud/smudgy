@@ -6,6 +6,7 @@ pub mod interop_extract;
 pub mod language_service;
 mod language_service_engine;
 pub mod language_service_worker;
+pub mod matches_reach;
 mod module_loader;
 mod npm_resolver;
 mod package_resolver;
