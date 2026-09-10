@@ -7,6 +7,7 @@ import {
   type RouteDirection,
   type RouteExit,
   type RouteRoom,
+  type MapRouteAreaId,
 } from "./map-route.ts";
 
 const AREA = "11111111-1111-4111-8111-111111111111";
@@ -16,7 +17,7 @@ function exit(
   from_direction: RouteDirection,
   to_room_number: number,
   command: string | null = null,
-  to_area_id: readonly [number, number] = AREA,
+  to_area_id: MapRouteAreaId = AREA,
 ): RouteExit {
   return {
     from_direction,
