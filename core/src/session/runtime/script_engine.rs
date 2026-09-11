@@ -62,6 +62,7 @@ mod ops;
 pub mod package_cache;
 mod package_provider;
 mod package_solver;
+mod script_uuid;
 
 pub use ops::layout_fold;
 

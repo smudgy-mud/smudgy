@@ -922,16 +922,19 @@ createHotkey({ key: "F1", modifiers: ["Control"] }, () => {
 });
 echo(hotkeys.exists("control+F1") ? "HOTKEY_REGISTERED" : "HOTKEY_MISSING");
 
-// Round-trip the current location through set/getCurrentLocation. The area id is a
-// [u64, u64] pair; room 42. getCurrentLocation should read it straight back.
-const area = [1n, 2n];
+// Round-trip the current location through set/getCurrentLocation. An area id is a canonical
+// UUID string, so it compares with `===` and survives JSON.stringify.
+const area = "67e55044-10b1-426f-9247-bb680e5fe0c8";
 mapper.setCurrentLocation(area, 42);
 const here = mapper.getCurrentLocation();
-// The area id pair round-trips as a [u64, u64]; serde may surface small ids as plain numbers,
-// so coerce both sides through Number for the comparison.
-const locOk = here !== undefined &&
-    Number(here.area[0]) === 1 && Number(here.area[1]) === 2 && here.room === 42;
+const locOk = here !== undefined && here.area === area && here.room === 42 &&
+    JSON.parse(JSON.stringify(here)).area === area;
 echo(locOk ? "LOCATION_OK" : ("LOCATION_FAIL " + JSON.stringify(here)));
+
+// The old [hi, lo] spelling is gone: it must be refused, not quietly reinterpreted.
+let rejected = false;
+try { mapper.setCurrentLocation([1n, 2n] as any, 43); } catch { rejected = true; }
+echo(rejected ? "LEGACY_ID_REJECTED" : "LEGACY_ID_ACCEPTED");
 "#;
 
 #[tokio::test]
@@ -1029,6 +1032,10 @@ async fn timers_hotkeys_and_mapper_location() {
         "a script hotkey's handler must fire on ExecHotkey.\nTranscript:\n{transcript}"
     );
     // setCurrentLocation -> getCurrentLocation round-trips.
+    assert!(
+        lines.iter().any(|l| l == "LEGACY_ID_REJECTED"),
+        "the old [hi, lo] id spelling must be refused, not reinterpreted.\nTranscript:\n{transcript}"
+    );
     assert!(
         lines.iter().any(|l| l == "LOCATION_OK"),
         "getCurrentLocation must round-trip the value set by setCurrentLocation.\nTranscript:\n{transcript}"

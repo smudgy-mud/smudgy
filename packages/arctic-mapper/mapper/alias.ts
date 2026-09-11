@@ -290,7 +290,7 @@ function moveSelected(direction: string) {
         
         const area = mapper.getAreaById(areaId);
         if (!area) {
-            echo(`Area ${areaId.map((c) => c.toString(16)).join("")} not found`);
+            echo(`Area ${areaId} not found`);
             return;
         }
         const room = area.room(roomId);
@@ -328,8 +328,7 @@ async function areaCommand([subcommand, ...args]: string[]) {
             echo("\nAreas:");
             for (const area of mapper.areas) {
                 echo(
-                    `  ${area.name} (${area.room_numbers.length} rooms) [${area.id.map((c) => c.toString(16)).join("")
-                    }]`,
+                    `  ${area.name} (${area.room_numbers.length} rooms) [${area.id}]`,
                 );
             }
             break;
@@ -705,7 +704,7 @@ const commands = {
         }
         const path = mapper.getPathBetweenRooms(fromRoom.area_id, fromRoom.room_number, toRoom.area_id, toRoom.room_number);
         for (const room of path) {
-            const areaId = room[0][0].toString(16) + room[0][1].toString(16);
+            const areaId = room[0];
             const roomNumber = room[1];
             echo(`area ${areaId} room ${roomNumber}`);
         }
@@ -815,8 +814,7 @@ const commands = {
         mapper.setCurrentLocation(found.id, room ? parseInt(room) : null);
 
         echo(
-            `Selected area: ${state.area?.name} [${found.id.map((c) => c.toString(16)).join("")
-            }]`,
+            `Selected area: ${state.area?.name} [${found.id}]`,
         );
 
         if (!room) {
@@ -937,7 +935,7 @@ const commands = {
                 state.area = mapper.getAreaById(areaId);
                 state.room = state.area.room(roomNumber);
                 for (const [direction, id] of createdExits) {
-                    echo(`Created exit ${direction} (${id.map((c) => c.toString(16)).join("")})`);
+                    echo(`Created exit ${direction} (${id})`);
                 }
             })().catch((error) => {
                 echo(`Map refresh failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1150,7 +1148,7 @@ function matchingRoomsWithReciprocalStub(
     const reciprocalDirection = OppositeDirection[direction];
     return mapper.listRoomsByTitleAndDescription(title, description)
         .filter((room): room is Room => !!room)
-        .filter((room) => room.area_id[0] === source.area_id[0] && room.area_id[1] === source.area_id[1] &&
+        .filter((room) => room.area_id === source.area_id &&
             room.room_number !== source.room_number)
         .filter((room) => room.exits.some((exit) =>
             exit.from_direction === reciprocalDirection && exit.to_room_number === null
