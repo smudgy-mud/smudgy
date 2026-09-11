@@ -3997,7 +3997,7 @@ THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO
 
 Used by:
 
-- smudgy_core 0.5.6
+- smudgy_core 0.5.7-ptb
 - rustybuzz 0.20.1
 
 ~~~
@@ -14244,10 +14244,10 @@ SOFTWARE.
 
 Used by:
 
-- iced-code-editor 0.5.1
 - deno_core 0.410.0
 - deno_permissions 0.116.0
 - deno_runtime 0.265.0
+- iced-code-editor 0.5.1
 - iced_graphics 0.14.0
 - iced_runtime 0.14.0
 - iced_winit 0.14.0
