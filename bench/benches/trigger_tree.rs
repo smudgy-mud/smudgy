@@ -48,6 +48,7 @@ fn push(mgr: &mut Manager, name: &str, pattern: &str, outer: Option<&str>, reach
         anti_patterns: &empty,
         matchers: None,
         action: ScriptAction::Noop,
+        reads_matches: true,
         prompt: false,
         enabled: true,
         priority: 0,

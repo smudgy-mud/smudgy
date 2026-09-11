@@ -73,6 +73,9 @@ sha2 = "0.10"
 # Fast non-cryptographic hasher for the per-isolate waker demux ready-set (`IsolateId`-keyed,
 # hot on every wake). Already in the tree via deno; avoids SipHash over the id's `Arc<str>`s.
 rustc-hash = "2"
+# XXH3 for the matcher's repeat-line cache: the hash has to cost a small fraction of
+# the scan it decides whether to skip. Already in the tree transitively.
+twox-hash = { version = "2", default-features = false, features = ["xxhash3_64"] }
 # Embeds the vendored editor runtime typings (Deno lib + @types/node) into the binary so
 # they can be written into a script author's `.smudgy/` project at session start.
 include_dir = "0.7"

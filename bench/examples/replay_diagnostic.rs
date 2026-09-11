@@ -100,6 +100,7 @@ fn push(manager: &mut Manager, name: &str, patterns: Vec<String>, color: Option<
             anti_patterns: &empty,
             matchers: Some(&matchers),
             action: ScriptAction::Noop,
+            reads_matches: true,
             prompt: false,
             enabled: true,
             priority: 0,

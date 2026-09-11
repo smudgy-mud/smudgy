@@ -1255,6 +1255,11 @@ pub struct PushTriggerParams<'a> {
     /// reproduces every stored vector exactly.
     pub matchers: Option<&'a [TriggerMatcherSource]>,
     pub action: ScriptAction,
+    /// Whether the body behind `action` can read the captures a fire hands it, from
+    /// [`ScriptEngine::action_reads_matches`](super::script_engine::ScriptEngine::action_reads_matches).
+    /// The dispatcher answers it because only the script engine can; everything else
+    /// passes `true`, which is the unproven case and keeps the existing path.
+    pub reads_matches: bool,
     pub prompt: bool,
     pub enabled: bool,
     pub priority: i32,
@@ -1821,6 +1826,7 @@ impl Manager {
         source: Option<Arc<str>>,
         command: Option<crate::models::matchers::CommandSpec>,
         exposure: Option<Arc<ExposedState>>,
+        reads_matches: bool,
     ) -> Result<()> {
         self.add_or_update_alias(
             Trigger::new_alias(
@@ -1835,6 +1841,7 @@ impl Manager {
             )?
             .with_source(source)
             .with_command(command)
+            .with_matches_reach(reads_matches)
             .with_allow_self_match(allow_self_match)
             .with_exposure(exposure),
         );
@@ -1873,6 +1880,7 @@ impl Manager {
                 params.line_limit,
             )?
             .with_source(params.source)
+            .with_matches_reach(params.reads_matches)
             .with_exposure(exposure)
             .with_placement(params.outer, params.reach),
         );
@@ -1898,6 +1906,7 @@ impl Manager {
         source: Option<Arc<str>>,
         outer: Option<Arc<String>>,
         reach: InnerReach,
+        reads_matches: bool,
     ) {
         self.add_or_update_trigger(
             Trigger::from_prepared(
@@ -1914,6 +1923,7 @@ impl Manager {
                 line_limit,
             )
             .with_source(source)
+            .with_matches_reach(reads_matches)
             .with_placement(outer, reach),
         );
     }
@@ -1932,6 +1942,7 @@ impl Manager {
         fire_limit: Option<u32>,
         source: Option<Arc<str>>,
         command: Option<crate::models::matchers::CommandSpec>,
+        reads_matches: bool,
     ) -> Result<()> {
         self.add_or_update_alias(
             Trigger::new_alias(
@@ -1946,6 +1957,7 @@ impl Manager {
             )?
             .with_source(source)
             .with_command(command)
+            .with_matches_reach(reads_matches)
             .with_allow_self_match(allow_self_match),
         );
         Ok(())
@@ -3257,6 +3269,14 @@ struct Trigger {
     colored_anti_pattern_set: Option<RegexSet>,
     colored_anti_patterns: Vec<(Regex, CompiledColorMatch)>,
     script: ScriptAction,
+    /// Whether the body behind `script` can observe the captures a fire hands it, decided
+    /// once at registration by
+    /// [`ScriptEngine::action_reads_matches`](super::script_engine::ScriptEngine::action_reads_matches).
+    /// `false` lets [`Self::run`] skip extracting them (see [`CapturePayload::Unread`]).
+    /// True for everything unproven, and for every trigger registered without the engine's
+    /// answer — tests, benches, and the plaintext bodies whose Send text expands captures
+    /// in Rust.
+    reads_matches: bool,
     prompt: bool,
     enabled: bool,
     /// Higher values are evaluated first; equal values retain registration order.
@@ -3517,6 +3537,9 @@ impl Trigger {
             colored_anti_pattern_set,
             colored_anti_patterns,
             script,
+            // Registration decides this where the engine is in reach; see
+            // `with_matches_reach`. Unproven until then.
+            reads_matches: true,
             prompt,
             enabled,
             priority,
@@ -3589,6 +3612,15 @@ impl Trigger {
         self
     }
 
+    /// Records whether the registered body can read the captures a fire hands it (see
+    /// [`Trigger::reads_matches`]). Chained at the push sites that registered the body
+    /// through the script engine, which is the only place that can answer it.
+    #[must_use]
+    fn with_matches_reach(mut self, reads_matches: bool) -> Self {
+        self.reads_matches = reads_matches;
+        self
+    }
+
     /// Attaches a Command alias's argument parser (see [`Trigger::command`]).
     #[must_use]
     fn with_command(mut self, command: Option<crate::models::matchers::CommandSpec>) -> Self {
@@ -3635,11 +3667,22 @@ impl Trigger {
             return Ok(None);
         }
 
-        let pattern = match match_type {
-            TriggerMatchType::Normal => self.patterns.get(pattern_idx).unwrap(),
-            TriggerMatchType::Raw => self.raw_patterns.get(pattern_idx).unwrap(),
-        };
-        let captures = if let Some(styled_line) = context.styled_line {
+        // A body that provably cannot read `matches` gets none built. #205 already skips
+        // the V8 object for such a body; everything behind it is skipped here — the second
+        // regex search over the line and the payload allocation, which together are the
+        // whole remaining per-fire capture cost.
+        //
+        // A trigger with something inside it is excluded even when its own body reads
+        // nothing: its firing keeps the payload as the `outer` chain, and the triggers
+        // inside it read that. The check is on `inner` rather than on registration because
+        // an inner trigger can register after its outer does.
+        //
+        // One `RunAutomation` is queued either way, below: a fire that elides differs from
+        // one that does not only in what it carries.
+        let captures = if !self.reads_matches && self.inner.is_none() {
+            CapturePayload::Unread
+        } else if let Some(styled_line) = context.styled_line {
+            let pattern = self.selected_pattern(match_type, pattern_idx);
             if context.base == 0 {
                 pattern.capture_line(
                     styled_line,
@@ -3655,6 +3698,7 @@ impl Trigger {
                 )
             }
         } else {
+            let pattern = self.selected_pattern(match_type, pattern_idx);
             // Ordered captures: position is the group number (index 0 = whole match), `name` set
             // only for named groups. The list is shared by the JS handlers (numeric/named
             // `matches` object) and the inline `SendSimple` template expansion.
@@ -3697,6 +3741,18 @@ impl Trigger {
                 firing: context.firing,
             });
         Ok(Some(captures))
+    }
+
+    /// The pattern the match was selected on, in the vector its match type indexes.
+    fn selected_pattern(
+        &self,
+        match_type: TriggerMatchType,
+        pattern_idx: usize,
+    ) -> &CapturePattern {
+        match match_type {
+            TriggerMatchType::Normal => self.patterns.get(pattern_idx).unwrap(),
+            TriggerMatchType::Raw => self.raw_patterns.get(pattern_idx).unwrap(),
+        }
     }
 
     /// The Command path of [`Trigger::run`]: tokenize and assign per the spec.
@@ -4362,6 +4418,7 @@ mod tests {
                     anti_patterns: &empty,
                     matchers: Some(&matchers),
                     action: ScriptAction::Noop,
+                    reads_matches: true,
                     prompt: false,
                     enabled: true,
                     priority: 0,
@@ -4458,6 +4515,7 @@ mod tests {
                         anti_patterns: &empty,
                         matchers: Some(&matchers),
                         action: ScriptAction::Noop,
+                        reads_matches: true,
                         prompt: false,
                         enabled: true,
                         priority: 0,
@@ -4959,6 +5017,7 @@ mod tests {
                     anti_patterns: &empty,
                     matchers: Some(&matchers),
                     action: ScriptAction::Noop,
+                    reads_matches: true,
                     prompt: false,
                     enabled: true,
                     priority: 0,
@@ -5033,6 +5092,7 @@ mod tests {
                 None,
                 None,
                 crate::models::triggers::InnerReach::DEFAULT,
+                true,
             );
             let line = Arc::new(StyledLine::new(
                 "plain red",
@@ -5093,6 +5153,7 @@ mod tests {
                     anti_patterns: &Arc::new(Vec::new()),
                     matchers: None,
                     action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
+                    reads_matches: true,
                     prompt: false,
                     enabled: true,
                     priority: 0,
@@ -5190,6 +5251,7 @@ mod tests {
                     anti_patterns: &Arc::new(Vec::new()),
                     matchers: None,
                     action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
+                    reads_matches: true,
                     prompt,
                     enabled: true,
                     priority: 0,
@@ -5733,6 +5795,7 @@ mod tests {
                     anti_patterns: &Arc::new(Vec::new()),
                     matchers: None,
                     action: ScriptAction::Noop,
+                    reads_matches: true,
                     prompt: false,
                     enabled: true,
                     priority: 0,
@@ -5800,6 +5863,7 @@ mod tests {
                         anti_patterns: &Arc::new(Vec::new()),
                         matchers: None,
                         action: ScriptAction::Noop,
+                        reads_matches: true,
                         prompt: false,
                         enabled: true,
                         priority: 0,
@@ -6029,6 +6093,7 @@ mod tests {
                     anti_patterns: &Arc::new(anti_patterns),
                     matchers: None,
                     action: ScriptAction::SendSimple(Arc::new("ok".to_string())),
+                    reads_matches: true,
                     prompt: false,
                     enabled: true,
                     priority: 0,
@@ -6380,6 +6445,7 @@ mod tests {
                     anti_patterns: &Arc::new(Vec::new()),
                     matchers: None,
                     action: ScriptAction::Noop,
+                    reads_matches: true,
                     prompt: false,
                     enabled: true,
                     priority: item.priority,

@@ -118,6 +118,7 @@ fn push_one_trigger(
         anti_patterns: &empty,
         matchers: None,
         action,
+        reads_matches: true,
         prompt: false,
         enabled,
         priority: 0,

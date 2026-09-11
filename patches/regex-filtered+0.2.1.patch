@@ -1,5 +1,3 @@
-diff --git a/src/int_set.rs b/src/int_set.rs
-index 7153d65..7548498 100644
 --- a/src/int_set.rs
 +++ b/src/int_set.rs
 @@ -1,16 +1,32 @@
@@ -38,8 +36,6 @@ index 7153d65..7548498 100644
      pub fn insert(&mut self, value: usize) -> bool {
          let idx = self.sparse[value];
          if self.dense.get(idx) != Some(&value) {
-diff --git a/src/lib.rs b/src/lib.rs
-index 5e7905e..937fd2a 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -2,6 +2,9 @@
@@ -52,10 +48,30 @@ index 5e7905e..937fd2a 100644
  use aho_corasick::AhoCorasick;
  
  mod int_set;
-@@ -267,6 +270,59 @@ pub struct Regexes {
-     prefilter: AhoCorasick,
- }
+@@ -243,12 +246,13 @@
+         let prefilter = AhoCorasick::builder()
+             .ascii_case_insensitive(true)
+             .prefilter(true)
+-            .build(atoms)?;
++            .build(&atoms)?;
  
+         Ok(Regexes {
+             regexes,
+             mapper,
+             prefilter,
++            atoms,
+         })
+     }
+ }
+@@ -265,6 +269,62 @@
+     regexes: Vec<regex::Regex>,
+     mapper: mapper::Mapper,
+     prefilter: AhoCorasick,
++    /// The strings [`Self::prefilter`] is built from, in its pattern-id order. Retained so
++    /// an embedder can scan for them in an automaton of its own; see [`Self::atoms`].
++    atoms: Vec<String>,
++}
++
 +thread_local! {
 +    /// The idle working buffers of this thread: the mapper scratch plus
 +    /// the candidate list it fills. A match takes them out, works in
@@ -107,12 +123,10 @@ index 5e7905e..937fd2a 100644
 +            );
 +        });
 +    }
-+}
-+
+ }
+ 
  impl Regexes {
-     // TODO:
-     // - number of tokens (prefilter.patterns_len())
-@@ -281,9 +337,21 @@ impl Regexes {
+@@ -281,9 +341,21 @@
              .map(|m| m.pattern().as_usize())
      }
  
@@ -136,11 +150,60 @@ index 5e7905e..937fd2a 100644
      }
  
      /// Returns *whether* any regex in the set matches the haystack.
-@@ -317,6 +385,44 @@ mod test {
-     use super::*;
+@@ -310,6 +382,49 @@
+     pub fn regexes(&self) -> &[regex::Regex] {
+         &self.regexes
+     }
++
++    /// The required literal atoms of this set, in the pattern-id order of the automaton
++    /// [`Self::matching`] runs internally.
++    ///
++    /// An embedder that matches literal patterns of its own would otherwise sweep every
++    /// haystack twice: once for its literals and once for these. Building one automaton
++    /// over both populations and handing the atom half to [`Self::matching_of`] makes it
++    /// one sweep. That automaton must be built the way this one is — ASCII
++    /// case-insensitive, since an atom only rules a pattern in and the regex behind it
++    /// decides — so an embedder whose own patterns are case-sensitive must confirm those
++    /// itself.
++    pub fn atoms(&self) -> &[String] {
++        &self.atoms
++    }
++
++    /// [`Self::matching`] over atom hits the caller already scanned for.
++    ///
++    /// `atoms` are indices into [`Self::atoms`], in any order and with repeats: the ids of
++    /// the atoms found in `haystack`. The result is what `matching` would have returned
++    /// for that haystack.
++    pub fn matching_of<'a>(
++        &'a self,
++        haystack: &'a str,
++        atoms: impl IntoIterator<Item = usize>,
++    ) -> impl Iterator<Item = (usize, &'a regex::Regex)> + 'a {
++        self.candidates_of(atoms).filter_map(move |idx| {
++            let r = &self.regexes[idx];
++            r.is_match(haystack).then_some((idx, r))
++        })
++    }
++
++    /// [`Self::prefiltered`] over atom ids the caller supplies rather than scanning for.
++    #[inline]
++    fn candidates_of(&self, atoms: impl IntoIterator<Item = usize>) -> Candidates {
++        let (mut scratch, mut candidates) = SCRATCH.try_with(|slot| slot.take()).unwrap_or_default();
++        self.mapper
++            .atom_to_re_into(atoms, &mut scratch, &mut candidates);
++        Candidates {
++            scratch,
++            candidates,
++            next: 0,
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -318,6 +433,44 @@
      use itertools::Itertools;
  
-+    #[test]
+     #[test]
 +    fn matching_reuses_the_thread_pool() {
 +        let f = Builder::new().push("abc.*xyz").unwrap().build().unwrap();
 +        assert!(f.is_match("abc123xyz"));
@@ -178,14 +241,13 @@ index 5e7905e..937fd2a 100644
 +        assert_eq!(outer, vec![0, 1]);
 +    }
 +
-     #[test]
++    #[test]
      fn empty_filter() {
          let f = Builder::new().build().unwrap();
-diff --git a/src/mapper.rs b/src/mapper.rs
-index 1324481..c2b5583 100644
+         assert_eq!(f.prefilter("0123").collect_vec(), vec![]);
 --- a/src/mapper.rs
 +++ b/src/mapper.rs
-@@ -183,11 +183,15 @@ impl Builder {
+@@ -183,11 +183,15 @@
  impl Display for Mapper {
      fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
          writeln!(f, "#Unique Atoms: {}", self.atom_to_entry.len())?;
@@ -204,7 +266,7 @@ index 1324481..c2b5583 100644
                  writeln!(f, "\t\tregex {r}")?;
              }
          }
-@@ -244,24 +248,69 @@ pub struct Mapper {
+@@ -244,24 +248,69 @@
      /// Atom index to entry id mapping
      atom_to_entry: Vec<usize>,
  }
@@ -282,7 +344,7 @@ index 1324481..c2b5583 100644
  
          let mut i = 0;
          while i < work.len() {
-@@ -285,8 +334,6 @@ impl Mapper {
+@@ -285,8 +334,6 @@
                  work.insert(j);
              }
          }
@@ -291,7 +353,7 @@ index 1324481..c2b5583 100644
      }
  }
  
-@@ -330,12 +377,18 @@ mod test {
+@@ -330,12 +377,18 @@
  
          assert_eq!(m.entries.len(), 3);
          assert_eq!(&m.atom_to_entry, &[0, 1]);

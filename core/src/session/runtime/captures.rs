@@ -13,6 +13,11 @@ use super::trigger::MatchCapture;
 /// and automation replacement. This handle never contains isolate-bound V8 values.
 #[derive(Clone, Debug)]
 pub enum CapturePayload {
+    /// Nothing was extracted, because the automation this rides to provably cannot read
+    /// it. The registration decided that (`RegisteredFunction::wants_matches` and its
+    /// inline-body twin), so the trigger skipped the search and the allocation entirely
+    /// rather than building values with no reader. Reads as an empty capture list.
+    Unread,
     Owned(Arc<Vec<MatchCapture>>),
     Ranged(Arc<RangedCaptures>),
 }
@@ -20,16 +25,27 @@ pub enum CapturePayload {
 impl CapturePayload {
     pub fn view(&self) -> CaptureView<'_> {
         match self {
+            // Reads as the empty capture list it is. `CaptureView` deliberately keeps the
+            // two shapes it had: it is walked per capture by the paths that marshal values
+            // out, and a third arm there costs those loops more than this indirection saves.
+            Self::Unread => CaptureView::Owned(&[]),
             Self::Owned(values) => CaptureView::Owned(values),
             Self::Ranged(values) => CaptureView::Ranged(values),
         }
+    }
+
+    /// Whether the captures were skipped rather than empty. Distinguishable here and
+    /// nowhere else: through a [`CaptureView`] the two are the same empty list, which is
+    /// what makes the elision unobservable.
+    pub fn is_unread(&self) -> bool {
+        matches!(self, Self::Unread)
     }
 
     /// The byte range of capture `index` within its source line, when the captures range
     /// into one. Owned captures have no source position.
     pub fn range(&self, index: usize) -> Option<Range<usize>> {
         match self {
-            Self::Owned(_) => None,
+            Self::Unread | Self::Owned(_) => None,
             Self::Ranged(values) => values.ranges.get(index).flatten(),
         }
     }
