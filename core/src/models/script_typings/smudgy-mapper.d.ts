@@ -491,6 +491,23 @@ interface Area {
     room(roomNumber: number): Room | undefined;
     /** Read a custom area property by key (or `undefined` if unset). */
     data(key: string): string | undefined;
+    /**
+     * This area's rooms whose `name` property is exactly `value`, as
+     * `room.data(name)` reads it. One indexed lookup, however many rooms the
+     * area has. An area answers for itself even when you have turned its map
+     * off — naming it is asking for it.
+     */
+    findRoomsByProperty(name: string, value: string): Room[];
+    /**
+     * This area's rooms carrying a property called `name`, whatever its value —
+     * "which rooms did I write this on at all".
+     */
+    findRoomsWithProperty(name: string): Room[];
+    /**
+     * This area's rooms carrying `tag` (case-insensitive), in no particular
+     * order.
+     */
+    findRoomsWithTag(tag: string): Room[];
     /** This area's text labels. */
     readonly labels: Label[];
     /** This area's graphical shapes. */
@@ -617,6 +634,38 @@ interface Mapper {
         description: string,
         visibleExitDirections: string[],
     ): (Room | undefined)[];
+    /**
+     * Every room on the map whose `name` property is exactly `value`, as
+     * `room.data(name)` reads it. Name and value both match exactly. The map
+     * keeps an index for this, so it costs one lookup however large the map is;
+     * there is no reason to walk the areas yourself. Rooms of maps you have
+     * turned off are left out.
+     */
+    findRoomsByProperty(name: string, value: string): Room[];
+    /**
+     * Every room on the map carrying a property called `name`, whatever its
+     * value — "which rooms did I write this on at all". Indexed like
+     * `findRoomsByProperty`. Rooms of maps you have turned off are left out.
+     */
+    findRoomsWithProperty(name: string): Room[];
+    /**
+     * Every room on the map carrying `tag` (case-insensitive), in no particular
+     * order. Reach for `findNearestRoomWithTag` when you want the closest one
+     * instead: that walks the map, this reads an index. Rooms of maps you have
+     * turned off are left out.
+     */
+    findRoomsWithTag(tag: string): Room[];
+    /**
+     * Every area whose `name` property is exactly `value`, as `area.data(name)`
+     * reads it. Indexed like the room lookups. Maps you have turned off are
+     * left out.
+     */
+    findAreasByProperty(name: string, value: string): Area[];
+    /**
+     * Every area carrying a property called `name`, whatever its value. Maps
+     * you have turned off are left out.
+     */
+    findAreasWithProperty(name: string): Area[];
     /** Rename an area after the backend acknowledges the change. */
     renameArea(area: Area | AreaIdLike, name: string): Promise<void>;
     /** Delete an area and everything in it. */

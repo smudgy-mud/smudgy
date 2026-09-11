@@ -50,6 +50,14 @@ deno_core::extension!(
       op_smudgy_mapper_list_area_room_numbers,
       op_smudgy_mapper_list_rooms_by_title_and_description,
       op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
+      op_smudgy_mapper_find_rooms_by_property,
+      op_smudgy_mapper_find_rooms_with_property,
+      op_smudgy_mapper_find_rooms_with_tag,
+      op_smudgy_mapper_find_areas_by_property,
+      op_smudgy_mapper_find_areas_with_property,
+      op_smudgy_mapper_find_area_rooms_by_property,
+      op_smudgy_mapper_find_area_rooms_with_property,
+      op_smudgy_mapper_find_area_rooms_with_tag,
       op_smudgy_mapper_get_area_room_by_number,
       op_smudgy_mapper_get_area_property,
       op_smudgy_mapper_get_area_next_room_number,
@@ -203,6 +211,24 @@ fn ensure_mapper(state: &OpState, write: bool) -> Result<(), MapperError> {
 /// the op off V8's fast-call path, costing several times a `#[string]` param's
 /// ~18 ns per id (`bench/examples/id_wire.rs`). The macro enforces the payoff --
 /// an op whose every argument is fast-compatible must be marked `fast`.
+/// Renders an atlas-wide room lookup's hits as script room refs.
+fn room_refs(
+    rooms: impl Iterator<Item = (AreaId, Arc<RoomCache>)>,
+) -> Vec<JsRoomRef> {
+    rooms
+        .map(|(area_id, room)| (ScriptUuid(area_id.0), room.get_room_number().0))
+        .collect()
+}
+
+/// Renders a per-area room lookup's hits as room numbers. The area is already
+/// named by the handle the call came through, so the id would be redundant.
+fn area_room_numbers(rooms: &[Arc<RoomCache>]) -> Vec<i32> {
+    rooms
+        .iter()
+        .map(|room| room.get_room_number().0)
+        .collect()
+}
+
 fn parse_id(value: &str) -> Result<Uuid, MapperError> {
     Uuid::try_parse(value).map_err(|_| MapperError::InvalidId(value.to_owned()))
 }
@@ -877,6 +903,132 @@ fn op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits(
     } else {
         Ok(vec![])
     }
+}
+
+/// `mapper.findRoomsByProperty`: every room in the current atlas whose
+/// `name` property holds exactly `value`. One probe of the atlas cache's
+/// name-and-value table.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_rooms_by_property(
+    state: &OpState,
+    #[string] name: &str,
+    #[string] value: &str,
+) -> Result<Vec<JsRoomRef>, MapperError> {
+    ensure_mapper(state, false)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Ok(vec![]);
+    };
+    Ok(room_refs(
+        mapper.get_current_atlas().get_rooms_by_property(name, value),
+    ))
+}
+
+/// `mapper.findRoomsWithProperty`: every room in the current atlas carrying a
+/// property named `name`, whatever its value. One probe.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_rooms_with_property(
+    state: &OpState,
+    #[string] name: &str,
+) -> Result<Vec<JsRoomRef>, MapperError> {
+    ensure_mapper(state, false)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Ok(vec![]);
+    };
+    Ok(room_refs(
+        mapper.get_current_atlas().get_rooms_with_property(name),
+    ))
+}
+
+/// `mapper.findRoomsWithTag`: every room in the current atlas carrying `tag`,
+/// matched case-insensitively. One probe -- unlike `findNearestRoomWithTag`,
+/// which walks the graph because it wants the closest one rather than all.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_rooms_with_tag(
+    state: &OpState,
+    #[string] tag: &str,
+) -> Result<Vec<JsRoomRef>, MapperError> {
+    ensure_mapper(state, false)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Ok(vec![]);
+    };
+    Ok(room_refs(mapper.get_current_atlas().get_rooms_with_tag(tag)))
+}
+
+/// `mapper.findAreasByProperty`: every area in the current atlas whose `name`
+/// property holds exactly `value`. One probe.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_areas_by_property(
+    state: &OpState,
+    #[string] name: &str,
+    #[string] value: &str,
+) -> Result<Vec<ScriptUuid>, MapperError> {
+    ensure_mapper(state, false)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Ok(vec![]);
+    };
+    Ok(mapper
+        .get_current_atlas()
+        .get_areas_by_property(name, value)
+        .map(|area_id| ScriptUuid(area_id.0))
+        .collect())
+}
+
+/// `mapper.findAreasWithProperty`: every area in the current atlas carrying a
+/// property named `name`, whatever its value. One probe.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_areas_with_property(
+    state: &OpState,
+    #[string] name: &str,
+) -> Result<Vec<ScriptUuid>, MapperError> {
+    ensure_mapper(state, false)?;
+    let Some(mapper) = state.try_borrow::<Mapper>() else {
+        return Ok(vec![]);
+    };
+    Ok(mapper
+        .get_current_atlas()
+        .get_areas_with_property(name)
+        .map(|area_id| ScriptUuid(area_id.0))
+        .collect())
+}
+
+/// `area.findRoomsByProperty`: the area's own rooms whose `name` property
+/// holds exactly `value`. Reads the handle's per-area table, so it answers for
+/// an excluded area too -- naming the area is explicit addressing.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_area_rooms_by_property(
+    #[cppgc] area_wrapper: &JSArea,
+    #[string] name: &str,
+    #[string] value: &str,
+) -> Vec<i32> {
+    area_room_numbers(area_wrapper.0.get_rooms_by_property(name, value))
+}
+
+/// `area.findRoomsWithProperty`: the area's own rooms carrying a property
+/// named `name`, whatever its value.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_area_rooms_with_property(
+    #[cppgc] area_wrapper: &JSArea,
+    #[string] name: &str,
+) -> Vec<i32> {
+    area_room_numbers(area_wrapper.0.get_rooms_with_property(name))
+}
+
+/// `area.findRoomsWithTag`: the area's own rooms carrying `tag`, matched
+/// case-insensitively.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_find_area_rooms_with_tag(
+    #[cppgc] area_wrapper: &JSArea,
+    #[string] tag: &str,
+) -> Vec<i32> {
+    area_room_numbers(area_wrapper.0.get_rooms_with_tag(tag))
 }
 
 #[op2]

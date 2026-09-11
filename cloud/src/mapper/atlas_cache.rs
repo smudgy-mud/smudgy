@@ -88,7 +88,13 @@ type RoomMatches = Vec<(AreaId, Arc<RoomCache>)>;
 /// excluded, or unloaded — exactly what a from-scratch rebuild would produce.
 type ExternalIdBindings = Vec<RoomKey>;
 
+/// The areas one area-lookup key resolves to, owned areas first. Areas are
+/// held by id rather than by handle: the atlas already owns the only
+/// authoritative snapshot of each, and an id cannot go stale against it.
+type AreaMatches = Vec<AreaId>;
+
 static EMPTY_ROOMS_LOOKUP_VEC: RoomMatches = Vec::new();
+static EMPTY_AREAS_LOOKUP_VEC: AreaMatches = Vec::new();
 
 /// A cross-entry rescue hit: a room found in a scope-excluded area (a map homed
 /// on a different server entry), with enough context to phrase the "show here
@@ -139,6 +145,31 @@ pub struct AtlasCache {
     /// sibling map on each step. Manual-disable exclusions are excluded from
     /// this index — only per-server-scope exclusions rescue.
     rooms_by_external_id_excluded: PersistentMap<String, ExternalIdBindings>,
+    /// Reverse index over rooms' properties by name alone — "which rooms carry
+    /// this property at all". Maintained exactly like the title tables, and
+    /// excluded areas are omitted from it for the same reason.
+    rooms_by_property_name: PersistentMap<String, RoomMatches>,
+    /// Reverse index over rooms' properties by name *and* value. The pair to
+    /// `rooms_by_property_name`, on the model of `rooms_by_title` /
+    /// `rooms_by_title_and_description`: both questions answer in one probe
+    /// rather than one probe and a scan.
+    ///
+    /// Values are unbounded, so this table costs a bucket per distinct
+    /// (name, value). A property carrying a per-room identity therefore spends
+    /// a bucket per room — which is the case that most wants the O(1) lookup,
+    /// and the one packages have been hand-rolling their own indexes to get.
+    rooms_by_property_name_and_value: PersistentMap<(String, String), RoomMatches>,
+    /// Reverse index over rooms' tags, keyed in the normalized (uppercase)
+    /// spelling so lookup is case-insensitive like [`RoomCache::has_tag`].
+    /// Distinct from the nearest-room searches, which walk the graph in
+    /// distance order and need no tag index; this one answers "all of them,
+    /// anywhere" without a traversal.
+    rooms_by_tag: PersistentMap<String, RoomMatches>,
+    /// The two area-property tables, mirroring the room pair above over areas'
+    /// own properties. An area contributes to these on the same placement
+    /// terms as its rooms contribute to the room tables.
+    areas_by_property_name: PersistentMap<String, AreaMatches>,
+    areas_by_property_name_and_value: PersistentMap<(String, String), AreaMatches>,
     /// Areas the viewer owns, for own-beats-shared precedence in lookups and
     /// routing. Maintained alongside the tables; lookups are O(1).
     owned_areas: HashSet<AreaId>,
@@ -174,6 +205,11 @@ impl AtlasCache {
             rooms_by_description: PersistentMap::new(),
             rooms_by_external_id: PersistentMap::new(),
             rooms_by_external_id_excluded: PersistentMap::new(),
+            rooms_by_property_name: PersistentMap::new(),
+            rooms_by_property_name_and_value: PersistentMap::new(),
+            rooms_by_tag: PersistentMap::new(),
+            areas_by_property_name: PersistentMap::new(),
+            areas_by_property_name_and_value: PersistentMap::new(),
             owned_areas: HashSet::new(),
             exclusions,
         };
@@ -222,6 +258,14 @@ impl AtlasCache {
                         self.add_room(area_id, new_room, new_placement);
                     }
                 }
+                // The area's own properties ride the same snapshot as its
+                // rooms. Comparing before rewriting keeps the common edit --
+                // one room, properties untouched -- from churning the area
+                // tables at all.
+                if old_area.property_entries() != area.property_entries() {
+                    self.remove_area_properties(area_id, old_area, new_placement);
+                    self.add_area_properties(area_id, &area, new_placement);
+                }
             }
             _ => {
                 if let Some(old_area) = old {
@@ -235,6 +279,7 @@ impl AtlasCache {
                 for room in area.get_rooms() {
                     self.add_room(area_id, room, new_placement);
                 }
+                self.add_area_properties(area_id, &area, new_placement);
             }
         }
 
@@ -247,6 +292,54 @@ impl AtlasCache {
         let placement = self.placement(&area_id, area);
         for room in area.get_rooms() {
             self.remove_room(area_id, room, placement);
+        }
+        self.remove_area_properties(area_id, area, placement);
+    }
+
+    /// Adds this snapshot of `area` to the area-property tables. Excluded
+    /// areas contribute nothing, matching how their rooms stay out of the room
+    /// tables: an atlas-wide search covers the active set, while explicit
+    /// addressing (`get_area`, and every per-area lookup) keeps reaching them.
+    fn add_area_properties(&mut self, area_id: AreaId, area: &AreaCache, placement: AreaPlacement) {
+        if !placement.identified {
+            return;
+        }
+        for (name, entry) in area.property_entries() {
+            insert_area_match(
+                &mut self.areas_by_property_name,
+                name.clone(),
+                area_id,
+                placement.owned,
+                &self.owned_areas,
+            );
+            insert_area_match(
+                &mut self.areas_by_property_name_and_value,
+                (name.clone(), entry.value.clone()),
+                area_id,
+                placement.owned,
+                &self.owned_areas,
+            );
+        }
+    }
+
+    /// Removes the area-property entries this snapshot of `area` contributed
+    /// under `placement`.
+    fn remove_area_properties(
+        &mut self,
+        area_id: AreaId,
+        area: &AreaCache,
+        placement: AreaPlacement,
+    ) {
+        if !placement.identified {
+            return;
+        }
+        for (name, entry) in area.property_entries() {
+            remove_area_match(&mut self.areas_by_property_name, name, area_id);
+            remove_area_match(
+                &mut self.areas_by_property_name_and_value,
+                &(name.clone(), entry.value.clone()),
+                area_id,
+            );
         }
     }
 
@@ -287,6 +380,34 @@ impl AtlasCache {
                 placement.owned,
                 &self.owned_areas,
             );
+            for (name, value) in room.properties() {
+                insert_match(
+                    &mut self.rooms_by_property_name,
+                    name.to_owned(),
+                    area_id,
+                    room,
+                    placement.owned,
+                    &self.owned_areas,
+                );
+                insert_match(
+                    &mut self.rooms_by_property_name_and_value,
+                    (name.to_owned(), value.to_owned()),
+                    area_id,
+                    room,
+                    placement.owned,
+                    &self.owned_areas,
+                );
+            }
+            for tag in room.tags() {
+                insert_match(
+                    &mut self.rooms_by_tag,
+                    tag.to_owned(),
+                    area_id,
+                    room,
+                    placement.owned,
+                    &self.owned_areas,
+                );
+            }
             if let Some(external_id) = room.get_external_id() {
                 insert_binding(
                     &mut self.rooms_by_external_id,
@@ -340,6 +461,23 @@ impl AtlasCache {
                 area_id,
                 room_number,
             );
+            for (name, value) in room.properties() {
+                remove_match(
+                    &mut self.rooms_by_property_name,
+                    name,
+                    area_id,
+                    room_number,
+                );
+                remove_match(
+                    &mut self.rooms_by_property_name_and_value,
+                    &(name.to_owned(), value.to_owned()),
+                    area_id,
+                    room_number,
+                );
+            }
+            for tag in room.tags() {
+                remove_match(&mut self.rooms_by_tag, tag, area_id, room_number);
+            }
             if let Some(external_id) = room.get_external_id() {
                 remove_binding(
                     &mut self.rooms_by_external_id,
@@ -518,6 +656,75 @@ impl AtlasCache {
             .unwrap_or(&EMPTY_ROOMS_LOOKUP_VEC)
             .iter()
             .cloned()
+    }
+
+    /// Every room in the atlas carrying a property named `name`. One probe.
+    /// Excluded areas are omitted, like the other atlas-wide room lookups.
+    #[must_use]
+    pub fn get_rooms_with_property(
+        &self,
+        name: &str,
+    ) -> impl ExactSizeIterator<Item = (AreaId, Arc<RoomCache>)> {
+        self.rooms_by_property_name
+            .get(name)
+            .unwrap_or(&EMPTY_ROOMS_LOOKUP_VEC)
+            .iter()
+            .cloned()
+    }
+
+    /// Every room in the atlas whose `name` property holds exactly `value`.
+    /// Name and value both match case-sensitively, on the same terms as
+    /// [`RoomCache::get_property`]. One probe.
+    #[must_use]
+    pub fn get_rooms_by_property(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> impl ExactSizeIterator<Item = (AreaId, Arc<RoomCache>)> {
+        self.rooms_by_property_name_and_value
+            .get(&(name.to_owned(), value.to_owned()))
+            .unwrap_or(&EMPTY_ROOMS_LOOKUP_VEC)
+            .iter()
+            .cloned()
+    }
+
+    /// Every room in the atlas carrying `tag`, matched case-insensitively like
+    /// [`RoomCache::has_tag`]. One probe, and no graph traversal -- unlike the
+    /// nearest-room searches, which want distance rather than the whole set.
+    #[must_use]
+    pub fn get_rooms_with_tag(
+        &self,
+        tag: &str,
+    ) -> impl ExactSizeIterator<Item = (AreaId, Arc<RoomCache>)> {
+        self.rooms_by_tag
+            .get(&crate::mapper::normalize_tag(tag))
+            .unwrap_or(&EMPTY_ROOMS_LOOKUP_VEC)
+            .iter()
+            .cloned()
+    }
+
+    /// Every area carrying a property named `name`. One probe.
+    #[must_use]
+    pub fn get_areas_with_property(&self, name: &str) -> impl ExactSizeIterator<Item = AreaId> {
+        self.areas_by_property_name
+            .get(name)
+            .unwrap_or(&EMPTY_AREAS_LOOKUP_VEC)
+            .iter()
+            .copied()
+    }
+
+    /// Every area whose `name` property holds exactly `value`. One probe.
+    #[must_use]
+    pub fn get_areas_by_property(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> impl ExactSizeIterator<Item = AreaId> {
+        self.areas_by_property_name_and_value
+            .get(&(name.to_owned(), value.to_owned()))
+            .unwrap_or(&EMPTY_AREAS_LOOKUP_VEC)
+            .iter()
+            .copied()
     }
 
     /// Resolves a room through its area's per-area table (rooms of excluded
@@ -809,6 +1016,50 @@ fn remove_match<K, Q>(
     }
 }
 
+/// Inserts one area under `key`, keeping the owned-area prefix intact on the
+/// same terms as [`insert_match`]. An area appears at most once per key, so no
+/// duplicate check is needed: a snapshot's properties are a map, and a
+/// replacement snapshot removes the old entries first.
+fn insert_area_match<K>(
+    table: &mut PersistentMap<K, AreaMatches>,
+    key: K,
+    area_id: AreaId,
+    owned: bool,
+    owned_areas: &HashSet<AreaId>,
+) where
+    K: Hash + Eq + Clone,
+{
+    if let Some(matches) = table.get_mut(&key) {
+        if owned {
+            let prefix = matches
+                .iter()
+                .take_while(|id| owned_areas.contains(id))
+                .count();
+            matches.insert(prefix, area_id);
+        } else {
+            matches.push(area_id);
+        }
+    } else {
+        table.insert(key, vec![area_id]);
+    }
+}
+
+/// Removes `area_id` from the match list under `key`, dropping the key when
+/// its list empties.
+fn remove_area_match<K, Q>(table: &mut PersistentMap<K, AreaMatches>, key: &Q, area_id: AreaId)
+where
+    K: Hash + Eq + Clone + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    let Some(matches) = table.get_mut(key) else {
+        return;
+    };
+    matches.retain(|id| *id != area_id);
+    if matches.is_empty() {
+        table.remove(key);
+    }
+}
+
 /// Inserts one external-id binding, keeping the owned-area prefix intact so
 /// the head of the list is the own-beats-shared resolution winner.
 fn insert_binding(
@@ -952,6 +1203,310 @@ mod tests {
             is_secret: false,
             external_id: None,
         }
+    }
+
+    /// [`room`] with properties and tags attached.
+    fn tagged_room(
+        number: i32,
+        title: &str,
+        properties: &[(&str, &str)],
+        tags: &[&str],
+    ) -> RoomWithDetails {
+        RoomWithDetails {
+            properties: properties
+                .iter()
+                .map(|(name, value)| crate::Property {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                    is_secret: false,
+                })
+                .collect(),
+            tags: tags
+                .iter()
+                .map(|tag| crate::mapper::normalize_tag(tag))
+                .collect(),
+            ..room(number, title, Vec::new())
+        }
+    }
+
+    /// [`cache_area`] carrying the area's own properties.
+    fn cache_area_with_properties(
+        id: AreaId,
+        owned: bool,
+        properties: &[(&str, &str)],
+        rooms: Vec<RoomWithDetails>,
+    ) -> (AreaId, Arc<AreaCache>) {
+        let (id, cache) = cache_area(id, owned, rooms);
+        let mut cache = (*cache).clone();
+        for (name, value) in properties {
+            cache = cache.set_property((*name).to_string(), (*value).to_string());
+        }
+        (id, Arc::new(cache))
+    }
+
+    fn room_numbers(rooms: impl Iterator<Item = (AreaId, Arc<RoomCache>)>) -> Vec<(AreaId, i32)> {
+        rooms
+            .map(|(area_id, room)| (area_id, room.get_room_number().0))
+            .collect()
+    }
+
+    #[test]
+    fn property_and_tag_lookups_answer_atlas_wide_with_owned_first() {
+        let owned_id = area_id(1);
+        let shared_id = area_id(2);
+
+        // Shared inserted first, so an unordered table would put it first.
+        let mut areas = HashMap::new();
+        let (id, cache) = cache_area(
+            shared_id,
+            false,
+            vec![tagged_room(7, "Plaza", &[("zone", "midgaard")], &["shop"])],
+        );
+        areas.insert(id, cache);
+        let (id, cache) = cache_area(
+            owned_id,
+            true,
+            vec![
+                tagged_room(1, "Gate", &[("zone", "midgaard")], &["SHOP", "quiet"]),
+                tagged_room(2, "Road", &[("zone", "elsewhere")], &[]),
+            ],
+        );
+        areas.insert(id, cache);
+
+        let atlas = atlas(areas);
+
+        // By value: only the rooms holding exactly that value, owned first.
+        assert_eq!(
+            room_numbers(atlas.get_rooms_by_property("zone", "midgaard")),
+            vec![(owned_id, 1), (shared_id, 7)]
+        );
+        // By name alone: every room carrying the property at all.
+        let mut with_property = room_numbers(atlas.get_rooms_with_property("zone"));
+        with_property.sort_by_key(|(id, number)| (id.0, *number));
+        assert_eq!(
+            with_property,
+            vec![(owned_id, 1), (owned_id, 2), (shared_id, 7)]
+        );
+        // A name no room carries, and a value no room holds.
+        assert_eq!(room_numbers(atlas.get_rooms_with_property("absent")), vec![]);
+        assert_eq!(
+            room_numbers(atlas.get_rooms_by_property("zone", "nowhere")),
+            vec![]
+        );
+        // Tags match case-insensitively, in either direction.
+        assert_eq!(
+            room_numbers(atlas.get_rooms_with_tag("shop")),
+            vec![(owned_id, 1), (shared_id, 7)]
+        );
+        assert_eq!(
+            room_numbers(atlas.get_rooms_with_tag("ShOp")),
+            vec![(owned_id, 1), (shared_id, 7)]
+        );
+    }
+
+    #[test]
+    fn area_property_lookups_answer_by_name_and_by_value() {
+        let owned_id = area_id(1);
+        let shared_id = area_id(2);
+
+        let mut areas = HashMap::new();
+        let (id, cache) =
+            cache_area_with_properties(shared_id, false, &[("kind", "city")], Vec::new());
+        areas.insert(id, cache);
+        let (id, cache) = cache_area_with_properties(
+            owned_id,
+            true,
+            &[("kind", "city"), ("era", "old")],
+            Vec::new(),
+        );
+        areas.insert(id, cache);
+
+        let atlas = atlas(areas);
+
+        assert_eq!(
+            atlas
+                .get_areas_by_property("kind", "city")
+                .collect::<Vec<_>>(),
+            vec![owned_id, shared_id]
+        );
+        let mut with_kind = atlas.get_areas_with_property("kind").collect::<Vec<_>>();
+        with_kind.sort_by_key(|id| id.0);
+        let mut expected = vec![owned_id, shared_id];
+        expected.sort_by_key(|id| id.0);
+        assert_eq!(with_kind, expected);
+        assert_eq!(
+            atlas.get_areas_with_property("era").collect::<Vec<_>>(),
+            vec![owned_id]
+        );
+        assert_eq!(atlas.get_areas_by_property("kind", "wilderness").count(), 0);
+        assert_eq!(atlas.get_areas_with_property("missing").count(), 0);
+    }
+
+    #[test]
+    fn incremental_writes_leave_the_tables_a_full_rebuild_would_produce() {
+        let id = area_id(1);
+
+        let initial = vec![
+            tagged_room(1, "Gate", &[("zone", "midgaard")], &["shop"]),
+            tagged_room(2, "Road", &[("zone", "midgaard")], &["quiet"]),
+        ];
+        let mut areas = HashMap::new();
+        let (area, cache) = cache_area_with_properties(id, true, &[("kind", "city")], initial);
+        areas.insert(area, cache);
+        let mut atlas = atlas(areas);
+
+        // Move room 1 to another zone, drop its tag, and change the area's own
+        // property: one write touching every table.
+        let rewritten = vec![
+            tagged_room(1, "Gate", &[("zone", "elsewhere")], &[]),
+            tagged_room(2, "Road", &[("zone", "midgaard")], &["quiet"]),
+        ];
+        let (_, next) = cache_area_with_properties(id, true, &[("kind", "wilderness")], rewritten);
+        atlas.apply_insert(id, next.clone());
+
+        // The same area set, built from scratch.
+        let rebuilt = atlas.rebuild_with_areas(HashMap::from([(id, next)]));
+
+        assert_eq!(
+            room_numbers(atlas.get_rooms_by_property("zone", "midgaard")),
+            room_numbers(rebuilt.get_rooms_by_property("zone", "midgaard"))
+        );
+        assert_eq!(
+            room_numbers(atlas.get_rooms_by_property("zone", "midgaard")),
+            vec![(id, 2)]
+        );
+        assert_eq!(
+            room_numbers(atlas.get_rooms_by_property("zone", "elsewhere")),
+            vec![(id, 1)]
+        );
+        // The stale tag and stale area property are gone, not merely shadowed.
+        assert_eq!(room_numbers(atlas.get_rooms_with_tag("shop")), vec![]);
+        assert_eq!(atlas.get_areas_by_property("kind", "city").count(), 0);
+        assert_eq!(
+            atlas
+                .get_areas_by_property("kind", "wilderness")
+                .collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert_eq!(
+            atlas.get_areas_with_property("kind").collect::<Vec<_>>(),
+            rebuilt.get_areas_with_property("kind").collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn excluded_areas_drop_out_of_property_and_tag_lookups() {
+        let kept = area_id(1);
+        let disabled = area_id(2);
+        let scoped_out = area_id(3);
+        let other_atlas = atlas_id(9);
+
+        let mut areas = HashMap::new();
+        let (id, cache) = cache_area_with_properties(
+            kept,
+            true,
+            &[("kind", "city")],
+            vec![tagged_room(1, "Gate", &[("zone", "midgaard")], &["shop"])],
+        );
+        areas.insert(id, cache);
+        let (id, cache) = cache_area_with_properties(
+            disabled,
+            true,
+            &[("kind", "city")],
+            vec![tagged_room(1, "Gate", &[("zone", "midgaard")], &["shop"])],
+        );
+        areas.insert(id, cache);
+
+        // A manually disabled area contributes nothing.
+        let atlas = atlas_with_disabled(areas, [disabled]);
+        assert_eq!(
+            room_numbers(atlas.get_rooms_by_property("zone", "midgaard")),
+            vec![(kept, 1)]
+        );
+        assert_eq!(
+            room_numbers(atlas.get_rooms_with_tag("shop")),
+            vec![(kept, 1)]
+        );
+        assert_eq!(
+            atlas
+                .get_areas_by_property("kind", "city")
+                .collect::<Vec<_>>(),
+            vec![kept]
+        );
+
+        // Nor does a scope-excluded one.
+        let mut areas = HashMap::new();
+        let (id, cache) = cache_area_with_properties(
+            kept,
+            true,
+            &[("kind", "city")],
+            vec![tagged_room(1, "Gate", &[("zone", "midgaard")], &["shop"])],
+        );
+        areas.insert(id, cache);
+        let (id, cache) = cache_area_in_atlas(
+            scoped_out,
+            Some(other_atlas),
+            true,
+            vec![tagged_room(1, "Gate", &[("zone", "midgaard")], &["shop"])],
+        );
+        areas.insert(id, cache);
+        let atlas = atlas_with_scope(areas, [other_atlas], []);
+        assert_eq!(
+            room_numbers(atlas.get_rooms_by_property("zone", "midgaard")),
+            vec![(kept, 1)]
+        );
+        assert_eq!(
+            room_numbers(atlas.get_rooms_with_tag("shop")),
+            vec![(kept, 1)]
+        );
+
+        // Explicit addressing still reaches an excluded area's rooms.
+        let excluded_area = atlas.get_area(&scoped_out).expect("area stays resident");
+        assert_eq!(
+            excluded_area.get_rooms_with_tag("shop").len(),
+            1,
+            "per-area lookups are explicit addressing and ignore exclusion"
+        );
+    }
+
+    #[test]
+    fn per_area_lookups_see_only_their_own_area() {
+        let first = area_id(1);
+        let second = area_id(2);
+
+        let (_, a) = cache_area(
+            first,
+            true,
+            vec![
+                tagged_room(1, "Gate", &[("zone", "midgaard")], &["shop"]),
+                tagged_room(2, "Road", &[("zone", "midgaard")], &[]),
+            ],
+        );
+        let (_, b) = cache_area(
+            second,
+            true,
+            vec![tagged_room(1, "Plaza", &[("zone", "midgaard")], &["shop"])],
+        );
+
+        let numbers = |rooms: &[Arc<RoomCache>]| {
+            rooms
+                .iter()
+                .map(|room| room.get_room_number().0)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            numbers(a.get_rooms_by_property("zone", "midgaard")),
+            vec![1, 2]
+        );
+        assert_eq!(numbers(b.get_rooms_by_property("zone", "midgaard")), vec![1]);
+        assert_eq!(numbers(a.get_rooms_with_property("zone")), vec![1, 2]);
+        assert_eq!(numbers(a.get_rooms_with_tag("SHOP")), vec![1]);
+        assert_eq!(numbers(a.get_rooms_with_tag("absent")), Vec::<i32>::new());
+        assert_eq!(
+            numbers(a.get_rooms_by_property("zone", "elsewhere")),
+            Vec::<i32>::new()
+        );
     }
 
     fn exit(id: u128, to_area: AreaId, to_room: i32, weight: f32) -> Exit {

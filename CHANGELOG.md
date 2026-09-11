@@ -50,6 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value and inserts a reference on click. Values are read when the automation
   fires; an automation that exposes nothing runs, and is saved, exactly as before.
 
+- **Find rooms and areas by what you wrote on them.** `mapper.findRoomsByProperty`,
+  `findRoomsWithProperty`, and `findRoomsWithTag` return every matching room on the
+  map; `findAreasByProperty` and `findAreasWithProperty` do the same for areas. The
+  three room lookups are also on an `Area`, where they answer for that area alone.
+  Property names and values match exactly, as `data()` reads them, and tags match
+  case-insensitively. Each is one indexed lookup rather than a walk over the map, so
+  a property holding a per-room id — a vnum, a server's own room number — resolves
+  in one step however large the map has grown. Packages have been keeping their own
+  tables in script to get this; they no longer need to. `findNearestRoomWithTag`
+  remains the one to reach for when you want the closest match rather than all of
+  them. Rooms and areas of maps you have turned off are left out, as they are from
+  the other map-wide lookups; asking an `Area` directly always answers.
+
 ### Changed
 
 - **Ids in maps now use UUID strings.** An area, exit, connection, atlas, label,
