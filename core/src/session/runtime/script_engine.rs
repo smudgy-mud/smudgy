@@ -53,6 +53,7 @@ mod fire_state;
 mod mapper_api;
 mod matches;
 use super::captures::OuterCaptures;
+use super::script_action::ScriptAction;
 use super::state_exposure::ExposedState;
 use super::trigger::FiringContext;
 use fire_state::FireStateCache;
@@ -3511,6 +3512,35 @@ impl<'a> ScriptEngine<'a> {
             wants_matches,
         });
         Ok(script_id)
+    }
+
+    /// Whether the registered body behind `action` can observe the `matches` object.
+    ///
+    /// This is the decision `RegisteredFunction::new` and [`Self::add_script`] already took
+    /// against the body's own source, read back so the *trigger engine* can act on it too:
+    /// a body that cannot read its captures needs none extracted, which saves the search
+    /// and the allocation behind the object #205 already skips.
+    ///
+    /// One-sided, like the decision it reports. Everything it cannot prove reads its
+    /// captures — a body it cannot find (a stale id, an isolate torn down between
+    /// registration and this call) included, and so does every non-JavaScript action,
+    /// whose Send text expands captures in Rust where no arity rule can see it.
+    pub fn action_reads_matches(&self, isolate: &IsolateId, action: &ScriptAction) -> bool {
+        let Some(bundle) = self.isolates.get(isolate) else {
+            return true;
+        };
+        match action {
+            ScriptAction::CallJavascriptFunction(id) => bundle
+                .script_functions
+                .borrow()
+                .get(usize::from(*id))
+                .is_none_or(|entry| entry.wants_matches),
+            ScriptAction::EvalJavascript(id) => bundle
+                .compiled_scripts
+                .get(usize::from(*id))
+                .is_none_or(|compiled| compiled.wants_matches),
+            ScriptAction::Noop | ScriptAction::SendRaw(_) | ScriptAction::SendSimple(_) => true,
+        }
     }
 
     pub fn set_is_captured(&mut self, isolate: &IsolateId, value: bool) {

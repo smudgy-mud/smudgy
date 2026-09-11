@@ -1257,6 +1257,10 @@ impl Inner<'_> {
                             exposure.is_some(),
                             &format!("alias:{origin:?}/{name}"),
                         )?;
+                        let reads_matches = self.script_engine.action_reads_matches(
+                            &isolate,
+                            &ScriptAction::EvalJavascript(script_id),
+                        );
                         self.trigger_manager.push_javascript_alias(
                             isolate,
                             origin,
@@ -1270,6 +1274,7 @@ impl Inner<'_> {
                             Some(Arc::from(src)),
                             command,
                             exposure,
+                            reads_matches,
                         )?;
                     }
                 }
@@ -1290,6 +1295,10 @@ impl Inner<'_> {
                     script_source,
                     command,
                 } = *params;
+                let reads_matches = self.script_engine.action_reads_matches(
+                    &isolate,
+                    &ScriptAction::CallJavascriptFunction(function_id),
+                );
                 self.trigger_manager.push_javascript_function_alias(
                     isolate,
                     origin,
@@ -1305,6 +1314,7 @@ impl Inner<'_> {
                     fire_limit,
                     script_source,
                     command,
+                    reads_matches,
                 )?;
                 self.push_command_names_if_changed().await?;
                 Ok(ActionResult::None)
@@ -1341,6 +1351,7 @@ impl Inner<'_> {
                     }
                 };
 
+                let reads_matches = self.script_engine.action_reads_matches(&isolate, &action);
                 self.trigger_manager.push_trigger_with_exposure(
                     PushTriggerParams {
                         isolate,
@@ -1351,6 +1362,7 @@ impl Inner<'_> {
                         anti_patterns: &Arc::new(trigger.anti_patterns.unwrap_or_default()),
                         matchers: trigger.matchers.as_deref(),
                         action,
+                        reads_matches,
                         enabled: trigger.enabled,
                         priority: trigger.priority,
                         fallthrough: trigger.fallthrough,
@@ -1382,6 +1394,7 @@ impl Inner<'_> {
                     outer,
                     reach,
                 } = *params;
+                let reads_matches = self.script_engine.action_reads_matches(&isolate, &script);
                 self.trigger_manager.push_script_trigger(
                     isolate,
                     origin,
@@ -1397,6 +1410,7 @@ impl Inner<'_> {
                     script_source,
                     outer,
                     reach,
+                    reads_matches,
                 );
                 Ok(ActionResult::None)
             }
