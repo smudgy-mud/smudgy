@@ -300,7 +300,7 @@ index 0d87c12..71357f2 100644
        op_metrics_factory_fn,
        op_driver.clone(),
        op_state.clone(),
-@@ -2367,6 +2368,33 @@ impl JsRuntime {
+@@ -2367,6 +2368,49 @@ impl JsRuntime {
      .await
    }
  
@@ -329,6 +329,22 @@ index 0d87c12..71357f2 100644
 +    let pending = EventLoopPendingState::new_from_scope(scope);
 +    let has_tick_scheduled = JsRealm::state_from_scope(scope).has_tick_scheduled();
 +    (pending.is_pending(), has_tick_scheduled)
++  }
++
++  /// `has_pending_work` alone, for a caller that does not need the tick flag.
++  ///
++  /// Collecting the pending state visits every sub-state — the op driver, the timer and
++  /// immediate tables, the module map, the rejection lists — and asks V8 whether it has
++  /// background tasks, which is a call across the FFI boundary. A caller on the per-call
++  /// path pays that once here instead of once for each half of the pair.
++  pub fn has_pending_work_from_scope(scope: &mut v8::PinScope) -> bool {
++    EventLoopPendingState::new_from_scope(scope).is_pending()
++  }
++
++  /// `has_tick_scheduled` alone. This is a single field read on the realm state, and
++  /// unlike its companion it costs nothing beyond finding that state.
++  pub fn has_tick_scheduled_from_scope(scope: &mut v8::PinScope) -> bool {
++    JsRealm::state_from_scope(scope).has_tick_scheduled()
 +  }
 +
    /// Runs a single tick of event loop

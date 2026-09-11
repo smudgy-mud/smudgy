@@ -3710,7 +3710,7 @@ fn call_function_in(
     // scheduled `nextTick`. Ask, rather than seed unconditionally, because the common
     // handler leaves none of that behind and the pump it would earn is a whole turn of
     // deno's loop (`EVENT-LOOP-READINESS-DEMUX.md` §5(e)).
-    if deno_core::JsRuntime::pending_state_from_scope(scope).0 {
+    if deno_core::JsRuntime::has_pending_work_from_scope(scope) {
         seeded.set(true);
     }
     // The handler has returned. Restore the enclosing depth, which is 0 at the outermost
@@ -3812,7 +3812,7 @@ fn run_script_in(
     };
     // Demux seed, on the same terms as [`call_function_in`]: the script's microtasks have
     // run, so a pump is earned only by work the event loop itself must service.
-    if deno_core::JsRuntime::pending_state_from_scope(scope).0 {
+    if deno_core::JsRuntime::has_pending_work_from_scope(scope) {
         seeded.set(true);
     }
     // The eval has returned. Restore the enclosing depth that the call saved above.
@@ -3857,8 +3857,7 @@ fn drain_handler_microtasks(
     if try_catch.has_caught() {
         return;
     }
-    let (_, has_tick_scheduled) = deno_core::JsRuntime::pending_state_from_scope(try_catch);
-    if !has_tick_scheduled {
+    if !deno_core::JsRuntime::has_tick_scheduled_from_scope(try_catch) {
         try_catch.perform_microtask_checkpoint();
     }
 }
