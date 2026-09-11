@@ -13,6 +13,14 @@ const {
     op_smudgy_mapper_list_area_room_numbers,
     op_smudgy_mapper_list_rooms_by_title_and_description,
     op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
+    op_smudgy_mapper_find_rooms_by_property,
+    op_smudgy_mapper_find_rooms_with_property,
+    op_smudgy_mapper_find_rooms_with_tag,
+    op_smudgy_mapper_find_areas_by_property,
+    op_smudgy_mapper_find_areas_with_property,
+    op_smudgy_mapper_find_area_rooms_by_property,
+    op_smudgy_mapper_find_area_rooms_with_property,
+    op_smudgy_mapper_find_area_rooms_with_tag,
     op_smudgy_mapper_create_area,
     op_smudgy_mapper_get_area_storage,
     op_smudgy_mapper_get_atlas_storage,
@@ -208,6 +216,26 @@ function areaIdOf(area: Area | AreaId): AreaId {
         : normalizeId<AreaId>((area as Area)?.id, what);
 }
 
+/** Resolves room references returned by the indexed lookups. A reference
+ * whose room has gone between the lookup and here is dropped rather than
+ * surfaced as a hole, so the result is always a list of real rooms. */
+function hydrateRooms(refs: [AreaId, RoomNumber][]): Room[] {
+    // Hits cluster by area, so the area handle is resolved once per area
+    // rather than once per room. Ids are strings, so they key a Map directly.
+    const areas = new Map<AreaId, Area>();
+    const rooms: Room[] = [];
+    for (const [areaId, roomNumber] of refs) {
+        let area = areas.get(areaId);
+        if (!area) {
+            area = mapper.getAreaById(areaId);
+            areas.set(areaId, area);
+        }
+        const room = area.room(roomNumber);
+        if (room) rooms.push(room);
+    }
+    return rooms;
+}
+
 function destinationForOp(destination: MapDestination) {
     return {
         storage: destination.storage,
@@ -361,6 +389,48 @@ const mapper = {
     listRoomsByTitleDescriptionAndVisibleExits(title: string, description: string, visibleExitDirections: string[]) {
         return op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits(title, description, visibleExitDirections).map(
             ([areaId, roomNumber]: [AreaId, RoomNumber]) => this.getAreaById(areaId).room(roomNumber)
+        );
+    },
+
+    /** Every room on the map whose `name` property is exactly `value`, as
+     * `room.data(name)` reads it. Name and value both match exactly. The map
+     * keeps an index for this, so it costs one lookup however large the map is;
+     * there is no reason to walk the areas yourself. Rooms of maps you have
+     * turned off are left out. Requires `mapper:read`. */
+    findRoomsByProperty(name: string, value: string): Room[] {
+        return hydrateRooms(op_smudgy_mapper_find_rooms_by_property(name, value));
+    },
+
+    /** Every room on the map carrying a property called `name`, whatever its
+     * value -- "which rooms did I write this on at all". Indexed like
+     * `findRoomsByProperty`. Rooms of maps you have turned off are left out.
+     * Requires `mapper:read`. */
+    findRoomsWithProperty(name: string): Room[] {
+        return hydrateRooms(op_smudgy_mapper_find_rooms_with_property(name));
+    },
+
+    /** Every room on the map carrying `tag` (case-insensitive), in no
+     * particular order. Reach for `findNearestRoomWithTag` when you want the
+     * closest one instead: that walks the map, this reads an index. Rooms of
+     * maps you have turned off are left out. Requires `mapper:read`. */
+    findRoomsWithTag(tag: string): Room[] {
+        return hydrateRooms(op_smudgy_mapper_find_rooms_with_tag(tag));
+    },
+
+    /** Every area whose `name` property is exactly `value`, as `area.data(name)`
+     * reads it. Indexed like the room lookups. Maps you have turned off are left
+     * out. Requires `mapper:read`. */
+    findAreasByProperty(name: string, value: string): Area[] {
+        return op_smudgy_mapper_find_areas_by_property(name, value).map((areaId: AreaId) =>
+            this.getAreaById(areaId)
+        );
+    },
+
+    /** Every area carrying a property called `name`, whatever its value. Maps
+     * you have turned off are left out. Requires `mapper:read`. */
+    findAreasWithProperty(name: string): Area[] {
+        return op_smudgy_mapper_find_areas_with_property(name).map((areaId: AreaId) =>
+            this.getAreaById(areaId)
         );
     },
 
@@ -1126,6 +1196,36 @@ class Area {
 
     data(key: string): string | undefined {
         return op_smudgy_mapper_get_area_property(this.#obj, key);
+    }
+
+    /** This area's rooms whose `name` property is exactly `value`, as
+     * `room.data(name)` reads it. One indexed lookup, however many rooms the
+     * area has. An area answers for itself even when you have turned its map
+     * off -- naming it is asking for it. */
+    findRoomsByProperty(name: string, value: string): Room[] {
+        return this.#rooms(op_smudgy_mapper_find_area_rooms_by_property(this.#obj, name, value));
+    }
+
+    /** This area's rooms carrying a property called `name`, whatever its
+     * value. */
+    findRoomsWithProperty(name: string): Room[] {
+        return this.#rooms(op_smudgy_mapper_find_area_rooms_with_property(this.#obj, name));
+    }
+
+    /** This area's rooms carrying `tag` (case-insensitive), in no particular
+     * order. */
+    findRoomsWithTag(tag: string): Room[] {
+        return this.#rooms(op_smudgy_mapper_find_area_rooms_with_tag(this.#obj, tag));
+    }
+
+    /** Resolves this area's own room numbers to rooms. */
+    #rooms(roomNumbers: RoomNumber[]): Room[] {
+        const rooms: Room[] = [];
+        for (const roomNumber of roomNumbers) {
+            const room = this.room(roomNumber);
+            if (room) rooms.push(room);
+        }
+        return rooms;
     }
 
     /** This area's text labels. */
