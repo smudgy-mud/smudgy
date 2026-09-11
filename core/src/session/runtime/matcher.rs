@@ -6,11 +6,17 @@
 //! time and routed to the cheapest engine that can match them:
 //!
 //! - **Pure literals** (including regex-escaped ones — the dominant case for
-//!   item-name substitutions) go to a single Aho-Corasick automaton: one
-//!   O(line) pass regardless of pattern count.
+//!   item-name substitutions) are found by name: a hit is the match.
 //! - **Everything else** goes to [`regex_filtered::Regexes`], a port of RE2's
-//!   `FilteredRE2`: an Aho-Corasick prefilter over each pattern's required
-//!   literal atoms, with the full regex run only for candidate patterns.
+//!   `FilteredRE2`: a prefilter over each pattern's required literal atoms, with
+//!   the full regex run only for candidate patterns.
+//!
+//! Both populations are found in **one** Aho-Corasick pass. The literals and the
+//! filtered set's atoms go into a single automaton whose pattern ids put the
+//! literals first: a hit below `literal_count` is a literal, and the rest are atom
+//! ids handed to `regex-filtered` to resolve into candidates. Scanning each line
+//! once for both is worth more than either tier's own automaton, because a sweep
+//! costs what the line is long whatever the pattern count.
 //! - Patterns `regex-filtered` cannot handle (none known in practice) fall
 //!   back to individually-compiled regexes checked on every line.
 //!
@@ -45,10 +51,20 @@ pub struct PatternSet {
     /// their original indices out of the text engines so a color-only trigger
     /// can proceed directly to its O(spans) style scan.
     always_match_indices: Vec<usize>,
-    /// Patterns that are pure literals, matched in one Aho-Corasick pass.
-    literals: AhoCorasick,
-    /// Aho-Corasick pattern id → index in `patterns`.
+    /// One automaton over the pure literals followed by the filtered set's required
+    /// atoms. Empty when the set has neither.
+    scan: AhoCorasick,
+    /// How many of `scan`'s patterns are literals: ids below this are literal patterns,
+    /// and ids at or above it are `regex-filtered` atom ids offset by it.
+    literal_count: usize,
+    /// The literal strings, in `scan`'s pattern-id order. `scan` is ASCII
+    /// case-insensitive because that is what an atom prefilter requires, so a literal
+    /// hit is confirmed against these bytes before it counts as a match.
+    literal_strings: Vec<Box<str>>,
+    /// `scan` pattern id → index in `patterns`.
     literal_indices: Vec<usize>,
+    /// The atom ids found on the current line, reused between lines.
+    atom_scratch: std::cell::RefCell<Vec<usize>>,
     /// Non-literal patterns, prefiltered by required literal atoms.
     filtered: regex_filtered::Regexes,
     /// `regex-filtered` pattern id → index in `patterns`.
@@ -103,11 +119,6 @@ impl PatternSet {
             }
         }
 
-        let literals = AhoCorasick::builder()
-            .match_kind(MatchKind::Standard)
-            .build(&literal_strings)
-            .context("failed to build literal pattern matcher")?;
-
         // `regex-filtered` parses with its own parser; in the unlikely event
         // it rejects a pattern the regex crate accepts, demote that pattern
         // to an individually-checked regex rather than failing the set.
@@ -139,14 +150,38 @@ impl PatternSet {
             }
         };
 
+        // One automaton for both populations, literals first so a hit's id says which it
+        // is. `MatchKind::Standard` is what `find_overlapping_iter` requires, and the
+        // ASCII case-insensitivity is what `regex-filtered` builds its own prefilter with
+        // — an atom rules a pattern in, and the regex behind it decides the case. A
+        // literal has no regex behind it, so `matches_into` confirms its bytes instead.
+        let literal_count = literal_strings.len();
+        let scan = AhoCorasick::builder()
+            .match_kind(MatchKind::Standard)
+            .ascii_case_insensitive(true)
+            .prefilter(true)
+            .build(
+                literal_strings
+                    .iter()
+                    .map(String::as_str)
+                    .chain(filtered.atoms().iter().map(String::as_str)),
+            )
+            .context("failed to build the pattern scanner")?;
+
         Ok(Self {
             patterns,
             always_match_indices,
-            literals,
+            scan,
+            literal_count,
+            literal_strings: literal_strings
+                .into_iter()
+                .map(String::into_boxed_str)
+                .collect(),
             literal_indices,
             filtered,
             filtered_indices,
             unfiltered,
+            atom_scratch: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -169,26 +204,34 @@ impl PatternSet {
             index,
             literal: None,
         }));
-        if !self.literal_indices.is_empty() {
-            out.extend(
-                self.literals
-                    .find_overlapping_iter(haystack)
-                    .map(|hit| PatternMatch {
-                        index: self.literal_indices[hit.pattern().as_usize()],
-                        literal: Some(hit.start()..hit.end()),
-                    }),
-            );
+        // The one pass. Literal hits are matches, once their case is confirmed; atom hits
+        // are candidates, resolved below by the set they belong to.
+        let mut atoms = self.atom_scratch.borrow_mut();
+        atoms.clear();
+        for hit in self.scan.find_overlapping_iter(haystack) {
+            let id = hit.pattern().as_usize();
+            if let Some(atom) = id.checked_sub(self.literal_count) {
+                atoms.push(atom);
+            } else if haystack.as_bytes()[hit.start()..hit.end()]
+                == *self.literal_strings[id].as_bytes()
+            {
+                out.push(PatternMatch {
+                    index: self.literal_indices[id],
+                    literal: Some(hit.start()..hit.end()),
+                });
+            }
         }
         if !self.filtered_indices.is_empty() {
             out.extend(
                 self.filtered
-                    .matching(haystack)
+                    .matching_of(haystack, atoms.drain(..))
                     .map(|(id, _)| PatternMatch {
                         index: self.filtered_indices[id],
                         literal: None,
                     }),
             );
         }
+        drop(atoms);
         out.extend(
             self.unfiltered
                 .iter()
@@ -324,6 +367,31 @@ mod tests {
         assert_eq!(set.matched_indices("needle"), (0..=7).collect::<Vec<_>>());
         assert_eq!(set.matched_indices("other"), vec![0, 3, 7]);
         assert_eq!(set.matched_indices(""), vec![0, 3, 7]);
+    }
+
+    #[test]
+    fn literals_stay_case_sensitive_in_the_shared_scanner() {
+        // The one automaton is ASCII case-insensitive, because that is what the atom
+        // prefilter it also serves requires. A literal has no regex behind it to settle
+        // the case, so `matches_into` confirms the bytes; without that, every literal
+        // trigger would silently become case-insensitive.
+        let set = PatternSet::build(["Dargaroth", "café", r"^A glowing (\w+)"]).unwrap();
+        assert_eq!(set.matched_indices("Dargaroth grins."), vec![0]);
+        assert!(set.matched_indices("dargaroth grins.").is_empty());
+        assert!(set.matched_indices("DARGAROTH grins.").is_empty());
+        // Non-ASCII is untouched by ASCII case folding, and the span stays on a
+        // character boundary.
+        assert_eq!(
+            set.matches("a café here"),
+            vec![PatternMatch {
+                index: 1,
+                literal: Some(2..7)
+            }]
+        );
+        assert!(set.matched_indices("a CAFÉ here").is_empty());
+        // The regex tier is unaffected: its atoms rule patterns in, and the regex decides.
+        assert_eq!(set.matched_indices("A glowing rune"), vec![2]);
+        assert!(set.matched_indices("a glowing rune").is_empty());
     }
 
     #[test]
