@@ -70,6 +70,33 @@ pub struct AreaCache {
     /// construction (and after [`Self::apply_secret_marks`]) so list UIs can
     /// show a cheap indicator without scanning rooms per redraw.
     has_secrets: bool,
+    /// Reverse lookups over this area's rooms by property and by tag.
+    room_lookups: RoomLookups,
+}
+
+/// The empty result an unmatched lookup borrows, so a miss allocates nothing
+/// and every accessor can return a slice.
+static EMPTY_ROOMS: Vec<Arc<RoomCache>> = Vec::new();
+
+/// One area's reverse lookups over its rooms' properties and tags. Rebuilt
+/// wholesale with the rest of the room state, next to the spatial R-trees and
+/// at the same cost class, so every room-mutating path maintains them by
+/// construction rather than by remembering to.
+///
+/// Properties are indexed twice — by name alone and by name with value —
+/// mirroring `AtlasCache`'s `rooms_by_title` / `rooms_by_title_and_description`
+/// pair, so "which rooms carry this at all" and "which rooms carry this exact
+/// value" are both one probe. The second table costs a bucket per distinct
+/// (name, value); a property holding a per-room identity spends one bucket per
+/// room, which is precisely the case that wants the O(1) lookup.
+///
+/// Tags are keyed in their normalized (uppercase) spelling, so lookup is
+/// case-insensitive on the same terms as [`RoomCache::has_tag`].
+#[derive(Debug, Clone, Default)]
+struct RoomLookups {
+    by_property_name: HashMap<String, Vec<Arc<RoomCache>>>,
+    by_property_name_and_value: HashMap<(String, String), Vec<Arc<RoomCache>>>,
+    by_tag: HashMap<String, Vec<Arc<RoomCache>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +145,35 @@ impl RTreeObject for ConnectionSpatialEntry {
 }
 
 impl AreaCache {
+    /// Builds the property and tag lookups from the area's rooms. Bucket order
+    /// follows `rooms`, which preserves the area's original room ordering, so
+    /// results are stable across rebuilds that do not reorder rooms.
+    fn build_room_lookups(rooms: &[Arc<RoomCache>]) -> RoomLookups {
+        let mut lookups = RoomLookups::default();
+        for room in rooms {
+            for (name, value) in room.properties() {
+                lookups
+                    .by_property_name
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push(room.clone());
+                lookups
+                    .by_property_name_and_value
+                    .entry((name.to_owned(), value.to_owned()))
+                    .or_default()
+                    .push(room.clone());
+            }
+            for tag in room.tags() {
+                lookups
+                    .by_tag
+                    .entry(tag.to_owned())
+                    .or_default()
+                    .push(room.clone());
+            }
+        }
+        lookups
+    }
+
     fn build_rooms_index(rooms: &[Arc<RoomCache>]) -> RTree<RoomSpatialEntry> {
         let entries: Vec<_> = rooms.iter().cloned().map(RoomSpatialEntry::new).collect();
         RTree::bulk_load(entries)
@@ -148,9 +204,11 @@ impl AreaCache {
             Self::build_room_connections(&self.id, &connections, &rooms_by_number);
         let rooms_index = Self::build_rooms_index(&rooms);
         let room_connections_index = Self::build_room_connections_index(&room_connections);
+        let room_lookups = Self::build_room_lookups(&rooms);
 
         Self {
             rev: self.rev + 1,
+            room_lookups,
             rooms_by_number,
             rooms,
             max_room_number,
@@ -197,6 +255,7 @@ impl AreaCache {
             Self::build_room_connections(&area.area.id, &area.connections, &rooms_by_number);
         let rooms_index = Self::build_rooms_index(&rooms);
         let room_connections_index = Self::build_room_connections_index(&room_connections);
+        let room_lookups = Self::build_room_lookups(&rooms);
 
         let mut cache = Self {
             id: area.area.id,
@@ -224,6 +283,7 @@ impl AreaCache {
             rooms_index,
             room_connections_index,
             has_secrets: false,
+            room_lookups,
         };
         cache.has_secrets = cache.compute_has_secrets();
         cache
@@ -526,6 +586,48 @@ impl AreaCache {
     #[must_use]
     pub fn get_room(&self, room_number: &RoomNumber) -> Option<&Arc<RoomCache>> {
         self.rooms_by_number.get(room_number)
+    }
+
+    /// This area's rooms carrying a property named `name`, whatever its value.
+    /// One hash probe; the slice is the index bucket itself, never a copy.
+    /// Order is unspecified but stable for an unchanged area.
+    #[must_use]
+    pub fn get_rooms_with_property(&self, name: &str) -> &[Arc<RoomCache>] {
+        self.room_lookups
+            .by_property_name
+            .get(name)
+            .unwrap_or(&EMPTY_ROOMS)
+    }
+
+    /// This area's rooms whose `name` property holds exactly `value`. Name and
+    /// value both match case-sensitively, on the same terms as
+    /// [`RoomCache::get_property`]. One hash probe.
+    #[must_use]
+    pub fn get_rooms_by_property(&self, name: &str, value: &str) -> &[Arc<RoomCache>] {
+        // The tuple key is owned, so probing allocates the pair — the same
+        // trade `AtlasCache`'s title-and-description lookup already makes, and
+        // negligible beside the work a caller does with the result.
+        self.room_lookups
+            .by_property_name_and_value
+            .get(&(name.to_owned(), value.to_owned()))
+            .unwrap_or(&EMPTY_ROOMS)
+    }
+
+    /// This area's rooms carrying `tag`, matched case-insensitively like
+    /// [`RoomCache::has_tag`]. One hash probe.
+    #[must_use]
+    pub fn get_rooms_with_tag(&self, tag: &str) -> &[Arc<RoomCache>] {
+        self.room_lookups
+            .by_tag
+            .get(&crate::mapper::normalize_tag(tag))
+            .unwrap_or(&EMPTY_ROOMS)
+    }
+
+    /// This area's own properties with their secrecy flags, for callers that
+    /// need to compare two snapshots' property sets rather than read one.
+    #[must_use]
+    pub(super) fn property_entries(&self) -> &HashMap<String, PropertyEntry> {
+        &self.properties
     }
 
     #[must_use]
