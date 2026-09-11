@@ -593,6 +593,15 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
     // two one-way arrivals fan into the neighboring canonical port lanes.
     // This runs through the authored package and script-visible
     // Exit.connection_id, not merely the pure TypeScript allocator.
+    //
+    // The six rooms tile a full 2x3 block on purpose. Two arrivals can only
+    // share the target's west wall from the diagonals either side of the
+    // reciprocal, which spans three rows -- and passive polish would compact
+    // any slack in that footprint, carrying an arrival onto another wall and
+    // dissolving the fan this asserts. A block with no empty cell is already
+    // at the minimum area and perimeter its room count allows, so the polish
+    // pass has nothing to gain and the arrangement holds however the quiet
+    // window falls.
     tx.send(gmcp(
         "Room.Info",
         r#"{
@@ -613,17 +622,27 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
         },
         {
           "vnum": 401, "name": "Reciprocal Source", "zone": 32,
-          "terrain": "city", "x": -3, "y": 0, "z": 0,
+          "terrain": "city", "x": -1, "y": 0, "z": 0,
           "current": false, "route": false, "destination": false
         },
         {
           "vnum": 402, "name": "Northwest Source", "zone": 32,
-          "terrain": "city", "x": -3, "y": -1, "z": 0,
+          "terrain": "city", "x": -1, "y": -1, "z": 0,
           "current": false, "route": false, "destination": false
         },
         {
           "vnum": 403, "name": "Southwest Source", "zone": 32,
-          "terrain": "city", "x": -3, "y": 1, "z": 0,
+          "terrain": "city", "x": -1, "y": 1, "z": 0,
+          "current": false, "route": false, "destination": false
+        },
+        {
+          "vnum": 404, "name": "North Filler", "zone": 32,
+          "terrain": "city", "x": 0, "y": -1, "z": 0,
+          "current": false, "route": false, "destination": false
+        },
+        {
+          "vnum": 405, "name": "South Filler", "zone": 32,
+          "terrain": "city", "x": 0, "y": 1, "z": 0,
           "current": false, "route": false, "destination": false
         }
       ],
@@ -639,6 +658,14 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
         {
           "from": 403, "to": 400, "direction": "southwest-arrival",
           "bidirectional": false, "closed": false, "locked": false, "route": false
+        },
+        {
+          "from": 404, "to": 400, "direction": "south",
+          "bidirectional": true, "closed": false, "locked": false, "route": false
+        },
+        {
+          "from": 405, "to": 400, "direction": "north",
+          "bidirectional": true, "closed": false, "locked": false, "route": false
         }
       ],
       "gps": {
@@ -659,7 +686,9 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
             target_port_layout(&mapper, "400", RoomSide::West).as_ref() == Some(&expected_ports)
         })
         .await,
-        "timed out waiting for one-way port disambiguation"
+        "timed out waiting for one-way port disambiguation: west wall {:?}\n{}",
+        target_port_layout(&mapper, "400", RoomSide::West),
+        lines.join("\n")
     );
     let transcript = lines.join("\n");
     assert!(
@@ -734,7 +763,9 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
             target_port_layout(&mapper, "500", RoomSide::West).as_ref() == Some(&expected_ports)
         })
         .await,
-        "timed out waiting for existing port migration"
+        "timed out waiting for existing port migration: west wall {:?}\n{}",
+        target_port_layout(&mapper, "500", RoomSide::West),
+        lines.join("\n")
     );
     assert_eq!(
         target_port_layout(&mapper, "500", RoomSide::West),
