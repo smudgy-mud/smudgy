@@ -195,6 +195,31 @@ iced-code-editor = { path = "./target/patch/iced-code-editor" }
 # Define workspace-wide lints
 [workspace.lints.clippy]
 pedantic = "warn"
+
+[profile.dev]
+# Each test binary links deno, V8, iced and wgpu. On windows-msvc that debug info
+# becomes a PDB file of roughly a gigabyte, and cargo keeps one per rebuild hash.
+# Line tables are enough for panic backtraces and test failures. `profile.symbols`
+# below gives full fidelity when a debugger needs it.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies supply most of that debug info and nobody steps through them. `*`
+# does not apply to workspace members, so smudgy's own crates keep their line tables.
+debug = false
+
+[profile.dev.build-override]
+# Build scripts and proc macros run. They are not debugged.
+debug = false
+
+[profile.symbols]
+# Full symbols on demand: `cargo test --profile symbols -p smudgy_core`. Cargo ties
+# a profile's output directory to its name, so these artifacts land in
+# `target/symbols/`, leaving the lean `target/debug/` build intact and the whole
+# directory disposable once a debugging session ends.
+inherits = "dev"
+debug = 2
+
 [profile.profiling]
 inherits = "release"
 debug = true
