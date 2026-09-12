@@ -996,7 +996,7 @@ impl PackageGraph {
 
     /// Packages with any declared relationship to `id`, including imported
     /// code dependencies and separately-running `requires` roots.
-    fn parents_of(&self, id: &str) -> Vec<String> {
+    pub fn parents_of(&self, id: &str) -> Vec<String> {
         let mut out = self
             .requires
             .iter()
@@ -1061,19 +1061,27 @@ impl PackageGraph {
     /// exists because `parent` pulls `child` in, so it follows the parent's context:
     /// it greys once `parent` is no longer effectively enabled, rather than reporting
     /// `child`'s global state (which stays on for a separately-installed `child` that
-    /// runs on its own — that belongs to `child`'s own row, not this edge). The
-    /// operative term is the parent for both ordinary imports and `requires`: an active requiring
-    /// parent is what activates an automatically installed required root.
+    /// runs on its own — that belongs to `child`'s own row, not this edge).
     pub fn dep_edge_active(&self, parent: &str, child: &str) -> bool {
-        let Some(edge) = self
-            .requires
+        self.requires
             .get(parent)
-            .and_then(|edges| edges.iter().find(|edge| edge.specifier == child))
-        else {
-            return false;
-        };
-        self.effectively_enabled(parent)
-            && (edge.kind == DependencyKind::Dependency || self.effectively_enabled(child))
+            .is_some_and(|edges| edges.iter().any(|edge| edge.specifier == child))
+            && self.effectively_enabled(parent)
+    }
+
+    /// The packages the tree nests under `parent`: its imported code dependencies, each once. They
+    /// execute inside the parent's isolate, so they belong under it. A `requires` target is a root
+    /// with its own top-level row and is never nested — a package the parent both imports and
+    /// requires appears here as the import only.
+    pub fn nested_dependencies(&self, parent: &str) -> Vec<&DepEdge> {
+        let mut seen = HashSet::new();
+        self.requires
+            .get(parent)
+            .into_iter()
+            .flatten()
+            .filter(|edge| edge.kind == DependencyKind::Dependency)
+            .filter(|edge| seen.insert(edge.specifier.as_str()))
+            .collect()
     }
 }
 
@@ -2353,18 +2361,40 @@ mod tests {
         assert!(!graph.effectively_enabled("library"));
         assert!(graph.effectively_enabled("worker"));
         assert!(graph.dep_edge_active("parent", "library"));
-        assert!(graph.dep_edge_active("parent", "worker"));
         assert!(graph.required_by("library").is_empty());
         assert_eq!(graph.required_by("worker"), ["parent"]);
         assert!(!graph.controllable("worker"));
 
         graph.intent.insert("parent".to_string(), false);
         assert!(!graph.effectively_enabled("worker"));
-        assert!(!graph.dep_edge_active("parent", "worker"));
 
         install(&mut graph, "worker", true);
         assert!(graph.effectively_enabled("worker"));
         assert!(graph.controllable("worker"));
+    }
+
+    #[test]
+    fn only_imports_nest_under_a_parent_and_each_once() {
+        // P imports L, requires W, and both imports and requires D.
+        let mut graph = PackageGraph::default();
+        install(&mut graph, "p", true);
+        imports(&mut graph, "p", "l");
+        requires(&mut graph, "p", "w");
+        imports(&mut graph, "p", "d");
+        requires(&mut graph, "p", "d");
+        imports(&mut graph, "p", "d");
+
+        let nested: Vec<&str> = graph
+            .nested_dependencies("p")
+            .iter()
+            .map(|edge| edge.specifier.as_str())
+            .collect();
+        assert_eq!(
+            nested,
+            ["l", "d"],
+            "W is a root with its own row; D shows once, as the import"
+        );
+        assert!(graph.nested_dependencies("w").is_empty());
     }
 
     mod inner_triggers {

@@ -26,12 +26,82 @@ use super::editors::pane_scroll;
 use super::keyboard_control::{KeyboardControl, linear_selection, publish_selection};
 use super::model::{NodeStatus, package_display_name};
 use super::packages::{
-    PublicationStatus, PublishVerdict, installed_package_tab_button, local_package_tab_button,
-    metric, publish_output_panel, publish_verdict, rating_metric, star_rate_row,
+    PublicationStatus, PublishVerdict, display_names, installed_package_tab_button,
+    local_package_tab_button, metric, publish_output_panel, publish_verdict, rating_metric,
+    star_rate_row,
 };
 use super::{AutomationsWindow, Elem, InstalledPackageTab, LocalPackageTab, Message, Selection};
 
+/// How the open package reaches a package listed under Dependencies: imported into its own
+/// isolate, run as a separate root it requires, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DepRelation {
+    Import,
+    Root,
+    Both,
+}
+
+/// Folds a package's edges into one entry per target: how it is reached, and the declared range
+/// (the import's, when both edges carry one).
+fn merge_dependency_edges(edges: &[super::model::DepEdge]) -> Vec<(&str, DepRelation, &str)> {
+    let mut merged: Vec<(&str, DepRelation, &str)> = Vec::new();
+    for edge in edges {
+        let relation = if edge.kind == DependencyKind::Requires {
+            DepRelation::Root
+        } else {
+            DepRelation::Import
+        };
+        match merged.iter_mut().find(|(spec, ..)| *spec == edge.specifier) {
+            Some(entry) => {
+                if entry.1 != relation {
+                    entry.1 = DepRelation::Both;
+                }
+                if entry.2.is_empty() || (relation == DepRelation::Import && !edge.range.is_empty())
+                {
+                    entry.2 = edge.range.as_str();
+                }
+            }
+            None => merged.push((edge.specifier.as_str(), relation, edge.range.as_str())),
+        }
+    }
+    merged
+}
+
 impl AutomationsWindow {
+    /// The inline confirm for a held activation change: what turns off with the package, and the
+    /// choice to turn them off together or leave everything as it is.
+    pub(super) fn view_activation_cascade_confirm(&self) -> Option<Elem<'_>> {
+        let pending = self.activation_cascade.as_ref()?;
+        let warning = crate::i18n::t!(
+            "package-disable-cascade-warning",
+            "name" => package_display_name(&pending.specifier),
+            "profiles" => pending.profiles.join(", "),
+            "packages" => super::packages::display_names(&pending.dependents),
+            "count" => pending.dependents.len() as i64
+        );
+        Some(
+            column![
+                container(text(warning).size(12.0).style(common::warning))
+                    .padding(8.0)
+                    .width(Length::Fill)
+                    .style(common::banner_style),
+                row![
+                    iced::widget::space::horizontal(),
+                    button(text(crate::i18n::t!("action-cancel")).size(12.0))
+                        .style(button_style::secondary)
+                        .on_press(Message::CancelActivationCascade),
+                    button(text(crate::i18n::t!("package-disable-cascade-confirm")).size(12.0))
+                        .style(button_style::secondary)
+                        .on_press(Message::ConfirmActivationCascade),
+                ]
+                .spacing(8.0)
+                .align_y(Vertical::Center),
+            ]
+            .spacing(6.0)
+            .into(),
+        )
+    }
+
     pub(super) fn view_installed_package(&self) -> Elem<'_> {
         let Some(locked) = self.installed_open.as_deref() else {
             return pane_scroll(column![
@@ -146,22 +216,36 @@ impl AutomationsWindow {
         let mut body = column![header, tabs].spacing(16.0);
 
         // Context banner.
-        let banner_text = if viewing_as_required {
-            Some(crate::i18n::t!("package-required-managed"))
-        } else if viewing_as_import {
-            Some(crate::i18n::t!("package-import-managed"))
-        } else if required_only {
-            Some(crate::i18n::t!("package-required-managed"))
-        } else if dep_only {
-            Some(crate::i18n::t!("package-dependency-managed"))
+        // Context banner: which packages reach this one, and nothing more. A reference view
+        // names the package it was reached through; a package's own pane names every parent.
+        let reached_through = match &self.selection {
+            Selection::Dependency { parent, spec } if spec == specifier => vec![parent.clone()],
+            _ => Vec::new(),
+        };
+        let banner_text = if viewing_as_required || required_only {
+            let needed_by = if requiring_dependents.is_empty() {
+                &reached_through
+            } else {
+                &requiring_dependents
+            };
+            Some(crate::i18n::t!(
+                "package-required-managed",
+                "packages" => display_names(needed_by)
+            ))
+        } else if viewing_as_import || dep_only {
+            let inside = if viewing_as_import {
+                reached_through
+            } else {
+                self.graph.parents_of(specifier)
+            };
+            Some(crate::i18n::t!(
+                "package-dependency-managed",
+                "packages" => display_names(&inside)
+            ))
         } else if !requiring_dependents.is_empty() {
-            let who: Vec<String> = requiring_dependents
-                .iter()
-                .map(|s| package_display_name(s).to_string())
-                .collect();
             Some(crate::i18n::t!(
                 "package-direct-and-required",
-                "packages" => who.join(", ")
+                "packages" => display_names(&requiring_dependents)
             ))
         } else if controllable && !effective {
             Some(crate::i18n::t!("package-disabled-review"))
@@ -301,7 +385,7 @@ impl AutomationsWindow {
                     enabled,
                     crate::i18n::ts!("package-needs"),
                     None,
-                    None,
+                    None::<DepRelation>,
                 ));
             }
             body = body.push(req);
@@ -335,6 +419,9 @@ impl AutomationsWindow {
                 })
                 .collect::<BTreeMap<_, _>>();
             if controllable {
+                if let Some(confirm) = self.view_activation_cascade_confirm() {
+                    body = body.push(confirm);
+                }
                 body = body.push(self.activation_controls(&locked.activation(), inherited_notices));
             }
             if self
@@ -391,52 +478,38 @@ impl AutomationsWindow {
                     .push(common::section_label(crate::i18n::ts!(
                         "package-dependencies"
                     )));
-            for edge in &deps {
-                // This row exists because the open package (`specifier`) depends on
-                // `edge.specifier`, so its dot follows the parent's context: it greys when the
-                // parent is disabled, instead of staying lit on the dep's global enabled state
-                // (which a separately-installed dep keeps on its own row).
-                let enabled = self.graph.dep_edge_active(specifier, &edge.specifier);
-                let resolved = self.graph.resolved.get(&edge.specifier).cloned();
-                let range = if edge.range.is_empty() {
+            // One row per package, however many edges reach it. An import row exists because the
+            // open package (`specifier`) pulls the import in, so its dot follows the parent's
+            // context: it greys when the parent is disabled, instead of staying lit on the dep's
+            // global enabled state (which a separately-installed dep keeps on its own row). A
+            // `requires` target is a root that runs on its own terms: its row reports its own
+            // state and opens its own pane. A package reached both ways is treated as the root.
+            for (dep, relation, declared) in merge_dependency_edges(&deps) {
+                let is_root = relation != DepRelation::Import;
+                let enabled = if is_root {
+                    self.graph.effectively_enabled(dep)
+                } else {
+                    self.graph.dep_edge_active(specifier, dep)
+                };
+                let resolved = self.graph.resolved.get(dep).cloned();
+                let range = if declared.is_empty() {
                     resolved
                         .clone()
                         .map(|v| format!("→ v{v}"))
                         .unwrap_or_default()
                 } else {
                     format!(
-                        "{} → v{}",
-                        edge.range,
+                        "{declared} → v{}",
                         resolved.clone().unwrap_or_else(|| "?".to_string())
                     )
                 };
                 dep_col = dep_col.push(self.dep_link_row(
-                    &edge.specifier,
+                    dep,
                     enabled,
                     &range,
-                    Some(specifier),
-                    Some(edge.kind),
+                    (!is_root).then_some(specifier.as_str()),
+                    Some(relation),
                 ));
-            }
-            if controllable
-                && !effective
-                && deps
-                    .iter()
-                    .any(|e| !self.graph.effectively_enabled(&e.specifier))
-            {
-                let names: Vec<String> = deps
-                    .iter()
-                    .map(|e| package_display_name(&e.specifier).to_string())
-                    .collect();
-                dep_col = dep_col.push(
-                    text(crate::i18n::t!(
-                        "package-enabling-dependencies",
-                        "name" => &name,
-                        "dependencies" => names.join(", ")
-                    ))
-                    .size(12.0)
-                    .style(common::muted),
-                );
             }
             body = body.push(dep_col);
         }
@@ -754,6 +827,9 @@ impl AutomationsWindow {
                         })
                 })
                 .collect::<BTreeMap<_, _>>();
+            if let Some(confirm) = self.view_activation_cascade_confirm() {
+                body = body.push(confirm);
+            }
             body = body.push(self.activation_controls(&locked.activation(), inherited_notices));
             if self.param_config.as_ref().is_some_and(|config| {
                 config.specifier == own_specifier && !config.params.is_empty()

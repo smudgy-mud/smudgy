@@ -1075,6 +1075,11 @@ impl AutomationsWindow {
         }
         let known = self.profile_names.iter().cloned().collect::<BTreeSet<_>>();
         let enabled = current.is_enabled_for(&profile_name);
+        // A package that runs here only because other roots require it shows its box checked, so
+        // unchecking it asks to turn those roots off — not to turn its own intent on.
+        if !enabled && self.open_package_inherits_profile(&profile_name) {
+            return self.request_inherited_profile_disable(profile_name);
+        }
         self.set_open_activation(current.with_profile(&profile_name, !enabled, &known))
     }
 
@@ -4398,7 +4403,11 @@ impl AutomationsWindow {
             let name = profile_name.to_string();
             let pointer_name = name.clone();
             let current = profile_name == self.profile_name;
-            let profile_enabled = activation.is_enabled_for(profile_name);
+            // The box reads the profile's effective state: checked when the package runs there
+            // because another root requires it, with the note below saying why. Unchecking such a
+            // box is a request to turn those roots off (`toggle_open_activation_profile`).
+            let profile_enabled = activation.is_enabled_for(profile_name)
+                || inherited_notices.contains_key(profile_name);
             let can_toggle_profile = storage_available
                 && self.profile_inventory_complete
                 && (profile_enabled || enable_block_reason.is_none());

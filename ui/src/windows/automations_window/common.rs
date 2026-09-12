@@ -290,52 +290,37 @@ pub fn badge<'a>(label: impl Into<String>) -> ThemedElement<'a, Message> {
 
 /// The small `DEP` tag shown on nested dependency rows.
 pub fn dep_tag<'a>() -> ThemedElement<'a, Message> {
-    container(
-        text(crate::i18n::t!("badge-dependency"))
-            .size(9.0)
-            .style(faint),
-    )
-    .padding(Padding {
-        top: 1.0,
-        bottom: 1.0,
-        left: 5.0,
-        right: 5.0,
-    })
-    .style(|theme: &Theme| container::Style {
-        background: None,
-        border: Border {
-            color: theme.styles.general.border,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        ..Default::default()
-    })
-    .into()
+    relation_tag(crate::i18n::t!("badge-dependency"))
 }
 
 /// The small `REQ` tag shown for a package that must run as a separate root.
 pub fn required_tag<'a>() -> ThemedElement<'a, Message> {
-    container(
-        text(crate::i18n::t!("badge-required"))
-            .size(9.0)
-            .style(faint),
-    )
-    .padding(Padding {
-        top: 1.0,
-        bottom: 1.0,
-        left: 5.0,
-        right: 5.0,
-    })
-    .style(|theme: &Theme| container::Style {
-        background: None,
-        border: Border {
-            color: theme.styles.general.border,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        ..Default::default()
-    })
-    .into()
+    relation_tag(crate::i18n::t!("badge-required"))
+}
+
+/// The `DEP + REQ` tag for a package that is both imported and run as a separate root.
+pub fn dep_req_tag<'a>() -> ThemedElement<'a, Message> {
+    relation_tag(crate::i18n::t!("badge-dependency-required"))
+}
+
+fn relation_tag<'a>(label: String) -> ThemedElement<'a, Message> {
+    container(text(label).size(9.0).style(faint))
+        .padding(Padding {
+            top: 1.0,
+            bottom: 1.0,
+            left: 5.0,
+            right: 5.0,
+        })
+        .style(|theme: &Theme| container::Style {
+            background: None,
+            border: Border {
+                color: theme.styles.general.border,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// A raised surface card (stat cards, panels).

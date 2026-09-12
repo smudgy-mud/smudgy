@@ -13,14 +13,14 @@ impl AutomationsWindow {
         enabled: bool,
         prefix: &str,
         parent: Option<&str>,
-        kind: Option<DependencyKind>,
+        relation: Option<DepRelation>,
     ) -> Elem<'a> {
         let name = package_display_name(specifier).to_string();
         // A dependency has no enable state of its own — it loads because the package that requires
         // it is enabled — so its rows read "active/inactive". The user-controllable "enabled/
-        // disabled" is reserved for the "Required by" parent rows (`is_dep` is `None`), which are
-        // top-level packages the user actually toggles.
-        let state = match (kind.is_some(), enabled) {
+        // disabled" is reserved for the "Required by" parent rows (`relation` is `None`), which
+        // are top-level packages the user actually toggles.
+        let state = match (relation.is_some(), enabled) {
             (true, true) => crate::i18n::ts!("package-state-active"),
             (true, false) => crate::i18n::ts!("package-state-inactive"),
             (false, true) => crate::i18n::ts!("package-state-enabled"),
@@ -36,11 +36,11 @@ impl AutomationsWindow {
         ]
         .spacing(8.0)
         .align_y(Vertical::Center);
-        if let Some(kind) = kind {
-            content = content.push(if kind == DependencyKind::Requires {
-                common::required_tag()
-            } else {
-                common::dep_tag()
+        if let Some(relation) = relation {
+            content = content.push(match relation {
+                DepRelation::Import => common::dep_tag(),
+                DepRelation::Root => common::required_tag(),
+                DepRelation::Both => common::dep_req_tag(),
             });
         }
         content = content
@@ -100,24 +100,16 @@ impl AutomationsWindow {
         }
     }
 
+    /// The way from an import-reference view to the package's own pane, for a package that is
+    /// also installed on its own. The button says it all.
     pub(super) fn dependency_also_installed_note(&self, specifier: &str) -> Elem<'_> {
-        column![
-            container(
-                text(crate::i18n::t!("package-also-installed"))
-                    .size(12.0)
-                    .style(common::muted),
-            )
-            .padding(10.0)
-            .style(common::banner_style),
-            row![
-                iced::widget::space::horizontal(),
-                button(text(crate::i18n::t!("package-open-own-pane")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::SelectInstalledPackage(specifier.to_string())),
-            ]
-            .align_y(Vertical::Center),
+        row![
+            iced::widget::space::horizontal(),
+            button(text(crate::i18n::t!("package-open-own-pane")).size(12.0))
+                .style(button_style::secondary)
+                .on_press(Message::SelectInstalledPackage(specifier.to_string())),
         ]
-        .spacing(8.0)
+        .align_y(Vertical::Center)
         .into()
     }
 
@@ -245,7 +237,8 @@ impl AutomationsWindow {
                         text(crate::i18n::t!(
                             "package-removal-required",
                             "name" => name,
-                            "packages" => names
+                            "packages" => names,
+                            "count" => breaks.len() as i64
                         ))
                         .size(12.0)
                         .style(common::warning),
