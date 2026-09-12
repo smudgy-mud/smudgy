@@ -71,8 +71,12 @@ pub use script_engine::layout_fold;
 // cache is a first-class local source of package content — session load serves from it
 // cache-first, and out-of-session consumers (the update checker, cache-sourced package
 // copies) read and warm the same store.
+use super::system_row::{
+    Progress, SESSION_ROW_ID, Severity, SystemRow, SystemRowId, SystemText, next_system_row_id,
+    push_loaded_clause,
+};
 pub use script_engine::package_cache;
-use script_engine::{ScriptEngine, ScriptEngineParams};
+use script_engine::{LoadSummary, ScriptEngine, ScriptEngineParams};
 #[cfg(not(feature = "bench-api"))]
 use store::SessionStore;
 // Expose the session store's flush/fanout machinery to the `smudgy_bench` crate (the same
@@ -311,6 +315,35 @@ mod runtime_helper_tests {
 /// to the committed length and re-seeking there lets the completed or
 /// retracted line be rewritten without duplication. The `BufWriter` is flushed
 /// first so the underlying `File` cursor is authoritative before the seek.
+/// What one mapper load came to, for the load row's map clause.
+pub(crate) struct MapsLoaded {
+    pub(crate) areas: usize,
+    pub(crate) shared: usize,
+    pub(crate) elapsed: Duration,
+}
+
+/// Send one system-row update straight to the UI, outside the row ledger —
+/// the only way to speak before (or while) `Inner` is being built. An append
+/// counts itself as one line; a replacement never changes the count, so this
+/// stays in step with the ledger either way.
+pub(crate) fn emit_system_row_direct(
+    ui_tx: &futures::channel::mpsc::Sender<TaggedSessionEvent>,
+    session_id: SessionId,
+    emitted_line_count: &std::rc::Weak<Cell<usize>>,
+    update: BufferUpdate,
+) {
+    if matches!(update, BufferUpdate::AppendSystem(_))
+        && let Some(count) = emitted_line_count.upgrade()
+    {
+        count.set(count.get() + 1);
+    }
+    let mut ui_tx = ui_tx.clone();
+    let _ = ui_tx.try_send(TaggedSessionEvent {
+        session_id,
+        event: SessionEvent::UpdateBuffer(Arc::new(vec![update])),
+    });
+}
+
 fn rewind_provisional_open_line(
     log_file: &mut BufWriter<File>,
     committed_len: u64,
@@ -1465,8 +1498,9 @@ impl Runtime {
             }
             let pending_line_operations = Rc::new(RefCell::new(Vec::new()));
 
-            // We start at 1 because the first line ("Loading session...") is already emitted
-            let emitted_line_count = Rc::new(Cell::new(0));
+            // Starts at 1: the spawn-time session rule (a whole system row) is
+            // already line 1 of the main buffer.
+            let emitted_line_count = Rc::new(Cell::new(1));
 
             // The session-side bounded ring of recently-emitted lines. The SAME `Rc` is
             // read by every isolate's `buffer.line(n)` read ops and written at emit time. It is
@@ -1574,6 +1608,26 @@ impl Runtime {
                 reset();
             }
 
+            // One row for everything this session loads. It opens pending
+            // (shimmering) before the engine blocks on packages, then gains a
+            // clause as each kind of thing finishes — so start-up reads as one
+            // line filling in rather than a pile of notices. Emitted straight
+            // to the UI because the ledger does not exist until `Inner` is
+            // built below; the count it takes is its line number.
+            let load_row = next_system_row_id();
+            let loading_row = SystemRow::notice(
+                load_row,
+                Progress::Pending,
+                SystemText::new(Severity::Info).text("Loading packages\u{2026}"),
+            );
+            emit_system_row_direct(
+                &local_ui_tx,
+                session_id,
+                &Rc::downgrade(&emitted_line_count),
+                BufferUpdate::AppendSystem(loading_row.clone()),
+            );
+            let load_row_line = emitted_line_count.get();
+
             let script_engine = ScriptEngine::new(ScriptEngineParams {
                 session_id,
                 server_name: &local_server_name,
@@ -1606,6 +1660,7 @@ impl Runtime {
                 input_sequence: input_sequence.clone(),
                 audio_scope: audio_scope.clone(),
             });
+            let load_summary = script_engine.load_summary().clone();
 
             // Seed runtime-relevant settings from disk; the UI live-updates
             // them later via `RuntimeAction::ApplySettings`.
@@ -1661,18 +1716,19 @@ impl Runtime {
                 ledger: {
                     let mut ledger =
                         RowLedger::new(emitted_line_count.clone(), recent_lines.clone());
-                    // The spawn-time "Loading session..." append left the main
-                    // buffer's tail line open — unless an engine-construction
-                    // session notice (emitted directly on ui_tx, each ending in
-                    // EnsureNewLine) already committed it, which the notice's
-                    // count bump records.
-                    if emitted_line_count.get() == 0 {
-                        ledger.seed_open_row(Arc::new(StyledLine::from_echo_str(
-                            "Loading session...",
-                        )));
-                    }
+                    // The spawn-time session heading is line 1, appended whole
+                    // and still pending; `run` finishes it once the runtime is
+                    // up. The load row took its own number just above. Other
+                    // engine-construction rows counted themselves and follow
+                    // unrecorded — nothing replaces them.
+                    ledger.seed_system_row(&SystemRow::loading_session(), 1);
+                    ledger.seed_system_row(&loading_row, load_row_line);
                     ledger
                 },
+                load_row: Some(load_row),
+                load_summary,
+                connection_row: None,
+                connection_target: None,
                 current_location: current_location.clone(),
                 pane_registry: pane_registry.clone(),
                 line_routing: line_routing.clone(),
@@ -1714,8 +1770,16 @@ impl Runtime {
                 // the session briefly stops responding. The flush only enqueues to
                 // the UI channel; the separate UI thread renders it independently
                 // of this thread's blocking rebuild.
+                // This row is the reload's load row: it shimmers as
+                // "Reloading scripts…" and the post-reload `run` fills it in
+                // with what came back, exactly as start-up does.
+                let reload_row = next_system_row_id();
                 runtime.block_on(async {
-                    if let Ok(Some(fut)) = inner.echo_str("Reloading scripts...") {
+                    if let Ok(Some(fut)) = inner.echo_system_row(SystemRow::notice(
+                        reload_row,
+                        Progress::Pending,
+                        SystemText::new(Severity::Info).text("Reloading scripts\u{2026}"),
+                    )) {
                         let _ = fut.await;
                     }
                 });
@@ -1734,6 +1798,8 @@ impl Runtime {
                     &mut inner.ledger,
                     RowLedger::new(emitted_line_count.clone(), recent_lines.clone()),
                 );
+                let old_connection_row = inner.connection_row;
+                let old_connection_target = inner.connection_target.clone();
                 let old_main_prefix_disposition = inner.main_prefix_disposition;
                 let old_main_partial_source_len = inner.main_partial_source_len;
                 let old_main_committed_source_len = inner.main_committed_source_len;
@@ -1969,6 +2035,7 @@ impl Runtime {
                     input_sequence: input_sequence.clone(),
                     audio_scope: audio_scope.clone(),
                 });
+                let new_load_summary = new_script_engine.load_summary().clone();
 
                 // The engine constructor blocked until every isolate's
                 // top-level code ran, so the claims are in. Queue the sweep
@@ -2044,6 +2111,12 @@ impl Runtime {
                     pending_buffer_updates: Vec::new(),
                     pending_line_operations: pending_line_operations.clone(), // Preserve the shared operations
                     ledger: old_ledger, // Count + recent-lines ring + open row survive reload
+                    // The "Reloading scripts…" row above is this generation's
+                    // load row; the connection rule outlives the rebuild.
+                    load_row: Some(reload_row),
+                    load_summary: new_load_summary,
+                    connection_row: old_connection_row,
+                    connection_target: old_connection_target,
                     current_location: current_location.clone(), // Preserve current location across reload
                     pane_registry: pane_registry.clone(),       // Panes survive script reloads
                     line_routing: line_routing.clone(),
@@ -2270,6 +2343,21 @@ struct Inner<'a> {
     /// Every main-pane update reaches the UI through [`Self::queue_update`], which folds
     /// it here first.
     ledger: RowLedger,
+    /// The one row that reports everything this session loaded. `Some` while
+    /// it is still gaining clauses (packages, then script modules, then map
+    /// areas); `None` once it is finished, or on a reload, which appends its
+    /// own finished row instead.
+    load_row: Option<SystemRowId>,
+    /// What the engine loaded, for the clauses of [`Self::load_row`].
+    load_summary: LoadSummary,
+    /// The connection rule: one row cycling `Opened offline · Connect` →
+    /// `Connecting to host…` → `Connected to host`. `Some` while that row is
+    /// still the live one to replace; a disconnect starts a fresh rule
+    /// because output has since scrolled between them.
+    connection_row: Option<SystemRowId>,
+    /// The host this session is connecting to, stamped at `Connect` so the
+    /// connected rule can name it.
+    connection_target: Option<Arc<String>>,
     /// `getCurrentLocation`: the last location pushed via `SetCurrentLocation`, mirrored on
     /// the session thread and shared (the same `Rc`) into every isolate's read op. Preserved
     /// across a reload like the recent-lines ring, so a script can still read where it is after a reload.
@@ -2924,14 +3012,6 @@ impl Inner<'_> {
         }
     }
 
-    fn echo_str<'s>(
-        &'s mut self,
-        line: &str,
-    ) -> Result<Option<SentSessionEvent<'s>>, anyhow::Error> {
-        self.echo_str_sync(line);
-        self.flush_buffer_updates()
-    }
-
     /// The styled-echo sibling of [`Self::echo_str_sync`]: each element is already one
     /// whole on-screen line (the op boundary split on `\n` and built the spans), so this
     /// appends them counted, exactly like a plain echo's lines.
@@ -2941,6 +3021,113 @@ impl Inner<'_> {
 
         for styled_line in lines {
             self.append_counted_line(styled_line.clone());
+        }
+    }
+
+    /// Append one row in the client's own voice: a whole counted row, behind
+    /// any open main line, which is committed first like every echo.
+    fn echo_system_row_sync(&mut self, row: Arc<SystemRow>) {
+        self.commit_open_main_line();
+        self.queue_update(BufferUpdate::AppendSystem(row));
+        self.note_local_main_commit();
+    }
+
+    fn echo_system_row(
+        &mut self,
+        row: Arc<SystemRow>,
+    ) -> Result<Option<SentSessionEvent<'_>>, anyhow::Error> {
+        self.echo_system_row_sync(row);
+        self.flush_buffer_updates()
+    }
+
+    /// Finish an in-progress system row in place (same id). Never touches the
+    /// open main line: the row being finished is already committed.
+    fn replace_system_row_sync(&mut self, row: Arc<SystemRow>) {
+        self.queue_update(BufferUpdate::ReplaceSystem(row));
+    }
+
+    /// Put the connection rule into a new state: `Opened offline · Connect` →
+    /// `Connecting to host…` → `Connected to host`, and later a disconnect.
+    ///
+    /// The states share one row for as long as that row is still the
+    /// transcript's last — the usual case, where the user clicks Connect on
+    /// the very line inviting it. Once the session's own output has scrolled
+    /// under it, the next state opens a rule of its own instead, so it is
+    /// seen where the reader is looking rather than edited silently above.
+    fn set_connection_rule(&mut self, text: SystemText, progress: Progress) {
+        let reuse = self
+            .connection_row
+            .filter(|id| self.ledger.is_last_row(*id));
+        let row = SystemRow::rule(reuse.unwrap_or_else(next_system_row_id), progress, text);
+        if reuse.is_some() {
+            self.replace_system_row_sync(row.clone());
+        } else {
+            self.echo_system_row_sync(row.clone());
+        }
+        self.connection_row = Some(row.id);
+    }
+
+    /// Rebuild the load row from everything reported so far. Called as each
+    /// kind of thing finishes, so the one row fills in rather than stacking
+    /// notices. `maps` is `None` until the mapper has answered.
+    fn refresh_load_row(&mut self, maps: Option<&MapsLoaded>, progress: Progress) {
+        let Some(id) = self.load_row else {
+            return;
+        };
+        let summary = self.load_summary.clone();
+        let mut first = true;
+        let mut text = SystemText::new(Severity::Info);
+        text = push_loaded_clause(
+            text,
+            summary.packages.len(),
+            "package",
+            "packages",
+            Some(summary.packages_elapsed),
+            &mut first,
+        );
+        text = push_loaded_clause(
+            text,
+            summary.modules,
+            "script module",
+            "script modules",
+            Some(summary.modules_elapsed),
+            &mut first,
+        );
+        if let Some(maps) = maps {
+            text = push_loaded_clause(
+                text,
+                maps.areas,
+                "map area",
+                "map areas",
+                Some(maps.elapsed),
+                &mut first,
+            );
+            if maps.shared > 0 {
+                text = text.muted(&format!(
+                    " ({} owned, {} shared)",
+                    maps.areas - maps.shared,
+                    maps.shared
+                ));
+            }
+        }
+        if first {
+            // Nothing at all loaded: say so plainly rather than leaving a row
+            // reading "Loaded".
+            text = text.text("Nothing to load");
+        }
+        let children = summary
+            .packages
+            .iter()
+            .map(|(name, version)| {
+                let version = version.as_ref().map(|version| format!("@{version}"));
+                SystemText::new(Severity::Info)
+                    .chip(name, version.as_deref())
+                    .into_child()
+            })
+            .collect();
+        self.replace_system_row_sync(SystemRow::group(id, progress, text, children));
+        if progress == Progress::Done {
+            self.load_row = None;
         }
     }
 
@@ -3170,6 +3357,20 @@ impl Inner<'_> {
                         self.log_open_line.clear();
                     }
                     BufferUpdate::PromptBoundary => {}
+                    // A system row's projection is a whole line. A finishing
+                    // replacement is logged as its own line too: the transcript
+                    // keeps both "Loading maps…" and what it became, as a
+                    // linear log must.
+                    BufferUpdate::AppendSystem(row) | BufferUpdate::ReplaceSystem(row) => {
+                        if self.log_open_on_disk {
+                            rewind_provisional_open_line(log_file, self.log_committed_len)?;
+                            self.log_open_on_disk = false;
+                        }
+                        let bytes = row.line.as_bytes();
+                        log_file.write_all(bytes)?;
+                        log_file.write_all(b"\n")?;
+                        self.log_committed_len += bytes.len() as u64 + 1;
+                    }
                     BufferUpdate::AppendTo(_, line) => {
                         if self.log_open_on_disk {
                             rewind_provisional_open_line(log_file, self.log_committed_len)?;
@@ -3249,6 +3450,31 @@ impl Inner<'_> {
             self.session_id, self.server_name, self.profile_name
         );
 
+        // The spawn-time session heading has read "Loading session…" until
+        // now; the runtime is up, so finish it. Only the first run finds it
+        // pending — a reload runs this again and must not rewrite it.
+        if self.ledger.system_row_progress(SESSION_ROW_ID) == Some(Progress::Pending) {
+            self.replace_system_row_sync(SystemRow::heading_rule(
+                SESSION_ROW_ID,
+                Progress::Done,
+                SystemText::new(Severity::Info)
+                    .strong(self.profile_name.as_str())
+                    .text(" on ")
+                    .text(self.server_name.as_str()),
+            ));
+        }
+
+        // Packages and script modules are in by now; show what they came to
+        // while the maps still load.
+        self.refresh_load_row(
+            None,
+            if self.mapper.is_some() {
+                Progress::Pending
+            } else {
+                Progress::Done
+            },
+        );
+
         // Bounded like Phase 1 below; hoisted so the start-up pre-drain can share it.
         const MAX_DENO_ITERS: usize = 16;
 
@@ -3282,7 +3508,6 @@ impl Inner<'_> {
         // session still loads its local maps. Cloud maps join via the sync
         // engine once the user logs in.
         if let Some(mapper) = self.mapper.clone() {
-            self.echo_str_sync("Loading maps...");
             let started = Instant::now();
             match mapper.load_all_areas().await {
                 Ok(summary) => {
@@ -3300,31 +3525,29 @@ impl Inner<'_> {
                             stat.source
                         );
                     }
-                    let total = summary.areas.len();
-                    if total == 0 {
-                        self.echo_str_sync("No maps to load.");
-                    } else {
-                        let shared = summary.areas.iter().filter(|s| s.shared).count();
-                        let owned = total - shared;
-                        let breakdown = if shared > 0 {
-                            format!(" ({owned} owned, {shared} shared)")
-                        } else {
-                            String::new()
-                        };
-                        self.echo_str_sync(&format!(
-                            "Loaded {total} map area{}{breakdown} in {}ms.",
-                            if total == 1 { "" } else { "s" },
-                            elapsed.as_millis()
-                        ));
-                    }
+                    let maps = MapsLoaded {
+                        areas: summary.areas.len(),
+                        shared: summary.areas.iter().filter(|s| s.shared).count(),
+                        elapsed,
+                    };
+                    self.refresh_load_row(Some(&maps), Progress::Done);
                 }
+                // A map failure is its own warning: the load row keeps
+                // reporting what DID load rather than being overwritten by an
+                // error about one of the three things it counts.
                 Err(e) if e.is_auth_error() => {
-                    self.echo_warn_str_sync(
+                    self.refresh_load_row(None, Progress::Done);
+                    self.echo_system_row_sync(SystemRow::plain_notice(
+                        Severity::Warn,
                         "Maps are unavailable. Sign in or create a smudgy account to use this feature.",
-                    );
+                    ));
                 }
                 Err(e) => {
-                    self.echo_warn_str_sync(&format!("Failed to load maps: {e}"));
+                    self.refresh_load_row(None, Progress::Done);
+                    self.echo_system_row_sync(SystemRow::plain_notice(
+                        Severity::Warn,
+                        &format!("Failed to load maps: {e}"),
+                    ));
                 }
             }
         }

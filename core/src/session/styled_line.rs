@@ -367,6 +367,16 @@ pub struct LinkProtocol {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LinkToken(());
 
+/// A client-side destination for a link in one of the client's own rows
+/// (see [`super::system_row`]): nothing is sent to the server or a script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppLink {
+    /// Connect the session (the offline rule's "Connect").
+    Connect,
+    /// Open the settings window (a package's "configure them in settings").
+    OpenSettings,
+}
+
 /// What a click on a linked range of a line does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkAction {
@@ -421,6 +431,9 @@ pub enum LinkAction {
         /// (see [`LinkToken`]).
         token: Arc<LinkToken>,
     },
+    /// Act inside the client. Minted only by the client's own rows; scripts
+    /// and servers have no wire form for it.
+    App(AppLink),
 }
 
 impl LinkAction {
@@ -467,7 +480,7 @@ impl LinkAction {
             Self::Send(command) | Self::OpenUrl(command) => Some(Cow::Borrowed(command.as_ref())),
             Self::ServerSend(command) => Some(Cow::Owned(format!("send:{command}"))),
             Self::Prompt(command) => Some(Cow::Owned(format!("prompt:{command}"))),
-            Self::Callback { .. } | Self::Configured { .. } => None,
+            Self::Callback { .. } | Self::Configured { .. } | Self::App(_) => None,
         }
     }
 
@@ -490,7 +503,7 @@ impl LinkAction {
             Self::Prompt(command) => Some(Arc::from(
                 tooltip_action_target(&format!("prompt:{command}")).as_ref(),
             )),
-            Self::Callback { .. } | Self::Configured { .. } => None,
+            Self::Callback { .. } | Self::Configured { .. } | Self::App(_) => None,
         }
     }
 

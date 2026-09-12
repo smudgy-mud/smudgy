@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use smudgy_core::session::runtime::RuntimeAction;
-use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
+use smudgy_core::session::{SessionEvent, SessionId, SessionParams, spawn};
 
 type Events =
     std::pin::Pin<Box<dyn futures::Stream<Item = smudgy_core::session::TaggedSessionEvent>>>;
@@ -56,7 +56,7 @@ async fn wait_for_line_starting_with(events: &mut Events, prefix: &str) -> Strin
             .unwrap_or_else(|| panic!("event stream ended before a line starting with {prefix:?}"));
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             for update in updates.iter() {
-                if let BufferUpdate::Append(line) = update
+                if let Some(line) = update.main_text()
                     && line.text.starts_with(prefix)
                 {
                     return line.text.clone();

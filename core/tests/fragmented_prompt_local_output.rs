@@ -133,6 +133,8 @@ enum LocalOutput {
 #[derive(Debug, PartialEq, Eq)]
 enum ObservedUpdate {
     Append(String),
+    /// A whole client-authored row (its text projection); see `system_row`.
+    System(String),
     BeginOpenLineReplacement,
     FinishOpenLineReplacement(Option<String>),
     EnsureNewLine,
@@ -161,6 +163,9 @@ fn test_home() -> &'static Path {
 fn observe(update: &BufferUpdate) -> ObservedUpdate {
     match update {
         BufferUpdate::Append(line) => ObservedUpdate::Append(line.text.clone()),
+        BufferUpdate::AppendSystem(row) | BufferUpdate::ReplaceSystem(row) => {
+            ObservedUpdate::System(row.line.text.clone())
+        }
         BufferUpdate::BeginOpenLineReplacement => ObservedUpdate::BeginOpenLineReplacement,
         BufferUpdate::FinishOpenLineReplacement(line) => {
             ObservedUpdate::FinishOpenLineReplacement(line.as_ref().map(|line| line.text.clone()))
@@ -291,6 +296,13 @@ fn rendered_rows(updates: &[ObservedUpdate]) -> Vec<String> {
         match update {
             ObservedUpdate::Append(text) => open.push_str(text),
             ObservedUpdate::EnsureNewLine => rows.push(std::mem::take(&mut open)),
+            // A system row is one whole row, closing any open one first.
+            ObservedUpdate::System(text) => {
+                if !open.is_empty() {
+                    rows.push(std::mem::take(&mut open));
+                }
+                rows.push(text.clone());
+            }
             ObservedUpdate::PromptBoundary => {}
             unexpected => panic!("unexpected presentation update: {unexpected:?}"),
         }

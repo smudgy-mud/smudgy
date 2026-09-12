@@ -186,7 +186,7 @@ async fn run_session(session_id: u32, server: &str, client: PackageApiClient) ->
 
 fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
     for update in updates {
-        if let BufferUpdate::Append(line) = update {
+        if let Some(line) = update.main_text() {
             lines.push(line.text.clone());
         }
     }

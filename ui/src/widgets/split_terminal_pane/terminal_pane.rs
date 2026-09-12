@@ -1,13 +1,14 @@
 use std::{
     cell::{Cell, Ref, RefCell},
     collections::HashSet,
+    ops::Range,
     rc::Rc,
     sync::Arc,
 };
 
 use crate::terminal_buffer::{
     BufferLinkState, LinkClickEvent, LinkKey, LinkProtocolState, LinkRenderStyle, RenderedOffsets,
-    SpanMetadata, TerminalBuffer, authored_color, make_span,
+    SpanMetadata, TerminalBuffer, authored_color, make_span, system_color, system_rendered_spans,
 };
 use iced::{
     Background, Border, Event, Pixels, Point, Rectangle, Size,
@@ -22,13 +23,15 @@ use iced::{
     alignment,
     time::{Duration, Instant},
     touch,
-    widget::text::LineHeight,
+    widget::text::{LineHeight, Span},
     window,
 };
 use smudgy_core::session::styled_line::{
     LinkAction, LinkDecoration, LinkMenu, LinkMenuItem, LinkSpan, LinkStyleState, LinkTooltip,
     LinkTooltipCallback, LinkTooltipText, StyledLine,
 };
+use smudgy_core::session::system_row::{Severity, SystemRow, SystemRowKind};
+use unicode_segmentation::UnicodeSegmentation;
 
 mod spans;
 
@@ -41,6 +44,253 @@ type Link = SpanMetadata;
 /// advance for the column-based line-length clamp.
 const ADVANCE_PROBE: &str = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 const TERMINAL_SELECTION_BACKGROUND: iced::Color = iced::Color::from_rgb8(55, 23, 130);
+
+/// Left inset of a system row's text: room for the gutter bar and, on a
+/// group, the fold chevron.
+const SYSTEM_INSET: f32 = 20.0;
+const SYSTEM_BAR_X: f32 = 3.0;
+const SYSTEM_BAR_WIDTH: f32 = 3.0;
+/// Frame cadence of the in-progress shimmer.
+const SHIMMER_FRAME_MS: u64 = 33;
+/// One sweep of the shimmer band across a pending row.
+const SHIMMER_PERIOD_SECS: f32 = 1.8;
+/// Half-width of the shimmer band, as a fraction of the row's text.
+const SHIMMER_BAND: f32 = 0.22;
+/// The session heading's size against the transcript around it: the H3 of
+/// this page, one major-third step up, which is what GitHub gives an `h3`.
+/// The session's name wants to be found, not announced.
+const SYSTEM_HEADING_SCALE: f32 = 1.25;
+/// A rule carries a line of air around its label — two lines in all — so a
+/// transcript boundary reads as a break in the page rather than as one more
+/// line of text.
+const SYSTEM_RULE_LEADING: f32 = 1.0;
+/// Gap between a rule's centred label and the lines reaching out from it.
+const SYSTEM_RULE_GAP: f32 = 12.0;
+/// How faintly a rule's line is drawn against the row's own colour.
+const SYSTEM_RULE_ALPHA: f32 = 0.16;
+
+/// Where a system row's text starts, measured from the pane's left edge: the
+/// gutter for an ordinary row, and for a rule the offset that centres its
+/// label in `row_width`.
+///
+/// Both the freshly-baked and the cached path call this, and the cached one
+/// calls it on every layout — the centring depends on the pane's width, so a
+/// resize has to move the label even when the paragraph itself needs no
+/// reshaping.
+fn system_text_x(inset: f32, is_rule: bool, row_width: f32, label_width: f32) -> f32 {
+    if is_rule {
+        inset + ((row_width - label_width) / 2.0).max(0.0)
+    } else {
+        inset
+    }
+}
+
+/// The shimmer band's brightening of `base` at weight `weight` (0 = the
+/// resting colour, 1 = the band's crest): lifted toward white and to full
+/// opacity.
+fn shimmer_color(base: iced::Color, weight: f32) -> iced::Color {
+    let lift = 0.6 * weight;
+    iced::Color {
+        r: base.r + (1.0 - base.r) * lift,
+        g: base.g + (1.0 - base.g) * lift,
+        b: base.b + (1.0 - base.b) * lift,
+        a: base.a + (1.0 - base.a) * weight,
+    }
+}
+
+/// Re-colour `spans` one grapheme at a time so a bright band sits at `phase`
+/// (0..1) of a sweep that enters from before the text and leaves past it.
+fn shimmer_spans(spans: &[Span<'static, Link>], phase: f32) -> Vec<Span<'static, Link>> {
+    let total = spans
+        .iter()
+        .map(|span| span.text.graphemes(true).count())
+        .sum::<usize>()
+        .max(1);
+    #[allow(clippy::cast_precision_loss)]
+    let total_f = total as f32;
+    let center = -SHIMMER_BAND + phase * (1.0 + 2.0 * SHIMMER_BAND);
+    let mut out = Vec::with_capacity(total);
+    let mut index = 0usize;
+    for span in spans {
+        for grapheme in span.text.graphemes(true) {
+            #[allow(clippy::cast_precision_loss)]
+            let position = (index as f32 + 0.5) / total_f;
+            index += 1;
+            let distance = (position - center).abs();
+            let weight = (1.0 - distance / SHIMMER_BAND).clamp(0.0, 1.0);
+            let weight = weight * weight * (3.0 - 2.0 * weight);
+            let mut piece = span.clone();
+            piece.text = std::borrow::Cow::Owned(grapheme.to_owned());
+            piece.color = Some(shimmer_color(
+                span.color.unwrap_or(iced::Color::WHITE),
+                weight,
+            ));
+            out.push(piece);
+        }
+    }
+    out
+}
+
+/// The gutter bar, rule line and fold chevron of one system row, drawn
+/// around its paragraph (which starts `cache.inset` in from the left).
+#[allow(clippy::too_many_arguments)]
+fn draw_system_row_decorations<Renderer>(
+    renderer: &mut Renderer,
+    prefs: &crate::prefs::TerminalPrefs,
+    bounds: Rectangle,
+    y: f32,
+    cache: &ParagraphCache<Renderer::Paragraph>,
+    row: &SystemRow,
+    font_size: f32,
+    line_height: f32,
+    viewport: Rectangle,
+) where
+    Renderer: text::Renderer<Font = iced::Font>,
+{
+    let base = system_color(prefs, row.severity);
+    let height = cache.row_height();
+    let text_top = y + cache.text_offset();
+    // A rule needs no gutter bar: it spans the pane edge to edge, and its own
+    // hairlines are the mark that the client is speaking. Every other system
+    // row is indented behind the bar.
+    let gutter_bar = !matches!(row.kind, SystemRowKind::Rule { .. });
+
+    // Chips: one rounded pill per chip, over the union of its spans' bounds.
+    // Drawn here rather than as a per-span highlight because a chip with a
+    // muted detail ("name" + "@1.2.3") is two spans, and two highlights meet
+    // in a seam of doubled borders instead of reading as one pill.
+    for chip in &cache.chip_spans {
+        let mut rows: Vec<Rectangle> = Vec::new();
+        for index in chip.clone() {
+            for region in cache.paragraph.span_bounds(index) {
+                match rows.iter_mut().find(|row| (row.y - region.y).abs() < 1.0) {
+                    Some(row) => {
+                        let right = (row.x + row.width).max(region.x + region.width);
+                        row.x = row.x.min(region.x);
+                        row.width = right - row.x;
+                        row.height = row.height.max(region.height);
+                    }
+                    None => rows.push(region),
+                }
+            }
+        }
+        for region in rows {
+            let pill = Rectangle {
+                x: bounds.x + cache.text_x + region.x - 4.0,
+                y: text_top + region.y + 1.0,
+                width: region.width + 8.0,
+                height: (region.height - 2.0).max(1.0),
+            };
+            if let Some(pill) = pill.intersection(&viewport) {
+                renderer.fill_quad(
+                    Quad {
+                        bounds: pill,
+                        border: Border {
+                            color: iced::Color { a: 0.28, ..base },
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Quad::default()
+                    },
+                    iced::Color { a: 0.10, ..base },
+                );
+            }
+        }
+    }
+
+    let bar = Rectangle {
+        x: bounds.x + SYSTEM_BAR_X,
+        y: y + 2.0,
+        width: SYSTEM_BAR_WIDTH,
+        height: (height - 4.0).max(1.0),
+    };
+    if gutter_bar && let Some(bar) = bar.intersection(&viewport) {
+        renderer.fill_quad(
+            Quad {
+                bounds: bar,
+                border: Border {
+                    radius: (SYSTEM_BAR_WIDTH / 2.0).into(),
+                    ..Border::default()
+                },
+                ..Quad::default()
+            },
+            iced::Color {
+                a: match row.severity {
+                    Severity::Info => 0.55,
+                    Severity::Warn => 0.9,
+                },
+                ..base
+            },
+        );
+    }
+
+    match &row.kind {
+        // A rule's label is centred, with a line reaching out to each side —
+        // the divider shape — drawn on the row's own vertical centre rather
+        // than the text's, since the row carries extra leading.
+        SystemRowKind::Rule { .. } => {
+            let left = bounds.x;
+            let right = bounds.x + bounds.width;
+            let (label_left, label_right) = cache.text_span();
+            let (label_left, label_right) = (bounds.x + label_left, bounds.x + label_right);
+            let line_y = (y + height / 2.0).round();
+            let mut line = |from: f32, to: f32| {
+                let rule = Rectangle {
+                    x: from,
+                    y: line_y,
+                    width: to - from,
+                    height: 1.0,
+                };
+                if rule.width > 4.0
+                    && let Some(rule) = rule.intersection(&viewport)
+                {
+                    renderer.fill_quad(
+                        Quad {
+                            bounds: rule,
+                            ..Quad::default()
+                        },
+                        iced::Color {
+                            a: SYSTEM_RULE_ALPHA,
+                            ..base
+                        },
+                    );
+                }
+            };
+            line(left, label_left - SYSTEM_RULE_GAP);
+            line(label_right + SYSTEM_RULE_GAP, right);
+        }
+        SystemRowKind::Group { children, .. } if !children.is_empty() => {
+            let chevron = if cache.expanded {
+                "\u{25BE}"
+            } else {
+                "\u{25B8}"
+            };
+            renderer.fill_text(
+                iced::advanced::text::Text {
+                    content: chevron.to_owned(),
+                    bounds: Size::new(SYSTEM_INSET - SYSTEM_BAR_X - SYSTEM_BAR_WIDTH, line_height),
+                    size: Pixels(font_size * 0.85),
+                    font: cache.paragraph.font(),
+                    line_height: LineHeight::Absolute(Pixels(line_height)),
+                    align_x: text::Alignment::Center,
+                    align_y: alignment::Vertical::Top,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                },
+                Point::new(
+                    bounds.x
+                        + SYSTEM_BAR_X
+                        + SYSTEM_BAR_WIDTH
+                        + (SYSTEM_INSET - SYSTEM_BAR_X - SYSTEM_BAR_WIDTH) / 2.0,
+                    text_top,
+                ),
+                iced::Color { a: 0.8, ..base },
+                viewport,
+            );
+        }
+        SystemRowKind::Group { .. } | SystemRowKind::Notice => {}
+    }
+}
 
 fn draw_text_decoration<Renderer: advanced::Renderer>(
     renderer: &mut Renderer,
@@ -113,6 +363,29 @@ struct ParagraphCache<P: text::Paragraph> {
     paragraph: P,
     hidden_blink_paragraphs: Rc<RefCell<HiddenBlinkParagraphs<P>>>,
     blink_modes: u8,
+    /// The client-authored row this paragraph shows, if it is one.
+    system: Option<Arc<SystemRow>>,
+    /// Whether a group row was baked unfolded (its children on lines below).
+    expanded: bool,
+    /// How far in from the pane's left edge this row's text starts: the
+    /// system gutter, plus the centring offset of a rule's label. Every x
+    /// that positions something against the text adds it, and hit testing
+    /// subtracts it.
+    text_x: f32,
+    /// The per-frame re-coloured paragraph of an in-progress row. Kept here
+    /// for the same reason as `hidden_blink_paragraphs`: the renderer holds
+    /// paragraphs weakly until GPU preparation. `None` for every row that
+    /// cannot shimmer, which is all of them but a loading notice — a slot
+    /// allocated per baked paragraph would be a heap allocation on the
+    /// per-line render path, paid by every line of game text.
+    shimmer_paragraph: Option<Rc<RefCell<Option<P>>>>,
+    /// Span-index range of each chip in this row, drawn as one pill each.
+    chip_spans: Vec<Range<usize>>,
+    /// Leading this row carries beyond its text, split evenly above and
+    /// below it: a rule's half-line of air. Every y that walks rows uses
+    /// [`ParagraphCache::row_height`]; every y that positions something
+    /// against the text adds [`ParagraphCache::text_offset`].
+    extra_height: f32,
     max_valid_width: f32,
     selection: LineSelection,
     search_selection: bool,
@@ -124,6 +397,23 @@ struct ParagraphCache<P: text::Paragraph> {
     /// without a prefs bump).
     font_size: f32,
     visual_generation: (u64, u64, u64),
+}
+
+impl<P: text::Paragraph> ParagraphCache<P> {
+    /// The full height this row occupies, its extra leading included.
+    fn row_height(&self) -> f32 {
+        self.paragraph.min_height() + self.extra_height
+    }
+
+    /// How far the text sits below the top of the row.
+    fn text_offset(&self) -> f32 {
+        self.extra_height / 2.0
+    }
+
+    /// The horizontal span the row's text occupies, from the pane's left edge.
+    fn text_span(&self) -> (f32, f32) {
+        (self.text_x, self.text_x + self.paragraph.min_width())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1118,6 +1408,9 @@ pub(super) struct State<P: text::Paragraph> {
     hidden_lines: HashSet<usize>,
     visual_generation: u64,
     seen_link_navigation_reset_epoch: u64,
+    /// Group rows the viewer has folded or unfolded, by line number, each
+    /// entry inverting the row's own default.
+    toggled_groups: HashSet<usize>,
 }
 
 impl<P: text::Paragraph> Default for State<P> {
@@ -1143,6 +1436,7 @@ impl<P: text::Paragraph> Default for State<P> {
             hidden_lines: HashSet::new(),
             visual_generation: 0,
             seen_link_navigation_reset_epoch: 0,
+            toggled_groups: HashSet::new(),
         }
     }
 }
@@ -1252,10 +1546,13 @@ impl<P: text::Paragraph> State<P> {
         for line in &self.cache {
             let line_number = line.line_number;
             let line_bottom = line_top;
-            line_top -= line.paragraph.min_height();
+            line_top -= line.row_height();
 
             if point.y >= line_top && point.y < line_bottom {
-                let point_in_paragraph = iced::Point::new(point.x, point.y - line_top);
+                let point_in_paragraph = iced::Point::new(
+                    point.x - line.text_x,
+                    point.y - line_top - line.text_offset(),
+                );
                 return match line.paragraph.hit_test(point_in_paragraph) {
                     Some(hit) => Some(BufferPosition {
                         line: line_number,
@@ -1333,10 +1630,11 @@ impl<P: text::Paragraph> State<P> {
     ) -> Option<Point> {
         let mut y = bounds.y + bounds.height;
         for cache in &self.cache {
-            y -= cache.paragraph.min_height();
+            y -= cache.row_height();
             if cache.line_number != line {
                 continue;
             }
+            let text_top = y + cache.text_offset();
 
             let range_begin = cache.offsets.source_to_rendered(begin);
             let range_end = cache.offsets.source_to_rendered(end);
@@ -1346,8 +1644,8 @@ impl<P: text::Paragraph> State<P> {
                 if byte_ranges_overlap(span_begin, span_end, range_begin, range_end) {
                     for region in cache.paragraph.span_bounds(index) {
                         let absolute = Rectangle {
-                            x: bounds.x + region.x,
-                            y: y + region.y,
+                            x: bounds.x + cache.text_x + region.x,
+                            y: text_top + region.y,
                             width: region.width,
                             height: region.height,
                         };
@@ -1701,6 +1999,38 @@ where
             let line_selection = selection.for_line(line_number);
             let line_search_selection = search_selection && line_selection.is_some();
 
+            // A system row is drawn in from a gutter and, for a group, folded
+            // or unfolded — both part of what the cached paragraph encodes.
+            let expanded = line.system.as_ref().is_some_and(|row| {
+                row.expanded_by_default() ^ state.toggled_groups.contains(&line_number)
+            });
+            // A rule is a divider: it spans the pane edge to edge with its
+            // label centred between two hairlines, and it carries extra air,
+            // the text centred in that. Every other system row is indented
+            // behind the gutter bar.
+            let is_rule = line
+                .system
+                .as_ref()
+                .is_some_and(|row| matches!(row.kind, SystemRowKind::Rule { .. }));
+            let inset = if line.system.is_some() && !is_rule {
+                SYSTEM_INSET
+            } else {
+                0.0
+            };
+            // The session's heading is set larger than everything else; every
+            // other row takes the pane's own metrics.
+            let (row_font_size, row_line_height) =
+                if line.system.as_ref().is_some_and(|row| row.is_prominent()) {
+                    (
+                        font_size * SYSTEM_HEADING_SCALE,
+                        (line_height * SYSTEM_HEADING_SCALE).round(),
+                    )
+                } else {
+                    (font_size, line_height)
+                };
+            let row_bounds =
+                iced::Size::new((text_bounds.width - inset).max(1.0), text_bounds.height);
+
             let dynamic_links = line.styled_line.links.iter().any(|link| {
                 link.style.as_ref().is_some_and(|style| style.has_states())
                     || link.action.protocol().is_some()
@@ -1726,24 +2056,42 @@ where
                 && Arc::ptr_eq(&cache.source, &line.styled_line)
                 && cache.selection == line_selection
                 && cache.search_selection == line_search_selection
+                && cache.expanded == expanded
             {
                 i += 1;
 
-                if text_bounds.width > cache.max_valid_width
-                    || text_bounds.width < cache.paragraph.min_bounds().width
+                if row_bounds.width > cache.max_valid_width
+                    || row_bounds.width < cache.paragraph.min_bounds().width
                 {
-                    cache.paragraph.resize(text_bounds);
+                    cache.paragraph.resize(row_bounds);
                     *cache.hidden_blink_paragraphs.borrow_mut() = HiddenBlinkParagraphs::default();
-                    cache.max_valid_width = text_bounds.width;
+                    if let Some(shimmer) = &cache.shimmer_paragraph {
+                        *shimmer.borrow_mut() = None;
+                    }
+                    cache.max_valid_width = row_bounds.width;
                 }
+                // Re-centre: a rule's label sits at the middle of whatever
+                // width the pane now has, and the paragraph may have rewrapped
+                // just above.
+                cache.text_x = system_text_x(
+                    inset,
+                    is_rule,
+                    row_bounds.width,
+                    cache.paragraph.min_width(),
+                );
 
                 new_cache.push(cache.clone());
 
-                available_y -= cache.paragraph.min_height();
+                available_y -= cache.row_height();
                 continue;
             }
 
-            let rendered = if dynamic_links {
+            let mut chip_spans = Vec::new();
+            let rendered = if let Some(row) = &line.system {
+                let (rendered, chips) = system_rendered_spans(row, expanded, &prefs);
+                chip_spans = chips;
+                rendered
+            } else if dynamic_links {
                 line.spans_with_link_state(&prefs, false, |link| {
                     let key = buffer_link_state
                         .key_at(line_number, link)
@@ -1790,17 +2138,27 @@ where
             let blink_modes = span_blink_modes(&spans_vec);
             let paragraph = Renderer::Paragraph::with_spans(iced::advanced::text::Text {
                 content: spans_vec.as_slice(),
-                bounds: text_bounds,
-                size: Pixels(font_size),
+                bounds: row_bounds,
+                size: Pixels(row_font_size),
                 font: prefs.font,
-                line_height: LineHeight::Absolute(Pixels(line_height)),
+                line_height: LineHeight::Absolute(Pixels(row_line_height)),
                 align_x: text::Alignment::Left,
                 align_y: alignment::Vertical::Top,
                 shaping: text::Shaping::Advanced,
                 wrapping: text::Wrapping::WordOrGlyph,
             });
 
-            available_y -= paragraph.min_height();
+            let extra_height = if is_rule {
+                (row_line_height * SYSTEM_RULE_LEADING).round()
+            } else {
+                0.0
+            };
+            // A rule's label is centred by where it is drawn, not by the
+            // paragraph's own alignment: every x in this widget measures from
+            // the text's left edge, and one offset keeps decorations,
+            // selection and hit testing agreeing with the glyphs.
+            let text_x = system_text_x(inset, is_rule, row_bounds.width, paragraph.min_width());
+            available_y -= paragraph.min_height() + extra_height;
 
             new_cache.push(ParagraphCache {
                 line_number,
@@ -1810,7 +2168,17 @@ where
                 paragraph,
                 hidden_blink_paragraphs: Rc::new(RefCell::new(HiddenBlinkParagraphs::default())),
                 blink_modes,
-                max_valid_width: text_bounds.width,
+                system: line.system.clone(),
+                expanded,
+                text_x,
+                shimmer_paragraph: line
+                    .system
+                    .as_ref()
+                    .is_some_and(|row| row.is_pending())
+                    .then(|| Rc::new(RefCell::new(None))),
+                chip_spans,
+                extra_height,
+                max_valid_width: row_bounds.width,
                 selection: line_selection,
                 search_selection: line_search_selection,
                 generation: prefs.generation,
@@ -1849,9 +2217,39 @@ where
         let prefs = crate::prefs::current();
 
         if let Some(clipped_viewport) = layout.bounds().intersection(viewport) {
+            // One phase for every shimmering row this frame, off the blink
+            // timebase so the sweep is continuous across frames.
+            let shimmer_phase = (Instant::now()
+                .saturating_duration_since(state.blink_epoch)
+                .as_secs_f32()
+                / SHIMMER_PERIOD_SECS)
+                .fract();
             let mut y = layout.bounds().y + layout.bounds().height;
             for cache in state.cache.iter() {
-                y -= cache.paragraph.min_height();
+                y -= cache.row_height();
+                let text_top = y + cache.text_offset();
+
+                if let Some(row) = &cache.system {
+                    // The row's own metrics, not the pane's: the session
+                    // heading is set larger, and its rule and chevron follow.
+                    let row_font_size = cache.paragraph.size().0;
+                    let row_line_height = cache
+                        .paragraph
+                        .line_height()
+                        .to_absolute(cache.paragraph.size())
+                        .0;
+                    draw_system_row_decorations(
+                        renderer,
+                        &prefs,
+                        layout.bounds(),
+                        y,
+                        cache,
+                        row,
+                        row_font_size,
+                        row_line_height,
+                        clipped_viewport,
+                    );
+                }
 
                 // Span decorations: explicit background quads and link underlines —
                 // the same geometry iced's rich_text widget draws (fill_paragraph
@@ -1876,8 +2274,8 @@ where
                     if let Some(highlight) = span.highlight {
                         for region in &regions {
                             let rect = Rectangle {
-                                x: layout.bounds().x + region.x,
-                                y: region.y + y,
+                                x: layout.bounds().x + cache.text_x + region.x,
+                                y: region.y + text_top,
                                 width: region.width,
                                 height: region.height,
                             };
@@ -1909,8 +2307,8 @@ where
                             .unwrap_or(iced::Color::WHITE);
                         for region in &regions {
                             let region = Rectangle {
-                                x: layout.bounds().x + region.x,
-                                y: region.y + y,
+                                x: layout.bounds().x + cache.text_x + region.x,
+                                y: region.y + text_top,
                                 width: region.width,
                                 height: region.height,
                             };
@@ -1947,8 +2345,8 @@ where
 
                     for span_bounds in span_bounds_list.iter() {
                         let span_rect = Rectangle {
-                            x: layout.bounds().x + span_bounds.x,
-                            y: span_bounds.y + y,
+                            x: layout.bounds().x + cache.text_x + span_bounds.x,
+                            y: span_bounds.y + text_top,
                             width: span_bounds.width,
                             height: span_bounds.height,
                         };
@@ -1970,8 +2368,30 @@ where
 
                 let hide_slow = cache.blink_modes & SLOW_BLINK != 0 && !state.slow_blink_visible;
                 let hide_fast = cache.blink_modes & FAST_BLINK != 0 && !state.fast_blink_visible;
-                let at = iced::Point::new(layout.bounds().x, y);
-                if hide_slow || hide_fast {
+                let at = iced::Point::new(layout.bounds().x + cache.text_x, text_top);
+                if let Some(shimmer) = cache
+                    .shimmer_paragraph
+                    .as_ref()
+                    .filter(|_| cache.system.as_ref().is_some_and(|row| row.is_pending()))
+                {
+                    // An in-progress row shimmers: its spans are re-coloured
+                    // per grapheme every frame around a sweeping band.
+                    let spans = shimmer_spans(cache.spans.spans().as_slice(), shimmer_phase);
+                    let paragraph = Renderer::Paragraph::with_spans(iced::advanced::text::Text {
+                        content: spans.as_slice(),
+                        bounds: cache.paragraph.bounds(),
+                        size: cache.paragraph.size(),
+                        font: cache.paragraph.font(),
+                        line_height: cache.paragraph.line_height(),
+                        align_x: cache.paragraph.align_x(),
+                        align_y: cache.paragraph.align_y(),
+                        shaping: cache.paragraph.shaping(),
+                        wrapping: cache.paragraph.wrapping(),
+                    });
+                    let mut slot = shimmer.borrow_mut();
+                    let paragraph = slot.insert(paragraph);
+                    renderer.fill_paragraph(paragraph, at, iced::Color::WHITE, clipped_viewport);
+                } else if hide_slow || hide_fast {
                     let mut hidden = cache.hidden_blink_paragraphs.borrow_mut();
                     let paragraph = match (hide_slow, hide_fast) {
                         (true, true) => &mut hidden.all,
@@ -2063,11 +2483,27 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         if cursor.is_over(layout.bounds()) {
+            let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
+            // A foldable group row takes a pointer: the whole row is its toggle.
+            // Checked only while one is on screen, so ordinary panes pay nothing.
+            if state
+                .cache
+                .iter()
+                .any(|cache| cache.system.as_ref().is_some_and(|row| row.is_group()))
+                && let Some(position) = cursor
+                    .position_in(layout.bounds())
+                    .and_then(|position| state.hit_test(layout.bounds(), position))
+                && state.cache.iter().any(|cache| {
+                    cache.line_number == position.line
+                        && cache.system.as_ref().is_some_and(|row| row.is_group())
+                })
+            {
+                return mouse::Interaction::Pointer;
+            }
             // Pointer over a link span; text cursor elsewhere. The `has_links` guard
             // keeps linkless sessions (the common case) from paying the per-frame
             // hit test at all.
             if self.on_link.is_some() && self.terminal_buffer.has_links() {
-                let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
                 if let Some(popup) = &state.menu_popup
                     && let Some(clipped_viewport) = layout.bounds().intersection(viewport)
                     && let Some(geometry) = link_menu_geometry::<Renderer>(
@@ -2164,6 +2600,14 @@ where
                 shell.request_redraw_at(
                     *now + Duration::from_millis(u64::try_from(next_ms).unwrap_or(1)),
                 );
+            }
+            // An in-progress system row on screen keeps the shimmer animating.
+            if state
+                .cache
+                .iter()
+                .any(|cache| cache.system.as_ref().is_some_and(|row| row.is_pending()))
+            {
+                shell.request_redraw_at(*now + Duration::from_millis(SHIMMER_FRAME_MS));
             }
         }
         if matches!(
@@ -2476,6 +2920,34 @@ where
                     shell.invalidate_layout();
                 }
 
+                // A click on a group row with no link under it folds or unfolds
+                // the group. Same click definition as links below.
+                let group_toggle = state.pressed_cell.as_ref().and_then(|pressed| {
+                    let position = cursor
+                        .position_in(layout.bounds())
+                        .and_then(|position| state.hit_test(layout.bounds(), position))?;
+                    if position != *pressed {
+                        return None;
+                    }
+                    let is_group = state.cache.iter().any(|cache| {
+                        cache.line_number == position.line
+                            && cache.system.as_ref().is_some_and(|row| row.is_group())
+                    });
+                    (is_group
+                        && self
+                            .available_link_at(state, position.line, position.column)
+                            .is_none())
+                    .then_some(position.line)
+                });
+                if let Some(line) = group_toggle {
+                    state.pressed_cell = None;
+                    if !state.toggled_groups.insert(line) {
+                        state.toggled_groups.remove(&line);
+                    }
+                    shell.invalidate_layout();
+                    shell.request_redraw();
+                }
+
                 // A click is a press and release resolving to the SAME buffer cell
                 // (`pressed_cell` survives only while the pointer stays on it): a drag
                 // ends elsewhere, and content scrolling under a stationary cursor
@@ -2732,6 +3204,92 @@ pub fn terminal_pane<'a, Message>(
     selection: Rc<RefCell<Selection>>,
 ) -> TerminalPane<'a, Message> {
     TerminalPane::new(buffer, selection)
+}
+
+#[cfg(test)]
+mod system_row_tests {
+    use super::*;
+
+    fn spans(text: &str) -> Vec<Span<'static, Link>> {
+        vec![Span::new(text.to_owned()).color(iced::Color::from_rgb(0.4, 0.6, 0.6))]
+    }
+
+    /// Perceived brightness of a span, for comparing band positions.
+    fn luma(span: &Span<'static, Link>) -> f32 {
+        let color = span.color.expect("shimmer colours every grapheme");
+        (color.r + color.g + color.b) / 3.0 * color.a
+    }
+
+    fn brightest(text: &str, phase: f32) -> usize {
+        let lit = shimmer_spans(&spans(text), phase);
+        lit.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                luma(a)
+                    .partial_cmp(&luma(b))
+                    .expect("shimmer colours are finite")
+            })
+            .expect("a non-empty row has a brightest grapheme")
+            .0
+    }
+
+    #[test]
+    fn the_band_sweeps_left_to_right_over_one_grapheme_per_span() {
+        let text = "Loading maps\u{2026}";
+        let graphemes = text.chars().count();
+        let lit = shimmer_spans(&spans(text), 0.5);
+        assert_eq!(lit.len(), graphemes);
+        let rejoined: String = lit.iter().map(|span| span.text.as_ref()).collect();
+        assert_eq!(rejoined, text, "the text itself is never altered");
+
+        // The band advances monotonically across a sweep, and enters and
+        // leaves past the ends (so the row lights up and dims fully).
+        let early = brightest(text, 0.1);
+        let middle = brightest(text, 0.5);
+        let late = brightest(text, 0.9);
+        assert!(
+            early < middle && middle < late,
+            "band positions {early} < {middle} < {late}"
+        );
+        assert!(middle > 0 && middle < graphemes - 1);
+    }
+
+    #[test]
+    fn the_band_is_a_crest_not_a_uniform_wash() {
+        let text = "Loading packages\u{2026}";
+        let lit = shimmer_spans(&spans(text), 0.5);
+        let peak = brightest(text, 0.5);
+        assert!(
+            luma(&lit[peak]) > luma(&lit[0]) * 1.2,
+            "the crest must out-shine the resting colour at the ends"
+        );
+        // Resting graphemes keep the row's own colour rather than washing out.
+        let resting = spans(text);
+        let base = luma(&resting[0]);
+        assert!((luma(&lit[0]) - base).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_rule_centres_its_label_and_follows_the_pane_width() {
+        // An ordinary row starts at the gutter whatever the width.
+        assert!((system_text_x(20.0, false, 800.0, 100.0) - 20.0).abs() < f32::EPSILON);
+        assert!((system_text_x(20.0, false, 400.0, 100.0) - 20.0).abs() < f32::EPSILON);
+
+        // A rule centres, and re-centres when the pane resizes — the bug this
+        // guards is the cached path keeping a stale offset across a resize.
+        assert!((system_text_x(0.0, true, 800.0, 100.0) - 350.0).abs() < f32::EPSILON);
+        assert!((system_text_x(0.0, true, 400.0, 100.0) - 150.0).abs() < f32::EPSILON);
+
+        // A label wider than the pane pins to the left rather than going
+        // negative and drawing off-screen.
+        assert!((system_text_x(0.0, true, 80.0, 100.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn an_empty_row_shimmers_without_panicking() {
+        assert!(shimmer_spans(&spans(""), 0.5).is_empty());
+        assert!(shimmer_spans(&[], 0.5).is_empty());
+    }
 }
 
 #[cfg(test)]

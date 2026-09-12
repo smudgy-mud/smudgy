@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Smudgy speaks in its own voice.** The client's own lines — the session
+  heading, what loaded, a package that needs configuring, the state of the
+  connection — are no longer plain terminal text. They are set in the
+  application's typeface in smudgy's purple, behind a coloured margin, with
+  package names as chips and warnings in amber. Lines that report work still
+  under way shimmer until the work finishes, and then rewrite themselves in
+  place: "Loading packages…" becomes "Loaded 5 packages (in 2ms), 2 script
+  modules (in 0ms), 163 map areas (in 214ms)", filling in as each part lands.
+  Click the loaded line to unfold what loaded, one chip per package.
+- **A session opens and closes with a rule.** The session's name is a heading
+  across the top of its transcript, and the connection is one line that follows
+  itself from Opened offline, through Connecting, to Connected — with Connect a
+  click away when the session is offline, and Configure it now a click away
+  when a package is not set up yet. A disconnect later in the session draws its
+  own rule, so the transcript keeps its boundaries where they happened.
 - **Triggers can hold triggers inside them.** A trigger inside another runs only
   on lines the outer trigger fired on, and can keep watching for a number of
   lines after that, or until the next prompt, or without limit. Each inner

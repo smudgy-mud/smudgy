@@ -21,6 +21,8 @@ use super::{
 };
 use crate::models::state_exposure::StateExposure;
 use crate::session::styled_line::StyledLine;
+use crate::session::styled_line::{AppLink, LinkAction};
+use crate::session::system_row::{Progress, Severity, SystemText};
 
 /// Forward a lazy tooltip request while preserving a terminal failure path.
 /// A runtime's receiver is dropped just before its registry entry is removed,
@@ -389,6 +391,17 @@ impl Inner<'_> {
                 compression,
                 tls,
             } => {
+                // The connection rule advances in place: the offline row the
+                // user just clicked becomes this, and this becomes
+                // "Connected to …" when the socket comes up.
+                self.connection_target = Some(Arc::new(format!("{host}:{port}")));
+                self.set_connection_rule(
+                    SystemText::new(Severity::Info)
+                        .text("Connecting to ")
+                        .strong(&format!("{host}:{port}"))
+                        .text("\u{2026}"),
+                    Progress::Pending,
+                );
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 let connection_generation = self.connection_generation;
                 // The MSSP snapshot describes one server's one connection; the new
@@ -609,6 +622,38 @@ impl Inner<'_> {
             // one event per call. The ingest path already works this way.
             RuntimeAction::Echo(line) => {
                 self.echo_str_sync(line.as_str());
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::EchoSystem(row) => {
+                self.echo_system_row_sync(row);
+                Ok(ActionResult::None)
+            }
+            // The attempt was called off before it came up.
+            RuntimeAction::ConnectionAbandoned => {
+                self.set_connection_rule(
+                    SystemText::new(Severity::Info).text("Disconnected"),
+                    Progress::Done,
+                );
+                Ok(ActionResult::None)
+            }
+            // The connect never came up: the rule says so where it stands,
+            // rather than leaving "Connecting to…" shimmering forever.
+            RuntimeAction::ConnectionFailed(error) => {
+                self.set_connection_rule(
+                    SystemText::new(Severity::Warn).text(&format!("Connection failed: {error}")),
+                    Progress::Done,
+                );
+                Ok(ActionResult::None)
+            }
+            // The offline state of the connection rule. The connect it
+            // invites replaces this very row.
+            RuntimeAction::OpenedOffline => {
+                self.set_connection_rule(
+                    SystemText::new(Severity::Info)
+                        .text("Opened offline \u{00b7} ")
+                        .link("Connect", LinkAction::App(AppLink::Connect)),
+                    Progress::Done,
+                );
                 Ok(ActionResult::None)
             }
             RuntimeAction::EchoStyled(lines) => {
@@ -1440,6 +1485,19 @@ impl Inner<'_> {
                 // task: the duration the disconnect notice reports is the time
                 // this runtime spent live on the connection.
                 self.connected_at = Some((self.connection_generation, std::time::Instant::now()));
+                // The last state this rule takes: from here the session's own
+                // output scrolls between it and any later disconnect, so that
+                // disconnect opens a rule of its own.
+                let target = self.connection_target.clone();
+                self.set_connection_rule(
+                    match &target {
+                        Some(host) => SystemText::new(Severity::Info)
+                            .text("Connected to ")
+                            .strong(host.as_str()),
+                        None => SystemText::new(Severity::Info).text("Connected"),
+                    },
+                    Progress::Done,
+                );
                 if !self
                     .connected
                     .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -1567,8 +1625,14 @@ impl Inner<'_> {
                     (false, None) => "Connection lost".to_string(),
                 };
                 // Same delivery as `Echo`: append without flushing, so the
-                // notice lands behind the connection's last lines in order.
-                self.echo_str_sync(&notice);
+                // rule lands behind the connection's last lines in order. A
+                // rule, because a connection ending is a boundary in the
+                // transcript — and a fresh one, because the connected rule is
+                // now far above this session's output.
+                self.set_connection_rule(
+                    SystemText::new(Severity::Info).text(&notice),
+                    Progress::Done,
+                );
                 Ok(ActionResult::None)
             }
             RuntimeAction::GmcpMessage { name, data } => {
