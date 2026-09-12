@@ -369,12 +369,14 @@ pub struct LinkToken(());
 
 /// A client-side destination for a link in one of the client's own rows
 /// (see [`super::system_row`]): nothing is sent to the server or a script.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppLink {
     /// Connect the session (the offline rule's "Connect").
     Connect,
-    /// Open the settings window (a package's "configure them in settings").
-    OpenSettings,
+    /// Open this package's parameters in the Automations window (the
+    /// unconfigured-package notice's "Configure it now."). Carries the
+    /// installed specifier, which is what the packages pane selects by.
+    ConfigurePackage(Arc<str>),
 }
 
 /// What a click on a linked range of a line does.

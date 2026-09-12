@@ -418,7 +418,12 @@ mod tests {
             .text(" packages: ")
             .chip("arctic-mapper", Some("@0.1.1"))
             .text(" ")
-            .link("Configure", LinkAction::App(AppLink::OpenSettings));
+            .link(
+                "Configure",
+                LinkAction::App(AppLink::ConfigurePackage(
+                    "smudgy://owner/arctic-mapper".into(),
+                )),
+            );
         let (line, chips) = text.into_line_and_chips();
         assert_eq!(
             line.text,

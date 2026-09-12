@@ -1277,7 +1277,12 @@ impl<'a> ScriptEngine<'a> {
                             .text(" ")
                             .strong(&spec.name)
                             .text(" hasn't been configured yet. ")
-                            .link("Configure it now.", LinkAction::App(AppLink::OpenSettings)),
+                            .link(
+                                "Configure it now.",
+                                LinkAction::App(AppLink::ConfigurePackage(
+                                    specifier.as_str().into(),
+                                )),
+                            ),
                     )),
                 );
                 // The gate reads the package's state row (`smudgy://local/<name>` for a local
