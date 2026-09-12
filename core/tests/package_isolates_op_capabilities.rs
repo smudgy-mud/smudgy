@@ -263,7 +263,7 @@ async fn send_raw_granted_without_echo_allows_bytes_and_warns_for_text() {
     assert_eq!(
         lines
             .iter()
-            .filter(|line| line.contains("sendRaw() warning"))
+            .filter(|line| line.contains("A change is coming to sendRaw()"))
             .count(),
         1,
         "{lines:#?}"

@@ -4580,28 +4580,22 @@ fn warn_raw_terminator(scope: &mut v8::PinScope, state: &mut OpState) {
             if super::is_internal_frame(&name) {
                 return None;
             }
-            Some((
-                name.clone(),
-                format!("{name}:{}:{}", frame.get_line_number(), frame.get_column()),
-            ))
+            Some(name)
         })
     });
-    let (key, location) =
-        source.unwrap_or_else(|| ("<script>".to_string(), "<script>".to_string()));
+    let key = source.unwrap_or_else(|| "<script>".to_string());
     if !state.has::<RawTerminatorWarnings>() {
         state.put(RawTerminatorWarnings::default());
     }
     if state.borrow_mut::<RawTerminatorWarnings>().0.insert(key) {
         // This is a host diagnostic in the caller's session, not a script echo.
         // It does not require the script's echo capability or reveal sent content.
-        let message = format!(
-            "sendRaw() warning at {location}: Smudgy added a final CRLF for compatibility. \
-             Starting in version 0.6.0, Smudgy will not add a final CRLF. \
-             Add \"\\n\" to keep sending a complete command. Binary input is already sent unchanged."
-        );
+        let message = "A change is coming to sendRaw(): starting in Smudgy 0.6.0, Smudgy will \
+             no longer automatically append a \"\\n\" if what is being sent doesn't end \
+             with one.";
         queue_own_action(
             state,
-            RuntimeAction::EchoStyled(vec![Arc::new(StyledLine::from_warn_str(&message))]),
+            RuntimeAction::EchoStyled(vec![Arc::new(StyledLine::from_warn_str(message))]),
         );
     }
 }

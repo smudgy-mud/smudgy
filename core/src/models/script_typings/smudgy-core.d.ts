@@ -1543,8 +1543,8 @@ declare module "smudgy:core" {
      * This automatic addition is deprecated. The function itself is not deprecated.
      *
      * Smudgy warns once per calling script when it needs this automatic addition.
-     * The warning identifies the script. Reloading the session's scripts resets
-     * the warnings. Strings ending with "\n" or "\r\n" do not cause this warning.
+     * Reloading the session's scripts resets the warnings. Strings ending with
+     * "\n" or "\r\n" do not cause this warning.
      *
      * **Starting in version 0.6.0**
      *
@@ -2058,8 +2058,8 @@ declare module "smudgy:core" {
    * This automatic addition is deprecated. The function itself is not deprecated.
    *
    * Smudgy warns once per calling script when it needs this automatic addition.
-   * The warning identifies the script. Reloading the session's scripts resets
-   * the warnings. Strings ending with "\n" or "\r\n" do not cause this warning.
+   * Reloading the session's scripts resets the warnings. Strings ending with
+   * "\n" or "\r\n" do not cause this warning.
    *
    * **Starting in version 0.6.0**
    *
@@ -3115,8 +3115,8 @@ declare module "smudgy:core" {
      * This automatic addition is deprecated. The function itself is not deprecated.
      *
      * Smudgy warns once per calling script when it needs this automatic addition.
-     * The warning identifies the script. Reloading the session's scripts resets
-     * the warnings. Strings ending with "\n" or "\r\n" do not cause this warning.
+     * Reloading the session's scripts resets the warnings. Strings ending with
+     * "\n" or "\r\n" do not cause this warning.
      *
      * **Starting in version 0.6.0**
      *
