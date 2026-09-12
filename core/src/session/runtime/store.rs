@@ -738,8 +738,6 @@ pub struct SessionStore {
     budgets: StoreBudgets,
     /// Producers already given the duplicate-key-collapse diagnostic this engine run.
     collapse_warned: HashSet<ProducerKey>,
-    /// (producer, isolate) pairs already given the non-home write diagnostic this engine run.
-    non_home_warned: HashSet<(ProducerKey, IsolateId)>,
     /// Data-only copy of the journal most recently committed, consumed by the
     /// runtime when it announces that flush to directed readers.
     last_published_writes: Vec<PublishedWrite>,
@@ -769,7 +767,6 @@ impl SessionStore {
             bindings_changed: false,
             budgets,
             collapse_warned: HashSet::new(),
-            non_home_warned: HashSet::new(),
             last_published_writes: Vec::new(),
         }
     }
@@ -790,7 +787,6 @@ impl SessionStore {
         self.pending_usage.clear();
         self.turn_heads.clear();
         self.collapse_warned.clear();
-        self.non_home_warned.clear();
         self.last_published_writes.clear();
     }
 
@@ -1442,12 +1438,6 @@ impl SessionStore {
             }
         }
         self.bindings_changed |= wake_ui;
-    }
-
-    /// One-time gate for the non-home write diagnostic: `true` exactly once per
-    /// `(producer, isolate)` per engine run.
-    pub fn note_non_home_write(&mut self, producer: ProducerKey, isolate: IsolateId) -> bool {
-        self.non_home_warned.insert((producer, isolate))
     }
 
     /// Every producer's committed subtree + usage for the runtime catalogue's snapshot

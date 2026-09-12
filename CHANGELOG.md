@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that brings required packages with it says which ones started. The package
   banners and notes that describe these relationships now just name the packages
   involved.
+- **Interop notices no longer appear in the session.** The `[interop]` lines about
+  code-imported copies of installed packages, refused writes from a non-home copy,
+  duplicate keys, and a full catalogue were confusing more people than they helped.
+  They now go to the log only; nothing else about the behaviour changed.
 - **Trigger and alias handlers cost less to run.** Each handler call now reuses the
   runtime state it needs instead of allocating it, queued fires share one identity
   record, and the per-line matching storage is kept from line to line. A script with

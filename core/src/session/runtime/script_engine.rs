@@ -1195,103 +1195,6 @@ impl<'a> ScriptEngine<'a> {
         });
     }
 
-    /// The code-import stumble diagnostic (`docs/interop.md` §3): after an isolate's
-    /// modules evaluate, every package **entry** its loader served whose interop home is a
-    /// different isolate is a code-imported copy of an installed package — its startup side
-    /// effects duplicate the home instance's, and the home gate will refuse its interop writes.
-    /// One teaching notice per package, emitted here at load so the wrong import is never silent.
-    /// Side-effect-free subpaths are legitimate dual-use-library imports and stay quiet.
-    /// Uninstalled packages (no home entry) get no notice: consuming a pure library by import is
-    /// the intended path. Covers the load-time module graph; a later dynamic `import()` of a
-    /// homed package is only caught at its first refused write.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_stumble_notices(
-        loader: &Rc<dyn PackageProvider>,
-        homes: &crate::session::runtime::store::HomeRegistry,
-        loaded_into: &IsolateId,
-        handle_packages: &std::collections::HashSet<(String, String)>,
-        ui_tx: &Sender<TaggedSessionEvent>,
-        session_id: SessionId,
-        emitted_line_count: &std::rc::Weak<Cell<usize>>,
-    ) {
-        let fold = |key: &smudgy_script::PackageKey| {
-            (
-                key.owner.to_ascii_lowercase(),
-                key.name.to_ascii_lowercase(),
-            )
-        };
-        let scrubbed: std::collections::HashSet<(String, String)> =
-            loader.scrubbed_packages().iter().map(fold).collect();
-        for key in loader.entry_loaded_packages() {
-            let folded = fold(&key);
-            let producer = crate::session::runtime::store::ProducerKey::Package {
-                owner: folded.0.clone(),
-                name: folded.1.clone(),
-            };
-            let installed = homes.borrow().contains_key(&folded);
-            if scrubbed.contains(&folded) {
-                // The scrub (interop.md §3) removed handle exports from this non-home copy;
-                // an import of one of those names fails at LINK with V8's "does not provide
-                // an export named …" — this notice is the dressing that names the fix.
-                Self::emit_session_notice(
-                    ui_tx,
-                    session_id,
-                    emitted_line_count,
-                    &format!(
-                        "[interop] smudgy://{owner}/{name} was code-imported, so its interop \
-                         handle exports were removed from this copy \u{2014} import them from \
-                         smudgy:state/{owner}/{name}, smudgy:events/{owner}/{name}, or \
-                         smudgy:procedures/{owner}/{name} instead.",
-                        owner = key.owner,
-                        name = key.name
-                    ),
-                );
-            } else if installed
-                && !crate::session::runtime::store::is_home(homes, &producer, loaded_into)
-            {
-                Self::emit_session_notice(
-                    ui_tx,
-                    session_id,
-                    emitted_line_count,
-                    &format!(
-                        "[interop] you code-imported the entry module of installed \
-                         smudgy://{}/{} \u{2014} this copy repeats the home instance's startup \
-                         side effects. Import a side-effect-free subpath or types only, or \
-                         consume its published state, events, or procedures.",
-                        key.owner, key.name
-                    ),
-                );
-            }
-        }
-        // On main, a trusted package's home load can't be scrubbed (one module map, one
-        // instance): a user script's code import hands out LIVE producer handles whose
-        // writes publish as the package — the accepted interop.md §1 residual, warned so the
-        // attribution is never a surprise.
-        if matches!(loaded_into, IsolateId::Main) {
-            for key in loader.user_code_imports() {
-                let folded = fold(&key);
-                let main_home = homes.borrow().get(&folded)
-                    == Some(&crate::session::runtime::store::HomeIsolate::Main);
-                if main_home && handle_packages.contains(&folded) {
-                    Self::emit_session_notice(
-                        ui_tx,
-                        session_id,
-                        emitted_line_count,
-                        &format!(
-                            "[interop] a user script or local module code-imported \
-                             smudgy://{owner}/{name}, which declares interop handles. The import \
-                             works (this is the package's home), but writes through those handles \
-                             publish AS the package \u{2014} prefer smudgy:state/{owner}/{name} \
-                             (and events/procedures) unless that attribution is intended.",
-                            owner = key.owner,
-                            name = key.name
-                        ),
-                    );
-                }
-            }
-        }
-    }
-
     /// Required-param load-gate for one isolate's installs, run over the params the last
     /// `solve_closure` collected on `provider`. An install whose required params are unset gets a
     /// session notice and is returned in the blocked set so the caller drops it (a blocked package
@@ -1542,20 +1445,6 @@ impl<'a> ScriptEngine<'a> {
                 }
             }
         }
-        // The installed packages that declare interop handles (folded keys) — the stumble
-        // pass warns when USER code code-imports one of these on main (interop.md §1/§3).
-        let interop_handle_packages: std::collections::HashSet<(String, String)> = plan
-            .installed_typings
-            .iter()
-            .filter(|pkg| !pkg.handles.is_empty())
-            .map(|pkg| {
-                (
-                    pkg.owner.to_ascii_lowercase(),
-                    pkg.name.to_ascii_lowercase(),
-                )
-            })
-            .collect();
-
         // Build the deno extension set for one isolate: its own `script_functions` registry
         // (the v8 globals the creation ops push into — isolate-bound, so never shared) plus the
         // shared session ops stamped with this isolate's id, the mapper bridge, and the
@@ -1923,19 +1812,6 @@ impl<'a> ScriptEngine<'a> {
                     &format!("[packages] failed to load modules \u{2014} {e:#}"),
                 );
             }
-        }
-        // Code-import stumble check over what main's loader actually served (partial loads
-        // included — a resolved copy evaluated even if a later module failed the load).
-        if let Some(loader) = &main_isolate_loader {
-            Self::emit_stumble_notices(
-                loader,
-                &home_registry,
-                &IsolateId::Main,
-                &interop_handle_packages,
-                &params.ui_tx,
-                params.session_id,
-                &params.emitted_line_count,
-            );
         }
         let main_waker = build_demux_waker(IsolateId::Main, &ready, &parent);
         let main_call_state = shared_call_state(main_runtime.deno_runtime());
@@ -2341,17 +2217,6 @@ impl<'a> ScriptEngine<'a> {
                 match load {
                     Ok(report) => {
                         fold_load_report(&report, &mut local_count, &mut package_lines);
-                        // Stumble check: a dependency embedded in this sandbox's closure that is
-                        // ALSO installed in its own right runs here as a code-imported copy.
-                        Self::emit_stumble_notices(
-                            &loader,
-                            &home_registry,
-                            &isolate_id,
-                            &interop_handle_packages,
-                            &params.ui_tx,
-                            params.session_id,
-                            &params.emitted_line_count,
-                        );
                     }
                     Err(e) => {
                         Self::emit_session_notice(

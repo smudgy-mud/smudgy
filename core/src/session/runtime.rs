@@ -2404,29 +2404,17 @@ impl Inner<'_> {
     /// standing and arm the one-shot trailing wake, and a new subscriber always gets a
     /// fresh snapshot at once. With no subscribers nothing is built (the dirty flag just
     /// accumulates and samples defer parsing), so an unopened tab costs one
-    /// `receiver_count` load per drain. Entry-budget refusal notices are echoed from here
-    /// regardless of subscription — this drain owns the catalogue's one surfacing path.
+    /// `receiver_count` load per drain.
     fn sync_catalogue_broadcast(&mut self) {
         let count = self.catalogue_tx.receiver_count();
         let new_subscriber = count > self.last_catalogue_receivers;
         self.last_catalogue_receivers = count;
         let subscribed = count > 0;
-        let (dirty, notices) = {
+        let dirty = {
             let mut catalogue = self.catalogue.borrow_mut();
             catalogue.set_subscribed(subscribed);
-            (catalogue.is_dirty(), catalogue.take_refusal_notices())
+            catalogue.is_dirty()
         };
-        for notice in notices {
-            // Ride the session channel like any queued echo; the run loop picks it up on
-            // the next pass.
-            if self
-                .session_runtime_tx
-                .send(RuntimeAction::Echo(Arc::new(notice)))
-                .is_err()
-            {
-                warn!("Dropping catalogue notice: runtime channel closed");
-            }
-        }
         if !subscribed {
             // Nobody listening: the dirty flag just accumulates, and the cadence needs no
             // clock read — the unopened-tab drain cost stays at loads and stores.

@@ -1436,7 +1436,7 @@ fn op_smudgy_emit(
     let event = interned_event(state, event_id)?;
     if !event.is_home {
         let isolate = current_isolate(state);
-        warn_non_home_write(state, &event.producer, isolate, "emit");
+        warn_non_home_write(&event.producer, isolate, "emit");
         return Ok(());
     }
     // Tier-2 catalogue sample at the emission choke point (`docs/interop.md`
@@ -1948,33 +1948,14 @@ fn resolve_root_path(root: &InteropRoot, subpath: &str) -> Result<store::StorePa
         .map_err(|err| StoreOpError(format!("smudgy: {err}")))
 }
 
-/// The one-time teaching diagnostic for a home-gated interop write that was refused: echoed to
-/// the session (once per producer × isolate per engine run) and logged every time. A refused
-/// write is a **no-op, not a throw** — the code making it is usually a code-imported copy the
-/// importer wants as a library, and interop is the one part that must not run twice.
-fn warn_non_home_write(
-    state: &mut OpState,
-    producer: &store::ProducerKey,
-    isolate: IsolateId,
-    verb: &str,
-) {
+/// Logs a home-gated interop write that was refused. A refused write is a **no-op, not a
+/// throw** — the code making it is usually a code-imported copy the importer wants as a library,
+/// and interop is the one part that must not run twice. The log is the only trace: a session
+/// echo here read as an error to users who had merely installed a package that imports another.
+fn warn_non_home_write(producer: &store::ProducerKey, isolate: IsolateId, verb: &str) {
     log::warn!(
         "smudgy: interop {verb} by {producer} ignored in {isolate:?}: not its home instance"
     );
-    let first = state
-        .borrow::<crate::session::runtime::SharedSessionStore>()
-        .borrow_mut()
-        .note_non_home_write(producer.clone(), isolate);
-    if first {
-        queue_own_action(
-            state,
-            RuntimeAction::Echo(Arc::new(format!(
-                "[interop] {producer}: {verb} ignored \u{2014} this copy of the package is not \
-                 its installed (home) instance, so it can read shared state but not publish. \
-                 If you code-imported it, import types only or consume its published state instead."
-            ))),
-        );
-    }
 }
 
 /// The shared interop **write** gate for `set` and procedure receipt (emit carries its own
@@ -2011,7 +1992,7 @@ fn gate_interop_write(
         Ok(true)
     } else {
         let isolate = current_isolate(state);
-        warn_non_home_write(state, &root.producer, isolate, verb);
+        warn_non_home_write(&root.producer, isolate, verb);
         Ok(false)
     }
 }
@@ -2069,13 +2050,10 @@ fn op_smudgy_store_set(
             StoreOpError(format!("smudgy: {err}"))
         })?;
     if outcome.first_duplicate_key_collapse {
-        queue_own_action(
-            state,
-            RuntimeAction::Echo(Arc::new(format!(
-                "[interop] {}: a published object contained two case-fold-equal \
-                 spellings of one key (keys are case-insensitive); the later value won",
-                root.producer_spec
-            ))),
+        log::warn!(
+            "smudgy: {}: a published object contained two case-fold-equal spellings of one key \
+             (keys are case-insensitive); the later value won",
+            root.producer_spec
         );
     }
     Ok(())

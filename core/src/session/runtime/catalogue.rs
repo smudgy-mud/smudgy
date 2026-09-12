@@ -273,7 +273,7 @@ pub enum CatalogueEvent {
 struct ProducerEntries {
     /// Entries admitted — the budget denominator ([`MAX_ENTRIES_PER_PRODUCER`]).
     admitted: usize,
-    /// Whether this producer's refusal diagnostic already went out (one teaching notice).
+    /// Whether this producer's refusal has been logged (once per producer).
     refusal_warned: bool,
     /// Entries per kind, keyed by folded name; indexed by [`CatalogueKind::index`].
     by_kind: [BTreeMap<Arc<str>, CatalogueEntry>; KINDS.len()],
@@ -285,10 +285,6 @@ pub struct RuntimeCatalogue {
     /// pass; nested per-producer maps keep hit-path lookups allocation-free (see
     /// [`ProducerEntries`]).
     entries: BTreeMap<Arc<str>, ProducerEntries>,
-    /// Refusal diagnostics awaiting echo — drained by the runtime's drain point, which owns
-    /// the session's echo channel (ops that mint entries indirectly, and host emitters with
-    /// no `OpState` at all, share this one surfacing path).
-    pending_notices: Vec<String>,
     /// Whether a store tab is subscribed — pushed by the runtime at each drain point.
     /// Authoritative only while no [`Self::attach_subscriber_probe`] handle is attached
     /// (unit tests and benches); the probe reads live subscriber presence per record.
@@ -326,14 +322,11 @@ impl RuntimeCatalogue {
             if !declared && slot.admitted >= MAX_ENTRIES_PER_PRODUCER {
                 if !slot.refusal_warned {
                     slot.refusal_warned = true;
-                    self.pending_notices.push(format!(
-                        "[interop] {producer}: the session catalogue is full for this \
-                         producer ({MAX_ENTRIES_PER_PRODUCER} entries), so new undeclared \
-                         names are no longer catalogued (declared handles are always \
-                         admitted, and existing entries keep recording). Hitting the cap \
-                         usually means state keys, events, or messages are being minted \
-                         dynamically without bound; publish under a fixed set of names."
-                    ));
+                    log::warn!(
+                        "smudgy: interop catalogue full for {producer} \
+                         ({MAX_ENTRIES_PER_PRODUCER} entries); new undeclared names are no \
+                         longer catalogued — publish under a fixed set of names"
+                    );
                 }
                 return None;
             }
@@ -530,12 +523,6 @@ impl RuntimeCatalogue {
     /// this flag then only serves probe-less harnesses.
     pub fn set_subscribed(&mut self, subscribed: bool) {
         self.subscribed = subscribed;
-    }
-
-    /// Drain the entry-budget refusal notices queued since the last drain (the runtime
-    /// echoes them to the session — one teaching diagnostic per producer).
-    pub fn take_refusal_notices(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.pending_notices)
     }
 
     /// Engine teardown: declared/confirmed are per-engine facts (the next engine's
@@ -1118,19 +1105,12 @@ mod tests {
                 "1",
             );
         }
-        assert!(
-            cat.take_refusal_notices().is_empty(),
-            "under the cap: no notice"
-        );
         let _ = cat.take_dirty();
 
-        // At the cap: an undeclared entry is refused (not recorded at all) with one notice…
+        // At the cap: an undeclared entry is refused (not recorded at all)…
         cat.sample_dynamic(&producer, CatalogueKind::Event, "overflow", "user", "1");
         cat.confirm_runtime(&producer, CatalogueKind::Event, "overflow2");
         cat.observe_state_key(&producer, "overflow3");
-        let notices = cat.take_refusal_notices();
-        assert_eq!(notices.len(), 1, "one teaching notice per producer");
-        assert!(notices[0].contains("smudgy://wbk/minty"));
         assert!(!cat.take_dirty(), "refusals do not dirty the catalogue");
 
         // …while declared entries are always admitted, and other producers are unaffected.
