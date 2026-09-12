@@ -2,7 +2,7 @@
 //! sandboxed package publishes into its own subtree and main-isolate code consumes it
 //! cross-isolate; the `interop:*` capabilities gate the ops (and removed `events` manifest
 //! tokens grant nothing); and the home-instance gate makes non-home writes inert — a forged
-//! creator and a code-imported copy alike no-op with a teaching diagnostic.
+//! creator and a code-imported copy alike no-op, logged rather than echoed.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -382,17 +382,11 @@ async fn non_home_writes_are_inert_with_teaching_diagnostics() {
         has_line(&lines, "FORGE_ATTEMPTED:undefined"),
         "a forged-creator write from main must be a no-op; transcript:\n{lines:#?}"
     );
-    // The teaching diagnostics: the refused write and the load-time code-import stumble.
+    // Neither the refused write nor the code-imported copy reaches the transcript: both are
+    // logged, never echoed.
     assert!(
-        has_line(
-            &lines,
-            "[interop] smudgy://wbk/tracker: state write ignored"
-        ),
-        "the refused write must explain itself once; transcript:\n{lines:#?}"
-    );
-    assert!(
-        has_line(&lines, "entry module of installed smudgy://wbk/tracker"),
-        "the code-import stumble notice must appear at load; transcript:\n{lines:#?}"
+        !lines.iter().any(|l| l.contains("[interop]")),
+        "interop refusals must stay out of the session; transcript:\n{lines:#?}"
     );
     // The home instance's write is the one that survives.
     assert!(

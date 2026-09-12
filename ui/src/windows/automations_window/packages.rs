@@ -55,7 +55,7 @@ use super::model::{
 use super::param_values::{self, ParamTarget, ParamValueEdit, ParamValueState, ScalarEdit};
 use super::{
     AutomationsWindow, DiscoverScope, Elem, Event, InstalledPackageTab, InstalledReadmeState,
-    LocalPackageTab, Message, Pane, Selection,
+    LocalPackageTab, Message, Pane, PendingActivationCascade, Selection,
 };
 
 /// Terminal-like output from the latest publish attempt, keyed to its package so navigating to a
@@ -1958,22 +1958,30 @@ impl AutomationsWindow {
             self.manage_feedback = Some(crate::i18n::t!("activation-profile-inventory-error"));
             return Update::none();
         }
-        let requested_specifier = match &self.pane {
-            Pane::InstalledPackage => self
-                .installed_open
-                .as_deref()
-                .map(|package| package.specifier.clone()),
-            Pane::OwnedPackage => self
-                .local_package
-                .as_ref()
-                .map(|package| self.local_own_spec(&package.name)),
-            _ => None,
-        };
-        let Some(requested_specifier) = requested_specifier else {
+        let Some(requested_specifier) = self.open_package_requested_specifier() else {
             return Update::none();
         };
         let installed_pane = matches!(self.pane, Pane::InstalledPackage);
         let specifier = self.governing_specifier(&requested_specifier);
+
+        // Turning the package off where running roots `require` it would leave those roots keeping
+        // it alive, so the change is held with what turns off alongside it. Confirmation re-enters
+        // through `confirm_activation_cascade`, which writes both in one lock replacement.
+        let (profiles, dependents) = self.activation_cascade_impact(&specifier, &activation);
+        if !dependents.is_empty() {
+            self.activation_cascade = Some(PendingActivationCascade {
+                specifier,
+                activation,
+                profiles,
+                dependents,
+                expected_lock: SharedPackageLock {
+                    packages: self.installed_packages.clone(),
+                },
+            });
+            return Update::none();
+        }
+        self.activation_cascade = None;
+        let started = self.required_roots_started_by(&specifier, &activation);
 
         let expected_package = self
             .installed_packages
@@ -2008,8 +2016,228 @@ impl AutomationsWindow {
                 activation,
             )
         };
+        if let Err(update) =
+            self.finish_package_activation_write(outcome, installed_pane, inserting_governing_row)
+        {
+            return update;
+        }
+        let event = self.package_activation_applied(installed_pane);
+        if started.is_empty() {
+            return Update::with_event(event);
+        }
+        // The required roots came on implicitly; say so, since nothing on this pane shows it.
+        let toast = self.show_toast(crate::i18n::t!(
+            "package-enabling-starts-required",
+            "name" => package_display_name(&specifier),
+            "packages" => display_names(&started)
+        ));
+        Update::new(toast, Some(event))
+    }
+
+    /// The durable specifier the open package pane edits activation for, before governing-row
+    /// resolution.
+    fn open_package_requested_specifier(&self) -> Option<String> {
+        match &self.pane {
+            Pane::InstalledPackage => self
+                .installed_open
+                .as_deref()
+                .map(|package| package.specifier.clone()),
+            Pane::OwnedPackage => self
+                .local_package
+                .as_ref()
+                .map(|package| self.local_own_spec(&package.name)),
+            _ => None,
+        }
+    }
+
+    /// Whether the open package runs in `profile` only because other roots require it there: its
+    /// own activation is off, yet it is effectively enabled.
+    pub(super) fn open_package_inherits_profile(&self, profile: &str) -> bool {
+        let Some(requested) = self.open_package_requested_specifier() else {
+            return false;
+        };
+        let specifier = self.governing_specifier(&requested);
+        let lock = SharedPackageLock {
+            packages: self.installed_packages.clone(),
+        };
+        lock.find(&specifier)
+            .is_some_and(|row| !row.is_enabled_for(profile))
+            && lock.is_effectively_enabled_for(&specifier, profile)
+    }
+
+    /// The profiles `activation` turns the governing row `specifier` off in while running roots
+    /// still require it there, with those roots (governing rows only, lockfile order, each once).
+    /// A profile the row was already off in is not a change being made here and never contributes.
+    fn activation_cascade_impact(
+        &self,
+        specifier: &str,
+        activation: &ProfileActivation,
+    ) -> (Vec<String>, Vec<String>) {
+        let lock = SharedPackageLock {
+            packages: self.installed_packages.clone(),
+        };
+        let Some(current) = lock.find(specifier) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut profiles = Vec::new();
+        let mut dependents: Vec<String> = Vec::new();
+        for profile in &self.profile_names {
+            if !current.is_enabled_for(profile) || activation.is_enabled_for(profile) {
+                continue;
+            }
+            let requirers = self.governing_requirers_enabled_for(&lock, specifier, profile);
+            if requirers.is_empty() {
+                continue;
+            }
+            profiles.push(profile.clone());
+            for requirer in requirers {
+                if !dependents.contains(&requirer) {
+                    dependents.push(requirer);
+                }
+            }
+        }
+        (profiles, dependents)
+    }
+
+    /// The running roots that transitively require `specifier` in `profile`, kept to the rows the
+    /// tree shows (a dormant fallback behind a local override is not one of them).
+    fn governing_requirers_enabled_for(
+        &self,
+        lock: &SharedPackageLock,
+        specifier: &str,
+        profile: &str,
+    ) -> Vec<String> {
+        lock.enabled_requirers_for(specifier, profile)
+            .into_iter()
+            .filter(|requirer| self.governing_specifier(requirer) == *requirer)
+            .collect()
+    }
+
+    /// The open package runs in `profile` only because other roots require it there, so its
+    /// checkbox reads on. Unchecking it can only mean turning those roots off: hold that as a
+    /// cascade of its (unchanged) own activation for confirmation.
+    pub(super) fn request_inherited_profile_disable(
+        &mut self,
+        profile: String,
+    ) -> Update<Message, Event> {
+        let Some(requested) = self.open_package_requested_specifier() else {
+            return Update::none();
+        };
+        let specifier = self.governing_specifier(&requested);
+        let lock = SharedPackageLock {
+            packages: self.installed_packages.clone(),
+        };
+        let dependents = self.governing_requirers_enabled_for(&lock, &specifier, &profile);
+        let Some(row) = lock.find(&specifier) else {
+            return Update::none();
+        };
+        if dependents.is_empty() {
+            return Update::none();
+        }
+        let activation = row.activation();
+        self.activation_cascade = Some(PendingActivationCascade {
+            specifier,
+            activation,
+            profiles: vec![profile],
+            dependents,
+            expected_lock: lock,
+        });
+        Update::none()
+    }
+
+    /// Write a held activation change together with its requirer cascade, in one lock replacement
+    /// guarded by the snapshot the confirmation was rendered from.
+    pub(super) fn confirm_activation_cascade(&mut self) -> Update<Message, Event> {
+        let Some(pending) = self.activation_cascade.take() else {
+            return Update::none();
+        };
+        if let Some(error) = self.package_state_error() {
+            self.manage_feedback = Some(error);
+            return Update::none();
+        }
+        if !self.profile_inventory_complete {
+            self.manage_feedback = Some(crate::i18n::t!("activation-profile-inventory-error"));
+            return Update::none();
+        }
+        let installed_pane = matches!(self.pane, Pane::InstalledPackage);
+        let known = self.profile_names.iter().cloned().collect::<BTreeSet<_>>();
+        let outcome = shared_packages::set_activation_with_requirer_cascade_if_unchanged(
+            &self.server_name,
+            &pending.expected_lock,
+            &pending.specifier,
+            pending.activation,
+            &known,
+        );
+        if let Err(update) = self.finish_package_activation_write(outcome, installed_pane, false) {
+            return update;
+        }
+        let event = self.package_activation_applied(installed_pane);
+        let toast = self.show_toast(crate::i18n::t!(
+            "package-disable-cascade-applied",
+            "name" => package_display_name(&pending.specifier),
+            "packages" => display_names(&pending.dependents)
+        ));
+        Update::new(toast, Some(event))
+    }
+
+    /// The `requires` roots (transitively) that `activation` starts for `specifier`: those not
+    /// yet running in a profile the change turns the package on in.
+    fn required_roots_started_by(
+        &self,
+        specifier: &str,
+        activation: &ProfileActivation,
+    ) -> Vec<String> {
+        let lock = SharedPackageLock {
+            packages: self.installed_packages.clone(),
+        };
+        let turned_on: Vec<&String> = self
+            .profile_names
+            .iter()
+            .filter(|profile| {
+                activation.is_enabled_for(profile)
+                    && !lock.is_effectively_enabled_for(specifier, profile)
+            })
+            .collect();
+        if turned_on.is_empty() {
+            return Vec::new();
+        }
+        let mut started = Vec::new();
+        let mut seen: HashSet<String> = HashSet::from([specifier.to_string()]);
+        let mut queue = vec![specifier.to_string()];
+        while let Some(current) = queue.pop() {
+            let required = self
+                .graph
+                .requires
+                .get(&current)
+                .into_iter()
+                .flatten()
+                .filter(|edge| edge.kind == DependencyKind::Requires);
+            for edge in required {
+                if !seen.insert(edge.specifier.clone()) {
+                    continue;
+                }
+                queue.push(edge.specifier.clone());
+                if turned_on
+                    .iter()
+                    .any(|profile| !lock.is_effectively_enabled_for(&edge.specifier, profile))
+                {
+                    started.push(edge.specifier.clone());
+                }
+            }
+        }
+        started
+    }
+
+    /// Reports a package activation write. `Ok` means it applied and the caller finishes with
+    /// [`Self::package_activation_applied`]; `Err` carries the update to return instead.
+    fn finish_package_activation_write(
+        &mut self,
+        outcome: anyhow::Result<Cas>,
+        installed_pane: bool,
+        inserting_governing_row: bool,
+    ) -> Result<(), Update<Message, Event>> {
         match outcome {
-            Ok(Cas::Applied) => {}
+            Ok(Cas::Applied) => Ok(()),
             Ok(Cas::StateChanged) => {
                 self.refresh_local_shadow_after_authoritative_mutation();
                 if let Err(message) = self.reload_package_lock_snapshot() {
@@ -2026,10 +2254,10 @@ impl AutomationsWindow {
                         self.manage_feedback = Some(message);
                     }
                 }
-                return Update::with_task(Task::batch([
+                Err(Update::with_task(Task::batch([
                     Task::done(Message::LoadLocalPackages),
                     Task::done(Message::LoadInstalledPackages),
-                ]));
+                ])))
             }
             Err(error) => {
                 if installed_pane {
@@ -2042,20 +2270,23 @@ impl AutomationsWindow {
                     self.manage_feedback = Some(message);
                 }
                 if inserting_governing_row {
-                    return Update::new(
+                    return Err(Update::new(
                         Task::done(Message::LoadInstalledPackages),
                         Some(Event::ScriptsChanged {
                             server_name: self.server_name.clone(),
                         }),
-                    );
+                    ));
                 }
-                return Update::none();
+                Err(Update::none())
             }
         }
+    }
+
+    /// Refreshes the window after an applied activation write and names the event to publish.
+    fn package_activation_applied(&mut self, installed_pane: bool) -> Event {
         if installed_pane {
             self.refresh_local_shadow_after_authoritative_mutation();
         }
-
         if let Err(message) = self.reload_package_lock_snapshot() {
             if matches!(self.pane, Pane::OwnedPackage) {
                 self.authoring_feedback = Some(message);
@@ -2063,9 +2294,9 @@ impl AutomationsWindow {
                 self.manage_feedback = Some(message);
             }
         }
-        Update::with_event(Event::ScriptsChanged {
+        Event::ScriptsChanged {
             server_name: self.server_name.clone(),
-        })
+        }
     }
 
     pub(super) fn set_open_parameter_scope(
@@ -2917,10 +3148,13 @@ impl AutomationsWindow {
         let Selection::Dependency { parent, spec } = &self.selection else {
             return None;
         };
-        self.graph
-            .requires
-            .get(parent)
-            .and_then(|edges| edges.iter().find(|edge| edge.specifier == *spec))
+        // Only imports nest in the tree, so a package the parent both imports and requires is
+        // being viewed as the import.
+        let edges = self.graph.requires.get(parent)?;
+        edges
+            .iter()
+            .find(|edge| edge.specifier == *spec && edge.kind == DependencyKind::Dependency)
+            .or_else(|| edges.iter().find(|edge| edge.specifier == *spec))
             .map(|edge| edge.kind)
     }
 
@@ -3769,7 +4003,11 @@ impl AutomationsWindow {
             return Update::with_task(Task::done(Message::LoadInstalledPackages));
         };
         if !target.has_direct_activation() {
-            self.manage_feedback = Some(crate::i18n::t!("package-required-managed"));
+            let needed_by = target.required_by.iter().cloned().collect::<Vec<_>>();
+            self.manage_feedback = Some(crate::i18n::t!(
+                "package-required-managed",
+                "packages" => display_names(&needed_by)
+            ));
             return Update::none();
         }
         if target.required_by.is_empty() {
@@ -9850,4 +10088,13 @@ mod tests {
         assert_eq!(update.task.units(), 2);
         assert!(matches!(update.event, Some(Event::ScriptsChanged { .. })));
     }
+}
+
+/// The display names of `specifiers`, comma-separated, for a sentence naming several packages.
+pub(super) fn display_names(specifiers: &[String]) -> String {
+    specifiers
+        .iter()
+        .map(|specifier| package_display_name(specifier).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }

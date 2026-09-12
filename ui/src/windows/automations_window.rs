@@ -398,6 +398,22 @@ pub enum Selection {
     StoreInspector,
 }
 
+/// A package activation change held for confirmation because turning the package off in a profile
+/// would also turn off the running roots that `require` it there. The Settings tab renders it as
+/// an inline confirm; confirming writes the change and the cascade in one lock replacement,
+/// guarded by `expected_lock`.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PendingActivationCascade {
+    /// The governing lock row the change applies to.
+    pub(super) specifier: String,
+    pub(super) activation: ProfileActivation,
+    /// The profiles the change turns the package off in, in inventory order.
+    pub(super) profiles: Vec<String>,
+    /// The running roots turned off with it, in lockfile order.
+    pub(super) dependents: Vec<String>,
+    pub(super) expected_lock: SharedPackageLock,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Ask the singleton window to move to another live session. This is normal guarded navigation:
@@ -822,6 +838,9 @@ pub enum Message {
     UninstallKeepOrphans,
     CancelUninstall,
     ConfirmUninstall,
+    /// Write the held activation change together with the requirer cascade it was shown with.
+    ConfirmActivationCascade,
+    CancelActivationCascade,
     StartForkPackage,
     SetForkName(String),
     CancelForkPackage,
@@ -1000,6 +1019,8 @@ pub enum Message {
     // ---- live (script-created) automations --------------------------------
     AutomationEvent(AutomationEvent),
     ToggleCreator(String),
+    /// Open or close a package's nested "N dependencies" group in the sidebar.
+    ToggleDependencies(String),
     ToggleCreatorShowAll(String),
 
     // ---- session-store inspector -------------------------------------------
@@ -1069,6 +1090,8 @@ pub struct AutomationsWindow {
     /// Creators whose nested automations are expanded (collapsed by default — a bulk package
     /// can create tens of thousands).
     pub(super) expanded_creators: HashSet<String>,
+    /// Package specifiers whose nested "N dependencies" group is open in the sidebar.
+    pub(super) expanded_dependencies: HashSet<String>,
     /// Creators showing all their automations rather than the first `CREATOR_SHOW_LIMIT`.
     pub(super) show_all_creators: HashSet<String>,
 
@@ -1287,6 +1310,8 @@ pub struct AutomationsWindow {
     /// — they are removed alongside it (forced, never kept). Computed with `uninstall_orphans` from
     /// `SharedPackageLock::plan_removal` when uninstall is requested (`script/REQUIRED-PACKAGES.md`).
     pub(super) uninstall_breaks: Vec<String>,
+    /// An activation change waiting for the user to accept the requirer cascade it entails.
+    pub(super) activation_cascade: Option<PendingActivationCascade>,
     /// Two-step confirm gate for the heavy Trust action.
     pub(super) confirm_trust: bool,
     /// A pending update re-prompt for the open installed package: the new version's added
@@ -1493,6 +1518,7 @@ impl AutomationsWindow {
             installed_package_state_error: None,
             live: LiveAutomations::default(),
             expanded_creators: HashSet::new(),
+            expanded_dependencies: HashSet::new(),
             show_all_creators: HashSet::new(),
             catalogue: None,
             store_toggled: HashSet::new(),
@@ -1591,6 +1617,7 @@ impl AutomationsWindow {
             uninstall_expected_lock: None,
             uninstall_orphans: Vec::new(),
             uninstall_breaks: Vec::new(),
+            activation_cascade: None,
             confirm_trust: false,
             update_delta: None,
             package_change_finalize: None,
@@ -1906,6 +1933,12 @@ impl AutomationsWindow {
             Message::ToggleCreator(id) => {
                 if !self.expanded_creators.remove(&id) {
                     self.expanded_creators.insert(id);
+                }
+                Update::none()
+            }
+            Message::ToggleDependencies(parent) => {
+                if !self.expanded_dependencies.remove(&parent) {
+                    self.expanded_dependencies.insert(parent);
                 }
                 Update::none()
             }
@@ -3532,6 +3565,11 @@ impl AutomationsWindow {
                 Update::none()
             }
             Message::ConfirmUninstall => self.uninstall_installed(),
+            Message::ConfirmActivationCascade => self.confirm_activation_cascade(),
+            Message::CancelActivationCascade => {
+                self.activation_cascade = None;
+                Update::none()
+            }
             Message::StartForkPackage => self.start_fork_package(),
             Message::SetForkName(name) => {
                 if !self.manage_busy && self.fork_draft_is_for_open_package() {
@@ -4115,6 +4153,7 @@ impl AutomationsWindow {
         self.confirm_delete_local = false;
         self.confirm_uninstall = false;
         self.uninstall_expected_lock = None;
+        self.activation_cascade = None;
         self.confirm_trust = false;
         self.clear_rename_draft();
         self.clear_fork_draft();
@@ -6378,6 +6417,172 @@ mod tab_traversal_tests {
         }
     }
 
+    /// A window open on `required_spec`'s Settings, over a lock where `root_spec` (on in every
+    /// profile) requires it. `required_activation` is the required package's own scope.
+    fn window_over_required_root(
+        label: &str,
+        required_activation: ProfileActivation,
+    ) -> (
+        AutomationsWindow,
+        smudgy_core::models::shared_packages::SharedPackageLock,
+    ) {
+        use smudgy_core::models::shared_packages::{self, LockedPackage, SharedPackageLock};
+
+        let _home = use_temp_smudgy_home();
+        let server_name = format!("{label}-{}", std::process::id());
+        create_test_server(&server_name, &["alpha", "beta"]);
+        let mut root = LockedPackage::new(ROOT_SPEC, UpdateMode::Auto);
+        root.set_activation(ProfileActivation::All);
+        let mut required = LockedPackage::new(REQUIRED_SPEC, UpdateMode::Auto);
+        required.set_activation(required_activation);
+        required.required_by.insert(ROOT_SPEC.into());
+        let lock = SharedPackageLock {
+            packages: vec![root, required.clone()],
+        };
+        shared_packages::save_lock(&server_name, &lock).unwrap();
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            server_name,
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+        window.profile_name = "alpha".into();
+        window.profile_names = vec!["alpha".into(), "beta".into()];
+        window.profile_inventory_complete = true;
+        window.installed_packages = lock.packages.clone();
+        window.rebuild_graph();
+        window.pane = Pane::InstalledPackage;
+        window.selection = Selection::InstalledPackage(REQUIRED_SPEC.into());
+        window.installed_open = Some(Box::new(required));
+        (window, lock)
+    }
+
+    const ROOT_SPEC: &str = "smudgy://publisher/mapper";
+    const REQUIRED_SPEC: &str = "smudgy://publisher/prompt";
+
+    #[test]
+    fn turning_a_required_root_off_holds_the_requirer_cascade_until_confirmed() {
+        use smudgy_core::models::shared_packages;
+
+        let (mut window, lock) =
+            window_over_required_root("activation-cascade", selected(&["alpha", "beta"]));
+
+        let held = window.update(Message::ToggleActivationProfile("alpha".to_string()));
+        assert!(
+            held.event.is_none(),
+            "nothing is written while the change waits"
+        );
+        let pending = window
+            .activation_cascade
+            .clone()
+            .expect("the change is held");
+        assert_eq!(pending.profiles, ["alpha"]);
+        assert_eq!(pending.dependents, [ROOT_SPEC]);
+        assert_eq!(pending.activation, selected(&["beta"]));
+        assert_eq!(
+            shared_packages::load_lock(&window.server_name).unwrap(),
+            lock
+        );
+
+        let confirmed = window.update(Message::ConfirmActivationCascade);
+        assert!(matches!(
+            confirmed.event,
+            Some(Event::ScriptsChanged { .. })
+        ));
+        assert!(window.activation_cascade.is_none());
+        let after = shared_packages::load_lock(&window.server_name).unwrap();
+        assert!(!after.is_effectively_enabled_for(REQUIRED_SPEC, "alpha"));
+        assert!(after.is_effectively_enabled_for(REQUIRED_SPEC, "beta"));
+        assert_eq!(
+            after.find(ROOT_SPEC).unwrap().activation(),
+            selected(&["beta"]),
+            "the requirer loses only the profile that turned off"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_held_cascade_leaves_every_activation_as_it_was() {
+        use smudgy_core::models::shared_packages;
+
+        let (mut window, lock) =
+            window_over_required_root("activation-cascade-cancel", ProfileActivation::All);
+
+        let _ = window.update(Message::DisableEverywhere);
+        let pending = window
+            .activation_cascade
+            .clone()
+            .expect("the change is held");
+        assert_eq!(pending.profiles, ["alpha", "beta"]);
+        let _ = window.update(Message::CancelActivationCascade);
+        assert!(window.activation_cascade.is_none());
+        assert_eq!(
+            shared_packages::load_lock(&window.server_name).unwrap(),
+            lock
+        );
+    }
+
+    #[test]
+    fn unchecking_a_profile_a_package_only_inherits_asks_to_turn_off_the_requirers() {
+        use smudgy_core::models::shared_packages;
+
+        // The required package's own scope is `beta` only; it runs in `alpha` through the root.
+        let (mut window, _lock) =
+            window_over_required_root("activation-cascade-inherited", selected(&["beta"]));
+        assert!(window.open_package_inherits_profile("alpha"));
+        assert!(!window.open_package_inherits_profile("beta"));
+
+        let held = window.update(Message::ToggleActivationProfile("alpha".to_string()));
+        assert!(held.event.is_none());
+        let pending = window
+            .activation_cascade
+            .clone()
+            .expect("the change is held");
+        assert_eq!(pending.profiles, ["alpha"]);
+        assert_eq!(pending.dependents, [ROOT_SPEC]);
+        assert_eq!(
+            pending.activation,
+            selected(&["beta"]),
+            "its own scope is unchanged; only the requirers turn off"
+        );
+
+        let _ = window.update(Message::ConfirmActivationCascade);
+        let after = shared_packages::load_lock(&window.server_name).unwrap();
+        assert!(!after.is_effectively_enabled_for(REQUIRED_SPEC, "alpha"));
+        assert!(after.is_effectively_enabled_for(REQUIRED_SPEC, "beta"));
+        assert_eq!(
+            after.find(REQUIRED_SPEC).unwrap().activation(),
+            selected(&["beta"])
+        );
+        assert_eq!(
+            after.find(ROOT_SPEC).unwrap().activation(),
+            selected(&["beta"])
+        );
+    }
+
+    #[test]
+    fn a_change_nothing_requires_writes_at_once_and_holds_no_cascade() {
+        use smudgy_core::models::shared_packages;
+
+        let (mut window, lock) =
+            window_over_required_root("activation-no-cascade", selected(&["alpha", "beta"]));
+        // Open the root instead: nothing requires it.
+        window.selection = Selection::InstalledPackage(ROOT_SPEC.into());
+        window.installed_open = Some(Box::new(lock.find(ROOT_SPEC).unwrap().clone()));
+
+        let written = window.update(Message::ToggleActivationProfile("alpha".to_string()));
+        assert!(matches!(written.event, Some(Event::ScriptsChanged { .. })));
+        assert!(window.activation_cascade.is_none());
+        let after = shared_packages::load_lock(&window.server_name).unwrap();
+        assert_eq!(
+            after.find(ROOT_SPEC).unwrap().activation(),
+            selected(&["beta"])
+        );
+        assert!(
+            after.is_effectively_enabled_for(REQUIRED_SPEC, "alpha"),
+            "the required package keeps its own scope"
+        );
+    }
+
     #[test]
     fn catalog_refresh_repairs_manifest_only_requirement_and_allows_promotion() {
         use smudgy_core::models::shared_packages::{
@@ -6601,7 +6806,10 @@ mod tab_traversal_tests {
         assert!(lock.is_effectively_enabled_for(child, "alpha"));
         assert!(!lock.is_effectively_enabled_for(stale, "alpha"));
         assert!(window.graph.dep_edge_active(root, child));
-        assert!(!window.graph.dep_edge_active(root, missing));
+        assert!(
+            !window.graph.effectively_enabled(missing),
+            "a required root that never resolved is not running; its own row says so"
+        );
         assert_eq!(
             window.graph.requires[root]
                 .iter()
@@ -6641,7 +6849,10 @@ mod tab_traversal_tests {
         assert_eq!(window.graph.resolved[root], "1.0.0");
         assert_eq!(window.graph.resolved[child], "1.0.0");
         assert_eq!(window.graph.requires[root].len(), 1);
-        assert!(!window.graph.dep_edge_active(root, child));
+        assert!(
+            !window.graph.effectively_enabled(child),
+            "the malformed manifest activates nothing; the required root stays off"
+        );
         assert!(window.blocked_updates.contains(root));
         assert!(window.graph.requirement_issues.contains_key(root));
         assert_eq!(

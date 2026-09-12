@@ -484,6 +484,28 @@ impl SharedPackageLock {
         self.plan_removal(removing, &requires_of)
     }
 
+    /// The installed roots that transitively `require` `specifier` and run in `profile_name`:
+    /// reverse reachability over the durable flattened `required_by` links, kept to rows that are
+    /// effectively enabled for that profile. A running requirer keeps its requirement running, so
+    /// turning `specifier` off in the profile means turning these off with it. `specifier` itself is
+    /// never included; order is deterministic (lockfile order).
+    #[must_use]
+    pub fn enabled_requirers_for(&self, specifier: &str, profile_name: &str) -> Vec<String> {
+        let mut requires_of: HashMap<String, Vec<String>> = HashMap::new();
+        for package in &self.packages {
+            for parent in &package.required_by {
+                requires_of
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(package.specifier.clone());
+            }
+        }
+        self.requirers_of_removal(specifier, &requires_of)
+            .into_iter()
+            .filter(|requirer| self.is_effectively_enabled_for(requirer, profile_name))
+            .collect()
+    }
+
     fn orphans_after(
         &self,
         seeds: &std::collections::HashSet<&str>,
@@ -1408,6 +1430,60 @@ pub fn set_governing_activation_if_unchanged(
     }
     mutate_row_if_unchanged(server_name, expected, |package| {
         package.set_activation(activation);
+    })
+}
+
+/// Replaces `specifier`'s activation and, for every profile the change turns off, also turns off
+/// the running roots that transitively `require` it — one lockfile replacement, applied only while
+/// the lock still matches the snapshot the confirmation was rendered from. Requirers without direct
+/// activation follow their own parents and need no edit. `known_profiles` canonicalizes each
+/// edited scope, as a single-profile toggle does.
+///
+/// # Errors
+/// Returns an error for an absent target or a lockfile failure.
+pub fn set_activation_with_requirer_cascade_if_unchanged(
+    server_name: &str,
+    expected: &SharedPackageLock,
+    specifier: &str,
+    activation: ProfileActivation,
+    known_profiles: &BTreeSet<String>,
+) -> Result<Cas> {
+    let _guard = guard(server_name);
+    mutate_lock(server_name, |lock| {
+        if lock != expected {
+            return Ok((Cas::StateChanged, false));
+        }
+        if lock.find(specifier).is_none() {
+            anyhow::bail!("package {specifier} is not installed");
+        }
+        // Collected before any edit so every requirer is judged against the same snapshot.
+        let mut cascade: Vec<(String, String)> = Vec::new();
+        for profile in known_profiles {
+            if !lock.is_effectively_enabled_for(specifier, profile)
+                || activation.is_enabled_for(profile)
+            {
+                continue;
+            }
+            for requirer in lock.enabled_requirers_for(specifier, profile) {
+                cascade.push((requirer, profile.clone()));
+            }
+        }
+        for (requirer, profile) in cascade {
+            let Some(row) = lock.find_mut(&requirer) else {
+                continue;
+            };
+            if row.has_direct_activation() {
+                let scope = row
+                    .activation()
+                    .with_profile(&profile, false, known_profiles);
+                row.set_activation(scope);
+            }
+        }
+        let target = lock
+            .find_mut(specifier)
+            .with_context(|| format!("package {specifier} is not installed"))?;
+        target.set_activation(activation);
+        Ok((Cas::Applied, true))
     })
 }
 
@@ -4146,5 +4222,111 @@ mod tests {
             validate_package_param_value(&table, &serde_json::json!([{"unknown": true}])).is_err()
         );
         assert!(validate_package_param_value(&table, &serde_json::json!([null])).is_err());
+    }
+
+    fn required_root(specifier: &str, required_by: &[&str]) -> LockedPackage {
+        let mut row = LockedPackage::new(specifier, UpdateMode::Auto);
+        row.set_activation(ProfileActivation::None);
+        row.installed_as_requirement = true;
+        row.requirement_lineage_known = true;
+        row.required_by = required_by.iter().map(|p| (*p).to_string()).collect();
+        row
+    }
+
+    /// `root` requires `mid`, `mid` requires `leaf`, and `other` requires `leaf` directly. `mid`
+    /// and `leaf` are automatic rows unless a test promotes them.
+    fn requirement_chain() -> SharedPackageLock {
+        let mut root = LockedPackage::new("smudgy://a/root", UpdateMode::Auto);
+        root.set_activation(ProfileActivation::All);
+        let mut other = LockedPackage::new("smudgy://a/other", UpdateMode::Auto);
+        other.set_activation(selected(&["beta"]));
+        SharedPackageLock {
+            packages: vec![
+                root,
+                required_root("smudgy://a/mid", &["smudgy://a/root"]),
+                required_root("smudgy://a/leaf", &["smudgy://a/mid", "smudgy://a/other"]),
+                other,
+            ],
+        }
+    }
+
+    #[test]
+    fn enabled_requirers_walk_the_running_requirers_transitively_per_profile() {
+        let lock = requirement_chain();
+        assert_eq!(
+            lock.enabled_requirers_for("smudgy://a/leaf", "alpha"),
+            ["smudgy://a/root", "smudgy://a/mid"],
+            "other is off in alpha, so it does not keep leaf running there"
+        );
+        assert_eq!(
+            lock.enabled_requirers_for("smudgy://a/leaf", "beta"),
+            ["smudgy://a/root", "smudgy://a/mid", "smudgy://a/other"]
+        );
+        assert!(
+            lock.enabled_requirers_for("smudgy://a/root", "alpha")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn activation_cascade_turns_off_running_requirers_only_where_the_target_turns_off() {
+        let server = test_server("cascade");
+        let mut lock = requirement_chain();
+        let leaf = lock.find_mut("smudgy://a/leaf").unwrap();
+        leaf.installed_as_requirement = false;
+        leaf.set_activation(selected(&["alpha", "beta"]));
+        save_lock(&server, &lock).unwrap();
+        let known: BTreeSet<String> = ["alpha", "beta"].iter().map(|p| (*p).to_string()).collect();
+
+        let outcome = set_activation_with_requirer_cascade_if_unchanged(
+            &server,
+            &lock,
+            "smudgy://a/leaf",
+            selected(&["beta"]),
+            &known,
+        )
+        .unwrap();
+        assert_eq!(outcome, Cas::Applied);
+
+        let after = load_lock(&server).unwrap();
+        assert!(!after.is_effectively_enabled_for("smudgy://a/leaf", "alpha"));
+        assert!(after.is_effectively_enabled_for("smudgy://a/leaf", "beta"));
+        assert_eq!(
+            after.find("smudgy://a/root").unwrap().activation(),
+            selected(&["beta"]),
+            "the running requirer loses only the profile that turned off"
+        );
+        assert_eq!(
+            after.find("smudgy://a/other").unwrap().activation(),
+            selected(&["beta"]),
+            "a requirer that was already off in alpha is untouched"
+        );
+        assert_eq!(
+            after.find("smudgy://a/mid").unwrap().activation(),
+            ProfileActivation::None,
+            "an automatic row has no intent of its own to clear; it follows its parents"
+        );
+        assert!(!after.is_effectively_enabled_for("smudgy://a/mid", "alpha"));
+    }
+
+    #[test]
+    fn activation_cascade_writes_nothing_when_the_lock_moved_on() {
+        let server = test_server("cascade-stale");
+        let lock = requirement_chain();
+        save_lock(&server, &lock).unwrap();
+        let mut stale = lock.clone();
+        stale.packages.pop();
+        let known: BTreeSet<String> = ["alpha", "beta"].iter().map(|p| (*p).to_string()).collect();
+
+        let outcome = set_activation_with_requirer_cascade_if_unchanged(
+            &server,
+            &stale,
+            "smudgy://a/mid",
+            ProfileActivation::None,
+            &known,
+        )
+        .unwrap();
+        assert_eq!(outcome, Cas::StateChanged);
+        assert_eq!(load_lock(&server).unwrap(), lock);
     }
 }

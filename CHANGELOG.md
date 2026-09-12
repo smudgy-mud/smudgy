@@ -52,6 +52,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The packages panel shows required packages once, on their own row.** A package
+  another package requires runs on its own, so it no longer repeats as a nested row
+  under each package that needs it; an automatically installed one carries a `REQ` tag
+  on its own row instead. Imported code dependencies still nest, now behind a
+  collapsible "N dependencies" group that opens when a search matches one of them.
+  Turning a package off where running packages require it asks first and names what
+  turns off with it; a package that runs only because another needs it shows its
+  profile checked, and unchecking it makes the same request. Turning a package on
+  that brings required packages with it says which ones started. The package
+  banners and notes that describe these relationships now just name the packages
+  involved.
+- **Interop notices no longer appear in the session.** The `[interop]` lines about
+  code-imported copies of installed packages, refused writes from a non-home copy,
+  duplicate keys, and a full catalogue were confusing more people than they helped.
+  They now go to the log only; nothing else about the behaviour changed.
 - **Trigger and alias handlers cost less to run.** Each handler call now reuses the
   runtime state it needs instead of allocating it, queued fires share one identity
   record, and the per-line matching storage is kept from line to line. A script with

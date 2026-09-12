@@ -2,8 +2,8 @@
 //! (`docs/interop.md` §10): the new-subscriber snapshot sent through
 //! `Runtime::subscribe_catalogue`, the leading-edge send + trailing-edge one-shot
 //! (`catalogue_resend_at`) that lands a burst's final state within the send window
-//! instead of at the 500 ms safety tick, and the entry-budget refusal notice surfacing
-//! as a session echo. The pure `CatalogueCadence` state machine has unit tests; these
+//! instead of at the 500 ms safety tick, and that the entry-budget refusal stays out of the
+//! session transcript. The pure `CatalogueCadence` state machine has unit tests; these
 //! exercise the runtime side those tests cannot see.
 
 use std::sync::Arc;
@@ -25,9 +25,8 @@ const tick = createEvent<any>("tick");
 createAlias("^burst$", () => { tick.emit({ n: 1 }); });
 "#;
 
-/// Module for the notice test: dynamic minting one past the per-producer entry budget
-/// (512), so the 513th undeclared entry queues the one-time teaching notice the drain
-/// point must surface as a session echo.
+/// Module for the refusal test: dynamic minting one past the per-producer entry budget
+/// (512), so the 513th undeclared entry is refused — logged, never echoed.
 const MINT_TS: &str = r#"
 import { createEvent, echo } from "smudgy:core";
 for (let i = 0; i < 513; i++) createEvent("mint_" + i);
@@ -186,10 +185,8 @@ async fn entry_budget_notice_is_echoed_into_the_session() {
         "the module ran to completion.\n{transcript}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("session catalogue is full")),
-        "the 513th undeclared entry queues the teaching notice and the drain point \
-         echoes it.\n{transcript}"
+        !lines.iter().any(|l| l.contains("[interop]")),
+        "the 513th undeclared entry is refused in the log only; nothing reaches the \
+         session.\n{transcript}"
     );
 }

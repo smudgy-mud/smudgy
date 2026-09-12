@@ -7,7 +7,6 @@ use iced::alignment::Vertical;
 use iced::widget::{Column, button, column, container, row, scrollable, text, text_input};
 use iced::{Background, Border, Color, Length, Padding};
 
-use smudgy_cloud::DependencyKind;
 use smudgy_core::models::packages;
 use smudgy_core::models::shared_packages::SharedPackageLock;
 use smudgy_core::session::runtime::AutomationKind;
@@ -614,13 +613,16 @@ impl AutomationsWindow {
             };
             let selected = self.selection == Selection::InstalledPackage(spec.clone());
             let select = Message::SelectInstalledPackage(spec.clone());
+            // A root that runs only because other packages require it has no nested row of its
+            // own anywhere; its top-level row carries the `REQ` tag instead.
+            let required_root = (!self.graph.controllable(spec)).then(common::required_tag);
             installed_rows.push(package_row(
                 status,
                 bootstrap_icons::CLOUD_CHECK,
                 package_display_name(spec).to_string(),
                 selected,
                 select,
-                scope_badge(),
+                trailing_tags([required_root, scope_badge()]),
             ));
             if let Some((owner, name)) = super::model::parse_specifier(spec)
                 && let Some(automations) = self.live.package(&owner, &name)
@@ -678,11 +680,30 @@ impl AutomationsWindow {
         }
     }
 
+    /// Nest `parent`'s imported code dependencies under it, behind a collapsible "N dependencies"
+    /// toggle. Only imports nest: they execute inside the parent's isolate. A `requires` target
+    /// runs as its own root and keeps its own top-level row, so it is never repeated here. The
+    /// toggle opens on its own while a search matches one of the nested names.
     fn build_dep_rows<'a>(&'a self, parent: &str, indent: usize, out: &mut Vec<Elem<'a>>) {
-        let Some(edges) = self.graph.requires.get(parent) else {
+        let deps = self.graph.nested_dependencies(parent);
+        if deps.is_empty() {
             return;
-        };
-        for edge in edges {
+        }
+        let expanded = self.expanded_dependencies.contains(parent)
+            || (!self.search.is_empty()
+                && deps
+                    .iter()
+                    .any(|edge| self.name_matches(package_display_name(&edge.specifier))));
+        out.push(collapsible_count_row(
+            indent,
+            expanded,
+            crate::i18n::t!("automations-dependency-count", "count" => deps.len() as i64),
+            Message::ToggleDependencies(parent.to_string()),
+        ));
+        if !expanded {
+            return;
+        }
+        for edge in deps {
             let spec = &edge.specifier;
             // Key the selection to this dependency *reference* (parent + spec), not the package
             // itself, so clicking it highlights only this row — not the package's own top-level
@@ -706,7 +727,7 @@ impl AutomationsWindow {
                 NodeStatus::Disabled
             };
             out.push(tree_row(
-                indent,
+                indent + 1,
                 None,
                 status,
                 bootstrap_icons::CLOUD_CHECK,
@@ -716,11 +737,7 @@ impl AutomationsWindow {
                     parent: parent.to_string(),
                     spec: spec.clone(),
                 },
-                Some(if edge.kind == DependencyKind::Requires {
-                    common::required_tag()
-                } else {
-                    common::dep_tag()
-                }),
+                Some(common::dep_tag()),
             ));
         }
     }
@@ -908,10 +925,8 @@ impl AutomationsWindow {
             return false;
         }
         self.graph
-            .requires
-            .get(spec)
-            .into_iter()
-            .flatten()
+            .nested_dependencies(spec)
+            .iter()
             .any(|e| self.name_matches(package_display_name(&e.specifier)))
     }
 
@@ -1172,14 +1187,31 @@ fn creator_toggle_row<'a>(
     total: usize,
     creator_id: String,
 ) -> Elem<'a> {
+    collapsible_count_row(
+        indent,
+        expanded,
+        crate::i18n::t!("automations-created-count", "count" => total as i64),
+        Message::ToggleCreator(creator_id),
+    )
+}
+
+/// A muted chevron + count row that opens or closes a nested group beneath a package node. It
+/// leads with the same spacer a twisty-less row does, so the chevron sits under the parent's icon
+/// rather than outboard of its status dot.
+fn collapsible_count_row<'a>(
+    indent: usize,
+    expanded: bool,
+    label: String,
+    on_press: Message,
+) -> Elem<'a> {
     let chevron = if expanded {
         bootstrap_icons::CHEVRON_DOWN
     } else {
         bootstrap_icons::CHEVRON_RIGHT
     };
-    let label = crate::i18n::t!("automations-created-count", "count" => total as i64);
     button(
         row![
+            iced::widget::space::horizontal().width(Length::Fixed(14.0)),
             text(chevron)
                 .font(fonts::BOOTSTRAP_ICONS)
                 .size(10.0)
@@ -1190,7 +1222,7 @@ fn creator_toggle_row<'a>(
         .align_y(Vertical::Center),
     )
     .style(button_style::list_item)
-    .on_press(Message::ToggleCreator(creator_id))
+    .on_press(on_press)
     .width(Length::Fill)
     .padding(Padding {
         top: 3.0,
@@ -1199,6 +1231,15 @@ fn creator_toggle_row<'a>(
         right: 6.0,
     })
     .into()
+}
+
+/// The trailing slot of a package row: whichever of the given tags exist, side by side.
+fn trailing_tags<'a>(tags: impl IntoIterator<Item = Option<Elem<'a>>>) -> Option<Elem<'a>> {
+    let tags = tags.into_iter().flatten().collect::<Vec<_>>();
+    if tags.is_empty() {
+        return None;
+    }
+    Some(row(tags).spacing(6.0).align_y(Vertical::Center).into())
 }
 
 /// The "show N more…" row revealing a creator's remaining automations beyond the cap.

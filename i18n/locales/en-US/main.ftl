@@ -1083,7 +1083,7 @@ package-tab-settings = Settings
 package-tab-permissions = Permissions
 package-tab-manifest = Manifest
 package-tab-sharing = Sharing
-package-required-in-profile = { $package } needs this package in this profile. Its direct setting is off, but it still runs.
+package-required-in-profile = Needed by { $package }.
 package-parameter-values = Package Settings
 package-parameter-global = Same settings on all profiles
 package-parameter-profile = Per-profile settings
@@ -1104,6 +1104,11 @@ automations-created-count =
     { $count ->
         [one] 1 automation
        *[other] { $count } automations
+    }
+automations-dependency-count =
+    { $count ->
+        [one] 1 dependency
+       *[other] { $count } dependencies
     }
 module-script-extension-required = A module file must end in .js, .ts, .jsx, or .tsx.
 module-import-only-help = Smudgy does not load this file directly. A script module can import it.
@@ -1576,9 +1581,9 @@ automation-code-show-completions = Show suggestions
 # Package management
 package-sign-in-shared = Sign in from the main window's Settings → Account to see the packages you own and ones friends have shared.
 package-no-selection = No package selected.
-package-dependency-managed = Installed automatically as a dependency — its on/off state follows the packages that need it, so it can't be toggled here.
-package-direct-and-required = You installed this directly. { $packages } also needs it. It runs when its direct setting or a package that needs it is active.
-package-disabled-review = Disabled until you allow it. Review the README and source below, then enable it when you trust it.
+package-dependency-managed = Runs inside { $packages }.
+package-direct-and-required = Also needed by { $packages }.
+package-disabled-review = Off. Enable it in Settings when you trust it.
 package-metric-author = Author
 package-metric-loaded = Loaded
 package-metric-latest-blocked = Latest (blocked)
@@ -1592,7 +1597,6 @@ package-update-mode = Update mode
 package-update-auto-track = Auto — track latest
 package-update-pinned-placeholder = Pinned — pick a version…
 package-dependencies = Dependencies
-package-enabling-dependencies = Enabling { $name } will also enable { $dependencies }.
 package-dependency-auto-remove = This dependency is removed automatically once no installed package requires it.
 package-state-active = active
 package-state-inactive = inactive
@@ -1613,7 +1617,6 @@ package-source-binary = Binary file ({ $size }) — not shown.
 package-source-too-large = File is { $size } — too large to preview (limit { $limit }).
 package-source-load-error = Couldn't load source: { $error }
     Re-select the file to try again.
-package-also-installed = This package is also installed on its own. Manage or uninstall it from its own entry in the sidebar.
 package-open-own-pane = Open its own pane
 package-actions = Actions
 package-edit-copy = Edit a copy
@@ -1624,9 +1627,19 @@ package-open-local-copy = Open local package
 package-copy-name-exists = A local package named “{ $name }” already exists. Open it or use a different name.
 package-copy-requirements-not-ready = Smudgy did not create the copy because one or more required packages must be installed or updated first. Install or update them, then try again.
 package-remove-standalone = Remove standalone install
-package-remove-standalone-help = Removes the on-its-own copy. { $name } stays installed as a dependency of { $packages }.
-package-removal-required = Removing { $name } also removes { $packages }, which require it.
-package-remove-orphans = Also remove { $packages }? Nothing else will require them afterward.
+package-remove-standalone-help = { $name } stays installed for { $packages }.
+package-removal-required = Removing { $name } also removes { $packages }, which { $count ->
+        [one] needs
+       *[other] need
+    } it.
+package-remove-orphans = Also remove { $packages }? Nothing else needs them.
+package-disable-cascade-warning = Turning { $name } off in { $profiles } also turns off { $packages }, which { $count ->
+        [one] needs
+       *[other] need
+    } it. Turn them off together?
+package-disable-cascade-confirm = Turn off all
+package-disable-cascade-applied = Turned off { $name } and { $packages }.
+package-enabling-starts-required = Turning { $name } on also started { $packages }.
 package-remove-all = Remove all
 package-remove = Remove
 package-uninstall = Uninstall
@@ -1893,8 +1906,7 @@ package-required-unavailable = Required package { $name } is not available: { $e
 package-requirer-unavailable = Smudgy cannot check the requirements of installed package { $name }: { $error }
 package-required-manifest-invalid = Package { $name } has an invalid manifest: { $error }
 package-install-required-unavailable = A required package is not available
-package-import-managed = This code runs inside its parent package. The parent controls its settings and permissions.
-package-required-managed = Another package needs this package. It runs for the same profiles as the packages that need it.
+package-required-managed = Needed by { $packages }.
 package-install-independently = Install independently
 package-requirements-refresh-incomplete = Could not fully refresh required packages: { $error }. Check that these packages are installed and their manifests are available.
 package-folder-locate-failed = Couldn't locate the folder: { $error }
@@ -1941,6 +1953,7 @@ package-version-build-metadata = Version must not include build metadata (drop t
 # Remaining app-shell and editor surfaces
 badge-dependency = DEP
 badge-required = REQ
+badge-dependency-required = DEP + REQ
 editor-example-alias-name = e.g. kill
 editor-example-hotkey-name = e.g. north
 editor-example-trigger-name = e.g. low-health-alert
@@ -1990,9 +2003,6 @@ runtime-call-javascript-function-error = Error calling JavaScript function: { $e
 runtime-add-script-error = Error adding script: { $error }
 runtime-gmcp-goodbye = GMCP: the server says goodbye.
 runtime-gmcp-goodbye-reason = GMCP: the server says goodbye: { $reason }
-runtime-interop-handles-removed = [interop] smudgy://{ $owner }/{ $name } was code-imported, so its interop handle exports were removed from this copy — import them from smudgy:state/{ $owner }/{ $name }, smudgy:events/{ $owner }/{ $name }, or smudgy:procedures/{ $owner }/{ $name } instead.
-runtime-interop-duplicate-installed = [interop] you code-imported the entry module of installed smudgy://{ $owner }/{ $name } — this copy repeats the home instance's startup side effects. Import a side-effect-free subpath or types only, or consume its published state, events, or procedures.
-runtime-interop-attribution = [interop] a user script or local module code-imported smudgy://{ $owner }/{ $name }, which declares interop handles. The import works (this is the package's home), but writes through those handles publish AS the package — prefer smudgy:state/{ $owner }/{ $name } (and events/procedures) unless that attribution is intended.
 runtime-package-required-params-missing = [package] { $name } not loaded: required param(s) { $params } are unset — configure them in settings
 runtime-package-not-loaded-reason = [package] { $name } not loaded — { $reason }.
 runtime-package-not-loaded-error = [package] { $name } not loaded — { $error }

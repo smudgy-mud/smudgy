@@ -1146,7 +1146,7 @@ package-tab-settings = Ustawienia
 package-tab-permissions = Uprawnienia
 package-tab-manifest = Manifest
 package-tab-sharing = Udostępnianie
-package-required-in-profile = Pakiet { $package } potrzebuje tego pakietu w tym profilu. Ustawienie bezpośrednie jest wyłączone, ale pakiet nadal działa.
+package-required-in-profile = Potrzebuje go { $package }.
 package-parameter-values = Package Settings
 package-parameter-global = Same settings on all profiles
 package-parameter-profile = Per-profile settings
@@ -1169,6 +1169,13 @@ automations-created-count =
         [few] { $count } automatyzacje
         [many] { $count } automatyzacji
        *[other] { $count } automatyzacji
+    }
+automations-dependency-count =
+    { $count ->
+        [one] 1 zależność
+        [few] { $count } zależności
+        [many] { $count } zależności
+       *[other] { $count } zależności
     }
 module-script-extension-required = Plik modułu musi mieć rozszerzenie .js, .ts, .jsx lub .tsx.
 module-import-only-help = Smudgy nie uruchamia tego pliku bezpośrednio. Moduł skryptowy może go importować.
@@ -1641,9 +1648,9 @@ automation-code-show-completions = Pokaż sugestie
 # Package management
 package-sign-in-shared = Zaloguj się w oknie głównym w Ustawienia → Konto, aby zobaczyć pakiety, które posiadasz, oraz te udostępnione przez znajomych.
 package-no-selection = Nie wybrano pakietu.
-package-dependency-managed = Zainstalowany automatycznie jako zależność — jego stan wł./wył. zależy od pakietów, które go potrzebują, więc nie można go tutaj przełączać.
-package-direct-and-required = Ten pakiet zainstalowano bezpośrednio. Pakiety { $packages } również go potrzebują. Pakiet działa, gdy jego ustawienie bezpośrednie lub wymagający go pakiet jest aktywny.
-package-disabled-review = Wyłączony, dopóki nie zezwolisz na jego działanie. Przejrzyj README i źródło poniżej, a następnie włącz go, gdy uznasz go za godny zaufania.
+package-dependency-managed = Działa wewnątrz: { $packages }.
+package-direct-and-required = Potrzebują go też: { $packages }.
+package-disabled-review = Wyłączony. Włącz go w Ustawieniach, gdy mu zaufasz.
 package-metric-author = Autor
 package-metric-loaded = Załadowana
 package-metric-latest-blocked = Najnowsza (zablokowana)
@@ -1657,7 +1664,6 @@ package-update-mode = Tryb aktualizacji
 package-update-auto-track = Auto — śledź najnowszą
 package-update-pinned-placeholder = Przypięta — wybierz wersję…
 package-dependencies = Zależności
-package-enabling-dependencies = Włączenie { $name } spowoduje też włączenie { $dependencies }.
 package-dependency-auto-remove = Ta zależność jest usuwana automatycznie, gdy żaden zainstalowany pakiet już jej nie wymaga.
 package-state-active = aktywny
 package-state-inactive = nieaktywny
@@ -1678,7 +1684,6 @@ package-source-binary = Plik binarny ({ $size }) — nie wyświetlono.
 package-source-too-large = Plik ma { $size } — zbyt duży, aby wyświetlić podgląd (limit { $limit }).
 package-source-load-error = Nie udało się załadować źródła: { $error }
     Wybierz plik ponownie, aby spróbować jeszcze raz.
-package-also-installed = Ten pakiet jest też zainstalowany samodzielnie. Zarządzaj nim lub odinstaluj go z jego własnego wpisu na pasku bocznym.
 package-open-own-pane = Otwórz jego własny panel
 package-actions = Akcje
 package-edit-copy = Edytuj kopię
@@ -1689,9 +1694,19 @@ package-open-local-copy = Otwórz pakiet lokalny
 package-copy-name-exists = Pakiet lokalny o nazwie „{ $name }” już istnieje. Otwórz go lub użyj innej nazwy.
 package-copy-requirements-not-ready = Smudgy nie utworzył kopii, ponieważ najpierw trzeba zainstalować lub zaktualizować co najmniej jeden wymagany pakiet. Zainstaluj lub zaktualizuj te pakiety, a następnie spróbuj ponownie.
 package-remove-standalone = Usuń instalację samodzielną
-package-remove-standalone-help = Usuwa samodzielną kopię. { $name } pozostaje zainstalowany jako zależność { $packages }.
-package-removal-required = Usunięcie { $name } usunie też { $packages }, które go wymagają.
-package-remove-orphans = Usunąć również { $packages }? Nic innego nie będzie ich już potem wymagać.
+package-remove-standalone-help = { $name } pozostaje zainstalowany dla: { $packages }.
+package-removal-required = Usunięcie { $name } usunie też { $packages }, { $count ->
+        [one] który go wymaga
+       *[other] które go wymagają
+    }.
+package-remove-orphans = Usunąć również { $packages }? Nic innego ich nie potrzebuje.
+package-disable-cascade-warning = Wyłączenie { $name } w { $profiles } wyłączy też { $packages }, { $count ->
+        [one] który go potrzebuje
+       *[other] które go potrzebują
+    }. Wyłączyć je razem?
+package-disable-cascade-confirm = Wyłącz wszystkie
+package-disable-cascade-applied = Wyłączono { $name } oraz { $packages }.
+package-enabling-starts-required = Włączenie { $name } uruchomiło też { $packages }.
 package-remove-all = Usuń wszystko
 package-remove = Usuń
 package-uninstall = Odinstaluj
@@ -1964,8 +1979,7 @@ package-required-unavailable = Wymagany pakiet { $name } jest niedostępny: { $e
 package-requirer-unavailable = Smudgy nie może sprawdzić wymagań zainstalowanego pakietu { $name }: { $error }
 package-required-manifest-invalid = Pakiet { $name } ma nieprawidłowy manifest: { $error }
 package-install-required-unavailable = Wymagany pakiet jest niedostępny
-package-import-managed = Ten kod działa wewnątrz pakietu nadrzędnego. Pakiet nadrzędny kontroluje jego ustawienia i uprawnienia.
-package-required-managed = Inny pakiet potrzebuje tego pakietu. Działa on w tych samych profilach co pakiety, które go potrzebują.
+package-required-managed = Potrzebują go: { $packages }.
 package-install-independently = Zainstaluj niezależnie
 package-requirements-refresh-incomplete = Nie udało się w pełni odświeżyć wymaganych pakietów: { $error }. Sprawdź, czy te pakiety są zainstalowane i czy ich manifesty są dostępne.
 package-folder-locate-failed = Nie udało się zlokalizować folderu: { $error }
@@ -2012,6 +2026,7 @@ package-version-build-metadata = Wersja nie może zawierać metadanych kompilacj
 # Remaining app-shell and editor surfaces
 badge-dependency = ZAL.
 badge-required = WYM.
+badge-dependency-required = DEP + REQ
 editor-example-alias-name = np. kill
 editor-example-hotkey-name = np. north
 editor-example-trigger-name = np. low-health-alert
@@ -2061,9 +2076,6 @@ runtime-call-javascript-function-error = Błąd podczas wywoływania funkcji Jav
 runtime-add-script-error = Błąd podczas dodawania skryptu: { $error }
 runtime-gmcp-goodbye = GMCP: serwer się żegna.
 runtime-gmcp-goodbye-reason = GMCP: serwer się żegna: { $reason }
-runtime-interop-handles-removed = [interop] smudgy://{ $owner }/{ $name } został zaimportowany jako kod, więc eksporty jego uchwytów interop zostały usunięte z tej kopii — zamiast tego zaimportuj je z smudgy:state/{ $owner }/{ $name }, smudgy:events/{ $owner }/{ $name } lub smudgy:procedures/{ $owner }/{ $name }.
-runtime-interop-duplicate-installed = [interop] zaimportowano jako kod smudgy://{ $owner }/{ $name }, który jest zainstalowany — ta kopia powiela skutki uboczne zainstalowanej instancji i nie może publikować stanu ani zdarzeń. Importuj tylko typy lub odczytuj jego opublikowany stan.
-runtime-interop-attribution = [interop] skrypt użytkownika lub lokalny moduł zaimportował jako kod smudgy://{ $owner }/{ $name }, który deklaruje uchwyty interop. Import działa (to macierzyste miejsce pakietu), ale zapisy przez te uchwyty są publikowane JAKO pakiet — preferuj smudgy:state/{ $owner }/{ $name } (oraz events/procedures), chyba że takie przypisanie jest zamierzone.
 runtime-package-required-params-missing = [package] { $name } nie załadowano: wymagane parametry ({ $params }) są nieustawione — skonfiguruj je w ustawieniach
 runtime-package-not-loaded-reason = [package] { $name } nie załadowano — { $reason }.
 runtime-package-not-loaded-error = [package] { $name } nie załadowano — { $error }

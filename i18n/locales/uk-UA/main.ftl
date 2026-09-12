@@ -1145,7 +1145,7 @@ package-tab-settings = Налаштування
 package-tab-permissions = Дозволи
 package-tab-manifest = Маніфест
 package-tab-sharing = Спільний доступ
-package-required-in-profile = Пакунок { $package } потребує цей пакунок у цьому профілі. Пряму активацію вимкнено, але пакунок усе одно працює.
+package-required-in-profile = Потрібен пакунку { $package }.
 package-parameter-values = Package Settings
 package-parameter-global = Same settings on all profiles
 package-parameter-profile = Per-profile settings
@@ -1168,6 +1168,13 @@ automations-created-count =
         [few] { $count } автоматизації
         [many] { $count } автоматизацій
        *[other] { $count } автоматизації
+    }
+automations-dependency-count =
+    { $count ->
+        [one] 1 залежність
+        [few] { $count } залежності
+        [many] { $count } залежностей
+       *[other] { $count } залежності
     }
 module-script-extension-required = Файл модуля повинен мати розширення .js, .ts, .jsx або .tsx.
 module-import-only-help = Smudgy не запускає цей файл безпосередньо. Модуль сценарію може його імпортувати.
@@ -1640,9 +1647,9 @@ automation-code-show-completions = Показати пропозиції
 # Package management
 package-sign-in-shared = Увійдіть у головному вікні в Налаштування → Обліковий запис, щоб побачити пакунки, якими ви володієте, а також ті, що надані друзями.
 package-no-selection = Пакунок не вибрано.
-package-dependency-managed = Встановлено автоматично як залежність — його стан увімк./вимк. залежить від пакунків, що його потребують, тож тут його не можна перемикати.
-package-direct-and-required = Цей пакунок встановлено безпосередньо. Пакунки { $packages } також його потребують. Він працює, коли активне його пряме налаштування або пакунок, якому він потрібен.
-package-disabled-review = Вимкнено, доки ви не дозволите йому працювати. Перегляньте README і джерело нижче, а потім увімкніть його, коли вважатимете його надійним.
+package-dependency-managed = Працює всередині { $packages }.
+package-direct-and-required = Його також потребує { $packages }.
+package-disabled-review = Вимкнено. Увімкніть у Налаштуваннях, коли довірятимете йому.
 package-metric-author = Автор
 package-metric-loaded = Завантажена
 package-metric-latest-blocked = Найновіша (заблокована)
@@ -1656,7 +1663,6 @@ package-update-mode = Режим оновлення
 package-update-auto-track = Авто — стежити за найновішою
 package-update-pinned-placeholder = Закріплена — виберіть версію…
 package-dependencies = Залежності
-package-enabling-dependencies = Увімкнення { $name } також увімкне { $dependencies }.
 package-dependency-auto-remove = Ця залежність видаляється автоматично, коли жоден встановлений пакунок її більше не потребує.
 package-state-active = активний
 package-state-inactive = неактивний
@@ -1677,7 +1683,6 @@ package-source-binary = Двійковий файл ({ $size }) — не пок�
 package-source-too-large = Файл має { $size } — завеликий для перегляду (ліміт { $limit }).
 package-source-load-error = Не вдалося завантажити джерело: { $error }
     Виберіть файл ще раз, щоб спробувати знову.
-package-also-installed = Цей пакунок також встановлено окремо. Керуйте ним або видаліть його з його власного запису на бічній панелі.
 package-open-own-pane = Відкрити його власну панель
 package-actions = Дії
 package-edit-copy = Редагувати копію
@@ -1688,9 +1693,19 @@ package-open-local-copy = Відкрити локальний пакунок
 package-copy-name-exists = Локальний пакунок із назвою «{ $name }» уже існує. Відкрийте його або вкажіть іншу назву.
 package-copy-requirements-not-ready = Smudgy не створив копію, оскільки спочатку потрібно встановити або оновити один чи кілька обов’язкових пакунків. Установіть або оновіть їх, а потім повторіть спробу.
 package-remove-standalone = Видалити окреме встановлення
-package-remove-standalone-help = Видаляє окрему копію. { $name } залишається встановленим як залежність { $packages }.
-package-removal-required = Видалення { $name } також видалить { $packages }, які його потребують.
-package-remove-orphans = Видалити також { $packages }? Ніщо інше їх більше не потребуватиме.
+package-remove-standalone-help = { $name } залишається встановленим для { $packages }.
+package-removal-required = Видалення { $name } також видалить { $packages }, { $count ->
+        [one] який його потребує
+       *[other] які його потребують
+    }.
+package-remove-orphans = Видалити також { $packages }? Ніщо інше їх не потребує.
+package-disable-cascade-warning = Вимкнення { $name } у { $profiles } також вимкне { $packages }, { $count ->
+        [one] якому він потрібен
+       *[other] яким він потрібен
+    }. Вимкнути їх разом?
+package-disable-cascade-confirm = Вимкнути всі
+package-disable-cascade-applied = Вимкнено { $name } та { $packages }.
+package-enabling-starts-required = Увімкнення { $name } також запустило { $packages }.
 package-remove-all = Видалити все
 package-remove = Видалити
 package-uninstall = Деінсталювати
@@ -1957,8 +1972,7 @@ package-required-unavailable = Обов’язковий пакунок { $name 
 package-requirer-unavailable = Smudgy не може перевірити вимоги встановленого пакунка { $name }: { $error }
 package-required-manifest-invalid = Пакунок { $name } має недійсний маніфест: { $error }
 package-install-required-unavailable = Обов’язковий пакунок недоступний
-package-import-managed = Цей код працює всередині батьківського пакунка. Батьківський пакунок керує його параметрами й дозволами.
-package-required-managed = Інший пакунок потребує цей пакунок. Він працює в тих самих профілях, що й пакунки, яким він потрібен.
+package-required-managed = Його потребує { $packages }.
 package-install-independently = Встановити незалежно
 package-requirements-refresh-incomplete = Не вдалося повністю оновити відомості про обов’язкові пакунки: { $error }. Перевірте, чи ці пакунки встановлено та чи доступні їхні маніфести.
 package-folder-locate-failed = Не вдалося знайти теку: { $error }
@@ -2005,6 +2019,7 @@ package-version-build-metadata = Версія не може містити ме�
 # Remaining app-shell and editor surfaces
 badge-dependency = ЗАЛ.
 badge-required = ВИМ.
+badge-dependency-required = DEP + REQ
 editor-example-alias-name = напр., kill
 editor-example-hotkey-name = напр., north
 editor-example-trigger-name = напр., low-health-alert
@@ -2054,9 +2069,6 @@ runtime-call-javascript-function-error = Помилка під час викли
 runtime-add-script-error = Помилка під час додавання скрипту: { $error }
 runtime-gmcp-goodbye = GMCP: сервер прощається.
 runtime-gmcp-goodbye-reason = GMCP: сервер прощається: { $reason }
-runtime-interop-handles-removed = [interop] smudgy://{ $owner }/{ $name } було імпортовано як код, тож експорти його interop-хендлів вилучено з цієї копії — натомість імпортуйте їх зі smudgy:state/{ $owner }/{ $name }, smudgy:events/{ $owner }/{ $name } або smudgy:procedures/{ $owner }/{ $name }.
-runtime-interop-duplicate-installed = [interop] імпортовано як код smudgy://{ $owner }/{ $name }, який встановлено — ця копія дублює побічні ефекти встановленого екземпляра й не може публікувати стан чи події. Імпортуйте лише типи або читайте його опублікований стан.
-runtime-interop-attribution = [interop] скрипт користувача або локальний модуль імпортував як код smudgy://{ $owner }/{ $name }, який оголошує interop-хендли. Імпорт працює (це рідне місце пакунка), але записи через ці хендли публікуються ЯК пакунок — надавайте перевагу smudgy:state/{ $owner }/{ $name } (а також events/procedures), якщо таке приписування не є навмисним.
 runtime-package-required-params-missing = [package] { $name } не завантажено: обов'язкові параметри ({ $params }) не задано — налаштуйте їх у налаштуваннях
 runtime-package-not-loaded-reason = [package] { $name } не завантажено — { $reason }.
 runtime-package-not-loaded-error = [package] { $name } не завантажено — { $error }

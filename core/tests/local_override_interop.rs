@@ -234,7 +234,7 @@ async fn local_producer_consumed_over_events_does_not_trip_the_stumble_notice() 
 /// stumble notice MUST still fire. (Same package graph as the regression, but a code import in
 /// place of an events consume.)
 #[tokio::test]
-async fn local_producer_actually_code_imported_still_stumbles() {
+async fn local_producer_actually_code_imported_loads_without_a_notice() {
     let server = "lo_codeimport";
     prepare_server(server);
 
@@ -280,11 +280,8 @@ async fn local_producer_actually_code_imported_still_stumbles() {
         "the consumer package must load; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(
-            &lines,
-            "entry module of installed smudgy://local/arctic-prompt"
-        ),
-        "a genuine code import of an installed local producer MUST still trip the stumble notice; \
+        !lines.iter().any(|l| l.contains("[interop]")),
+        "a genuine code import of an installed local producer loads without a session notice; \
          transcript:\n{lines:#?}"
     );
 }
@@ -334,13 +331,6 @@ async fn installed_package_helper_subpath_does_not_trip_the_stumble_notice() {
     assert!(
         has_line(&lines, "PROMPT_ENTRY_RAN") && has_line(&lines, "HELPER_VALUE:42"),
         "the installed entry and imported helper must both run; transcript:\n{lines:#?}"
-    );
-    assert!(
-        !has_line(
-            &lines,
-            "code-imported the entry module of installed smudgy://local/arctic-prompt"
-        ),
-        "a helper subpath must not be mistaken for a duplicate entry load; transcript:\n{lines:#?}"
     );
 }
 
@@ -393,10 +383,8 @@ async fn code_imported_handle_exports_are_scrubbed_to_a_link_failure() {
         "the failure is V8's link error, not a mystery; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(&lines, "interop \u{2014} import them from")
-            || has_line(&lines, "handle exports were removed")
-            || has_line(&lines, "smudgy:state/local/arctic-prompt"),
-        "the scrub notice names the scheme-import fix; transcript:\n{lines:#?}"
+        !lines.iter().any(|l| l.contains("[interop]")),
+        "the link error stands alone; no interop notice is echoed; transcript:\n{lines:#?}"
     );
 }
 
@@ -441,8 +429,8 @@ async fn code_import_of_non_handle_exports_survives_the_scrub() {
         "non-handle exports survive the scrub; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(&lines, "handle exports were removed"),
-        "the scrub notice teaches the scheme imports; transcript:\n{lines:#?}"
+        !lines.iter().any(|l| l.contains("[interop]")),
+        "the scrub is silent in the session; transcript:\n{lines:#?}"
     );
 }
 
@@ -450,7 +438,7 @@ async fn code_import_of_non_handle_exports_survives_the_scrub() {
 /// a user module's code import hands out live producer handles. The accepted interop.md §1
 /// residual — warned, so the attribution is never a surprise.
 #[tokio::test]
-async fn user_code_import_of_trusted_handle_package_warns() {
+async fn user_code_import_of_trusted_handle_package_is_silent() {
     let server = "lo_user_import";
     prepare_server(server);
 
@@ -484,8 +472,8 @@ async fn user_code_import_of_trusted_handle_package_warns() {
         "the home load serves the LIVE producer handle to user code; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(&lines, "publish AS the package"),
-        "the attribution warning fires once; transcript:\n{lines:#?}"
+        !lines.iter().any(|l| l.contains("[interop]")),
+        "no attribution warning is echoed; transcript:\n{lines:#?}"
     );
 }
 
@@ -850,11 +838,8 @@ async fn a_deferred_dynamic_import_is_caught_at_write_not_by_the_load_stumble() 
         "a dynamic import after the load graph settles must NOT trip the load-time stumble; transcript:\n{lines:#?}"
     );
     assert!(
-        has_line(
-            &lines,
-            "[interop] smudgy://local/arctic-prompt: state write ignored"
-        ),
-        "the copy's non-home write must be refused at write time with the teaching diagnostic; transcript:\n{lines:#?}"
+        !lines.iter().any(|l| l.contains("[interop]")),
+        "the copy's non-home write is refused in the log only, never echoed; transcript:\n{lines:#?}"
     );
 }
 
