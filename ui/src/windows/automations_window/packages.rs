@@ -548,9 +548,10 @@ pub struct InstallResolution {
     /// A required root or its manifest could not be resolved. `requires` is mandatory, so this is
     /// a blocking error rather than a best-effort omission.
     pub required_unavailable: Option<String>,
-    /// Exact durable package state used to build this resolution. Consent is valid only while
-    /// both snapshots still match; otherwise local shadows, activation, and dependency edges may
-    /// no longer be the ones the user reviewed.
+    /// Durable package state this resolution was built from. Consent stays valid while the rows
+    /// the plan writes or relies on, the rows governing their leaves, and the local manifest set
+    /// still match (`SharedPackageLock::plan_rows_match`); otherwise local shadows, activation,
+    /// or requirement rows may no longer be the ones the user reviewed.
     pub expected_lock: SharedPackageLock,
     pub expected_local_manifests: HashMap<String, PackageManifest>,
 }
@@ -804,6 +805,15 @@ pub(super) fn human_size(bytes: u64) -> String {
     // `bytes % div < div`, so `(bytes % div) * 10 < div * 10 <= 10 MiB * 10` — no overflow.
     let tenth = (bytes % div) * 10 / div;
     format!("{}.{} {}", bytes / div, tenth, unit)
+}
+
+/// The rows a consent plan writes or relies on: the chosen root and every required root, whether
+/// or not the latter is already satisfied. These are the rows a grant re-validates against the
+/// lock before committing.
+fn plan_specifiers(root: &str, required_roots: &[RequiredRoot]) -> Vec<String> {
+    std::iter::once(root.to_string())
+        .chain(required_roots.iter().map(|root| root.specifier.clone()))
+        .collect()
 }
 
 /// Reads every local package manifest as one complete shadow-resolution snapshot. A listed folder
@@ -3923,6 +3933,7 @@ impl AutomationsWindow {
                 if let Err(error) = self.validate_consent_snapshot(
                     &resolution.expected_lock,
                     &resolution.expected_local_manifests,
+                    &plan_specifiers(&resolution.specifier, &resolution.required_roots),
                 ) {
                     self.manage_feedback = Some(error);
                     return Update::with_task(Task::batch([
@@ -5070,6 +5081,7 @@ impl AutomationsWindow {
                 if let Err(error) = self.validate_consent_snapshot(
                     &prompt.expected_lock,
                     &prompt.expected_local_manifests,
+                    &plan_specifiers(&prompt.specifier, &prompt.required_roots),
                 ) {
                     if let Some(draft) = self.manifest_draft.as_mut() {
                         draft.error = Some(error);
@@ -6669,9 +6681,11 @@ impl AutomationsWindow {
         self.consent_busy = false;
         match result {
             Ok(res) => {
-                if let Err(error) = self
-                    .validate_consent_snapshot(&res.expected_lock, &res.expected_local_manifests)
-                {
+                if let Err(error) = self.validate_consent_snapshot(
+                    &res.expected_lock,
+                    &res.expected_local_manifests,
+                    &plan_specifiers(&res.specifier, &res.required_roots),
+                ) {
                     self.discover_error = Some(error);
                     return Update::with_task(Task::batch([
                         Task::done(Message::LoadLocalPackages),
@@ -6711,11 +6725,12 @@ impl AutomationsWindow {
     /// resolution first. No lock state changes until [`Self::consent_cache_prepared`] receives a
     /// complete cache-authority set for the still-current prompt.
     pub(super) fn consent_grant(&mut self, enable: bool) -> Update<Message, Event> {
-        let Some((expected_lock, expected_local_manifests, prompt_account_fence)) =
+        let Some((expected_lock, expected_local_manifests, plan, prompt_account_fence)) =
             self.consent_prompt.as_ref().map(|prompt| {
                 (
                     prompt.expected_lock.clone(),
                     prompt.expected_local_manifests.clone(),
+                    plan_specifiers(&prompt.specifier, &prompt.required_roots),
                     prompt.account_fence,
                 )
             })
@@ -6729,7 +6744,7 @@ impl AutomationsWindow {
             return Update::none();
         }
         if let Err(error) =
-            self.validate_consent_snapshot(&expected_lock, &expected_local_manifests)
+            self.validate_consent_snapshot(&expected_lock, &expected_local_manifests, &plan)
         {
             if let Some(prompt) = self.consent_prompt.as_mut() {
                 prompt.error = Some(error);
@@ -6841,11 +6856,12 @@ impl AutomationsWindow {
         enable: bool,
         cache: PreparedConsentCache,
     ) -> Update<Message, Event> {
-        let Some((expected_lock, expected_local_manifests, account_fence)) =
+        let Some((expected_lock, expected_local_manifests, plan, account_fence)) =
             self.consent_prompt.as_ref().map(|prompt| {
                 (
                     prompt.expected_lock.clone(),
                     prompt.expected_local_manifests.clone(),
+                    plan_specifiers(&prompt.specifier, &prompt.required_roots),
                     prompt.account_fence,
                 )
             })
@@ -6857,7 +6873,7 @@ impl AutomationsWindow {
             return Update::none();
         }
         if let Err(error) =
-            self.validate_consent_snapshot(&expected_lock, &expected_local_manifests)
+            self.validate_consent_snapshot(&expected_lock, &expected_local_manifests, &plan)
         {
             if let Some(prompt) = self.consent_prompt.as_mut() {
                 prompt.error = Some(error);
@@ -7697,17 +7713,23 @@ impl AutomationsWindow {
         Ok((lock, local_manifests))
     }
 
-    /// Revalidates the exact lock and local-manifest authority used to prepare a consent card.
-    /// This runs both when Grant starts and after asynchronous cache preparation, so a prompt
-    /// cannot approve a package plan whose activation, dependency graph, or local shadow changed
-    /// while it was open.
+    /// Revalidates the package authority a consent card was prepared from: every row the plan
+    /// writes or relies on, the row governing each of their leaves, and the local manifest set
+    /// (`SharedPackageLock::plan_rows_match`). This runs when the card is built, when Grant
+    /// starts, and after asynchronous cache preparation, so a prompt cannot approve a plan whose
+    /// rows, activation, or local shadow changed while it was open. The engine stamping a
+    /// resolution or audio use on some other package — or on a plan row — is not such a change,
+    /// and never sends the user back to review a plan that did not move.
     fn validate_consent_snapshot(
         &mut self,
         expected_lock: &SharedPackageLock,
         expected_local_manifests: &HashMap<String, PackageManifest>,
+        plan_specifiers: &[String],
     ) -> Result<(), String> {
         let (current_lock, current_local_manifests) = self.load_consent_resolution_state()?;
-        if &current_lock != expected_lock || &current_local_manifests != expected_local_manifests {
+        if !current_lock.plan_rows_match(expected_lock, plan_specifiers.iter().map(String::as_str))
+            || &current_local_manifests != expected_local_manifests
+        {
             return Err(crate::i18n::t!("package-install-plan-changed"));
         }
         Ok(())

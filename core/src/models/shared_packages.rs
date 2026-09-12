@@ -243,6 +243,25 @@ impl LockedPackage {
         self.activation = Some(activation);
     }
 
+    /// Everything a reviewed plan can depend on: identity, update policy, staged version, trust,
+    /// consent, activation, parameter scope, and install provenance. Runtime observations — the
+    /// integrity stamp, audio use, a dismissed offer — and requirement links are excluded: the
+    /// engine, the update checker, and the dependency-graph refresh write those at will, and none
+    /// of them changes what a user reviewed.
+    fn reviewed_state(&self) -> impl PartialEq + '_ {
+        (
+            &self.specifier,
+            &self.mode,
+            self.staged_version(),
+            self.trusted,
+            &self.consented_permissions,
+            self.enabled,
+            &self.activation,
+            &self.parameter_scope,
+            self.installed_as_requirement,
+        )
+    }
+
     /// Whether this row still has independent activation intent.
     ///
     /// A legacy automatic row with no persisted lineage keeps its old behavior until a current
@@ -353,6 +372,36 @@ impl SharedPackageLock {
     pub fn governing_specifier(&self, specifier: &str) -> Option<&str> {
         self.governing_package(specifier, true)
             .map(|package| package.specifier.as_str())
+    }
+
+    /// Whether every row a reviewed plan writes or relies on still reads as it did in `expected`,
+    /// and the same row still governs each of those leaves. Rows outside the plan are free to
+    /// move, and so are the runtime observations on rows inside it (a resolution stamp, audio
+    /// use, a dismissed offer, another root's links). A row absent from both locks counts as
+    /// unchanged.
+    ///
+    /// This is the consent commit's compare-and-swap: it refuses a grant only when something the
+    /// user reviewed — a plan row's identity, policy, staged version, trust, consent, activation,
+    /// or which row governs its leaf — moved while the consent window was open.
+    #[must_use]
+    pub fn plan_rows_match<'a>(
+        &self,
+        expected: &Self,
+        plan_specifiers: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let same_row =
+            |mine: Option<&LockedPackage>, theirs: Option<&LockedPackage>| match (mine, theirs) {
+                (None, None) => true,
+                (Some(mine), Some(theirs)) => mine.reviewed_state() == theirs.reviewed_state(),
+                _ => false,
+            };
+        plan_specifiers.into_iter().all(|specifier| {
+            same_row(self.find(specifier), expected.find(specifier))
+                && same_row(
+                    self.governing_package(specifier, true),
+                    expected.governing_package(specifier, true),
+                )
+        })
     }
 
     /// Whether a package is a direct active root or is required by one for this profile.
@@ -869,8 +918,10 @@ pub fn install_package_with_activation_if_unchanged(
 /// Newly materialized required roots start in Auto mode with no direct activation and are marked
 /// as automatically installed. Their effective activation follows active `required_by` roots.
 ///
-/// Returns `false` when another writer changed package state and nothing was written; callers
-/// must resolve and present the plan again.
+/// Returns `false` when another writer changed a row the plan writes or relies on, or the row
+/// governing its leaf, and nothing was written; callers must resolve and present the plan again.
+/// Rows outside the plan, and runtime observations on rows inside it, never block the commit
+/// ([`SharedPackageLock::plan_rows_match`]).
 ///
 /// # Errors
 /// Returns an error for an invalid or contradictory plan, a missing row marked satisfied, or a
@@ -892,7 +943,11 @@ pub fn install_package_with_requirements_if_unchanged(
     validate_required_install_plan(root_specifier, required)?;
 
     mutate_lock(server_name, |lock| {
-        if expected_lock != lock {
+        if !lock.plan_rows_match(
+            expected_lock,
+            std::iter::once(root_specifier)
+                .chain(required.iter().map(|item| item.specifier.as_str())),
+        ) {
             return Ok((false, false));
         }
         validate_satisfied_required_rows(lock, required)?;
@@ -1870,8 +1925,9 @@ pub fn commit_local_manifest(
 }
 
 /// Accepts a local manifest and the complete required-package relationship state that was
-/// resolved from it, only while the manifest and the complete package lock still match the
-/// editor's snapshots.
+/// resolved from it, only while the manifest, the rows the plan writes or relies on, and the
+/// rows governing their leaves still match the editor's snapshots
+/// ([`SharedPackageLock::plan_rows_match`]).
 ///
 /// # Errors
 /// Returns an error for an invalid identity or plan, missing/stale package rows, or a failed
@@ -1930,7 +1986,17 @@ fn commit_local_manifest_inner(
 
     let dir = server_dir(server_name)?;
     let mut lock = load_lock_in(&dir)?;
-    if expected_lock.is_some_and(|expected| expected != &lock) {
+    if let Some(expected) = expected_lock
+        && !lock.plan_rows_match(
+            expected,
+            std::iter::once(root_specifier).chain(
+                required
+                    .into_iter()
+                    .flatten()
+                    .map(|item| item.specifier.as_str()),
+            ),
+        )
+    {
         return Ok(LocalManifestCommit::StateChanged);
     }
     let matching_roots = lock
@@ -3660,26 +3726,110 @@ mod tests {
             Some("2.0.0")
         );
 
-        // A stale snapshot commits nothing.
+        // A snapshot that predates the plan's own rows commits nothing.
         assert!(
             !install_package_with_requirements_if_unchanged(
                 &server,
                 &expected,
+                "smudgy://a/root",
+                "2.1.0",
+                &PackagePermissions::default(),
+                UpdateMode::Auto,
+                ProfileActivation::All,
+                &required,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            load_lock(&server)
+                .unwrap()
+                .find("smudgy://a/root")
+                .unwrap()
+                .staged_version(),
+            Some("2.0.0")
+        );
+    }
+
+    #[test]
+    fn consent_commit_ignores_rows_and_stamps_outside_the_plan() {
+        let server = test_server("plan-rows");
+        install_package(&server, "smudgy://a/root", UpdateMode::Auto, true).unwrap();
+        let install_other = |expected: &SharedPackageLock, version: &str| {
+            install_package_with_requirements_if_unchanged(
+                &server,
+                expected,
                 "smudgy://a/other",
-                "1.0.0",
+                version,
                 &PackagePermissions::default(),
                 UpdateMode::Auto,
                 ProfileActivation::All,
                 &[],
             )
             .unwrap()
-        );
-        assert!(
+        };
+        let staged_other = || {
             load_lock(&server)
                 .unwrap()
                 .find("smudgy://a/other")
-                .is_none()
+                .and_then(|package| package.staged_version().map(str::to_string))
+        };
+
+        // While a consent window for `a/other` is open, the engine stamps a resolution and audio
+        // use on the running `a/root` and a graph refresh links it from another root. None of
+        // that is what the user reviewed.
+        let snapshot = load_lock(&server).unwrap();
+        mutate_lock(&server, |lock| {
+            let root = lock.find_mut("smudgy://a/root").unwrap();
+            root.integrity = Some("stamped".into());
+            root.audio_used = true;
+            root.required_by.insert("smudgy://z/parent".into());
+            root.requirement_lineage_known = true;
+            Ok(((), true))
+        })
+        .unwrap();
+        assert!(
+            install_other(&snapshot, "1.0.0"),
+            "rows outside the plan never block the commit"
         );
+        assert_eq!(staged_other().as_deref(), Some("1.0.0"));
+
+        // Observations on the plan row itself are just as free to move.
+        let snapshot = load_lock(&server).unwrap();
+        mutate_lock(&server, |lock| {
+            let other = lock.find_mut("smudgy://a/other").unwrap();
+            other.integrity = Some("stamped".into());
+            other.audio_used = true;
+            other.dismissed_update_version = Some("9.0.0".into());
+            Ok(((), true))
+        })
+        .unwrap();
+        assert!(
+            install_other(&snapshot, "1.1.0"),
+            "runtime stamps on the plan row never block the commit"
+        );
+        assert_eq!(staged_other().as_deref(), Some("1.1.0"));
+
+        // A reviewed field on the plan row does block it: nothing is written.
+        let snapshot = load_lock(&server).unwrap();
+        set_activation(&server, "smudgy://a/other", ProfileActivation::None).unwrap();
+        assert!(
+            !install_other(&snapshot, "1.2.0"),
+            "a concurrent activation change refuses the commit"
+        );
+        assert_eq!(staged_other().as_deref(), Some("1.1.0"));
+
+        // So does a new row contending for the plan row's leaf.
+        let snapshot = load_lock(&server).unwrap();
+        mutate_lock(&server, |lock| {
+            lock.upsert(LockedPackage::new("smudgy://b/other", UpdateMode::Auto));
+            Ok(((), true))
+        })
+        .unwrap();
+        assert!(
+            !install_other(&snapshot, "1.2.0"),
+            "a same-leaf row refuses the commit"
+        );
+        assert_eq!(staged_other().as_deref(), Some("1.1.0"));
     }
 
     #[test]
