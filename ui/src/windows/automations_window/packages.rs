@@ -3055,6 +3055,19 @@ impl AutomationsWindow {
 // ============================================================================
 
 impl AutomationsWindow {
+    /// Land on one package's parameters, for a request made outside this window (a session's
+    /// "Configure it now." link). A local override opens its author view instead, so the tab is
+    /// chosen from the pane the open actually produced rather than from the specifier's shape.
+    pub(super) fn focus_package_settings(&mut self, specifier: &str) -> Update<Message, Event> {
+        let update = self.open_installed_package(specifier.to_string());
+        if matches!(self.pane, Pane::OwnedPackage) {
+            self.local_package_tab = LocalPackageTab::Settings;
+        } else {
+            self.installed_package_tab = InstalledPackageTab::Settings;
+        }
+        update
+    }
+
     pub(super) fn open_installed_package(&mut self, specifier: String) -> Update<Message, Event> {
         if let Some(local_name) = self.local_override_name(&specifier).map(str::to_string) {
             return self.open_owned_package(local_name);

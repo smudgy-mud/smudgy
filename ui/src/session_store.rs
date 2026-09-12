@@ -688,9 +688,10 @@ pub enum Message {
     /// A terminal link activation, published by the widget and handled only
     /// after its immutable scrollback borrow has been released.
     LinkActivated(LinkClickEvent),
-    /// A client-row link asked for the settings window. Bubbled: the daemon
-    /// owns windows, so it intercepts this and opens (or focuses) settings.
-    OpenSettings,
+    /// A client-row link asked for a package's parameters, by installed
+    /// specifier. Bubbled: the daemon owns windows, so it intercepts this and
+    /// opens (or re-targets) the Automations window on that package.
+    ConfigurePackage(Arc<str>),
     /// Global settings changed: apply the scrollback limit and re-bake span
     /// styles here, and forward the runtime-relevant pieces to the session.
     ApplySettings(Settings),
@@ -2106,7 +2107,9 @@ impl ManagedSession {
             }
             // The client's own rows act inside the client: no send, no script.
             LinkAction::App(AppLink::Connect) => return Task::done(Message::Reconnect),
-            LinkAction::App(AppLink::OpenSettings) => return Task::done(Message::OpenSettings),
+            LinkAction::App(AppLink::ConfigurePackage(specifier)) => {
+                return Task::done(Message::ConfigurePackage(specifier));
+            }
             LinkAction::ServerSend(command) => {
                 if self.server_config.borrow().allows_server_link(None) {
                     self.note_visibility_input();
@@ -2590,7 +2593,7 @@ impl ManagedSession {
             Message::OpenAudioPanel => Task::none(),
             Message::LinkActivated(event) => self.handle_link_activation(event),
             // Answered by the daemon, which owns windows.
-            Message::OpenSettings => Task::none(),
+            Message::ConfigurePackage(_) => Task::none(),
             Message::PaneInput(key, input_msg) => {
                 // Deliberately not `input_for_mut`: a `PaneInput` message is
                 // minted only for pane-hosted inputs, so `main` must stay a

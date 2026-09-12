@@ -157,6 +157,12 @@ pub enum Event {
         server_name: Arc<String>,
         session_id: SessionId,
     },
+    /// A session row's "Configure it now." link: open the Automations window
+    /// on this session and land it on the package's parameters.
+    ConfigurePackage {
+        session_id: SessionId,
+        specifier: Arc<str>,
+    },
     CreateNewMapEditorWindow {
         mapper: Mapper,
         /// The originating session's server entry — the scope context the map
@@ -3129,6 +3135,15 @@ impl SmudgyWindow {
                     session_store::Message::OpenAudioPanel => {
                         Update::new(Task::none(), Some(Event::OpenAudioPanel))
                     }
+                    // A client row's "Configure it now." link. Windows are the
+                    // daemon's, so bubble the request up rather than handing it
+                    // to the session, which owns none.
+                    session_store::Message::ConfigurePackage(specifier) => {
+                        Update::with_event(Event::ConfigurePackage {
+                            session_id,
+                            specifier,
+                        })
+                    }
                     session_store::Message::SetMapperCurrentLocation(area_id, room_number) => {
                         // Keep the session's own map widgets in step, and bubble
                         // up for the standalone map editor windows.
@@ -4177,6 +4192,32 @@ mod tests {
 
     fn test_window() -> SmudgyWindow {
         SmudgyWindow::new(window::Id::unique(), crate::cloud_account::test_handles())
+    }
+
+    /// The "Configure it now." link on an unconfigured-package row resolves,
+    /// through the session's own update, to `ConfigurePackage`. Panes have no
+    /// window of their own, so the request only reaches the Automations window
+    /// if this handler bubbles it — with the clicked package intact.
+    #[test]
+    fn session_configure_link_requests_the_package_it_names() {
+        let mut window = test_window();
+        let mut sessions = SessionStore::new(crate::cloud_account::test_handles());
+        let update = window.update(
+            Message::SessionPaneUserAction {
+                session_id: SessionId::from(7),
+                msg: session_store::Message::ConfigurePackage("smudgy://kapusniak/comms".into()),
+            },
+            &mut sessions,
+        );
+        let Some(Event::ConfigurePackage {
+            session_id,
+            specifier,
+        }) = update.event
+        else {
+            panic!("the configure link must bubble out of the pane");
+        };
+        assert_eq!(session_id, SessionId::from(7));
+        assert_eq!(&*specifier, "smudgy://kapusniak/comms");
     }
 
     #[cfg(feature = "web-audio-cpal")]

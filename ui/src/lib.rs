@@ -26,7 +26,9 @@ use smudgy_core::session::ui_command::{
 use smudgy_core::session::{SessionEvent, SessionId, TaggedSessionEvent};
 
 // Core session imports
-use windows::automations_window::{AutomationsWindow, Event as AutomationsWindowEvent};
+use windows::automations_window::{
+    AutomationsWindow, Event as AutomationsWindowEvent, Focus as AutomationsFocus,
+};
 use windows::settings_window::{self, Event as SettingsWindowEvent, SettingsWindow};
 use windows::smudgy_window::SmudgyWindow;
 
@@ -130,6 +132,9 @@ struct AutomationsContext {
     server_name: String,
     session_id: SessionId,
     profile_name: String,
+    /// Where the request that asked for this context wants the window to land, once its initial
+    /// loads have run. `None` is the ordinary open, which keeps the window's own default view.
+    focus: Option<AutomationsFocus>,
 }
 
 /// An Automations native window whose asynchronous `window::open` completion has not registered
@@ -546,6 +551,8 @@ enum Message {
         /// Captured with the originating session request. Do not look it up again after this
         /// queued message runs: the session may have closed or changed in the meantime.
         profile_name: String,
+        /// Where the requesting click wants the window to land (a package's parameters, say).
+        focus: Option<AutomationsFocus>,
     },
     MapEditorWindowMessage(window::Id, windows::map_editor_window::Message),
     NewMapEditorWindow {
@@ -3212,7 +3219,7 @@ fn install_automations_context(
         context.session_id,
         context.profile_name,
     );
-    let task = window.init();
+    let task = window.init_with_focus(context.focus);
     smudgy.automations_window = Some((id, window));
     Some(task.map(move |message| Message::AutomationsWindowMessage {
         id,
@@ -3784,6 +3791,22 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     // request. Closing the last main window must first honor Automations guards.
                     update_body(smudgy, Message::RequestCloseWindow(id)),
                 ]),
+                Some(SmudgyWindowEvent::ConfigurePackage {
+                    session_id,
+                    specifier,
+                }) => {
+                    // A session row's "Configure it now.": the package's parameters live in the
+                    // Automations window, on this session's own profile.
+                    let open = smudgy.sessions.get(session_id).map(|session| {
+                        Task::done(Message::CreateAutomationsWindow {
+                            server_name: Arc::new(session.server_name.clone()),
+                            session_id,
+                            profile_name: session.profile_name.clone(),
+                            focus: Some(AutomationsFocus::PackageSettings(specifier)),
+                        })
+                    });
+                    Task::batch([Some(task), open].into_iter().flatten())
+                }
                 Some(SmudgyWindowEvent::CreateNewScriptEditorWindow {
                     server_name,
                     session_id,
@@ -3793,6 +3816,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                             server_name,
                             session_id,
                             profile_name: session.profile_name.clone(),
+                            focus: None,
                         })
                     });
                     Task::batch([Some(task), open].into_iter().flatten())
@@ -4053,6 +4077,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                                 server_name: Arc::new(server_name.clone()),
                                 session_id,
                                 profile_name: session.profile_name.clone(),
+                                focus: None,
                             })
                         });
                     match open {
@@ -4590,18 +4615,31 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 } else {
                     (Task::none(), Task::none())
                 };
-            // A client-row link in the session asked for settings; windows
-            // are the daemon's, so it answers here.
-            let open_settings = if matches!(msg, session_store::Message::OpenSettings) {
-                Task::done(Message::CreateSettingsWindow)
-            } else {
-                Task::none()
+            // A client-row link in the session asked for a package's parameters; windows are
+            // the daemon's, so it answers here. (A click inside a pane arrives as the hosting
+            // window's `ConfigurePackage` event instead; this is the store-routed path.)
+            let configure = match &msg {
+                session_store::Message::ConfigurePackage(specifier) => {
+                    let specifier = specifier.clone();
+                    smudgy
+                        .sessions
+                        .get(session_id)
+                        .map_or_else(Task::none, |session| {
+                            Task::done(Message::CreateAutomationsWindow {
+                                server_name: Arc::new(session.server_name.clone()),
+                                session_id,
+                                profile_name: session.profile_name.clone(),
+                                focus: Some(AutomationsFocus::PackageSettings(specifier)),
+                            })
+                        })
+                }
+                _ => Task::none(),
             };
             if let Some(session) = smudgy.sessions.get_mut(session_id) {
                 let session_task = session
                     .update(msg)
                     .map(move |msg| Message::SessionAction(session_id, msg));
-                Task::batch([session_task, editor_fan_out, bind_task, open_settings])
+                Task::batch([session_task, editor_fan_out, bind_task, configure])
             } else {
                 log::debug!("Dropping action for closed session {session_id}");
                 Task::none()
@@ -4790,12 +4828,14 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     server_name,
                     session_id,
                     profile_name,
+                    focus,
                 }) => {
                     let old_context_task = update.task;
                     let requested = AutomationsContext {
                         server_name,
                         session_id,
                         profile_name,
+                        focus,
                     };
                     let Some(init) = install_automations_context(smudgy, id, requested.clone())
                     else {
@@ -4844,11 +4884,13 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             server_name,
             session_id,
             profile_name,
+            focus,
         } => {
             let requested = AutomationsContext {
                 server_name: server_name.to_string(),
                 session_id,
                 profile_name,
+                focus,
             };
             let last_main_is_closing = all_main_windows_are_closing(
                 smudgy.smudgy_windows.keys().copied(),
@@ -4878,7 +4920,21 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 let id = *id;
                 if window.session_id() == session_id {
                     window.cancel_pending_context_switch();
-                    return window::gain_focus(id);
+                    // The window is already on the requested context, so its loads have run:
+                    // the navigation goes straight in, with no guard to clear.
+                    let generation = smudgy.automations_context_generation;
+                    let navigate = requested.focus.map(|focus| {
+                        Task::done(Message::AutomationsWindowMessage {
+                            id,
+                            generation,
+                            message: windows::automations_window::Message::Focus(focus),
+                        })
+                    });
+                    return Task::batch(
+                        [Some(window::gain_focus(id)), navigate]
+                            .into_iter()
+                            .flatten(),
+                    );
                 }
                 // The window runs its unsaved-changes guard and answers with
                 // `Event::SwitchContext`, which rebuilds it for the requested session.
@@ -4892,6 +4948,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                             server_name: requested.server_name,
                             session_id: requested.session_id,
                             profile_name: requested.profile_name,
+                            focus: requested.focus,
                         },
                     }),
                 ]);
@@ -7937,6 +7994,7 @@ mod tests {
             server_name: "Arctic".to_string(),
             session_id: SessionId::from(7),
             profile_name: "main".to_string(),
+            focus: None,
         };
         let mut opening = Some(OpeningAutomationsWindow {
             id: current_id,
@@ -7962,6 +8020,7 @@ mod tests {
                 server_name: "Arctic".to_string(),
                 session_id: SessionId::from(7),
                 profile_name: "main".to_string(),
+                focus: None,
             },
         });
 

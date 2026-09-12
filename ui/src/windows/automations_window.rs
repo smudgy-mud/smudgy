@@ -157,6 +157,15 @@ fn matcher_hsv_hex(hsv: smudgy_core::models::matchers::MatcherHsv) -> String {
 /// Convenience alias for this window's themed elements.
 pub(crate) type Elem<'a> = ThemedElement<'a, Message>;
 
+/// Where a request that opens (or re-targets) the window asks it to land. Carried from the click
+/// that made the request, so a guarded context switch still arrives at what the user clicked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Focus {
+    /// A package's parameters, by installed specifier — the unconfigured-package notice's
+    /// "Configure it now.".
+    PackageSettings(Arc<str>),
+}
+
 /// Events bubbled up to the daemon when persisted runtime inputs change.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -172,6 +181,8 @@ pub enum Event {
         server_name: String,
         session_id: SessionId,
         profile_name: String,
+        /// Where the request that triggered the switch wants the rebuilt window to land.
+        focus: Option<Focus>,
     },
     /// The user chose Keep editing for this exact daemon-requested context switch.
     ContextSwitchCancelled,
@@ -423,7 +434,11 @@ pub enum Message {
         server_name: String,
         session_id: SessionId,
         profile_name: String,
+        focus: Option<Focus>,
     },
+    /// Navigate to what an out-of-window request asked for, once this context's initial loads
+    /// have landed.
+    Focus(Focus),
     // ---- loading -----------------------------------------------------------
     ScriptsLoaded {
         scripts: BTreeMap<String, Script>,
@@ -1653,6 +1668,16 @@ impl AutomationsWindow {
         }
     }
 
+    /// The initial loads, followed by whatever navigation the request that opened this context
+    /// asked for. The focus is *chained* so it resolves against loaded package state rather than
+    /// the empty lists this state starts with.
+    pub fn init_with_focus(&self, focus: Option<Focus>) -> Task<Message> {
+        match focus {
+            Some(focus) => self.init().chain(Task::done(Message::Focus(focus))),
+            None => self.init(),
+        }
+    }
+
     pub fn init(&self) -> Task<Message> {
         Task::batch([
             Task::done(self.load_scripts_message()),
@@ -1857,11 +1882,16 @@ impl AutomationsWindow {
                 server_name,
                 session_id,
                 profile_name,
+                focus,
             } => Update::with_event(Event::SwitchContext {
                 server_name,
                 session_id,
                 profile_name,
+                focus,
             }),
+            Message::Focus(Focus::PackageSettings(specifier)) => {
+                self.focus_package_settings(&specifier)
+            }
             // -------- loading ----------------------------------------------
             Message::AccountChanged => self.account_changed(),
             Message::ScriptsLoaded {
@@ -4008,10 +4038,12 @@ impl AutomationsWindow {
                 server_name,
                 session_id,
                 profile_name,
+                focus,
             } => Update::with_event(Event::SwitchContext {
                 server_name,
                 session_id,
                 profile_name,
+                focus,
             }),
             Message::RequestClose => Update::with_event(Event::CloseRequested),
             // Definition results are state-fenced and can become stale while this confirmation is
@@ -5688,6 +5720,7 @@ mod tab_traversal_tests {
             server_name: "other-server".to_string(),
             session_id: SessionId::from(42),
             profile_name: "other-profile".to_string(),
+            focus: Some(Focus::PackageSettings("smudgy://owner/package".into())),
         }
     }
 
@@ -5701,6 +5734,30 @@ mod tab_traversal_tests {
         window.update(Message::CancelDiscardNavRevision(
             window.pending_nav_revision,
         ))
+    }
+
+    /// The session notice's "Configure it now." arrives here as a focus. It must select the
+    /// package it names and open the tab its parameters live on — an installed package the
+    /// window has no lockfile row for included, since the focus can precede the first load.
+    #[test]
+    fn package_focus_opens_that_package_on_its_settings_tab() {
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            "source-server".to_string(),
+            crate::cloud_account::test_handles(),
+            SessionId::from(1),
+        );
+
+        let _ = window.update(Message::Focus(Focus::PackageSettings(
+            "smudgy://kapusniak/comms".into(),
+        )));
+
+        assert!(matches!(window.pane, Pane::InstalledPackage));
+        assert_eq!(
+            window.selection,
+            Selection::InstalledPackage("smudgy://kapusniak/comms".to_string())
+        );
+        assert_eq!(window.installed_package_tab, InstalledPackageTab::Settings);
     }
 
     #[test]
@@ -5720,9 +5777,11 @@ mod tab_traversal_tests {
                 server_name,
                 session_id,
                 profile_name,
+                focus,
             }) if server_name == "other-server"
                 && session_id == SessionId::from(42)
                 && profile_name == "other-profile"
+                && focus == Some(Focus::PackageSettings("smudgy://owner/package".into()))
         ));
         assert!(window.pending_nav.is_none());
     }
@@ -5819,7 +5878,11 @@ mod tab_traversal_tests {
         ));
 
         let confirmed = confirm_pending(&mut window);
-        assert!(matches!(confirmed.event, Some(Event::SwitchContext { .. })));
+        assert!(matches!(
+            confirmed.event,
+            Some(Event::SwitchContext { focus, .. })
+                if focus == Some(Focus::PackageSettings("smudgy://owner/package".into())),
+        ));
         assert!(window.pending_nav.is_none());
         assert!(window.has_unsaved_changes());
     }
@@ -5865,6 +5928,7 @@ mod tab_traversal_tests {
             server_name: "newest-server".to_string(),
             session_id: SessionId::from(99),
             profile_name: "newest-profile".to_string(),
+            focus: None,
         });
         assert_ne!(window.pending_nav_revision, stale_revision);
 
