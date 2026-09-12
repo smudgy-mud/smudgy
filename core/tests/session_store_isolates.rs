@@ -138,7 +138,7 @@ async fn run_session(
 
 fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
     for update in updates {
-        if let BufferUpdate::Append(line) = update {
+        if let Some(line) = update.main_text() {
             lines.push(line.text.clone());
         }
     }

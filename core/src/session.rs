@@ -9,6 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 use styled_line::StyledLine;
+use system_row::SystemRow;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
@@ -25,6 +26,7 @@ pub mod connection;
 pub mod registry;
 pub mod runtime;
 pub mod styled_line;
+pub mod system_row;
 pub mod ui_command;
 
 #[derive(From, Into, Display, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Add)]
@@ -403,6 +405,38 @@ pub enum BufferUpdate {
     /// addressed by [`runtime::pane::MAIN_PANE_KEY`]. Line numbering
     /// continues from where it was — clearing never resets parity.
     Clear(PaneKey),
+    /// One whole main-buffer row in the client's own voice (see
+    /// [`system_row`]). Counts as exactly one committed line; the row's
+    /// projection is the line every text consumer sees. Never a fragment:
+    /// producers commit any open tail row first.
+    AppendSystem(Arc<SystemRow>),
+    /// Replace the system row appended under the same id — an in-progress
+    /// notice finishing in place. The row keeps its line number; the ledger,
+    /// the log and the terminal all swap the projection. A row no longer
+    /// held (scrolled out, cleared) is appended instead, so the finished
+    /// text is never lost.
+    ReplaceSystem(Arc<SystemRow>),
+}
+
+impl BufferUpdate {
+    /// The text this update adds to the main buffer, if any: an appended
+    /// fragment, or a system row's whole projection (on append and on its
+    /// finishing replacement alike). Replacement-of-open-line and pane
+    /// deliveries are not main-buffer additions and read as `None`.
+    #[must_use]
+    pub fn main_text(&self) -> Option<&Arc<StyledLine>> {
+        match self {
+            Self::Append(line) => Some(line),
+            Self::AppendSystem(row) | Self::ReplaceSystem(row) => Some(&row.line),
+            Self::BeginOpenLineReplacement
+            | Self::FinishOpenLineReplacement(_)
+            | Self::EnsureNewLine
+            | Self::PromptBoundary
+            | Self::AppendTo(..)
+            | Self::RetractOpenLine
+            | Self::Clear(_) => None,
+        }
+    }
 }
 
 pub fn spawn(params: Arc<SessionParams>) -> impl Stream<Item = TaggedSessionEvent> {
@@ -551,9 +585,9 @@ fn try_spawn_inner(
 
     if let Err(e) = ui_tx.try_send(TaggedSessionEvent {
         session_id: params.session_id,
-        event: SessionEvent::UpdateBuffer(Arc::new(vec![BufferUpdate::Append(Arc::new(
-            StyledLine::from_echo_str("Loading session..."),
-        ))])),
+        event: SessionEvent::UpdateBuffer(Arc::new(vec![BufferUpdate::AppendSystem(
+            SystemRow::loading_session(),
+        )])),
     }) {
         error!("Failed to send initial buffer update: {e:?}");
     }

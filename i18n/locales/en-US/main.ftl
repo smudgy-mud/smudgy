@@ -1980,16 +1980,25 @@ map-this-map = This map
 map-unknown = Unknown map
 manifest-host-example = e.g. aardwolf.org
 
-# Session runtime feedback
-runtime-loading-session = Loading session...
-runtime-reloading-scripts = Reloading scripts...
+# Session runtime feedback. These rows are spoken in the client's own voice
+# (system rows: a purple gutter bar, the application font, chips for names).
+runtime-loading-session = Loading session…
+runtime-session-rule = { $profile } on { $server }
+runtime-reloading-scripts = Reloading scripts…
+runtime-loading-packages = Loading packages…
+# One row gains a clause per kind of thing as it finishes loading.
+runtime-loaded-packages-clause = Loaded { $count } packages (in { $milliseconds }ms)
+runtime-loaded-modules-clause = { $count } script modules (in { $milliseconds }ms)
+runtime-loaded-maps-clause = { $count } map areas (in { $milliseconds }ms)
+runtime-loaded-maps-shared = ({ $owned } owned, { $shared } shared)
+runtime-nothing-loaded = Nothing to load
+# One rule cycles through the connection's states on a single row.
+runtime-opened-offline = Opened offline · Connect
+runtime-connecting-to = Connecting to { $host }…
+runtime-connected-to = Connected to { $host }
+runtime-connection-failed = Connection failed: { $error }
+runtime-connection-abandoned = Disconnected
 runtime-send-error = Send error: { $error }
-runtime-loading-maps = Loading maps...
-runtime-no-maps = No maps to load.
-runtime-map-loaded = Loaded { $total } map area in { $milliseconds }ms.
-runtime-maps-loaded = Loaded { $total } map areas in { $milliseconds }ms.
-runtime-map-loaded-with-shared = Loaded { $total } map area ({ $owned } owned, { $shared } shared) in { $milliseconds }ms.
-runtime-maps-loaded-with-shared = Loaded { $total } map areas ({ $owned } owned, { $shared } shared) in { $milliseconds }ms.
 runtime-maps-auth-required = Maps are unavailable. Sign in or create a Smudgy account to use this feature.
 runtime-maps-load-failed = Failed to load maps: { $error }
 runtime-error = Error in runtime: { $error }
@@ -2003,7 +2012,7 @@ runtime-call-javascript-function-error = Error calling JavaScript function: { $e
 runtime-add-script-error = Error adding script: { $error }
 runtime-gmcp-goodbye = GMCP: the server says goodbye.
 runtime-gmcp-goodbye-reason = GMCP: the server says goodbye: { $reason }
-runtime-package-required-params-missing = [package] { $name } not loaded: required param(s) { $params } are unset — configure them in settings
+runtime-package-required-params-missing = { $name } hasn't been configured yet. Configure it now.
 runtime-package-not-loaded-reason = [package] { $name } not loaded — { $reason }.
 runtime-package-not-loaded-error = [package] { $name } not loaded — { $error }
 runtime-packages-modules-load-failed = [packages] failed to load modules — { $error }
@@ -2013,10 +2022,7 @@ runtime-package-sandbox-build-failed = [package] { $name } failed to build its p
 runtime-package-isolate-start-failed = [package] { $name } failed to start its isolate — { $error }
 runtime-package-load-failed = [package] { $name } failed to load — { $error }
 runtime-package-no-backend = [package] { $name } not loaded: no package backend for this session
-runtime-script-module-loaded = Loaded { $count } script module.
-runtime-script-modules-loaded = Loaded { $count } script modules.
-runtime-package-loaded = Loaded { $count } package: { $packages }.
-runtime-packages-loaded = Loaded { $count } packages: { $packages }.
+
 runtime-package-updated = [package] { $name } updated { $from } → { $to }
 runtime-package-duplicate-versions = [package] warning: { $name } loaded at { $count } coexisting versions ({ $versions }) — side effects may collide; consider forking or pinning
 package-version-floor-invalid = { $package } declares an unusable min_smudgy_version ("{ $version }" is not a semver version); the package needs a corrected release

@@ -15,6 +15,7 @@ use crate::models::aliases::AliasDefinition;
 use crate::models::hotkeys::HotkeyDefinition;
 use crate::models::triggers::TriggerDefinition;
 use crate::session::styled_line::StyledLine;
+use crate::session::system_row::SystemRow;
 use crate::session::{HotkeyId, SessionId};
 
 use super::captures::CapturePayload;
@@ -253,6 +254,22 @@ pub enum RuntimeAction {
         firing: FiringContext,
     },
     Echo(Arc<String>),
+    /// The session opened without connecting. Puts the connection rule into
+    /// its offline state — one row that later becomes `Connecting to …` and
+    /// then `Connected to …` rather than three separate lines.
+    OpenedOffline,
+    /// The transport never came up. Finishes the connection rule with the
+    /// reason (a refused port, a TLS handshake failure) in place of the
+    /// `Connecting to …` state it is showing.
+    ConnectionFailed(Arc<String>),
+    /// The user disconnected before the transport came up. Finishes the
+    /// connection rule; no `Connected`/`Disconnected` pair ever fired.
+    ConnectionAbandoned,
+    /// Echo one row in the client's own voice (`system_row`): a notice, rule
+    /// or group. Takes the counted whole-row path — any open main line is
+    /// committed first — and rides the same coalesced delivery as
+    /// [`RuntimeAction::Echo`].
+    EchoSystem(Arc<SystemRow>),
     /// A Command alias matched its first word but a required argument was
     /// missing (D10's third outcome): echo the usage line locally and mark the
     /// input captured, so nothing reaches the MUD and no script runs. Not a

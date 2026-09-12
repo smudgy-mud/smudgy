@@ -174,6 +174,13 @@ async fn pane_routing_matrix_parity_and_registry_semantics() {
                 for update in updates.iter() {
                     match update {
                         BufferUpdate::Append(line) => seen.push(Seen::Append(line.text.clone())),
+                        // A client-authored row is one whole main row; its finishing
+                        // replacement lands on the same row and adds none.
+                        BufferUpdate::AppendSystem(row) => {
+                            seen.push(Seen::Append(row.line.text.clone()));
+                            seen.push(Seen::EnsureNewLine);
+                        }
+                        BufferUpdate::ReplaceSystem(_) => {}
                         BufferUpdate::EnsureNewLine => seen.push(Seen::EnsureNewLine),
                         BufferUpdate::AppendTo(key, line) => {
                             seen.push(Seen::AppendTo(*key, line.text.clone()));
@@ -725,6 +732,13 @@ async fn redirect_to_widgets_throws_and_echo_before_close_delivers() {
                 for update in updates.iter() {
                     match update {
                         BufferUpdate::Append(line) => seen.push(Seen::Append(line.text.clone())),
+                        // A client-authored row is one whole main row; its finishing
+                        // replacement lands on the same row and adds none.
+                        BufferUpdate::AppendSystem(row) => {
+                            seen.push(Seen::Append(row.line.text.clone()));
+                            seen.push(Seen::EnsureNewLine);
+                        }
+                        BufferUpdate::ReplaceSystem(_) => {}
                         BufferUpdate::EnsureNewLine => seen.push(Seen::EnsureNewLine),
                         BufferUpdate::AppendTo(key, line) => {
                             seen.push(Seen::AppendTo(*key, line.text.clone()));

@@ -1217,11 +1217,8 @@ impl Connection {
             let (write_to_socket_tx, mut write_to_socket_rx) =
                 tokio::sync::mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
 
-            runtime_tx
-                .send(RuntimeAction::Echo(Arc::new(format!(
-                    "Connecting to {addr}..."
-                ))))
-                .ok();
+            // The session's connection rule already says this on screen (it
+            // is the row the user clicked Connect on); this side only logs.
             info!("Connecting to {addr}...");
 
             // Set once the transport is up: selects the full teardown
@@ -1252,9 +1249,8 @@ impl Connection {
                     };
                 match connect_result {
                     Ok(mut stream) => {
-                        runtime_tx
-                            .send(RuntimeAction::Echo(Arc::new("Connected.".to_string())))
-                            .ok();
+                        // `RuntimeAction::Connected` below advances the session's
+                        // connection rule to "Connected to …"; this side only logs.
                         info!("Connected");
 
                         {
@@ -1748,9 +1744,7 @@ impl Connection {
                         // (self-signed / expired / name mismatch) gives no other hint, and the
                         // policy is never a silent fallback to plaintext.
                         runtime_tx
-                            .send(RuntimeAction::Echo(Arc::new(format!(
-                                "Connection failed: {err}"
-                            ))))
+                            .send(RuntimeAction::ConnectionFailed(Arc::new(format!("{err}"))))
                             .map_err(|_| {
                                 warn!("Error notifying runtime of connection failure; ignoring");
                             })
@@ -1806,9 +1800,9 @@ impl Connection {
                 // attempt is abandoned with an echo alone. `Connected` (and
                 // `sys:connect`) never fired, so no `Disconnected` unwind —
                 // the runtime's connect/disconnect events stay strictly paired.
-                runtime_tx
-                    .send(RuntimeAction::Echo(Arc::new("Disconnected.".to_string())))
-                    .ok();
+                // The rule reports it, so the abandoned attempt reads as one
+                // row rather than a bare line under "Connecting to …".
+                runtime_tx.send(RuntimeAction::ConnectionAbandoned).ok();
             }
             trace!("Connection cleaning up");
             clear_socket_sender(&socket_tx);

@@ -56,7 +56,7 @@ fn session_params(session_id: u32, server: &str) -> Arc<SessionParams> {
 
 fn collect_lines(updates: &[BufferUpdate], lines: &mut Vec<String>) {
     for update in updates {
-        if let BufferUpdate::Append(line) = update {
+        if let Some(line) = update.main_text() {
             lines.push(line.text.clone());
         }
     }
@@ -1486,7 +1486,7 @@ input.completion.add("keep");
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("[package] wordbomb failed to load")),
+            .any(|l| l.starts_with("package wordbomb failed to load")),
         "the load failure surfaced; transcript:\n{lines:#?}"
     );
 

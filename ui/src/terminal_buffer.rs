@@ -6,6 +6,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     num::NonZeroUsize,
+    ops::Range,
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -17,6 +18,7 @@ use smudgy_core::session::styled_line::{
     Blink, Color, LinkAction, LinkColor, LinkDecoration, LinkSpan, LinkStyle, LinkTextStyle,
     LinkTooltip, LinkVisibility, LinkVisibilityAction, Style, StyledLine, Underline,
 };
+use smudgy_core::session::system_row::{Severity, SystemRow, SystemRowId};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[doc(hidden)]
@@ -1488,6 +1490,11 @@ pub struct BufferLine {
     /// the pane actually lays out are baked. Cleared — not eagerly rebaked —
     /// on palette changes and line edits.
     spans: std::cell::OnceCell<Rc<Vec<Span<'static, SpanMetadata>>>>,
+    /// Set when this row is one the client authored (see
+    /// `smudgy_core::session::system_row`). `styled_line` is then the row's
+    /// text projection — still what selection, search and copy read — and the
+    /// pane draws the row from this instead of the baked `spans`.
+    pub system: Option<Arc<SystemRow>>,
 }
 
 /// One case-insensitive text match in the terminal's absolute line/column
@@ -1510,6 +1517,17 @@ impl From<Arc<StyledLine>> for BufferLine {
         Self {
             spans: std::cell::OnceCell::new(),
             styled_line,
+            system: None,
+        }
+    }
+}
+
+impl From<Arc<SystemRow>> for BufferLine {
+    fn from(row: Arc<SystemRow>) -> Self {
+        Self {
+            spans: std::cell::OnceCell::new(),
+            styled_line: row.line.clone(),
+            system: Some(row),
         }
     }
 }
@@ -1571,6 +1589,9 @@ pub struct TerminalBuffer {
     /// return replacement. It survives UI batch boundaries and unrelated
     /// trigger output until the matching finish update arrives.
     open_line_replacement: Option<DetachedLinks>,
+    /// Line number of every system row this buffer still holds, so a
+    /// replacement lands on the same row. Mirrors core's ledger.
+    system_rows: HashMap<SystemRowId, usize>,
 }
 
 impl Default for TerminalBuffer {
@@ -1616,6 +1637,7 @@ impl TerminalBuffer {
             link_navigation_reset_epoch: 0,
             link_state: Rc::new(RefCell::new(BufferLinkState::new(protocol_state))),
             open_line_replacement: None,
+            system_rows: HashMap::new(),
         }
     }
 
@@ -1678,7 +1700,65 @@ impl TerminalBuffer {
         let line_number = self.last_line_number - self.lines.len() + 1;
         if let Some(line) = self.lines.pop_front() {
             self.note_removed(line_number, &line);
+            if let Some(row) = &line.system {
+                self.system_rows.remove(&row.id);
+            }
         }
+    }
+
+    /// Append one row in the client's own voice as a whole committed line.
+    /// Never a fragment: an open tail row is closed first — core's ledger
+    /// closes it the same way — so numbering stays in step.
+    pub fn append_system_row(&mut self, row: Arc<SystemRow>) {
+        self.line_terminated = true;
+        while self.lines.len() > (self.max_lines.get() - 1) {
+            self.evict_front();
+        }
+        self.last_line_number += 1;
+        self.system_rows.insert(row.id, self.last_line_number);
+        let line: BufferLine = row.into();
+        self.note_added(self.last_line_number, &line);
+        self.lines.push_back(line);
+    }
+
+    /// Update a system row in place: same line number, new projection. A row
+    /// this buffer no longer holds (scrolled out, cleared) is **dropped** —
+    /// re-appending a stale "Loading…" result below unrelated output would be
+    /// worse than losing it, and because a replacement never consumes a line
+    /// number, core's ledger and this buffer stay in step whichever of them
+    /// still holds the row.
+    pub fn replace_system_row(&mut self, row: Arc<SystemRow>) {
+        let Some(line_number) = self.system_rows.get(&row.id).copied() else {
+            return;
+        };
+        let offset = self.last_line_number - self.lines.len();
+        let index = line_number
+            .checked_sub(offset + 1)
+            .filter(|index| *index < self.lines.len())
+            .filter(|index| {
+                self.lines[*index]
+                    .system
+                    .as_ref()
+                    .is_some_and(|held| held.id == row.id)
+            });
+        let Some(index) = index else {
+            self.system_rows.remove(&row.id);
+            return;
+        };
+        let had_links = !self.lines[index].styled_line.links.is_empty();
+        let replacement: BufferLine = row.into();
+        let has_links = !replacement.styled_line.links.is_empty();
+        match (had_links, has_links) {
+            (false, true) => self.lines_with_links += 1,
+            (true, false) => self.lines_with_links -= 1,
+            _ => {}
+        }
+        if had_links || has_links {
+            self.link_state
+                .borrow_mut()
+                .replace_line(line_number, Some(&replacement.styled_line));
+        }
+        self.lines[index] = replacement;
     }
 
     /// Changes the scrollback limit, trimming the oldest lines if the buffer
@@ -2329,7 +2409,204 @@ impl TerminalBuffer {
         self.lines.clear();
         self.lines_with_links = 0;
         self.line_terminated = true;
+        self.system_rows.clear();
     }
+}
+
+/// The face system rows are set in: the application's own proportional
+/// font, so the client visibly speaks in a different voice from the game.
+pub(crate) const SYSTEM_FONT: iced::Font = crate::assets::fonts::GEIST_VF;
+
+/// Smudgy's own purple, in the two values that keep it legible: the lighter
+/// one for text on a dark ground, the deeper one on a light ground. The
+/// client speaks in its brand colour rather than borrowing the scheme's echo
+/// role, so its rows read as the app talking whatever palette the terminal
+/// wears.
+const SYSTEM_PURPLE_ON_DARK: iced::Color = iced::Color::from_rgb(0.686, 0.596, 0.980);
+const SYSTEM_PURPLE_ON_LIGHT: iced::Color = iced::Color::from_rgb(0.357, 0.169, 0.788);
+
+/// The colour a system row of `severity` is drawn in. Warnings keep the
+/// scheme's warn role: a warning must look like a warning, not like chrome.
+pub(crate) fn system_color(prefs: &TerminalPrefs, severity: Severity) -> iced::Color {
+    match severity {
+        Severity::Info => {
+            let background = prefs.palette.background;
+            // Rec. 601 luma is enough to tell a dark ground from a light one.
+            let luma = 0.299 * background.r + 0.587 * background.g + 0.114 * background.b;
+            if luma > 0.5 {
+                SYSTEM_PURPLE_ON_LIGHT
+            } else {
+                SYSTEM_PURPLE_ON_DARK
+            }
+        }
+        Severity::Warn => prefs.palette.warn,
+    }
+}
+
+/// Bake one system row for the pane: its projection in the system voice, and
+/// — for an unfolded group — each child on its own line below. The children
+/// are display-only, so the offsets map every rendered position past the
+/// summary back to the summary's end: selection, copy and links never reach
+/// into them.
+///
+/// Returns the spans beside the **span-index range of each chip**. A chip's
+/// pill is drawn by the pane as one quad over those spans' bounds rather than
+/// as a per-span highlight: a chip spans two spans whenever it carries a
+/// muted detail (a version), and two highlights would meet in a seam of
+/// doubled borders instead of reading as one pill.
+pub(crate) fn system_rendered_spans(
+    row: &SystemRow,
+    expanded: bool,
+    prefs: &TerminalPrefs,
+) -> (RenderedSpans, Vec<Range<usize>>) {
+    let mut spans = Vec::new();
+    let mut chip_spans = Vec::new();
+    push_system_line(
+        &mut spans,
+        &mut chip_spans,
+        &row.line,
+        &row.chips,
+        row.severity,
+        prefs,
+    );
+    let summary_len = row.line.text.len();
+    let children = if expanded { row.children() } else { &[] };
+    for child in children {
+        spans.push(Span::new("\n    ").font(SYSTEM_FONT));
+        push_system_line(
+            &mut spans,
+            &mut chip_spans,
+            &child.line,
+            &child.chips,
+            child.severity,
+            prefs,
+        );
+    }
+    let offsets = if children.is_empty() {
+        RenderedOffsets::Identity
+    } else {
+        RenderedOffsets::Mapped {
+            identity_prefix: summary_len,
+            source: Rc::from([summary_len]),
+            rendered: Rc::from([summary_len]),
+        }
+    };
+    (
+        RenderedSpans {
+            spans: Rc::new(spans),
+            offsets,
+        },
+        chip_spans,
+    )
+}
+
+/// Split `line` at every style, chip and link boundary and push one system
+/// span per segment, recording the span-index range of each chip.
+fn push_system_line(
+    spans: &mut Vec<Span<'static, Link>>,
+    chip_spans: &mut Vec<Range<usize>>,
+    line: &StyledLine,
+    chips: &[Range<usize>],
+    severity: Severity,
+    prefs: &TerminalPrefs,
+) {
+    let base = system_color(prefs, severity);
+    let text = line.text.as_str();
+    let mut bounds =
+        Vec::with_capacity(2 + 2 * (line.spans.len() + chips.len() + line.links.len()));
+    bounds.push(0);
+    bounds.push(text.len());
+    for span in &line.spans {
+        bounds.push(span.begin_pos);
+        bounds.push(span.end_pos);
+    }
+    for chip in chips {
+        bounds.push(chip.start);
+        bounds.push(chip.end);
+    }
+    for link in &line.links {
+        bounds.push(link.begin_pos);
+        bounds.push(link.end_pos);
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    // The span index at which the chip now being walked started; a change of
+    // chip (or its end) closes the range.
+    let mut open_chip: Option<(usize, usize)> = None;
+    for window in bounds.windows(2) {
+        let (begin, end) = (window[0], window[1]);
+        if begin >= end
+            || end > text.len()
+            || !text.is_char_boundary(begin)
+            || !text.is_char_boundary(end)
+        {
+            continue;
+        }
+        let style = line
+            .spans
+            .iter()
+            .find(|span| span.begin_pos <= begin && end <= span.end_pos)
+            .map_or(Style::DEFAULT, |span| span.style);
+        let chip = chips
+            .iter()
+            .position(|chip| chip.start <= begin && end <= chip.end);
+        if open_chip.map(|(index, _)| index) != chip {
+            if let Some((_, first)) = open_chip.take() {
+                chip_spans.push(first..spans.len());
+            }
+            if let Some(index) = chip {
+                open_chip = Some((index, spans.len()));
+            }
+        }
+        let linked = line
+            .links
+            .iter()
+            .any(|link| link.begin_pos <= begin && end <= link.end_pos);
+        spans.push(system_span(
+            &text[begin..end],
+            style,
+            chip.is_some(),
+            linked,
+            base,
+        ));
+    }
+    if let Some((_, first)) = open_chip {
+        chip_spans.push(first..spans.len());
+    }
+}
+
+/// One segment of a system row. Body text is slightly dimmed; emphasis,
+/// chips and links carry the full colour; faint runs (versions, timings)
+/// recede further. A chip's pill is drawn by the pane, not here.
+fn system_span(
+    text: &str,
+    style: Style,
+    chip: bool,
+    linked: bool,
+    base: iced::Color,
+) -> Span<'static, Link> {
+    let mut font = SYSTEM_FONT;
+    if style.attributes.bold {
+        font.weight = iced::font::Weight::Bold;
+    }
+    if style.attributes.italic {
+        font.style = iced::font::Style::Italic;
+    }
+    let mut color = base;
+    if style.attributes.faint {
+        color.a *= 0.6;
+    } else if !style.attributes.bold && !linked && !chip {
+        color.a *= 0.85;
+    }
+    let mut span = Span::new(text.to_owned()).font(font).color(color);
+    if linked {
+        span = span.link(SpanMetadata {
+            underline: LinkDecoration::Solid,
+            decoration_color: Some(base),
+            ..SpanMetadata::default()
+        });
+    }
+    span
 }
 
 /// Lowercase a string a grapheme at a time into `folded`, retaining each
@@ -2384,6 +2661,193 @@ mod tests {
     // Helper to create Arc<StyledLine> for tests
     fn sl(s: &str) -> Arc<StyledLine> {
         Arc::new(StyledLine::new(s, Vec::<VtSpan>::new()))
+    }
+
+    mod system_rows {
+        use super::*;
+        use smudgy_core::session::styled_line::AppLink;
+        use smudgy_core::session::system_row::{Progress, SystemText};
+
+        fn texts(buffer: &TerminalBuffer) -> Vec<String> {
+            let mut lines: Vec<_> = buffer
+                .iter_rev_with_line_number(None)
+                .map(|(_, line)| line.styled_line.text.clone())
+                .collect();
+            lines.reverse();
+            lines
+        }
+
+        #[test]
+        fn a_system_row_closes_the_open_line_and_takes_one_number() {
+            let mut buffer = TerminalBuffer::new();
+            buffer.extend_line(sl("open partial"));
+            buffer.append_system_row(SystemRow::notice(
+                10,
+                Progress::Done,
+                SystemText::new(Severity::Info).text("Loading maps…"),
+            ));
+            assert_eq!(buffer.last_line_number(), 2);
+            assert_eq!(texts(&buffer), vec!["open partial", "Loading maps…"]);
+            // The next fragment starts a fresh line rather than gluing onto the row.
+            buffer.extend_line(sl("server"));
+            assert_eq!(buffer.last_line_number(), 3);
+            assert!(
+                buffer
+                    .iter_rev_with_line_number(None)
+                    .next()
+                    .unwrap()
+                    .1
+                    .system
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn a_row_is_replaced_in_place_however_often_it_changes() {
+            let mut buffer = TerminalBuffer::new();
+            buffer.append_system_row(SystemRow::notice(
+                11,
+                Progress::Pending,
+                SystemText::new(Severity::Info).text("Loading maps…"),
+            ));
+            buffer.extend_line(sl("later"));
+            buffer.commit_current_line();
+            buffer.replace_system_row(SystemRow::notice(
+                11,
+                Progress::Done,
+                SystemText::new(Severity::Info).text("Loaded 3 map areas"),
+            ));
+            assert_eq!(buffer.last_line_number(), 2);
+            assert_eq!(texts(&buffer), vec!["Loaded 3 map areas", "later"]);
+            let (number, line) = buffer.iter_rev_with_line_number(None).nth(1).unwrap();
+            assert_eq!(number, 1);
+            assert!(line.system.as_ref().is_some_and(|row| !row.is_pending()));
+
+            // A finished row stays addressable — the connection rule cycles
+            // through its states on one row — and never takes a new number.
+            buffer.replace_system_row(SystemRow::rule(
+                11,
+                Progress::Done,
+                SystemText::new(Severity::Info).text("Connected"),
+            ));
+            assert_eq!(buffer.last_line_number(), 2);
+            assert_eq!(texts(&buffer), vec!["Connected", "later"]);
+        }
+
+        #[test]
+        fn replacing_a_row_keeps_link_accounting_straight() {
+            let mut buffer = TerminalBuffer::new();
+            buffer.append_system_row(SystemRow::notice(
+                12,
+                Progress::Pending,
+                SystemText::new(Severity::Info).text("Loading…"),
+            ));
+            assert!(!buffer.has_links());
+            buffer.replace_system_row(SystemRow::rule(
+                12,
+                Progress::Done,
+                SystemText::new(Severity::Info)
+                    .text("Offline · ")
+                    .link("Connect", LinkAction::App(AppLink::Connect)),
+            ));
+            assert!(buffer.has_links());
+            assert!(buffer.link_span_at(1, 12).is_some());
+            buffer.clear_lines();
+            assert!(!buffer.has_links());
+        }
+
+        #[test]
+        fn an_evicted_rows_update_is_dropped_rather_than_re_appended() {
+            let mut buffer = TerminalBuffer::new_with_max_lines(NonZeroUsize::new(2).unwrap());
+            buffer.append_system_row(SystemRow::notice(
+                13,
+                Progress::Pending,
+                SystemText::new(Severity::Info).text("Loading…"),
+            ));
+            buffer.push_line(sl("a"));
+            buffer.push_line(sl("b"));
+            buffer.replace_system_row(SystemRow::notice(
+                13,
+                Progress::Done,
+                SystemText::new(Severity::Info).text("Loaded"),
+            ));
+            // The row scrolled away; its result does not reappear at the
+            // bottom, and no line number was consumed.
+            assert_eq!(texts(&buffer), vec!["a", "b"]);
+            assert_eq!(buffer.last_line_number(), 3);
+        }
+
+        #[test]
+        fn a_cleared_row_cannot_be_replaced() {
+            let mut buffer = TerminalBuffer::new();
+            buffer.append_system_row(SystemRow::notice(
+                14,
+                Progress::Pending,
+                SystemText::new(Severity::Info).text("Loading…"),
+            ));
+            buffer.clear_lines();
+            buffer.replace_system_row(SystemRow::notice(
+                14,
+                Progress::Done,
+                SystemText::new(Severity::Info).text("Loaded"),
+            ));
+            assert!(texts(&buffer).is_empty());
+        }
+
+        #[test]
+        fn system_spans_map_children_back_to_the_summary_end() {
+            let prefs = crate::prefs::current();
+            let row = SystemRow::group(
+                14,
+                Progress::Done,
+                SystemText::new(Severity::Info)
+                    .text("Loaded ")
+                    .strong("2 packages"),
+                vec![
+                    SystemText::new(Severity::Info)
+                        .chip("a", Some("@1"))
+                        .into_child(),
+                    SystemText::new(Severity::Info).chip("b", None).into_child(),
+                ],
+            );
+            let (collapsed, collapsed_chips) = system_rendered_spans(&row, false, &prefs);
+            let collapsed_text: String = collapsed.spans.iter().map(|s| s.text.as_ref()).collect();
+            assert_eq!(collapsed_text, "Loaded 2 packages");
+            assert!(matches!(collapsed.offsets, RenderedOffsets::Identity));
+            assert!(collapsed_chips.is_empty());
+
+            let (expanded, expanded_chips) = system_rendered_spans(&row, true, &prefs);
+            let expanded_text: String = expanded.spans.iter().map(|s| s.text.as_ref()).collect();
+            assert_eq!(expanded_text, "Loaded 2 packages\n    a@1\n    b");
+            let summary_len = "Loaded 2 packages".len();
+            assert_eq!(expanded.offsets.rendered_to_source(3), 3);
+            assert_eq!(
+                expanded.offsets.rendered_to_source(summary_len + 7),
+                summary_len
+            );
+            assert_eq!(
+                expanded.offsets.source_to_rendered(summary_len),
+                summary_len
+            );
+            // One chip per child, and the name+version chip is ONE range over
+            // its two spans — the pane draws a single pill over both.
+            assert_eq!(expanded_chips.len(), 2);
+            let chip_text = |range: &std::ops::Range<usize>| -> String {
+                expanded.spans[range.clone()]
+                    .iter()
+                    .map(|s| s.text.as_ref())
+                    .collect()
+            };
+            assert_eq!(chip_text(&expanded_chips[0]), "a@1");
+            assert_eq!(expanded_chips[0].len(), 2);
+            assert_eq!(chip_text(&expanded_chips[1]), "b");
+            // Nothing carries a per-span highlight; emphasis is bold.
+            assert!(expanded.spans.iter().all(|s| s.highlight.is_none()));
+            assert!(collapsed.spans.iter().any(|s| {
+                s.text == "2 packages"
+                    && s.font.is_some_and(|f| f.weight == iced::font::Weight::Bold)
+            }));
+        }
     }
 
     #[test]

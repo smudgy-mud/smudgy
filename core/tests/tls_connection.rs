@@ -88,6 +88,12 @@ fn drain(
             Ok(RuntimeAction::HandleIncomingLine(line)) => lines.push(line.text.clone()),
             Ok(RuntimeAction::HandleIncomingPartialLine(line)) => lines.push(line.text.clone()),
             Ok(RuntimeAction::Echo(text)) => echoes.push(text.to_string()),
+            // The connect failure reaches the session as its own action now,
+            // so the connection rule can report it in place of "Connecting
+            // to …" rather than as a loose echo under it.
+            Ok(RuntimeAction::ConnectionFailed(error)) => {
+                echoes.push(format!("Connection failed: {error}"));
+            }
             Ok(_) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
         }

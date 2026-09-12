@@ -41,7 +41,8 @@ use crate::{
             script_engine::ops::SharedCallState,
             trigger::{AliasSender, Manager, MatchCapture, SharedAutomationRegistry},
         },
-        styled_line::StyledLine,
+        styled_line::{AppLink, LinkAction, StyledLine},
+        system_row::{Progress, Severity, SystemRow, SystemText, next_system_row_id},
         ui_command::{PaneCommand, UiCommand, UiCommandProducer},
     },
 };
@@ -131,6 +132,20 @@ impl FunctionId {
     pub const fn from_raw(id: usize) -> Self {
         Self(id)
     }
+}
+
+/// What one engine build loaded, for the session's load row. The two
+/// durations are the phases that produced them: the main isolate's module
+/// graph (the local script modules, and any trusted package riding in main),
+/// and the sandboxed package isolates.
+#[derive(Debug, Clone, Default)]
+pub struct LoadSummary {
+    /// Each loaded package as `(name, resolved version)`.
+    pub packages: Vec<(String, Option<String>)>,
+    /// How many local script-module files loaded.
+    pub modules: usize,
+    pub packages_elapsed: std::time::Duration,
+    pub modules_elapsed: std::time::Duration,
 }
 
 pub struct ScriptEngineParams<'a> {
@@ -645,6 +660,8 @@ pub struct ScriptEngine<'a> {
     ui_tx: Sender<TaggedSessionEvent>,
     #[allow(dead_code)]
     mapper: Option<Mapper>,
+    /// What this build loaded; the runtime reads it for the session's load row.
+    load_summary: LoadSummary,
     /// Unique lifecycle authority for every Web Audio extension in this exact engine
     /// generation. The runtime consumes it before reload teardown so the replacement cannot
     /// contend with a still-draining predecessor for application host permits.
@@ -1178,21 +1195,31 @@ impl<'a> ScriptEngine<'a> {
         emitted_line_count: &std::rc::Weak<Cell<usize>>,
         message: &str,
     ) {
-        let mut updates = Vec::new();
         for line in message.split('\n') {
-            updates.push(BufferUpdate::Append(Arc::new(StyledLine::from_echo_str(
-                line,
-            ))));
-            updates.push(BufferUpdate::EnsureNewLine);
-            if let Some(count) = emitted_line_count.upgrade() {
-                count.set(count.get() + 1);
-            }
+            Self::emit_session_row(
+                ui_tx,
+                session_id,
+                emitted_line_count,
+                BufferUpdate::AppendSystem(SystemRow::plain_notice(Severity::Warn, line)),
+            );
         }
-        let mut ui_tx = ui_tx.clone();
-        let _ = ui_tx.try_send(TaggedSessionEvent {
-            session_id,
-            event: SessionEvent::UpdateBuffer(Arc::new(updates)),
-        });
+    }
+
+    /// One system-row update straight to the UI, outside the runtime's row
+    /// ledger — engine construction runs before (and during) the ledger's
+    /// existence. See [`super::emit_system_row_direct`].
+    fn emit_session_row(
+        ui_tx: &Sender<TaggedSessionEvent>,
+        session_id: SessionId,
+        emitted_line_count: &std::rc::Weak<Cell<usize>>,
+        update: BufferUpdate,
+    ) {
+        super::emit_system_row_direct(ui_tx, session_id, emitted_line_count, update);
+    }
+
+    /// What this engine build loaded, for the session's load row.
+    pub(crate) fn load_summary(&self) -> &LoadSummary {
+        &self.load_summary
     }
 
     /// Required-param load-gate for one isolate's installs, run over the params the last
@@ -1230,16 +1257,28 @@ impl<'a> ScriptEngine<'a> {
                 }
             };
             if let (false, Ok(spec)) = (missing.is_empty(), SmudgySpecifier::parse(&specifier)) {
-                Self::emit_session_notice(
+                // Which parameters are missing is a detail for the log; on
+                // screen the package simply isn't set up yet, and the remedy
+                // is one click away.
+                warn!(
+                    "[package] {} not loaded for profile {profile_name}: required param(s) {} are unset",
+                    spec.name,
+                    missing.join(", ")
+                );
+                Self::emit_session_row(
                     ui_tx,
                     session_id,
                     emitted_line_count,
-                    &format!(
-                        "[package] {} not loaded for profile {}: required param(s) {} are unset \u{2014} configure them in settings",
-                        spec.name,
-                        profile_name,
-                        missing.join(", ")
-                    ),
+                    BufferUpdate::AppendSystem(SystemRow::notice(
+                        next_system_row_id(),
+                        Progress::Done,
+                        SystemText::new(Severity::Warn)
+                            .chip("package", None)
+                            .text(" ")
+                            .strong(&spec.name)
+                            .text(" hasn't been configured yet. ")
+                            .link("Configure it now.", LinkAction::App(AppLink::OpenSettings)),
+                    )),
                 );
                 // The gate reads the package's state row (`smudgy://local/<name>` for a local
                 // package) while the root list names the canonical owner; block by the
@@ -1719,7 +1758,12 @@ impl<'a> ScriptEngine<'a> {
         // failure surfaces its own cause line above and leaves both tallies at zero, so the
         // per-line emission below prints nothing misleading when nothing actually loaded.
         let mut local_count = 0usize;
-        let mut package_lines: Vec<String> = Vec::new();
+        let mut package_lines: Vec<(String, Option<String>)> = Vec::new();
+        // Timed separately so the load row can say how long each kind of
+        // thing took. The split is by phase, not by module: a trusted package
+        // loads inside the main graph and so counts toward that phase.
+        let mut modules_elapsed = std::time::Duration::ZERO;
+        let mut packages_elapsed = std::time::Duration::ZERO;
         let mut isolates: HashMap<IsolateId, Isolate> = HashMap::new();
         // The concrete forked provider for each sandboxed isolate, held so its per-isolate
         // auto-update + duplicate-version notices can be drained after all loads (cloud only).
@@ -1784,6 +1828,7 @@ impl<'a> ScriptEngine<'a> {
             );
             crate::session::registry::set_inspector_address(params.session_id, addr);
         }
+        let main_load_started = std::time::Instant::now();
         let main_load = {
             // Model B: bracket the v8 work — `load_modules` evaluates JS, so main must be the
             // thread's current isolate while it loads, then released.
@@ -1792,6 +1837,7 @@ impl<'a> ScriptEngine<'a> {
                 .tokio_runtime
                 .block_on(async { main_runtime.load_modules(&main_set).await })
         };
+        modules_elapsed += main_load_started.elapsed();
         match main_load {
             Ok(report) => {
                 info!(
@@ -2206,6 +2252,7 @@ impl<'a> ScriptEngine<'a> {
                     local_modules: Vec::new(),
                     packages: vec![runtime_key.to_user_specifier()],
                 };
+                let package_load_started = std::time::Instant::now();
                 let load = {
                     // Model B: this sandboxed isolate is the current one while its single
                     // synthetic entry evaluates, then released.
@@ -2214,6 +2261,7 @@ impl<'a> ScriptEngine<'a> {
                         .tokio_runtime
                         .block_on(async { runtime.load_modules(&set).await })
                 };
+                packages_elapsed += package_load_started.elapsed();
                 match load {
                     Ok(report) => {
                         fold_load_report(&report, &mut local_count, &mut package_lines);
@@ -2428,36 +2476,17 @@ impl<'a> ScriptEngine<'a> {
             }
         }
 
-        // Confirm what auto-loaded across all isolates, so the user sees their modules +
-        // installed packages took effect. Modules and packages are different things, so they get
-        // separate lines, and a zero count of either is noise the user shouldn't read — each line
-        // appears only when it has something to report. A clean profile with neither prints
-        // nothing; a main-load failure (which surfaces its own cause line above) leaves both
-        // counts at zero here, so nothing falsely claims a clean empty profile.
-        if local_count > 0 {
-            Self::emit_session_notice(
-                &params.ui_tx,
-                params.session_id,
-                &params.emitted_line_count,
-                &format!(
-                    "Loaded {local_count} script module{}.",
-                    if local_count == 1 { "" } else { "s" }
-                ),
-            );
-        }
-        if !package_lines.is_empty() {
-            Self::emit_session_notice(
-                &params.ui_tx,
-                params.session_id,
-                &params.emitted_line_count,
-                &format!(
-                    "Loaded {} package{}: {}.",
-                    package_lines.len(),
-                    if package_lines.len() == 1 { "" } else { "s" },
-                    package_lines.join(", ")
-                ),
-            );
-        }
+        // What auto-loaded across all isolates goes back to the runtime, which
+        // owns the session's one load row: the counts here become its package
+        // and script-module clauses, and the packages its chips. Warnings
+        // raised along the way are rows of their own, so a collapsed summary
+        // never hides one.
+        let load_summary = LoadSummary {
+            packages: package_lines,
+            modules: local_count,
+            packages_elapsed,
+            modules_elapsed,
+        };
         // Auto-update + duplicate-version notices are cloud-provider-only and PER-ISOLATE: main
         // and each sandboxed isolate solved its own closure, so draining each provider in turn means
         // the duplicate-version warning is an INTRA-isolate collision only — a cross-isolate
@@ -2470,11 +2499,14 @@ impl<'a> ScriptEngine<'a> {
                 for (specifier, from, to) in provider.take_version_changes() {
                     let name = SmudgySpecifier::parse(&specifier)
                         .map_or_else(|_| specifier.clone(), |spec| spec.name);
-                    Self::emit_session_notice(
+                    Self::emit_session_row(
                         &params.ui_tx,
                         params.session_id,
                         &params.emitted_line_count,
-                        &format!("[package] {name} updated {from} \u{2192} {to}"),
+                        BufferUpdate::AppendSystem(SystemRow::plain_notice(
+                            Severity::Info,
+                            &format!("[package] {name} updated {from} \u{2192} {to}"),
+                        )),
                     );
                 }
             }
@@ -2586,6 +2618,7 @@ impl<'a> ScriptEngine<'a> {
 
         Self {
             session_id: params.session_id,
+            load_summary,
             isolates,
             event_registry,
             remote_state_registry,
@@ -4491,20 +4524,26 @@ fn expand_data_placeholder(entry: &str, data_dir: &std::path::Path) -> Option<St
     })
 }
 
-/// Fold a just-loaded isolate's [`LoadReport`] into the running session-echo tallies: count
-/// local module files and collect each package as `name@version` (or bare `name` when the
-/// resolved version is unavailable). Used for both the main and sandboxed isolate loads.
-fn fold_load_report(report: &LoadReport, local_count: &mut usize, package_lines: &mut Vec<String>) {
+/// Tally one isolate's load report: local modules by count, packages by
+/// `(name, resolved version)` for the loaded-packages group's chips.
+fn fold_load_report(
+    report: &LoadReport,
+    local_count: &mut usize,
+    package_lines: &mut Vec<(String, Option<String>)>,
+) {
     for module in &report.modules {
         match module.kind {
             LoadedModuleKind::LocalFile => *local_count += 1,
             LoadedModuleKind::Package => {
                 let name = SmudgySpecifier::parse(&module.specifier)
                     .map_or_else(|_| module.specifier.clone(), |spec| spec.name);
-                package_lines.push(match &module.package {
-                    Some(pkg) => format!("{name}@{}", pkg.resolved_version),
-                    None => name,
-                });
+                package_lines.push((
+                    name,
+                    module
+                        .package
+                        .as_ref()
+                        .map(|pkg| pkg.resolved_version.clone()),
+                ));
             }
         }
     }

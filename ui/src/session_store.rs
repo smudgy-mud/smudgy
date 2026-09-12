@@ -43,8 +43,9 @@ use smudgy_core::session::runtime::pane::{
 };
 use smudgy_core::session::runtime::{IsolateId, RuntimeAction};
 use smudgy_core::session::styled_line::{
-    InvisiblePolicy, LinkAction, LinkTooltipCallback, escape_invisible_text,
+    AppLink, InvisiblePolicy, LinkAction, LinkTooltipCallback, escape_invisible_text,
 };
+use smudgy_core::session::system_row::{Severity, SystemRow};
 use smudgy_core::session::ui_command::UiCommandBus;
 use smudgy_core::session::{self, SessionEvent, SessionId};
 use smudgy_core::session::{BufferUpdate, TaggedSessionEvent};
@@ -687,6 +688,9 @@ pub enum Message {
     /// A terminal link activation, published by the widget and handled only
     /// after its immutable scrollback borrow has been released.
     LinkActivated(LinkClickEvent),
+    /// A client-row link asked for the settings window. Bubbled: the daemon
+    /// owns windows, so it intercepts this and opens (or focuses) settings.
+    OpenSettings,
     /// Global settings changed: apply the scrollback limit and re-bake span
     /// styles here, and forward the runtime-relevant pieces to the session.
     ApplySettings(Settings),
@@ -2056,7 +2060,7 @@ impl ManagedSession {
     /// published it. A command link sends on this pane's session; a callback
     /// link retains the session/isolate address that minted it. Server OSC 8
     /// actions pass the per-server trust gate first.
-    fn handle_link_activation(&mut self, event: LinkClickEvent) {
+    fn handle_link_activation(&mut self, event: LinkClickEvent) -> Task<Message> {
         let action = match event.action {
             LinkAction::Send(command) => {
                 self.note_visibility_input();
@@ -2098,8 +2102,11 @@ impl ManagedSession {
                         grant_server: false,
                     });
                 }
-                return;
+                return Task::none();
             }
+            // The client's own rows act inside the client: no send, no script.
+            LinkAction::App(AppLink::Connect) => return Task::done(Message::Reconnect),
+            LinkAction::App(AppLink::OpenSettings) => return Task::done(Message::OpenSettings),
             LinkAction::ServerSend(command) => {
                 if self.server_config.borrow().allows_server_link(None) {
                     self.note_visibility_input();
@@ -2113,7 +2120,7 @@ impl ManagedSession {
                         grant_host: false,
                         grant_server: false,
                     });
-                    return;
+                    return Task::none();
                 }
             }
             LinkAction::Prompt(text) => {
@@ -2122,7 +2129,7 @@ impl ManagedSession {
                         "Session {}: dropping OSC prompt: session runtime not ready",
                         self.id
                     );
-                    return;
+                    return Task::none();
                 };
                 for op in [InputOp::Replace(Arc::new(text.to_string())), InputOp::Focus] {
                     if let Err(e) = tx.send(RuntimeAction::InputApply {
@@ -2133,13 +2140,14 @@ impl ManagedSession {
                         break;
                     }
                 }
-                return;
+                return Task::none();
             }
             // TerminalPane resolves configured primary actions and menu rows
             // before dispatch. Treat an unexpected wrapper as inert.
-            LinkAction::Configured { .. } => return,
+            LinkAction::Configured { .. } => return Task::none(),
         };
         self.send_runtime_action(action);
+        Task::none()
     }
 
     /// Route a lazy hover callback to the isolate that created the styled link.
@@ -2169,11 +2177,12 @@ impl ManagedSession {
                 self.note_visibility_input();
                 self.send_runtime_action(RuntimeAction::Send(Arc::new(command.to_string())));
             }
-            // Prompt and script links never pass through the trust gate.
+            // Prompt, script and client links never pass through the trust gate.
             LinkAction::Prompt(_)
             | LinkAction::Configured { .. }
             | LinkAction::Send(_)
-            | LinkAction::Callback { .. } => {}
+            | LinkAction::Callback { .. }
+            | LinkAction::App(_) => {}
         }
     }
 
@@ -2227,11 +2236,14 @@ impl ManagedSession {
         self.runtime_tx.is_some()
     }
 
-    /// Print one informational line into the session's terminal — the package
-    /// checker's staging/uninstall notices. Best-effort: a not-yet-ready runtime
-    /// drops the line with a log warning.
+    /// Print one informational line into the session's terminal in the
+    /// client's own voice — the package checker's staging/uninstall notices.
+    /// Best-effort: a not-yet-ready runtime drops the line with a log warning.
     pub fn echo_notice(&self, line: String) {
-        self.send_runtime_action(RuntimeAction::Echo(Arc::new(line)));
+        self.send_runtime_action(RuntimeAction::EchoSystem(SystemRow::plain_notice(
+            Severity::Info,
+            &line,
+        )));
     }
 
     fn send_runtime_action(&self, action: RuntimeAction) {
@@ -2576,10 +2588,9 @@ impl ManagedSession {
             }
             #[cfg(feature = "web-audio-cpal")]
             Message::OpenAudioPanel => Task::none(),
-            Message::LinkActivated(event) => {
-                self.handle_link_activation(event);
-                Task::none()
-            }
+            Message::LinkActivated(event) => self.handle_link_activation(event),
+            // Answered by the daemon, which owns windows.
+            Message::OpenSettings => Task::none(),
             Message::PaneInput(key, input_msg) => {
                 // Deliberately not `input_for_mut`: a `PaneInput` message is
                 // minted only for pane-hosted inputs, so `main` must stay a
@@ -2675,9 +2686,10 @@ impl ManagedSession {
                             // socket), or opened offline — don't auto-connect. Orient
                             // the user the first time a fresh offline session comes up.
                             if first_ready && !self.auto_connect {
-                                self.send_runtime_action(RuntimeAction::Echo(Arc::new(
-                                    "Opened offline. Press Connect to go online.".to_string(),
-                                )));
+                                // The connection rule's first state. The
+                                // runtime owns that row from here: the connect
+                                // this invites replaces it in place.
+                                self.send_runtime_action(RuntimeAction::OpenedOffline);
                             }
                             Task::none()
                         } else {
@@ -2698,6 +2710,16 @@ impl ManagedSession {
                                     let mut buffer = self.terminal_buffer.borrow_mut();
                                     buffer.note_visibility_output();
                                     buffer.extend_line(line.clone());
+                                }
+                                BufferUpdate::AppendSystem(row) => {
+                                    let mut buffer = self.terminal_buffer.borrow_mut();
+                                    buffer.note_visibility_output();
+                                    buffer.append_system_row(row.clone());
+                                }
+                                BufferUpdate::ReplaceSystem(row) => {
+                                    self.terminal_buffer
+                                        .borrow_mut()
+                                        .replace_system_row(row.clone());
                                 }
                                 BufferUpdate::AppendTo(key, line) => {
                                     // Core validates sinks against the live registry when it

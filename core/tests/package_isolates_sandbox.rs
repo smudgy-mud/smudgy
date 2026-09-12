@@ -196,7 +196,7 @@ async fn wait_for_audio_markers(
             let event = events.next().await.expect("audio session remains live");
             if let SessionEvent::UpdateBuffer(updates) = event.event {
                 for update in updates.iter() {
-                    if let BufferUpdate::Append(line) = update {
+                    if let Some(line) = update.main_text() {
                         transcript.push(line.text.clone());
                         if expected.contains(&line.text) {
                             observed.insert(line.text.clone());
@@ -519,7 +519,7 @@ async fn run_scenario_inner(
             SessionEvent::RuntimeReady(tx) => break tx,
             SessionEvent::UpdateBuffer(updates) => {
                 for update in updates.iter() {
-                    if let BufferUpdate::Append(line) = update {
+                    if let Some(line) = update.main_text() {
                         lines.push(line.text.clone());
                     }
                 }
@@ -543,7 +543,7 @@ async fn run_scenario_inner(
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             for update in updates.iter() {
-                if let BufferUpdate::Append(line) = update {
+                if let Some(line) = update.main_text() {
                     lines.push(line.text.clone());
                     if !sent && line.text == gate {
                         seen_gate += 1;
@@ -1091,7 +1091,7 @@ async fn repeated_full_session_reload_returns_exact_audio_baseline() {
                     SessionEvent::RuntimeReady(tx) => reload_tx = Some(tx),
                     SessionEvent::UpdateBuffer(updates) => {
                         for update in updates.iter() {
-                            if let BufferUpdate::Append(line) = update {
+                            if let Some(line) = update.main_text() {
                                 transcript.push(line.text.clone());
                                 if expected.contains(&line.text) {
                                     observed.insert(line.text.clone());
@@ -1584,7 +1584,7 @@ async fn full_reload_device_death_preserves_event_and_isolate_boundaries() {
             SessionEvent::RuntimeReady(tx) => break tx,
             SessionEvent::UpdateBuffer(updates) => {
                 for update in updates.iter() {
-                    if let BufferUpdate::Append(line) = update {
+                    if let Some(line) = update.main_text() {
                         sibling_transcript.push(line.text.clone());
                     }
                 }
@@ -1651,7 +1651,7 @@ async fn full_reload_device_death_preserves_event_and_isolate_boundaries() {
             SessionEvent::RuntimeReady(tx) => break tx,
             SessionEvent::UpdateBuffer(updates) => {
                 for update in updates.iter() {
-                    if let BufferUpdate::Append(line) = update {
+                    if let Some(line) = update.main_text() {
                         target_transcript.push(line.text.clone());
                     }
                 }
@@ -2107,7 +2107,7 @@ async fn failing_sandboxed_package_is_skipped_without_aborting() {
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("[package] broken failed to load")),
+            .any(|l| l.starts_with("package broken failed to load")),
         "the failing package must be reported (skipped, not silently ignored); transcript:\n{lines:#?}"
     );
 }
@@ -2329,7 +2329,7 @@ async fn run_with_factory(
             SessionEvent::RuntimeReady(tx) => break tx,
             SessionEvent::UpdateBuffer(updates) => {
                 for update in updates.iter() {
-                    if let BufferUpdate::Append(line) = update {
+                    if let Some(line) = update.main_text() {
                         lines.push(line.text.clone());
                     }
                 }
@@ -2352,7 +2352,7 @@ async fn run_with_factory(
     while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
         if let SessionEvent::UpdateBuffer(updates) = event.event {
             for update in updates.iter() {
-                if let BufferUpdate::Append(line) = update {
+                if let Some(line) = update.main_text() {
                     lines.push(line.text.clone());
                     if !sent && line.text == gate {
                         seen_gate += 1;

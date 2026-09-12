@@ -4590,11 +4590,18 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 } else {
                     (Task::none(), Task::none())
                 };
+            // A client-row link in the session asked for settings; windows
+            // are the daemon's, so it answers here.
+            let open_settings = if matches!(msg, session_store::Message::OpenSettings) {
+                Task::done(Message::CreateSettingsWindow)
+            } else {
+                Task::none()
+            };
             if let Some(session) = smudgy.sessions.get_mut(session_id) {
                 let session_task = session
                     .update(msg)
                     .map(move |msg| Message::SessionAction(session_id, msg));
-                Task::batch([session_task, editor_fan_out, bind_task])
+                Task::batch([session_task, editor_fan_out, bind_task, open_settings])
             } else {
                 log::debug!("Dropping action for closed session {session_id}");
                 Task::none()
