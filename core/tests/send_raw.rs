@@ -179,14 +179,9 @@ sendRaw("end\n");
     assert_eq!(
         lines
             .iter()
-            .filter(|line| line.contains("sendRaw() warning"))
+            .filter(|line| line.contains("A change is coming to sendRaw()"))
             .count(),
         1
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("sendRaw() warning") && line.contains("sendraw.ts"))
     );
     assert!(lines.iter().any(|line| line == "a;b"));
     assert!(
@@ -207,7 +202,11 @@ sendRaw("after\n");
 "#;
     let expected = b"caf\xe9 \xff\xff\r\n\xc3\xbf\xff\xf1\xff\xffafter\r\n".to_vec();
     let lines = socket_case(9811, body, expected, Some("windows-1252")).await;
-    assert!(!lines.iter().any(|line| line.contains("sendRaw() warning")));
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("A change is coming to sendRaw()"))
+    );
     assert!(lines.iter().any(|line| line.contains("Send error:")));
 }
 
@@ -245,7 +244,11 @@ echo("VALIDATION_OK");
 "#;
     let lines = socket_case(9812, body, b"VALID".to_vec(), None).await;
     assert!(lines.iter().any(|line| line == "VALIDATION_OK"));
-    assert!(!lines.iter().any(|line| line.contains("sendRaw() warning")));
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("A change is coming to sendRaw()"))
+    );
 }
 
 #[tokio::test]
@@ -316,15 +319,9 @@ sendRaw("async private payload");
     }
     let warnings: Vec<_> = lines
         .iter()
-        .filter(|line| line.contains("sendRaw() warning"))
+        .filter(|line| line.contains("A change is coming to sendRaw()"))
         .collect();
     assert_eq!(warnings.len(), 4, "{lines:#?}");
-    for name in ["first.ts", "second.ts", "first-inline", "second-inline"] {
-        assert!(
-            warnings.iter().any(|line| line.contains(name)),
-            "{warnings:#?}"
-        );
-    }
     assert!(warnings.iter().all(|line| !line.contains("payload")));
     tx.send(RuntimeAction::Reload).unwrap();
     loop {
@@ -335,7 +332,7 @@ sendRaw("async private payload");
         collect(&event.event, &mut lines);
         if lines
             .iter()
-            .filter(|line| line.contains("sendRaw() warning"))
+            .filter(|line| line.contains("A change is coming to sendRaw()"))
             .count()
             == 6
         {
