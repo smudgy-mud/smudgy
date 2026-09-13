@@ -37,6 +37,11 @@ const RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const RECOVERY_MAX_NULL_ADVANCE: Duration = Duration::from_millis(100);
 const CALLBACK_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const OWNER_RESUME_GAP: Duration = Duration::from_millis(500);
+/// Output-demand silence threshold: one 16-bit LSB. Nothing below it reaches a
+/// listener on any PCM endpoint, so it cannot justify holding the device open.
+const AUDIBLE_SAMPLE_THRESHOLD: f32 = 1.0 / 32_768.0;
+/// Continuous silence before the demand-driven policy releases the stream.
+const OUTPUT_IDLE_DETACH_AFTER: Duration = Duration::from_secs(10);
 const RUNTIME_ERROR_QUEUE_CAPACITY: usize = 32;
 const ERROR_ADMISSION_PHASE_MASK: usize = 0b11;
 const ERROR_ADMISSION_COUNT_ONE: usize = 0b100;
@@ -349,6 +354,11 @@ impl fmt::Debug for SystemMixerService {
 impl SystemMixerService {
     /// Start the sole process mixer on the default physical output device.
     ///
+    /// Startup verifies the device and its format but does not open a native
+    /// stream. The stream is built on the first audible frame and released
+    /// again after continuous silence, so an idle client holds no audio
+    /// endpoint and asserts no power request.
+    ///
     /// # Errors
     ///
     /// Returns a stable mixer or system-output startup failure. An uncertain
@@ -363,6 +373,9 @@ impl SystemMixerService {
                 factory: SystemHostFactory,
                 lease,
                 sample_rate,
+                idle: OutputIdlePolicy::DetachWhenIdle {
+                    after: OUTPUT_IDLE_DETACH_AFTER,
+                },
                 #[cfg(test)]
                 proof_hook: None,
             },
@@ -679,6 +692,61 @@ impl OutputBuffer<'_> {
     }
 }
 
+/// Owner-rendered audio captured while a demanded stream was being attached.
+///
+/// The first native callbacks of the new stream drain it ahead of live
+/// rendering, so waking from idle loses no onset. Access follows the callback
+/// scratch rules: sole entry through the `active` claim.
+struct Primer {
+    samples: Box<[f32]>,
+    len: usize,
+    pos: usize,
+}
+
+impl Primer {
+    fn new() -> Self {
+        Self {
+            samples: vec![0.0; PHYSICAL_SCRATCH_SAMPLES].into_boxed_slice(),
+            len: 0,
+            pos: 0,
+        }
+    }
+
+    fn stash(&mut self, rendered: &[f32]) {
+        let len = rendered.len().min(self.samples.len());
+        self.samples[..len].copy_from_slice(&rendered[..len]);
+        self.len = len;
+        self.pos = 0;
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.pos = 0;
+    }
+
+    /// Copies whole pending frames into the front of `output`; returns the
+    /// sample count written.
+    fn drain_into(&mut self, output: &mut [f32]) -> usize {
+        let mut count = (self.len - self.pos).min(output.len());
+        count -= count % PHYSICAL_CHANNELS;
+        output[..count].copy_from_slice(&self.samples[self.pos..self.pos + count]);
+        self.pos += count;
+        count
+    }
+}
+
+fn is_audible(samples: &[f32]) -> bool {
+    samples
+        .iter()
+        .any(|sample| sample.abs() > AUDIBLE_SAMPLE_THRESHOLD)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerRender {
+    Silent,
+    Audible,
+}
+
 struct CallbackState {
     // Admission proof: every gate check/claim/release and every owner
     // pause/revoke/generation/idle transition is SeqCst. `error_admission`
@@ -695,8 +763,12 @@ struct CallbackState {
     error_admission: AtomicUsize,
     generation: AtomicU64,
     pending_recovery: AtomicU64,
+    /// Set by any render that produced a sample above the audible threshold;
+    /// consumed by the owner's idle accounting.
+    audible: AtomicBool,
     renderer: UnsafeCell<Option<JoinedRenderer>>,
     scratch: UnsafeCell<Box<[f32]>>,
+    primer: UnsafeCell<Primer>,
     failures: DriverFailureSignal,
     #[cfg(test)]
     proof_hook: Option<Arc<TestProofHook>>,
@@ -723,8 +795,10 @@ impl CallbackState {
             error_admission: AtomicUsize::new(EndpointPhase::Active as usize),
             generation: AtomicU64::new(1),
             pending_recovery: AtomicU64::new(0),
+            audible: AtomicBool::new(false),
             renderer: UnsafeCell::new(None),
             scratch: UnsafeCell::new(vec![0.0; PHYSICAL_SCRATCH_SAMPLES].into_boxed_slice()),
+            primer: UnsafeCell::new(Primer::new()),
             failures,
             #[cfg(test)]
             proof_hook,
@@ -878,9 +952,20 @@ impl CallbackState {
         // SAFETY: the active-entry CAS provides sole callback access.
         let scratch = unsafe { &mut *self.scratch.get() };
         let scratch = &mut scratch[..samples];
-        if renderer.render(scratch, PHYSICAL_CHANNELS).is_ok() {
+        // SAFETY: the active-entry CAS provides sole callback access.
+        let primer = unsafe { &mut *self.primer.get() };
+        let primed_samples = primer.drain_into(scratch);
+        let live = &mut scratch[primed_samples..];
+        if live.is_empty() || renderer.render(live, PHYSICAL_CHANNELS).is_ok() {
+            if is_audible(scratch) {
+                self.audible.store(true, Ordering::SeqCst);
+            }
             output.copy_from_f32(scratch);
         }
+    }
+
+    fn take_audible(&self) -> bool {
+        self.audible.swap(false, Ordering::SeqCst)
     }
 
     fn revoke(&self) {
@@ -976,6 +1061,15 @@ impl CallbackState {
     }
 
     fn render_recovery_silence(&self, frames: usize) -> bool {
+        self.render_owner_side(frames, false).is_some()
+    }
+
+    /// Renders `frames` on the owner while no native callback may enter.
+    ///
+    /// With `keep_audible`, an audible result is stashed as the primer for the
+    /// stream that this demand is about to attach. Returns `None` when the
+    /// render could not run or failed.
+    fn render_owner_side(&self, frames: usize, keep_audible: bool) -> Option<OwnerRender> {
         if frames == 0
             || frames > MAX_PHYSICAL_CALLBACK_FRAMES
             || self.revoked.load(Ordering::SeqCst)
@@ -985,26 +1079,51 @@ impl CallbackState {
                 .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
         {
+            return None;
+        }
+        let _active = ActiveCallback {
+            active: &self.active,
+        };
+        // SAFETY: owner-side rendering starts only after any old stream has
+        // joined, remains paused to native callbacks, and owns `active`.
+        let renderer = unsafe { &mut *self.renderer.get() };
+        let Some(renderer) = renderer.as_mut() else {
+            self.failures.report(MixerOutputFailure::BackendFailure);
+            return None;
+        };
+        // SAFETY: the owner has sole callback access.
+        let scratch = unsafe { &mut *self.scratch.get() };
+        let scratch = &mut scratch[..frames * PHYSICAL_CHANNELS];
+        if renderer.render(scratch, PHYSICAL_CHANNELS).is_err() {
+            return None;
+        }
+        if !is_audible(scratch) {
+            return Some(OwnerRender::Silent);
+        }
+        if keep_audible {
+            // SAFETY: the owner has sole callback access.
+            let primer = unsafe { &mut *self.primer.get() };
+            primer.stash(scratch);
+        }
+        Some(OwnerRender::Audible)
+    }
+
+    /// Discards any stashed primer. Returns `false` if a callback held entry.
+    fn clear_primer(&self) -> bool {
+        if self
+            .active
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return false;
         }
         let _active = ActiveCallback {
             active: &self.active,
         };
-        // SAFETY: recovery rendering starts only after the old stream has
-        // joined, remains paused to native callbacks, and owns `active`.
-        let renderer = unsafe { &mut *self.renderer.get() };
-        let Some(renderer) = renderer.as_mut() else {
-            self.failures.report(MixerOutputFailure::BackendFailure);
-            return false;
-        };
-        // SAFETY: the recovery owner has sole callback access.
-        let scratch = unsafe { &mut *self.scratch.get() };
-        renderer
-            .render(
-                &mut scratch[..frames * PHYSICAL_CHANNELS],
-                PHYSICAL_CHANNELS,
-            )
-            .is_ok()
+        // SAFETY: the active claim provides sole callback access.
+        let primer = unsafe { &mut *self.primer.get() };
+        primer.clear();
+        true
     }
 
     #[cfg(test)]
@@ -1094,10 +1213,26 @@ fn runtime_event_from_cpal(kind: CpalErrorKind) -> DriverRuntimeEvent {
     }
 }
 
+/// How the driver holds the native output stream while the mixer is silent.
+///
+/// An open stream keeps the endpoint's power request asserted even when every
+/// frame it receives is zero. On Windows that blocks automatic sleep for as
+/// long as the process lives, so production output is demand-driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputIdlePolicy {
+    /// Build and play the stream at start and hold it until shutdown.
+    AlwaysOpen,
+    /// Build the stream on the first audible frame and release it after
+    /// `after` of continuous silence. Logical time keeps advancing through
+    /// owner-side null rendering while no stream exists.
+    DetachWhenIdle { after: Duration },
+}
+
 struct SystemDriverSettings<F> {
     factory: F,
     lease: OutputLease,
     sample_rate: u32,
+    idle: OutputIdlePolicy,
     #[cfg(test)]
     proof_hook: Option<Arc<TestProofHook>>,
 }
@@ -1117,6 +1252,11 @@ struct CpalOutputDriver<F: HostFactory> {
     retired: bool,
     cleanup_uncertain: bool,
     recovery: RecoveryState,
+    idle: OutputIdlePolicy,
+    /// Last instant a render produced an audible sample while a stream was
+    /// active; the demand-driven policy releases the stream once `now`
+    /// exceeds this by its idle threshold.
+    last_audible_at: Instant,
     output_generation: u64,
     logged_runtime_events: u64,
     last_callback_epoch: u64,
@@ -1124,8 +1264,20 @@ struct CpalOutputDriver<F: HostFactory> {
     last_maintenance_at: Instant,
 }
 
+/// Endpoint lifecycle beyond a live stream. `Waiting` and `CatchingUp` are
+/// failure recovery; `Idle` and `Waking` are demand-driven output.
 enum RecoveryState {
     Active,
+    /// No native stream exists by choice. The owner null-renders wall-clock
+    /// time until a render turns audible, then attaches a stream.
+    Idle {
+        last_null_tick: Instant,
+    },
+    /// A demanded stream is built and playing but its data callback is not
+    /// yet admitted. Logical time stays frozen until activation.
+    Waking {
+        generation: u64,
+    },
     Waiting {
         reason: DriverRuntimeEvent,
         attempt: u32,
@@ -1147,6 +1299,19 @@ enum RecoveryState {
 
 fn system_error(operation: SystemOutputOperation, failure: HostFailure) -> SystemOutputError {
     SystemOutputError::new(failure.kind, operation, failure.detail)
+}
+
+/// Classifies an owner-side attach failure as the runtime event recovery
+/// reports and retries under.
+fn runtime_event_for(error: &SystemOutputError) -> DriverRuntimeEvent {
+    match error.kind() {
+        SystemOutputErrorKind::DeviceUnavailable => DriverRuntimeEvent::DeviceNotAvailable,
+        SystemOutputErrorKind::OutputInUse => DriverRuntimeEvent::DeviceBusy,
+        SystemOutputErrorKind::UnsupportedFormat => DriverRuntimeEvent::UnsupportedConfig,
+        SystemOutputErrorKind::BackendFailure | SystemOutputErrorKind::Protocol => {
+            DriverRuntimeEvent::BackendError
+        }
+    }
 }
 
 fn contain_host_call<T>(
@@ -1280,6 +1445,7 @@ impl<F: HostFactory> JoinedOutputDriver for CpalOutputDriver<F> {
             factory,
             lease,
             sample_rate,
+            idle,
             #[cfg(test)]
             proof_hook,
         } = settings;
@@ -1334,6 +1500,8 @@ impl<F: HostFactory> JoinedOutputDriver for CpalOutputDriver<F> {
                 retired: false,
                 cleanup_uncertain: false,
                 recovery: RecoveryState::Active,
+                idle,
+                last_audible_at: now,
                 output_generation: 1,
                 logged_runtime_events: 0,
                 last_callback_epoch: 0,
@@ -1358,6 +1526,17 @@ impl<F: HostFactory> JoinedOutputDriver for CpalOutputDriver<F> {
                 SystemOutputOperation::Build,
                 "the physical callback renderer was already installed or revoked",
             ));
+        }
+        if matches!(self.idle, OutputIdlePolicy::DetachWhenIdle { .. }) {
+            // Demand-driven output builds no stream until the first audible
+            // frame. Pausing the callback state admits owner-side null
+            // rendering, which is what advances logical time until then.
+            callback.pause();
+            self.drop_device()?;
+            self.recovery = RecoveryState::Idle {
+                last_null_tick: Instant::now(),
+            };
+            return Ok(());
         }
         let device = self.device.as_ref().ok_or_else(|| {
             SystemOutputError::new(
@@ -1386,6 +1565,13 @@ impl<F: HostFactory> JoinedOutputDriver for CpalOutputDriver<F> {
     }
 
     fn play(&mut self) -> Result<(), Self::Error> {
+        if matches!(self.recovery, RecoveryState::Idle { .. }) {
+            // Demand-driven output plays once the first audible frame
+            // attaches a stream. Maintenance replaces `recovery` with
+            // `Active` before it reopens, so a wake's own play is not
+            // short-circuited here.
+            return Ok(());
+        }
         let stream = self.stream.as_ref().ok_or_else(|| {
             SystemOutputError::new(
                 SystemOutputErrorKind::Protocol,
@@ -1836,13 +2022,14 @@ impl<F: HostFactory> CpalOutputDriver<F> {
     fn rebase_recovery_cursor_after_owner_resume(&mut self, now: Instant) {
         let last_null_tick = match &mut self.recovery {
             RecoveryState::Waiting { last_null_tick, .. }
-            | RecoveryState::CatchingUp { last_null_tick, .. } => last_null_tick,
-            RecoveryState::Active => return,
+            | RecoveryState::CatchingUp { last_null_tick, .. }
+            | RecoveryState::Idle { last_null_tick } => last_null_tick,
+            RecoveryState::Active | RecoveryState::Waking { .. } => return,
         };
         let skipped = now.saturating_duration_since(*last_null_tick);
         *last_null_tick = now;
         log::info!(
-            "physical audio recovery owner resumed after a suspended interval; discarded {skipped:?} of wall-clock backlog"
+            "physical audio owner resumed after a suspended interval; discarded {skipped:?} of wall-clock backlog"
         );
     }
 
@@ -1878,7 +2065,7 @@ impl<F: HostFactory> CpalOutputDriver<F> {
         match state {
             RecoveryState::Active => {
                 let Some(reason) = pending else {
-                    return DriverMaintenance::Continue;
+                    return self.maintain_idle_policy(now, &mut null_frames_remaining);
                 };
                 log::warn!(
                     "physical audio endpoint generation {} requires recovery: {reason:?}",
@@ -2076,50 +2263,13 @@ impl<F: HostFactory> CpalOutputDriver<F> {
                         return DriverMaintenance::Continue;
                     }
                     GenerationActivation::RuntimeError => {
-                        // The error callback won the same atomic handoff that
-                        // would have admitted data callbacks. Publish Waiting
-                        // first, then retire the still-silent endpoint and use
-                        // the callback's exact classified event when present.
-                        let observed_at = Instant::now();
-                        self.recovery = RecoveryState::Waiting {
-                            reason: DriverRuntimeEvent::BackendError,
-                            attempt,
-                            next_attempt: observed_at + backoff,
-                            backoff: backoff.saturating_mul(2).min(RECOVERY_MAX_BACKOFF),
-                            started_at,
-                            last_null_tick,
-                        };
-                        if !self.retire_stream_for_recovery() {
-                            return DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure);
-                        }
-                        let terminal_failure = self
-                            .callback
-                            .as_ref()
-                            .and_then(|callback| callback.failures.0.upgrade())
-                            .and_then(|status| status.failure());
-                        if let Some(failure) = terminal_failure {
-                            return DriverMaintenance::Terminal(failure);
-                        }
-                        let reason = self
-                            .callback
-                            .as_ref()
-                            .and_then(|callback| callback.take_recovery_event())
-                            .unwrap_or(DriverRuntimeEvent::BackendError);
-                        let last_null_tick = self.render_recovery_time(
-                            last_null_tick,
-                            Instant::now(),
-                            &mut null_frames_remaining,
-                        );
-                        let detail = format!("{reason:?} won replacement-endpoint activation");
-                        self.schedule_recovery_wait(
-                            reason,
+                        return self.retire_after_activation_lost(
                             attempt,
                             backoff,
                             started_at,
                             last_null_tick,
-                            detail,
+                            &mut null_frames_remaining,
                         );
-                        return DriverMaintenance::Continue;
                     }
                     GenerationActivation::Invalid => {
                         let error = SystemOutputError::new(
@@ -2142,10 +2292,267 @@ impl<F: HostFactory> CpalOutputDriver<F> {
                 );
                 self.reset_runtime_event_log();
                 self.note_recovered(recovered_at);
+                self.note_attached(recovered_at);
                 self.recovery = RecoveryState::Active;
                 DriverMaintenance::Continue
             }
+            RecoveryState::Idle { last_null_tick } => {
+                // No native stream exists, so `pending` can hold nothing
+                // actionable: error callbacks were joined at release.
+                let (last_null_tick, rendered) =
+                    self.render_idle_time(last_null_tick, now, &mut null_frames_remaining);
+                if rendered != OwnerRender::Audible {
+                    self.recovery = RecoveryState::Idle { last_null_tick };
+                    return DriverMaintenance::Continue;
+                }
+                log::debug!("physical audio output demanded; attaching the native stream");
+                self.wake_from_idle()
+            }
+            RecoveryState::Waking { generation } => self.maintain_waking(generation),
         }
+    }
+
+    /// Active-stream idle accounting for the demand-driven policy.
+    fn maintain_idle_policy(
+        &mut self,
+        now: Instant,
+        null_frames_remaining: &mut usize,
+    ) -> DriverMaintenance {
+        let OutputIdlePolicy::DetachWhenIdle { after } = self.idle else {
+            return DriverMaintenance::Continue;
+        };
+        let Some(callback) = self.callback.as_ref() else {
+            return DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure);
+        };
+        if callback.take_audible() {
+            self.last_audible_at = now;
+            return DriverMaintenance::Continue;
+        }
+        if now.saturating_duration_since(self.last_audible_at) < after {
+            return DriverMaintenance::Continue;
+        }
+        log::debug!("physical audio output silent for {after:?}; releasing the native stream");
+        // Publish the idle state before destroying the stream, as recovery
+        // does, so a teardown unwind is observed against the intended state.
+        self.recovery = RecoveryState::Idle {
+            last_null_tick: now,
+        };
+        if !self.retire_stream_for_recovery() {
+            return DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure);
+        }
+        if let Some(callback) = self.callback.as_ref() {
+            // Callbacks admitted before the pause may have flagged audio that
+            // the stream already played; it is not new demand.
+            callback.take_audible();
+        }
+        let last_null_tick = self.render_recovery_time(now, Instant::now(), null_frames_remaining);
+        self.recovery = RecoveryState::Idle { last_null_tick };
+        DriverMaintenance::Continue
+    }
+
+    /// Null-renders idle wall-clock time, keeping an audible result as the
+    /// primer. Mirrors [`Self::render_recovery_time`] with demand detection.
+    fn render_idle_time(
+        &self,
+        from: Instant,
+        now: Instant,
+        frames_remaining: &mut usize,
+    ) -> (Instant, OwnerRender) {
+        let Some(callback) = self.callback.as_ref() else {
+            return (from, OwnerRender::Silent);
+        };
+        let frames = self
+            .recovery_frames_between(from, now)
+            .min(*frames_remaining)
+            .min(MAX_PHYSICAL_CALLBACK_FRAMES);
+        if frames == 0 {
+            return (from, OwnerRender::Silent);
+        }
+        let Some(rendered) = callback.render_owner_side(frames, true) else {
+            return (from, OwnerRender::Silent);
+        };
+        *frames_remaining -= frames;
+        let rendered_nanos =
+            u64::try_from((frames as u128 * 1_000_000_000) / u128::from(self.sample_rate))
+                .expect("bounded callback frames fit a u64 nanosecond duration");
+        (from + Duration::from_nanos(rendered_nanos), rendered)
+    }
+
+    /// Attaches a stream for demanded output. Logical time stays frozen: the
+    /// primer already holds the onset, so no null budget is spent.
+    fn wake_from_idle(&mut self) -> DriverMaintenance {
+        let mut frozen_tick = Instant::now();
+        let mut frozen_budget = 0;
+        match self.attempt_reopen(&mut frozen_tick, &mut frozen_budget) {
+            Ok((_format, generation)) => self.maintain_waking(generation),
+            Err(error) if self.cleanup_uncertain => {
+                log::error!("physical audio output attach lost teardown proof: {error}");
+                DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure)
+            }
+            Err(error) if error.kind() == SystemOutputErrorKind::Protocol => {
+                log::error!(
+                    "physical audio output attach encountered a terminal protocol failure: {error}"
+                );
+                DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure)
+            }
+            Err(error) => {
+                // The endpoint changed or vanished while idle. Ordinary
+                // recovery takes over with backoff; by the time it succeeds
+                // the primer is stale.
+                if let Some(callback) = self.callback.as_ref() {
+                    callback.clear_primer();
+                }
+                let started_at = Instant::now();
+                self.schedule_recovery_wait(
+                    runtime_event_for(&error),
+                    1,
+                    RECOVERY_INITIAL_BACKOFF,
+                    started_at,
+                    started_at,
+                    &error,
+                );
+                DriverMaintenance::Continue
+            }
+        }
+    }
+
+    /// Admits the data callback of a demanded stream once no error callback
+    /// contends for the handoff.
+    fn maintain_waking(&mut self, generation: u64) -> DriverMaintenance {
+        self.drain_runtime_errors();
+        let pending = self
+            .callback
+            .as_ref()
+            .and_then(|callback| callback.take_recovery_event());
+        if let Some(reason) = pending {
+            let observed_at = Instant::now();
+            self.recovery = RecoveryState::Waiting {
+                reason,
+                attempt: 1,
+                next_attempt: observed_at + RECOVERY_INITIAL_BACKOFF,
+                backoff: RECOVERY_INITIAL_BACKOFF
+                    .saturating_mul(2)
+                    .min(RECOVERY_MAX_BACKOFF),
+                started_at: observed_at,
+                last_null_tick: observed_at,
+            };
+            if !self.retire_stream_for_recovery() {
+                return DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure);
+            }
+            if let Some(callback) = self.callback.as_ref() {
+                callback.clear_primer();
+            }
+            let detail = format!("{reason:?} while the demanded endpoint was still provisional");
+            self.schedule_recovery_wait(
+                reason,
+                1,
+                RECOVERY_INITIAL_BACKOFF,
+                observed_at,
+                Instant::now(),
+                detail,
+            );
+            return DriverMaintenance::Continue;
+        }
+        let activation = self
+            .callback
+            .as_ref()
+            .map_or(GenerationActivation::Invalid, |callback| {
+                callback.activate_generation(generation)
+            });
+        match activation {
+            GenerationActivation::Activated => {
+                let attached_at = Instant::now();
+                self.reset_runtime_event_log();
+                self.note_recovered(attached_at);
+                self.note_attached(attached_at);
+                self.recovery = RecoveryState::Active;
+                log::debug!(
+                    "physical audio output attached on generation {}",
+                    self.output_generation
+                );
+                DriverMaintenance::Continue
+            }
+            GenerationActivation::Deferred => {
+                self.recovery = RecoveryState::Waking { generation };
+                DriverMaintenance::Continue
+            }
+            GenerationActivation::RuntimeError => {
+                let observed_at = Instant::now();
+                let mut frozen_budget = 0;
+                self.retire_after_activation_lost(
+                    1,
+                    RECOVERY_INITIAL_BACKOFF,
+                    observed_at,
+                    observed_at,
+                    &mut frozen_budget,
+                )
+            }
+            GenerationActivation::Invalid => {
+                let error = SystemOutputError::new(
+                    SystemOutputErrorKind::Protocol,
+                    SystemOutputOperation::Play,
+                    "the demanded physical stream could not be activated",
+                );
+                log::error!(
+                    "physical audio output attach encountered a terminal protocol failure: {error}"
+                );
+                DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure)
+            }
+        }
+    }
+
+    /// Restarts idle accounting for a stream that just became active.
+    fn note_attached(&mut self, at: Instant) {
+        self.last_audible_at = at;
+        if let Some(callback) = self.callback.as_ref() {
+            callback.take_audible();
+        }
+    }
+
+    /// The error callback won the atomic handoff that would have admitted
+    /// data callbacks. Publishes Waiting first, then retires the still-silent
+    /// endpoint and uses the callback's exact classified event when present.
+    fn retire_after_activation_lost(
+        &mut self,
+        attempt: u32,
+        backoff: Duration,
+        started_at: Instant,
+        last_null_tick: Instant,
+        null_frames_remaining: &mut usize,
+    ) -> DriverMaintenance {
+        let observed_at = Instant::now();
+        self.recovery = RecoveryState::Waiting {
+            reason: DriverRuntimeEvent::BackendError,
+            attempt,
+            next_attempt: observed_at + backoff,
+            backoff: backoff.saturating_mul(2).min(RECOVERY_MAX_BACKOFF),
+            started_at,
+            last_null_tick,
+        };
+        if !self.retire_stream_for_recovery() {
+            return DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure);
+        }
+        if let Some(callback) = self.callback.as_ref() {
+            callback.clear_primer();
+        }
+        let terminal_failure = self
+            .callback
+            .as_ref()
+            .and_then(|callback| callback.failures.0.upgrade())
+            .and_then(|status| status.failure());
+        if let Some(failure) = terminal_failure {
+            return DriverMaintenance::Terminal(failure);
+        }
+        let reason = self
+            .callback
+            .as_ref()
+            .and_then(|callback| callback.take_recovery_event())
+            .unwrap_or(DriverRuntimeEvent::BackendError);
+        let last_null_tick =
+            self.render_recovery_time(last_null_tick, Instant::now(), null_frames_remaining);
+        let detail = format!("{reason:?} won replacement-endpoint activation");
+        self.schedule_recovery_wait(reason, attempt, backoff, started_at, last_null_tick, detail);
+        DriverMaintenance::Continue
     }
 
     fn drop_device(&mut self) -> Result<(), SystemOutputError> {
