@@ -41,7 +41,12 @@ const OWNER_RESUME_GAP: Duration = Duration::from_millis(500);
 /// listener on any PCM endpoint, so it cannot justify holding the device open.
 const AUDIBLE_SAMPLE_THRESHOLD: f32 = 1.0 / 32_768.0;
 /// Continuous silence before the demand-driven policy releases the stream.
-const OUTPUT_IDLE_DETACH_AFTER: Duration = Duration::from_secs(10);
+///
+/// A wake costs one owner tick to notice demand plus a native stream build,
+/// measured at 10-13 ms on a USB endpoint, before the primed onset plays.
+/// Holding the stream for minutes keeps that off ordinary play while still
+/// releasing the endpoint long before any sleep timeout would matter.
+const OUTPUT_IDLE_DETACH_AFTER: Duration = Duration::from_secs(5 * 60);
 const RUNTIME_ERROR_QUEUE_CAPACITY: usize = 32;
 const ERROR_ADMISSION_PHASE_MASK: usize = 0b11;
 const ERROR_ADMISSION_COUNT_ONE: usize = 0b100;
@@ -1277,6 +1282,7 @@ enum RecoveryState {
     /// yet admitted. Logical time stays frozen until activation.
     Waking {
         generation: u64,
+        demanded_at: Instant,
     },
     Waiting {
         reason: DriverRuntimeEvent,
@@ -2306,9 +2312,12 @@ impl<F: HostFactory> CpalOutputDriver<F> {
                     return DriverMaintenance::Continue;
                 }
                 log::debug!("physical audio output demanded; attaching the native stream");
-                self.wake_from_idle()
+                self.wake_from_idle(now)
             }
-            RecoveryState::Waking { generation } => self.maintain_waking(generation),
+            RecoveryState::Waking {
+                generation,
+                demanded_at,
+            } => self.maintain_waking(generation, demanded_at),
         }
     }
 
@@ -2380,11 +2389,11 @@ impl<F: HostFactory> CpalOutputDriver<F> {
 
     /// Attaches a stream for demanded output. Logical time stays frozen: the
     /// primer already holds the onset, so no null budget is spent.
-    fn wake_from_idle(&mut self) -> DriverMaintenance {
+    fn wake_from_idle(&mut self, demanded_at: Instant) -> DriverMaintenance {
         let mut frozen_tick = Instant::now();
         let mut frozen_budget = 0;
         match self.attempt_reopen(&mut frozen_tick, &mut frozen_budget) {
-            Ok((_format, generation)) => self.maintain_waking(generation),
+            Ok((_format, generation)) => self.maintain_waking(generation, demanded_at),
             Err(error) if self.cleanup_uncertain => {
                 log::error!("physical audio output attach lost teardown proof: {error}");
                 DriverMaintenance::Terminal(MixerOutputFailure::BackendFailure)
@@ -2418,7 +2427,7 @@ impl<F: HostFactory> CpalOutputDriver<F> {
 
     /// Admits the data callback of a demanded stream once no error callback
     /// contends for the handoff.
-    fn maintain_waking(&mut self, generation: u64) -> DriverMaintenance {
+    fn maintain_waking(&mut self, generation: u64, demanded_at: Instant) -> DriverMaintenance {
         self.drain_runtime_errors();
         let pending = self
             .callback
@@ -2467,13 +2476,17 @@ impl<F: HostFactory> CpalOutputDriver<F> {
                 self.note_attached(attached_at);
                 self.recovery = RecoveryState::Active;
                 log::debug!(
-                    "physical audio output attached on generation {}",
-                    self.output_generation
+                    "physical audio output attached on generation {} {:?} after demand",
+                    self.output_generation,
+                    attached_at.saturating_duration_since(demanded_at)
                 );
                 DriverMaintenance::Continue
             }
             GenerationActivation::Deferred => {
-                self.recovery = RecoveryState::Waking { generation };
+                self.recovery = RecoveryState::Waking {
+                    generation,
+                    demanded_at,
+                };
                 DriverMaintenance::Continue
             }
             GenerationActivation::RuntimeError => {
