@@ -160,7 +160,7 @@ function sendTraversalCommand(raw: string): void {
   // emitted movement from recursively firing aliases.
   for (const part of raw.split(";")) {
     const command = part.trim();
-    if (command) sendRaw(command);
+    if (command) sendRaw(command + "\n");
   }
 }
 
