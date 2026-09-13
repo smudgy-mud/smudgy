@@ -120,6 +120,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete and uninstall actions clean up parameter values and secrets; a folder that
   is merely missing keeps them, and a package re-created under that name adopts
   them.
+
+### Fixed
+
+- **An idle smudgy no longer keeps the computer awake.** Smudgy used to open
+  the audio device the moment it started and hold it, silent, until it quit.
+  Windows counts that as audio playing, so a computer with smudgy open would
+  never go to sleep on its own. The device is now opened when a sound actually
+  plays and released again after five minutes of silence, without losing the
+  start of the sound that wakes it.
+
+## [0.5.7-ptb] - 2026-09-01
+
+### Added
+
+- **History matching.** for example, if you type `tell` and hit up, you'll get the
+  most recent command that started with tell.  configurable
+- **Public test and nightly build channels.** Versions beginning with `ptb` or
+  `nightly` use release data and services while identifying their build time and
+  source commit in the title bar.
+
+### Changed
+
 - **Less work per line on the way in.** Color and attribute escape sequences are
   parsed without allocating, a prompt row glued to the text that completes it no
   longer copies the row on either side, regex triggers no longer allocate working

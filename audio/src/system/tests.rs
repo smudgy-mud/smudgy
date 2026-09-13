@@ -404,6 +404,7 @@ fn attempt_fake_with_hook(
             factory: FakeFactory(Arc::clone(&state)),
             lease,
             sample_rate,
+            idle: OutputIdlePolicy::AlwaysOpen,
             proof_hook,
         },
         sample_rate,
@@ -434,6 +435,7 @@ fn direct_fake_mixer(
             factory: FakeFactory(Arc::clone(&state)),
             lease,
             sample_rate: TEST_RATE,
+            idle: OutputIdlePolicy::AlwaysOpen,
             proof_hook: None,
         },
         Arc::clone(&status),
@@ -1268,6 +1270,7 @@ fn recovery_catch_up_is_bounded_and_keeps_reopened_data_paused() {
             factory: FakeFactory(Arc::clone(&state)),
             lease,
             sample_rate: TEST_RATE,
+            idle: OutputIdlePolicy::AlwaysOpen,
             proof_hook: None,
         },
         status,
@@ -1516,6 +1519,7 @@ fn long_owner_suspend_discards_wall_clock_backlog_and_reactivates_once() {
             factory: FakeFactory(Arc::clone(&state)),
             lease,
             sample_rate: TEST_RATE,
+            idle: OutputIdlePolicy::AlwaysOpen,
             proof_hook: None,
         },
         status,
@@ -1582,6 +1586,7 @@ fn recovery_capable_driver_owns_stall_while_retiring_session_waits() {
             factory: FakeFactory(Arc::clone(&state)),
             lease,
             sample_rate: TEST_RATE,
+            idle: OutputIdlePolicy::AlwaysOpen,
             proof_hook: None,
         },
         Arc::clone(&status),
@@ -2164,4 +2169,208 @@ fn manual_default_device_silent_open_suspend_resume_close_and_repeat() {
     let shutdown = repeat.shutdown();
     assert!(shutdown.clean);
     assert!(shutdown.failure.is_none());
+}
+
+const RAMP_STEP: f32 = 1e-6;
+
+fn start_fake_idle(config: FakeConfig, after: Duration) -> (MixerService, Arc<FakeState>) {
+    let state = Arc::new(FakeState::new(config));
+    let lease = OutputLease::acquire(fresh_lease_flag()).unwrap();
+    let service = MixerService::start_with_driver::<CpalOutputDriver<FakeFactory>>(
+        SystemDriverSettings {
+            factory: FakeFactory(Arc::clone(&state)),
+            lease,
+            sample_rate: TEST_RATE,
+            idle: OutputIdlePolicy::DetachWhenIdle { after },
+            proof_hook: None,
+        },
+        TEST_RATE,
+    )
+    .unwrap();
+    (service, state)
+}
+
+/// Renders a level the test flips at will. Above zero it ramps by one step
+/// per frame, so the first sample a stream delivers identifies exactly which
+/// rendered frame it came from.
+struct DemandInput {
+    level: Arc<std::sync::atomic::AtomicU32>,
+    ramp: u32,
+}
+
+impl MixerInput for DemandInput {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the ramp stays far below the f32 mantissa within any test"
+    )]
+    fn render(&mut self, output: &mut [MixerFrame]) -> MixerInputStatus {
+        let level = f32::from_bits(self.level.load(Ordering::Acquire));
+        for frame in output {
+            let sample = if level == 0.0 {
+                0.0
+            } else {
+                self.ramp += 1;
+                level + self.ramp as f32 * RAMP_STEP
+            };
+            *frame = MixerFrame::from_mono(sample);
+        }
+        MixerInputStatus::Active
+    }
+}
+
+fn install_demand(
+    service: &MixerService,
+    level: f32,
+) -> (
+    crate::MixerSessionOwner,
+    crate::RunningMixerInput,
+    Arc<std::sync::atomic::AtomicU32>,
+) {
+    let level = Arc::new(std::sync::atomic::AtomicU32::new(level.to_bits()));
+    let session = service.add_session(AudioSessionId(1)).unwrap();
+    let running = session
+        .script_bus()
+        .try_reserve_input()
+        .unwrap()
+        .start_preboxed(Box::new(DemandInput {
+            level: Arc::clone(&level),
+            ramp: 0,
+        }))
+        .unwrap();
+    (session, running, level)
+}
+
+fn lifecycle_count(state: &FakeState, operation: &str) -> usize {
+    state
+        .lifecycle
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(recorded, _)| *recorded == operation)
+        .count()
+}
+
+#[test]
+fn demand_driven_start_verifies_the_endpoint_without_a_stream() {
+    let (service, state) = start_fake_idle(FakeConfig::default(), Duration::from_millis(50));
+    let (session, running, _level) = install_demand(&service, 0.0);
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(state.build_count.load(Ordering::Acquire), 0);
+    assert_eq!(state.play_count.load(Ordering::Acquire), 0);
+    // Input retirement is proven by owner-side null rendering while no
+    // native stream exists.
+    assert!(block_on(running.shutdown()).unwrap().is_clean());
+    drop(session);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(shutdown.failure, None);
+    assert_eq!(lifecycle_count(&state, "stream-build"), 0);
+    assert_eq!(lifecycle_count(&state, "stream-play"), 0);
+    for required in [
+        "host-create",
+        "default-device",
+        "supported-configs",
+        "device-drop",
+        "host-drop",
+    ] {
+        assert_eq!(lifecycle_count(&state, required), 1, "{required}");
+    }
+}
+
+#[test]
+fn demand_driven_output_attaches_on_the_first_audible_frame_without_losing_it() {
+    let (service, state) = start_fake_idle(FakeConfig::default(), Duration::from_secs(10));
+    let (session, running, level) = install_demand(&service, 0.0);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(state.build_count.load(Ordering::Acquire), 0);
+    level.store(0.5f32.to_bits(), Ordering::Release);
+    eventually(|| state.play_count.load(Ordering::Acquire) == 1);
+    let mut first = None;
+    eventually(|| {
+        let output = state.invoke_f32(512, 9.0);
+        first = output.iter().copied().find(|sample| *sample != 0.0);
+        first.is_some()
+    });
+    let first = first.unwrap();
+    assert!(
+        (first - (0.5 + RAMP_STEP)).abs() < RAMP_STEP / 2.0,
+        "the first delivered sample {first} is not the first audible frame"
+    );
+    assert_eq!(state.build_count.load(Ordering::Acquire), 1);
+    let shutdown = running.shutdown();
+    drop(state.invoke_f32(2, 9.0));
+    assert!(block_on(shutdown).unwrap().is_clean());
+    drop(session);
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn demand_driven_output_releases_after_continuous_silence_and_reattaches() {
+    let (service, state) = start_fake_idle(
+        FakeConfig {
+            retain_callback_after_drop: true,
+            ..FakeConfig::default()
+        },
+        Duration::from_millis(100),
+    );
+    let (session, running, level) = install_demand(&service, 0.5);
+    eventually(|| state.play_count.load(Ordering::Acquire) == 1);
+    // Audible callbacks hold the stream well past the idle threshold.
+    let held_until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < held_until {
+        drop(state.invoke_f32(64, 9.0));
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(state.stream_drop_count.load(Ordering::Acquire), 0);
+    level.store(0.0f32.to_bits(), Ordering::Release);
+    // Silent callbacks are not demand. They stop before the threshold so no
+    // fake invocation is in flight when the owner destroys the stream; the
+    // real stream destructor joins the native callback, the fake does not.
+    let silent_until = Instant::now() + Duration::from_millis(40);
+    while Instant::now() < silent_until {
+        drop(state.invoke_f32(64, 9.0));
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(state.stream_drop_count.load(Ordering::Acquire), 0);
+    eventually(|| state.stream_drop_count.load(Ordering::Acquire) == 1);
+    assert_eq!(state.build_count.load(Ordering::Acquire), 1);
+    level.store(0.5f32.to_bits(), Ordering::Release);
+    eventually(|| state.play_count.load(Ordering::Acquire) == 2);
+    eventually(|| {
+        state
+            .invoke_f32(64, 9.0)
+            .iter()
+            .any(|sample| *sample != 0.0)
+    });
+    let shutdown = running.shutdown();
+    drop(state.invoke_f32(2, 9.0));
+    assert!(block_on(shutdown).unwrap().is_clean());
+    drop(session);
+    let shutdown = service.shutdown();
+    assert!(shutdown.clean);
+    assert_eq!(state.stream_drop_count.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn demand_driven_attach_failure_recovers_with_backoff() {
+    let (service, state) = start_fake_idle(FakeConfig::default(), Duration::from_secs(10));
+    let (session, running, level) = install_demand(&service, 0.0);
+    state.device_available.store(false, Ordering::Release);
+    level.store(0.5f32.to_bits(), Ordering::Release);
+    // The startup enumeration plus at least two failed attach attempts.
+    eventually(|| lifecycle_count(&state, "default-device") >= 3);
+    assert_eq!(state.build_count.load(Ordering::Acquire), 0);
+    state.device_available.store(true, Ordering::Release);
+    eventually(|| state.play_count.load(Ordering::Acquire) == 1);
+    eventually(|| {
+        state
+            .invoke_f32(64, 9.0)
+            .iter()
+            .any(|sample| *sample != 0.0)
+    });
+    let shutdown = running.shutdown();
+    drop(state.invoke_f32(2, 9.0));
+    assert!(block_on(shutdown).unwrap().is_clean());
+    drop(session);
+    assert!(service.shutdown().clean);
 }
