@@ -10,6 +10,7 @@ use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Module exercising the store from the main isolate:
 /// - set-at-path + synchronous read-your-writes within the writing turn (`RW`), with
@@ -125,6 +126,12 @@ import { createState, echo } from "smudgy:core";
 const store = (globalThis as any).__smudgy_store;
 const paths: string[] = [];
 store.onWrite("user", "vitals", (path: string) => { paths.push(path); });
+// Per-write callbacks follow journal order. This separate path is written last,
+// so its callback observes every vitals notification without a timer race.
+store.onWrite("user", "value_proxy_done", () => {
+    echo("PATHS:" + JSON.stringify(paths));
+    echo("VALUE_PROXY_DONE");
+});
 
 const vitals = createState<any>('vitals');
 vitals.set({ hp: 10, stats: { str: 5 } });
@@ -137,7 +144,7 @@ echo("DEL:" + String((vitals.value as any).stats));
 echo("KEYS:" + JSON.stringify(Object.keys(vitals.value)));
 vitals.value = { fresh: 1 };
 echo("WHOLE:" + JSON.stringify(vitals.value));
-setTimeout(() => echo("PATHS:" + JSON.stringify(paths)), 50);
+store.set(null, "value_proxy_done", true);
 "#;
 
 /// Module exercising the leaf-aware read path (`docs/interop.md` §4a) through
@@ -484,17 +491,18 @@ echo("ATCAP:" + store.get("user", "vitals.hp"));
 "#;
 
 async fn run_module(session_id: u32, server: &str, source: &str) -> Vec<String> {
-    run_module_counting_wakes(session_id, server, source)
+    run_module_counting_wakes(session_id, server, source, None)
         .await
         .0
 }
 
 /// Like [`run_module`], but also counts the `StoreBindingsChanged` repaint wakes observed on
-/// the session event stream.
+/// the session event stream. When supplied, wait for a completion marker across quiet gaps.
 async fn run_module_counting_wakes(
     session_id: u32,
     server: &str,
     source: &str,
+    completion_marker: Option<&str>,
 ) -> (Vec<String>, usize) {
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
@@ -532,7 +540,19 @@ async fn run_module_counting_wakes(
             _ => {}
         }
     };
-    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+    let deadline = tokio::time::Instant::now() + COMPLETION_TIMEOUT;
+    loop {
+        if completion_marker.is_some_and(|marker| lines.iter().any(|line| line == marker)) {
+            break;
+        }
+        let next_deadline = if completion_marker.is_some() {
+            deadline
+        } else {
+            tokio::time::Instant::now() + QUIET_PERIOD
+        };
+        let Ok(Some(event)) = tokio::time::timeout_at(next_deadline, events.next()).await else {
+            break;
+        };
         match event.event {
             SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
             SessionEvent::StoreBindingsChanged => wakes += 1,
@@ -540,6 +560,12 @@ async fn run_module_counting_wakes(
         }
     }
     tx.send(RuntimeAction::Shutdown).ok();
+    if let Some(marker) = completion_marker {
+        assert!(
+            lines.iter().any(|line| line == marker),
+            "session ended or timed out before {marker}: output={lines:?}"
+        );
+    }
     (lines, wakes)
 }
 
@@ -785,7 +811,13 @@ async fn on_write_replays_every_write_in_order_with_paths() {
 
 #[tokio::test]
 async fn value_proxy_publishes_set_at_path_per_assignment() {
-    let lines = run_module(7305, "StoreValueProxy", VALUE_PROXY_TS).await;
+    let (lines, _) = run_module_counting_wakes(
+        7305,
+        "StoreValueProxy",
+        VALUE_PROXY_TS,
+        Some("VALUE_PROXY_DONE"),
+    )
+    .await;
     let transcript = lines.join("\n");
 
     assert!(
@@ -816,6 +848,23 @@ async fn value_proxy_publishes_set_at_path_per_assignment() {
             .any(|l| l == r#"PATHS:["vitals","vitals.hp","vitals.stats.str","vitals","vitals"]"#),
         "every assignment is one set-at-path at the assigned path.\n{transcript}"
     );
+}
+
+#[tokio::test]
+async fn value_proxy_completion_waits_across_a_quiet_gap() {
+    // Deliver the sentinel after the old 900 ms quiet cutoff. The collector must
+    // keep waiting for completion even when the earlier output has gone quiet.
+    let source = VALUE_PROXY_TS.replace(
+        r#"store.set(null, "value_proxy_done", true);"#,
+        r#"setTimeout(() => store.set(null, "value_proxy_done", true), 1500);"#,
+    );
+    run_module_counting_wakes(
+        7325,
+        "StoreValueProxyDelayed",
+        &source,
+        Some("VALUE_PROXY_DONE"),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1024,7 +1073,7 @@ async fn procedures_deliver_async_with_stamped_caller_and_queue_briefly() {
 
 #[tokio::test]
 async fn bindings_mint_deduped_tokens_and_wake_per_writing_turn() {
-    let (lines, wakes) = run_module_counting_wakes(7303, "StoreBind", BIND_TS).await;
+    let (lines, wakes) = run_module_counting_wakes(7303, "StoreBind", BIND_TS, None).await;
     let transcript = lines.join("\n");
 
     assert!(
