@@ -116,6 +116,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is merely missing keeps them, and a package re-created under that name adopts
   them.
 
+### Fixed
+
+- **An idle smudgy no longer keeps the computer awake.** Smudgy used to open
+  the audio device the moment it started and hold it, silent, until it quit.
+  Windows counts that as audio playing, so a computer with smudgy open would
+  never go to sleep on its own. The device is now opened when a sound actually
+  plays and released again after five minutes of silence, without losing the
+  start of the sound that wakes it.
+
 ## [0.5.7-ptb] - 2026-09-01
 
 ### Added
