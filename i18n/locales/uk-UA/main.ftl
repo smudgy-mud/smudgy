@@ -1,3 +1,60 @@
+### TERMINOLOGY USED
+###
+### map          → мапа (not карта)               
+### folder       → тека (not папка)
+### package      → пакунок (not пакет)
+### settings     → налаштування — the values a user configures.
+### parameters   → параметри — only the declarations in a package manifest
+###                (manifest-param-*).
+### delete       → Видалити — destroys the thing.
+### remove       → Вилучити — takes it out of a set; the thing may survive.
+### uninstall    → Деінсталювати
+### debugging    → зневадження (not налагодження)
+### handle       → дескриптор
+### control characters/bytes → символи керування / байти керування
+###                (not керівні символи, which means "governing").
+### by default   → типово (not за замовчуванням, a calque of по умолчанию).
+###
+### PUNCTUATION
+###
+### Apostrophe: one character throughout (U+0027), as in ім'я, з'єднання.
+### Quotation marks: «» for quoted names and UI labels.
+### Ellipsis: … (U+2026), never three periods.
+###
+### PLURALS
+###
+### Ukrainian has four CLDR categories, and [one] fires on 1, 21, 31, 101 —
+### not only on 1. Three rules are:
+###
+### 1. Never hardcode the digit inside a branch. Write { $count } пакунок,
+###    not 1 пакунок, or 21 renders as "1".
+### 2. When the numeral is printed, all four branches are needed, and the verb
+###    agrees too: [one] takes a singular verb (21 пакунок потребує),
+###    [few] and [many] take plural.
+### 3. *[other] fires only on fractional values, which take the genitive
+###    singular: 1,5 дня, 1,5 пакунка. It is not a synonym for [many].
+###
+### Where a string is a badge or a stat rather than a sentence, prefer
+### label-first (невдалих: { $count }) over a selector — the number then sits
+### outside the agreement chain and no branch is needed. See mapper-sync-failed,
+### mapper-secret-count-warning, mapper-route-preview-stats.
+###
+### If the English source shows a count that Ukrainian needs but the source
+### omits, the count may be added on this side (see package-removal-required)
+### but flag it, since the two locales then differ in what they display.
+###
+### REGISTER
+###
+### Address the user with ви, lowercase.
+### Checkbox and toggle labels take the infinitive: Показувати, Приховувати,
+### Увімкнути — not the imperative.
+### Confirmations use Справді видалити…? — not the calqued
+### Ви впевнені, що хочете видалити…?
+### Avoid the copula є in affirmative statements (Поле обов'язкове, not
+### Поле є обов'язковим). Negations keep не є, which is normal Ukrainian.
+
+
+
 # Locale names
 locale-system = Системна мова
 locale-english = Англійська (США)
@@ -29,7 +86,7 @@ action-save = Зберегти
 action-send = Надіслати
 action-sign-in = Увійти
 action-sign-out = Вийти
-action-update = Оновити
+action-update = Оновити версію
 state-disabled = Вимкнений
 state-enabled = Увімкнений
 state-loading = Завантаження…
@@ -49,7 +106,7 @@ message-count =
 
 # Settings window navigation
 nav-account = Обліковий запис
-nav-preferences = Налаштування
+nav-preferences = Параметри
 nav-audio = Аудіо
 nav-security = Безпека
 nav-friends = Друзі
@@ -99,7 +156,7 @@ account-error-nickname-empty = Вкажіть псевдонім.
 account-error-nickname-format = Псевдонім має містити 3–24 символи: літери, цифри, «-» або «_».
 
 # Preferences
-preferences-title = Налаштування
+preferences-title = Параметри
 preferences-appearance = Вигляд
 preferences-terminal-font = Шрифт терміналу
 preferences-font-size = Розмір шрифту
@@ -111,15 +168,14 @@ preferences-disable-blink-help = Текст, який MUD надсилає як 
 preferences-bold-mode-bold = Показувати жирний текст жирним
 preferences-bold-mode-bright = Показувати жирний текст яскравим
 preferences-bold-mode-both = Показувати жирний текст жирним і яскравим
-link-tooltip-loading = Завантаження…
 preferences-press-enter = Натисніть Enter, щоб застосувати.
 preferences-line-length = Довжина рядка
 preferences-wrap-window = переносити за шириною вікна
 preferences-line-length-help = Максимальна кількість символів у рядку до перенесення; порожнє поле переносить за шириною вікна. Натисніть Enter, щоб застосувати.
 preferences-theme = Тема
-preferences-theme-extended-colors = Пристосовувати коди TrueColor та 256-колірні до кольорів теми.
+preferences-theme-extended-colors = Пристосовувати коди TrueColor і 256-колірні до кольорів теми
 preferences-theme-extended-colors-help = Коли цю опцію вимкнено, коди 256-колірної палітри та TrueColor відображаються точно, через що темний текст у темах може бути важко читати, якщо у вас не чорне тло.
-preferences-scrollback = Історія сесії
+preferences-scrollback = Буфер прокручування
 preferences-scrollback-help = Кількість рядків, що зберігаються для кожної сесії. Натисніть Enter, щоб застосувати.
 preferences-link-tooltip-delay = Затримка підказки посилання (мс)
 preferences-link-tooltip-delay-help = Час, протягом якого вказівник має залишатися над посиланням, перш ніж з'явиться підказка. 0 показує її одразу; максимальне значення — 60000. Натисніть Enter, щоб застосувати.
@@ -143,14 +199,14 @@ preferences-advanced = Додатково
 preferences-advanced-scripting = Увімкнути розширені функції скриптів
 preferences-advanced-scripting-help = Розблоковує опцію «Вилучити пісочницю» (запуск встановленого пакунка з повним доступом).
 preferences-integrations = Інтеграції
-preferences-discord-rich-presence = Показуйте гру, у яку ви граєте, у Discord.
-preferences-discord-rich-presence-help = Відображає напис «Playing Smudgy» та назву сервера під час підключення через програму Discord на цьому комп’ютері. Налаштування конфіденційності Discord визначають, хто бачитиме ваш статус.
+preferences-discord-rich-presence = Показувати в Discord гру, у яку ви граєте
+preferences-discord-rich-presence-help = Відображає напис «Playing Smudgy» та назву сервера під час підключення через програму Discord на цьому комп'ютері. Налаштування конфіденційності Discord визначають, хто бачитиме ваш статус.
 preferences-updates = Оновлення
 preferences-auto-updates = Автоматично перевіряти наявність оновлень
 preferences-mask-password-input = Приховувати введений текст, коли сервер запитує пароль
 preferences-history-case-sensitive-match = Враховувати регістр при пошуку в історії
-preferences-history-case-sensitive-match-help = Up/Down перебирає лише записи історії, що починаються з тексту, який залишився невиділеним. Вимкнено за замовчуванням — пошук без урахування регістру; увімкніть для точного збігу регістру.
-preferences-max-history = Розмір історії вводу
+preferences-history-case-sensitive-match-help = Up/Down перебирає лише записи історії, що починаються з тексту, який залишився невиділеним. Типово вимкнено — пошук без урахування регістру; увімкніть для точного збігу регістру.
+preferences-max-history = Розмір історії введення
 preferences-max-history-help = Скільки останніх команд запам'ятовує історія Up/Down. 0 — зберігати все.
 preferences-invalid-value = некоректне значення
 
@@ -194,7 +250,7 @@ friends-verify-email = Підтвердьте електронну адресу,
 friends-go-account = Перейти до облікового запису
 
 # Client validation labels
-validation-invalid-value = неправильне значення
+validation-invalid-value = некоректне значення
 
 # Server text encoding
 encoding-label = Кодування тексту сервера
@@ -244,7 +300,7 @@ server-mccp4-compression = Дозволити стиснення (MCCP4)
 server-tls = Безпечне з'єднання (TLS)
 server-tls-verify = Перевіряти сертифікат
 server-tls-insecure-help = Знімайте позначку лише для серверів із самопідписаними сертифікатами (незахищено).
-server-confirm-delete = Ви впевнені, що хочете видалити сервер «{ $name }»? Цю дію не можна скасувати.
+server-confirm-delete = Справді видалити сервер «{ $name }»? Цю дію не можна скасувати.
 server-confirm-delete-action = Так, видалити цей сервер
 server-error-port = Некоректний номер порту. Номер порту має бути в діапазоні від 1 до 65535.
 server-error-host-empty = Поле «Хост» не може бути порожнім.
@@ -254,8 +310,8 @@ server-error-config = Помилка конфігурації: { $error }
 server-error-create = Не вдалося створити сервер: { $error }
 server-error-update = Не вдалося оновити сервер: { $error }
 server-error-delete = Не вдалося видалити сервер: { $error }
-server-error-state-changed = The server changed before the save finished. Reload it and try again.
-server-error-delete-state-changed = The server changed before the delete finished. Reload it and try again.
+server-error-state-changed = Сервер змінився до завершення збереження. Перезавантажте його та повторіть спробу.
+server-error-delete-state-changed = Сервер змінився до завершення видалення. Перезавантажте його та повторіть спробу.
 server-error-cache-changed = Сервер змінився до очищення кешу зображень. Перевірте його та повторіть спробу.
 server-error-cache-clear = Не вдалося очистити кеш зображень: { $error }
 server-error-action-delete = Неочікувана помилка: не можна надіслати під час підтвердження видалення.
@@ -263,17 +319,19 @@ server-error-action-missing = Неочікувана помилка: немає 
 server-edit-short = Редагувати
 server-details-missing = Відомості про сервер не знайдено.
 
-# Спостережені метадані сервера (MSSP) на екрані підключення
+# Observed server metadata (MSSP) on the connect screen
 observed-players = { $players ->
-    [one] 1 гравець
+    [one] { $players } гравець
     [few] { $players } гравці
-   *[other] { $players } гравців
+    [many] { $players } гравців
+   *[other] { $players } гравця
 }
 observed-last-connected = Останнє з'єднання { $ago }
 observed-uptime = { $days ->
     [one] працює { $days } день
     [few] працює { $days } дні
-   *[other] працює { $days } днів
+    [many] працює { $days } днів
+   *[other] працює { $days } дня
 }
 observed-tls-available = Доступний TLS
 observed-contact = Контакт: { $contact }
@@ -285,7 +343,7 @@ ago-minutes = { $minutes } хв тому
 ago-hours = { $hours } год тому
 ago-days = { $days } дн тому
 
-# Пропозиція перейти на TLS під час сесії
+# In-session offer to switch to TLS
 tls-offer-body = Цей сервер пропонує зашифроване з'єднання через порт { $port }.
 tls-offer-accept = Перемкнутися й підключитися знову
 tls-offer-decline = Не для цього сервера
@@ -305,7 +363,7 @@ profile-add = Додати профіль
 profile-create = Створити профіль
 profile-edit = Редагувати профіль
 profile-delete = Видалити профіль
-profile-confirm-delete = Ви впевнені, що хочете видалити профіль «{ $name }»?
+profile-confirm-delete = Справді видалити профіль «{ $name }»?
 profile-confirm-delete-action = Так, видалити цей профіль
 profile-connect = Підключитися
 profile-offline = Офлайн
@@ -331,10 +389,10 @@ profile-error-password-clear = Не вдалося очистити збереж
 profile-error-create = Не вдалося створити профіль: { $error }
 profile-error-update = Не вдалося оновити профіль: { $error }
 profile-error-delete = Не вдалося видалити профіль: { $error }
-profile-error-server-state-changed = The server changed before the profile could be created. Review it and try again.
-profile-error-state-changed = The profile changed before the save could finish. Review it and try again.
-profile-error-delete-state-changed = The profile changed before it could be deleted. Review it and try again.
-profile-error-password-state-changed = The profile changed before its stored password could be cleared.
+profile-error-server-state-changed = Сервер змінився, перш ніж вдалося створити профіль. Перевірте його та повторіть спробу.
+profile-error-state-changed = Профіль змінився до завершення збереження. Перевірте його та повторіть спробу.
+profile-error-delete-state-changed = Профіль змінився, перш ніж його вдалося видалити. Перевірте його та повторіть спробу.
+profile-error-password-state-changed = Профіль змінився, перш ніж вдалося очистити збережений пароль.
 profile-warning-password-state-changed = Профіль { $server } / { $profile } збережено, але пароль не змінено, оскільки профіль знову змінився. Перевірте профіль і повторіть спробу.
 profile-warning-password-failed = Профіль { $server } / { $profile } збережено, але його пароль не вдалося змінити: { $error }
 
@@ -343,7 +401,7 @@ window-main-development = Smudgy — ВЕРСІЯ ДЛЯ РОЗРОБНИКІВ
 window-main-release-candidate = Smudgy — КАНДИДАТ НА ВИПУСК { $version }
 window-main-public-test-build = Smudgy — ПУБЛІЧНА ТЕСТОВА ВЕРСІЯ { $version } — зібрана { $build }
 window-main-nightly = Smudgy — ЩОДЕННА ВЕРСІЯ { $version } — зібрана { $build }
-window-automations = автоматизації Smudgy — { $server }
+window-automations = Smudgy — Автоматизації — { $server }
 toolbar-connect = Підключитися
 toolbar-automations = Автоматизації
 toolbar-map-editor = Редактор мап
@@ -355,14 +413,19 @@ layouts-apply-hint = Натисніть на розкладку, щоб заст
 layouts-empty = Немає збережених розкладок для { $server }.
 layouts-overwrite = Перезаписати
 layouts-rename = Перейменувати
-layouts-save-as = Зберегти поточну як...
+layouts-save-as = Зберегти поточну як…
 layouts-reset = Скинути розкладку панелей
 layouts-name-placeholder = Назва розкладки
 layouts-confirm-overwrite = Перезаписати розкладку «{ $name }» поточним розташуванням?
 layouts-confirm-delete = Видалити розкладку «{ $name }»?
 layouts-confirm-reset = Звільнити збережену геометрію панелей цієї сесії та розмістити її панелі заново згідно з поточними визначеннями скриптів?
 layouts-saved = Збережено розкладку «{ $name }».
-layouts-saved-partial = Збережено розкладку «{ $name }» — не вдалося додати { $count } збережених карток-заповнювачів.
+layouts-saved-partial = Збережено розкладку «{ $name }» — { $count ->
+        [one] не вдалося додати { $count } збережену картку-заповнювач
+        [few] не вдалося додати { $count } збережені картки-заповнювачі
+        [many] не вдалося додати { $count } збережених карток-заповнювачів
+       *[other] не вдалося додати { $count } збереженої картки-заповнювача
+    }.
 layouts-save-failed = Не вдалося зберегти розкладку: { $error }
 layouts-keep-or-close-intro = Ця розкладка не включає ці сесії. Виберіть, що станеться з кожною:
 layouts-keep = Залишити
@@ -406,24 +469,24 @@ shell-visit-download = Перейдіть на сторінку завантаж
 shell-remind-later = Нагадати пізніше
 shell-skip-version = Пропустити цю версію
 
-# Сповіщення про оновлення пакетів (нижня пігулка головного вікна)
-toast-package-updates-ready = Оновлення пакетів готові ({ $count })
+# Package-update toasts (the main window's bottom pill)
+toast-package-updates-ready = Оновлення пакунків готові ({ $count })
 toast-package-reload-scripts = Перезавантажити скрипти
 toast-package-ignore = Ігнорувати
 toast-package-needs-permissions = Оновлення { $name } потребує нових дозволів
 toast-package-review = Переглянути…
 toast-package-pin-current = Закріпити поточну версію
 toast-package-later = Пізніше
-toast-package-attention = Оновлень пакетів, що потребують уваги: { $count }
+toast-package-attention = Оновлень пакунків, що потребують уваги: { $count }
 toast-package-open-automations = Переглянути у вікні автоматизацій
 toast-package-update-failed = Сталася помилка під час завантаження оновлення для { $name }. Щоб повторити спробу, закрийте та знову відкрийте цю сесію.
 
-# Вікно перегляду оновлення пакета
-package-update-modal-title = Оновлення пакета
+# The package-update review modal
+package-update-modal-title = Оновлення пакунка
 package-update-versions = { $current } → { $latest }
 package-update-version-new = Нова версія { $latest }
 package-update-asks = Це оновлення потребує додаткових дозволів:
-package-update-needs-smudgy = Це оновлення потребує smudgy { $version } або новішої версії. Спершу оновіть smudgy.
+package-update-needs-smudgy = Це оновлення потребує Smudgy { $version } або новішої версії. Спершу оновіть Smudgy.
 package-update-grant = Надати дозволи й оновити
 package-update-pin = Закріпити поточну версію
 package-update-not-now = Не зараз
@@ -521,7 +584,7 @@ mapper-link-delete-secret-warning = Це з'єднання містить тає
 mapper-link-delete-action = Видалити з'єднання
 mapper-link-delete-title = Видалити з'єднання
 mapper-route-preview-link = Попередній перегляд автоматичного маршруту для з'єднання { $id }
-mapper-route-preview-stats = { $points } збережених зламів на мапі · { $states } відвіданих станів скрипта-розв'язувача
+mapper-route-preview-stats = збережених зламів на мапі: { $points } · відвіданих станів скрипта-розв'язувача: { $states }
 mapper-route-preview-accept-help = Прийняття замінює збережені точки однією оборотною зміною типу compare-and-set (порівняти і записати). Скасування залишає поточний маршрут без змін.
 mapper-route-preview-public-help = Автоматичне прокладання маршруту використовує лише публічні кімнати; у режимі з відкритими секретами маршрут може накладатися на непов'язані таємні кімнати.
 mapper-route-preview-accept = Прийняти маршрут
@@ -538,7 +601,11 @@ mapper-redistribute-offsets = Попередній перегляд зсувів
 mapper-redistribute-help = Ручні порти залишаються нерухомими. Перпендикулярні кінцеві відрізки виправляються в тій самій зміні.
 mapper-redistribute-title = Перерозподілити порти
 mapper-copy-boundary-one = { $count } граничне з'єднання залишає виділені кімнати.
-mapper-copy-boundary-many = { $count } граничних з'єднань залишає виділені кімнати.
+mapper-copy-boundary-many = { $count ->
+        [one] { $count } граничне з'єднання залишає виділені кімнати.
+        [few] { $count } граничні з'єднання залишають виділені кімнати.
+       *[other] { $count } граничних з'єднань залишає виділені кімнати.
+    }
 mapper-copy-boundary-help = Типово вони пропускаються. Якщо їх додати, кожне стає висячим одностороннім з'єднанням без збережених точок маршруту.
 mapper-copy-include-boundary = Додати з'єднання, що виходять за межі виділення
 mapper-copy-selection-title = { $action } виділення
@@ -555,7 +622,12 @@ mapper-new-area = Нова область
 mapper-name-new-area = Назвіть нову область
 mapper-area-name-placeholder = назва області
 mapper-delete-area = Видалити область
-mapper-delete-area-question = Видалити «{ $name }» та її { $rooms } кімнат?
+mapper-delete-area-question = Видалити «{ $name }» та { $rooms ->
+        [one] { $rooms } кімнату в ній
+        [few] { $rooms } кімнати в ній
+        [many] { $rooms } кімнат у ній
+       *[other] { $rooms } кімнати в ній
+    }?
 mapper-cannot-undo = Цю дію не можна скасувати.
 mapper-new-folder = Нова тека
 mapper-name-new-folder = Назвіть нову теку
@@ -605,7 +677,7 @@ mapper-transfer-title = Передати «{ $name }»
 mapper-show-on-servers = Показувати на серверах
 mapper-show-name-on = Показувати «{ $name }» на:
 mapper-no-server-entries = Немає записів серверів.
-mapper-unchecked-all-servers = Знята позначка всюди означає «видимо на кожному сервері».
+mapper-unchecked-all-servers = Якщо не позначено жодного сервера, мапа видима на всіх серверах.
 mapper-scope = Обсяг
 mapper-scope-area = Лише ця область
 mapper-scope-atlas = Його атлас (охоплює області, додані пізніше)
@@ -625,7 +697,7 @@ mapper-secrets-owner-only = Лише власник мапи може надав
 mapper-make-admin-area = Надати права адміністратора
 mapper-disclose-servers = Розкрити сервери
 mapper-disclose-servers-help = Отримувачі бачать ці назви серверів, завдяки чому їхній клієнт може автоматично розмістити мапи у відповідній грі.
-mapper-secret-count-warning = { $rooms } таємних кімнат, { $exits } таємних виходів та { $other } таємних нотаток/позначок/фігур НЕ буде надано в доступ.
+mapper-secret-count-warning = НЕ буде надано в доступ — таємних кімнат: { $rooms }, таємних виходів: { $exits }, таємних нотаток/позначок/фігур: { $other }.
 mapper-review-secrets = Переглянути секрети
 mapper-no-marked-secrets = Ніщо в цій області не позначено як таємне — доступ буде надано до всього.
 mapper-secret-forward-only = Позначення чогось як таємного ПІСЛЯ надання доступу впливає лише на майбутні синхронізації — те, до чого вже надано доступ, залишається видимим для користувачів.
@@ -720,8 +792,8 @@ shape-type-rounded-rectangle = Прямокутник із заокруглен�
 alignment-left = Ліворуч
 alignment-center = По центру
 alignment-right = Праворуч
-alignment-top = Догори
-alignment-bottom = Донизу
+alignment-top = Вгорі
+alignment-bottom = Внизу
 
 # Map inspector
 inspector-nothing-changed = Без змін
@@ -928,15 +1000,15 @@ mapper-transfer-action = Передати…
 mapper-transfer-tip = Передати цю мапу другові (після прийняття він стає її власником)
 mapper-inactive-location-tip = Не використовується для визначення вашого розташування — активуйте її у списку областей
 mapper-syncing = синхронізація { $count }
-mapper-sync-failed = { $count } невдалих
+mapper-sync-failed = невдалих: { $count }
 mapper-sync = Синхронізувати
 mapper-sync-tip = Синхронізувати з хмарою
 mapper-shared-by-friend = Надано другом
 mapper-a-friend = друг
 mapper-shared-by-owner-pair = Надано користувачем { $sharer } · власник: { $owner }
 mapper-shared-by-person = Надано користувачем { $person }
-mapper-window-title = Smudgy редактор мап
-mapper-window-area-title = Smudgy редактор мап — { $area }
+mapper-window-title = Smudgy — редактор мап
+mapper-window-area-title = Smudgy — редактор мап — { $area }
 mapper-copy-report = Скопійовано області: { $copied }; пропущено: { $skipped } (не можна скопіювати).
 mapper-copy-rooms-denied = Власник цієї мапи не дозволив копіювати кімнати.
 mapper-create-first-room = Створити першу кімнату
@@ -997,7 +1069,7 @@ automations-store = Крамниця
 automations-reload = Перезавантажити
 automations-state-unavailable = Smudgy не вдалося прочитати всі дані автоматизації. Виправте файли, а потім перезавантажте їх.
 automations-inspect = Інспектувати
-automations-inspect-help = Відкрити інспектор скриптів для активної сесії цього сервера (потрібна підключена сесія з увімкненим налагодженням)
+automations-inspect-help = Відкрити інспектор скриптів для активної сесії цього сервера (потрібна підключена сесія з увімкненим зневадженням)
 automations-modules = Модулі
 automations-session-store = Сховище сесії
 palette-group-create = Створити
@@ -1030,7 +1102,7 @@ store-empty = Ще нічого не опубліковано. Стан з'яв�
 store-usage = записи: { $entries } · { $bytes }
 store-more-hidden = … ще { $count } не показано
 store-catalogue = Стан, події та повідомлення
-store-catalogue-empty = Ще не виявлено жодного інтероп-хендла. Тут з'являться оголошені хендли, згенеровані події та надіслані повідомлення.
+store-catalogue-empty = Ще не виявлено жодного дескриптора interop. Тут з'являться оголошені дескриптори, згенеровані події та надіслані повідомлення.
 store-provenance-declared = оголошений
 store-provenance-declared-unseen = оголошений · не виявлений у цій сесії
 store-provenance-runtime = створений під час виконання
@@ -1079,7 +1151,7 @@ editor-failed-modules-dir = Не вдалося знайти каталог мо
 editor-failed-create-module = Не вдалося створити модуль: { $error }
 editor-module-created = Створено модуль { $name }.
 editor-create-module = Створити модуль
-automation-inspector-unavailable = Інспектор ще недоступний — запускається, коли сесія під'єднається. Під'єднайте цю сесію ще раз, а потім знову натисніть Інспекція.
+automation-inspector-unavailable = Інспектор ще недоступний — запускається, коли сесія підключиться. Підключіть цю сесію ще раз, а потім знову натисніть «Інспектувати».
 editor-delete = Видалити
 editor-unsaved = Незбережені зміни
 editor-discard = Відхилити
@@ -1127,16 +1199,19 @@ activation-disable-everywhere = Вимкнути всюди
 activation-current-profile = Поточний
 activation-every-profile = Кожен профіль
 activation-no-profile = Немає профілів
-activation-profile-count = { $enabled } з { $total } профілів
+activation-profile-count = { $total ->
+        [one] { $enabled } з { $total } профілю
+       *[other] { $enabled } з { $total } профілів
+    }
 activation-profile-list-unavailable = Список профілів недоступний
 activation-profile-inventory-error = Smudgy не вдалося прочитати всі профілі. Виправте файли профілів і перезавантажте їх, перш ніж змінювати окремі профілі.
-activation-folder-state-error = Smudgy не вдалося прочитати активацію папок. Виправте файл packages.json і перезавантажте його, перш ніж змінювати активацію.
-activation-folder-error-blocked = Fix the folder error shown above before you change activation.
+activation-folder-state-error = Smudgy не вдалося прочитати активацію тек. Виправте файл packages.json і перезавантажте його, перш ніж змінювати активацію.
+activation-folder-error-blocked = Виправте помилку теки, показану вище, перш ніж змінювати активацію.
 activation-module-state-error = Smudgy не вдалося прочитати активацію модулів. Виправте файл налаштувань модулів і перезавантажте його, перш ніж змінювати активацію.
-automation-folder-case-ambiguous = Цій назві відповідає кілька збережених папок. Перейменуйте один із варіантів, що відрізняються лише регістром, перш ніж змінювати активацію.
+automation-folder-case-ambiguous = Цій назві відповідає кілька збережених тек. Перейменуйте один із варіантів, що відрізняються лише регістром, перш ніж змінювати активацію.
 automation-folder-state-unavailable = Smudgy не може зберегти автоматизації, оскільки не вдалося прочитати packages.json. Виправте файл і перезавантажте його.
 activation-create-profile = Створіть профіль, щоб вибрати його тут.
-activation-folder-masked = Цю папку вимкнено, тому що папку { $ancestor } вимкнено для цього профілю.
+activation-folder-masked = Цю теку вимкнено, тому що теку { $ancestor } вимкнено для цього профілю.
 module-tab-settings = Налаштування
 module-tab-source = Джерело
 module-nested-load-help = Вкладені модулі типово не запускаються. Інші модулі можуть їх імпортувати.
@@ -1146,37 +1221,37 @@ package-tab-permissions = Дозволи
 package-tab-manifest = Маніфест
 package-tab-sharing = Спільний доступ
 package-required-in-profile = Потрібен пакунку { $package }.
-package-parameter-values = Package Settings
-package-parameter-global = Same settings on all profiles
-package-parameter-profile = Per-profile settings
+package-parameter-values = Налаштування пакунка
+package-parameter-global = Однакові налаштування для всіх профілів
+package-parameter-profile = Окремі налаштування для кожного профілю
 package-parameter-profile-label = Профіль
-package-parameter-profile-status = Problems
+package-parameter-profile-status = Проблеми
 package-parameter-missing = Відсутні: { $params }
-package-parameter-scope-updated = Область параметрів оновлено.
-package-copy-settings = Copy settings to…
-package-copy-settings-title = Copy settings to another profile
-package-copy-settings-help = Copies the settings for { $profile } to the profile you choose, replacing its current values.
-package-copy-settings-destination = Destination profile
-package-copy-settings-choose = Choose a profile
-package-settings-copied = Settings copied to { $profile }.
-package-settings-copy-failed = Smudgy could not copy the settings: { $error }
+package-parameter-scope-updated = Область налаштувань оновлено.
+package-copy-settings = Копіювати налаштування до…
+package-copy-settings-title = Копіювати налаштування до іншого профілю
+package-copy-settings-help = Копіює налаштування профілю { $profile } до профілю, який ви виберете, замінюючи його поточні значення.
+package-copy-settings-destination = Профіль призначення
+package-copy-settings-choose = Виберіть профіль
+package-settings-copied = Налаштування скопійовано до профілю { $profile }.
+package-settings-copy-failed = Smudgy не може скопіювати налаштування: { $error }
 automation-discard-and-switch = Відкинути зміни й перейти
 automation-discard-and-close = Відкинути зміни й закрити
 automations-created-count =
     { $count ->
-        [one] 1 автоматизація
+        [one] { $count } автоматизація
         [few] { $count } автоматизації
         [many] { $count } автоматизацій
        *[other] { $count } автоматизації
     }
 automations-dependency-count =
     { $count ->
-        [one] 1 залежність
+        [one] { $count } залежність
         [few] { $count } залежності
         [many] { $count } залежностей
        *[other] { $count } залежності
     }
-module-script-extension-required = Файл модуля повинен мати розширення .js, .ts, .jsx або .tsx.
+module-script-extension-required = Файл модуля має закінчуватися на .js, .ts, .jsx або .tsx.
 module-import-only-help = Smudgy не запускає цей файл безпосередньо. Модуль сценарію може його імпортувати.
 module-save-before-activation = Збережіть зміни перед зміною профілів, у яких цей модуль активний.
 package-save-before-activation = Збережіть зміни пакунка, перш ніж увімкнути його в інших профілях.
@@ -1197,7 +1272,7 @@ package-use-profile-globally = Використовувати цей профі�
 package-remote-leaf-conflict = Smudgy виявив суперечливих віддалених власників пакунка «{ $name }». Назви опублікованих пакунків глобально унікальні, тому Smudgy не завантажив і не змінив цей пакунок.
 package-preparing-cache = Завантаження та перевірка файлів пакунка…
 package-required-root-version-invalid = Smudgy не може перевірити вимоги пакунка { $name }, оскільки його версія недійсна: { $error }
-package-required-graph-unstable = Граф потрібних пакунків не має одного стабільного розв’язання версій. Встановлення зупинено.
+package-required-graph-unstable = Граф потрібних пакунків не має одного стабільного розв'язання версій. Встановлення зупинено.
 package-source-nul-warning = Цей вихідний код містить байти NUL. Smudgy показує кожен із них як ␀, щоб не приховувати виконуваний текст. Цей режим перевірки доступний лише для читання.
 automation-publication-record-warning = Цей номер версії вже використано. Не публікуйте його повторно. Перевірте цю інформацію:
     { $warnings }
@@ -1208,17 +1283,17 @@ automation-publication-link-missing-warning = { $name }@{ $version } є на с�
 automation-publication-link-unverified-warning = { $name }@{ $version } є на сервері, але Smudgy не зміг перевірити локальне посилання на публікацію: { $error }. Перезавантажте список пакунків перед перейменуванням або видаленням локального пакунка.
 automation-publication-local-changed-warning = { $name }@{ $version } є на сервері, але локальний пакунок змінився під час публікації. Опублікована версія містить попередні файли. Перевірте опублікований вихідний код перед створенням наступної версії.
 automation-publication-description-warning = { $name }@{ $version } є на сервері, але Smudgy не зміг оновити опис пакунка: { $error }. Ви можете опублікувати пізнішу версію, щоб повторити спробу оновлення опису.
-package-shared-check = ✓ Надано доступ
+package-shared-check = ✓ Доступ надано
 package-local-override-note = Цей локальний пакунок має пріоритет над установленим пакунком із такою самою назвою. Установлений пакунок повернеться після видалення локального пакунка.
-package-local-reconcile-failed = Smudgy не вдалося підготувати параметри локального пакунка: { $error }
+package-local-reconcile-failed = Smudgy не вдалося підготувати налаштування локального пакунка: { $error }
 package-local-state-unavailable = Smudgy не може прочитати повний стан локальних пакунків. Останній коректний стан залишається видимим, але зміни вимкнено: { $error }
 package-installed-state-unavailable = Smudgy не може прочитати стан установлених пакунків. Останній коректний стан залишається видимим, але зміни вимкнено: { $error }
-package-settings-read-unavailable = Smudgy не може прочитати параметри цього пакунка. Жодні значення не змінено: { $error }
-package-settings-read-unavailable-generic = Smudgy не може прочитати параметри цього пакунка. Перезавантажте дані та спробуйте ще раз.
-package-settings-row-missing = Smudgy не може знайти запис параметрів цього пакунка.
-package-param-prompt-scope-changed = Цей пакунок тепер має окремі параметри для кожного профілю. Закрийте це вікно й налаштуйте кожен активний профіль у вкладці «Параметри».
+package-settings-read-unavailable = Smudgy не може прочитати налаштування цього пакунка. Жодні значення не змінено: { $error }
+package-settings-read-unavailable-generic = Smudgy не може прочитати налаштування цього пакунка. Перезавантажте дані та спробуйте ще раз.
+package-settings-row-missing = Smudgy не може знайти запис налаштувань цього пакунка.
+package-param-prompt-scope-changed = Цей пакунок тепер має окремі налаштування для кожного профілю. Закрийте це вікно й налаштуйте кожен активний профіль у вкладці «Налаштування».
 
-# ---- Редактори зіставлень аліасів і тригерів ----
+# ---- Alias and trigger matcher editors ----
 editor-match-input-as = Зіставляти введення як
 editor-kind-command = Команда + аргументи
 editor-kind-pattern = Простий шаблон
@@ -1227,7 +1302,7 @@ editor-kind-raw = Необроблені байти
 editor-badge-advanced = Розширений
 editor-badge-wizardry = Експертний
 editor-card-example-command = greet <person>
-editor-raw-hint = Запишіть \e як символ екранування. Коди кольорів і керівні байти залишаються в рядку.
+editor-raw-hint = Запишіть \e як символ екранування. Коди кольорів і байти керування залишаються в рядку.
 editor-group-exceptions = Винятки
 editor-group-exceptions-note = Не дає цьому тригеру спрацювати
 editor-group-raw = Необроблені збіги
@@ -1238,7 +1313,7 @@ editor-add-exception-another = Додати ще один виняток
 editor-add-exception = Додати виняток
 editor-add-exception-tip = Якщо є збіг, тригер не спрацює
 editor-match-raw = Зіставляти необроблені байти
-editor-match-raw-tip = Необроблений регулярний вираз, що зіставляється перед текстом зі збереженням кодів кольорів і керівних байтів
+editor-match-raw-tip = Необроблений регулярний вираз, що зіставляється перед текстом зі збереженням кодів кольорів і байтів керування
 editor-match-color = Зіставляти колір
 editor-color-foreground = Передній план
 editor-color-background = Тло
@@ -1274,7 +1349,7 @@ editor-color-crossed-out = Закреслення
 editor-color-reverse = Інверсія
 editor-move-up = Перемістити вгору
 editor-move-down = Перемістити вниз
-editor-remove-line = Видалити цей рядок
+editor-remove-line = Вилучити цей рядок
 editor-dot-matches = відповідає тестовому рядку
 editor-dot-no-match = не відповідає тестовому рядку
 editor-dot-blocks = відповідає — блокує тригер
@@ -1361,7 +1436,12 @@ editor-overlap-restart = Почати спочатку
 editor-overlap-each = Спостерігати за кожним окремо
 editor-verdict-inside-suffix = всередині { $outer }
 editor-folder-from-outer = Тека · { $folder } (від { $outer })
-editor-delete-outer-question = Видалити цей тригер і { $count } тригерів усередині нього?
+editor-delete-outer-question = Видалити цей тригер і { $count ->
+        [one] { $count } тригер усередині нього
+        [few] { $count } тригери всередині нього
+        [many] { $count } тригерів усередині нього
+       *[other] { $count } тригера всередині нього
+    }?
 editor-move-inside-out = Перемістити їх назовні
 editor-delete-inside-too = Видалити і їх
 palette-move-inside = Перемістити { $subject } всередину { $outer }
@@ -1369,7 +1449,7 @@ palette-move-outside = Перемістити { $subject } з { $outer }
 
 editor-matched-values = Зіставлені значення
 
-# Спробувати та результати перевірки
+# Try-it and test results
 editor-try-alias-cta = Спробуйте з текстом, який ви могли б ввести
 editor-try-trigger-cta = Спробуйте з рядком, надісланим грою
 editor-try-it = Спробувати
@@ -1385,7 +1465,7 @@ editor-verdict-no-matchers = ✗ немає рядків для зіставле
 editor-verdict-invalid-regex = ✗ некоректний регулярний вираз: { $error }
 editor-verdict-compile-error = ✗ { $error }
 
-# Коли спрацьовує
+# When it runs
 editor-when-it-runs = Коли спрацьовує
 editor-priority = Пріоритет
 editor-priority-note-aliases = Аліаси з вищими номерами спрацьовують першими.
@@ -1394,7 +1474,7 @@ editor-continue-aliases = Також дозволити спрацювати і�
 editor-continue-triggers = Також дозволити спрацювати іншим відповідним тригерам
 editor-allow-self-match = Дозволити тексту, який надсилає цей аліас, збігатися з ним самим
 
-# Що зчитує (відкритий стан)
+# What it reads (exposed state)
 editor-reveal-state = Зчитувати стан із GMCP або пакунка
 editor-hide-state = Сховати параметри стану
 editor-what-it-reads = Що зчитує
@@ -1413,17 +1493,17 @@ editor-state-unexpose-tooltip = Припинити відкривати { $path 
 editor-state-insert-tooltip = Вставити { $reference }
 editor-state-not-exposed = { $reference } не відкрито для цього елемента ({ $kind })
 editor-state-name-taken = Інше відкрите значення вже використовує назву { $name }
-editor-state-name-shadows-smudgy = { $name } зі smudgy буде недоступним у цьому скрипті.
+editor-state-name-shadows-smudgy = { $name } зі Smudgy буде недоступним у цьому скрипті.
 editor-state-name-shadows-javascript = { $name } із JavaScript буде недоступним у цьому скрипті.
 editor-state-name-shadows-deno = { $name } із Deno буде недоступним у цьому скрипті.
 editor-state-name-shadows-capture = { $name } також є зіставленим значенням; саме лише ${ $name } означає збіг
 editor-state-bad-name = { $name } не є припустимою назвою
-editor-state-reserved-name = { $name } є ключовим словом JavaScript і не може бути назвою
+editor-state-reserved-name = { $name } — ключове слово JavaScript, тому не може бути назвою
 editor-state-bad-path = { $path } не є припустимим шляхом
 editor-state-empty = Сховище наразі порожнє.
 editor-state-invalid = Не вдається використати відкрите значення: { $error }
 
-# Модуль дії
+# Action module
 editor-tab-send-text = Надіслати текст
 editor-tab-run-js = Запустити JavaScript
 editor-gen-alias-hello = say Hello, { $hole }!
@@ -1433,19 +1513,19 @@ editor-gen-alias-emote-none = emote smiles and waves.
 editor-gen-trigger = say I heard about { $hole }.
 editor-gen-trigger-none = say Understood.
 
-# Підказки полів
+# Field hints
 editor-gutter-before-pattern = Перед шаблоном може бути будь-який текст
 editor-gutter-after-pattern = Після шаблону може бути будь-який текст
 editor-gutter-before-regex = Немає ^ — перед виразом може бути будь-який текст
 editor-gutter-after-regex = Немає $ — після виразу може бути будь-який текст
 
-# Описи заголовків і посилання внизу
+# Header descriptions and footer links
 editor-deck-alias = Аліаси дають змогу створювати власні команди.
 editor-deck-trigger = Тригери реагують на текст, надісланий грою.
 editor-delete-this-alias = Видалити цей аліас
 editor-delete-this-trigger = Видалити цей тригер
 widget-hotkey-click-to-record = Натисніть, щоб зареєструватися
-widget-hotkey-listening = слухання...
+widget-hotkey-listening = очікування клавіш…
 
 # Package manifest editor
 manifest-kind-text = Текст
@@ -1454,8 +1534,8 @@ manifest-kind-number = Число
 manifest-kind-dropdown = Розкривний список
 manifest-kind-list = Список
 manifest-kind-table = Таблиця
-manifest-version-required = Версія є обов'язковою (напр., 1.0.0).
-manifest-min-version-invalid = Значення нової версії Smudgy «{ $version }» некоректне (напр., 0.4.0).
+manifest-version-required = Потрібно вказати версію (напр., 1.0.0).
+manifest-min-version-invalid = Значення поля «Потребує Smudgy» — «{ $version }» — не є версією (напр., 0.4.0).
 manifest-param-needs-key = Параметр #{ $number } потребує ключа.
 manifest-param-error = Параметр «{ $key }»: { $reason }
 manifest-duplicate-param-key = Дубльований ключ параметра «{ $key }».
@@ -1466,7 +1546,7 @@ manifest-column = стовпець «{ $key }»
 manifest-duplicate-column = Дубльований ключ стовпця «{ $key }».
 manifest-table-needs-column = Таблиця потребує щонайменше одного стовпця з ключем.
 manifest-no-nested-container = { $item } не може саме бути списком чи таблицею.
-manifest-item-dropdown-needs-option = { $item } є розкривним списком і потребує щонайменше однієї опції.
+manifest-item-dropdown-needs-option = { $item } — розкривний список, тож потрібна щонайменше одна опція.
 manifest-duplicate-option = Дубльоване значення опції «{ $value }».
 manifest-default-from-options = Типове значення має бути однією з опцій.
 manifest-default-boolean-error = Типове значення має бути true або false.
@@ -1510,7 +1590,12 @@ manifest-none-period = Немає.
 manifest-required = обов'язковий
 manifest-secret = таємний
 manifest-default-value = типово { $value }
-manifest-kind-dropdown-summary = розкривний список ({ $count } опцій)
+manifest-kind-dropdown-summary = { $count ->
+        [one] розкривний список ({ $count } опція)
+        [few] розкривний список ({ $count } опції)
+        [many] розкривний список ({ $count } опцій)
+       *[other] розкривний список ({ $count } опції)
+    }
 manifest-kind-list-summary = список типу { $kind }
 manifest-kind-table-summary = таблиця [{ $columns }]
 manifest-fully-sandboxed = Повністю в пісочниці — без спеціальних можливостей.
@@ -1544,13 +1629,13 @@ manifest-tab-system = Система
 manifest-sandbox-deny-note = Встановлення в пісочниці не має доступу ні до чого, що не перелічено тут.
 manifest-dependency-lock-note = Публікація фіксує точну версію кожної залежності на момент публікації. Користувачі отримають новіші версії залежностей лише після того, як ви випустите нову версію цього пакунка, яка їх оновить.
 manifest-readable-path-warning = Шлях для читання поза $DATA спричиняє попередження. Надавайте перевагу $DATA, якщо читання зовнішніх файлів не є необхідним.
-manifest-dependencies-help = Інші пакунки Smudgy, які імпортує цей пакунок: smudgy://owner/name@^1.2. Наразі підтримуються лише пакунки smudgy://. Керування версіями пакунків jsr і npm здійснюється їхніми завантажувачами, і пакунок може їх імпортувати, коли має доступ до реєстру.
+manifest-dependencies-help = Інші пакунки Smudgy, які імпортує цей пакунок: smudgy://owner/name@^1.2. Наразі підтримуються лише пакунки smudgy://. Версіями пакунків jsr і npm керують їхні завантажувачі, і пакунок може їх імпортувати, коли має доступ до реєстру.
 manifest-add-dependency-placeholder = Додайте один зі своїх встановлених або локальних пакунків…
 manifest-dependency = залежність
 manifest-any-version-placeholder = будь-яка версія
 manifest-min-version-help = Мінімальна версія Smudgy, на якій працює цей пакунок. Це може запобігти автоматичному оновленню старіших клієнтів до несумісної версії пакунка. Залиште порожнім, щоб дозволити будь-яку версію Smudgy.
 manifest-min-version-format-error = Це не версія. Використайте формат semver, напр., 0.3.5, або залиште порожнім.
-manifest-min-version-newer = Новіша за це Smudgy ({ $running }) — встановлення й завантаження відхиляються нижче за { $required } (ваша локальна копія розробника залишається поза цим правилом).
+manifest-min-version-newer = Новіша за цю версію Smudgy ({ $running }) — встановлення й завантаження відхиляються нижче за { $required } (ваша локальна копія розробника залишається поза цим правилом).
 manifest-hosts-help = Хости, на які націлений цей пакунок у розділі Огляд, застосовуються під час публікації. Залиште порожнім, щоб він був незалежним від хоста.
 manifest-host = хост
 manifest-required-packages = Обов'язкові пакунки
@@ -1561,7 +1646,7 @@ manifest-allow-import-help = Коли вимкнено, модулі цього 
 manifest-allowed-hosts = Дозволені хости
 manifest-host-format-help = ім'я хоста, ім'я хоста:порт, * (будь-який хост/порт) або *:порт (будь-який хост на цьому порту).
 manifest-local-ipc = Локальний IPC
-manifest-local-ipc-help = Локальні служби, до яких цей пакунок може під'єднуватися. Кожен рядок — одна кінцева точка, оголошена для обох родин платформ: шлях Unix-сокета та/або ім'я каналу Windows (smudgy сам додає \\.\pipe\). Надається лише поле, що відповідає платформі користувача.
+manifest-local-ipc-help = Локальні служби, до яких цей пакунок може підключитися. Кожен рядок — одна кінцева точка, оголошена для обох родин платформ: шлях Unix-сокета та/або ім'я каналу Windows (Smudgy сам додає \\.\pipe\). Надається лише поле, що відповідає платформі користувача.
 manifest-ipc-unix-label = Шлях Unix-сокета
 manifest-ipc-pipe-label = Ім'я каналу Windows
 manifest-ipc-unix-placeholder = /var/run/example.sock
@@ -1569,9 +1654,9 @@ manifest-ipc-pipe-placeholder = example-service
 manifest-ipc-endpoint = локальну кінцеву точку IPC
 manifest-ipc-warning = Локальна кінцева точка IPC може діставатися привілейованих системних служб (наприклад, сокета Docker) з повними правами користувача.
 manifest-ipc-unix-invalid = Рядок Локального IPC №{ $number }: шлях Unix-сокета має бути абсолютним (починатися з /).
-manifest-ipc-pipe-invalid = Рядок Локального IPC №{ $number }: ім'я каналу Windows не може містити /, \ чи : — smudgy сам додає \\.\pipe\.
+manifest-ipc-pipe-invalid = Рядок Локального IPC №{ $number }: ім'я каналу Windows не може містити /, \ чи : — Smudgy сам додає \\.\pipe\.
 manifest-net-local-transport-error = Дозволений хост «{ $entry }» називає локальний сокет. Дозволені хости — лише інтернет-хости; локальні кінцеві точки оголошуються в розділі «Локальний IPC».
-manifest-pipe-namespace-path-error = Шлях «{ $entry }» вказує на простір імен каналів Windows. Відкрити канал означає під'єднатися до нього; оголосіть цю кінцеву точку в розділі «Локальний IPC».
+manifest-pipe-namespace-path-error = Шлях «{ $entry }» вказує на простір імен каналів Windows. Відкрити канал означає підключитися до нього; оголосіть цю кінцеву точку в розділі «Локальний IPC».
 manifest-import-none = Немає модулів поза екосистемою Smudgy
 manifest-import-registries = Може завантажувати й запускати модулі з публічних реєстрів (npm, jsr)
 manifest-import-any = Може завантажувати й запускати модулі з будь-якого джерела
@@ -1599,8 +1684,8 @@ manifest-cap-create-aliases = визначення вхідних аліасів
 manifest-cap-create-triggers = реагування на вихідні дані гри
 manifest-cap-send = надсилання команд так, ніби їх було введено (проходять через ваші аліаси)
 manifest-cap-send-raw = надсилати текст і необроблені байти безпосередньо до гри, оминаючи аліаси. Smudgy не показує необроблені байти у вікні виводу
-manifest-cap-echo = відображення тексту на вашому екрані
-manifest-cap-sessions = доступ до інших ваших під'єднаних сесій
+manifest-cap-echo = показ тексту на вашому екрані
+manifest-cap-sessions = доступ до інших ваших підключених сесій
 manifest-cap-display = приховування, виділення, вставлення або заміна тексту
 manifest-cap-mapper-read = читання ваших мап
 manifest-cap-mapper-read-required = читання ваших мап (потрібне для зміни мап)
@@ -1663,7 +1748,7 @@ package-update-mode = Режим оновлення
 package-update-auto-track = Авто — стежити за найновішою
 package-update-pinned-placeholder = Закріплена — виберіть версію…
 package-dependencies = Залежності
-package-dependency-auto-remove = Ця залежність видаляється автоматично, коли жоден встановлений пакунок її більше не потребує.
+package-dependency-auto-remove = Ця залежність вилучається автоматично, коли жоден встановлений пакунок її більше не потребує.
 package-state-active = активний
 package-state-inactive = неактивний
 package-state-enabled = увімкнений
@@ -1678,7 +1763,7 @@ package-no-source-files = Цей пакунок не містить жодних
 package-select-source = Виберіть файл, щоб переглянути його джерело.
 package-source-missing = Цей файл більше не є частиною пакунка.
 package-source-fetching = Завантаження джерела…
-package-source-bidi-warning = Увага: цей файл містить двонапрямлені або невидимі керівні символи, тож показаний текст може не відповідати тому, що насправді виконується.
+package-source-bidi-warning = Увага: цей файл містить двонапрямлені або невидимі символи керування, тож показаний текст може не відповідати тому, що насправді виконується.
 package-source-binary = Двійковий файл ({ $size }) — не показано.
 package-source-too-large = Файл має { $size } — завеликий для перегляду (ліміт { $limit }).
 package-source-load-error = Не вдалося завантажити джерело: { $error }
@@ -1691,29 +1776,33 @@ package-copy-name = Локальна назва
 package-create-copy = Створити копію
 package-open-local-copy = Відкрити локальний пакунок
 package-copy-name-exists = Локальний пакунок із назвою «{ $name }» уже існує. Відкрийте його або вкажіть іншу назву.
-package-copy-requirements-not-ready = Smudgy не створив копію, оскільки спочатку потрібно встановити або оновити один чи кілька обов’язкових пакунків. Установіть або оновіть їх, а потім повторіть спробу.
-package-remove-standalone = Видалити окреме встановлення
+package-copy-requirements-not-ready = Smudgy не створив копію, оскільки спочатку потрібно встановити або оновити один чи кілька обов'язкових пакунків. Встановіть або оновіть їх, а потім повторіть спробу.
+package-remove-standalone = Вилучити окреме встановлення
 package-remove-standalone-help = { $name } залишається встановленим для { $packages }.
-package-removal-required = Видалення { $name } також видалить { $packages }, { $count ->
-        [one] який його потребує
-       *[other] які його потребують
-    }.
-package-remove-orphans = Видалити також { $packages }? Ніщо інше їх не потребує.
-package-disable-cascade-warning = Вимкнення { $name } у { $profiles } також вимкне { $packages }, { $count ->
-        [one] якому він потрібен
-       *[other] яким він потрібен
-    }. Вимкнути їх разом?
+package-removal-required = Вилучення { $name } також вилучить { $count ->
+        [one] { $count } пакунок, який його потребує
+        [few] { $count } пакунки, які його потребують
+        [many] { $count } пакунків, які його потребують
+       *[other] { $count } пакунка, який його потребує
+    }: { $packages }.
+package-remove-orphans = Вилучити також { $packages }? Ніщо інше їх не потребує.
+package-disable-cascade-warning = Вимкнення { $name } у { $profiles } також вимкне { $count ->
+        [one] { $count } пакунок, якому він потрібен
+        [few] { $count } пакунки, яким він потрібен
+        [many] { $count } пакунків, яким він потрібен
+       *[other] { $count } пакунка, якому він потрібен
+    }: { $packages }. Вимкнути їх разом?
 package-disable-cascade-confirm = Вимкнути всі
 package-disable-cascade-applied = Вимкнено { $name } та { $packages }.
 package-enabling-starts-required = Увімкнення { $name } також запустило { $packages }.
-package-remove-all = Видалити все
-package-remove = Видалити
+package-remove-all = Вилучити все
+package-remove = Вилучити
 package-uninstall = Деінсталювати
-package-remove-together-question = Видалити їх разом?
-package-remove-standalone-question = Видалити окреме встановлення?
-package-uninstall-question = Деінсталювати (видаляє параметри й секрети)?
+package-remove-together-question = Вилучити їх разом?
+package-remove-standalone-question = Вилучити окреме встановлення?
+package-uninstall-question = Деінсталювати (видаляє налаштування й секрети)?
 package-keep-orphans = Зберегти їх
-package-remove-standalone-ellipsis = Видалити окреме встановлення…
+package-remove-standalone-ellipsis = Вилучити окреме встановлення…
 package-uninstall-name = Деінсталювати { $name }…
 package-kind-alias = аліас
 package-kind-trigger = тригер
@@ -1733,7 +1822,7 @@ package-body-does = Виконує
 package-body-nothing = (нічого)
 package-public = Публічний
 package-private = Приватний
-package-owned-subtitle = Ви є власником цього пакунка · v{ $version }
+package-owned-subtitle = Ви власник цього пакунка · v{ $version }
 package-new-name-placeholder = нова назва
 package-save-name = Зберегти назву
 package-rename = Перейменувати
@@ -1748,7 +1837,7 @@ package-account-changed = Обліковий запис змінився. Пер
 package-account-review-changed = Обліковий запис змінився. Перевірте цей пакунок, а потім повторіть спробу.
 package-operation-in-progress = Виконується інша зміна цього пакунка. Зачекайте, доки вона завершиться, і повторіть спробу.
 manifest-operation-expired = Ця зміна маніфесту більше не активна. Закрийте цей перегляд, а потім збережіть маніфест ще раз.
-package-save-before-rename = Збережіть зміни у вихідному коді та маніфесті перед перейменуванням пакета.
+package-save-before-rename = Збережіть зміни у вихідному коді та маніфесті перед перейменуванням пакунка.
 package-version-already-used = Версію v{ $version } вже опубліковано. Номери версій не можна використовувати повторно.
 package-version-up-to-date = Версію v{ $version } опубліковано, і вона містить усі локальні зміни.
 package-version-local-changes = У вас є локальні зміни, внесені після публікації версії v{ $version }. Опубліковані версії не можна оновлювати. Збільште номер версії, щоб опублікувати зміни.
@@ -1799,7 +1888,10 @@ package-manage = Керувати
 package-view = Переглянути
 package-install = Встановити
 package-installed = Встановлено
-package-search-meta = { $owner } · v{ $version } · { $count } встановлень ·
+package-search-meta = { $count ->
+        [many] { $owner } · v{ $version } · { $count } встановлень ·
+       *[other] { $owner } · v{ $version } · { $count } встановлення ·
+    }
 package-you = Ви
 package-back = ‹ Назад
 package-comments = Коментарі
@@ -1891,7 +1983,7 @@ permission-can-create-triggers = Створювати тригери
 permission-can-send-both = Надсилати команди через аліаси або надсилати текст і необроблені байти безпосередньо до гри. Smudgy не показує необроблені байти у вікні виводу. Гра все одно може надіслати відповідь.
 permission-can-send-aliases = Надсилати команди до гри так, ніби ви їх ввели, потенційно спрацьовуючи аліаси
 permission-can-send-direct = Надсилати текст і необроблені байти безпосередньо до гри, оминаючи аліаси. Smudgy не показує необроблені байти у вікні виводу. Гра все одно може надіслати відповідь.
-permission-can-echo = Відображати текст на екрані
+permission-can-echo = Показувати текст на екрані
 permission-can-sessions = Взаємодіяти з іншими відкритими сесіями, зокрема змінювати розташування вікон цього сервера
 permission-can-display = Приховувати, змінювати стиль, вставляти або замінювати текст гри та бачити поточний рядок
 permission-can-map-read = Читати ваші мапи
@@ -1906,7 +1998,7 @@ permission-can-gmcp = Надсилати повідомлення GMCP до гр
 permission-cannot-send = надсилати команди до гри
 permission-cannot-aliases = створювати аліаси
 permission-cannot-triggers = створювати тригери, що реагують на вихідні дані гри
-permission-cannot-echo = відображати текст на екрані
+permission-cannot-echo = показувати текст на екрані
 permission-cannot-sessions = звертатися до інших ваших сесій
 permission-cannot-display = взаємодіяти з терміналом гри (приховувати, стилізувати, вставляти чи замінювати текст; ані бачити поточний рядок)
 permission-cannot-map-read = читати ваші мапи
@@ -1953,8 +2045,8 @@ package-switched = Перемкнено на { $name }.
 package-update-failed = Не вдалося оновити { $name }: { $error }
 package-update-mode-failed = Не вдалося встановити режим оновлення: { $error }
 package-uninstall-failed = Не вдалося деінсталювати: { $error }
-package-partial-remove-failed = Видалено { $removed }, але не вдалося видалити { $failed }: { $error }
-package-removed-standalone-toast = Видалено окреме встановлення { $name }; залишається встановленим як залежність.
+package-partial-remove-failed = Вилучено { $removed }, але не вдалося вилучити { $failed }: { $error }
+package-removed-standalone-toast = Вилучено окреме встановлення { $name }; залишається встановленим як залежність.
 package-uninstalled-toast = Деінсталювано { $name }.
 package-uninstalled-with = Деінсталювано { $name } + { $dependencies }.
 package-none-selected = Пакунок не вибрано.
@@ -1968,13 +2060,13 @@ package-fork-mirrored-toast = Створено вимкнене локальне
 package-fork-inactive = Ви редагуєте окремий локальний пакунок «{ $name }». Спочатку він вимкнений у всіх профілях.
 package-fork-inactive-toast = Створено локальну копію { $name } (вимкнена).
 package-fork-failed = Не вдалося відредагувати копію: { $error }
-package-required-unavailable = Обов’язковий пакунок { $name } недоступний: { $error }
+package-required-unavailable = Обов'язковий пакунок { $name } недоступний: { $error }
 package-requirer-unavailable = Smudgy не може перевірити вимоги встановленого пакунка { $name }: { $error }
 package-required-manifest-invalid = Пакунок { $name } має недійсний маніфест: { $error }
-package-install-required-unavailable = Обов’язковий пакунок недоступний
+package-install-required-unavailable = Обов'язковий пакунок недоступний
 package-required-managed = Його потребує { $packages }.
 package-install-independently = Встановити незалежно
-package-requirements-refresh-incomplete = Не вдалося повністю оновити відомості про обов’язкові пакунки: { $error }. Перевірте, чи ці пакунки встановлено та чи доступні їхні маніфести.
+package-requirements-refresh-incomplete = Не вдалося повністю оновити відомості про обов'язкові пакунки: { $error }. Перевірте, чи ці пакунки встановлено та чи доступні їхні маніфести.
 package-folder-locate-failed = Не вдалося знайти теку: { $error }
 package-folder-missing = Цієї теки пакунка ще не існує.
 package-folder-open-failed = Не вдалося відкрити теку: { $error }
@@ -2005,11 +2097,11 @@ package-required-install-failed = Не вдалося встановити об�
 package-installed-enabled-toast = Встановлено й увімкнено { $name }.
 package-updated-toast = { $name } оновлено.
 package-installed-review-toast = Встановлено { $name }.
-package-field-required = Поле «{ $field }» є обов'язковим.
+package-field-required = Поле «{ $field }» обов'язкове.
 package-field-invalid = «{ $field }»: { $reason }
 package-field-save-failed = Не вдалося зберегти «{ $field }»: { $error }
-package-settings-save-failed = Smudgy не може зберегти параметри пакунка: { $error }
-package-settings-state-changed = Параметри пакунка змінилися, поки ця форма була відкрита. Smudgy не зберіг ці значення. Знову відкрийте параметри пакунка, перевірте поточні значення та повторіть спробу.
+package-settings-save-failed = Smudgy не може зберегти налаштування пакунка: { $error }
+package-settings-state-changed = Налаштування пакунка змінилися, поки ця форма була відкрита. Smudgy не зберіг ці значення. Знову відкрийте налаштування пакунка, перевірте поточні значення та повторіть спробу.
 package-settings-saved = Налаштування збережено.
 package-clear-secret-failed = Не вдалося очистити «{ $field }»: { $error }
 package-secret-cleared = Секрет очищено.
@@ -2019,7 +2111,7 @@ package-version-build-metadata = Версія не може містити ме�
 # Remaining app-shell and editor surfaces
 badge-dependency = ЗАЛ.
 badge-required = ВИМ.
-badge-dependency-required = DEP + REQ
+badge-dependency-required = ЗАЛ. + ВИМ.
 editor-example-alias-name = напр., kill
 editor-example-hotkey-name = напр., north
 editor-example-trigger-name = напр., low-health-alert
@@ -2029,6 +2121,7 @@ link-confirm-open-title = Сервер хоче відкрити посилан�
 link-confirm-send-title = Сервер хоче надіслати команду від вашого імені
 link-confirm-allow-host = Завжди дозволяти посилання на { $host }
 link-confirm-trust-server = Завжди довіряти посиланням із цього сервера
+link-tooltip-loading = Завантаження…
 map-another-map = інша мапа
 map-another-server = інший сервер
 map-rooms-match-elsewhere = Кімнати тут збігаються з «{ $name }» (показується на { $servers })
@@ -2047,13 +2140,28 @@ map-unknown = Невідома мапа
 manifest-host-example = напр., aardwolf.org
 
 # Session runtime feedback
-runtime-loading-session = Завантаження сесії...
-runtime-reloading-scripts = Перезавантаження скриптів...
+runtime-loading-session = Завантаження сесії…
+runtime-reloading-scripts = Перезавантаження скриптів…
 runtime-session-rule = { $profile } на { $server }
 runtime-loading-packages = Завантаження пакунків…
-runtime-loaded-packages-clause = Завантажено { $count } пакунків (за { $milliseconds } мс)
-runtime-loaded-modules-clause = { $count } модулів скриптів (за { $milliseconds } мс)
-runtime-loaded-maps-clause = { $count } областей мап (за { $milliseconds } мс)
+runtime-loaded-packages-clause = { $count ->
+        [one] Завантажено { $count } пакунок (за { $milliseconds } мс)
+        [few] Завантажено { $count } пакунки (за { $milliseconds } мс)
+        [many] Завантажено { $count } пакунків (за { $milliseconds } мс)
+       *[other] Завантажено { $count } пакунка (за { $milliseconds } мс)
+    }
+runtime-loaded-modules-clause = { $count ->
+        [one] { $count } модуль скриптів (за { $milliseconds } мс)
+        [few] { $count } модулі скриптів (за { $milliseconds } мс)
+        [many] { $count } модулів скриптів (за { $milliseconds } мс)
+       *[other] { $count } модуля скриптів (за { $milliseconds } мс)
+    }
+runtime-loaded-maps-clause = { $count ->
+        [one] { $count } область мап (за { $milliseconds } мс)
+        [few] { $count } області мап (за { $milliseconds } мс)
+        [many] { $count } областей мап (за { $milliseconds } мс)
+       *[other] { $count } області мап (за { $milliseconds } мс)
+    }
 runtime-loaded-maps-shared = ({ $owned } власних, { $shared } наданих)
 runtime-nothing-loaded = Немає чого завантажувати
 runtime-opened-offline = Відкрито офлайн · Підключитися
@@ -2093,12 +2201,16 @@ widget-text-editor-unavailable = Текстовий редактор недос�
 widget-map-unavailable = Мапа недоступна
 widget-map-no-mapper = Мапа недоступна (немає мапера)
 validation-name-empty = Назва не може бути порожньою
-validation-name-too-long = Назва не може бути довшою за { $max } символів
+validation-name-too-long = { $max ->
+        [one] Назва не може бути довшою за { $max } символ
+        [few] Назва не може бути довшою за { $max } символи
+       *[other] Назва не може бути довшою за { $max } символів
+    }
 validation-name-character = Назва не може містити символ «{ $character }»
-validation-name-control = Назва не може містити керівних символів
+validation-name-control = Назва не може містити символів керування
 validation-name-whitespace = Назва не може містити табуляцій чи символів кінця рядка
 validation-name-dot-edge = Назва не може починатися чи закінчуватися символом «.»
-validation-name-reserved = «{ $name }» є зарезервованою назвою
+validation-name-reserved = «{ $name }» — зарезервована назва
 validation-folder-empty = Назва теки не може бути порожньою
 validation-folder-empty-segment = Шлях теки не може містити порожніх сегментів
 validation-module-empty = Назва модуля не може бути порожньою
@@ -2106,5 +2218,9 @@ validation-module-leading-slash = Назва модуля не може почи
 validation-module-empty-segment = Шлях модуля не може містити порожніх сегментів
 validation-module-traversal = Шлях модуля не може містити сегментів «.» чи «..»
 validation-package-empty = Назва пакунка не може бути порожньою
-validation-package-too-long = Назва пакунка не може бути довшою за { $max } символів
+validation-package-too-long = { $max ->
+        [one] Назва пакунка не може бути довшою за { $max } символ
+        [few] Назва пакунка не може бути довшою за { $max } символи
+       *[other] Назва пакунка не може бути довшою за { $max } символів
+    }
 validation-package-characters = Назви пакунків можуть містити лише літери, цифри, «-» та «_»
