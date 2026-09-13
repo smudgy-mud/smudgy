@@ -46,7 +46,7 @@ const AUDIBLE_SAMPLE_THRESHOLD: f32 = 1.0 / 32_768.0;
 /// measured at 10-13 ms on a USB endpoint, before the primed onset plays.
 /// Holding the stream for minutes keeps that off ordinary play while still
 /// releasing the endpoint long before any sleep timeout would matter.
-const OUTPUT_IDLE_DETACH_AFTER: Duration = Duration::from_secs(5 * 60);
+const OUTPUT_IDLE_DETACH_AFTER: Duration = Duration::from_mins(5);
 const RUNTIME_ERROR_QUEUE_CAPACITY: usize = 32;
 const ERROR_ADMISSION_PHASE_MASK: usize = 0b11;
 const ERROR_ADMISSION_COUNT_ONE: usize = 0b100;
