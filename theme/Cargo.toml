@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_theme"
-version = "0.5.7"
+version = "0.5.8-ptb"
 edition = "2024"
 
 [dependencies]
