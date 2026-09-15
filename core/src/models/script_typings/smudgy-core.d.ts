@@ -3309,18 +3309,17 @@ declare module "smudgy:events/map" {
 
   /**
    * Fires when the current map location changes, whether or not a mapper
-   * package is installed. `areaId` is the area's UUID as a string;
-   * `roomNumber` is the room number, or `null` when the location has no
-   * specific room.
+   * package is installed. `areaId` is the area's id; `roomNumber` is the room
+   * number, or `null` when the location has no specific room.
    *
-   * Note that the string `areaId` is a different representation from the
-   * `AreaId` pair the `mapper` API uses; the two are not interchangeable.
-   * 
+   * It is the same {@link AreaId} the `mapper` API uses, so it can be passed
+   * straight to a mapper call.
+   *
    * Unstable: This event is new and may change in future releases. The event
    * itself is guaranteed to remain, but the payload, particularly the
    * areaId, may change.
    */
-  export const room: EventConsumer<{ areaId: string; roomNumber: number | null }>;
+  export const room: EventConsumer<{ areaId: AreaId; roomNumber: number | null }>;
 }
 
 declare module "smudgy:events/input" {

@@ -38,7 +38,7 @@ function roomKey(room: LayoutModelRoom): string {
 
 /** Compare the inputs that can affect a plan, independent of host enumeration order. */
 export function sameLayoutSnapshot(a: LayoutModel, b: LayoutModel): boolean {
-  if (a.areaId?.[0] !== b.areaId?.[0] || a.areaId?.[1] !== b.areaId?.[1] ||
+  if (a.areaId !== b.areaId ||
     a.rooms.length !== b.rooms.length || a.edges.length !== b.edges.length) return false;
 
   const aRooms = a.rooms.map(roomKey).sort();

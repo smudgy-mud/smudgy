@@ -1,7 +1,8 @@
 // Pure helpers for the NF command layer. Keeping route construction
 // independent from smudgy:core makes the edge cases cheap to exercise in Node.
 
-export type NavigationAreaId = readonly [number, number];
+/** An area id as the mapper spells it: a canonical UUID string. */
+export type NavigationAreaId = string;
 
 export interface NavigationExit {
   from_direction: string;
@@ -48,7 +49,7 @@ const DIRECTION_COMMANDS: Readonly<Record<string, string>> = {
 };
 
 export function sameAreaId(left: NavigationAreaId, right: NavigationAreaId): boolean {
-  return left[0] === right[0] && left[1] === right[1];
+  return left === right;
 }
 
 function exitCommand(exit: NavigationExit): string | undefined {

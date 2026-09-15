@@ -44,6 +44,12 @@ aho-corasick = { workspace = true }
 # public ImageStore + image_source grammar layers (no V8, no I/O).
 smudgy_widgets = { workspace = true }
 criterion = "0.5"
+# `id_wire` (example) builds its own op extension on a bare `JsRuntime` to
+# price UUID wire shapes across the Rust/V8 boundary. Same workspace pin as
+# every other consumer -- `links = "v8"` forbids a second version.
+deno_core = { workspace = true }
+uuid = { version = "1.7", features = ["v4"] }
+serde = { workspace = true }
 regex = { workspace = true }
 regex-filtered = { workspace = true }
 regex-syntax = { workspace = true }

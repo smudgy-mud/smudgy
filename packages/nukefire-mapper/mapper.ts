@@ -231,7 +231,7 @@ function areaKey(area: { id: AreaId }): string {
 }
 
 function areaIdKey(areaId: AreaId): string {
-  return `${areaId[0]}:${areaId[1]}`;
+  return areaId;
 }
 
 function sameAreaId(a: AreaId, b: AreaId): boolean {
@@ -522,7 +522,7 @@ function canonicalConnectionGeometry(
 }
 
 function connectionMirrorKey(id: ConnectionId): string {
-  return `${id[0]}:${id[1]}`;
+  return id;
 }
 
 /**
