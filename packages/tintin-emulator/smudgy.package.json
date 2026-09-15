@@ -2,7 +2,7 @@
     "version": "0.0.6",
     "description": "Type TinTin++ commands at the input line: #alias, #action, #variable, #showme and friends become native smudgy automations.",
     "entry": "index.ts",
-    "min_smudgy_version": "0.5.0",
+    "min_smudgy_version": "0.5.7",
     "params": [
         {
             "key": "commandChar",

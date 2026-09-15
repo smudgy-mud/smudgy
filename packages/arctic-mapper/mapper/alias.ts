@@ -952,7 +952,7 @@ function sendCommands(commands: string) {
     for (const command of commands.split(";")) {
         const trimmed = command.trim();
         if (trimmed) {
-            sendRaw(trimmed);
+            sendRaw(trimmed + "\n");
         }
     }
 }

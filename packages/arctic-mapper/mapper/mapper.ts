@@ -267,7 +267,7 @@ export function speedwalk(to: Room, from: Room | null = state.room): number {
         for (const part of raw.split(";")) {
             const command = part.trim();
             if (command) {
-                sendRaw(command);
+                sendRaw(command + "\n");
             }
         }
     };
