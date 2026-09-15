@@ -5,6 +5,41 @@ All notable changes to smudgy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A command that can't be sent comes back, and the session reconnects.** When
+  the connection has dropped, pressing Enter no longer ends in a bare error line.
+  The line you typed returns to the input box, selected, and a notice names it
+  and says what is happening — "You were disconnected. **look** could not be
+  sent. Reconnecting…" — shimmering until the session is back, or offering "Try
+  again" if it does not come back. An alias counts as something you typed
+  however it was reached, so a trigger that runs one gets the alias's command
+  back in the input too. Any other send from a script or trigger that fails the
+  same way reconnects as well, but is only reported ("A script tried to send
+  **look**, but it was dropped."): it never touches what you are typing and is
+  never re-sent for you. Every send that fails while the reconnect is under way
+  gets its own line, in order, and they all settle together when the connection
+  is back. Sessions you opened offline or
+  disconnected yourself stay offline: their notice offers "Connect" instead, and
+  nothing dials. Smudgy dials once per Enter, so a server that is down is never
+  hammered. A new preference, on by default, turns the automatic reconnect off.
+- **Scripts can connect and disconnect a session.** `session.connect()` and
+  `session.disconnect()` do exactly what the title-bar buttons do, including
+  re-reading the server and profile settings on every connect. Neither takes
+  arguments; `connect()` does nothing while the session is connected or
+  connecting, and `disconnect()` nothing while it is offline, so they are safe to
+  call unconditionally. A package needs permission to send commands to use them —
+  connecting sends your profile's login text — and the reach-others permission
+  to drive a session other than its own.
+
+### Fixed
+
+- **The connection rule no longer flips to "Disconnected" when a connect attempt
+  is replaced mid-dial.** A newer attempt's "Connecting to …" is left alone when
+  the attempt it replaced reports its own end.
+
 ## [0.5.7] - 2026-09-13
 
 ### Added

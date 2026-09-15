@@ -2662,6 +2662,7 @@ impl ManagedSession {
                             raw_line_prefix: Arc::new(settings.raw_line_prefix),
                             log_enabled: settings.logging.enabled,
                             bold_is_bright: settings.terminal_bold_mode.uses_bright_palette(),
+                            reconnect_on_send_error: settings.reconnect_on_send_error,
                             script_settings: Box::new(script_settings),
                         }) {
                             log::error!("Failed to send settings to runtime: {e}");
@@ -2879,6 +2880,26 @@ impl ManagedSession {
                         self.tls_offer = None;
                         Task::none()
                     }
+                    SessionEvent::ConnectRequested { only_if_intended } => {
+                        // A script's `session.connect()`, or the send-error
+                        // recovery. Answer on the button's own path so online
+                        // intent, the config re-read, and the
+                        // Connect/Reconnect label all behave identically.
+                        //
+                        // The recovery asks only conditionally: a send fails
+                        // the same way on a dropped connection and on one the
+                        // user deliberately closed, and only the intent held
+                        // here tells those apart.
+                        if only_if_intended && !self.auto_connect {
+                            // Say so, or the notice waiting on this dial
+                            // would shimmer on.
+                            self.send_runtime_action(RuntimeAction::ConnectDeclined);
+                            Task::none()
+                        } else {
+                            Task::done(Message::Reconnect)
+                        }
+                    }
+                    SessionEvent::DisconnectRequested => Task::done(Message::Disconnect),
                     SessionEvent::OfferTlsUpgrade { port } => {
                         self.tls_offer = Some(port);
                         Task::none()
@@ -3078,7 +3099,11 @@ impl ManagedSession {
                 self.workspace_dirty = true;
                 match session::config::load_connect_action(&self.server_name, &self.profile_name) {
                     Ok(action) => self.send_runtime_action(action),
-                    Err(e) => log::error!("Failed to load connection config: {e:?}"),
+                    Err(e) => {
+                        log::error!("Failed to load connection config: {e:?}");
+                        // Nothing will dial: let a notice waiting on it settle.
+                        self.send_runtime_action(RuntimeAction::ConnectDeclined);
+                    }
                 }
 
                 Task::none()
@@ -3142,6 +3167,7 @@ impl ManagedSession {
                     raw_line_prefix: Arc::new(settings.raw_line_prefix),
                     log_enabled: settings.logging.enabled,
                     bold_is_bright: settings.terminal_bold_mode.uses_bright_palette(),
+                    reconnect_on_send_error: settings.reconnect_on_send_error,
                     script_settings: Box::new(script_settings),
                 });
 

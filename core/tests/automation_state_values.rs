@@ -147,6 +147,7 @@ fn apply_settings() -> RuntimeAction {
         raw_line_prefix: Arc::new("\\".to_string()),
         log_enabled: false,
         bold_is_bright: false,
+        reconnect_on_send_error: false,
         script_settings: Box::default(),
     }
 }

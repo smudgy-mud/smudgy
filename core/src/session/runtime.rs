@@ -53,7 +53,7 @@ mod store;
 
 pub(crate) use catalogue::SharedCatalogue;
 use catalogue::{CadenceDecision, CatalogueCadence, CatalogueEvent, RuntimeCatalogue};
-use input::InputMirror;
+use input::{InputMirror, InputOp};
 pub(crate) use input::{
     SharedInputMirror, SharedInputSubmission, SharedInputWordSets, SharedPaneInputCallbacks,
 };
@@ -106,7 +106,7 @@ use crate::session::{
 use super::{
     SessionId, TaggedSessionEvent,
     connection::Connection,
-    styled_line::{LineFragments, StyledLine},
+    styled_line::{AppLink, LineFragments, LinkAction, StyledLine},
 };
 
 use super::{BufferUpdate, SessionEvent};
@@ -1678,6 +1678,12 @@ impl Runtime {
             let mut inner = Inner {
                 log_file: None,
                 log_enabled: settings.logging.enabled,
+                reconnect_on_send_error: settings.reconnect_on_send_error,
+                connect_intent: false,
+                dial: Dial::Idle,
+                auto_redial_spent: false,
+                rescue_scope: None,
+                send_failures: Vec::new(),
                 last_log_flush: Instant::now(),
                 session_id,
                 user_automations: crate::session::config::UserAutomations::default(),
@@ -1810,6 +1816,10 @@ impl Runtime {
                 let old_connection = inner.connection.take();
                 let old_connection_generation = inner.connection_generation;
                 let old_connected_at = inner.connected_at.take();
+                let old_connect_intent = inner.connect_intent;
+                let old_dial = inner.dial;
+                let old_auto_redial_spent = inner.auto_redial_spent;
+                let old_send_failures = std::mem::take(&mut inner.send_failures);
                 let old_pending_send_on_connect = inner.pending_send_on_connect.take();
                 // The surviving connection's VtProcessor holds a clone of this
                 // exact cell (like the raw-wanted flag below); the rebuilt
@@ -2081,6 +2091,15 @@ impl Runtime {
                 inner = Inner {
                     log_file: None, // Will restart logging
                     log_enabled: settings.logging.enabled,
+                    reconnect_on_send_error: settings.reconnect_on_send_error,
+                    // Session-lifetime like the connection they describe.
+                    connect_intent: old_connect_intent,
+                    dial: old_dial,
+                    auto_redial_spent: old_auto_redial_spent,
+                    // The action frame that would have closed it is discarded
+                    // with the reload; the scope goes with it.
+                    rescue_scope: None,
+                    send_failures: old_send_failures,
                     last_log_flush: Instant::now(),
                     session_id,
                     user_automations: crate::session::config::UserAutomations::default(),
@@ -2265,6 +2284,130 @@ impl Runtime {
     }
 }
 
+/// Whether a connection attempt is under way; see `Inner::dial`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dial {
+    Idle,
+    /// Dialing, under this connection generation.
+    InFlight(u64),
+}
+
+/// The line a failed send inside it hands back; see `Inner::rescue_scope`.
+struct RescueScope {
+    line: Arc<String>,
+    /// Whether the line has been handed back to the input already.
+    rescued: bool,
+    /// Whether a notice names this line already. One line, one row: every
+    /// command of a separator-split line fails on its own, and an alias body
+    /// may send several times.
+    reported: bool,
+}
+
+/// What the client is doing about a write that never reached the wire; the
+/// states of a send-failure notice (`Inner::send_failures`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailureKind {
+    /// The client asked to reconnect and is waiting for the attempt to end.
+    Reconnecting,
+    /// An attempt was already under way when the send failed; waiting on it.
+    Connecting,
+    /// The attempt the row waited on came up.
+    Reconnected,
+    /// The attempt the row waited on did not come up.
+    ReconnectFailed,
+    /// The attempt the row waited on was called off (the user disconnected).
+    ReconnectAbandoned,
+    /// Nothing is dialed: the session is offline by choice, the preference is
+    /// off, or the client has dialed once already for this stretch of failures.
+    NotConnected,
+}
+
+impl SendFailureKind {
+    /// A row is pending exactly while it waits on a connection attempt.
+    fn progress(self) -> Progress {
+        match self {
+            Self::Reconnecting | Self::Connecting => Progress::Pending,
+            Self::Reconnected
+            | Self::ReconnectFailed
+            | Self::ReconnectAbandoned
+            | Self::NotConnected => Progress::Done,
+        }
+    }
+}
+
+/// One send-failure notice on screen; see `Inner::send_failures`.
+#[derive(Debug, Clone)]
+struct SendFailureRow {
+    id: SystemRowId,
+    kind: SendFailureKind,
+    /// What could not be sent, as the row names it.
+    subject: SendSubject,
+}
+
+/// What a failed write was carrying and where it came from — the difference
+/// between a row that says "press Enter to send it again" and one that only
+/// reports what a script tried.
+#[derive(Debug, Clone)]
+struct SendSubject {
+    origin: SendOrigin,
+    /// The text as the row shows it: one line, cut short if long, secrets
+    /// already masked, or a stand-in for bytes.
+    display: Arc<str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendOrigin {
+    /// The line the user typed; it is back in the input, selected.
+    Typed,
+    /// A script's, automation's or hotkey's send — never in the input, and
+    /// never re-sent on the user's behalf.
+    Script,
+    /// A send that carried secrets (the auto-login, a masked submission),
+    /// shown masked and, like a script's, never re-sent.
+    Redacted,
+}
+
+impl SendSubject {
+    /// The longest a subject is shown at; longer text is cut with an ellipsis.
+    const DISPLAY_LIMIT: usize = 60;
+
+    fn new(origin: SendOrigin, text: &str) -> Self {
+        let first_line = text.lines().next().unwrap_or("").trim_end_matches('\r');
+        let multi_line = text.trim_end_matches(['\r', '\n']).contains('\n');
+        let mut display: String = first_line.chars().take(Self::DISPLAY_LIMIT).collect();
+        if multi_line || first_line.chars().count() > Self::DISPLAY_LIMIT {
+            display.push('\u{2026}');
+        }
+        if display.is_empty() {
+            display.push_str("an empty line");
+        }
+        Self {
+            origin,
+            display: Arc::from(display),
+        }
+    }
+
+    fn typed(line: &str) -> Self {
+        Self::new(SendOrigin::Typed, line)
+    }
+
+    fn script(text: &str) -> Self {
+        Self::new(SendOrigin::Script, text)
+    }
+
+    /// Bytes a script composed: nothing to quote.
+    fn script_bytes() -> Self {
+        Self {
+            origin: SendOrigin::Script,
+            display: Arc::from("binary data"),
+        }
+    }
+
+    fn redacted(display: &str) -> Self {
+        Self::new(SendOrigin::Redacted, display)
+    }
+}
+
 struct Inner<'a> {
     session_id: SessionId,
     user_automations: crate::session::config::UserAutomations,
@@ -2335,6 +2478,53 @@ struct Inner<'a> {
     /// Whether the plaintext screen log is enabled (seeded from settings,
     /// live-toggled via `RuntimeAction::ApplySettings`).
     log_enabled: bool,
+    /// Reconnect on the session's behalf when a send fails while it still
+    /// means to be online (`Settings::reconnect_on_send_error`). Seeded from
+    /// disk at construction and refreshed by [`RuntimeAction::ApplySettings`],
+    /// like `log_enabled`.
+    reconnect_on_send_error: bool,
+    /// Whether this session means to be online: set by every `Connect` (the
+    /// daemon sends one only on the user's Connect, or for a session restored
+    /// online), cleared by `Disconnect`. A session opened offline never gains
+    /// it, and one the user disconnected loses it — the two cases a failed
+    /// send must not dial for. The runtime's mirror of the daemon's intent;
+    /// the daemon still decides (`ConnectRequested { only_if_intended }`).
+    connect_intent: bool,
+    /// Whether a connection attempt is under way, and which one. A send that
+    /// fails while it dials must not start another — `Connection::connect`
+    /// cancels the socket it replaces — and `session.connect()` is a no-op
+    /// meanwhile. Every attempt ends in exactly one of `Connected`,
+    /// `ConnectionFailed` or `ConnectionAbandoned`, each stamped with the
+    /// generation so a replaced attempt's late ending is told from the live one's.
+    dial: Dial,
+    /// Whether the client has already dialed on its own for the current
+    /// stretch of failing sends. Two things pace it. A typed submission
+    /// releases it (`SubmitInput`): Enter is the user asking, so a dead server
+    /// is redialed once per Enter and never faster. A send reaching the
+    /// transport releases it too. Nothing else does — not `Connected`, not a
+    /// failed dial — because a peer that accepts, greets, then resets fails
+    /// the profile's auto-login on every attempt, and a timer-driven script
+    /// send would otherwise redial a dead server as fast as it can refuse.
+    auto_redial_spent: bool,
+    /// The line a failed send hands back to the input, while its expansion is
+    /// being dispatched (up to `EndRescueScope`): the line the user typed
+    /// (`SubmitInput`), or — with nothing typed in flight — the command that
+    /// matched an alias, however it was reached (a trigger's `send("kd")`
+    /// counts: an alias is a user command). Whatever fails inside the window —
+    /// the line, a separator-split command of it, an alias body's `send()` —
+    /// hands this line back, once. Sends outside any scope (automation bodies
+    /// on a timer, hotkeys, links, the auto-login) were never in the input and
+    /// never go there. A send deferred past the alias's own run carries no
+    /// context and counts as outside.
+    rescue_scope: Option<RescueScope>,
+    /// The notices reporting failed sends, one row per send in the order they
+    /// failed, each updated in place — like the load row — as the attempt they
+    /// wait on comes up or fails. Every send that fails while an attempt is
+    /// under way gets its own row (a trigger firing three times while the
+    /// client reconnects is three lines), and all the pending rows settle
+    /// together. Settled rows are dropped from here at the next failure; they
+    /// stay on screen as they are.
+    send_failures: Vec<SendFailureRow>,
     /// When the session log was last flushed; see [`LOG_FLUSH_INTERVAL`].
     last_log_flush: Instant,
     pending_line_operations: Rc<RefCell<Vec<LineOperation>>>,
@@ -3003,6 +3193,302 @@ impl Inner<'_> {
         self.flush_buffer_updates()
     }
 
+    /// A write reached the transport: the outage the last automatic dial answered is
+    /// over, so the next failure may dial again.
+    #[inline]
+    fn note_send_succeeded(&mut self) {
+        self.auto_redial_spent = false;
+    }
+
+    /// Open a rescue scope for `line`. `typed` marks the user's own submission:
+    /// Enter is the user asking, so it also releases the automatic-dial latch —
+    /// a dead server is redialed once per submission, never faster. An alias
+    /// reached some other way opens the scope without touching the latch.
+    fn begin_rescue_scope(&mut self, line: Arc<String>, typed: bool) {
+        self.rescue_scope = Some(RescueScope {
+            line,
+            rescued: false,
+            reported: false,
+        });
+        if typed {
+            self.auto_redial_spent = false;
+        }
+    }
+
+    /// Close the rescue scope (`EndRescueScope`, or a submission that finished
+    /// synchronously or was cancelled).
+    fn end_rescue_scope(&mut self) {
+        self.rescue_scope = None;
+    }
+
+    /// Open a rescue scope for a command that matched an alias, unless one is
+    /// open already (the typed line, or an outer alias, wins). The end marker
+    /// goes behind the alias's spawned actions, so the scope covers the whole
+    /// synchronous expansion.
+    fn open_alias_scope(&mut self, command: &Arc<String>) {
+        if self.rescue_scope.is_some() {
+            return;
+        }
+        self.begin_rescue_scope(Arc::clone(command), false);
+        self.spawned_actions
+            .borrow_mut()
+            .push_back(RuntimeAction::EndRescueScope);
+    }
+
+    /// Wrap a typed submission's dispatch result so its scope closes after the
+    /// whole expansion: a `Run` list gets the end marker queued behind it (the
+    /// splice is depth-first, so the marker runs after every command and
+    /// everything it expanded into); anything else finished synchronously and
+    /// the scope closes now.
+    fn scope_dispatch_result(&mut self, result: ActionResult) -> ActionResult {
+        match result {
+            ActionResult::Run(mut actions) => {
+                actions.push(RuntimeAction::EndRescueScope);
+                ActionResult::Run(actions)
+            }
+            other => {
+                self.end_rescue_scope();
+                other
+            }
+        }
+    }
+
+    /// Hand the scope's line back to the input, fully selected, if a rescue
+    /// scope is open and it has not been handed back already. Returns the
+    /// line the input now holds. `Propose` is the "here's your text back"
+    /// primitive: it replaces the buffer and selects the whole of it, so the
+    /// next keystroke discards it and Enter re-sends it.
+    async fn rescue_scope_line(&mut self) -> Result<Option<Arc<String>>, anyhow::Error> {
+        let Some(scope) = self.rescue_scope.as_mut() else {
+            return Ok(None);
+        };
+        if scope.line.is_empty() {
+            return Ok(None);
+        }
+        let line = Arc::clone(&scope.line);
+        if scope.rescued {
+            return Ok(Some(line));
+        }
+        scope.rescued = true;
+        let op = InputOp::Propose(Arc::clone(&line));
+        self.ui_tx
+            .send(TaggedSessionEvent {
+                session_id: self.session_id,
+                event: SessionEvent::InputOp {
+                    key: MAIN_PANE_KEY,
+                    op,
+                },
+            })
+            .await?;
+        Ok(Some(line))
+    }
+
+    /// Ask the daemon to connect this session. The runtime cannot build a
+    /// [`RuntimeAction::Connect`] itself: the server and profile
+    /// configurations are re-read — and the `$PASSWORD` token re-substituted
+    /// from the OS keyring — on every connect, and that read belongs to the
+    /// daemon. It answers with a freshly loaded `Connect`.
+    async fn request_connect(&mut self, only_if_intended: bool) -> Result<(), anyhow::Error> {
+        self.ui_tx
+            .send(TaggedSessionEvent {
+                session_id: self.session_id,
+                event: SessionEvent::ConnectRequested { only_if_intended },
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// A write never reached the wire. `Connection::write` fails only when the
+    /// socket task is gone — the connection dropped and the runtime has already
+    /// said so, an attempt is still dialing, or the user disconnected — so the
+    /// error itself goes to the log and a row says what was lost and what the
+    /// client is doing about it:
+    ///
+    /// - Inside a rescue scope the scope's line comes back to the input and
+    ///   the row names it, once for the scope; `subject` (what this particular
+    ///   write carried) is what the row names otherwise — a script's text, or
+    ///   masked text — and every such send gets a row of its own, in order.
+    /// - A session that still means to be online is reconnected — once per
+    ///   typed submission or successful send (`auto_redial_spent`), and not
+    ///   while an attempt is already under way — and the rows shimmer until
+    ///   that attempt ends, settling together on the fact or as a failure with
+    ///   a `Try again` link. Nothing is ever re-sent on the user's behalf.
+    /// - A session offline by choice, or with the preference off, gets a
+    ///   `Connect` link and nothing is dialed: opened-offline and
+    ///   disconnected sessions stay where the user put them.
+    ///
+    /// What must never be overturned is an explicit Disconnect, and the daemon
+    /// owns that intent: the request carries `only_if_intended` so it can still
+    /// decline. The socket needs no explicit teardown — [`Connection::connect`]
+    /// cancels the one it replaces.
+    async fn report_send_failure(
+        &mut self,
+        error: &anyhow::Error,
+        subject: SendSubject,
+    ) -> Result<(), anyhow::Error> {
+        warn!("Send failed ({}): {error:?}", subject.display);
+        let subject = match self.rescue_scope_line().await? {
+            Some(line) => {
+                let scope = self
+                    .rescue_scope
+                    .as_mut()
+                    .expect("a rescued line has a scope");
+                if scope.reported {
+                    // The same typed line (or alias command) failing again
+                    // down its own expansion: already on screen.
+                    return Ok(());
+                }
+                scope.reported = true;
+                SendSubject::typed(&line)
+            }
+            None => subject,
+        };
+        let mut dial_now = false;
+        let kind = if self.send_failure_pending() {
+            // An attempt is already asked for or under way: this row joins the
+            // ones waiting on it.
+            SendFailureKind::Reconnecting
+        } else if !(self.connect_intent && self.reconnect_on_send_error) || self.auto_redial_spent {
+            SendFailureKind::NotConnected
+        } else if matches!(self.dial, Dial::InFlight(_)) {
+            SendFailureKind::Connecting
+        } else {
+            self.auto_redial_spent = true;
+            dial_now = true;
+            SendFailureKind::Reconnecting
+        };
+        self.push_send_failure_row(kind, subject);
+        if let Some(future) = self.flush_buffer_updates()? {
+            future.await?;
+        }
+        if dial_now {
+            self.request_connect(true).await?;
+        }
+        Ok(())
+    }
+
+    /// Append a send-failure notice. Rows already settled are forgotten here
+    /// (they stay on screen as they are), so the list only ever holds what a
+    /// later outcome can still change.
+    fn push_send_failure_row(&mut self, kind: SendFailureKind, subject: SendSubject) {
+        self.send_failures
+            .retain(|row| row.kind.progress() == Progress::Pending);
+        let id = next_system_row_id();
+        let text = self.send_failure_text(kind, &subject);
+        self.echo_system_row_sync(SystemRow::notice(id, kind.progress(), text));
+        self.send_failures
+            .push(SendFailureRow { id, kind, subject });
+    }
+
+    /// The end of the attempt the pending send-failure notices were waiting
+    /// on. Finishes every pending row in place, in order; nothing to do when
+    /// none is pending.
+    fn settle_send_failures(&mut self, outcome: SendFailureKind) {
+        debug_assert_eq!(outcome.progress(), Progress::Done);
+        let pending: Vec<SendFailureRow> = self
+            .send_failures
+            .iter()
+            .filter(|row| row.kind.progress() == Progress::Pending)
+            .cloned()
+            .collect();
+        for row in pending {
+            let text = self.send_failure_text(outcome, &row.subject);
+            self.replace_system_row_sync(SystemRow::notice(row.id, Progress::Done, text));
+        }
+        for row in &mut self.send_failures {
+            if row.kind.progress() == Progress::Pending {
+                row.kind = outcome;
+            }
+        }
+    }
+
+    /// Whether a send-failure notice is waiting on a connection attempt — what
+    /// makes that attempt's rule read `Reconnecting to …` rather than
+    /// `Connecting to …`.
+    fn send_failure_pending(&self) -> bool {
+        self.send_failures
+            .iter()
+            .any(|row| row.kind.progress() == Progress::Pending)
+    }
+
+    /// The wording of a send-failure notice in each of its states: what
+    /// happened, what could not be sent (named), and — while something is still
+    /// to come — what the client is doing. A reconnect that comes up just
+    /// settles the row on the fact; the connection rule says the rest, and the
+    /// line in the input speaks for itself. Nothing is ever re-sent on the
+    /// user's behalf.
+    ///
+    /// A typed line leads with what happened to the user ("You were
+    /// disconnected. **look** could not be sent."); a script's leads with what
+    /// the script did ("A script tried to send **look**, but it was dropped."),
+    /// the state following.
+    fn send_failure_text(&self, kind: SendFailureKind, subject: &SendSubject) -> SystemText {
+        // The title-bar control makes the same distinction.
+        let connect_label = if self.connection_target.is_some() {
+            "Reconnect"
+        } else {
+            "Connect"
+        };
+        let severity = match kind {
+            SendFailureKind::Reconnecting
+            | SendFailureKind::Connecting
+            | SendFailureKind::ReconnectFailed => Severity::Warn,
+            SendFailureKind::Reconnected
+            | SendFailureKind::ReconnectAbandoned
+            | SendFailureKind::NotConnected => Severity::Info,
+        };
+        let mut text = SystemText::new(severity);
+        text = match subject.origin {
+            SendOrigin::Typed | SendOrigin::Redacted => {
+                let lead = match kind {
+                    SendFailureKind::Reconnecting | SendFailureKind::Reconnected => {
+                        "You were disconnected. "
+                    }
+                    SendFailureKind::Connecting => "Still connecting. ",
+                    SendFailureKind::ReconnectFailed => "Couldn\u{2019}t reconnect. ",
+                    SendFailureKind::ReconnectAbandoned => "Disconnected. ",
+                    SendFailureKind::NotConnected => "Not connected. ",
+                };
+                // The reconnected row keeps the pending row's tense: it is
+                // that row, settled, with nothing more to say.
+                let outcome = match kind {
+                    SendFailureKind::Reconnecting
+                    | SendFailureKind::Connecting
+                    | SendFailureKind::Reconnected => " could not be sent.",
+                    SendFailureKind::ReconnectFailed
+                    | SendFailureKind::ReconnectAbandoned
+                    | SendFailureKind::NotConnected => " was not sent.",
+                };
+                text.text(lead).strong(&subject.display).text(outcome)
+            }
+            SendOrigin::Script => {
+                let text = text
+                    .text("A script tried to send ")
+                    .strong(&subject.display)
+                    .text(", but it was dropped.");
+                match kind {
+                    SendFailureKind::Connecting => text.text(" Still connecting\u{2026}"),
+                    SendFailureKind::ReconnectFailed => text.text(" Couldn\u{2019}t reconnect."),
+                    SendFailureKind::ReconnectAbandoned => text.text(" Disconnected."),
+                    SendFailureKind::NotConnected => text.text(" Not connected."),
+                    SendFailureKind::Reconnecting | SendFailureKind::Reconnected => text,
+                }
+            }
+        };
+        match kind {
+            SendFailureKind::Reconnecting => text.text(" Reconnecting\u{2026}"),
+            SendFailureKind::ReconnectFailed => text
+                .text(" ")
+                .link("Try again", LinkAction::App(AppLink::Connect)),
+            SendFailureKind::NotConnected => text
+                .text(" ")
+                .link(connect_label, LinkAction::App(AppLink::Connect)),
+            SendFailureKind::Connecting
+            | SendFailureKind::Reconnected
+            | SendFailureKind::ReconnectAbandoned => text,
+        }
+    }
+
     #[inline]
     fn echo_str_sync(&mut self, line: &str) {
         self.commit_open_main_line();
@@ -3139,11 +3625,11 @@ impl Inner<'_> {
         if let Some(connection) = &self.connection
             && let Err(error) = connection.write(Arc::clone(&text)).await
         {
-            if let Some(future) = self.echo_warn_str(&format!("Send error: {error:?}"))? {
-                future.await?;
-            }
+            self.report_send_failure(&error, SendSubject::script(&text))
+                .await?;
             return Ok(());
         }
+        self.note_send_succeeded();
         for part in text.split_inclusive('\n') {
             if let Some(line) = part.strip_suffix("\r\n") {
                 if self.main_open_line() {
@@ -3171,12 +3657,12 @@ impl Inner<'_> {
         if let Some(ref connection) = self.connection
             && let Err(error) = connection.write(arc_socket_str).await
         {
-            warn!("Error writing to connection: {error:?}");
-            if let Some(future) = self.echo_warn_str(format!("Send error: {error:?}").as_str())? {
-                future.await?;
-            }
+            // Named as a script's unless a typed submission claims it.
+            self.report_send_failure(&error, SendSubject::script(line))
+                .await?;
             return Ok(());
         }
+        self.note_send_succeeded();
 
         let styled_line = Arc::new(StyledLine::from_output_str(line));
 
@@ -3210,12 +3696,15 @@ impl Inner<'_> {
         if let Some(ref connection) = self.connection
             && let Err(error) = connection.write(arc_socket_str).await
         {
-            warn!("Error writing to connection: {error:?}");
-            if let Some(future) = self.echo_warn_str(format!("Send error: {error:?}").as_str())? {
-                future.await?;
-            }
+            // A masked submission and the auto-login never enter a typed
+            // submission's scope, so nothing here can hand a secret back to
+            // the input in the clear — and the row names the masked form.
+            let display = redact(line, redactions);
+            self.report_send_failure(&error, SendSubject::redacted(&display))
+                .await?;
             return Ok(());
         }
+        self.note_send_succeeded();
 
         let display = redact(line, redactions);
         let styled_line = Arc::new(StyledLine::from_output_str(&display));

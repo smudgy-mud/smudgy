@@ -80,6 +80,7 @@ async fn script_reads_settings_via_get_settings() {
         raw_line_prefix: Arc::new("\\".to_string()),
         log_enabled: true,
         bold_is_bright: false,
+        reconnect_on_send_error: false,
         script_settings: Box::new(script_settings),
     })
     .unwrap();

@@ -40,6 +40,25 @@ pub enum SessionEvent {
     RuntimeReady(UnboundedSender<RuntimeAction>),
     Connected,
     Disconnected,
+    /// This session asked to be connected — a script's `session.connect()`, or
+    /// the send-error recovery. The daemon answers it exactly like the
+    /// title-bar Connect: mark online intent and send back a freshly loaded
+    /// `RuntimeAction::Connect` (the server/profile config and the keyring
+    /// password substitution are re-read on every connect, which is why this
+    /// cannot be answered on the session thread).
+    ConnectRequested {
+        /// Connect only while this session still wants to be online. The
+        /// send-error recovery sets it: after an explicit Disconnect the
+        /// retained transport still fails every write, and dialing back out on
+        /// one of those would quietly overturn the user's own decision. A
+        /// script's `session.connect()` is an explicit request and clears it.
+        only_if_intended: bool,
+    },
+    /// This session asked to be disconnected (`session.disconnect()`). The
+    /// runtime has already established that the transport is live; the daemon
+    /// treats it exactly like the title-bar Disconnect, clearing the session's
+    /// online intent so a later reload does not silently reconnect.
+    DisconnectRequested,
     UpdateBuffer(Arc<Vec<BufferUpdate>>),
     ClearHotkeys,
     RegisterHotkey(HotkeyId, HotkeyDefinition),

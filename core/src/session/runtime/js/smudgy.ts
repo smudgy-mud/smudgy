@@ -59,6 +59,8 @@ const {
     op_smudgy_session_echo,
     op_smudgy_session_echo_styled,
     op_smudgy_session_reload,
+    op_smudgy_session_connect,
+    op_smudgy_session_disconnect,
     op_smudgy_session_send,
     op_smudgy_session_send_raw,
     op_smudgy_session_send_bytes,
@@ -3003,6 +3005,26 @@ class Session {
     /** Reload this session's scripts (rebuilds its engine). */
     reload(): void {
         op_smudgy_session_reload(this.id);
+    }
+
+    /** Connect this session, exactly as the title-bar Connect button does: the
+     *  server and profile configurations are re-read, so a connect always uses
+     *  the saved settings as they stand now. Takes no arguments -- a session is
+     *  bound to its server entry, and connecting never chooses a destination.
+     *  Does nothing while the session is connected or a connection attempt is
+     *  under way, so it is safe to call unconditionally. Needs the `send`
+     *  capability: a connect sends the profile's auto-login text. */
+    connect(): void {
+        op_smudgy_session_connect(this.id);
+    }
+
+    /** Disconnect this session, exactly as the title-bar Disconnect button
+     *  does -- including clearing the session's online intent, so reloading
+     *  will not silently reconnect it. Takes no arguments. Does nothing when
+     *  the session is not connected. Needs the `send` capability, like
+     *  `connect()`. */
+    disconnect(): void {
+        op_smudgy_session_disconnect(this.id);
     }
 
     /** Send a line to the MUD, processed exactly as if typed by the user. */

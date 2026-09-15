@@ -91,7 +91,7 @@ fn drain(
             // The connect failure reaches the session as its own action now,
             // so the connection rule can report it in place of "Connecting
             // to …" rather than as a loose echo under it.
-            Ok(RuntimeAction::ConnectionFailed(error)) => {
+            Ok(RuntimeAction::ConnectionFailed { error, .. }) => {
                 echoes.push(format!("Connection failed: {error}"));
             }
             Ok(_) => {}
