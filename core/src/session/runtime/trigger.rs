@@ -2949,12 +2949,14 @@ impl Manager {
     /// Match one outgoing line against the alias set. `sender` names the alias whose
     /// expansion produced the line, when one did (typed input passes `None`), and `depth`
     /// counts nested expansions toward the loop-bail limit.
+    /// Returns whether an alias matched `line` — the caller's cue to open a
+    /// rescue scope for the alias's expansion.
     pub fn process_outgoing_line(
         &mut self,
         line: &str,
         depth: u32,
         sender: Option<&AliasSender>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Lazily rebuild the alias PatternSet here (mirrors how
         // `process_incoming_line` rebuilds the trigger set) so alias inserts at
         // load time stay O(1) and we pay one rebuild on the first command.
@@ -2970,7 +2972,7 @@ impl Manager {
         line: &str,
         depth: u32,
         sender: Option<&AliasSender>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let is_captured = Arc::new(AtomicBool::new(false));
         let mut fallthrough_scopes = FallthroughScopes::new();
         // Aliases evaluate in a single pass, so the fired list is inert here; it exists
@@ -3000,7 +3002,7 @@ impl Manager {
                 is_captured,
                 Arc::new(line.to_string()),
             ));
-        Ok(())
+        Ok(!matches.is_empty())
     }
 
     /// Execute a matched plaintext command template. This happens at dispatch time (rather than

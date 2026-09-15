@@ -313,6 +313,67 @@ async fn send_raw_to_another_session_requires_reach_others() {
     }
 }
 
+/// `connect`/`disconnect` ride the `send` capability rather than being ungated like
+/// `reload`: a connect re-substitutes the profile's `$PASSWORD` and transmits the auto-login,
+/// so a package that may not `send` must not be able to make the client send that either.
+/// A foreign target needs `reach-others` on top, as everywhere.
+#[tokio::test]
+async fn connect_and_disconnect_need_send_and_reach_others_for_others() {
+    let src = r#"
+        import session, { echo } from "smudgy:core";
+        const current = session.session;
+        const SessionClass = Object.getPrototypeOf(current).constructor;
+        const foreign = new SessionClass(current.id + 1);
+        for (const [who, target] of [["self", current], ["foreign", foreign]]) {
+            for (const verb of ["connect", "disconnect"]) {
+                try { target[verb](); echo(who + ":" + verb + ":ALLOWED"); }
+                catch (error) { echo(who + ":" + verb + ":DENIED:" + error.message); }
+            }
+        }
+    "#;
+    for (id, send, reach) in [(9685, false, true), (9687, true, false), (9689, true, true)] {
+        let lines = run_capability_case(
+            id,
+            &format!("pi_caps_transport_reach_{id}"),
+            "smudgy://wbk/transport-reach",
+            Some(consent_with(|s| {
+                s.echo = true;
+                s.send = send;
+                s.reach_others = reach;
+            })),
+            make_package("wbk", "transport-reach", "1.0.0", src),
+        )
+        .await;
+        for verb in ["connect", "disconnect"] {
+            // Without `send`, even the own session's transport is out of reach, and the
+            // denial names `send` whether the target is local or foreign.
+            let (expected_self, missing) = if send {
+                ("ALLOWED", "reach-others")
+            } else {
+                ("DENIED", "send")
+            };
+            assert!(
+                has_line(&lines, &format!("self:{verb}:{expected_self}")),
+                "own-session {verb} must be gated by 'send' alone; transcript:\n{lines:#?}"
+            );
+            if send && reach {
+                assert!(
+                    has_line(&lines, &format!("foreign:{verb}:ALLOWED")),
+                    "{lines:#?}"
+                );
+            } else {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains(&format!("foreign:{verb}:DENIED:"))
+                            && line.contains(missing)),
+                    "the denial must name the missing '{missing}' capability; transcript:\n{lines:#?}"
+                );
+            }
+        }
+    }
+}
+
 /// A package with no smudgy block is denied EVERY gated op, including `echo` itself.
 ///
 /// Part A grants `echo` ONLY (the reporting channel) and confirms every *other* gated op throws:

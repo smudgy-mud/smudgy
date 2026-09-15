@@ -201,6 +201,7 @@ fn apply_bold_is_bright(enabled: bool) -> RuntimeAction {
         raw_line_prefix: Arc::new(settings.raw_line_prefix.clone()),
         log_enabled: false,
         bold_is_bright: enabled,
+        reconnect_on_send_error: false,
         script_settings: Box::new(ScriptSettings::from(&settings)),
     }
 }

@@ -1744,7 +1744,10 @@ impl Connection {
                         // (self-signed / expired / name mismatch) gives no other hint, and the
                         // policy is never a silent fallback to plaintext.
                         runtime_tx
-                            .send(RuntimeAction::ConnectionFailed(Arc::new(format!("{err}"))))
+                            .send(RuntimeAction::ConnectionFailed {
+                                connection_generation: generation,
+                                error: Arc::new(format!("{err}")),
+                            })
                             .map_err(|_| {
                                 warn!("Error notifying runtime of connection failure; ignoring");
                             })
@@ -1802,7 +1805,11 @@ impl Connection {
                 // the runtime's connect/disconnect events stay strictly paired.
                 // The rule reports it, so the abandoned attempt reads as one
                 // row rather than a bare line under "Connecting to …".
-                runtime_tx.send(RuntimeAction::ConnectionAbandoned).ok();
+                runtime_tx
+                    .send(RuntimeAction::ConnectionAbandoned {
+                        connection_generation: generation,
+                    })
+                    .ok();
             }
             trace!("Connection cleaning up");
             clear_socket_sender(&socket_tx);

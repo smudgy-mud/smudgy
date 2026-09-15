@@ -19,6 +19,7 @@ use super::{
     ActionResult, ExposedState, Inner, IsolateId, MainPrefixDisposition, RuntimeAction,
     ScriptAction,
 };
+use super::{Dial, SendFailureKind, SendSubject};
 use crate::models::state_exposure::StateExposure;
 use crate::session::styled_line::StyledLine;
 use crate::session::styled_line::{AppLink, LinkAction};
@@ -241,7 +242,12 @@ impl Inner<'_> {
                 .trigger_manager
                 .process_outgoing_line(rest, depth, sender.as_deref())
             {
-                Ok(()) => Ok(ActionResult::None),
+                Ok(alias_fired) => {
+                    if alias_fired {
+                        self.open_alias_scope(&line);
+                    }
+                    Ok(ActionResult::None)
+                }
                 Err(err) => Ok(ActionResult::Echo(format!(
                     "Error processing command {err:?}"
                 ))),
@@ -391,19 +397,30 @@ impl Inner<'_> {
                 compression,
                 tls,
             } => {
+                // Every `Connect` is the daemon acting on online intent — the
+                // user's Connect, a session restored online, or the answer to
+                // a request made on that intent's behalf.
+                self.connect_intent = true;
                 // The connection rule advances in place: the offline row the
                 // user just clicked becomes this, and this becomes
-                // "Connected to …" when the socket comes up.
+                // "Connected to …" when the socket comes up. An attempt made
+                // for a command that could not be sent says so.
                 self.connection_target = Some(Arc::new(format!("{host}:{port}")));
+                let verb = if self.send_failure_pending() {
+                    "Reconnecting to "
+                } else {
+                    "Connecting to "
+                };
                 self.set_connection_rule(
                     SystemText::new(Severity::Info)
-                        .text("Connecting to ")
+                        .text(verb)
                         .strong(&format!("{host}:{port}"))
                         .text("\u{2026}"),
                     Progress::Pending,
                 );
                 self.connection_generation = self.connection_generation.wrapping_add(1);
                 let connection_generation = self.connection_generation;
+                self.dial = Dial::InFlight(connection_generation);
                 // The MSSP snapshot describes one server's one connection; the new
                 // connect clears it before any fresh variables can arrive. (GMCP/MSDP
                 // clear on their negotiation-on arms instead — MSSP has none.) The
@@ -498,6 +515,9 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::Disconnect => {
+                // The user's choice (or a script's, on the user's own path):
+                // from here a failed send must not dial.
+                self.connect_intent = false;
                 // Signal the socket task to stop; it emits `Disconnected` on its
                 // way out (the same path an unexpected drop takes). Keeping the
                 // `Connection` around is harmless — a later `Connect` replaces it.
@@ -507,6 +527,40 @@ impl Inner<'_> {
                 self.pending_send_on_connect = None;
                 self.send_on_connect_armed
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::ConnectRequested => {
+                // The transport flag is the authority on liveness (the
+                // `Connection` outlives its socket), so this is where
+                // `session.connect()` becomes a no-op on a connected session —
+                // and on one still dialing, since a fresh `Connect` would
+                // cancel the attempt under way.
+                if !self.connected.load(Ordering::Acquire) && self.dial == Dial::Idle {
+                    // An explicit request: it establishes online intent rather
+                    // than deferring to it, exactly like the title-bar button.
+                    self.request_connect(false).await?;
+                }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::ConnectDeclined => {
+                // The daemon is the authority on intent; a decline means the
+                // session is offline by its choice, and the notice says so.
+                self.connect_intent = false;
+                self.settle_send_failures(SendFailureKind::NotConnected);
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::DisconnectRequested => {
+                // Symmetrically, `session.disconnect()` no-ops when nothing is
+                // connected. The daemon does the teardown so the online intent
+                // is cleared on the same path the title-bar button uses.
+                if self.connected.load(Ordering::Acquire) {
+                    self.ui_tx
+                        .send(TaggedSessionEvent {
+                            session_id: self.session_id,
+                            event: SessionEvent::DisconnectRequested,
+                        })
+                        .await?;
+                }
                 Ok(ActionResult::None)
             }
             RuntimeAction::HandleIncomingLine(line) => {
@@ -628,21 +682,40 @@ impl Inner<'_> {
                 self.echo_system_row_sync(row);
                 Ok(ActionResult::None)
             }
-            // The attempt was called off before it came up.
-            RuntimeAction::ConnectionAbandoned => {
+            // The attempt was called off before it came up. Only the live
+            // attempt's ending counts: a dial a newer `Connect` replaced ends
+            // this way too, after that `Connect` has already put its own
+            // "Connecting to …" on the rule.
+            RuntimeAction::ConnectionAbandoned {
+                connection_generation,
+            } => {
+                if connection_generation != self.connection_generation {
+                    return Ok(ActionResult::None);
+                }
+                self.dial = Dial::Idle;
                 self.set_connection_rule(
                     SystemText::new(Severity::Info).text("Disconnected"),
                     Progress::Done,
                 );
+                self.settle_send_failures(SendFailureKind::ReconnectAbandoned);
                 Ok(ActionResult::None)
             }
             // The connect never came up: the rule says so where it stands,
-            // rather than leaving "Connecting to…" shimmering forever.
-            RuntimeAction::ConnectionFailed(error) => {
+            // rather than leaving "Connecting to…" shimmering forever. Same
+            // generation gate as the abandoned case.
+            RuntimeAction::ConnectionFailed {
+                connection_generation,
+                error,
+            } => {
+                if connection_generation != self.connection_generation {
+                    return Ok(ActionResult::None);
+                }
+                self.dial = Dial::Idle;
                 self.set_connection_rule(
                     SystemText::new(Severity::Warn).text(&format!("Connection failed: {error}")),
                     Progress::Done,
                 );
+                self.settle_send_failures(SendFailureKind::ReconnectFailed);
                 Ok(ActionResult::None)
             }
             // The offline state of the connection rule. The connect it
@@ -724,8 +797,13 @@ impl Inner<'_> {
                 let handlers = self.gated_host_emit("sys:input", || {
                     serde_json::json!({ "text": line.as_str() }).to_string()
                 });
+                // The scope names what was typed, not what a handler may make
+                // of it: a rescue hands back the user's own line, and
+                // re-submitting it runs the handlers again.
+                self.begin_rescue_scope(Arc::clone(&line), true);
                 if handlers.is_empty() {
-                    self.dispatch_send(line, 0, None).await
+                    let result = self.dispatch_send(line, 0, None).await?;
+                    Ok(self.scope_dispatch_result(result))
                 } else {
                     // Install the generation-stamped submission the handlers act on.
                     self.input_submission.borrow_mut().install(line);
@@ -744,10 +822,18 @@ impl Inner<'_> {
                 let submission = self.input_submission.borrow_mut().take();
                 match submission {
                     Some(submission) if !submission.is_cancelled() => {
-                        self.dispatch_send(submission.into_text(), 0, None).await
+                        let result = self.dispatch_send(submission.into_text(), 0, None).await?;
+                        Ok(self.scope_dispatch_result(result))
                     }
-                    _ => Ok(ActionResult::None),
+                    _ => {
+                        self.end_rescue_scope();
+                        Ok(ActionResult::None)
+                    }
                 }
+            }
+            RuntimeAction::EndRescueScope => {
+                self.end_rescue_scope();
+                Ok(ActionResult::None)
             }
             RuntimeAction::ProcessOutgoingLine {
                 line,
@@ -764,7 +850,13 @@ impl Inner<'_> {
                     depth,
                     sender.as_deref(),
                 ) {
-                    Ok(()) => {
+                    Ok(alias_fired) => {
+                        // An alias is a user command however it was reached: a
+                        // send failing anywhere in its expansion hands this
+                        // command back to the input.
+                        if alias_fired {
+                            self.open_alias_scope(&line);
+                        }
                         // sys:send — the command (post-alias) about to reach the game.
                         let payload = serde_json::json!({ "command": line.as_str() }).to_string();
                         Ok(self.run_host_event("sys:send", &payload))
@@ -785,10 +877,16 @@ impl Inner<'_> {
             RuntimeAction::SendRawBytes(bytes) => {
                 if !bytes.is_empty()
                     && let Some(connection) = &self.connection
-                    && let Err(error) = connection.write_raw(bytes).await
-                    && let Some(future) = self.echo_warn_str(&format!("Send error: {error:?}"))?
                 {
-                    future.await?;
+                    match connection.write_raw(bytes).await {
+                        // Bytes reaching the wire prove the transport works, like
+                        // any other send.
+                        Ok(()) => self.note_send_succeeded(),
+                        Err(error) => {
+                            self.report_send_failure(&error, SendSubject::script_bytes())
+                                .await?;
+                        }
+                    }
                 }
                 Ok(ActionResult::None)
             }
@@ -1481,10 +1579,16 @@ impl Inner<'_> {
                 Ok(ActionResult::None)
             }
             RuntimeAction::Connected => {
+                self.dial = Dial::Idle;
                 // Start the runtime's connection clock here, not in the socket
                 // task: the duration the disconnect notice reports is the time
                 // this runtime spent live on the connection.
                 self.connected_at = Some((self.connection_generation, std::time::Instant::now()));
+                // A command that could not be sent asked for this: tell the
+                // reader it is time to press Enter. Deliberately not the point
+                // that lets the client dial again — a peer that greets and
+                // resets would fail the auto-login here every time.
+                self.settle_send_failures(SendFailureKind::Reconnected);
                 // The last state this rule takes: from here the session's own
                 // output scrolls between it and any later disconnect, so that
                 // disconnect opens a rule of its own.
@@ -1534,6 +1638,7 @@ impl Inner<'_> {
                 // otherwise erase the NEW connection's pending send before its
                 // first displayable packet releases it.
                 if connection_generation == self.connection_generation {
+                    self.dial = Dial::Idle;
                     self.pending_send_on_connect = None;
                     self.send_on_connect_armed
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2631,6 +2736,7 @@ impl Inner<'_> {
                 raw_line_prefix,
                 log_enabled,
                 bold_is_bright,
+                reconnect_on_send_error,
                 script_settings,
             } => {
                 self.trigger_manager
@@ -2639,6 +2745,7 @@ impl Inner<'_> {
                 self.command_separator = command_separator;
                 self.raw_line_prefix = raw_line_prefix;
                 self.set_log_enabled(log_enabled);
+                self.reconnect_on_send_error = reconnect_on_send_error;
                 // Refresh the script-visible snapshot (`getSettings()`) including the
                 // UI-resolved palette.
                 *self.settings_snapshot.borrow_mut() = *script_settings;

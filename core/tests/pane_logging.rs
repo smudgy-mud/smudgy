@@ -34,6 +34,7 @@ fn apply_settings(log_enabled: bool) -> RuntimeAction {
         raw_line_prefix: Arc::new(settings.raw_line_prefix.clone()),
         log_enabled,
         bold_is_bright: settings.terminal_bold_mode.uses_bright_palette(),
+        reconnect_on_send_error: false,
         script_settings: Box::new(ScriptSettings::from(&settings)),
     }
 }

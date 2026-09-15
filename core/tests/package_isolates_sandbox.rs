@@ -534,6 +534,7 @@ async fn run_scenario_inner(
         raw_line_prefix: Arc::new("\\".to_string()),
         log_enabled: true,
         bold_is_bright: false,
+        reconnect_on_send_error: false,
         script_settings: Box::new(smudgy_core::models::settings::ScriptSettings::default()),
     })
     .unwrap();
@@ -2343,6 +2344,7 @@ async fn run_with_factory(
         raw_line_prefix: Arc::new("\\".to_string()),
         log_enabled: true,
         bold_is_bright: false,
+        reconnect_on_send_error: false,
         script_settings: Box::new(smudgy_core::models::settings::ScriptSettings::default()),
     })
     .unwrap();
