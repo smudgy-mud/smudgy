@@ -31,7 +31,7 @@ export interface FollowedLocation {
 }
 
 function sameAreaId(a: AreaId, b: AreaId): boolean {
-  return a[0] === b[0] && a[1] === b[1];
+  return a === b;
 }
 
 function roomInArea(area: FollowArea, externalId: string): FollowRoom | undefined {
