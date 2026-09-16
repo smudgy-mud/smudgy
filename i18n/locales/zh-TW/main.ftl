@@ -1970,7 +1970,6 @@ runtime-loaded-packages-clause = 已載入 { $count } 個套件（耗時 { $mill
 runtime-loaded-modules-clause = { $count } 個指令碼模組（耗時 { $milliseconds } 毫秒）
 runtime-loaded-maps-clause = { $count } 個地圖區域（耗時 { $milliseconds } 毫秒）
 runtime-loaded-maps-shared = （自有 { $owned }、共享 { $shared }）
-runtime-nothing-loaded = 沒有可載入的項目
 runtime-opened-offline = 以離線模式開啟 · 連線
 runtime-connecting-to = 正在連線至 { $host }…
 runtime-connected-to = 已連線至 { $host }

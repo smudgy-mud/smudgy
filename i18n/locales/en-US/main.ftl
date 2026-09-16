@@ -1993,7 +1993,6 @@ runtime-loaded-packages-clause = Loaded { $count } packages (in { $milliseconds 
 runtime-loaded-modules-clause = { $count } script modules (in { $milliseconds }ms)
 runtime-loaded-maps-clause = { $count } map areas (in { $milliseconds }ms)
 runtime-loaded-maps-shared = ({ $owned } owned, { $shared } shared)
-runtime-nothing-loaded = Nothing to load
 # One rule cycles through the connection's states on a single row.
 runtime-opened-offline = Opened offline · Connect
 runtime-connecting-to = Connecting to { $host }…
