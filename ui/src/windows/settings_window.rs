@@ -171,6 +171,7 @@ pub enum Message {
     PrefRawPrefixSubmitted,
     PrefCommandInputBehaviorSelected(CommandInputBehavior),
     PrefMaskOnServerEchoToggled(bool),
+    PrefReconnectOnSendErrorToggled(bool),
     PrefHistoryCaseSensitiveMatchToggled(bool),
     PrefHidePaneHeadersToggled(bool),
     PrefLoggingToggled(bool),
@@ -787,6 +788,10 @@ impl SettingsWindow {
             }
             Message::PrefMaskOnServerEchoToggled(mask) => {
                 self.settings.mask_input_on_server_echo = mask;
+                self.settings_changed()
+            }
+            Message::PrefReconnectOnSendErrorToggled(enabled) => {
+                self.settings.reconnect_on_send_error = enabled;
                 self.settings_changed()
             }
             Message::PrefHistoryCaseSensitiveMatchToggled(enabled) => {
@@ -1553,6 +1558,15 @@ impl SettingsWindow {
                      dots instead of your text (with an eye button to peek). Turn off \
                      to keep your typing visible.",
                 ),
+            ]
+            .spacing(2),
+        );
+        col = col.push(
+            column![
+                checkbox(self.settings.reconnect_on_send_error)
+                    .label(t!("preferences-reconnect-on-send-error"))
+                    .on_toggle(Message::PrefReconnectOnSendErrorToggled),
+                dim_text_owned(t!("preferences-reconnect-on-send-error-help")),
             ]
             .spacing(2),
         );

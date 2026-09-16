@@ -61,6 +61,7 @@ async fn raw_prefix_bypasses_splitting_and_alias_matching() {
         raw_line_prefix: Arc::new("\\".to_string()),
         log_enabled: true,
         bold_is_bright: false,
+        reconnect_on_send_error: false,
         script_settings: Box::new(smudgy_core::models::settings::ScriptSettings::default()),
     })
     .unwrap();

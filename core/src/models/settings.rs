@@ -353,6 +353,16 @@ pub struct Settings {
     /// unmasked (the Mudlet `mDisablePasswordMasking` opt-out).
     #[serde(default = "default_true")]
     pub mask_input_on_server_echo: bool,
+    /// When a command cannot be sent because the connection is gone, and the
+    /// session still means to be online (it was connected and neither opened
+    /// offline nor disconnected by the user), reconnect on its behalf. The
+    /// typed line comes back to the input either way, fully selected, so Enter
+    /// re-sends it once the connection is up and typing replaces it; this
+    /// setting decides only whether the dial happens by itself. On by default;
+    /// off leaves a dropped session where it is, with a Connect link in the
+    /// notice instead.
+    #[serde(default = "default_true")]
+    pub reconnect_on_send_error: bool,
     /// Up/Down history navigation always cycles through entries that have
     /// the *unselected* part of the current input as a prefix (an empty, or
     /// fully selected input matches *every* entry).
@@ -891,6 +901,7 @@ impl Default for Settings {
             raw_line_prefix: default_raw_line_prefix(),
             command_input_behavior: CommandInputBehavior::default(),
             mask_input_on_server_echo: true,
+            reconnect_on_send_error: true,
             history_case_sensitive_match: false,
             max_history: default_max_history(),
             hide_pane_headers: true,

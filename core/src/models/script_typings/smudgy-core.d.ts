@@ -1621,6 +1621,41 @@ declare module "smudgy:core" {
     sendRaw(data: string | BufferSource): void;
     /** Reload this session's scripts and automations. */
     reload(): void;
+    /**
+     * Connect this session, exactly as the title-bar Connect button does: the
+     * server and profile configurations are re-read, so a connect always uses
+     * the saved settings as they stand now.
+     *
+     * Takes no arguments -- a session is bound to its server entry, and
+     * connecting never chooses a destination. Does nothing while the session
+     * is connected or a connection attempt is under way, so it is safe to call
+     * unconditionally -- from the `disconnected` handle in
+     * `smudgy:events/sessions`, or from a timer.
+     *
+     * Needs the `send` capability: a connect re-reads the profile's stored
+     * password and sends its auto-login text, so it can put on the wire what
+     * {@link Session.send} would. Acting on another session additionally
+     * requires `reach-others`.
+     *
+     * @example
+     * // Bring every same-server session online.
+     * for (const s of getSessions()) s.connect();
+     */
+    connect(): void;
+    /**
+     * Disconnect this session, exactly as the title-bar Disconnect button does
+     * -- including clearing the session's online intent, so reloading will not
+     * silently reconnect it.
+     *
+     * Takes no arguments. Does nothing when the session is not connected --
+     * so it cannot cancel the pending reconnect left behind by a drop the user
+     * did not ask for. To keep a session offline across a reload, disconnect
+     * it while it is still up.
+     *
+     * Needs the `send` capability, like {@link Session.connect}. Acting on
+     * another session additionally requires `reach-others`.
+     */
+    disconnect(): void;
     /** This session's main (output + input) pane. */
     readonly mainPane: Pane;
     /** This session's pane registry (see {@link PaneRegistry}). */

@@ -154,6 +154,34 @@ pub enum RuntimeAction {
     /// socket task then emits [`RuntimeAction::Disconnected`] like any other
     /// drop. A no-op when there is no live connection.
     Disconnect,
+    /// A script asked this session to connect (`session.connect()`). The
+    /// runtime cannot build a [`Self::Connect`] itself — the server/profile
+    /// configuration and the keyring password substitution are the daemon's to
+    /// read — so this forwards [`crate::session::SessionEvent::ConnectRequested`]
+    /// and the daemon answers with a freshly loaded `Connect`. Dropped when the
+    /// transport is already live or a connection attempt is under way, which is
+    /// what makes `session.connect()` a no-op on a session that is connected or
+    /// connecting.
+    ConnectRequested,
+    /// The daemon did not dial for a request this runtime made on the
+    /// session's behalf — the request deferred to an online intent the daemon
+    /// no longer holds, or the connection configuration failed to load. Lets
+    /// a send-failure notice waiting on that dial settle instead of shimmering
+    /// on; the runtime's intent mirror follows the daemon's.
+    ConnectDeclined,
+    /// A script asked this session to disconnect (`session.disconnect()`).
+    /// Routed through the daemon as [`crate::session::SessionEvent::DisconnectRequested`]
+    /// rather than straight to [`Self::Disconnect`], so a scripted disconnect
+    /// clears the session's online intent exactly like the title-bar button
+    /// (a later reload must not silently reconnect).
+    ///
+    /// Dropped when there is no live transport, which is what makes
+    /// `session.disconnect()` a no-op on a disconnected session — and, like
+    /// the title-bar button (which reads Connect once the transport is gone),
+    /// means it cannot clear the intent left behind by a drop the user did not
+    /// ask for. A script that wants a session to stay offline across a reload
+    /// has to disconnect it while it is still up.
+    DisconnectRequested,
     HandleIncomingLine(Arc<StyledLine>),
     /// A newline completed a logical line whose prefix was already emitted as
     /// one or more transport-batch partials. `line` is the assembled whole
@@ -211,6 +239,16 @@ pub enum RuntimeAction {
     /// Constructed only by the `SubmitInput` dispatch arm; it rides the
     /// spawned-action queue, which a reload clears along with the state it consumes.
     CompleteInputSubmission,
+    /// The end of a rescue scope. `SubmitInput` opens one naming the line the
+    /// user typed, and a command that matches an alias opens one naming that
+    /// command (unless a scope is already open), so a send that fails anywhere
+    /// inside — the line itself, a separator-split command, an alias body's
+    /// `send()` — can hand *that line* back to the input; this closes the
+    /// scope. Queued behind the split commands or the alias's spawned actions,
+    /// it runs only after every one of them and everything they expanded into
+    /// (depth-first order), and it rides the same action frame a reload
+    /// discards along with the scope.
+    EndRescueScope,
     /// Internal line-oriented send used by command aliases and typed input.
     SendRaw(Arc<String>),
     /// Script `sendRaw` text, already normalized and terminated as required by the API.
@@ -260,11 +298,24 @@ pub enum RuntimeAction {
     OpenedOffline,
     /// The transport never came up. Finishes the connection rule with the
     /// reason (a refused port, a TLS handshake failure) in place of the
-    /// `Connecting to …` state it is showing.
-    ConnectionFailed(Arc<String>),
-    /// The user disconnected before the transport came up. Finishes the
-    /// connection rule; no `Connected`/`Disconnected` pair ever fired.
-    ConnectionAbandoned,
+    /// `Connecting to …` state it is showing, and settles the send-failure
+    /// notice that asked for the dial.
+    ///
+    /// Stamped with the attempt's generation, like `Disconnected`: a dial that
+    /// a newer `Connect` replaced still reports its own end, and that late
+    /// report must neither rewrite the new attempt's rule nor clear its
+    /// in-flight state.
+    ConnectionFailed {
+        connection_generation: u64,
+        error: Arc<String>,
+    },
+    /// The attempt was called off before the transport came up — the user
+    /// disconnected, or a newer `Connect` replaced it. Finishes the connection
+    /// rule; no `Connected`/`Disconnected` pair ever fired. Generation-stamped
+    /// for the same reason as [`Self::ConnectionFailed`].
+    ConnectionAbandoned {
+        connection_generation: u64,
+    },
     /// Echo one row in the client's own voice (`system_row`): a notice, rule
     /// or group. Takes the counted whole-row path — any open main line is
     /// committed first — and rides the same coalesced delivery as
@@ -707,6 +758,9 @@ pub enum RuntimeAction {
         /// to bright variants during matching with a color filter. The runtime
         /// caches this value in [`super::trigger::Manager`].
         bold_is_bright: bool,
+        /// Reconnect on the session's behalf when a send fails while it still
+        /// means to be online (`Settings::reconnect_on_send_error`).
+        reconnect_on_send_error: bool,
         script_settings: Box<crate::models::settings::ScriptSettings>,
     },
     RequestRepaint,

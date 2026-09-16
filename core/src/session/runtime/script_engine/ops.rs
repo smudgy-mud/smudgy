@@ -53,6 +53,8 @@ deno_core::extension!(
     op_smudgy_session_echo,
     op_smudgy_session_echo_styled,
     op_smudgy_session_reload,
+    op_smudgy_session_connect,
+    op_smudgy_session_disconnect,
     op_smudgy_session_send,
     op_smudgy_session_send_raw,
     op_smudgy_session_send_bytes,
@@ -4632,6 +4634,39 @@ fn op_smudgy_session_reload(state: &mut OpState, session_id: u32) -> Result<(), 
     let target = SessionId::from(session_id);
     ensure_session_target(state, target, true, "reload")?;
     route_session_action(state, target, RuntimeAction::Reload);
+    Ok(())
+}
+
+/// Connect a session's transport (`session.connect()`).
+///
+/// Gated by `send`, not ungated like `reload`: a connect re-substitutes the profile's
+/// `$PASSWORD` from the keyring and transmits the auto-login text, so a package that may
+/// not [`op_smudgy_session_send`] must not be able to make the client send that either.
+/// Severing and re-establishing the game connection sits on the same side of the line. A
+/// foreign target adds the `reach_others` gate in [`ensure_session_target`], as everywhere.
+///
+/// The runtime the action lands on drops it when that session's transport is already live
+/// or an attempt is under way, which is what makes this a no-op on a session that is
+/// connected or connecting (a fresh `Connect` would cancel the attempt in flight, since
+/// [`crate::session::connection::Connection::connect`] cancels the socket it replaces). The
+/// check deliberately happens there, not here: the routed action can sit behind a queue, so
+/// only the target's own dispatch sees the state that decides.
+#[op2(fast)]
+fn op_smudgy_session_connect(state: &mut OpState, session_id: u32) -> Result<(), NotCapable> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).send, "send")?;
+    route_session_action(state, target, RuntimeAction::ConnectRequested);
+    Ok(())
+}
+
+/// Disconnect a session's transport (`session.disconnect()`); the mirror of
+/// [`op_smudgy_session_connect`], down to the `send` gate and the
+/// no-op-when-already-disconnected check living in the target's dispatch.
+#[op2(fast)]
+fn op_smudgy_session_disconnect(state: &mut OpState, session_id: u32) -> Result<(), NotCapable> {
+    let target = SessionId::from(session_id);
+    ensure_session_target(state, target, grants(state).send, "send")?;
+    route_session_action(state, target, RuntimeAction::DisconnectRequested);
     Ok(())
 }
 
