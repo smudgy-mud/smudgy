@@ -64,6 +64,9 @@ pub mod dts;
 
 // Each smudgy_script build embeds one startup snapshot. V8 uses one shared heap
 // for all live isolates, so every isolate in the process must use that snapshot.
+// That includes throwaway isolates in unit tests: a snapshot-less `JsRuntime`
+// created while snapshot-booted isolates live in the same test process aborts
+// V8 (a libc++ hardening failure) once the scheduler interleaves them.
 // A base build freezes deno_runtime extension state. A Web Audio build also
 // freezes deno_audio operation and object metadata.
 //
