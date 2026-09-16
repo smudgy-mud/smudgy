@@ -2966,8 +2966,44 @@ mod compatibility_tests {
         AreaMutation, JSAreaBatchOperation, JSRoomParams, MAX_MUTATION_OPERATIONS, MapStorage,
         compat_ephemeral_storage, pack_area_batch_operations, resolve_create_storage,
     };
-    use deno_core::{FastString, JsRuntime, RuntimeOptions};
+    use deno_core::FastString;
     use serde_json::json;
+    use smudgy_script::{ModulePolicy, ScriptRuntime, ScriptRuntimeOptions, WorkerMode};
+    use std::rc::Rc;
+
+    /// A throwaway isolate for decoding a script value, booted from the smudgy_script startup
+    /// snapshot like every other isolate in this test process. V8 shares one read-only heap
+    /// across a process's isolates, so a snapshot-less `JsRuntime::new(RuntimeOptions::default())`
+    /// running alongside the snapshot-booted isolates of other unit tests (the typings tests
+    /// compile through `smudgy_script::dts`) aborts V8 with a libc++ hardening failure when the
+    /// scheduler interleaves them. Returned with its data dir so the dir outlives the runtime.
+    fn snapshot_runtime() -> (ScriptRuntime, tempfile::TempDir) {
+        let data_dir = tempfile::tempdir().expect("data dir for the test isolate");
+        let tokio = Rc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime for the test isolate"),
+        );
+        let runtime = ScriptRuntime::new(ScriptRuntimeOptions {
+            extensions: Vec::new(),
+            data_dir: data_dir.path().to_path_buf(),
+            webstorage_dir: None,
+            module_policy: ModulePolicy {
+                allow_https: false,
+                ..Default::default()
+            },
+            inspector: None,
+            tokio,
+            package_provider: None,
+            permissions: None,
+            broadcast_channel: None,
+            workers: WorkerMode::Disabled,
+            max_live_workers_override: None,
+        })
+        .expect("snapshot-booted test isolate");
+        (runtime, data_dir)
+    }
 
     #[test]
     fn ephemeral_flag_stays_pinned_to_session_through_0_5() {
@@ -3093,8 +3129,9 @@ mod compatibility_tests {
 
     #[test]
     fn externally_tagged_batch_decodes_v8_bigint_ids() {
-        let mut runtime = JsRuntime::new(RuntimeOptions::default());
+        let (mut runtime, _data_dir) = snapshot_runtime();
         let value = runtime
+            .deno_runtime()
             .execute_script(
                 "<mapper-batch-bigint>",
                 FastString::from_static(
@@ -3111,7 +3148,7 @@ mod compatibility_tests {
                 ),
             )
             .expect("evaluate bigint payload");
-        deno_core::scope!(scope, &mut runtime);
+        deno_core::scope!(scope, runtime.deno_runtime());
         let local = deno_core::v8::Local::new(scope, value);
         let operations: Vec<JSAreaBatchOperation> =
             deno_core::serde_v8::from_v8(scope, local).expect("decode bigint ids");
@@ -3123,8 +3160,9 @@ mod compatibility_tests {
 
     #[test]
     fn externally_tagged_create_link_decodes_v8_bigint_traversal_area_id() {
-        let mut runtime = JsRuntime::new(RuntimeOptions::default());
+        let (mut runtime, _data_dir) = snapshot_runtime();
         let value = runtime
+            .deno_runtime()
             .execute_script(
                 "<mapper-create-link-bigint>",
                 FastString::from_static(
@@ -3148,7 +3186,7 @@ mod compatibility_tests {
                 ),
             )
             .expect("evaluate create-link bigint payload");
-        deno_core::scope!(scope, &mut runtime);
+        deno_core::scope!(scope, runtime.deno_runtime());
         let local = deno_core::v8::Local::new(scope, value);
         let operations: Vec<JSAreaBatchOperation> = deno_core::serde_v8::from_v8(scope, local)
             .expect("decode create-link bigint traversal area id");
