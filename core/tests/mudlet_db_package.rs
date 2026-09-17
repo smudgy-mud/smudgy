@@ -17,21 +17,24 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use smudgy_core::models::shared_packages::{self, UpdateMode};
 use smudgy_core::session::runtime::{RuntimeAction, RuntimeThreadJoinOutcome, join_runtime_thread};
 use smudgy_core::session::{
     BufferUpdate, PackageProviderFactory, SessionEvent, SessionId, SessionParams,
-    spawn_with_package_provider,
+    TaggedSessionEvent, spawn_with_package_provider,
 };
 use smudgy_script::{
     InMemoryPackageProvider, PackageKey, PackageManifest, PackageModuleSource, PackageProvider,
     ResolvedPackage,
 };
+use tokio::time::Instant;
 
 const MUDLET_DB_SPEC: &str = "smudgy://official/mudlet-db";
 const CALENDAR_SPEC: &str = "smudgy://smudgy-mud/calendar-todo-list";
 const QUIET_PERIOD: Duration = Duration::from_millis(900);
+/// How long a session may take to load, or to answer one typed line, on a starved runner.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // V8 snapshot deserialization is not safe when several session runtimes start at once on
 // Windows (see package_isolates_sandbox.rs); every test here holds this for its whole run.
@@ -197,11 +200,32 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// Spawn a headless session resolving `smudgy://` from `factory`, drain its output until it
-/// goes quiet, then send each of `inputs` (waiting for quiet after each) and drain again.
-async fn run_session(
+/// goes quiet, then shut it down and return every appended line.
+async fn run_session(server: &str, factory: PackageProviderFactory) -> Vec<String> {
+    drive_session(server, factory, None).await
+}
+
+/// [`run_session`] that also types input. `ready` is a prefix of the line that proves the
+/// session is listening (typically its "Loaded N package" row); each `inputs` entry pairs
+/// one typed line with a prefix of the last line it must produce, and the next line is
+/// typed only once that answer has arrived.
+///
+/// Waiting on the session's own output rather than on a quiet gap keeps the test honest
+/// on a starved runner: silence there means "not scheduled yet" as often as "idle", and a
+/// line typed into a session that has not finished loading is simply lost.
+async fn run_session_typing(
     server: &str,
     factory: PackageProviderFactory,
-    inputs: &[&str],
+    ready: &str,
+    inputs: &[(&str, &str)],
+) -> Vec<String> {
+    drive_session(server, factory, Some((ready, inputs))).await
+}
+
+async fn drive_session(
+    server: &str,
+    factory: PackageProviderFactory,
+    typing: Option<(&str, &[(&str, &str)])>,
 ) -> Vec<String> {
     let session_id = SessionId::from(NEXT_SESSION.fetch_add(1, Ordering::SeqCst));
     let params = Arc::new(SessionParams {
@@ -215,22 +239,25 @@ async fn run_session(
         on_engine_rebuild: None,
     });
 
+    let started = Instant::now();
     let mut events = Box::pin(spawn_with_package_provider(params, factory));
     let mut lines: Vec<String> = Vec::new();
+    let ready_deadline = started + RESPONSE_TIMEOUT;
     let tx = loop {
-        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+        let event = tokio::time::timeout_at(ready_deadline, events.next())
             .await
-            .expect("timed out waiting for RuntimeReady")
-            .expect("event stream ended before RuntimeReady");
+            .unwrap_or_else(|_| {
+                panic!("no RuntimeReady within {RESPONSE_TIMEOUT:?}; transcript:\n{lines:#?}")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "event stream ended before RuntimeReady after {:?}; transcript:\n{lines:#?}",
+                    started.elapsed()
+                )
+            });
         match event.event {
             SessionEvent::RuntimeReady(tx) => break tx,
-            SessionEvent::UpdateBuffer(updates) => {
-                for update in updates.iter() {
-                    if let BufferUpdate::Append(line) = update {
-                        lines.push(line.text.clone());
-                    }
-                }
-            }
+            SessionEvent::UpdateBuffer(updates) => collect_lines(&updates, &mut lines),
             _ => {}
         }
     };
@@ -245,25 +272,37 @@ async fn run_session(
     })
     .unwrap();
 
-    let mut pending = inputs.iter();
+    if let Some((ready, inputs)) = typing {
+        let what = format!("the ready line (starting {ready:?})");
+        wait_for_line(&mut events, &mut lines, 0, started, &what, |line| {
+            line.starts_with(ready)
+        })
+        .await;
+        for (input, expected) in inputs {
+            let from = lines.len();
+            tx.send(RuntimeAction::Send(Arc::new((*input).to_string())))
+                .expect("runtime accepts input");
+            let what = format!("the answer to {input:?} (a line starting {expected:?})");
+            wait_for_line(&mut events, &mut lines, from, started, &what, |line| {
+                line.starts_with(expected)
+            })
+            .await;
+        }
+    }
+
+    // Drain whatever trails the last answer, then stop.
     loop {
         match tokio::time::timeout(QUIET_PERIOD, events.next()).await {
             Ok(Some(event)) => {
                 if let SessionEvent::UpdateBuffer(updates) = event.event {
-                    for update in updates.iter() {
-                        if let BufferUpdate::Append(line) = update {
-                            lines.push(line.text.clone());
-                        }
-                    }
+                    collect_lines(&updates, &mut lines);
                 }
             }
-            Ok(None) => break,
-            Err(_) => match pending.next() {
-                Some(input) => tx
-                    .send(RuntimeAction::Send(Arc::new((*input).to_string())))
-                    .expect("runtime accepts input"),
-                None => break,
-            },
+            Ok(None) => panic!(
+                "event stream ended before shutdown after {:?}; transcript:\n{lines:#?}",
+                started.elapsed()
+            ),
+            Err(_) => break,
         }
     }
 
@@ -276,6 +315,55 @@ async fn run_session(
         .expect("runtime join task does not panic");
     assert_eq!(joined, RuntimeThreadJoinOutcome::Clean { session_id });
     lines
+}
+
+/// Records echoed lines and system rows in arrival order. A replaced system row (the load
+/// row filling in) is recorded as its own line, as the session log does.
+fn collect_lines(updates: &[BufferUpdate], lines: &mut Vec<String>) {
+    for update in updates {
+        match update {
+            BufferUpdate::Append(line) => lines.push(line.text.clone()),
+            BufferUpdate::AppendSystem(row) | BufferUpdate::ReplaceSystem(row) => {
+                lines.push(row.line.text.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Reads events until a line at index `from` or later satisfies `matches`, failing with the
+/// transcript and the time since spawn if the session ends or stays silent instead.
+async fn wait_for_line<S>(
+    events: &mut S,
+    lines: &mut Vec<String>,
+    from: usize,
+    started: Instant,
+    what: &str,
+    matches: impl Fn(&str) -> bool,
+) where
+    S: Stream<Item = TaggedSessionEvent> + Unpin,
+{
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    loop {
+        if lines[from..].iter().any(|line| matches(line)) {
+            return;
+        }
+        match tokio::time::timeout_at(deadline, events.next()).await {
+            Ok(Some(event)) => {
+                if let SessionEvent::UpdateBuffer(updates) = event.event {
+                    collect_lines(&updates, lines);
+                }
+            }
+            Ok(None) => panic!(
+                "event stream ended while waiting for {what}, {:?} after spawn; transcript:\n{lines:#?}",
+                started.elapsed()
+            ),
+            Err(_) => panic!(
+                "no {what} within {RESPONSE_TIMEOUT:?}, {:?} after spawn; transcript:\n{lines:#?}",
+                started.elapsed()
+            ),
+        }
+    }
 }
 
 /// Install `spec` untrusted (its own sandboxed isolate) with the consent `permissions`, plus
@@ -408,7 +496,7 @@ async fn package_regressions_hold_in_the_sandboxed_runtime() {
         "smudgy://wbk/dbregressions",
         factory().closure_permissions(),
     );
-    let lines = run_session(server, factory, &[]).await;
+    let lines = run_session(server, factory).await;
     assert_regression_lines(&lines);
 }
 
@@ -425,7 +513,7 @@ async fn package_regressions_hold_in_a_trusted_local_module() {
         REGRESSION_SOURCE.replace("__CAN_SNAPSHOT__", "true"),
     )
     .unwrap();
-    let lines = run_session(server, factory_for(vec![mudlet_db_package()]), &[]).await;
+    let lines = run_session(server, factory_for(vec![mudlet_db_package()])).await;
     assert_regression_lines(&lines);
 }
 
@@ -464,7 +552,7 @@ async fn sandboxed_consumer_keeps_a_file_database_in_its_data_dir() {
         factory().closure_permissions(),
     );
 
-    let lines = run_session(server, factory, &[]).await;
+    let lines = run_session(server, factory).await;
 
     let data_dir = PathBuf::from(line_starting(&lines, "DATADIR:").expect("DATADIR line"));
     assert!(
@@ -517,7 +605,7 @@ async fn sandboxed_consumer_without_file_grants_gets_a_permission_diagnostic() {
         factory().closure_permissions(),
     );
 
-    let lines = run_session(server, factory, &[]).await;
+    let lines = run_session(server, factory).await;
 
     let error = line_starting(&lines, "OPEN_ERR:").unwrap_or_else(|| {
         panic!("the open must fail without read/write grants; transcript:\n{lines:#?}")
@@ -561,7 +649,7 @@ async fn trusted_local_module_imports_the_package_with_main_authority() {
     std::fs::write(server_dir.join("modules").join("main_db.ts"), module_src).unwrap();
 
     // Nothing installed: the package is only imported by the trusted local module.
-    let lines = run_session(server, factory_for(vec![mudlet_db_package()]), &[]).await;
+    let lines = run_session(server, factory_for(vec![mudlet_db_package()])).await;
 
     assert!(
         has_line(&lines, "MAIN_DB:from main"),
@@ -586,13 +674,23 @@ async fn calendar_package_runs_end_to_end_from_typed_input() {
     // Exactly the manifest's own asks: proves the declared grants are the ones it needs.
     install_with_consent(server, CALENDAR_SPEC, calendar.manifest.permissions.clone());
 
-    let lines = run_session(
+    // Each line's answer is the last command's output: the listing rows after both adds,
+    // the listing after the reset, and the deletion (recycling an already deleted event
+    // prints nothing).
+    let lines = run_session_typing(
         server,
         factory,
+        "Loaded 1 package",
         &[
-            "todo visit shipyard;todo buy bait;todo",
-            "done 1;done;reset done;todo",
-            "event Council = 01/01/01;event;delevent 1;recycle events",
+            (
+                "todo visit shipyard;todo buy bait;todo",
+                "%% 2      %% buy bait",
+            ),
+            ("done 1;done;reset done;todo", "%% 1      %% buy bait"),
+            (
+                "event Council = 01/01/01;event;delevent 1;recycle events",
+                "Event 'Council' at '01/01/01' deleted from database.",
+            ),
         ],
     )
     .await;
