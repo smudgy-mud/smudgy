@@ -2165,7 +2165,6 @@ runtime-loaded-maps-clause = { $count ->
        *[other] { $count } області мап (за { $milliseconds } мс)
     }
 runtime-loaded-maps-shared = ({ $owned } власних, { $shared } наданих)
-runtime-nothing-loaded = Немає чого завантажувати
 runtime-opened-offline = Відкрито офлайн · Підключитися
 runtime-connecting-to = Підключення до { $host }…
 runtime-connected-to = Підключено до { $host }

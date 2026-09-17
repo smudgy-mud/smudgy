@@ -151,9 +151,13 @@ fn draw_system_row_decorations<Renderer>(
     let height = cache.row_height();
     let text_top = y + cache.text_offset();
     // A rule needs no gutter bar: it spans the pane edge to edge, and its own
-    // hairlines are the mark that the client is speaking. Every other system
-    // row is indented behind the bar.
-    let gutter_bar = !matches!(row.kind, SystemRowKind::Rule { .. });
+    // hairlines are the mark that the client is speaking. A blank row (no
+    // text, nothing to unfold) draws nothing at all, so a row that turned out
+    // to have nothing to say reads as an empty line rather than a bar beside
+    // one. Every other system row is indented behind the bar.
+    let blank = row.line.text.is_empty()
+        && !matches!(&row.kind, SystemRowKind::Group { children, .. } if !children.is_empty());
+    let gutter_bar = !blank && !matches!(row.kind, SystemRowKind::Rule { .. });
 
     // Chips: one rounded pill per chip, over the union of its spans' bounds.
     // Drawn here rather than as a per-span highlight because a chip with a

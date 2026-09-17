@@ -2064,7 +2064,6 @@ runtime-loaded-packages-clause = Załadowano { $count } pakietów (w { $millisec
 runtime-loaded-modules-clause = { $count } modułów skryptów (w { $milliseconds } ms)
 runtime-loaded-maps-clause = { $count } obszarów map (w { $milliseconds } ms)
 runtime-loaded-maps-shared = ({ $owned } własnych, { $shared } udostępnionych)
-runtime-nothing-loaded = Nie ma czego załadować
 runtime-opened-offline = Otwarto w trybie offline · Połącz
 runtime-connecting-to = Łączenie z { $host }…
 runtime-connected-to = Połączono z { $host }

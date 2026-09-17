@@ -3596,11 +3596,9 @@ impl Inner<'_> {
                 ));
             }
         }
-        if first {
-            // Nothing at all loaded: say so plainly rather than leaving a row
-            // reading "Loaded".
-            text = text.text("Nothing to load");
-        }
+        // Nothing at all loaded leaves the row blank: the pane draws a blank
+        // system row as an empty line, so a profile with nothing to load
+        // says nothing about it.
         let children = summary
             .packages
             .iter()
