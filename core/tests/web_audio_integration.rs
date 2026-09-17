@@ -154,6 +154,15 @@ async fn local_audio_file_reaches_the_smudgy_session_mixer() {
     let mut peak = 0_f32;
     let mut paused = false;
     let mut paused_blocks = 0;
+    // Audible samples and probe ticks per fixture phase (playing, paused marker
+    // seen, resuming marker seen), so a count outside the expected window says
+    // where the samples went missing or came back twice.
+    let mut phase = 0;
+    let mut phase_samples = [0_usize; 3];
+    let mut phase_ticks = [0_usize; 3];
+    // Audible samples away from the fixture's 0.25 * 0.5 level: file content
+    // replayed or lost stays at that level, a foreign signal does not.
+    let mut off_level_samples = [0_usize; 3];
     let mut interval = tokio::time::interval(Duration::from_millis(5));
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -163,12 +172,13 @@ async fn local_audio_file_reaches_the_smudgy_session_mixer() {
                     // the event loop drains. Observe the trusted fixture's phase
                     // marker directly so silence is checked during the pause.
                     match std::fs::read_to_string(modules.join("phase.txt")).as_deref() {
-                        Ok("paused") => paused = true,
-                        Ok("resuming") => paused = false,
+                        Ok("paused") => { paused = true; phase = 1; }
+                        Ok("resuming") => { paused = false; phase = 2; }
                         _ => {}
                     }
                     let mut output = [0_f32; 480];
                     probe.render(&mut output, 2).unwrap();
+                    phase_ticks[phase] += 1;
                     if paused && matches!(std::fs::read_to_string(modules.join("phase.txt")).as_deref(), Ok("paused")) {
                         paused_blocks += 1;
                         assert!(output.iter().all(|sample| sample.abs() < 0.000_001),
@@ -177,7 +187,11 @@ async fn local_audio_file_reaches_the_smudgy_session_mixer() {
                     for sample in output {
                         assert!(sample.is_finite());
                         peak = peak.max(sample.abs());
-                        audible_samples += usize::from(sample.abs() > 0.01);
+                        let audible = usize::from(sample.abs() > 0.01);
+                        audible_samples += audible;
+                        phase_samples[phase] += audible;
+                        off_level_samples[phase] +=
+                            audible & usize::from((sample.abs() - 0.125).abs() > 0.002);
                     }
                 }
                 event = events.next() => {
@@ -198,9 +212,16 @@ async fn local_audio_file_reaches_the_smudgy_session_mixer() {
             }
         }
     }).await.unwrap_or_else(|_| panic!("file playback timed out: {transcript:?}"));
+    let summary = format!(
+        "audible samples {audible_samples} by phase (playing, paused, resuming) \
+         {phase_samples:?}, of which off-level {off_level_samples:?}; probe ticks \
+         {phase_ticks:?}; paused blocks {paused_blocks}; peak {peak}; transcript \
+         {transcript:?}"
+    );
+    eprintln!("file playback summary: {summary}");
     assert!(
         (17_000..=19_200).contains(&audible_samples),
-        "pause/resume lost or replayed file samples: {audible_samples}"
+        "pause/resume lost or replayed file samples: {summary}"
     );
     assert!(paused_blocks > 20, "pause interval was not exercised");
     assert!(

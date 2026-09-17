@@ -3,7 +3,7 @@
 //! File-source script graph, lifecycle, and quota integration.
 use deno_audio::{
     AudioEventPumpLiveness, AudioExtensionOptions, AudioFileOpener, AudioFileResolver, AudioHost,
-    AudioHostLimits, AudioLimits, SilentAudioOutput, install_audio_file_resolver,
+    AudioHostLimits, AudioHostUsage, AudioLimits, SilentAudioOutput, install_audio_file_resolver,
 };
 use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions};
 use deno_error::JsErrorBox;
@@ -124,6 +124,27 @@ async fn run(runtime: &mut JsRuntime, script: &'static str) {
         .unwrap();
 }
 
+/// Waits for the host's accounting to reach `settled`.
+///
+/// A script sees `close()` resolve when the shutdown receipt is confirmed, but
+/// the online permit and the decoder job counters are released by observer
+/// threads that wait on the same receipt independently, so a reading taken the
+/// instant the event loop drains can still be one thread hand-off early.
+async fn assert_usage_settles(host: &AudioHost, settled: impl Fn(AudioHostUsage) -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let usage = host.usage();
+        if settled(usage) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "audio host usage did not settle: {usage:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 #[tokio::test]
 async fn media_player_preloads_replays_and_releases_contexts_before_ended() {
     let fixtures = Fixtures::new();
@@ -156,9 +177,12 @@ async fn media_player_preloads_replays_and_releases_contexts_before_ended() {
         await audio.close(); await audio.close();
         if (audio.src !== 'short' || !audio.paused || audio.ended) throw new Error('close did not reset reusable player');
     ").await;
-    assert_eq!(host.usage().online_contexts(), 0);
-    assert_eq!(host.usage().streaming_jobs(), 0);
-    assert_eq!(host.usage().scheduled_sources(), 0);
+    assert_usage_settles(&host, |usage| {
+        usage.online_contexts() == 0
+            && usage.streaming_jobs() == 0
+            && usage.scheduled_sources() == 0
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -190,8 +214,10 @@ async fn media_player_pause_interrupts_pending_play_and_resumes_without_ending()
         if (endedCount !== 1 || playingCount !== 2) throw new Error('duplicate lifecycle events');
         await audio.close();
     ").await;
-    assert_eq!(host.usage().online_contexts(), 0);
-    assert_eq!(host.usage().streaming_jobs(), 0);
+    assert_usage_settles(&host, |usage| {
+        usage.online_contexts() == 0 && usage.streaming_jobs() == 0
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -226,8 +252,10 @@ async fn media_player_replacement_and_close_cancel_loads_without_stale_events() 
         audio.src = '';
         await audio.close();
     ").await;
-    assert_eq!(host.usage().online_contexts(), 0);
-    assert_eq!(host.usage().streaming_jobs(), 0);
+    assert_usage_settles(&host, |usage| {
+        usage.online_contexts() == 0 && usage.streaming_jobs() == 0
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -259,8 +287,10 @@ async fn media_player_load_errors_are_observable_and_retry_requires_load() {
         if (audio.error !== null || endedCount !== 0) throw new Error('failed source emitted ended or error persisted');
         await audio.close();
     ").await;
-    assert_eq!(host.usage().online_contexts(), 0);
-    assert_eq!(host.usage().streaming_jobs(), 0);
+    assert_usage_settles(&host, |usage| {
+        usage.online_contexts() == 0 && usage.streaming_jobs() == 0
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -295,9 +325,12 @@ async fn media_player_paused_resources_are_bounded_and_close_allows_another_play
         await second.play(); await ended;
         await second.close();
     ").await;
-    assert_eq!(host.usage().online_contexts(), 0);
-    assert_eq!(host.usage().streaming_jobs(), 0);
-    assert_eq!(host.usage().scheduled_sources(), 0);
+    assert_usage_settles(&host, |usage| {
+        usage.online_contexts() == 0
+            && usage.streaming_jobs() == 0
+            && usage.scheduled_sources() == 0
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -331,8 +364,10 @@ async fn file_node_connects_ends_once_and_rejects_cross_context_and_restarts() {
         await context.close(); await other.close();
         if (count !== 1 || source.error !== null) throw new Error('incorrect completion');
     ").await;
-    assert_eq!(host.usage().streaming_jobs(), 0);
-    assert_eq!(host.usage().scheduled_sources(), 0);
+    assert_usage_settles(&host, |usage| {
+        usage.streaming_jobs() == 0 && usage.scheduled_sources() == 0
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -361,8 +396,10 @@ async fn file_refusals_and_cancelled_full_queue_leave_slots_reusable() {
     ",
     )
     .await;
-    assert_eq!(host.usage().streaming_jobs(), 0);
-    assert_eq!(host.usage().scheduled_sources(), 0);
+    assert_usage_settles(&host, |usage| {
+        usage.streaming_jobs() == 0 && usage.scheduled_sources() == 0
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -384,7 +421,7 @@ async fn close_drains_running_file_and_paused_load_cancels() {
         await closing;
         if (!rejected) throw new Error('source conversion admitted a worker after close');
     ").await;
-    assert_eq!(host.usage().streaming_jobs(), 0);
+    assert_usage_settles(&host, |usage| usage.streaming_jobs() == 0).await;
 }
 
 #[tokio::test]
@@ -406,7 +443,7 @@ async fn absent_resolver_and_file_size_limit_fail_closed() {
         ",
         )
         .await;
-        assert_eq!(host.usage().streaming_jobs(), 0);
+        assert_usage_settles(&host, |usage| usage.streaming_jobs() == 0).await;
     }
 }
 
@@ -435,6 +472,8 @@ async fn close_joins_unstarted_sources_and_failed_start_keeps_source_reusable() 
     ",
     )
     .await;
-    assert_eq!(host.usage().streaming_jobs(), 0);
-    assert_eq!(host.usage().scheduled_sources(), 0);
+    assert_usage_settles(&host, |usage| {
+        usage.streaming_jobs() == 0 && usage.scheduled_sources() == 0
+    })
+    .await;
 }

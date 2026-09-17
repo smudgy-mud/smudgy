@@ -141,7 +141,17 @@ fn script_file_factory_uses_runtime_read_grants_and_rejects_urls() {
         .unwrap()
         .unwrap();
     });
-    assert_eq!(host.usage().streaming_jobs(), 0);
+    // The decoder job is released by its observer thread after the worker
+    // joins, which can land a hand-off after the player's close() resolved.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while host.usage().streaming_jobs() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "streaming job was not released: {:?}",
+            host.usage()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 #[test]

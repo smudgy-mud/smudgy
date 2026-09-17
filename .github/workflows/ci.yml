@@ -140,14 +140,14 @@ jobs:
       - name: Test hardware-independent audio contracts
         if: matrix.mode == 'physical'
         run: |
-          cargo test -p smudgy_audio --features physical-output --lib --locked
-          cargo test -p smudgy_audio_web --lib --locked
+          cargo test -p smudgy_audio --features physical-output --lib --locked --no-fail-fast
+          cargo test -p smudgy_audio_web --lib --locked --no-fail-fast
 
       - name: Test hosted silent Web Audio integration
         if: matrix.mode != 'default'
         run: >-
           cargo test -p smudgy_core --no-default-features --features web-audio
-          --test web_audio_integration --test package_isolates_sandbox --locked
+          --test web_audio_integration --test package_isolates_sandbox --locked --no-fail-fast
 
       - name: Check workspace
         if: matrix.mode == 'default'
@@ -158,5 +158,5 @@ jobs:
         # This test reaches the real OS credential service, which is not a
         # deterministic dependency on headless hosted runners.
         run: >-
-          cargo test --workspace --lib --tests --locked --
+          cargo test --workspace --lib --tests --locked --no-fail-fast --
           --skip models::shared_packages::tests::missing_required_params_tracks_only_unset_required_keys
