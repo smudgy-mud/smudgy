@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_i18n"
-version = "0.5.8-ptb"
+version = "0.5.8-ptb.2"
 edition = "2024"
 
 [dependencies]
