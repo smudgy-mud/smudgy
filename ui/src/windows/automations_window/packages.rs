@@ -89,15 +89,6 @@ pub(super) struct ProfileChoice {
     pub(super) label: String,
 }
 
-/// The copy-settings dialog: which package's per-profile values to copy, from which profile,
-/// and the destination the user has picked so far.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopySettingsPrompt {
-    pub specifier: String,
-    pub source: String,
-    pub destination: Option<String>,
-}
-
 impl std::fmt::Display for ProfileChoice {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.label)
@@ -157,13 +148,28 @@ pub struct ParamConfig {
     pub error: Option<String>,
     /// Set after a successful save so the section can confirm it; cleared on the next edit.
     pub saved: bool,
+    pub revision: i64,
+    pub saving: bool,
 }
 
 impl ParamConfig {
     /// Builds the editor for `specifier`'s `params`, seeding each non-secret value from the on-disk
     /// param store and recording which secrets are already set. Reads the param files once, at
     /// pane-open time (never from `view`).
-    fn seed(
+    pub(super) fn seed(
+        server_name: &str,
+        profile_name: &str,
+        expected_package: LockedPackage,
+        params: Vec<PackageParameter>,
+    ) -> Result<Self, String> {
+        shared_packages::with_local_package_transaction(server_name, |_| {
+            Self::seed_locked(server_name, profile_name, expected_package, params)
+                .map_err(anyhow::Error::msg)
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    fn seed_locked(
         server_name: &str,
         profile_name: &str,
         expected_package: LockedPackage,
@@ -175,6 +181,10 @@ impl ParamConfig {
             ParameterScope::Global => ParamValueScope::Global,
             ParameterScope::Profile => ParamValueScope::Profile(profile_name),
         };
+        shared_packages::prepare_package_parameters(server_name, &expected_package, &params)
+            .map_err(|e| e.to_string())?;
+        let revision = shared_packages::parameter_revision(server_name, scope, &specifier)
+            .map_err(|e| e.to_string())?;
         let mut values = HashMap::new();
         let mut secret_stored = HashSet::new();
         for param in &params {
@@ -217,10 +227,12 @@ impl ParamConfig {
             touched: HashSet::new(),
             error: None,
             saved: false,
+            revision,
+            saving: false,
         })
     }
 
-    fn unavailable(
+    pub(super) fn unavailable(
         specifier: String,
         parameter_scope: ParameterScope,
         profile_name: &str,
@@ -239,6 +251,8 @@ impl ParamConfig {
             touched: HashSet::new(),
             error: Some(error),
             saved: false,
+            revision: 0,
+            saving: false,
         }
     }
 }
@@ -265,7 +279,7 @@ fn secret_text(state: Option<&ParamValueState>) -> String {
 enum Persist {
     /// A secret value, written to the OS keyring.
     Secret(String),
-    /// A non-secret JSON value, written to `smudgy.params.json`.
+    /// An ordinary value, written to the server settings database.
     Value(serde_json::Value),
     /// A non-secret value to clear (the box was emptied), so the package reads null and may apply
     /// its own default.
@@ -2368,186 +2382,7 @@ impl AutomationsWindow {
         self.commit_open_parameter_scope(ParameterScope::Global)
     }
 
-    /// Open the copy-settings dialog for the parameter editor's current profile. Only a package in
-    /// per-profile scope with an editable, current configuration can copy.
-    pub(super) fn open_copy_settings(&mut self) -> Update<Message, Event> {
-        let Some(config) = self.param_config.as_ref() else {
-            return Update::none();
-        };
-        if !self.param_config_edit_available(config)
-            || config.parameter_scope != ParameterScope::Profile
-            || self.profile_names.len() < 2
-        {
-            return Update::none();
-        }
-        self.copy_settings_prompt = Some(CopySettingsPrompt {
-            specifier: config.specifier.clone(),
-            source: config.profile_name.clone(),
-            destination: None,
-        });
-        Update::none()
-    }
-
-    pub(super) fn select_copy_settings_destination(
-        &mut self,
-        profile_name: String,
-    ) -> Update<Message, Event> {
-        if let Some(prompt) = self.copy_settings_prompt.as_mut()
-            && profile_name != prompt.source
-            && self.profile_names.contains(&profile_name)
-        {
-            prompt.destination = Some(profile_name);
-        }
-        Update::none()
-    }
-
-    pub(super) fn cancel_copy_settings(&mut self) -> Update<Message, Event> {
-        self.copy_settings_prompt = None;
-        Update::none()
-    }
-
-    /// Copy every declared value and secret of the open package from the dialog's source profile
-    /// to its destination, replacing the destination's values, and reload a session running the
-    /// destination profile.
-    pub(super) fn confirm_copy_settings(&mut self) -> Update<Message, Event> {
-        let Some(prompt) = self.copy_settings_prompt.take() else {
-            return Update::none();
-        };
-        let Some(destination) = prompt.destination else {
-            return Update::none();
-        };
-        let Some((expected, params)) = self
-            .param_config
-            .as_ref()
-            .filter(|config| {
-                config.specifier == prompt.specifier
-                    && config.profile_name == prompt.source
-                    && self.param_config_edit_available(config)
-            })
-            .and_then(|config| {
-                config
-                    .expected_package
-                    .clone()
-                    .map(|expected| (expected, config.params.clone()))
-            })
-        else {
-            return Update::none();
-        };
-        match shared_packages::copy_profile_param_values_if_unchanged(
-            &self.server_name,
-            &expected,
-            &params,
-            &prompt.source,
-            &destination,
-        ) {
-            Ok(PackageParamCommit::Applied) => {}
-            Ok(PackageParamCommit::StateChanged) => {
-                return self.fail_config_parameter_state_changed();
-            }
-            Err(error) => {
-                return self.fail_config(crate::i18n::t!(
-                    "package-settings-copy-failed",
-                    "error" => error.to_string()
-                ));
-            }
-        }
-        let event = self
-            .configuration_change_affects_running(&prompt.specifier, Some(&destination))
-            .then(|| Event::ScriptsChanged {
-                server_name: self.server_name.clone(),
-            });
-        Update::new(
-            self.show_toast(crate::i18n::t!("package-settings-copied", "profile" => &destination)),
-            event,
-        )
-    }
-
-    /// The copy-settings dialog over the whole window: a backdrop that cancels, and a card with
-    /// the destination picker and Cancel/Copy actions. Copy is offered only once a destination is
-    /// chosen.
-    pub(super) fn view_copy_settings_modal<'a>(
-        &'a self,
-        prompt: &'a CopySettingsPrompt,
-    ) -> Elem<'a> {
-        let backdrop = iced::widget::mouse_area(
-            container(iced::widget::space::vertical())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|theme: &crate::theme::Theme| container::Style {
-                    background: Some(Background::Color(theme.styles.general.overlay_background)),
-                    ..Default::default()
-                }),
-        )
-        .on_press(Message::CancelCopySettings);
-
-        let choices = self
-            .profile_names
-            .iter()
-            .filter(|profile| **profile != prompt.source)
-            .map(|profile| ProfileChoice {
-                key: profile.clone(),
-                label: profile.clone(),
-            })
-            .collect::<Vec<_>>();
-        let selected = choices
-            .iter()
-            .find(|choice| Some(&choice.key) == prompt.destination.as_ref())
-            .cloned();
-        let card = container(
-            column![
-                text(crate::i18n::t!("package-copy-settings-title")).size(14.0),
-                text(crate::i18n::t!(
-                    "package-copy-settings-help",
-                    "profile" => &prompt.source
-                ))
-                .size(12.0)
-                .style(common::muted),
-                row![
-                    text(crate::i18n::t!("package-copy-settings-destination"))
-                        .size(12.0)
-                        .style(common::muted),
-                    iced::widget::pick_list(choices, selected, |choice| {
-                        Message::SelectCopySettingsDestination(choice.key)
-                    })
-                    .placeholder(crate::i18n::ts!("package-copy-settings-choose")),
-                ]
-                .spacing(10.0)
-                .align_y(Vertical::Center),
-                row![
-                    iced::widget::space::horizontal(),
-                    button(text(crate::i18n::t!("action-cancel")).size(12.0))
-                        .style(button_style::secondary)
-                        .on_press(Message::CancelCopySettings),
-                    button(text(crate::i18n::t!("action-copy")).size(12.0))
-                        .style(button_style::primary)
-                        .on_press_maybe(
-                            prompt
-                                .destination
-                                .is_some()
-                                .then_some(Message::ConfirmCopySettings)
-                        ),
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center),
-            ]
-            .spacing(10.0),
-        )
-        .padding(16.0)
-        .width(Length::Fixed(420.0))
-        .style(common::card_style);
-        let centered = container(card)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Center)
-            .align_y(Vertical::Center);
-        iced::widget::stack![backdrop, centered]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
-    /// Compare the complete stored profile values without displaying secret contents. A global
-    /// source can be selected automatically only when every profile is identical.
+    /// Compare stored profile values without displaying secrets, to choose a global source.
     fn profile_param_values_are_equal(
         &self,
         specifier: &str,
@@ -7165,6 +7000,8 @@ impl AutomationsWindow {
             .find(specifier)
             .cloned()
             .ok_or_else(|| crate::i18n::t!("package-install-plan-changed"))?;
+        shared_packages::prepare_package_parameters(&self.server_name, &expected_package, params)
+            .map_err(|error| error.to_string())?;
         // A single modal cannot safely choose values for every profile. Profile-scoped packages
         // remain fail-closed until the explicit Settings checklist is completed for each active
         // profile.
@@ -7284,18 +7121,41 @@ impl AutomationsWindow {
             .intent
             .insert(finalize.specifier.clone(), enabled_here);
         let name = package_display_name(&finalize.specifier);
-        let message = finalize.warning.unwrap_or_else(|| match finalize.kind {
-            PackageChangeKind::Manifest => crate::i18n::t!("manifest-saved"),
-            PackageChangeKind::Update => {
-                crate::i18n::t!("package-updated-toast", "name" => name)
+        let restored = if matches!(finalize.kind, PackageChangeKind::Install) {
+            match shared_packages::take_settings_restoration_notice(
+                &self.server_name,
+                &finalize.specifier,
+            ) {
+                Ok(Some(skipped)) if skipped.is_empty() => {
+                    Some(crate::i18n::t!("package-settings-restored"))
+                }
+                Ok(Some(skipped)) => Some(
+                    crate::i18n::t!("package-settings-restored-partial", "keys" => skipped.join(", ")),
+                ),
+                Ok(None) => None,
+                Err(error) => {
+                    log::warn!("Could not read settings recovery notice: {error:#}");
+                    None
+                }
             }
-            PackageChangeKind::Install if enabled_here => {
-                crate::i18n::t!("package-installed-enabled-toast", "name" => name)
-            }
-            PackageChangeKind::Install => {
-                crate::i18n::t!("package-installed-review-toast", "name" => name)
-            }
-        });
+        } else {
+            None
+        };
+        let message = finalize
+            .warning
+            .or(restored)
+            .unwrap_or_else(|| match finalize.kind {
+                PackageChangeKind::Manifest => crate::i18n::t!("manifest-saved"),
+                PackageChangeKind::Update => {
+                    crate::i18n::t!("package-updated-toast", "name" => name)
+                }
+                PackageChangeKind::Install if enabled_here => {
+                    crate::i18n::t!("package-installed-enabled-toast", "name" => name)
+                }
+                PackageChangeKind::Install => {
+                    crate::i18n::t!("package-installed-review-toast", "name" => name)
+                }
+            });
         let toast = self.show_toast(message);
         let event = Some(Event::ScriptsChanged {
             server_name: self.server_name.clone(),
@@ -7748,22 +7608,23 @@ impl AutomationsWindow {
         Ok(())
     }
 
-    fn param_config_edit_available(&self, config: &ParamConfig) -> bool {
+    pub(super) fn param_config_edit_available(&self, config: &ParamConfig) -> bool {
         config.available
+            && !config.saving
             && self.package_state_available()
             && (config.parameter_scope == ParameterScope::Global || self.profile_inventory_complete)
     }
 
     // ---- in-pane param-value editor (installed & owned panes) -------------
 
-    /// (Re)seed the inline param-value editor for the open package. `None` when the package
-    /// declares no params, so the section renders nothing. Called when a package pane opens (and
+    /// (Re)seed the inline param-value editor, even when the package declares no params,
+    /// retaining access to its history. Called when a package pane opens (and
     /// when an owned package's manifest is saved, which can add/remove params).
     pub(super) fn seed_param_config(&mut self, specifier: String, params: Vec<PackageParameter>) {
-        if params.is_empty() {
-            self.param_config = None;
-            return;
-        }
+        self.settings_request = self.settings_request.wrapping_add(1);
+        self.settings_dialog = None;
+        self.settings_menu_open = false;
+        self.settings_paste_ready = None;
         let expected_package = self
             .installed_packages
             .iter()
@@ -7813,7 +7674,7 @@ impl AutomationsWindow {
         );
     }
 
-    /// Persist every declared param's configured value: non-secrets to `smudgy.params.json`
+    /// Persist edited parameter values: ordinary values to the server settings database
     /// (cleared when emptied), secrets to the keyring (an empty box keeps the stored secret).
     /// Required params must resolve to a value; a value that fails to project for its kind (a number
     /// that won't parse, a dropdown value that isn't a choice) is reported and nothing is written. An
@@ -7827,18 +7688,11 @@ impl AutomationsWindow {
         if !editable {
             return Update::none();
         }
-        let (specifier, expected_package, params, parameter_scope, profile_name) =
-            match self.param_config.as_ref() {
-                Some(config) => (
-                    config.specifier.clone(),
-                    config.expected_package.clone(),
-                    config.params.clone(),
-                    config.parameter_scope,
-                    config.profile_name.clone(),
-                ),
-                None => return Update::none(),
-            };
-        let Some(expected_package) = expected_package else {
+        let (expected_package, params) = match self.param_config.as_ref() {
+            Some(config) => (config.expected_package.clone(), config.params.clone()),
+            None => return Update::none(),
+        };
+        let Some(_expected_package) = expected_package else {
             return Update::none();
         };
         let secret_stored = self
@@ -7904,64 +7758,11 @@ impl AutomationsWindow {
             }
         }
 
-        let value_scope = match parameter_scope {
-            ParameterScope::Global => ParamValueScope::Global,
-            ParameterScope::Profile => ParamValueScope::Profile(&profile_name),
-        };
         let mutations = plan
             .iter()
             .map(|(key, persist)| persist.mutation(key))
-            .collect::<Vec<_>>();
-        match shared_packages::commit_package_params_scoped_if_unchanged(
-            &self.server_name,
-            value_scope,
-            &expected_package,
-            &mutations,
-        ) {
-            Ok(PackageParamCommit::Applied) => {}
-            Ok(PackageParamCommit::StateChanged) => {
-                return self.fail_config_parameter_state_changed();
-            }
-            Err(error) => {
-                return self.fail_config(crate::i18n::t!(
-                    "package-settings-save-failed",
-                    "error" => error.to_string()
-                ));
-            }
-        }
-
-        // Reflect the writes in the editor: a secret just typed is now stored, and its (write-only)
-        // box is cleared so plaintext doesn't linger; mark the section saved.
-        if let Some(config) = self.param_config.as_mut() {
-            for (key, persist) in &plan {
-                if matches!(persist, Persist::Secret(_)) {
-                    config.secret_stored.insert(key.clone());
-                    config
-                        .values
-                        .insert(key.clone(), ParamValueState::Text(String::new()));
-                }
-            }
-            // The current state is now the on-disk state; a follow-up Save without edits writes
-            // nothing (and doesn't re-materialize untouched defaults).
-            config.touched.clear();
-            config.error = None;
-            config.saved = true;
-        }
-
-        // A running (enabled) package should pick up the new config — hot-reload the live session,
-        // the same signal an enabled install emits. A disabled package reads the new values when it
-        // is next enabled, so there's nothing to reload.
-        let affected_profile =
-            matches!(parameter_scope, ParameterScope::Profile).then_some(profile_name.as_str());
-        let event = self
-            .configuration_change_affects_running(&specifier, affected_profile)
-            .then(|| Event::ScriptsChanged {
-                server_name: self.server_name.clone(),
-            });
-        Update::new(
-            self.show_toast(crate::i18n::t!("package-settings-saved")),
-            event,
-        )
+            .collect();
+        self.save_settings_edits(mutations)
     }
 
     /// Remove a stored secret param entirely (the only way to *unset* a secret, since the box can
@@ -10111,6 +9912,8 @@ mod tests {
             touched: HashSet::from(["token".to_string()]),
             error: None,
             saved: false,
+            revision: 0,
+            saving: false,
         });
 
         let update = window.fail_config_parameter_state_changed();

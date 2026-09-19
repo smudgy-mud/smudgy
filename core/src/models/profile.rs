@@ -265,6 +265,8 @@ pub fn create_profile(
     validate_profile_name(profile_name)?;
     let _lifecycle_guard = lifecycle_guard(server_name)?;
 
+    let _package_guard = super::shared_packages::guard(server_name);
+
     config.validate().context(format!(
         "Invalid configuration for profile '{profile_name}' in server '{server_name}'"
     ))?;
@@ -328,6 +330,8 @@ pub fn create_profile(
         "Failed to write profile.json for profile '{profile_name}' in server '{server_name}' at {}",
         config_path.display()
     ))?;
+
+    crate::storage::create_profile(&server_path, profile_name)?;
 
     Ok(Profile {
         name: profile_name.to_string(),
@@ -496,6 +500,7 @@ pub fn update_profile_if_unchanged(
 /// * The directory or its contents cannot be removed due to permissions or other I/O issues.
 pub fn delete_profile(server_name: &str, profile_name: &str) -> Result<()> {
     let _lifecycle_guard = lifecycle_guard(server_name)?;
+    let _package_guard = super::shared_packages::guard(server_name);
     let profile_path = profile_dir(server_name, profile_name)?;
 
     match fs::symlink_metadata(&profile_path) {
@@ -523,6 +528,8 @@ pub fn delete_profile(server_name: &str, profile_name: &str) -> Result<()> {
         .context("Failed to remove deleted profile from module activation")?;
     super::shared_packages::remove_profile_activation(server_name, profile_name)
         .context("Failed to remove deleted profile from package activation")?;
+
+    crate::storage::remove_profile(&get_smudgy_home()?.join(server_name), profile_name)?;
 
     fs::remove_dir_all(&profile_path).context(format!(
         "Failed to delete directory for profile '{profile_name}' in server '{server_name}' at {}",

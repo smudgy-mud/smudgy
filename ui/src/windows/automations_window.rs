@@ -59,6 +59,7 @@ mod package_tabs;
 mod packages;
 mod palette;
 mod param_values;
+mod settings_history;
 mod sharing_status;
 mod sidebar;
 mod state_values;
@@ -835,11 +836,6 @@ pub enum Message {
     ConfirmGlobalParameterSource,
     CancelGlobalParameterSource,
     SelectParameterProfile(String),
-    /// Open the dialog that copies the current profile's settings to another profile.
-    OpenCopySettings,
-    SelectCopySettingsDestination(String),
-    CancelCopySettings,
-    ConfirmCopySettings,
     /// A source-browser module body finished fetching for the open installed package, keyed by its
     /// `content_hash`. Content-addressed, so a late result just fills the cache and is matched to
     /// the selected file by hash — no staleness token needed.
@@ -985,6 +981,7 @@ pub enum Message {
     // in-pane param-value editor (installed & owned package panes): save all, or clear a stored
     // secret. Distinct from the install-time `ParamPrompt*` gate above.
     ParamConfigSave,
+    SettingsHistory(settings_history::SettingsMessage),
     ParamConfigClearSecret(String),
 
     // ---- private & shared --------------------------------------------------
@@ -1066,8 +1063,6 @@ pub struct AutomationsWindow {
     pub(super) account_epoch: u64,
     /// Profile→Global needs an explicit source when stored profile values differ.
     pub(super) confirm_global_parameter_source: bool,
-    /// The open copy-settings dialog, if any. Cleared with the rest of the parameter editor.
-    pub(super) copy_settings_prompt: Option<packages::CopySettingsPrompt>,
     pub(super) mud_host: Option<String>,
     /// Whether advanced scripting features are unlocked (settings `advanced_scripting_features`):
     /// the "Remove sandbox" package action and the script inspector. Read at construction and
@@ -1376,6 +1371,11 @@ pub struct AutomationsWindow {
     /// package that declares params opens; `None` otherwise. Independent of `param_prompt`, which is
     /// the install-time required-params gate.
     pub(super) param_config: Option<ParamConfig>,
+    settings_dialog: Option<settings_history::SettingsDialog>,
+    settings_request: u64,
+    settings_menu_open: bool,
+    settings_menu_request: u64,
+    settings_paste_ready: Option<settings_history::Destination>,
     /// Per-profile required-parameter completeness for `param_config` when it is profile-scoped;
     /// `None` otherwise. Maintained by `sync_profile_param_status` after every update so the
     /// Settings tab never reads parameter storage while rendering.
@@ -1515,7 +1515,6 @@ impl AutomationsWindow {
             parameter_profile: profile_name,
             account_epoch: 0,
             confirm_global_parameter_source: false,
-            copy_settings_prompt: None,
             profile_names,
             profile_inventory_complete,
             mud_host,
@@ -1657,6 +1656,11 @@ impl AutomationsWindow {
             param_prompt: None,
             param_prompt_queue: Vec::new(),
             param_config: None,
+            settings_dialog: None,
+            settings_request: 0,
+            settings_menu_open: false,
+            settings_menu_request: 0,
+            settings_paste_ready: None,
             profile_param_status: None,
             shared_with_me: None,
             my_cloud_packages: None,
@@ -1842,6 +1846,18 @@ impl AutomationsWindow {
         // `SMUDGY_LOG=smudgy_ui::windows::automations_window=trace` to watch
         // every message this window handles.
         log::trace!("{message:?}");
+        // Global shortcuts can subscribe to captured events; keep them out of modal dialogs.
+        if self.settings_dialog.is_some()
+            && matches!(
+                message,
+                Message::OpenPalette
+                    | Message::TriggerCodeCompletion
+                    | Message::FocusNext(_)
+                    | Message::FocusPrevious(_)
+            )
+        {
+            return Update::none();
+        }
         // Drafts guard all navigation that can unmount them.
         let navigation_needs_guard =
             Self::is_guarded_navigation(&message) && self.has_unsaved_draft();
@@ -3564,15 +3580,8 @@ impl AutomationsWindow {
             Message::ConfirmGlobalParameterSource => self.confirm_global_parameter_source(),
             Message::CancelGlobalParameterSource => {
                 self.confirm_global_parameter_source = false;
-                self.copy_settings_prompt = None;
                 Update::none()
             }
-            Message::OpenCopySettings => self.open_copy_settings(),
-            Message::SelectCopySettingsDestination(profile_name) => {
-                self.select_copy_settings_destination(profile_name)
-            }
-            Message::CancelCopySettings => self.cancel_copy_settings(),
-            Message::ConfirmCopySettings => self.confirm_copy_settings(),
             Message::SelectParameterProfile(profile_name) => {
                 self.select_parameter_profile(profile_name)
             }
@@ -3745,6 +3754,7 @@ impl AutomationsWindow {
             Message::ParamPromptSubmit => self.param_prompt_submit(),
             Message::ParamPromptCancel => self.param_prompt_cancel(),
             Message::ParamConfigSave => self.param_config_save(),
+            Message::SettingsHistory(message) => self.update_settings_history(message),
             Message::ParamConfigClearSecret(key) => self.param_config_clear_secret(key),
 
             // -------- private & shared -------------------------------------
@@ -4211,6 +4221,10 @@ impl AutomationsWindow {
         self.share_feedback = None;
         // Drop the inline param-value editor; the next package pane re-seeds it from its own params.
         self.param_config = None;
+        self.settings_dialog = None;
+        self.settings_menu_open = false;
+        self.settings_paste_ready = None;
+        self.settings_request = self.settings_request.wrapping_add(1);
         self.confirm_global_parameter_source = false;
         // Abandon any in-flight install confirmation / update re-prompt on navigation — neither
         // has written anything yet (the consent window writes only on Grant). Bumping the
@@ -4295,8 +4309,8 @@ impl AutomationsWindow {
         if self.palette_open {
             layers.push(self.view_palette());
         }
-        if let Some(prompt) = &self.copy_settings_prompt {
-            layers.push(self.view_copy_settings_modal(prompt));
+        if let Some(dialog) = &self.settings_dialog {
+            layers.push(self.view_settings_dialog(dialog));
         }
         if let Some(message) = &self.toast {
             layers.push(common::toast(message));
@@ -5787,63 +5801,6 @@ mod tab_traversal_tests {
     }
 
     #[test]
-    fn copy_settings_dialog_needs_profile_scope_and_a_different_destination() {
-        let mut window = AutomationsWindow::new(
-            window::Id::unique(),
-            "copy-settings-server".to_string(),
-            crate::cloud_account::test_handles(),
-            SessionId::from(1),
-        );
-        window.profile_names = vec!["alt".to_string(), "main".to_string()];
-        window.profile_inventory_complete = true;
-        window.parameter_profile = "main".to_string();
-        let seed = |scope: ParameterScope| ParamConfig {
-            specifier: "smudgy://owner/package".to_string(),
-            expected_package: Some(LockedPackage::new(
-                "smudgy://owner/package",
-                UpdateMode::Auto,
-            )),
-            parameter_scope: scope,
-            profile_name: "main".to_string(),
-            available: true,
-            params: Vec::new(),
-            values: HashMap::new(),
-            secret_stored: HashSet::new(),
-            touched: HashSet::new(),
-            error: None,
-            saved: false,
-        };
-
-        window.param_config = Some(seed(ParameterScope::Global));
-        let _ = window.update(Message::OpenCopySettings);
-        assert!(
-            window.copy_settings_prompt.is_none(),
-            "same-settings-everywhere has nothing to copy between profiles"
-        );
-
-        window.param_config = Some(seed(ParameterScope::Profile));
-        let _ = window.update(Message::OpenCopySettings);
-        let prompt = window.copy_settings_prompt.clone().expect("dialog opens");
-        assert_eq!(prompt.source, "main");
-        assert_eq!(prompt.destination, None);
-
-        let _ = window.update(Message::SelectCopySettingsDestination("main".to_string()));
-        assert_eq!(
-            window.copy_settings_prompt.as_ref().unwrap().destination,
-            None,
-            "the source profile is not a destination"
-        );
-        let _ = window.update(Message::SelectCopySettingsDestination("alt".to_string()));
-        assert_eq!(
-            window.copy_settings_prompt.as_ref().unwrap().destination,
-            Some("alt".to_string())
-        );
-
-        let _ = window.update(Message::CancelCopySettings);
-        assert!(window.copy_settings_prompt.is_none());
-    }
-
-    #[test]
     fn context_switch_uses_the_existing_guard_for_parameter_drafts() {
         let mut window = AutomationsWindow::new(
             window::Id::unique(),
@@ -5866,6 +5823,8 @@ mod tab_traversal_tests {
             touched: HashSet::from(["draft".to_string()]),
             error: None,
             saved: false,
+            revision: 0,
+            saving: false,
         });
 
         let update = window.update(context_switch_message());
@@ -6099,6 +6058,8 @@ mod tab_traversal_tests {
             touched: HashSet::from(["draft".to_string()]),
             error: None,
             saved: false,
+            revision: 0,
+            saving: false,
         });
 
         let profile_update = window.update(Message::SelectParameterProfile("alt".to_string()));
@@ -6334,6 +6295,8 @@ mod tab_traversal_tests {
             touched: HashSet::new(),
             error: None,
             saved: false,
+            revision: 0,
+            saving: false,
         };
         window.param_config = Some(config.clone());
         assert!(window.profile_param_status.is_none());

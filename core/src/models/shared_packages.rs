@@ -8,8 +8,8 @@
 //!   update mode (auto-latest by default, or pinned to a version), the last-resolved version +
 //!   integrity hash (for offline reuse and reproducibility), activation, parameter scope, and
 //!   `required_by` links;
-//! - **non-secret parameter values** (`smudgy.params.json`, and the same file inside each
-//!   profile directory for profile-scoped values);
+//! - **ordinary settings and history** in `smudgy-state.sqlite3`, shared by all profiles;
+//!   legacy `smudgy.params.json` files are imported once and retained as migration backups;
 //! - **secret parameter values** — declared *secret* parameters go to the OS keyring (with
 //!   an obfuscated-file fallback), never to plain JSON, mirroring the cloud-session
 //!   token in [`crate::models::auth`]. A per-server index of keyring slots makes them
@@ -46,8 +46,7 @@ use crate::models::local_packages::LOCAL_OWNER;
 
 /// Lockfile name, relative to a server directory.
 const LOCK_FILE: &str = "smudgy.lock.json";
-/// Non-secret param-values file name, relative to a server or profile directory.
-const PARAMS_FILE: &str = "smudgy.params.json";
+
 /// Obfuscated secret-option fallback file (used only when no OS keyring is available).
 const SECRETS_FILE: &str = ".package-secrets.json";
 /// Keyring slots that may hold a package secret, so profile/server deletion can find them.
@@ -770,10 +769,53 @@ fn load_lock_in(dir: &Path) -> Result<SharedPackageLock> {
 fn save_lock_in(dir: &Path, lock: &SharedPackageLock) -> Result<()> {
     fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create server dir {}", dir.display()))?;
+    let previous = load_lock_in(dir)?;
+    let mut updated = lock.clone();
+    // Checkpoint while the old scope metadata is still available. Keeping values active here
+    // preserves folderless local reconciliation; explicit uninstall deactivates them afterward.
+    for package in &previous.packages {
+        if updated.find(&package.specifier).is_none() {
+            import_parameter_scopes(dir)?;
+            crate::storage::checkpoint(
+                dir,
+                &package.specifier,
+                package.parameter_scope == ParameterScope::Profile,
+            )?;
+        }
+    }
+    for package in &mut updated.packages {
+        if previous.find(&package.specifier).is_none()
+            && let Some(profile_scope) = crate::storage::restore(dir, &package.specifier)?
+        {
+            package.parameter_scope = if profile_scope {
+                ParameterScope::Profile
+            } else {
+                ParameterScope::Global
+            };
+        }
+    }
     let path = dir.join(LOCK_FILE);
-    let json = serde_json::to_string_pretty(lock).context("Failed to serialize package lock")?;
+    let json =
+        serde_json::to_string_pretty(&updated).context("Failed to serialize package lock")?;
     write_atomic(&path, json.as_bytes())
         .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+fn import_parameter_scopes(server: &Path) -> Result<()> {
+    load_param_values_in(server)?;
+    match fs::read_dir(server.join("profiles")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    load_param_values_in(&entry.path())?;
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 /// The specifier whose lock row governs `requested_specifier`'s leaf once local folders are
@@ -2039,6 +2081,131 @@ fn commit_local_manifest_inner(
 /// Non-secret parameter values, keyed by package specifier then parameter key.
 pub type PackageParamValues = HashMap<String, HashMap<String, serde_json::Value>>;
 
+/// Accepts a loaded manifest's ordinary parameter schema before exposing its settings.
+/// # Errors
+/// Returns storage errors. A stale manifest never rewrites a newer installation's settings.
+pub fn prepare_package_parameters(
+    server_name: &str,
+    package: &LockedPackage,
+    params: &[PackageParameter],
+) -> Result<()> {
+    let _guard = guard(server_name);
+    let lock = load_lock_in(&server_dir(server_name)?)?;
+    anyhow::ensure!(
+        lock.find(&package.specifier) == Some(package),
+        "Package changed while settings were being loaded"
+    );
+    for dir in package_param_dirs(server_name)? {
+        load_param_values_in(&dir)?;
+    }
+    crate::storage::register_schema(
+        &server_dir(server_name)?,
+        &package.specifier,
+        params,
+        package.staged_version(),
+    )
+}
+
+/// Returns the pending automatic-recovery notification, including incompatible fields.
+/// # Errors
+/// Returns storage errors.
+pub fn take_settings_restoration_notice(
+    server_name: &str,
+    specifier: &str,
+) -> Result<Option<Vec<String>>> {
+    let _guard = guard(server_name);
+    crate::storage::take_restoration_notice(&server_dir(server_name)?, specifier)
+}
+
+/// Reads a settings revision under the same lock used by all package writers.
+/// # Errors
+/// Returns storage errors.
+pub fn parameter_revision(
+    server_name: &str,
+    scope: ParamValueScope<'_>,
+    specifier: &str,
+) -> Result<i64> {
+    let _guard = guard(server_name);
+    crate::storage::revision(&param_dir(server_name, scope)?, specifier)
+}
+
+/// Copies saved ordinary settings. Explicitly unset keys are included; secrets never are.
+/// # Errors
+/// Returns storage errors.
+pub fn settings_snapshot(
+    server_name: &str,
+    scope: ParamValueScope<'_>,
+    specifier: &str,
+    params: &[PackageParameter],
+) -> Result<crate::storage::SettingsSnapshot> {
+    let _guard = guard(server_name);
+    let values = load_param_values_in(&param_dir(server_name, scope)?)?;
+    let values = values.get(specifier);
+    Ok(crate::storage::SettingsSnapshot {
+        format: 1,
+        package: specifier.to_string(),
+        parameters: params.iter().filter(|p| !p.secret).cloned().collect(),
+        version: load_lock_in(&server_dir(server_name)?)?
+            .find(specifier)
+            .and_then(|p| p.staged_version())
+            .map(str::to_owned),
+        values: params
+            .iter()
+            .filter(|p| !p.secret)
+            .map(|p| (p.key.clone(), values.and_then(|v| v.get(&p.key)).cloned()))
+            .collect(),
+    })
+}
+
+/// Lists ordinary configuration history. Secrets declared by the current manifest are excluded.
+/// # Errors
+/// Returns storage errors.
+pub fn settings_history(
+    server_name: &str,
+    scope: ParamValueScope<'_>,
+    specifier: &str,
+    params: &[PackageParameter],
+) -> Result<Vec<crate::storage::HistoryEntry>> {
+    let _guard = guard(server_name);
+    let mut entries = crate::storage::history(&param_dir(server_name, scope)?, specifier)?;
+    for entry in &mut entries {
+        entry
+            .snapshot
+            .values
+            .retain(|key, _| !params.iter().any(|p| p.key == *key && p.secret));
+    }
+    Ok(entries)
+}
+
+/// Deletes browsable history, leaving current/reinstall state intact.
+/// # Errors
+/// Returns storage errors.
+pub fn clear_settings_history(
+    server_name: &str,
+    scope: ParamValueScope<'_>,
+    specifier: &str,
+) -> Result<()> {
+    let _guard = guard(server_name);
+    crate::storage::clear_history(&param_dir(server_name, scope)?, specifier)
+}
+
+/// Saves editor mutations only when both the governing row and the value revision still match.
+/// # Errors
+/// Returns storage errors; stale editors return `StateChanged` without writing.
+pub fn commit_package_params_at_revision(
+    server_name: &str,
+    scope: ParamValueScope<'_>,
+    expected: &LockedPackage,
+    revision: i64,
+    mutations: &[PackageParamMutation],
+) -> Result<PackageParamCommit> {
+    let _guard = guard(server_name);
+    if parameter_revision(server_name, scope, &expected.specifier)? != revision {
+        return Ok(PackageParamCommit::StateChanged);
+    }
+    commit_package_params_scoped_if_unchanged(server_name, scope, expected, mutations)
+}
+
 /// The persisted location for a package parameter value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamValueScope<'a> {
@@ -2138,22 +2305,11 @@ fn param_dir(server_name: &str, scope: ParamValueScope<'_>) -> Result<PathBuf> {
 }
 
 fn load_param_values_in(dir: &Path) -> Result<PackageParamValues> {
-    let path = dir.join(PARAMS_FILE);
-    match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(PackageParamValues::new()),
-        Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
-    }
+    crate::storage::load(dir)
 }
 
 fn save_param_values_in(dir: &Path, values: &PackageParamValues) -> Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("Failed to create server dir {}", dir.display()))?;
-    let path = dir.join(PARAMS_FILE);
-    let json = serde_json::to_string_pretty(values).context("Failed to serialize option values")?;
-    write_atomic(&path, json.as_bytes())
-        .with_context(|| format!("Failed to write {}", path.display()))
+    crate::storage::save(dir, values)
 }
 
 /// Loads non-secret parameter values from one persisted scope.
@@ -2239,11 +2395,7 @@ pub fn get_param_value_scoped_checked(
     key: &str,
 ) -> Result<Option<serde_json::Value>> {
     let _guard = guard(server_name);
-    let values = load_param_values_in(&param_dir(server_name, scope)?)?;
-    Ok(values
-        .get(specifier)
-        .and_then(|params| params.get(key))
-        .cloned())
+    crate::storage::get(&param_dir(server_name, scope)?, specifier, key)
 }
 
 /// Whether a declared parameter has an explicit value in one persisted scope, keeping
@@ -2334,6 +2486,9 @@ pub fn missing_required_params_for_profile_checked(
     specifier: &str,
     params: &[PackageParameter],
 ) -> Result<Vec<String>> {
+    if let Some(row) = load_lock(server_name)?.find(specifier).cloned() {
+        prepare_package_parameters(server_name, &row, params)?;
+    }
     if !params.iter().any(|param| param.required) {
         return Ok(Vec::new());
     }
@@ -2375,6 +2530,28 @@ pub fn get_param_value_for_profile_checked(
         load_secret_param_scoped_checked(server_name, scope, specifier, key)?
             .map(serde_json::Value::String),
     )
+}
+
+/// Reads a declared parameter from its own store, so an unset ordinary value never requires
+/// contacting the credential service. Read failures remain distinct from an unset value.
+/// # Errors
+/// Returns settings or credential-store errors.
+pub fn get_declared_param_for_profile_checked(
+    server_name: &str,
+    profile_name: &str,
+    specifier: &str,
+    parameter: &PackageParameter,
+) -> Result<Option<serde_json::Value>> {
+    let _guard = guard(server_name);
+    let scope = configured_param_scope(server_name, profile_name, specifier)?;
+    if parameter.secret {
+        Ok(
+            load_secret_param_scoped_checked(server_name, scope, specifier, &parameter.key)?
+                .map(serde_json::Value::String),
+        )
+    } else {
+        get_param_value_scoped_checked(server_name, scope, specifier, &parameter.key)
+    }
 }
 
 /// Validates a script-supplied value against one declared package parameter.
@@ -2475,6 +2652,7 @@ pub fn save_package_param_for_profile(
     param: &PackageParameter,
     value: serde_json::Value,
 ) -> Result<()> {
+    let _guard = guard(server_name);
     validate_package_param_value(param, &value)?;
     let scope = configured_param_scope(server_name, profile_name, specifier)?;
     if param.secret {
@@ -2483,13 +2661,19 @@ pub fn save_package_param_for_profile(
             .ok_or_else(|| anyhow::anyhow!("secret parameter '{}' must be a string", param.key))?;
         save_secret_param_scoped(server_name, scope, specifier, &param.key, secret)
     } else {
-        save_param_value_scoped(server_name, scope, specifier, &param.key, value)
+        let dir = param_dir(server_name, scope)?;
+        let mut values = load_param_values_in(&dir)?;
+        values
+            .entry(specifier.to_string())
+            .or_default()
+            .insert(param.key.clone(), value);
+        crate::storage::save_with_source(&dir, &values, true)
     }
 }
 
 /// Copies one package's declared values between parameter scopes. With `only_missing`, existing
 /// destination values are preserved; otherwise the destination mirrors the source exactly,
-/// including clears. Secret values move through the keyring and never enter the JSON store.
+/// including clears. Secret values move through the keyring and never enter the ordinary settings store.
 fn copy_param_values(
     server_name: &str,
     specifier: &str,
@@ -2501,6 +2685,10 @@ fn copy_param_values(
     if from == to {
         return Ok(());
     }
+    let source = load_param_values_in(&param_dir(server_name, from)?)?;
+    let target_dir = param_dir(server_name, to)?;
+    let mut target = load_param_values_in(&target_dir)?;
+    let package_values = target.entry(specifier.to_string()).or_default();
     for param in params {
         if param.secret {
             let destination =
@@ -2518,22 +2706,21 @@ fn copy_param_values(
                 None => {}
             }
         } else {
-            let destination =
-                get_param_value_scoped_checked(server_name, to, specifier, &param.key)?;
-            if only_missing && destination.is_some() {
+            if only_missing && package_values.contains_key(&param.key) {
                 continue;
             }
-            match get_param_value_scoped_checked(server_name, from, specifier, &param.key)? {
+            match source.get(specifier).and_then(|v| v.get(&param.key)) {
                 Some(value) => {
-                    save_param_value_scoped(server_name, to, specifier, &param.key, value)?;
+                    package_values.insert(param.key.clone(), value.clone());
                 }
-                None if !only_missing && destination.is_some() => {
-                    clear_param_value_scoped(server_name, to, specifier, &param.key)?;
+                None if !only_missing => {
+                    package_values.remove(&param.key);
                 }
                 None => {}
             }
         }
     }
+    save_param_values_in(&target_dir, &target)?;
     Ok(())
 }
 
@@ -2633,7 +2820,7 @@ fn scope_matches(expected: &LockedPackage, scope: ParamValueScope<'_>) -> bool {
 /// Commits all parameter changes from one UI Save while the complete governing row, authority,
 /// and configured value scope still match the editor snapshot.
 ///
-/// Non-secret values are projected into one `smudgy.params.json` replacement; secret values are
+/// Ordinary values and history commit in one `SQLite` transaction; secret values are
 /// then written to the keyring one by one.
 ///
 /// # Errors
@@ -2732,6 +2919,13 @@ fn package_param_dirs(server_name: &str) -> Result<Vec<PathBuf>> {
             return Err(error).with_context(|| format!("Failed to read {}", profiles.display()));
         }
     }
+    for profile in crate::storage::profiles(&server)? {
+        validate_param_profile_name(&profile)?;
+        let path = profiles.join(profile);
+        if !dirs.contains(&path) {
+            dirs.push(path);
+        }
+    }
     Ok(dirs)
 }
 
@@ -2741,6 +2935,10 @@ fn package_param_dirs(server_name: &str) -> Result<Vec<PathBuf>> {
 /// created package identity inherit a credential meant for an older package.
 pub(crate) fn package_param_state_exists(server_name: &str, specifier: &str) -> Result<bool> {
     let _guard = guard(server_name);
+    // Installation can establish the server directory later, when publishing its first lockfile.
+    if !server_dir(server_name)?.try_exists()? {
+        return Ok(false);
+    }
     for dir in package_param_dirs(server_name)? {
         if load_param_values_in(&dir)?.contains_key(specifier) {
             return Ok(true);
@@ -2805,18 +3003,19 @@ fn indexed_secret_scope<'a>(
         .map(|profile| (Some(profile), key))
 }
 
-/// Removes all global and profile-specific parameter state for one package.
+/// Archives ordinary settings in every scope and removes a package's secret state.
 ///
 /// # Errors
 /// Returns an error if persisted parameter state cannot be loaded or saved. Failed keyring
 /// deletions remain tombstoned and are included in the error.
 pub fn remove_package_param_state(server_name: &str, specifier: &str) -> Result<()> {
     let _guard = guard(server_name);
-    for dir in package_param_dirs(server_name)? {
-        let mut values = load_param_values_in(&dir)?;
-        if values.remove(specifier).is_some() {
-            save_param_values_in(&dir, &values)?;
+    let server = server_dir(server_name)?;
+    if server.try_exists()? {
+        for dir in package_param_dirs(server_name)? {
+            load_param_values_in(&dir)?;
         }
+        crate::storage::archive(&server, specifier, None)?;
     }
     let mut slots = load_secret_index(server_name)?;
     slots.extend(load_secret_tombstones(server_name)?);
@@ -2846,6 +3045,8 @@ pub fn remove_package_param_state(server_name: &str, specifier: &str) -> Result<
 /// Returns an error if a values file or secret cannot be read or written.
 pub(crate) fn copy_package_param_state(server_name: &str, from: &str, to: &str) -> Result<()> {
     let _guard = guard(server_name);
+    import_parameter_scopes(&server_dir(server_name)?)?;
+    crate::storage::copy_identity(&server_dir(server_name)?, from, to)?;
     for dir in package_param_dirs(server_name)? {
         let mut values = load_param_values_in(&dir)?;
         if let Some(copied) = values.get(from).cloned() {
@@ -4478,5 +4679,111 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, Cas::StateChanged);
         assert_eq!(load_lock(&server).unwrap(), lock);
+    }
+    #[test]
+    fn settings_reinstall_restores_scopes_but_respects_reset() {
+        let server = test_server("settings-reinstall");
+        let spec = "smudgy://a/recovery";
+        install_package(&server, spec, UpdateMode::Auto, true).unwrap();
+        save_param_value(&server, spec, "color", serde_json::json!("blue")).unwrap();
+        save_param_value_scoped(
+            &server,
+            ParamValueScope::Profile("Main"),
+            spec,
+            "color",
+            serde_json::json!("green"),
+        )
+        .unwrap();
+        mutate_lock(&server, |lock| {
+            lock.find_mut(spec).unwrap().parameter_scope = ParameterScope::Profile;
+            Ok(((), true))
+        })
+        .unwrap();
+        uninstall_package(&server, spec).unwrap();
+        assert!(
+            get_param_value_scoped_checked(
+                &server,
+                ParamValueScope::Profile("Main"),
+                spec,
+                "color"
+            )
+            .unwrap()
+            .is_none()
+        );
+        install_package(&server, spec, UpdateMode::Auto, true).unwrap();
+        assert_eq!(
+            load_lock(&server)
+                .unwrap()
+                .find(spec)
+                .unwrap()
+                .parameter_scope,
+            ParameterScope::Profile
+        );
+        assert_eq!(
+            get_param_value_for_profile_checked(&server, "Main", spec, "color").unwrap(),
+            Some(serde_json::json!("green"))
+        );
+        clear_param_value_scoped(&server, ParamValueScope::Profile("Main"), spec, "color").unwrap();
+        uninstall_package(&server, spec).unwrap();
+        install_package(&server, spec, UpdateMode::Auto, true).unwrap();
+        assert!(
+            get_param_value_scoped_checked(
+                &server,
+                ParamValueScope::Profile("Main"),
+                spec,
+                "color"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            settings_history(&server, ParamValueScope::Profile("Main"), spec, &[])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn settings_revision_rejects_stale_editor_and_concurrent_writers_preserve_other_keys() {
+        let server = test_server("settings-concurrent");
+        let spec = "smudgy://a/recovery";
+        install_package(&server, spec, UpdateMode::Auto, true).unwrap();
+        let row = load_lock(&server).unwrap().find(spec).unwrap().clone();
+        let revision = parameter_revision(&server, ParamValueScope::Global, spec).unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|n| {
+                let server = server.clone();
+                std::thread::spawn(move || {
+                    save_param_value(&server, spec, &format!("key{n}"), serde_json::json!(n))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            load_param_values_scoped(&server, ParamValueScope::Global).unwrap()[spec].len(),
+            8
+        );
+        assert_eq!(
+            commit_package_params_at_revision(
+                &server,
+                ParamValueScope::Global,
+                &row,
+                revision,
+                &[PackageParamMutation::SetValue {
+                    key: "key0".into(),
+                    value: serde_json::json!("stale")
+                }]
+            )
+            .unwrap(),
+            PackageParamCommit::StateChanged
+        );
+        assert_eq!(
+            get_param_value_scoped_checked(&server, ParamValueScope::Global, spec, "key0").unwrap(),
+            Some(serde_json::json!(0))
+        );
     }
 }

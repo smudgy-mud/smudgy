@@ -12,10 +12,9 @@ impl AutomationsWindow {
         let package_lock = SharedPackageLock {
             packages: self.installed_packages.clone(),
         };
-        let config_available = self
-            .param_config
-            .as_ref()
-            .is_some_and(|config| config.specifier == locked.specifier && config.available);
+        let config_available = self.param_config.as_ref().is_some_and(|config| {
+            config.specifier == locked.specifier && config.available && !config.saving
+        });
         let scope_editable =
             self.package_state_available() && self.profile_inventory_complete && config_available;
         let scope_controls: Elem<'a> = if scope_editable {
@@ -228,27 +227,15 @@ impl AutomationsWindow {
         };
         if let Some(error) = unavailable {
             return Some(
-                container(
-                    column![
-                        text(crate::i18n::t!("package-runtime-settings-help"))
-                            .size(12.0)
-                            .style(common::muted),
-                        text(error).size(12.0).style(common::danger),
-                    ]
-                    .spacing(10.0),
-                )
-                .padding(16.0)
-                .width(Length::Fill)
-                .style(common::card_style)
-                .into(),
+                container(text(error).size(12.0).style(common::danger))
+                    .padding(16.0)
+                    .width(Length::Fill)
+                    .style(common::card_style)
+                    .into(),
             );
         }
 
-        let mut form = Column::new().spacing(10.0).push(
-            text(crate::i18n::t!("package-runtime-settings-help"))
-                .size(12.0)
-                .style(common::muted),
-        );
+        let mut form = Column::new().spacing(10.0);
 
         for param in &config.params {
             let state = config.values.get(&param.key);
@@ -273,28 +260,28 @@ impl AutomationsWindow {
 
         if let Some(error) = &config.error {
             form = form.push(text(error.clone()).size(12.0).style(common::danger));
-        } else if config.saved {
-            form = form.push(
-                text(crate::i18n::t!("package-saved"))
-                    .size(12.0)
-                    .style(common::accent),
-            );
         }
 
-        let mut actions = row![iced::widget::space::horizontal()]
-            .spacing(8.0)
-            .align_y(Vertical::Center);
-        if config.parameter_scope == ParameterScope::Profile && self.profile_names.len() > 1 {
+        let mut actions = row![].spacing(8.0).align_y(Vertical::Center);
+        if config.saved && config.error.is_none() {
             actions = actions.push(
-                button(text(crate::i18n::t!("package-copy-settings")).size(12.0))
-                    .style(button_style::secondary)
-                    .on_press(Message::OpenCopySettings),
+                text(crate::i18n::t!("package-saved"))
+                    .size(12)
+                    .style(common::muted),
+            );
+        } else if config.params.iter().any(|param| param.required) {
+            actions = actions.push(
+                text(crate::i18n::t!("package-settings-required"))
+                    .size(12)
+                    .style(common::muted),
             );
         }
+        actions = actions.push(iced::widget::space::horizontal());
+        actions = actions.push(self.view_settings_menu());
         actions = actions.push(
-            button(text(crate::i18n::t!("package-save-settings")).size(12.0))
+            button(text(crate::i18n::t!("action-save")).size(12.0))
                 .style(button_style::primary)
-                .on_press(Message::ParamConfigSave),
+                .on_press_maybe((!config.saving).then_some(Message::ParamConfigSave)),
         );
         form = form.push(actions);
 

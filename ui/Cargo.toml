@@ -22,6 +22,8 @@ smudgy_i18n = { workspace = true }
 sys-locale = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+# Entry-level settings comparisons; already used by the editor dependency graph.
+imara-diff = { version = "0.2", default-features = false }
 iced = { workspace = true }
 iced-code-editor = { workspace = true }
 iced_anim = { workspace = true }
