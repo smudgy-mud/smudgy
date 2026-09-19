@@ -5,6 +5,11 @@ use smudgy_cloud::CloudError;
 
 /// Renders a [`CloudError`] as a short, user-facing message.
 pub fn display_error(err: &CloudError) -> String {
+    if let CloudError::InvalidInput(reason) | CloudError::StructuralConflict(reason) = err
+        && let Some(key) = merge_refusal_key(reason)
+    {
+        return crate::i18n::translate(key);
+    }
     match err {
         CloudError::AreaNotFound(id) => {
             crate::i18n::t!("cloud-error-area-not-found", "id" => id.to_string())
@@ -95,9 +100,97 @@ pub fn display_error(err: &CloudError) -> String {
     }
 }
 
+fn merge_refusal_key(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "merge_areas_no_sources" => "cloud-error-merge-areas-no-sources",
+        "merge_areas_same_area" => "cloud-error-merge-areas-same-area",
+        "merge_areas_no_rooms" => "cloud-error-merge-areas-no-rooms",
+        "merge_areas_room_not_found" => "cloud-error-merge-areas-room-not-found",
+        "merge_areas_mixed_tiers" => "cloud-error-merge-areas-mixed-tiers",
+        "merge_areas_unsupported_storage" => "cloud-error-merge-areas-unsupported-storage",
+        "merge_requires_full_projection" => "cloud-error-merge-requires-full-projection",
+        "merge_areas_busy" => "cloud-error-merge-areas-busy",
+        "merge_areas_source_changed" => "cloud-error-merge-areas-source-changed",
+        "merge_areas_room_numbers_exhausted" => "cloud-error-merge-areas-room-numbers-exhausted",
+        "merge_areas_invalid_translation" => "cloud-error-merge-areas-invalid-translation",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_refusals_use_specific_localized_messages() {
+        for (code, key) in [
+            (
+                "merge_areas_no_sources",
+                "cloud-error-merge-areas-no-sources",
+            ),
+            ("merge_areas_same_area", "cloud-error-merge-areas-same-area"),
+            ("merge_areas_no_rooms", "cloud-error-merge-areas-no-rooms"),
+            (
+                "merge_areas_room_not_found",
+                "cloud-error-merge-areas-room-not-found",
+            ),
+            (
+                "merge_areas_mixed_tiers",
+                "cloud-error-merge-areas-mixed-tiers",
+            ),
+            (
+                "merge_areas_unsupported_storage",
+                "cloud-error-merge-areas-unsupported-storage",
+            ),
+            (
+                "merge_requires_full_projection",
+                "cloud-error-merge-requires-full-projection",
+            ),
+            ("merge_areas_busy", "cloud-error-merge-areas-busy"),
+            (
+                "merge_areas_source_changed",
+                "cloud-error-merge-areas-source-changed",
+            ),
+            (
+                "merge_areas_room_numbers_exhausted",
+                "cloud-error-merge-areas-room-numbers-exhausted",
+            ),
+            (
+                "merge_areas_invalid_translation",
+                "cloud-error-merge-areas-invalid-translation",
+            ),
+        ] {
+            let error = if code == "merge_areas_invalid_translation" {
+                CloudError::InvalidInput(code.to_string())
+            } else {
+                CloudError::StructuralConflict(code.to_string())
+            };
+            let rendered = display_error(&error);
+            assert_eq!(rendered, crate::i18n::translate(key), "{code}");
+            assert!(!rendered.contains(code), "{rendered}");
+            for catalog in smudgy_i18n::available_catalogs() {
+                let translator = smudgy_i18n::Translator::for_tag(catalog.tag).unwrap();
+                let translated = translator.translate(key);
+                assert!(!translated.is_empty() && !translated.contains('⟦'), "{key}");
+                if catalog.tag != "en-US" {
+                    assert_ne!(
+                        translated,
+                        smudgy_i18n::Translator::default().translate(key),
+                        "{} must translate {key}",
+                        catalog.tag
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_merge_refusals_keep_their_details() {
+        let rendered = display_error(&CloudError::StructuralConflict(
+            "merge_areas_future_reason".to_string(),
+        ));
+        assert!(rendered.contains("merge_areas_future_reason"));
+    }
 
     #[test]
     fn unauthorized_errors_do_not_leak_internal_diagnostics() {

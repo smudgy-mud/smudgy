@@ -784,7 +784,8 @@ interface Mapper {
      * `refreshAreas()` before retrying: an error does not guarantee that the maps
      * were left unchanged.
      * All touched maps must use the same storage tier: local or session. Cloud maps
-     * and links from a different tier are refused. Refusal codes:
+     * and links from a different tier are refused. Refusal messages explain the
+     * reason and include a stable code that scripts can check:
      * - `merge_areas_no_sources`: no source areas were provided.
      * - `merge_areas_same_area`: a source repeats or is the destination.
      * - `merge_areas_no_rooms`: an explicit room list is empty.

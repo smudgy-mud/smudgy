@@ -454,6 +454,17 @@ cloud-error-revision-conflict = 此項目已在伺服器上變更，請重新整
 cloud-error-projection-changed = 你對此項目的存取權限已變更，請重新整理後再試。
 cloud-error-operation-reused = 無法安全地完成此操作，請重新整理後再試。
 cloud-error-structural-conflict = 此變更與目前的地圖結構衝突：{ $detail }
+cloud-error-merge-areas-no-sources = 請至少選取一個要合併的來源區域。
+cloud-error-merge-areas-same-area = 每個來源區域只能出現一次，且必須與目標區域不同。
+cloud-error-merge-areas-no-rooms = 請從每個要部分合併的來源區域選取至少一個房間，或省略房間選取以合併整個區域。
+cloud-error-merge-areas-room-not-found = 來源區域中找不到所選房間。請在合併前檢查房間編號。
+cloud-error-merge-areas-mixed-tiers = 所有受影響的區域，包括連結至合併區域的其他區域，都必須使用相同的儲存方式：本機或工作階段。
+cloud-error-merge-areas-unsupported-storage = 此儲存方式不支援區域合併。請使用支援合併的本機或工作階段儲存方式。
+cloud-error-merge-requires-full-projection = 合併需要所有受影響區域的完整存取權，包括連結至合併區域的其他區域。
+cloud-error-merge-areas-busy = 受影響的區域有待處理的編輯或其他進行中的操作。請先完成或處理這些操作，再進行合併。
+cloud-error-merge-areas-source-changed = 受影響的區域在準備合併時發生變更。請檢查目前的地圖後再試一次。
+cloud-error-merge-areas-room-numbers-exhausted = 目標區域沒有足夠的可用房間編號可供此次合併使用。請選擇其他目標區域。
+cloud-error-merge-areas-invalid-translation = 位移量或位移後的位置超出支援範圍。請使用有限的座標值，並將樓層維持在 32 位元整數範圍內。
 cloud-error-invalid-connection = 此連線無效：{ $detail }
 
 # 好友、封鎖與所有權轉移

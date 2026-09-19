@@ -111,7 +111,9 @@ pub enum CloudError {
 
     /// 409 `structural_conflict` — the revision matched but the requested
     /// link topology is no longer valid (normally only possible in a
-    /// compound operation). Carries the server's stable reason string.
+    /// compound operation). Also used for local merge refusals. Carries a
+    /// stable reason string; presentation must distinguish argument refusals
+    /// from concurrent changes.
     StructuralConflict(String),
 
     /// 422 `invalid_connection` — a Connection payload failed validation.
@@ -127,6 +129,12 @@ pub enum CloudError {
 
 impl fmt::Display for CloudError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::InvalidInput(reason) | Self::StructuralConflict(reason) = self
+            && let Some(message) = merge_refusal_message(reason)
+        {
+            // Scripts use these stable codes to identify refusals.
+            return write!(f, "{message} ({reason})");
+        }
         match self {
             CloudError::LocalCommitPending { message, .. } => {
                 write!(f, "Local commit pending recovery: {message}")
@@ -211,6 +219,43 @@ impl fmt::Display for CloudError {
 }
 
 impl std::error::Error for CloudError {}
+
+fn merge_refusal_message(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "merge_areas_no_sources" => "Choose at least one source area to merge.",
+        "merge_areas_same_area" => {
+            "Each source area must appear once and must differ from the destination."
+        }
+        "merge_areas_no_rooms" => {
+            "Select at least one room from each partial source, or omit the room selection to merge the whole area."
+        }
+        "merge_areas_room_not_found" => {
+            "A selected room is missing from its source area. Check the room numbers before merging."
+        }
+        "merge_areas_mixed_tiers" => {
+            "All affected areas, including areas with links into the merge, must use the same storage: local or session."
+        }
+        "merge_areas_unsupported_storage" => {
+            "This storage does not support area merges. Use supported local or session storage."
+        }
+        "merge_requires_full_projection" => {
+            "Merging requires full access to every affected area, including areas with links into the merge."
+        }
+        "merge_areas_busy" => {
+            "An affected area has pending edits or another operation in progress. Finish or resolve those operations before merging."
+        }
+        "merge_areas_source_changed" => {
+            "An affected area changed while the merge was being prepared. Review the current map and try again."
+        }
+        "merge_areas_room_numbers_exhausted" => {
+            "The destination does not have enough available room numbers for this merge. Choose another destination."
+        }
+        "merge_areas_invalid_translation" => {
+            "The translation or a resulting position is outside the supported range. Use finite coordinates and keep levels within the 32-bit integer range."
+        }
+        _ => return None,
+    })
+}
 
 impl CloudError {
     /// Maps an HTTP error status plus the server's envelope `error` string to
@@ -336,5 +381,54 @@ impl From<std::io::Error> for CloudError {
 impl From<uuid::Error> for CloudError {
     fn from(err: uuid::Error) -> Self {
         CloudError::InvalidInput(format!("Invalid UUID: {err}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_refusals_explain_the_reason_and_preserve_the_code() {
+        for (code, guidance) in [
+            ("merge_areas_no_sources", "at least one source"),
+            ("merge_areas_same_area", "must appear once"),
+            ("merge_areas_no_rooms", "at least one room"),
+            ("merge_areas_room_not_found", "Check the room numbers"),
+            ("merge_areas_mixed_tiers", "same storage"),
+            ("merge_areas_unsupported_storage", "local or session"),
+            ("merge_requires_full_projection", "full access"),
+            ("merge_areas_busy", "pending edits"),
+            ("merge_areas_source_changed", "Review the current map"),
+            ("merge_areas_room_numbers_exhausted", "room numbers"),
+            ("merge_areas_invalid_translation", "supported range"),
+        ] {
+            let error = if code == "merge_areas_invalid_translation" {
+                CloudError::InvalidInput(code.to_string())
+            } else {
+                CloudError::StructuralConflict(code.to_string())
+            };
+            let message = error.to_string();
+            assert!(message.contains(guidance), "{code}: {message}");
+            assert!(message.ends_with(&format!("({code})")), "{message}");
+            assert!(
+                !message.contains("structure changed underneath"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_and_unknown_refusals_keep_their_diagnostics() {
+        for reason in ["link_target_missing", "merge_areas_future_reason"] {
+            assert_eq!(
+                CloudError::StructuralConflict(reason.to_string()).to_string(),
+                format!("The map's structure changed underneath this edit: {reason}")
+            );
+        }
+        assert_eq!(
+            CloudError::InvalidInput("invalid UUID".to_string()).to_string(),
+            "Invalid input: invalid UUID"
+        );
     }
 }

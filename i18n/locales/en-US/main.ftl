@@ -461,6 +461,17 @@ cloud-error-revision-conflict = This item changed on the server. Refresh and try
 cloud-error-projection-changed = Your access to this item changed. Refresh and try again.
 cloud-error-operation-reused = This operation could not be completed safely. Refresh and try again.
 cloud-error-structural-conflict = This change conflicts with the current map structure: { $detail }
+cloud-error-merge-areas-no-sources = Choose at least one source area to merge.
+cloud-error-merge-areas-same-area = Each source area must appear once and must differ from the destination.
+cloud-error-merge-areas-no-rooms = Select at least one room from each partial source, or omit the room selection to merge the whole area.
+cloud-error-merge-areas-room-not-found = A selected room is missing from its source area. Check the room numbers before merging.
+cloud-error-merge-areas-mixed-tiers = All affected areas, including areas with links into the merge, must use the same storage: local or session.
+cloud-error-merge-areas-unsupported-storage = This storage does not support area merges. Use supported local or session storage.
+cloud-error-merge-requires-full-projection = Merging requires full access to every affected area, including areas with links into the merge.
+cloud-error-merge-areas-busy = An affected area has pending edits or another operation in progress. Finish or resolve those operations before merging.
+cloud-error-merge-areas-source-changed = An affected area changed while the merge was being prepared. Review the current map and try again.
+cloud-error-merge-areas-room-numbers-exhausted = The destination does not have enough available room numbers for this merge. Choose another destination.
+cloud-error-merge-areas-invalid-translation = The translation or a resulting position is outside the supported range. Use finite coordinates and keep levels within the 32-bit integer range.
 cloud-error-invalid-connection = This connection is invalid: { $detail }
 
 # Friends, blocks, and ownership transfers

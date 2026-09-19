@@ -1934,7 +1934,7 @@ struct JsMergedRoomFrom {
 /// Resolves with every moved room's old address and new number once the backend commits. When
 /// the session stands in a moved room, its current location follows the room through the same
 /// path `setCurrentLocation` takes, so `map:room` fires and the UI marker moves. Local and
-/// session tiers only; refusals surface as `Failed to merge areas: <code>`. Write-gated.
+/// session tiers only; refusals include an explanation and a stable reason code. Write-gated.
 #[op2(async(lazy))]
 #[serde]
 async fn op_smudgy_mapper_merge_areas(

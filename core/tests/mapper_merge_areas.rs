@@ -29,13 +29,15 @@ const failures = [];
 const check = (label, actual, expected) => {
     if (actual !== expected) failures.push(`${label}: got [${actual}] want [${expected}]`);
 };
-const refuses = async (label, code, call) => {
+const refuses = async (label, code, call, guidance) => {
     try {
         await call();
         failures.push(`${label}: resolved, want ${code}`);
     } catch (error) {
         const text = error instanceof Error ? error.message : String(error);
         if (!text.includes(code)) failures.push(`${label}: threw [${text}] want ${code}`);
+        if (guidance && !text.includes(guidance)) failures.push(`${label}: threw [${text}] want guidance [${guidance}]`);
+        if (text.includes("structure changed underneath")) failures.push(`${label}: misleading concurrency message [${text}]`);
     }
 };
 
@@ -57,7 +59,7 @@ const b1 = await mapper.createRoom(b, { title: "B1", x: 0, y: 0, level: 0, exter
 const b2 = await mapper.createRoom(b, { title: "B2", x: 1, y: 0, level: 0, externalId: "b2" });
 await mapper.setRoomProperty(b, b2, "k", "v");
 const c1 = await mapper.createRoom(c, { title: "C1", x: 0, y: 0, level: 0 });
-const c2 = await mapper.createRoom(c, { title: "C2", x: 0, y: -1, level: 0, externalId: "c2" });
+const c2 = await mapper.createRoom(c, { title: "C2", x: 0, y: -1, level: 1, externalId: "c2" });
 await mapper.createRoom(s, { title: "S1", x: 0, y: 0, level: 0 });
 check("numbering", [a1, a2, a3, b1, b2, c1, c2].join(","), "1,2,3,1,2,1,2");
 
@@ -101,12 +103,14 @@ check("c1/exit", target(gamma.room(c1)?.exits.find((exit) => exit.from_direction
 const location = mapper.getCurrentLocation();
 check("location", `${tag(location?.area)}${location?.room}`, "A5");
 
-await refuses("no_sources", "merge_areas_no_sources", () => mapper.mergeAreas(a, []));
-await refuses("same_area", "merge_areas_same_area", () => mapper.mergeAreas(a, [a]));
-await refuses("repeated", "merge_areas_same_area", () => mapper.mergeAreas(a, [c, c]));
-await refuses("mixed_tiers", "merge_areas_mixed_tiers", () => mapper.mergeAreas(a, [s]));
-await refuses("room_not_found", "merge_areas_room_not_found", () => mapper.mergeAreas(a, [{ area: c, rooms: [99] }]));
-await refuses("no_rooms", "merge_areas_no_rooms", () => mapper.mergeAreas(a, [{ area: c, rooms: [] }]));
+await refuses("no_sources", "merge_areas_no_sources", () => mapper.mergeAreas(a, []), "at least one source");
+await refuses("same_area", "merge_areas_same_area", () => mapper.mergeAreas(a, [a]), "differ from the destination");
+await refuses("repeated", "merge_areas_same_area", () => mapper.mergeAreas(a, [c, c]), "must appear once");
+await refuses("mixed_tiers", "merge_areas_mixed_tiers", () => mapper.mergeAreas(a, [s]), "same storage");
+await refuses("room_not_found", "merge_areas_room_not_found", () => mapper.mergeAreas(a, [{ area: c, rooms: [99] }]), "Check the room numbers");
+await refuses("no_rooms", "merge_areas_no_rooms", () => mapper.mergeAreas(a, [{ area: c, rooms: [] }]), "at least one room");
+// The offset itself is valid input, but adding it to C.2's level overflows in Rust.
+await refuses("level overflow", "merge_areas_invalid_translation", () => mapper.mergeAreas(a, [{ area: c, rooms: [c2], translate: { level: 2147483647 } }]), "supported range");
 
 for (const value of [NaN, Infinity, -Infinity, 1.5, 2147483648, "1", null]) {
     await refuses("invalid level", "merge_areas_invalid_translation", () => mapper.mergeAreas(a, [{ area: c, translate: { level: value } }]));

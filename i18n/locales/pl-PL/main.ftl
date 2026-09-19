@@ -466,6 +466,17 @@ cloud-error-revision-conflict = Ten element zmienił się na serwerze. Odśwież
 cloud-error-projection-changed = Twój dostęp do tego elementu uległ zmianie. Odśwież i spróbuj ponownie.
 cloud-error-operation-reused = Tej operacji nie udało się bezpiecznie ukończyć. Odśwież i spróbuj ponownie.
 cloud-error-structural-conflict = Ta zmiana jest sprzeczna z obecną strukturą mapy: { $detail }
+cloud-error-merge-areas-no-sources = Wybierz co najmniej jeden obszar źródłowy do scalenia.
+cloud-error-merge-areas-same-area = Każdy obszar źródłowy musi wystąpić tylko raz i różnić się od obszaru docelowego.
+cloud-error-merge-areas-no-rooms = Wybierz co najmniej jedno pomieszczenie z każdego częściowo scalonego źródła lub pomiń wybór pomieszczeń, aby scalić cały obszar.
+cloud-error-merge-areas-room-not-found = Wybranego pomieszczenia nie ma w obszarze źródłowym. Sprawdź numery pomieszczeń przed scaleniem.
+cloud-error-merge-areas-mixed-tiers = Wszystkie obszary objęte scaleniem, w tym obszary z prowadzącymi do nich połączeniami, muszą używać tego samego miejsca przechowywania: lokalnego lub sesji.
+cloud-error-merge-areas-unsupported-storage = To miejsce przechowywania nie obsługuje scalania obszarów. Użyj obsługiwanego przechowywania lokalnego lub w sesji.
+cloud-error-merge-requires-full-projection = Scalanie wymaga pełnego dostępu do wszystkich objętych nim obszarów, w tym obszarów z prowadzącymi do nich połączeniami.
+cloud-error-merge-areas-busy = W jednym z obszarów są oczekujące zmiany lub trwa inna operacja. Zakończ lub rozwiąż te operacje przed scaleniem.
+cloud-error-merge-areas-source-changed = Jeden z obszarów zmienił się podczas przygotowywania scalenia. Sprawdź aktualną mapę i spróbuj ponownie.
+cloud-error-merge-areas-room-numbers-exhausted = W obszarze docelowym nie ma wystarczającej liczby dostępnych numerów pomieszczeń do tego scalenia. Wybierz inny obszar docelowy.
+cloud-error-merge-areas-invalid-translation = Przesunięcie lub wynikowa pozycja wykracza poza obsługiwany zakres. Użyj skończonych współrzędnych i poziomów w zakresie 32-bitowej liczby całkowitej.
 cloud-error-invalid-connection = To połączenie jest nieprawidłowe: { $detail }
 
 # Friends, blocks, and ownership transfers
