@@ -7,7 +7,7 @@
 //! parallel. The displayed cache is the confirmed state plus these pending
 //! operations (the optimistic overlay is applied at enqueue time and
 //! rebuilt from a fresh fetch after conflicts). Cloud work is restart-durable;
-//! local and ephemeral backends still use only the in-session queue.
+//! local edits have their own durable journal; ephemeral edits stay in session.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(windows))]
@@ -15,6 +15,7 @@ use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,7 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
+use crate::backends::area_merge::RoomRemap;
 use crate::mutation::{AreaMutation, OperationId};
 use crate::{AreaId, AreaWithDetails, CloudError, CloudResult, RoomNumber};
 
@@ -187,6 +189,9 @@ pub enum AreaPhase {
     Ready,
     /// Head is on the wire.
     InFlight,
+    /// A local journal has decided the head. Only published recovery can
+    /// settle it; request retries and cancellation cannot undo the decision.
+    AwaitingPublication,
     /// The backend has already accepted the head, but its replayable `.json`
     /// body could not yet be atomically moved to cleanup-only `.ack`.
     /// Retrying this phase must never resend the mutation.
@@ -262,6 +267,18 @@ pub enum MapperEvent {
     /// The server requires a newer client; cloud syncing paused without
     /// discarding the session's pending queues.
     UpgradePaused,
+    /// Areas were folded into one and the published atlas already reflects
+    /// it: `deleted` lists the sources that are gone (a source that gave up
+    /// only some rooms stays and is not listed), every room in `rooms` now
+    /// lives in `into` under its `to` number, and every exit that named one
+    /// of them follows. A subscriber holding room handles into a source (an
+    /// editor selection, a marker) remaps them from `rooms` instead of
+    /// discovering the move on its own.
+    AreasMerged {
+        into: AreaId,
+        deleted: Vec<AreaId>,
+        rooms: Vec<RoomRemap>,
+    },
 }
 
 /// Verdict of [`PendingQueue::transport_failure`]. All terminal accounting
@@ -307,6 +324,9 @@ struct AreaQueue {
     fingerprint: Option<String>,
     queue: VecDeque<PendingEnvelope>,
     phase: AreaPhase,
+    /// Replay can invalidate a follower while the head still owns a request
+    /// or durable completion. Review waits until that head leaves the queue.
+    deferred_conflict: Option<OperationId>,
     /// Restored journal work has not yet been folded over a freshly fetched
     /// projection for this viewer.
     requires_recovery_base: bool,
@@ -328,13 +348,19 @@ fn retry_delay(attempts: u32) -> Duration {
         .min(BACKOFF_CAP)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedPublication {
+    Deferred,
+    Allowed,
+}
+
 #[derive(Debug, Default)]
 struct State {
     areas: HashMap<AreaId, AreaQueue>,
     /// Areas under an acknowledged delete. New envelopes are rejected and
     /// queued envelopes cannot begin sending until the delete commits or
     /// aborts.
-    deleting: HashSet<AreaId>,
+    deleting: HashMap<AreaId, FencedPublication>,
     /// Delete requests that were durably prepared before a prior process
     /// reset. They are resolved against backend truth before WAL replay.
     delete_intents: HashSet<AreaId>,
@@ -455,6 +481,7 @@ pub struct PendingQueue {
     next_sequence: AtomicU64,
     recovery_errors: Mutex<Vec<String>>,
     pub(crate) notify: Notify,
+    projection_notify: Arc<Notify>,
     events: broadcast::Sender<MapperEvent>,
 }
 
@@ -486,11 +513,27 @@ impl PendingQueue {
             next_sequence: AtomicU64::new(1),
             recovery_errors: Mutex::new(Vec::new()),
             notify: Notify::new(),
+            projection_notify: Arc::new(Notify::new()),
             events,
         };
         queue.cleanup_retired_records();
         queue.restore_local_records();
         queue
+    }
+
+    /// Queue transitions wake both consumers. Separate permits keep the
+    /// mutation worker from consuming the local adopter's wakeup.
+    fn changed(&self) {
+        self.notify.notify_one();
+        self.projection_changed();
+    }
+
+    pub(crate) fn projection_changed(&self) {
+        self.projection_notify.notify_one();
+    }
+
+    pub(crate) fn projection_changes(&self) -> Arc<Notify> {
+        self.projection_notify.clone()
     }
 
     /// Subscribe to queue lifecycle events.
@@ -536,7 +579,7 @@ impl PendingQueue {
         }
 
         let validate = |state: &State, area_id: AreaId, envelope: &PendingEnvelope| {
-            if state.deleting.contains(&area_id) || state.delete_intents.contains(&area_id) {
+            if state.deleting.contains_key(&area_id) || state.delete_intents.contains(&area_id) {
                 return Err(CloudError::PendingOperations(
                     "this area is being deleted".to_string(),
                 ));
@@ -684,7 +727,7 @@ impl PendingQueue {
         {
             self.emit(MapperEvent::AreaStatusChanged { area_id });
         }
-        self.notify.notify_one();
+        self.changed();
     }
 
     fn checksum(body: &impl Serialize) -> CloudResult<String> {
@@ -1691,7 +1734,7 @@ impl PendingQueue {
         for area_id in changed {
             self.emit(MapperEvent::AreaStatusChanged { area_id });
         }
-        self.notify.notify_one();
+        self.changed();
         activation
     }
 
@@ -1708,6 +1751,38 @@ impl PendingQueue {
                 retryable: false,
             };
         }
+    }
+
+    /// Select the next phase before releasing the queue lock: a worker must
+    /// never observe a sendable follower between retirement and conflict review.
+    fn resume_with_deferred_conflict(area: &mut AreaQueue) -> Option<PendingEnvelope> {
+        area.phase = AreaPhase::Ready;
+        Self::park_expired_head(area);
+        if area.phase != AreaPhase::Ready {
+            return None;
+        }
+        let operation = area.deferred_conflict.take()?;
+        let envelope = area
+            .queue
+            .iter()
+            .find(|envelope| envelope.operation_id == operation)?
+            .clone();
+        area.phase = AreaPhase::Conflict {
+            operation_id: operation,
+        };
+        Some(envelope)
+    }
+
+    fn emit_conflict(&self, area_id: AreaId, envelope: PendingEnvelope) {
+        self.complete_operation(
+            envelope.operation_id,
+            Err("map edit requires conflict review".to_string()),
+        );
+        self.emit(MapperEvent::MutationConflict {
+            area_id,
+            operation_id: envelope.operation_id,
+            description: envelope.description,
+        });
     }
 
     #[must_use]
@@ -1738,11 +1813,79 @@ impl PendingQueue {
         self.state.lock().delete_intents.contains(&area_id)
     }
 
+    pub(crate) fn delete_needs_recovery(&self, area_id: AreaId) -> bool {
+        let state = self.state.lock();
+        state.delete_intents.contains(&area_id) && !state.deleting.contains_key(&area_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_in_flight(&self, area_id: AreaId) -> bool {
+        self.state.lock().areas.get(&area_id).is_some_and(|area| {
+            matches!(
+                area.phase,
+                AreaPhase::InFlight | AreaPhase::AwaitingPublication
+            )
+        })
+    }
+
     /// Whether an in-session delete/move fence or a recovered durable delete
     /// intent currently makes metadata writes unsafe for this area.
     pub(crate) fn is_delete_fenced(&self, area_id: AreaId) -> bool {
         let state = self.state.lock();
-        state.deleting.contains(&area_id) || state.delete_intents.contains(&area_id)
+        state.deleting.contains_key(&area_id) || state.delete_intents.contains(&area_id)
+    }
+
+    /// Copying a relocation's source does not require hiding committed updates.
+    /// New edits and queued sends remain fenced; revision checks still guard deletion.
+    pub(crate) fn allow_fenced_publication(&self, area_id: AreaId) {
+        if let Some(publication) = self.state.lock().deleting.get_mut(&area_id) {
+            *publication = FencedPublication::Allowed;
+        }
+        self.projection_changed();
+    }
+
+    pub(crate) fn blocks_publication(&self, area_id: AreaId) -> bool {
+        let state = self.state.lock();
+        state.deleting.get(&area_id).map_or_else(
+            || state.delete_intents.contains(&area_id),
+            |publication| *publication == FencedPublication::Deferred,
+        )
+    }
+
+    /// Envelopes queued for this area, sent or not.
+    #[must_use]
+    pub(crate) fn queued_len(&self, area_id: AreaId) -> usize {
+        self.state
+            .lock()
+            .areas
+            .get(&area_id)
+            .map_or(0, |area| area.queue.len())
+    }
+
+    /// Whether this area holds envelopes the worker will still deliver on
+    /// its own: queued work in a phase that sends, retries or retires
+    /// without user action, on an area nothing else has fenced. A parked,
+    /// conflicted, fenced or recovery-gated queue is not draining; a caller
+    /// that needs the backend up to date waits on this and then lets the
+    /// fence path report why a still-populated queue cannot move.
+    #[must_use]
+    pub(crate) fn is_draining(&self, area_id: AreaId) -> bool {
+        let state = self.state.lock();
+        if state.deleting.contains_key(&area_id) || state.delete_intents.contains(&area_id) {
+            return false;
+        }
+        state.areas.get(&area_id).is_some_and(|area| {
+            !area.queue.is_empty()
+                && !area.requires_recovery_base
+                && matches!(
+                    area.phase,
+                    AreaPhase::Ready
+                        | AreaPhase::InFlight
+                        | AreaPhase::AwaitingPublication
+                        | AreaPhase::Backoff { .. }
+                        | AreaPhase::AwaitingRetirement { .. }
+                )
+        })
     }
 
     #[must_use]
@@ -1766,6 +1909,7 @@ impl PendingQueue {
     }
 
     pub(crate) fn recovery_base_loaded(&self, area_id: AreaId) -> bool {
+        let mut conflicted = None;
         let reopened = {
             let mut state = self.state.lock();
             let Some(area) = state.areas.get_mut(&area_id) else {
@@ -1774,7 +1918,9 @@ impl PendingQueue {
             area.requires_recovery_base = false;
             if area.recovery_base_failed {
                 area.recovery_base_failed = false;
-                area.phase = AreaPhase::Ready;
+                if matches!(area.phase, AreaPhase::Failed { .. }) {
+                    conflicted = Self::resume_with_deferred_conflict(area);
+                }
                 area.queue.front().map(|envelope| envelope.operation_id)
             } else {
                 None
@@ -1782,8 +1928,11 @@ impl PendingQueue {
         };
         if let Some(operation_id) = reopened {
             self.reset_completion(operation_id);
+            if let Some(envelope) = conflicted {
+                self.emit_conflict(area_id, envelope);
+            }
             self.emit(MapperEvent::AreaStatusChanged { area_id });
-            self.notify.notify_one();
+            self.changed();
         }
         reopened.is_some()
     }
@@ -2048,7 +2197,7 @@ impl PendingQueue {
         let candidates: Vec<AreaId> = state.areas.keys().copied().collect();
         let active_viewer = state.active_viewer;
         for area_id in candidates {
-            if state.deleting.contains(&area_id) || state.delete_intents.contains(&area_id) {
+            if state.deleting.contains_key(&area_id) || state.delete_intents.contains(&area_id) {
                 continue;
             }
             let area = state.areas.get_mut(&area_id).expect("key just listed");
@@ -2068,7 +2217,10 @@ impl PendingQueue {
                     earliest = Some(earliest.map_or(*until, |earliest| earliest.min(*until)));
                     continue;
                 }
-                AreaPhase::InFlight | AreaPhase::Conflict { .. } | AreaPhase::Failed { .. } => {
+                AreaPhase::InFlight
+                | AreaPhase::AwaitingPublication
+                | AreaPhase::Conflict { .. }
+                | AreaPhase::Failed { .. } => {
                     continue;
                 }
             }
@@ -2102,11 +2254,13 @@ impl PendingQueue {
     ) -> (Option<(AreaId, OperationId)>, Option<Instant>) {
         let mut earliest = None;
         let mut settled = None;
+        let mut conflicted = None;
         {
             let mut state = self.state.lock();
             let candidates: Vec<_> = state.areas.keys().copied().collect();
             for area_id in candidates {
-                if state.deleting.contains(&area_id) || state.delete_intents.contains(&area_id) {
+                if state.deleting.contains_key(&area_id) || state.delete_intents.contains(&area_id)
+                {
                     continue;
                 }
                 let area = state.areas.get_mut(&area_id).expect("key just listed");
@@ -2142,8 +2296,7 @@ impl PendingQueue {
                             area.confirmed_rev =
                                 Some(area.confirmed_rev.map_or(rev, |current| current.max(rev)));
                         }
-                        area.phase = AreaPhase::Ready;
-                        Self::park_expired_head(area);
+                        conflicted = Self::resume_with_deferred_conflict(area);
                         settled = Some((area_id, operation_id));
                         break;
                     }
@@ -2171,10 +2324,35 @@ impl PendingQueue {
                 operation_id,
             });
             self.complete_operation(operation_id, Ok(()));
+            if let Some(envelope) = conflicted {
+                self.emit_conflict(area_id, envelope);
+            }
             self.emit(MapperEvent::AreaStatusChanged { area_id });
-            self.notify.notify_one();
+            self.changed();
         }
         (settled, earliest)
+    }
+
+    /// The local journal proves this head is already decided. Retain it
+    /// until publication, including when its WAL was restored after restart.
+    pub(crate) fn hold_journaled(&self, area_id: AreaId, operation: OperationId) -> bool {
+        let mut state = self.state.lock();
+        let Some(area) = state.areas.get_mut(&area_id) else {
+            return false;
+        };
+        if !area
+            .queue
+            .front()
+            .is_some_and(|head| head.local_durable && head.operation_id == operation)
+            || !matches!(
+                area.phase,
+                AreaPhase::Ready | AreaPhase::InFlight | AreaPhase::AwaitingPublication
+            )
+        {
+            return false;
+        }
+        area.phase = AreaPhase::AwaitingPublication;
+        true
     }
 
     /// Acknowledges the in-flight head: pops it, records the resulting
@@ -2185,6 +2363,7 @@ impl PendingQueue {
         operation_id: OperationId,
         new_rev: Option<i64>,
     ) -> bool {
+        let mut conflicted = None;
         let removed = {
             let mut state = self.state.lock();
             let mut removed = None;
@@ -2212,7 +2391,7 @@ impl PendingQueue {
                         };
                         drop(state);
                         self.emit(MapperEvent::AreaStatusChanged { area_id });
-                        self.notify.notify_one();
+                        self.changed();
                         return false;
                     }
                     removed = area.queue.pop_front();
@@ -2226,8 +2405,9 @@ impl PendingQueue {
                     area.confirmed_rev =
                         Some(area.confirmed_rev.map_or(rev, |current| current.max(rev)));
                 }
-                area.phase = AreaPhase::Ready;
-                Self::park_expired_head(area);
+                if removed.is_some() {
+                    conflicted = Self::resume_with_deferred_conflict(area);
+                }
             }
             removed
         };
@@ -2239,29 +2419,27 @@ impl PendingQueue {
             operation_id,
         });
         self.complete_operation(operation_id, Ok(()));
+        if let Some(envelope) = conflicted {
+            self.emit_conflict(area_id, envelope);
+        }
         self.emit(MapperEvent::AreaStatusChanged { area_id });
-        self.notify.notify_one();
+        self.changed();
         true
     }
 
-    /// Readies the queue for the post-conflict resend: the head goes out
-    /// again under the new confirmed revision (same operation id, so the
-    /// server's idempotency receipt keeps the retry single-apply). Two
-    /// callers: the reconcile path when every pending envelope passed the
-    /// structural sanity check (phase still `InFlight`), and the Keep-mine
-    /// resolution after its display rebuild (phase still `Conflict` — held
-    /// paused so the resend can never race the rebuild's fold).
+    /// Releases Keep mine after its display rebuild. An outstanding request
+    /// needs its exact verdict transition, not this user-resolution transition.
     pub(crate) fn ready_resend(&self, area_id: AreaId) {
         {
             let mut state = self.state.lock();
             if let Some(area) = state.areas.get_mut(&area_id)
-                && matches!(area.phase, AreaPhase::InFlight | AreaPhase::Conflict { .. })
+                && matches!(area.phase, AreaPhase::Conflict { .. })
             {
                 area.phase = AreaPhase::Ready;
             }
         }
         self.emit(MapperEvent::AreaStatusChanged { area_id });
-        self.notify.notify_one();
+        self.changed();
     }
 
     /// Parks the in-flight head after a transport failure, or fails it
@@ -2320,46 +2498,94 @@ impl PendingQueue {
             });
         }
         self.emit(MapperEvent::AreaStatusChanged { area_id });
-        self.notify.notify_one();
+        self.changed();
         verdict
     }
 
-    /// Pauses an area's queue after a failed sanity check, targeting the
-    /// envelope that failed — the whole queue holds (per-area order is the
-    /// contract), but review and discard address exactly that operation.
-    /// If the targeted envelope has already left the queue (an interleaved
-    /// cancel), there is nothing to review and the queue reopens instead.
+    /// Records an ordinary display replay failure without taking ownership
+    /// away from an outstanding request or durable completion.
+    #[cfg(test)]
     pub(crate) fn pause_conflict(&self, area_id: AreaId, operation_id: OperationId) {
+        self.record_replay_result(area_id, Some(operation_id));
+    }
+
+    /// A complete `StopAtFailure` replay replaces any deferred result, including
+    /// clearing it when newer confirmed state makes every operation valid.
+    pub(crate) fn record_replay_result(&self, area_id: AreaId, failed: Option<OperationId>) {
         let conflicted = {
             let mut state = self.state.lock();
-            state.areas.get_mut(&area_id).and_then(|area| {
-                let envelope = area
-                    .queue
-                    .iter()
-                    .find(|e| e.operation_id == operation_id)
-                    .cloned();
-                area.phase = if envelope.is_some() {
-                    AreaPhase::Conflict { operation_id }
-                } else {
-                    AreaPhase::Ready
-                };
-                envelope
-            })
+            state
+                .areas
+                .get_mut(&area_id)
+                .and_then(|area| Self::record_replay_locked(area, failed))
         };
         if let Some(envelope) = conflicted {
-            self.complete_operation(
-                envelope.operation_id,
-                Err("map edit requires conflict review".to_string()),
-            );
-            self.emit(MapperEvent::MutationConflict {
-                area_id,
-                operation_id: envelope.operation_id,
-                description: envelope.description,
-            });
-        } else {
-            self.notify.notify_one();
+            self.emit_conflict(area_id, envelope);
+            self.emit(MapperEvent::AreaStatusChanged { area_id });
+        }
+    }
+
+    fn record_replay_locked(
+        area: &mut AreaQueue,
+        failed: Option<OperationId>,
+    ) -> Option<PendingEnvelope> {
+        let envelope = failed.and_then(|operation| {
+            area.queue
+                .iter()
+                .find(|envelope| envelope.operation_id == operation)
+                .cloned()
+        });
+        area.deferred_conflict = envelope.as_ref().map(|envelope| envelope.operation_id);
+        if matches!(
+            area.phase,
+            AreaPhase::InFlight
+                | AreaPhase::AwaitingPublication
+                | AreaPhase::AwaitingRetirement { .. }
+                | AreaPhase::Failed { .. }
+        ) {
+            return None;
+        }
+        let envelope = envelope?;
+        area.deferred_conflict = None;
+        let phase = AreaPhase::Conflict {
+            operation_id: envelope.operation_id,
+        };
+        if area.phase == phase {
+            return None;
+        }
+        area.phase = phase;
+        Some(envelope)
+    }
+
+    /// The exact request returned a definitive conflict. Unlike display replay,
+    /// this verdict may release `InFlight` and expose its freshly replayed result.
+    pub(crate) fn finish_conflict_replay(
+        &self,
+        area_id: AreaId,
+        head: OperationId,
+        failed: Option<OperationId>,
+    ) {
+        let conflicted = {
+            let mut state = self.state.lock();
+            let Some(area) = state.areas.get_mut(&area_id) else {
+                return;
+            };
+            if area.phase != AreaPhase::InFlight
+                || area
+                    .queue
+                    .front()
+                    .is_none_or(|envelope| envelope.operation_id != head)
+            {
+                return;
+            }
+            area.phase = AreaPhase::Ready;
+            Self::record_replay_locked(area, failed)
+        };
+        if let Some(envelope) = conflicted {
+            self.emit_conflict(area_id, envelope);
         }
         self.emit(MapperEvent::AreaStatusChanged { area_id });
+        self.changed();
     }
 
     /// Parks the in-flight head as permanently failed (validation/auth).
@@ -2427,7 +2653,12 @@ impl PendingQueue {
             let mut state = self.state.lock();
             state.upgrade_paused = true;
             for area in state.areas.values_mut() {
-                if area.phase == AreaPhase::InFlight {
+                if area.phase == AreaPhase::InFlight
+                    && area
+                        .queue
+                        .front()
+                        .is_some_and(|head| head.viewer_id.is_some())
+                {
                     area.phase = AreaPhase::Ready;
                 }
             }
@@ -2439,7 +2670,7 @@ impl PendingQueue {
     /// signed in, or the floor moved).
     pub fn resume_after_upgrade(&self) {
         self.state.lock().upgrade_paused = false;
-        self.notify.notify_one();
+        self.changed();
     }
 
     /// Keep mine: keep every pending operation (a deliberate overwrite of
@@ -2493,7 +2724,7 @@ impl PendingQueue {
         }
         self.emit(MapperEvent::AreaStatusChanged { area_id });
         if !keep_mine {
-            self.notify.notify_one();
+            self.changed();
         }
         Ok(ConflictResolution {
             resolved: true,
@@ -2511,6 +2742,7 @@ impl PendingQueue {
             unparked: false,
             discarded: None,
         };
+        let mut conflicted = None;
         let discarded = {
             let mut state = self.state.lock();
             let Some(area) = state.areas.get_mut(&area_id) else {
@@ -2564,8 +2796,7 @@ impl PendingQueue {
                 // Retirement is the discard commit point. Keep the area
                 // failed until it succeeds so an I/O error cannot wake and
                 // resend an edit the user chose to discard.
-                area.phase = AreaPhase::Ready;
-                Self::park_expired_head(area);
+                conflicted = Self::resume_with_deferred_conflict(area);
                 removed
             }
         };
@@ -2575,8 +2806,11 @@ impl PendingQueue {
                 Err("failed map edit was discarded".to_string()),
             );
         }
+        if let Some(envelope) = conflicted {
+            self.emit_conflict(area_id, envelope);
+        }
         self.emit(MapperEvent::AreaStatusChanged { area_id });
-        self.notify.notify_one();
+        self.changed();
         Ok(FailureResolution {
             unparked: true,
             discarded,
@@ -2593,14 +2827,15 @@ impl PendingQueue {
                 "this area's interrupted delete is still being reconciled".to_string(),
             ));
         }
-        if !state.deleting.insert(area_id) {
+        if state.deleting.contains_key(&area_id) {
             return Err(CloudError::PendingOperations(
                 "this area is already being deleted".to_string(),
             ));
         }
+        state.deleting.insert(area_id, FencedPublication::Deferred);
         drop(state);
         self.emit(MapperEvent::AreaStatusChanged { area_id });
-        self.notify.notify_one();
+        self.changed();
         Ok(())
     }
 
@@ -2610,7 +2845,7 @@ impl PendingQueue {
     pub(crate) fn prepare_delete(&self, area_id: AreaId) -> CloudResult<()> {
         let snapshot = {
             let state = self.state.lock();
-            if !state.deleting.contains(&area_id) {
+            if !state.deleting.contains_key(&area_id) {
                 return Err(CloudError::PendingOperations(
                     "this area is not fenced for deletion".to_string(),
                 ));
@@ -2623,7 +2858,7 @@ impl PendingQueue {
         };
         self.write_delete_intents(area_id, &snapshot)?;
         let mut state = self.state.lock();
-        if !state.deleting.contains(&area_id) {
+        if !state.deleting.contains_key(&area_id) {
             return Err(CloudError::PendingOperations(
                 "this area's delete fence changed while it was prepared".to_string(),
             ));
@@ -2642,12 +2877,12 @@ impl PendingQueue {
     /// is already quiescent and need not be retried before deletion.
     pub(crate) async fn wait_until_delete_quiescent(&self, area_id: AreaId) {
         loop {
-            let in_flight = self
-                .state
-                .lock()
-                .areas
-                .get(&area_id)
-                .is_some_and(|area| area.phase == AreaPhase::InFlight);
+            let in_flight = self.state.lock().areas.get(&area_id).is_some_and(|area| {
+                matches!(
+                    area.phase,
+                    AreaPhase::InFlight | AreaPhase::AwaitingPublication
+                )
+            });
             if !in_flight {
                 return;
             }
@@ -2692,7 +2927,7 @@ impl PendingQueue {
             );
         }
         self.emit(MapperEvent::AreaStatusChanged { area_id });
-        self.notify.notify_one();
+        self.changed();
         Ok(removed)
     }
 
@@ -2719,11 +2954,11 @@ impl PendingQueue {
                     envelope.delete_intent = false;
                 }
             }
-            removed_fence || removed_intent
+            removed_fence.is_some() || removed_intent
         };
         if changed {
             self.emit(MapperEvent::AreaStatusChanged { area_id });
-            self.notify.notify_one();
+            self.changed();
         }
         Ok(())
     }
@@ -2745,7 +2980,7 @@ impl PendingQueue {
             }
         }
         self.emit(MapperEvent::AreaStatusChanged { area_id });
-        self.notify.notify_one();
+        self.changed();
     }
 
     /// Resolves a recovered pre-delete intent when the area still exists.
@@ -2780,6 +3015,7 @@ impl PendingQueue {
         area_id: AreaId,
         operation_id: OperationId,
     ) -> CloudResult<Option<PendingEnvelope>> {
+        let mut conflicted = None;
         let removed = {
             let mut state = self.state.lock();
             let Some(area) = state.areas.get_mut(&area_id) else {
@@ -2792,11 +3028,19 @@ impl PendingQueue {
             else {
                 return Ok(None);
             };
-            if position == 0 && area.phase != AreaPhase::Ready {
+            if (position == 0 && area.phase != AreaPhase::Ready)
+                || (area.requires_recovery_base && area.queue[position].local_durable)
+            {
                 return Ok(None);
             }
             self.retire_journal(&area.queue[position])?;
             let removed = area.queue.remove(position);
+            if area.deferred_conflict == Some(operation_id) {
+                area.deferred_conflict = None;
+            }
+            if position == 0 {
+                conflicted = Self::resume_with_deferred_conflict(area);
+            }
             // Cancelling the (non-head) envelope a conflict pause targets
             // leaves nothing to review; reopen the queue.
             if let AreaPhase::Conflict {
@@ -2809,12 +3053,15 @@ impl PendingQueue {
             removed
         };
         self.emit(MapperEvent::AreaStatusChanged { area_id });
+        if let Some(envelope) = conflicted {
+            self.emit_conflict(area_id, envelope);
+        }
         if removed.is_some() {
             self.complete_operation(
                 operation_id,
                 Err("map edit was canceled before acknowledgement".to_string()),
             );
-            self.notify.notify_one();
+            self.changed();
         }
         Ok(removed)
     }
@@ -2906,9 +3153,10 @@ impl PendingQueue {
                 retryable: *retryable,
             },
             AreaPhase::Backoff { .. } => AreaSaveStatus::Offline(pending),
-            AreaPhase::Ready | AreaPhase::InFlight | AreaPhase::AwaitingRetirement { .. } => {
-                AreaSaveStatus::Saving(pending)
-            }
+            AreaPhase::Ready
+            | AreaPhase::InFlight
+            | AreaPhase::AwaitingPublication
+            | AreaPhase::AwaitingRetirement { .. } => AreaSaveStatus::Saving(pending),
         }
     }
 }
@@ -3044,7 +3292,7 @@ mod tests {
         assert_eq!(q.conflicted_operation_id(area), None);
         let (taken, _) = q.take_ready(Instant::now());
         let (_, env, _, _) = taken.expect("head");
-        q.pause_conflict(area, env.operation_id);
+        q.finish_conflict_replay(area, env.operation_id, Some(env.operation_id));
         assert_eq!(q.save_status(area), AreaSaveStatus::ConflictNeedsReview);
         assert_eq!(q.conflicted_operation_id(area), Some(env.operation_id));
 
@@ -3060,7 +3308,7 @@ mod tests {
 
         let (retaken, _) = q.take_ready(Instant::now());
         assert_eq!(retaken.expect("resent").1.operation_id, env.operation_id);
-        q.pause_conflict(area, env.operation_id);
+        q.finish_conflict_replay(area, env.operation_id, Some(env.operation_id));
         // Keep theirs: the conflicted envelope is discarded.
         let resolution = q.resolve_conflict(area, false).expect("keep theirs");
         assert!(resolution.resolved);
@@ -3091,7 +3339,7 @@ mod tests {
         let _ = q.take_ready(Instant::now());
 
         // The sanity check failed on the follower, not the head.
-        q.pause_conflict(area, second_id);
+        q.finish_conflict_replay(area, first_id, Some(second_id));
         let event = loop {
             if let MapperEvent::MutationConflict {
                 operation_id,
@@ -3129,7 +3377,7 @@ mod tests {
         let _ = q.take_ready(Instant::now());
         // The targeted envelope is no longer queued (an interleaved cancel):
         // nothing to review, so the queue must not stick in Conflict.
-        q.pause_conflict(area, Uuid::new_v4());
+        q.finish_conflict_replay(area, first_id, Some(Uuid::new_v4()));
         let (retaken, _) = q.take_ready(Instant::now());
         assert_eq!(retaken.expect("queue reopened").1.operation_id, first_id);
     }
@@ -3604,6 +3852,40 @@ mod tests {
     }
 
     #[test]
+    fn recovered_base_promotes_replayed_conflict_before_dispatch() {
+        for follower_conflicts in [false, true] {
+            let root = journal_test_root();
+            let area = AreaId(Uuid::new_v4());
+            let head = local_durable_envelope("restored head");
+            let head_id = head.operation_id;
+            let follower = local_durable_envelope("restored follower");
+            let failed = if follower_conflicts {
+                follower.operation_id
+            } else {
+                head_id
+            };
+            {
+                let queue = PendingQueue::with_journal(root.clone());
+                queue.enqueue(area, head).expect("head");
+                queue.enqueue(area, follower).expect("follower");
+            }
+            let queue = PendingQueue::with_journal(root.clone());
+            assert!(queue.recovery_base_unavailable(area, "unavailable".to_string()));
+            queue.record_replay_result(area, Some(failed));
+            assert!(queue.recovery_base_loaded(area));
+            assert_eq!(queue.conflicted_operation_id(area), Some(failed));
+            assert!(queue.take_ready(Instant::now()).0.is_none());
+            assert!(
+                queue
+                    .cancel(area, head_id)
+                    .expect("conflicted queue")
+                    .is_none()
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn startup_removes_crash_leftovers_from_retired_namespace() {
         let root = journal_test_root();
         let namespace = "test-backend".to_string();
@@ -3812,6 +4094,142 @@ mod tests {
             restarted.recovered_local_operations().is_empty(),
             "acknowledged local work cannot replay after restart"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replay_conflict_waits_for_request_and_journal_publication() {
+        let root = journal_test_root();
+        let area = AreaId(Uuid::new_v4());
+        let queue = PendingQueue::with_journal(root.clone());
+        let head = local_durable_envelope("decided head");
+        let head_id = head.operation_id;
+        let follower = local_durable_envelope("dependent follower");
+        let follower_id = follower.operation_id;
+        queue.enqueue(area, head).expect("head");
+        queue.enqueue(area, follower).expect("follower");
+        queue.take_ready(Instant::now()).0.expect("dispatch");
+
+        queue.pause_conflict(area, follower_id);
+        assert!(queue.is_in_flight_at_generation(area, head_id, None, 0));
+        assert_eq!(queue.conflicted_operation_id(area), None);
+        assert!(
+            !queue
+                .resolve_conflict(area, true)
+                .expect("no review")
+                .resolved
+        );
+        assert!(
+            queue
+                .cancel(area, head_id)
+                .expect("protected head")
+                .is_none()
+        );
+
+        queue.pause_for_upgrade();
+        assert!(queue.is_in_flight_at_generation(area, head_id, None, 0));
+        assert!(
+            queue
+                .cancel(area, head_id)
+                .expect("live local request")
+                .is_none()
+        );
+        queue.resume_after_upgrade();
+
+        assert!(queue.hold_journaled(area, head_id));
+        queue.finish_conflict_replay(area, head_id, Some(follower_id));
+        queue.ready_resend(area);
+        queue.pause_for_upgrade();
+        queue.resume_after_upgrade();
+        assert_eq!(queue.conflicted_operation_id(area), None);
+        assert!(queue.take_ready(Instant::now()).0.is_none());
+        assert!(queue.cancel(area, head_id).expect("decided head").is_none());
+
+        assert!(queue.acknowledge(area, head_id, Some(2)));
+        assert_eq!(queue.conflicted_operation_id(area), Some(follower_id));
+        assert!(queue.take_ready(Instant::now()).0.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_replay_or_cancellation_clears_only_deferred_conflicts() {
+        for cancel in [false, true] {
+            let queue = PendingQueue::new();
+            let area = AreaId(Uuid::new_v4());
+            let head = envelope("head");
+            let head_id = head.operation_id;
+            let follower = envelope("follower");
+            let follower_id = follower.operation_id;
+            queue.enqueue(area, head).expect("head");
+            queue.enqueue(area, follower).expect("follower");
+            queue.take_ready(Instant::now()).0.expect("dispatch");
+            queue.record_replay_result(area, Some(follower_id));
+            if cancel {
+                assert!(
+                    queue
+                        .cancel(area, follower_id)
+                        .expect("cancel follower")
+                        .is_some()
+                );
+            } else {
+                queue.record_replay_result(area, None);
+            }
+            assert!(queue.is_in_flight_at_generation(area, head_id, None, 0));
+            assert!(queue.acknowledge(area, head_id, Some(2)));
+            assert_eq!(queue.conflicted_operation_id(area), None);
+            if !cancel {
+                queue.pause_conflict(area, follower_id);
+                queue.record_replay_result(area, None);
+                assert_eq!(queue.conflicted_operation_id(area), Some(follower_id));
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_conflict_survives_failed_acknowledgement_retirement() {
+        let root = journal_test_root();
+        let area = AreaId(Uuid::new_v4());
+        let queue = PendingQueue::with_journal(root.clone());
+        let head = local_durable_envelope("head");
+        let head_id = head.operation_id;
+        let follower = local_durable_envelope("follower");
+        let follower_id = follower.operation_id;
+        queue.enqueue(area, head).expect("head");
+        queue.enqueue(area, follower).expect("follower");
+        queue.take_ready(Instant::now()).0.expect("dispatch");
+        assert!(queue.hold_journaled(area, head_id));
+        queue.record_replay_result(area, Some(follower_id));
+
+        let acknowledged = queue.pending_for(area)[0]
+            .journal_path
+            .as_ref()
+            .expect("journal path")
+            .with_extension("ack");
+        fs::create_dir(&acknowledged).expect("block retirement");
+        assert!(!queue.acknowledge(area, head_id, Some(2)));
+        queue.record_replay_result(area, Some(follower_id));
+        assert_eq!(queue.conflicted_operation_id(area), None);
+        assert!(
+            queue
+                .cancel(area, head_id)
+                .expect("protected head")
+                .is_none()
+        );
+        assert!(
+            queue
+                .retry_ready_retirement(Instant::now() + Duration::from_hours(1))
+                .0
+                .is_none()
+        );
+        fs::remove_dir(&acknowledged).expect("unblock retirement");
+        assert_eq!(
+            queue
+                .retry_ready_retirement(Instant::now() + Duration::from_hours(2))
+                .0,
+            Some((area, head_id))
+        );
+        assert_eq!(queue.conflicted_operation_id(area), Some(follower_id));
+        assert!(queue.take_ready(Instant::now()).0.is_none());
         let _ = fs::remove_dir_all(root);
     }
 

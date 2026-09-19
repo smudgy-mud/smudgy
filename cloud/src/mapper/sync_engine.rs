@@ -65,7 +65,7 @@ pub(super) fn spawn(inner: &Arc<Inner>) {
     let weak = Arc::downgrade(inner);
     let notify = inner.sync_notify.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut engine = Engine::new();
 
         loop {
@@ -78,13 +78,23 @@ pub(super) fn spawn(inner: &Arc<Inner>) {
             // explicit request: a local edit, a login, or the map editor's Sync
             // button all call `Mapper::sync_now`. No periodic timer — the cloud
             // is contacted only on user or app action.
-            notify.notified().await;
+            tokio::select! {
+                () = notify.notified() => {},
+                result = async {
+                    match engine.cloud_changes.as_mut() {
+                        Some(changes) => changes.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => if result.is_err() { engine.cloud_changes = None; },
+            }
         }
     });
+    inner.background_tasks.lock().push(task.abort_handle());
 }
 
 /// Per-task reconciliation state.
 struct Engine {
+    cloud_changes: Option<tokio::sync::watch::Receiver<u64>>,
     /// The row set as of the last fully-applied tick; ids whose refetch was
     /// deferred are kept dirty here so the next tick retries them.
     prev_rows: HashMap<AreaId, SyncRow>,
@@ -96,16 +106,21 @@ struct Engine {
 impl Engine {
     fn new() -> Self {
         Self {
+            cloud_changes: None,
             prev_rows: HashMap::new(),
             last_auth_generation: None,
         }
     }
 
     async fn tick(&mut self, inner: &Inner) {
+        if let Some(changes) = &mut self.cloud_changes {
+            changes.borrow_and_update();
+        }
         set_state(inner, SyncState::Syncing);
 
         let auth_generation = inner.backend.auth_generation();
         if self.last_auth_generation != Some(auth_generation) {
+            self.cloud_changes = None;
             // Credential changed (or first tick): the viewer may differ, so
             // forget prior rows — a full resync follows naturally — and let
             // the caching layer re-namespace its disk cache. The generation is
@@ -131,6 +146,7 @@ impl Engine {
                         return;
                     }
                     self.last_auth_generation = Some(auth_generation);
+                    self.cloud_changes = inner.backend.cloud_changes();
                 }
                 Err(CloudError::NotFoundOrNoAccess) => {
                     if !inner.activate_pending_viewer(None, auth_generation) {
@@ -138,6 +154,7 @@ impl Engine {
                         return;
                     }
                     self.last_auth_generation = Some(auth_generation);
+                    self.cloud_changes = inner.backend.cloud_changes();
                 }
                 Err(err) => {
                     warn!("Failed to resolve viewer identity: {err}");
@@ -223,6 +240,22 @@ impl Engine {
         if inner.backend.auth_generation() != auth_generation {
             return false;
         }
+        // Local documents are adopted as one generation by local_projection.
+        // An HTTP response must never publish individual pieces of that graph.
+        let mut local = inner.local_projection.lock().known.clone();
+        local.extend(inner.backend.local_area_ids());
+        let cloud_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| !local.contains(&row.area_id))
+            .cloned()
+            .collect();
+        let rows = cloud_rows.as_slice();
+        let pre_fetch_ids: HashSet<_> = pre_fetch_ids
+            .iter()
+            .filter(|id| !local.contains(id))
+            .copied()
+            .collect();
+        self.prev_rows.retain(|id, _| !local.contains(id));
         note_rows_confirmed(inner, rows);
 
         let prev = std::mem::take(&mut self.prev_rows);
@@ -260,6 +293,9 @@ impl Engine {
         // intent even when the sync row itself is unchanged. Force a point
         // fetch so area presence can durably abort that intent.
         for area_id in inner.pending.recovery_area_ids() {
+            if local.contains(&area_id) {
+                continue;
+            }
             if new_rows.contains_key(&area_id)
                 && !to_refetch
                     .iter()
@@ -274,14 +310,12 @@ impl Engine {
                 return false;
             }
             inner.backend.purge_area(area_id).await;
+            let _gate = inner.mutation_gate.lock();
             if inner.backend.auth_generation() != auth_generation {
                 return false;
             }
             if inner.atlas_cache.load().get_area(area_id).is_some() {
-                inner
-                    .atlas_cache
-                    .rcu(|cache| Arc::new(cache.delete_area(*area_id)));
-                inner.sync_revision.fetch_add(1, Ordering::AcqRel);
+                inner.publish_areas(&[], &[*area_id]);
             }
         }
 
@@ -311,6 +345,7 @@ impl Engine {
             .recovery_area_ids()
             .into_iter()
             .filter(|area_id| !new_rows.contains_key(area_id))
+            .filter(|area_id| !local.contains(area_id))
             .collect();
         for area_id in absent_recovery {
             match refetch_area(inner, &area_id, auth_generation).await {
@@ -326,28 +361,9 @@ impl Engine {
                     | CloudError::PermissionDenied(_)
                     | CloudError::AreaNotFound(_),
                 ) => {
-                    if inner.pending.has_delete_intent(area_id) {
-                        match inner.pending.commit_recovered_delete(area_id) {
-                            Ok(discarded) => {
-                                inner.account_deleted_pending(area_id, &discarded);
-                            }
-                            Err(error) => {
-                                warn!(
-                                    "Failed to commit recovered delete intent for area {area_id}: {error}"
-                                );
-                                deferred.insert(area_id);
-                            }
-                        }
-                        continue;
-                    }
-                    let message = format!(
-                        "saved edits for area {area_id} cannot be restored because the area is unavailable; access may have changed or the area may have been deleted"
-                    );
-                    if inner.pending.recovery_base_unavailable(area_id, message) {
-                        inner
-                            .sync_stats
-                            .operations_failed
-                            .fetch_add(1, Ordering::Relaxed);
+                    if let Err(error) = inner.recover_unavailable_area(area_id) {
+                        warn!("Could not reconcile unavailable area {area_id}: {error}");
+                        deferred.insert(area_id);
                     }
                 }
                 Err(err) => {
@@ -365,12 +381,11 @@ impl Engine {
                 // blank the area rather than keep rendering the old
                 // projection (the refetch re-adds it on success).
                 inner.backend.purge_area(area_id).await;
+                let _gate = inner.mutation_gate.lock();
                 if inner.backend.auth_generation() != auth_generation {
                     return false;
                 }
-                inner
-                    .atlas_cache
-                    .rcu(|cache| Arc::new(cache.delete_area(*area_id)));
+                inner.publish_areas(&[], &[*area_id]);
             }
             let has_cached_base = inner.atlas_cache.load().get_area(area_id).is_some();
             let requires_recovery_base = inner.pending.requires_recovery_base(*area_id);
@@ -458,10 +473,12 @@ impl Engine {
 }
 
 fn clear_cloud_projection(inner: &Inner) {
-    let local = inner.backend.local_area_ids();
+    let _gate = inner.mutation_gate.lock();
+    let mut local = inner.local_projection.lock().known.clone();
+    local.extend(inner.backend.local_area_ids());
     let ephemeral = inner.backend.ephemeral_area_ids();
     let local_atlases = inner.backend.local_atlas_ids();
-    inner.atlas_cache.rcu(|cache| {
+    inner.publish_cache(|cache| {
         let retained = cache
             .areas()
             .filter(|area| {
@@ -476,7 +493,6 @@ fn clear_cloud_projection(inner: &Inner) {
         .atlas_storage_by_id
         .lock()
         .retain(|atlas_id, _| local_atlases.contains(atlas_id));
-    inner.sync_revision.fetch_add(1, Ordering::AcqRel);
     inner
         .auth_projection_revision
         .fetch_add(1, Ordering::AcqRel);
@@ -559,9 +575,7 @@ async fn refetch_area(inner: &Inner, area_id: &AreaId, auth_generation: u64) -> 
     if cloud_area && inner.backend.auth_generation() != auth_generation {
         return Err(CloudError::CredentialChanged);
     }
-    if inner.pending.has_delete_intent(*area_id) {
-        inner.pending.abort_recovered_delete(*area_id)?;
-    }
+    inner.pending.abort_recovered_delete(*area_id)?;
     let (confirmed_rev, _) = inner.pending.confirmed_rev(*area_id);
     if fetched_revision_is_stale(confirmed_before_fetch, confirmed_rev, details.area.rev) {
         warn!(
@@ -593,10 +607,7 @@ async fn refetch_area(inner: &Inner, area_id: &AreaId, auth_generation: u64) -> 
         return Ok(true);
     }
 
-    let failed = inner.replay_pending_over_locked(*area_id, &details, ReplayMode::StopAtFailure);
-    if let Some(operation_id) = failed {
-        inner.pending.pause_conflict(*area_id, operation_id);
-    }
+    inner.replay_pending_over_locked(*area_id, &details, ReplayMode::StopAtFailure);
     if inner.pending.recovery_base_loaded(*area_id) {
         inner
             .sync_stats
@@ -691,7 +702,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use parking_lot::Mutex;
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
     use tokio::sync::Semaphore;
     use uuid::Uuid;
 
@@ -1298,6 +1309,55 @@ mod tests {
             &cached_a,
             &std::iter::once(area_b).collect()
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_request_settles_before_notifying() {
+        let backend = ScriptedBackend::new();
+        let id = AreaId(Uuid::new_v4());
+        let area = sample_area(id, 1, Some(SHARED_EDIT), Some("h1"));
+        backend.put_area(area.clone());
+        backend.set_rows(vec![ScriptedBackend::row_for(&area)]);
+        let mapper = new_mapper(&backend).await;
+        *backend.update_gate.lock() = Some(Arc::new(Semaphore::new(0)));
+        let rename = {
+            let mapper = mapper.clone();
+            tokio::spawn(async move { mapper.rename_area(id, "cancelled").await })
+        };
+        wait_until(|| {
+            mapper
+                .inner
+                .metadata_writes_by_area
+                .lock()
+                .contains_key(&id)
+        })
+        .await;
+        let notify = mapper.inner.pending.projection_changes();
+        // Consume startup signals before testing this request's settlement.
+        while tokio::time::timeout(Duration::from_millis(1), notify.notified())
+            .await
+            .is_ok()
+        {}
+        rename.abort();
+        assert!(rename.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .unwrap();
+        assert!(
+            !mapper
+                .inner
+                .metadata_writes_by_area
+                .lock()
+                .contains_key(&id)
+        );
+        assert!(!mapper.inner.pending_by_area.lock().contains_key(&id));
+        assert_eq!(mapper.inner.sync_stats.operations_sent(), 1);
+        assert_eq!(mapper.inner.sync_stats.operations_failed(), 1);
+        assert_eq!(mapper.inner.sync_stats.pending_operations(), 0);
+        assert_eq!(
+            mapper.get_current_atlas().get_area(&id).unwrap().get_name(),
+            area.area.name
+        );
     }
 
     #[tokio::test]

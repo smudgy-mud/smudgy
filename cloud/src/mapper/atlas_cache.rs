@@ -523,11 +523,6 @@ impl AtlasCache {
     }
 
     #[must_use]
-    pub(super) fn add_area(&self, area_id: AreaId, area: Arc<AreaCache>) -> Self {
-        self.insert_area(area_id, area)
-    }
-
-    #[must_use]
     pub(super) fn insert_area(&self, area_id: AreaId, area: Arc<AreaCache>) -> Self {
         let mut next = self.clone();
         next.apply_insert(area_id, area);
@@ -978,10 +973,7 @@ fn insert_match<K>(
     let entry = (area_id, room.clone());
     if let Some(matches) = table.get_mut(&key) {
         if owned {
-            let prefix = matches
-                .iter()
-                .take_while(|(id, _)| owned_areas.contains(id))
-                .count();
+            let prefix = matches.partition_point(|(id, _)| owned_areas.contains(id));
             matches.insert(prefix, entry);
         } else {
             matches.push(entry);
@@ -1026,10 +1018,7 @@ fn insert_area_match<K>(
 {
     if let Some(matches) = table.get_mut(&key) {
         if owned {
-            let prefix = matches
-                .iter()
-                .take_while(|id| owned_areas.contains(id))
-                .count();
+            let prefix = matches.partition_point(|id| owned_areas.contains(id));
             matches.insert(prefix, area_id);
         } else {
             matches.push(area_id);
@@ -2406,7 +2395,7 @@ mod tests {
         let (_, cache_b) = cache_area(b_id, false, vec![b1, b3]);
         let atlas_incremental = atlas_incremental.insert_area(b_id, cache_b);
         let (_, cache_c) = cache_area(c_id, true, vec![room(9, "Delta", Vec::new())]);
-        let atlas_incremental = atlas_incremental.add_area(c_id, cache_c);
+        let atlas_incremental = atlas_incremental.insert_area(c_id, cache_c);
         // ...including a retitle, a room deletion, and an area deletion.
         let area_a = atlas_incremental.get_area(&a_id).expect("area a");
         let retitled = area_a.upsert_room(

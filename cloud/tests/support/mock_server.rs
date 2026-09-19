@@ -231,6 +231,10 @@ fn router(state: Shared) -> Router {
 /// server's `enforce_client_version`. No-op unless a test raised the floor via
 /// [`MockHandle::set_min_client_version`].
 async fn version_gate(State(state): State<Shared>, request: Request, next: Next) -> Response {
+    state.lock().http_requests.push((
+        request.method().to_string(),
+        request.uri().path().to_string(),
+    ));
     let (rejection, upgrade) = {
         let st = state.lock();
         let headers = request.headers();

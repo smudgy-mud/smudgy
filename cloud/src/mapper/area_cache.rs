@@ -230,8 +230,8 @@ impl AreaCache {
 
         let rooms: Vec<Arc<RoomCache>> = area
             .rooms
-            .iter()
-            .map(|r| Arc::new(r.clone().into()))
+            .into_iter()
+            .map(|room| Arc::new(room.into()))
             .collect();
         let rooms_by_number = rooms
             .iter()
@@ -239,12 +239,12 @@ impl AreaCache {
             .collect();
         let properties = area
             .properties
-            .iter()
+            .into_iter()
             .map(|p| {
                 (
-                    p.name.clone(),
+                    p.name,
                     PropertyEntry {
-                        value: p.value.clone(),
+                        value: p.value,
                         is_secret: p.is_secret,
                     },
                 )
@@ -649,6 +649,19 @@ impl AreaCache {
         }
     }
 
+    pub(super) fn with_local_metadata(&self, area: &crate::Area) -> Self {
+        let mut updated = self.clone();
+        updated.name.clone_from(&area.name);
+        updated.meta.atlas_id = area.atlas_id;
+        updated.meta.atlas_name.clone_from(&area.atlas_name);
+        updated.rev = (self.rev + 1).max(area.rev);
+        updated
+    }
+
+    pub(super) fn advance_revision(&mut self, revision: i64) {
+        self.rev = self.rev.max(revision + 1);
+    }
+
     /// Returns a copy filed into `atlas_id` (`Some`) or pulled loose
     /// (`None`). Bumps `rev` like other local edits so an open editor on the
     /// area notices; the folder regrouping itself is read fresh from
@@ -719,6 +732,12 @@ impl AreaCache {
     #[must_use]
     pub fn next_room_number(&self) -> RoomNumber {
         RoomNumber(self.max_room_number.0 + 1)
+    }
+
+    /// Keeps an exhausted allocation cursor representable for merge planning
+    /// and reservations, without wrapping into an occupied room number.
+    pub(crate) fn room_number_floor(&self) -> i64 {
+        i64::from(self.max_room_number.0) + 1
     }
 
     #[must_use]

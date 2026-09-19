@@ -1,4 +1,32 @@
-use crate::backends::{MapperBackend, area_edits};
+//! Session map views, optimistic edits, and completion of backend writes.
+//!
+//! Readers pin immutable [`AtlasCache`] values through `ArcSwap`; reading a
+//! map takes no writer lock. [`pending`] owns the durable edit queue and its
+//! send/retry/review phases. [`projection`] folds confirmed documents with that
+//! queue. [`local_projection`] adopts complete store generations, while
+//! [`sync_engine`] reconciles cloud changes under the current credentials.
+//!
+//! The local store owns journal replay. [`recovery`] owns session completion
+//! after a decided write becomes visible: mutation acknowledgements, merge
+//! fences, and reserved room numbers. A failed recovery preserves readable
+//! maps and retains those obligations. Queue wakes retry adoption; automatic
+//! disk recovery runs at most once per observed store generation.
+//!
+//! [`merge`] orchestrates multi-area edits: validate tier and inputs, drain
+//! queues within a deadline, fence touched areas, prepare and commit, then
+//! publish before releasing fences. Delete/move fences hold queue followers;
+//! metadata-write fences defer adoption during rename/move; room-number holds
+//! keep open drafts out of a merge's allocation range. Each has an owned guard
+//! so cancellation cannot abandon a decided write or strand a pre-commit hold.
+//!
+//! Synchronous publication lock order is `mutation_gate`, `local_projection`,
+//! `recovery`, then short-lived pending/reservation bookkeeping locks. Recovery
+//! registration releases its lock before requesting adoption. Never hold these
+//! synchronous guards across an await. Async load, import, and atlas-catalog
+//! gates serialize their respective operations; backend writer locks belong to
+//! the stores. Store commits finish before session publication takes its locks.
+
+use crate::backends::{AreaMergeCommit, AreaMergePlan, AreaMergeSource, MapperBackend, area_edits};
 use crate::error::CloudResult;
 use crate::mapper::area_cache::AreaCache;
 use crate::mapper::exit_cache::ExitCache;
@@ -28,6 +56,14 @@ use uuid::Uuid;
 pub mod area_cache;
 pub mod atlas_cache;
 pub mod exit_cache;
+mod local_projection;
+mod merge;
+#[cfg(test)]
+use merge::MERGE_DRAIN_TIMEOUT;
+mod projection;
+mod recovery;
+use projection::{CommittedChange, MetadataChange};
+use recovery::{MergeRecovery, SessionRecovery};
 pub mod pending;
 pub mod room_cache;
 pub mod room_connection;
@@ -680,69 +716,57 @@ impl SyncStats {
 /// Tracks an acknowledged (non-journaled) metadata request through shutdown
 /// draining and sync-engine refetch deferral. Cancellation counts as failure
 /// and always releases the per-area marker.
-struct AcknowledgedWrite {
+struct AcknowledgedWrite<'a> {
+    inner: &'a Inner,
     area_id: AreaId,
-    pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
-    metadata_writes_by_area: Option<Arc<Mutex<HashMap<AreaId, u64>>>>,
-    stats: Arc<SyncStats>,
-    settled: bool,
+    metadata: bool,
+    succeeded: bool,
 }
 
-impl AcknowledgedWrite {
-    fn new(
-        area_id: AreaId,
-        pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
-        stats: Arc<SyncStats>,
-    ) -> Self {
-        stats.operations_sent.fetch_add(1, Ordering::Relaxed);
-        *pending_by_area.lock().entry(area_id).or_insert(0) += 1;
+impl<'a> AcknowledgedWrite<'a> {
+    fn new(inner: &'a Inner, area_id: AreaId) -> Self {
+        inner
+            .sync_stats
+            .operations_sent
+            .fetch_add(1, Ordering::Relaxed);
+        *inner.pending_by_area.lock().entry(area_id).or_insert(0) += 1;
         Self {
+            inner,
             area_id,
-            pending_by_area,
-            metadata_writes_by_area: None,
-            stats,
-            settled: false,
+            metadata: false,
+            succeeded: false,
         }
     }
 
-    fn new_metadata(
-        area_id: AreaId,
-        pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
-        metadata_writes_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
-        stats: Arc<SyncStats>,
-    ) -> Self {
-        let mut write = Self::new(area_id, pending_by_area, stats);
-        *metadata_writes_by_area.lock().entry(area_id).or_insert(0) += 1;
-        write.metadata_writes_by_area = Some(metadata_writes_by_area);
+    fn new_metadata(inner: &'a Inner, area_id: AreaId) -> Self {
+        let mut write = Self::new(inner, area_id);
+        *inner
+            .metadata_writes_by_area
+            .lock()
+            .entry(area_id)
+            .or_insert(0) += 1;
+        write.metadata = true;
         write
     }
 
-    fn release_metadata_marker(&self) {
-        if let Some(writes) = &self.metadata_writes_by_area {
-            Inner::decrement_pending(writes, self.area_id);
-        }
-    }
-
     fn settle(mut self, succeeded: bool) {
-        let counter = if succeeded {
-            &self.stats.operations_succeeded
-        } else {
-            &self.stats.operations_failed
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-        Inner::decrement_pending(&self.pending_by_area, self.area_id);
-        self.release_metadata_marker();
-        self.settled = true;
+        self.succeeded = succeeded;
     }
 }
 
-impl Drop for AcknowledgedWrite {
+impl Drop for AcknowledgedWrite<'_> {
     fn drop(&mut self) {
-        if !self.settled {
-            self.stats.operations_failed.fetch_add(1, Ordering::Relaxed);
-            Inner::decrement_pending(&self.pending_by_area, self.area_id);
-            self.release_metadata_marker();
+        let counter = if self.succeeded {
+            &self.inner.sync_stats.operations_succeeded
+        } else {
+            &self.inner.sync_stats.operations_failed
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if self.metadata {
+            Inner::decrement_count(&self.inner.metadata_writes_by_area, self.area_id, 1);
         }
+        // Wake reconciliation only after every marker has been released.
+        self.inner.settle_pending(self.area_id, 1);
     }
 }
 
@@ -791,6 +815,22 @@ impl AreaDeleteFence {
         }
     }
 
+    /// Reopens an area that was fenced without being deleted: an operation
+    /// that froze several documents together (a merge's destination and its
+    /// third parties) and has either finished with them or given up before
+    /// writing anything. The area and its queued WAL resume exactly as they
+    /// were; there is no intent to reconcile because no delete was ever
+    /// requested for it.
+    fn release(mut self) {
+        self.armed = false;
+        if let Err(error) = self.pending.abort_delete(self.area_id) {
+            warn!(
+                "failed to durably release the fence on area {}: {error}; keeping the area fenced",
+                self.area_id
+            );
+        }
+    }
+
     fn commit(mut self) -> CloudResult<Vec<PendingEnvelope>> {
         match self.pending.commit_delete(self.area_id) {
             Ok(removed) => {
@@ -831,6 +871,20 @@ pub(crate) struct AreaMoveFence {
     delete_fence: Option<AreaDeleteFence>,
 }
 
+struct RoomNumberHold {
+    inner: std::sync::Weak<Inner>,
+    area: AreaId,
+    token: Uuid,
+}
+
+impl Drop for RoomNumberHold {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.release_room_reservations(&self.area, self.token);
+        }
+    }
+}
+
 impl AreaMoveFence {
     #[must_use]
     pub(crate) fn area_id(&self) -> AreaId {
@@ -841,6 +895,32 @@ impl AreaMoveFence {
         self.delete_fence
             .take()
             .expect("a move fence is committed at most once")
+    }
+
+    /// Reopens the area without deleting it (see [`AreaDeleteFence::release`]).
+    fn release(self) {
+        self.into_delete_fence().release();
+    }
+
+    /// Retires the area's queue after a backend transaction that already
+    /// deleted the area alongside others: the same prepare-then-commit the
+    /// standalone delete performs, minus the request in between. The
+    /// returned envelopes are the unsent edits the deletion discarded; the
+    /// caller accounts for them exactly as a completed delete does.
+    fn commit_deleted(self) -> CloudResult<Vec<PendingEnvelope>> {
+        let mut fence = self.into_delete_fence();
+        // The backend has already committed, so the intent must not abort
+        // here: a queue verified drained before the transaction has no
+        // durable record to mark, and a marker failure on one that somehow
+        // does falls through to the tombstone the commit writes itself.
+        if let Err(error) = fence.prepare() {
+            warn!(
+                "failed to record the delete intent for merged area {}: {error}",
+                fence.area_id
+            );
+        }
+        fence.request_started();
+        fence.commit()
     }
 }
 
@@ -872,6 +952,10 @@ pub struct Inner {
     /// metadata even when `/me` or the subsequent atlas fetch fails.
     auth_projection_revision: AtomicU64,
     sync_notify: Arc<Notify>,
+    local_projection: Mutex<local_projection::LocalProjection>,
+    local_published: tokio::sync::watch::Sender<u64>,
+    recovery: Mutex<SessionRecovery>,
+    background_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     /// In-flight local write operations per area; the sync engine defers
     /// refetching an area while its count is non-zero.
     pending_by_area: Arc<Mutex<HashMap<AreaId, u64>>>,
@@ -892,8 +976,9 @@ pub struct Inner {
     ephemeral_cap_warned: AtomicBool,
 
     /// Initial-load gate for presence-checked imports: `None` until the first
-    /// [`Inner::load_all_areas`] completes, then whether it succeeded.
-    initial_load: tokio::sync::watch::Sender<Option<bool>>,
+    /// load completes, then its result for scripts and the startup summary.
+    initial_load: tokio::sync::watch::Sender<Option<CloudResult<LoadMapsSummary>>>,
+    load_gate: tokio::sync::Mutex<()>,
     /// Serializes presence-checked imports so two concurrent seeds cannot
     /// both miss (and then both import) the same area name.
     import_gate: tokio::sync::Mutex<()>,
@@ -902,20 +987,22 @@ pub struct Inner {
     /// cache order and replay order must never diverge.
     mutation_gate: Mutex<()>,
     /// Room numbers handed out to open scripted mutators but not yet
-    /// occupied by a committed room (see [`Mapper::reserve_room_number`]).
-    /// Every ambient allocation path consults this through
-    /// [`Mapper::next_room_number`] so a draft and a concurrent create can
-    /// never receive the same number.
+    /// occupied by a committed room (see [`Mapper::reserve_room_number`]),
+    /// and the band an in-flight merge may fill (see
+    /// [`Inner::hold_room_number_floor`]). Every ambient allocation path
+    /// consults this through [`Mapper::next_room_number`] so a draft and a
+    /// concurrent create can never receive the same number.
     room_reservations: Mutex<HashMap<AreaId, RoomReservations>>,
 }
 
 /// Per-area reservation state: the next number a reservation would take and
-/// the tokens (one per open mutator) holding numbers below it. The entry is
-/// dropped when the last holder releases, returning allocation to the cache
-/// maximum — an aborted mutator's numbers become available again.
+/// the tokens (one per open mutator, one per in-flight merge) holding
+/// numbers below it. The entry is dropped when the last holder releases,
+/// returning allocation to the cache maximum — an aborted mutator's numbers
+/// and a failed merge's band become available again.
 #[derive(Debug, Default)]
 struct RoomReservations {
-    floor: i32,
+    floor: i64,
     holders: HashMap<Uuid, u32>,
 }
 
@@ -932,6 +1019,14 @@ pub struct AreasImportedIfAbsent {
 impl std::fmt::Debug for Mapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[Mapper]")
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for task in self.background_tasks.get_mut().drain(..) {
+            task.abort();
+        }
     }
 }
 
@@ -1000,12 +1095,17 @@ impl Mapper {
             sync_revision: AtomicU64::new(0),
             auth_projection_revision: AtomicU64::new(0),
             sync_notify: Arc::new(Notify::new()),
+            local_projection: Mutex::new(local_projection::LocalProjection::default()),
+            local_published: tokio::sync::watch::channel(0).0,
+            recovery: Mutex::new(SessionRecovery::default()),
+            background_tasks: Mutex::new(Vec::new()),
             pending_by_area: Arc::new(Mutex::new(pending_by_area)),
             metadata_writes_by_area: Arc::new(Mutex::new(HashMap::new())),
             accounted_operations: Mutex::new(accounted_operations),
             pending,
             ephemeral_cap_warned: AtomicBool::new(false),
             initial_load: tokio::sync::watch::channel(None).0,
+            load_gate: tokio::sync::Mutex::new(()),
             import_gate: tokio::sync::Mutex::new(()),
             mutation_gate: Mutex::new(()),
             room_reservations: Mutex::new(HashMap::new()),
@@ -1016,6 +1116,7 @@ impl Mapper {
         };
 
         Inner::spawn_mutation_worker(&mapper.inner);
+        local_projection::spawn(&mapper.inner);
 
         if supports_sync {
             sync_engine::spawn(&mapper.inner);
@@ -1024,10 +1125,31 @@ impl Mapper {
         mapper
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_local_updates_for_test(&self) {
+        if let Some(task) = self.inner.background_tasks.lock().first() {
+            task.abort();
+        }
+    }
+
     /// Wake the background sync engine for an immediate tick (no-op when the
     /// backend has no sync support).
     pub fn sync_now(&self) {
-        self.inner.sync_notify.notify_one();
+        self.inner.request_sync();
+    }
+
+    /// Reload externally changed local files and recover any decided local
+    /// transaction, then adopt the resulting generation in this session.
+    ///
+    /// # Errors
+    /// Reports filesystem and transaction recovery failures, retaining the
+    /// previous committed snapshot until recovery succeeds.
+    pub async fn refresh_local_store(&self) -> CloudResult<()> {
+        self.inner.backend.refresh_local().await?;
+        local_projection::adopt_refreshed(&self.inner);
+        local_projection::adopt_and_wait(&self.inner).await;
+        self.inner.pending.projection_changed();
+        Ok(())
     }
 
     /// Snapshot of the sync engine's current status.
@@ -1200,7 +1322,7 @@ impl Mapper {
     pub fn area_storage(&self, area_id: &AreaId) -> MapStorage {
         if self.inner.backend.ephemeral_area_ids().contains(area_id) {
             MapStorage::Session
-        } else if self.inner.backend.local_area_ids().contains(area_id) {
+        } else if self.inner.is_local_projection(*area_id) {
             MapStorage::Local
         } else {
             MapStorage::Cloud
@@ -1219,7 +1341,7 @@ impl Mapper {
     /// `createRoom`, the map editor's place/paste gestures) must allocate
     /// through this rather than the raw cache maximum, or a concurrent
     /// mutator draft and the ambient create would silently merge into one
-    /// room. Returns `None` when the area is not loaded.
+    /// room. Returns `None` when the area is not loaded or numbers are exhausted.
     #[must_use]
     pub fn next_room_number(&self, area_id: &AreaId) -> Option<RoomNumber> {
         let base = self
@@ -1227,11 +1349,10 @@ impl Mapper {
             .atlas_cache
             .load()
             .get_area(area_id)?
-            .next_room_number()
-            .0;
+            .room_number_floor();
         let reservations = self.inner.room_reservations.lock();
         let floor = reservations.get(area_id).map_or(base, |state| state.floor);
-        Some(RoomNumber(base.max(floor)))
+        i32::try_from(base.max(floor)).ok().map(RoomNumber)
     }
 
     /// Reserve the next free room number for an open scripted mutator.
@@ -1242,6 +1363,7 @@ impl Mapper {
     ///
     /// # Errors
     /// [`CloudError::AreaNotFound`] when the area is not loaded.
+    /// [`CloudError::InvalidInput`] when no further room number is representable.
     pub fn reserve_room_number(&self, area_id: &AreaId, token: Uuid) -> CloudResult<RoomNumber> {
         let base = self
             .inner
@@ -1249,27 +1371,22 @@ impl Mapper {
             .load()
             .get_area(area_id)
             .ok_or(CloudError::AreaNotFound(*area_id))?
-            .next_room_number()
-            .0;
+            .room_number_floor();
         let mut reservations = self.inner.room_reservations.lock();
         let state = reservations.entry(*area_id).or_default();
         let number = base.max(state.floor);
+        let allocated = i32::try_from(number)
+            .map_err(|_| CloudError::InvalidInput("room number space is exhausted".into()))?;
         state.floor = number + 1;
         *state.holders.entry(token).or_insert(0) += 1;
-        Ok(RoomNumber(number))
+        Ok(RoomNumber(allocated))
     }
 
     /// Release every room-number reservation held under `token` for an
     /// area. Idempotent; when the last holder releases, allocation falls
     /// back to the cache maximum.
     pub fn release_room_reservations(&self, area_id: &AreaId, token: Uuid) {
-        let mut reservations = self.inner.room_reservations.lock();
-        if let Some(state) = reservations.get_mut(area_id) {
-            state.holders.remove(&token);
-            if state.holders.is_empty() {
-                reservations.remove(area_id);
-            }
-        }
+        self.inner.release_room_reservations(area_id, token);
     }
 
     /// Area ids in session storage — the set the editor's atlas tree and
@@ -1352,6 +1469,30 @@ impl Mapper {
             .collect()
     }
 
+    /// Keep the content and its deletion precondition paired across adoption.
+    /// Recheck review status because a newly adopted base can conflict with
+    /// queued edits after a relocation acquired its source fences.
+    pub(crate) fn snapshot_relocation_sources(
+        &self,
+        area_ids: &[AreaId],
+    ) -> CloudResult<(Vec<AreaWithDetails>, Vec<Option<i64>>)> {
+        let _gate = self.inner.mutation_gate.lock();
+        // An ordinary copy remains available for maps awaiting review. An
+        // atlas move also reaches here through its inner copy operation.
+        for id in area_ids {
+            if self.inner.pending.is_delete_fenced(*id) {
+                self.inner
+                    .ensure_move_sources_reviewed(std::slice::from_ref(id))?;
+            }
+        }
+        let documents = self.snapshot_areas(area_ids)?;
+        let revisions = area_ids
+            .iter()
+            .map(|id| self.confirmed_area_rev(*id))
+            .collect();
+        Ok((documents, revisions))
+    }
+
     /// Populates a freshly created **local-tier** destination with a fully
     /// freshened document in one atomic, durable file write — the relocation
     /// counterpart of [`Mapper::import_areas`]'s wholesale persistence.
@@ -1390,15 +1531,9 @@ impl Mapper {
             .backend
             .import_local_area(document.clone())
             .await?;
-        self.inner.pending.note_confirmed_rev(
-            area_id,
-            document.area.rev,
-            document.area.access.map(|access| access.fingerprint()),
-        );
-        let populated = Arc::new(AreaCache::new_with_area(document));
         self.inner
-            .atlas_cache
-            .rcu(|cache| Arc::new(cache.with_areas_updated(vec![(area_id, populated.clone())])));
+            .publish_committed(CommittedChange::Documents(&[document], &[]), true)
+            .await;
         Ok(true)
     }
 
@@ -1441,15 +1576,9 @@ impl Mapper {
     /// client-side copy would have staged.
     pub(crate) async fn adopt_cloud_copy(&self, area_id: AreaId) -> CloudResult<()> {
         let details = self.inner.backend.get_area(&area_id).await?;
-        self.inner.pending.note_confirmed_rev(
-            area_id,
-            details.area.rev,
-            details.area.access.map(|access| access.fingerprint()),
-        );
-        let adopted = Arc::new(AreaCache::new_with_area(details));
         self.inner
-            .atlas_cache
-            .rcu(|cache| Arc::new(cache.add_area(area_id, adopted.clone())));
+            .publish_committed(CommittedChange::Documents(&[details], &[]), false)
+            .await;
         Ok(())
     }
 
@@ -1458,8 +1587,19 @@ impl Mapper {
     /// and its WAL usable. Existing in-flight content writes are allowed to
     /// finish; future content and metadata writes are rejected until these
     /// guards are committed or dropped.
+    #[cfg(test)]
     pub(crate) fn begin_area_move(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
         self.inner.begin_area_move(area_ids)
+    }
+
+    /// Relocation freezes writes but can display committed source updates.
+    /// Unlike a merge, it performs several separately visible transactions.
+    pub(crate) fn begin_relocation(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
+        let fences = self.inner.begin_area_move(area_ids)?;
+        for fence in &fences {
+            self.inner.pending.allow_fenced_publication(fence.area_id());
+        }
+        Ok(fences)
     }
 
     pub(crate) async fn wait_area_move_quiescent(&self, fences: &[AreaMoveFence]) {
@@ -1505,6 +1645,30 @@ impl Mapper {
         self.inner.load_all_areas()
     }
 
+    /// Load startup maps once, sharing work with scripts that await readiness.
+    /// Explicit `load_all_areas` calls still load again.
+    ///
+    /// # Errors
+    /// Returns the initial map load error.
+    pub async fn load_initial_areas(&self) -> CloudResult<LoadMapsSummary> {
+        let _gate = self.inner.load_gate.lock().await;
+        if let Some(Ok(summary)) = self.inner.initial_load.borrow().as_ref() {
+            return Ok(summary.clone());
+        }
+        self.inner.load_areas().await
+    }
+
+    /// Wait for initial loading and make current local changes visible here.
+    /// Starts or retries loading if needed; after success, reuses the loaded maps.
+    ///
+    /// # Errors
+    /// Reports a failed initial map load.
+    pub async fn ready(&self) -> CloudResult<()> {
+        self.load_initial_areas().await?;
+        local_projection::adopt_and_wait(&self.inner).await;
+        Ok(())
+    }
+
     /// Rename an area and update the cache only after backend acknowledgement.
     pub async fn rename_area(&self, area_id: AreaId, name: &str) -> CloudResult<()> {
         self.inner.rename_area_and_wait(area_id, name).await
@@ -1525,6 +1689,60 @@ impl Mapper {
     /// acknowledged delete contract.
     pub async fn delete_area_and_wait(&self, area_id: AreaId) -> CloudResult<()> {
         self.delete_area(area_id).await
+    }
+
+    /// Folds whole areas into `into` as one backend transaction and
+    /// publishes the result as one atlas snapshot: the sources' rooms,
+    /// exits, labels, shapes and connections move (translated per source),
+    /// every exit in the same storage tier that named a moved room follows
+    /// it, and the sources are deleted. Resolves with the room remap and
+    /// the post-merge documents once the backend has committed.
+    ///
+    /// The call bypasses the per-area envelope queue the way a delete does.
+    /// Every touched area (destination, sources, and each loaded third party
+    /// holding an exit into a source) first drains its queued edits, then is
+    /// fenced against new ones until the merge settles, so the transaction's
+    /// revision preconditions describe what the backend really holds. The
+    /// destination's allocation floor covers numbers reserved by open
+    /// scripted drafts, so a draft committed afterwards cannot collide with a
+    /// moved room. A draft open on a source is not detected; its submission
+    /// fails with `AreaNotFound` afterwards, as after any delete.
+    ///
+    /// # Errors
+    /// Every refusal is a [`CloudError::StructuralConflict`] carrying one of
+    /// these codes, and touches nothing:
+    /// - `merge_areas_no_sources`: `sources` is empty.
+    /// - `merge_areas_same_area`: a source repeats or names `into`.
+    /// - `merge_areas_no_rooms`: a source lists an empty set of rooms.
+    /// - `merge_areas_room_not_found`: a source lists a room it does not
+    ///   hold.
+    /// - `merge_areas_unsupported_storage`: the areas are cloud areas.
+    /// - `merge_areas_mixed_tiers`: the touched areas do not all live in
+    ///   one storage tier.
+    /// - `merge_requires_full_projection`: a touched area is a redacted
+    ///   projection.
+    /// - `merge_areas_busy`: a touched area holds edits parked for review or
+    ///   an in-flight metadata write, or edits keep arriving faster than the
+    ///   merge can fence them.
+    /// - `merge_areas_source_changed`: a touched document moved between the
+    ///   plan and the commit (another writer, or a link into a source that
+    ///   appeared while queued edits drained); nothing was written.
+    ///
+    /// [`CloudError::AreaNotFound`] names an id that is not loaded (or, at
+    /// commit, not stored). Any other backend error surfaces unchanged; in
+    /// failures before commitment release the fences. A journaled local
+    /// transaction keeps them until recovery publishes its committed generation.
+    pub async fn merge_areas(
+        &self,
+        into: AreaId,
+        sources: Vec<AreaMergeSource>,
+    ) -> CloudResult<AreaMergeCommit> {
+        let inner = self.inner.clone();
+        // Once started, orchestration owns its fences until the transaction's
+        // outcome is published or retained for recovery, even if JS cancels.
+        tokio::spawn(async move { inner.merge_areas(into, sources).await })
+            .await
+            .map_err(|error| CloudError::InternalError(error.to_string()))?
     }
 
     // === ATLAS (FOLDER) OPERATIONS ===
@@ -1667,24 +1885,13 @@ impl Mapper {
         let inner = self.inner.clone();
         async move {
             let _gate = inner.atlas_catalog_gate.lock().await;
+            let local = inner.backend.local_atlas_ids().contains(&atlas_id)
+                && inner.backend.local_snapshot().is_some();
             inner.backend.delete_atlas(&atlas_id).await?;
-            inner.atlas_cache.rcu(|cache| {
-                let areas = cache
-                    .areas()
-                    .map(|area| {
-                        let area_id = *area.get_id();
-                        let area = if area.meta().atlas_id == Some(atlas_id) {
-                            Arc::new(area.with_atlas(None))
-                        } else {
-                            area
-                        };
-                        (area_id, area)
-                    })
-                    .collect();
-                Arc::new(cache.rebuild_with_areas(areas))
-            });
+            inner
+                .publish_committed(CommittedChange::DeleteAtlas(atlas_id), local)
+                .await;
             inner.atlas_storage_by_id.lock().remove(&atlas_id);
-            inner.sync_revision.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
     }
@@ -2172,10 +2379,18 @@ impl Inner {
     /// # Errors
     /// Returns error if backend operations fail
     pub async fn load_all_areas(&self) -> CloudResult<LoadMapsSummary> {
+        let _gate = self.load_gate.lock().await;
+        self.load_areas().await
+    }
+
+    async fn load_areas(&self) -> CloudResult<LoadMapsSummary> {
         let result = self.load_all_areas_inner().await;
+        if result.is_ok() {
+            local_projection::adopt_and_wait(self).await;
+        }
         // Open the initial-load gate either way: presence-checked imports wait
-        // on it, and distinguish success from failure by the flag's value.
-        self.initial_load.send_replace(Some(result.is_ok()));
+        // on it. Retain the summary so startup can reuse a script's load.
+        self.initial_load.send_replace(Some(result.clone()));
         if result.is_ok() {
             self.report_abandoned_relocations();
         }
@@ -2212,12 +2427,19 @@ impl Inner {
         let auth_generation = self.backend.auth_generation();
         let list_start = Instant::now();
         let areas = self.backend.list_areas().await?;
+        let listed_local = self.backend.local_snapshot();
         let list_duration = list_start.elapsed();
 
         let mut fetched_areas = HashMap::with_capacity(areas.len());
         let mut stats = Vec::with_capacity(areas.len());
 
         for area in areas {
+            if listed_local
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.contains_area(area.id))
+            {
+                continue;
+            }
             let load_start = Instant::now();
             match self.backend.get_area(&area.id).await {
                 Ok(details) => {
@@ -2248,11 +2470,99 @@ impl Inner {
         if self.backend.auth_generation() != auth_generation {
             return Err(CloudError::CredentialChanged);
         }
-        // A composite list may intentionally omit the cloud tier when it is
-        // offline. Resolve every still-unfetched delete intent with a point
-        // read instead of treating list absence as proof of deletion.
+        self.recover_deletes_for_load(&mut fetched_areas, &mut stats, auth_generation)
+            .await?;
+        // Adopt revisions and fold queued work under the same gate used by
+        // mutation compilation. Entry scripts racing initial load can neither
+        // lose an optimistic edit nor have its create/update meaning silently
+        // changed by the fetched document.
+        let mutation_guard = self.mutation_gate.lock();
+        if self.backend.auth_generation() != auth_generation {
+            return Err(CloudError::CredentialChanged);
+        }
+        // Use one current local generation under mutation coordination. The
+        // listing and remote fetches above may span several local commits.
+        let current_local = self.backend.local_snapshot();
+        if let Some(local) = &current_local {
+            let mut projection = self.local_projection.lock();
+            if let Some(listed) = &listed_local {
+                projection
+                    .known
+                    .extend(listed.areas().map(|details| details.area.id));
+            }
+            projection
+                .known
+                .extend(local.areas().map(|details| details.area.id));
+            fetched_areas.retain(|id, _| !projection.known.contains(id));
+            for details in local.areas() {
+                stats.push(AreaLoadStat {
+                    area_id: details.area.id,
+                    name: details.area.name.clone(),
+                    revision: details.area.rev,
+                    load_duration: Duration::ZERO,
+                    source: self.backend.last_area_source(&details.area.id),
+                    shared: false,
+                });
+            }
+        }
+        let mut new_cache = HashMap::with_capacity(fetched_areas.len());
+        // Local publication has one owner. Preserve its current view until
+        // complete-generation adoption can pass the session's fences.
+        {
+            let projection = self.local_projection.lock();
+            for area in self.atlas_cache.load().areas() {
+                if projection.known.contains(area.get_id()) {
+                    new_cache.insert(*area.get_id(), area);
+                }
+            }
+        }
+        for (area_id, details) in fetched_areas {
+            self.pending.abort_recovered_delete(area_id)?;
+            // A full load buffers several GETs; an ACK may have advanced this
+            // area's revision while another document was still loading.
+            self.pending.note_confirmed_rev(
+                area_id,
+                details.area.rev,
+                details.area.access.map(|access| access.fingerprint()),
+            );
+            let (area, _) = self.project_confirmed(
+                &details,
+                ReplayMode::StopAtFailure,
+                current_local.as_deref(),
+            );
+            self.pending.recovery_base_loaded(area_id);
+            new_cache.insert(area_id, area);
+        }
+        // Carry every exclusion axis across the wholesale rebuild.
+        self.publish_cache(|cache| Arc::new(cache.rebuild_with_areas(new_cache.clone())));
+        local_projection::adopt_locked(self);
+        drop(mutation_guard);
+
+        // The wholesale store can race the sync engine (e.g. re-inserting an
+        // area the engine removed between our list and store). Nudge the
+        // engine: its next tick prunes anything the fresh row set no longer
+        // covers, so any membership drift heals immediately.
+        self.request_sync();
+
+        Ok(LoadMapsSummary {
+            list_duration,
+            areas: stats,
+        })
+    }
+
+    /// Resolve interrupted remote deletes omitted by an offline composite list.
+    /// Local delete recovery belongs to the generation adopter's writer barrier.
+    async fn recover_deletes_for_load(
+        &self,
+        fetched_areas: &mut HashMap<AreaId, AreaWithDetails>,
+        stats: &mut Vec<AreaLoadStat>,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
         for area_id in self.pending.recovery_area_ids() {
-            if fetched_areas.contains_key(&area_id) || !self.pending.has_delete_intent(area_id) {
+            if self.is_local_projection(area_id)
+                || fetched_areas.contains_key(&area_id)
+                || !self.pending.has_delete_intent(area_id)
+            {
                 continue;
             }
             let cloud_intent = self.pending.delete_intent_is_cloud(area_id);
@@ -2261,7 +2571,7 @@ impl Inner {
                     .get_area_at_generation(&area_id, auth_generation)
                     .await
             } else {
-                self.backend.get_area(&area_id).await
+                self.backend_for_area(area_id).get_area(&area_id).await
             };
             match fetched {
                 Ok(details) => {
@@ -2282,8 +2592,7 @@ impl Inner {
                     | CloudError::PermissionDenied(_)
                     | CloudError::AreaNotFound(_),
                 ) => {
-                    let discarded = self.pending.commit_recovered_delete(area_id)?;
-                    self.account_deleted_pending(area_id, &discarded);
+                    self.recover_unavailable_area(area_id)?;
                 }
                 Err(CloudError::CredentialChanged) => {
                     return Err(CloudError::CredentialChanged);
@@ -2293,47 +2602,7 @@ impl Inner {
                 }
             }
         }
-        // Adopt revisions and fold queued work under the same gate used by
-        // mutation compilation. Entry scripts racing initial load can neither
-        // lose an optimistic edit nor have its create/update meaning silently
-        // changed by the fetched document.
-        let _mutation_guard = self.mutation_gate.lock();
-        if self.backend.auth_generation() != auth_generation {
-            return Err(CloudError::CredentialChanged);
-        }
-        let mut new_cache = HashMap::with_capacity(fetched_areas.len());
-        for (area_id, details) in fetched_areas {
-            if self.pending.has_delete_intent(area_id) {
-                self.pending.abort_recovered_delete(area_id)?;
-            }
-            self.pending.note_confirmed_rev(
-                area_id,
-                details.area.rev,
-                details.area.access.map(|access| access.fingerprint()),
-            );
-            let (details, failed) = self.fold_pending(area_id, &details, ReplayMode::StopAtFailure);
-            if let Some(operation_id) = failed {
-                self.pending.pause_conflict(area_id, operation_id);
-            }
-            self.pending.recovery_base_loaded(area_id);
-            new_cache.insert(area_id, Arc::new(AreaCache::new_with_area(details)));
-        }
-        // Carry every exclusion axis across the wholesale rebuild.
-        let new_cache = Arc::new(self.atlas_cache.load().rebuild_with_areas(new_cache));
-        self.atlas_cache.store(new_cache);
-        self.sync_revision.fetch_add(1, Ordering::AcqRel);
-        drop(_mutation_guard);
-
-        // The wholesale store can race the sync engine (e.g. re-inserting an
-        // area the engine removed between our list and store). Nudge the
-        // engine: its next tick prunes anything the fresh row set no longer
-        // covers, so any membership drift heals immediately.
-        self.sync_notify.notify_one();
-
-        Ok(LoadMapsSummary {
-            list_duration,
-            areas: stats,
-        })
+        Ok(())
     }
 
     // === READ OPERATIONS (Instant, Lock-Free) ===
@@ -2408,42 +2677,39 @@ impl Inner {
         storage: MapStorage,
     ) -> CloudResult<AreaId> {
         let backend_area = self.backend.create_area_at(request, storage).await?;
-        self.finish_created_area(backend_area)
+        self.finish_created_area(backend_area, storage == MapStorage::Local)
+            .await
     }
 
     async fn create_area_from_request(&self, request: CreateAreaRequest) -> CloudResult<AreaId> {
-        // Create area on backend first to get the real ID
+        // Resolve local routing before capturing the intended tier. A local
+        // area may already be deleted again when its create response arrives.
+        self.backend.subscribe_local().await?;
+        let local = !request.ephemeral
+            && request.atlas_id.map_or_else(
+                || !self.backend.has_credential(),
+                |id| self.backend.local_atlas_ids().contains(&id),
+            );
         let backend_area = self.backend.create_area(request).await?;
-        self.finish_created_area(backend_area)
+        self.finish_created_area(backend_area, local).await
     }
 
-    fn finish_created_area(&self, backend_area: Area) -> CloudResult<AreaId> {
+    async fn finish_created_area(&self, backend_area: Area, local: bool) -> CloudResult<AreaId> {
         let area_id = backend_area.id;
 
-        // The created row is backend truth for the new area's revision.
-        self.pending.note_confirmed_rev(
-            area_id,
-            backend_area.rev,
-            backend_area.access.map(|access| access.fingerprint()),
-        );
-
-        self.atlas_cache.rcu(|cache| {
-            Arc::new(cache.add_area(
-                area_id,
-                Arc::new(AreaCache::new_with_area(AreaWithDetails {
-                    area: backend_area.clone(),
-                    format_version: crate::AREA_FORMAT_VERSION,
-                    content_hash: None,
-                    properties: vec![],
-                    rooms: vec![],
-                    labels: vec![],
-                    shapes: vec![],
-                    connections: vec![],
-                    linked_areas: vec![],
-                })),
-            ))
-        });
-        self.sync_revision.fetch_add(1, Ordering::AcqRel);
+        let details = AreaWithDetails {
+            area: backend_area,
+            format_version: crate::AREA_FORMAT_VERSION,
+            content_hash: None,
+            properties: vec![],
+            rooms: vec![],
+            labels: vec![],
+            shapes: vec![],
+            connections: vec![],
+            linked_areas: vec![],
+        };
+        self.publish_committed(CommittedChange::Documents(&[details], &[]), local)
+            .await;
 
         Ok(area_id)
     }
@@ -2490,28 +2756,9 @@ impl Inner {
 
         for details in &areas {
             self.backend.import_local_area(details.clone()).await?;
-            // The stored document is backend truth for the imported area.
-            self.pending.note_confirmed_rev(
-                details.area.id,
-                details.area.rev,
-                details.area.access.map(|access| access.fingerprint()),
-            );
         }
-
-        // Rebuild the atlas once for the whole set (one index build per area, no per-op churn).
-        self.atlas_cache.rcu(|cache| {
-            let mut next = cache.add_area(
-                areas[0].area.id,
-                Arc::new(AreaCache::new_with_area(areas[0].clone())),
-            );
-            for details in areas.iter().skip(1) {
-                next = next.add_area(
-                    details.area.id,
-                    Arc::new(AreaCache::new_with_area(details.clone())),
-                );
-            }
-            Arc::new(next)
-        });
+        self.publish_committed(CommittedChange::Documents(&areas, &[]), true)
+            .await;
 
         Ok(areas.iter().map(|details| details.area.id).collect())
     }
@@ -2525,18 +2772,17 @@ impl Inner {
     /// blind into an unknown atlas.
     async fn wait_for_initial_load(&self) -> CloudResult<()> {
         let mut gate = self.initial_load.subscribe();
-        let outcome = *gate.wait_for(Option::is_some).await.map_err(|_| {
+        let outcome = gate.wait_for(Option::is_some).await.map_err(|_| {
             crate::CloudError::InternalError(
                 "mapper dropped before its initial area load".to_string(),
             )
         })?;
-        if outcome == Some(true) {
-            Ok(())
-        } else {
-            Err(crate::CloudError::InternalError(
-                "initial area load failed; refusing a presence-checked import".to_string(),
-            ))
-        }
+        outcome
+            .as_ref()
+            .expect("load outcome is present")
+            .as_ref()
+            .map(|_| ())
+            .map_err(Clone::clone)
     }
 
     /// Presence-checked import — the offer-once seeding primitive. Imports (via
@@ -2588,7 +2834,7 @@ impl Inner {
     /// # Errors
     /// Propagates the backend's read error.
     pub async fn export_area(&self, area_id: AreaId) -> CloudResult<AreaWithDetails> {
-        let cloud_area = !self.backend.local_area_ids().contains(&area_id)
+        let cloud_area = !self.is_local_projection(area_id)
             && !self.backend.ephemeral_area_ids().contains(&area_id);
         let mut details = if cloud_area {
             let auth_generation = self.backend.auth_generation();
@@ -2596,7 +2842,7 @@ impl Inner {
                 .get_area_at_generation(&area_id, auth_generation)
                 .await?
         } else {
-            self.backend.get_area(&area_id).await?
+            self.backend_for_area(area_id).get_area(&area_id).await?
         };
         details.connections.sort_by_key(|connection| connection.id);
         Ok(details)
@@ -2612,19 +2858,7 @@ impl Inner {
             .map(|area| area.effective_access())
     }
 
-    fn begin_area_move(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
-        let _mutation_guard = self.mutation_gate.lock();
-        let metadata = self.metadata_writes_by_area.lock();
-        if let Some(area_id) = area_ids
-            .iter()
-            .find(|area_id| metadata.contains_key(area_id))
-        {
-            return Err(CloudError::PendingOperations(format!(
-                "map {area_id} is still being renamed or filed; retry the move when it finishes"
-            )));
-        }
-        drop(metadata);
-
+    fn ensure_move_sources_reviewed(&self, area_ids: &[AreaId]) -> CloudResult<()> {
         // A queue paused for review holds edits the backend has not accepted.
         // Moving such an area would snapshot the optimistic view and delete
         // the source, silently resolving the pause as "keep mine" against
@@ -2639,6 +2873,24 @@ impl Inner {
                 "map {area_id} has edits awaiting conflict or failure review; resolve them before moving the map"
             )));
         }
+
+        Ok(())
+    }
+
+    fn begin_area_move(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
+        let _mutation_guard = self.mutation_gate.lock();
+        let metadata = self.metadata_writes_by_area.lock();
+        if let Some(area_id) = area_ids
+            .iter()
+            .find(|area_id| metadata.contains_key(area_id))
+        {
+            return Err(CloudError::PendingOperations(format!(
+                "map {area_id} is still being renamed or filed; retry the move when it finishes"
+            )));
+        }
+        drop(metadata);
+
+        self.ensure_move_sources_reviewed(area_ids)?;
 
         let mut fences = Vec::with_capacity(area_ids.len());
         for &area_id in area_ids {
@@ -2702,7 +2954,7 @@ impl Inner {
                     .get_area_at_generation(&area_id, auth_generation)
                     .await
             } else {
-                self.backend.get_area(&area_id).await
+                self.backend_for_area(area_id).get_area(&area_id).await
             };
             match current {
                 Ok(details) if details.area.rev != expected_rev => {
@@ -2723,11 +2975,7 @@ impl Inner {
         }
         delete_fence.prepare()?;
         delete_fence.request_started();
-        let tracking = AcknowledgedWrite::new(
-            area_id,
-            self.pending_by_area.clone(),
-            self.sync_stats.clone(),
-        );
+        let tracking = AcknowledgedWrite::new(self, area_id);
         // The expected revision rides the DELETE itself; the backend (or the
         // server behind it) refuses with a RevisionConflict when the area
         // moved past it, atomically with the delete.
@@ -2736,7 +2984,7 @@ impl Inner {
                 .delete_area_expecting_at_generation(&area_id, expected_rev, auth_generation)
                 .await
         } else {
-            self.backend
+            self.backend_for_area(area_id)
                 .delete_area_expecting(&area_id, expected_rev)
                 .await
         };
@@ -2755,13 +3003,13 @@ impl Inner {
                 // point GET.
                 delete_fence.reconcile();
             }
-            self.sync_notify.notify_one();
+            self.request_sync();
             return Err(error);
         }
         let discarded = match delete_fence.commit() {
             Ok(discarded) => discarded,
             Err(error) => {
-                self.sync_notify.notify_one();
+                self.request_sync();
                 return Err(error);
             }
         };
@@ -2770,58 +3018,14 @@ impl Inner {
         if auth_generation.is_some_and(|generation| self.backend.auth_generation() != generation) {
             return Ok(());
         }
-        self.atlas_cache.rcu(|cache| {
-            cache.get_area(&area_id).map_or_else(
-                || cache.clone(),
-                |_area| Arc::new(cache.delete_area(area_id)),
-            )
-        });
+        self.publish_committed(CommittedChange::Documents(&[], &[area_id]), false)
+            .await;
         Ok(())
     }
 
     async fn rename_area_and_wait(&self, area_id: AreaId, name: &str) -> CloudResult<()> {
-        let auth_generation = self.metadata_auth_generation(area_id);
-        let updates = AreaUpdates {
-            name: Some(name.to_string()),
-            atlas_id: None,
-        };
-        let tracking = {
-            let _mutation_guard = self.mutation_gate.lock();
-            if self.pending.is_delete_fenced(area_id) {
-                return Err(CloudError::PendingOperations(
-                    "this map is being moved or deleted".to_string(),
-                ));
-            }
-            AcknowledgedWrite::new_metadata(
-                area_id,
-                self.pending_by_area.clone(),
-                self.metadata_writes_by_area.clone(),
-                self.sync_stats.clone(),
-            )
-        };
-        let result = if let Some(auth_generation) = auth_generation {
-            self.backend
-                .update_area_at_generation(&area_id, updates, auth_generation)
-                .await
-        } else {
-            self.backend.update_area(&area_id, updates).await
-        };
-        if let Err(error) = result {
-            tracking.settle(false);
-            return Err(error);
-        }
-        if auth_generation.is_some_and(|generation| self.backend.auth_generation() != generation) {
-            tracking.settle(true);
-            return Ok(());
-        }
-        self.atlas_cache.rcu(|cache| {
-            cache.get_area(&area_id).map_or_else(
-                || cache.clone(),
-                |area| Arc::new(cache.insert_area(area_id, Arc::new(area.rename(name)))),
-            )
-        });
-        tracking.settle(true);
-        Ok(())
+        self.update_metadata(area_id, MetadataChange::Rename(name))
+            .await
     }
 
     async fn move_area_to_atlas_and_wait(
@@ -2829,7 +3033,17 @@ impl Inner {
         area_id: AreaId,
         atlas_id: Option<AtlasId>,
     ) -> CloudResult<()> {
+        self.update_metadata(area_id, MetadataChange::Move(atlas_id))
+            .await
+    }
+
+    async fn update_metadata(
+        &self,
+        area_id: AreaId,
+        change: MetadataChange<'_>,
+    ) -> CloudResult<()> {
         let auth_generation = self.metadata_auth_generation(area_id);
+        let backend = self.backend_for_area(area_id);
         let tracking = {
             let _mutation_guard = self.mutation_gate.lock();
             if self.pending.is_delete_fenced(area_id) {
@@ -2837,42 +3051,56 @@ impl Inner {
                     "this map is being moved or deleted".to_string(),
                 ));
             }
-            AcknowledgedWrite::new_metadata(
-                area_id,
-                self.pending_by_area.clone(),
-                self.metadata_writes_by_area.clone(),
-                self.sync_stats.clone(),
-            )
+            AcknowledgedWrite::new_metadata(self, area_id)
         };
-        let result = if let Some(auth_generation) = auth_generation {
-            self.backend
-                .move_area_to_atlas_at_generation(&area_id, atlas_id, auth_generation)
-                .await
-        } else {
-            self.backend.move_area_to_atlas(&area_id, atlas_id).await
+        let result = match change {
+            MetadataChange::Rename(name) => {
+                let updates = AreaUpdates {
+                    name: Some(name.to_string()),
+                    atlas_id: None,
+                };
+                if let Some(generation) = auth_generation {
+                    self.backend
+                        .update_area_at_generation(&area_id, updates, generation)
+                        .await
+                } else {
+                    backend.update_area(&area_id, updates).await
+                }
+            }
+            MetadataChange::Move(atlas_id) => {
+                if let Some(generation) = auth_generation {
+                    self.backend
+                        .move_area_to_atlas_at_generation(&area_id, atlas_id, generation)
+                        .await
+                } else {
+                    backend.move_area_to_atlas(&area_id, atlas_id).await
+                }
+            }
         };
-        if let Err(error) = result {
-            tracking.settle(false);
-            return Err(error);
-        }
-        if auth_generation.is_some_and(|generation| self.backend.auth_generation() != generation) {
+        result?; // Dropping the guard settles failures and cancellation.
+        let generation = {
+            let _gate = self.mutation_gate.lock();
             tracking.settle(true);
-            return Ok(());
+            if auth_generation.is_none_or(|generation| self.backend.auth_generation() == generation)
+            {
+                self.publish_committed_locked(CommittedChange::Metadata(area_id, change), false)
+            } else {
+                None
+            }
+        };
+        if let Some(generation) = generation {
+            local_projection::wait_until_published(self, generation).await;
         }
-        self.atlas_cache.rcu(|cache| {
-            cache.get_area(&area_id).map_or_else(
-                || cache.clone(),
-                |area| Arc::new(cache.insert_area(area_id, Arc::new(area.with_atlas(atlas_id)))),
-            )
-        });
-        tracking.settle(true);
         Ok(())
     }
 
     fn metadata_auth_generation(&self, area_id: AreaId) -> Option<u64> {
-        (!self.backend.local_area_ids().contains(&area_id)
-            && !self.backend.ephemeral_area_ids().contains(&area_id))
-        .then(|| self.backend.auth_generation())
+        if self.is_local_projection(area_id) {
+            self.local_projection.lock().known.insert(area_id);
+            return None;
+        }
+        (!self.backend.ephemeral_area_ids().contains(&area_id))
+            .then(|| self.backend.auth_generation())
     }
 
     pub fn set_area_property(
@@ -3430,16 +3658,30 @@ impl Inner {
 
     // === INTERNAL SYNC HELPERS ===
 
-    /// Drops one in-flight write marker for `area_id`, removing the entry
+    /// Drops settled write markers for `area_id`, removing the entry
     /// once the count reaches zero.
-    fn decrement_pending(pending_by_area: &Mutex<HashMap<AreaId, u64>>, area_id: AreaId) {
+    fn decrement_count(
+        pending_by_area: &Mutex<HashMap<AreaId, u64>>,
+        area_id: AreaId,
+        settled: u64,
+    ) {
         let mut pending = pending_by_area.lock();
         if let Some(count) = pending.get_mut(&area_id) {
-            *count = count.saturating_sub(1);
+            *count = count.saturating_sub(settled);
             if *count == 0 {
                 pending.remove(&area_id);
             }
         }
+    }
+
+    fn settle_pending(&self, area_id: AreaId, count: u64) {
+        Self::decrement_count(&self.pending_by_area, area_id, count);
+        self.pending.projection_changed();
+    }
+
+    fn request_sync(&self) {
+        self.sync_notify.notify_one();
+        self.pending.projection_changed();
     }
 
     pub(crate) fn account_deleted_pending(&self, area_id: AreaId, discarded: &[PendingEnvelope]) {
@@ -3455,9 +3697,7 @@ impl Inner {
         self.sync_stats
             .operations_failed
             .fetch_add(discarded_count, Ordering::Relaxed);
-        for _ in 0..discarded_count {
-            Self::decrement_pending(&self.pending_by_area, area_id);
-        }
+        self.settle_pending(area_id, discarded_count);
     }
 
     // === CAS PENDING QUEUE ===
@@ -3603,10 +3843,13 @@ impl Inner {
             area_edits::validate_connection_graph(&mut details)?;
             details.area.rev += 1;
 
-            let local_area = self.backend.local_area_ids().contains(&area_id);
+            let local_area = self.is_local_projection(area_id);
             let ephemeral_area = self.backend.ephemeral_area_ids().contains(&area_id);
             let non_cloud = !self.backend.supports_sync() || local_area || ephemeral_area;
-            let local_durable = local_area || (!self.backend.supports_sync() && !ephemeral_area);
+            let local_durable = local_area
+                || (!self.backend.supports_sync()
+                    && !ephemeral_area
+                    && self.backend.local_snapshot().is_none());
             let (viewer_id, auth_generation) = if non_cloud {
                 (None, self.backend.auth_generation())
             } else {
@@ -3704,7 +3947,7 @@ impl Inner {
                                 .sync_stats
                                 .operations_succeeded
                                 .fetch_add(1, Ordering::Relaxed);
-                            Self::decrement_pending(&inner.pending_by_area, area_id);
+                            inner.settle_pending(area_id, 1);
                         }
                         continue;
                     }
@@ -3772,7 +4015,9 @@ impl Inner {
             }],
             payload: envelope.ops,
         };
-        let result = if viewer_id.is_some() {
+        let result = if envelope.local_durable {
+            self.backend.execute_local_mutation(&area_id, &wire).await
+        } else if viewer_id.is_some() {
             self.backend
                 .execute_mutation_at_generation(&area_id, &wire, auth_generation)
                 .await
@@ -3828,7 +4073,7 @@ impl Inner {
                     self.sync_stats
                         .operations_succeeded
                         .fetch_add(1, Ordering::Relaxed);
-                    Self::decrement_pending(&self.pending_by_area, area_id);
+                    self.settle_pending(area_id, 1);
                 }
 
                 // A compound mutation can move aggregates beyond its own
@@ -3836,8 +4081,15 @@ impl Inner {
                 // revisions and nudge the sync engine to refetch the
                 // affected projections.
                 if foreign_versions {
-                    self.sync_notify.notify_one();
+                    self.request_sync();
                 }
+            }
+            Err(CloudError::LocalCommitPending { generation, .. }) => {
+                self.recovery
+                    .lock()
+                    .retain_mutation(self, generation, area_id, operation_id);
+                local_projection::adopt(self);
+                self.pending.projection_changed();
             }
             Err(CloudError::RevisionConflict { .. } | CloudError::ProjectionChanged { .. }) => {
                 self.reconcile_conflict(area_id, operation_id, viewer_id, auth_generation)
@@ -3861,7 +4113,7 @@ impl Inner {
                 // it into the newly authenticated viewer namespace.
                 self.pending
                     .credential_changed(area_id, operation_id, auth_generation);
-                self.sync_notify.notify_one();
+                self.request_sync();
             }
             Err(err) if err.is_transport_error() => {
                 self.transport_failure_with_accounting(area_id, operation_id);
@@ -3913,7 +4165,7 @@ impl Inner {
         if viewer_id.is_some() && self.backend.auth_generation() != auth_generation {
             self.pending
                 .credential_changed(area_id, operation_id, auth_generation);
-            self.sync_notify.notify_one();
+            self.request_sync();
             return;
         }
         self.backend.purge_area(&area_id).await;
@@ -3922,7 +4174,7 @@ impl Inner {
                 .get_area_at_generation(&area_id, auth_generation)
                 .await
         } else {
-            self.backend.get_area(&area_id).await
+            self.backend_for_area(area_id).get_area(&area_id).await
         };
         match fetched {
             Ok(fresh) => {
@@ -3930,7 +4182,7 @@ impl Inner {
                 if viewer_id.is_some() && self.backend.auth_generation() != auth_generation {
                     self.pending
                         .credential_changed(area_id, operation_id, auth_generation);
-                    self.sync_notify.notify_one();
+                    self.request_sync();
                     return;
                 }
                 if !self.pending.is_in_flight_at_generation(
@@ -3941,15 +4193,15 @@ impl Inner {
                 ) {
                     return;
                 }
-                match self.replay_pending_over_locked(area_id, &fresh, ReplayMode::StopAtFailure) {
-                    None => self.pending.ready_resend(area_id),
-                    Some(failed) => self.pending.pause_conflict(area_id, failed),
-                }
+                let failed =
+                    self.replay_pending_over_locked(area_id, &fresh, ReplayMode::StopAtFailure);
+                self.pending
+                    .finish_conflict_replay(area_id, operation_id, failed);
             }
             Err(CloudError::CredentialChanged) => {
                 self.pending
                     .credential_changed(area_id, operation_id, auth_generation);
-                self.sync_notify.notify_one();
+                self.request_sync();
             }
             Err(err) => {
                 // The refetch itself failed; back off and retry like any
@@ -3964,15 +4216,19 @@ impl Inner {
     /// per `mode`. Envelopes are atomic: each applies to a scratch copy so
     /// a partly applicable envelope leaves no trace in the fold. Returns
     /// the folded document and the first failing envelope's operation id.
-    fn fold_pending(
+    fn fold_pending_with_receipts(
         &self,
         area_id: AreaId,
         fresh: &AreaWithDetails,
         mode: ReplayMode,
+        local: Option<&crate::backends::local::LocalSnapshot>,
     ) -> (AreaWithDetails, Option<OperationId>) {
         let mut working = fresh.clone();
         let mut first_failed = None;
         for envelope in self.pending.pending_for(area_id) {
+            if local.is_some_and(|snapshot| snapshot.has_applied(area_id, envelope.operation_id)) {
+                continue;
+            }
             let mut scratch = working.clone();
             let preconditions_hold =
                 mode == ReplayMode::KeepMine || envelope.structural_preconditions_hold(&working);
@@ -3995,16 +4251,27 @@ impl Inner {
         (working, first_failed)
     }
 
+    fn is_local_projection(&self, area_id: AreaId) -> bool {
+        self.local_projection.lock().known.contains(&area_id)
+            || self
+                .backend
+                .local_snapshot()
+                .is_some_and(|snapshot| snapshot.contains_area(area_id))
+    }
+
+    fn backend_for_area(&self, area_id: AreaId) -> &dyn MapperBackend {
+        if self.is_local_projection(area_id) {
+            self.backend
+                .local_backend()
+                .unwrap_or(self.backend.as_ref())
+        } else {
+            self.backend.as_ref()
+        }
+    }
+
     /// Rebuilds the displayed area as `fresh confirmed projection + pending
     /// envelopes` (folded per `mode`), records the fetched revision and
     /// fingerprint as backend truth, and swaps the rebuilt cache in.
-    ///
-    /// The fold races concurrent enqueues: an envelope whose optimistic
-    /// effect landed on the pre-swap cache would vanish from a swap folded
-    /// without it, so the store's enqueue epoch is compared across each
-    /// snapshot→swap window and the fold re-runs on a change. The retry is
-    /// bounded — a sustained write storm keeps its later envelopes queued
-    /// either way, and the sync engine heals any display residue.
     ///
     /// Returns the operation id of the first envelope that failed to
     /// apply, from the last fold performed (`None` = everything applied).
@@ -4015,25 +4282,17 @@ impl Inner {
         fresh: &AreaWithDetails,
         mode: ReplayMode,
     ) -> Option<OperationId> {
+        if self.is_local_projection(area_id) {
+            return local_projection::replay_locked(self, area_id, mode);
+        }
         self.pending.adopt_confirmed_rev(
             area_id,
             fresh.area.rev,
             fresh.area.access.map(|access| access.fingerprint()),
         );
-        let (working, failed) = self.fold_pending(area_id, fresh, mode);
-        self.swap_area_details(working);
+        let (area, failed) = self.project_confirmed(fresh, mode, None);
+        self.publish_areas(&[(area_id, area)], &[]);
         failed
-    }
-
-    /// Swaps a full area document into the atlas cache the way a sync
-    /// refetch lands one, bumping the sync revision so pollers notice. The
-    /// rcu preserves every other area and every exclusion axis.
-    fn swap_area_details(&self, details: AreaWithDetails) {
-        let area_id = details.area.id;
-        let area_cache = Arc::new(AreaCache::new_with_area(details));
-        self.atlas_cache
-            .rcu(|cache| Arc::new(cache.insert_area(area_id, area_cache.clone())));
-        self.sync_revision.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Purges any cached copy of `area_id` and refetches the backend's
@@ -4055,7 +4314,7 @@ impl Inner {
                     .get_area_at_generation(&area_id, auth_generation)
                     .await
             }
-            _ => self.backend.get_area(&area_id).await,
+            _ => self.backend_for_area(area_id).get_area(&area_id).await,
         };
         match fetched {
             Ok(fresh) => Some(fresh),
@@ -4087,11 +4346,7 @@ impl Inner {
             if !self.read_identity_is_active(identity) {
                 return;
             }
-            if let Some(failed) =
-                self.replay_pending_over_locked(area_id, &fresh, ReplayMode::StopAtFailure)
-            {
-                self.pending.pause_conflict(area_id, failed);
-            }
+            self.replay_pending_over_locked(area_id, &fresh, ReplayMode::StopAtFailure);
         }
     }
 
@@ -4128,7 +4383,7 @@ impl Inner {
             self.sync_stats
                 .operations_failed
                 .fetch_add(1, Ordering::Relaxed);
-            Self::decrement_pending(&self.pending_by_area, area_id);
+            self.settle_pending(area_id, 1);
             self.rebuild_after_removal(area_id, identity).await;
         } else if keep_mine {
             // The store held the queue paused for exactly this window:
@@ -4163,9 +4418,9 @@ impl Inner {
             // A restored queue may be waiting for an unavailable base rather
             // than for the mutation worker. Re-run reconciliation as well as
             // waking the pending queue.
-            self.sync_notify.notify_one();
+            self.request_sync();
         } else if resolution.discarded.is_some() {
-            Self::decrement_pending(&self.pending_by_area, area_id);
+            self.settle_pending(area_id, 1);
             self.rebuild_after_removal(area_id, identity).await;
         }
         Ok(())
@@ -4185,7 +4440,7 @@ impl Inner {
         self.sync_stats
             .operations_sent
             .fetch_sub(1, Ordering::Relaxed);
-        Self::decrement_pending(&self.pending_by_area, area_id);
+        self.settle_pending(area_id, 1);
         self.rebuild_after_removal(area_id, Some((removed.viewer_id, removed.auth_generation)))
             .await;
         Ok(true)
@@ -4267,6 +4522,26 @@ mod tests {
         /// server-side expected-rev precondition's verdict) instead of
         /// applying.
         refuse_deletes: Mutex<bool>,
+        /// Areas this backend reports as its local tier. Empty by default,
+        /// which makes every served area read as cloud-owned to the mapper;
+        /// tests of tier-bound operations opt areas in.
+        local_ids: Mutex<HashSet<AreaId>>,
+        session_ids: Mutex<HashSet<AreaId>>,
+        /// Every merge plan received, in arrival order, refused or not.
+        merge_plans: Mutex<Vec<AreaMergePlan>>,
+        /// When set, merges refuse with a `RevisionConflict` (a touched
+        /// document moved past the plan) without applying.
+        refuse_merges: Mutex<bool>,
+        /// While `true`, every received envelope waits on the wire before it
+        /// applies, so a test can hold one in flight and queue followers
+        /// behind it.
+        hold_mutations: tokio::sync::watch::Sender<bool>,
+        /// While `true`, a received merge plan waits before it applies, so a
+        /// test can observe the mapper mid-commit.
+        hold_merges: tokio::sync::watch::Sender<bool>,
+        /// The area revision precondition of every received envelope, in
+        /// arrival order (`None` = no area precondition).
+        mutation_revs: Mutex<Vec<Option<i64>>>,
     }
 
     impl FixedBackend {
@@ -4278,6 +4553,13 @@ mod tests {
                 fail_with: Mutex::new(None),
                 deletes: Mutex::new(Vec::new()),
                 refuse_deletes: Mutex::new(false),
+                local_ids: Mutex::new(HashSet::new()),
+                session_ids: Mutex::new(HashSet::new()),
+                merge_plans: Mutex::new(Vec::new()),
+                refuse_merges: Mutex::new(false),
+                hold_mutations: tokio::sync::watch::channel(false).0,
+                hold_merges: tokio::sync::watch::channel(false).0,
+                mutation_revs: Mutex::new(Vec::new()),
             }
         }
 
@@ -4291,6 +4573,22 @@ mod tests {
 
         fn refuse_deletes_with_conflict(&self, refuse: bool) {
             *self.refuse_deletes.lock() = refuse;
+        }
+
+        fn serve_as_local(&self, area_ids: &[AreaId]) {
+            self.local_ids.lock().extend(area_ids.iter().copied());
+        }
+
+        fn refuse_merges_with_conflict(&self, refuse: bool) {
+            *self.refuse_merges.lock() = refuse;
+        }
+
+        fn hold_mutations(&self, hold: bool) {
+            self.hold_mutations.send_replace(hold);
+        }
+
+        fn hold_merges(&self, hold: bool) {
+            self.hold_merges.send_replace(hold);
         }
     }
 
@@ -4359,9 +4657,23 @@ mod tests {
             area_id: &AreaId,
             envelope: &crate::mutation::MutationEnvelope,
         ) -> CloudResult<crate::mutation::MutationResult> {
+            let mut released = self.hold_mutations.subscribe();
+            released
+                .wait_for(|held| !held)
+                .await
+                .expect("the hold gate outlives every envelope");
             self.mutations
                 .lock()
                 .push((envelope.operation_id, envelope.payload.len()));
+            self.mutation_revs.lock().push(
+                envelope
+                    .preconditions
+                    .iter()
+                    .find(|precondition| {
+                        precondition.resource == ResourceKind::Area && precondition.id == area_id.0
+                    })
+                    .map(|precondition| precondition.expected_rev),
+            );
             if let Some(err) = self.fail_with.lock().clone() {
                 return Err(err);
             }
@@ -4375,6 +4687,72 @@ mod tests {
             let result = area_edits::apply_envelope(&mut working, *area_id, envelope)?;
             *details = working;
             Ok(result)
+        }
+
+        fn local_area_ids(&self) -> HashSet<AreaId> {
+            self.local_ids.lock().clone()
+        }
+
+        fn ephemeral_area_ids(&self) -> HashSet<AreaId> {
+            self.session_ids.lock().clone()
+        }
+
+        /// The applier over in-memory documents, all-or-nothing like the
+        /// real tiers: working copies are swapped in only after it succeeds.
+        async fn merge_areas(&self, plan: &AreaMergePlan) -> CloudResult<AreaMergeCommit> {
+            self.merge_plans.lock().push(plan.clone());
+            let mut released = self.hold_merges.subscribe();
+            released
+                .wait_for(|held| !held)
+                .await
+                .expect("the hold gate outlives every merge");
+            let mut areas = self.areas.lock();
+            let load = |id: AreaId| -> CloudResult<AreaWithDetails> {
+                areas.get(&id).cloned().ok_or(CloudError::AreaNotFound(id))
+            };
+            if *self.refuse_merges.lock() {
+                let (id, expected_rev) = plan.expected[0];
+                let current_rev = load(id).map_or(0, |details| details.area.rev);
+                return Err(CloudError::RevisionConflict {
+                    id: id.0,
+                    expected_rev,
+                    current_rev: current_rev + 1,
+                });
+            }
+            let mut into = load(plan.into)?;
+            let mut sources = plan
+                .sources
+                .iter()
+                .map(|source| load(source.id))
+                .collect::<CloudResult<Vec<_>>>()?;
+            let mut inbound = plan
+                .inbound
+                .iter()
+                .map(|id| load(*id))
+                .collect::<CloudResult<Vec<_>>>()?;
+            let outcome =
+                crate::backends::apply_area_merge(plan, &mut into, &mut sources, &mut inbound)?;
+            // Post-images in versions order: the destination, the partial
+            // sources, the changed third parties. Whole sources are
+            // tombstoned and never written.
+            let mut post_images: HashMap<AreaId, AreaWithDetails> = std::iter::once(into)
+                .chain(sources)
+                .chain(inbound)
+                .map(|details| (details.area.id, details))
+                .collect();
+            let documents: Vec<AreaWithDetails> = outcome
+                .versions
+                .iter()
+                .filter(|version| !version.deleted)
+                .filter_map(|version| post_images.remove(&AreaId(version.id)))
+                .collect();
+            for details in &documents {
+                areas.insert(details.area.id, details.clone());
+            }
+            for id in plan.deleted_areas() {
+                areas.remove(&id);
+            }
+            Ok(AreaMergeCommit { outcome, documents })
         }
     }
 
@@ -4421,6 +4799,60 @@ mod tests {
 
     fn temp_cache_dir() -> PathBuf {
         std::env::temp_dir().join(format!("smudgy-mapper-test-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn full_load_preserves_newer_acknowledged_revision() {
+        let id = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(id, "room")]));
+        let mapper = Mapper::new(backend, temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+        // An ACK has advanced backend truth, but a buffered/cached GET still
+        // carries the old body. Full loads do not have a per-GET stale check.
+        mapper.inner.pending.note_confirmed_rev(id, 2, None);
+        mapper.load_all_areas().await.unwrap();
+        assert_eq!(mapper.inner.pending.confirmed_rev(id).0, Some(2));
+    }
+
+    #[tokio::test]
+    async fn metadata_publication_reuses_rooms_and_untouched_areas() {
+        let id = AreaId(Uuid::new_v4());
+        let other = AreaId(Uuid::new_v4());
+        let atlas_id = AtlasId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![
+            sample_area(id, "first"),
+            sample_area(other, "second"),
+        ]));
+        let mapper = Mapper::new(backend, temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+        let before = mapper.get_current_atlas();
+        let original = before.get_area(&id).unwrap();
+        let untouched = before.get_area(&other).unwrap();
+        let room = original.get_room(&RoomNumber(1)).unwrap();
+
+        mapper.rename_area(id, "renamed").await.unwrap();
+        mapper.move_area_to_atlas(id, Some(atlas_id)).await.unwrap();
+        let filed = mapper.get_current_atlas().get_area(&id).unwrap();
+        assert_eq!(filed.get_name(), "renamed");
+        assert_eq!(filed.meta().atlas_id, Some(atlas_id));
+        // The backend deletion is irrelevant here: exercise the same confirmed
+        // publication used when an atlas-delete request has succeeded.
+        mapper
+            .inner
+            .publish_committed(CommittedChange::DeleteAtlas(atlas_id), false)
+            .await;
+        let after = mapper.get_current_atlas();
+        let loose = after.get_area(&id).unwrap();
+        assert_eq!(loose.meta().atlas_id, None);
+        assert!(Arc::ptr_eq(room, filed.get_room(&RoomNumber(1)).unwrap()));
+        assert!(Arc::ptr_eq(room, loose.get_room(&RoomNumber(1)).unwrap()));
+        assert!(Arc::ptr_eq(&untouched, &after.get_area(&other).unwrap()));
+        assert_ne!(
+            original.get_name(),
+            "renamed",
+            "retained readers stay immutable"
+        );
+        assert_eq!(original.meta().atlas_id, None);
     }
 
     #[tokio::test]
@@ -4480,12 +4912,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_retries_after_the_map_directory_becomes_available() {
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let areas = local.join("areas-v2");
+        std::fs::write(&areas, b"unavailable directory").unwrap();
+        let mapper = Mapper::new(Arc::new(LocalBackend::new(&local)), root.join("cache"));
+        assert!(mapper.ready().await.is_err());
+        std::fs::remove_file(areas).unwrap();
+        mapper
+            .ready()
+            .await
+            .expect("retry initialization in the same session");
+        let id = mapper.create_area("Available".into()).await.unwrap();
+        assert!(mapper.get_current_atlas().get_area(&id).is_some());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_loading_and_adopts_without_rereading_files() {
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        let backend = Arc::new(LocalBackend::new(&local));
+        let id = AreaId(Uuid::new_v4());
+        backend
+            .import_local_area(sample_area(id, "Initial"))
+            .await
+            .unwrap();
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.pause_local_updates_for_test();
+        let (first, second) = tokio::join!(mapper.ready(), mapper.ready());
+        first.unwrap();
+        second.unwrap();
+        assert!(mapper.get_current_atlas().get_area(&id).is_some());
+        backend
+            .update_area(
+                &id,
+                AreaUpdates {
+                    name: Some("Other session".into()),
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        mapper.ready().await.unwrap();
+        assert_eq!(
+            mapper.get_current_atlas().get_area(&id).unwrap().get_name(),
+            "Other session"
+        );
+        let before = backend.snapshot().await.unwrap();
+        let mut external = backend.get_area(&id).await.unwrap();
+        external.area.name = "External file edit".into();
+        std::fs::write(
+            local.join("areas-v2").join(format!("{id}.json")),
+            serde_json::to_vec(&external).unwrap(),
+        )
+        .unwrap();
+        mapper.ready().await.unwrap();
+        assert!(Arc::ptr_eq(&before, &backend.snapshot().await.unwrap()));
+        assert_eq!(
+            mapper.get_current_atlas().get_area(&id).unwrap().get_name(),
+            "Other session"
+        );
+        mapper.refresh_local_store().await.unwrap();
+        assert_eq!(
+            mapper.get_current_atlas().get_area(&id).unwrap().get_name(),
+            "External file edit"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn refresh_areas_loads_durable_writes_from_another_mapper_instance() {
         let root = temp_cache_dir();
         let reader = Mapper::new(
             Arc::new(LocalBackend::new(root.join("local"))),
             root.join("reader-cache"),
         );
+        // Exercise explicit refresh independently of automatic live adoption.
+        reader.pause_local_updates_for_test();
         reader.load_all_areas().await.expect("reader initial load");
 
         let writer = Mapper::new(
@@ -6327,6 +6833,1740 @@ mod tests {
             mapper.next_room_number(&a_id),
             Some(RoomNumber(5)),
             "an aborted mutator's numbers become available again"
+        );
+    }
+
+    // === MERGE AREAS ===
+
+    /// The three documents every merge test starts from: destination A with
+    /// rooms 1..3 and A.3 linked east to B.1; source B with rooms 1 and 2,
+    /// B.1 linked back to A.3 and carrying an external id and a property;
+    /// third party C with one room whose exit names B.2. A's floor is 4, so
+    /// the merge lands B.1 as A.4 and B.2 as A.5.
+    struct MergeFixture {
+        a: AreaId,
+        b: AreaId,
+        c: AreaId,
+        documents: Vec<AreaWithDetails>,
+    }
+
+    const B_ONE_EXTERNAL_ID: &str = "b-one";
+
+    fn merge_fixture() -> MergeFixture {
+        let a = AreaId(Uuid::new_v4());
+        let b = AreaId(Uuid::new_v4());
+        let c = AreaId(Uuid::new_v4());
+        let mut b_one = room_with_exits(1, vec![exit_to(2, a, 3)]);
+        b_one.external_id = Some(B_ONE_EXTERNAL_ID.to_string());
+        b_one.properties.push(crate::Property {
+            name: "shard".to_string(),
+            value: "jurassic".to_string(),
+            is_secret: false,
+        });
+        let documents = vec![
+            area_with_rooms(
+                a,
+                vec![
+                    room_with_exits(1, vec![]),
+                    room_with_exits(2, vec![]),
+                    room_with_exits(3, vec![exit_to(1, b, 1)]),
+                ],
+            ),
+            area_with_rooms(b, vec![b_one, room_with_exits(2, vec![])]),
+            area_with_rooms(c, vec![room_with_exits(1, vec![exit_to(3, b, 2)])]),
+        ];
+        MergeFixture { a, b, c, documents }
+    }
+
+    /// A mapper over the fixture served by a [`FixedBackend`] that reports
+    /// every fixture area as local, so the merge's tier checks pass.
+    async fn fixed_merge_mapper() -> (MergeFixture, Arc<FixedBackend>, Mapper) {
+        let fixture = merge_fixture();
+        let backend = Arc::new(FixedBackend::new(fixture.documents.clone()));
+        // This fixture commits in memory and has no local snapshot publisher.
+        backend
+            .session_ids
+            .lock()
+            .extend([fixture.a, fixture.b, fixture.c]);
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+        (fixture, backend, mapper)
+    }
+
+    fn merge_source(id: AreaId) -> AreaMergeSource {
+        AreaMergeSource {
+            id,
+            translate: crate::backends::Translate::default(),
+            rooms: None,
+        }
+    }
+
+    fn exit_target(
+        atlas: &AtlasCache,
+        area_id: AreaId,
+        room: i32,
+        exit: u128,
+    ) -> (Option<AreaId>, Option<RoomNumber>) {
+        let exit = atlas
+            .get_room(&RoomKey::new(area_id, RoomNumber(room)))
+            .expect("room present")
+            .get_exits()
+            .iter()
+            .find(|candidate| candidate.id == ExitId(Uuid::from_u128(exit)))
+            .expect("exit present")
+            .clone();
+        (exit.to_area_id, exit.to_room_number)
+    }
+
+    fn sorted_rooms(atlas: &AtlasCache, area_id: AreaId) -> Vec<i32> {
+        let mut numbers: Vec<i32> = atlas
+            .get_area(&area_id)
+            .expect("area present")
+            .get_rooms()
+            .iter()
+            .map(|room| room.get_room_number().0)
+            .collect();
+        numbers.sort_unstable();
+        numbers
+    }
+
+    fn conflict_code(error: &CloudError) -> &str {
+        match error {
+            CloudError::StructuralConflict(code) => code,
+            other => panic!("expected a structural conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_local_create_response_cannot_replace_or_resurrect_newer_state() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.load_all_areas().await.unwrap();
+        let created = backend
+            .create_area(CreateAreaRequest {
+                name: "Original".into(),
+                atlas_id: None,
+                ephemeral: false,
+            })
+            .await
+            .unwrap();
+        backend
+            .update_area(
+                &created.id,
+                AreaUpdates {
+                    name: Some("Newer".into()),
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        local_projection::adopt(&mapper.inner);
+        mapper
+            .inner
+            .finish_created_area(created.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            mapper
+                .get_current_atlas()
+                .get_area(&created.id)
+                .unwrap()
+                .get_name(),
+            "Newer"
+        );
+        backend.delete_area(&created.id).await.unwrap();
+        local_projection::adopt(&mapper.inner);
+        mapper
+            .inner
+            .finish_created_area(created.clone(), true)
+            .await
+            .unwrap();
+        assert!(mapper.get_current_atlas().get_area(&created.id).is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_committed_local_head_is_not_replayed_before_its_ack_arrives() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let fixture = merge_fixture();
+        for details in &fixture.documents {
+            backend.import_local_area(details.clone()).await.unwrap();
+        }
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.load_all_areas().await.unwrap();
+        mapper
+            .create_room(
+                RoomKey::new(fixture.a, RoomNumber(4)),
+                RoomUpdates::default(),
+            )
+            .unwrap();
+        let (claimed, _) = mapper.inner.pending.take_ready(Instant::now());
+        let (_, pending, expected_rev, access_fingerprint) = claimed.unwrap();
+        let envelope = MutationEnvelope {
+            operation_id: pending.operation_id,
+            preconditions: vec![Precondition {
+                resource: ResourceKind::Area,
+                id: fixture.a.0,
+                expected_rev: expected_rev.unwrap(),
+                access_fingerprint,
+            }],
+            payload: pending.ops,
+        };
+        backend
+            .execute_mutation(&fixture.a, &envelope)
+            .await
+            .unwrap();
+        local_projection::adopt(&mapper.inner);
+        let snapshot = backend.snapshot().await.unwrap();
+        let (_, failed) = mapper.inner.fold_pending_with_receipts(
+            fixture.a,
+            snapshot.area(fixture.a).unwrap(),
+            ReplayMode::StopAtFailure,
+            Some(&snapshot),
+        );
+        assert_eq!(
+            failed, None,
+            "the create precondition must not fail against its own receipt"
+        );
+        assert_eq!(
+            sorted_rooms(&mapper.get_current_atlas(), fixture.a),
+            vec![1, 2, 3, 4]
+        );
+        assert!(mapper.inner.pending.has_in_flight(fixture.a));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_local_conflict_rebuild_adopts_the_entire_merge_generation() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let fixture = merge_fixture();
+        for details in &fixture.documents {
+            backend.import_local_area(details.clone()).await.unwrap();
+        }
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.load_all_areas().await.unwrap();
+        let queued = mapper
+            .create_room(
+                RoomKey::new(fixture.a, RoomNumber(4)),
+                RoomUpdates::default(),
+            )
+            .unwrap();
+        // Claim the request before yielding so the test controls its conflict
+        // response while another session commits a merge into the same number.
+        let (claimed, _) = mapper.inner.pending.take_ready(Instant::now());
+        assert_eq!(
+            claimed.unwrap().1.operation_id,
+            queued.operation_id().unwrap()
+        );
+        backend
+            .merge_areas(&AreaMergePlan {
+                into: fixture.a,
+                sources: vec![merge_source(fixture.b)],
+                inbound: vec![fixture.c],
+                expected: fixture
+                    .documents
+                    .iter()
+                    .map(|details| (details.area.id, details.area.rev))
+                    .collect(),
+                number_floor: RoomNumber(4),
+            })
+            .await
+            .unwrap();
+        mapper
+            .inner
+            .reconcile_conflict(fixture.a, queued.operation_id().unwrap(), None, 0)
+            .await;
+        let atlas = mapper.get_current_atlas();
+        assert!(atlas.get_area(&fixture.b).is_none());
+        assert_eq!(sorted_rooms(&atlas, fixture.a), vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            exit_target(&atlas, fixture.c, 1, 3),
+            (Some(fixture.a), Some(RoomNumber(5)))
+        );
+        assert!(
+            mapper
+                .wait_for_mutation(queued.operation_id().unwrap())
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn initial_adoption_removes_local_sources_loaded_before_subscription() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let fixture = merge_fixture();
+        for details in &fixture.documents {
+            backend.import_local_area(details.clone()).await.unwrap();
+        }
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.pause_local_updates_for_test();
+        mapper.load_all_areas().await.unwrap();
+        let stale_source = backend.get_area(&fixture.b).await.unwrap();
+        backend
+            .merge_areas(&AreaMergePlan {
+                into: fixture.a,
+                sources: vec![merge_source(fixture.b)],
+                inbound: vec![fixture.c],
+                expected: fixture
+                    .documents
+                    .iter()
+                    .map(|details| (details.area.id, details.area.rev))
+                    .collect(),
+                number_floor: RoomNumber(4),
+            })
+            .await
+            .unwrap();
+        local_projection::adopt(&mapper.inner);
+        assert!(mapper.get_current_atlas().get_area(&fixture.b).is_none());
+        {
+            let _gate = mapper.inner.mutation_gate.lock();
+            mapper.inner.replay_pending_over_locked(
+                fixture.b,
+                &stale_source,
+                ReplayMode::StopAtFailure,
+            );
+        }
+        assert!(
+            mapper.get_current_atlas().get_area(&fixture.b).is_none(),
+            "a late refetch must not resurrect the merged source"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cold_degraded_store_publishes_survivors_despite_a_restored_delete_intent() {
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        let cache = root.join("cache");
+        let id = AreaId(Uuid::new_v4());
+        let operation = Uuid::new_v4();
+        {
+            let backend = LocalBackend::new(&local);
+            let mut document = sample_area(id, "Survivor");
+            document.area.name = "Survivor".into();
+            backend.import_local_area(document).await.unwrap();
+        }
+        {
+            let pending = PendingQueue::with_journal_namespace(
+                cache.join("pending-mutations"),
+                "non-cloud".into(),
+            );
+            let envelope = PendingEnvelope {
+                operation_id: operation,
+                ops: vec![AreaMutation::UpsertRoom {
+                    room_number: RoomNumber(77),
+                    body: RoomUpdates::default(),
+                }],
+                description: "edit before interrupted delete".into(),
+                structural_preconditions: Vec::new(),
+                attempts: 0,
+                viewer_id: None,
+                local_durable: true,
+                auth_generation: 0,
+                sequence: 0,
+                queued_at: Utc::now(),
+                journal_path: None,
+                receipt_expired: false,
+                published: false,
+                journal_batch_id: None,
+                delete_intent: false,
+            };
+            pending.enqueue_staged(id, envelope).unwrap();
+            pending.begin_delete(id).unwrap();
+            pending.prepare_delete(id).unwrap();
+        }
+        let transactions = local.join("transactions");
+        std::fs::create_dir_all(&transactions).unwrap();
+        let journal = transactions.join(format!("multi-write-{:020}-{}.json", 1, Uuid::new_v4()));
+        std::fs::write(&journal, "{not a transaction").unwrap();
+        let backend = Arc::new(LocalBackend::new(&local));
+        backend.journal_single_writes_for_test().await;
+        assert!(backend.snapshot().await.unwrap().recovery_error.is_some());
+        let mapper = Mapper::new(backend.clone(), cache);
+        assert!(mapper.inner.pending.has_delete_intent(id));
+        tokio::time::timeout(Duration::from_secs(2), mapper.load_all_areas())
+            .await
+            .expect("a degraded store must not hang startup")
+            .unwrap();
+        mapper.ready().await.unwrap();
+        assert_eq!(
+            mapper.get_current_atlas().get_area(&id).unwrap().get_name(),
+            "Survivor"
+        );
+        assert!(mapper.inner.pending.has_delete_intent(id));
+        assert!(mapper.inner.pending.is_delete_fenced(id));
+        wait_until(|| backend.refresh_attempts_for_test() > 0).await;
+        for _ in 0..8 {
+            mapper.inner.pending.projection_changed();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend.refresh_attempts_for_test(),
+            1,
+            "queue wakes must not retry unchanged failed recovery"
+        );
+        assert!(mapper.refresh_local_store().await.is_err());
+        assert_eq!(
+            backend.refresh_attempts_for_test(),
+            2,
+            "explicit refresh must still attempt recovery"
+        );
+        mapper.inner.pending.projection_changed();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(backend.refresh_attempts_for_test(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&journal).unwrap(),
+            "{not a transaction"
+        );
+        std::fs::remove_file(journal).unwrap();
+        mapper.refresh_local_store().await.unwrap();
+        assert!(!mapper.inner.pending.has_delete_intent(id));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            mapper.inner.pending.wait_for_completion(operation),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn unreadable_local_file_does_not_settle_an_ambiguous_delete() {
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        let backend = Arc::new(LocalBackend::new(&local));
+        let id = AreaId(Uuid::new_v4());
+        backend
+            .import_local_area(sample_area(id, "retained"))
+            .await
+            .unwrap();
+        let mapper = Mapper::new(backend, root.join("cache"));
+        mapper.pause_local_updates_for_test();
+        mapper.load_all_areas().await.unwrap();
+        let path = local.join("areas-v2").join(format!("{id}.json"));
+        let original = std::fs::read(&path).unwrap();
+        let mut fence = AreaDeleteFence::begin(id, mapper.inner.pending.clone()).unwrap();
+        fence.prepare().unwrap();
+        fence.request_started();
+        fence.reconcile();
+
+        std::fs::write(&path, "invalid JSON").unwrap();
+        mapper.refresh_local_store().await.unwrap();
+        assert!(mapper.inner.pending.has_delete_intent(id));
+        assert!(mapper.inner.pending.is_delete_fenced(id));
+        assert!(mapper.get_current_atlas().get_area(&id).is_some());
+
+        std::fs::write(&path, original).unwrap();
+        mapper.refresh_local_store().await.unwrap();
+        assert!(!mapper.inner.pending.has_delete_intent(id));
+        assert!(!mapper.inner.pending.is_delete_fenced(id));
+        assert!(mapper.get_current_atlas().get_area(&id).is_some());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_standalone_local_delete_recovers_and_releases_its_fence() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let area = backend
+            .create_area(CreateAreaRequest {
+                name: "Delete".into(),
+                atlas_id: None,
+                ephemeral: false,
+            })
+            .await
+            .unwrap();
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.load_all_areas().await.unwrap();
+        let mut fence = AreaDeleteFence::begin(area.id, mapper.inner.pending.clone()).unwrap();
+        fence.prepare().unwrap();
+        fence.request_started();
+        backend.delete_area(&area.id).await.unwrap();
+        fence.reconcile();
+        wait_until(|| {
+            mapper.get_current_atlas().get_area(&area.id).is_none()
+                && !mapper.inner.pending.is_delete_fenced(area.id)
+        })
+        .await;
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn local_commit_updates_an_idle_session_as_one_generation_and_preserves_its_filters() {
+        let root = temp_cache_dir();
+        let writer = Arc::new(LocalBackend::new(root.join("local")));
+        let fixture = merge_fixture();
+        for details in &fixture.documents {
+            writer.import_local_area(details.clone()).await.unwrap();
+        }
+        let observer_backend = Arc::new(LocalBackend::new(root.join("local").join(".")));
+        let observer = Mapper::new(observer_backend, root.join("observer"));
+        observer.load_all_areas().await.unwrap();
+        observer.set_area_enabled(fixture.c, false);
+        local_projection::adopt(&observer.inner);
+        let retained = observer.get_current_atlas();
+        // A session fence delays the whole generation, including the merge's
+        // destination and rewritten inbound links, until it is released.
+        let fence = AreaDeleteFence::begin(fixture.c, observer.inner.pending.clone()).unwrap();
+        let plan = AreaMergePlan {
+            into: fixture.a,
+            sources: vec![merge_source(fixture.b)],
+            inbound: vec![fixture.c],
+            expected: fixture
+                .documents
+                .iter()
+                .map(|details| (details.area.id, details.area.rev))
+                .collect(),
+            number_floor: RoomNumber(4),
+        };
+        writer.merge_areas(&plan).await.unwrap();
+        local_projection::adopt(&observer.inner);
+        assert_eq!(
+            sorted_rooms(&observer.get_current_atlas(), fixture.a),
+            vec![1, 2, 3]
+        );
+        assert!(observer.get_current_atlas().get_area(&fixture.b).is_some());
+        {
+            let reload = observer.load_all_areas();
+            tokio::pin!(reload);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut reload)
+                    .await
+                    .is_err()
+            );
+            assert!(observer.inner.pending.is_delete_fenced(fixture.c));
+            assert!(observer.get_current_atlas().get_area(&fixture.b).is_some());
+            assert_eq!(
+                sorted_rooms(&observer.get_current_atlas(), fixture.a),
+                vec![1, 2, 3]
+            );
+            fence.release();
+            tokio::time::timeout(Duration::from_secs(2), reload)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        wait_until(|| observer.get_current_atlas().get_area(&fixture.b).is_none()).await;
+        let current = observer.get_current_atlas();
+        assert_eq!(sorted_rooms(&current, fixture.a), vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            exit_target(&current, fixture.c, 1, 3),
+            (Some(fixture.a), Some(RoomNumber(5)))
+        );
+        assert!(observer.disabled_areas().contains(&fixture.c));
+        assert!(retained.get_area(&fixture.b).is_some());
+        assert_eq!(sorted_rooms(&retained, fixture.a), vec![1, 2, 3]);
+
+        writer
+            .update_area(
+                &fixture.a,
+                AreaUpdates {
+                    name: Some("Changed while idle".into()),
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        wait_until(|| {
+            observer
+                .get_current_atlas()
+                .get_area(&fixture.a)
+                .unwrap()
+                .get_name()
+                == "Changed while idle"
+        })
+        .await;
+        let tasks = observer.inner.background_tasks.lock().clone();
+        let weak = Arc::downgrade(&observer.inner);
+        drop(observer);
+        wait_until(|| {
+            weak.upgrade().is_none() && tasks.iter().all(tokio::task::AbortHandle::is_finished)
+        })
+        .await;
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn relocation_rechecks_late_conflicts_but_allows_an_ordinary_copy() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let fixture = merge_fixture();
+        for document in &fixture.documents {
+            backend.import_local_area(document.clone()).await.unwrap();
+        }
+        let mapper = Mapper::new(backend, root.join("cache"));
+        mapper.load_all_areas().await.unwrap();
+        let submission = mapper
+            .upsert_room(
+                RoomKey::new(fixture.a, RoomNumber(99)),
+                RoomUpdates::default(),
+            )
+            .unwrap();
+        let fences = mapper.begin_relocation(&[fixture.a]).unwrap();
+        mapper
+            .inner
+            .pending
+            .pause_conflict(fixture.a, submission.operation_id().unwrap());
+        assert!(matches!(
+            mapper.snapshot_relocation_sources(&[fixture.a]),
+            Err(CloudError::PendingOperations(_))
+        ));
+        drop(fences);
+        assert!(mapper.snapshot_relocation_sources(&[fixture.a]).is_ok());
+        let copied = mapper
+            .relocate_areas(
+                vec![fixture.a],
+                MapDestination::loose(MapStorage::Local),
+                crate::relocation::RelocationMode::Copy,
+            )
+            .await
+            .unwrap();
+        assert_eq!(copied.destination_ids.len(), 1);
+        assert!(mapper.get_current_atlas().get_area(&fixture.a).is_some());
+        assert_eq!(
+            mapper.inner.pending.save_status(fixture.a),
+            AreaSaveStatus::ConflictNeedsReview
+        );
+    }
+
+    #[tokio::test]
+    async fn relocation_sources_allow_publication_but_keep_the_copied_revision_guard() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let fixture = merge_fixture();
+        for document in &fixture.documents {
+            backend.import_local_area(document.clone()).await.unwrap();
+        }
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.load_all_areas().await.unwrap();
+        mapper.pause_local_updates_for_test();
+        let sources = [fixture.a, fixture.b];
+        let fences = mapper.begin_relocation(&sources).unwrap();
+        mapper.wait_area_move_quiescent(&fences).await;
+        let (copied, confirmed) = mapper.snapshot_relocation_sources(&sources).unwrap();
+        let expected: Vec<_> = copied
+            .iter()
+            .zip(confirmed)
+            .map(|(document, rev)| rev.unwrap_or(document.area.rev))
+            .collect();
+        backend
+            .update_area(
+                &fixture.b,
+                AreaUpdates {
+                    name: Some("Changed after the copy".into()),
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // A local destination write publishes the entire generation, even
+        // though the two source fences still prohibit edits and queued sends.
+        let destination = tokio::time::timeout(
+            Duration::from_secs(2),
+            mapper.create_area_at(
+                "Destination".into(),
+                MapDestination::loose(MapStorage::Local),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(mapper.get_current_atlas().get_area(&destination).is_some());
+        assert_eq!(
+            mapper
+                .get_current_atlas()
+                .get_area(&fixture.b)
+                .unwrap()
+                .get_name(),
+            "Changed after the copy"
+        );
+        assert!(matches!(
+            mapper.upsert_room(
+                RoomKey::new(fixture.b, RoomNumber(99)),
+                RoomUpdates::default()
+            ),
+            Err(CloudError::PendingOperations(_))
+        ));
+        let mut fences = fences.into_iter();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            mapper.commit_area_move(fences.next().unwrap(), Some(expected[0])),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            mapper.commit_area_move(fences.next().unwrap(), Some(expected[1])),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(error, CloudError::RevisionConflict { .. }));
+        assert_eq!(
+            backend.get_area(&fixture.b).await.unwrap().area.name,
+            "Changed after the copy"
+        );
+        assert!(mapper.get_current_atlas().get_area(&fixture.a).is_none());
+        assert!(!mapper.inner.pending.is_delete_fenced(fixture.b));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn local_create_and_merge_wait_for_session_publication() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let fixture = merge_fixture();
+        for details in &fixture.documents {
+            backend.import_local_area(details.clone()).await.unwrap();
+        }
+        let unrelated = AreaId(Uuid::new_v4());
+        backend
+            .import_local_area(sample_area(unrelated, "Unrelated"))
+            .await
+            .unwrap();
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.load_all_areas().await.unwrap();
+        for merge in [false, true] {
+            let fence = AreaDeleteFence::begin(unrelated, mapper.inner.pending.clone()).unwrap();
+            backend
+                .update_area(
+                    &unrelated,
+                    AreaUpdates {
+                        name: Some(format!("Changed: {merge}")),
+                        atlas_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let operation = {
+                let mapper = mapper.clone();
+                tokio::spawn(async move {
+                    if merge {
+                        mapper
+                            .merge_areas(fixture.a, vec![merge_source(fixture.b)])
+                            .await
+                            .map(|_| fixture.a)
+                    } else {
+                        mapper
+                            .create_area_at(
+                                "Created".into(),
+                                MapDestination::loose(MapStorage::Local),
+                            )
+                            .await
+                    }
+                })
+            };
+            // Wait for the durable commit, not an arbitrary scheduling delay.
+            wait_until(|| {
+                let snapshot = backend.local_snapshot().unwrap();
+                if merge {
+                    !snapshot.contains_area(fixture.b)
+                } else {
+                    snapshot.areas().any(|a| a.area.name == "Created")
+                }
+            })
+            .await;
+            assert!(
+                !operation.is_finished(),
+                "an awaited write must cover session visibility"
+            );
+            assert!(mapper.get_current_atlas().get_area(&fixture.b).is_some());
+            if !merge {
+                assert!(
+                    !mapper
+                        .get_current_atlas()
+                        .areas()
+                        .any(|a| a.get_name() == "Created")
+                );
+            }
+            fence.release();
+            let id = tokio::time::timeout(Duration::from_secs(2), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(mapper.get_current_atlas().get_area(&id).is_some());
+            if merge {
+                assert!(mapper.get_current_atlas().get_area(&fixture.b).is_none());
+                assert!(mapper.inner.room_reservations.lock().is_empty());
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_areas_publishes_one_snapshot_with_sources_gone_and_indexes_clean() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let fixture = merge_fixture();
+        for document in &fixture.documents {
+            backend
+                .import_local_area(document.clone())
+                .await
+                .expect("store fixture area");
+        }
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.load_all_areas().await.expect("load");
+        let MergeFixture { a, b, c, .. } = fixture;
+        let revision = mapper.sync_revision();
+
+        let commit = mapper
+            .merge_areas(a, vec![merge_source(b)])
+            .await
+            .expect("merge through the local store");
+
+        let remap: Vec<(RoomKey, RoomNumber)> = commit
+            .outcome
+            .rooms
+            .iter()
+            .map(|room| (room.from.clone(), room.to))
+            .collect();
+        assert_eq!(
+            remap,
+            vec![
+                (RoomKey::new(b, RoomNumber(1)), RoomNumber(4)),
+                (RoomKey::new(b, RoomNumber(2)), RoomNumber(5)),
+            ],
+            "B's rooms take A's next free numbers in source order"
+        );
+
+        let atlas = mapper.get_current_atlas();
+        assert!(atlas.get_area(&b).is_none(), "the source is gone");
+        let destination = atlas.get_area(&a).expect("destination");
+        let mut numbers: Vec<i32> = destination
+            .get_rooms()
+            .iter()
+            .map(|room| room.get_room_number().0)
+            .collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            atlas
+                .find_room_by_external_id(B_ONE_EXTERNAL_ID)
+                .map(|(key, _)| key),
+            Some(RoomKey::new(a, RoomNumber(4))),
+            "the external id answers with the destination address"
+        );
+        let by_property: Vec<(AreaId, RoomNumber)> = atlas
+            .get_rooms_by_property("shard", "jurassic")
+            .map(|(area_id, room)| (area_id, room.get_room_number()))
+            .collect();
+        assert_eq!(by_property, vec![(a, RoomNumber(4))]);
+        assert_eq!(
+            exit_target(&atlas, c, 1, 3),
+            (Some(a), Some(RoomNumber(5))),
+            "the third party's exit follows the moved room"
+        );
+        assert_eq!(exit_target(&atlas, a, 3, 1), (Some(a), Some(RoomNumber(4))));
+        assert_eq!(exit_target(&atlas, a, 4, 2), (Some(a), Some(RoomNumber(3))));
+        assert!(mapper.sync_revision() > revision, "pollers notice");
+        assert!(
+            backend.get_area(&b).await.is_err(),
+            "the store no longer holds the source"
+        );
+        assert_eq!(mapper.inner.pending.total_pending(), 0);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_areas_refuses_before_fencing_when_a_queue_is_parked() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        let MergeFixture { a, b, .. } = fixture;
+
+        backend.fail_mutations_with(Some(CloudError::PermissionDenied(
+            "read-only share".to_string(),
+        )));
+        mapper
+            .upsert_room(
+                RoomKey::new(a, RoomNumber(1)),
+                RoomUpdates {
+                    title: Some("Annex".to_string()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .expect("enqueue room");
+        wait_until(|| {
+            matches!(
+                mapper.area_save_status(a),
+                AreaSaveStatus::CouldNotSave { .. }
+            )
+        })
+        .await;
+        let pending_before = mapper.inner.pending.total_pending();
+
+        let error = mapper
+            .merge_areas(a, vec![merge_source(b)])
+            .await
+            .expect_err("a parked queue refuses the merge");
+        assert_eq!(conflict_code(&error), "merge_areas_busy");
+        assert_eq!(mapper.inner.pending.total_pending(), pending_before);
+        assert!(
+            backend.merge_plans.lock().is_empty(),
+            "nothing reached the backend"
+        );
+        assert!(mapper.get_current_atlas().get_area(&b).is_some());
+
+        // No fence was left behind: ordinary edits still enqueue everywhere.
+        for area in [a, b, fixture.c] {
+            mapper
+                .upsert_room(RoomKey::new(area, RoomNumber(1)), RoomUpdates::default())
+                .expect("the area is not fenced");
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_areas_waits_for_queued_envelopes_before_committing() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        let MergeFixture { a, b, c, .. } = fixture;
+
+        // One envelope held on the wire, a second queued unsent behind it.
+        backend.hold_mutations(true);
+        for title in ["first", "second"] {
+            mapper
+                .upsert_room(
+                    RoomKey::new(c, RoomNumber(1)),
+                    RoomUpdates {
+                        title: Some(title.to_string()),
+                        ..RoomUpdates::default()
+                    },
+                )
+                .expect("enqueue third-party edit");
+        }
+        assert_eq!(mapper.inner.pending.total_pending(), 2);
+
+        let merging = {
+            let mapper = mapper.clone();
+            tokio::spawn(async move { mapper.merge_areas(a, vec![merge_source(b)]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!merging.is_finished(), "the merge waits for the queue");
+        assert!(
+            backend.merge_plans.lock().is_empty(),
+            "no plan is built while edits are outstanding"
+        );
+
+        backend.hold_mutations(false);
+        let commit = merging
+            .await
+            .expect("merge task")
+            .expect("merge after the queue drains");
+
+        assert_eq!(
+            backend.mutations.lock().len(),
+            2,
+            "both envelopes reached the backend before the merge"
+        );
+        let plans = backend.merge_plans.lock();
+        assert_eq!(plans.len(), 1);
+        let expected_c = plans[0]
+            .expected
+            .iter()
+            .find(|(id, _)| *id == c)
+            .map(|(_, rev)| *rev);
+        assert_eq!(
+            expected_c,
+            Some(3),
+            "the plan stands on the revision both envelopes produced"
+        );
+        drop(plans);
+        let third = commit
+            .documents
+            .iter()
+            .find(|document| document.area.id == c)
+            .expect("the third party was rewritten");
+        assert_eq!(third.rooms[0].title, "second", "no edit was lost");
+        assert_eq!(mapper.inner.pending.total_pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn merge_areas_source_changed_releases_every_fence() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        let MergeFixture { a, b, c, .. } = fixture;
+        backend.refuse_merges_with_conflict(true);
+        let pending_before = mapper.inner.pending.total_pending();
+        let revision = mapper.sync_revision();
+
+        let error = mapper
+            .merge_areas(a, vec![merge_source(b)])
+            .await
+            .expect_err("the backend's revision verdict refuses the merge");
+        assert_eq!(conflict_code(&error), "merge_areas_source_changed");
+        assert_eq!(backend.merge_plans.lock().len(), 1, "the plan was sent");
+        assert_eq!(mapper.inner.pending.total_pending(), pending_before);
+        assert_eq!(mapper.sync_revision(), revision, "nothing was published");
+        assert!(mapper.get_current_atlas().get_area(&b).is_some());
+
+        for area in [a, b, c] {
+            mapper
+                .upsert_room(RoomKey::new(area, RoomNumber(1)), RoomUpdates::default())
+                .expect("every touched area reopened");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_merge_caller_keeps_fences_until_owned_completion() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        backend.hold_merges(true);
+        let caller = {
+            let mapper = mapper.clone();
+            tokio::spawn(async move {
+                mapper
+                    .merge_areas(fixture.a, vec![merge_source(fixture.b)])
+                    .await
+            })
+        };
+        wait_until(|| !backend.merge_plans.lock().is_empty()).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(mapper.inner.pending.is_delete_fenced(fixture.a));
+        assert!(mapper.inner.pending.is_delete_fenced(fixture.b));
+        backend.hold_merges(false);
+        wait_until(|| mapper.get_current_atlas().get_area(&fixture.b).is_none()).await;
+        assert!(!mapper.inner.pending.is_delete_fenced(fixture.a));
+        assert!(mapper.inner.room_reservations.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restarted_journaled_mutation_stays_non_discardable_until_published() {
+        for cold in [false, true] {
+            let root = temp_cache_dir();
+            let local = root.join("local");
+            let cache = root.join("cache");
+            let mut backend = Arc::new(LocalBackend::new(&local));
+            backend.journal_single_writes_for_test().await;
+            let id = AreaId(Uuid::new_v4());
+            backend
+                .import_local_area(sample_area(id, "Original"))
+                .await
+                .unwrap();
+            let mapper = Mapper::new(backend.clone(), &cache);
+            mapper.pause_local_updates_for_test();
+            mapper.load_all_areas().await.unwrap();
+            let path = local.join("areas-v2").join(format!("{id}.json"));
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let operation = mapper
+                .upsert_room(RoomKey::new(id, RoomNumber(77)), RoomUpdates::default())
+                .unwrap()
+                .operation_id()
+                .unwrap();
+            wait_until(|| !mapper.inner.recovery.lock().mutations.is_empty()).await;
+            let wal = mapper.inner.pending.pending_for(id)[0]
+                .journal_path
+                .clone()
+                .unwrap();
+            let original_wal = std::fs::read(&wal).unwrap();
+            let tasks = mapper.inner.background_tasks.lock().clone();
+            drop(mapper);
+            wait_until(|| tasks.iter().all(tokio::task::AbortHandle::is_finished)).await;
+            if cold {
+                drop(backend);
+                backend = Arc::new(LocalBackend::new(&local));
+            }
+            let restarted = Mapper::new(backend.clone(), &cache);
+            assert!(
+                !restarted.cancel_pending(id, operation).await.unwrap(),
+                "a restored WAL needs its recovery base before cancellation is safe"
+            );
+            restarted.load_all_areas().await.unwrap();
+            wait_until(|| {
+                !restarted.inner.recovery.lock().mutations.is_empty()
+                    || matches!(
+                        restarted.inner.pending.save_status(id),
+                        AreaSaveStatus::CouldNotSave { .. }
+                    )
+            })
+            .await;
+            assert_eq!(
+                restarted.inner.pending.save_status(id),
+                AreaSaveStatus::Saving(1),
+                "cold={cold}"
+            );
+            assert!(!restarted.cancel_pending(id, operation).await.unwrap());
+            restarted.resolve_failed(id, false).await.unwrap();
+            assert_eq!(std::fs::read(&wal).unwrap(), original_wal);
+            assert_eq!(restarted.inner.pending.pending_for(id).len(), 1);
+            std::fs::remove_dir(&path).unwrap();
+            restarted.refresh_local_store().await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                restarted.inner.pending.wait_for_completion(operation),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                backend
+                    .get_area(&id)
+                    .await
+                    .unwrap()
+                    .rooms
+                    .iter()
+                    .filter(|room| room.room_number == RoomNumber(77))
+                    .count(),
+                1
+            );
+            assert!(restarted.inner.pending.pending_for(id).is_empty());
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_journaled_mutation_cannot_be_discarded_before_recovery() {
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        let backend = Arc::new(LocalBackend::new(&local));
+        backend.journal_single_writes_for_test().await;
+        let id = AreaId(Uuid::new_v4());
+        backend
+            .import_local_area(sample_area(id, "Durable edit"))
+            .await
+            .unwrap();
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.pause_local_updates_for_test();
+        mapper.load_all_areas().await.unwrap();
+        let path = local.join("areas-v2").join(format!("{id}.json"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        mapper
+            .upsert_room(RoomKey::new(id, RoomNumber(77)), RoomUpdates::default())
+            .unwrap();
+        wait_until(|| !mapper.inner.recovery.lock().mutations.is_empty()).await;
+        let operation = mapper.inner.pending.pending_for(id)[0].operation_id;
+        assert_eq!(
+            mapper.inner.pending.save_status(id),
+            AreaSaveStatus::Saving(1)
+        );
+        assert!(!mapper.cancel_pending(id, operation).await.unwrap());
+        mapper.resolve_failed(id, false).await.unwrap();
+        assert_eq!(mapper.inner.pending.pending_for(id).len(), 1);
+        assert!(mapper.refresh_local_store().await.is_err());
+        assert_eq!(mapper.inner.pending.pending_for(id).len(), 1);
+        mapper.inner.pending.pause_for_upgrade();
+        assert!(
+            !mapper.cancel_pending(id, operation).await.unwrap(),
+            "a cloud upgrade pause must not make a decided local edit cancelable"
+        );
+        mapper.inner.pending.resume_after_upgrade();
+        let fences = mapper.begin_area_move(&[id]).unwrap();
+        let quiescent = mapper.wait_area_move_quiescent(&fences);
+        tokio::pin!(quiescent);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut quiescent)
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), mapper.refresh_local_store())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut quiescent)
+            .await
+            .unwrap();
+        assert!(mapper.inner.pending.is_delete_fenced(id));
+        mapper
+            .inner
+            .pending
+            .wait_for_completion(operation)
+            .await
+            .unwrap();
+        assert!(mapper.inner.pending.pending_for(id).is_empty());
+        assert!(mapper.inner.recovery.lock().mutations.is_empty());
+        assert!(
+            mapper
+                .get_current_atlas()
+                .get_area(&id)
+                .unwrap()
+                .get_room(&RoomNumber(77))
+                .is_some()
+        );
+        assert_eq!(
+            backend
+                .get_area(&id)
+                .await
+                .unwrap()
+                .rooms
+                .iter()
+                .filter(|room| room.room_number == RoomNumber(77))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn follower_conflict_cannot_release_a_journaled_head() {
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        let backend = Arc::new(LocalBackend::new(&local));
+        backend.journal_single_writes_for_test().await;
+        let id = AreaId(Uuid::new_v4());
+        backend
+            .import_local_area(sample_area(id, "Base"))
+            .await
+            .unwrap();
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.pause_local_updates_for_test();
+        mapper.load_all_areas().await.unwrap();
+        let path = local.join("areas-v2").join(format!("{id}.json"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        mapper
+            .upsert_room(RoomKey::new(id, RoomNumber(77)), RoomUpdates::default())
+            .unwrap();
+        wait_until(|| !mapper.inner.recovery.lock().mutations.is_empty()).await;
+        let head = mapper.inner.pending.pending_for(id)[0].operation_id;
+        let follower = RoomKey::new(id, RoomNumber(88));
+        mapper
+            .upsert_room(follower.clone(), RoomUpdates::default())
+            .unwrap();
+        mapper
+            .upsert_room(
+                follower,
+                RoomUpdates {
+                    title: Some("Dependent edit".into()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .unwrap();
+        let queued = mapper.inner.pending.pending_for(id);
+        let creator = queued[1].operation_id;
+        let dependent = queued[2].operation_id;
+        assert!(mapper.cancel_pending(id, creator).await.unwrap());
+        assert_eq!(mapper.area_save_status(id), AreaSaveStatus::Saving(2));
+        mapper.resolve_conflict(id, true).await.unwrap();
+        assert!(!mapper.cancel_pending(id, head).await.unwrap());
+        assert_eq!(mapper.inner.pending.pending_for(id).len(), 2);
+
+        std::fs::remove_dir(&path).unwrap();
+        mapper.refresh_local_store().await.unwrap();
+        mapper
+            .inner
+            .pending
+            .wait_for_completion(head)
+            .await
+            .unwrap();
+        assert_eq!(
+            mapper.area_save_status(id),
+            AreaSaveStatus::ConflictNeedsReview
+        );
+        assert_eq!(
+            mapper.inner.pending.pending_for(id)[0].operation_id,
+            dependent
+        );
+        let stored = backend.get_area(&id).await.unwrap();
+        assert!(
+            stored
+                .rooms
+                .iter()
+                .any(|room| room.room_number == RoomNumber(77))
+        );
+        assert!(
+            !stored
+                .rooms
+                .iter()
+                .any(|room| room.room_number == RoomNumber(88))
+        );
+        mapper.resolve_conflict(id, false).await.unwrap();
+        assert_eq!(mapper.area_save_status(id), AreaSaveStatus::Saved);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_refuses_a_queue_waiting_for_publication_within_its_deadline() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        backend.session_ids.lock().clear();
+        backend.serve_as_local(&[fixture.a, fixture.b, fixture.c]);
+        backend.hold_mutations(true);
+        let submission = mapper
+            .upsert_room(
+                RoomKey::new(fixture.a, RoomNumber(1)),
+                RoomUpdates {
+                    title: Some("Waiting".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        wait_until(|| mapper.inner.pending.has_in_flight(fixture.a)).await;
+        assert!(
+            mapper
+                .inner
+                .pending
+                .hold_journaled(fixture.a, submission.operation_id().unwrap())
+        );
+        let error = tokio::time::timeout(
+            MERGE_DRAIN_TIMEOUT + Duration::from_secs(1),
+            mapper.merge_areas(fixture.a, vec![merge_source(fixture.b)]),
+        )
+        .await
+        .expect("merge must settle within its own deadline")
+        .unwrap_err();
+        assert_eq!(conflict_code(&error), "merge_areas_busy");
+        assert!(backend.merge_plans.lock().is_empty());
+        assert!(!mapper.inner.pending.is_delete_fenced(fixture.a));
+        assert!(mapper.inner.room_reservations.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_merge_publishes_through_the_composite_backend() {
+        use crate::backends::{CompositeBackend, EphemeralBackend};
+
+        let root = temp_cache_dir();
+        let backend = Arc::new(CompositeBackend::new(
+            Arc::new(LocalBackend::new(root.join("local"))),
+            Arc::new(EphemeralBackend::new()),
+        ));
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.ready().await.unwrap();
+        let into = mapper
+            .create_area_at(
+                "Destination".into(),
+                MapDestination::loose(MapStorage::Session),
+            )
+            .await
+            .unwrap();
+        let source = mapper
+            .create_area_at("Source".into(), MapDestination::loose(MapStorage::Session))
+            .await
+            .unwrap();
+        mapper
+            .upsert_room(
+                RoomKey::new(source, RoomNumber(1)),
+                RoomUpdates {
+                    title: Some("Moved room".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        mapper
+            .merge_areas(into, vec![merge_source(source)])
+            .await
+            .unwrap();
+        let atlas = mapper.get_current_atlas();
+        assert!(atlas.get_area(&source).is_none());
+        assert_eq!(sorted_rooms(&atlas, into), vec![1]);
+        assert_eq!(backend.get_area(&into).await.unwrap().rooms.len(), 1);
+        assert!(mapper.inner.recovery.lock().merges.is_empty());
+        assert!(mapper.inner.room_reservations.lock().is_empty());
+        assert!(!mapper.inner.pending.is_delete_fenced(into));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_journaled_merge_drives_its_own_recovery() {
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        let backend = Arc::new(LocalBackend::new(&local));
+        let fixture = merge_fixture();
+        for details in &fixture.documents {
+            backend.import_local_area(details.clone()).await.unwrap();
+        }
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.ready().await.unwrap();
+        let blocked = local.join("areas-v2").join(format!("{}.json", fixture.c));
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(matches!(
+            mapper
+                .merge_areas(fixture.a, vec![merge_source(fixture.b)])
+                .await,
+            Err(CloudError::LocalCommitPending { .. })
+        ));
+        // Remove the transient obstruction before this current-thread runtime
+        // runs the observer. No mutation, explicit refresh or later write wakes it.
+        std::fs::remove_dir(blocked).unwrap();
+        wait_until(|| mapper.get_current_atlas().get_area(&fixture.b).is_none()).await;
+        assert_eq!(backend.refresh_attempts_for_test(), 1);
+        assert!(mapper.inner.recovery.lock().merges.is_empty());
+        assert!(mapper.inner.room_reservations.lock().is_empty());
+        for id in [fixture.a, fixture.b, fixture.c] {
+            assert!(!mapper.inner.pending.is_delete_fenced(id));
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_journaled_merge_keeps_fences_until_explicit_recovery_publishes() {
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        let backend = Arc::new(LocalBackend::new(&local));
+        let fixture = merge_fixture();
+        for details in &fixture.documents {
+            backend.import_local_area(details.clone()).await.unwrap();
+        }
+        let mapper = Mapper::new(backend, root.join("cache"));
+        mapper.load_all_areas().await.unwrap();
+        local_projection::adopt(&mapper.inner);
+        let blocked = local.join("areas-v2").join(format!("{}.json", fixture.c));
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let error = mapper
+            .merge_areas(fixture.a, vec![merge_source(fixture.b)])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CloudError::LocalCommitPending { .. }));
+        // A wake without a newer committed generation must keep completion owned.
+        local_projection::adopt(&mapper.inner);
+        for id in [fixture.a, fixture.b, fixture.c] {
+            assert!(mapper.inner.pending.is_delete_fenced(id));
+        }
+        assert!(mapper.get_current_atlas().get_area(&fixture.b).is_some());
+        assert!(!mapper.inner.room_reservations.lock().is_empty());
+        std::fs::remove_dir(blocked).unwrap();
+        mapper.refresh_local_store().await.unwrap();
+        assert!(mapper.get_current_atlas().get_area(&fixture.b).is_none());
+        assert_eq!(
+            sorted_rooms(&mapper.get_current_atlas(), fixture.a),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert!(!mapper.inner.pending.is_delete_fenced(fixture.a));
+        assert!(!mapper.inner.pending.is_delete_fenced(fixture.c));
+        assert!(mapper.inner.room_reservations.lock().is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A draft opened while the backend is committing must not reserve a
+    /// number the merge is about to place. The fixture's destination has
+    /// rooms 1..3 (floor 4) and the source two rooms, so the merge fills
+    /// 4 and 5; the draft lands at 6, and later drafts continue past it.
+    #[tokio::test]
+    async fn merge_areas_keeps_drafts_out_of_its_numbering_band() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        let MergeFixture { a, b, .. } = fixture;
+        backend.hold_merges(true);
+
+        let merging = {
+            let mapper = mapper.clone();
+            tokio::spawn(async move { mapper.merge_areas(a, vec![merge_source(b)]).await })
+        };
+        wait_until(|| !backend.merge_plans.lock().is_empty()).await;
+        assert!(!merging.is_finished(), "the backend holds the commit");
+        let number_floor = backend.merge_plans.lock()[0].number_floor;
+        assert_eq!(number_floor, RoomNumber(4));
+
+        let draft = Uuid::new_v4();
+        let reserved = mapper
+            .reserve_room_number(&a, draft)
+            .expect("the destination is loaded");
+        assert!(
+            reserved.0 >= number_floor.0 + 2,
+            "a draft opened mid-commit lands above the band, got {reserved:?}"
+        );
+
+        backend.hold_merges(false);
+        let commit = merging
+            .await
+            .expect("merge task")
+            .expect("merge after the gate opens");
+        assert!(
+            commit.outcome.rooms.iter().all(|room| room.to < reserved),
+            "every merged room sits below the draft's number: {:?}",
+            commit.outcome.rooms
+        );
+        assert_eq!(
+            mapper.reserve_room_number(&a, draft).expect("reserve"),
+            RoomNumber(reserved.0 + 1),
+            "the draft keeps counting past its own reservation"
+        );
+        mapper.release_room_reservations(&a, draft);
+        assert_eq!(
+            mapper.next_room_number(&a),
+            Some(RoomNumber(6)),
+            "with the draft gone, allocation follows the merged cache"
+        );
+    }
+
+    /// A failed merge releases its hold on the destination's floor: the
+    /// next reservation is what the cache alone dictates.
+    #[tokio::test]
+    async fn merge_areas_failure_releases_its_hold_on_the_allocation_floor() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        let MergeFixture { a, b, .. } = fixture;
+        backend.refuse_merges_with_conflict(true);
+
+        mapper
+            .merge_areas(a, vec![merge_source(b)])
+            .await
+            .expect_err("the backend refuses");
+
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(4)));
+        assert_eq!(
+            mapper
+                .reserve_room_number(&a, Uuid::new_v4())
+                .expect("reserve"),
+            RoomNumber(4),
+            "no merge hold survives the failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_areas_refuses_same_area_mixed_tiers_and_cloud_without_touching_anything() {
+        let fixture = merge_fixture();
+        let backend = Arc::new(FixedBackend::new(fixture.documents.clone()));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+        let MergeFixture { a, b, c, .. } = fixture;
+        let revision = mapper.sync_revision();
+
+        let refusal = |result: CloudResult<AreaMergeCommit>| match result {
+            Err(CloudError::StructuralConflict(code)) => code,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert_eq!(
+            refusal(mapper.merge_areas(a, vec![]).await),
+            "merge_areas_no_sources"
+        );
+        assert_eq!(
+            refusal(mapper.merge_areas(a, vec![merge_source(a)]).await),
+            "merge_areas_same_area"
+        );
+        assert_eq!(
+            refusal(
+                mapper
+                    .merge_areas(a, vec![merge_source(b), merge_source(b)])
+                    .await
+            ),
+            "merge_areas_same_area"
+        );
+        // Nothing is served as local yet: every fixture area reads as cloud.
+        assert_eq!(
+            refusal(mapper.merge_areas(a, vec![merge_source(b)]).await),
+            "merge_areas_unsupported_storage"
+        );
+        let unknown = AreaId(Uuid::new_v4());
+        assert!(matches!(
+            mapper.merge_areas(a, vec![merge_source(unknown)]).await,
+            Err(CloudError::AreaNotFound(id)) if id == unknown
+        ));
+
+        // A local destination with a cloud source, then a local pair whose
+        // third party lives in another tier.
+        backend.serve_as_local(&[a]);
+        assert_eq!(
+            refusal(mapper.merge_areas(a, vec![merge_source(b)]).await),
+            "merge_areas_mixed_tiers"
+        );
+        backend.serve_as_local(&[b]);
+        assert_eq!(
+            refusal(mapper.merge_areas(a, vec![merge_source(b)]).await),
+            "merge_areas_mixed_tiers"
+        );
+
+        assert!(backend.merge_plans.lock().is_empty());
+        assert_eq!(mapper.inner.pending.total_pending(), 0);
+        assert_eq!(mapper.sync_revision(), revision);
+        let atlas = mapper.get_current_atlas();
+        for area in [a, b, c] {
+            assert!(atlas.get_area(&area).is_some(), "every area is untouched");
+        }
+        assert_eq!(
+            exit_target(&atlas, c, 1, 3),
+            (Some(b), Some(RoomNumber(2))),
+            "no exit was retargeted"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_areas_emits_areas_merged_with_the_remap() {
+        let (fixture, _backend, mapper) = fixed_merge_mapper().await;
+        let MergeFixture { a, b, .. } = fixture;
+        let mut events = mapper.subscribe_mapper_events();
+
+        let commit = mapper
+            .merge_areas(a, vec![merge_source(b)])
+            .await
+            .expect("merge");
+
+        let merged = loop {
+            if let MapperEvent::AreasMerged {
+                into,
+                deleted,
+                rooms,
+            } = events.recv().await.expect("event stream open")
+            {
+                break (into, deleted, rooms);
+            }
+        };
+        assert_eq!(merged.0, a);
+        assert_eq!(merged.1, vec![b], "a whole source is announced as deleted");
+        assert_eq!(merged.2, commit.outcome.rooms);
+        assert!(
+            mapper.get_current_atlas().get_area(&b).is_none(),
+            "the event follows publication"
+        );
+    }
+
+    /// A source that gives up only some rooms is written, not deleted: it
+    /// stays in the atlas with its remaining rooms, its fence is released
+    /// so the next edit enqueues, its confirmed revision is the merge's,
+    /// and the event lists nothing as deleted.
+    #[tokio::test]
+    async fn merge_areas_partial_source_stays_and_reopens() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        let MergeFixture { a, b, c, .. } = fixture;
+        let mut events = mapper.subscribe_mapper_events();
+        let revision = mapper.sync_revision();
+
+        let commit = mapper
+            .merge_areas(
+                a,
+                vec![AreaMergeSource {
+                    rooms: Some(vec![RoomNumber(2)]),
+                    ..merge_source(b)
+                }],
+            )
+            .await
+            .expect("partial merge");
+
+        assert_eq!(
+            commit.outcome.rooms,
+            vec![crate::backends::RoomRemap {
+                from: RoomKey::new(b, RoomNumber(2)),
+                to: RoomNumber(4),
+            }],
+            "only the listed room moves"
+        );
+        let atlas = mapper.get_current_atlas();
+        let source = atlas.get_area(&b).expect("the partial source stays");
+        assert_eq!(sorted_rooms(&atlas, b), vec![1], "the unlisted room stays");
+        assert_eq!(
+            atlas
+                .find_room_by_external_id(B_ONE_EXTERNAL_ID)
+                .map(|(key, _)| key),
+            Some(RoomKey::new(b, RoomNumber(1))),
+            "the remaining room's index entries still point into the source"
+        );
+        assert_eq!(sorted_rooms(&atlas, a), vec![1, 2, 3, 4]);
+        assert_eq!(
+            exit_target(&atlas, c, 1, 3),
+            (Some(a), Some(RoomNumber(4))),
+            "the third party's exit follows the moved room"
+        );
+        assert_eq!(
+            exit_target(&atlas, b, 1, 2),
+            (Some(a), Some(RoomNumber(3))),
+            "an exit from a remaining room out of the area is untouched"
+        );
+        assert!(mapper.sync_revision() > revision);
+
+        let source_version = commit
+            .outcome
+            .versions
+            .iter()
+            .find(|version| version.id == b.0)
+            .expect("the partial source reports a version");
+        assert!(!source_version.deleted, "written, not deleted");
+        assert!(
+            commit
+                .documents
+                .iter()
+                .any(|document| document.area.id == b),
+            "its post-image comes back with the commit"
+        );
+        assert_eq!(source.get_rev(), source_version.rev);
+        assert_eq!(mapper.confirmed_area_rev(b), Some(source_version.rev));
+        assert!(
+            backend.areas.lock().contains_key(&b),
+            "the backend keeps the source"
+        );
+
+        let merged = loop {
+            if let MapperEvent::AreasMerged { deleted, .. } =
+                events.recv().await.expect("event stream open")
+            {
+                break deleted;
+            }
+        };
+        assert!(merged.is_empty(), "nothing was deleted");
+
+        // The fence is released: an edit on the source enqueues and lands
+        // against the merge's revision.
+        let submission = mapper
+            .upsert_room(
+                RoomKey::new(b, RoomNumber(1)),
+                RoomUpdates {
+                    title: Some("Still here".to_string()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .expect("the partial source reopened");
+        mapper
+            .wait_for_mutation(submission.operation_id().expect("queued"))
+            .await
+            .expect("the backend accepts the precondition");
+        assert_eq!(
+            backend.mutation_revs.lock().last().copied().flatten(),
+            Some(source_version.rev),
+            "the envelope's precondition is the merge's revision"
+        );
+        assert_eq!(mapper.inner.pending.total_pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn merge_areas_notes_the_destination_confirmed_rev_so_later_envelopes_carry_it() {
+        let (fixture, backend, mapper) = fixed_merge_mapper().await;
+        let MergeFixture { a, b, c, .. } = fixture;
+
+        let commit = mapper
+            .merge_areas(a, vec![merge_source(b)])
+            .await
+            .expect("merge");
+        let new_rev = |area: AreaId| {
+            commit
+                .outcome
+                .versions
+                .iter()
+                .find(|version| version.id == area.0 && !version.deleted)
+                .map(|version| version.rev)
+                .expect("a written document reports its revision")
+        };
+        assert_eq!(mapper.confirmed_area_rev(a), Some(new_rev(a)));
+        assert_eq!(mapper.confirmed_area_rev(c), Some(new_rev(c)));
+
+        let submission = mapper
+            .upsert_room(
+                RoomKey::new(a, RoomNumber(4)),
+                RoomUpdates {
+                    title: Some("Moved in".to_string()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .expect("enqueue on the merged destination");
+        mapper
+            .wait_for_mutation(submission.operation_id().expect("queued"))
+            .await
+            .expect("the backend accepts the precondition");
+        assert_eq!(
+            backend.mutation_revs.lock().last().copied().flatten(),
+            Some(new_rev(a)),
+            "the envelope's precondition is the merge's revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_area_bumps_the_sync_revision() {
+        let a_id = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(a_id, "Plaza")]));
+        let mapper = Mapper::new(backend, temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+        let revision = mapper.sync_revision();
+
+        mapper.delete_area(a_id).await.expect("delete");
+
+        assert!(mapper.get_current_atlas().get_area(&a_id).is_none());
+        assert!(
+            mapper.sync_revision() > revision,
+            "a delete changes the atlas and pollers must notice"
         );
     }
 }
