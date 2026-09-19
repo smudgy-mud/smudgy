@@ -49,10 +49,16 @@
 //! RCU plus one unbounded-channel push — the same cost the app's calling
 //! thread pays before background sync picks the op up.
 //!
+//! `SMUDGY_BENCH_PERSISTENCE_ONLY=1` skips unrelated fixtures for `local_save`
+//! and `local_merge` runs. Local merges require `--features pr-benchmarks`.
+//!
 //! Env vars: `SMUDGY_BENCH_LINES=n` scales BIG down (no log corpus here, so
 //! the knob maps to rooms as `BIG = clamp(25 * n, 1_000, 50_000)`; SMALL/MED
 //! stay fixed and BIG entries are skipped if the scaled size collides with
 //! them). `SMUDGY_BENCH_SKIP_SANITY=1` skips the state-restoring sanity pass.
+
+#[path = "mapper_scale/persistence.rs"]
+mod persistence;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -502,6 +508,9 @@ fn sanity_identification(atlas: &AtlasCache, queries: &[(String, String)], multi
 
 #[allow(clippy::too_many_lines)]
 fn mapper_scale(c: &mut Criterion) {
+    if std::env::var_os("SMUDGY_BENCH_PERSISTENCE_ONLY").is_some() {
+        return;
+    }
     let big = big_rooms();
     eprintln!(
         "sizes: SMALL={SMALL} MED={MED} BIG={big} rooms (~{ROOMS_PER_AREA}-room areas; \
@@ -683,5 +692,10 @@ fn mapper_scale(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, mapper_scale);
+criterion_group!(
+    benches,
+    mapper_scale,
+    persistence::local_writes,
+    persistence::local_merges
+);
 criterion_main!(benches);
