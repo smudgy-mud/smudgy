@@ -291,7 +291,7 @@ pub fn reattach_after_update(
 
 /// The in-place §3.2 update of a one-member Connection to its exit's new
 /// topology.
-fn retarget_in_place(
+pub(crate) fn retarget_in_place(
     connection: &mut Connection,
     after: &ExitTopology,
     room_site: &impl Fn(RoomNumber) -> Option<RoomSite>,

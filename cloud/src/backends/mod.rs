@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 pub(crate) mod area_edits;
+pub mod area_merge;
 pub mod cached;
 pub mod cloud;
 pub mod composite;
@@ -14,6 +15,10 @@ pub mod ephemeral;
 pub mod local;
 pub mod local_migration;
 
+pub use area_merge::{
+    AreaMergeCommit, AreaMergeOutcome, AreaMergePlan, AreaMergeSource, RoomRemap, Translate,
+    apply_area_merge,
+};
 pub use cached::{CachedBackend, CachedCloudMapper};
 pub use cloud::{CloudMapper, Credential, CredentialSource};
 pub use composite::CompositeBackend;
