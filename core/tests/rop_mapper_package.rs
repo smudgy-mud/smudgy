@@ -51,6 +51,29 @@ impl TestTierBackend {
 
 #[async_trait]
 impl MapperBackend for TestTierBackend {
+    fn local_snapshot(&self) -> Option<Arc<smudgy_cloud::backends::local::LocalSnapshot>> {
+        if self.storage == MapStorage::Local {
+            self.inner.local_snapshot()
+        } else {
+            None
+        }
+    }
+
+    async fn subscribe_local(&self) -> CloudResult<Option<tokio::sync::watch::Receiver<u64>>> {
+        if self.storage == MapStorage::Local {
+            self.inner.subscribe_local().await
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn refresh_local(&self) -> CloudResult<()> {
+        if self.storage == MapStorage::Local {
+            self.inner.refresh_local().await?;
+        }
+        Ok(())
+    }
+
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
         self.inner.create_area(request).await
     }

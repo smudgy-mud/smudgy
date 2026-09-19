@@ -8346,8 +8346,17 @@ fn op_smudgy_mapper_set_current_location(
         smudgy_cloud::Uuid::try_parse(area_id)
             .map_err(|_| SetCurrentLocationError::InvalidId(area_id.to_owned()))?,
     );
-    // Mirror the location on the session thread so `getCurrentLocation` can read it back
-    // (the UI marker the action fans out is otherwise write-only and not readable cross-thread).
+    set_current_location(state, area_id, room_number);
+    Ok(())
+}
+
+/// Record the session's current mapper location: the shared cell
+/// `getCurrentLocation` reads back, and the `SetCurrentLocation` action that
+/// moves the UI marker and fires `map:room`. The cell is written here because
+/// the marker the action fans out is write-only and not readable cross-thread.
+/// Every path that moves the location goes through this so the two never
+/// disagree, including a mapper op that relocates the room the session stands in.
+pub(super) fn set_current_location(state: &mut OpState, area_id: AreaId, room_number: Option<i32>) {
     *state
         .borrow::<crate::session::runtime::CurrentLocation>()
         .borrow_mut() = Some((area_id, room_number));
@@ -8355,7 +8364,6 @@ fn op_smudgy_mapper_set_current_location(
         state,
         RuntimeAction::SetCurrentLocation(area_id, room_number),
     );
-    Ok(())
 }
 
 /// A mapper location as serialized to JS: the area id string plus an optional room

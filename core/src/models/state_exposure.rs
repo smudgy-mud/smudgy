@@ -165,6 +165,7 @@ pub const JS_RESERVED_NAMES: &[&str] = &[
 /// declarations. Kept alphabetical (ASCII order) for binary search.
 pub const INLINE_SCOPE_NAMES: &[&str] = &[
     "Area",
+    "MutateAreaError",
     "aliases",
     "buffer",
     "byId",
@@ -686,7 +687,7 @@ mod tests {
 
     #[test]
     fn known_globals_are_bucketed_and_unknown_names_are_not() {
-        for name in ["send", "gmcp", "line", "Area"] {
+        for name in ["send", "gmcp", "line", "Area", "MutateAreaError"] {
             assert_eq!(
                 StateExposure::known_global(name),
                 Some(KnownGlobal::Smudgy),

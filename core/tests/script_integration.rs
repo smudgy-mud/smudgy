@@ -29,7 +29,7 @@ import { createHash } from "node:crypto";
 // module imports what it uses from smudgy:core: mapper values and
 // `createAlias`/`echo`/`send` as named exports, and the current-session facade as
 // the default export (`session`) for live accessors like `reload`/`vars`.
-import session, { Area, createAlias, echo, mapper, send, vars } from "smudgy:core";
+import session, { Area, MutateAreaError, createAlias, echo, mapper, send, vars } from "smudgy:core";
 
 // A JS-function alias that calls reload() exercises the
 // `op_smudgy_session_reload` op (own-session route). Reloading rebuilds the
@@ -67,6 +67,8 @@ echo(mapperOpOk ? "MAPPER_OP_OK" : "MAPPER_OP_FAIL");
 const mapperGlobalsGone =
     !("mapper" in globalThis) &&
     !("Area" in globalThis) &&
+    !("MutateAreaError" in globalThis) &&
+    session.MutateAreaError === MutateAreaError &&
     !("__smudgy_install_mapper" in globalThis) &&
     typeof Area === "function";
 echo(mapperGlobalsGone ? "MAPPER_GLOBALS_GONE" : "MAPPER_GLOBALS_LEAKED");
@@ -886,7 +888,7 @@ async fn arctic_style_module_loads_and_runs_in_session() {
     );
     assert!(
         lines.iter().any(|l| l == "MAPPER_GLOBALS_GONE"),
-        "mapper and Area must be module exports, not public globals.\nTranscript:\n{transcript}"
+        "Mapper values must be module exports, not public globals.\nTranscript:\n{transcript}"
     );
     assert!(
         lines.iter().any(|l| l == "hello world"),

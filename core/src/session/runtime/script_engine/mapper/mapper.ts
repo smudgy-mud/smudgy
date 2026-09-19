@@ -10,6 +10,7 @@ const {
     op_smudgy_mapper_get_current_location,
     op_smudgy_mapper_list_area_ids,
     op_smudgy_mapper_refresh_areas,
+    op_smudgy_mapper_ready,
     op_smudgy_mapper_list_area_room_numbers,
     op_smudgy_mapper_list_rooms_by_title_and_description,
     op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits,
@@ -76,6 +77,7 @@ const {
     op_smudgy_mapper_create_room_exit,
     op_smudgy_mapper_set_room_exit,
     op_smudgy_mapper_merge_rooms,
+    op_smudgy_mapper_merge_areas,
     op_smudgy_mapper_delete_room,
     op_smudgy_mapper_delete_room_exit,
     op_smudgy_mapper_get_area_labels,
@@ -184,6 +186,16 @@ interface MutateAreaOptions {
     description?: string;
 }
 
+class MutateAreaError extends Error {
+    readonly committedOperations: readonly OperationId[];
+
+    constructor(message: string, committedOperations: readonly OperationId[]) {
+        super(message);
+        this.name = "MutateAreaError";
+        this.committedOperations = committedOperations;
+    }
+}
+
 /** Accept an id argument and hand back the string the ops take. Anything else is the
  * caller's mistake, and fails here with a clear TypeError rather than an opaque serde
  * error inside the op. */
@@ -243,10 +255,19 @@ function destinationForOp(destination: MapDestination) {
     };
 }
 
+/** Maps for the current session. Sessions sharing local maps see each other's changes
+ * automatically. Cloud changes prompt sessions using the same service and account to refresh. */
 const mapper = {
-    /** Refresh every visible area from durable storage. Use this before a
-     * presence-based package upsert that can run during startup or after a
-     * mapping-owner handoff. Requires `mapper:read`. */
+    /** Wait until this session's maps are ready for startup lookups or updates.
+     * Loads maps if startup has not done so; later calls use loaded maps.
+     * Requires `mapper:read`. */
+    ready(): Promise<void> {
+        return op_smudgy_mapper_ready();
+    },
+
+    /** Reload maps, including changes made to local files outside the app.
+     * Updated maps are available to this session when the call resolves.
+     * Use `ready()` for startup checks. Requires `mapper:read`. */
     refreshAreas(): Promise<void> {
         return op_smudgy_mapper_refresh_areas();
     },
@@ -337,14 +358,12 @@ const mapper = {
         return new Area(area);
     },
 
-    /** Collect related writes to one area and submit them in the fewest practical
-     * ordered envelopes. The whole callback is validated and durably staged before
-     * anything is published, so a locally invalid batch submits nothing even across
-     * an envelope split. Each emitted envelope is atomic at the backend; if a later
-     * envelope fails after earlier ones were acknowledged, the thrown Error carries
-     * the acknowledged prefix as `committedOperations` (acknowledged envelopes are
-     * never rolled back). Draft room numbers are reserved host-side for the life of
-     * the callback (see AreaMutator.createRoom). */
+    /** Collect related writes to one area. Callback and validation failures submit
+     * nothing and pass through unchanged. Large batches may save in several ordered
+     * steps; each step is atomic, and saved steps are not rolled back. Resolves once
+     * all steps are saved, returning their operation IDs in order. Save failures throw
+     * MutateAreaError with the IDs confirmed saved so far; other edits may still be
+     * pending. See the public declaration for the error-handling example. */
     async mutateArea(
         area: Area | AreaId,
         callback: (mutation: AreaMutator) => void | Promise<void>,
@@ -363,9 +382,7 @@ const mapper = {
                     options?.description ?? "Scripted area mutation",
                 );
             if (outcome.error !== null && outcome.error !== undefined) {
-                const failure = new Error(outcome.error);
-                (failure as any).committedOperations = outcome.committed;
-                throw failure;
+                throw new MutateAreaError(outcome.error, outcome.committed);
             }
             return outcome.committed;
         } catch (error) {
@@ -622,6 +639,50 @@ const mapper = {
         const keepRoomNumber = keep instanceof Room ? keep.room_number : keep;
         const removeRoomNumber = remove instanceof Room ? remove.room_number : remove;
         return op_smudgy_mapper_merge_rooms(areaId, keepRoomNumber, removeRoomNumber);
+    },
+    /** Fold areas into `into` as one durable transaction. Whole sources move their content
+     * and are deleted; a source with `rooms` keeps its labels, shapes and area properties,
+     * even if every room moves. The destination keeps its own area metadata and properties.
+     * Offsets apply only to moved content; exits in the same storage tier follow moved rooms.
+     * Resolves with each moved room's old address and new number, with the updated maps
+     * available to this session. Invalid offsets or exhausted room numbers leave maps unchanged.
+     * After an interrupted save, call `refreshAreas()` before retrying: an error does not
+     * guarantee that the maps were left unchanged.
+     * Local and session maps only. Requires `mapper:write`. */
+    mergeAreas(into: Area | AreaId, sources: (Area | AreaId | MergeAreaSource)[]): Promise<MergedRoom[]> {
+        const intoId = areaIdOf(into);
+        const entries = sources.map((source) => {
+            // A bare handle or id carries no room list and no offset; only a source entry can.
+            const entry: MergeAreaSource =
+                typeof source === "object" && source !== null && "area" in source
+                    ? source
+                    : { area: source };
+            const wire: { area: AreaId; rooms?: RoomNumber[]; translate?: MergeAreaSource["translate"] } = {
+                area: areaIdOf(entry.area),
+            };
+            const integer = (value: unknown): value is number =>
+                typeof value === "number" && Number.isInteger(value) &&
+                value >= -2147483648 && value <= 2147483647;
+            if (entry.rooms !== undefined) {
+                if (!Array.isArray(entry.rooms) ||
+                    Array.from(entry.rooms).some((room) => !integer(room))) {
+                    throw new TypeError("merge_areas_invalid_rooms: rooms must be an array of 32-bit integers");
+                }
+                wire.rooms = entry.rooms;
+            }
+            if (entry.translate !== undefined) {
+                const offset = entry.translate;
+                if (offset === null || typeof offset !== "object" ||
+                    [offset.x, offset.y].some((value) => value !== undefined &&
+                        (typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > 3.4028234663852886e38)) ||
+                    (offset.level !== undefined && !integer(offset.level))) {
+                    throw new TypeError("merge_areas_invalid_translation: translation requires finite coordinates and a 32-bit integer level");
+                }
+                wire.translate = offset;
+            }
+            return wire;
+        });
+        return op_smudgy_mapper_merge_areas(intoId, entries);
     },
     deleteRoom(area: Area | AreaId, room: Room | RoomNumber): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
@@ -1127,6 +1188,22 @@ interface ShapeUpdates {
 // A portable area JSON blob produced by `exportArea` and consumed by `importArea`/`importAreas`.
 // Treat it as opaque: round-trip it (export -> store -> import) without introspecting its shape.
 type AreaJson = Record<string, unknown>;
+
+// One source of `mergeAreas` and one entry of its result. Mirror the `MergeAreaSource` and
+// `MergedRoom` interfaces in the published contract.
+interface MergeAreaSource {
+    area: Area | AreaId;
+    /** Nonempty list: move these rooms but keep the source, labels, shapes and area properties,
+     * even if all rooms are listed. Omit to move everything and delete the source. */
+    rooms?: RoomNumber[];
+    /** Added only to moved content; omitted axes are 0. Coordinates/results must be finite
+     * and levels must fit signed 32-bit integers. */
+    translate?: { x?: number; y?: number; level?: number };
+}
+interface MergedRoom {
+    readonly from: { area: AreaId; room: RoomNumber };
+    readonly to: RoomNumber;
+}
 class Atlas {
     constructor(
         readonly id: AtlasId,
@@ -1322,12 +1399,12 @@ class Room {
 }
 
 // smudgy.ts loads before this extension and exposes a one-shot private registrar. Hand the
-// public values to its lexical facade instead of publishing `mapper` or `Area` on globalThis.
+// public values to its lexical facade without publishing them on globalThis.
 const installMapper = (globalThis as any).__smudgy_install_mapper;
 if (typeof installMapper !== "function") {
     throw new TypeError("smudgy mapper registrar is unavailable");
 }
-installMapper(mapper, Area);
+installMapper(mapper, Area, MutateAreaError);
 
 // Drift-guard surface for `mapper_ts_impl_conforms_to_contract` (models/script_typings.rs):
 // these TYPE-ONLY exports let the conformance test assert this runtime impl satisfies the
@@ -1335,6 +1412,7 @@ installMapper(mapper, Area);
 // erased -- the session reaches the API through the private handoff above, never these.
 export type MapperImpl = typeof mapper;
 export type AreaConstructorImpl = typeof Area;
+export type MutateAreaErrorConstructorImpl = typeof MutateAreaError;
 export type AreaImpl = Area;
 export type RoomImpl = Room;
 export type ExitImpl = Exit;

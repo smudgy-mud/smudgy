@@ -3111,6 +3111,17 @@ declare module "smudgy:core" {
    */
   export type Area = NonNullable<ReturnType<Mapper["getAreaById"]>>;
 
+  /** A save failure from `mapper.mutateArea`, after its changes were submitted.
+   * Callback and validation errors retain their original types.
+   */
+  export class MutateAreaError extends Error {
+    /** Operation IDs confirmed saved before the failure, in submission order.
+     * May be empty. These changes are not rolled back; other edits may still be pending.
+     */
+    readonly committedOperations: readonly OperationId[];
+    constructor(message: string, committedOperations: readonly OperationId[]);
+  }
+
   // ---- Default export: the current-session facade -------------------------
 
   /**
@@ -3263,6 +3274,8 @@ declare module "smudgy:core" {
     readonly mapper: Mapper;
     /** The runtime area constructor used by the named `Area` export. */
     readonly Area: typeof Area;
+    /** The error constructor for save failures from `mapper.mutateArea`. */
+    readonly MutateAreaError: typeof MutateAreaError;
     /** The current session. */
     readonly session: Session;
     /** The current session's command input. */
