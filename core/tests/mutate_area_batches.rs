@@ -277,7 +277,7 @@ async fn run_module_on(
 #[tokio::test]
 async fn later_envelope_failure_reports_the_committed_prefix() {
     const MODULE: &str = r#"
-import { createAlias, echo, mapper } from "smudgy:core";
+import api, { createAlias, echo, mapper, MutateAreaError } from "smudgy:core";
 
 createAlias("^gobatch$", async () => {
     try {
@@ -290,7 +290,9 @@ createAlias("^gobatch$", async () => {
             });
             echo("BATCH_OK");
         } catch (error) {
-            const committed = (error as any).committedOperations;
+            const committed = error instanceof MutateAreaError ? error.committedOperations : undefined;
+            if (!(error instanceof MutateAreaError) || !(error instanceof Error) ||
+                error.name !== "MutateAreaError" || api.MutateAreaError !== MutateAreaError) throw error;
             echo("BATCH_ERR committed=" +
                 (Array.isArray(committed) ? committed.length : "missing"));
         }
@@ -313,7 +315,7 @@ createAlias("^gobatch$", async () => {
 #[tokio::test]
 async fn staged_validation_failure_publishes_no_envelope() {
     const MODULE: &str = r#"
-import { createAlias, echo, mapper } from "smudgy:core";
+import { createAlias, echo, mapper, MutateAreaError } from "smudgy:core";
 
 createAlias("^gostage$", async () => {
     try {
@@ -324,11 +326,11 @@ createAlias("^gostage$", async () => {
                     await m.createRoom({ title: "room " + i });
                 }
                 // Lands in the second envelope; no such exit exists.
-                await m.setRoomExit(1, [1, 2] as any, { is_hidden: true });
+                await m.setRoomExit(1, "00000000-0000-0000-0000-000000000001", { is_hidden: true });
             });
             echo("STAGE_OK");
         } catch (error) {
-            const committed = (error as any).committedOperations;
+            const committed = error instanceof MutateAreaError ? error.committedOperations : undefined;
             const rooms = mapper.getAreaById(area.id).room_numbers.length;
             echo("STAGE_ERR rooms=" + rooms + " committed=" +
                 (Array.isArray(committed) ? committed.length : "missing"));
@@ -356,7 +358,7 @@ createAlias("^gostage$", async () => {
 #[tokio::test]
 async fn create_room_collision_verdict_surfaces_through_the_thrown_error() {
     const MODULE: &str = r#"
-import { createAlias, echo, mapper } from "smudgy:core";
+import { createAlias, echo, mapper, MutateAreaError } from "smudgy:core";
 
 createAlias("^gocollide$", async () => {
     try {
@@ -367,7 +369,7 @@ createAlias("^gocollide$", async () => {
             });
             echo("COLLIDE_OK");
         } catch (error) {
-            const committed = (error as any).committedOperations;
+            const committed = error instanceof MutateAreaError ? error.committedOperations : undefined;
             const named = String(error).includes("room_number_exists");
             echo("COLLIDE_ERR named=" + named + " committed=" +
                 (Array.isArray(committed) ? committed.length : "missing"));
@@ -392,5 +394,47 @@ createAlias("^gocollide$", async () => {
             .iter()
             .any(|line| line == "COLLIDE_ERR named=true committed=0"),
         "the refusal must read as the room-number collision with no committed prefix.\n{transcript}"
+    );
+}
+
+/// A callback failure retains its original identity and publishes no draft changes.
+#[tokio::test]
+async fn callback_failure_is_not_wrapped_as_a_save_failure() {
+    const MODULE: &str = r#"
+import { createAlias, echo, mapper, MutateAreaError } from "smudgy:core";
+
+createAlias("^gocallback$", async () => {
+    try {
+        const area = await mapper.createArea("Callbackland", { storage: "local" });
+        const original = new Error("callback stopped");
+        try {
+            await mapper.mutateArea(area, async m => {
+                await m.createRoom({ title: "unsaved draft" });
+                throw original;
+            });
+            echo("CALLBACK_UNEXPECTED_SUCCESS");
+        } catch (error) {
+            echo("CALLBACK_ERR original=" + (error === original) +
+                " saveError=" + (error instanceof MutateAreaError) +
+                " rooms=" + mapper.getAreaById(area.id).room_numbers.length);
+        }
+    } catch (error) {
+        echo("CALLBACK_SETUP_FAIL " + error);
+    }
+});
+"#;
+    let lines = run_module(
+        "MutateCallbackTest",
+        9404,
+        MODULE,
+        "gocallback",
+        "CALLBACK_",
+    )
+    .await;
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "CALLBACK_ERR original=true saveError=false rooms=0"),
+        "callback errors must pass through without submitting drafts: {lines:?}"
     );
 }

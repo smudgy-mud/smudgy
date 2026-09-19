@@ -204,7 +204,7 @@ pub(crate) fn exit_from_args(exit_data: ExitArgs, connection_id: ConnectionId) -
 }
 
 /// Projects one stored exit into its connection-relevant topology.
-fn exit_topology(area_id: AreaId, from_room: RoomNumber, exit: &Exit) -> ExitTopology {
+pub(super) fn exit_topology(area_id: AreaId, from_room: RoomNumber, exit: &Exit) -> ExitTopology {
     let same_area = exit.to_area_id == Some(area_id);
     ExitTopology {
         id: exit.id,
@@ -219,7 +219,10 @@ fn exit_topology(area_id: AreaId, from_room: RoomNumber, exit: &Exit) -> ExitTop
 
 /// Every exit's topology in the document, optionally excluding one (the
 /// exit being edited or deleted).
-fn exit_topologies(area: &AreaWithDetails, exclude: Option<ExitId>) -> Vec<ExitTopology> {
+pub(super) fn exit_topologies(
+    area: &AreaWithDetails,
+    exclude: Option<ExitId>,
+) -> Vec<ExitTopology> {
     let area_id = area.area.id;
     area.rooms
         .iter()
@@ -234,7 +237,7 @@ fn exit_topologies(area: &AreaWithDetails, exclude: Option<ExitId>) -> Vec<ExitT
 
 /// A room-placement lookup over the document, for anchor bearings and
 /// level classification.
-fn room_site(area: &AreaWithDetails) -> impl Fn(RoomNumber) -> Option<RoomSite> + '_ {
+pub(super) fn room_site(area: &AreaWithDetails) -> impl Fn(RoomNumber) -> Option<RoomSite> + '_ {
     |number| {
         area.rooms
             .iter()
@@ -473,7 +476,7 @@ fn connection_members(details: &AreaWithDetails, id: ConnectionId) -> Vec<ExitTo
         .collect()
 }
 
-fn members_are_reciprocal(a: &ExitTopology, b: &ExitTopology) -> bool {
+pub(super) fn members_are_reciprocal(a: &ExitTopology, b: &ExitTopology) -> bool {
     a.from_room != b.from_room
         && a.to_room_in_area == Some(b.from_room)
         && b.to_room_in_area == Some(a.from_room)
@@ -1245,67 +1248,26 @@ pub(crate) fn apply_mutation(
             exit_id,
             new_connection_id,
         } => {
-            if details
-                .connections
-                .iter()
-                .any(|connection| connection.id == *new_connection_id)
-            {
-                return Err(invalid_connection("duplicate_connection"));
-            }
-            let (from_room, old_connection_id) = details
+            let old_id = details
                 .rooms
                 .iter()
-                .find_map(|room| {
-                    room.exits
+                .flat_map(|room| &room.exits)
+                .find(|exit| exit.id == *exit_id)
+                .map(|exit| exit.connection_id);
+            unlink_exits(details, &[(*exit_id, *new_connection_id)])?;
+            let old_id = old_id.expect("unlink validated the exit");
+            let connections = [old_id, *new_connection_id]
+                .into_iter()
+                .map(|id| {
+                    details
+                        .connections
                         .iter()
-                        .find(|exit| exit.id == *exit_id)
-                        .map(|exit| (room.room_number, exit.connection_id))
+                        .find(|connection| connection.id == id)
+                        .expect("unlink preserves both connections")
+                        .clone()
                 })
-                .ok_or(CloudError::ExitNotFound(*exit_id))?;
-            if connection_members(details, old_connection_id).len() != 2 {
-                return Err(invalid_connection("unlink_requires_pair"));
-            }
-            let mut cloned = details
-                .connections
-                .iter()
-                .find(|connection| connection.id == old_connection_id)
-                .cloned()
-                .ok_or_else(|| invalid_connection("connection_not_found"))?;
-            cloned.id = *new_connection_id;
-            // Give the split line a nearby stored port without moving the
-            // original. The server may choose a denser authoritative slot;
-            // this deterministic local result keeps the two lines operable.
-            let offset = |value: f32| {
-                if value <= 0.9 {
-                    value + 0.05
-                } else {
-                    value - 0.05
-                }
-            };
-            if cloned.endpoint_a.room_number == from_room {
-                cloned.endpoint_a.port_offset = offset(cloned.endpoint_a.port_offset);
-                cloned.endpoint_a.port_mode = crate::PortMode::AutoPinned;
-            } else if let Some(endpoint) = cloned.endpoint_b.as_mut()
-                && endpoint.room_number == from_room
-            {
-                endpoint.port_offset = offset(endpoint.port_offset);
-                endpoint.port_mode = crate::PortMode::AutoPinned;
-            }
-            for room in &mut details.rooms {
-                if let Some(exit) = room.exits.iter_mut().find(|exit| exit.id == *exit_id) {
-                    exit.connection_id = *new_connection_id;
-                }
-            }
-            details.connections.push(cloned.clone());
-            let old = details
-                .connections
-                .iter()
-                .find(|connection| connection.id == old_connection_id)
-                .cloned()
-                .expect("source exists");
-            Ok(OpResult::Connections {
-                connections: vec![old, cloned],
-            })
+                .collect();
+            Ok(OpResult::Connections { connections })
         }
         AreaMutation::DeleteLink { connection_id } => {
             if !details
@@ -1381,6 +1343,78 @@ pub(crate) fn apply_mutation(
             })
         }
     }
+}
+
+/// Splits selected exits with the same rules as `Unlink`, indexing the document
+/// once for a batch. Order and fresh ids come from the caller. As with the
+/// mutation applier, the caller discards the document on failure.
+pub(super) fn unlink_exits(
+    details: &mut AreaWithDetails,
+    splits: &[(ExitId, ConnectionId)],
+) -> CloudResult<()> {
+    use std::collections::HashMap;
+    if splits.is_empty() {
+        return Ok(());
+    }
+    let mut members: HashMap<ConnectionId, usize> = HashMap::new();
+    let mut exits = HashMap::new();
+    for (room_index, room) in details.rooms.iter().enumerate() {
+        for (exit_index, exit) in room.exits.iter().enumerate() {
+            *members.entry(exit.connection_id).or_default() += 1;
+            exits.insert(exit.id, (room_index, exit_index));
+        }
+    }
+    let mut connections: HashMap<_, _> = details
+        .connections
+        .iter()
+        .enumerate()
+        .map(|(index, connection)| (connection.id, index))
+        .collect();
+    for &(exit_id, new_connection_id) in splits {
+        if connections.contains_key(&new_connection_id) {
+            return Err(invalid_connection("duplicate_connection"));
+        }
+        let &(room_index, exit_index) = exits
+            .get(&exit_id)
+            .ok_or(CloudError::ExitNotFound(exit_id))?;
+        let room = &mut details.rooms[room_index];
+        let from_room = room.room_number;
+        let exit = &mut room.exits[exit_index];
+        let old_connection_id = exit.connection_id;
+        if members.get(&old_connection_id) != Some(&2) {
+            return Err(invalid_connection("unlink_requires_pair"));
+        }
+        let &index = connections
+            .get(&old_connection_id)
+            .ok_or_else(|| invalid_connection("connection_not_found"))?;
+        let mut cloned = details.connections[index].clone();
+        cloned.id = new_connection_id;
+        // Give the split line a nearby stored port without moving the
+        // original. The server may choose a denser authoritative slot;
+        // this deterministic local result keeps the two lines operable.
+        let offset = |value: f32| {
+            if value <= 0.9 {
+                value + 0.05
+            } else {
+                value - 0.05
+            }
+        };
+        if cloned.endpoint_a.room_number == from_room {
+            cloned.endpoint_a.port_offset = offset(cloned.endpoint_a.port_offset);
+            cloned.endpoint_a.port_mode = crate::PortMode::AutoPinned;
+        } else if let Some(endpoint) = cloned.endpoint_b.as_mut()
+            && endpoint.room_number == from_room
+        {
+            endpoint.port_offset = offset(endpoint.port_offset);
+            endpoint.port_mode = crate::PortMode::AutoPinned;
+        }
+        exit.connection_id = new_connection_id;
+        members.insert(old_connection_id, 1);
+        members.insert(new_connection_id, 1);
+        connections.insert(new_connection_id, details.connections.len());
+        details.connections.push(cloned);
+    }
+    Ok(())
 }
 
 /// The single-precondition check local tiers enforce: an envelope is

@@ -567,14 +567,21 @@ interface CreateAtlasOptions {
 }
 
 /**
- * The map API for the current session. Each session has its own current
- * location; changes to persistent areas sync to the cloud in the background.
+ * Maps for the current session. Each session has its own current location.
+ * Sessions sharing local maps see each other's changes automatically.
+ * Cloud changes prompt sessions using the same service and account to refresh.
  */
 interface Mapper {
     /**
-     * Refresh every visible area from durable storage. Package entry points
-     * should await this before a presence-based upsert that can run during
-     * startup or after mapping ownership moves between sessions.
+     * Wait until this session's maps are ready for startup lookups or updates.
+     * Loads maps if startup has not done so; later calls use loaded maps.
+     * Requires `mapper:read`.
+     */
+    ready(): Promise<void>;
+    /**
+     * Reload maps, including changes made to local files outside the app.
+     * Updated maps are available to this session when the call resolves.
+     * Use `ready()` for startup checks. Requires `mapper:read`.
      */
     refreshAreas(): Promise<void>;
     /**
@@ -606,14 +613,25 @@ interface Mapper {
     readonly areas: Area[];
     getAreaById(id: AreaIdLike): Area;
     /**
-     * Collect related writes to one area and submit them in the fewest practical ordered
-     * envelopes. The whole callback is validated and durably staged before anything is
-     * published, so a locally invalid batch submits nothing, even when oversized work is
-     * split into several envelopes. Each envelope is atomic at the backend; acknowledged
-     * envelopes are never rolled back, so if a later envelope fails after earlier ones
-     * were accepted, the thrown `Error` carries the acknowledged prefix on its
-     * `committedOperations` property (an `OperationId[]`). If the callback throws,
-     * nothing is submitted.
+     * Collect related writes to one area. Callback and validation failures submit
+     * nothing and pass through unchanged. Large batches may save in several ordered
+     * steps; each step is atomic, and saved steps are not rolled back.
+     * Resolves once all steps are saved, returning their operation IDs in order.
+     * Save failures throw `MutateAreaError` with the IDs confirmed saved so far.
+     * Other edits may still be pending; retrying the whole callback can duplicate work.
+     *
+     * @example
+     * ```ts
+     * import { mapper, MutateAreaError } from "smudgy:core";
+     * try {
+     *     await mapper.mutateArea(area, m => m.setRoomTitle(1, "Town square"));
+     * } catch (error) {
+     *     if (error instanceof MutateAreaError) {
+     *         console.log("Saved operation IDs:", error.committedOperations);
+     *     }
+     *     throw error;
+     * }
+     * ```
      */
     mutateArea(
         area: Area | AreaIdLike,
@@ -751,6 +769,39 @@ interface Mapper {
      * backend acknowledgement.
      */
     mergeRooms(area: Area | AreaIdLike, keep: Room | RoomNumber, remove: Room | RoomNumber): Promise<OperationId | null>;
+    /**
+     * Fold areas into `into` in one operation. Whole sources move their
+     * rooms, exits, labels, shapes and connections, then are deleted. A source
+     * with `rooms` keeps its area, labels, shapes and area properties, even if all
+     * its rooms move. The destination keeps its own area metadata and properties;
+     * whole sources' area metadata and properties are discarded.
+     * Offsets apply only to moved content. Exits in the same storage tier follow
+     * moved rooms. Room numbers stay where free and unreserved, or are reassigned.
+     * Resolves with each moved room's old address and new number, with the updated
+     * maps available to this session. Invalid offsets or exhausted room numbers
+     * leave maps unchanged (`merge_areas_invalid_translation` or
+     * `merge_areas_room_numbers_exhausted`). After an interrupted save, call
+     * `refreshAreas()` before retrying: an error does not guarantee that the maps
+     * were left unchanged.
+     * All touched maps must use the same storage tier: local or session. Cloud maps
+     * and links from a different tier are refused. Refusal messages explain the
+     * reason and include a stable code that scripts can check:
+     * - `merge_areas_no_sources`: no source areas were provided.
+     * - `merge_areas_same_area`: a source repeats or is the destination.
+     * - `merge_areas_no_rooms`: an explicit room list is empty.
+     * - `merge_areas_invalid_rooms`: a room list is not an array of 32-bit integers.
+     * - `merge_areas_room_not_found`: a selected room is missing.
+     * - `merge_areas_mixed_tiers`: affected maps use different storage tiers.
+     * - `merge_areas_unsupported_storage`: cloud merges are unsupported.
+     * - `merge_requires_full_projection`: an affected map hides secret content.
+     * - `merge_areas_busy`: pending edits or another operation prevent the merge.
+     * - `merge_areas_source_changed`: maps or incoming links changed while waiting.
+     * - `merge_areas_invalid_translation`: offsets are invalid or coordinates overflow.
+     * - `merge_areas_room_numbers_exhausted`: no representable room number remains.
+     * Missing maps, invalid connections and storage failures also reject the call.
+     * Requires `mapper:write`.
+     */
+    mergeAreas(into: Area | AreaIdLike, sources: (Area | AreaIdLike | MergeAreaSource)[]): Promise<MergedRoom[]>;
     /** Delete a room. */
     deleteRoom(area: Area | AreaIdLike, room: Room | RoomNumber): Promise<OperationId | null>;
     /** Delete an exit from a room. */
@@ -802,4 +853,27 @@ interface AreasImportedIfAbsent {
     readonly added: AreaId[];
     /** Names skipped because a resident map already has that name. */
     readonly skipped: string[];
+}
+
+/** One source of {@link Mapper.mergeAreas}: an area, optionally just some of
+ * its rooms, and the rigid offset applied to what moves before it lands in
+ * the destination. */
+interface MergeAreaSource {
+    /** The area to draw from. */
+    area: Area | AreaIdLike;
+    /** Move these rooms; keep the source, labels, shapes and area properties,
+     * even if all rooms are listed. Must be nonempty. Omit to move everything
+     * and delete the source. */
+    rooms?: RoomNumber[];
+    /** Added only to moved rooms, labels, shapes and route points. Omitted axes
+     * are 0. Coordinates and their results must be finite; levels must fit signed 32-bit integers. */
+    translate?: { x?: number; y?: number; level?: number };
+}
+
+/** One room moved by {@link Mapper.mergeAreas}. */
+interface MergedRoom {
+    /** The room's old address. Its source is deleted only when `rooms` was omitted. */
+    readonly from: { area: AreaId; room: RoomNumber };
+    /** The room's number in the destination area now. */
+    readonly to: RoomNumber;
 }

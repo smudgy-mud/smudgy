@@ -10,13 +10,13 @@ use super::ops::SmudgyGrants;
 use super::script_uuid::ScriptUuid;
 use crate::session::runtime::action::{ActionQueue, RuntimeAction};
 use smudgy_cloud::{
-    AreaId, AreaWithDetails, AtlasId, Connection, ConnectionArgs, ConnectionDash,
+    AreaId, AreaMergeSource, AreaWithDetails, AtlasId, Connection, ConnectionArgs, ConnectionDash,
     ConnectionEndpoint, ConnectionId, ConnectionKind, ConnectionRouting, ConnectionUpdates,
     CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, ExitArgs, ExitDirection,
     ExitId, ExitUpdates, HorizontalAlignment, Label, LabelArgs, LabelId, LabelUpdates,
-    MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode, RoomNumber, RoomSide,
-    RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId, ShapeType, ShapeUpdates, Uuid,
-    VerticalAlignment,
+    MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode, RoomNumber, RoomRemap,
+    RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId, ShapeType, ShapeUpdates,
+    Translate, Uuid, VerticalAlignment,
     mapper::{
         AreaMutationBatch, MutationSubmission, RoomKey, area_cache::AreaCache,
         room_cache::RoomCache,
@@ -29,6 +29,7 @@ deno_core::extension!(
   ops = [
       op_smudgy_mapper_list_area_ids,
       op_smudgy_mapper_refresh_areas,
+      op_smudgy_mapper_ready,
       op_smudgy_mapper_create_area,
       op_smudgy_mapper_get_area_storage,
       op_smudgy_mapper_get_atlas_storage,
@@ -95,6 +96,7 @@ deno_core::extension!(
       op_smudgy_mapper_create_room_exit,
       op_smudgy_mapper_set_room_exit,
       op_smudgy_mapper_merge_rooms,
+      op_smudgy_mapper_merge_areas,
       op_smudgy_mapper_delete_room,
       op_smudgy_mapper_delete_room_exit,
       op_smudgy_mapper_get_area_labels,
@@ -301,10 +303,22 @@ fn op_smudgy_mapper_list_area_ids(state: &mut OpState) -> Result<Vec<ScriptUuid>
     }
 }
 
-/// Refresh the mapper's complete area projection from its authoritative
-/// backends. Package entry points use this before presence-based upserts so
-/// startup order or a mapping-owner handoff cannot make a resident map look
-/// absent in a stale per-session cache.
+/// Wait for startup maps and current same-app local changes.
+#[op2(async(lazy), fast)]
+async fn op_smudgy_mapper_ready(state: Rc<RefCell<OpState>>) -> Result<(), MapperError> {
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, false)?;
+        state
+            .try_borrow::<Mapper>()
+            .cloned()
+            .ok_or(MapperError::MapperNotEnabled)?
+    };
+    mapper.ready().await.map_err(operation_failed("load maps"))
+}
+
+/// Explicitly reload maps, including external changes to local files.
+/// Startup presence checks use the readiness op instead.
 #[op2(async(lazy), fast)]
 async fn op_smudgy_mapper_refresh_areas(state: Rc<RefCell<OpState>>) -> Result<(), MapperError> {
     let mapper = {
@@ -315,6 +329,10 @@ async fn op_smudgy_mapper_refresh_areas(state: Rc<RefCell<OpState>>) -> Result<(
             .cloned()
             .ok_or(MapperError::MapperNotEnabled)?
     };
+    mapper
+        .refresh_local_store()
+        .await
+        .map_err(operation_failed("refresh local maps"))?;
     mapper
         .load_all_areas()
         .await
@@ -1859,6 +1877,124 @@ async fn op_smudgy_mapper_merge_rooms(
     }
 }
 
+/// One source of `mergeAreas`: the area to draw from, the rooms to take when only some should
+/// move (an absent list moves everything and deletes the area), and the rigid offset applied to
+/// what moves before it lands in the destination. An omitted offset, or an omitted axis, is 0.
+#[derive(Debug, Deserialize)]
+struct JsMergeAreaSource {
+    area: ScriptUuid,
+    rooms: Option<Vec<i32>>,
+    translate: Option<JsTranslate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsTranslate {
+    x: Option<f32>,
+    y: Option<f32>,
+    level: Option<i32>,
+}
+
+impl JsMergeAreaSource {
+    fn into_source(self) -> AreaMergeSource {
+        let translate = self
+            .translate
+            .map_or_else(Translate::default, |translate| Translate {
+                x: translate.x.unwrap_or(0.0),
+                y: translate.y.unwrap_or(0.0),
+                level: translate.level.unwrap_or(0),
+            });
+        AreaMergeSource {
+            id: AreaId(self.area.into_uuid()),
+            translate,
+            rooms: self
+                .rooms
+                .map(|rooms| rooms.into_iter().map(RoomNumber).collect()),
+        }
+    }
+}
+
+/// One entry of the `mergeAreas` result: the address a moved room had and the number it holds
+/// now in the destination.
+#[derive(serde::Serialize)]
+struct JsMergedRoom {
+    from: JsMergedRoomFrom,
+    to: i32,
+}
+
+#[derive(serde::Serialize)]
+struct JsMergedRoomFrom {
+    area: ScriptUuid,
+    room: i32,
+}
+
+/// `mergeAreas(into, sources)`: fold areas into `into` as one durable transaction -- rooms,
+/// exits, labels, shapes and connections move (translated per source), every exit in the same
+/// storage tier that pointed at a moved room follows it, and a source that gave everything is
+/// deleted while one that listed only some rooms stays. Nothing changes unless everything does.
+/// Resolves with every moved room's old address and new number once the backend commits. When
+/// the session stands in a moved room, its current location follows the room through the same
+/// path `setCurrentLocation` takes, so `map:room` fires and the UI marker moves. Local and
+/// session tiers only; refusals include an explanation and a stable reason code. Write-gated.
+#[op2(async(lazy))]
+#[serde]
+async fn op_smudgy_mapper_merge_areas(
+    state: Rc<RefCell<OpState>>,
+    #[string] into: String,
+    #[serde] sources: Vec<JsMergeAreaSource>,
+) -> Result<Vec<JsMergedRoom>, MapperError> {
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, true)?;
+        state
+            .try_borrow::<Mapper>()
+            .cloned()
+            .ok_or(MapperError::MapperNotEnabled)?
+    };
+    let into = AreaId(parse_id(&into)?);
+    let commit = mapper
+        .merge_areas(
+            into,
+            sources
+                .into_iter()
+                .map(JsMergeAreaSource::into_source)
+                .collect(),
+        )
+        .await
+        .map_err(operation_failed("merge areas"))?;
+    let rooms = commit.outcome.rooms;
+    follow_merged_current_location(&mut state.borrow_mut(), into, &rooms);
+    Ok(rooms
+        .into_iter()
+        .map(|remap| JsMergedRoom {
+            from: JsMergedRoomFrom {
+                area: ScriptUuid(remap.from.area_id.0),
+                room: remap.from.room_number.0,
+            },
+            to: remap.to.0,
+        })
+        .collect())
+}
+
+/// Carry the session's current location along with a merge: standing in a moved room means
+/// standing at its new address afterwards, with the same cell write and `SetCurrentLocation`
+/// action `setCurrentLocation` performs. A location in a non-source area, one naming a source
+/// area without a room, or one whose room the remap does not carry is left as it is.
+fn follow_merged_current_location(state: &mut OpState, into: AreaId, rooms: &[RoomRemap]) {
+    let current = *state
+        .borrow::<crate::session::runtime::CurrentLocation>()
+        .borrow();
+    let Some((area_id, Some(room_number))) = current else {
+        return;
+    };
+    let Some(moved) = rooms
+        .iter()
+        .find(|remap| remap.from.area_id == area_id && remap.from.room_number.0 == room_number)
+    else {
+        return;
+    };
+    super::ops::set_current_location(state, into, Some(moved.to.0));
+}
+
 #[op2(async(lazy), fast)]
 #[serde]
 async fn op_smudgy_mapper_delete_room(
@@ -2275,8 +2411,8 @@ fn op_smudgy_mapper_generate_id(state: &OpState) -> Result<ScriptUuid, MapperErr
 /// The host outcome of a scripted `mutateArea`: the acknowledged envelope
 /// operation ids in submission order, plus the failure message when a later
 /// envelope failed after earlier ones were already accepted. The TS layer
-/// shapes a non-`null` `error` into the thrown `Error` and attaches
-/// `committed` as its `committedOperations` property.
+/// shapes a non-`null` `error` into `MutateAreaError`, with `committed`
+/// exposed as its `committedOperations` property.
 #[derive(Serialize)]
 struct JsMutateAreaOutcome {
     committed: Vec<ScriptUuid>,

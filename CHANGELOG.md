@@ -45,8 +45,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains the one to reach for when you want the closest match rather than all of
   them. Rooms and areas of maps you have turned off are left out, as they are from
   the other map-wide lookups; asking an `Area` directly always answers.
+- **Scripts can fold several map areas into one.** `mapper.mergeAreas(into, sources)`
+  moves rooms, exits, labels, shapes and connections into one destination, with
+  an optional offset per source. Whole sources are deleted. A source with a
+  `rooms` list stays, even if every room moves; its labels, shapes and area
+  properties stay with it. The destination keeps its area metadata and properties.
+  Room numbers are preserved where free and unreserved, and otherwise reassigned.
+  Exits in the same storage tier follow moved rooms, and reciprocal links between
+  merged areas become one link. The result lists each room's old and new address;
+  your current location follows if its room moved. Local and session maps are
+  supported; cloud maps are refused.
+  Invalid offsets, coordinate or level overflow, and exhausted room numbers are
+  rejected before maps change. Other sessions see the result together. If a save
+  is interrupted, call `mapper.refreshAreas()` or restart Smudgy before retrying.
+- **Scripts can wait for maps to be ready.** `mapper.ready()` waits for startup
+  loading before a script looks up or edits maps.
+- **Batch edit errors identify saved work.** `MutateAreaError` reports the
+  operation IDs confirmed saved before a `mapper.mutateArea()` failure.
 
 ### Changed
+
+- **Map changes reach other sessions in the same running app.** Sessions sharing
+  local maps see saved changes together. Cloud changes reach other sessions
+  using the same service and account. Changes made to
+  local files outside Smudgy require an explicit `mapper.refreshAreas()` call.
 
 - **Ids in maps now use UUID strings.** An area, exit, connection, atlas, label,
   or shape id, and the ids `mutateArea` returns, are each that thing's own UUID

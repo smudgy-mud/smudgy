@@ -2,10 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -14,7 +11,9 @@ use parking_lot::RwLock;
 use tokio::task;
 use uuid::Uuid;
 
-use super::{LEGACY_ACCESS_FINGERPRINT, MapperBackend, cloud::CloudMapper};
+use super::{
+    AreaMergeCommit, AreaMergePlan, LEGACY_ACCESS_FINGERPRINT, MapperBackend, cloud::CloudMapper,
+};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage, SyncRow,
@@ -84,6 +83,25 @@ struct KnownAreaState {
     fingerprint: Option<String>,
 }
 
+/// A write can finish before `/me` resolves. Retain that generation's dirty
+/// bit until a verified viewer supplies its scope. One lock serializes reset,
+/// identity installation and publication, so old writes cannot dirty a new viewer.
+struct CloudHintState {
+    generation: u64,
+    scope: Option<Arc<super::cloud_changes::CloudChanges>>,
+    dirty: bool,
+}
+
+impl CloudHintState {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            scope: None,
+            dirty: false,
+        }
+    }
+}
+
 /// Generic caching layer that keeps `get_area` responses in memory and on
 /// disk (namespaced per viewer) while always forwarding `list_areas` to the
 /// upstream backend.
@@ -99,7 +117,8 @@ where
     /// The credential generation the caches were populated under; reads
     /// compare it so a credential switch stops serving the previous
     /// viewer's data immediately (see [`Self::check_auth_generation`]).
-    seen_auth_generation: AtomicU64,
+    cloud_hints: RwLock<CloudHintState>,
+    writer_id: Uuid,
     area_cache: RwLock<HashMap<AreaId, Arc<AreaWithDetails>>>,
     known: RwLock<HashMap<AreaId, KnownAreaState>>,
     last_sources: RwLock<HashMap<AreaId, AreaLoadSource>>,
@@ -140,12 +159,13 @@ where
                 );
             }
         }
-        let seen_auth_generation = AtomicU64::new(inner.auth_generation());
+        let cloud_hints = RwLock::new(CloudHintState::new(inner.auth_generation()));
         Self {
             inner,
             cache_dir,
             viewer: RwLock::new(None),
-            seen_auth_generation,
+            cloud_hints,
+            writer_id: Uuid::new_v4(),
             area_cache: RwLock::new(HashMap::new()),
             known: RwLock::new(HashMap::new()),
             last_sources: RwLock::new(HashMap::new()),
@@ -318,8 +338,10 @@ where
     /// without waiting for the sync engine to resolve the new identity over
     /// the network. `viewer_identity` re-establishes the namespace later.
     fn check_auth_generation(&self) {
+        let mut hints = self.cloud_hints.write();
         let generation = self.inner.auth_generation();
-        if self.seen_auth_generation.swap(generation, Ordering::AcqRel) != generation {
+        if hints.generation != generation {
+            *hints = CloudHintState::new(generation);
             *self.viewer.write() = None;
             self.area_cache.write().clear();
             self.known.write().clear();
@@ -327,24 +349,54 @@ where
         }
     }
 
-    fn install_viewer_identity(&self, identity: Option<Uuid>) {
-        let Some(id) = identity else {
-            return;
-        };
+    fn install_viewer_identity(&self, identity: Option<Uuid>, generation: u64) -> bool {
+        let mut hints = self.cloud_hints.write();
+        if hints.generation != generation || self.inner.auth_generation() != generation {
+            return false;
+        }
+        hints.scope = identity.and_then(|id| {
+            self.inner
+                .mutation_journal_namespace()
+                .map(|origin| super::cloud_changes::CloudChanges::for_viewer(&origin, id))
+        });
         let changed = {
             let mut viewer = self.viewer.write();
-            if *viewer == Some(id) {
-                false
-            } else {
-                *viewer = Some(id);
-                true
-            }
+            let changed = *viewer != identity;
+            *viewer = identity;
+            changed
         };
         if changed {
             // A different viewer must never see another viewer's cache.
             self.area_cache.write().clear();
             self.known.write().clear();
             self.last_sources.write().clear();
+        }
+        if hints.dirty
+            && let Some(scope) = &hints.scope
+        {
+            scope.publish(self.writer_id);
+            hints.dirty = false;
+        }
+        true
+    }
+
+    fn cloud_write_generation(&self) -> u64 {
+        self.check_auth_generation();
+        self.cloud_hints.read().generation
+    }
+
+    fn publish_cloud_change(&self, generation: u64) {
+        if !self.inner.supports_sync() || self.inner.local_snapshot().is_some() {
+            return;
+        }
+        let mut hints = self.cloud_hints.write();
+        if hints.generation != generation || self.inner.auth_generation() != generation {
+            return;
+        }
+        if let Some(scope) = &hints.scope {
+            scope.publish(self.writer_id);
+        } else {
+            hints.dirty = true;
         }
     }
 
@@ -483,8 +535,10 @@ where
     T: MapperBackend + Send + Sync,
 {
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
+        let hint = self.cloud_write_generation();
         let area = self.inner.create_area(request).await?;
         self.invalidate_area(&area.id).await;
+        self.publish_cloud_change(hint);
         Ok(area)
     }
 
@@ -493,8 +547,10 @@ where
         request: CreateAreaRequest,
         storage: MapStorage,
     ) -> CloudResult<Area> {
+        let hint = self.cloud_write_generation();
         let area = self.inner.create_area_at(request, storage).await?;
         self.invalidate_area(&area.id).await;
+        self.publish_cloud_change(hint);
         Ok(area)
     }
 
@@ -504,10 +560,12 @@ where
         name: &str,
         atlas_id: Option<AtlasId>,
     ) -> CloudResult<Option<Area>> {
+        let hint = self.cloud_write_generation();
         let copied = self.inner.copy_cloud_area(source, name, atlas_id).await?;
         if let Some(area) = &copied {
             self.invalidate_area(&area.id).await;
         }
+        self.publish_cloud_change(hint);
         Ok(copied)
     }
 
@@ -572,6 +630,7 @@ where
     }
 
     async fn viewer_identity(&self) -> CloudResult<Option<Uuid>> {
+        self.check_auth_generation();
         let auth_generation = self.inner.auth_generation();
         // Errors propagate without touching the current viewer.
         let identity = self.inner.viewer_identity().await?;
@@ -580,7 +639,10 @@ where
             return Err(CloudError::CredentialChanged);
         }
 
-        self.install_viewer_identity(identity);
+        if !self.install_viewer_identity(identity, auth_generation) {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
+        }
         Ok(identity)
     }
 
@@ -588,6 +650,7 @@ where
         &self,
         auth_generation: u64,
     ) -> CloudResult<Option<Uuid>> {
+        self.check_auth_generation();
         if self.inner.auth_generation() != auth_generation {
             self.check_auth_generation();
             return Err(CloudError::CredentialChanged);
@@ -600,7 +663,10 @@ where
             self.check_auth_generation();
             return Err(CloudError::CredentialChanged);
         }
-        self.install_viewer_identity(identity);
+        if !self.install_viewer_identity(identity, auth_generation) {
+            self.check_auth_generation();
+            return Err(CloudError::CredentialChanged);
+        }
         Ok(identity)
     }
 
@@ -653,8 +719,10 @@ where
     }
 
     async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
         self.inner.update_area(area_id, updates).await?;
         self.invalidate_area(area_id).await;
+        self.publish_cloud_change(hint);
         Ok(())
     }
 
@@ -664,6 +732,7 @@ where
         updates: AreaUpdates,
         auth_generation: u64,
     ) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
         self.inner
             .update_area_at_generation(area_id, updates, auth_generation)
             .await?;
@@ -672,12 +741,15 @@ where
         } else {
             self.check_auth_generation();
         }
+        self.publish_cloud_change(hint);
         Ok(())
     }
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
         self.inner.delete_area(area_id).await?;
         self.invalidate_area(area_id).await;
+        self.publish_cloud_change(hint);
         Ok(())
     }
 
@@ -686,6 +758,7 @@ where
         area_id: &AreaId,
         auth_generation: u64,
     ) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
         self.inner
             .delete_area_at_generation(area_id, auth_generation)
             .await?;
@@ -694,6 +767,7 @@ where
         } else {
             self.check_auth_generation();
         }
+        self.publish_cloud_change(hint);
         Ok(())
     }
 
@@ -706,10 +780,12 @@ where
         area_id: &AreaId,
         expected_rev: Option<i64>,
     ) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
         self.inner
             .delete_area_expecting(area_id, expected_rev)
             .await?;
         self.invalidate_area(area_id).await;
+        self.publish_cloud_change(hint);
         Ok(())
     }
 
@@ -719,6 +795,7 @@ where
         expected_rev: Option<i64>,
         auth_generation: u64,
     ) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
         self.inner
             .delete_area_expecting_at_generation(area_id, expected_rev, auth_generation)
             .await?;
@@ -727,6 +804,7 @@ where
         } else {
             self.check_auth_generation();
         }
+        self.publish_cloud_change(hint);
         Ok(())
     }
 
@@ -735,12 +813,14 @@ where
         area_id: &AreaId,
         envelope: &MutationEnvelope,
     ) -> CloudResult<MutationResult> {
+        let hint = self.cloud_write_generation();
         // Pure passthrough of the envelope — preconditions and conflicts are
         // the upstream's verdict. A success moved the area, so its cached
         // bytes are stale; a failure (including a revision conflict) changed
         // nothing and keeps the cache.
         let result = self.inner.execute_mutation(area_id, envelope).await?;
         self.invalidate_area(area_id).await;
+        self.publish_cloud_change(hint);
         Ok(result)
     }
 
@@ -750,6 +830,7 @@ where
         envelope: &MutationEnvelope,
         auth_generation: u64,
     ) -> CloudResult<MutationResult> {
+        let hint = self.cloud_write_generation();
         let result = self
             .inner
             .execute_mutation_at_generation(area_id, envelope, auth_generation)
@@ -759,7 +840,23 @@ where
         } else {
             self.check_auth_generation();
         }
+        self.publish_cloud_change(hint);
         Ok(result)
+    }
+
+    // ===== MULTI-AREA TRANSACTIONS =====
+
+    async fn merge_areas(&self, plan: &AreaMergePlan) -> CloudResult<AreaMergeCommit> {
+        // Pure passthrough of the plan; the upstream judges its revisions. A
+        // commit rewrote the destination, removed the sources and may have
+        // rewritten any third party, so every cached copy the plan names is
+        // stale. A refusal (including a revision conflict) changed nothing
+        // and keeps the cache.
+        let commit = self.inner.merge_areas(plan).await?;
+        for id in plan.touched_areas() {
+            self.invalidate_area(&id).await;
+        }
+        Ok(commit)
     }
 
     // Atlas operations are metadata-only (folders, not area bytes), so they
@@ -772,19 +869,67 @@ where
     }
 
     async fn create_atlas(&self, name: &str) -> CloudResult<Atlas> {
-        self.inner.create_atlas(name).await
+        let hint = self.cloud_write_generation();
+        let result = self.inner.create_atlas(name).await;
+        if result.is_ok() {
+            self.publish_cloud_change(hint);
+        }
+        result
     }
 
     async fn create_atlas_at(&self, name: &str, storage: MapStorage) -> CloudResult<Atlas> {
-        self.inner.create_atlas_at(name, storage).await
+        let hint = self.cloud_write_generation();
+        let result = self.inner.create_atlas_at(name, storage).await;
+        if result.is_ok() {
+            self.publish_cloud_change(hint);
+        }
+        result
     }
 
     async fn rename_atlas(&self, atlas_id: &AtlasId, name: &str) -> CloudResult<Atlas> {
-        self.inner.rename_atlas(atlas_id, name).await
+        let hint = self.cloud_write_generation();
+        let result = self.inner.rename_atlas(atlas_id, name).await;
+        if result.is_ok() {
+            self.publish_cloud_change(hint);
+        }
+        result
     }
 
     async fn delete_atlas(&self, atlas_id: &AtlasId) -> CloudResult<()> {
-        self.inner.delete_atlas(atlas_id).await
+        let hint = self.cloud_write_generation();
+        let result = self.inner.delete_atlas(atlas_id).await;
+        if result.is_ok() {
+            self.publish_cloud_change(hint);
+        }
+        result
+    }
+
+    fn cloud_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.check_auth_generation();
+        let hints = self.cloud_hints.read();
+        if hints.generation != self.inner.auth_generation() {
+            return None;
+        }
+        hints
+            .scope
+            .as_ref()
+            .map(|scope| scope.subscribe(self.writer_id))
+    }
+
+    fn local_backend(&self) -> Option<&dyn MapperBackend> {
+        self.inner.local_backend()
+    }
+
+    fn local_snapshot(&self) -> Option<Arc<super::local::LocalSnapshot>> {
+        self.inner.local_snapshot()
+    }
+
+    async fn subscribe_local(&self) -> CloudResult<Option<tokio::sync::watch::Receiver<u64>>> {
+        self.inner.subscribe_local().await
+    }
+
+    async fn refresh_local(&self) -> CloudResult<()> {
+        self.inner.refresh_local().await
     }
 
     fn local_atlas_ids(&self) -> HashSet<AtlasId> {
@@ -811,13 +956,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AreaAccess, CloudError};
+    use crate::{
+        AreaAccess, CloudError, RoomNumber,
+        backends::{AreaMergeOutcome, AreaMergeSource, Translate},
+        mutation::{ResourceKind, VersionInfo},
+    };
     use async_trait::async_trait;
     use chrono::Utc;
     use parking_lot::Mutex;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use uuid::Uuid;
 
@@ -827,6 +976,8 @@ mod tests {
         list_calls: Arc<AtomicUsize>,
         get_calls: Arc<AtomicUsize>,
         viewer: Arc<Mutex<Option<Uuid>>>,
+        generation: Arc<AtomicU64>,
+        cloud_origin: Option<String>,
     }
 
     impl MockBackend {
@@ -838,6 +989,8 @@ mod tests {
                 list_calls: Arc::new(AtomicUsize::new(0)),
                 get_calls: Arc::new(AtomicUsize::new(0)),
                 viewer: Arc::new(Mutex::new(None)),
+                generation: Arc::new(AtomicU64::new(0)),
+                cloud_origin: None,
             }
         }
 
@@ -883,6 +1036,18 @@ mod tests {
             Ok(*self.viewer.lock())
         }
 
+        fn auth_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+
+        fn supports_sync(&self) -> bool {
+            self.cloud_origin.is_some()
+        }
+
+        fn mutation_journal_namespace(&self) -> Option<String> {
+            self.cloud_origin.clone()
+        }
+
         async fn update_area(&self, _area_id: &AreaId, _updates: AreaUpdates) -> CloudResult<()> {
             Ok(())
         }
@@ -905,13 +1070,52 @@ mod tests {
             area.area.rev += 1;
             Ok(MutationResult {
                 operation_id: envelope.operation_id,
-                versions: vec![crate::mutation::VersionInfo {
-                    resource: crate::mutation::ResourceKind::Area,
+                versions: vec![VersionInfo {
+                    resource: ResourceKind::Area,
                     id: area_id.0,
                     rev: area.area.rev,
                     deleted: false,
                 }],
                 data: Vec::new(),
+            })
+        }
+
+        // Scripted merge: honors the expected revisions, bumps the
+        // destination and drops the sources, so tests can observe which
+        // cached copies survive a commit and which survive a refusal.
+        async fn merge_areas(&self, plan: &AreaMergePlan) -> CloudResult<AreaMergeCommit> {
+            let mut storage = self.storage.lock();
+            for (id, expected_rev) in &plan.expected {
+                let current_rev = storage
+                    .get(id)
+                    .ok_or(CloudError::AreaNotFound(*id))?
+                    .area
+                    .rev;
+                if current_rev != *expected_rev {
+                    return Err(CloudError::RevisionConflict {
+                        id: id.0,
+                        expected_rev: *expected_rev,
+                        current_rev,
+                    });
+                }
+            }
+            let into = storage.get_mut(&plan.into).expect("destination present");
+            into.area.rev += 1;
+            let destination = into.clone();
+            for id in plan.deleted_areas() {
+                storage.remove(&id);
+            }
+            Ok(AreaMergeCommit {
+                outcome: AreaMergeOutcome {
+                    rooms: Vec::new(),
+                    versions: vec![VersionInfo {
+                        resource: ResourceKind::Area,
+                        id: plan.into.0,
+                        rev: destination.area.rev,
+                        deleted: false,
+                    }],
+                },
+                documents: vec![destination],
             })
         }
     }
@@ -1250,5 +1454,252 @@ mod tests {
         );
 
         fs::remove_dir_all(cache_dir).ok();
+    }
+
+    // ===== area merges =====
+
+    fn merge_plan(into: AreaId, source: AreaId, third: AreaId, expected_rev: i64) -> AreaMergePlan {
+        AreaMergePlan {
+            into,
+            sources: vec![AreaMergeSource {
+                id: source,
+                translate: Translate::default(),
+                rooms: None,
+            }],
+            inbound: vec![third],
+            expected: vec![
+                (into, expected_rev),
+                (source, expected_rev),
+                (third, expected_rev),
+            ],
+            number_floor: RoomNumber(1),
+        }
+    }
+
+    /// Three areas warm in memory, on disk and in the known-state map.
+    async fn warm_cache(
+        backend: &MockBackend,
+        cached: &CachedBackend<MockBackend>,
+        ids: &[AreaId],
+    ) {
+        cached.list_areas().await.expect("list ok");
+        for id in ids {
+            cached.get_area(id).await.expect("fetch");
+        }
+        for id in ids {
+            cached.get_area(id).await.expect("cache hit");
+        }
+        assert_eq!(backend.get_calls.load(Ordering::Relaxed), ids.len());
+    }
+
+    fn cached_ids(cached: &CachedBackend<MockBackend>) -> (HashSet<AreaId>, HashSet<AreaId>) {
+        (
+            cached.area_cache.read().keys().copied().collect(),
+            cached.known.read().keys().copied().collect(),
+        )
+    }
+
+    /// A committed merge invalidates every area the plan names — the
+    /// destination, the sources and the third parties — so the next read of
+    /// any survivor goes upstream and observes the post-merge document.
+    #[tokio::test]
+    async fn merge_areas_invalidates_every_touched_area_on_success() {
+        let into = AreaId(Uuid::new_v4());
+        let source = AreaId(Uuid::new_v4());
+        let third = AreaId(Uuid::new_v4());
+        let backend = MockBackend::new(vec![
+            sample_area_with_rev(into, 1),
+            sample_area_with_rev(source, 1),
+            sample_area_with_rev(third, 1),
+        ]);
+        let cache_dir = temp_cache_dir();
+        let cached = CachedBackend::new(backend.clone(), cache_dir.clone());
+        warm_cache(&backend, &cached, &[into, source, third]).await;
+
+        let commit = cached
+            .merge_areas(&merge_plan(into, source, third, 1))
+            .await
+            .expect("mock accepts the plan");
+        assert_eq!(commit.documents[0].area.rev, 2);
+
+        let (in_memory, known) = cached_ids(&cached);
+        for id in [into, source, third] {
+            assert!(!in_memory.contains(&id), "{id} left in memory");
+            assert!(!known.contains(&id), "{id} left in the known-state map");
+            assert!(
+                area_files_in(&cache_dir.join("v2").join("anon"), &id).is_empty(),
+                "{id} left on disk"
+            );
+        }
+        let refreshed = cached.get_area(&into).await.expect("refetch");
+        assert_eq!(refreshed.area.rev, 2, "the pre-merge copy is not served");
+        assert_eq!(backend.get_calls.load(Ordering::Relaxed), 4);
+
+        fs::remove_dir_all(cache_dir).ok();
+    }
+
+    /// A refused merge changed nothing upstream, so every cached copy stays
+    /// valid and keeps serving.
+    #[tokio::test]
+    async fn merge_areas_keeps_every_cached_area_on_refusal() {
+        let into = AreaId(Uuid::new_v4());
+        let source = AreaId(Uuid::new_v4());
+        let third = AreaId(Uuid::new_v4());
+        let backend = MockBackend::new(vec![
+            sample_area_with_rev(into, 1),
+            sample_area_with_rev(source, 1),
+            sample_area_with_rev(third, 1),
+        ]);
+        let cache_dir = temp_cache_dir();
+        let cached = CachedBackend::new(backend.clone(), cache_dir.clone());
+        warm_cache(&backend, &cached, &[into, source, third]).await;
+
+        let result = cached
+            .merge_areas(&merge_plan(into, source, third, 7))
+            .await;
+        assert!(
+            matches!(result, Err(CloudError::RevisionConflict { .. })),
+            "the upstream verdict passes through, got {result:?}"
+        );
+
+        let (in_memory, known) = cached_ids(&cached);
+        for id in [into, source, third] {
+            assert!(in_memory.contains(&id));
+            assert!(known.contains(&id));
+        }
+        for id in [into, source, third] {
+            cached.get_area(&id).await.expect("cache hit");
+        }
+        assert_eq!(
+            backend.get_calls.load(Ordering::Relaxed),
+            3,
+            "no read went upstream"
+        );
+
+        fs::remove_dir_all(cache_dir).ok();
+    }
+
+    fn cloud_hint_backend(viewer: Uuid, origin: &str) -> CachedBackend<MockBackend> {
+        let mut backend = MockBackend::new(vec![]);
+        backend.cloud_origin = Some(origin.to_string());
+        backend.set_viewer(Some(viewer));
+        CachedBackend::new(backend, temp_cache_dir())
+    }
+
+    #[tokio::test]
+    async fn cloud_hints_preserve_writes_completed_before_verified_identity() {
+        let viewer = Uuid::new_v4();
+        let cached = cloud_hint_backend(viewer, "https://startup-hints.example/api");
+        let observer = super::super::cloud_changes::CloudChanges::for_viewer(
+            "https://startup-hints.example/api",
+            viewer,
+        );
+        let mut changes = observer.subscribe(Uuid::new_v4());
+        for _ in 0..2 {
+            cached
+                .update_area(&AreaId(Uuid::new_v4()), AreaUpdates::default())
+                .await
+                .unwrap();
+        }
+        assert!(
+            !changes.has_changed().unwrap(),
+            "unverified writes carry no viewer scope"
+        );
+        cached.viewer_identity_at_generation(0).await.unwrap();
+        assert!(
+            changes.has_changed().unwrap(),
+            "verification flushes the pending hint"
+        );
+        assert_eq!(*changes.borrow_and_update(), 1, "startup writes coalesce");
+        cached.viewer_identity_at_generation(0).await.unwrap();
+        assert!(
+            !changes.has_changed().unwrap(),
+            "installation does not replay a flushed hint"
+        );
+        fs::remove_dir_all(&cached.cache_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloud_hints_use_identity_resolved_while_a_write_was_in_flight() {
+        let viewer = Uuid::new_v4();
+        let cached = cloud_hint_backend(viewer, "https://in-flight-hints.example/api");
+        let started = cached.cloud_write_generation();
+        cached.viewer_identity().await.unwrap();
+        let changes = cached
+            .cloud_hints
+            .read()
+            .scope
+            .as_ref()
+            .unwrap()
+            .subscribe(Uuid::new_v4());
+        cached.publish_cloud_change(started);
+        assert!(changes.has_changed().unwrap());
+        fs::remove_dir_all(&cached.cache_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloud_hints_keep_the_new_scope_after_a_credential_switch() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let cached = cloud_hint_backend(first, "https://switch-hints.example/api");
+        cached.viewer_identity_at_generation(0).await.unwrap();
+        let old_scope = super::super::cloud_changes::CloudChanges::for_viewer(
+            "https://switch-hints.example/api",
+            first,
+        );
+        let old_changes = old_scope.subscribe(Uuid::new_v4());
+        cached.inner.set_viewer(Some(second));
+        cached.inner.generation.store(1, Ordering::Release);
+        assert_eq!(
+            cached.viewer_identity_at_generation(1).await.unwrap(),
+            Some(second)
+        );
+        let changes = cached
+            .cloud_hints
+            .read()
+            .scope
+            .as_ref()
+            .unwrap()
+            .subscribe(Uuid::new_v4());
+        assert_eq!(*cached.viewer.read(), Some(second));
+        cached
+            .update_area(&AreaId(Uuid::new_v4()), AreaUpdates::default())
+            .await
+            .unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert!(!old_changes.has_changed().unwrap());
+        assert!(
+            !cached.install_viewer_identity(Some(first), 0),
+            "stale identity cannot replace the scope"
+        );
+        assert_eq!(*cached.viewer.read(), Some(second));
+        fs::remove_dir_all(&cached.cache_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloud_hints_discard_old_dirty_state_and_late_completions_on_switch() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let cached = cloud_hint_backend(first, "https://dirty-hints.example/api");
+        let old_write = cached.cloud_write_generation();
+        cached.publish_cloud_change(old_write);
+        assert!(cached.cloud_hints.read().dirty);
+        cached.inner.set_viewer(Some(second));
+        cached.inner.generation.store(1, Ordering::Release);
+        let new_scope = super::super::cloud_changes::CloudChanges::for_viewer(
+            "https://dirty-hints.example/api",
+            second,
+        );
+        let changes = new_scope.subscribe(Uuid::new_v4());
+        cached.viewer_identity_at_generation(1).await.unwrap();
+        cached.publish_cloud_change(old_write);
+        assert!(
+            !changes.has_changed().unwrap(),
+            "old writes must not wake the new viewer"
+        );
+        assert!(!cached.cloud_hints.read().dirty);
+        cached.publish_cloud_change(cached.cloud_write_generation());
+        assert!(changes.has_changed().unwrap());
+        fs::remove_dir_all(&cached.cache_dir).unwrap();
     }
 }

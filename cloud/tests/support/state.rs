@@ -383,6 +383,7 @@ pub struct PendingTransferRecord {
 
 #[derive(Debug, Default)]
 pub struct MockState {
+    pub http_requests: Vec<(String, String)>,
     pub users: Vec<UserRecord>,
     /// Raw token -> key record (the real server stores sha256 digests).
     pub api_keys: HashMap<String, ApiKeyRecord>,

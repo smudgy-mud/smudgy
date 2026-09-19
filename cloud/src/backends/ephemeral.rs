@@ -22,7 +22,7 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use uuid::Uuid;
 
-use super::{MapperBackend, area_edits};
+use super::{AreaMergeCommit, AreaMergePlan, MapperBackend, apply_area_merge, area_edits};
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, CloudError, CloudResult,
     CreateAreaRequest, MapStorage,
@@ -176,6 +176,55 @@ impl MapperBackend for EphemeralBackend {
         Ok(result)
     }
 
+    // ===== MULTI-AREA TRANSACTIONS =====
+
+    async fn merge_areas(&self, plan: &AreaMergePlan) -> CloudResult<AreaMergeCommit> {
+        // One store lock across load, apply and swap. The applier runs over
+        // working clones of every named document; they replace the stored
+        // ones, and the whole sources leave the store, only once it has
+        // succeeded in full, so a refused merge leaves every area exactly
+        // as it was.
+        let mut areas = self.areas.write();
+        let stored = |id: AreaId| -> CloudResult<AreaWithDetails> {
+            areas.get(&id).cloned().ok_or(CloudError::AreaNotFound(id))
+        };
+        let mut into = stored(plan.into)?;
+        let mut sources = plan
+            .sources
+            .iter()
+            .map(|source| stored(source.id))
+            .collect::<CloudResult<Vec<_>>>()?;
+        let mut inbound = plan
+            .inbound
+            .iter()
+            .map(|id| stored(*id))
+            .collect::<CloudResult<Vec<_>>>()?;
+
+        let outcome = apply_area_merge(plan, &mut into, &mut sources, &mut inbound)?;
+
+        // A partial source is a written document like a third party; a
+        // whole source is removed below and never a post-image.
+        let mut post_images: HashMap<AreaId, AreaWithDetails> =
+            HashMap::with_capacity(1 + sources.len() + inbound.len());
+        post_images.insert(into.area.id, into);
+        for document in sources.into_iter().chain(inbound) {
+            post_images.insert(document.area.id, document);
+        }
+        let documents: Vec<AreaWithDetails> = outcome
+            .versions
+            .iter()
+            .filter(|version| !version.deleted)
+            .filter_map(|version| post_images.remove(&AreaId(version.id)))
+            .collect();
+        for document in &documents {
+            areas.insert(document.area.id, document.clone());
+        }
+        for id in plan.deleted_areas() {
+            areas.remove(&id);
+        }
+        Ok(AreaMergeCommit { outcome, documents })
+    }
+
     fn ephemeral_area_ids(&self) -> std::collections::HashSet<AreaId> {
         self.areas.read().keys().copied().collect()
     }
@@ -188,6 +237,8 @@ mod tests {
         ConnectionArgs, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind,
         ConnectionRouting, CornerStyle, ExitArgs, ExitDirection, ExitId, LabelArgs, LabelId,
         MapPoint, PortMode, RoomNumber, RoomSide, RoomUpdates, SegmentShape, ShapeArgs, ShapeId,
+        backends::{AreaMergeSource, RoomRemap, Translate},
+        mapper::RoomKey,
         mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
     };
 
@@ -983,5 +1034,160 @@ mod tests {
             Err(CloudError::NotFoundOrNoAccess)
         ));
         assert!(backend.list_areas().await.expect("list").is_empty());
+    }
+
+    // ===== area merges =====
+
+    /// Seeds room 1 in `area_id`, with an exit north out of it to `exit_to`
+    /// when given; the area ends at rev 2.
+    async fn seed_room(
+        backend: &EphemeralBackend,
+        area_id: AreaId,
+        exit_to: Option<(AreaId, i32)>,
+    ) {
+        let mut payload = vec![AreaMutation::UpsertRoom {
+            room_number: RoomNumber(1),
+            body: RoomUpdates::default(),
+        }];
+        if let Some((to_area, to_room)) = exit_to {
+            payload.push(AreaMutation::CreateExit {
+                room_number: RoomNumber(1),
+                body: ExitArgs {
+                    from_direction: ExitDirection::North,
+                    to_area_id: Some(to_area),
+                    to_room_number: Some(RoomNumber(to_room)),
+                    ..ExitArgs::default()
+                },
+            });
+        }
+        backend
+            .execute_mutation(&area_id, &envelope(area_id, 1, payload))
+            .await
+            .expect("seed envelope");
+    }
+
+    /// A destination with room 1, a source with room 1, and a third party
+    /// whose room 1 exits into the source's room; all at rev 2.
+    async fn merge_areas_fixture(backend: &EphemeralBackend) -> (AreaId, AreaId, AreaId) {
+        let mut ids = Vec::new();
+        for name in ["Into", "Source", "Third"] {
+            ids.push(backend.create_area(request(name)).await.expect("create").id);
+        }
+        let (into, source, third) = (ids[0], ids[1], ids[2]);
+        seed_room(backend, into, None).await;
+        seed_room(backend, source, None).await;
+        seed_room(backend, third, Some((source, 1))).await;
+        (into, source, third)
+    }
+
+    fn merge_plan(into: AreaId, source: AreaId, third: AreaId) -> AreaMergePlan {
+        AreaMergePlan {
+            into,
+            sources: vec![AreaMergeSource {
+                id: source,
+                translate: Translate::default(),
+                rooms: None,
+            }],
+            inbound: vec![third],
+            expected: vec![(into, 2), (source, 2), (third, 2)],
+            number_floor: RoomNumber(2),
+        }
+    }
+
+    /// Every stored area, serialized, in id order.
+    fn store_snapshot(backend: &EphemeralBackend) -> Vec<(AreaId, String)> {
+        let mut snapshot: Vec<(AreaId, String)> = backend
+            .areas
+            .read()
+            .values()
+            .map(|details| {
+                (
+                    details.area.id,
+                    serde_json::to_string(details).expect("serialize"),
+                )
+            })
+            .collect();
+        snapshot.sort_by_key(|(id, _)| id.0);
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn merge_areas_moves_the_room_and_removes_the_source() {
+        let backend = EphemeralBackend::new();
+        let (into, source, third) = merge_areas_fixture(&backend).await;
+
+        let commit = backend
+            .merge_areas(&merge_plan(into, source, third))
+            .await
+            .expect("merge");
+
+        assert_eq!(
+            commit.outcome.rooms,
+            vec![RoomRemap {
+                from: RoomKey::new(source, RoomNumber(1)),
+                to: RoomNumber(2),
+            }]
+        );
+        let written: Vec<AreaId> = commit
+            .documents
+            .iter()
+            .map(|document| document.area.id)
+            .collect();
+        assert_eq!(written, vec![into, third]);
+
+        let destination = backend.get_area(&into).await.expect("destination");
+        assert_eq!(destination.area.rev, 3);
+        assert_eq!(destination.rooms.len(), 2);
+        assert_eq!(
+            serde_json::to_string(&destination).expect("serialize"),
+            serde_json::to_string(&commit.documents[0]).expect("serialize"),
+            "the store holds the returned post-image"
+        );
+        let third_party = backend.get_area(&third).await.expect("third party");
+        assert_eq!(third_party.area.rev, 3);
+        assert_eq!(third_party.rooms[0].exits[0].to_area_id, Some(into));
+        assert_eq!(
+            third_party.rooms[0].exits[0].to_room_number,
+            Some(RoomNumber(2))
+        );
+        assert!(matches!(
+            backend.get_area(&source).await,
+            Err(CloudError::NotFoundOrNoAccess)
+        ));
+        assert!(!backend.ephemeral_area_ids().contains(&source));
+    }
+
+    #[tokio::test]
+    async fn merge_areas_refused_leaves_every_area_unchanged() {
+        let backend = EphemeralBackend::new();
+        let (into, source, third) = merge_areas_fixture(&backend).await;
+        let before = store_snapshot(&backend);
+
+        let mut drifted = merge_plan(into, source, third);
+        drifted.expected[1].1 = 3;
+        let result = backend.merge_areas(&drifted).await;
+        assert!(
+            matches!(
+                &result,
+                Err(CloudError::RevisionConflict {
+                    id,
+                    expected_rev: 3,
+                    current_rev: 2,
+                }) if *id == source.0
+            ),
+            "a moved revision conflicts unchanged, got {result:?}"
+        );
+        assert_eq!(store_snapshot(&backend), before, "nothing was swapped in");
+
+        let ghost = AreaId(Uuid::new_v4());
+        let mut missing = merge_plan(into, source, third);
+        missing.inbound[0] = ghost;
+        missing.expected[2].0 = ghost;
+        let result = backend.merge_areas(&missing).await;
+        assert!(
+            matches!(&result, Err(CloudError::AreaNotFound(id)) if *id == ghost),
+            "a named area with no document is AreaNotFound, got {result:?}"
+        );
+        assert_eq!(store_snapshot(&backend), before);
     }
 }

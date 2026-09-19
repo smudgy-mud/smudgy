@@ -2768,15 +2768,17 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
         sources.insert("impl.ts".to_string(), SMUDGY_MAPPER_TS.to_string());
         sources.insert(
             "check.ts".to_string(),
-            "import { Area } from \"smudgy:core\";\n\
-             import type { MapperImpl, AreaConstructorImpl, AreaImpl, RoomImpl, ExitImpl } from \"./impl.ts\";\n\
+            "import { Area, MutateAreaError } from \"smudgy:core\";\n\
+             import type { MapperImpl, AreaConstructorImpl, MutateAreaErrorConstructorImpl, AreaImpl, RoomImpl, ExitImpl } from \"./impl.ts\";\n\
              declare const m: MapperImpl;\n\
+             declare const errorConstructor: MutateAreaErrorConstructorImpl;\n\
              declare const areaConstructor: AreaConstructorImpl;\n\
              declare const a: AreaImpl;\n\
              declare const r: RoomImpl;\n\
              declare const e: ExitImpl;\n\
              // The runtime impl must fulfill the published global map-type contract.\n\
              export const __mapper: Mapper = m;\n\
+             export const __errorConstructor: typeof MutateAreaError = errorConstructor;\n\
              export const __areaConstructor: typeof Area = areaConstructor;\n\
              export const __area: Area = a;\n\
              export const __room: Room = r;\n\
@@ -3060,7 +3062,7 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
     /// installed `smudgy://` package scripts do — `Room`/`Area`/`Exit`/`ExitId`/`RoomNumber`/
     /// `AreaId` as AMBIENT GLOBALS (no type imports), with the runtime `mapper`/`Area` values imported
     /// from `smudgy:core` — against the shipped typings. A clean compile proves the map types stay
-    /// ambient while the two values use the module surface; a regression here is the "map types no
+    /// ambient while runtime values use the module surface; a regression here is the "map types no
     /// longer available" breakage.
     #[test]
     fn external_package_map_surface_is_typed() {
@@ -3079,7 +3081,14 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
             // Room/Area/Exit/ExitId/RoomNumber/AreaId stay global ambient types; mapper and the
             // Area constructor are explicit runtime imports.
             r##"
-            import { mapper, Area } from "smudgy:core";
+            import api, { mapper, Area, MutateAreaError } from "smudgy:core";
+
+            function savedBeforeFailure(error: unknown): readonly OperationId[] {
+              const constructor: typeof MutateAreaError = api.MutateAreaError;
+              void constructor;
+              if (error instanceof MutateAreaError) return error.committedOperations;
+              throw error;
+            }
 
             function useRoom(room: Room): void {
               const aid: AreaId = room.area_id;
@@ -3135,6 +3144,7 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
               const exitId: ExitId = await mapper.createRoomExit(room.area_id, room.room_number, { from_direction: "North" });
               const updateId: OperationId | null = await mapper.setRoomExit(room.area_id, room.room_number, exitId, { command: "enter hole" });
               const mergeId: OperationId | null = await mapper.mergeRooms(room.area_id, room.room_number, room.room_number + 1);
+              const merged: MergedRoom[] = await mapper.mergeAreas(room.area_id, [a, newArea.id, { area: a, translate: { x: 40 } }, { area: a, rooms: [room.room_number], translate: { y: 8 } }]);
               await mapper.deleteRoomExit(room.area_id, room.room_number, exitId);
               await mapper.deleteRoom(room.area_id, room.room_number);
               mapper.setCurrentLocation(room.area_id, room.room_number);
@@ -3149,9 +3159,9 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
               await mapper.setRoomTitle(room.area_id, room.room_number, "t");
               await mapper.setRoomDescription(room.area_id, room.room_number, "d");
               await mapper.renameArea(room.area_id, "n");
-              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void batchIds; void updateId; void mergeId;
+              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void batchIds; void updateId; void mergeId; void merged;
             }
-            export { useRoom, useArea, useExit, useMapper };
+            export { useRoom, useArea, useExit, useMapper, savedBeforeFailure };
             "##
             .to_string(),
         );

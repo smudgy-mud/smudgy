@@ -1882,6 +1882,11 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
         serde_json::to_vec_pretty(&document).expect("serialize future-format area document"),
     )
     .expect("replace bound map with future-format document");
+    // External file edits enter the shared store only through explicit refresh.
+    mapper
+        .refresh_local_store()
+        .await
+        .expect("refresh external edit");
 
     // A NEW room in the adopted zone: the first attempt drafts into the bound
     // local map and fails at submit; the retry must land a REAL room in a

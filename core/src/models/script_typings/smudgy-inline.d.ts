@@ -160,6 +160,7 @@ declare global {
   const submission: SmudgyApi["submission"];
   const mapper: SmudgyApi["mapper"];
   const Area: SmudgyApi["Area"];
+  const MutateAreaError: SmudgyApi["MutateAreaError"];
   const session: SmudgyApi["session"];
   const input: SmudgyApi["input"];
   const id: SmudgyApi["id"];

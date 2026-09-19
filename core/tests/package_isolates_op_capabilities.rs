@@ -819,6 +819,55 @@ async fn mapper_write_gates_set_current_location() {
     );
 }
 
+/// `mapper:write` gates `mapper.mergeAreas` the same way. The gate runs before the op touches
+/// the (absent, in this harness) `Mapper`, so the denial names the capability; once consented,
+/// the same call gets past the gate and fails on the missing mapper instead.
+#[tokio::test]
+async fn mapper_write_gates_merge_areas() {
+    let src = r#"
+        import { echo, mapper } from "smudgy:core";
+        try {
+            await mapper.mergeAreas(
+                "67e55044-10b1-426f-9247-bb680e5fe0c8",
+                [{ area: "1b4e28ba-2fa1-11d2-883f-0016d3cca427", translate: { x: 10 } }],
+            );
+            echo("MERGE_OK");
+        } catch (e) { echo("MERGE_DENIED:" + (e?.message ?? String(e))); }
+        echo("DONE");
+    "#;
+    let denied = run_capability_case(
+        9691,
+        "pi_caps_merge_areas_deny",
+        "smudgy://wbk/consolidator",
+        Some(consent_with(|_| {})),
+        make_package("wbk", "consolidator", "1.0.0", src),
+    )
+    .await;
+    assert!(
+        !has_line(&denied, "MERGE_OK")
+            && has_line(&denied, "MERGE_DENIED:")
+            && has_line(&denied, "mapper-write"),
+        "without mapper-write, mergeAreas must throw naming the capability; transcript:\n{denied:#?}"
+    );
+
+    let allowed = run_capability_case(
+        9692,
+        "pi_caps_merge_areas_allow",
+        "smudgy://wbk/consolidator",
+        Some(consent_with(|s| s.mapper_write = true)),
+        make_package("wbk", "consolidator", "1.0.0", src),
+    )
+    .await;
+    assert!(
+        !has_line(&allowed, "MERGE_OK")
+            && has_line(&allowed, "MERGE_DENIED:")
+            && !has_line(&allowed, "mapper-write")
+            && has_line(&allowed, "Mapper not enabled"),
+        "with mapper-write consented the gate opens; without a mapper the call must fail on the \
+         missing mapper, not the capability; transcript:\n{allowed:#?}"
+    );
+}
+
 /// `set_*_enabled` is gated on create-aliases AND own-origin-scoped: a package granted
 /// `create_aliases` can create its own alias and toggle it (the toggle is keyed by
 /// `(this isolate, this package's origin, name)`, so it can only ever reach the package's OWN

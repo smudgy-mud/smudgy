@@ -3996,7 +3996,7 @@ impl Inner<'_> {
         // engine once the user logs in.
         if let Some(mapper) = self.mapper.clone() {
             let started = Instant::now();
-            match mapper.load_all_areas().await {
+            match mapper.load_initial_areas().await {
                 Ok(summary) => {
                     let elapsed = started.elapsed();
                     // The per-area detail (id/rev/source/timing) is invaluable when one map is

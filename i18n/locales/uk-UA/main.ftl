@@ -516,6 +516,7 @@ cloud-error-authentication = Помилка автентифікації: { $det
 cloud-error-permission = Відмовлено в доступі: { $detail }
 cloud-error-internal = Внутрішня помилка: { $detail }
 cloud-error-pending = Операції в очікуванні: { $detail }
+cloud-error-local-commit-pending = Зміну локальної карти збережено для відновлення, але завершити її не вдалося. Оновіть карти або перезапустіть Smudgy, щоб повторити відновлення.
 cloud-error-unauthorized = Ви не увійшли.
 cloud-error-unauthorized-detail = Ви не увійшли: { $detail }
 cloud-error-name-unavailable = Ім'я недоступне: { $detail }
@@ -527,6 +528,17 @@ cloud-error-revision-conflict = Цей елемент змінився на се
 cloud-error-projection-changed = Ваш доступ до цього елемента змінився. Оновіть і спробуйте ще раз.
 cloud-error-operation-reused = Цю операцію не вдалося безпечно завершити. Оновіть і спробуйте ще раз.
 cloud-error-structural-conflict = Ця зміна суперечить поточній структурі мапи: { $detail }
+cloud-error-merge-areas-no-sources = Виберіть принаймні одну вихідну область для об’єднання.
+cloud-error-merge-areas-same-area = Кожна вихідна область має бути вказана лише один раз і відрізнятися від цільової.
+cloud-error-merge-areas-no-rooms = Виберіть принаймні одну кімнату з кожної частково об’єднуваної області або не вказуйте вибір кімнат, щоб об’єднати всю область.
+cloud-error-merge-areas-room-not-found = Вибраної кімнати немає у вихідній області. Перевірте номери кімнат перед об’єднанням.
+cloud-error-merge-areas-mixed-tiers = Усі задіяні області, зокрема області з посиланнями на об’єднувані, мають використовувати однакове сховище: локальне або сеансу.
+cloud-error-merge-areas-unsupported-storage = Це сховище не підтримує об’єднання областей. Використовуйте підтримуване локальне сховище або сховище сеансу.
+cloud-error-merge-requires-full-projection = Для об’єднання потрібен повний доступ до всіх задіяних областей, зокрема областей із посиланнями на об’єднувані.
+cloud-error-merge-areas-busy = В одній із задіяних областей є незавершені зміни або триває інша операція. Завершіть або врегулюйте ці операції перед об’єднанням.
+cloud-error-merge-areas-source-changed = Одна із задіяних областей змінилася під час підготовки об’єднання. Перегляньте поточну мапу й спробуйте ще раз.
+cloud-error-merge-areas-room-numbers-exhausted = У цільовій області недостатньо доступних номерів кімнат для цього об’єднання. Виберіть іншу цільову область.
+cloud-error-merge-areas-invalid-translation = Зсув або кінцева позиція виходить за підтримуваний діапазон. Використовуйте скінченні координати й рівні в межах 32-бітного цілого числа.
 cloud-error-invalid-connection = Це з'єднання некоректне: { $detail }
 
 # Friends, blocks, and ownership transfers

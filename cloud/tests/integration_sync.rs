@@ -8,6 +8,8 @@
 //! `sync_now`).
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
+#[path = "integration_sync/local_queue_regressions.rs"]
+mod local_queue_regressions;
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -182,6 +184,81 @@ fn cache_files_for_area(dir: &Path, area_id: AreaId) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 // 1. A grant appears in the grantee's atlas cache via /sync, redacted.
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acknowledged_cloud_edits_wake_only_sessions_for_the_same_viewer() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("hint-owner@example.com", "hint-owner", true);
+    let stranger = server.create_user("hint-other@example.com", "hint-other", true);
+    let area = server.create_area(&owner, "Shared between my sessions");
+    server.add_room(area, 1, "Before", false);
+    let writer_dir = TempCacheDir::new("hint-writer");
+    let observer_dir = TempCacheDir::new("hint-observer");
+    let stranger_dir = TempCacheDir::new("hint-stranger");
+    let writer = new_synced_mapper(&server.base_url, &owner.api_key, writer_dir.path()).await;
+    let observer = new_synced_mapper(&server.base_url, &owner.api_key, observer_dir.path()).await;
+    let stranger_mapper =
+        new_synced_mapper(&server.base_url, &stranger.api_key, stranger_dir.path()).await;
+    let stranger_sync = stranger_mapper.sync_status().last_sync;
+    let operation = writer
+        .upsert_room(
+            RoomKey::new(area, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("Acknowledged elsewhere".into()),
+                ..RoomUpdates::default()
+            },
+        )
+        .unwrap();
+    writer
+        .wait_for_mutation(operation.operation_id().unwrap())
+        .await
+        .unwrap();
+    wait_until(|| {
+        observer
+            .get_current_atlas()
+            .get_room(&RoomKey::new(area, RoomNumber(1)))
+            .is_some_and(|room| room.get_title() == "Acknowledged elsewhere")
+    })
+    .await;
+    assert!(
+        stranger_mapper
+            .get_current_atlas()
+            .get_area(&area)
+            .is_none()
+    );
+    assert_eq!(stranger_mapper.sync_status().last_sync, stranger_sync);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_generation_adoption_does_not_request_cloud_sync() {
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("local-hint@example.com", "local-hint", true);
+    let cache = TempCacheDir::new("local-hint");
+    let local = Arc::new(smudgy_cloud::LocalBackend::new(cache.path().join("local")));
+    let cloud = Arc::new(CachedCloudMapper::new(
+        CloudMapper::new(server.base_url.clone(), owner.api_key.clone()),
+        cache.path().join("cloud"),
+    ));
+    let mapper = Mapper::new(
+        Arc::new(smudgy_cloud::CompositeBackend::new(local.clone(), cloud)),
+        cache.path().join("mapper"),
+    );
+    wait_until(|| {
+        mapper.sync_status().last_sync.is_some() && mapper.sync_status().state == SyncState::Idle
+    })
+    .await;
+    let synced = mapper.sync_status().last_sync;
+    let area = local
+        .create_area(smudgy_cloud::CreateAreaRequest {
+            name: "Local only".into(),
+            atlas_id: None,
+            ephemeral: false,
+        })
+        .await
+        .unwrap();
+    wait_until(|| mapper.get_current_atlas().get_area(&area.id).is_some()).await;
+    assert_eq!(mapper.sync_status().last_sync, synced);
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn share_appears_in_grantee_atlas_via_sync() {
@@ -1134,7 +1211,14 @@ async fn legacy_api_key_path_unchanged() {
 
     // The sync engine settles in Idle and keeps the area.
     tick(&mapper).await;
-    let status = mapper.sync_status();
+    // Loading also requests a tick; observe a settled status even if that
+    // request and the explicit tick complete in separate turns.
+    let mut status = mapper.sync_status();
+    wait_until(|| {
+        status = mapper.sync_status();
+        status.state == SyncState::Idle
+    })
+    .await;
     assert_eq!(status.state, SyncState::Idle);
     assert!(status.last_error.is_none());
     assert!(
@@ -1495,4 +1579,159 @@ async fn idempotent_tag_readd_moves_no_rev() {
         .expect("area cached");
     let room = cached.get_room(&RoomNumber(1)).expect("room present");
     assert_eq!(room.tags().collect::<Vec<_>>(), vec!["INN"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_composite_mappers_keep_local_edits_local_and_ignore_their_own_cloud_hints() {
+    use smudgy_cloud::{CompositeBackend, LocalBackend};
+    let server = MockServer::spawn().await;
+    let owner = server.create_user("composite@example.com", "composite", true);
+    let cloud_area = server.create_area(&owner, "Cloud");
+    server.add_room(cloud_area, 1, "Before", false);
+    let directory = TempCacheDir::new("two-composites");
+    let make = || {
+        Mapper::new(
+            Arc::new(CompositeBackend::new(
+                Arc::new(LocalBackend::new(directory.path().join("local"))),
+                Arc::new(CachedCloudMapper::new(
+                    CloudMapper::with_credentials(
+                        server.base_url.clone(),
+                        CredentialSource::new(Some(Credential::ApiKey(owner.api_key.clone()))),
+                    ),
+                    directory.path().join("cloud"),
+                )),
+            )),
+            directory.path().join("mapper"),
+        )
+    };
+    let writer = make();
+    let observer = make();
+    writer.ready().await.unwrap();
+    observer.ready().await.unwrap();
+    wait_until(|| {
+        writer.sync_status().last_sync.is_some() && observer.sync_status().last_sync.is_some()
+    })
+    .await;
+    let local_area = writer
+        .create_area_at("Local".into(), MapDestination::loose(MapStorage::Local))
+        .await
+        .unwrap();
+    wait_until(|| observer.get_current_atlas().get_area(&local_area).is_some()).await;
+    let revision = writer.sync_revision();
+    server.state.lock().http_requests.clear();
+    let mut last_revision = 0;
+    for sequence in 0..8 {
+        let operation = writer
+            .upsert_room(
+                RoomKey::new(local_area, RoomNumber(1)),
+                RoomUpdates {
+                    title: Some(format!("Local {sequence}")),
+                    ..RoomUpdates::default()
+                },
+            )
+            .unwrap();
+        let optimistic = writer.get_current_atlas().get_area(&local_area).unwrap();
+        assert!(optimistic.get_rev() > last_revision);
+        last_revision = optimistic.get_rev();
+        writer
+            .wait_for_mutation(operation.operation_id().unwrap())
+            .await
+            .unwrap();
+        writer.ready().await.unwrap();
+        let saved = writer.get_current_atlas().get_area(&local_area).unwrap();
+        assert!(
+            Arc::ptr_eq(&optimistic, &saved),
+            "own adoption must preserve the optimistic cache"
+        );
+    }
+    let mut burst = Vec::new();
+    for sequence in 0..8 {
+        burst.push(
+            writer
+                .upsert_room(
+                    RoomKey::new(local_area, RoomNumber(1)),
+                    RoomUpdates {
+                        title: Some(format!("Burst {sequence}")),
+                        ..RoomUpdates::default()
+                    },
+                )
+                .unwrap()
+                .operation_id()
+                .unwrap(),
+        );
+    }
+    let optimistic = writer.get_current_atlas().get_area(&local_area).unwrap();
+    for operation in burst {
+        writer.wait_for_mutation(operation).await.unwrap();
+        assert!(
+            writer
+                .get_current_atlas()
+                .get_area(&local_area)
+                .unwrap()
+                .get_rev()
+                >= optimistic.get_rev()
+        );
+    }
+    writer.ready().await.unwrap();
+    assert!(Arc::ptr_eq(
+        &optimistic,
+        &writer.get_current_atlas().get_area(&local_area).unwrap()
+    ));
+    wait_until(|| {
+        observer
+            .get_current_atlas()
+            .get_room(&RoomKey::new(local_area, RoomNumber(1)))
+            .is_some_and(|room| room.get_title() == "Burst 7")
+    })
+    .await;
+    assert_eq!(
+        writer.sync_revision(),
+        revision,
+        "own content saves do not refresh cloud inventory"
+    );
+    let before = writer.get_current_atlas().get_area(&local_area).unwrap();
+    writer.rename_area(local_area, "Renamed").await.unwrap();
+    let renamed = writer.get_current_atlas().get_area(&local_area).unwrap();
+    assert!(Arc::ptr_eq(
+        before.get_room(&RoomNumber(1)).unwrap(),
+        renamed.get_room(&RoomNumber(1)).unwrap()
+    ));
+    assert!(
+        writer.sync_revision() > revision,
+        "metadata refreshes inventory"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        server.state.lock().http_requests.is_empty(),
+        "local commits must not wake cloud sync"
+    );
+    let writer_sync = writer.sync_status().last_sync;
+    let operation = writer
+        .upsert_room(
+            RoomKey::new(cloud_area, RoomNumber(1)),
+            RoomUpdates {
+                title: Some("Cloud edit".into()),
+                ..RoomUpdates::default()
+            },
+        )
+        .unwrap();
+    writer
+        .wait_for_mutation(operation.operation_id().unwrap())
+        .await
+        .unwrap();
+    wait_until(|| {
+        observer
+            .get_current_atlas()
+            .get_room(&RoomKey::new(cloud_area, RoomNumber(1)))
+            .is_some_and(|room| room.get_title() == "Cloud edit")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(writer.sync_status().last_sync, writer_sync);
+    let requests = server.state.lock().http_requests.clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "one mutation and one observer sync/refetch: {requests:?}"
+    );
 }

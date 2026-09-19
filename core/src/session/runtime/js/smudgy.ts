@@ -6232,7 +6232,7 @@ function __smudgy_make_event_consumer<T>(
  * `with (globalThis.__smudgy_user_api) { ... }`.
  *
  * The live-state members are getters/functions, so they stay live through `with` and the
- * default export: `mapper` and `Area` are getters (the smudgy.js facade is built before mapper.ts
+ * default export: mapper values are getters (the smudgy.js facade is built before mapper.ts
  * hands them to this extension, so the lookup MUST be deferred), `getSessions()`/`getProfile()`
  * are functions (the session set + profile fields change). `session`/`id`
  * derive from a constant session id, so a snapshot is correct -- they are getters only so the
@@ -6244,21 +6244,24 @@ function __smudgy_make_event_consumer<T>(
  */
 let __smudgy_mapper_api: any;
 let __smudgy_area_constructor: any;
+let __smudgy_mutate_area_error: typeof import("smudgy:core").MutateAreaError;
 
-/** Receive the mapper extension's public values without making either one a public global. */
-function __smudgy_install_mapper(mapperApi: unknown, AreaConstructor: unknown): void {
+/** Receive the mapper extension's public values without public globals. */
+function __smudgy_install_mapper(mapperApi: unknown, AreaConstructor: unknown, MutateAreaErrorConstructor: unknown): void {
     if (__smudgy_mapper_api !== undefined || __smudgy_area_constructor !== undefined) {
         throw new TypeError("smudgy mapper API was installed more than once");
     }
     if (
         typeof mapperApi !== "object" ||
         mapperApi === null ||
-        typeof AreaConstructor !== "function"
+        typeof AreaConstructor !== "function" ||
+        typeof MutateAreaErrorConstructor !== "function"
     ) {
         throw new TypeError("smudgy mapper extension supplied an invalid API");
     }
     __smudgy_mapper_api = mapperApi;
     __smudgy_area_constructor = AreaConstructor;
+    __smudgy_mutate_area_error = MutateAreaErrorConstructor as typeof __smudgy_mutate_area_error;
 }
 
 function __smudgy_make_api(creator: { kind: string }) {
@@ -6285,6 +6288,9 @@ function __smudgy_make_api(creator: { kind: string }) {
         },
         get Area(): any {
             return __smudgy_area_constructor;
+        },
+        get MutateAreaError() {
+            return __smudgy_mutate_area_error;
         },
         // The current session's main command input. A getter for symmetry with
         // `session`; the handle itself is a stable addresser (session id + "main"
@@ -6528,12 +6534,12 @@ export type SmudgyCoreApi = ReturnType<typeof __smudgy_make_api>;
 Object.defineProperty(globalThis, "__smudgy_create_api", { value: __smudgy_make_api });
 
 // One-shot private bridge from the later-loading mapper extension. The bridge removes itself as
-// soon as mapper.ts calls it; neither the mapper object nor the Area constructor becomes a public
-// global. This is runtime plumbing, not part of the author-facing smudgy:core contract.
+// soon as mapper.ts calls it; none of the mapper values become public globals.
+// This is runtime plumbing, not part of the author-facing smudgy:core contract.
 Object.defineProperty(globalThis, "__smudgy_install_mapper", {
     configurable: true,
-    value: (mapperApi: unknown, AreaConstructor: unknown) => {
-        __smudgy_install_mapper(mapperApi, AreaConstructor);
+    value: (mapperApi: unknown, AreaConstructor: unknown, MutateAreaErrorConstructor: unknown) => {
+        __smudgy_install_mapper(mapperApi, AreaConstructor, MutateAreaErrorConstructor);
         delete (globalThis as any).__smudgy_install_mapper;
     },
 });

@@ -257,14 +257,14 @@ impl Mapper {
         // members stay editable throughout and are merely re-filed and
         // relinked at the end.
         let mut move_fences = if mode == RelocationMode::Move {
-            let fences = self.begin_area_move(&copied_ids)?;
+            let fences = self.begin_relocation(&copied_ids)?;
             self.wait_area_move_quiescent(&fences).await;
             Some(fences)
         } else {
             None
         };
 
-        let snapshots = self.snapshot_areas(&copied_ids)?;
+        let (snapshots, confirmed_revs) = self.snapshot_relocation_sources(&copied_ids)?;
         for snapshot in &snapshots {
             validate_import_document(snapshot)?;
         }
@@ -272,10 +272,10 @@ impl Mapper {
         // acknowledged revision when one is known, else the cached document
         // revision (queued-but-unsent optimistic bumps ride the copy and are
         // discarded with the source, so they must not inflate the guard).
-        let expected_revs: Vec<i64> = copied_ids
+        let expected_revs: Vec<i64> = confirmed_revs
             .iter()
             .zip(&snapshots)
-            .map(|(id, snapshot)| self.confirmed_area_rev(*id).unwrap_or(snapshot.area.rev))
+            .map(|(confirmed, snapshot)| confirmed.unwrap_or(snapshot.area.rev))
             .collect();
         let mut copy_destination_ids = Vec::with_capacity(snapshots.len());
         let mut server_copied = vec![false; snapshots.len()];
@@ -286,7 +286,7 @@ impl Mapper {
                 self.area_storage(&source_id),
                 destination.storage,
                 mode,
-                self.confirmed_area_rev(source_id),
+                confirmed_revs[index],
             ) {
                 match self
                     .copy_cloud_area(source_id, &snapshot.area.name, destination.atlas_id)
@@ -522,7 +522,7 @@ impl Mapper {
         }
 
         let mut move_fences = if mode == RelocationMode::Move {
-            let fences = self.begin_area_move(&member_ids)?;
+            let fences = self.begin_relocation(&member_ids)?;
             self.wait_area_move_quiescent(&fences).await;
             Some(fences)
         } else {
@@ -1473,6 +1473,9 @@ mod tests {
         )
         .await;
 
+        // Keep the observer disconnected so its copied revision remains stale.
+        stale.pause_local_updates_for_test();
+
         // Another client edits the source after this client's cache was
         // built; the backend revision moves past the snapshot's.
         let other = make_mapper();
@@ -2314,8 +2317,9 @@ mod tests {
             .await
             .expect("create loaded member");
 
-        // A second process adds a member after the first mapper's cache was
-        // built. The inventory sees it; the first cache deliberately does not.
+        // Deliberately keep this session behind while another adds a member.
+        // Live same-process adoption would otherwise race the refusal check.
+        first.pause_local_updates_for_test();
         let second = make_mapper();
         second.load_all_areas().await.expect("load second mapper");
         second
