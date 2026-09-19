@@ -555,6 +555,7 @@ pub fn delete_server(name: &str) -> Result<()> {
 }
 
 fn remove_server_locked(current: &Server) -> Result<()> {
+    let _package_guard = super::shared_packages::guard(&current.name);
     // Deterministic credentials live outside the server directory. They must be gone before the
     // directory is removed; otherwise removing the local index would make an orphaned keyring
     // entry impossible to identify safely.

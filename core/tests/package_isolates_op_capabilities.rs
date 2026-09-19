@@ -541,7 +541,8 @@ async fn reach_others_gates_foreign_input_panes_and_swap_directly() {
         import session, { echo } from "smudgy:core";
         const current = session.session;
         const SessionClass = Object.getPrototypeOf(current).constructor;
-        const foreign = new SessionClass(current.id + 1);
+        // Adjacent IDs belong to other tests running in parallel. Use an unused ID.
+        const foreign = new SessionClass(0xFFFF_FFFE);
         const probe = (name, fn) => {
             try { fn(); echo(name + ":NO_THROW"); }
             catch (e) { echo(name + ":ERR:" + (e?.message ?? String(e))); }

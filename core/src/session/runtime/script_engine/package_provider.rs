@@ -2410,6 +2410,7 @@ mod tests {
     fn required_param_gate_honors_the_configured_profile_scope() {
         use_temp_smudgy_home();
         let server = "RequiredParamCheckedScopeTest";
+        std::fs::create_dir_all(crate::get_smudgy_home().unwrap().join(server)).unwrap();
         let profile = "Work";
         let specifier = "smudgy://wbk/mapper";
         let client = PackageApiClient::new(

@@ -15,6 +15,7 @@ serde = { workspace = true }
 indexmap = { workspace = true }
 smudgy_cloud = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = "0.40.2"
 validator = { workspace = true }
 cfg-if = { workspace = true }
 tokio = { workspace = true }

@@ -6,6 +6,7 @@ pub mod drag_overlay;
 pub mod dropdown;
 pub mod hotkey_input;
 pub mod hotkey_matching_input;
+pub mod modal_layer;
 pub mod split_terminal_pane;
 pub mod tab_host;
 pub mod tab_press;
