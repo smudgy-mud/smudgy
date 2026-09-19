@@ -442,6 +442,7 @@ cloud-error-authentication = 身分驗證錯誤：{ $detail }
 cloud-error-permission = 權限不足：{ $detail }
 cloud-error-internal = 內部錯誤：{ $detail }
 cloud-error-pending = 尚有未完成的操作：{ $detail }
+cloud-error-local-commit-pending = 本機地圖變更已儲存以供復原，但未能完成。請重新整理地圖或重新啟動 Smudgy，以再次嘗試復原。
 cloud-error-unauthorized = 尚未登入。
 cloud-error-unauthorized-detail = 尚未登入：{ $detail }
 cloud-error-name-unavailable = 此名稱無法使用：{ $detail }

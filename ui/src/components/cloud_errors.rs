@@ -55,6 +55,9 @@ pub fn display_error(err: &CloudError) -> String {
         CloudError::InternalError(detail) => {
             crate::i18n::t!("cloud-error-internal", "detail" => detail)
         }
+        CloudError::LocalCommitPending { .. } => {
+            crate::i18n::t!("cloud-error-local-commit-pending")
+        }
         CloudError::PendingOperations(detail) => {
             crate::i18n::t!("cloud-error-pending", "detail" => detail)
         }

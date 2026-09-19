@@ -449,6 +449,7 @@ cloud-error-authentication = Authentication error: { $detail }
 cloud-error-permission = Permission denied: { $detail }
 cloud-error-internal = Internal error: { $detail }
 cloud-error-pending = Pending operations: { $detail }
+cloud-error-local-commit-pending = The local map change is saved for recovery but could not finish. Refresh the maps or restart Smudgy to retry recovery.
 cloud-error-unauthorized = You are not signed in.
 cloud-error-unauthorized-detail = You are not signed in: { $detail }
 cloud-error-name-unavailable = Name unavailable: { $detail }

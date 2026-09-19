@@ -10,6 +10,7 @@ pub(crate) mod area_edits;
 pub mod area_merge;
 pub mod cached;
 pub mod cloud;
+mod cloud_changes;
 pub mod composite;
 pub mod ephemeral;
 pub mod local;
@@ -33,6 +34,48 @@ pub const LEGACY_ACCESS_FINGERPRINT: &str = "legacy";
 /// Core trait defining all mapping operations
 #[async_trait]
 pub trait MapperBackend: Send + Sync {
+    /// The explicit local tier, including ids removed from its current snapshot.
+    fn local_backend(&self) -> Option<&dyn MapperBackend> {
+        None
+    }
+
+    /// Execute a queued local write without inferring its tier from live membership.
+    async fn execute_local_mutation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult> {
+        if let Some(local) = self.local_backend() {
+            local.execute_mutation(area_id, envelope).await
+        } else if !self.supports_sync() {
+            self.execute_mutation(area_id, envelope).await
+        } else {
+            Err(CloudError::AreaNotFound(*area_id))
+        }
+    }
+
+    /// Subscribe after resolving identity. Hints contain no data and only
+    /// request a credential-bound reconciliation by the receiving session.
+    fn cloud_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+
+    /// The current committed local generation, if this backend owns a local store.
+    fn local_snapshot(&self) -> Option<std::sync::Arc<local::LocalSnapshot>> {
+        None
+    }
+
+    /// Initialize the local store and subscribe to coalesced generation changes.
+    /// Subscribe before loading a snapshot to avoid missing a concurrent commit.
+    async fn subscribe_local(&self) -> CloudResult<Option<tokio::sync::watch::Receiver<u64>>> {
+        Ok(None)
+    }
+
+    /// Explicitly reload local files modified outside this process.
+    async fn refresh_local(&self) -> CloudResult<()> {
+        Ok(())
+    }
+
     // ===== AREA OPERATIONS =====
 
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area>;
@@ -256,6 +299,32 @@ pub trait MapperBackend: Send + Sync {
             return Err(CloudError::CredentialChanged);
         }
         self.execute_mutation(area_id, envelope).await
+    }
+
+    // ===== MULTI-AREA TRANSACTIONS =====
+
+    /// Folds the plan's sources into its destination as one transaction:
+    /// every document the plan names is read at its expected revision,
+    /// [`apply_area_merge`] runs over those authoritative copies, and then
+    /// either every post-image lands and every source is removed, or
+    /// nothing changes. The commit carries the applier's outcome and the
+    /// written documents, so the caller republishes without a second read.
+    /// A revision that moved since the plan was built is
+    /// [`CloudError::RevisionConflict`] and nothing is written.
+    ///
+    /// The default REFUSES with [`CloudError::StructuralConflict`]
+    /// `merge_areas_unsupported_storage` — the behavior of any backend that
+    /// does not own full documents it can rewrite together. The local and
+    /// ephemeral tiers implement it; the cloud tier keeps the default until
+    /// the server applies the same function. Every id in `plan.expected`
+    /// must belong to one tier: a multi-tier backend refuses a plan that
+    /// straddles tiers with `merge_areas_mixed_tiers` instead of forwarding
+    /// it to any of them.
+    async fn merge_areas(&self, plan: &AreaMergePlan) -> CloudResult<AreaMergeCommit> {
+        let _ = plan;
+        Err(CloudError::StructuralConflict(
+            "merge_areas_unsupported_storage".to_string(),
+        ))
     }
 
     // ===== ATLAS (FOLDER) OPERATIONS =====

@@ -516,6 +516,7 @@ cloud-error-authentication = Помилка автентифікації: { $det
 cloud-error-permission = Відмовлено в доступі: { $detail }
 cloud-error-internal = Внутрішня помилка: { $detail }
 cloud-error-pending = Операції в очікуванні: { $detail }
+cloud-error-local-commit-pending = Зміну локальної карти збережено для відновлення, але завершити її не вдалося. Оновіть карти або перезапустіть Smudgy, щоб повторити відновлення.
 cloud-error-unauthorized = Ви не увійшли.
 cloud-error-unauthorized-detail = Ви не увійшли: { $detail }
 cloud-error-name-unavailable = Ім'я недоступне: { $detail }

@@ -18,8 +18,8 @@
 //! which old binaries do not know how to overwrite (§8.3). A v1 file in the
 //! old `areas/` namespace is migrated the first time it is seen — the scan
 //! migrates stragglers **eagerly** (so a freshly-opened store lists every
-//! area consistently), and a direct `get_area` of an unscanned id migrates
-//! on demand. Each migration first writes an untouched timestamped backup,
+//! area consistently). Migration runs only during initialization or explicit
+//! refresh. Each migration first writes an untouched timestamped backup,
 //! then atomically writes the migrated document into `areas-v2/`; only the
 //! completed rename marks the migration done, and any failure leaves the v1
 //! file intact and unopened (never a partial or empty replacement). Once a
@@ -28,27 +28,31 @@
 //! Documents newer than [`crate::AREA_FORMAT_VERSION`] are a hard read-only
 //! error naming the file.
 //!
-//! An area's atlas membership lives in its own `atlas_id` field, so moving an
-//! area between folders is a single-file rewrite. Folder deletion journals
-//! every member document before clearing the ids; reopening rolls a prepared
-//! transaction back or a committed one forward, so a crash cannot leave only
-//! part of the folder detached.
+//! Single-document saves use atomic replacement. Changes spanning documents
+//! share one redo journal; its durable installation is the commit decision.
+//! Recovery finishes decided transactions before accepting another write.
+//! Legacy single-document and atlas-delete journals remain readable.
 //!
-//! A lightweight in-memory index of area/atlas metadata is loaded once,
-//! lazily, off the construction hot path (the first async call triggers the
-//! disk scan via [`tokio::task::spawn_blocking`]); a large local store must
-//! not stall startup. Mutations keep the index in lock-step with disk.
+//! Sessions mounting the same canonical directory share one store, initialized
+//! lazily off the construction hot path. Reads pin immutable generations and
+//! never wait for the writer or touch disk. A successful transaction publishes
+//! all its changes in one swap, then signals subscribers. Unchanged documents
+//! are shared across generations. External file edits require explicit refresh.
 
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
+    sync::{
+        Arc, LazyLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::Utc;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, OnceCell},
@@ -56,7 +60,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::{MapperBackend, area_edits, local_migration};
+use super::{
+    AreaMergeCommit, AreaMergePlan, MapperBackend, apply_area_merge, area_edits, local_migration,
+};
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CloudResult, CreateAreaRequest, MapStorage,
@@ -65,6 +71,39 @@ use crate::{
 
 const LOCAL_OPERATION_RECEIPT_LIMIT: usize = 1024;
 const ATLAS_DELETE_TRANSACTION_PREFIX: &str = "atlas-delete-";
+const MULTI_WRITE_TRANSACTION_PREFIX: &str = "multi-write-";
+
+/// The sequence the last multi-write journal took. Journals are named
+/// `multi-write-{sequence}-{uuid}.json` with the sequence zero-padded, so
+/// their file names sort in commit order and recovery replays them oldest
+/// first. The counter is process-wide and monotonic: every allocation is a
+/// `fetch_add`, and every scan of a transactions directory raises it past
+/// the highest sequence found there, so a journal written after a restart
+/// always sorts after one that lingered through it. A wall clock would not
+/// give that guarantee (it can step backwards, and its resolution can tie).
+static MULTI_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Coordinate store ownership by canonical filesystem identity. Weak registry
+/// entries do not keep unused stores alive.
+/// This coordinates sessions in this process, not separate app processes.
+static STORES: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Weak<LocalStore>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn next_multi_write_sequence() -> u64 {
+    MULTI_WRITE_SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// The sequence a multi-write journal's file name carries; `None` for a
+/// name without one, which sorts before every sequenced journal.
+fn multi_write_sequence_of(path: &Path) -> Option<u64> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix(MULTI_WRITE_TRANSACTION_PREFIX)?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalMutationReceipt {
@@ -77,6 +116,9 @@ struct LocalMutationReceipt {
 /// as the mutation result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalAreaDocument {
+    /// Metadata-only copies retain this identity so sessions can reuse room indexes.
+    #[serde(skip)]
+    content_identity: Arc<()>,
     #[serde(flatten)]
     details: AreaWithDetails,
     #[serde(
@@ -90,6 +132,7 @@ struct LocalAreaDocument {
 impl LocalAreaDocument {
     fn new(details: AreaWithDetails) -> Self {
         Self {
+            content_identity: Arc::new(()),
             details,
             applied_operations: Vec::new(),
         }
@@ -128,20 +171,552 @@ struct LocalAtlasDeleteTransaction {
     committed: bool,
 }
 
-/// On-disk authoritative map store. Cheaply shareable behind an `Arc`.
+/// A committed set of document writes and deletes that must land together.
+/// The journal is complete before any document is touched, so recovery only
+/// ever rolls forward; re-applying it is idempotent. Unlike the atlas-delete
+/// journal there is no prepared phase and hence no `committed` flag: the
+/// journal's existence is the commit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LocalMultiWriteTransaction {
+    /// Full post-images, receipts included.
+    writes: Vec<LocalAreaDocument>,
+    deletes: Vec<AreaId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    atlases: Vec<Atlas>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deleted_atlases: Vec<AtlasId>,
+    /// Explicit imports replace existing documents, even at a lower revision.
+    /// Ordinary writes and recovery preserve newer on-disk documents.
+    #[serde(default)]
+    exact: bool,
+}
+
+/// A published local generation. Documents are committed, readable state;
+/// journaled operations remain separate until recovery publishes their result.
+/// Cloning shares persistent maps and unchanged documents.
+#[derive(Debug, Clone, Default)]
+pub struct LocalSnapshot {
+    pub generation: u64,
+    documents: imbl::HashMap<AreaId, Arc<LocalAreaDocument>>,
+    atlases: imbl::HashMap<AtlasId, Atlas>,
+    errors: imbl::HashMap<AreaId, CloudError>,
+    pub(crate) recovery_error: Option<CloudError>,
+    blocked_atlases: imbl::HashSet<AtlasId>,
+    journaled_operations: imbl::HashSet<(AreaId, Uuid)>,
+}
+
+impl LocalSnapshot {
+    pub(crate) fn applied_after(&self, area: AreaId, operation: Uuid, revision: i64) -> bool {
+        self.documents
+            .get(&area)
+            .and_then(|document| document.receipt(operation))
+            .is_some_and(|result| {
+                result
+                    .versions
+                    .iter()
+                    .any(|version| version.id == area.0 && version.rev > revision)
+            })
+    }
+
+    pub(crate) fn shares_content(&self, other: &Self, id: AreaId) -> bool {
+        self.documents
+            .get(&id)
+            .zip(other.documents.get(&id))
+            .is_some_and(|(a, b)| Arc::ptr_eq(&a.content_identity, &b.content_identity))
+    }
+
+    pub(crate) fn journaled_operations(&self) -> impl Iterator<Item = &(AreaId, Uuid)> {
+        self.journaled_operations.iter()
+    }
+
+    fn remember_journaled(&mut self, transaction: &LocalMultiWriteTransaction) {
+        for document in &transaction.writes {
+            self.journaled_operations.extend(
+                document
+                    .applied_operations
+                    .iter()
+                    .map(|receipt| (document.details.area.id, receipt.operation_id)),
+            );
+        }
+    }
+
+    pub(crate) fn has_applied(&self, area: AreaId, operation: Uuid) -> bool {
+        self.documents.get(&area).is_some_and(|document| {
+            document
+                .applied_operations
+                .iter()
+                .any(|receipt| receipt.operation_id == operation)
+        })
+    }
+
+    pub(crate) fn shares_area(&self, other: &Self, id: AreaId) -> bool {
+        self.documents
+            .get(&id)
+            .zip(other.documents.get(&id))
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+    }
+    #[must_use]
+    pub fn contains_area(&self, id: AreaId) -> bool {
+        self.documents.contains_key(&id) || self.errors.contains_key(&id)
+    }
+
+    pub fn areas(&self) -> impl Iterator<Item = &AreaWithDetails> {
+        self.documents.values().map(|document| &document.details)
+    }
+
+    pub fn atlases(&self) -> impl Iterator<Item = &Atlas> {
+        self.atlases.values()
+    }
+
+    pub(crate) fn atlas_ids(&self) -> impl Iterator<Item = AtlasId> + '_ {
+        self.atlases
+            .keys()
+            .chain(self.blocked_atlases.iter())
+            .copied()
+    }
+
+    /// Borrow an area from this pinned generation.
+    ///
+    /// # Errors
+    /// Reports an absent area or its startup/refresh read error.
+    pub fn area(&self, id: AreaId) -> CloudResult<&AreaWithDetails> {
+        self.documents
+            .get(&id)
+            .map(|document| &document.details)
+            .ok_or_else(|| {
+                self.errors
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or(CloudError::AreaNotFound(id))
+            })
+    }
+
+    fn document(&self, id: AreaId) -> CloudResult<LocalAreaDocument> {
+        self.area(id)?;
+        Ok(self.documents[&id].as_ref().clone())
+    }
+
+    fn apply(&mut self, transaction: LocalMultiWriteTransaction) {
+        for document in transaction.writes {
+            let id = document.details.area.id;
+            self.errors.remove(&id);
+            self.documents.insert(id, Arc::new(document));
+        }
+        for id in transaction.deletes {
+            self.documents.remove(&id);
+            self.errors.remove(&id);
+        }
+        for atlas in transaction.atlases {
+            self.atlases.insert(atlas.id, atlas);
+        }
+        for id in transaction.deleted_atlases {
+            self.atlases.remove(&id);
+        }
+    }
+}
+
+struct LocalStore {
+    root: PathBuf,
+    writer: Arc<Mutex<()>>,
+    initialized: AtomicBool,
+    needs_reload: AtomicBool,
+    snapshot: ArcSwap<LocalSnapshot>,
+    changed: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    write_faults: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    retirement_faults: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    refresh_attempts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    legacy_single_journals: AtomicBool,
+}
+
+impl LocalStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            writer: Arc::new(Mutex::new(())),
+            initialized: AtomicBool::new(false),
+            needs_reload: AtomicBool::new(false),
+            snapshot: ArcSwap::from_pointee(LocalSnapshot::default()),
+            changed: tokio::sync::watch::channel(0).0,
+            #[cfg(test)]
+            write_faults: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            retirement_faults: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            refresh_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_single_journals: AtomicBool::new(false),
+        }
+    }
+
+    fn publish(&self, mut snapshot: LocalSnapshot) {
+        snapshot.generation = self.snapshot.load().generation + 1;
+        let generation = snapshot.generation;
+        self.snapshot.store(Arc::new(snapshot));
+        self.changed.send_replace(generation);
+    }
+
+    /// Recovery must finish before a writer derives or validates its inputs.
+    /// Refuse further writes if a journal cannot be read, applied or retired.
+    fn recover(&self) -> CloudResult<bool> {
+        let transactions = self.root.join("transactions");
+        let entries = match fs::read_dir(&transactions) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let journals: Vec<_> = entries
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        path.extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+                            && (name.starts_with(MULTI_WRITE_TRANSACTION_PREFIX)
+                                || name.starts_with(ATLAS_DELETE_TRANSACTION_PREFIX))
+                    })
+            })
+            .collect();
+        if journals.is_empty() {
+            if self.needs_reload.load(Ordering::Acquire) {
+                sync_parent(&transactions.join("retired-journal"))?;
+            }
+            return Ok(false);
+        }
+        self.needs_reload.store(true, Ordering::Release);
+        let areas = self.root.join("areas-v2");
+        recover_atlas_delete_transactions(&transactions, &areas, &self.root.join("atlases"));
+        recover_multi_write_transactions(&transactions, &areas, &self.root.join("areas"));
+        sync_parent(&transactions.join("retired-journal"))?;
+        if let Some(path) = journals.iter().find(|path| path.exists()) {
+            return Err(CloudError::InternalError(format!(
+                "local transaction {} requires recovery before further writes",
+                path.display()
+            )));
+        }
+        Ok(true)
+    }
+
+    fn scan(&self) -> CloudResult<LocalSnapshot> {
+        self.scan_with_migration(true)
+    }
+
+    fn scan_with_migration(&self, migrate_legacy: bool) -> CloudResult<LocalSnapshot> {
+        let areas = self.root.join("areas-v2");
+        let legacy = self.root.join("areas");
+        let backup = self.root.join("areas-v1-backup");
+        let documents = scan_areas(&areas, &legacy, migrate_legacy.then_some(backup.as_path()))?;
+        let mut snapshot = LocalSnapshot {
+            documents: documents
+                .into_iter()
+                .map(|(id, document)| (id, Arc::new(document)))
+                .collect(),
+            atlases: scan_atlases(&self.root.join("atlases"))?
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        // Retain read failures in the snapshot. Ordinary reads never retry IO
+        // or migrate files, including reads of an unsupported document version.
+        for directory in [&areas, &legacy] {
+            if let Ok(entries) = fs::read_dir(directory) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_none_or(|extension| extension != "json") {
+                        continue;
+                    }
+                    let Some(id) = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .and_then(|stem| Uuid::parse_str(stem).ok())
+                        .map(AreaId)
+                    else {
+                        continue;
+                    };
+                    if snapshot.documents.contains_key(&id) || snapshot.errors.contains_key(&id) {
+                        continue;
+                    }
+                    let error = if directory == &areas {
+                        fs::read(&path)
+                            .map_err(CloudError::from)
+                            .and_then(|bytes| parse_v2_document(&bytes, &path))
+                            .err()
+                    } else {
+                        Some(CloudError::InvalidInput(format!(
+                            "could not migrate local map {}",
+                            path.display()
+                        )))
+                    };
+                    if let Some(error) = error {
+                        snapshot.errors.insert(id, error);
+                    }
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// A cold start has no previous generation to retain. Keep surviving
+    /// documents readable, but withhold every member of an unfinished known
+    /// transaction rather than publish its partially installed post-images.
+    /// An unreadable journal cannot identify its members; preserve the files
+    /// and report the degraded store instead of denying unrelated reads.
+    fn scan_blocked(&self, error: &CloudError) -> CloudResult<LocalSnapshot> {
+        let mut snapshot = self.scan_with_migration(false)?;
+        snapshot.recovery_error = Some(error.clone());
+        if let Ok(entries) = fs::read_dir(self.root.join("transactions")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if path
+                    .extension()
+                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("json"))
+                {
+                    continue;
+                }
+                let (areas, atlases) = if name.starts_with(MULTI_WRITE_TRANSACTION_PREFIX) {
+                    let Ok(transaction) = read_multi_write_journal(&path) else {
+                        continue;
+                    };
+                    snapshot.remember_journaled(&transaction);
+                    (
+                        transaction
+                            .writes
+                            .iter()
+                            .map(|d| d.details.area.id)
+                            .chain(transaction.deletes)
+                            .collect::<Vec<_>>(),
+                        transaction
+                            .atlases
+                            .iter()
+                            .map(|a| a.id)
+                            .chain(transaction.deleted_atlases)
+                            .collect::<Vec<_>>(),
+                    )
+                } else if name.starts_with(ATLAS_DELETE_TRANSACTION_PREFIX) {
+                    let Ok(bytes) = fs::read(&path) else { continue };
+                    let Ok(transaction) =
+                        serde_json::from_slice::<LocalAtlasDeleteTransaction>(&bytes)
+                    else {
+                        continue;
+                    };
+                    (
+                        transaction
+                            .members
+                            .iter()
+                            .map(|d| d.details.area.id)
+                            .collect(),
+                        vec![transaction.atlas.id],
+                    )
+                } else {
+                    continue;
+                };
+                for id in areas {
+                    snapshot.documents.remove(&id);
+                    snapshot.errors.insert(id, error.clone());
+                }
+                for id in atlases {
+                    snapshot.atlases.remove(&id);
+                    snapshot.blocked_atlases.insert(id);
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
+    /// Keep the last readable documents, but publish the durable operation
+    /// identities so a restarted session cannot offer to discard these edits.
+    fn commit_pending(
+        &self,
+        transaction: &LocalMultiWriteTransaction,
+        message: String,
+    ) -> CloudError {
+        let mut snapshot = self.snapshot.load_full().as_ref().clone();
+        snapshot.recovery_error = Some(CloudError::InternalError(message.clone()));
+        snapshot.remember_journaled(transaction);
+        self.publish(snapshot);
+        CloudError::LocalCommitPending {
+            generation: self.snapshot.load().generation,
+            message,
+        }
+    }
+
+    fn commit_single(&self, transaction: LocalMultiWriteTransaction) -> CloudResult<()> {
+        let (path, bytes) = if let Some(document) = transaction.writes.first() {
+            (
+                self.root
+                    .join("areas-v2")
+                    .join(format!("{}.json", document.details.area.id)),
+                serde_json::to_vec_pretty(document)?,
+            )
+        } else {
+            let atlas = &transaction.atlases[0];
+            (
+                self.root.join("atlases").join(format!("{}.json", atlas.id)),
+                serde_json::to_vec_pretty(atlas)?,
+            )
+        };
+        fs::create_dir_all(path.parent().expect("document directory"))?;
+        install_atomic(&path, &bytes)?;
+        self.needs_reload.store(true, Ordering::Release);
+        #[cfg(test)]
+        let durability = if self
+            .retirement_faults
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            Err(io::Error::other("injected directory sync failure"))
+        } else {
+            sync_parent(&path)
+        };
+        #[cfg(not(test))]
+        let durability = sync_parent(&path);
+        if let Err(error) = durability {
+            return Err(self.commit_pending(
+                &transaction,
+                format!(
+                    "local file {} was replaced but durability could not be confirmed: {error}",
+                    path.display()
+                ),
+            ));
+        }
+        self.needs_reload.store(false, Ordering::Release);
+        let mut snapshot = self.snapshot.load_full().as_ref().clone();
+        snapshot.apply(transaction);
+        self.publish(snapshot);
+        Ok(())
+    }
+
+    fn check_disk_revisions(&self, transaction: &LocalMultiWriteTransaction) -> CloudResult<()> {
+        if !transaction.exact {
+            let snapshot = self.snapshot.load();
+            for id in transaction
+                .writes
+                .iter()
+                .map(|d| d.details.area.id)
+                .chain(transaction.deletes.iter().copied())
+            {
+                let path = self.root.join("areas-v2").join(format!("{id}.json"));
+                // Unreadable targets are handled by roll-forward below, which
+                // retains the decided transaction for recovery. A readable
+                // newer document, however, is a conflict before the decision.
+                if let Ok(bytes) = fs::read(&path) {
+                    let disk_rev = v2_document_revision(&bytes, &path)?;
+                    let expected = snapshot
+                        .documents
+                        .get(&id)
+                        .map_or(0, |d| d.details.area.rev);
+                    if disk_rev > expected {
+                        return Err(CloudError::InvalidInput(format!(
+                            "local area {id} changed on disk; refresh local maps before saving"
+                        )));
+                    }
+                } else if !path.exists() && snapshot.contains_area(id) {
+                    return Err(CloudError::InvalidInput(format!(
+                        "local area {id} was removed on disk; refresh local maps before saving"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(&self, transaction: LocalMultiWriteTransaction) -> CloudResult<()> {
+        if transaction.writes.is_empty()
+            && transaction.deletes.is_empty()
+            && transaction.atlases.is_empty()
+            && transaction.deleted_atlases.is_empty()
+        {
+            return Ok(());
+        }
+        self.check_disk_revisions(&transaction)?;
+        let single_write = transaction.writes.len() + transaction.atlases.len() == 1
+            && transaction.deletes.is_empty()
+            && transaction.deleted_atlases.is_empty();
+        #[cfg(test)]
+        let single_write = single_write && !self.legacy_single_journals.load(Ordering::Acquire);
+        if single_write {
+            return self.commit_single(transaction);
+        }
+        let directory = self.root.join("transactions");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!(
+            "{MULTI_WRITE_TRANSACTION_PREFIX}{:020}-{}.json",
+            next_multi_write_sequence(),
+            Uuid::new_v4()
+        ));
+        let bytes = serde_json::to_vec_pretty(&transaction)?;
+        if let Err(error) = write_atomic(&path, &bytes) {
+            if fs::metadata(&path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
+                return Err(error.into());
+            }
+            self.needs_reload.store(true, Ordering::Release);
+            return Err(self.commit_pending(
+                &transaction,
+                format!(
+                    "transaction {} was installed but durability could not be confirmed: {error}",
+                    path.display()
+                ),
+            ));
+        }
+        // The durable decision is now made. The blocking owner retains both
+        // store and writer guard even if its async caller is cancelled.
+        self.needs_reload.store(true, Ordering::Release);
+        let finish = || {
+            #[cfg(test)]
+            if self
+                .write_faults
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(CloudError::InternalError("injected write fault".into()));
+            }
+            roll_multi_write_journal_forward(
+                &path,
+                &transaction,
+                &HashSet::new(),
+                &self.root.join("areas-v2"),
+                &self.root.join("areas"),
+            )?;
+            #[cfg(test)]
+            if self
+                .retirement_faults
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(CloudError::InternalError(
+                    "injected retirement flush fault".into(),
+                ));
+            }
+            Ok::<_, CloudError>(())
+        };
+        if let Err(first) = finish()
+            && let Err(second) = finish()
+        {
+            return Err(self.commit_pending(&transaction, format!(
+                "transaction {} is journaled and completes on the next start or refresh: {first}; retry: {second}", path.display()
+            )));
+        }
+        let mut snapshot = self.snapshot.load_full().as_ref().clone();
+        snapshot.apply(transaction);
+        self.publish(snapshot);
+        self.needs_reload.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// A lazy handle to the process-wide store for a canonical local directory.
+/// Construction does no IO; after initialization reads pin immutable state.
 pub struct LocalBackend {
     root: PathBuf,
-    /// Lightweight metadata index (area/atlas headers), so `list_areas` and
-    /// sync-row synthesis don't re-read every file. Mirrors disk exactly.
-    areas: RwLock<HashMap<AreaId, Area>>,
-    atlases: RwLock<HashMap<AtlasId, Atlas>>,
-    /// Drives the one-time lazy scan that fills the index.
-    loaded: OnceCell<()>,
-    /// Serializes read-modify-write of area files. Local writes are
-    /// user-driven and infrequent, but a direct create (run on the UI task)
-    /// can overlap a queued mutation on the same area; without this, the
-    /// whole-file rewrite would drop one of the two writes.
-    write_lock: Mutex<()>,
+    store: OnceCell<Arc<LocalStore>>,
 }
 
 impl std::fmt::Debug for LocalBackend {
@@ -153,185 +728,127 @@ impl std::fmt::Debug for LocalBackend {
 }
 
 impl LocalBackend {
-    /// Creates a backend rooted at `root`. **Does no disk IO** — neither the
-    /// directory scan nor `mkdir` happens here, so a large store can't stall
-    /// the construction hot path; both are deferred to the first async call.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            areas: RwLock::new(HashMap::new()),
-            atlases: RwLock::new(HashMap::new()),
-            loaded: OnceCell::new(),
-            write_lock: Mutex::new(()),
+            store: OnceCell::new(),
         }
     }
 
-    /// The authoritative v2 area namespace.
-    fn areas_dir(&self) -> PathBuf {
-        self.root.join("areas-v2")
-    }
-
-    /// The v1 namespace: only ever read (as a migration source); v2 code
-    /// never writes here, so an old binary's files stay recoverable.
-    fn legacy_areas_dir(&self) -> PathBuf {
-        self.root.join("areas")
-    }
-
-    /// Untouched pre-migration v1 bytes, one timestamped file per migration.
-    fn backup_dir(&self) -> PathBuf {
-        self.root.join("areas-v1-backup")
-    }
-
-    fn atlases_dir(&self) -> PathBuf {
-        self.root.join("atlases")
-    }
-
-    fn transactions_dir(&self) -> PathBuf {
-        self.root.join("transactions")
-    }
-
-    fn atlas_delete_transaction_path(&self, transaction_id: Uuid) -> PathBuf {
-        self.transactions_dir().join(format!(
-            "{ATLAS_DELETE_TRANSACTION_PREFIX}{transaction_id}.json"
-        ))
-    }
-
-    fn area_path(&self, id: AreaId) -> PathBuf {
-        self.areas_dir().join(format!("{id}.json"))
-    }
-
-    fn legacy_area_path(&self, id: AreaId) -> PathBuf {
-        self.legacy_areas_dir().join(format!("{id}.json"))
-    }
-
-    fn atlas_path(&self, id: AtlasId) -> PathBuf {
-        self.atlases_dir().join(format!("{id}.json"))
-    }
-
-    /// Scans both directories once and fills the in-memory index. Idempotent;
-    /// concurrent callers share one scan. Used by the create/mutate paths,
-    /// which read the authoritative file fresh anyway and only need the index
-    /// to be non-empty.
-    async fn ensure_loaded(&self) {
-        self.loaded.get_or_init(|| self.reload()).await;
-    }
-
-    /// Rebuilds the in-memory index from disk. Called by `list_*` (and atlas
-    /// rename/delete) so the listing reflects external changes — notably
-    /// another session's `LocalBackend` writing to the same shared local
-    /// directory; the index alone would otherwise be a stale one-shot snapshot.
-    async fn reload(&self) {
-        let _guard = self.write_lock.lock().await;
-        let areas_dir = self.areas_dir();
-        let legacy_dir = self.legacy_areas_dir();
-        let backup_dir = self.backup_dir();
-        let atlases_dir = self.atlases_dir();
-        let transactions_dir = self.transactions_dir();
-        match task::spawn_blocking(move || {
-            recover_atlas_delete_transactions(&transactions_dir, &areas_dir, &atlases_dir);
-            (
-                scan_areas(&areas_dir, &legacy_dir, &backup_dir),
-                scan_atlases(&atlases_dir),
-            )
-        })
-        .await
-        {
-            Ok((areas, atlases)) => {
-                *self.areas.write() = areas;
-                *self.atlases.write() = atlases;
-                // A reload also satisfies the one-shot `ensure_loaded` guard.
-                let _ = self.loaded.set(());
-            }
-            Err(err) => log::warn!("local map store scan failed: {err}"),
-        }
-    }
-
-    /// Reads one area's full record from disk: the v2 namespace first, and
-    /// only when it has no copy, the v1 namespace via on-demand migration.
-    async fn load_area_document(&self, id: AreaId) -> CloudResult<LocalAreaDocument> {
-        let v2_path = self.area_path(id);
-        let legacy_path = self.legacy_area_path(id);
-        let backup_dir = self.backup_dir();
-        task::spawn_blocking(move || -> CloudResult<LocalAreaDocument> {
-            match fs::read(&v2_path) {
-                Ok(bytes) => parse_v2_document(&bytes, &v2_path),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    let legacy_bytes = fs::read(&legacy_path).map_err(|err| match err.kind() {
-                        io::ErrorKind::NotFound => CloudError::NotFoundOrNoAccess,
-                        _ => CloudError::from(err),
-                    })?;
-                    migrate_legacy_file(&legacy_bytes, &legacy_path, &v2_path, &backup_dir)
-                        .map(LocalAreaDocument::new)
-                }
-                Err(err) => Err(CloudError::from(err)),
-            }
-        })
-        .await
-        .map_err(|err| CloudError::InternalError(err.to_string()))?
-    }
-
-    async fn load_area(&self, id: AreaId) -> CloudResult<AreaWithDetails> {
-        self.load_area_document(id)
+    async fn resolve(&self) -> CloudResult<Arc<LocalStore>> {
+        self.store
+            .get_or_try_init(|| async {
+                let root = self.root.clone();
+                task::spawn_blocking(move || {
+                    fs::create_dir_all(&root)?;
+                    let canonical = fs::canonicalize(root)?;
+                    let mut stores = STORES.lock();
+                    stores.retain(|_, store| store.strong_count() > 0);
+                    let slot = stores.entry(canonical.clone()).or_default();
+                    if let Some(store) = slot.upgrade() {
+                        return Ok(store);
+                    }
+                    let store = Arc::new(LocalStore::new(canonical));
+                    *slot = Arc::downgrade(&store);
+                    Ok::<_, CloudError>(store)
+                })
+                .await
+                .map_err(|error| CloudError::InternalError(error.to_string()))?
+            })
             .await
-            .map(|document| document.details)
+            .cloned()
     }
 
-    /// Writes one area's full record to disk (creating the directory if
-    /// needed) and refreshes its index entry. The write is atomic
-    /// (temp file + rename) so a concurrent reader never sees a torn file.
-    async fn store_area(&self, area: AreaWithDetails) -> CloudResult<()> {
-        self.store_area_document(LocalAreaDocument::new(area)).await
+    async fn ensure_loaded(&self) -> CloudResult<Arc<LocalStore>> {
+        let store = self.resolve().await?;
+        if !store.initialized.load(Ordering::Acquire) {
+            let guard = Arc::clone(&store.writer).lock_owned().await;
+            let owned = Arc::clone(&store);
+            task::spawn_blocking(move || {
+                let _guard = guard;
+                if !owned.initialized.load(Ordering::Acquire) {
+                    let snapshot = match owned.recover() {
+                        Ok(_) => {
+                            let snapshot = owned.scan()?;
+                            owned.needs_reload.store(false, Ordering::Release);
+                            snapshot
+                        }
+                        Err(error) => {
+                            log::warn!("Local maps are read-only until recovery succeeds: {error}");
+                            owned.scan_blocked(&error)?
+                        }
+                    };
+                    owned.publish(snapshot);
+                    owned.initialized.store(true, Ordering::Release);
+                }
+                Ok::<_, CloudError>(())
+            })
+            .await
+            .map_err(|error| CloudError::InternalError(error.to_string()))??;
+        }
+        Ok(store)
     }
 
-    async fn store_area_document(&self, document: LocalAreaDocument) -> CloudResult<()> {
-        let dir = self.areas_dir();
-        let path = self.area_path(document.details.area.id);
-        let to_write = document.clone();
-        task::spawn_blocking(move || -> CloudResult<()> {
-            fs::create_dir_all(&dir)?;
-            write_atomic(&path, &serde_json::to_vec_pretty(&to_write)?)?;
+    /// Pin one committed generation without taking the writer lock.
+    ///
+    /// # Errors
+    /// Reports directory initialization failures. Unfinished transactions
+    /// block writes and reads of their known members, not unrelated areas.
+    pub async fn snapshot(&self) -> CloudResult<Arc<LocalSnapshot>> {
+        Ok(self.ensure_loaded().await?.snapshot.load_full())
+    }
+
+    /// Explicitly adopt external filesystem changes. Normal reads do not
+    /// scan, migrate or recover; same-process writes publish automatically.
+    ///
+    /// # Errors
+    /// Reports directory access or unfinished journal recovery failures.
+    pub async fn refresh(&self) -> CloudResult<()> {
+        let store = self.resolve().await?;
+        #[cfg(test)]
+        store.refresh_attempts.fetch_add(1, Ordering::Relaxed);
+        let guard = Arc::clone(&store.writer).lock_owned().await;
+        task::spawn_blocking(move || {
+            let _guard = guard;
+            store.needs_reload.store(true, Ordering::Release);
+            store.recover()?;
+            store.publish(store.scan()?);
+            store.needs_reload.store(false, Ordering::Release);
+            store.initialized.store(true, Ordering::Release);
             Ok(())
         })
         .await
-        .map_err(|err| CloudError::InternalError(err.to_string()))??;
-        self.areas
-            .write()
-            .insert(document.details.area.id, document.details.area);
-        Ok(())
+        .map_err(|error| CloudError::InternalError(error.to_string()))?
     }
 
-    /// Read-modify-write one area: loads it, applies `f` (which may mutate it
-    /// and returns a value), bumps `rev`, persists, and updates the index.
-    /// The `write_lock` makes the load→store sequence atomic against other
-    /// local writers, so an overlapping mutation can't drop this one.
-    async fn mutate_area<R, F>(&self, area_id: AreaId, f: F) -> CloudResult<R>
-    where
-        F: FnOnce(&mut AreaWithDetails) -> CloudResult<R> + Send,
-        R: Send,
-    {
-        self.ensure_loaded().await;
-        let _guard = self.write_lock.lock().await;
-        let mut document = self.load_area_document(area_id).await?;
-        let result = f(&mut document.details)?;
-        document.details.area.rev += 1;
-        self.store_area_document(document).await?;
-        Ok(result)
+    #[cfg(test)]
+    pub(crate) fn refresh_attempts_for_test(&self) -> usize {
+        self.store
+            .get()
+            .map_or(0, |store| store.refresh_attempts.load(Ordering::Relaxed))
     }
 
-    async fn store_atlas(&self, atlas: Atlas) -> CloudResult<()> {
-        let dir = self.atlases_dir();
-        let path = self.atlas_path(atlas.id);
-        let to_write = atlas.clone();
-        task::spawn_blocking(move || -> CloudResult<()> {
-            fs::create_dir_all(&dir)?;
-            write_atomic(&path, &serde_json::to_vec_pretty(&to_write)?)?;
-            Ok(())
+    async fn transact<R: Send + 'static>(
+        &self,
+        prepare: impl FnOnce(&LocalSnapshot) -> CloudResult<(LocalMultiWriteTransaction, R)>
+        + Send
+        + 'static,
+    ) -> CloudResult<R> {
+        let store = self.ensure_loaded().await?;
+        let guard = Arc::clone(&store.writer).lock_owned().await;
+        task::spawn_blocking(move || {
+            let _guard = guard;
+            if store.recover()? || store.needs_reload.load(Ordering::Acquire) {
+                store.publish(store.scan()?);
+                store.needs_reload.store(false, Ordering::Release);
+            }
+            let (transaction, result) = prepare(&store.snapshot.load_full())?;
+            store.commit(transaction)?;
+            Ok(result)
         })
         .await
-        .map_err(|err| CloudError::InternalError(err.to_string()))??;
-        self.atlases.write().insert(atlas.id, atlas);
-        Ok(())
+        .map_err(|error| CloudError::InternalError(error.to_string()))?
     }
 }
 
@@ -345,20 +862,40 @@ impl LocalBackend {
 /// sufficient. A leftover `.tmp` from a crash is ignored by the `.json`-only
 /// scan.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    install_atomic(path, bytes)?;
+    sync_parent(path)
+}
+
+fn install_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut file = fs::File::create(&tmp)?;
         io::Write::write_all(&mut file, bytes)?;
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)?;
+    fs::rename(&tmp, path)
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("local map path has no parent directory"))?;
     #[cfg(unix)]
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
+    fs::File::open(parent)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = parent;
     Ok(())
+}
+
+fn remove_durable(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match sync_parent(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        },
+        Err(error) => Err(error),
+    }
 }
 
 /// Resolve any atlas-delete journal before rebuilding the in-memory index.
@@ -465,10 +1002,185 @@ fn recover_atlas_delete_transactions(transactions: &Path, areas: &Path, atlases:
     }
 }
 
-async fn store_atlas_delete_transaction(
-    path: PathBuf,
-    transaction: LocalAtlasDeleteTransaction,
+/// Rolls every multi-write journal forward before the index is rebuilt. A
+/// journal exists only once its transaction is fully decided, so recovery
+/// has a single direction: re-apply every post-image, remove every deleted
+/// area from both namespaces, then retire the journal. Each step is
+/// idempotent, so a crash during recovery is finished by the next one.
+/// Returns the transactions that were fully rolled forward, oldest first.
+///
+/// Journals replay in sequence order, the order their transactions
+/// committed in (see [`MULTI_WRITE_SEQUENCE`]). Transactions run one at a
+/// time under `write_lock`, so each journal holds complete post-images
+/// taken after every earlier transaction finished; replaying them in that
+/// order lands the newest state last. Two guards cover journals that
+/// lingered past their transaction: a post-image whose document on disk is
+/// already newer is skipped, so a completed journal whose removal failed
+/// cannot revert an edit made after it; and a post-image whose area a later
+/// journal in the same pass deletes is skipped, so it cannot resurrect
+/// that area even briefly. Deletes always apply: area ids are never reused,
+/// so removing an already-removed area is a no-op. A journal that fails to
+/// parse is logged and left in place.
+fn recover_multi_write_transactions(
+    transactions: &Path,
+    areas: &Path,
+    legacy_areas: &Path,
+) -> Vec<LocalMultiWriteTransaction> {
+    let mut journals = Vec::new();
+    for path in multi_write_journals(transactions) {
+        match read_multi_write_journal(&path) {
+            Ok(transaction) => journals.push((path, transaction)),
+            Err(error) => {
+                log::warn!(
+                    "could not read local multi-write transaction {}: {error}",
+                    path.display()
+                );
+                return Vec::new();
+            }
+        }
+    }
+    let mut recovered = Vec::with_capacity(journals.len());
+    for (index, (path, transaction)) in journals.iter().enumerate() {
+        let deleted_later: HashSet<AreaId> = journals[index + 1..]
+            .iter()
+            .flat_map(|(_, later)| later.deletes.iter().copied())
+            .collect();
+        match roll_multi_write_journal_forward(
+            path,
+            transaction,
+            &deleted_later,
+            areas,
+            legacy_areas,
+        ) {
+            Ok(()) => recovered.push(transaction.clone()),
+            Err(error) => {
+                log::warn!(
+                    "could not recover local multi-write transaction {}: {error}",
+                    path.display()
+                );
+                break;
+            }
+        }
+    }
+    recovered
+}
+
+/// Every multi-write journal under `transactions`, oldest first by
+/// sequence. Also raises [`MULTI_WRITE_SEQUENCE`] past every sequence seen,
+/// so a journal written later in this process sorts after all of them.
+fn multi_write_journals(transactions: &Path) -> Vec<PathBuf> {
+    let entries = match fs::read_dir(transactions) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            log::warn!(
+                "could not scan local map transactions {}: {error}",
+                transactions.display()
+            );
+            return Vec::new();
+        }
+    };
+    let mut journals: Vec<(Option<u64>, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let is_json = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            is_json
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(MULTI_WRITE_TRANSACTION_PREFIX))
+        })
+        .map(|path| (multi_write_sequence_of(&path), path))
+        .collect();
+    journals.sort();
+    for (sequence, _) in &journals {
+        if let Some(sequence) = sequence {
+            MULTI_WRITE_SEQUENCE.fetch_max(*sequence, Ordering::AcqRel);
+        }
+    }
+    journals.into_iter().map(|(_, path)| path).collect()
+}
+
+fn read_multi_write_journal(path: &Path) -> CloudResult<LocalMultiWriteTransaction> {
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Rolls one multi-write journal forward and retires it: every post-image
+/// is written unless its area is in `deleted_later` or its document on disk
+/// already carries a higher `rev`; every delete removes both namespaces;
+/// then the journal file is removed. Any failure leaves the journal in
+/// place for the next attempt.
+fn roll_multi_write_journal_forward(
+    path: &Path,
+    transaction: &LocalMultiWriteTransaction,
+    deleted_later: &HashSet<AreaId>,
+    areas: &Path,
+    legacy_areas: &Path,
 ) -> CloudResult<()> {
+    fs::create_dir_all(areas)?;
+    for document in &transaction.writes {
+        let area_id = document.details.area.id;
+        if deleted_later.contains(&area_id) {
+            continue;
+        }
+        let area_path = areas.join(format!("{area_id}.json"));
+        let disk_is_newer = !transaction.exact
+            && match fs::read(&area_path) {
+                Ok(bytes) => v2_document_revision(&bytes, &area_path)? > document.details.area.rev,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+        if !disk_is_newer {
+            write_atomic(&area_path, &serde_json::to_vec_pretty(document)?)?;
+        }
+    }
+    for area_id in &transaction.deletes {
+        let file = format!("{area_id}.json");
+        remove_area_files(&areas.join(&file), &legacy_areas.join(&file))?;
+    }
+    let atlases = areas
+        .parent()
+        .expect("area directory has a store root")
+        .join("atlases");
+    if !transaction.atlases.is_empty() {
+        fs::create_dir_all(&atlases)?;
+    }
+    for atlas in &transaction.atlases {
+        write_atomic(
+            &atlases.join(format!("{}.json", atlas.id)),
+            &serde_json::to_vec_pretty(atlas)?,
+        )?;
+    }
+    for id in &transaction.deleted_atlases {
+        let path = atlases.join(format!("{id}.json"));
+        remove_durable(&path)?;
+    }
+    remove_durable(path)?;
+    Ok(())
+}
+
+/// Removes an area from both namespaces, tolerating an absent file in
+/// either. The v1 file must go with the v2 one: deleting only the v2 copy
+/// would resurrect the area through the straggler migration on the next
+/// scan. Timestamped backups stay; they are recovery, not state.
+fn remove_area_files(path: &Path, legacy_path: &Path) -> CloudResult<()> {
+    for target in [path, legacy_path] {
+        remove_durable(target)?;
+    }
+    Ok(())
+}
+
+/// Journals one transaction record atomically, creating the transactions
+/// directory on first use.
+#[cfg(test)]
+async fn store_transaction_file<T>(path: PathBuf, transaction: T) -> CloudResult<()>
+where
+    T: Serialize + Send + 'static,
+{
     task::spawn_blocking(move || -> CloudResult<()> {
         if let Some(directory) = path.parent() {
             fs::create_dir_all(directory)?;
@@ -480,6 +1192,7 @@ async fn store_atlas_delete_transaction(
     .map_err(|error| CloudError::InternalError(error.to_string()))?
 }
 
+#[cfg(test)]
 async fn remove_transaction_file(path: PathBuf) -> CloudResult<()> {
     task::spawn_blocking(move || match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -511,7 +1224,25 @@ fn document_version(bytes: &[u8]) -> CloudResult<u32> {
 /// file (opening it read-write would corrupt data this build cannot
 /// represent), and an older one does not belong in `areas-v2/` at all.
 fn parse_v2_document(bytes: &[u8], path: &Path) -> CloudResult<LocalAreaDocument> {
-    let version = document_version(bytes)?;
+    validate_v2_version(document_version(bytes)?, path)?;
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Revision guards need no room graph or receipt allocations. Serde still
+/// consumes the complete JSON and validates the header's format and types.
+fn v2_document_revision(bytes: &[u8], path: &Path) -> CloudResult<i64> {
+    #[derive(Deserialize)]
+    struct Header {
+        #[serde(default = "probe_v1")]
+        format_version: u32,
+        rev: i64,
+    }
+    let header: Header = serde_json::from_slice(bytes)?;
+    validate_v2_version(header.format_version, path)?;
+    Ok(header.rev)
+}
+
+fn validate_v2_version(version: u32, path: &Path) -> CloudResult<()> {
     if version > crate::AREA_FORMAT_VERSION {
         return Err(CloudError::InvalidInput(format!(
             "local area file {} is format v{version}, newer than this client (max v{}); \
@@ -527,7 +1258,7 @@ fn parse_v2_document(bytes: &[u8], path: &Path) -> CloudResult<LocalAreaDocument
             path.display(),
         )));
     }
-    Ok(serde_json::from_slice(bytes)?)
+    Ok(())
 }
 
 /// Migrates one v1-namespace file into the v2 namespace (§8.3): version
@@ -540,8 +1271,7 @@ fn parse_v2_document(bytes: &[u8], path: &Path) -> CloudResult<LocalAreaDocument
 fn migrate_legacy_file(
     bytes: &[u8],
     legacy_path: &Path,
-    v2_path: &Path,
-    backup_dir: &Path,
+    persistence: Option<(&Path, &Path)>,
 ) -> CloudResult<AreaWithDetails> {
     let version = document_version(bytes).map_err(|err| {
         CloudError::InvalidInput(format!(
@@ -574,24 +1304,29 @@ fn migrate_legacy_file(
                 ))
             })?;
 
-        // Backup BEFORE anything else can go wrong: the untouched v1 bytes,
-        // timestamped so repeated attempts never clobber an older backup.
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        let backup_path = backup_dir.join(format!("{}.{timestamp}.json", legacy.area.id));
-        fs::create_dir_all(backup_dir)
-            .and_then(|()| fs::write(&backup_path, bytes))
-            .map_err(|err| {
-                CloudError::InternalError(format!(
-                    "cannot back up {} before migration (leaving the v1 file untouched): {err}",
-                    legacy_path.display()
-                ))
-            })?;
+        if let Some((_, backup_dir)) = persistence {
+            // Backup BEFORE anything else can go wrong: the untouched v1 bytes,
+            // timestamped so repeated attempts never clobber an older backup.
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let backup_path = backup_dir.join(format!("{}.{timestamp}.json", legacy.area.id));
+            fs::create_dir_all(backup_dir)
+                .and_then(|()| fs::write(&backup_path, bytes))
+                .map_err(|err| {
+                    CloudError::InternalError(format!(
+                        "cannot back up {} before migration (leaving the v1 file untouched): {err}",
+                        legacy_path.display()
+                    ))
+                })?;
+        }
 
         local_migration::migrate_v1(legacy)
     };
 
+    let Some((v2_path, _)) = persistence else {
+        return Ok(details);
+    };
     // The atomic durable write into areas-v2 is what completes the
     // migration; on failure the v1 source stays authoritative.
     if let Some(parent) = v2_path.parent() {
@@ -620,26 +1355,32 @@ fn migrate_legacy_file(
 /// consistently instead of surfacing v1 areas one `get_area` at a time).
 /// Once an id has a v2 copy its v1 file is never re-read; a failed
 /// migration is reported and skipped, leaving the v1 file intact.
-fn scan_areas(dir: &Path, legacy_dir: &Path, backup_dir: &Path) -> HashMap<AreaId, Area> {
-    let mut out: HashMap<AreaId, Area> = HashMap::new();
+fn scan_areas(
+    dir: &Path,
+    legacy_dir: &Path,
+    backup_dir: Option<&Path>,
+) -> CloudResult<HashMap<AreaId, LocalAreaDocument>> {
+    let mut out: HashMap<AreaId, LocalAreaDocument> = HashMap::new();
     let mut migrated: HashSet<AreaId> = HashSet::new();
     let scanned = read_json_dir(dir, |bytes, path| match parse_v2_document(bytes, path) {
-        Ok(document) => Some((document.details.area.id, document.details.area)),
+        Ok(document) => Some((document.details.area.id, document)),
         Err(err) => {
             log::warn!("skipping local map file: {err}");
             None
         }
-    });
+    })?;
     for (id, area) in scanned {
         migrated.insert(id);
         out.insert(id, area);
     }
 
-    let Ok(entries) = fs::read_dir(legacy_dir) else {
-        return out; // no v1 namespace => nothing to migrate
+    let entries = match fs::read_dir(legacy_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(error.into()),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let path = entry?.path();
         let is_json = path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
@@ -658,8 +1399,11 @@ fn scan_areas(dir: &Path, legacy_dir: &Path, backup_dir: &Path) -> HashMap<AreaI
         }
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(err) => {
-                log::warn!("failed to read local map file {}: {err}", path.display());
+            Err(error) => {
+                log::warn!(
+                    "skipping unreadable local map file {}: {error}",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -679,15 +1423,19 @@ fn scan_areas(dir: &Path, legacy_dir: &Path, backup_dir: &Path) -> HashMap<AreaI
             continue;
         }
         let v2_path = dir.join(format!("{id}.json"));
-        match migrate_legacy_file(&bytes, &path, &v2_path, backup_dir) {
+        match migrate_legacy_file(
+            &bytes,
+            &path,
+            backup_dir.map(|backup| (v2_path.as_path(), backup)),
+        ) {
             Ok(details) => {
                 migrated.insert(id);
-                out.insert(details.area.id, details.area);
+                out.insert(details.area.id, LocalAreaDocument::new(details));
             }
             Err(err) => log::warn!("local map migration failed: {err}"),
         }
     }
-    out
+    Ok(out)
 }
 
 /// Serde probe for a document's area id.
@@ -697,7 +1445,7 @@ struct AreaIdProbe {
 }
 
 /// Reads every `*.json` under `dir` as an [`Atlas`] manifest, keyed by id.
-fn scan_atlases(dir: &Path) -> HashMap<AtlasId, Atlas> {
+fn scan_atlases(dir: &Path) -> CloudResult<HashMap<AtlasId, Atlas>> {
     read_json_dir(dir, |bytes, path| {
         let parsed = serde_json::from_slice::<Atlas>(bytes).ok();
         if parsed.is_none() {
@@ -707,76 +1455,85 @@ fn scan_atlases(dir: &Path) -> HashMap<AtlasId, Atlas> {
     })
 }
 
-fn read_json_dir<K, V>(dir: &Path, parse: impl Fn(&[u8], &Path) -> Option<(K, V)>) -> HashMap<K, V>
+fn read_json_dir<K, V>(
+    dir: &Path,
+    parse: impl Fn(&[u8], &Path) -> Option<(K, V)>,
+) -> CloudResult<HashMap<K, V>>
 where
     K: std::hash::Hash + Eq,
 {
     let mut out = HashMap::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return out; // missing dir => empty store
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(error.into()),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let path = entry?.path();
         let is_json = path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
         if !is_json {
             continue;
         }
-        match fs::read(&path) {
-            Ok(bytes) => {
-                if let Some((k, v)) = parse(&bytes, &path) {
-                    out.insert(k, v);
-                }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!("Could not read local map file {}: {error}", path.display());
+                continue;
             }
-            Err(err) => log::warn!("failed to read local map file {}: {err}", path.display()),
+        };
+        if let Some((key, value)) = parse(&bytes, &path) {
+            out.insert(key, value);
         }
     }
-    out
+    Ok(out)
 }
 
 #[async_trait]
 impl MapperBackend for LocalBackend {
-    // Local areas are always the viewer's own and never need a credential.
     fn has_credential(&self) -> bool {
         true
     }
 
-    // ===== AREA OPERATIONS =====
-
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
-        self.ensure_loaded().await;
-        let area = Area {
-            id: AreaId(Uuid::new_v4()),
-            user_id: None,
-            atlas_id: request.atlas_id,
-            // Local areas keep no atlas name; the folder tree is local.
-            atlas_name: None,
-            name: request.name,
-            created_at: Utc::now(),
-            rev: 1,
-            access: Some(AreaAccess::OWNER),
-            owner_nickname: None,
-            copied_from_area_id: None,
-            copied_from_rev: None,
-            copied_at: None,
-            // Local areas are never synced, so they never carry a server-
-            // issued per-viewer family token.
-            family_token: None,
-        };
-        let details = AreaWithDetails {
-            area: area.clone(),
-            format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
-            properties: Vec::new(),
-            rooms: Vec::new(),
-            labels: Vec::new(),
-            shapes: Vec::new(),
-            connections: Vec::new(),
-            linked_areas: Vec::new(),
-        };
-        self.store_area(details).await?;
-        Ok(area)
+        self.transact(move |_| {
+            let area = Area {
+                id: AreaId(Uuid::new_v4()),
+                user_id: None,
+                atlas_id: request.atlas_id,
+                atlas_name: None,
+                name: request.name,
+                created_at: Utc::now(),
+                rev: 1,
+                access: Some(AreaAccess::OWNER),
+                owner_nickname: None,
+                copied_from_area_id: None,
+                copied_from_rev: None,
+                copied_at: None,
+                family_token: None,
+            };
+            let details = AreaWithDetails {
+                area: area.clone(),
+                format_version: crate::AREA_FORMAT_VERSION,
+                content_hash: None,
+                properties: Vec::new(),
+                rooms: Vec::new(),
+                labels: Vec::new(),
+                shapes: Vec::new(),
+                connections: Vec::new(),
+                linked_areas: Vec::new(),
+            };
+            Ok((
+                LocalMultiWriteTransaction {
+                    writes: vec![LocalAreaDocument::new(details)],
+                    exact: true,
+                    ..Default::default()
+                },
+                area,
+            ))
+        })
+        .await
     }
 
     async fn create_area_at(
@@ -793,113 +1550,198 @@ impl MapperBackend for LocalBackend {
     }
 
     async fn import_local_area(&self, details: AreaWithDetails) -> CloudResult<()> {
-        self.ensure_loaded().await;
-        self.store_area(details).await
+        self.transact(move |_| {
+            Ok((
+                LocalMultiWriteTransaction {
+                    writes: vec![LocalAreaDocument::new(details)],
+                    exact: true,
+                    ..Default::default()
+                },
+                (),
+            ))
+        })
+        .await
     }
 
     async fn list_areas(&self) -> CloudResult<Vec<Area>> {
-        self.reload().await;
-        Ok(self.areas.read().values().cloned().collect())
+        Ok(self
+            .snapshot()
+            .await?
+            .areas()
+            .map(|details| details.area.clone())
+            .collect())
     }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
-        self.ensure_loaded().await;
-        self.load_area(*area_id).await
+        self.snapshot()
+            .await?
+            .area(*area_id)
+            .cloned()
+            .map_err(|error| match error {
+                CloudError::AreaNotFound(_) => CloudError::NotFoundOrNoAccess,
+                other => other,
+            })
     }
 
     async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()> {
-        self.mutate_area(*area_id, move |area| {
+        let id = *area_id;
+        self.transact(move |snapshot| {
+            let mut document = snapshot.document(id)?;
             if let Some(name) = updates.name {
-                area.area.name = name;
+                document.details.area.name = name;
             }
-            // `Option<Option<_>>`: present sets (or clears), absent leaves it.
             if let Some(atlas_id) = updates.atlas_id {
-                area.area.atlas_id = atlas_id;
+                document.details.area.atlas_id = atlas_id;
             }
-            Ok(())
+            document.details.area.rev += 1;
+            Ok((
+                LocalMultiWriteTransaction {
+                    writes: vec![document],
+                    ..Default::default()
+                },
+                (),
+            ))
         })
         .await
     }
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
-        self.ensure_loaded().await;
-        // Serialize deletion with versioned mutation persistence. Without
-        // this lock, a worker can load the area, deletion can unlink it, and
-        // the worker can then store its stale working copy back to disk.
-        let _guard = self.write_lock.lock().await;
-        let path = self.area_path(*area_id);
-        // The v1-namespace file goes too: deleting only the v2 copy would
-        // resurrect the area through the straggler migration on the next
-        // scan. Timestamped backups stay — they are recovery, not state.
-        let legacy_path = self.legacy_area_path(*area_id);
-        task::spawn_blocking(move || {
-            for target in [&path, &legacy_path] {
-                match fs::remove_file(target) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(CloudError::from(err)),
-                }
-            }
-            Ok(())
+        let id = *area_id;
+        self.transact(move |_| {
+            Ok((
+                LocalMultiWriteTransaction {
+                    deletes: vec![id],
+                    ..Default::default()
+                },
+                (),
+            ))
         })
         .await
-        .map_err(|err| CloudError::InternalError(err.to_string()))??;
-        self.areas.write().remove(area_id);
-        Ok(())
     }
-
-    // ===== VERSIONED MUTATIONS =====
 
     async fn execute_mutation(
         &self,
         area_id: &AreaId,
         envelope: &MutationEnvelope,
     ) -> CloudResult<MutationResult> {
-        // The compare-and-set write path: the shared applier owns the
-        // precondition check and the single revision bump, so this bypasses
-        // `mutate_area` (whose unconditional bump would double-count) while
-        // keeping the same lock + load + store shape. Any applier error
-        // discards the working copy before it reaches disk, so a failed
-        // envelope changes nothing.
-        self.ensure_loaded().await;
-        let _guard = self.write_lock.lock().await;
-        let mut document = self
-            .load_area_document(*area_id)
-            .await
-            .map_err(|err| match err {
-                CloudError::NotFoundOrNoAccess => CloudError::AreaNotFound(*area_id),
-                other => other,
-            })?;
-        if let Some(result) = document.receipt(envelope.operation_id) {
-            return Ok(result);
-        }
-        let result = area_edits::apply_envelope(&mut document.details, *area_id, envelope)?;
-        document.remember(result.clone());
-        self.store_area_document(document).await?;
-        Ok(result)
+        let id = *area_id;
+        let envelope = envelope.clone();
+        self.transact(move |snapshot| {
+            let mut document = snapshot.document(id)?;
+            if let Some(result) = document.receipt(envelope.operation_id) {
+                return Ok((LocalMultiWriteTransaction::default(), result));
+            }
+            let result = area_edits::apply_envelope(&mut document.details, id, &envelope)?;
+            document.content_identity = Arc::new(());
+            document.remember(result.clone());
+            Ok((
+                LocalMultiWriteTransaction {
+                    writes: vec![document],
+                    ..Default::default()
+                },
+                result,
+            ))
+        })
+        .await
     }
 
-    // ===== ATLAS (FOLDER) OPERATIONS =====
+    async fn merge_areas(&self, plan: &AreaMergePlan) -> CloudResult<AreaMergeCommit> {
+        let plan = plan.clone();
+        self.transact(move |snapshot| {
+            let LocalAreaDocument {
+                details: mut into,
+                applied_operations: into_receipts,
+                ..
+            } = snapshot.document(plan.into)?;
+            let mut sources = Vec::with_capacity(plan.sources.len());
+            let mut source_receipts = Vec::with_capacity(plan.sources.len());
+            for source in &plan.sources {
+                let document = snapshot.document(source.id)?;
+                sources.push(document.details);
+                source_receipts.push(document.applied_operations);
+            }
+            let mut inbound = Vec::with_capacity(plan.inbound.len());
+            let mut inbound_receipts = Vec::with_capacity(plan.inbound.len());
+            for id in &plan.inbound {
+                let document = snapshot.document(*id)?;
+                inbound.push(document.details);
+                inbound_receipts.push(document.applied_operations);
+            }
+
+            let outcome = apply_area_merge(&plan, &mut into, &mut sources, &mut inbound)?;
+
+            // Only documents the applier reports as changed are rewritten; a
+            // third party none of whose exits named a source keeps its bytes,
+            // and a whole source is deleted rather than written.
+            let mut post_images: HashMap<AreaId, LocalAreaDocument> =
+                HashMap::with_capacity(1 + sources.len() + inbound.len());
+            post_images.insert(
+                into.area.id,
+                LocalAreaDocument {
+                    content_identity: Arc::new(()),
+                    details: into,
+                    applied_operations: into_receipts,
+                },
+            );
+            let kept_sources = sources
+                .into_iter()
+                .zip(source_receipts)
+                .filter(|(details, _)| {
+                    plan.sources
+                        .iter()
+                        .any(|source| source.id == details.area.id && source.is_partial())
+                });
+            for (details, applied_operations) in
+                kept_sources.chain(inbound.into_iter().zip(inbound_receipts))
+            {
+                post_images.insert(
+                    details.area.id,
+                    LocalAreaDocument {
+                        content_identity: Arc::new(()),
+                        details,
+                        applied_operations,
+                    },
+                );
+            }
+            let writes: Vec<LocalAreaDocument> = outcome
+                .versions
+                .iter()
+                .filter(|version| !version.deleted)
+                .filter_map(|version| post_images.remove(&AreaId(version.id)))
+                .collect();
+            let deletes = plan.deleted_areas();
+            let documents: Vec<AreaWithDetails> = writes
+                .iter()
+                .map(|document| document.details.clone())
+                .collect();
+            Ok((
+                LocalMultiWriteTransaction {
+                    writes,
+                    deletes,
+                    ..Default::default()
+                },
+                AreaMergeCommit { outcome, documents },
+            ))
+        })
+        .await
+    }
 
     async fn list_atlases(&self) -> CloudResult<Vec<AtlasListItem>> {
-        self.reload().await;
-        let areas = self.areas.read();
-        let atlases = self.atlases.read();
-        let mut items: Vec<AtlasListItem> = atlases
-            .values()
+        let snapshot = self.snapshot().await?;
+        let mut items: Vec<_> = snapshot
+            .atlases()
             .map(|atlas| AtlasListItem {
                 id: atlas.id,
                 name: atlas.name.clone(),
                 created_at: atlas.created_at,
+                rev: atlas.rev,
                 area_count: i64::try_from(
-                    areas
-                        .values()
-                        .filter(|area| area.atlas_id == Some(atlas.id))
+                    snapshot
+                        .areas()
+                        .filter(|details| details.area.atlas_id == Some(atlas.id))
                         .count(),
                 )
                 .unwrap_or(i64::MAX),
-                rev: atlas.rev,
-                // Local atlases are owned by the user (no sharing on the local tier).
                 is_owner: true,
                 can_admin: true,
                 owner_nickname: None,
@@ -910,8 +1752,6 @@ impl MapperBackend for LocalBackend {
     }
 
     async fn create_atlas(&self, name: &str) -> CloudResult<Atlas> {
-        self.ensure_loaded().await;
-        let _guard = self.write_lock.lock().await;
         let atlas = Atlas {
             id: AtlasId(Uuid::new_v4()),
             user_id: None,
@@ -919,8 +1759,16 @@ impl MapperBackend for LocalBackend {
             created_at: Utc::now(),
             rev: 1,
         };
-        self.store_atlas(atlas.clone()).await?;
-        Ok(atlas)
+        self.transact(move |_| {
+            Ok((
+                LocalMultiWriteTransaction {
+                    atlases: vec![atlas.clone()],
+                    ..Default::default()
+                },
+                atlas,
+            ))
+        })
+        .await
     }
 
     async fn create_atlas_at(&self, name: &str, storage: MapStorage) -> CloudResult<Atlas> {
@@ -933,120 +1781,177 @@ impl MapperBackend for LocalBackend {
     }
 
     async fn rename_atlas(&self, atlas_id: &AtlasId, name: &str) -> CloudResult<Atlas> {
-        self.reload().await;
-        let _guard = self.write_lock.lock().await;
-        let mut atlas = self
-            .atlases
-            .read()
-            .get(atlas_id)
-            .cloned()
-            .ok_or(CloudError::NotFoundOrNoAccess)?;
-        atlas.name = name.to_string();
-        atlas.rev += 1;
-        self.store_atlas(atlas.clone()).await?;
-        Ok(atlas)
+        let id = *atlas_id;
+        let name = name.to_string();
+        self.transact(move |snapshot| {
+            let mut atlas = snapshot
+                .atlases
+                .get(&id)
+                .cloned()
+                .ok_or(CloudError::NotFoundOrNoAccess)?;
+            atlas.name = name;
+            atlas.rev += 1;
+            Ok((
+                LocalMultiWriteTransaction {
+                    atlases: vec![atlas.clone()],
+                    ..Default::default()
+                },
+                atlas,
+            ))
+        })
+        .await
     }
 
     async fn delete_atlas(&self, atlas_id: &AtlasId) -> CloudResult<()> {
-        self.reload().await;
-        let _guard = self.write_lock.lock().await;
-        let atlas = self
-            .atlases
-            .read()
-            .get(atlas_id)
-            .cloned()
-            .ok_or(CloudError::NotFoundOrNoAccess)?;
-        // Gentle delete: member areas survive and become loose.
-        let members: Vec<AreaId> = self
-            .areas
-            .read()
-            .values()
-            .filter(|area| area.atlas_id == Some(*atlas_id))
-            .map(|area| area.id)
-            .collect();
-        let mut originals = Vec::with_capacity(members.len());
-        for area_id in members {
-            originals.push(self.load_area_document(area_id).await?);
-        }
-
-        let transaction_path = self.atlas_delete_transaction_path(Uuid::new_v4());
-        let mut transaction = LocalAtlasDeleteTransaction {
-            atlas,
-            members: originals,
-            committed: false,
-        };
-        store_atlas_delete_transaction(transaction_path.clone(), transaction.clone()).await?;
-
-        let mutation_result = async {
-            for original in &transaction.members {
-                let mut detached = original.clone();
-                detached.details.area.atlas_id = None;
-                detached.details.area.rev += 1;
-                self.store_area_document(detached).await?;
+        let id = *atlas_id;
+        self.transact(move |snapshot| {
+            if !snapshot.atlases.contains_key(&id) {
+                return Err(CloudError::NotFoundOrNoAccess);
             }
-
-            let path = self.atlas_path(*atlas_id);
-            task::spawn_blocking(move || match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(CloudError::from(err)),
-            })
-            .await
-            .map_err(|err| CloudError::InternalError(err.to_string()))??;
-
-            transaction.committed = true;
-            store_atlas_delete_transaction(transaction_path.clone(), transaction.clone()).await
-        }
-        .await;
-
-        if let Err(error) = mutation_result {
-            let rollback_result = async {
-                for original in &transaction.members {
-                    let mut current = match self.load_area_document(original.details.area.id).await
-                    {
-                        Ok(current) => current,
-                        // Another writer may have deleted the area while this
-                        // transaction was in flight. Gentle atlas deletion
-                        // never owns that deletion, so rollback must preserve it.
-                        Err(CloudError::NotFoundOrNoAccess) => continue,
-                        Err(error) => return Err(error),
-                    };
-                    // Preserve newer document content and any later move to a
-                    // different atlas. Only our detached (loose) state rolls
-                    // back to the source atlas.
-                    if current.details.area.atlas_id.is_none() {
-                        current.details.area.atlas_id = Some(transaction.atlas.id);
-                        current.details.area.rev += 1;
-                        self.store_area_document(current).await?;
-                    }
-                }
-                self.store_atlas(transaction.atlas.clone()).await?;
-                remove_transaction_file(transaction_path.clone()).await
-            }
-            .await;
-            return match rollback_result {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(CloudError::InternalError(format!(
-                    "atlas delete failed: {error}; rollback remains journaled after: {rollback_error}"
-                ))),
-            };
-        }
-
-        self.atlases.write().remove(atlas_id);
-        if let Err(error) = remove_transaction_file(transaction_path).await {
-            // The committed marker makes this safe: the next reload rolls the
-            // delete forward and removes the leftover journal.
-            log::warn!("could not remove committed atlas-delete journal: {error}");
-        }
-        Ok(())
+            let writes = snapshot
+                .documents
+                .values()
+                .filter(|document| document.details.area.atlas_id == Some(id))
+                .map(|document| {
+                    let mut detached = document.as_ref().clone();
+                    detached.details.area.atlas_id = None;
+                    detached.details.area.rev += 1;
+                    detached
+                })
+                .collect();
+            Ok((
+                LocalMultiWriteTransaction {
+                    writes,
+                    deleted_atlases: vec![id],
+                    ..Default::default()
+                },
+                (),
+            ))
+        })
+        .await
     }
 
     fn local_atlas_ids(&self) -> HashSet<AtlasId> {
-        self.atlases.read().keys().copied().collect()
+        self.local_snapshot()
+            .map_or_else(HashSet::new, |snapshot| snapshot.atlas_ids().collect())
     }
 
     fn local_area_ids(&self) -> HashSet<AreaId> {
-        self.areas.read().keys().copied().collect()
+        self.local_snapshot().map_or_else(HashSet::new, |snapshot| {
+            snapshot.documents.keys().copied().collect()
+        })
+    }
+
+    fn local_snapshot(&self) -> Option<Arc<LocalSnapshot>> {
+        self.store
+            .get()
+            .filter(|store| store.initialized.load(Ordering::Acquire))
+            .map(|store| store.snapshot.load_full())
+    }
+
+    async fn subscribe_local(&self) -> CloudResult<Option<tokio::sync::watch::Receiver<u64>>> {
+        Ok(Some(self.ensure_loaded().await?.changed.subscribe()))
+    }
+
+    async fn refresh_local(&self) -> CloudResult<()> {
+        self.refresh().await
+    }
+}
+
+#[cfg(test)]
+impl LocalBackend {
+    /// Exercise recovery of single-document journals created by older versions.
+    pub(crate) async fn journal_single_writes_for_test(&self) {
+        self.ensure_loaded()
+            .await
+            .unwrap()
+            .legacy_single_journals
+            .store(true, Ordering::Release);
+    }
+    async fn lock_store(&self) -> CloudResult<tokio::sync::OwnedMutexGuard<()>> {
+        Ok(self
+            .ensure_loaded()
+            .await?
+            .writer
+            .clone()
+            .lock_owned()
+            .await)
+    }
+    fn areas_dir(&self) -> PathBuf {
+        self.root.join("areas-v2")
+    }
+    fn legacy_areas_dir(&self) -> PathBuf {
+        self.root.join("areas")
+    }
+    fn atlases_dir(&self) -> PathBuf {
+        self.root.join("atlases")
+    }
+    fn transactions_dir(&self) -> PathBuf {
+        self.root.join("transactions")
+    }
+    fn area_path(&self, id: AreaId) -> PathBuf {
+        self.areas_dir().join(format!("{id}.json"))
+    }
+    fn legacy_area_path(&self, id: AreaId) -> PathBuf {
+        self.legacy_areas_dir().join(format!("{id}.json"))
+    }
+    fn atlas_path(&self, id: AtlasId) -> PathBuf {
+        self.atlases_dir().join(format!("{id}.json"))
+    }
+    fn atlas_delete_transaction_path(&self, id: Uuid) -> PathBuf {
+        self.transactions_dir()
+            .join(format!("{ATLAS_DELETE_TRANSACTION_PREFIX}{id}.json"))
+    }
+    fn multi_write_transaction_path(&self, sequence: u64, id: Uuid) -> PathBuf {
+        self.transactions_dir().join(format!(
+            "{MULTI_WRITE_TRANSACTION_PREFIX}{sequence:020}-{id}.json"
+        ))
+    }
+    async fn reload(&self) -> CloudResult<()> {
+        self.refresh().await
+    }
+    async fn load_area_document(&self, id: AreaId) -> CloudResult<LocalAreaDocument> {
+        self.snapshot().await?.document(id)
+    }
+    async fn load_area(&self, id: AreaId) -> CloudResult<AreaWithDetails> {
+        self.get_area(&id).await
+    }
+    // Fixture helpers: callers serialize these operations with lock_store.
+    async fn store_area_document(&self, document: LocalAreaDocument) -> CloudResult<()> {
+        self.ensure_loaded()
+            .await?
+            .commit(LocalMultiWriteTransaction {
+                writes: vec![document],
+                ..Default::default()
+            })
+    }
+    async fn commit_documents(
+        &self,
+        writes: Vec<LocalAreaDocument>,
+        deletes: Vec<AreaId>,
+    ) -> CloudResult<()> {
+        let store = self.ensure_loaded().await?;
+        if store.recover()? {
+            store.publish(store.scan()?);
+        }
+        store.commit(LocalMultiWriteTransaction {
+            writes,
+            deletes,
+            ..Default::default()
+        })
+    }
+    async fn apply_committed_documents(
+        &self,
+        transaction: &LocalMultiWriteTransaction,
+    ) -> CloudResult<()> {
+        self.ensure_loaded().await?.commit(transaction.clone())
+    }
+    fn headers(&self) -> HashMap<AreaId, Area> {
+        self.local_snapshot()
+            .unwrap()
+            .areas()
+            .map(|details| (details.area.id, details.area.clone()))
+            .collect()
     }
 }
 
@@ -1056,9 +1961,444 @@ mod tests {
     use crate::{
         ExitArgs, ExitDirection, ExitId, LabelArgs, LabelId, RoomNumber, RoomUpdates, ShapeArgs,
         ShapeId,
+        backends::{AreaMergeSource, RoomRemap, Translate},
+        mapper::RoomKey,
         mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
     };
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn failed_retirement_without_a_journal_reloads_before_the_next_write() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        backend.journal_single_writes_for_test().await;
+        let area = backend
+            .create_area(new_area_request("Original", None))
+            .await
+            .unwrap();
+        backend
+            .ensure_loaded()
+            .await
+            .unwrap()
+            .retirement_faults
+            .store(2, Ordering::Release);
+        let result = backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: Some("Committed".into()),
+                    atlas_id: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(CloudError::LocalCommitPending { .. })));
+        assert_eq!(
+            backend.get_area(&area.id).await.unwrap().area.name,
+            "Original"
+        );
+        assert_eq!(fs::read_dir(root.join("transactions")).unwrap().count(), 0);
+        backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: None,
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let latest = backend.get_area(&area.id).await.unwrap();
+        assert_eq!(latest.area.name, "Committed");
+        assert_eq!(latest.area.rev, 3);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_commit_preserves_a_newer_file_until_explicit_refresh() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Original", None))
+            .await
+            .unwrap();
+        let mut newer = backend.get_area(&area.id).await.unwrap();
+        newer.area.name = "External revision".into();
+        newer.area.rev += 10;
+        let bytes = serde_json::to_vec(&LocalAreaDocument::new(newer)).unwrap();
+        fs::write(backend.area_path(area.id), &bytes).unwrap();
+        let before = backend.snapshot().await.unwrap();
+        let result = backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: Some("Stale overwrite".into()),
+                    atlas_id: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(CloudError::InvalidInput(_))));
+        assert_eq!(fs::read(backend.area_path(area.id)).unwrap(), bytes);
+        assert!(Arc::ptr_eq(&before, &backend.snapshot().await.unwrap()));
+        assert!(multi_write_journals(&backend).is_empty());
+        backend.refresh().await.unwrap();
+        assert_eq!(backend.get_area(&area.id).await.unwrap().area.rev, 11);
+        backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: Some("After refresh".into()),
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.get_area(&area.id).await.unwrap().area.rev, 12);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn replacing_an_import_keeps_disk_and_snapshot_identical() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Original", None))
+            .await
+            .unwrap();
+        let mut imported = backend.get_area(&area.id).await.unwrap();
+        backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: Some("Revision two".into()),
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        imported.area.name = "Explicit replacement at revision one".into();
+        backend.import_local_area(imported.clone()).await.unwrap();
+        let before = serde_json::to_value(backend.get_area(&area.id).await.unwrap()).unwrap();
+        backend.refresh().await.unwrap();
+        assert_eq!(before, serde_json::to_value(imported).unwrap());
+        assert_eq!(
+            before,
+            serde_json::to_value(backend.get_area(&area.id).await.unwrap()).unwrap()
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_directory_refresh_preserves_the_committed_generation() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Keep me", None))
+            .await
+            .unwrap();
+        let before = backend.snapshot().await.unwrap();
+        let saved = root.join("saved-areas");
+        fs::rename(backend.areas_dir(), &saved).unwrap();
+        fs::write(backend.areas_dir(), b"not a directory").unwrap();
+        assert!(backend.refresh().await.is_err());
+        assert!(Arc::ptr_eq(&before, &backend.snapshot().await.unwrap()));
+        assert_eq!(
+            backend.get_area(&area.id).await.unwrap().area.name,
+            "Keep me"
+        );
+        fs::remove_file(backend.areas_dir()).unwrap();
+        fs::rename(saved, backend.areas_dir()).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn recovery_followed_by_scan_failure_must_reload_before_the_next_writer() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (writes, deletes) = merge_shaped(&documents);
+        let removed = deletes[0];
+        let destination = writes[0].details.area.id;
+        let journal =
+            backend.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        store_transaction_file(
+            journal.clone(),
+            LocalMultiWriteTransaction {
+                writes: writes.clone(),
+                deletes,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        fs::write(backend.atlases_dir(), b"obstruct scanning after recovery").unwrap();
+        assert!(backend.refresh().await.is_err());
+        assert!(
+            !journal.exists(),
+            "disk recovery finished before the failed scan"
+        );
+        fs::remove_file(backend.atlases_dir()).unwrap();
+        backend
+            .update_area(
+                &destination,
+                AreaUpdates {
+                    name: Some("Later rename".into()),
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.get_area(&destination).await.unwrap().area.rev,
+            writes[0].details.area.rev + 1
+        );
+        assert_eq!(
+            backend
+                .get_area(&writes[1].details.area.id)
+                .await
+                .unwrap()
+                .area
+                .name,
+            writes[1].details.area.name
+        );
+        assert!(backend.get_area(&removed).await.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_legacy_recovery_retains_later_delete_journals() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (writes, deletes) = merge_shaped(&documents);
+        let removed_id = writes[0].details.area.id;
+        let early =
+            backend.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        let later =
+            backend.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        store_transaction_file(
+            early.clone(),
+            LocalMultiWriteTransaction {
+                writes: writes.clone(),
+                deletes,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store_transaction_file(
+            later.clone(),
+            LocalMultiWriteTransaction {
+                deletes: vec![removed_id],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let obstruction = backend.area_path(writes[1].details.area.id);
+        fs::remove_file(&obstruction).unwrap();
+        fs::create_dir(&obstruction).unwrap();
+        let before = backend.snapshot().await.unwrap();
+        assert!(backend.refresh().await.is_err());
+        assert!(Arc::ptr_eq(&before, &backend.snapshot().await.unwrap()));
+        assert!(early.exists() && later.exists());
+        drop(backend);
+        let backend = LocalBackend::new(&root);
+        let blocked = backend.snapshot().await.unwrap();
+        assert!(blocked.recovery_error.is_some());
+        for id in writes
+            .iter()
+            .map(|d| d.details.area.id)
+            .chain(documents.iter().map(|d| d.details.area.id))
+        {
+            assert!(blocked.contains_area(id));
+            assert!(
+                blocked.area(id).is_err(),
+                "an unfinished merge must not expose partial results"
+            );
+        }
+        fs::remove_dir(obstruction).unwrap();
+        backend.refresh().await.unwrap();
+        assert!(backend.get_area(&removed_id).await.is_err());
+        assert!(!backend.area_path(removed_id).exists());
+        assert!(!early.exists() && !later.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn generations_share_unchanged_documents_and_coalesce_notifications() {
+        let root = temp_root();
+        let first = LocalBackend::new(&root);
+        let documents = three_areas(&first).await;
+        let second = LocalBackend::new(root.join("."));
+        let mut changed = second.subscribe_local().await.unwrap().unwrap();
+        let before = second.snapshot().await.unwrap();
+        let changed_id = documents[0].details.area.id;
+        let unchanged_id = documents[1].details.area.id;
+        for name in ["One", "Two", "Latest"] {
+            first
+                .update_area(
+                    &changed_id,
+                    AreaUpdates {
+                        name: Some(name.into()),
+                        atlas_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        changed.changed().await.unwrap();
+        let after = second.snapshot().await.unwrap();
+        assert_eq!(*changed.borrow_and_update(), after.generation);
+        assert_eq!(after.generation, before.generation + 3);
+        assert_eq!(after.area(changed_id).unwrap().area.name, "Latest");
+        assert_eq!(before.area(changed_id).unwrap().area.rev, 1);
+        assert!(Arc::ptr_eq(
+            &before.documents[&unchanged_id],
+            &after.documents[&unchanged_id]
+        ));
+        assert!(!Arc::ptr_eq(
+            &before.documents[&changed_id],
+            &after.documents[&changed_id]
+        ));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_does_not_release_the_transaction_owner() {
+        let root = temp_root();
+        let backend = Arc::new(LocalBackend::new(&root));
+        let area = backend
+            .create_area(new_area_request("Original", None))
+            .await
+            .unwrap();
+        let old = backend.snapshot().await.unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let caller = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                backend
+                    .transact(move |snapshot| {
+                        entered.send(()).unwrap();
+                        resume.recv().unwrap();
+                        let mut document = snapshot.document(area.id)?;
+                        document.details.area.name = "Committed after cancellation".into();
+                        document.details.area.rev += 1;
+                        Ok((
+                            LocalMultiWriteTransaction {
+                                writes: vec![document],
+                                ..Default::default()
+                            },
+                            (),
+                        ))
+                    })
+                    .await
+            })
+        };
+        started.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let following = backend.update_area(
+            &area.id,
+            AreaUpdates {
+                name: Some("Following writer".into()),
+                atlas_id: None,
+            },
+        );
+        tokio::pin!(following);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut following)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            backend.get_area(&area.id).await.unwrap().area.name,
+            "Original"
+        );
+        release.send(()).unwrap();
+        following.await.unwrap();
+        assert_eq!(backend.get_area(&area.id).await.unwrap().area.rev, 3);
+        assert_eq!(old.area(area.id).unwrap().area.name, "Original");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn single_save_recovers_an_installed_file_after_directory_sync_failure() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Original", None))
+            .await
+            .unwrap();
+        backend
+            .store
+            .get()
+            .unwrap()
+            .retirement_faults
+            .store(1, Ordering::Release);
+        let result = backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: Some("Installed".into()),
+                    atlas_id: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(CloudError::LocalCommitPending { .. })));
+        assert!(!backend.transactions_dir().exists());
+        assert_eq!(
+            backend.get_area(&area.id).await.unwrap().area.name,
+            "Original"
+        );
+        backend.refresh().await.unwrap();
+        assert_eq!(
+            backend.get_area(&area.id).await.unwrap().area.name,
+            "Installed"
+        );
+        assert!(backend.snapshot().await.unwrap().recovery_error.is_none());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn single_save_needs_no_journal_and_missing_files_are_conflicts() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Original", None))
+            .await
+            .unwrap();
+        assert!(!backend.transactions_dir().exists());
+        backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: Some("Saved".into()),
+                    atlas_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !backend.transactions_dir().exists(),
+            "single saves never create a store journal"
+        );
+        let before = backend.snapshot().await.unwrap();
+        fs::remove_file(backend.area_path(area.id)).unwrap();
+        let result = backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: Some("Must not resurrect".into()),
+                    atlas_id: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(CloudError::InvalidInput(_))));
+        assert!(!backend.area_path(area.id).exists());
+        assert!(Arc::ptr_eq(&before, &backend.snapshot().await.unwrap()));
+        fs::remove_dir_all(root).ok();
+    }
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("smudgy-local-test-{}", Uuid::new_v4()))
@@ -1126,6 +2466,7 @@ mod tests {
         // A fresh backend on the same root lazily loads the persisted area —
         // the bytes are authoritative on disk, not just in memory.
         let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
         let listed = reopened.list_areas().await.expect("reopened list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, area.id);
@@ -1177,7 +2518,7 @@ mod tests {
             committed: false,
         };
         let transaction_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
-        store_atlas_delete_transaction(transaction_path.clone(), transaction)
+        store_transaction_file(transaction_path.clone(), transaction)
             .await
             .expect("prepared journal");
 
@@ -1195,6 +2536,7 @@ mod tests {
         drop(backend);
 
         let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
         let atlases = reopened.list_atlases().await.expect("recover and list");
         assert_eq!(atlases.len(), 1);
         assert_eq!(atlases[0].id, atlas.id);
@@ -1226,7 +2568,7 @@ mod tests {
             committed: true,
         };
         let transaction_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
-        store_atlas_delete_transaction(transaction_path.clone(), transaction)
+        store_transaction_file(transaction_path.clone(), transaction)
             .await
             .expect("committed journal");
         drop(backend);
@@ -1234,6 +2576,7 @@ mod tests {
         // Even if the process stopped immediately after the commit marker,
         // reopening deterministically finishes every member detach and delete.
         let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
         assert!(
             reopened
                 .list_atlases()
@@ -1275,7 +2618,7 @@ mod tests {
             committed: false,
         };
         let transaction_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
-        store_atlas_delete_transaction(transaction_path.clone(), transaction)
+        store_transaction_file(transaction_path.clone(), transaction)
             .await
             .expect("prepared journal");
 
@@ -1294,6 +2637,7 @@ mod tests {
         drop(backend);
 
         let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
         reopened.list_atlases().await.expect("recover and list");
         let recovered = reopened.get_area(&area.id).await.expect("surviving area");
         assert_eq!(recovered.area.atlas_id, Some(destination.id));
@@ -1319,7 +2663,7 @@ mod tests {
         let prepared_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
         let committed_path = backend.atlas_delete_transaction_path(Uuid::new_v4());
         for (path, committed) in [(&prepared_path, false), (&committed_path, true)] {
-            store_atlas_delete_transaction(
+            store_transaction_file(
                 path.to_path_buf(),
                 LocalAtlasDeleteTransaction {
                     atlas: atlas.clone(),
@@ -1336,6 +2680,7 @@ mod tests {
         // collected first so an older prepared record can never resurrect the
         // atlas regardless of which journal is visited first.
         let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
         assert!(
             reopened
                 .list_atlases()
@@ -1954,6 +3299,7 @@ mod tests {
         stale["rev"] = serde_json::json!(99);
         write_v1_file(&root, area_id, &stale);
         let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
         let details = reopened.get_area(&area_id).await.expect("get");
         assert_eq!(
             details.area.name, "Lazy Lane",
@@ -2006,6 +3352,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
         doc["format_version"] = serde_json::json!(3);
         fs::write(&path, serde_json::to_vec_pretty(&doc).expect("serialize")).expect("write");
+        backend.refresh().await.expect("adopt external edit");
 
         let err = backend
             .get_area(&area.id)
@@ -2019,6 +3366,7 @@ mod tests {
 
         // The scan skips it too (reported, not fatal).
         let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
         assert!(reopened.list_areas().await.expect("list").is_empty());
 
         fs::remove_dir_all(&root).ok();
@@ -2174,6 +3522,7 @@ mod tests {
         // retirement. The stale expected revision would conflict if the
         // operation were applied again.
         let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
         let replayed = reopened
             .execute_mutation(&area_id, &mutation)
             .await
@@ -2201,7 +3550,7 @@ mod tests {
             .await
             .expect("create");
 
-        let write_guard = backend.write_lock.lock().await;
+        let write_guard = backend.lock_store().await.expect("store lock");
         let delete = {
             let backend = backend.clone();
             tokio::spawn(async move { backend.delete_area(&area.id).await })
@@ -2215,6 +3564,1246 @@ mod tests {
         drop(write_guard);
         delete.await.expect("delete task").expect("delete");
         assert!(backend.get_area(&area.id).await.is_err());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ===== multi-write transactions =====
+
+    /// Three empty areas, returned as their on-disk documents.
+    async fn three_areas(backend: &LocalBackend) -> Vec<LocalAreaDocument> {
+        let mut documents = Vec::new();
+        for name in ["A", "B", "C"] {
+            let area = backend
+                .create_area(new_area_request(name, None))
+                .await
+                .expect("create");
+            documents.push(backend.load_area_document(area.id).await.expect("document"));
+        }
+        documents
+    }
+
+    /// A merge-shaped transaction over `three_areas`: the first two are
+    /// rewritten with a new name and a bumped rev, the third is deleted.
+    fn merge_shaped(documents: &[LocalAreaDocument]) -> (Vec<LocalAreaDocument>, Vec<AreaId>) {
+        let writes = documents[..2]
+            .iter()
+            .map(|document| {
+                let mut written = document.clone();
+                written.details.area.name = format!("{} (merged)", written.details.area.name);
+                written.details.area.rev += 1;
+                written
+            })
+            .collect();
+        (writes, vec![documents[2].details.area.id])
+    }
+
+    fn multi_write_journals(backend: &LocalBackend) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(backend.transactions_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(MULTI_WRITE_TRANSACTION_PREFIX))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn commit_documents_writes_and_deletes_together() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (writes, deletes) = merge_shaped(&documents);
+        let removed_id = deletes[0];
+
+        {
+            let _guard = backend.lock_store().await.expect("store lock");
+            backend
+                .commit_documents(writes.clone(), deletes)
+                .await
+                .expect("commit");
+        }
+
+        for written in &writes {
+            let on_disk = backend
+                .get_area(&written.details.area.id)
+                .await
+                .expect("written area");
+            assert_eq!(on_disk.area.name, written.details.area.name);
+            assert_eq!(on_disk.area.rev, written.details.area.rev);
+        }
+        assert!(matches!(
+            backend.get_area(&removed_id).await,
+            Err(CloudError::NotFoundOrNoAccess)
+        ));
+        assert!(!backend.area_path(removed_id).exists());
+
+        let headers = backend.headers();
+        assert_eq!(headers.len(), 2, "index mirrors disk");
+        for written in &writes {
+            assert_eq!(
+                headers[&written.details.area.id].name,
+                written.details.area.name
+            );
+        }
+        assert!(!headers.contains_key(&removed_id));
+        assert!(
+            multi_write_journals(&backend).is_empty(),
+            "a completed transaction retires its journal"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn multi_write_journal_rolls_forward_on_reopen() {
+        let crashed_root = temp_root();
+        let clean_root = temp_root();
+        let crashed = LocalBackend::new(&crashed_root);
+        let clean = LocalBackend::new(&clean_root);
+        let documents = three_areas(&crashed).await;
+        // The same three documents, ids included, in a second store that
+        // will run the transaction without interruption.
+        for document in &documents {
+            clean
+                .store_area_document(document.clone())
+                .await
+                .expect("seed clean store");
+        }
+        let (writes, deletes) = merge_shaped(&documents);
+        let removed_id = deletes[0];
+        {
+            let _guard = clean.lock_store().await.expect("store lock");
+            clean
+                .commit_documents(writes.clone(), deletes.clone())
+                .await
+                .expect("uninterrupted commit");
+        }
+
+        // Crash after the journal and the first post-image landed: the
+        // second write and the delete never ran.
+        let journal =
+            crashed.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        store_transaction_file(
+            journal.clone(),
+            LocalMultiWriteTransaction {
+                writes: writes.clone(),
+                deletes,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("journal");
+        crashed
+            .store_area_document(writes[0].clone())
+            .await
+            .expect("first write");
+        drop(crashed);
+
+        let reopened = LocalBackend::new(&crashed_root);
+        reopened.ensure_loaded().await.expect("load reopened store");
+        let second = reopened
+            .get_area(&writes[1].details.area.id)
+            .await
+            .expect("second write completed");
+        assert_eq!(second.area.name, writes[1].details.area.name);
+        assert_eq!(second.area.rev, writes[1].details.area.rev);
+        assert!(matches!(
+            reopened.get_area(&removed_id).await,
+            Err(CloudError::NotFoundOrNoAccess)
+        ));
+        assert!(!journal.exists(), "recovery retires the journal");
+        assert!(!reopened.headers().contains_key(&removed_id));
+
+        for written in &writes {
+            let id = written.details.area.id;
+            assert_eq!(
+                fs::read(reopened.area_path(id)).expect("recovered bytes"),
+                fs::read(clean.area_path(id)).expect("clean bytes"),
+                "recovery lands the same bytes as an uninterrupted run"
+            );
+        }
+        assert!(!clean.area_path(removed_id).exists());
+        assert!(!reopened.area_path(removed_id).exists());
+
+        fs::remove_dir_all(&crashed_root).ok();
+        fs::remove_dir_all(&clean_root).ok();
+    }
+
+    #[tokio::test]
+    async fn multi_write_journal_replay_is_idempotent() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (writes, deletes) = merge_shaped(&documents);
+        let removed_id = deletes[0];
+        let transaction = LocalMultiWriteTransaction {
+            writes: writes.clone(),
+            deletes,
+            ..Default::default()
+        };
+        let journal =
+            backend.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        store_transaction_file(journal.clone(), transaction.clone())
+            .await
+            .expect("journal");
+        let (transactions, areas, legacy) = (
+            backend.transactions_dir(),
+            backend.areas_dir(),
+            backend.legacy_areas_dir(),
+        );
+
+        recover_multi_write_transactions(&transactions, &areas, &legacy);
+        let snapshot = |backend: &LocalBackend| -> Vec<Vec<u8>> {
+            writes
+                .iter()
+                .map(|written| fs::read(backend.area_path(written.details.area.id)).expect("bytes"))
+                .collect()
+        };
+        let first = snapshot(&backend);
+        assert!(!journal.exists());
+        assert!(!backend.area_path(removed_id).exists());
+
+        // A second pass over an empty transactions directory changes nothing.
+        recover_multi_write_transactions(&transactions, &areas, &legacy);
+        assert_eq!(snapshot(&backend), first);
+
+        // Re-applying the same journal (a crash mid-recovery) changes nothing
+        // either: each post-image is already on disk, each delete already done.
+        store_transaction_file(journal.clone(), transaction)
+            .await
+            .expect("journal again");
+        recover_multi_write_transactions(&transactions, &areas, &legacy);
+        assert_eq!(snapshot(&backend), first);
+        assert!(!journal.exists());
+        assert!(!backend.area_path(removed_id).exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn multi_write_recovery_skips_a_document_disk_has_moved_past() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (writes, deletes) = merge_shaped(&documents);
+        let journal =
+            backend.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        store_transaction_file(
+            journal.clone(),
+            LocalMultiWriteTransaction {
+                writes: writes.clone(),
+                deletes,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("journal");
+
+        // A completed transaction whose journal removal failed, followed by
+        // an ordinary edit: the edit's rev is higher than the post-image's.
+        let mut later = writes[0].clone();
+        later.details.area.name = "Edited after the transaction".to_string();
+        later.details.area.rev += 1;
+        backend
+            .store_area_document(later.clone())
+            .await
+            .expect("later edit");
+
+        recover_multi_write_transactions(
+            &backend.transactions_dir(),
+            &backend.areas_dir(),
+            &backend.legacy_areas_dir(),
+        );
+        backend.refresh().await.expect("adopt disk recovery");
+        let kept = backend
+            .get_area(&later.details.area.id)
+            .await
+            .expect("edited area");
+        assert_eq!(kept.area.name, "Edited after the transaction");
+        assert_eq!(kept.area.rev, later.details.area.rev);
+        let rolled = backend
+            .get_area(&writes[1].details.area.id)
+            .await
+            .expect("other area");
+        assert_eq!(rolled.area.name, writes[1].details.area.name);
+        assert!(!journal.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn multi_write_recovery_removes_both_namespaces() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Straggler", None))
+            .await
+            .expect("create");
+        // A v1-namespace copy in the current format: if it survived the
+        // delete, the straggler migration would adopt it verbatim on the
+        // next scan and the area would be listed again (see the note in
+        // `delete_area`).
+        let v2_bytes = fs::read(backend.area_path(area.id)).expect("v2 bytes");
+        fs::create_dir_all(backend.legacy_areas_dir()).expect("legacy dir");
+        fs::write(backend.legacy_area_path(area.id), v2_bytes).expect("legacy copy");
+        let journal =
+            backend.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        store_transaction_file(
+            journal.clone(),
+            LocalMultiWriteTransaction {
+                writes: Vec::new(),
+                deletes: vec![area.id],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("journal");
+        drop(backend);
+
+        let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
+        let listed = reopened.list_areas().await.expect("recover and list");
+        assert!(listed.is_empty(), "the deleted area is not resurrected");
+        assert!(!reopened.area_path(area.id).exists());
+        assert!(!reopened.legacy_area_path(area.id).exists());
+        assert!(!journal.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn unparseable_multi_write_journal_is_left_in_place() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Survivor", None))
+            .await
+            .expect("create");
+        let journal =
+            backend.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        fs::create_dir_all(backend.transactions_dir()).expect("transactions dir");
+        let mut legacy = backend.get_area(&area.id).await.unwrap();
+        legacy.area.id = AreaId(Uuid::new_v4());
+        legacy.area.name = "Legacy namespace".into();
+        fs::create_dir_all(backend.legacy_areas_dir()).unwrap();
+        let legacy_path = backend.legacy_area_path(legacy.area.id);
+        fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let unreadable_id = AreaId(Uuid::new_v4());
+        fs::create_dir(backend.legacy_area_path(unreadable_id)).unwrap();
+        let garbage = b"{ not a transaction";
+        fs::write(&journal, garbage).expect("garbage journal");
+        drop(backend);
+
+        let reopened = Arc::new(LocalBackend::new(&root));
+        let listed = reopened
+            .list_areas()
+            .await
+            .expect("surviving maps remain readable");
+        assert_eq!(listed.len(), 2);
+        assert!(reopened.get_area(&unreadable_id).await.is_err());
+        assert!(listed.iter().any(|entry| entry.id == area.id));
+        assert_eq!(
+            reopened.get_area(&area.id).await.unwrap().area.name,
+            "Survivor"
+        );
+        assert_eq!(
+            reopened.get_area(&legacy.area.id).await.unwrap().area.name,
+            "Legacy namespace"
+        );
+        assert!(
+            !reopened.area_path(legacy.area.id).exists(),
+            "degraded reads must not migrate files"
+        );
+        assert!(reopened.snapshot().await.unwrap().recovery_error.is_some());
+        assert!(reopened.refresh().await.is_err());
+        assert!(
+            reopened
+                .create_area(new_area_request("Blocked", None))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&journal).expect("journal still present"),
+            garbage,
+            "an unreadable journal is left for inspection, untouched"
+        );
+        let cloud = Arc::new(crate::backends::EphemeralBackend::new());
+        let remote = cloud
+            .create_area(new_area_request("Cloud", None))
+            .await
+            .unwrap();
+        let composite = crate::backends::CompositeBackend::new(reopened.clone(), cloud);
+        assert_eq!(
+            composite.get_area(&remote.id).await.unwrap().area.name,
+            "Cloud"
+        );
+        assert_eq!(
+            composite.get_area(&area.id).await.unwrap().area.name,
+            "Survivor"
+        );
+        fs::remove_file(&journal).unwrap();
+        reopened
+            .create_area(new_area_request("Unblocked", None))
+            .await
+            .unwrap();
+        assert!(reopened.snapshot().await.unwrap().recovery_error.is_none());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A post-image write that fails after the journal landed is finished
+    /// inline: the caller sees `Ok`, disk and the header index hold the
+    /// outcome, and no journal lingers.
+    #[tokio::test]
+    async fn commit_documents_finishes_inline_when_a_write_fails_after_the_journal() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (writes, deletes) = merge_shaped(&documents);
+        let removed_id = deletes[0];
+        backend
+            .store
+            .get()
+            .unwrap()
+            .write_faults
+            .store(1, std::sync::atomic::Ordering::Release);
+
+        {
+            let _guard = backend.lock_store().await.expect("store lock");
+            backend
+                .commit_documents(writes.clone(), deletes)
+                .await
+                .expect("the stalled transaction is finished inline");
+        }
+
+        for written in &writes {
+            let on_disk = backend
+                .get_area(&written.details.area.id)
+                .await
+                .expect("written area");
+            assert_eq!(on_disk.area.name, written.details.area.name);
+            assert_eq!(on_disk.area.rev, written.details.area.rev);
+        }
+        assert!(!backend.area_path(removed_id).exists());
+        let headers = backend.headers();
+        assert_eq!(headers.len(), 2, "the index mirrors the finished outcome");
+        for written in &writes {
+            assert_eq!(
+                headers[&written.details.area.id].rev,
+                written.details.area.rev
+            );
+        }
+        assert!(!headers.contains_key(&removed_id));
+        assert!(
+            multi_write_journals(&backend).is_empty(),
+            "the finished transaction retires its journal"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// When the inline roll-forward fails too, the error says the
+    /// transaction is journaled, the journal stays, and the next reload
+    /// finishes it once the obstruction is gone.
+    #[tokio::test]
+    async fn commit_documents_reports_a_journaled_transaction_when_inline_recovery_fails() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (writes, deletes) = merge_shaped(&documents);
+        let removed_id = deletes[0];
+        // A directory where the second post-image must land: the atomic
+        // rename onto it fails on every platform, inline and on retry.
+        let obstructed = backend.area_path(writes[1].details.area.id);
+        fs::remove_file(&obstructed).expect("clear the target");
+        fs::create_dir_all(&obstructed).expect("obstruct the target");
+
+        let error = {
+            let _guard = backend.lock_store().await.expect("store lock");
+            backend
+                .commit_documents(writes.clone(), deletes)
+                .await
+                .expect_err("the obstruction defeats the inline roll-forward")
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("journaled") && message.contains("completes on the next start"),
+            "{message}"
+        );
+        let journals = multi_write_journals(&backend);
+        assert_eq!(journals.len(), 1, "the journal waits for the next start");
+
+        fs::remove_dir(&obstructed).expect("lift the obstruction");
+        backend.reload().await.expect("reload");
+        for written in &writes {
+            let on_disk = backend
+                .get_area(&written.details.area.id)
+                .await
+                .expect("written area");
+            assert_eq!(on_disk.area.name, written.details.area.name);
+        }
+        assert!(!backend.area_path(removed_id).exists());
+        assert!(!journals[0].exists(), "the reload retires the journal");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A journal left behind by an earlier transaction is rolled forward
+    /// before the next transaction writes its own, so its outcome does not
+    /// wait for a reload.
+    #[tokio::test]
+    async fn commit_documents_rolls_lingering_journals_forward_first() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (lingering_writes, lingering_deletes) = merge_shaped(&documents);
+        let removed_id = lingering_deletes[0];
+        // The earlier transaction's journal, none of whose steps ran.
+        let lingering =
+            backend.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        store_transaction_file(
+            lingering.clone(),
+            LocalMultiWriteTransaction {
+                writes: lingering_writes.clone(),
+                deletes: lingering_deletes,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("lingering journal");
+
+        // A fresh transaction touching only the second area, on top of the
+        // lingering one's post-image.
+        let mut fresh = lingering_writes[1].clone();
+        fresh.details.area.name = "Fresh".to_string();
+        fresh.details.area.rev += 1;
+        {
+            let _guard = backend.lock_store().await.expect("store lock");
+            backend
+                .commit_documents(vec![fresh.clone()], Vec::new())
+                .await
+                .expect("commit");
+        }
+
+        assert!(
+            !lingering.exists(),
+            "the lingering journal was retired first"
+        );
+        let first = backend
+            .get_area(&lingering_writes[0].details.area.id)
+            .await
+            .expect("first area");
+        assert_eq!(first.area.name, lingering_writes[0].details.area.name);
+        let second = backend
+            .get_area(&fresh.details.area.id)
+            .await
+            .expect("second area");
+        assert_eq!(second.area.name, "Fresh");
+        assert!(!backend.area_path(removed_id).exists());
+        let headers = backend.headers();
+        assert_eq!(
+            headers[&first.area.id].name, first.area.name,
+            "the index follows the rolled-forward journal"
+        );
+        assert!(!headers.contains_key(&removed_id));
+        assert!(multi_write_journals(&backend).is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two lingering journals replay oldest first, and a write in the older
+    /// one whose area the newer one deletes is not replayed: the area stays
+    /// deleted, and a document both wrote ends at the newer revision.
+    #[tokio::test]
+    async fn multi_write_journals_replay_in_sequence_and_a_later_delete_wins() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let documents = three_areas(&backend).await;
+        let (a, b, c) = (
+            documents[0].details.area.id,
+            documents[1].details.area.id,
+            documents[2].details.area.id,
+        );
+        let renamed = |document: &LocalAreaDocument, name: &str, rev: i64| {
+            let mut written = document.clone();
+            written.details.area.name = name.to_string();
+            written.details.area.rev = rev;
+            written
+        };
+        // Sequence 7 writes A and B and deletes C; sequence 12 rewrites A
+        // and deletes B. The uuids are chosen so that a name order ignoring
+        // the sequence would replay them the other way round.
+        let older = backend.multi_write_transaction_path(7, Uuid::from_u128(u128::MAX));
+        let newer = backend.multi_write_transaction_path(12, Uuid::from_u128(1));
+        store_transaction_file(
+            older.clone(),
+            LocalMultiWriteTransaction {
+                writes: vec![
+                    renamed(&documents[0], "A first", 2),
+                    renamed(&documents[1], "B first", 2),
+                ],
+                deletes: vec![c],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("older journal");
+        store_transaction_file(
+            newer.clone(),
+            LocalMultiWriteTransaction {
+                writes: vec![renamed(&documents[0], "A second", 3)],
+                deletes: vec![b],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("newer journal");
+        drop(backend);
+
+        let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
+        let listed = reopened.list_areas().await.expect("recover and list");
+        assert_eq!(
+            listed.iter().map(|area| area.id).collect::<Vec<_>>(),
+            vec![a],
+            "only the survivor is listed"
+        );
+        let survivor = reopened.get_area(&a).await.expect("survivor");
+        assert_eq!(survivor.area.name, "A second");
+        assert_eq!(survivor.area.rev, 3);
+        assert!(!reopened.area_path(b).exists(), "the later delete wins");
+        assert!(!reopened.area_path(c).exists());
+        assert!(!older.exists() && !newer.exists(), "both journals retired");
+        assert!(
+            next_multi_write_sequence() > 12,
+            "the sequence continues past every journal seen on disk"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ===== area merges =====
+
+    /// Seeds room 1 in `area_id` through one envelope, with an exit north
+    /// out of it to `exit_to` when given. Leaves the area at rev 2 holding
+    /// one receipt.
+    async fn seed_room(backend: &LocalBackend, area_id: AreaId, exit_to: Option<(AreaId, i32)>) {
+        let mut payload = vec![AreaMutation::UpsertRoom {
+            room_number: RoomNumber(1),
+            body: RoomUpdates {
+                title: Some("Hall".to_string()),
+                ..RoomUpdates::default()
+            },
+        }];
+        if let Some((to_area, to_room)) = exit_to {
+            payload.push(AreaMutation::CreateExit {
+                room_number: RoomNumber(1),
+                body: ExitArgs {
+                    from_direction: ExitDirection::North,
+                    to_area_id: Some(to_area),
+                    to_room_number: Some(RoomNumber(to_room)),
+                    ..ExitArgs::default()
+                },
+            });
+        }
+        backend
+            .execute_mutation(&area_id, &envelope(area_id, 1, payload))
+            .await
+            .expect("seed envelope");
+    }
+
+    /// A destination with room 1, a source with room 1 (so the merge must
+    /// renumber it), and a third party with room 1 whose exit points into
+    /// the source's room when `third_party_links_source`, else nowhere.
+    /// Every area is at rev 2 with one receipt.
+    async fn merge_areas_fixture(
+        backend: &LocalBackend,
+        third_party_links_source: bool,
+    ) -> (AreaId, AreaId, AreaId) {
+        let mut ids = Vec::new();
+        for name in ["Into", "Source", "Third"] {
+            let area = backend
+                .create_area(new_area_request(name, None))
+                .await
+                .expect("create");
+            ids.push(area.id);
+        }
+        let (into, source, third) = (ids[0], ids[1], ids[2]);
+        seed_room(backend, into, None).await;
+        seed_room(backend, source, None).await;
+        seed_room(
+            backend,
+            third,
+            third_party_links_source.then_some((source, 1)),
+        )
+        .await;
+        (into, source, third)
+    }
+
+    /// A plan over the live documents: every expected rev as stored, the
+    /// floor one above the destination's highest room number.
+    async fn merge_plan(
+        backend: &LocalBackend,
+        into: AreaId,
+        sources: &[AreaId],
+        inbound: &[AreaId],
+    ) -> AreaMergePlan {
+        let mut expected = Vec::new();
+        for id in std::iter::once(&into).chain(sources).chain(inbound) {
+            let rev = backend.get_area(id).await.expect("touched area").area.rev;
+            expected.push((*id, rev));
+        }
+        let floor = backend
+            .get_area(&into)
+            .await
+            .expect("destination")
+            .rooms
+            .iter()
+            .map(|room| room.room_number.0)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        AreaMergePlan {
+            into,
+            sources: sources
+                .iter()
+                .map(|id| AreaMergeSource {
+                    id: *id,
+                    translate: Translate::default(),
+                    rooms: None,
+                })
+                .collect(),
+            inbound: inbound.to_vec(),
+            expected,
+            number_floor: RoomNumber(floor),
+        }
+    }
+
+    fn area_bytes(backend: &LocalBackend, id: AreaId) -> Vec<u8> {
+        fs::read(backend.area_path(id)).expect("area bytes")
+    }
+
+    fn receipt_count(backend: &LocalBackend, id: AreaId) -> usize {
+        let json: serde_json::Value =
+            serde_json::from_slice(&area_bytes(backend, id)).expect("parse document");
+        json["_smudgy_applied_operations"]
+            .as_array()
+            .map_or(0, Vec::len)
+    }
+
+    fn header_revs(backend: &LocalBackend) -> Vec<(AreaId, i64)> {
+        let mut revs: Vec<(AreaId, i64)> = backend
+            .headers()
+            .values()
+            .map(|area| (area.id, area.rev))
+            .collect();
+        revs.sort_by_key(|(id, _)| id.0);
+        revs
+    }
+
+    #[tokio::test]
+    async fn merge_areas_writes_destination_and_changed_third_parties_and_deletes_sources() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let (into, source, third) = merge_areas_fixture(&backend, true).await;
+        // A v1-namespace copy of the source: the delete must clear it too,
+        // or the straggler migration would resurrect the source on the
+        // next scan.
+        fs::create_dir_all(backend.legacy_areas_dir()).expect("legacy dir");
+        fs::write(
+            backend.legacy_area_path(source),
+            area_bytes(&backend, source),
+        )
+        .expect("legacy copy");
+        let plan = merge_plan(&backend, into, &[source], &[third]).await;
+
+        let commit = backend.merge_areas(&plan).await.expect("merge");
+
+        assert_eq!(
+            commit.outcome.rooms,
+            vec![RoomRemap {
+                from: RoomKey::new(source, RoomNumber(1)),
+                to: RoomNumber(2),
+            }],
+            "the colliding source room lands above the destination's"
+        );
+        let written: Vec<AreaId> = commit
+            .documents
+            .iter()
+            .map(|document| document.area.id)
+            .collect();
+        assert_eq!(
+            written,
+            vec![into, third],
+            "post-images: the destination, then the changed third party"
+        );
+
+        let destination = backend.get_area(&into).await.expect("destination");
+        assert_eq!(destination.area.rev, 3);
+        let mut numbers: Vec<i32> = destination
+            .rooms
+            .iter()
+            .map(|room| room.room_number.0)
+            .collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, vec![1, 2]);
+        assert_eq!(
+            serde_json::to_string(&destination).expect("serialize"),
+            serde_json::to_string(&commit.documents[0]).expect("serialize"),
+            "the returned post-image is what disk holds"
+        );
+
+        let third_party = backend.get_area(&third).await.expect("third party");
+        assert_eq!(third_party.area.rev, 3);
+        let exit = &third_party.rooms[0].exits[0];
+        assert_eq!(exit.to_area_id, Some(into), "the inbound exit followed");
+        assert_eq!(exit.to_room_number, Some(RoomNumber(2)));
+        assert_eq!(
+            serde_json::to_string(&third_party).expect("serialize"),
+            serde_json::to_string(&commit.documents[1]).expect("serialize")
+        );
+
+        assert!(matches!(
+            backend.get_area(&source).await,
+            Err(CloudError::NotFoundOrNoAccess)
+        ));
+        assert!(!backend.area_path(source).exists(), "v2 copy removed");
+        assert!(
+            !backend.legacy_area_path(source).exists(),
+            "v1 copy removed too"
+        );
+        assert_eq!(
+            receipt_count(&backend, into),
+            1,
+            "the destination keeps its receipts"
+        );
+        assert_eq!(receipt_count(&backend, third), 1, "so does the third party");
+        let mut expected_headers = vec![(into, 3), (third, 3)];
+        expected_headers.sort_by_key(|(id, _)| id.0);
+        assert_eq!(
+            header_revs(&backend),
+            expected_headers,
+            "index mirrors disk"
+        );
+        assert!(
+            multi_write_journals(&backend).is_empty(),
+            "a completed merge retires its journal"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_areas_revision_drift_stores_nothing() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let (into, source, third) = merge_areas_fixture(&backend, true).await;
+        let mut plan = merge_plan(&backend, into, &[source], &[third]).await;
+        for (id, rev) in &mut plan.expected {
+            if *id == source {
+                *rev += 1;
+            }
+        }
+        let before: Vec<Vec<u8>> = [into, source, third]
+            .iter()
+            .map(|id| area_bytes(&backend, *id))
+            .collect();
+        let headers_before = header_revs(&backend);
+
+        let result = backend.merge_areas(&plan).await;
+        assert!(
+            matches!(
+                &result,
+                Err(CloudError::RevisionConflict {
+                    id,
+                    expected_rev: 3,
+                    current_rev: 2,
+                }) if *id == source.0
+            ),
+            "a moved revision must conflict unchanged, got {result:?}"
+        );
+
+        let after: Vec<Vec<u8>> = [into, source, third]
+            .iter()
+            .map(|id| area_bytes(&backend, *id))
+            .collect();
+        assert_eq!(
+            after, before,
+            "a refused merge leaves every file byte-identical"
+        );
+        assert_eq!(header_revs(&backend), headers_before);
+        assert!(
+            multi_write_journals(&backend).is_empty(),
+            "nothing was journaled"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_areas_missing_source_is_area_not_found_and_writes_nothing() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let (into, source, third) = merge_areas_fixture(&backend, true).await;
+        let mut plan = merge_plan(&backend, into, &[source], &[third]).await;
+        let ghost = AreaId(Uuid::new_v4());
+        plan.sources[0].id = ghost;
+        plan.expected[1].0 = ghost;
+        let before: Vec<Vec<u8>> = [into, source, third]
+            .iter()
+            .map(|id| area_bytes(&backend, *id))
+            .collect();
+
+        let result = backend.merge_areas(&plan).await;
+        assert!(
+            matches!(&result, Err(CloudError::AreaNotFound(id)) if *id == ghost),
+            "a source with no document is AreaNotFound, got {result:?}"
+        );
+
+        let after: Vec<Vec<u8>> = [into, source, third]
+            .iter()
+            .map(|id| area_bytes(&backend, *id))
+            .collect();
+        assert_eq!(after, before);
+        assert!(multi_write_journals(&backend).is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn store_lock_is_shared_by_directory_aliases_and_independent_between_roots() {
+        let root = temp_root();
+        let first = LocalBackend::new(&root);
+        let alias = LocalBackend::new(root.join("."));
+        let separate_root = temp_root();
+        let separate = LocalBackend::new(&separate_root);
+        let guard = first.lock_store().await.expect("first lock");
+        let waiting = alias.lock_store();
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "an alias must wait for the existing store owner"
+        );
+        let independent =
+            tokio::time::timeout(std::time::Duration::from_secs(5), separate.lock_store())
+                .await
+                .expect("another root is independent")
+                .expect("separate lock");
+        drop(guard);
+        let alias_guard = waiting.await.expect("alias lock");
+        assert!(Arc::ptr_eq(
+            first.store.get().unwrap(),
+            alias.store.get().unwrap()
+        ));
+        drop((alias_guard, independent));
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&separate_root).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_waits_for_another_sessions_edit_then_checks_its_revision() {
+        let root = temp_root();
+        let writer = LocalBackend::new(&root);
+        let (into, source, third) = merge_areas_fixture(&writer, true).await;
+        let merging = LocalBackend::new(&root);
+        merging
+            .ensure_loaded()
+            .await
+            .expect("second session loaded");
+        let plan = merge_plan(&writer, into, &[source], &[third]).await;
+
+        // Pause an ordinary writer after its read, before its persistence.
+        let guard = writer.lock_store().await.expect("writer lock");
+        let mut document = writer.load_area_document(source).await.expect("source");
+        let merge = merging.merge_areas(&plan);
+        tokio::pin!(merge);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut merge)
+                .await
+                .is_err(),
+            "another session's merge must wait for this edit"
+        );
+        document.details.area.name = "Edited in the other session".to_string();
+        document.details.area.rev += 1;
+        writer
+            .store_area_document(document)
+            .await
+            .expect("persist edit");
+        drop(guard);
+
+        assert!(
+            matches!(merge.await, Err(CloudError::RevisionConflict { id, .. }) if id == source.0)
+        );
+        let preserved = merging.get_area(&source).await.expect("source survives");
+        assert_eq!(preserved.area.name, "Edited in the other session");
+        assert_eq!(
+            merging
+                .get_area(&into)
+                .await
+                .expect("destination")
+                .rooms
+                .len(),
+            1
+        );
+        assert!(multi_write_journals(&writer).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn another_session_reads_the_old_snapshot_during_an_active_merge() {
+        let root = temp_root();
+        let writer = LocalBackend::new(&root);
+        let (into, source, third) = merge_areas_fixture(&writer, true).await;
+        let reader = LocalBackend::new(&root);
+        reader.ensure_loaded().await.expect("second session loaded");
+        let plan = merge_plan(&writer, into, &[source], &[third]).await;
+        let guard = writer.lock_store().await.expect("transaction lock");
+        let mut destination = writer.load_area_document(into).await.expect("destination");
+        let mut sources = vec![writer.load_area(source).await.expect("source")];
+        let mut inbound = vec![writer.load_area(third).await.expect("third party")];
+        apply_area_merge(&plan, &mut destination.details, &mut sources, &mut inbound)
+            .expect("apply");
+        let transaction = LocalMultiWriteTransaction {
+            writes: vec![destination, LocalAreaDocument::new(inbound.remove(0))],
+            deletes: vec![source],
+            ..Default::default()
+        };
+        let path = writer.multi_write_transaction_path(next_multi_write_sequence(), Uuid::new_v4());
+        store_transaction_file(path.clone(), transaction.clone())
+            .await
+            .expect("journal");
+        // Pause at the real commit boundary: the journal is durable but its
+        // post-images have not landed. Readers must not treat it as abandoned.
+        let retained = reader.snapshot().await.expect("pin old generation");
+        let listed =
+            tokio::time::timeout(std::time::Duration::from_millis(50), reader.list_areas())
+                .await
+                .expect("read does not wait")
+                .expect("list");
+        assert!(listed.iter().any(|area| area.id == source));
+        assert_eq!(
+            reader
+                .get_area(&into)
+                .await
+                .expect("old destination")
+                .rooms
+                .len(),
+            1
+        );
+        assert!(
+            path.exists(),
+            "the second session must not retire the journal"
+        );
+        assert!(writer.area_path(source).exists());
+        writer
+            .apply_committed_documents(&transaction)
+            .await
+            .expect("finish commit");
+        remove_transaction_file(path).await.expect("retire journal");
+        drop(guard);
+
+        assert_eq!(
+            retained
+                .area(into)
+                .expect("retained old destination")
+                .rooms
+                .len(),
+            1
+        );
+        assert!(retained.area(source).is_ok());
+        assert_eq!(
+            reader
+                .get_area(&into)
+                .await
+                .expect("merged destination")
+                .rooms
+                .len(),
+            2
+        );
+        let listed = reader.list_areas().await.expect("committed listing");
+        assert!(!listed.iter().any(|area| area.id == source));
+        assert_eq!(
+            reader.get_area(&third).await.expect("third party").rooms[0].exits[0].to_area_id,
+            Some(into)
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_areas_holds_the_write_lock_for_the_whole_span() {
+        let root = temp_root();
+        let backend = Arc::new(LocalBackend::new(&root));
+        let (into, source, third) = merge_areas_fixture(&backend, true).await;
+        let plan = merge_plan(&backend, into, &[source], &[third]).await;
+
+        let write_guard = backend.lock_store().await.expect("store lock");
+        let merge = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.merge_areas(&plan).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !merge.is_finished(),
+            "the merge must wait for an in-flight whole-file mutation"
+        );
+
+        drop(write_guard);
+        let commit = merge.await.expect("merge task").expect("merge");
+        assert_eq!(commit.documents[0].area.id, into);
+        assert!(backend.get_area(&source).await.is_err());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A source that gives up only some rooms is written like a third
+    /// party, receipts and all, and stays on disk and in the header index
+    /// at its new revision; only whole sources are deleted.
+    #[tokio::test]
+    async fn merge_areas_partial_source_is_written_with_its_receipts_and_kept() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let (into, source, third) = merge_areas_fixture(&backend, true).await;
+        // A second room in the source, reaching room 1, so the source keeps
+        // something and one of its exits must follow the moved room.
+        backend
+            .execute_mutation(
+                &source,
+                &envelope(
+                    source,
+                    2,
+                    vec![
+                        AreaMutation::UpsertRoom {
+                            room_number: RoomNumber(2),
+                            body: RoomUpdates {
+                                title: Some("Annex".to_string()),
+                                ..RoomUpdates::default()
+                            },
+                        },
+                        AreaMutation::CreateExit {
+                            room_number: RoomNumber(2),
+                            body: ExitArgs {
+                                from_direction: ExitDirection::South,
+                                to_area_id: Some(source),
+                                to_room_number: Some(RoomNumber(1)),
+                                ..ExitArgs::default()
+                            },
+                        },
+                    ],
+                ),
+            )
+            .await
+            .expect("second envelope");
+        assert_eq!(receipt_count(&backend, source), 2);
+        let mut plan = merge_plan(&backend, into, &[source], &[third]).await;
+        plan.sources[0].rooms = Some(vec![RoomNumber(1)]);
+
+        let commit = backend.merge_areas(&plan).await.expect("partial merge");
+
+        assert_eq!(
+            commit.outcome.rooms,
+            vec![RoomRemap {
+                from: RoomKey::new(source, RoomNumber(1)),
+                to: RoomNumber(2),
+            }]
+        );
+        let written: Vec<AreaId> = commit
+            .documents
+            .iter()
+            .map(|document| document.area.id)
+            .collect();
+        assert_eq!(
+            written,
+            vec![into, source, third],
+            "post-images: the destination, the partial source, the changed third party"
+        );
+        assert!(
+            commit
+                .outcome
+                .versions
+                .iter()
+                .any(|version| version.id == source.0 && !version.deleted && version.rev == 4),
+            "the partial source reports a write, not a delete: {:?}",
+            commit.outcome.versions
+        );
+
+        let kept = backend.get_area(&source).await.expect("the source stays");
+        assert_eq!(kept.area.rev, 4);
+        assert_eq!(kept.rooms.len(), 1);
+        assert_eq!(kept.rooms[0].room_number, RoomNumber(2));
+        let exit = &kept.rooms[0].exits[0];
+        assert_eq!(
+            (exit.to_area_id, exit.to_room_number),
+            (Some(into), Some(RoomNumber(2))),
+            "the remaining room's exit follows the moved room"
+        );
+        assert_eq!(
+            serde_json::to_string(&kept).expect("serialize"),
+            serde_json::to_string(&commit.documents[1]).expect("serialize"),
+            "the returned post-image is what disk holds"
+        );
+        assert!(backend.area_path(source).exists(), "not removed from disk");
+        assert_eq!(
+            receipt_count(&backend, source),
+            2,
+            "the partial source keeps its receipts"
+        );
+        let third_party = backend.get_area(&third).await.expect("third party");
+        let exit = &third_party.rooms[0].exits[0];
+        assert_eq!(
+            (exit.to_area_id, exit.to_room_number),
+            (Some(into), Some(RoomNumber(2)))
+        );
+        let mut expected_headers = vec![(into, 3), (source, 4), (third, 3)];
+        expected_headers.sort_by_key(|(id, _)| id.0);
+        assert_eq!(
+            header_revs(&backend),
+            expected_headers,
+            "index mirrors disk"
+        );
+        assert!(multi_write_journals(&backend).is_empty());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn merge_areas_unchanged_third_party_is_not_rewritten() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let (into, source, third) = merge_areas_fixture(&backend, false).await;
+        let plan = merge_plan(&backend, into, &[source], &[third]).await;
+        let third_before = area_bytes(&backend, third);
+
+        let commit = backend.merge_areas(&plan).await.expect("merge");
+
+        let written: Vec<AreaId> = commit
+            .documents
+            .iter()
+            .map(|document| document.area.id)
+            .collect();
+        assert_eq!(written, vec![into], "only the destination is a post-image");
+        assert!(
+            commit
+                .outcome
+                .versions
+                .iter()
+                .all(|version| version.id != third.0),
+            "an untouched third party reports no version"
+        );
+        assert_eq!(
+            area_bytes(&backend, third),
+            third_before,
+            "its file is byte-identical"
+        );
+        assert_eq!(backend.get_area(&third).await.expect("third").area.rev, 2);
+        assert!(backend.get_area(&source).await.is_err());
 
         fs::remove_dir_all(&root).ok();
     }

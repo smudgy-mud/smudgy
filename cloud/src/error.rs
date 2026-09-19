@@ -51,6 +51,9 @@ pub enum CloudError {
     /// Internal error
     InternalError(String),
 
+    /// A durable local decision needs recovery. This is not a rolled-back write.
+    LocalCommitPending { message: String, generation: u64 },
+
     /// `PendingOperations`
     PendingOperations(String),
 
@@ -125,6 +128,9 @@ pub enum CloudError {
 impl fmt::Display for CloudError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CloudError::LocalCommitPending { message, .. } => {
+                write!(f, "Local commit pending recovery: {message}")
+            }
             CloudError::AreaNotFound(id) => write!(f, "Area not found: {id}"),
             CloudError::RoomNotFound(room_key) => {
                 write!(

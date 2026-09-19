@@ -454,6 +454,7 @@ cloud-error-authentication = Błąd uwierzytelniania: { $detail }
 cloud-error-permission = Odmowa dostępu: { $detail }
 cloud-error-internal = Błąd wewnętrzny: { $detail }
 cloud-error-pending = Oczekujące operacje: { $detail }
+cloud-error-local-commit-pending = Zmiana mapy lokalnej została zapisana do odzyskania, ale nie można było jej dokończyć. Odśwież mapy lub uruchom ponownie Smudgy, aby ponowić próbę odzyskania.
 cloud-error-unauthorized = Nie jesteś zalogowany.
 cloud-error-unauthorized-detail = Nie jesteś zalogowany: { $detail }
 cloud-error-name-unavailable = Nazwa niedostępna: { $detail }
