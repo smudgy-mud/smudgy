@@ -1,6 +1,6 @@
 use crate::i18n::t;
-use iced::widget::{Id, Row, button, column, container, operation, text, text_editor};
-use iced::{Length, Pixels, Task};
+use iced::Task;
+use iced::widget::{Id, column, container, operation, text, text_editor};
 use log::warn;
 
 use crate::theme::Element;
@@ -15,6 +15,10 @@ use smudgy_core::models::server::{
     ServerCas, link_url_host, load_server, update_server_if_unchanged, with_server_if_unchanged,
 };
 use smudgy_core::models::{profile::Profile, server::Server};
+use smudgy_ui_shared::connect_model::{
+    ConnectViewModel, Form as ConnectForm, Intent as ConnectIntent, Panel as ConnectPanel,
+    ProfileInventory, ProfileSummary,
+};
 use std::collections::HashMap;
 
 mod observed;
@@ -46,6 +50,9 @@ pub(super) fn server_name_input_id() -> Id {
 }
 pub(super) fn server_host_input_id() -> Id {
     Id::new("connect-server-host")
+}
+pub(super) fn server_wss_input_id() -> Id {
+    Id::new("connect-server-wss")
 }
 pub(super) fn server_port_input_id() -> Id {
     Id::new("connect-server-port")
@@ -142,12 +149,26 @@ pub enum Message {
     ObservedLinkCancel,
 }
 
+impl From<ConnectIntent> for Message {
+    fn from(intent: ConnectIntent) -> Self {
+        match intent {
+            ConnectIntent::SelectServer(name) => Self::SelectServer(name),
+            ConnectIntent::NewServer => Self::RequestCreateServer,
+            ConnectIntent::EditServer(name) => Self::RequestEditServer(name),
+            ConnectIntent::NewProfile => Self::RequestCreateProfile,
+            ConnectIntent::EditProfile(name) => Self::RequestEditProfile(name),
+            ConnectIntent::Connect { server, profile } => Self::ConnectProfile(server, profile),
+        }
+    }
+}
+
 /// Fields in the server create/edit form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ServerFormField {
     Name, // Only for Create
     Host,
     Port,
+    WssUrl,
     Encoding,
 }
 
@@ -180,6 +201,7 @@ pub struct ServerConfigFormData {
     pub name: String,
     pub host: String,
     pub port: String,
+    pub wss_url: String,
     /// The encoding dropdown's display value; [`server::DEFAULT_ENCODING_CHOICE`]
     /// stands for "no override" (UTF-8, `ServerConfig::encoding = None`).
     pub encoding: String,
@@ -199,6 +221,7 @@ impl Default for ServerConfigFormData {
             name: String::new(),
             host: String::new(),
             port: String::new(),
+            wss_url: String::new(),
             encoding: server::DEFAULT_ENCODING_CHOICE.to_string(),
             compression: true,
             mccp4_compression: true,
@@ -600,10 +623,11 @@ impl std::fmt::Debug for State {
 }
 
 fn initial_server<'a>(servers: &'a [Server], recent: Option<&str>) -> Option<&'a Server> {
-    servers
-        .iter()
-        .find(|server| Some(server.name.as_str()) == recent)
-        .or_else(|| servers.first())
+    let index = smudgy_session_model::connect::preferred_index(
+        servers.iter().map(|server| server.name.as_str()),
+        recent,
+    )?;
+    Some(&servers[index])
 }
 
 impl State {
@@ -1391,6 +1415,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     name: server_to_edit.name.clone(), // Pre-fill name (though not directly editable usually)
                     host: server_to_edit.config.host.clone(),
                     port: server_to_edit.config.port.to_string(),
+                    wss_url: server_to_edit.config.wss_url.clone().unwrap_or_default(),
                     encoding: server_to_edit
                         .config
                         .encoding
@@ -1416,7 +1441,12 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                 );
                 state.selected_server = Some(server_name); // Ensure server remains selected
                 // Name isn't editable in edit mode; focus the first editable field.
-                task = Task::batch([operation::focus(server_host_input_id()), usage_task]);
+                let field = if server_to_edit.config.wss_url.is_some() {
+                    server_wss_input_id()
+                } else {
+                    server_host_input_id()
+                };
+                task = Task::batch([operation::focus(field), usage_task]);
             } else {
                 warn!("Error: Requested to edit non-existent server '{server_name}'");
             }
@@ -1522,6 +1552,7 @@ pub fn update(state: &mut State, message: Message) -> (Task<Message>, Option<Eve
                     ServerFormField::Name => state.server_form_data.name = value,
                     ServerFormField::Host => state.server_form_data.host = value,
                     ServerFormField::Port => state.server_form_data.port = value,
+                    ServerFormField::WssUrl => state.server_form_data.wss_url = value,
                     ServerFormField::Encoding => state.server_form_data.encoding = value,
                 }
                 state.server_crud_error = None; // Clear error when user types
@@ -1837,71 +1868,91 @@ fn view_placeholder(state: &State) -> Element<'_, Message> {
     }
 
     if state.servers.is_empty() {
-        // First-run welcome: a guided start, not an instruction fragment.
-        column![
-            text(t!("servers-get-started")).size(Pixels(22.0)),
-            text(t!("servers-get-started-help")).style(builtins::text::muted),
-            button(text(t!("servers-add-first")))
-                .style(builtins::button::primary)
-                .padding([8, 18])
-                .on_press(Message::RequestCreateServer),
-        ]
-        .spacing(15)
-        .into()
+        smudgy_ui_shared::connect_modal::empty_servers(
+            t!("servers-get-started"),
+            t!("servers-get-started-help"),
+            t!("servers-add-first"),
+            Message::RequestCreateServer,
+        )
     } else {
         column![text(t!("servers-select")).style(builtins::text::muted)].into()
     }
 }
 
+fn view_model(state: &State) -> ConnectViewModel<'_> {
+    let inventory = match state.selected_server.as_ref() {
+        Some(name) if state.is_loading_profiles.as_ref() == Some(name) => ProfileInventory::Loading,
+        Some(name) => state
+            .profiles
+            .get(name)
+            .map_or(ProfileInventory::Unavailable, |profiles| {
+                ProfileInventory::Ready(profiles.iter().map(|profile| ProfileSummary {
+                    name: &profile.name,
+                    caption: &profile.config.caption,
+                }))
+            }),
+        None => ProfileInventory::Unavailable,
+    };
+    let form = if state.server_action.is_some() {
+        ConnectForm::Server
+    } else if state.profile_action.is_some() {
+        ConnectForm::Profile
+    } else {
+        ConnectForm::None
+    };
+    ConnectViewModel::project(
+        state.servers.iter().map(|server| server.name.as_str()),
+        state.selected_server.as_deref(),
+        inventory,
+        form,
+    )
+}
+
 /// The main view function for the connect modal.
 pub fn view(state: &State) -> Element<'_, Message> {
-    let server_pane = view_server_list(state);
+    let model = view_model(state);
+    let server_pane = view_server_list(state, model.servers, model.new_server);
 
     // Determine the content for the main pane based on the state. The details
     // view manages its own overflow (a pinned header/footer around an inner
     // profile-list scrollable, which an outer scrollable's unbounded height
     // would collapse); every other pane is a fixed-height form or placeholder
     // that must scroll rather than clip when the modal shrinks.
-    let (main_pane_content, scrolls_itself) = if let Some(action) = &state.server_action {
-        // Show server form if a server action is active
-        (view_server_form(state, action), false)
-    } else if let Some(action) = &state.profile_action {
-        // Show profile form if a profile action is active (Create, Edit, or ConfirmDelete)
-        (view_profile_form(state, action), false)
-    } else if let Some(server_name) = &state.selected_server {
-        // Show server details and profiles if a server is selected
-        (view_server_details_and_profiles(state, server_name), true)
-    } else {
-        // Show placeholder if no server is selected and no form is active
-        (view_placeholder(state), false)
+    let (main_pane_content, scrolls_itself) = match model.panel {
+        ConnectPanel::ServerForm => (
+            view_server_form(
+                state,
+                state.server_action.as_ref().expect("server form is open"),
+            ),
+            false,
+        ),
+        ConnectPanel::ProfileForm => (
+            view_profile_form(
+                state,
+                state.profile_action.as_ref().expect("profile form is open"),
+            ),
+            false,
+        ),
+        ConnectPanel::ServerDetails => (
+            view_server_details_and_profiles(
+                state,
+                model.selected.expect("selected server exists"),
+            ),
+            true,
+        ),
+        ConnectPanel::Placeholder => (view_placeholder(state), false),
     };
-    let main_pane_content: Element<'_, Message> = if scrolls_itself {
-        main_pane_content
-    } else {
-        // Right padding keeps form controls clear of the overlaid scrollbar
-        // that appears once the pane overflows.
-        iced::widget::scrollable(
-            container(main_pane_content).padding(iced::Padding::ZERO.right(14)),
-        )
-        .height(Length::Fill)
-        .into()
-    };
-
-    let main_pane = container(main_pane_content)
-        .width(Length::Fill)
-        .padding(15)
-        .into();
-
-    // Combine panes into the modal body
-    let panes: Element<'_, Message> = Row::with_children(vec![server_pane, main_pane]).into();
-    let body: Element<'_, Message> = match &state.session_open_error {
-        Some(error) => column![
-            container(text(error).style(builtins::text::danger)).padding([8, 15]),
-            panes,
-        ]
-        .into(),
-        None => panes,
-    };
+    let banner = state.session_open_error.as_ref().map(|error| {
+        container(text(error).style(builtins::text::danger))
+            .padding([8, 15])
+            .into()
+    });
+    let body = smudgy_ui_shared::connect_modal::body(
+        server_pane,
+        main_pane_content,
+        scrolls_itself,
+        banner,
+    );
 
     // A metadata link held at the trust gate renders its confirm dialog over
     // the whole modal body, exactly like the session view's link dialog.

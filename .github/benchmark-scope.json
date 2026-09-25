@@ -66,7 +66,12 @@
       "name": "connection ingest",
       "globs": [
         "core/src/session/connection.rs",
-        "core/src/session/connection/**"
+        "core/src/session/connection/**",
+        "protocol/src/telnet.rs",
+        "protocol/src/responders.rs",
+        "protocol/src/transcode.rs",
+        "protocol/src/vt.rs",
+        "protocol/src/sgr.rs"
       ],
       "criterion": [
         "ingest"
@@ -81,7 +86,8 @@
     {
       "name": "styled lines",
       "globs": [
-        "core/src/session/styled_line.rs"
+        "core/src/session/styled_line.rs",
+        "session_model/src/styled_line.rs"
       ],
       "criterion": [
         "ingest",
@@ -174,7 +180,13 @@
         "ui/src/terminal_buffer/**",
         "ui/src/**/terminal*.rs",
         "ui/src/**/buffer*.rs",
-        "ui/src/**/line*.rs"
+        "ui/src/**/line*.rs",
+        "ui_shared/src/terminal_buffer.rs",
+        "ui_shared/src/terminal_buffer/**",
+        "ui_shared/src/split_terminal_pane.rs",
+        "ui_shared/src/split_terminal_pane/**",
+        "ui_shared/src/prefs.rs",
+        "ui/src/prefs.rs"
       ],
       "criterion": [
         "terminal_buffer"

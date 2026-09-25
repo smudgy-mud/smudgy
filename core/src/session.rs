@@ -1,4 +1,3 @@
-use derive_more::{Add, Display, From, Into};
 use futures::Stream;
 use runtime::RuntimeAction;
 use smudgy_cloud::{AreaId, AtlasId, Mapper};
@@ -29,9 +28,7 @@ pub mod styled_line;
 pub mod system_row;
 pub mod ui_command;
 
-#[derive(From, Into, Display, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Add)]
-#[repr(transparent)]
-pub struct SessionId(u32);
+pub use smudgy_session_model::SessionId;
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -380,9 +377,7 @@ impl Debug for SessionParams {
     }
 }
 
-#[derive(Display, Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[repr(transparent)]
-pub struct HotkeyId(usize);
+pub use smudgy_session_model::HotkeyId;
 
 impl std::hash::Hash for SessionParams {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

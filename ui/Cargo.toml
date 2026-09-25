@@ -17,8 +17,10 @@ smudgy_core = { workspace = true }
 smudgy_script = { workspace = true }
 smudgy_cloud = { workspace = true }
 smudgy_theme = { workspace = true }
+smudgy_ui_shared = { workspace = true }
+smudgy_session_model = { workspace = true }
 smudgy_map_widget = { workspace = true }
-smudgy_i18n = { workspace = true }
+smudgy_i18n = { workspace = true, features = ["all-locales"] }
 sys-locale = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
@@ -119,6 +121,7 @@ web-audio = ["smudgy_core/web-audio"]
 # `smudgy_audio/physical-output`. Production packaging still selects this
 # feature explicitly, and it is also the crate default.
 web-audio-cpal = [
+    "smudgy_ui_shared/web-audio-cpal",
     "web-audio",
     "dep:futures",
     "dep:smudgy_audio",

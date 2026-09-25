@@ -2,13 +2,8 @@
 pub use self::connect::Event as ConnectEvent;
 pub use self::connect::Message as ConnectMessage;
 
-use iced::Length;
 use iced::Task;
-use iced::widget::row;
-use iced::widget::text;
-use iced::widget::{column, container};
 
-use crate::theme;
 use crate::theme::Element;
 // Import modal implementation modules
 pub mod connect;
@@ -93,25 +88,7 @@ impl Modal {
             ),
         };
 
-        let title_bar_text = text(title)
-            .center()
-            .width(Length::Fill)
-            .height(Length::Fixed(34.0));
-
-        container(column![
-            container(row![title_bar_text])
-                .style(theme::builtins::container::modal_title_bar)
-                .width(Length::Fill)
-                .height(Length::Fixed(34.0)),
-            container(inner)
-                .style(theme::builtins::container::modal_body)
-                .width(Length::Fill)
-                .height(Length::Fill),
-        ])
-        .width(Length::Fixed(width))
-        .height(Length::Fixed(height))
-        .style(theme::builtins::container::modal_container)
-        .into()
+        smudgy_ui_shared::connect_modal::frame_with_size(title, inner, width, height)
     }
 
     /// Perform initial loading task when a modal is first shown (optional).

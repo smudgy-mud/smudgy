@@ -3,11 +3,10 @@
 use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
-use url::{Host, Url};
+use url::Host;
 use validator::Validate;
 
 use super::persistence::write_atomic;
@@ -20,7 +19,7 @@ pub enum ServerCas<T> {
 }
 
 fn validate_server_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.contains(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+    if !smudgy_session_model::connect::valid_name(name) {
         anyhow::bail!(
             "Invalid server name: '{}'. Use only alphanumeric, underscore, or hyphen.",
             name
@@ -75,6 +74,10 @@ pub struct ServerConfig {
     /// On by default; off accepts any certificate (self-signed MUD ports — insecure).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub tls_verify: bool,
+    /// Binary Telnet over a secure WebSocket. Legacy host/port fields remain
+    /// populated for server identity and backwards-compatible metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wss_url: Option<String>,
 }
 
 const fn default_true() -> bool {
@@ -100,7 +103,27 @@ impl ServerConfig {
             mccp4_compression: None,
             tls: false,
             tls_verify: true,
+            wss_url: None,
         }
+    }
+
+    /// Check the WebSocket-specific contract after the regular field validation.
+    ///
+    /// # Errors
+    /// Rejects non-WSS URLs, embedded credentials/fragments, or a URL that
+    /// disagrees with the stored host and port used by session metadata.
+    pub fn validate_transport(&self) -> Result<()> {
+        let Some(endpoint) = &self.wss_url else {
+            return Ok(());
+        };
+        let (host, port) = parse_wss_address(endpoint)?;
+        anyhow::ensure!(
+            host == self.host && port == self.port,
+            "WSS URL host/port must match the server address"
+        );
+        anyhow::ensure!(self.tls, "WSS requires TLS");
+        anyhow::ensure!(self.tls_verify, "WSS requires certificate verification");
+        Ok(())
     }
 
     /// Whether MCCP4 is enabled after applying the legacy shared-compression fallback.
@@ -149,6 +172,14 @@ impl ServerConfig {
     }
 }
 
+/// Parse the binary-Telnet-over-WSS address accepted by both native and web.
+///
+/// # Errors
+/// Rejects a non-WSS URL, absent host, embedded credentials, or fragment.
+pub fn parse_wss_address(endpoint: &str) -> Result<(String, u16)> {
+    smudgy_protocol::wss::parse_address(endpoint).map_err(|error| anyhow::anyhow!(error))
+}
+
 fn canonical_link_host(host: &str) -> Option<String> {
     if let Ok(address) = host.parse::<Ipv6Addr>() {
         return Some(address.to_string());
@@ -165,34 +196,7 @@ fn canonical_link_host(host: &str) -> Option<String> {
 /// authority is empty, or the URL has no valid host.
 #[must_use]
 pub fn link_url_host(url: &str) -> Option<String> {
-    // WHATWG parsing removes ASCII tab/newline characters before parsing. Do
-    // the same before checking the written authority so `https://\t/path`
-    // cannot recover into a host and bypass the stricter empty-authority rule.
-    let normalized = if url.contains(['\t', '\n', '\r']) {
-        Cow::Owned(
-            url.chars()
-                .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
-                .collect::<String>(),
-        )
-    } else {
-        Cow::Borrowed(url)
-    };
-    // `url` correctly follows browser recovery rules, under which
-    // `https:///path` becomes `https://path/`. Server-authored OSC links keep
-    // the stricter existing contract: an authority must actually be written.
-    let (_, raw_authority) = normalized.split_once("://")?;
-    if raw_authority.starts_with(['/', '\\', '?', '#']) {
-        return None;
-    }
-    let parsed = Url::parse(&normalized).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https" | "ftp") {
-        return None;
-    }
-    match parsed.host()? {
-        Host::Domain(host) => Some(host.to_string()),
-        Host::Ipv4(host) => Some(host.to_string()),
-        Host::Ipv6(host) => Some(host.to_string()),
-    }
+    smudgy_protocol::link_url_host(url)
 }
 
 /// Represents a server, including its configuration and associated directory path.
@@ -308,6 +312,7 @@ fn load_server_config(path: &PathBuf) -> Result<ServerConfig> {
         "Server config validation failed: {}",
         path.display()
     ))?;
+    config.validate_transport()?;
     Ok(config)
 }
 
@@ -390,6 +395,7 @@ pub fn create_server(name: &str, config: ServerConfig) -> Result<Server> {
     config
         .validate()
         .context(format!("Invalid configuration for server '{name}'"))?;
+    config.validate_transport()?;
 
     let server_path = get_smudgy_home()?.join(name);
     if server_path.exists() {
@@ -481,6 +487,7 @@ pub fn update_server(name: &str, new_config: ServerConfig) -> Result<Server> {
     new_config.validate().context(format!(
         "Invalid new configuration provided for server '{name}'"
     ))?;
+    new_config.validate_transport()?;
     let _profile_lifecycle_guard = super::profile::lifecycle_guard(name)?;
 
     let server_path = get_smudgy_home()?.join(name);
@@ -602,7 +609,7 @@ pub fn delete_server_if_unchanged_and_then(
 
 #[cfg(test)]
 mod link_trust_tests {
-    use super::{ServerConfig, link_url_host};
+    use super::{ServerConfig, link_url_host, parse_wss_address};
 
     fn config(hosts: &[&str], all: bool) -> ServerConfig {
         ServerConfig {
@@ -735,5 +742,41 @@ mod link_trust_tests {
         let decoded: ServerConfig = serde_json::from_str(&json).unwrap();
         assert!(!decoded.compression);
         assert!(decoded.accepts_mccp4_compression());
+    }
+
+    #[test]
+    fn wss_address_keeps_the_full_endpoint_and_rejects_unsafe_forms() {
+        assert_eq!(
+            parse_wss_address("wss://last-outpost.com/ws/telnet/?profile=one").unwrap(),
+            ("last-outpost.com".to_owned(), 443)
+        );
+        assert_eq!(
+            parse_wss_address("wss://example.org:8443/play").unwrap(),
+            ("example.org".to_owned(), 8443)
+        );
+        for invalid in [
+            "ws://example.org/play",
+            "wss://user:password@example.org/play",
+            "wss://example.org/play#fragment",
+            "wss://example.org:0/play",
+        ] {
+            assert!(parse_wss_address(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn wss_config_requires_matching_identity_and_certificate_verification() {
+        let mut config = ServerConfig::new("example.org".to_owned(), 443);
+        config.wss_url = Some("wss://example.org/play".to_owned());
+        config.tls = true;
+        assert!(config.validate_transport().is_ok());
+        config.port = 8443;
+        assert!(config.validate_transport().is_err());
+        config.port = 443;
+        config.tls = false;
+        assert!(config.validate_transport().is_err());
+        config.tls = true;
+        config.tls_verify = false;
+        assert!(config.validate_transport().is_err());
     }
 }

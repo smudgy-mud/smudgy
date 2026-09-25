@@ -1,0 +1,30 @@
+[package]
+name = "smudgy_ui_shared"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+web-audio-cpal = []
+
+[dependencies]
+arc-swap = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }
+encoding_rs = "0.8"
+iced = { workspace = true }
+iced_runtime = { workspace = true }
+log = { workspace = true }
+regex = { workspace = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true }
+smallvec = { workspace = true }
+smudgy_protocol = { workspace = true }
+smudgy_theme = { workspace = true }
+smudgy_session_model = { workspace = true }
+unicode-segmentation = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }

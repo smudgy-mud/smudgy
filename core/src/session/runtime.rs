@@ -1,5 +1,10 @@
 use anyhow::Result;
 use smudgy_cloud::Mapper;
+use smudgy_session_model::input_policy::redact;
+use smudgy_session_model::send_failure::{
+    ConnectionIntent as SendConnectionIntent, ReconnectState, SendFailureAction,
+    decide as decide_send_failure,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
@@ -195,10 +200,6 @@ impl LineRouting {
 /// `pending_line_operations`.
 pub(crate) type SharedLineRouting = Rc<RefCell<LineRouting>>;
 
-/// Fixed-width mask substituted for each redacted secret in echoed/logged output.
-/// Fixed width so it doesn't leak the secret's length.
-const REDACTION_MASK: &str = "********";
-
 /// What the main pane currently contains from a fragmented inbound logical line.
 ///
 /// The row ledger describes the terminal's physical tail. This state describes the
@@ -237,19 +238,6 @@ impl MainPrefixDisposition {
     fn defers_partial_main(self) -> bool {
         matches!(self, Self::CommittedGap | Self::Incomplete)
     }
-}
-
-/// Replaces every (non-empty) literal `redactions` substring in `text` with
-/// [`REDACTION_MASK`]. Used to keep secrets (e.g. a substituted `$PASSWORD`) out of
-/// the client's view and the session log while still sending them to the server.
-fn redact(text: &str, redactions: &[String]) -> String {
-    let mut out = text.to_string();
-    for secret in redactions {
-        if !secret.is_empty() {
-            out = out.replace(secret.as_str(), REDACTION_MASK);
-        }
-    }
-    out
 }
 
 /// Stop accepting external work and terminally fail any tooltip resolutions
@@ -3343,19 +3331,28 @@ impl Inner<'_> {
             }
             None => subject,
         };
-        let mut dial_now = false;
-        let kind = if self.send_failure_pending() {
-            // An attempt is already asked for or under way: this row joins the
-            // ones waiting on it.
-            SendFailureKind::Reconnecting
-        } else if !(self.connect_intent && self.reconnect_on_send_error) || self.auto_redial_spent {
-            SendFailureKind::NotConnected
+        let reconnect_state = if self.send_failure_pending() {
+            ReconnectState::Pending
+        } else if self.auto_redial_spent {
+            ReconnectState::Spent
         } else if matches!(self.dial, Dial::InFlight(_)) {
-            SendFailureKind::Connecting
+            ReconnectState::Connecting
         } else {
-            self.auto_redial_spent = true;
-            dial_now = true;
-            SendFailureKind::Reconnecting
+            ReconnectState::Idle
+        };
+        let action = decide_send_failure(
+            SendConnectionIntent::from_bool(self.connect_intent),
+            self.reconnect_on_send_error,
+            reconnect_state,
+        );
+        let (kind, dial_now) = match action {
+            SendFailureAction::JoinReconnect => (SendFailureKind::Reconnecting, false),
+            SendFailureAction::ReportNotConnected => (SendFailureKind::NotConnected, false),
+            SendFailureAction::ReportConnecting => (SendFailureKind::Connecting, false),
+            SendFailureAction::Reconnect => {
+                self.auto_redial_spent = true;
+                (SendFailureKind::Reconnecting, true)
+            }
         };
         self.push_send_failure_row(kind, subject);
         if let Some(future) = self.flush_buffer_updates()? {

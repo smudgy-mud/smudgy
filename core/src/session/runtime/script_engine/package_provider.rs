@@ -82,6 +82,8 @@ pub enum CapRefusal {
     /// above this smudgy. Carries the newest such candidate's
     /// [`SmudgyVersionFloor::refusal`](shared_packages::SmudgyVersionFloor::refusal) reason.
     NeedsNewerSmudgy(String),
+    /// All enumerated versions are web-only (or depend on a web-only package).
+    UnsupportedTarget,
     /// No candidate version could be enumerated at all. The causes are alternatives: the
     /// specifier doesn't parse; the cloud doesn't know the package (never published, deleted,
     /// or a reserved owner such as a stale `smudgy://local/…` install whose folder is gone) or
@@ -1339,6 +1341,9 @@ impl SmudgyPackageProvider {
         // package's consent record. Their on-disk manifest is authoritative and the engine
         // builds their sandbox grant from the live local closure.
         if let Some((local_key, local)) = self.local_override(&key) {
+            if !local.manifest.target.supports_native() {
+                return Err(CapRefusal::UnsupportedTarget);
+            }
             let state_specifier = Self::local_state_specifier(&local.name);
             let pin = self
                 .lock
@@ -1398,7 +1403,7 @@ impl SmudgyPackageProvider {
                 // Offline, or signed out and the package isn't public (the anonymous viewer
                 // can't see it): we can't shop for a newer version, so fall back to the last
                 // version we resolved. The closure gate below still applies: cached
-                // metadata can prove a permission or version-floor mismatch while the
+                // metadata can prove a permission, version-floor, or target mismatch while the
                 // cloud is down and will keep that version blocked. Nodes whose metadata is
                 // unavailable retain the legacy best-effort fold; the sandbox still grants no
                 // more than the user's persisted consent.
@@ -1416,8 +1421,13 @@ impl SmudgyPackageProvider {
         // the actionable refusal ("update smudgy") when nothing loads.
         let running = shared_packages::running_smudgy_release();
         let mut floor_refusal: Option<String> = None;
+        let mut saw_native_candidate = false;
         for candidate in candidates {
-            let (union, floor) = self.closure_union_for(&key, &candidate).await;
+            let (union, floor, native_compatible) = self.closure_union_for(&key, &candidate).await;
+            if !native_compatible {
+                continue;
+            }
+            saw_native_candidate = true;
             if !union.is_within(consented) {
                 continue;
             }
@@ -1429,10 +1439,15 @@ impl SmudgyPackageProvider {
             }
             return Ok(candidate);
         }
-        Err(floor_refusal.map_or(CapRefusal::Permissions, CapRefusal::NeedsNewerSmudgy))
+        if !saw_native_candidate {
+            Err(CapRefusal::UnsupportedTarget)
+        } else {
+            Err(floor_refusal.map_or(CapRefusal::Permissions, CapRefusal::NeedsNewerSmudgy))
+        }
     }
 
-    /// The deno-native permission union and `min_smudgy_version` floor over the closure rooted
+    /// The deno-native permission union, `min_smudgy_version` floor, and native-target
+    /// compatibility over the closure rooted
     /// at `root_key@root_version` — the same fold [`solve_closure`](Self::solve_closure) does,
     /// but for a *specific* root version and without mutating solve state, so
     /// [`cap_version`](Self::cap_version) can evaluate candidate versions. Best-effort (a dep
@@ -1444,9 +1459,14 @@ impl SmudgyPackageProvider {
         &self,
         root_key: &PackageKey,
         root_version: &str,
-    ) -> (PackagePermissions, shared_packages::SmudgyVersionFloor) {
+    ) -> (
+        PackagePermissions,
+        shared_packages::SmudgyVersionFloor,
+        bool,
+    ) {
         let mut union = PackagePermissions::default();
         let mut floor = shared_packages::SmudgyVersionFloor::default();
+        let mut native_compatible = true;
         let mut seen: HashSet<(PackageKey, String)> = HashSet::new();
         let mut stack: Vec<(PackageKey, String)> =
             vec![(root_key.clone(), root_version.to_string())];
@@ -1460,6 +1480,7 @@ impl SmudgyPackageProvider {
                 continue;
             }
             if let Some(manifest) = meta.manifest {
+                native_compatible &= manifest.target.supports_native();
                 union.merge(&manifest.permissions);
                 floor.fold(&key.name, manifest.min_smudgy_version.as_deref());
             }
@@ -1473,7 +1494,7 @@ impl SmudgyPackageProvider {
                 }
             }
         }
-        (union, floor)
+        (union, floor, native_compatible)
     }
 
     /// The fold of [`closure_union_for`](Self::closure_union_for) computed **entirely
@@ -1492,10 +1513,15 @@ impl SmudgyPackageProvider {
         &self,
         root_key: &PackageKey,
         root_version: &str,
-    ) -> Option<(PackagePermissions, shared_packages::SmudgyVersionFloor)> {
+    ) -> Option<(
+        PackagePermissions,
+        shared_packages::SmudgyVersionFloor,
+        bool,
+    )> {
         let cache = self.disk_cache.as_ref()?;
         let mut union = PackagePermissions::default();
         let mut floor = shared_packages::SmudgyVersionFloor::default();
+        let mut native_compatible = true;
         let mut seen: HashSet<(PackageKey, String)> = HashSet::new();
         let mut stack: Vec<(PackageKey, String)> =
             vec![(root_key.clone(), root_version.to_string())];
@@ -1510,6 +1536,7 @@ impl SmudgyPackageProvider {
                 continue;
             }
             let meta = cache.read_meta(&key, &version)?;
+            native_compatible &= meta.manifest.target.supports_native();
             union.merge(&meta.manifest.permissions);
             floor.fold(&key.name, meta.manifest.min_smudgy_version.as_deref());
             for dep in meta
@@ -1522,7 +1549,7 @@ impl SmudgyPackageProvider {
                 }
             }
         }
-        Some((union, floor))
+        Some((union, floor, native_compatible))
     }
 
     /// Each top-level install's `(specifier, declared params)`, collected by the last
@@ -1564,11 +1591,15 @@ impl SmudgyPackageProvider {
     }
 }
 
-/// Why `manifest`'s own `min_smudgy_version` floor refuses to run on this smudgy, if it
-/// does — the single-manifest form of the closure fold in `closure_union_for`, used where a
+/// Why `manifest` refuses to run on this native build, if it does. Checks both its
+/// declared target and its `min_smudgy_version` floor. This is the single-manifest
+/// form of the closure fold in `closure_union_for`, used where a
 /// package is gated one manifest at a time (each closure member passes through
 /// `resolve_package` itself, so per-manifest checks still cover the whole closure).
-fn manifest_floor_refusal(name: &str, manifest: &PackageManifest) -> Option<String> {
+fn manifest_native_refusal(name: &str, manifest: &PackageManifest) -> Option<String> {
+    if !manifest.target.supports_native() {
+        return Some(format!("package '{name}' targets the web build only"));
+    }
     let mut floor = shared_packages::SmudgyVersionFloor::default();
     floor.fold(name, manifest.min_smudgy_version.as_deref());
     floor.refusal(&shared_packages::running_smudgy_release())
@@ -1695,6 +1726,11 @@ impl SmudgyPackageProvider {
                 .manifest
                 .as_ref()
                 .expect("local walk metadata always carries its parsed local manifest");
+            if let Some(reason) = manifest_native_refusal(&key.name, manifest) {
+                return Err(PackageError::Other(format!(
+                    "{specifier} not loaded: {reason}"
+                )));
+            }
             self.check_required_params(&specifier, &meta.state_specifier, &manifest.params)?;
             let local = self
                 .try_local_override(requested_key, track)
@@ -1726,7 +1762,7 @@ impl SmudgyPackageProvider {
             // gate — but under a possibly NEWER smudgy since downgraded, so re-check
             // the cached manifest's floor before serving (the same guard the offline
             // fallback below applies).
-            if let Some(reason) = manifest_floor_refusal(&key.name, &package.manifest) {
+            if let Some(reason) = manifest_native_refusal(&key.name, &package.manifest) {
                 return Err(PackageError::Other(format!(
                     "{specifier} not loaded: {reason}"
                 )));
@@ -1777,7 +1813,8 @@ impl SmudgyPackageProvider {
                         // The disk cache was written by a resolve that passed the version-floor
                         // gate — but under a possibly NEWER smudgy since downgraded, so re-check
                         // the cached manifest's floor before serving it.
-                        if let Some(reason) = manifest_floor_refusal(&key.name, &package.manifest) {
+                        if let Some(reason) = manifest_native_refusal(&key.name, &package.manifest)
+                        {
                             return Err(PackageError::Other(format!(
                                 "{specifier} not loaded: {reason}"
                             )));
@@ -1831,7 +1868,7 @@ impl SmudgyPackageProvider {
         // too-new package pulled in transitively (its dep edges carry locked versions the
         // pre-pass gates don't walk) is refused with a clear reason instead of evaluating
         // against script APIs this smudgy doesn't have.
-        if let Some(reason) = manifest_floor_refusal(&key.name, &manifest) {
+        if let Some(reason) = manifest_native_refusal(&key.name, &manifest) {
             return Err(PackageError::Other(format!(
                 "{specifier} not loaded: {reason}"
             )));
@@ -2257,7 +2294,7 @@ mod tests {
             &provider,
             "Work",
             &ui_tx,
-            crate::session::SessionId(1),
+            crate::session::SessionId::from(1),
             &std::rc::Rc::downgrade(&emitted),
         );
         assert!(
@@ -2901,6 +2938,85 @@ mod tests {
             .cap_version("smudgy://local/duo", &PackagePermissions::default())
             .await;
         assert_eq!(capped, Err(CapRefusal::NoVersions));
+    }
+
+    #[tokio::test]
+    async fn native_version_cap_holds_back_a_web_only_update() {
+        let registry = spawn_registry(&[MockPackage {
+            owner: "wbk",
+            name: "app",
+            version: "2.0.0",
+            manifest_extra: r#", "target":"web""#,
+            deps: &[],
+            body: "export const web = true;",
+        }]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().unwrap();
+        provider.disk_cache = Some(warm_cache(
+            dir.path(),
+            &pkg_key("app"),
+            "1.0.0",
+            "",
+            "export const native = true;",
+            &[],
+        ));
+        let entry = staged_lock_entry(
+            provider.disk_cache.as_ref().unwrap(),
+            "smudgy://wbk/app",
+            "1.0.0",
+        );
+        persist_installed_entry(&provider, entry);
+
+        assert_eq!(
+            provider
+                .cap_version("smudgy://wbk/app", &PackagePermissions::default())
+                .await,
+            Ok("1.0.0".to_owned()),
+        );
+        assert!(
+            provider
+                .closure_union_from_cache(&pkg_key("app"), "1.0.0")
+                .unwrap()
+                .2
+        );
+
+        let web_only = provider
+            .fetch_wire(&pkg_key("app"), Some("2.0.0"))
+            .await
+            .unwrap();
+        assert_eq!(web_only.version, "2.0.0");
+        assert!(
+            provider
+                .resolve_package(&pkg_key("app"), None)
+                .await
+                .is_ok(),
+            "the staged native version still loads"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_only_package_is_not_evaluated_by_native() {
+        let registry = spawn_registry(&[MockPackage {
+            owner: "wbk",
+            name: "webapp",
+            version: "1.0.0",
+            manifest_extra: r#", "target":"web""#,
+            deps: &[],
+            body: "throw new Error('must not run natively');",
+        }]);
+        let provider = provider_for(&registry);
+        assert_eq!(
+            provider
+                .cap_version("smudgy://wbk/webapp", &PackagePermissions::default())
+                .await,
+            Err(CapRefusal::UnsupportedTarget),
+        );
+        let error = provider
+            .resolve_package(&pkg_key("webapp"), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("web build only"));
+        assert!(provider.loaded_packages().is_empty());
     }
 
     fn util_req(version: &str, is_pin: bool) -> DepRequirement {
@@ -3992,9 +4108,10 @@ mod tests {
         );
         persist_installed_entry(&provider, entry);
 
-        let (union, floor) = provider
+        let (union, floor, native_compatible) = provider
             .closure_union_from_cache(&pkg_key("app"), "1.2.0")
             .expect("a fully cached closure folds");
+        assert!(native_compatible);
         assert_eq!(
             union.net,
             vec!["example.com".to_string()],

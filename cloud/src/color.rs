@@ -1,8 +1,5 @@
 //! Panic-safe CSS color parsing.
 
-use std::panic::{self, AssertUnwindSafe};
-use std::str::FromStr;
-
 /// Parses a CSS-style color string (`#rrggbb`, `rgb(..)`, `hsl(..)`, named
 /// colors, ...) into an iced color, treating anything unparseable as
 /// "not a color".
@@ -16,40 +13,12 @@ use std::str::FromStr;
 /// reported as `None` like any other parse failure.
 #[must_use]
 pub fn parse_css_color(color: &str) -> Option<iced::Color> {
-    if color.is_empty() {
-        return None;
-    }
-
-    // `color_art` accepts `#rgba`/`#rrggbbaa` but silently discards the alpha digits
-    // (`parsed.alpha()` reports 1.0), so hex-with-alpha spellings peel the alpha off here
-    // and delegate the plain-hex remainder.
-    if let Some(hex) = color.strip_prefix('#')
-        && matches!(hex.len(), 4 | 8)
-        && hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        let (rgb, alpha) = hex.split_at(hex.len() - hex.len() / 4);
-        let alpha = u8::from_str_radix(alpha, 16).ok()?;
-        // A single alpha nibble expands like CSS short hex: `x` means `xx`.
-        let alpha = if hex.len() == 4 { alpha * 17 } else { alpha };
-        let base = parse_css_color(&format!("#{rgb}"))?;
-        return Some(iced::Color {
-            a: f32::from(alpha) / 255.0,
-            ..base
-        });
-    }
-
-    let parsed = panic::catch_unwind(AssertUnwindSafe(|| color_art::Color::from_str(color).ok()))
-        .ok()
-        .flatten()?;
-
-    #[allow(clippy::cast_possible_truncation)]
-    let alpha = parsed.alpha() as f32;
-
+    let parsed = smudgy_protocol::css_color::parse_css_color(color)?;
     Some(iced::Color::from_rgba8(
-        parsed.red(),
-        parsed.green(),
-        parsed.blue(),
-        alpha,
+        parsed.red,
+        parsed.green,
+        parsed.blue,
+        parsed.alpha,
     ))
 }
 

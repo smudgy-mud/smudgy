@@ -42,7 +42,7 @@ mod images;
 mod package_requirements;
 mod package_update_checker;
 mod pane_drag;
-mod pane_groups;
+pub use smudgy_ui_shared::pane_groups;
 pub mod prefs;
 mod session_store;
 pub mod terminal_buffer;

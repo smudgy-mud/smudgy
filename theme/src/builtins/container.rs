@@ -157,7 +157,7 @@ pub fn notice(theme: &Theme) -> container::Style {
 }
 
 /// Pane title bar: a faint text-color tint that marks the drag-handle band
-/// of a pane_grid pane without competing with the pane body. Derived from the
+/// of a `pane_grid` pane without competing with the pane body. Derived from the
 /// palette so it stays visible when the user remaps the theme colors.
 #[must_use]
 pub fn pane_title_bar(theme: &Theme) -> container::Style {

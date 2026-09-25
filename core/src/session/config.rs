@@ -892,6 +892,7 @@ fn connect_action_from_snapshot(
     RuntimeAction::Connect {
         host: server.config.host.into(),
         port: server.config.port,
+        wss_url: server.config.wss_url.map(Arc::new),
         send_on_connect,
         send_on_connect_redactions: Arc::new(send_on_connect_redactions),
         encoding: server.config.encoding.map(Arc::new),

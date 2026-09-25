@@ -144,6 +144,7 @@ def main() -> None:
     workspace = load_toml("Cargo.toml")
     about = load_toml("about.toml")
     ui = load_toml("ui/Cargo.toml")
+    ui_shared = load_toml("ui_shared/Cargo.toml")
     core = load_toml("core/Cargo.toml")
     script = load_toml("script/Cargo.toml")
     audio = load_toml("audio/Cargo.toml")
@@ -256,6 +257,12 @@ def main() -> None:
     require_feature(core, "web-audio-cpal", {"web-audio"}, crate="smudgy_core")
     require_feature(ui, "web-audio", {"smudgy_core/web-audio"}, crate="smudgy_ui")
     require_feature(
+        ui_shared,
+        "web-audio-cpal",
+        set(),
+        crate="smudgy_ui_shared",
+    )
+    require_feature(
         ui,
         "web-audio-cpal",
         {
@@ -264,6 +271,7 @@ def main() -> None:
             "dep:smudgy_audio",
             "dep:smudgy_audio_web",
             "smudgy_audio/physical-output",
+            "smudgy_ui_shared/web-audio-cpal",
         },
         crate="smudgy_ui",
     )

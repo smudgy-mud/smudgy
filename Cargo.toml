@@ -1,6 +1,23 @@
 [workspace]
-members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "inspector", "audio", "audio_web"]
-# Everything except `inspector`, `scriptref`, and the internal `audio_web` integration crate.
+members = [
+    "ui",
+    "core",
+    "cloud",
+    "i18n",
+    "map_widget",
+    "bench",
+    "script",
+    "inspector",
+    "audio",
+    "audio_web",
+    "protocol",
+    "engine",
+    "session_model",
+    "ui_shared",
+    "web",
+]
+# Desktop and shared crates only. The browser experiment (`web`),
+# `inspector`, `scriptref`, and the internal `audio_web` integration crate stay opt-in.
 # This leaves exactly one bin target (ui's
 # `smudgy`) in the default set, so a bare `cargo run` / `cargo build` / `cargo
 # test` resolves to the app without needing `-p` or `--bin`. `inspector` is a
@@ -11,7 +28,18 @@ members = ["ui", "core", "cloud", "i18n", "map_widget", "bench", "script", "insp
 # `scriptref` (`smudgy_scriptref`) is likewise a standalone dev tool — the script
 # API reference generator/publisher — excluded for the same reason; run it with
 # `cargo run -p smudgy_scriptref`.
-default-members = ["ui", "core", "cloud", "map_widget", "bench", "script", "audio"]
+default-members = [
+    "ui",
+    "core",
+    "cloud",
+    "map_widget",
+    "bench",
+    "script",
+    "audio",
+    "protocol",
+    "session_model",
+    "ui_shared",
+]
 resolver = "2"
 
 # Define shared dependencies for the workspace
@@ -82,17 +110,25 @@ futures = "0.3"
 regex = "1"
 regex-filtered = "=0.2.1"
 regex-syntax = "0.8"
+unicode-width = "0.2.2"
+unicode-segmentation = "1"
+rustc-hash = "2"
+smallvec = "1"
 aho-corasick = "1.1"
 ordered-float = { version = "4.0", default-features = false }
 smudgy_core = { path = "./core" }
+smudgy_session_model = { path = "./session_model" }
 smudgy_script = { path = "./script" }
 smudgy_theme = { path = "./theme" }
 smudgy_cloud = { path = "./cloud", features = ["cloud"] }
 smudgy_widgets = { path = "./widgets" }
 smudgy_map_widget = { path = "./map_widget" }
-smudgy_i18n = { path = "./i18n" }
+smudgy_i18n = { path = "./i18n", default-features = false }
 smudgy_audio = { path = "./audio" }
 smudgy_audio_web = { path = "./audio_web" }
+smudgy_protocol = { path = "./protocol" }
+smudgy_engine = { path = "./engine" }
+smudgy_ui_shared = { path = "./ui_shared" }
 kira = { version = "0.12.3", default-features = false }
 cpal = { version = "=0.18.2", default-features = false }
 # Web Audio extension. Keep the revision immutable: this is the exact

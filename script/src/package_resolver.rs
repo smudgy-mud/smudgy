@@ -410,6 +410,13 @@ pub fn module_type_for(path: &str) -> deno_core::ModuleType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PackageManifest {
     pub version: String,
+    /// Where this package's Smudgy API usage is supported. Older manifests
+    /// remain native-only; web and both require an explicit author declaration.
+    #[serde(
+        default,
+        skip_serializing_if = "smudgy_session_model::script_target::ScriptTarget::is_native"
+    )]
+    pub target: smudgy_session_model::script_target::ScriptTarget,
     /// A short, human-readable description (surfaced in Discover search + the package page).
     /// The package's *name* is intentionally absent: it is implied by the package's folder name
     /// (and the published namespace), so it can never drift from it. A legacy `name` key in an
@@ -3075,6 +3082,7 @@ mod tests {
         // carried verbatim when present. A list/table column is itself a scalar param.
         let manifest = PackageManifest {
             version: "1.0.0".to_string(),
+            target: Default::default(),
             description: String::new(),
             entry: None,
             min_smudgy_version: None,
@@ -3661,11 +3669,34 @@ mod tests {
         let manifest = PackageManifest::parse(r#"{ "name": "mapper", "version": "1.0.0" }"#)
             .expect("minimal manifest parses");
         assert_eq!(manifest.version, "1.0.0");
+        assert_eq!(
+            manifest.target,
+            smudgy_session_model::script_target::ScriptTarget::Native
+        );
         assert!(manifest.description.is_empty());
         assert!(manifest.dependencies.is_empty());
         assert!(manifest.hosts.is_empty());
         assert!(manifest.params.is_empty());
         assert!(manifest.permissions.is_empty());
+    }
+
+    #[test]
+    fn manifest_target_defaults_native_and_round_trips_web_or_both() {
+        use smudgy_session_model::script_target::ScriptTarget;
+        let native = PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap();
+        assert_eq!(native.target, ScriptTarget::Native);
+        assert!(
+            !serde_json::to_string(&native)
+                .unwrap()
+                .contains("\"target\"")
+        );
+        for target in [ScriptTarget::Web, ScriptTarget::Both] {
+            let mut manifest = native.clone();
+            manifest.target = target;
+            let json = serde_json::to_string(&manifest).unwrap();
+            assert_eq!(PackageManifest::parse(&json).unwrap().target, target);
+        }
+        assert!(PackageManifest::parse(r#"{"version":"1.0.0","target":"future"}"#).is_err());
     }
 
     #[test]

@@ -74,7 +74,7 @@ pub fn borderless(theme: &Theme, status: Status) -> Style {
     };
 
     match status {
-        Status::Active => active,
+        Status::Active | Status::Focused { .. } => active,
         Status::Hovered => Style {
             border: Border {
                 color: theme.styles.general.border,
@@ -83,7 +83,6 @@ pub fn borderless(theme: &Theme, status: Status) -> Style {
             },
             ..active
         },
-        Status::Focused { .. } => active,
         Status::Disabled => Style {
             background: Background::Color(theme.styles.general.overlay_background),
             value: active.placeholder,

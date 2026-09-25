@@ -1,0 +1,16 @@
+[package]
+name = "smudgy_session_model"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+derive_more = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+thiserror = "2.0.12"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }

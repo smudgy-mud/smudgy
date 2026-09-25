@@ -14,6 +14,7 @@
 //! key, a default that doesn't parse for its type) surfaces a message and is not written.
 
 use std::collections::HashSet;
+use std::fmt;
 
 use iced::alignment::Vertical;
 use iced::widget::{
@@ -28,6 +29,7 @@ use smudgy_core::models::shared_packages::{
     PackageParameter, PackagePermissions, ParamKind, ParamOption, SmudgyCapabilities,
     is_local_transport_net_entry, is_windows_pipe_namespace_entry, running_smudgy_release,
 };
+use smudgy_session_model::script_target::ScriptTarget;
 
 use crate::assets::{bootstrap_icons, fonts};
 use crate::theme::builtins::button as button_style;
@@ -43,6 +45,7 @@ use super::{AutomationsWindow, Elem, Event, Message};
 #[derive(Debug, Clone)]
 pub struct ManifestDraft {
     pub version: String,
+    pub target: ScriptTarget,
     pub description: String,
     pub entry: String,
     /// The minimum smudgy version the package runs on (`min_smudgy_version`), or blank for
@@ -85,10 +88,24 @@ pub struct ManifestDraft {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetChoice(ScriptTarget);
+
+impl fmt::Display for TargetChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.0 {
+            ScriptTarget::Native => crate::i18n::ts!("manifest-target-native"),
+            ScriptTarget::Web => crate::i18n::ts!("manifest-target-web"),
+            ScriptTarget::Both => crate::i18n::ts!("manifest-target-both"),
+        })
+    }
+}
+
 impl Default for ManifestDraft {
     fn default() -> Self {
         Self {
             version: String::new(),
+            target: ScriptTarget::Native,
             description: String::new(),
             entry: String::new(),
             min_smudgy_version: String::new(),
@@ -234,6 +251,7 @@ pub enum Cap {
 #[derive(Debug, Clone)]
 pub enum ManifestEdit {
     Version(String),
+    Target(ScriptTarget),
     Description(String),
     Entry(String),
     /// Set `min_smudgy_version` — the minimum smudgy version the package runs on (blank =
@@ -381,6 +399,7 @@ impl ManifestDraft {
     pub fn from_manifest(manifest: &PackageManifest) -> Self {
         Self {
             version: manifest.version.clone(),
+            target: manifest.target,
             description: manifest.description.clone(),
             entry: manifest.entry.clone().unwrap_or_default(),
             min_smudgy_version: manifest.min_smudgy_version.clone().unwrap_or_default(),
@@ -530,6 +549,7 @@ impl ManifestDraft {
 
         Ok(PackageManifest {
             version,
+            target: self.target,
             description: self.description.trim().to_string(),
             entry,
             min_smudgy_version,
@@ -952,6 +972,7 @@ impl AutomationsWindow {
         match edit {
             ManifestEdit::Version(value) => draft.version = value,
             ManifestEdit::Description(value) => draft.description = value,
+            ManifestEdit::Target(value) => draft.target = value,
             ManifestEdit::Entry(value) => draft.entry = value,
             ManifestEdit::MinSmudgyVersion(value) => draft.min_smudgy_version = value,
             ManifestEdit::Importable(value) => draft.importable = value,
@@ -1454,6 +1475,20 @@ impl AutomationsWindow {
             .into(),
         ));
         body = body.push(field_row(
+            crate::i18n::ts!("manifest-runtime-compatibility"),
+            pick_list(
+                [
+                    TargetChoice(ScriptTarget::Native),
+                    TargetChoice(ScriptTarget::Web),
+                    TargetChoice(ScriptTarget::Both),
+                ],
+                Some(TargetChoice(draft.target)),
+                |target| Message::EditManifest(ManifestEdit::Target(target.0)),
+            )
+            .width(Length::Fixed(220.0))
+            .into(),
+        ));
+        body = body.push(field_row(
             crate::i18n::ts!("manifest-entry"),
             text_input(crate::i18n::ts!("manifest-entry-placeholder"), &draft.entry)
                 .on_input(|v| Message::EditManifest(ManifestEdit::Entry(v)))
@@ -1595,6 +1630,12 @@ fn manifest_readonly_body(manifest: &PackageManifest) -> Elem<'_> {
                 manifest.description.trim(),
                 crate::i18n::ts!("manifest-no-description")
             )
+        ),
+        ro_block(
+            crate::i18n::ts!("manifest-runtime-compatibility"),
+            text(TargetChoice(manifest.target).to_string())
+                .size(14.0)
+                .into()
         ),
         ro_block(crate::i18n::ts!("manifest-entry"), entry),
         ro_block(
@@ -3118,6 +3159,7 @@ mod tests {
     fn sample_manifest() -> PackageManifest {
         PackageManifest {
             version: "1.2.3".to_string(),
+            target: Default::default(),
             description: "A test package".to_string(),
             entry: Some("index.ts".to_string()),
             min_smudgy_version: Some("0.3.0".to_string()),

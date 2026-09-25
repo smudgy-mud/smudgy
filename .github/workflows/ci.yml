@@ -50,6 +50,70 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  browser-e2e:
+    name: Browser end-to-end
+    needs: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install pinned Rust and browser target
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+
+      - name: Materialize dependency source patches
+        run: |
+          command -v cargo-patch-crate >/dev/null 2>&1 ||
+            cargo install --locked patch-crate
+          cargo patch-crate --force
+
+      - name: Install Trunk
+        run: |
+          command -v trunk >/dev/null 2>&1 ||
+            cargo install --locked trunk --version 0.21.14
+
+      - name: Install Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install browser test dependencies
+        run: npm ci --prefix web
+
+      - name: Install Chromium and software WebGPU dependencies
+        run: |
+          npx --prefix web playwright install --with-deps chromium
+          sudo apt-get install --yes --no-install-recommends \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            xauth \
+            xvfb
+
+      - name: Build and test browser client
+        working-directory: web
+        env:
+          PLAYWRIGHT_SOFTWARE_WEBGPU: '1'
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' npm run test:e2e
+
+      - name: Upload failure traces
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: browser-e2e-failures
+          path: web/test-results/
+          if-no-files-found: ignore
+
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.mode }})
     needs: fmt
@@ -152,6 +216,22 @@ jobs:
       - name: Check workspace
         if: matrix.mode == 'default'
         run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Install browser target
+        if: matrix.os == 'ubuntu-latest' && matrix.mode == 'default'
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Check browser client
+        if: matrix.os == 'ubuntu-latest' && matrix.mode == 'default'
+        run: cargo check -p smudgy_web_client --target wasm32-unknown-unknown --locked
+
+      - name: Keep the desktop dependency graph browser-free
+        if: matrix.os == 'ubuntu-latest' && matrix.mode == 'default'
+        run: |
+          if cargo tree -p smudgy_ui -e normal --locked | grep -Eq 'smudgy_(engine|web_client) v'; then
+            echo 'Desktop unexpectedly links the browser client or portable engine' >&2
+            exit 1
+          fi
 
       - name: Test workspace
         if: matrix.mode == 'default'

@@ -1,8 +1,8 @@
 //! Benchmarks the bytes-to-`StyledLine` **ingest pipeline** — the canonical
 //! smudgy hot path every inbound socket byte crosses: telnet/IAC
-//! preprocessing (`core/src/session/connection/telnet.rs`), VT/ANSI parsing
-//! (`vtparse` driven by `core/src/session/connection/vt_processor.rs`), and
-//! per-line `StyledLine` construction (`core/src/session/styled_line.rs`),
+//! preprocessing (`protocol/src/telnet.rs`), VT/ANSI parsing
+//! (`vtparse` driven by `protocol/src/vt.rs`), and
+//! per-line `StyledLine` construction (`session_model/src/styled_line.rs`),
 //! composed by `feed_inbound` (`core/src/session/connection.rs`) exactly the
 //! way the connect loop's read path drives it (connection.rs ~232-263: read
 //! up to 64 KiB, `feed_inbound`, flush negotiation replies, then
@@ -21,7 +21,7 @@
 //!   span-vec allocation (`consume_into_pending_line` drains into a fresh
 //!   `Vec` per line), and the `from_utf8_lossy` re-validation of `buf_raw`.
 //! - `sgr/process/*`: the SGR state machine
-//!   (`core/src/session/connection/vt_processor/sgr.rs`) folding
+//!   (`protocol/src/sgr.rs`) folding
 //!   representative `CSI … m` parameter lists — the per-escape style cost.
 //!
 //! Why it matters: this path is the socket-to-display latency floor and the

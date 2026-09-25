@@ -24,7 +24,7 @@ reqwest = { version = "0.12.8", features = ["json"] }
 url = "2"
 tokio = { workspace = true, features = ["rt"] }
 arc-swap = { workspace = true }
-color-art = { workspace = true }
+smudgy_protocol = { workspace = true }
 pathfinding = { workspace = true }
 rstar = "0.12.2"
 sha2 = "0.10"

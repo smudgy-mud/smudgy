@@ -7,265 +7,34 @@
 //! change, and once at startup.
 
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::ArcSwap;
-use iced::{Background, Color, Font};
+use iced::{Color, Font};
 use smudgy_cloud::parse_css_color;
 use smudgy_core::models::settings::{
     CommandInputBehavior, MAX_LINK_TOOLTIP_DELAY_MS, ScriptPalette, Settings, TerminalBoldMode,
     ThemeTweaks,
 };
-use smudgy_core::session::connection::vt_processor::AnsiColor;
 use smudgy_core::session::styled_line::Color as VtColor;
+use smudgy_ui_shared::prefs as shared;
 
 use crate::assets;
 use crate::components::color_picker::Hsv;
 
-pub mod palettes;
-
-/// A named color scheme: the terminal's ANSI palette, default
-/// foreground/background, and the app chrome it implies.
-#[derive(Clone, PartialEq)]
-pub struct TerminalPalette {
-    pub name: &'static str,
-    /// Indexed `[normal 8, bright 8]` in ANSI order (black, red, green,
-    /// yellow, blue, magenta, cyan, white).
-    pub ansi: [Color; 16],
-    /// Default text color (plain server text, SGR 0/39). Distinct from
-    /// `ansi[7]` so light schemes stay readable.
-    pub foreground: Color,
-    /// The terminal/window background; also the zero point of the
-    /// archetypal RGB mapping.
-    pub background: Color,
-    pub echo: Color,
-    pub warn: Color,
-    pub output: Color,
-    pub selection: Color,
-    /// Background of the command-input strip. Its contrast against
-    /// `background` (the terminal behind it) is a deliberate design element —
-    /// every scheme picks this pairing, usually the scheme's companion
-    /// surface color (darker for dark themes, dimmer for light ones).
-    pub input_background: Color,
-    /// Accent for the app theme; `None` falls back to the foreground.
-    pub accent: Option<Color>,
-    /// When true, the app chrome (backgrounds, text, modals…) is derived
-    /// from this palette; false keeps the stock smudgy theme untouched.
-    pub derive_app_theme: bool,
-}
-
-/// Perceptually uniform color used while constructing the themed RGB cube.
-/// Palette colors enter and leave as gamma-encoded sRGB; interpolation happens
-/// here so equal-sized steps are much closer to equal visual changes.
-#[derive(Clone, Copy)]
-struct Oklab {
-    lightness: f32,
-    green_red: f32,
-    blue_yellow: f32,
-}
-
-impl Oklab {
-    #[allow(clippy::excessive_precision)]
-    fn from_srgb(color: Color) -> Self {
-        let red = srgb_to_linear(color.r);
-        let green = srgb_to_linear(color.g);
-        let blue = srgb_to_linear(color.b);
-
-        let long =
-            0.412_221_46_f32.mul_add(red, 0.536_332_55_f32.mul_add(green, 0.051_445_995 * blue));
-        let medium =
-            0.211_903_5_f32.mul_add(red, 0.680_699_5_f32.mul_add(green, 0.107_396_96 * blue));
-        let short =
-            0.088_302_46_f32.mul_add(red, 0.281_718_85_f32.mul_add(green, 0.629_978_7 * blue));
-
-        let long = long.cbrt();
-        let medium = medium.cbrt();
-        let short = short.cbrt();
-
-        Self {
-            lightness: 0.210_454_26_f32.mul_add(
-                long,
-                0.793_617_8_f32.mul_add(medium, -0.004_072_047 * short),
-            ),
-            green_red: 1.977_998_5_f32.mul_add(
-                long,
-                (-2.428_592_2_f32).mul_add(medium, 0.450_593_7 * short),
-            ),
-            blue_yellow: 0.025_904_037_f32.mul_add(
-                long,
-                0.782_771_77_f32.mul_add(medium, -0.808_675_77 * short),
-            ),
-        }
-    }
-
-    #[allow(clippy::excessive_precision)]
-    fn into_srgb(self) -> Color {
-        let long = 0.396_337_78_f32.mul_add(
-            self.green_red,
-            0.215_803_76_f32.mul_add(self.blue_yellow, self.lightness),
-        );
-        let medium = (-0.105_561_346_f32).mul_add(
-            self.green_red,
-            (-0.063_854_17_f32).mul_add(self.blue_yellow, self.lightness),
-        );
-        let short = (-0.089_484_18_f32).mul_add(
-            self.green_red,
-            (-1.291_485_5_f32).mul_add(self.blue_yellow, self.lightness),
-        );
-
-        let long = long.powi(3);
-        let medium = medium.powi(3);
-        let short = short.powi(3);
-
-        let red = 4.076_741_7_f32.mul_add(
-            long,
-            (-3.307_711_6_f32).mul_add(medium, 0.230_969_94 * short),
-        );
-        let green =
-            (-1.268_438_f32).mul_add(long, 2.609_757_4_f32.mul_add(medium, -0.341_319_4 * short));
-        let blue = (-0.004_196_086_3_f32).mul_add(
-            long,
-            (-0.703_418_6_f32).mul_add(medium, 1.707_614_7 * short),
-        );
-
-        Color::from_rgb(
-            linear_to_srgb(red),
-            linear_to_srgb(green),
-            linear_to_srgb(blue),
-        )
-    }
-
-    fn mix(self, other: Self, amount: f32) -> Self {
-        let interpolate = |from: f32, to: f32| (to - from).mul_add(amount, from);
-        Self {
-            lightness: interpolate(self.lightness, other.lightness),
-            green_red: interpolate(self.green_red, other.green_red),
-            blue_yellow: interpolate(self.blue_yellow, other.blue_yellow),
-        }
-    }
-}
-
-fn srgb_to_linear(channel: f32) -> f32 {
-    if channel <= 0.040_45 {
-        channel / 12.92
-    } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn linear_to_srgb(channel: f32) -> f32 {
-    let encoded = if channel <= 0.003_130_8 {
-        12.92 * channel
-    } else {
-        1.055 * channel.powf(1.0 / 2.4) - 0.055
-    };
-    encoded.clamp(0.0, 1.0)
-}
-
-impl TerminalPalette {
-    /// Maps a styled-line color through this palette.
-    #[must_use]
-    pub fn resolve(&self, vt_color: VtColor, theme_extended_colors: bool) -> Color {
-        match vt_color {
-            VtColor::Ansi { color, bold } => {
-                let base = match color {
-                    AnsiColor::Black => 0,
-                    AnsiColor::Red => 1,
-                    AnsiColor::Green => 2,
-                    AnsiColor::Yellow => 3,
-                    AnsiColor::Blue => 4,
-                    AnsiColor::Magenta => 5,
-                    AnsiColor::Cyan => 6,
-                    AnsiColor::White => 7,
-                };
-                self.ansi[base + usize::from(bold) * 8]
-            }
-            VtColor::Rgb { r, g, b } => {
-                if theme_extended_colors {
-                    self.archetypal(r, g, b)
-                } else {
-                    Color::from_rgb8(r, g, b)
-                }
-            }
-            VtColor::Echo => self.echo,
-            VtColor::Warn => self.warn,
-            VtColor::Output => self.output,
-            VtColor::DefaultForeground { bold } => {
-                if bold {
-                    self.bright_default()
-                } else {
-                    self.foreground
-                }
-            }
-            VtColor::DefaultBackground => Color::TRANSPARENT,
-        }
-    }
-
-    /// What `ESC[1m` on plain text renders as: bright white when the scheme
-    /// gives it contrast, otherwise the plain foreground. Several canonical
-    /// light schemes (Solarized Light, Tomorrow) define `ansi15` equal to
-    /// their background — without this guard bolded default text would be
-    /// invisible there.
-    fn bright_default(&self) -> Color {
-        let bright = self.ansi[15];
-        let bg = self.background;
-        let distance = (bright.r - bg.r).abs() + (bright.g - bg.g).abs() + (bright.b - bg.b).abs();
-        if distance < 0.3 {
-            self.foreground
-        } else {
-            bright
-        }
-    }
-
-    /// Archetypal interpretation of a truecolor (and 256-color, which core
-    /// flattens to RGB) value. The eight corners of the server's RGB cube map
-    /// to the theme background and its seven bright ANSI colors; trilinear
-    /// interpolation in OKLab keeps intermediate steps perceptually smooth.
-    /// The theme's bright colors are therefore the output ceiling rather than
-    /// unrestricted sRGB primaries. A bright-white slot too close to the
-    /// background uses the readable default foreground, as bold plain text
-    /// does.
-    #[must_use]
-    pub fn archetypal(&self, r: u8, g: u8, b: u8) -> Color {
-        let red = f32::from(r) / 255.0;
-        let green = f32::from(g) / 255.0;
-        let blue = f32::from(b) / 255.0;
-
-        // Corner order follows the RGB bits: black/background, red, green,
-        // yellow, blue, magenta, cyan, white.
-        let background = Oklab::from_srgb(self.background);
-        let bright_red = Oklab::from_srgb(self.ansi[9]);
-        let bright_green = Oklab::from_srgb(self.ansi[10]);
-        let bright_yellow = Oklab::from_srgb(self.ansi[11]);
-        let bright_blue = Oklab::from_srgb(self.ansi[12]);
-        let bright_magenta = Oklab::from_srgb(self.ansi[13]);
-        let bright_cyan = Oklab::from_srgb(self.ansi[14]);
-        let bright_white = Oklab::from_srgb(self.bright_default());
-
-        let black_red = background.mix(bright_red, red);
-        let green_yellow = bright_green.mix(bright_yellow, red);
-        let blue_magenta = bright_blue.mix(bright_magenta, red);
-        let cyan_white = bright_cyan.mix(bright_white, red);
-        let no_blue = black_red.mix(green_yellow, green);
-        let full_blue = blue_magenta.mix(cyan_white, green);
-
-        no_blue.mix(full_blue, blue).into_srgb()
-    }
-}
+pub use smudgy_ui_shared::palettes;
+pub use smudgy_ui_shared::prefs::NamedTerminalPalette as TerminalPalette;
 
 #[must_use]
 pub fn palettes() -> &'static [&'static TerminalPalette] {
-    &palettes::ALL
+    shared::palettes()
 }
 
 /// Looks a palette up by name, falling back to the default scheme.
 #[must_use]
 pub fn palette_by_name(name: &str) -> &'static TerminalPalette {
-    palettes()
-        .iter()
-        .find(|p| p.name.eq_ignore_ascii_case(name))
-        .copied()
-        .unwrap_or(&palettes::SMUDGY)
+    shared::palette_by_name(name)
 }
 
 /// Font families bundled with the app (always available in the picker).
@@ -284,59 +53,24 @@ pub const BUNDLED_FONT_FAMILIES: &[&str] = &[
     "VT323",
 ];
 
-/// The hot snapshot every terminal view reads per frame.
+/// Desktop snapshot. Shared render fields have one authoritative definition;
+/// native-only settings retain their persisted enum and app-theme metadata.
 #[derive(Clone)]
 pub struct TerminalPrefs {
-    pub font: Font,
-    pub font_size: f32,
-    /// Allow the terminal font's ligature/contextual substitutions. Mirrored
-    /// into the `iced_graphics` shaping registry by [`sync_terminal_ligatures`];
-    /// kept in the snapshot so a toggle bumps `generation` and re-shapes
-    /// every cached paragraph.
-    pub ligatures: bool,
-    /// Whether SGR bold changes font weight, ANSI palette brightness, or both.
-    pub bold_mode: TerminalBoldMode,
-    /// When true, SGR blink is suppressed (at draw time), so it renders as if
-    /// no blink SGR was sent. Deliberately absent from `visually_equal`:
-    /// nothing bakes this into a paragraph, and evaluating it per frame is
-    /// what lets a toggle apply to the text already on screen.
-    pub disable_blink: bool,
-    pub line_height: f32,
-    /// Maximum line length in columns; `None` wraps at the pane width.
-    pub line_length: Option<u16>,
-    /// Hover delay for OSC and script-created link tooltips, in milliseconds.
-    /// This does not affect context-menu opening.
-    pub link_tooltip_delay_ms: u64,
-    /// The effective palette: the chosen base scheme with the user's
-    /// per-theme tweaks applied. Base schemes are never modified.
+    render: shared::TerminalPrefs,
+    /// Effective named palette, including desktop app-chrome metadata.
     pub palette: Arc<TerminalPalette>,
-    /// Whether server-supplied 256-color and truecolor values pass through
-    /// the palette's perceptual cube. False renders those values as literal
-    /// sRGB while leaving named ANSI colors theme-controlled.
-    pub theme_extended_colors: bool,
-    /// What the command input does with the text after a send (and, for the
-    /// default, on focus loss). Non-visual, so it never bumps `generation`.
+    pub bold_mode: TerminalBoldMode,
     pub command_input_behavior: CommandInputBehavior,
-    /// Mask the command input while the server hides echo (telnet `WILL
-    /// ECHO`). Negotiation is answered either way; this only gates whether
-    /// the input masks. Non-visual, so it never bumps `generation`.
-    pub mask_input_on_server_echo: bool,
-    /// Whether Up/Down history-prefix matching is case-sensitive.
-    pub history_case_sensitive_match: bool,
-    /// How many recent commands the Up/Down input history remembers. `0`
-    /// means unlimited (never evict). Read live by `SessionInput`, not
-    /// cached at construction, so a change takes effect immediately.
-    pub max_history: usize,
-    /// Hide pane headers unless the window's toolbar is expanded (the
-    /// distraction-free rule; per-pane `always-show` overrides it). Read per
-    /// frame by the pane-grid view; chrome-level, so it never bumps
-    /// `generation`.
-    pub hide_pane_headers: bool,
-    /// Bumped on every [`apply`]; caches that bake prefs-derived data
-    /// (paragraphs, span colors) key on it.
-    pub generation: u64,
 }
 
+impl Deref for TerminalPrefs {
+    type Target = shared::TerminalPrefs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.render
+    }
+}
 /// The effective terminal palette for `settings`: the chosen base scheme with the user's
 /// per-theme tweaks applied (base schemes are never modified). Shared by [`TerminalPrefs`] and
 /// the script-visible [`script_palette`] so both see identical colors.
@@ -379,27 +113,34 @@ impl TerminalPrefs {
 
     fn from_settings(settings: &Settings, generation: u64) -> Self {
         let font_size = settings.terminal_font_size.clamp(8.0, 40.0);
+        let palette = Arc::new(effective_palette(settings));
+        let bold_mode = settings.terminal_bold_mode;
+        let command_input_behavior = settings.command_input_behavior;
         Self {
-            font: font_for_family(&settings.terminal_font_family),
-            font_size,
-            ligatures: settings.terminal_font_ligatures,
+            render: shared::TerminalPrefs {
+                font: font_for_family(&settings.terminal_font_family),
+                font_size,
+                ligatures: settings.terminal_font_ligatures,
+                bold_mode,
+                disable_blink: settings.terminal_disable_blink,
+                line_height: (font_size * 1.25).round(),
+                // Hand-edited settings.json bypasses the UI's validation.
+                line_length: settings.terminal_line_length.map(|len| len.clamp(20, 1000)),
+                link_tooltip_delay_ms: settings
+                    .link_tooltip_delay_ms
+                    .min(MAX_LINK_TOOLTIP_DELAY_MS),
+                palette: Arc::new(palette.render.clone()),
+                theme_extended_colors: settings.theme_extended_colors,
+                command_input_behavior,
+                mask_input_on_server_echo: settings.mask_input_on_server_echo,
+                history_case_sensitive_match: settings.history_case_sensitive_match,
+                max_history: settings.max_history,
+                hide_pane_headers: settings.hide_pane_headers,
+                generation,
+            },
+            palette,
             bold_mode: settings.terminal_bold_mode,
-            disable_blink: settings.terminal_disable_blink,
-            line_height: (font_size * 1.25).round(),
-            // Clamp here too: hand-edited settings.json bypasses the UI
-            // validation, and 0 columns would shape zero-width paragraphs.
-            line_length: settings.terminal_line_length.map(|len| len.clamp(20, 1000)),
-            link_tooltip_delay_ms: settings
-                .link_tooltip_delay_ms
-                .min(MAX_LINK_TOOLTIP_DELAY_MS),
-            palette: Arc::new(effective_palette(settings)),
-            theme_extended_colors: settings.theme_extended_colors,
             command_input_behavior: settings.command_input_behavior,
-            mask_input_on_server_echo: settings.mask_input_on_server_echo,
-            history_case_sensitive_match: settings.history_case_sensitive_match,
-            max_history: settings.max_history,
-            hide_pane_headers: settings.hide_pane_headers,
-            generation,
         }
     }
 }
@@ -549,6 +290,7 @@ pub fn apply_tweaks(base: &TerminalPalette, tweaks: &ThemeTweaks) -> TerminalPal
 static PREFS: LazyLock<ArcSwap<TerminalPrefs>> = LazyLock::new(|| {
     let prefs = TerminalPrefs::from_settings(&Settings::default(), 0);
     sync_terminal_ligatures(None, &prefs.font, prefs.ligatures);
+    publish_shared_terminal_prefs(&prefs);
     ArcSwap::from_pointee(prefs)
 });
 
@@ -599,27 +341,16 @@ pub fn apply(settings: &Settings) {
         && *next.palette == *current.palette
         && next.theme_extended_colors == current.theme_extended_colors;
     if !visually_equal {
-        next.generation = current.generation + 1;
+        next.render.generation = current.generation + 1;
     }
     publish_markdown_colors(&next.palette);
+    publish_shared_terminal_prefs(&next);
     PREFS.store(Arc::new(next));
 }
 
-/// Serialize tests that call [`apply`] against the process-wide `PREFS`
-/// global, as `cargo test` runs tests in parallel threads within one process.
-/// Only tests that actually call `apply` need this; reading [`current`]
-/// against the untouched default (as most tests already do, e.g.
-/// `command_input_behavior` assertions elsewhere) needs no lock.
-#[cfg(test)]
-static PREFS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
-pub(crate) fn lock_prefs_test() -> std::sync::MutexGuard<'static, ()> {
-    PREFS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn publish_shared_terminal_prefs(prefs: &TerminalPrefs) {
+    shared::set_current(prefs.render.clone());
 }
-
 /// Resolves the Markdown-widget colors for the effective palette and publishes
 /// them to `smudgy_theme`. `smudgy_widgets` renders Markdown but can't reach the
 /// terminal scheme (this crate depends on it, not the reverse), so the colors
@@ -675,11 +406,11 @@ pub fn font_for_family(family: &str) -> Font {
 }
 
 /// Linear per-channel blend from `a` toward `b` (alpha kept from `a`).
-fn mix(a: Color, b: Color, t: f32) -> Color {
+fn mix(a: Color, b: Color, amount: f32) -> Color {
     Color {
-        r: (b.r - a.r).mul_add(t, a.r),
-        g: (b.g - a.g).mul_add(t, a.g),
-        b: (b.b - a.b).mul_add(t, a.b),
+        r: (b.r - a.r).mul_add(amount, a.r),
+        g: (b.g - a.g).mul_add(amount, a.g),
+        b: (b.b - a.b).mul_add(amount, a.b),
         a: a.a,
     }
 }
@@ -691,38 +422,7 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 #[must_use]
 pub fn app_theme() -> smudgy_theme::Theme {
     let prefs = current();
-    let palette = &prefs.palette;
-    let mut theme = smudgy_theme::smudgy();
-    if !palette.derive_app_theme {
-        // Stock chrome — but the surfaces still follow the (possibly
-        // tweaked) palette, since the terminal renders transparently over
-        // the window background. Untweaked, these equal the stock values.
-        theme.styles.general.background = palette.background;
-        theme.styles.general.input_background = palette.input_background;
-        return theme;
-    }
-
-    let bg = palette.background;
-    let fg = palette.foreground;
-
-    theme.styles.general.background = bg;
-    theme.styles.general.container_background = mix(bg, fg, 0.05);
-    theme.styles.general.border = mix(bg, fg, 0.18);
-    theme.styles.general.rule = mix(bg, fg, 0.14);
-    theme.styles.general.overlay_background = Color { a: 0.9, ..bg };
-    theme.styles.general.accent = palette.accent.unwrap_or(fg);
-
-    theme.styles.text.normal = fg;
-    theme.styles.text.success = palette.ansi[2];
-    theme.styles.text.error = palette.ansi[1];
-
-    theme.styles.general.input_background = palette.input_background;
-    theme.styles.general.input_text = fg;
-
-    theme.styles.modal.title_bar_background = Background::Color(mix(bg, fg, 0.10));
-    theme.styles.modal.body_background = Background::Color(mix(bg, fg, 0.04));
-
-    theme
+    shared::app_theme_for_palette(&prefs.palette)
 }
 
 #[cfg(test)]
@@ -786,6 +486,45 @@ mod tests {
             palette.resolve(source, true),
             Color::from_rgb8(95, 135, 175)
         );
+    }
+
+    #[test]
+    fn every_named_palette_uses_the_shared_render_snapshot() {
+        use smudgy_core::session::styled_line::Color as VtColor;
+
+        for palette in palettes() {
+            let settings = Settings {
+                theme: palette.name.to_owned(),
+                theme_extended_colors: true,
+                ..Settings::default()
+            };
+            let prefs = TerminalPrefs::from_settings(&settings, 0);
+            assert_eq!(prefs.palette.name, palette.name);
+            assert!(prefs.render.palette.as_ref() == &prefs.palette.render);
+            for color in [
+                VtColor::Echo,
+                VtColor::Warn,
+                VtColor::Output,
+                VtColor::DefaultForeground { bold: true },
+                VtColor::Rgb {
+                    r: 95,
+                    g: 135,
+                    b: 175,
+                },
+            ] {
+                assert_eq!(prefs.resolve(color.clone()), prefs.render.resolve(color));
+            }
+        }
+    }
+
+    #[test]
+    fn native_initialization_publishes_defaults_to_shared_widgets() {
+        let native = super::current();
+        let shared = smudgy_ui_shared::prefs::current();
+        assert!(shared.theme_extended_colors);
+        assert_eq!(native.theme_extended_colors, shared.theme_extended_colors);
+        assert!(native.palette.render == *shared.palette);
+        assert_eq!(native.generation, shared.generation);
     }
 
     #[test]

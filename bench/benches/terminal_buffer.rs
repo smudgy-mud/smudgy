@@ -2,7 +2,7 @@
 //! span baking), the layer every line of server output crosses between the
 //! session runtime and the renderer.
 //!
-//! What it measures (all in `ui/src/terminal_buffer.rs`):
+//! What it measures (implemented in `ui_shared/src/terminal_buffer.rs`):
 //!   - `extend_line/{whole_lines,frag4,frag16}`: one corpus pass into a fresh
 //!     `TerminalBuffer`, fed as whole lines vs. 4/16 network-fragment slices
 //!     per line. For an OPEN line, `TerminalBuffer::extend_line` deep-copies
@@ -274,6 +274,15 @@ fn terminal_buffer(c: &mut Criterion) {
     // headless, the LazyLock self-initializes from `Settings::default()` on
     // this first call — no window, no settings file.
     let prefs = smudgy_ui::prefs::current();
+    let shared = smudgy_ui_shared::prefs::current();
+    assert_eq!(
+        prefs.theme_extended_colors, shared.theme_extended_colors,
+        "benchmark must measure the same extended-color policy as native Smudgy"
+    );
+    assert!(
+        prefs.palette.render == *shared.palette,
+        "benchmark must use the native render palette, not the shared fallback"
+    );
 
     // `TerminalBuffer::new()`'s default scrollback limit.
     let capacity = NonZeroUsize::new(10_000).expect("non-zero capacity");

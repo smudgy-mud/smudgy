@@ -11,11 +11,13 @@ use iced::{
     window,
 };
 use smudgy_cloud::{AreaId, Mapper};
+use smudgy_core::models::profile::{DEFAULT_PROFILE_NAME, ensure_default_profile};
 use smudgy_core::models::shared_packages::LockedPackage;
 use smudgy_core::session::SessionId;
 use smudgy_core::session::runtime::pane::{
     MAIN_PANE_KEY, PaneKey, PanePlacement, SplitDirection, TabPosition, TitleBarPolicy,
 };
+pub use smudgy_session_model::pane::PaneRef;
 
 use rustc_hash::FxHashMap;
 
@@ -292,16 +294,6 @@ pub enum Event {
     ResetSessionLayout(SessionId),
 }
 
-/// Grid payload: a reference into the daemon's session store identifying
-/// which session pane fills this slot. `key == MAIN_PANE_KEY` is the
-/// session's fused output+input pane; any other key is a script-created pane
-/// whose display state lives in the session's pane map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PaneRef {
-    pub session_id: SessionId,
-    pub key: PaneKey,
-}
-
 /// Identify the one input a tab selection displaced. Script selection only
 /// blurs a pane actually obscured by the tab change; an ordinary chrome
 /// re-selection also releases the prior focus group when activation moves.
@@ -574,8 +566,7 @@ fn direction_axis(direction: SplitDirection) -> (pane_grid::Axis, bool) {
     }
 }
 
-/// The pane_grid axis (and new-first flag) for a body-edge drop region.
-/// `Center` never reaches a split; the arm exists for totality only.
+/// The pane-grid axis and child order for a body-edge placement.
 fn split_axis(region: DropRegion) -> (pane_grid::Axis, bool) {
     match region {
         DropRegion::Left => (pane_grid::Axis::Vertical, true),
@@ -2331,11 +2322,16 @@ impl SmudgyWindow {
         slot: usize,
         sessions: &mut SessionStore,
     ) -> Option<Task<Message>> {
-        let owner = self.layout.group_of(tab)?;
-        if !self.layout.merge_tab(tab, group, slot) {
-            return None;
-        }
-        if owner == group {
+        let effect = smudgy_ui_shared::pane_workspace::apply_local_drop(
+            &mut self.layout,
+            tab,
+            pane_drag::DragAction::Merge { group, slot },
+            None,
+        )?;
+        if matches!(
+            effect,
+            smudgy_ui_shared::pane_workspace::DropEffect::Reordered { .. }
+        ) {
             // Strip order is group content: the grid configuration carries
             // group ids and needs no rebuild — the keyed body host re-pairs
             // each subtree with its moved tab on the next view. The order is
@@ -2362,9 +2358,12 @@ impl SmudgyWindow {
         region: DropRegion,
         sessions: &mut SessionStore,
     ) -> Option<Task<Message>> {
-        let (axis, new_first) = split_axis(region);
-        self.layout
-            .split_tab_as_singleton(tab, group, axis, new_first, SplitSizing::Ratio(0.5))?;
+        smudgy_ui_shared::pane_workspace::apply_local_drop(
+            &mut self.layout,
+            tab,
+            pane_drag::DragAction::Split { group, region },
+            None,
+        )?;
         self.mark_grid_dirty();
         Some(self.select_tab(tab, sessions))
     }
@@ -2379,25 +2378,12 @@ impl SmudgyWindow {
         side: GridEdgeSide,
         sessions: &mut SessionStore,
     ) -> Option<Task<Message>> {
-        let moved = self.layout.remove_tab(tab)?;
-        // The binding entry survives the round trip: the tab keeps its id
-        // and its pane, only its leaf moves.
-        let result = match side {
-            GridEdgeSide::Left => self.layout.insert_cluster_front(moved),
-            GridEdgeSide::Right => self.layout.push_cluster(moved),
-            GridEdgeSide::Top => self
-                .layout
-                .wrap_all(pane_grid::Axis::Horizontal, true, moved),
-            GridEdgeSide::Bottom => self
-                .layout
-                .wrap_all(pane_grid::Axis::Horizontal, false, moved),
-        };
-        if let Err(rejected) = result {
-            // Unreachable (the tab was just removed, so it is admissible);
-            // re-host rather than lose it.
-            debug_assert!(false, "grid-edge re-hosting rejected a detached tab");
-            self.host_as_cluster(rejected);
-        }
+        smudgy_ui_shared::pane_workspace::apply_local_drop(
+            &mut self.layout,
+            tab,
+            pane_drag::DragAction::GridEdge(side),
+            None,
+        )?;
         self.mark_grid_dirty();
         Some(self.select_tab(tab, sessions))
     }
@@ -2686,6 +2672,18 @@ impl SmudgyWindow {
         auto_connect: bool,
         sessions: &mut SessionStore,
     ) -> Task<Message> {
+        // The first quick connection creates one ordinary profile. Keeping
+        // it durable gives history and profile-scoped package settings a
+        // stable home while server-wide automations still apply to it.
+        if profile_name == DEFAULT_PROFILE_NAME
+            && let Err(error) = ensure_default_profile(&server_name)
+        {
+            log::error!("Could not open Default profile on {server_name}: {error:#}");
+            if let Some(modal::Modal::Connect(state)) = &mut self.modal {
+                state.set_session_open_error(error.to_string());
+            }
+            return Task::none();
+        }
         let session_id =
             match sessions.open_session(server_name.clone(), profile_name.clone(), auto_connect) {
                 Ok(session_id) => session_id,
@@ -2984,7 +2982,7 @@ impl SmudgyWindow {
                                 keep,
                             })
                         }
-                        modal::layouts::Event::Save { name } => {
+                        modal::layouts::Event::Save { name, .. } => {
                             // The menu stays open: the save outcome (and any
                             // partial-capture annotation) lands back in it.
                             Update::with_event(Event::SaveLayout { server, name })
@@ -3734,6 +3732,14 @@ impl SmudgyWindow {
                             drag_live: drag.live,
                             modifiers: drag.modifiers,
                             visibility_eyes: show_all,
+                            labels: components::tab_strip::StripLabels {
+                                connect: crate::i18n::ts!("session-action-connect"),
+                                reconnect: crate::i18n::ts!("session-action-reconnect"),
+                                disconnect: crate::i18n::ts!("session-action-disconnect"),
+                                close: crate::i18n::ts!("pane-tab-close"),
+                                hide: crate::i18n::ts!("pane-tab-hide"),
+                                show: crate::i18n::ts!("pane-tab-show"),
+                            },
                             on_strip_bounds: Box::new(move |bounds| {
                                 self.strip_bands.borrow_mut().insert(group, bounds);
                             }),

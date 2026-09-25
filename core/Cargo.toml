@@ -14,6 +14,8 @@ serde = { workspace = true }
 # is first-contribution order, and in-place casing updates keep position).
 indexmap = { workspace = true }
 smudgy_cloud = { workspace = true }
+smudgy_protocol = { workspace = true }
+smudgy_session_model = { workspace = true }
 serde_json = { workspace = true }
 validator = { workspace = true }
 cfg-if = { workspace = true }
@@ -51,6 +53,9 @@ zstd = "0.13"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 rustls = "0.23"
 rustls-platform-verifier = "0.6"
+# Native WSS transport. Keep the TCP/TLS read loop unchanged; only the
+# connection-time transport choice and WebSocket message boundary differ.
+tokio-tungstenite = { version = "0.26.2", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 log = { workspace = true }
 smudgy_script = { workspace = true }
 deno_audio = { workspace = true, optional = true }

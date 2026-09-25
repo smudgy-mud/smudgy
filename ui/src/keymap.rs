@@ -1,28 +1,13 @@
 use iced::keyboard::{Key, Modifiers, key, key::Named};
 use smudgy_core::models::hotkeys::HotkeyDefinition;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum MaybePhysicalKey {
-    Key(iced::keyboard::Key),
-    Physical(iced::keyboard::key::Physical),
-}
+pub use smudgy_ui_shared::keymap::{HotkeyKeys, MaybePhysicalKey};
 
-/// Efficient storage for hotkey data with pre-converted iced types
-#[derive(Debug, Clone)]
-pub struct HotkeyKeys {
-    pub main_key: MaybePhysicalKey,
-    pub modifiers: iced::keyboard::Modifiers,
-}
-
-impl From<HotkeyDefinition> for HotkeyKeys {
-    fn from(hotkey: HotkeyDefinition) -> Self {
-        let main_key = hotkey_to_maybe_physical_key(&hotkey);
-        let modifiers = hotkey_to_iced_modifiers(&hotkey);
-
-        HotkeyKeys {
-            main_key,
-            modifiers,
-        }
+/// Converts a persisted core hotkey into the portable UI representation.
+pub fn hotkey_keys(hotkey: &HotkeyDefinition) -> HotkeyKeys {
+    HotkeyKeys {
+        main_key: hotkey_to_maybe_physical_key(hotkey),
+        modifiers: hotkey_to_iced_modifiers(hotkey),
     }
 }
 
@@ -983,7 +968,7 @@ mod tests {
             state: Vec::new(),
         };
 
-        let hotkey_keys: HotkeyKeys = hotkey.into();
+        let hotkey_keys = hotkey_keys(&hotkey);
 
         // Test the main key
         match hotkey_keys.main_key {
@@ -1033,7 +1018,7 @@ mod tests {
             state: Vec::new(),
         };
 
-        let hotkey_keys: HotkeyKeys = hotkey.into();
+        let hotkey_keys = hotkey_keys(&hotkey);
         assert_eq!(
             hotkey_keys.main_key,
             MaybePhysicalKey::Key(Key::Character("t".into()))

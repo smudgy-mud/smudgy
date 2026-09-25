@@ -1,4 +1,6 @@
-use iced::{Background, Border, Color, Gradient, Shadow, Vector, border::Radius, gradient::Linear};
+use iced::{Background, Border, Color, Shadow, Vector, border::Radius};
+#[cfg(not(target_arch = "wasm32"))]
+use iced::{Gradient, gradient::Linear};
 
 use super::{Button, Buttons, General, Modal, Styles, Tabs, Text, Theme};
 
@@ -38,11 +40,10 @@ pub fn smudgy() -> Theme {
                 drop_marker: Color::from_rgba8(255, 255, 255, 0.9),
             },
             modal: Modal {
-                title_bar_background: Background::Gradient(Gradient::Linear(
-                    Linear::new(0)
-                        .add_stop(0.0, Color::from_rgb8(55, 23, 130))
-                        .add_stop(1.0, Color::from_rgb8(63, 40, 116)),
-                )),
+                title_bar_background: accent_background(
+                    Color::from_rgb8(55, 23, 130),
+                    Color::from_rgb8(63, 40, 116),
+                ),
                 title_bar_border: Border {
                     color: Color::from_rgb8(78, 55, 131),
                     width: 1.0,
@@ -62,21 +63,18 @@ pub fn smudgy() -> Theme {
             },
             buttons: Buttons {
                 primary: Button {
-                    background: Background::Gradient(Gradient::Linear(
-                        Linear::new(0)
-                            .add_stop(0.0, Color::from_rgb8(55, 23, 130))
-                            .add_stop(1.0, Color::from_rgb8(63, 40, 116)),
-                    )),
-                    background_hover: Background::Gradient(Gradient::Linear(
-                        Linear::new(0)
-                            .add_stop(0.0, Color::from_rgb8(60, 28, 135))
-                            .add_stop(1.0, Color::from_rgb8(68, 45, 121)),
-                    )),
-                    background_pressed: Background::Gradient(Gradient::Linear(
-                        Linear::new(0)
-                            .add_stop(0.0, Color::from_rgb8(50, 18, 125))
-                            .add_stop(1.0, Color::from_rgb8(63, 40, 116)),
-                    )),
+                    background: accent_background(
+                        Color::from_rgb8(55, 23, 130),
+                        Color::from_rgb8(63, 40, 116),
+                    ),
+                    background_hover: accent_background(
+                        Color::from_rgb8(60, 28, 135),
+                        Color::from_rgb8(68, 45, 121),
+                    ),
+                    background_pressed: accent_background(
+                        Color::from_rgb8(50, 18, 125),
+                        Color::from_rgb8(63, 40, 116),
+                    ),
                     border: Border {
                         color: Color::from_rgb8(78, 55, 131),
                         width: 1.0,
@@ -98,4 +96,19 @@ pub fn smudgy() -> Theme {
             },
         },
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn accent_background(start: Color, end: Color) -> Background {
+    Background::Gradient(Gradient::Linear(
+        Linear::new(0).add_stop(0.0, start).add_stop(1.0, end),
+    ))
+}
+
+// iced_wgpu does not render gradient quads on wasm32; keep the accent visible.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn accent_background(start: Color, _end: Color) -> Background {
+    Background::Color(start)
 }

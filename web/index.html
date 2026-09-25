@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="smudgy-script-runtime" content="https://runtime.smudgy.org/runtime-frame.html" />
+    <title>Smudgy Web</title>
+    <link data-trunk rel="rust" data-bin="smudgy-web" />
+    <link data-trunk rel="rust" data-bin="smudgy-web-worker" data-type="worker" />
+    <link data-trunk rel="copy-file" href="session-worker.js" />
+    <link data-trunk rel="copy-file" href="runtime-frame.html" />
+    <link data-trunk rel="copy-file" href="runtime-broker.js" />
+    <link data-trunk rel="copy-file" href="package-installer.js" />
+    <link data-trunk rel="copy-file" href="package-install-worker.js" />
+    <link data-trunk rel="copy-file" href="node_modules/esbuild-wasm/esm/browser.min.js" />
+    <link data-trunk rel="copy-file" href="node_modules/esbuild-wasm/esbuild.wasm" />
+    <link data-trunk rel="copy-file" href="THIRD-PARTY-NOTICES.md" />
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #111318;
+      }
+
+      body > canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body></body>
+</html>

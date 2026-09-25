@@ -15,7 +15,7 @@ use crate::terminal_buffer::{LinkClickEvent, LinkProtocolState, TerminalBuffer};
 use crate::theme::Element;
 use crate::widgets::split_terminal_pane;
 use iced::widget::{
-    button, center, checkbox, column, container, mouse_area, opaque, row, space, stack, svg, text,
+    button, center, checkbox, column, container, mouse_area, opaque, row, space, stack, text,
 };
 use iced::{Alignment, Border, Color, Length, Padding, Subscription, Task};
 use log::info;
@@ -1037,27 +1037,6 @@ fn pane_submit_runtime_action(key: PaneKey, text: Arc<String>, _masked: bool) ->
 fn scrollback_limit(settings: &Settings) -> NonZeroUsize {
     NonZeroUsize::new(settings.scrollback_length)
         .unwrap_or(NonZeroUsize::new(100_000).expect("default scrollback is non-zero"))
-}
-
-/// A small icon button for a pane's title-bar controls row (close, the
-/// visibility eye). The icon color derives from the palette so it stays
-/// visible when the user remaps the theme.
-pub fn title_bar_icon_button<M: Clone + 'static>(
-    handle: svg::Handle,
-    message: M,
-) -> Element<'static, M> {
-    button(
-        svg(handle)
-            .width(11)
-            .height(11)
-            .style(|theme: &crate::Theme, _| svg::Style {
-                color: Some(theme.styles.text.normal.scale_alpha(0.5)),
-            }),
-    )
-    .style(smudgy_theme::builtins::button::link)
-    .padding(3)
-    .on_press(message)
-    .into()
 }
 
 /// Build the terminal's event-only link callback once a session runtime exists.
@@ -2335,7 +2314,7 @@ impl ManagedSession {
     /// the widget message path and a script's `InputOp`.
     fn finish_main_input_update(
         &mut self,
-        update: crate::update::Update<session_input::Message, session_input::Event>,
+        update: smudgy_ui_shared::update::Update<session_input::Message, session_input::Event>,
     ) -> Task<Message> {
         self.sync_input_history(MAIN_PANE_KEY);
         if let Some(event) = update.event {
@@ -2359,7 +2338,7 @@ impl ManagedSession {
     fn finish_pane_input_update(
         &mut self,
         key: PaneKey,
-        update: crate::update::Update<session_input::Message, session_input::Event>,
+        update: smudgy_ui_shared::update::Update<session_input::Message, session_input::Event>,
     ) -> Task<Message> {
         self.sync_input_history(key);
         let event_task = match update.event {
@@ -2824,7 +2803,7 @@ impl ManagedSession {
                     }
                     SessionEvent::RegisterHotkey(name, hotkey) => {
                         for input in self.all_inputs_mut() {
-                            input.register_hotkey(name, hotkey.clone());
+                            input.register_hotkey(name, crate::keymap::hotkey_keys(&hotkey));
                         }
                         Task::none()
                     }

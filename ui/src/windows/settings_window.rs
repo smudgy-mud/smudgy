@@ -16,9 +16,12 @@ use iced::{Alignment, Background, Color, Length, Task};
 use smudgy_cloud::cloud_api::{ApiKeyInfo, AuthSession, CreatedApiKey, SessionInfo, UserProfile};
 use smudgy_cloud::{CloudError, Uuid};
 use smudgy_core::models::settings::{
-    CommandInputBehavior, MAX_LINK_TOOLTIP_DELAY_MS, Settings, TerminalBoldMode, ThemeTweaks,
-    clear_update_check_seed, load_settings,
+    Settings, ThemeTweaks, clear_update_check_seed, load_settings,
 };
+use smudgy_session_model::input_policy::CommandSyntax;
+use smudgy_ui_shared::settings_appearance::{self, Appearance, Change as AppearanceChange};
+use smudgy_ui_shared::settings_input::{self, Change as InputChange, InputPreferences};
+use smudgy_ui_shared::settings_theme;
 
 use crate::cloud_account::CloudHandles;
 use crate::components::cloud_errors::display_error;
@@ -81,34 +84,6 @@ pub enum TweakSlider {
     Saturation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TerminalBoldModeChoice {
-    mode: TerminalBoldMode,
-    label: String,
-}
-
-impl TerminalBoldModeChoice {
-    fn all() -> Vec<Self> {
-        TerminalBoldMode::ALL
-            .into_iter()
-            .map(|mode| Self {
-                mode,
-                label: match mode {
-                    TerminalBoldMode::Bold => t!("preferences-bold-mode-bold"),
-                    TerminalBoldMode::Bright => t!("preferences-bold-mode-bright"),
-                    TerminalBoldMode::BoldAndBright => t!("preferences-bold-mode-both"),
-                },
-            })
-            .collect()
-    }
-}
-
-impl std::fmt::Display for TerminalBoldModeChoice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.label)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Message {
     TabSelected(Tab),
@@ -150,30 +125,11 @@ pub enum Message {
 
     PrefFontSelected(String),
     PrefFontLigaturesToggled(bool),
-    PrefBoldModeSelected(TerminalBoldMode),
-    PrefDisableBlinkToggled(bool),
+    Appearance(settings_appearance::Message),
     PrefLocaleSelected(LocaleChoice),
-    PrefFontSizeChanged(String),
-    PrefFontSizeSubmitted,
-    PrefLineLengthChanged(String),
-    PrefLineLengthSubmitted,
-    PrefThemeSelected(String),
-    PrefThemeExtendedColorsToggled(bool),
-    PrefScrollbackChanged(String),
-    PrefScrollbackSubmitted,
-    PrefMaxHistoryChanged(String),
-    PrefMaxHistorySubmitted,
-    PrefLinkTooltipDelayChanged(String),
-    PrefLinkTooltipDelaySubmitted,
-    PrefSeparatorChanged(String),
-    PrefSeparatorSubmitted,
-    PrefRawPrefixChanged(String),
-    PrefRawPrefixSubmitted,
-    PrefCommandInputBehaviorSelected(CommandInputBehavior),
-    PrefMaskOnServerEchoToggled(bool),
-    PrefReconnectOnSendErrorToggled(bool),
-    PrefHistoryCaseSensitiveMatchToggled(bool),
-    PrefHidePaneHeadersToggled(bool),
+    Theme(settings_theme::Message),
+    Syntax(settings_input::SyntaxMessage),
+    Input(settings_input::Message),
     PrefLoggingToggled(bool),
     PrefRawLoggingToggled(bool),
     PrefAdvancedScriptingToggled(bool),
@@ -245,13 +201,10 @@ pub struct SettingsWindow {
     settings: Settings,
     /// Raw text for the numeric preference fields; validity is computed at
     /// render and only valid parses commit into [`Self::settings`].
-    font_size_input: String,
-    line_length_input: String,
-    scrollback_input: String,
-    max_history_input: String,
-    link_tooltip_delay_input: String,
-    separator_input: String,
-    raw_prefix_input: String,
+    appearance: settings_appearance::State,
+    input: settings_input::State,
+    syntax: settings_input::SyntaxState,
+    theme: settings_theme::State,
     /// Monospaced system font families, `None` until the first Preferences
     /// tab open kicks off enumeration.
     system_fonts: Option<Vec<String>>,
@@ -280,16 +233,28 @@ impl SettingsWindow {
             .unwrap_or_default();
         let social = SocialPanel::new(cloud.clone());
         let settings = load_settings();
-        let font_size_input = settings.terminal_font_size.to_string();
-        let line_length_input = settings
-            .terminal_line_length
-            .map(|len| len.to_string())
-            .unwrap_or_default();
-        let scrollback_input = settings.scrollback_length.to_string();
-        let max_history_input = settings.max_history.to_string();
-        let link_tooltip_delay_input = settings.link_tooltip_delay_ms.to_string();
-        let separator_input = settings.command_separator.clone();
-        let raw_prefix_input = settings.raw_line_prefix.clone();
+        let appearance = settings_appearance::State::new(Appearance {
+            font_size: settings.terminal_font_size,
+            bold_mode: settings.terminal_bold_mode,
+            disable_blink: settings.terminal_disable_blink,
+            line_length: settings.terminal_line_length,
+            link_tooltip_delay_ms: settings.link_tooltip_delay_ms,
+            theme_extended_colors: settings.theme_extended_colors,
+            hide_pane_headers: settings.hide_pane_headers,
+            scrollback_lines: settings.scrollback_length,
+        });
+        let input = settings_input::State::new(InputPreferences {
+            command_input_behavior: settings.command_input_behavior,
+            mask_input_on_server_echo: settings.mask_input_on_server_echo,
+            reconnect_on_send_error: settings.reconnect_on_send_error,
+            history_case_sensitive_match: settings.history_case_sensitive_match,
+            max_history: settings.max_history,
+        });
+        let syntax = settings_input::SyntaxState::new(CommandSyntax {
+            separator: settings.command_separator.clone(),
+            raw_prefix: settings.raw_line_prefix.clone(),
+        });
+        let theme = settings_theme::State::new(settings.theme.clone());
         Self {
             cloud,
             tab: Tab::Account,
@@ -307,13 +272,10 @@ impl SettingsWindow {
             created_key: None,
             security_error: None,
             settings,
-            font_size_input,
-            line_length_input,
-            scrollback_input,
-            max_history_input,
-            link_tooltip_delay_input,
-            separator_input,
-            raw_prefix_input,
+            appearance,
+            input,
+            syntax,
+            theme,
             system_fonts: None,
             tweak_tab: TweakTab::Adjust,
             tweak_picker: None,
@@ -662,146 +624,91 @@ impl SettingsWindow {
                 self.settings.terminal_font_ligatures = enabled;
                 self.settings_changed()
             }
-            Message::PrefBoldModeSelected(mode) => {
-                self.settings.terminal_bold_mode = mode;
-                self.settings_changed()
-            }
-            Message::PrefDisableBlinkToggled(disable) => {
-                self.settings.terminal_disable_blink = disable;
-                self.settings_changed()
-            }
+            Message::Appearance(message) => match self.appearance.update(message) {
+                Some(AppearanceChange::FontSize(size)) => {
+                    self.settings.terminal_font_size = size;
+                    self.settings_changed()
+                }
+                Some(AppearanceChange::BoldMode(mode)) => {
+                    self.settings.terminal_bold_mode = mode;
+                    self.settings_changed()
+                }
+                Some(AppearanceChange::DisableBlink(disable)) => {
+                    self.settings.terminal_disable_blink = disable;
+                    self.settings_changed()
+                }
+                Some(AppearanceChange::LineLength(length)) => {
+                    self.settings.terminal_line_length = length;
+                    self.settings_changed()
+                }
+                Some(AppearanceChange::LinkTooltipDelay(delay)) => {
+                    self.settings.link_tooltip_delay_ms = delay;
+                    self.settings_changed()
+                }
+                Some(AppearanceChange::ThemeExtendedColors(enabled)) => {
+                    self.settings.theme_extended_colors = enabled;
+                    self.settings_changed()
+                }
+                Some(AppearanceChange::HidePaneHeaders(enabled)) => {
+                    self.settings.hide_pane_headers = enabled;
+                    self.settings_changed()
+                }
+                Some(AppearanceChange::ScrollbackLines(lines)) => {
+                    self.settings.scrollback_length = lines;
+                    self.settings_changed()
+                }
+                None => Update::none(),
+            },
             Message::PrefLocaleSelected(locale) => {
                 self.settings.locale = locale.preference().to_string();
                 i18n::activate(&self.settings.locale);
                 self.settings_changed()
             }
-            // Typing only edits the buffer; commits happen on Enter so a
-            // partially-typed value never runs the save/fan-out pipeline
-            // (for scrollback that would destructively trim the buffer).
-            Message::PrefFontSizeChanged(value) => {
-                self.font_size_input = value;
-                Update::none()
-            }
-            Message::PrefFontSizeSubmitted => match self.font_size_input.trim().parse::<f32>() {
-                Ok(size) if (8.0..=40.0).contains(&size) => {
-                    self.settings.terminal_font_size = size;
-                    self.settings_changed()
-                }
-                _ => Update::none(),
-            },
-            Message::PrefLineLengthChanged(value) => {
-                self.line_length_input = value;
-                Update::none()
-            }
-            Message::PrefLineLengthSubmitted => {
-                if self.line_length_input.trim().is_empty() {
-                    // Empty is a valid commit: wrap to the window width.
-                    self.settings.terminal_line_length = None;
-                    return self.settings_changed();
-                }
-                match self.line_length_input.trim().parse::<u16>() {
-                    Ok(len) if (20..=1000).contains(&len) => {
-                        self.settings.terminal_line_length = Some(len);
-                        self.settings_changed()
-                    }
-                    _ => Update::none(),
-                }
-            }
-            Message::PrefThemeSelected(name) => {
+            // Numeric buffers commit only on Enter; a partially typed value
+            // must never mutate live settings.
+            Message::Theme(message) => {
+                let Some(name) = self.theme.update(message) else {
+                    return Update::none();
+                };
                 self.settings.theme = name;
                 // The panel now edits the new theme's own tweak entry; an
                 // open picker would point at the old theme's slot.
                 self.tweak_picker = None;
                 self.settings_changed()
             }
-            Message::PrefThemeExtendedColorsToggled(enabled) => {
-                self.settings.theme_extended_colors = enabled;
-                self.settings_changed()
-            }
-            Message::PrefScrollbackChanged(value) => {
-                self.scrollback_input = value;
-                Update::none()
-            }
-            Message::PrefScrollbackSubmitted => {
-                match self.scrollback_input.trim().parse::<usize>() {
-                    Ok(lines) if (100..=10_000_000).contains(&lines) => {
-                        self.settings.scrollback_length = lines;
-                        self.settings_changed()
-                    }
-                    _ => Update::none(),
+            // These short, free-form fields commit on each edit so clicking
+            // away cannot discard a value typed since the last Enter.
+            Message::Syntax(message) => {
+                if !self.syntax.update(message) {
+                    return Update::none();
                 }
+                self.settings.command_separator = self.syntax.value().separator.clone();
+                self.settings.raw_line_prefix = self.syntax.value().raw_prefix.clone();
+                self.settings_changed()
             }
-            Message::PrefMaxHistoryChanged(value) => {
-                self.max_history_input = value;
-                Update::none()
-            }
-            Message::PrefMaxHistorySubmitted => {
-                match self.max_history_input.trim().parse::<usize>() {
-                    Ok(count) if count <= 1_000_000 => {
-                        self.settings.max_history = count;
-                        self.settings_changed()
-                    }
-                    _ => Update::none(),
+            Message::Input(message) => match self.input.update(message) {
+                Some(InputChange::CommandInputBehavior(behavior)) => {
+                    self.settings.command_input_behavior = behavior;
+                    self.settings_changed()
                 }
-            }
-            Message::PrefLinkTooltipDelayChanged(value) => {
-                self.link_tooltip_delay_input = value;
-                Update::none()
-            }
-            Message::PrefLinkTooltipDelaySubmitted => {
-                match self.link_tooltip_delay_input.trim().parse::<u64>() {
-                    Ok(delay) if delay <= MAX_LINK_TOOLTIP_DELAY_MS => {
-                        self.settings.link_tooltip_delay_ms = delay;
-                        self.settings_changed()
-                    }
-                    _ => Update::none(),
+                Some(InputChange::MaskInputOnServerEcho(mask)) => {
+                    self.settings.mask_input_on_server_echo = mask;
+                    self.settings_changed()
                 }
-            }
-            // Unlike the numeric fields (whose commit is gated to Enter so a
-            // half-typed value can't destructively trim the buffer), the
-            // separator and prefix are short and free-form: commit on every
-            // edit. The previous Enter-only path silently dropped a value that
-            // was typed and then clicked away from — it never reached
-            // settings.json, so the runtime kept loading the default.
-            Message::PrefSeparatorChanged(value) => {
-                // Separators are a handful of characters at most.
-                self.separator_input = value.chars().take(4).collect();
-                self.settings.command_separator = self.separator_input.clone();
-                self.settings_changed()
-            }
-            Message::PrefSeparatorSubmitted => {
-                self.settings.command_separator = self.separator_input.clone();
-                self.settings_changed()
-            }
-            Message::PrefRawPrefixChanged(value) => {
-                self.raw_prefix_input = value;
-                self.settings.raw_line_prefix = self.raw_prefix_input.clone();
-                self.settings_changed()
-            }
-            Message::PrefRawPrefixSubmitted => {
-                self.settings.raw_line_prefix = self.raw_prefix_input.clone();
-                self.settings_changed()
-            }
-            Message::PrefCommandInputBehaviorSelected(behavior) => {
-                self.settings.command_input_behavior = behavior;
-                self.settings_changed()
-            }
-            Message::PrefMaskOnServerEchoToggled(mask) => {
-                self.settings.mask_input_on_server_echo = mask;
-                self.settings_changed()
-            }
-            Message::PrefReconnectOnSendErrorToggled(enabled) => {
-                self.settings.reconnect_on_send_error = enabled;
-                self.settings_changed()
-            }
-            Message::PrefHistoryCaseSensitiveMatchToggled(enabled) => {
-                self.settings.history_case_sensitive_match = enabled;
-                self.settings_changed()
-            }
-            Message::PrefHidePaneHeadersToggled(hide) => {
-                self.settings.hide_pane_headers = hide;
-                self.settings_changed()
-            }
+                Some(InputChange::ReconnectOnSendError(enabled)) => {
+                    self.settings.reconnect_on_send_error = enabled;
+                    self.settings_changed()
+                }
+                Some(InputChange::HistoryCaseSensitiveMatch(enabled)) => {
+                    self.settings.history_case_sensitive_match = enabled;
+                    self.settings_changed()
+                }
+                Some(InputChange::MaxHistory(count)) => {
+                    self.settings.max_history = count;
+                    self.settings_changed()
+                }
+                None => Update::none(),
+            },
             Message::PrefLoggingToggled(enabled) => {
                 self.settings.logging.enabled = enabled;
                 self.settings_changed()
@@ -1349,30 +1256,6 @@ impl SettingsWindow {
     /// inspector's convention: raw text in a buffer, validity computed at
     /// render, only valid parses commit.
     fn preferences_view(&self) -> ThemedElement<'_, Message> {
-        let font_size_valid = matches!(
-            self.font_size_input.trim().parse::<f32>(),
-            Ok(size) if (8.0..=40.0).contains(&size)
-        );
-        let line_length_valid = self.line_length_input.trim().is_empty()
-            || matches!(
-                self.line_length_input.trim().parse::<u16>(),
-                Ok(len) if (20..=1000).contains(&len)
-            );
-        let scrollback_valid = matches!(
-            self.scrollback_input.trim().parse::<usize>(),
-            Ok(lines) if (100..=10_000_000).contains(&lines)
-        );
-        // 0 is a valid value here (unlimited history), unlike scrollback's
-        // own 100-minimum -- so the accepted range starts at 0, not 100.
-        let max_history_valid = matches!(
-            self.max_history_input.trim().parse::<usize>(),
-            Ok(count) if count <= 1_000_000
-        );
-        let link_tooltip_delay_valid = matches!(
-            self.link_tooltip_delay_input.trim().parse::<u64>(),
-            Ok(delay) if delay <= MAX_LINK_TOOLTIP_DELAY_MS
-        );
-
         let mut col = column![text(t!("preferences-title")).size(20)].spacing(12);
 
         col = col.push(
@@ -1411,185 +1294,31 @@ impl SettingsWindow {
                 .label(t!("preferences-font-ligatures"))
                 .on_toggle(Message::PrefFontLigaturesToggled),
         );
-        let bold_mode_choices = TerminalBoldModeChoice::all();
-        let selected_bold_mode = bold_mode_choices
-            .iter()
-            .find(|choice| choice.mode == self.settings.terminal_bold_mode)
-            .cloned();
         col = col.push(
-            column![
-                dim_text_owned(t!("preferences-bold-is-bright")),
-                pick_list(bold_mode_choices, selected_bold_mode, |choice| {
-                    Message::PrefBoldModeSelected(choice.mode)
-                },)
-                .text_size(13)
-                .width(280),
-                dim_text_owned(t!("preferences-bold-is-bright-help")),
-            ]
-            .spacing(2),
+            settings_appearance::view(&self.appearance, &i18n::translate).map(Message::Appearance),
         );
-        col = col.push(
-            column![
-                checkbox(self.settings.terminal_disable_blink)
-                    .label(t!("preferences-disable-blink"))
-                    .on_toggle(Message::PrefDisableBlinkToggled),
-                dim_text_owned(t!("preferences-disable-blink-help")),
-            ]
-            .spacing(2),
-        );
-        col = col.push(pref_input(
-            t!("preferences-font-size"),
-            "16",
-            &self.font_size_input,
-            font_size_valid,
-            Some(t!("preferences-press-enter")),
-            120.0,
-            Message::PrefFontSizeChanged,
-            Message::PrefFontSizeSubmitted,
-        ));
-        col = col.push(pref_input(
-            t!("preferences-line-length"),
-            ts!("preferences-wrap-window"),
-            &self.line_length_input,
-            line_length_valid,
-            Some(t!("preferences-line-length-help")),
-            120.0,
-            Message::PrefLineLengthChanged,
-            Message::PrefLineLengthSubmitted,
-        ));
-        col = col.push(
-            column![
-                dim_text_owned(t!("preferences-theme")),
-                pick_list(
-                    self.theme_options(),
-                    Some(self.settings.theme.clone()),
-                    Message::PrefThemeSelected,
-                )
-                .text_size(13)
-                .width(280),
-            ]
-            .spacing(2),
-        );
+        col = col.push(settings_theme::view(&self.theme, &i18n::translate).map(Message::Theme));
         col = col.push(self.tweak_panel());
         col = col.push(
-            column![
-                checkbox(self.settings.theme_extended_colors)
-                    .label(t!("preferences-theme-extended-colors"))
-                    .on_toggle(Message::PrefThemeExtendedColorsToggled),
-                dim_text_owned(t!("preferences-theme-extended-colors-help")),
-            ]
-            .spacing(2),
+            settings_appearance::theme_extended_colors_view(&self.appearance, &i18n::translate)
+                .map(Message::Appearance),
         );
-        col = col.push(pref_input(
-            t!("preferences-scrollback"),
-            "100000",
-            &self.scrollback_input,
-            scrollback_valid,
-            Some(t!("preferences-scrollback-help")),
-            140.0,
-            Message::PrefScrollbackChanged,
-            Message::PrefScrollbackSubmitted,
-        ));
-        col = col.push(pref_input(
-            t!("preferences-link-tooltip-delay"),
-            "0",
-            &self.link_tooltip_delay_input,
-            link_tooltip_delay_valid,
-            Some(t!("preferences-link-tooltip-delay-help")),
-            140.0,
-            Message::PrefLinkTooltipDelayChanged,
-            Message::PrefLinkTooltipDelaySubmitted,
-        ));
         col = col.push(
-            column![
-                checkbox(self.settings.hide_pane_headers)
-                    .label(t!("preferences-hide-pane-headers"))
-                    .on_toggle(Message::PrefHidePaneHeadersToggled),
-                dim_text_owned(t!("preferences-hide-pane-headers-help")),
-            ]
-            .spacing(2),
+            settings_appearance::scrollback_view(&self.appearance, &i18n::translate)
+                .map(Message::Appearance),
+        );
+        col = col.push(
+            settings_appearance::pane_headers_view(&self.appearance, &i18n::translate)
+                .map(Message::Appearance),
         );
 
         col = col.push(rule::horizontal(1));
 
         // ===== input =====
         col = col.push(text(t!("preferences-input")).size(15));
-        col = col.push(pref_input(
-            t!("preferences-command-separator"),
-            ";",
-            &self.separator_input,
-            true,
-            Some(t!("preferences-command-separator-help")),
-            80.0,
-            Message::PrefSeparatorChanged,
-            Message::PrefSeparatorSubmitted,
-        ));
-        col = col.push(pref_input(
-            t!("preferences-raw-prefix"),
-            "\\",
-            &self.raw_prefix_input,
-            true,
-            Some(t!("preferences-raw-prefix-help")),
-            80.0,
-            Message::PrefRawPrefixChanged,
-            Message::PrefRawPrefixSubmitted,
-        ));
-        col = col.push(
-            column![
-                dim_text_owned(t!("preferences-command-input")),
-                pick_list(
-                    CommandInputBehavior::ALL.to_vec(),
-                    Some(self.settings.command_input_behavior),
-                    Message::PrefCommandInputBehaviorSelected,
-                )
-                .text_size(13)
-                .width(320),
-                dim_text("What happens to the input box and its text after you press Enter",),
-            ]
-            .spacing(2),
-        );
-        col = col.push(
-            column![
-                checkbox(self.settings.mask_input_on_server_echo)
-                    .label(t!("preferences-mask-password-input"))
-                    .on_toggle(Message::PrefMaskOnServerEchoToggled),
-                dim_text(
-                    "When a MUD turns off echo for a password prompt, the input shows \
-                     dots instead of your text (with an eye button to peek). Turn off \
-                     to keep your typing visible.",
-                ),
-            ]
-            .spacing(2),
-        );
-        col = col.push(
-            column![
-                checkbox(self.settings.reconnect_on_send_error)
-                    .label(t!("preferences-reconnect-on-send-error"))
-                    .on_toggle(Message::PrefReconnectOnSendErrorToggled),
-                dim_text_owned(t!("preferences-reconnect-on-send-error-help")),
-            ]
-            .spacing(2),
-        );
-        col = col.push(
-            column![
-                checkbox(self.settings.history_case_sensitive_match)
-                    .label(t!("preferences-history-case-sensitive-match"))
-                    .on_toggle(Message::PrefHistoryCaseSensitiveMatchToggled),
-                dim_text_owned(t!("preferences-history-case-sensitive-match-help")),
-            ]
-            .spacing(2),
-        );
-        col = col.push(pref_input(
-            t!("preferences-max-history"),
-            "1000",
-            &self.max_history_input,
-            max_history_valid,
-            Some(t!("preferences-max-history-help")),
-            120.0,
-            Message::PrefMaxHistoryChanged,
-            Message::PrefMaxHistorySubmitted,
-        ));
-
+        col = col
+            .push(settings_input::syntax_view(&self.syntax, &i18n::translate).map(Message::Syntax));
+        col = col.push(settings_input::view(&self.input, &i18n::translate).map(Message::Input));
         col = col.push(rule::horizontal(1));
 
         // ===== logging =====
@@ -1668,20 +1397,6 @@ impl SettingsWindow {
             );
         }
         let current = &self.settings.terminal_font_family;
-        if !current.is_empty() && !options.iter().any(|option| option == current) {
-            options.push(current.clone());
-        }
-        options
-    }
-
-    /// Theme picker options, with the same unknown-selection fallback as
-    /// [`Self::font_options`].
-    fn theme_options(&self) -> Vec<String> {
-        let mut options: Vec<String> = prefs::palettes()
-            .iter()
-            .map(|palette| palette.name.to_string())
-            .collect();
-        let current = &self.settings.theme;
         if !current.is_empty() && !options.iter().any(|option| option == current) {
             options.push(current.clone());
         }
@@ -1986,54 +1701,6 @@ fn enumerate_system_fonts() -> Task<Message> {
         },
         Message::SystemFontsLoaded,
     )
-}
-
-/// De-emphasized text for field labels and helper lines under preference
-/// controls (the map inspector's `field_label` convention, copied locally).
-fn dim_text<'a>(label: &'static str) -> iced::widget::Text<'a, crate::Theme> {
-    text(label)
-        .size(11)
-        .style(|theme: &crate::Theme| iced::widget::text::Style {
-            color: Some(theme.styles.text.normal.scale_alpha(0.6)),
-        })
-}
-
-/// A labeled text input for the Preferences tab: dimmed label above, the raw
-/// buffer inside, an "invalid value" hint when it doesn't validate, and an
-/// optional helper line below (the map inspector's `labeled_input`
-/// convention, copied locally).
-fn pref_input<'a>(
-    label: String,
-    placeholder: &'static str,
-    value: &str,
-    valid: bool,
-    helper: Option<String>,
-    width: f32,
-    on_input: impl Fn(String) -> Message + 'a,
-    on_submit: Message,
-) -> ThemedElement<'a, Message> {
-    let mut col = column![
-        dim_text_owned(label),
-        text_input(placeholder, value)
-            .size(14)
-            .width(width)
-            .on_input(on_input)
-            .on_submit(on_submit),
-    ]
-    .spacing(2);
-
-    if !valid {
-        col = col.push(
-            text(t!("validation-invalid-value"))
-                .size(11)
-                .style(theme::builtins::text::danger),
-        );
-    }
-    if let Some(helper) = helper {
-        col = col.push(dim_text_owned(helper));
-    }
-
-    col.into()
 }
 
 /// De-emphasized owned text for translated labels and runtime strings.

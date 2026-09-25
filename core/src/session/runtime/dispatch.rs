@@ -391,6 +391,7 @@ impl Inner<'_> {
             RuntimeAction::Connect {
                 host,
                 port,
+                wss_url,
                 send_on_connect,
                 send_on_connect_redactions,
                 encoding,
@@ -405,7 +406,10 @@ impl Inner<'_> {
                 // user just clicked becomes this, and this becomes
                 // "Connected to …" when the socket comes up. An attempt made
                 // for a command that could not be sent says so.
-                self.connection_target = Some(Arc::new(format!("{host}:{port}")));
+                let connection_label = wss_url
+                    .as_ref()
+                    .map_or_else(|| format!("{host}:{port}"), |url| url.to_string());
+                self.connection_target = Some(Arc::new(connection_label.clone()));
                 let verb = if self.send_failure_pending() {
                     "Reconnecting to "
                 } else {
@@ -414,7 +418,7 @@ impl Inner<'_> {
                 self.set_connection_rule(
                     SystemText::new(Severity::Info)
                         .text(verb)
-                        .strong(&format!("{host}:{port}"))
+                        .strong(&connection_label)
                         .text("\u{2026}"),
                     Progress::Pending,
                 );
@@ -502,9 +506,10 @@ impl Inner<'_> {
                     None
                 };
 
-                connection.connect(
+                connection.connect_target(
                     host.as_str(),
                     port,
+                    wss_url.as_deref().map(String::as_str),
                     raw_log_path,
                     encoding,
                     compression,

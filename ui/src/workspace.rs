@@ -38,31 +38,14 @@
 pub mod apply;
 pub mod autosave;
 pub mod binding;
-pub mod dto;
+pub use smudgy_session_model::workspace as dto;
 pub mod file;
 pub mod last_session;
 pub mod layouts;
 pub mod preferences;
 pub mod restore;
-pub mod snapshot;
+pub use smudgy_ui_shared::workspace_snapshot as snapshot;
 pub mod writer;
 
-/// Which stored template a user-initiated restore reads: a named layout in
-/// the acting server's `layouts/` store, or that server's last-session
-/// snapshot. Both drive the identical apply flow — plan, keep-or-close
-/// questions, spawns, revalidation — differing only in where the template
-/// bytes come from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TemplateSource {
-    Named(String),
-    LastSession,
-}
-
-impl std::fmt::Display for TemplateSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Named(name) => write!(f, "layout '{name}'"),
-            Self::LastSession => write!(f, "the last session"),
-        }
-    }
-}
+/// Native compatibility path for the storage-neutral template identity.
+pub use smudgy_session_model::layout_template::TemplateSource;

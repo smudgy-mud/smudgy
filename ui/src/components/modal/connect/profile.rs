@@ -1,14 +1,11 @@
 //! Profile CRUD: async wrappers, form submission handling, and profile-side views.
 
-use iced::font::Weight;
-
 use crate::i18n::{t, ts};
 use iced::widget::{
-    Column, Row, TextInput, button, column, container, scrollable,
-    space::{horizontal as horizontal_space, vertical as vertical_space},
-    text, text_editor,
+    Column, Row, TextInput, button, column, container, space::horizontal as horizontal_space, text,
+    text_editor,
 };
-use iced::{Alignment, Font, Length, Padding, Pixels, Task};
+use iced::{Alignment, Length, Pixels, Task};
 use log::warn;
 use validator::Validate;
 
@@ -304,15 +301,21 @@ pub(super) fn view_profile_form<'a>(
                 .padding([8, 18])
                 .on_press(Message::CancelProfileForm);
 
-            Column::new()
-                .push(form_title(t!("profile-add"), action.server_name()))
-                .push(name_field)
-                .push(description_field(state))
-                .push(on_connect_field(state))
-                .push(profile_error(state))
-                .push(Row::new().push(save_button).push(cancel_button).spacing(10))
-                .spacing(15)
-                .into()
+            smudgy_ui_shared::connect_modal::form(
+                form_title(t!("profile-add"), action.server_name()),
+                vec![
+                    name_field.into(),
+                    description_field(state),
+                    on_connect_field(state),
+                    profile_error(state),
+                ],
+                Row::new()
+                    .push(save_button)
+                    .push(cancel_button)
+                    .spacing(10)
+                    .into(),
+                None,
+            )
         }
         ProfileCrudAction::Edit { expected, .. } => {
             // Name is the profile key (rename isn't supported by the backend), so
@@ -342,17 +345,21 @@ pub(super) fn view_profile_form<'a>(
                 delete_button.on_press(Message::RequestConfirmDeleteProfile)
             };
 
-            Column::new()
-                .push(form_title(t!("profile-edit"), action.server_name()))
-                .push(name_field)
-                .push(description_field(state))
-                .push(on_connect_field(state))
-                .push(profile_error(state))
-                .push(Row::new().push(save_button).push(cancel_button).spacing(10))
-                .push(vertical_space().height(Pixels(10.0)))
-                .push(delete_button)
-                .spacing(15)
-                .into()
+            smudgy_ui_shared::connect_modal::form(
+                form_title(t!("profile-edit"), action.server_name()),
+                vec![
+                    name_field.into(),
+                    description_field(state),
+                    on_connect_field(state),
+                    profile_error(state),
+                ],
+                Row::new()
+                    .push(save_button)
+                    .push(cancel_button)
+                    .spacing(10)
+                    .into(),
+                Some(delete_button.into()),
+            )
         }
         ProfileCrudAction::ConfirmDelete { expected, .. } => {
             let confirmation_text =
@@ -371,18 +378,16 @@ pub(super) fn view_profile_form<'a>(
                 .padding([8, 18])
                 .on_press(Message::CancelProfileForm);
 
-            Column::new()
-                .push(text(t!("profile-delete")).size(Pixels(22.0)))
-                .push(confirmation_text)
-                .push(profile_error(state))
-                .push(
-                    Row::new()
-                        .push(confirm_delete_button)
-                        .push(cancel_delete_button)
-                        .spacing(10),
-                )
-                .spacing(15)
-                .into()
+            smudgy_ui_shared::connect_modal::form(
+                text(t!("profile-delete")).size(Pixels(22.0)).into(),
+                vec![confirmation_text.into(), profile_error(state)],
+                Row::new()
+                    .push(confirm_delete_button)
+                    .push(cancel_delete_button)
+                    .spacing(10)
+                    .into(),
+                None,
+            )
         }
     }
 }
@@ -529,8 +534,14 @@ fn profile_error(state: &State) -> Element<'_, Message> {
 /// in mono, then the `Profiles` section and its list / empty state.
 pub(super) fn view_server_details_and_profiles<'a>(
     state: &'a State,
-    server_name: &'a ServerName,
+    model: smudgy_ui_shared::connect_model::SelectedServer<'a>,
 ) -> Element<'a, Message> {
+    use smudgy_ui_shared::connect_model::Profiles;
+
+    let server_name = state
+        .selected_server
+        .as_ref()
+        .expect("server details have a selected server");
     let server_details = state.servers.iter().find(|s| s.name == *server_name);
 
     // Title: server name on the left, a quiet inline "✎ Edit" on the right.
@@ -547,62 +558,52 @@ pub(super) fn view_server_details_and_profiles<'a>(
     )
     .style(builtins::button::link)
     .padding([2, 8])
-    .on_press(Message::RequestEditServer(server_name.clone()));
+    .on_press(Message::from(model.edit));
 
-    let mut title_row = Row::new();
-    // The game's advertised icon (the MSSP `ICON` pipeline's cached artifact)
-    // beside the name; without one the title renders exactly as it always has.
-    if let Some(handle) = state.icons.get(server_name) {
-        title_row = title_row.push(
-            iced::widget::image(handle.clone())
-                .width(Pixels(28.0))
-                .height(Pixels(28.0)),
-        );
-    }
-    let title_row = title_row
-        .push(text(server_name).size(Pixels(24.0)))
-        .push(horizontal_space())
-        .push(edit_action)
-        .spacing(10)
-        .align_y(Alignment::Center);
-
-    // Address: host : port together, in mono.
-    let address: Element<Message> = if let Some(server) = server_details {
-        text(format!("{} : {}", server.config.host, server.config.port))
-            .font(fonts::GEIST_MONO_VF)
-            .size(13)
-            .style(builtins::text::muted)
+    // The advertised icon remains a native-only adornment in the common header.
+    let icon = state.icons.get(server_name).map(|handle| {
+        iced::widget::image(handle.clone())
+            .width(Pixels(28.0))
+            .height(Pixels(28.0))
             .into()
+    });
+
+    // Address: preserve the full WSS path/query when applicable.
+    let address: Element<Message> = if let Some(server) = server_details {
+        text(
+            server
+                .config
+                .wss_url
+                .clone()
+                .unwrap_or_else(|| format!("{} : {}", server.config.host, server.config.port)),
+        )
+        .font(fonts::GEIST_MONO_VF)
+        .size(13)
+        .style(builtins::text::muted)
+        .into()
     } else {
         text(t!("server-details-missing"))
             .style(builtins::text::danger)
             .into()
     };
 
-    let profiles = state.profiles.get(server_name);
-    let is_loading_p = state.is_loading_profiles.as_ref() == Some(server_name);
-
-    let profile_list_content: Element<Message> = match (profiles, is_loading_p) {
+    let profile_list_content: Element<Message> = match model.profiles {
         // Render nothing while a (rare) async profile load is in flight — the modal
         // preloads the first server's profiles, so this only happens briefly when
         // switching to another server, and a blank beat reads quieter than a
         // "Loading profiles…" flash.
-        (_, true) => Column::new().into(),
-        (Some(profiles), false) if profiles.is_empty() => view_empty_profiles(),
-        (Some(profiles), false) => profiles
-            .iter()
+        Profiles::Loading => Column::new().into(),
+        Profiles::Ready(profiles) if profiles.is_empty() => view_empty_profiles(),
+        Profiles::Ready(profiles) => profiles
+            .into_iter()
             .fold(Column::new().spacing(10), |col, profile| {
                 col.push(profile_row(server_name, profile))
             })
             .into(),
-        (None, false) => {
+        Profiles::Unavailable => {
             column![text(t!("profiles-load-error")).style(builtins::text::danger)].into()
         }
     };
-
-    let helper = text(t!("profiles-saved-help"))
-        .size(12)
-        .style(builtins::text::muted);
 
     // "Restore last session (Kapusnik, Kapusta)" — offered only while the
     // server's last-session snapshot exists and parses; the label carries
@@ -622,66 +623,64 @@ pub(super) fn view_server_details_and_profiles<'a>(
                 .into()
         });
 
-    let mut content_col = Column::new().push(title_row);
+    let mut summary = Vec::new();
     // Observed metadata (the `observed.json` sidecar), all optional: the
     // game's own name as a subtitle, then the band under the address. A
     // server with no sidecar renders exactly as it always has.
     if let Some(subtitle) = super::observed::game_name_subtitle(state, server_name) {
-        content_col = content_col.push(subtitle);
+        summary.push(subtitle);
     }
-    content_col = content_col.push(address);
+    summary.push(address);
     if let Some(band) =
         server_details.and_then(|server| super::observed::metadata_band(state, server))
     {
-        content_col = content_col.push(band);
+        summary.push(band);
     }
     if let Some(restore_last) = restore_last {
-        content_col = content_col.push(restore_last);
+        summary.push(restore_last);
     }
-    content_col = content_col
-        .push(vertical_space().height(Pixels(4.0)))
-        .push(text(t!("profiles-title")).size(Pixels(18.0)))
-        .push(helper)
-        // Right padding keeps the rows' trailing `Connect`/`Offline` buttons clear
-        // of the overlaid vertical scrollbar that appears once the list overflows.
-        .push(
-            scrollable(container(profile_list_content).padding(Padding::ZERO.right(14)))
-                .height(Length::FillPortion(1)),
-        )
-        .spacing(12);
-
-    // Footer "+ New Profile" — only when profiles exist; the empty state carries
-    // its own primary CTA (one primary action per view).
-    if profiles.is_some_and(|p| !p.is_empty()) {
-        content_col = content_col.push(
-            button(text(t!("profiles-new")))
+    if let Some(intent) = model.quick_connect {
+        summary.push(
+            button(text(t!("profile-connect-default")))
                 .width(Length::Fill)
                 .padding([6, 10])
                 .style(builtins::button::secondary)
-                .on_press(Message::RequestCreateProfile),
+                .on_press(Message::from(intent))
+                .into(),
         );
     }
-
-    content_col.into()
+    smudgy_ui_shared::connect_modal::server_details(
+        smudgy_ui_shared::connect_modal::ServerDetails {
+            name: model.name,
+            icon,
+            edit: edit_action.into(),
+            summary,
+            profiles_title: t!("profiles-title"),
+            profiles_help: t!("profiles-saved-help"),
+            profiles: profile_list_content,
+            // The empty state carries its own primary CTA.
+            new_profile: model.new_profile.map(|intent| {
+                smudgy_ui_shared::connect_modal::new_profile(
+                    t!("profiles-new"),
+                    Message::from(intent),
+                )
+            }),
+        },
+    )
 }
 
 /// A single profile row: bold name + muted description (left, filling), a quiet
 /// pencil edit icon, then the primary `Connect` action at the end.
-fn profile_row<'a>(server_name: &'a ServerName, profile: &'a Profile) -> Element<'a, Message> {
-    let mut name_col = Column::new()
-        .push(text(&profile.name).font(Font {
-            weight: Weight::Bold,
-            ..fonts::GEIST_VF
-        }))
-        .spacing(2);
-    if !profile.config.caption.is_empty() {
-        name_col = name_col.push(
-            text(&profile.config.caption)
-                .size(12)
-                .style(builtins::text::muted),
-        );
-    }
-
+fn profile_row<'a>(
+    server_name: &'a ServerName,
+    profile: smudgy_ui_shared::connect_model::ProfileRow<'a>,
+) -> Element<'a, Message> {
+    let smudgy_ui_shared::connect_model::ProfileRow {
+        name,
+        caption,
+        edit,
+        connect,
+    } = profile;
     let edit_icon = button(
         text(bootstrap_icons::PENCIL)
             .font(fonts::BOOTSTRAP_ICONS)
@@ -689,15 +688,12 @@ fn profile_row<'a>(server_name: &'a ServerName, profile: &'a Profile) -> Element
     )
     .style(builtins::button::link)
     .padding([2, 6])
-    .on_press(Message::RequestEditProfile(profile.name.clone()));
+    .on_press(Message::from(edit));
 
     let connect_button = button(text(t!("profile-connect")))
         .style(builtins::button::primary)
         .padding([6, 16])
-        .on_press(Message::ConnectProfile(
-            server_name.clone(),
-            profile.name.clone(),
-        ));
+        .on_press(Message::from(connect));
 
     // Open the session without connecting (map editor / automations offline).
     let open_offline_button = button(text(t!("profile-offline")))
@@ -705,34 +701,25 @@ fn profile_row<'a>(server_name: &'a ServerName, profile: &'a Profile) -> Element
         .padding([6, 16])
         .on_press(Message::OpenOfflineProfile(
             server_name.clone(),
-            profile.name.clone(),
+            name.to_owned(),
         ));
 
-    Row::new()
-        .push(name_col.width(Length::Fill))
-        .push(edit_icon)
-        .push(connect_button)
-        .push(open_offline_button)
-        .spacing(10)
-        .align_y(Alignment::Center)
-        .into()
+    smudgy_ui_shared::connect_modal::profile_row(
+        name,
+        caption,
+        vec![
+            edit_icon.into(),
+            connect_button.into(),
+            open_offline_button.into(),
+        ],
+    )
 }
 
 /// Empty-state for a server with no profiles yet.
 fn view_empty_profiles() -> Element<'static, Message> {
-    container(
-        column![
-            text(t!("profiles-empty")).size(Pixels(16.0)),
-            button(text(t!("profiles-new")))
-                .padding([8, 18])
-                .style(builtins::button::primary)
-                .on_press(Message::RequestCreateProfile),
-        ]
-        .spacing(12)
-        .align_x(Alignment::Center),
+    smudgy_ui_shared::connect_modal::empty_profiles(
+        t!("profiles-empty"),
+        t!("profiles-new"),
+        Message::from(smudgy_ui_shared::connect_model::Intent::NewProfile),
     )
-    .width(Length::Fill)
-    .padding(20)
-    .center_x(Length::Fill)
-    .into()
 }

@@ -134,6 +134,8 @@ pub enum RuntimeAction {
     Connect {
         host: Arc<String>,
         port: u16,
+        /// Full secure WebSocket URL. `None` retains the original TCP/TLS path.
+        wss_url: Option<Arc<String>>,
         /// Profile text to send after the first fully processed inbound packet
         /// containing at least one non-empty terminal line.
         send_on_connect: Option<Arc<String>>,

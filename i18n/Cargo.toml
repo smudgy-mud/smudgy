@@ -3,6 +3,10 @@ name = "smudgy_i18n"
 version = "0.5.8-ptb"
 edition = "2024"
 
+[features]
+default = ["all-locales"]
+all-locales = []
+
 [dependencies]
 fluent-bundle = { workspace = true }
 unic-langid = { workspace = true }
