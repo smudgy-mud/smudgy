@@ -1,0 +1,6 @@
+/dist/
+/e2e-dist/
+/node_modules/
+/playwright-report/
+/test-results/
+/debug.log

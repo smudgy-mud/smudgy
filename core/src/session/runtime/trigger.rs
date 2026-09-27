@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use regex::{Regex, RegexSet};
+pub use smudgy_session_model::input_policy::split_commands;
 
 use crate::models::matchers::{
     MatcherColor, MatcherColorMatch, MatcherHsv, MatcherHsvRange, MatcherRole,
@@ -758,19 +759,6 @@ fn expand_template_with(
     state: Option<&ExposedState>,
 ) -> String {
     expand_template_view(template, CaptureView::Owned(captures), None, state)
-}
-
-/// Splits an outgoing chunk into commands: always on '\n', additionally on
-/// `separator` when it is non-empty.
-#[must_use]
-pub fn split_commands<'a>(text: &'a str, separator: &str) -> Vec<&'a str> {
-    if separator.is_empty() {
-        text.split('\n').collect()
-    } else {
-        text.split('\n')
-            .flat_map(|chunk| chunk.split(separator))
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy)]

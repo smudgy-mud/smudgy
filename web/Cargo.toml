@@ -1,0 +1,55 @@
+[package]
+name = "smudgy_web_client"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "smudgy-web"
+path = "src/main.rs"
+
+[[bin]]
+name = "smudgy-web-worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+encoding_rs = "0.8"
+iced = { workspace = true, features = ["fira-sans"] }
+regex = { workspace = true }
+serde = { workspace = true }
+smudgy_engine = { workspace = true }
+smudgy_i18n = { workspace = true, default-features = false }
+smudgy_protocol = { workspace = true }
+smudgy_session_model = { workspace = true }
+smudgy_theme = { workspace = true }
+smudgy_ui_shared = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures = { workspace = true }
+js-sys = "0.3"
+log = { workspace = true }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "CloseEvent",
+    "DedicatedWorkerGlobalScope",
+    "ErrorEvent",
+    "Event",
+    "MessageEvent",
+    "Location",
+    "Storage",
+    "WebSocket",
+    "Window",
+    "Worker",
+] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "worker_wire"
+harness = false

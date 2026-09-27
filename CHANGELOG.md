@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Smudgy now has an experimental browser client built on the same session and
+  UI foundations as the native app.** The WebAssembly build supports multiple
+  sessions, shared preferences and themes, session tabs, draggable pane grids,
+  local browser storage, secure WebSocket connections, MCCP2, and a bounded
+  scripting host. The extraction also moves portable session, automation, pane,
+  and input behavior into shared crates so browser work exercises the same
+  abstractions instead of growing a parallel client. This is a developer preview,
+  not full browser/native parity; `web/README.md` documents the remaining runtime,
+  security, package, persistence, and multi-window limitations.
 - **A command that can't be sent comes back, and the session reconnects.** When
   the connection has dropped, pressing Enter no longer ends in a bare error line.
   The line you typed returns to the input box, selected, and a notice names it

@@ -165,68 +165,8 @@ pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
 /// Largest link-tooltip delay accepted by the preferences UI and renderer.
 /// Keeps a hand-edited settings file from scheduling an effectively unbounded
 /// redraw deadline.
-pub const MAX_LINK_TOOLTIP_DELAY_MS: u64 = 60_000;
-
-/// How an SGR bold attribute is presented in terminal output.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", from = "TerminalBoldModeCompat")]
-pub enum TerminalBoldMode {
-    /// Increase the selected terminal font's weight without changing color.
-    Bold,
-    /// Use the bright ANSI palette without changing font weight.
-    Bright,
-    /// Increase font weight and use the bright ANSI palette.
-    BoldAndBright,
-}
-
-impl TerminalBoldMode {
-    pub const ALL: [Self; 3] = [Self::Bold, Self::Bright, Self::BoldAndBright];
-
-    #[must_use]
-    pub const fn uses_bold_weight(self) -> bool {
-        matches!(self, Self::Bold | Self::BoldAndBright)
-    }
-
-    #[must_use]
-    pub const fn uses_bright_palette(self) -> bool {
-        matches!(self, Self::Bright | Self::BoldAndBright)
-    }
-}
-
-impl Default for TerminalBoldMode {
-    fn default() -> Self {
-        Self::BoldAndBright
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TerminalBoldModeName {
-    Bold,
-    Bright,
-    BoldAndBright,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum TerminalBoldModeCompat {
-    Name(TerminalBoldModeName),
-    LegacyBool(bool),
-}
-
-impl From<TerminalBoldModeCompat> for TerminalBoldMode {
-    fn from(value: TerminalBoldModeCompat) -> Self {
-        match value {
-            TerminalBoldModeCompat::Name(TerminalBoldModeName::Bold) => Self::Bold,
-            TerminalBoldModeCompat::Name(TerminalBoldModeName::Bright) => Self::Bright,
-            TerminalBoldModeCompat::Name(TerminalBoldModeName::BoldAndBright) => {
-                Self::BoldAndBright
-            }
-            TerminalBoldModeCompat::LegacyBool(true) => Self::BoldAndBright,
-            TerminalBoldModeCompat::LegacyBool(false) => Self::Bold,
-        }
-    }
-}
+pub use smudgy_session_model::MAX_LINK_TOOLTIP_DELAY_MS;
+pub use smudgy_session_model::preferences::{CommandInputBehavior, TerminalBoldMode};
 
 /// Represents the global application settings.
 ///
@@ -705,50 +645,6 @@ impl Default for LoggingSettings {
     }
 }
 
-/// What the session command input does with the just-sent text after you
-/// press Enter — and, for one mode, what happens when the input loses focus
-/// with text still in it.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandInputBehavior {
-    /// Select the sent text (so the next keystroke replaces it), then clear
-    /// the input entirely when it loses focus.
-    SelectAllClearOnBlur,
-    /// Select the sent text and leave it; it persists (selected) until
-    /// replaced. Losing focus does nothing. The default.
-    #[default]
-    SelectAll,
-    /// Clear the input immediately on send.
-    Clear,
-}
-
-impl CommandInputBehavior {
-    /// Every variant in display order — the source for the preferences picker.
-    pub const ALL: [CommandInputBehavior; 3] = [
-        CommandInputBehavior::SelectAllClearOnBlur,
-        CommandInputBehavior::SelectAll,
-        CommandInputBehavior::Clear,
-    ];
-
-    /// A short human label for the preferences picker.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            CommandInputBehavior::SelectAllClearOnBlur => {
-                "Select all on send, clear when unfocused"
-            }
-            CommandInputBehavior::SelectAll => "Select all on send",
-            CommandInputBehavior::Clear => "Clear on send",
-        }
-    }
-}
-
-impl std::fmt::Display for CommandInputBehavior {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.label())
-    }
-}
-
 /// The read-only view of the app settings exposed to scripts via `getSettings()`
 /// (`smudgy:core`). Carries only the display/behavior settings a script can reasonably act
 /// on — never anything sensitive (no API base URL, dismissal bookkeeping, or secrets). Sent
@@ -837,7 +733,7 @@ impl Settings {
 
 /// Helper for serde default scrollback length.
 fn default_scrollback_length() -> usize {
-    100_000
+    smudgy_session_model::DEFAULT_SCROLLBACK_LINES
 }
 
 fn default_max_history() -> usize {
@@ -861,11 +757,11 @@ fn default_theme() -> String {
 }
 
 fn default_command_separator() -> String {
-    ";".to_string()
+    smudgy_session_model::input_policy::DEFAULT_COMMAND_SEPARATOR.to_string()
 }
 
 fn default_raw_line_prefix() -> String {
-    "\\\\".to_string()
+    smudgy_session_model::input_policy::DEFAULT_RAW_LINE_PREFIX.to_string()
 }
 
 const fn default_true() -> bool {

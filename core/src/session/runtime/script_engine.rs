@@ -32,7 +32,7 @@ use smudgy_script::{
 use crate::{
     get_smudgy_home,
     session::{
-        BufferUpdate, PackageProviderFactory, ScriptExtensionFactory, SessionEvent, SessionId,
+        BufferUpdate, PackageProviderFactory, ScriptExtensionFactory, SessionId,
         TaggedSessionEvent,
         runtime::{
             ActionResult, IsolateId, SingletonRegistry,
@@ -46,6 +46,9 @@ use crate::{
         ui_command::{PaneCommand, UiCommand, UiCommandProducer},
     },
 };
+
+#[cfg(feature = "web-audio")]
+use crate::session::SessionEvent;
 
 use anyhow::{Result, anyhow, bail};
 use deno_core::url::Url;
@@ -1974,8 +1977,9 @@ impl<'a> ScriptEngine<'a> {
                             .filter(|staged| {
                                 provider
                                     .closure_union_from_cache(&spec.package_key(), staged)
-                                    .is_some_and(|(union, floor)| {
+                                    .is_some_and(|(union, floor, native_compatible)| {
                                         union.is_within(&consented)
+                                            && native_compatible
                                             && floor
                                                 .refusal(&crate::models::shared_packages::running_smudgy_release())
                                                 .is_none()
@@ -2011,6 +2015,18 @@ impl<'a> ScriptEngine<'a> {
                                     &params.emitted_line_count,
                                     &format!(
                                         "[package] {} not loaded \u{2014} {reason}.",
+                                        spec.name
+                                    ),
+                                );
+                                continue;
+                            }
+                            Err(package_provider::CapRefusal::UnsupportedTarget) => {
+                                Self::emit_session_notice(
+                                    &params.ui_tx,
+                                    params.session_id,
+                                    &params.emitted_line_count,
+                                    &format!(
+                                        "[package] {} not loaded — no version supports the native build.",
                                         spec.name
                                     ),
                                 );

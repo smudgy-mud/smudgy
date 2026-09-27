@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
-use futures::channel::mpsc;
+use futures::{SinkExt, Stream, StreamExt, channel::mpsc};
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWriteExt, Interest},
     net::{TcpSocket, TcpStream},
@@ -15,19 +15,20 @@ use tokio::{
         oneshot,
     },
 };
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message as WsMessage};
 use vt_processor::VtProcessor;
 use vtparse::VTParser;
 
 use super::{TaggedSessionEvent, runtime::RuntimeAction};
 
-pub mod gmcp;
+pub use smudgy_protocol::gmcp;
 pub mod inflow;
-pub mod msdp;
-pub mod mssp;
+pub use smudgy_protocol::msdp;
+pub use smudgy_protocol::mssp;
 pub mod plain_run;
-pub mod responders;
-pub mod telnet;
-pub mod transcode;
+pub use smudgy_protocol::responders;
+pub use smudgy_protocol::telnet;
+pub use smudgy_protocol::transcode;
 pub mod vt_processor;
 
 /// The glue between the telnet preprocessor and the VT parser for one socket read. A private
@@ -449,6 +450,27 @@ enum GameStream {
     Plain(TcpStream),
     /// A TLS session over TCP.
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// Binary Telnet messages over a verified secure WebSocket.
+    Wss(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+}
+
+fn websocket_chunk(message: WsMessage, buf: &mut Vec<u8>) -> io::Result<Option<usize>> {
+    match message {
+        WsMessage::Binary(bytes) => {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            buf.clear();
+            buf.extend_from_slice(&bytes);
+            Ok(Some(buf.len()))
+        }
+        WsMessage::Close(_) => Ok(Some(0)),
+        WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => Ok(None),
+        WsMessage::Text(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MUD sent a non-binary WebSocket message",
+        )),
+    }
 }
 
 impl GameStream {
@@ -471,6 +493,17 @@ impl GameStream {
                 buf.clear();
                 stream.read_buf(buf).await
             }
+            Self::Wss(stream) => loop {
+                match stream.next().await {
+                    Some(Ok(message)) => {
+                        if let Some(n) = websocket_chunk(message, buf)? {
+                            return Ok(n);
+                        }
+                    }
+                    Some(Err(error)) => return Err(io::Error::other(error)),
+                    None => return Ok(0),
+                }
+            },
         }
     }
 
@@ -504,6 +537,22 @@ impl GameStream {
                     std::task::Poll::Pending => Ok(None),
                 }
             }
+            Self::Wss(stream) => loop {
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                match std::pin::Pin::new(&mut **stream).poll_next(&mut cx) {
+                    std::task::Poll::Ready(Some(Ok(message))) => {
+                        if let Some(n) = websocket_chunk(message, buf)? {
+                            return Ok(Some(n));
+                        }
+                    }
+                    std::task::Poll::Ready(Some(Err(error))) => {
+                        return Err(io::Error::other(error));
+                    }
+                    std::task::Poll::Ready(None) => return Ok(Some(0)),
+                    std::task::Poll::Pending => return Ok(None),
+                }
+            },
         }
     }
 
@@ -515,6 +564,18 @@ impl GameStream {
         match self {
             Self::Plain(stream) => write_all_with_stall_guard(stream, bytes, stall).await,
             Self::Tls(stream) => write_all_with_stall_guard(stream, bytes, stall).await,
+            Self::Wss(stream) => match tokio::time::timeout(
+                stall,
+                stream.send(WsMessage::Binary(bytes.to_vec().into())),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(io::Error::other),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no write progress within {stall:?}"),
+                )),
+            },
         }
     }
 }
@@ -697,20 +758,13 @@ async fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
 /// Connect the transport: TCP, then a TLS handshake if requested. `host` is the server name
 /// for certificate verification and SNI (a DNS name or IP literal).
 async fn connect_stream(host: &str, port: u16, tls: TlsMode) -> io::Result<GameStream> {
-    // rustls 0.23 needs a process-global CryptoProvider. `smudgy_script` installs the
-    // aws_lc_rs provider, but a session may connect before any script runs (and headless
-    // tests have no script runtime), so install it here too — idempotent.
-    static PROVIDER: OnceLock<()> = OnceLock::new();
-
     let stream = connect_tcp(host, port).await?;
     stream.set_nodelay(true)?;
     if tls == TlsMode::Off {
         return Ok(GameStream::Plain(stream));
     }
 
-    PROVIDER.get_or_init(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
+    install_tls_provider();
 
     let config = tls_client_config(tls == TlsMode::NoVerify)?;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
@@ -718,6 +772,36 @@ async fn connect_stream(host: &str, port: u16, tls: TlsMode) -> io::Result<GameS
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let tls_stream = connector.connect(server_name, stream).await?;
     Ok(GameStream::Tls(Box::new(tls_stream)))
+}
+
+fn install_tls_provider() {
+    // A connection may start before scripts install the process-global provider.
+    static PROVIDER: OnceLock<()> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+async fn connect_wss(url: &str) -> io::Result<GameStream> {
+    crate::models::server::parse_wss_address(url).map_err(io::Error::other)?;
+    install_tls_provider();
+    let config = Arc::new(tls_client_config(false)?);
+    connect_wss_with_config(url, config).await
+}
+
+async fn connect_wss_with_config(
+    url: &str,
+    config: Arc<rustls::ClientConfig>,
+) -> io::Result<GameStream> {
+    let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+        url,
+        None,
+        true,
+        Some(tokio_tungstenite::Connector::Rustls(config)),
+    )
+    .await
+    .map_err(io::Error::other)?;
+    Ok(GameStream::Wss(Box::new(stream)))
 }
 
 /// Build the client TLS config: the OS trust store (via `rustls-platform-verifier`), or —
@@ -1157,8 +1241,24 @@ impl Connection {
         compression: InboundCompression,
         tls: TlsMode,
     ) {
-        let addr = format!("{host}:{port}");
+        self.connect_target(host, port, None, raw_log_path, encoding, compression, tls);
+    }
+
+    /// Connect via TCP/TLS or WSS, retaining the same Telnet/VT ingest path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_target(
+        &mut self,
+        host: &str,
+        port: u16,
+        wss_url: Option<&str>,
+        raw_log_path: Option<PathBuf>,
+        encoding: Option<&'static encoding_rs::Encoding>,
+        compression: InboundCompression,
+        tls: TlsMode,
+    ) {
+        let addr = wss_url.map_or_else(|| format!("{host}:{port}"), str::to_owned);
         let host = host.to_string();
+        let wss_url = wss_url.map(str::to_owned);
         let runtime_tx = self.runtime_tx.clone();
         let (tx, mut disconnect_rx) = oneshot::channel();
 
@@ -1203,7 +1303,10 @@ impl Connection {
             // Subnegotiation responder state (TTYPE cycle, NAWS reporting). Reads the
             // shared size cell at report time, so the first NAWS answer already carries
             // the size the UI last reported; `secure` sets the MTTS SSL bit.
-            let mut protocol = responders::ProtocolState::new(window_size, tls != TlsMode::Off);
+            let mut protocol = responders::ProtocolState::new(
+                window_size,
+                wss_url.is_some() || tls != TlsMode::Off,
+            );
             // Charset transcoding: the per-server setting seeds it (None = UTF-8, a pure
             // pass-through); a CHARSET negotiation switches it mid-stream.
             let mut transcode = transcode::Transcode::new(encoding.unwrap_or(encoding_rs::UTF_8));
@@ -1237,16 +1340,21 @@ impl Connection {
             // the signal here is the only escape), a mid-batch read, or a
             // black-holed handshake that otherwise only CONNECT_TIMEOUT ends.
             let run = async {
-                let connect_result =
-                    match tokio::time::timeout(CONNECT_TIMEOUT, connect_stream(&host, port, tls))
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(_elapsed) => Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("timed out after {}s", CONNECT_TIMEOUT.as_secs()),
-                        )),
-                    };
+                let connect_result = match tokio::time::timeout(CONNECT_TIMEOUT, async {
+                    if let Some(url) = &wss_url {
+                        connect_wss(url).await
+                    } else {
+                        connect_stream(&host, port, tls).await
+                    }
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out after {}s", CONNECT_TIMEOUT.as_secs()),
+                    )),
+                };
                 match connect_result {
                     Ok(mut stream) => {
                         // `RuntimeAction::Connected` below advances the session's
@@ -1836,10 +1944,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::time::Duration;
 
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc as tokio_mpsc;
     use tokio::time::timeout;
+    use tokio_rustls::TlsAcceptor;
 
     use super::telnet::{command, option};
     use super::*;
@@ -1856,6 +1966,87 @@ mod tests {
             ),
             runtime_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn wss_carries_binary_telnet_frames_over_verified_tls() {
+        install_tls_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("self-signed test certificate");
+        let certificate = CertificateDer::from(cert.cert.der().to_vec());
+        let key = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("test key");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key)
+            .expect("server TLS config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).expect("trusted test root");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local port").port();
+        let reject_acceptor = acceptor.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept TCP");
+            let tls = acceptor.accept(tcp).await.expect("accept TLS");
+            let mut ws = tokio_tungstenite::accept_async(tls)
+                .await
+                .expect("accept WebSocket");
+            ws.send(WsMessage::Binary(Vec::new().into()))
+                .await
+                .expect("empty frame");
+            ws.send(WsMessage::Binary(b"welcome\r\n".to_vec().into()))
+                .await
+                .expect("greeting");
+            let command = ws.next().await.expect("outbound frame").expect("frame");
+            assert_eq!(command, WsMessage::Binary(b"look\r\n".to_vec().into()));
+        });
+
+        let url = format!("wss://localhost:{port}/ws/telnet/?profile=test");
+        let mut stream = timeout(
+            Duration::from_secs(5),
+            connect_wss_with_config(&url, Arc::new(client_config)),
+        )
+        .await
+        .expect("WSS connect deadline")
+        .expect("WSS connect");
+        let mut bytes = Vec::with_capacity(64);
+        let count = timeout(Duration::from_secs(5), stream.fill(&mut bytes))
+            .await
+            .expect("read deadline")
+            .expect("read WSS frame");
+        assert_eq!(&bytes[..count], b"welcome\r\n");
+        stream
+            .write_all_stall_guarded(b"look\r\n", Duration::from_secs(5))
+            .await
+            .expect("send command");
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server deadline")
+            .expect("server task");
+
+        // The production connector uses the OS verifier, not the test root.
+        // A fresh self-signed endpoint must fail rather than falling back.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local port").port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept TCP");
+            let _ = reject_acceptor.accept(tcp).await;
+        });
+        let url = format!("wss://localhost:{port}/ws/telnet/");
+        assert!(
+            timeout(Duration::from_secs(5), connect_wss(&url))
+                .await
+                .expect("certificate rejection deadline")
+                .is_err()
+        );
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server deadline")
+            .expect("server task");
     }
 
     /// The pre-bulk-path byte loop, kept as the reference the Ground-state fast path must

@@ -45,6 +45,11 @@ pub struct Profile {
     pub config: ProfileConfig,
 }
 
+/// The ordinary, durable profile used for a server's quick-connect path.
+/// Server-wide automations and packages enabled for all profiles apply here
+/// and continue to apply to profiles created later.
+pub use smudgy_session_model::connect::DEFAULT_PROFILE_NAME;
+
 /// Result of a profile mutation guarded by an exact configuration snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileCas<T> {
@@ -334,6 +339,31 @@ pub fn create_profile(
         path: profile_path,
         config,
     })
+}
+
+/// Load a server's Default profile, creating it with no login commands on
+/// first use. This keeps quick connect on the existing profile-backed runtime:
+/// history, profile-scoped package values, and reconnect use one stable scope.
+/// An existing but malformed Default profile is never replaced.
+///
+/// # Errors
+/// Returns a profile read or creation error, including an unreadable existing
+/// profile. A concurrent successful creation is loaded instead of overwritten.
+pub fn ensure_default_profile(server_name: &str) -> Result<Profile> {
+    let _guard = lifecycle_guard(server_name)?;
+    match load_profile(server_name, DEFAULT_PROFILE_NAME) {
+        Ok(profile) => Ok(profile),
+        Err(load_error) => {
+            if profile_dir(server_name, DEFAULT_PROFILE_NAME)?.exists() {
+                return Err(load_error);
+            }
+            let config = ProfileConfig {
+                caption: String::new(),
+                send_on_connect: String::new(),
+            };
+            create_profile(server_name, DEFAULT_PROFILE_NAME, config)
+        }
+    }
 }
 
 /// Creates a profile only while the exact server snapshot selected by the caller is still current.

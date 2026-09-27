@@ -17,12 +17,13 @@
 
 use std::io;
 
-use flate2::{Decompress, FlushDecompress, Status};
+use flate2::Decompress;
+use smudgy_protocol::mccp;
 use zstd::stream::raw::{Decoder as ZstdDecoder, InBuffer, Operation, OutBuffer};
 
 /// The most decompressed output produced per [`Inflow::step`] call. Also the natural
 /// granularity for the caller's pacing (commit + yield cadence under a high-ratio burst).
-pub const INFLATE_CHUNK: usize = 64 * 1024;
+pub const INFLATE_CHUNK: usize = mccp::INFLATE_CHUNK;
 
 /// A negotiated compression codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,19 +111,11 @@ impl Inflow {
         match self {
             Self::Plain => unreachable!("step is only called while a compression stream is active"),
             Self::Inflate(z) => {
-                out.clear();
-                // `reserve_exact`, not `reserve`: `decompress_vec` fills up to `capacity()`,
-                // so an over-allocating `reserve` would let one step exceed INFLATE_CHUNK —
-                // breaking both the bomb bound and the caller's pacing. Exact keeps it true.
-                out.reserve_exact(INFLATE_CHUNK - out.len());
-                let before = z.total_in();
-                let status = z
-                    .decompress_vec(input, out, FlushDecompress::None)
-                    .map_err(io::Error::other)?;
-                let consumed = usize::try_from(z.total_in() - before).unwrap_or(usize::MAX);
-                match status {
-                    Status::StreamEnd => Ok(InflateStep::End { consumed }),
-                    Status::Ok | Status::BufError => Ok(InflateStep::Progress { consumed }),
+                let (consumed, ended) = mccp::inflate_step(z, input, out)?;
+                if ended {
+                    Ok(InflateStep::End { consumed })
+                } else {
+                    Ok(InflateStep::Progress { consumed })
                 }
             }
             Self::Zstd(dec) => {

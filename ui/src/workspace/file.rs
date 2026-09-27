@@ -126,7 +126,7 @@ mod tests {
 
     const TEMPLATE_FILE_NAME: &str = "combat.json";
 
-    const GOLDEN: &str = include_str!("testdata/workspace_v1.json");
+    const GOLDEN: &str = include_str!("../../../session_model/testdata/workspace_v1.json");
 
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("temporary directory")

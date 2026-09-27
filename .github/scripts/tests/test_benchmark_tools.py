@@ -88,6 +88,29 @@ class ScopeSelectionTests(unittest.TestCase):
                 self.assertIn(target, result["criterion_targets"])
                 self.assertEqual(result["uncovered_files"], [])
 
+    def test_extracted_native_hot_paths_still_select_paired_benchmarks(self) -> None:
+        cases = {
+            "protocol/src/telnet.rs": {"ingest"},
+            "protocol/src/responders.rs": {"ingest"},
+            "protocol/src/transcode.rs": {"ingest"},
+            "protocol/src/vt.rs": {"ingest"},
+            "protocol/src/sgr.rs": {"ingest"},
+            "session_model/src/styled_line.rs": {"ingest", "terminal_buffer"},
+            "ui_shared/src/terminal_buffer.rs": {"terminal_buffer"},
+            "ui_shared/src/terminal_buffer/selection.rs": {"terminal_buffer"},
+            "ui_shared/src/split_terminal_pane/terminal_pane/spans.rs": {"terminal_buffer"},
+            "ui_shared/src/prefs.rs": {"terminal_buffer"},
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                result = self.selector.select(self.config, [path])
+                self.assertTrue(expected.issubset(result["criterion_targets"]))
+                self.assertTrue(result["has_benchmarks"])
+                self.assertEqual(result["uncovered_files"], [])
+
+        result = self.selector.select(self.config, ["protocol/src/vt.rs"])
+        self.assertEqual(result["callgrind_targets"], ["ingest_callgrind"])
+
     def test_truncated_changed_file_list_is_an_explicit_gap(self) -> None:
         result = self.selector.select(
             self.config,

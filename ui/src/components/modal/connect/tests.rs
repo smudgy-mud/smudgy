@@ -28,6 +28,27 @@ fn server(name: &str) -> Server {
 }
 
 #[test]
+fn native_connect_projects_host_records_into_shared_intents() {
+    let mut state = initial_state();
+    state.servers.push(server("mud"));
+    state.selected_server = Some("mud".into());
+    state
+        .profiles
+        .insert("mud".into(), vec![profile("Default", "starter", "")]);
+    let model = view_model(&state);
+    assert_eq!(model.panel, ConnectPanel::ServerDetails);
+    let selected = model.selected.expect("selected server");
+    assert!(selected.quick_connect.is_none());
+    let smudgy_ui_shared::connect_model::Profiles::Ready(rows) = selected.profiles else {
+        panic!("profiles loaded");
+    };
+    assert!(matches!(
+        Message::from(rows.into_iter().next().unwrap().connect),
+        Message::ConnectProfile(server, profile) if server == "mud" && profile == "Default"
+    ));
+}
+
+#[test]
 fn test_initial_state_is_correct() {
     let state = initial_state();
     assert!(state.servers.is_empty());
@@ -107,6 +128,35 @@ fn test_submit_server_form_create_valid() {
 
     assert!(event.is_none());
     assert!(state.server_crud_error.is_none());
+}
+
+#[test]
+fn wss_server_form_preserves_path_and_query() {
+    let mut state = initial_state();
+    state.server_action = Some(ServerCrudAction::Create);
+    state.server_form_data = ServerConfigFormData {
+        name: "Outpost".to_owned(),
+        wss_url: "wss://last-outpost.com/ws/telnet/?profile=one".to_owned(),
+        ..ServerConfigFormData::default()
+    };
+
+    let (_task, event) = update(&mut state, Message::SubmitServerForm);
+    assert!(event.is_none());
+    assert!(state.server_crud_error.is_none());
+    let pending = state
+        .pending_server_operation
+        .as_ref()
+        .expect("pending save");
+    assert!(matches!(
+        &pending.action,
+        ServerOperationAction::Create { config, .. }
+            if config.host == "last-outpost.com"
+                && config.port == 443
+                && config.tls
+                && config.tls_verify
+                && config.wss_url.as_deref()
+                    == Some("wss://last-outpost.com/ws/telnet/?profile=one")
+    ));
 }
 
 #[test]

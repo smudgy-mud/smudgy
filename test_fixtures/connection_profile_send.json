@@ -1,0 +1,8 @@
+{
+  "empty_packet": "\r\n",
+  "greeting": "Welcome\r\n",
+  "trigger_pattern": "^Welcome$",
+  "trigger_command": "triggered",
+  "profile_command": "login",
+  "expected_outbound": ["triggered\r\n", "login\r\n"]
+}

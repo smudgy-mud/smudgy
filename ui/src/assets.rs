@@ -251,17 +251,6 @@ pub mod hero_icons {
     pub static BARS_3: LazyLock<svg::Handle> =
         LazyLock::new(|| svg::Handle::from_memory(BARS_3_BYTES));
 
-    pub const EYE_BYTES: &[u8] =
-        include_bytes!("../../assets/heroicons/optimized/16/solid/eye.svg");
-
-    pub static EYE: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(EYE_BYTES));
-
-    pub const EYE_SLASH_BYTES: &[u8] =
-        include_bytes!("../../assets/heroicons/optimized/16/solid/eye-slash.svg");
-
-    pub static EYE_SLASH: LazyLock<svg::Handle> =
-        LazyLock::new(|| svg::Handle::from_memory(EYE_SLASH_BYTES));
-
     pub const MINUS_BYTES: &[u8] =
         include_bytes!("../../assets/heroicons/optimized/16/solid/minus.svg");
 

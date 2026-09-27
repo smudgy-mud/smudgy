@@ -58,6 +58,7 @@ regex-syntax = { workspace = true }
 # ALSA on Linux) into every bench build, which must stay buildable on
 # audio-less hosts such as the pinned benchmark runner.
 smudgy_ui = { path = "../ui", default-features = false }
+smudgy_ui_shared = { workspace = true }
 vtparse = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

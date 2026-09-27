@@ -160,6 +160,7 @@ fn connect_action(port: u16, tls: TlsMode) -> RuntimeAction {
     RuntimeAction::Connect {
         host: Arc::new("127.0.0.1".to_string()),
         port,
+        wss_url: None,
         send_on_connect: None,
         send_on_connect_redactions: Arc::new(Vec::new()),
         encoding: None,

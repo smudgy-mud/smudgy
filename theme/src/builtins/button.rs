@@ -66,23 +66,15 @@ pub fn secondary(theme: &Theme, status: button::Status) -> button::Style {
 #[must_use]
 pub fn list_item(theme: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Active => button::Style {
-            background: None,
-            text_color: theme.styles.text.normal,
-            ..Default::default()
-        },
+        button::Status::Active | button::Status::Pressed | button::Status::Disabled => {
+            button::Style {
+                background: None,
+                text_color: theme.styles.text.normal,
+                ..Default::default()
+            }
+        }
         button::Status::Hovered => button::Style {
             background: Some(Color::from_rgba8(255, 255, 255, 0.1).into()),
-            text_color: theme.styles.text.normal,
-            ..Default::default()
-        },
-        button::Status::Pressed => button::Style {
-            background: None,
-            text_color: theme.styles.text.normal,
-            ..Default::default()
-        },
-        button::Status::Disabled => button::Style {
-            background: None,
             text_color: theme.styles.text.normal,
             ..Default::default()
         },
@@ -92,23 +84,15 @@ pub fn list_item(theme: &Theme, status: button::Status) -> button::Style {
 #[must_use]
 pub fn list_item_selected(theme: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Active => button::Style {
-            background: Some(Color::from_rgba8(255, 255, 255, 0.15).into()),
-            text_color: theme.styles.text.normal,
-            ..Default::default()
-        },
+        button::Status::Active | button::Status::Pressed | button::Status::Disabled => {
+            button::Style {
+                background: Some(Color::from_rgba8(255, 255, 255, 0.15).into()),
+                text_color: theme.styles.text.normal,
+                ..Default::default()
+            }
+        }
         button::Status::Hovered => button::Style {
             background: Some(Color::from_rgba8(255, 255, 255, 0.2).into()),
-            text_color: theme.styles.text.normal,
-            ..Default::default()
-        },
-        button::Status::Pressed => button::Style {
-            background: Some(Color::from_rgba8(255, 255, 255, 0.15).into()),
-            text_color: theme.styles.text.normal,
-            ..Default::default()
-        },
-        button::Status::Disabled => button::Style {
-            background: Some(Color::from_rgba8(255, 255, 255, 0.15).into()),
             text_color: theme.styles.text.normal,
             ..Default::default()
         },

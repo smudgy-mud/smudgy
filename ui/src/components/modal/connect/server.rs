@@ -3,8 +3,7 @@
 use std::fmt;
 
 use iced::widget::{
-    Column, Row, TextInput, button, checkbox, column, pick_list, scrollable,
-    space::{horizontal as horizontal_space, vertical as vertical_space},
+    Row, TextInput, button, checkbox, column, pick_list, space::horizontal as horizontal_space,
     text,
 };
 use iced::{Alignment, Length, Pixels, Task};
@@ -15,12 +14,13 @@ use crate::i18n::{t, ts};
 use crate::theme::Element;
 use crate::theme::builtins;
 
-use smudgy_core::models::server::{ServerCas, ServerConfig};
+use smudgy_core::models::server::{ServerCas, ServerConfig, parse_wss_address};
 
 use super::{
     AppliedServerOperation, Message, ServerCrudAction, ServerFormField, ServerOperationAction,
     ServerOperationCompletion, ServerOperationEnvelope, ServerOperationError, State,
     next_server_operation_id, server_host_input_id, server_name_input_id, server_port_input_id,
+    server_wss_input_id,
 };
 
 /// The encoding dropdown's "no override" entry — UTF-8, i.e.
@@ -193,6 +193,42 @@ pub(super) fn format_bytes(bytes: u64) -> String {
 
 // --- Update Logic ---
 
+fn form_address(state: &State) -> Result<(String, u16, Option<String>), String> {
+    let wss_url = state.server_form_data.wss_url.trim();
+    if !wss_url.is_empty() {
+        return parse_wss_address(wss_url)
+            .map(|(host, port)| (host, port, Some(wss_url.to_owned())))
+            .map_err(|error| error.to_string());
+    }
+    let port = state
+        .server_form_data
+        .port
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| t!("server-error-port"))?;
+    Ok((state.server_form_data.host.trim().to_owned(), port, None))
+}
+
+fn wss_field(state: &State) -> Element<'_, Message> {
+    column![
+        text(t!("server-wss-url"))
+            .size(13)
+            .style(builtins::text::muted),
+        TextInput::new(
+            "wss://example.org/ws/telnet/",
+            &state.server_form_data.wss_url
+        )
+        .id(server_wss_input_id())
+        .on_input(|value| Message::UpdateServerFormField(ServerFormField::WssUrl, value))
+        .on_submit(Message::SubmitServerForm),
+        text(t!("server-wss-help"))
+            .size(12)
+            .style(builtins::text::muted),
+    ]
+    .spacing(4)
+    .into()
+}
+
 /// Helper function to handle server form submission.
 pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
     if state.pending_server_operation.is_some() {
@@ -204,21 +240,25 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
     match state.server_action.clone() {
         // Clone needed for async task
         Some(ServerCrudAction::Create) => {
-            let port = match state.server_form_data.port.trim().parse::<u16>() {
-                Ok(p) => p,
-                Err(_) => {
-                    state.server_crud_error = Some(t!("server-error-port"));
+            let (host, port, wss_url) = match form_address(state) {
+                Ok(address) => address,
+                Err(error) => {
+                    state.server_crud_error = Some(error);
                     return Task::none();
                 }
             };
-            let mut config =
-                ServerConfig::new(state.server_form_data.host.trim().to_string(), port);
+            let mut config = ServerConfig::new(host, port);
+            config.wss_url = wss_url;
             config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
             config.compression = state.server_form_data.compression;
             config.mccp4_compression = Some(state.server_form_data.mccp4_compression);
-            config.tls = state.server_form_data.tls;
-            config.tls_verify = state.server_form_data.tls_verify;
-            if let Err(e) = config.validate() {
+            config.tls = config.wss_url.is_some() || state.server_form_data.tls;
+            config.tls_verify = config.wss_url.is_some() || state.server_form_data.tls_verify;
+            if let Err(e) = config
+                .validate()
+                .map_err(anyhow::Error::from)
+                .and_then(|()| config.validate_transport())
+            {
                 state.server_crud_error = Some(t!("server-error-config", "error" => e.to_string()));
                 return Task::none();
             }
@@ -246,10 +286,10 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
             )
         }
         Some(ServerCrudAction::Edit(expected)) => {
-            let port = match state.server_form_data.port.trim().parse::<u16>() {
-                Ok(p) => p,
-                Err(_) => {
-                    state.server_crud_error = Some(t!("server-error-port"));
+            let (host, port, wss_url) = match form_address(state) {
+                Ok(address) => address,
+                Err(error) => {
+                    state.server_crud_error = Some(error);
                     return Task::none();
                 }
             };
@@ -257,14 +297,19 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
             // forward from the existing config, so an address edit never
             // silently revokes them.
             let mut config = expected.config.clone();
-            config.host = state.server_form_data.host.trim().to_string();
+            config.host = host;
             config.port = port;
+            config.wss_url = wss_url;
             config.encoding = form_encoding_to_config(&state.server_form_data.encoding);
             config.compression = state.server_form_data.compression;
             config.mccp4_compression = Some(state.server_form_data.mccp4_compression);
-            config.tls = state.server_form_data.tls;
-            config.tls_verify = state.server_form_data.tls_verify;
-            if let Err(e) = config.validate() {
+            config.tls = config.wss_url.is_some() || state.server_form_data.tls;
+            config.tls_verify = config.wss_url.is_some() || state.server_form_data.tls_verify;
+            if let Err(e) = config
+                .validate()
+                .map_err(anyhow::Error::from)
+                .and_then(|()| config.validate_transport())
+            {
                 state.server_crud_error = Some(t!("server-error-config", "error" => e.to_string()));
                 return Task::none();
             }
@@ -296,75 +341,51 @@ pub(super) fn handle_submit_server_form(state: &mut State) -> Task<Message> {
 
 /// Renders the left rail: a small `Servers` header, the server list, and a
 /// persistent `+ New Server` button pinned at the bottom.
-pub(super) fn view_server_list(state: &State) -> Element<'_, Message> {
-    let server_list_content: Element<Message> = if state.servers.is_empty() {
-        if state.is_loading_servers {
-            column![text(t!("servers-loading")).style(builtins::text::muted)]
-        } else {
-            // The no-servers welcome/CTA lives in the right pane; keep the
-            // rail itself quiet.
-            column![text(t!("servers-empty")).style(builtins::text::muted)]
-        }
-        .into()
+pub(super) fn view_server_list<'a>(
+    state: &'a State,
+    servers: Vec<smudgy_ui_shared::connect_model::ServerRow<'a>>,
+    new_server: smudgy_ui_shared::connect_model::Intent,
+) -> Element<'a, Message> {
+    use smudgy_ui_shared::connect_modal::{RailItem, server_rail};
+    let rows = servers
+        .into_iter()
+        .map(|server| {
+            // Native-only advertised icons remain an optional label adornment.
+            let label: Element<Message> = if let Some(handle) = state.icons.get(server.name) {
+                Row::new()
+                    .push(
+                        iced::widget::image(handle.clone())
+                            .width(Pixels(16.0))
+                            .height(Pixels(16.0)),
+                    )
+                    .push(text(server.name))
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .into()
+            } else {
+                text(server.name).into()
+            };
+            RailItem {
+                label,
+                selected: server.selected,
+                select: server.select.map(Message::from),
+            }
+        })
+        .collect();
+    let heading = t!("servers-title");
+    let empty = if state.is_loading_servers {
+        t!("servers-loading")
     } else {
-        state
-            .servers
-            .iter()
-            .fold(Column::new().spacing(2), |col, server| {
-                let is_selected = state.selected_server.as_ref() == Some(&server.name);
-
-                // The game's advertised icon (the MSSP `ICON` pipeline's
-                // cached artifact) leads the row at text size; a server
-                // without one renders its name exactly as it always has.
-                let label: Element<Message> = if let Some(handle) = state.icons.get(&server.name) {
-                    Row::new()
-                        .push(
-                            iced::widget::image(handle.clone())
-                                .width(Pixels(16.0))
-                                .height(Pixels(16.0)),
-                        )
-                        .push(text(&server.name))
-                        .spacing(8)
-                        .align_y(Alignment::Center)
-                        .into()
-                } else {
-                    text(&server.name).into()
-                };
-                let mut server_button = button(label).width(Length::Fill).padding([6, 10]);
-                server_button = if is_selected {
-                    server_button.style(builtins::button::list_item_selected)
-                } else {
-                    server_button.style(builtins::button::list_item)
-                };
-
-                // While a profile form is open the rail selection is inert — the
-                // user is mid-edit and switching servers would discard that
-                // context. (`+ New Server` below stays live and resets the form.)
-                if state.profile_action.is_none() {
-                    server_button =
-                        server_button.on_press(Message::SelectServer(server.name.clone()));
-                }
-
-                col.push(server_button)
-            })
-            .into()
+        t!("servers-empty")
     };
-
-    column![
-        text(t!("servers-title"))
-            .size(12)
-            .style(builtins::text::muted),
-        scrollable(server_list_content).height(Length::Fill),
-        button(text(t!("servers-new")))
-            .width(Length::Fill)
-            .padding([6, 10])
-            .style(builtins::button::secondary)
-            .on_press(Message::RequestCreateServer),
-    ]
-    .width(Length::Fixed(200.0))
-    .spacing(10)
-    .padding(15)
-    .into()
+    let new_label = t!("servers-new");
+    server_rail(
+        &heading,
+        &empty,
+        &new_label,
+        rows,
+        Message::from(new_server),
+    )
 }
 
 /// Renders the server create/edit form.
@@ -386,7 +407,7 @@ pub(super) fn view_server_form<'a>(
             ]
             .spacing(4);
 
-            let host_field = column![
+            let host_field: Element<Message> = column![
                 text(t!("server-host"))
                     .size(13)
                     .style(builtins::text::muted),
@@ -395,9 +416,10 @@ pub(super) fn view_server_form<'a>(
                     .on_input(|val| Message::UpdateServerFormField(ServerFormField::Host, val))
                     .on_submit(Message::SubmitServerForm),
             ]
-            .spacing(4);
+            .spacing(4)
+            .into();
 
-            let port_field = column![
+            let port_field: Element<Message> = column![
                 text(t!("server-port"))
                     .size(13)
                     .style(builtins::text::muted),
@@ -410,7 +432,8 @@ pub(super) fn view_server_form<'a>(
                     .size(12)
                     .style(builtins::text::muted),
             ]
-            .spacing(4);
+            .spacing(4)
+            .into();
 
             let mut save_button = button(text(t!("server-save-add-profile")))
                 .style(builtins::button::primary)
@@ -423,18 +446,37 @@ pub(super) fn view_server_form<'a>(
                 .padding([8, 18])
                 .on_press(Message::CancelServerForm);
 
-            Column::new()
-                .push(text(t!("server-add")).size(Pixels(22.0)))
-                .push(name_field)
-                .push(host_field)
-                .push(port_field)
-                .push(encoding_field(state))
-                .push(compression_field(state))
-                .push(tls_field(state))
-                .push(server_error(state))
-                .push(Row::new().push(save_button).push(cancel_button).spacing(10))
-                .spacing(15)
-                .into()
+            smudgy_ui_shared::connect_modal::form(
+                text(t!("server-add")).size(Pixels(22.0)).into(),
+                vec![
+                    name_field.into(),
+                    wss_field(state),
+                    if state.server_form_data.wss_url.trim().is_empty() {
+                        host_field
+                    } else {
+                        horizontal_space().into()
+                    },
+                    if state.server_form_data.wss_url.trim().is_empty() {
+                        port_field
+                    } else {
+                        horizontal_space().into()
+                    },
+                    encoding_field(state),
+                    compression_field(state),
+                    if state.server_form_data.wss_url.trim().is_empty() {
+                        tls_field(state)
+                    } else {
+                        horizontal_space().into()
+                    },
+                    server_error(state),
+                ],
+                Row::new()
+                    .push(save_button)
+                    .push(cancel_button)
+                    .spacing(10)
+                    .into(),
+                None,
+            )
         }
         ServerCrudAction::Edit(expected) => {
             // --- Edit Form — name is the key and stays read-only ---
@@ -447,7 +489,7 @@ pub(super) fn view_server_form<'a>(
             ]
             .spacing(4);
 
-            let host_field = column![
+            let host_field: Element<Message> = column![
                 text(t!("server-host"))
                     .size(13)
                     .style(builtins::text::muted),
@@ -456,9 +498,10 @@ pub(super) fn view_server_form<'a>(
                     .on_input(|val| Message::UpdateServerFormField(ServerFormField::Host, val))
                     .on_submit(Message::SubmitServerForm),
             ]
-            .spacing(4);
+            .spacing(4)
+            .into();
 
-            let port_field = column![
+            let port_field: Element<Message> = column![
                 text(t!("server-port"))
                     .size(13)
                     .style(builtins::text::muted),
@@ -471,7 +514,8 @@ pub(super) fn view_server_form<'a>(
                     .size(12)
                     .style(builtins::text::muted),
             ]
-            .spacing(4);
+            .spacing(4)
+            .into();
 
             let mut save_button = button(text(t!("action-save")))
                 .style(builtins::button::primary)
@@ -500,27 +544,48 @@ pub(super) fn view_server_form<'a>(
                 .style(builtins::button::link)
                 .on_press(Message::RequestClearImageCache(expected.clone()));
 
-            Column::new()
-                .push(text(t!("server-edit")).size(Pixels(22.0)))
-                .push(name_field)
-                .push(host_field)
-                .push(port_field)
-                .push(encoding_field(state))
-                .push(compression_field(state))
-                .push(tls_field(state))
-                .push(server_error(state))
-                .push(Row::new().push(save_button).push(cancel_button).spacing(10))
-                .push(vertical_space().height(Pixels(10.0)))
-                .push(
-                    Row::new()
-                        .push(cache_usage)
-                        .push(clear_cache_button)
-                        .spacing(10)
-                        .align_y(iced::Alignment::Center),
-                )
-                .push(delete_button)
-                .spacing(15)
-                .into()
+            smudgy_ui_shared::connect_modal::form(
+                text(t!("server-edit")).size(Pixels(22.0)).into(),
+                vec![
+                    name_field.into(),
+                    wss_field(state),
+                    if state.server_form_data.wss_url.trim().is_empty() {
+                        host_field
+                    } else {
+                        horizontal_space().into()
+                    },
+                    if state.server_form_data.wss_url.trim().is_empty() {
+                        port_field
+                    } else {
+                        horizontal_space().into()
+                    },
+                    encoding_field(state),
+                    compression_field(state),
+                    if state.server_form_data.wss_url.trim().is_empty() {
+                        tls_field(state)
+                    } else {
+                        horizontal_space().into()
+                    },
+                    server_error(state),
+                ],
+                Row::new()
+                    .push(save_button)
+                    .push(cancel_button)
+                    .spacing(10)
+                    .into(),
+                Some(
+                    column![
+                        Row::new()
+                            .push(cache_usage)
+                            .push(clear_cache_button)
+                            .spacing(10)
+                            .align_y(iced::Alignment::Center),
+                        delete_button,
+                    ]
+                    .spacing(15)
+                    .into(),
+                ),
+            )
         }
         ServerCrudAction::ConfirmDelete(expected) => {
             // --- Delete Confirmation ---
@@ -540,18 +605,16 @@ pub(super) fn view_server_form<'a>(
                 .padding([8, 18])
                 .on_press(Message::CancelServerForm);
 
-            Column::new()
-                .push(text(t!("server-delete")).size(Pixels(22.0)))
-                .push(confirmation_text)
-                .push(server_error(state))
-                .push(
-                    Row::new()
-                        .push(confirm_delete_button)
-                        .push(cancel_delete_button)
-                        .spacing(10),
-                )
-                .spacing(15)
-                .into()
+            smudgy_ui_shared::connect_modal::form(
+                text(t!("server-delete")).size(Pixels(22.0)).into(),
+                vec![confirmation_text.into(), server_error(state)],
+                Row::new()
+                    .push(confirm_delete_button)
+                    .push(cancel_delete_button)
+                    .spacing(10)
+                    .into(),
+                None,
+            )
         }
     }
 }

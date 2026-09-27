@@ -308,7 +308,9 @@ mod tests {
 
     #[test]
     fn catalog_matching_is_data_driven_and_region_safe() {
+        #[cfg(feature = "all-locales")]
         assert_eq!(Translator::for_tag("zh_TW.UTF-8").unwrap().tag(), "zh-TW");
+        #[cfg(feature = "all-locales")]
         assert_eq!(Translator::for_tag("zh-Hant-TW").unwrap().tag(), "zh-TW");
         assert_eq!(Translator::for_tag("en_GB.UTF-8").unwrap().tag(), "en-US");
         assert!(Translator::for_tag("zh-HK").is_none());

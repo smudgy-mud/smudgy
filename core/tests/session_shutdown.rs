@@ -56,6 +56,7 @@ async fn connected_session_runtime_joins_on_shutdown() {
     tx.send(RuntimeAction::Connect {
         host: Arc::new("127.0.0.1".to_string()),
         port,
+        wss_url: None,
         send_on_connect: None,
         send_on_connect_redactions: Arc::new(Vec::new()),
         encoding: None,

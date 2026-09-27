@@ -921,7 +921,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -941,7 +941,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -961,7 +961,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -11344,6 +11344,7 @@ dependencies = [
  "smudgy_core",
  "smudgy_script",
  "smudgy_ui",
+ "smudgy_ui_shared",
  "smudgy_widgets",
  "tempfile",
  "tokio",
@@ -11359,7 +11360,6 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
- "color-art",
  "derive_more",
  "hex",
  "hmac",
@@ -11377,6 +11377,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smudgy_protocol",
  "thiserror 2.0.12",
  "tokio",
  "tokio-test",
@@ -11425,16 +11426,32 @@ dependencies = [
  "smudgy_audio",
  "smudgy_audio_web",
  "smudgy_cloud",
+ "smudgy_protocol",
  "smudgy_script",
+ "smudgy_session_model",
  "tempfile",
  "thiserror 2.0.12",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "twox-hash",
  "url",
  "validator",
  "vtparse",
  "zstd",
+]
+
+[[package]]
+name = "smudgy_engine"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "encoding_rs",
+ "flate2",
+ "regex",
+ "smudgy_protocol",
+ "smudgy_session_model",
+ "vtparse",
 ]
 
 [[package]]
@@ -11471,6 +11488,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "smudgy_protocol"
+version = "0.5.8-ptb"
+dependencies = [
+ "color-art",
+ "encoding_rs",
+ "flate2",
+ "getrandom 0.2.16",
+ "log",
+ "memchr",
+ "serde_json",
+ "smudgy_session_model",
+ "url",
+ "vtparse",
+]
+
+[[package]]
 name = "smudgy_script"
 version = "0.5.8-ptb"
 dependencies = [
@@ -11502,9 +11535,21 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "smudgy_session_model",
  "sys_traits",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "smudgy_session_model"
+version = "0.1.0"
+dependencies = [
+ "derive_more",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
 ]
 
 [[package]]
@@ -11556,7 +11601,9 @@ dependencies = [
  "smudgy_i18n",
  "smudgy_map_widget",
  "smudgy_script",
+ "smudgy_session_model",
  "smudgy_theme",
+ "smudgy_ui_shared",
  "smudgy_widgets",
  "sys-locale",
  "tempfile",
@@ -11567,6 +11614,51 @@ dependencies = [
  "validator",
  "winapi",
  "winresource",
+]
+
+[[package]]
+name = "smudgy_ui_shared"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "bytemuck",
+ "encoding_rs",
+ "iced",
+ "iced_runtime",
+ "log",
+ "regex",
+ "rustc-hash 2.1.1",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "smudgy_protocol",
+ "smudgy_session_model",
+ "smudgy_theme",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "smudgy_web_client"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "encoding_rs",
+ "futures",
+ "iced",
+ "js-sys",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "smudgy_engine",
+ "smudgy_i18n",
+ "smudgy_protocol",
+ "smudgy_session_model",
+ "smudgy_theme",
+ "smudgy_ui_shared",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -13311,6 +13403,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-native-certs 0.8.4",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13562,6 +13670,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 dependencies = [
  "core_maths",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.1",
+ "rustls",
+ "rustls-pki-types",
+ "sha1",
+ "thiserror 2.0.12",
+ "utf-8",
 ]
 
 [[package]]

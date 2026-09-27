@@ -1350,7 +1350,7 @@ fn op_smudgy_on<'s>(
         _ => {}
     }
     let source = match source_kind {
-        1 => EventSourceFilter::Exact(SessionId(source_session)),
+        1 => EventSourceFilter::Exact(SessionId::from(source_session)),
         2 => EventSourceFilter::All { include_self },
         _ => EventSourceFilter::Own,
     };
