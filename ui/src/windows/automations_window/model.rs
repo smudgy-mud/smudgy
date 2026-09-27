@@ -1762,7 +1762,10 @@ impl AutomationsWindow {
                 | Message::ParamConfigClearSecret(_)
                 | Message::SetParameterScope(_)
                 | Message::ConfirmGlobalParameterSource
-                | Message::ConfirmCopySettings
+                | Message::SettingsHistory(super::settings_history::SettingsMessage::Finished(
+                    _,
+                    _
+                ))
                 | Message::SelectParameterProfile(_)
         )
     }

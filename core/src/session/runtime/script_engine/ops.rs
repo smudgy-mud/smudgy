@@ -758,6 +758,11 @@ pub struct DeclaredPackageParams(
 #[error("smudgy:params.set: {0}")]
 struct ParamSetError(String);
 
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+#[class(type)]
+#[error("smudgy:params.get: {0}")]
+struct ParamGetError(String);
+
 fn param_state_specifier(
     state: &OpState,
     isolate: &IsolateId,
@@ -792,7 +797,7 @@ fn param_state_specifier(
 }
 
 /// Read a package's param value by its specifier (`smudgy://owner/name`) and key.
-/// Non-secret values come from `smudgy.params.json`, secrets from the OS keyring.
+/// Ordinary values come from the server settings database, secrets from the OS keyring.
 /// Returns null when the key is unset.
 ///
 /// Sandboxed-package reads are gated to the caller's OWN namespace. The per-importer
@@ -806,22 +811,20 @@ fn param_state_specifier(
 /// another same-server package's params and keyring secrets just by passing the victim's
 /// specifier.
 ///
-/// Manifest-blind (the op sees only specifier + key): it reads the non-secret store first,
-/// then the keyring. A manifest `default` is not applied here. If a key exists in BOTH stores
-/// (e.g. a param flips `secret` across versions and stale plaintext lingers), the non-secret
-/// value shadows the secret; the stores are expected to stay mutually exclusive. A secret read
-/// does synchronous keyring I/O per call with no caching, so a hot-path `get()` of a secret can
-/// add latency on slow keyrings (fast on Windows).
+/// Declared ordinary keys read the ordinary store; declared secrets read the keyring. This
+/// avoids credential-service I/O for unset ordinary values. A manifest `default` is applied by
+/// the script binding, not this op. Undeclared keys retain the legacy ordinary-then-secret lookup.
+/// Storage failures are reported to scripts instead of silently substituting defaults.
 #[op2]
 #[serde]
 fn op_smudgy_param_get(
     state: &mut OpState,
     #[string] specifier: String,
     #[string] key: String,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, ParamGetError> {
     let isolate = current_isolate(state);
     if !param_read_allowed(&isolate, &specifier) {
-        return None;
+        return Ok(None);
     }
     let server = state.borrow::<ServerName>().0.clone();
     let profile = state.borrow::<ProfileName>().0.clone();
@@ -830,7 +833,7 @@ fn op_smudgy_param_get(
     // loading fails closed in the provider for the same reason; deny here as a second boundary
     // (and for test providers) rather than expose any published package's values or secrets.
     if local_inventory.error.is_some() && !matches!(isolate, IsolateId::Main) {
-        return None;
+        return Ok(None);
     }
     // Local packages execute under the current public/runtime owner but persist settings only
     // under the reserved local state coordinate. Rewrite after the isolate authorization check:
@@ -851,12 +854,26 @@ fn op_smudgy_param_get(
                 local_name
             )
         });
-    crate::models::shared_packages::get_param_value_for_profile(
+    let declared = state.borrow::<DeclaredPackageParams>().0.borrow();
+    if let Some(parameter) = declared
+        .get(&state_specifier)
+        .and_then(|params| params.iter().find(|p| p.key == key))
+    {
+        return crate::models::shared_packages::get_declared_param_for_profile_checked(
+            &server,
+            &profile,
+            &state_specifier,
+            parameter,
+        )
+        .map_err(|error| ParamGetError(format!("{error:#}")));
+    }
+    crate::models::shared_packages::get_param_value_for_profile_checked(
         &server,
         &profile,
         &state_specifier,
         &key,
     )
+    .map_err(|error| ParamGetError(format!("{error:#}")))
 }
 
 /// Validate and save one parameter declared by the calling package's active manifest.

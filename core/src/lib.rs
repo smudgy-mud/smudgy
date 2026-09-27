@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 #[macro_use]
 extern crate log;
 
+pub mod storage;
+
 /// UTC timestamp embedded when this crate was compiled.
 pub const BUILD_TIME_UTC: &str = build_time::build_time_utc!("%Y-%m-%d %H:%M:%S UTC");
 
