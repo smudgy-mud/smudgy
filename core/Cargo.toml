@@ -17,6 +17,7 @@ smudgy_cloud = { workspace = true }
 smudgy_protocol = { workspace = true }
 smudgy_session_model = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = "0.40.2"
 validator = { workspace = true }
 cfg-if = { workspace = true }
 tokio = { workspace = true }

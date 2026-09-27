@@ -15,6 +15,7 @@ pub mod keymap;
 pub mod layouts_modal;
 pub mod layouts_view;
 pub mod main_toolbar;
+pub mod modal_layer;
 pub mod palettes;
 pub mod pane_drag;
 pub mod pane_groups;

@@ -19,19 +19,19 @@ use crate::theme::Theme;
 /// The gap between the anchor and the floated content.
 const GAP: f32 = 4.0;
 
-pub struct Dropdown<'a, Message> {
+pub struct Dropdown<'a, Message, Renderer = iced::Renderer> {
     /// `[anchor]` closed, `[anchor, content]` open.
-    children: Vec<Element<'a, Message, Theme, iced::Renderer>>,
+    children: Vec<Element<'a, Message, Theme, Renderer>>,
     on_dismiss: Message,
     #[allow(clippy::type_complexity)]
     on_key: Option<Box<dyn Fn(&keyboard::Key) -> Option<Message> + 'a>>,
 }
 
-impl<'a, Message> Dropdown<'a, Message> {
+impl<'a, Message, Renderer> Dropdown<'a, Message, Renderer> {
     /// An anchored dropdown: `content` is `Some` while open.
     pub fn new(
-        anchor: impl Into<Element<'a, Message, Theme, iced::Renderer>>,
-        content: Option<Element<'a, Message, Theme, iced::Renderer>>,
+        anchor: impl Into<Element<'a, Message, Theme, Renderer>>,
+        content: Option<Element<'a, Message, Theme, Renderer>>,
         on_dismiss: Message,
     ) -> Self {
         let mut children = vec![anchor.into()];
@@ -57,7 +57,9 @@ impl<'a, Message> Dropdown<'a, Message> {
     }
 }
 
-impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Dropdown<'_, Message> {
+impl<Message: Clone, Renderer: renderer::Renderer> Widget<Message, Theme, Renderer>
+    for Dropdown<'_, Message, Renderer>
+{
     fn tag(&self) -> tree::Tag {
         tree::Tag::stateless()
     }
@@ -77,7 +79,7 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Dropdown<'_, Mes
     fn layout(
         &mut self,
         tree: &mut Tree,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         // Only the anchor participates in normal layout; the content is laid
@@ -96,7 +98,7 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Dropdown<'_, Mes
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
@@ -143,7 +145,7 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Dropdown<'_, Mes
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
     ) -> mouse::Interaction {
         self.children[0].as_widget().mouse_interaction(
             &tree.children[0],
@@ -157,7 +159,7 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Dropdown<'_, Mes
     fn draw(
         &self,
         tree: &Tree,
-        renderer: &mut iced::Renderer,
+        renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
         layout: Layout<'_>,
@@ -179,7 +181,7 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Dropdown<'_, Mes
         &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
         operation: &mut dyn iced::advanced::widget::Operation,
     ) {
         self.children[0].as_widget_mut().operate(
@@ -194,10 +196,10 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Dropdown<'_, Mes
         &'b mut self,
         tree: &'b mut Tree,
         layout: Layout<'b>,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         if self.children.len() > 1 {
             let (anchor_trees, content_trees) = tree.children.split_at_mut(1);
             let _ = anchor_trees;
@@ -223,24 +225,24 @@ impl<Message: Clone> Widget<Message, Theme, iced::Renderer> for Dropdown<'_, Mes
     }
 }
 
-impl<'a, Message: Clone + 'a> From<Dropdown<'a, Message>>
-    for Element<'a, Message, Theme, iced::Renderer>
+impl<'a, Message: Clone + 'a, Renderer: renderer::Renderer + 'a>
+    From<Dropdown<'a, Message, Renderer>> for Element<'a, Message, Theme, Renderer>
 {
-    fn from(dropdown: Dropdown<'a, Message>) -> Self {
+    fn from(dropdown: Dropdown<'a, Message, Renderer>) -> Self {
         Element::new(dropdown)
     }
 }
 
-struct DropdownOverlay<'a, 'b, Message> {
-    content: &'b mut Element<'a, Message, Theme, iced::Renderer>,
+struct DropdownOverlay<'a, 'b, Message, Renderer> {
+    content: &'b mut Element<'a, Message, Theme, Renderer>,
     tree: &'b mut Tree,
     anchor: Rectangle,
 }
 
-impl<Message> overlay::Overlay<Message, Theme, iced::Renderer>
-    for DropdownOverlay<'_, '_, Message>
+impl<Message, Renderer: renderer::Renderer> overlay::Overlay<Message, Theme, Renderer>
+    for DropdownOverlay<'_, '_, Message, Renderer>
 {
-    fn layout(&mut self, renderer: &iced::Renderer, bounds: Size) -> layout::Node {
+    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         let limits = layout::Limits::new(Size::ZERO, bounds);
         let node = self
             .content
@@ -264,7 +266,7 @@ impl<Message> overlay::Overlay<Message, Theme, iced::Renderer>
         event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) {
@@ -290,7 +292,7 @@ impl<Message> overlay::Overlay<Message, Theme, iced::Renderer>
         &self,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
     ) -> mouse::Interaction {
         self.content.as_widget().mouse_interaction(
             self.tree,
@@ -303,7 +305,7 @@ impl<Message> overlay::Overlay<Message, Theme, iced::Renderer>
 
     fn draw(
         &self,
-        renderer: &mut iced::Renderer,
+        renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
         layout: Layout<'_>,
@@ -318,5 +320,76 @@ impl<Message> overlay::Overlay<Message, Theme, iced::Renderer>
             cursor,
             &layout.bounds(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::widget::Space;
+
+    #[test]
+    fn overlay_follows_its_anchor_inside_translated_and_scrolled_parents() {
+        let mut dropdown: Element<'_, u8, Theme, ()> = Dropdown::new(
+            Space::new().width(40).height(30),
+            Some(Space::new().width(200).height(160).into()),
+            0,
+        )
+        .into();
+        let mut tree = Tree::new(dropdown.as_widget());
+        let bounds = Size::new(1500.0, 800.0);
+        let viewport = Rectangle::with_size(bounds);
+        let node = dropdown
+            .as_widget_mut()
+            .layout(&mut tree, &(), &layout::Limits::new(Size::ZERO, bounds))
+            .move_to(Point::new(1200.0, 540.0));
+        assert_eq!(
+            node.size(),
+            Size::new(40.0, 30.0),
+            "menu width must not enlarge the anchor"
+        );
+        let mut overlay = dropdown
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                Layout::new(&node),
+                &(),
+                &viewport,
+                Vector::new(30.0, -220.0),
+            )
+            .unwrap();
+        let node = overlay.as_overlay_mut().layout(&(), bounds);
+        assert_eq!(
+            node.bounds(),
+            Rectangle {
+                x: 1230.0,
+                y: 354.0,
+                width: 200.0,
+                height: 160.0
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_flips_above_and_stays_inside_the_right_edge() {
+        let mut dropdown: Element<'_, u8, Theme, ()> = Dropdown::new(
+            Space::new().width(40).height(30),
+            Some(Space::new().width(200).height(160).into()),
+            0,
+        )
+        .into();
+        let mut tree = Tree::new(dropdown.as_widget());
+        let bounds = Size::new(1500.0, 800.0);
+        let viewport = Rectangle::with_size(bounds);
+        let node = dropdown
+            .as_widget_mut()
+            .layout(&mut tree, &(), &layout::Limits::new(Size::ZERO, bounds))
+            .move_to(Point::new(1440.0, 750.0));
+        let mut overlay = dropdown
+            .as_widget_mut()
+            .overlay(&mut tree, Layout::new(&node), &(), &viewport, Vector::ZERO)
+            .unwrap();
+        let node = overlay.as_overlay_mut().layout(&(), bounds);
+        assert_eq!(node.bounds().position(), Point::new(1300.0, 586.0));
     }
 }
