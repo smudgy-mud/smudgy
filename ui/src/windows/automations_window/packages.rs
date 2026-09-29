@@ -14,8 +14,8 @@ use iced::{Background, Border, Color, Font, Length};
 
 use smudgy_cloud::cloud_api::{CloudApiClient, FriendView};
 use smudgy_cloud::package_api::{
-    CommentView, PackageApiClient, PackageDetail, PackageGrantView, PackageSearchResult,
-    ResolvedPackageWire, SearchCategory, VersionListItem,
+    AvailableWithSmudgyUpgrade, CommentView, PackageApiClient, PackageDetail, PackageGrantView,
+    PackageSearchResult, ResolvedPackageWire, SearchCategory, VersionListItem,
 };
 use smudgy_cloud::{CloudError, DependencyKind, Uuid};
 use smudgy_core::models::local_packages::{self, LocalModule};
@@ -540,6 +540,8 @@ pub struct InstallResolution {
     pub owner: String,
     pub name: String,
     pub version: String,
+    /// A newer package release that the server may advertise now but this Smudgy cannot run.
+    pub available_with_smudgy_upgrade: Option<AvailableWithSmudgyUpgrade>,
     /// The whole closure permission union — recorded verbatim as `consented_permissions`
     /// on Grant. Computed by walking the dependency closure (mirrors the engine's `solve_closure`).
     pub permissions: PackagePermissions,
@@ -609,6 +611,7 @@ pub struct ConsentPrompt {
     pub owner: String,
     pub name: String,
     pub version: String,
+    pub available_with_smudgy_upgrade: Option<AvailableWithSmudgyUpgrade>,
     /// The closure union the user grants on confirm (recorded as `consented_permissions`).
     pub permissions: PackagePermissions,
     /// The root manifest's params — carried so a Grant can chain straight into the
@@ -882,6 +885,7 @@ async fn resolve_install_closure(
     };
     let expected_local_manifests = local_manifests.clone();
     let root = client.resolve_package(owner, name, pinned).await?;
+    let available_with_smudgy_upgrade = root.available_with_smudgy_upgrade.clone();
     let ResolvedImportClosure {
         permissions,
         floor,
@@ -897,6 +901,7 @@ async fn resolve_install_closure(
             owner: root.owner_nickname,
             name: root.name,
             version: root.version,
+            available_with_smudgy_upgrade,
             permissions,
             params,
             closure: import_closure,
@@ -917,6 +922,7 @@ async fn resolve_install_closure(
         owner: root.owner_nickname,
         name: root.name,
         version: root.version,
+        available_with_smudgy_upgrade,
         permissions,
         params,
         closure: import_closure,
@@ -3802,6 +3808,7 @@ impl AutomationsWindow {
                     owner: resolution.owner,
                     name: resolution.name,
                     version: resolution.version,
+                    available_with_smudgy_upgrade: resolution.available_with_smudgy_upgrade,
                     permissions: resolution.permissions,
                     params: resolution.params,
                     closure: resolution.closure,
@@ -4875,6 +4882,7 @@ impl AutomationsWindow {
                     owner: crate::i18n::t!("package-local-publisher"),
                     name: name.clone(),
                     version,
+                    available_with_smudgy_upgrade: None,
                     permissions,
                     params: Vec::new(),
                     closure: Vec::new(),
@@ -6548,6 +6556,7 @@ impl AutomationsWindow {
                     owner: res.owner,
                     name: res.name,
                     version: res.version,
+                    available_with_smudgy_upgrade: res.available_with_smudgy_upgrade,
                     permissions: res.permissions,
                     params: res.params,
                     closure: res.closure,
@@ -8441,7 +8450,7 @@ impl AutomationsWindow {
                     &result.name,
                 )))
                 .into()
-        } else {
+        } else if result.latest_version.is_some() {
             // "View" opens the package's detail page (README, comments, rating); "Install" begins
             // the install straight away (resolve → consent), the same flow as the detail page's
             // own Install button — so the user can install without a detour through the detail.
@@ -8462,6 +8471,10 @@ impl AutomationsWindow {
             .spacing(8.0)
             .align_y(Vertical::Center)
             .into()
+        } else {
+            button(text(crate::i18n::t!("package-upgrade-smudgy")).size(12.0))
+                .style(button_style::secondary)
+                .into()
         };
         // Meta line as a single text run: the prefix and rating average/count inherit the faint base
         // color, while the ★ span is tinted the "out" color.
@@ -8478,32 +8491,41 @@ impl AutomationsWindow {
             star_color,
         ));
         let meta_line: Elem = rich_text(meta_spans).size(11.0).style(common::faint).into();
-        container(card_with_trailing_action(
-            column![
-                row![
-                    text(result.name.clone()).size(15.0),
-                    if installed {
-                        common::badge(crate::i18n::t!("package-installed"))
-                    } else {
-                        iced::widget::space::horizontal()
-                            .width(Length::Shrink)
-                            .into()
-                    },
-                ]
-                .spacing(8.0)
-                .align_y(Vertical::Center),
-                text(result.description.clone())
-                    .size(12.0)
-                    .style(common::muted),
-                meta_line,
+        let mut summary = column![
+            row![
+                text(result.name.clone()).size(15.0),
+                if installed {
+                    common::badge(crate::i18n::t!("package-installed"))
+                } else {
+                    iced::widget::space::horizontal()
+                        .width(Length::Shrink)
+                        .into()
+                },
             ]
-            .spacing(3.0),
-            action,
-        ))
-        .padding(12.0)
-        .width(Length::Fill)
-        .style(common::card_style)
-        .into()
+            .spacing(8.0)
+            .align_y(Vertical::Center),
+            text(result.description.clone())
+                .size(12.0)
+                .style(common::muted),
+            meta_line,
+        ]
+        .spacing(3.0);
+        if let Some(advisory) = &result.available_with_smudgy_upgrade {
+            summary = summary.push(
+                text(crate::i18n::t!(
+                    "package-available-with-smudgy-upgrade",
+                    "package_version" => &advisory.package_version,
+                    "smudgy_version" => &advisory.minimum_smudgy_version
+                ))
+                .size(11.0)
+                .style(common::accent),
+            );
+        }
+        container(card_with_trailing_action(summary, action))
+            .padding(12.0)
+            .width(Length::Fill)
+            .style(common::card_style)
+            .into()
     }
 
     fn view_discover_detail(&self, detail: &PackageDetail) -> Elem<'_> {
@@ -8517,10 +8539,14 @@ impl AutomationsWindow {
             button(text(crate::i18n::t!("package-installed")).size(12.0))
                 .style(button_style::secondary)
                 .into()
-        } else {
+        } else if detail.latest_version.is_some() {
             button(text(crate::i18n::t!("package-install")).size(12.0))
                 .style(button_style::primary)
                 .on_press(Message::DiscoverInstall)
+                .into()
+        } else {
+            button(text(crate::i18n::t!("package-upgrade-smudgy")).size(12.0))
+                .style(button_style::secondary)
                 .into()
         };
         // The meta line is a single text run: the owner/version/installs prefix and the rating
@@ -8553,6 +8579,21 @@ impl AutomationsWindow {
         .spacing(8.0);
         if !pkg.description.is_empty() {
             col = col.push(text(pkg.description.clone()).size(13.0));
+        }
+        if let Some(advisory) = &detail.available_with_smudgy_upgrade {
+            col = col.push(
+                container(
+                    text(crate::i18n::t!(
+                        "package-available-with-smudgy-upgrade",
+                        "package_version" => &advisory.package_version,
+                        "smudgy_version" => &advisory.minimum_smudgy_version
+                    ))
+                    .size(13.0),
+                )
+                .padding(10.0)
+                .width(Length::Fill)
+                .style(common::banner_style),
+            );
         }
         if let Some(readme) = &self.discover_readme {
             let settings = markdown::Settings::with_text_size(
@@ -8711,6 +8752,23 @@ impl AutomationsWindow {
                     .size(12.0)
                     .style(common::muted),
             );
+
+        if let Some(advisory) = &prompt.available_with_smudgy_upgrade {
+            form = form.push(
+                container(
+                    text(crate::i18n::t!(
+                        "package-installing-compatible-version",
+                        "current_version" => &prompt.version,
+                        "package_version" => &advisory.package_version,
+                        "smudgy_version" => &advisory.minimum_smudgy_version
+                    ))
+                    .size(12.0),
+                )
+                .padding(10.0)
+                .width(Length::Fill)
+                .style(common::banner_style),
+            );
+        }
 
         let can = permission_can_lines(&prompt.permissions);
         if can.is_empty() {
@@ -9722,6 +9780,7 @@ mod tests {
             owner,
             name,
             version: version.to_string(),
+            available_with_smudgy_upgrade: None,
             permissions,
             params: Vec::new(),
             closure: Vec::new(),
@@ -9742,6 +9801,7 @@ mod tests {
             owner: local_packages::LOCAL_OWNER.to_string(),
             name: name.to_string(),
             version: "0.1.0".to_string(),
+            available_with_smudgy_upgrade: None,
             permissions: PackagePermissions::default(),
             params: Vec::new(),
             closure: Vec::new(),

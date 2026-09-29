@@ -274,6 +274,31 @@ impl AutomationsWindow {
             body = body.push(self.view_update_delta(delta));
         }
 
+        // The server may project an older, runnable latest while advertising a newer public
+        // package release behind a Smudgy upgrade. Keep that signal visible even for pinned or
+        // already-up-to-date installs; it is informational and never changes the update policy.
+        if tab == InstalledPackageTab::About
+            && !viewing_as_import
+            && let Some(advisory) = self
+                .installed_rating
+                .as_deref()
+                .and_then(|detail| detail.available_with_smudgy_upgrade.as_ref())
+        {
+            body = body.push(
+                container(
+                    text(crate::i18n::t!(
+                        "package-available-with-smudgy-upgrade",
+                        "package_version" => &advisory.package_version,
+                        "smudgy_version" => &advisory.minimum_smudgy_version
+                    ))
+                    .size(13.0),
+                )
+                .padding(12.0)
+                .width(Length::Fill)
+                .style(common::banner_style),
+            );
+        }
+
         // Meta row. "Loaded" is the version the engine actually resolved (the lockfile's
         // last-resolved record) — which, for a held-back package, is the older fitting version,
         // NOT the latest the inspect pane probes. Show the held-back latest separately so the two
