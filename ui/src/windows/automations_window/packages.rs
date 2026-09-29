@@ -8472,9 +8472,22 @@ impl AutomationsWindow {
             .align_y(Vertical::Center)
             .into()
         } else {
-            button(text(crate::i18n::t!("package-upgrade-smudgy")).size(12.0))
-                .style(button_style::secondary)
-                .into()
+            // No release this Smudgy can run: the detail page stays reachable, and the upgrade
+            // hint is a plain label rather than an action.
+            row![
+                text(crate::i18n::t!("package-upgrade-smudgy"))
+                    .size(12.0)
+                    .style(common::muted),
+                button(text(crate::i18n::t!("package-view")).size(12.0))
+                    .style(button_style::secondary)
+                    .on_press(Message::DiscoverSelect {
+                        package_id: result.package_id,
+                        owner: result.owner_nickname.clone(),
+                    }),
+            ]
+            .spacing(8.0)
+            .align_y(Vertical::Center)
+            .into()
         };
         // Meta line as a single text run: the prefix and rating average/count inherit the faint base
         // color, while the ★ span is tinted the "out" color.
@@ -8545,8 +8558,9 @@ impl AutomationsWindow {
                 .on_press(Message::DiscoverInstall)
                 .into()
         } else {
-            button(text(crate::i18n::t!("package-upgrade-smudgy")).size(12.0))
-                .style(button_style::secondary)
+            text(crate::i18n::t!("package-upgrade-smudgy"))
+                .size(12.0)
+                .style(common::muted)
                 .into()
         };
         // The meta line is a single text run: the owner/version/installs prefix and the rating
