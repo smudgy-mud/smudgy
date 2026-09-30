@@ -1,5 +1,8 @@
 import { mapper, sendRaw, echo } from 'smudgy:core';
 import { get } from 'smudgy:params';
+import { idsMatch } from './ids.ts';
+
+export { idsMatch } from './ids.ts';
 
 export enum RoomFlags {
     DT = 'DT',
@@ -223,18 +226,6 @@ export const DirectionLetter: Record<Direction, string> = {
 /** Room property holding the command that opens/clears this room's exit (e.g. `open n`, `part brush`). */
 export function openCommandProperty(direction: Direction): string {
     return `open_${DirectionLetter[direction]}_command`;
-}
-
-export function idsMatch(id1: AreaId | undefined | null, id2: AreaId | undefined | null) {
-    if (!id1 && !id2) {
-        return true;
-    }
-
-    if (!id1 || !id2) {
-        return false;
-    }
-
-    return id1 === id2;
 }
 
 /**

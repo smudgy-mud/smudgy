@@ -478,6 +478,16 @@ impl HostFailure {
 trait HostFactory: Clone + Send + 'static {
     type Host: OutputHost;
 
+    /// Whether the backend can convert an explicit stereo render stream even
+    /// when device enumeration advertises only its native mix channel count.
+    ///
+    /// CPAL's WASAPI output path enables `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`,
+    /// so Windows can matrix stereo into a multichannel endpoint. Other hosts
+    /// must continue to select only configurations they advertise.
+    fn supports_stereo_channel_conversion(&self) -> bool {
+        false
+    }
+
     fn create(self) -> Result<Self::Host, HostFailure>;
 }
 
@@ -647,6 +657,23 @@ fn plan_output(
             "the default device has no exact stereo PCM configuration at the requested rate",
         )
     })
+}
+
+fn plan_output_with_channel_conversion(
+    ranges: &[OutputConfigRange],
+    sample_rate: u32,
+) -> Result<OutputPlan, HostFailure> {
+    plan_output(
+        ranges
+            .iter()
+            .copied()
+            .filter(|range| range.channels > 0)
+            .map(|mut range| {
+                range.channels = PHYSICAL_CHANNELS;
+                range
+            }),
+        sample_rate,
+    )
 }
 
 enum OutputBuffer<'a> {
@@ -1410,6 +1437,7 @@ fn stage_default_endpoint<F: HostFactory>(
     host: &mut Option<ManuallyDrop<F::Host>>,
     device: &mut Option<ManuallyDrop<HostDevice<F>>>,
 ) -> Result<OutputPlan, SystemOutputError> {
+    let supports_stereo_channel_conversion = factory.supports_stereo_channel_conversion();
     *host = Some(ManuallyDrop::new(contain_host_call(
         SystemOutputOperation::Setup,
         || factory.create(),
@@ -1432,8 +1460,21 @@ fn stage_default_endpoint<F: HostFactory>(
             .expect("device is staged during planning")
             .supported_output_configs()
     })?;
-    plan_output(ranges, sample_rate)
-        .map_err(|error| system_error(SystemOutputOperation::Plan, error))
+    match plan_output(ranges.iter().copied(), sample_rate) {
+        Ok(plan) => Ok(plan),
+        Err(error) if supports_stereo_channel_conversion => {
+            match plan_output_with_channel_conversion(&ranges, sample_rate) {
+                Ok(plan) => {
+                    log::info!(
+                        "physical audio has no advertised stereo channel layout at {sample_rate} Hz; attempting host channel conversion"
+                    );
+                    Ok(plan)
+                }
+                Err(_) => Err(system_error(SystemOutputOperation::Plan, error)),
+            }
+        }
+        Err(error) => Err(system_error(SystemOutputOperation::Plan, error)),
+    }
 }
 
 impl<F: HostFactory> JoinedOutputDriver for CpalOutputDriver<F> {
@@ -2607,6 +2648,10 @@ struct SystemStream(cpal::Stream);
 
 impl HostFactory for SystemHostFactory {
     type Host = SystemHost;
+
+    fn supports_stereo_channel_conversion(&self) -> bool {
+        cfg!(target_os = "windows")
+    }
 
     fn create(self) -> Result<Self::Host, HostFailure> {
         Ok(SystemHost(cpal::default_host()))

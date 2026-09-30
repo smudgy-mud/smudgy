@@ -451,6 +451,15 @@ pub(crate) fn evaluate_entry(
     let installed_deleted = result.installed.is_some_and(|i| i.deleted);
     let installed_yanked = result.installed.is_some_and(|i| i.yanked);
     let Some(latest) = &result.latest else {
+        if let Some(advisory) = &result.available_with_smudgy_upgrade {
+            return EntryPlan {
+                outcome: CheckOutcome::NeedsSmudgy {
+                    latest: advisory.package_version.clone(),
+                    required: advisory.minimum_smudgy_version.clone(),
+                },
+                action: EntryAction::None,
+            };
+        }
         if installed_deleted {
             // Hard-deleted AND no live versions remain — the one definitive signal.
             return EntryPlan {
@@ -472,7 +481,12 @@ pub(crate) fn evaluate_entry(
     // Pinned entries get statuses only: no folds, no offers — the "pinning ends the
     // expensive grant checks" promise.
     if entry.pinned_version().is_some() {
-        let outcome = if installed_yanked {
+        let outcome = if let Some(advisory) = &result.available_with_smudgy_upgrade {
+            CheckOutcome::NeedsSmudgy {
+                latest: advisory.package_version.clone(),
+                required: advisory.minimum_smudgy_version.clone(),
+            }
+        } else if installed_yanked {
             CheckOutcome::Yanked
         } else {
             CheckOutcome::UpToDate
@@ -492,7 +506,12 @@ pub(crate) fn evaluate_entry(
         }
     };
     if !is_candidate {
-        let outcome = if installed_yanked {
+        let outcome = if let Some(advisory) = &result.available_with_smudgy_upgrade {
+            CheckOutcome::NeedsSmudgy {
+                latest: advisory.package_version.clone(),
+                required: advisory.minimum_smudgy_version.clone(),
+            }
+        } else if installed_yanked {
             CheckOutcome::Yanked
         } else {
             CheckOutcome::UpToDate
@@ -1036,8 +1055,8 @@ mod tests {
 
     use sha2::Digest;
     use smudgy_cloud::package_api::{
-        CheckUpdatesResult, UpdateCheckClosureNode, UpdateCheckDependency, UpdateCheckInstalled,
-        UpdateCheckLatest,
+        AvailableWithSmudgyUpgrade, CheckUpdatesResult, UpdateCheckClosureNode,
+        UpdateCheckDependency, UpdateCheckInstalled, UpdateCheckLatest,
     };
     use smudgy_cloud::{Credential, CredentialSource};
     use smudgy_core::models::shared_packages::UpdateMode;
@@ -1212,6 +1231,7 @@ mod tests {
                 deleted: false,
             }),
             latest,
+            available_with_smudgy_upgrade: None,
             closure: Vec::new(),
         }
     }
@@ -1234,6 +1254,34 @@ mod tests {
             &running(),
         );
         assert_eq!(plan.outcome, CheckOutcome::UpToDate);
+        assert!(matches!(plan.action, EntryAction::None));
+    }
+
+    #[test]
+    fn incompatible_advertised_version_is_informational_and_never_uninstalls() {
+        let mut result = ok_result(None);
+        result.installed = Some(UpdateCheckInstalled {
+            yanked: false,
+            deleted: true,
+        });
+        result.available_with_smudgy_upgrade = Some(AvailableWithSmudgyUpgrade {
+            package_version: "2.0.0".into(),
+            minimum_smudgy_version: "1.1.0".into(),
+        });
+        let plan = evaluate_entry(
+            "arctic",
+            &entry(Some("1.2.0")),
+            &result,
+            &no_meta,
+            &running(),
+        );
+        assert_eq!(
+            plan.outcome,
+            CheckOutcome::NeedsSmudgy {
+                latest: "2.0.0".into(),
+                required: "1.1.0".into(),
+            }
+        );
         assert!(matches!(plan.action, EntryAction::None));
     }
 

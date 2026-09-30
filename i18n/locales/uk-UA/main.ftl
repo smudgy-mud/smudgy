@@ -1908,7 +1908,9 @@ package-no-results = Немає результатів — введіть зап
 package-manage = Керувати
 package-view = Переглянути
 package-install = Встановити
+package-upgrade-smudgy = Оновити Smudgy
 package-installed = Встановлено
+package-available-with-smudgy-upgrade = Пакунок v{ $package_version } доступний у Smudgy { $smudgy_version } або новішій версії.
 package-search-meta = { $count ->
         [many] { $owner } · v{ $version } · { $count } встановлень ·
        *[other] { $owner } · v{ $version } · { $count } встановлення ·
@@ -1928,6 +1930,7 @@ package-runtime-settings-help = Значення, які цей пакунок �
 package-saved = Збережено.
 package-save-settings = Зберегти налаштування
 package-install-title = Встановити { $name } v{ $version }
+package-installing-compatible-version = Встановлюється сумісна версія v{ $current_version }. Пакунок v{ $package_version } стане доступним у Smudgy { $smudgy_version } або новішій версії.
 package-update-review-title = Перевірити { $name } v{ $version }
 package-manifest-review-title = Перевірити зміни в пакунку { $name }
 package-local-publisher = Локальний пакунок

@@ -89,6 +89,7 @@ enum FakeFailure {
 )]
 struct FakeConfig {
     ranges: Vec<OutputConfigRange>,
+    supports_stereo_channel_conversion: bool,
     failure: FakeFailure,
     callback_during_build: bool,
     callback_during_play: bool,
@@ -110,6 +111,7 @@ impl Default for FakeConfig {
                 DriverSampleFormat::F32,
                 OutputBufferRange::Range { min: 64, max: 512 },
             )],
+            supports_stereo_channel_conversion: false,
             failure: FakeFailure::None,
             callback_during_build: false,
             callback_during_play: false,
@@ -220,6 +222,10 @@ struct FakeStream(Arc<FakeState>);
 
 impl HostFactory for FakeFactory {
     type Host = FakeHost;
+
+    fn supports_stereo_channel_conversion(&self) -> bool {
+        self.0.config.supports_stereo_channel_conversion
+    }
 
     fn create(self) -> Result<Self::Host, HostFailure> {
         self.0.record("host-create");
@@ -575,6 +581,90 @@ fn unknown_buffer_size_publishes_no_hint() {
     .unwrap();
     assert_eq!(plan.stream.buffer_size, OutputBufferRequest::Default);
     assert_eq!(plan.physical.buffer_frames_hint(), None);
+}
+
+#[test]
+fn host_conversion_falls_back_to_stereo_for_a_multichannel_endpoint() {
+    let ranges = vec![range(
+        8,
+        TEST_RATE,
+        TEST_RATE,
+        DriverSampleFormat::F32,
+        OutputBufferRange::Unknown,
+    )];
+    let converted = plan_output_with_channel_conversion(&ranges, TEST_RATE).unwrap();
+    assert_eq!(converted.stream.channels, 2);
+    assert_eq!(converted.stream.sample_rate, TEST_RATE);
+    assert_eq!(converted.stream.sample_format, DriverSampleFormat::F32);
+    assert_eq!(converted.stream.buffer_size, OutputBufferRequest::Default);
+
+    let strict = attempt_fake(
+        FakeConfig {
+            ranges: ranges.clone(),
+            ..FakeConfig::default()
+        },
+        TEST_RATE,
+        fresh_lease_flag(),
+    )
+    .result
+    .unwrap_err();
+    assert!(matches!(
+        strict,
+        MixerStartError::Backend(ref error)
+            if error.kind() == SystemOutputErrorKind::UnsupportedFormat
+                && error.operation() == SystemOutputOperation::Plan
+    ));
+
+    let (service, state) = start_fake(FakeConfig {
+        ranges,
+        supports_stereo_channel_conversion: true,
+        ..FakeConfig::default()
+    });
+    assert_eq!(state.build_count.load(Ordering::Acquire), 1);
+    assert!(state.callbacks.lock().unwrap().data.is_some());
+    assert!(service.shutdown().clean);
+}
+
+#[test]
+fn host_channel_conversion_does_not_mask_other_format_incompatibilities() {
+    let incompatible_ranges = [
+        vec![range(
+            8,
+            44_100,
+            44_100,
+            DriverSampleFormat::F32,
+            OutputBufferRange::Unknown,
+        )],
+        vec![range(
+            8,
+            TEST_RATE,
+            TEST_RATE,
+            DriverSampleFormat::F32,
+            OutputBufferRange::Range {
+                min: MAX_PHYSICAL_CALLBACK_FRAMES + 1,
+                max: MAX_PHYSICAL_CALLBACK_FRAMES + 2,
+            },
+        )],
+    ];
+    for ranges in incompatible_ranges {
+        let error = attempt_fake(
+            FakeConfig {
+                ranges,
+                supports_stereo_channel_conversion: true,
+                ..FakeConfig::default()
+            },
+            TEST_RATE,
+            fresh_lease_flag(),
+        )
+        .result
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MixerStartError::Backend(ref error)
+                if error.kind() == SystemOutputErrorKind::UnsupportedFormat
+                    && error.operation() == SystemOutputOperation::Plan
+        ));
+    }
 }
 
 #[test]

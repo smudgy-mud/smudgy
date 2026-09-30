@@ -31,9 +31,25 @@ use uuid::Uuid;
 
 use crate::{CloudError, CloudResult, backends::CredentialSource};
 
+/// Advertises support for [`AvailableWithSmudgyUpgrade`] and advisory-only discovery
+/// results. Client-relative compatibility projection itself is keyed by the existing
+/// client-version header, including for older clients. Keeping this package-specific
+/// avoids sending registry protocol details to presigned or package-chosen content URLs.
+const PACKAGE_COMPATIBILITY_HEADER: &str = "x-smudgy-package-compatibility";
+const PACKAGE_COMPATIBILITY_VERSION: &str = "1";
+
 // ===========================================================================
 // Wire types (mirror smudgy-api `src/models.rs` package DTOs)
 // ===========================================================================
+
+/// A newer package version that this client may advertise but cannot run until
+/// Smudgy itself is upgraded. The server limits these advisories to its per-request
+/// public advertising ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableWithSmudgyUpgrade {
+    pub package_version: String,
+    pub minimum_smudgy_version: String,
+}
 
 /// A package namespace owned by a user (`POST /packages`, `GET /packages/{id}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,8 +73,13 @@ pub struct PackageView {
 pub struct PackageDetail {
     #[serde(flatten)]
     pub package: PackageView,
+    /// The latest version selected for this caller (compatible on advisory-capable servers).
     #[serde(default)]
     pub latest_version: Option<String>,
+    /// A newer release hidden behind a Smudgy version floor, when the client advertised
+    /// advisory support.
+    #[serde(default)]
+    pub available_with_smudgy_upgrade: Option<AvailableWithSmudgyUpgrade>,
     #[serde(default)]
     pub version_count: i64,
     #[serde(default)]
@@ -86,8 +107,11 @@ pub struct PackageSearchResult {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// The latest version selected for this caller (compatible on advisory-capable servers).
     #[serde(default)]
     pub latest_version: Option<String>,
+    #[serde(default)]
+    pub available_with_smudgy_upgrade: Option<AvailableWithSmudgyUpgrade>,
     #[serde(default)]
     pub aligned_hosts: Vec<String>,
     /// Whether the package is host-agnostic (no aligned hosts).
@@ -126,6 +150,9 @@ pub struct ResolvedPackageWire {
     pub owner_nickname: String,
     pub name: String,
     pub version: String,
+    /// A newer release that becomes selectable after upgrading Smudgy.
+    #[serde(default)]
+    pub available_with_smudgy_upgrade: Option<AvailableWithSmudgyUpgrade>,
     /// The package manifest (`smudgy.package.json`) as stored. Parsed client-side into
     /// `smudgy_script::PackageManifest` by the runtime's package provider.
     #[serde(default)]
@@ -364,9 +391,14 @@ pub struct CheckUpdatesResult {
     /// the server doesn't know it.
     #[serde(default)]
     pub installed: Option<UpdateCheckInstalled>,
-    /// The newest non-yanked version; `None` when no live versions remain.
+    /// The newest non-yanked version selected for this caller. When no version is runnable,
+    /// advisory-capable servers retain the absolute newest live version here as a deletion-safety
+    /// fallback; `None` therefore continues to mean that no non-yanked live versions remain.
     #[serde(default)]
     pub latest: Option<UpdateCheckLatest>,
+    /// A newer package version that the running Smudgy cannot use yet.
+    #[serde(default)]
+    pub available_with_smudgy_upgrade: Option<AvailableWithSmudgyUpgrade>,
     /// The distinct transitive nodes of `latest`'s dependency closure at their locked
     /// versions (walked over `kind = "dependency"` edges only), minus anything the
     /// request's `have` covered — and additionally filtered to viewer-visible packages,
@@ -390,9 +422,10 @@ pub struct UpdateCheckInstalled {
     pub deleted: bool,
 }
 
-/// The newest live version in a check-updates result — everything a cached resolution
-/// needs *except* content URLs (no presigns anywhere in this endpoint), so every part
-/// of it is immutably cacheable.
+/// The newest live version selected for this caller in a check-updates result — or the absolute
+/// newest live fallback when none is runnable — with everything a cached resolution needs
+/// *except* content URLs (no presigns anywhere in this endpoint), so every part is immutably
+/// cacheable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateCheckLatest {
     pub version: String,
@@ -1102,6 +1135,7 @@ impl PackageApiClient {
         debug!("{method} {url}");
 
         let mut request = self.client.request(method.clone(), &url);
+        request = request.header(PACKAGE_COMPATIBILITY_HEADER, PACKAGE_COMPATIBILITY_VERSION);
         match auth {
             Auth::Required => {
                 request = request.header("authorization", self.auth_header()?);
@@ -1296,6 +1330,7 @@ mod tests {
         assert_eq!(resolved.aligned_hosts, vec!["mud.arctic.org"]);
         // A response without `dependencies` (an older server) parses to an empty set.
         assert!(resolved.dependencies.is_empty());
+        assert!(resolved.available_with_smudgy_upgrade.is_none());
     }
 
     #[test]
@@ -1305,6 +1340,10 @@ mod tests {
             "owner_nickname": "wbk",
             "name": "app",
             "version": "1.0.0",
+            "available_with_smudgy_upgrade": {
+                "package_version": "1.1.0",
+                "minimum_smudgy_version": "0.5.9"
+            },
             "manifest": { "name": "app", "version": "1.0.0" },
             "modules": [],
             "dependencies": [
@@ -1323,6 +1362,12 @@ mod tests {
             "an old server's omitted kind is a code dependency"
         );
         assert_eq!(resolved.dependencies[1].kind, DependencyKind::Requires);
+        assert_eq!(
+            resolved
+                .available_with_smudgy_upgrade
+                .map(|upgrade| upgrade.package_version),
+            Some("1.1.0".to_string())
+        );
     }
 
     #[test]
@@ -1365,6 +1410,10 @@ mod tests {
                       "resolved_version": "1.0.0" }
                 ]
             },
+            "available_with_smudgy_upgrade": {
+                "package_version": "1.4.0",
+                "minimum_smudgy_version": "0.5.9"
+            },
             "closure": [
                 { "owner": "wbk", "name": "duo-core", "version": "1.1.0",
                   "manifest": { "name": "duo-core", "version": "1.1.0" },
@@ -1393,6 +1442,11 @@ mod tests {
         );
         assert_eq!(result.closure.len(), 1);
         assert_eq!(result.closure[0].version, "1.1.0");
+        let advisory = result
+            .available_with_smudgy_upgrade
+            .expect("upgrade advisory");
+        assert_eq!(advisory.package_version, "1.4.0");
+        assert_eq!(advisory.minimum_smudgy_version, "0.5.9");
 
         // The uniform miss: nulls for installed/latest, an empty closure.
         let miss: CheckUpdatesResult = serde_json::from_value(serde_json::json!({
@@ -1403,6 +1457,7 @@ mod tests {
         assert_eq!(miss.status, "not_found");
         assert_eq!(miss.installed, None);
         assert!(miss.latest.is_none());
+        assert!(miss.available_with_smudgy_upgrade.is_none());
         assert!(miss.closure.is_empty());
     }
 
@@ -1431,6 +1486,48 @@ mod tests {
         assert!(result.host_agnostic);
         assert_eq!(result.avg_rating, None);
         assert!(result.aligned_hosts.is_empty());
+        assert!(result.available_with_smudgy_upgrade.is_none());
+    }
+
+    #[test]
+    fn discovery_shapes_parse_package_upgrade_advisories() {
+        let advisory = serde_json::json!({
+            "package_version": "2.0.0",
+            "minimum_smudgy_version": "0.6.0"
+        });
+        let search: PackageSearchResult = serde_json::from_value(serde_json::json!({
+            "package_id": "00000000-0000-0000-0000-000000000002",
+            "owner_nickname": "wbk",
+            "name": "speedwalk",
+            "available_with_smudgy_upgrade": advisory
+        }))
+        .unwrap();
+        assert_eq!(
+            search
+                .available_with_smudgy_upgrade
+                .as_ref()
+                .map(|upgrade| upgrade.package_version.as_str()),
+            Some("2.0.0")
+        );
+
+        let detail: PackageDetail = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000002",
+            "owner_id": "00000000-0000-0000-0000-000000000003",
+            "name": "speedwalk",
+            "created_at": "2026-06-20T00:00:00Z",
+            "updated_at": "2026-06-20T00:00:00Z",
+            "available_with_smudgy_upgrade": {
+                "package_version": "2.0.0",
+                "minimum_smudgy_version": "0.6.0"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            detail
+                .available_with_smudgy_upgrade
+                .map(|upgrade| upgrade.minimum_smudgy_version),
+            Some("0.6.0".to_string())
+        );
     }
 
     #[test]

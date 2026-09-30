@@ -71,6 +71,8 @@ struct MockState {
     /// server's over-cap contract (no 400; only the request caps 400). Tests set it
     /// to exercise the client's cannot-evaluate handling of an elided closure.
     closure_node_cap: Option<usize>,
+    /// Most recent package-protocol capability value observed on resolve.
+    package_compatibility: Option<String>,
 }
 
 type Shared = Arc<Mutex<MockState>>;
@@ -235,6 +237,11 @@ async fn upload_blob(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Package capability negotiation belongs on registry API calls, never on presigned or
+    // package-chosen content URLs.
+    if headers.contains_key("x-smudgy-package-compatibility") {
+        return (StatusCode::BAD_REQUEST, "package header leaked to blob URL").into_response();
+    }
     let actual = sha256_hex(&body);
     // Mirror S3's signed-checksum binding: the client MUST replay the `x-amz-checksum-sha256`
     // header from begin (the mock uses the hex hash as its value), and the body must match it
@@ -409,13 +416,18 @@ async fn delete_version(
 async fn resolve(
     State(state): State<Shared>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Response {
     let name = params.get("name").cloned().unwrap_or_default();
     let range = params
         .get("version")
         .cloned()
         .unwrap_or_else(|| "latest".to_string());
-    let st = state.lock().unwrap();
+    let mut st = state.lock().unwrap();
+    st.package_compatibility = headers
+        .get("x-smudgy-package-compatibility")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let Some(pkg) = st.packages.iter().find(|p| p.name == name) else {
         return envelope(404, Value::Null);
     };
@@ -671,7 +683,14 @@ async fn check_updates(State(state): State<Shared>, body: String) -> Response {
     envelope(200, json!({ "results": results }))
 }
 
-async fn get_blob(State(state): State<Shared>, Path(hash): Path<String>) -> Response {
+async fn get_blob(
+    State(state): State<Shared>,
+    Path(hash): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if headers.contains_key("x-smudgy-package-compatibility") {
+        return (StatusCode::BAD_REQUEST, "package header leaked to blob URL").into_response();
+    }
     let st = state.lock().unwrap();
     match st.blobs.get(&hash) {
         Some(body) => (StatusCode::OK, body.clone()).into_response(),
@@ -1099,12 +1118,17 @@ async fn resolve_carries_locked_dependencies() {
 
 #[tokio::test]
 async fn resolve_missing_package_is_not_found() {
-    let (base_url, _state) = spawn_mock().await;
+    let (base_url, state) = spawn_mock().await;
     let api = client(&base_url);
     let result = api.resolve_package("wbk", "ghost", None).await;
     assert!(
         result.is_err(),
         "unknown package resolves to an error (404)"
+    );
+    assert_eq!(
+        state.lock().unwrap().package_compatibility.as_deref(),
+        Some("1"),
+        "package requests advertise advisory support explicitly"
     );
 }
 

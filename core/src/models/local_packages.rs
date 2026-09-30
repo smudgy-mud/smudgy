@@ -2318,6 +2318,7 @@ mod tests {
             owner_nickname: "author".into(),
             name: package.name.clone(),
             version: package.manifest.version.clone(),
+            available_with_smudgy_upgrade: None,
             manifest: serde_json::to_value(&package.manifest).unwrap(),
             is_public: false,
             aligned_hosts: Vec::new(),

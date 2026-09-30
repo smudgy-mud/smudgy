@@ -24,7 +24,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use smudgy_cloud::package_api::{
-    CheckUpdatesResult, UpdateCheckClosureNode, UpdateCheckInstalled, UpdateCheckLatest,
+    AvailableWithSmudgyUpgrade, CheckUpdatesResult, UpdateCheckClosureNode, UpdateCheckInstalled,
+    UpdateCheckLatest,
 };
 
 /// How long checked facts stay fresh. Within this window another session's checker
@@ -61,6 +62,7 @@ struct StoredFacts {
     name: String,
     status: String,
     latest: Option<UpdateCheckLatest>,
+    available_with_smudgy_upgrade: Option<AvailableWithSmudgyUpgrade>,
     closure: Vec<UpdateCheckClosureNode>,
     /// Per queried installed version: the status the server reported for it (`None`
     /// when the server answered null — a version it has never seen).
@@ -127,6 +129,7 @@ impl FactsCache {
             status: facts.status.clone(),
             installed,
             latest: facts.latest.clone(),
+            available_with_smudgy_upgrade: facts.available_with_smudgy_upgrade.clone(),
             closure: facts.closure.clone(),
         })
     }
@@ -151,6 +154,7 @@ impl FactsCache {
                     name: result.name.clone(),
                     status: result.status.clone(),
                     latest: result.latest.clone(),
+                    available_with_smudgy_upgrade: result.available_with_smudgy_upgrade.clone(),
                     closure: result.closure.clone(),
                     installed: HashMap::new(),
                 },
@@ -161,6 +165,9 @@ impl FactsCache {
             facts.fetched_at = now;
             facts.status.clone_from(&result.status);
             facts.latest.clone_from(&result.latest);
+            facts
+                .available_with_smudgy_upgrade
+                .clone_from(&result.available_with_smudgy_upgrade);
             facts.closure.clone_from(&result.closure);
             facts
         };
@@ -205,6 +212,7 @@ mod tests {
                 modules: Vec::new(),
                 dependencies: Vec::new(),
             }),
+            available_with_smudgy_upgrade: None,
             closure: Vec::new(),
         }
     }
@@ -214,7 +222,12 @@ mod tests {
         let cache = FactsCache::with_ttl(Duration::from_mins(5));
         let key = facts_key("wbk", "mapper");
         assert!(cache.get_fresh(&key, Some("1.2.0")).is_none());
-        cache.put(&key, Some("1.2.0"), &result(Some("1.3.0")));
+        let mut registry_result = result(Some("1.3.0"));
+        registry_result.available_with_smudgy_upgrade = Some(AvailableWithSmudgyUpgrade {
+            package_version: "1.4.0".into(),
+            minimum_smudgy_version: "0.5.9".into(),
+        });
+        cache.put(&key, Some("1.2.0"), &registry_result);
         let hit = cache
             .get_fresh(&key, Some("1.2.0"))
             .expect("fresh facts answer the same query");
@@ -228,6 +241,12 @@ mod tests {
                 yanked: false,
                 deleted: false
             })
+        );
+        assert_eq!(
+            hit.available_with_smudgy_upgrade
+                .as_ref()
+                .map(|upgrade| upgrade.package_version.as_str()),
+            Some("1.4.0")
         );
         // A different package is a miss; the key is case-folded.
         assert!(

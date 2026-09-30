@@ -3997,7 +3997,7 @@ THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO
 
 Used by:
 
-- smudgy_core 0.5.7-ptb
+- smudgy_core 0.5.8-ptb
 - rustybuzz 0.20.1
 
 ~~~

@@ -1820,7 +1820,9 @@ package-no-results = Brak wyników — wpisz zapytanie i naciśnij Szukaj.
 package-manage = Zarządzaj
 package-view = Wyświetl
 package-install = Zainstaluj
+package-upgrade-smudgy = Zaktualizuj Smudgy
 package-installed = Zainstalowano
+package-available-with-smudgy-upgrade = Pakiet v{ $package_version } jest dostępny w Smudgy { $smudgy_version } lub nowszym.
 package-search-meta =
     { $owner } · v{ $version } · { $count ->
         [one] { $count } instalacja
@@ -1843,6 +1845,7 @@ package-runtime-settings-help = Wartości, które ten pakiet odczytuje w czasie 
 package-saved = Zapisano.
 package-save-settings = Zapisz ustawienia
 package-install-title = Zainstaluj { $name } v{ $version }
+package-installing-compatible-version = Instalowanie zgodnej wersji v{ $current_version }. Pakiet v{ $package_version } będzie dostępny w Smudgy { $smudgy_version } lub nowszym.
 package-update-review-title = Sprawdź { $name } v{ $version }
 package-manifest-review-title = Sprawdź zmiany w pakiecie { $name }
 package-local-publisher = Pakiet lokalny
