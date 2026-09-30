@@ -590,7 +590,14 @@ impl AutomationsWindow {
 
         // ---- INSTALLED (cloud) ----
         let mut installed_rows: Vec<Elem<'a>> = Vec::new();
-        for pkg in &self.installed_packages {
+        let mut installed = self.installed_packages.iter().collect::<Vec<_>>();
+        installed.sort_by_cached_key(|pkg| {
+            (
+                package_display_name(&pkg.specifier).to_lowercase(),
+                pkg.specifier.to_lowercase(),
+            )
+        });
+        for pkg in installed {
             let spec = &pkg.specifier;
             if local_leaf_names.contains(&package_display_name(spec).to_ascii_lowercase()) {
                 continue; // the LOCAL row is the canonical view; this record is fallback only
@@ -639,7 +646,9 @@ impl AutomationsWindow {
 
         // ---- LOCAL (authored) ----
         let mut local_rows: Vec<Elem<'a>> = Vec::new();
-        for name in &self.local_packages {
+        let mut locals = self.local_packages.iter().collect::<Vec<_>>();
+        locals.sort_by_cached_key(|name| (name.to_lowercase(), (*name).clone()));
+        for name in locals {
             if !self.name_matches(name) {
                 continue;
             }
