@@ -1,5 +1,5 @@
 {
-  "version": "0.1.5",
+  "version": "0.1.8",
   "description": "An auto-mapper for ArcticMUD",
   "entry": "index.ts",
   "min_smudgy_version": "0.5.8",
