@@ -18,6 +18,16 @@ use smudgy_ui_shared::modal_layer::ModalLayer;
 
 // Allow room for schema metadata and formatting around the 4 MiB stored-value limit.
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
+/// The settings dialog card never grows past this height, and keeps this margin from the window
+/// edges when the window is shorter.
+const DIALOG_MAX_HEIGHT: f32 = 600.0;
+const DIALOG_MARGIN: f32 = 24.0;
+/// Height the card spends outside its scrolling list: padding, title, subtitle, action row, and
+/// the gaps between them.
+const DIALOG_CHROME: f32 = 160.0;
+/// Height of one muted note line under the list, plus its gap.
+const DIALOG_NOTE: f32 = 36.0;
+const DIALOG_MIN_LIST: f32 = 80.0;
 
 #[derive(Debug, Clone)]
 pub struct Destination {
@@ -1589,6 +1599,32 @@ impl AutomationsWindow {
     }
 
     pub(super) fn view_settings_dialog<'a>(&'a self, dialog: &'a SettingsDialog) -> Elem<'a> {
+        let backdrop = mouse_area(
+            container(iced::widget::space::vertical())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|theme: &crate::theme::Theme| container::Style {
+                    background: Some(Background::Color(theme.styles.general.overlay_background)),
+                    ..Default::default()
+                }),
+        )
+        .on_press(message(SettingsMessage::Cancel));
+        // The card learns the window height here so its list can scroll inside whatever room is
+        // left, rather than pushing the action row out of the card.
+        let card = iced::widget::responsive(move |size| {
+            container(opaque(self.view_settings_card(dialog, size.height)))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
+        });
+        ModalLayer::new(
+            iced::widget::stack![backdrop, card],
+            message(SettingsMessage::Cancel),
+        )
+        .into()
+    }
+
+    fn view_settings_card<'a>(&'a self, dialog: &'a SettingsDialog, available: f32) -> Elem<'a> {
         let destination = &dialog.destination;
         let scope = match destination.package.parameter_scope {
             ParameterScope::Global => crate::i18n::t!("package-settings-all-profiles"),
@@ -1618,6 +1654,16 @@ impl AutomationsWindow {
         };
         let changes_settings =
             action.is_some() && matches!(dialog.kind, DialogKind::Preview(..) | DialogKind::Reset);
+        let secrets_note = changes_settings && destination.params.iter().any(|param| param.secret);
+        let unsaved_note = changes_settings
+            && self
+                .param_config
+                .as_ref()
+                .is_some_and(|config| !config.touched.is_empty());
+        let notes = f32::from(u8::from(secrets_note) + u8::from(unsaved_note))
+            + if dialog.error.is_some() { 2.0 } else { 0.0 };
+        let card_height = (available - 2.0 * DIALOG_MARGIN).min(DIALOG_MAX_HEIGHT);
+        let list_height = (card_height - DIALOG_CHROME - notes * DIALOG_NOTE).max(DIALOG_MIN_LIST);
         let mut body = column![
             text(title).size(18),
             text(format!(
@@ -1672,7 +1718,7 @@ impl AutomationsWindow {
                             .snap_within_viewport(true),
                         );
                     }
-                    body = body.push(scrollable(items).height(Length::Shrink));
+                    body = body.push(container(scrollable(items)).max_height(list_height));
                 }
             }
             DialogKind::Preview(preview, _) => {
@@ -1724,7 +1770,7 @@ impl AutomationsWindow {
                         tooltip::Position::Top,
                     ).delay(std::time::Duration::from_millis(350)).snap_within_viewport(true));
                 }
-                body = body.push(scrollable(changes).height(Length::Shrink));
+                body = body.push(container(scrollable(changes)).max_height(list_height));
             }
             DialogKind::Reset => {
                 body = body.push(text(crate::i18n::t!("package-settings-reset-confirm")).size(13))
@@ -1733,19 +1779,14 @@ impl AutomationsWindow {
                 body = body.push(text(crate::i18n::t!("package-settings-forget-confirm")).size(13))
             }
         }
-        if changes_settings && destination.params.iter().any(|param| param.secret) {
+        if secrets_note {
             body = body.push(
                 text(crate::i18n::t!("package-settings-no-secrets"))
                     .size(12)
                     .style(common::muted),
             );
         }
-        if changes_settings
-            && self
-                .param_config
-                .as_ref()
-                .is_some_and(|config| !config.touched.is_empty())
-        {
+        if unsaved_note {
             body = body.push(
                 text(crate::i18n::t!("package-settings-unsaved-warning"))
                     .size(12)
@@ -1792,31 +1833,12 @@ impl AutomationsWindow {
             );
         }
         body = body.push(actions);
-        let backdrop = mouse_area(
-            container(iced::widget::space::vertical())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|theme: &crate::theme::Theme| container::Style {
-                    background: Some(Background::Color(theme.styles.general.overlay_background)),
-                    ..Default::default()
-                }),
-        )
-        .on_press(message(SettingsMessage::Cancel));
-        let card = container(body)
+        container(body)
             .padding(20)
             .max_width(600)
-            .max_height(600)
-            .style(common::card_style);
-        ModalLayer::new(
-            iced::widget::stack![
-                backdrop,
-                container(opaque(card))
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill),
-            ],
-            message(SettingsMessage::Cancel),
-        )
-        .into()
+            .max_height(card_height)
+            .style(common::card_style)
+            .into()
     }
 }
 
