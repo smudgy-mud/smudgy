@@ -300,35 +300,39 @@ const realisticQuietPolishes = (): [string, IntegralLayoutRequest][] => [
   ["six-crossing cluster", quietPolish(sixCrossingCluster())],
 ];
 
-test("a polish that sends its local chart gets the whole-map compaction a reflow gets", () => {
+test("a polish that sends its local chart is finished cheaply, and a reflow packs axis groups", () => {
   for (const [label, request] of realisticQuietPolishes()) {
     assert.ok(request.nodes.length > 0, `${label}: the polish sends a chart`);
     const trace: LayoutTraceEvent[] = [];
     const charted = planIntegralLayout({ ...request, trace: (event) => trace.push(event) });
-    const reflowed = planIntegralLayout({ ...request, nodes: [] });
-
-    assert.ok(
+    assert.equal(
       trace.some((event) => event.type === "axis-progress" && event.phase === "gravity"),
-      `${label}: axis-group compaction ran`,
+      false,
+      `${label}: the polish packs no axis groups`,
+    );
+    assertFinished(request, charted.positions, `${label}: the polished plan`);
+
+    const reflow = { ...request, nodes: [] };
+    const reflowTrace: LayoutTraceEvent[] = [];
+    const reflowed = planIntegralLayout({ ...reflow, trace: (event) => reflowTrace.push(event) });
+    assert.ok(
+      reflowTrace.some((event) => event.type === "axis-progress" && event.phase === "gravity"),
+      `${label}: the reflow packs axis groups`,
     );
     assert.equal(
-      compareLayoutQuality(charted.quality, reflowed.quality),
-      0,
-      `${label}: the chart costs the polish none of the reflow's quality`,
-    );
-    assert.equal(
-      compactIntegralLayoutPlan(request, charted),
-      charted,
-      `${label}: a whole-map compaction finds nothing left to gain`,
+      compactIntegralLayoutPlan(reflow, reflowed),
+      reflowed,
+      `${label}: a whole-map compaction finds nothing left to gain after a reflow`,
     );
   }
-  // The stored cluster crosses six links; its whole-map compaction clears every one.
-  const cluster = planIntegralLayout(quietPolish(sixCrossingCluster()));
+  // The stored cluster crosses six links; a reflow clears every one.
+  const cluster = planIntegralLayout({ ...quietPolish(sixCrossingCluster()), nodes: [] });
   assert.equal(cluster.quality.linkCrossings, 0);
 });
 
-test("a whole-map polish previews its layout before the axis-group pass, and its plan never ranks below it", () => {
-  for (const [label, request] of realisticQuietPolishes()) {
+test("a reflow previews its layout before the axis-group pass, and its plan never ranks below it", () => {
+  for (const [label, polish] of realisticQuietPolishes()) {
+    const request = { ...polish, nodes: [] };
     const trace: LayoutTraceEvent[] = [];
     const plan = planIntegralLayout({ ...request, trace: (event) => trace.push(event) });
     const previews = trace.filter((event) => event.type === "preview");
@@ -344,10 +348,14 @@ test("a whole-map polish previews its layout before the axis-group pass, and its
       compareLayoutQuality(plan.quality, preview.candidate.quality) >= 0,
       `${label}: the plan ranks at or above its preview`,
     );
-    // Without the axis-group pass there is nothing to wait for.
+    // Without the axis-group pass there is nothing to wait for, as for a
+    // polish that sends its chart.
     const unpacked: LayoutTraceEvent[] = [];
     planIntegralLayout({ ...request, trace: (event) => unpacked.push(event) }, { axisGroupCompaction: false });
     assert.equal(unpacked.some((event) => event.type === "preview"), false, `${label}: no pass, no preview`);
+    const charted: LayoutTraceEvent[] = [];
+    planIntegralLayout({ ...polish, trace: (event) => charted.push(event) });
+    assert.equal(charted.some((event) => event.type === "preview"), false, `${label}: a polish previews nothing`);
   }
 });
 

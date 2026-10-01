@@ -210,14 +210,18 @@ bounded operation before a geometric fixed point can be reported.
 A request polishes the whole map when its topology is fully resident: every
 chart node it sends is also a resident, as when it sends none, and it lets
 existing rooms move. A mapper's quiet polish that sends its local chart is
-such a request, as is a reflow. A whole-map request gets the whole-map
-compaction stages: its standard pass recursively packs mutually blocking room
-groups along both planar axes from every directional orientation (axis-group
+such a request, as is a reflow. Every layout a whole-map request publishes is
+finished as described below. A reflow, which sends no chart, also packs axis
+groups: its standard pass recursively packs mutually blocking room groups
+along both planar axes from every directional orientation (axis-group
 compaction), starting another full pass after every pass that gains until one
 gains nothing, and the deep crossing repair heals its provisional winners the
-same way. A request with a chart node that is not a resident places new rooms
-and keeps its low-latency path: its standard pass gets neither those stages
-nor the finishing below.
+same way. That packing can take minutes on a large map, so a polish that sends
+its chart skips it everywhere, its constraint repair included, and keeps to
+the cheap fixed point; `packsAxisGroups` says which a request gets. A request
+with a chart node that is not a resident places new rooms and keeps its
+low-latency path: its standard pass gets neither the packing nor the
+finishing below.
 
 Every other layout published as an improvement ends at the cheap compaction
 fixed point, `compactIntegralLayoutPlan` with `axisGroupCompaction: false`:
@@ -229,20 +233,21 @@ request's constraint repair: its incumbents, early preview and polished
 layouts, each under the admission of the stage that publishes it. A full
 compaction ends with the same fixed point. The planner, the preview and polish
 go on from the finished layout. The deep crossing repair goes on from its raw
-transaction and publishes and returns each copy at the fixed point of a full
-trace-silent compaction instead, so compacting a layout it streams changes
-nothing; only a compaction that cancellation cuts short leaves the cheap fixed
-point. A plan whose quick crossing repair published an improvement receives
-one more full compaction for the same reason. A repaired plan ends at the
+transaction and publishes and returns each copy at the fixed point of a
+trace-silent compaction instead, packing axis groups where the request allows,
+so compacting a layout it streams the same way changes nothing; only a
+compaction that cancellation cuts short leaves the cheap fixed point. A plan
+whose quick crossing repair published an improvement receives one more
+compaction for the same reason. A repaired plan ends at the
 fixed point too, and finishing a finished layout leaves it as it is. No plan
 ranks below a layout published before it, so a streamed layout never takes a
 result's place.
 
 Axis-group compaction can take far longer than the rest of a standard pass:
-seconds on a few hundred rooms. Before it starts, a whole-map request whose
+seconds to minutes on a few hundred rooms. Before it starts, a reflow whose
 progress is observed publishes its layout as it stands, finished, as a
 `preview` event that `planIntegralLayoutAsync` streams as an improvement, so a
-map shows the polish begin within moments and the compacted plan when it is
+map shows the reflow begin within moments and the compacted plan when it is
 ready.
 
 The spacing pass moves attached axis groups atomically and never increases any

@@ -9047,6 +9047,19 @@ export function compactIntegralLayoutPlan(
 }
 
 /**
+ * Whether compaction may pack axis groups for `request`: only for a whole-map
+ * request that sends no chart, such as a reflow. Packing can take minutes on a
+ * large map, so a request that sends a chart, such as a mapper's quiet polish,
+ * ends at the cheap compaction fixed point instead.
+ */
+export function packsAxisGroups(
+  request: Pick<IntegralLayoutRequest, "nodes">,
+  control: { readonly axisGroupCompaction?: boolean } = {},
+): boolean {
+  return request.nodes.length === 0 && control.axisGroupCompaction !== false;
+}
+
+/**
  * Whether every room of a request is already on the map: it has no chart node
  * that is not also a resident. Such a request reflows or polishes the whole
  * map; one with a chart node of its own places new rooms.
@@ -9171,11 +9184,12 @@ export function planIntegralLayout(
   chartReflow = [];
   CANDIDATE_EVALUATORS.delete(current);
   // A request whose rooms are all on the map already reflows or polishes the
-  // whole map: it gets the whole-map compaction stages, and every layout it
-  // publishes, its plan included, ends at the cheap compaction fixed point.
-  // New-room placement keeps its low-latency path without either.
+  // whole map: every layout it publishes, its plan included, ends at the cheap
+  // compaction fixed point, and one that sends no chart also packs axis
+  // groups. New-room placement keeps its low-latency path without either.
   const fullyResident = topologyFullyResident(request);
   const finishesLayouts = request.allowExistingMoves !== false && fullyResident;
+  const packsGroups = packsAxisGroups(request, control);
   const finishLayout = (value: Candidate): Candidate => finishCompaction(
     value,
     current,
@@ -9318,10 +9332,8 @@ export function planIntegralLayout(
     );
   const vacuumed = repairAdoptedCrossings(vacuumedRaw);
   // New-room placement already performs its own local repair. The group pass
-  // is a final whole-map reflow/constraint-polish stage and is intentionally
-  // reserved for requests whose topology is already fully resident.
-  const runsAxisGroups = request.allowExistingMoves !== false && fullyResident &&
-    control.axisGroupCompaction !== false;
+  // is a final whole-map stage, reserved for a request that sends no chart.
+  const runsAxisGroups = request.allowExistingMoves !== false && packsGroups;
   // The group pass can take far longer than everything before it, so a caller
   // watching the plan is shown the layout as it stands first, finished.
   const preview = runsAxisGroups && request.trace ? finishLayout(vacuumed) : undefined;
@@ -9390,7 +9402,7 @@ export function planIntegralLayout(
     const plan = compactIntegralLayoutPlan(
       trace === request.trace ? request : { ...request, trace },
       seedPlan,
-      { acceptsPositions, axisGroupCompaction: control.axisGroupCompaction },
+      { acceptsPositions, axisGroupCompaction: packsGroups },
     );
     if (plan === seedPlan) return base;
     const result = candidate(new Map(plan.positions), current, request.edges);
@@ -9544,7 +9556,8 @@ function settleDeepCrossingLayout(
  * The search goes on from raw transactions, while each layout it publishes,
  * and so the plan it returns, is that transaction at the fixed point of a
  * trace-silent `compactIntegralLayoutPlan` under `control.acceptsPositions`:
- * a layout it streams is one compaction leaves as it is. A compaction that
+ * a layout it streams is one compaction leaves as it is. That compaction packs
+ * axis groups only where `packsAxisGroups` allows, and one that
  * `control.shouldCancel` cuts short leaves the cheap fixed point instead.
  */
 export function repairIntegralLayoutCrossingsDeep(
@@ -9594,6 +9607,11 @@ export function repairIntegralLayoutCrossingsDeep(
     position: integral(resident.position),
   }]));
   const current = new Map([...residents].map(([id, resident]) => [id, resident.position]));
+  // A request that sends a chart keeps to the cheap compaction fixed point,
+  // in the axis heal and in every layout the repair publishes alike.
+  const crossingControl: CrossingRepairControl = packsAxisGroups(request, control)
+    ? control
+    : { ...control, axisGroupCompaction: false };
   const seedCandidate = candidate(new Map(seed.positions), current, request.edges);
   seedCandidate.score.collisions = 0;
   seedCandidate.score.quality = { ...seed.quality };
@@ -9607,9 +9625,9 @@ export function repairIntegralLayoutCrossingsDeep(
     request.centerId,
     topologyFullyResident(request),
     request.trace,
-    control,
+    crossingControl,
     10_000,
-    (value) => settleDeepCrossingLayout(value, request, current, residents, control),
+    (value) => settleDeepCrossingLayout(value, request, current, residents, crossingControl),
   );
   deepCrossingRepair(seedCandidate, context, 1);
   // Every layout the repair published is finished, and it returns the last.
