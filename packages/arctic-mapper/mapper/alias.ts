@@ -1,4 +1,4 @@
-import { createAlias, createHotkey, createTrigger, Matches, echo, send, sendRaw, capture, line, mapper} from "smudgy:core";
+import { createAlias, createHotkey, createTrigger, Matches, echo, send, sendRaw, capture, buffer, line, mapper} from "smudgy:core";
 import { extractMarkdownLinks } from "smudgy:widgets";
 import {
     planAreaChange,
@@ -56,28 +56,45 @@ createHotkey({ key: "Enter", modifiers: ["CTRL"] }, () => {
 }, { name: "room_notes_link" });
 
 // When we enter a room whose notes carry a link, hint it inline in the game's prompt (the
-// same link CTRL+ENTER follows), borrowing the older command-hint module's approach. Deferred
-// one microtask so the mapper's room handler has settled state.room before we read its notes.
-mapEvent.on("room", (room: RoomEvent) => {
-    queueMicrotask(() => {
-        const link = firstLink(state.room?.data("notes") ?? "");
-        if (!link) {
-            return;
-        }
-        // Slip the hint in just before the prompt's ">" on its already-emitted line. Show the
-        // link text (which may read more nicely than the destination CTRL+ENTER runs).
-        const at = room.prompt.lastIndexOf(">");
+// same link CTRL+ENTER follows), borrowing the older command-hint module's approach. Runs in
+// the map update queue after the room event's handler, so state.room is the room just
+// entered.
+function hintShortcut(room: RoomEvent) {
+    const link = firstLink(state.room?.data("notes") ?? "");
+    if (!link) {
+        return;
+    }
+    // Slip the hint in just before the prompt's ">". Show the link text (which may read more
+    // nicely than the destination CTRL+ENTER runs).
+    const at = room.prompt.lastIndexOf(">");
 
-        if (at < 0) {
-            return;
+    if (at < 0) {
+        return;
+    }
+    const target = promptLine(room.prompt_line_number, room.prompt.slice(0, at));
+    if (!target) {
+        return;
+    }
+    try {
+        target.insert(` Shortcut:${link.text}`, at);
+    } catch (e) {
+        echo(`Error inserting link hint: ${e}`);
+    }
+}
+
+// The prompt's line, found by its text. `number` is what the prompt's line was predicted to
+// be; an echo during the prompt's own pass is emitted ahead of it and pushes it later, so
+// search the emitted lines from there up. Not emitted yet means it is still in flight: a
+// buffer edit of a line not yet emitted is dropped, so edit the current line instead.
+function promptLine(number: number, prefix: string) {
+    for (let n = number; n < line.number; n++) {
+        const emitted = buffer.line(n);
+        if (emitted.text.startsWith(prefix)) {
+            return emitted;
         }
-        try {
-            line.insert(` Shortcut:${link.text}`, at);
-        } catch (e) {
-            echo(`Error inserting link hint: ${e}`);
-        }
-    });
-});
+    }
+    return line.text.startsWith(prefix) ? line : null;
+}
 
 // Speedwalk to the nearest room matching a dot-separated tag filter. Each token
 // is a required tag, or an excluded tag when prefixed with `!`. Tags are set with
@@ -1432,7 +1449,10 @@ async function handleRoomEvent(roomEvent: RoomEvent) {
 
 let mapUpdateQueue = Promise.resolve();
 mapEvent.on("room", (roomEvent: RoomEvent) => {
-    mapUpdateQueue = mapUpdateQueue.then(() => handleRoomEvent(roomEvent)).catch((error) => {
-        echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);
-    });
+    mapUpdateQueue = mapUpdateQueue
+        .then(() => handleRoomEvent(roomEvent))
+        .then(() => hintShortcut(roomEvent))
+        .catch((error) => {
+            echo(`Automatic map update failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
 });
