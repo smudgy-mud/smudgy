@@ -9,7 +9,7 @@ import {
   type LayoutModel,
   type LayoutModelRoom,
   type PlannedLayout,
-  type PlanLayoutOptions,
+  type PlanLayoutAsyncOptions,
 } from "./model.ts";
 
 const STALE_SNAPSHOT_RETRIES = 1;
@@ -33,6 +33,15 @@ function roomKey(room: LayoutModelRoom): string {
     room.position.y,
     room.position.level,
     room.movable,
+  ]);
+}
+
+/** Exact, order-independent identity for the inputs represented by a layout model. */
+export function layoutSnapshotKey(model: Readonly<LayoutModel>): string {
+  return JSON.stringify([
+    model.areaId ?? null,
+    model.rooms.map(roomKey).sort(),
+    model.edges.map(edgeKey).sort(),
   ]);
 }
 
@@ -67,7 +76,7 @@ export class StaleLayoutSnapshotError extends Error {
 export async function planStableLayoutSnapshot(
   loadSnapshot: () => LayoutModel,
   change: LayoutChange,
-  options: PlanLayoutOptions = {},
+  options: PlanLayoutAsyncOptions = {},
   control: LayoutWorkerControlOptions = {},
 ): Promise<PlannedLayout> {
   const startedAt = performance.now();
@@ -75,12 +84,15 @@ export async function planStableLayoutSnapshot(
   // Attempts re-plan across awaits; a deep copy insulates them from caller
   // mutation of the change, including any nested members the union may carry.
   const stableChange = structuredClone(change);
-  const stableOptions: PlanLayoutOptions = {
+  const stableOptions: PlanLayoutAsyncOptions = {
     allowExistingMoves: options.allowExistingMoves,
     fixedRooms: options.fixedRooms ? [...options.fixedRooms] : undefined,
     defaultElevation: options.defaultElevation,
     effort: options.effort,
     maxPlanningPasses: options.maxPlanningPasses,
+    constraintRepair: options.constraintRepair
+      ? { ...options.constraintRepair }
+      : undefined,
   };
   const attempts = STALE_SNAPSHOT_RETRIES + 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {

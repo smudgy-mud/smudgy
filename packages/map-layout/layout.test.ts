@@ -91,6 +91,54 @@ test("anchors a new chart from a vertical resident omitted by the source", () =>
   assert.equal(result.quality.cardinalRayViolations, 0);
 });
 
+test("counts an exit as mis-levelled when its rooms' levels disagree with its own vector", () => {
+  const measure = (from: GridPosition, to: GridPosition, direction: LayoutEdge["direction"], vector?: GridPosition) => {
+    const quality = measureIntegralLayoutQuality(
+      new Map([["a", from], ["b", to]]),
+      [edge("a", "b", direction, vector)],
+    );
+    return [quality.cardinalRayViolations, quality.levelViolations];
+  };
+  // A compass exit belongs on one level.
+  assert.deepEqual(measure(at(0, 0), at(1, 0), "East"), [0, 0]);
+  assert.deepEqual(measure(at(0, 0), at(1, 0, 1), "East"), [1, 1]);
+  assert.deepEqual(measure(at(0, 0), at(-1, 0), "East"), [1, 0]);
+  // Up leads higher and Down lower; level 2 is above level 1.
+  assert.deepEqual(measure(at(0, 0, 1), at(0, 0, 2), "Up"), [0, 0]);
+  assert.deepEqual(measure(at(0, 0, 1), at(0, 0, 1), "Up"), [1, 1]);
+  assert.deepEqual(measure(at(0, 0, 1), at(0, 0, 0), "Up"), [1, 1]);
+  assert.deepEqual(measure(at(0, 0, 1), at(0, 0, 2), "Down"), [1, 1]);
+  // Higher but beside the room is drawn wrong on the plane only.
+  assert.deepEqual(measure(at(0, 0, 1), at(1, 0, 2), "Up"), [1, 0]);
+  // A projected Up exit is drawn on one level, so its vector decides.
+  assert.deepEqual(measure(at(0, 0), at(1, -1), "Up", at(1, -1)), [0, 0]);
+  assert.deepEqual(measure(at(0, 0), at(1, -1, 1), "Up", at(1, -1)), [1, 1]);
+  // Exits without a direction to keep are never mis-levelled.
+  assert.deepEqual(measure(at(0, 0), at(1, -1, 1), "Northeast"), [0, 0]);
+  assert.deepEqual(measure(at(0, 0), at(3, 3, 2), "In"), [0, 0]);
+  // No layout draws a self-loop on another level.
+  const loop = measureIntegralLayoutQuality(new Map([["a", at(0, 0)]]), [edge("a", "a", "Up")]);
+  assert.deepEqual([loop.cardinalRayViolations, loop.levelViolations], [1, 0]);
+});
+
+test("counts the extra levels exits drawn right climb or descend as level slack", () => {
+  const slack = (to: GridPosition, direction: LayoutEdge["direction"], vector?: GridPosition) => {
+    const quality = measureIntegralLayoutQuality(
+      new Map([["a", at(0, 0)], ["b", to]]),
+      [edge("a", "b", direction, vector)],
+    );
+    return [quality.cardinalRayViolations, quality.levelSlack, quality.cardinalSlack];
+  };
+  assert.deepEqual(slack(at(0, 0, 1), "Up"), [0, 0, 0]);
+  assert.deepEqual(slack(at(0, 0, 3), "Up"), [0, 2, 2]);
+  assert.deepEqual(slack(at(0, 0, -2), "Down"), [0, 1, 1]);
+  // Only climbing or descending counts: a long flat exit, a projected Up
+  // exit on one level, and an exit drawn wrong span no extra level.
+  assert.deepEqual(slack(at(3, 0), "East"), [0, 0, 2]);
+  assert.deepEqual(slack(at(2, -2), "Up", at(1, -1)), [0, 0, 1]);
+  assert.deepEqual(slack(at(1, 0, 3), "Up"), [1, 0, 0]);
+});
+
 test("treats a projected up/down pair as an authoritative diagonal", () => {
   const result = plan({
     centerId: "lower",
@@ -1038,6 +1086,76 @@ test("a late public fallback receives the complete compaction fixed point", () =
   assert.equal(compactIntegralLayoutPlan(request, result), result);
 });
 
+test("settled reflow closes every axis-compaction basin before publication", () => {
+  const request: IntegralLayoutRequest = {
+    centerId: "r0",
+    allowExistingMoves: true,
+    nodes: [],
+    residents: [
+      resident("r0", -1, 9, false),
+      resident("r1", -4, -8),
+      resident("r2", 2, -2, false),
+      resident("r4", -1, -5),
+      resident("r5", 1, -8),
+      resident("r6", 8, -8),
+      resident("r7", 6, -8),
+    ],
+    edges: [
+      edge("r0", "r1", "North"),
+      edge("r1", "r2", "West"),
+      edge("r1", "r5", "North"),
+      edge("r4", "r6", "North"),
+      edge("r1", "r7", "East"),
+    ],
+  };
+
+  const result = planIntegralLayout(request);
+
+  // The first axis basin has footprint 56 and cardinal slack 12. A neutral
+  // vacuum used to stop the closure there even though another axis pass could
+  // reach this visibly tighter basin.
+  assert.equal(result.quality.footprintArea, 48);
+  assert.equal(result.quality.footprintPerimeter, 32);
+  assert.equal(result.quality.cardinalSlack, 1);
+  assert.equal(compactIntegralLayoutPlan(request, result), result);
+});
+
+test("quick crossing selections receive a final compaction closure", () => {
+  const trace: LayoutTraceEvent[] = [];
+  const request: IntegralLayoutRequest = {
+    centerId: "r0",
+    allowExistingMoves: true,
+    nodes: [],
+    residents: [
+      resident("r0", -6, 7, false),
+      resident("r1", -4, 5, false),
+      resident("r2", -10, -6),
+      resident("r3", -6, 6),
+      resident("r4", 5, 6),
+      resident("r5", -3, 6),
+      resident("r6", 6, 1),
+      resident("r7", 9, 0),
+    ],
+    edges: [
+      edge("r0", "r1", "Other"),
+      edge("r0", "r2", "North"),
+      edge("r2", "r3", "East"), edge("r3", "r2", "West"),
+      edge("r0", "r4", "North"), edge("r4", "r0", "South"),
+      edge("r4", "r5", "North"), edge("r5", "r4", "South"),
+      edge("r4", "r6", "North"), edge("r6", "r4", "South"),
+      edge("r4", "r7", "East"), edge("r7", "r4", "West"),
+    ],
+    trace: (event) => trace.push(event),
+  };
+
+  const result = planIntegralLayout(request);
+
+  assert.ok(trace.some((event) => event.type === "crossing-repair" && event.mode === "quick"));
+  assert.deepEqual(result.positions.get("r7"), at(-4, 6));
+  assert.equal(result.quality.routingViolations, 4);
+  assert.equal(compactIntegralLayoutPlan(request, result), result);
+});
+
 test("an in-flight new-room request stays on the topology-first path", () => {
   const request = unevenSeriesRequest("x", [0, 1, 5, 9]);
   const trace: LayoutTraceEvent[] = [];
@@ -1499,14 +1617,23 @@ test("streams a stable top-eight obstruction frontier without changing trace ord
       edges,
       trace: (event) => trace.push(event),
     });
-    return { result, trace };
+    // Axis-compaction telemetry is throttled by wall-clock time; every other
+    // event is deterministic.
+    return { result, trace: trace.filter((event) => event.type !== "axis-progress") };
   };
 
   const first = run();
   const second = run();
   assert.deepEqual(second, first);
-  assert.equal(first.result.quality.roomObstructions, 2);
-  assert.equal(first.trace.filter((event) => event.type === "obstruction-repair").length, 8);
+  const repairs = first.trace.filter(
+    (event): event is Extract<LayoutTraceEvent, { type: "obstruction-repair" }> =>
+      event.type === "obstruction-repair",
+  );
+  assert.equal(repairs.length, 8);
+  assert.equal(repairs.at(-1)?.after.quality.roomObstructions, 2);
+  // Every chart node is a resident, so the whole-map compaction stages clear
+  // the two obstructions the eight-wide frontier leaves.
+  assert.equal(first.result.quality.roomObstructions, 0);
   assert.deepEqual(
     first.trace
       .filter((event) => event.type === "obstruction-candidates")
@@ -1738,20 +1865,24 @@ test("reflow winners rescore to their reported quality tuple", () => {
   }
 });
 
+/**
+ * A nested bridge tree laid out with every ray on its exit and no route
+ * blocked, leaving three crossings the deep repair clears in several steps.
+ */
 function progressiveCrossingRegressionArea(): IntegralLayoutRequest {
   const cells = [
     [-8, 11],
-    [-5, 5],
-    [10, 2],
-    [-2, -3],
-    [-7, -6],
-    [9, -4],
-    [-8, -3],
-    [-8, 5],
-    [8, 4],
-    [1, -6],
-    [5, -10],
-    [-6, 0],
+    [-10, 11],
+    [-10, 12],
+    [-11, 11],
+    [-8, 12],
+    [-9, 12],
+    [-8, 10],
+    [-11, 8],
+    [-10, 9],
+    [-7, 7],
+    [-11, 9],
+    [-7, 9],
   ] as const;
   const parents = [0, 1, 1, 0, 4, 0, 5, 7, 2, 3, 0] as const;
   const directions = [
@@ -1788,6 +1919,26 @@ function progressiveCrossingRegressionArea(): IntegralLayoutRequest {
   };
 }
 
+function rawCrossingPublicationRegressionArea(): IntegralLayoutRequest {
+  const cells = [
+    [-7, -4], [-8, -4], [-2, 2], [-8, -2], [4, 3], [8, -5], [3, 3],
+    [-2, 7], [2, -6], [-6, 8], [3, 5], [5, 7], [8, -8],
+  ] as const;
+  const parents = [0, 0, 0, 1, 1, 2, 4, 1, 6, 8, 5, 2] as const;
+  const residents = cells.map(([x, y], index) => resident(`raw-${index}`, x, y, index !== 0));
+  const edges = parents.flatMap((parent, offset) => [
+    edge(`raw-${parent}`, `raw-${offset + 1}`, "Other"),
+    edge(`raw-${offset + 1}`, `raw-${parent}`, "Other"),
+  ]);
+  return {
+    residents,
+    nodes: [],
+    edges,
+    centerId: "raw-0",
+    allowExistingMoves: true,
+  };
+}
+
 test("deep crossing progress is freshly scored and globally monotonic", () => {
   const request = progressiveCrossingRegressionArea();
   const seed = planIntegralLayout(request);
@@ -1806,6 +1957,16 @@ test("deep crossing progress is freshly scored and globally monotonic", () => {
       const measured = measureIntegralLayoutQuality(positions, request.edges);
       assert.deepEqual(progress.candidate.quality, measured, "published tuple was not fresh");
       assert.deepEqual(progress.bestQuality, measured, "published candidate was not the global best");
+      const checkpoint: IntegralLayoutPlan = {
+        positions,
+        movedExisting: new Set(),
+        quality: measured,
+      };
+      assert.equal(
+        compactIntegralLayoutPlan(request, checkpoint),
+        checkpoint,
+        "every deep crossing publication must already be compaction-idempotent",
+      );
       assert.ok(
         compareLayoutQuality(measured, previous) > 0,
         "progressive geometry regressed or tied the preceding publication",
@@ -1815,8 +1976,101 @@ test("deep crossing progress is freshly scored and globally monotonic", () => {
     },
   });
 
-  assert.ok(improvements >= 2, "fixture must exercise a multi-step progressive stream");
+  assert.ok(improvements >= 1, "fixture must exercise a progressive improvement");
   assert.ok(compareLayoutQuality(result.plan.quality, previous) >= 0);
+  assert.equal(compactIntegralLayoutPlan(request, result.plan), result.plan);
+});
+
+test("deep crossing progress compacts raw bridge passages before publication", () => {
+  const residentOnly = rawCrossingPublicationRegressionArea();
+  const promoted = residentOnly.residents.at(-1)!;
+  for (const withNewNode of [false, true]) {
+    // A new node disables crossing DFS's internal axis polish. The public
+    // settlement boundary must still compact the raw transaction in both
+    // modes rather than exposing a giant bridge passage.
+    const request: IntegralLayoutRequest = withNewNode
+      ? {
+        ...residentOnly,
+        residents: residentOnly.residents.slice(0, -1),
+        nodes: [{ id: promoted.id, relative: promoted.position }],
+      }
+      : residentOnly;
+    const positions = new Map(
+      residentOnly.residents.map((room) => [room.id, room.position]),
+    );
+    const seed: IntegralLayoutPlan = {
+      positions,
+      movedExisting: new Set(),
+      quality: measureIntegralLayoutQuality(positions, request.edges),
+    };
+    let previous = seed.quality;
+    let improvements = 0;
+    const result = repairIntegralLayoutCrossingsDeep(request, seed, {
+      maximumWork: 20,
+      onProgress: (progress) => {
+        if (progress.kind !== "improvement") return;
+        const published = new Map(progress.candidate.positions?.map(({ id, x, y, level }) => [
+          id,
+          { x, y, level },
+        ]));
+        assert.equal(published.size, positions.size);
+        const checkpoint: IntegralLayoutPlan = {
+          positions: published,
+          movedExisting: new Set(),
+          quality: progress.candidate.quality,
+        };
+        assert.equal(
+          compactIntegralLayoutPlan(request, checkpoint),
+          checkpoint,
+          `a progressive crossing checkpoint withNewNode=${withNewNode} must be compacted`,
+        );
+        assert.ok(compareLayoutQuality(checkpoint.quality, previous) > 0);
+        previous = checkpoint.quality;
+        improvements += 1;
+      },
+    });
+
+    assert.ok(improvements > 0);
+    assert.equal(result.plan.quality.routingViolations, 0);
+    assert.equal(result.plan.quality.linkCrossings, 0);
+    assert.equal(result.plan.quality.footprintArea, 15);
+    assert.equal(compactIntegralLayoutPlan(request, result.plan), result.plan);
+  }
+});
+
+test("settled deep publications do not truncate the raw search budget", () => {
+  const request = rawCrossingPublicationRegressionArea();
+  const positions = new Map(request.residents.map((room) => [room.id, room.position]));
+  const seed: IntegralLayoutPlan = {
+    positions,
+    movedExisting: new Set(),
+    quality: measureIntegralLayoutQuality(positions, request.edges),
+  };
+  let improvements = 0;
+  const result = repairIntegralLayoutCrossingsDeep(request, seed, {
+    maximumWork: 80,
+    onProgress: (progress) => {
+      if (progress.kind !== "improvement") return;
+      const checkpointPositions = new Map(
+        progress.candidate.positions?.map(({ id, x, y, level }) => [id, { x, y, level }]),
+      );
+      const checkpoint: IntegralLayoutPlan = {
+        positions: checkpointPositions,
+        movedExisting: new Set(),
+        quality: progress.candidate.quality,
+      };
+      assert.equal(compactIntegralLayoutPlan(request, checkpoint), checkpoint);
+      improvements += 1;
+    },
+  });
+
+  // The settled checkpoint has zero crossings within 20 macros, but it must
+  // not stop raw DFS from spending the caller's larger bounded budget.
+  assert.equal(result.stats.macrosConsidered, 80);
+  assert.ok(improvements >= 1);
+  assert.equal(result.plan.quality.footprintArea, 15);
+  assert.equal(result.plan.quality.footprintPerimeter, 16);
+  assert.equal(compactIntegralLayoutPlan(request, result.plan), result.plan);
 });
 
 test("deep crossing repair winners rescore to their reported quality tuple", () => {

@@ -373,6 +373,10 @@ struct State {
     /// Cloud journal namespace currently authorized by a successful identity
     /// resolution. Other viewers' records stay dormant on disk.
     active_viewer: Option<(Uuid, u64)>,
+    /// Areas whose queues a test keeps from sending, so the order in which
+    /// different areas' envelopes reach their stores is the test's choice.
+    #[cfg(test)]
+    held: HashSet<AreaId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2200,6 +2204,10 @@ impl PendingQueue {
             if state.deleting.contains_key(&area_id) || state.delete_intents.contains(&area_id) {
                 continue;
             }
+            #[cfg(test)]
+            if state.held.contains(&area_id) {
+                continue;
+            }
             let area = state.areas.get_mut(&area_id).expect("key just listed");
             if area.requires_recovery_base {
                 continue;
@@ -2507,6 +2515,21 @@ impl PendingQueue {
     #[cfg(test)]
     pub(crate) fn pause_conflict(&self, area_id: AreaId, operation_id: OperationId) {
         self.record_replay_result(area_id, Some(operation_id));
+    }
+
+    /// Keeps (`true`) or lets (`false`) an area's queue send: while kept,
+    /// nothing queued for the area is sent, whatever else is ready.
+    #[cfg(test)]
+    pub(crate) fn hold_sending(&self, area_id: AreaId, held: bool) {
+        {
+            let mut state = self.state.lock();
+            if held {
+                state.held.insert(area_id);
+            } else {
+                state.held.remove(&area_id);
+            }
+        }
+        self.changed();
     }
 
     /// A complete `StopAtFailure` replay replaces any deferred result, including

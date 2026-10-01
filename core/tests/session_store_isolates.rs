@@ -862,6 +862,7 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
             createProcedure,
             createState,
             echo,
+            getSessions,
             session,
         } from "smudgy:core";
         import { vitals } from "smudgy:state/wbk/tracker";
@@ -897,6 +898,16 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
                 directed.post({ n: 7 });
                 orderedState.set({ answer: 42 });
                 orderedPoster.to(beta).post({});
+            });
+        }
+        if (session.profile.name === "Beta") {
+            createAlias("^owner-call$", () => {
+                const owner = getSessions()[0];
+                if (!owner) {
+                    echo("OWNER_MISSING");
+                    return;
+                }
+                refresh.to(owner).post({ n: 8 });
             });
         }
         "#,
@@ -943,6 +954,9 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
     alpha_tx
         .send(RuntimeAction::Send(Arc::new("remote-call".to_string())))
         .unwrap();
+    beta_tx
+        .send(RuntimeAction::Send(Arc::new("owner-call".to_string())))
+        .unwrap();
     let mut alpha_lines = Vec::new();
     let mut beta_lines = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -952,6 +966,7 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
             && has_line(&alpha_lines, "REMOTE_PREVIOUS:2")
             && has_line(&alpha_lines, "REMOTE_WRITE:hp=3")
             && has_line(&alpha_lines, "REMOTE_TERMINAL:true")
+            && has_line(&alpha_lines, "REMOTE_PROC:Beta:user:8")
             && has_line(&beta_lines, "REMOTE_PROC:Alpha:user:7")
             && has_line(&beta_lines, "REMOTE_ORDERED:42"))
     {
@@ -987,6 +1002,7 @@ async fn state_and_procedure_handles_direct_to_another_same_server_session() {
         "REMOTE_PREVIOUS:2",
         "REMOTE_WRITE:hp=3",
         "REMOTE_TERMINAL:true",
+        "REMOTE_PROC:Beta:user:8",
     ] {
         assert!(
             has_line(&alpha_lines, expected),

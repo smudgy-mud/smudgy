@@ -82,7 +82,15 @@ export type ConstraintExtensionInspection<TCandidate, TScore> =
   | {
     /** A complete, hard-valid layout. Soft defects do not invalidate it. */
     readonly type: "candidate";
-    readonly candidate: TCandidate;
+    /**
+     * Eager value for callers whose candidate is already cheap to retain.
+     * Expensive geometry callers may instead provide `materializeCandidate`;
+     * the search invokes it synchronously, before the next inspection, only
+     * when this state becomes the strict incumbent. A materializer may
+     * therefore snapshot caller-owned inspection scratch on demand.
+     */
+    readonly candidate?: TCandidate;
+    readonly materializeCandidate?: () => TCandidate;
     readonly score: TScore;
     /** One optional defect to branch on after accepting the candidate. */
     readonly softDefect?: ConstraintExtensionDefect;
@@ -102,6 +110,14 @@ export interface ConstraintExtensionInspectContext {
    * for the synchronous duration of `inspect`; copy it if it must be retained.
    */
   readonly extensionArcs: readonly ConstraintExtensionArc[];
+  /**
+   * Allocation-free, order-independent fingerprint of `extensionArcs`. These
+   * lanes are maintained as arcs enter and leave the reversible search path,
+   * so geometry callers need not clone and sort a deep path for every state.
+   */
+  readonly extensionFingerprintFirst: number;
+  readonly extensionFingerprintSecond: number;
+  readonly extensionFingerprintCount: number;
   /** One-based number of this inspected state. */
   readonly state: number;
   /** Root is depth zero. */
@@ -176,6 +192,8 @@ export interface ConstraintExtensionSearchOptions<TCandidate, TScore> {
   readonly onEqualPrimaryDiversification?: (
     request: ConstraintExtensionDiversificationRequest<TCandidate, TScore>,
   ) => void;
+  /** Skip the active-arc snapshot when the diversification consumer needs only the defect. */
+  readonly snapshotDiversificationArcs?: boolean;
 }
 
 export interface ConstraintExtensionSearchResult<TCandidate, TScore>
@@ -217,6 +235,22 @@ const DEFAULT_PROGRESS_INTERVAL_STATES = 256;
 /** A few MiB of lightweight nodes rather than millions of retained objects. */
 const DEFAULT_MAX_LIVE_SEARCH_NODES = 32_768;
 const NEVER_CANCEL = (): boolean => false;
+
+function extensionArcFingerprintFirst(arc: Readonly<ConstraintExtensionArc>): number {
+  let first = 0x811c9dc5;
+  first = Math.imul(first ^ arc.axis, 0x01000193) >>> 0;
+  first = Math.imul(first ^ arc.from, 0x01000193) >>> 0;
+  first = Math.imul(first ^ arc.to, 0x01000193) >>> 0;
+  return first;
+}
+
+function extensionArcFingerprintSecond(arc: Readonly<ConstraintExtensionArc>): number {
+  let second = 0x9e3779b9;
+  second = Math.imul(second ^ (arc.axis + 0x7f4a7c15), 0x85ebca6b) >>> 0;
+  second = Math.imul(second ^ (arc.from + 0x7f4a7c15), 0x85ebca6b) >>> 0;
+  second = Math.imul(second ^ (arc.to + 0x7f4a7c15), 0x85ebca6b) >>> 0;
+  return second;
+}
 
 class DenseReachabilityDag implements ReversibleDag {
   readonly #size: number;
@@ -656,6 +690,27 @@ export function searchConstraintExtensions<TCandidate, TScore>(
   }
 
   const activeArcs: ConstraintExtensionArc[] = [];
+  let extensionFingerprintFirst = 0;
+  let extensionFingerprintSecond = 0;
+  let extensionFingerprintCount = 0;
+  const pushActiveArc = (arc: ConstraintExtensionArc): void => {
+    const first = extensionArcFingerprintFirst(arc);
+    const second = extensionArcFingerprintSecond(arc);
+    activeArcs.push(arc);
+    extensionFingerprintFirst ^= first;
+    extensionFingerprintSecond = (extensionFingerprintSecond + second) >>> 0;
+    extensionFingerprintCount += 1;
+  };
+  const truncateActiveArcs = (length: number): void => {
+    while (activeArcs.length > length) {
+      const arc = activeArcs.pop() as ConstraintExtensionArc;
+      const first = extensionArcFingerprintFirst(arc);
+      const second = extensionArcFingerprintSecond(arc);
+      extensionFingerprintFirst ^= first;
+      extensionFingerprintSecond = (extensionFingerprintSecond - second) >>> 0;
+      extensionFingerprintCount -= 1;
+    }
+  };
   const appliedPath: AppliedFrame<TScore>[] = [];
   let nextOrdinal = 0;
   // Frontier order: chains without a candidate ancestor first (deepest first,
@@ -771,6 +826,9 @@ export function searchConstraintExtensions<TCandidate, TScore>(
     if (depth > maxDepth) maxDepth = depth;
     const inspection = options.inspect({
       extensionArcs: activeArcs,
+      extensionFingerprintFirst: extensionFingerprintFirst >>> 0,
+      extensionFingerprintSecond,
+      extensionFingerprintCount,
       state: states,
       depth,
       branches,
@@ -796,7 +854,7 @@ export function searchConstraintExtensions<TCandidate, TScore>(
         options.onEqualPrimaryDiversification({
           reason: "hard-conflict",
           defect: conflict,
-          extensionArcs: activeArcs.slice(),
+          extensionArcs: options.snapshotDiversificationArcs === false ? [] : activeArcs.slice(),
         });
       }
       if (depth === 0 && conflict.alternatives.length === 0
@@ -811,14 +869,28 @@ export function searchConstraintExtensions<TCandidate, TScore>(
       candidateStates += 1;
       const isBetter = !hasBest
         || options.compareScores(inspection.score, bestScore as TScore) > 0;
+      let materialized: TCandidate | undefined;
+      let hasMaterialized = false;
+      const materialize = (): TCandidate => {
+        if (hasMaterialized) return materialized as TCandidate;
+        if ("candidate" in inspection) {
+          materialized = inspection.candidate;
+        } else if (inspection.materializeCandidate) {
+          materialized = inspection.materializeCandidate();
+        } else {
+          throw new TypeError("candidate inspection must provide a candidate value or materializer");
+        }
+        hasMaterialized = true;
+        return materialized as TCandidate;
+      };
       if (isBetter) {
         hasBest = true;
-        best = inspection.candidate;
+        best = materialize();
         bestScore = inspection.score;
         rawIncumbents += 1;
         if (inspection.softDefect) softIncumbents += 1;
         options.onIncumbent?.({
-          candidate: inspection.candidate,
+          candidate: best,
           score: inspection.score,
           hasSoftDefect: inspection.softDefect !== undefined,
           stats: stats(),
@@ -829,9 +901,13 @@ export function searchConstraintExtensions<TCandidate, TScore>(
           options.onEqualPrimaryDiversification({
             reason: "soft-defect",
             defect: inspection.softDefect,
-            candidate: inspection.candidate,
+            candidate: hasMaterialized
+              ? materialized
+              : "candidate" in inspection
+              ? inspection.candidate
+              : undefined,
             score: inspection.score,
-            extensionArcs: activeArcs.slice(),
+            extensionArcs: options.snapshotDiversificationArcs === false ? [] : activeArcs.slice(),
           });
         }
         enqueueAlternatives(depth + 1, inspection.softDefect.alternatives, inspection.score);
@@ -858,7 +934,7 @@ export function searchConstraintExtensions<TCandidate, TScore>(
     if (appliedPath.length > common) {
       const frame = appliedPath[common];
       for (let axis = 0; axis < 3; axis += 1) dags[axis].rollback(frame.checkpoints[axis]);
-      activeArcs.length = frame.arcLength;
+      truncateActiveArcs(frame.arcLength);
       releaseAppliedPathFrom(common);
     }
     for (let index = common; index < ancestorsScratch.length; index += 1) {
@@ -872,7 +948,7 @@ export function searchConstraintExtensions<TCandidate, TScore>(
           ancestorsScratch.length = 0;
           return false;
         }
-        if (result === "added") activeArcs.push(arc);
+        if (result === "added") pushActiveArc(arc);
       }
       retainNode(ancestor);
       appliedPath.push({ node: ancestor, checkpoints, arcLength });
@@ -917,20 +993,20 @@ export function searchConstraintExtensions<TCandidate, TScore>(
       }
       if (result === "added") {
         alternativeResult = "added";
-        activeArcs.push(arc);
+        pushActiveArc(arc);
       }
     }
 
     if (alternativeResult === "cancelled") {
       for (let axis = 0; axis < 3; axis += 1) dags[axis].rollback(checkpoints[axis]);
-      activeArcs.length = arcLength;
+      truncateActiveArcs(arcLength);
       cancelled = true;
       releaseNode(node);
       break;
     }
     if (alternativeResult === "cycle") {
       for (let axis = 0; axis < 3; axis += 1) dags[axis].rollback(checkpoints[axis]);
-      activeArcs.length = arcLength;
+      truncateActiveArcs(arcLength);
       cyclePrunes += 1;
       releaseNode(node);
       continue;

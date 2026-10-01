@@ -36,6 +36,58 @@ jobs:
           python-version: '3.13'
       - run: python -m unittest discover -s bin/tests -v
 
+  packages:
+    name: Package tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # `node --test` passes when its glob matches no files, so failglob makes a
+    # moved or renamed suite fail its step instead of silently testing nothing.
+    defaults:
+      run:
+        shell: bash -O failglob -e {0}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      # The suites use node:test and Node's built-in TypeScript type stripping
+      # and have no npm dependencies, so there is nothing to install or cache.
+      - name: Install Node
+        id: node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.18.1'
+
+      # One step per package names the failing suite, and every suite runs
+      # even after an earlier one fails, so one red package cannot hide another.
+      - name: Test arctic-mapper
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        run: node --test packages/arctic-mapper/mapper/*.test.ts
+
+      - name: Test calendar-todo-list
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        run: node --test packages/calendar-todo-list/test/*.test.ts
+
+      - name: Test map-layout
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        run: node --test packages/map-layout/*.test.ts
+
+      - name: Test mudlet-db
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        run: node --test packages/mudlet-db/test/*.test.ts
+
+      - name: Test nukefire-mapper
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        run: node --test packages/nukefire-mapper/*.test.ts
+
+      - name: Test nukefire-scripts
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        run: node --test packages/nukefire-scripts/*.test.ts
+
+      - name: Test tintin-emulator
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
+        run: node --test packages/tintin-emulator/test/*.test.ts
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

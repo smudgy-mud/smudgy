@@ -30,43 +30,43 @@
           ],
           [
             "budget-1",
-            -6,
-            -8,
+            -5,
+            -5,
             0
           ],
           [
             "budget-10",
             -4,
-            -7,
+            -3,
             0
           ],
           [
             "budget-11",
-            -4,
-            -6,
+            -3,
+            -5,
             0
           ],
           [
             "budget-12",
-            -6,
             -5,
+            -4,
             0
           ],
           [
             "budget-2",
             -6,
-            -6,
+            -4,
             0
           ],
           [
             "budget-3",
-            -7,
             -6,
+            -5,
             0
           ],
           [
             "budget-4",
-            -4,
+            -3,
             -4,
             0
           ],
@@ -79,25 +79,25 @@
           [
             "budget-6",
             -5,
-            -5,
+            -3,
             0
           ],
           [
             "budget-7",
-            -5,
-            -4,
+            -3,
+            -3,
             0
           ],
           [
             "budget-8",
-            -5,
-            -8,
+            -4,
+            -4,
             0
           ],
           [
             "budget-9",
             -6,
-            -4,
+            -3,
             0
           ]
         ],
@@ -105,8 +105,10 @@
           "cardinalRayViolations": 0,
           "cardinalSlack": 0,
           "exitPortViolations": 0,
-          "footprintArea": 20,
-          "footprintPerimeter": 18,
+          "footprintArea": 15,
+          "footprintPerimeter": 16,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 0,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
@@ -125,7 +127,7 @@
         "batches": {},
         "events": {
           "crossing-progress:deep:complete": 1,
-          "crossing-repair": 3
+          "crossing-repair": 1
         }
       }
     },
@@ -158,74 +160,74 @@
           ],
           [
             "budget-1",
-            -7,
+            -5,
             -5,
             0
           ],
           [
             "budget-10",
-            -5,
+            -4,
             -3,
             0
           ],
           [
             "budget-11",
-            -5,
+            -3,
             -5,
             0
           ],
           [
             "budget-12",
-            -7,
-            -2,
+            -5,
+            -4,
             0
           ],
           [
             "budget-2",
             -6,
-            -2,
+            -4,
             0
           ],
           [
             "budget-3",
-            -7,
-            -3,
-            0
-          ],
-          [
-            "budget-4",
-            -5,
-            -2,
-            0
-          ],
-          [
-            "budget-5",
             -6,
             -5,
             0
           ],
           [
+            "budget-4",
+            -3,
+            -4,
+            0
+          ],
+          [
+            "budget-5",
+            -4,
+            -5,
+            0
+          ],
+          [
             "budget-6",
-            -7,
-            -1,
+            -5,
+            -3,
             0
           ],
           [
             "budget-7",
-            -5,
-            -1,
+            -3,
+            -3,
             0
           ],
           [
             "budget-8",
-            -5,
+            -4,
             -4,
             0
           ],
           [
             "budget-9",
             -6,
-            -1,
+            -3,
             0
           ]
         ],
@@ -235,6 +237,8 @@
           "exitPortViolations": 0,
           "footprintArea": 15,
           "footprintPerimeter": 16,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 0,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
@@ -253,7 +257,7 @@
         "batches": {},
         "events": {
           "crossing-progress:deep:complete": 1,
-          "crossing-repair": 6
+          "crossing-repair": 1
         }
       }
     },
@@ -298,6 +302,7 @@
         "beforeSettledRoutingViolations": 1,
         "beforeSettledViolations": 1,
         "beforeViolations": 1,
+        "candidateMaterializations": 1,
         "compactionAttempts": 1,
         "constraintOptimal": true,
         "crossingRepair": {
@@ -329,6 +334,8 @@
         },
         "maskDiversifications": 1,
         "optimal": true,
+        "outcome": "searched",
+        "peakLiveSearchNodes": 0,
         "polishAnchorsTried": 5,
         "polishCutoff": "fixed-point",
         "polishImprovements": 0,
@@ -337,6 +344,7 @@
         "rawIncumbents": 2,
         "reciprocalRelaxedEdges": 0,
         "relaxedEdges": 1,
+        "relaxedLevelRelations": 0,
         "restarts": 0,
         "selected": false,
         "separatorBranches": 0,
@@ -383,6 +391,7 @@
           "crossing-progress:deep:complete": 1,
           "crossing-progress:quick:complete": 1,
           "obstruction-candidates": 1,
+          "preview": 1,
           "selection": 2
         }
       }
@@ -467,6 +476,8 @@
           "exitPortViolations": 7,
           "footprintArea": 15,
           "footprintPerimeter": 16,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 1,
           "reciprocalExitPortViolations": 7,
           "reciprocalRayViolations": 2,
@@ -511,44 +522,44 @@
           ],
           [
             "nested-1",
-            -10,
+            -9,
             11,
             0
           ],
           [
             "nested-10",
-            -11,
-            10,
+            -10,
+            13,
             0
           ],
           [
             "nested-11",
-            -10,
-            10,
+            -7,
+            11,
             0
           ],
           [
             "nested-2",
-            -10,
-            12,
+            -9,
+            15,
             0
           ],
           [
             "nested-3",
-            -11,
+            -10,
             11,
             0
           ],
           [
             "nested-4",
             -8,
-            12,
+            13,
             0
           ],
           [
             "nested-5",
             -9,
-            12,
+            13,
             0
           ],
           [
@@ -559,48 +570,49 @@
           ],
           [
             "nested-7",
-            -10,
-            13,
+            -8,
+            14,
             0
           ],
           [
             "nested-8",
-            -11,
-            13,
+            -7,
+            12,
             0
           ],
           [
             "nested-9",
-            -11,
-            12,
+            -7,
+            15,
             0
           ]
         ],
         "quality": {
           "cardinalRayViolations": 0,
-          "cardinalSlack": 2,
+          "cardinalSlack": 8,
           "exitPortViolations": 0,
-          "footprintArea": 16,
-          "footprintPerimeter": 16,
+          "footprintArea": 24,
+          "footprintPerimeter": 20,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 0,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
-          "roomObstructions": 0,
-          "routingViolations": 0
+          "roomObstructions": 1,
+          "routingViolations": 1
         }
       },
       "stats": {
-        "crossingsConsidered": 13,
-        "macrosConsidered": 500,
-        "maxDepth": 4,
-        "pushClosures": 473,
-        "visitedStates": 473
+        "crossingsConsidered": 0,
+        "macrosConsidered": 0,
+        "maxDepth": 0,
+        "pushClosures": 0,
+        "visitedStates": 0
       },
       "trace": {
         "batches": {},
         "events": {
-          "crossing-progress:deep:complete": 1,
-          "crossing-repair": 5
+          "crossing-progress:deep:complete": 1
         }
       }
     },
@@ -628,44 +640,44 @@
           ],
           [
             "nested-1",
-            -10,
+            -9,
             11,
             0
           ],
           [
             "nested-10",
-            -11,
-            9,
+            -10,
+            13,
             0
           ],
           [
             "nested-11",
             -7,
-            9,
+            11,
             0
           ],
           [
             "nested-2",
-            -10,
-            12,
+            -9,
+            15,
             0
           ],
           [
             "nested-3",
-            -11,
+            -10,
             11,
             0
           ],
           [
             "nested-4",
             -8,
-            12,
+            13,
             0
           ],
           [
             "nested-5",
             -9,
-            12,
+            13,
             0
           ],
           [
@@ -676,34 +688,36 @@
           ],
           [
             "nested-7",
-            -11,
-            8,
+            -8,
+            14,
             0
           ],
           [
             "nested-8",
-            -10,
-            9,
+            -7,
+            12,
             0
           ],
           [
             "nested-9",
             -7,
-            7,
+            15,
             0
           ]
         ],
         "quality": {
           "cardinalRayViolations": 0,
-          "cardinalSlack": 2,
+          "cardinalSlack": 8,
           "exitPortViolations": 0,
-          "footprintArea": 30,
-          "footprintPerimeter": 22,
-          "linkCrossings": 3,
+          "footprintArea": 24,
+          "footprintPerimeter": 20,
+          "levelSlack": 0,
+          "levelViolations": 0,
+          "linkCrossings": 0,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
-          "roomObstructions": 0,
-          "routingViolations": 0
+          "roomObstructions": 1,
+          "routingViolations": 1
         }
       },
       "trace": {
@@ -730,8 +744,7 @@
           }
         },
         "events": {
-          "axis-progress:spacing:complete": 1,
-          "bridge-vacuum": 1,
+          "axis-progress:spacing:complete": 2,
           "candidate-batch:all-candidates": 1,
           "candidate-batch:chart-reflow": 1,
           "candidate-batch:exact-new": 1,
@@ -739,10 +752,10 @@
           "candidate-batch:stable": 1,
           "crossing-progress:quick:complete": 1,
           "crossing-repair": 1,
-          "improvement": 12,
+          "improvement": 6,
           "obstruction-candidates": 2,
-          "selection": 2,
-          "vacuum": 2
+          "preview": 1,
+          "selection": 2
         }
       }
     },
@@ -2292,6 +2305,8 @@
         "exitPortViolations": 2,
         "footprintArea": 210,
         "footprintPerimeter": 58,
+        "levelSlack": 0,
+        "levelViolations": 0,
         "linkCrossings": 3,
         "reciprocalExitPortViolations": 2,
         "reciprocalRayViolations": 0,
@@ -3181,6 +3196,8 @@
           "exitPortViolations": 0,
           "footprintArea": 196,
           "footprintPerimeter": 56,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 3,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
@@ -3220,6 +3237,7 @@
           "candidate-batch:stable": 1,
           "crossing-progress:quick:complete": 1,
           "obstruction-candidates": 1,
+          "preview": 1,
           "selection": 2
         }
       }
@@ -3323,7 +3341,7 @@
         ],
         [
           "r012",
-          9,
+          10,
           -2,
           0
         ],
@@ -5056,6 +5074,8 @@
         "exitPortViolations": 2,
         "footprintArea": 360,
         "footprintPerimeter": 76,
+        "levelSlack": 0,
+        "levelViolations": 0,
         "linkCrossings": 4,
         "reciprocalExitPortViolations": 2,
         "reciprocalRayViolations": 0,
@@ -5470,7 +5490,7 @@
           ],
           [
             "r012",
-            9,
+            10,
             -2,
             0
           ],
@@ -7203,6 +7223,8 @@
           "exitPortViolations": 0,
           "footprintArea": 360,
           "footprintPerimeter": 76,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 4,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
@@ -7242,6 +7264,7 @@
           "candidate-batch:stable": 1,
           "crossing-progress:quick:complete": 1,
           "obstruction-candidates": 1,
+          "preview": 1,
           "selection": 2
         }
       }
@@ -7670,6 +7693,8 @@
         "exitPortViolations": 0,
         "footprintArea": 56,
         "footprintPerimeter": 30,
+        "levelSlack": 0,
+        "levelViolations": 0,
         "linkCrossings": 0,
         "reciprocalExitPortViolations": 0,
         "reciprocalRayViolations": 0,
@@ -8043,6 +8068,8 @@
           "exitPortViolations": 0,
           "footprintArea": 70,
           "footprintPerimeter": 34,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 0,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
@@ -8055,6 +8082,7 @@
         "beforeSettledRoutingViolations": 12,
         "beforeSettledViolations": 10,
         "beforeViolations": 10,
+        "candidateMaterializations": 0,
         "compactionAttempts": 1,
         "constraintOptimal": true,
         "crossingRepair": {
@@ -8086,6 +8114,8 @@
         },
         "maskDiversifications": 1,
         "optimal": true,
+        "outcome": "searched",
+        "peakLiveSearchNodes": 0,
         "polishAnchorsTried": 9,
         "polishCutoff": "fixed-point",
         "polishImprovements": 0,
@@ -8094,6 +8124,7 @@
         "rawIncumbents": 1,
         "reciprocalRelaxedEdges": 0,
         "relaxedEdges": 0,
+        "relaxedLevelRelations": 0,
         "restarts": 0,
         "selected": false,
         "separatorBranches": 0,
@@ -8141,6 +8172,7 @@
           "crossing-progress:deep:complete": 1,
           "crossing-progress:quick:complete": 1,
           "obstruction-candidates": 1,
+          "preview": 1,
           "selection": 2
         }
       }
@@ -8460,6 +8492,8 @@
           "exitPortViolations": 3,
           "footprintArea": 110,
           "footprintPerimeter": 42,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 6,
           "reciprocalExitPortViolations": 3,
           "reciprocalRayViolations": 10,
@@ -8826,6 +8860,8 @@
           "exitPortViolations": 0,
           "footprintArea": 56,
           "footprintPerimeter": 30,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 0,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
@@ -8865,6 +8901,7 @@
           "candidate-batch:stable": 1,
           "crossing-progress:quick:complete": 1,
           "obstruction-candidates": 1,
+          "preview": 1,
           "selection": 2
         }
       }
@@ -8978,6 +9015,8 @@
           "exitPortViolations": 0,
           "footprintArea": 16,
           "footprintPerimeter": 16,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 0,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
@@ -9009,7 +9048,7 @@
           }
         },
         "events": {
-          "axis-progress:spacing:complete": 1,
+          "axis-progress:spacing:complete": 2,
           "candidate-batch:all-candidates": 1,
           "candidate-batch:chart-reflow": 1,
           "candidate-batch:exact-new": 1,
@@ -9018,6 +9057,7 @@
           "crossing-progress:quick:complete": 1,
           "crossing-repair": 1,
           "obstruction-candidates": 1,
+          "preview": 1,
           "selection": 2
         }
       }
@@ -9060,6 +9100,8 @@
           "exitPortViolations": 0,
           "footprintArea": 4,
           "footprintPerimeter": 8,
+          "levelSlack": 0,
+          "levelViolations": 0,
           "linkCrossings": 0,
           "reciprocalExitPortViolations": 0,
           "reciprocalRayViolations": 0,
@@ -9072,6 +9114,7 @@
         "beforeSettledRoutingViolations": 4,
         "beforeSettledViolations": 0,
         "beforeViolations": 0,
+        "candidateMaterializations": 2,
         "compactionAttempts": 1,
         "constraintOptimal": true,
         "crossingRepair": {
@@ -9103,6 +9146,8 @@
         },
         "maskDiversifications": 1,
         "optimal": true,
+        "outcome": "searched",
+        "peakLiveSearchNodes": 4,
         "polishAnchorsTried": 6,
         "polishCutoff": "fixed-point",
         "polishImprovements": 1,
@@ -9111,6 +9156,7 @@
         "rawIncumbents": 2,
         "reciprocalRelaxedEdges": 0,
         "relaxedEdges": 0,
+        "relaxedLevelRelations": 0,
         "restarts": 0,
         "selected": true,
         "separatorBranches": 2,
@@ -9158,6 +9204,7 @@
           "crossing-progress:deep:complete": 1,
           "crossing-progress:quick:complete": 1,
           "obstruction-candidates": 1,
+          "preview": 1,
           "selection": 2
         }
       }

@@ -1,11 +1,11 @@
 {
-  "version": "0.5.1",
+  "version": "0.5.5",
   "description": "NukeFire widgets deck: vitals, maps + GPS, comms and more",
   "entry": "index.ts",
-  "min_smudgy_version": "0.5.5",
+  "min_smudgy_version": "0.5.7",
   "dependencies": [
     "smudgy://kapusniak/nukefire-gmcp",
-    "smudgy://kapusniak/map-layout@^0.2.1"
+    "smudgy://kapusniak/map-layout@^0.2.3"
   ],
   "requires": [
     "smudgy://kapusniak/nukefire-gmcp",
@@ -147,6 +147,7 @@
       ],
       "session": [
         "send",
+        "send-direct",
         "echo",
         "reach-others"
       ],

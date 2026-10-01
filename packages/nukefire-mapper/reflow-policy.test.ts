@@ -18,6 +18,14 @@ test("the quiet full-reflow lane performs and clears deferred movement", () => {
   });
 });
 
+test("the prompt lane carries already-deferred work without inventing topology growth", () => {
+  assert.deepEqual(reflowPolicy(false, true, false, true), {
+    runPlanner: false,
+    moveExisting: false,
+    deferExistingReflow: true,
+  });
+});
+
 test("ordinary movement skips the planner", () => {
   assert.deepEqual(reflowPolicy(false, false, true, true), {
     runPlanner: false,

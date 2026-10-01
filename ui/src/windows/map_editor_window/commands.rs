@@ -1138,11 +1138,11 @@ pub fn delete_selection(
     }
 
     // Deleting a room nulls the destination of every exit that pointed at it
-    // (the server cascades this and `Mapper::delete_room` mirrors it in the
-    // cache). Capture an `UpdateExit` restore for each such inbound exit so
-    // undo re-links it. Exits hosted by a room that is *also* being deleted
-    // are restored by that room's own exit recreation above, so they are
-    // skipped here.
+    // (the server cascades this, and `Mapper::delete_room` clears the same
+    // exits in their own maps). Capture an `UpdateExit` restore for each
+    // such inbound exit so undo re-links it. Exits hosted by a room that is
+    // *also* being deleted are restored by that room's own exit recreation
+    // above, so they are skipped here.
     let deleted_rooms: HashSet<RoomKey> = selection
         .rooms()
         .map(|room_number| RoomKey::new(area_id, room_number))
@@ -2939,18 +2939,20 @@ pub fn boundary_link_count(
 
 /// Maps copied room numbers onto numbers vacant in the target area.
 ///
-/// Cross-area pastes (`preserve_numbers`) keep each source number when it
-/// is vacant — not occupied and not already claimed by this paste — so a
-/// merge-back lands on the same identities. Collisions, and every
-/// same-area paste, allocate fresh numbers counting up from `first_fresh`
-/// and skipping anything occupied or claimed.
+/// `taken` holds the numbers the target area cannot give out: its rooms'
+/// and those its exits lead to without a room there. Cross-area pastes
+/// (`preserve_numbers`) keep each source number when it is vacant — not
+/// taken and not already claimed by this paste — so a merge-back lands on
+/// the same identities. Collisions, and every same-area paste, allocate
+/// fresh numbers counting up from `first_fresh` and skipping anything taken
+/// or claimed.
 fn remap_room_numbers(
     source: &[RoomNumber],
-    occupied: &HashSet<RoomNumber>,
+    taken: &HashSet<RoomNumber>,
     first_fresh: RoomNumber,
     preserve_numbers: bool,
 ) -> HashMap<RoomNumber, RoomNumber> {
-    let mut claimed = occupied.clone();
+    let mut claimed = taken.clone();
     let mut next = first_fresh.0;
     let mut mapping = HashMap::with_capacity(source.len());
 
@@ -3046,8 +3048,10 @@ pub fn paste_clipboard(
     clipboard: &EntityClipboard,
     level: i32,
     offset: Vector,
-    // Reservation-aware allocation base from the Mapper (skips numbers held
-    // by open scripted mutators); `None` falls back to the cache maximum.
+    // The first number a pasted room may take when it cannot keep its own:
+    // the Mapper's reservation-aware allocation, which also passes over
+    // numbers links lead to. `None` when the target has no room numbers
+    // left; a clipboard holding rooms then pastes nothing.
     next_room_number: Option<RoomNumber>,
 ) -> (Option<Command>, Vec<RoomNumber>, usize) {
     if clipboard.is_empty() {
@@ -3076,22 +3080,27 @@ pub fn paste_clipboard(
     let mut mapping: HashMap<RoomNumber, RoomNumber> = HashMap::new();
 
     if !clipboard.rooms.is_empty() {
+        let Some(first_fresh) = next_room_number else {
+            return (None, Vec::new(), 0);
+        };
         let occupied: HashSet<RoomNumber> = area
             .get_rooms()
             .iter()
             .map(|room| room.get_room_number())
+            .collect();
+        // A pasted room that kept a number an exit already leads to would
+        // silently become that exit's destination.
+        let taken: HashSet<RoomNumber> = occupied
+            .iter()
+            .copied()
+            .chain(atlas.vacant_exit_targets(&target_area_id))
             .collect();
         let source_numbers: Vec<RoomNumber> = clipboard
             .rooms
             .iter()
             .map(|room| room.room_number)
             .collect();
-        mapping = remap_room_numbers(
-            &source_numbers,
-            &occupied,
-            next_room_number.unwrap_or_else(|| area.next_room_number()),
-            !same_area,
-        );
+        mapping = remap_room_numbers(&source_numbers, &taken, first_fresh, !same_area);
 
         let mut legacy_exits = Vec::new();
         for room in &clipboard.rooms {
@@ -4782,7 +4791,7 @@ mod tests {
             &clipboard,
             0,
             Vector::new(0.0, 0.0),
-            None,
+            mapper.next_room_number(&target),
         );
         let command = command.expect("command");
         // Room 1 keeps its number (vacant in the target); room 2 collides
@@ -4855,6 +4864,49 @@ mod tests {
         assert!(area.get_room(&RoomNumber(2)).is_some());
     }
 
+    /// The target holds room 2, and another map's exit leads to its room 1,
+    /// which no longer exists. A pasted room 1 does not keep that number, so
+    /// the exit keeps leading nowhere instead of into the pasted room.
+    #[tokio::test]
+    async fn cross_area_paste_never_keeps_a_number_a_stale_exit_leads_to() {
+        let mapper = test_mapper();
+        let source = area_with_rooms(&mapper, &[(1, 0.0, 0.0)]).await;
+        let target = area_with_rooms(&mapper, &[(2, 50.0, 50.0)]).await;
+        let elsewhere = area_with_rooms(&mapper, &[(1, 0.0, 0.0)]).await;
+        mapper
+            .create_exit(
+                RoomKey::new(elsewhere, RoomNumber(1)),
+                ExitArgs {
+                    from_direction: ExitDirection::East,
+                    to_area_id: Some(target),
+                    to_room_number: Some(RoomNumber(1)),
+                    weight: 1.0,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("an exit to a room that is gone");
+        let clipboard = snapshot_selection(
+            &mapper.get_current_atlas(),
+            source,
+            &select_rooms(&[1]),
+            true,
+            false,
+        );
+
+        let (command, pasted, _) = paste_clipboard(
+            &mapper.get_current_atlas(),
+            target,
+            &clipboard,
+            0,
+            Vector::new(0.0, 0.0),
+            mapper.next_room_number(&target),
+        );
+
+        assert!(command.is_some());
+        assert_eq!(pasted, vec![RoomNumber(3)]);
+    }
+
     #[tokio::test]
     async fn same_area_paste_allocates_fresh_numbers_and_links_inside_the_copy() {
         let mapper = test_mapper();
@@ -4887,7 +4939,7 @@ mod tests {
             &clipboard,
             0,
             Vector::new(1.0, 1.0),
-            None,
+            mapper.next_room_number(&area_id),
         );
         let command = command.expect("command");
         assert_eq!(

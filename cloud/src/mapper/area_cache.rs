@@ -878,25 +878,42 @@ impl AreaCache {
         self.rebuild_room_state(new_rooms_by_number, new_rooms, max_room_number, connections)
     }
 
-    /// Resets every exit in this area that points to `target` to no
-    /// destination, returning the rebuilt area, or `None` when nothing here
-    /// linked to `target`. Mirrors the server's inbound-exit cascade on room
-    /// deletion so the cache never shows exits dangling at a deleted room
-    /// until the next sync (see [`RoomCache::null_exits_to`]).
-    pub(super) fn null_inbound_exits(&self, target: &RoomKey) -> Option<Self> {
+    /// Resets every exit in this area that leads to one of `numbers` in
+    /// `target_area` to no destination, returning the rebuilt area with its
+    /// revision advanced once, or `None` when nothing here led there. Mirrors
+    /// the server's inbound-exit cascade on room deletion (see
+    /// [`RoomCache::null_exits_into`]) for links between cloud areas, which
+    /// the server clears in the deletion's own transaction. Links from any
+    /// other area are cleared by an ordinary exit update queued for that
+    /// area, which leaves the same document.
+    pub(super) fn null_inbound_exits(
+        &self,
+        target_area: AreaId,
+        numbers: &HashSet<RoomNumber>,
+    ) -> Option<Self> {
+        // Every area is asked on every deletion; most answer no without
+        // copying anything.
+        let leads_in = self.rooms.iter().any(|room| {
+            room.get_exits()
+                .iter()
+                .any(|exit| RoomCache::exit_leads_into(exit, target_area, numbers))
+        });
+        if !leads_in {
+            return None;
+        }
         let mut new_rooms_by_number = self.rooms_by_number.clone();
         let mut touched = HashSet::new();
-        // The pre-null copies of every affected exit, for Connection repair.
-        let mut affected: Vec<(RoomNumber, ExitCache)> = Vec::new();
+        // The topology of every affected exit before its destination was
+        // cleared, for Connection repair.
+        let mut cleared: Vec<ExitTopology> = Vec::new();
         for (room_number, room) in &self.rooms_by_number {
-            if let Some(updated) = room.null_exits_to(target) {
-                for exit in room.get_exits() {
-                    if exit.to_area_id == Some(target.area_id)
-                        && exit.to_room_number == Some(target.room_number)
-                    {
-                        affected.push((*room_number, exit.clone()));
-                    }
-                }
+            if let Some(updated) = room.null_exits_into(target_area, numbers) {
+                cleared.extend(
+                    room.get_exits()
+                        .iter()
+                        .filter(|exit| RoomCache::exit_leads_into(exit, target_area, numbers))
+                        .map(|exit| Self::exit_topology(&self.id, *room_number, exit)),
+                );
                 new_rooms_by_number.insert(*room_number, Arc::new(updated));
                 touched.insert(*room_number);
             }
@@ -917,31 +934,27 @@ impl AreaCache {
                 level: room.get_level(),
             })
         };
-        for (room_number, before_exit) in &affected {
-            let before = Self::exit_topology(&self.id, *room_number, before_exit);
-            let after = ExitTopology {
-                to_room_in_area: None,
-                to_direction: None,
-                leaves_area: false,
-                ..before
-            };
-            let peers = Self::topologies_of(&self.id, &new_rooms_by_number, Some(before_exit.id));
-            connection_lifecycle::reattach_after_update(
-                &before,
-                &after,
-                &peers,
-                &mut connections,
-                site,
-            );
-        }
-
-        let mut new_rooms = self.rooms.clone();
-        new_rooms.retain(|r| !touched.contains(&r.get_room_number()));
-        new_rooms.extend(
-            touched
-                .iter()
-                .filter_map(|n| new_rooms_by_number.get(n).cloned()),
+        let exits = Self::topologies_of(&self.id, &new_rooms_by_number, None);
+        connection_lifecycle::repair_after_destinations_cleared(
+            &cleared,
+            &exits,
+            &mut connections,
+            site,
         );
+
+        // Rooms keep their places, as they do in the stored document.
+        let new_rooms = self
+            .rooms
+            .iter()
+            .map(|room| {
+                let number = room.get_room_number();
+                if touched.contains(&number) {
+                    new_rooms_by_number[&number].clone()
+                } else {
+                    room.clone()
+                }
+            })
+            .collect();
 
         Some(self.rebuild_room_state(
             new_rooms_by_number,

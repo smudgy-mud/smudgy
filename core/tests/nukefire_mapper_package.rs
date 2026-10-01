@@ -3,158 +3,21 @@
 //! per-message helpers the mapper consumes; the real mapper and map-layout
 //! sources run sandboxed under their manifests.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+mod support;
 
-use futures::StreamExt;
 use smudgy_cloud::mutation::AreaMutation;
 use smudgy_cloud::{
-    CloudMapper, CompositeBackend, Credential, CredentialSource, ExitArgs, ExitDirection,
-    LocalBackend, MapDestination, MapStorage, Mapper, MapperBackend, PackageApiClient, PortMode,
-    RoomNumber, RoomSide, RoomUpdates,
+    ExitArgs, ExitDirection, MapDestination, MapStorage, Mapper, PortMode, RoomNumber, RoomSide,
+    RoomUpdates,
 };
-use smudgy_core::models::local_packages::packages_dir;
-use smudgy_core::models::shared_packages::{self, UpdateMode};
+use smudgy_core::models::shared_packages;
 use smudgy_core::session::runtime::RuntimeAction;
-use smudgy_core::session::{
-    BufferUpdate, SessionEvent, SessionId, SessionParams, TaggedSessionEvent, spawn,
+use support::nukefire::{
+    MAPPER_SPEC, Session, find_file, gmcp, install_mapper_packages, local_mapper, smudgy_home,
+    start_session, wait_for_map_state,
 };
 
-const MAP_WAIT: Duration = Duration::from_secs(15);
 const SERVER: &str = "tdome.nukefire.org";
-const MAPPER_SPEC: &str = "smudgy://local/nukefire-mapper";
-
-fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(root).ok()? {
-        let entry = entry.ok()?;
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_file(&path, name) {
-                return Some(found);
-            }
-        } else if path.file_name().is_some_and(|candidate| candidate == name) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn copy_package(server: &str, name: &str) {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("packages")
-        .join(name);
-    let destination = packages_dir(server).expect("packages dir").join(name);
-    std::fs::create_dir_all(&destination).expect("create package directory");
-    for entry in std::fs::read_dir(&source).unwrap_or_else(|_| panic!("read package {name}")) {
-        let entry = entry.expect("package entry");
-        if entry.file_type().expect("entry type").is_file() {
-            std::fs::copy(entry.path(), destination.join(entry.file_name()))
-                .expect("copy package source");
-        }
-    }
-}
-
-fn localize_mapper_dependencies(server: &str) {
-    let directory = packages_dir(server)
-        .expect("packages dir")
-        .join("nukefire-mapper");
-    for entry in std::fs::read_dir(&directory).expect("read mapper package") {
-        let entry = entry.expect("mapper package entry");
-        let path = entry.path();
-        let is_source = path.extension().is_some_and(|extension| extension == "ts");
-        let is_manifest = path
-            .file_name()
-            .is_some_and(|name| name == "smudgy.package.json");
-        if !is_source && !is_manifest {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("read mapper source");
-        let localized = source
-            .replace(
-                "smudgy://kapusniak/nukefire-gmcp",
-                "smudgy://local/nukefire-gmcp",
-            )
-            .replace("smudgy://kapusniak/map-layout", "smudgy://local/map-layout");
-        std::fs::write(path, localized).expect("localize mapper dependency");
-    }
-}
-
-fn write_gmcp_fixture(server: &str) {
-    let directory = packages_dir(server)
-        .expect("packages dir")
-        .join("nukefire-gmcp");
-    std::fs::create_dir_all(&directory).expect("create GMCP fixture");
-    std::fs::write(
-        directory.join("smudgy.package.json"),
-        r#"{
-          "version": "0.0.0-test",
-          "entry": "index.ts",
-          "permissions": { "smudgy": { "interop": ["read"] } }
-        }"#,
-    )
-    .expect("write GMCP fixture manifest");
-    std::fs::write(
-        directory.join("index.ts"),
-        r#"import gmcp from "smudgy:state/gmcp";
-export const nukefire = gmcp;
-export function watchMessage(name: string, handler: (payload: any) => void) {
-  return nukefire.watch(name, handler);
-}
-export function onMessage(name: string, handler: (payload: any) => void) {
-  return nukefire.onWrite(name, (path: string, snapshot: any) => {
-    if (path.toLowerCase() === name.toLowerCase() && snapshot !== undefined) handler(snapshot);
-  });
-}
-"#,
-    )
-    .expect("write GMCP fixture source");
-}
-
-fn gmcp(name: &str, data: &str) -> RuntimeAction {
-    RuntimeAction::GmcpMessage {
-        name: Arc::from(name),
-        data: Some(Arc::from(data)),
-    }
-}
-
-fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
-    for update in updates {
-        if let BufferUpdate::Append(line) = update {
-            lines.push(line.text.clone());
-        }
-    }
-}
-
-async fn wait_for_map_state<S, F>(events: &mut S, lines: &mut Vec<String>, ready: F) -> bool
-where
-    S: futures::Stream<Item = TaggedSessionEvent> + Unpin,
-    F: Fn() -> bool,
-{
-    let deadline = tokio::time::Instant::now() + MAP_WAIT;
-    loop {
-        if ready() {
-            return true;
-        }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let remaining = deadline - now;
-        match tokio::time::timeout(remaining.min(Duration::from_millis(100)), events.next()).await {
-            Ok(Some(event)) => {
-                if let SessionEvent::UpdateBuffer(updates) = event.event {
-                    collect(&updates, lines);
-                }
-            }
-            Ok(None) => return ready(),
-            Err(_) => {}
-        }
-    }
-}
 
 fn target_port_layout(
     mapper: &Mapper,
@@ -205,19 +68,8 @@ fn area_property_for_room(mapper: &Mapper, external_id: &str, property: &str) ->
 // it would hide which GMCP messages and durable mapper state share a runtime.
 #[allow(clippy::too_many_lines)]
 async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
-    let home = tempfile::tempdir().expect("create temp home");
-    let home_path = home.path().to_path_buf();
-    std::mem::forget(home);
-    smudgy_core::set_smudgy_home(&home_path);
-    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
-    std::fs::create_dir_all(smudgy_home.join(SERVER).join("modules")).unwrap();
-    std::fs::create_dir_all(smudgy_home.join(SERVER).join("logs")).unwrap();
-    copy_package(SERVER, "map-layout");
-    copy_package(SERVER, "nukefire-mapper");
-    write_gmcp_fixture(SERVER);
-    localize_mapper_dependencies(SERVER);
-    shared_packages::install_package(SERVER, MAPPER_SPEC, UpdateMode::Auto, true)
-        .expect("install NukeFire mapper");
+    let smudgy_home = smudgy_home();
+    install_mapper_packages(SERVER);
     shared_packages::save_param_value(
         SERVER,
         MAPPER_SPEC,
@@ -227,14 +79,7 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
     .expect("enable mapper decision log");
 
     let map_root = smudgy_home.join("map-test");
-    let local = Arc::new(LocalBackend::new(map_root.join("local")));
-    let cloud = Arc::new(CloudMapper::new(
-        "http://127.0.0.1:0".to_string(),
-        "test-key".to_string(),
-    ));
-    let backend: Arc<dyn MapperBackend + Send + Sync> =
-        Arc::new(CompositeBackend::new(local, cloud));
-    let mapper = Mapper::new(backend, map_root.join("cache"));
+    let mapper = local_mapper(&map_root);
 
     // Stand in for a map created by an older package version: every port still
     // occupies its semantic midpoint, and an otherwise identical Map.Local
@@ -270,6 +115,11 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
                 AreaMutation::UpsertAreaProperty {
                     name: "nukefire.zone".to_string(),
                     value: "33".to_string(),
+                    is_secret: None,
+                },
+                AreaMutation::UpsertAreaProperty {
+                    name: "nukefire.mapper".to_string(),
+                    value: "NukeFire.Map.Local".to_string(),
                     is_secret: None,
                 },
                 // Simulate an earlier quiet reflow which was interrupted. The
@@ -331,34 +181,11 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
             .await
             .expect("existing centered ports acknowledged");
     }
-    let params = Arc::new(SessionParams {
-        session_id: SessionId::from(9360_u32),
-        server_name: Arc::new(SERVER.to_string()),
-        profile_name: Arc::new("Test".to_string()),
-        profile_subtext: Arc::new(String::new()),
-        mapper: Some(mapper.clone()),
-        package_client: Some(PackageApiClient::new(
-            "http://127.0.0.1:0",
-            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
-        )),
-        extra_script_extensions: Arc::new(Vec::new),
-        on_engine_rebuild: None,
-    });
-
-    let mut events = Box::pin(spawn(params));
-    let mut lines = Vec::new();
-    let tx = loop {
-        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
-            .await
-            .expect("timed out waiting for RuntimeReady")
-            .expect("event stream ended before RuntimeReady");
-        match event.event {
-            SessionEvent::RuntimeReady(tx) => break tx,
-            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
-            _ => {}
-        }
-    };
-    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    let Session {
+        tx,
+        mut events,
+        mut lines,
+    } = start_session(SERVER, 9360, &mapper).await;
     tx.send(gmcp(
         "Room.Info",
         r#"{
@@ -419,7 +246,13 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
         .collect();
     assert_eq!(areas.len(), 1, "repeat snapshots reuse the zone area");
     assert_eq!(areas[0].get_name(), "Tek Angeles");
-    assert_eq!(areas[0].get_property("nukefire.zone"), Some("30"));
+    // The zone the player stands in is filed into the map for its area name:
+    // that map is keyed by the folded name and marked as the mapper's own.
+    assert_eq!(areas[0].get_property("nukefire.area"), Some("tek angeles"));
+    assert_eq!(
+        areas[0].get_property("nukefire.mapper"),
+        Some("NukeFire.Map.Local")
+    );
     let (room, _) = atlas
         .find_room_by_external_id("100")
         .unwrap_or_else(|| panic!("room 100 was mapped; transcript:\n{transcript}"));
@@ -587,6 +420,60 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
         .await,
         "timed out waiting for the progressive reflow decision record:\n{}",
         lines.join("\n")
+    );
+
+    // Re-enter the first zone on a server plane which has no room or vertical
+    // seam in the durable map yet. Map.Local room z values are relative to its
+    // current plane, so the mapper must not merge this new chart into level 0.
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{
+          "num": 210, "name": "High Re-entry", "area": "Tek Angeles",
+          "zone": 42, "terrain": "inside", "exits": {},
+          "coords": { "x": 0, "y": 0, "z": 0 }
+        }"#,
+    ))
+    .unwrap();
+    let high_reentry_snapshot = r#"{
+      "version": 1, "source": "bigmap+gps", "center": 210,
+      "zone": 30, "plane": 2,
+      "rooms": [{
+        "vnum": 210, "name": "High Re-entry", "zone": 30,
+        "terrain": "inside", "x": 0, "y": 0, "z": 0,
+        "current": true, "route": false, "destination": false
+      }],
+      "links": [],
+      "gps": {
+        "active": false, "type": "none", "target": -1,
+        "description": "", "steps": 0, "route_raw": ""
+      },
+      "truncated": false
+    }"#;
+    tx.send(gmcp("NukeFire.Map.Local", high_reentry_snapshot))
+        .unwrap();
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            mapper
+                .get_current_atlas()
+                .find_room_by_external_id("210")
+                .is_some()
+        })
+        .await,
+        "timed out waiting for the zone re-entry"
+    );
+    let transcript = lines.join("\n");
+    let atlas = mapper.get_current_atlas();
+    let (_, high_reentry) = atlas
+        .find_room_by_external_id("210")
+        .expect("high re-entry room");
+    assert_eq!(
+        high_reentry.get_level(),
+        2,
+        "an unanchored zone re-entry follows Map.Local.plane; transcript:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("invalid_routing"),
+        "zone re-entry produced an invalid connection mutation:\n{transcript}"
     );
 
     // A reciprocal west-wall connection keeps its semantic midpoint while
@@ -781,15 +668,21 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
             )
             .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
             .is_some_and(|memo| {
-                memo["v"] == 2
+                memo["v"] == 3
                     && memo["g"]
                         .as_str()
                         .is_some_and(|geometry| !geometry.is_empty())
-                    && memo["c"].as_array().is_some_and(|contexts| {
-                        contexts.len() == 1
-                            && contexts[0].as_str().is_some_and(|key| {
+                    && memo["c"].as_array().is_some_and(|settlements| {
+                        settlements.len() == 1
+                            && settlements[0]["k"].as_str().is_some_and(|key| {
                                 key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
                             })
+                            && settlements[0]["s"] == 2
+                            && settlements[0]["e"] == 1
+                            && matches!(
+                                settlements[0]["t"].as_str(),
+                                Some("perfect" | "fixed-point" | "ceiling")
+                            )
                     })
             })
         })
@@ -798,10 +691,112 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
     );
     assert_eq!(
         area_property_for_room(&mapper, "500", "nukefire.layout.polish-pending").as_deref(),
-        Some("true"),
-        "a context-relative fixed point must preserve area-wide polish eligibility"
+        Some(""),
+        "a fixed point clears the legacy pending bit while retaining settlement evidence"
     );
-    let records: Vec<serde_json::Value> = std::fs::read_to_string(decision_log)
+    let current_decision_records = || -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&decision_log)
+            .unwrap_or_default()
+            .lines()
+            // The package appends one complete JSON line at a time. Ignore a
+            // concurrently observed partial tail while polling below.
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    };
+    let settled_layout_decisions = current_decision_records()
+        .iter()
+        .filter(|record| {
+            record["kind"] == "layout-decision"
+                && record["area"]["name"] == "Port Existing Test"
+                && record["trigger"]["moveExisting"].as_bool() == Some(true)
+        })
+        .count();
+    assert!(
+        settled_layout_decisions > 0,
+        "the initial passive polish must reach the Worker before testing re-entry"
+    );
+
+    // Leave the settled area, then return through the same center/chart. The
+    // durable v3 memo must be evaluated before dispatching a second Worker.
+    let visits_to_400 = current_decision_records()
+        .iter()
+        .filter(|record| record["kind"] == "current-location" && record["vnum"] == 400)
+        .count();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{
+          "num": 400, "name": "Port Target", "area": "Port Test",
+          "zone": 32, "terrain": "city", "exits": {},
+          "coords": { "x": 0, "y": 0, "z": 0 }
+        }"#,
+    ))
+    .unwrap();
+    tx.send(gmcp("NukeFire.Map.Local", port_snapshot)).unwrap();
+    assert!(
+        wait_for_map_state(&mut events, &mut lines, || {
+            current_decision_records()
+                .iter()
+                .filter(|record| record["kind"] == "current-location" && record["vnum"] == 400)
+                .count()
+                > visits_to_400
+        })
+        .await,
+        "timed out leaving the settled area before the re-entry check"
+    );
+
+    let prior_settled_skips = current_decision_records()
+        .iter()
+        .filter(|record| {
+            record["kind"] == "layout-polish-retry-skipped"
+                && record["area"]["name"] == "Port Existing Test"
+        })
+        .count();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{
+          "num": 500, "name": "Existing Port Target", "area": "Port Existing Test",
+          "zone": 33, "terrain": "city", "exits": {},
+          "coords": { "x": 0, "y": 0, "z": 0 }
+        }"#,
+    ))
+    .unwrap();
+    tx.send(gmcp("NukeFire.Map.Local", existing_port_snapshot))
+        .unwrap();
+    let reentry_skipped = wait_for_map_state(&mut events, &mut lines, || {
+        current_decision_records()
+            .iter()
+            .filter(|record| {
+                record["kind"] == "layout-polish-retry-skipped"
+                    && record["area"]["name"] == "Port Existing Test"
+                    && record["reason"] == "settled"
+            })
+            .count()
+            > prior_settled_skips
+    })
+    .await;
+    assert!(
+        reentry_skipped,
+        "timed out waiting for same-chart re-entry to consume the settled memo; tail: {:#?}",
+        current_decision_records()
+            .into_iter()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        current_decision_records()
+            .iter()
+            .filter(|record| {
+                record["kind"] == "layout-decision"
+                    && record["area"]["name"] == "Port Existing Test"
+                    && record["trigger"]["moveExisting"].as_bool() == Some(true)
+            })
+            .count(),
+        settled_layout_decisions,
+        "same-chart A→B→A re-entry must not dispatch a second layout decision"
+    );
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&decision_log)
         .expect("read mapper decision log")
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid decision record"))

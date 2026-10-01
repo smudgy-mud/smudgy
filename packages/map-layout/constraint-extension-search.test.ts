@@ -544,3 +544,83 @@ test("the production default bounds a wide frontier independently of total work"
   assert.equal(result.peakFrontierNodes, 32_768);
   assert.equal(result.peakLiveSearchNodes, 32_768);
 });
+
+test("lazy candidates materialize only when they become the strict incumbent", () => {
+  let materializations = 0;
+  const result = searchConstraintExtensions<string, number>({
+    axisNodeCounts: [3, 1, 1],
+    inspect: ({ extensionArcs }) => ({
+      type: "candidate",
+      materializeCandidate: () => {
+        materializations += 1;
+        return extensionArcs.length === 0 ? "root" : `child-${extensionArcs.length}`;
+      },
+      score: 10 - extensionArcs.length,
+      softDefect: extensionArcs.length === 0
+        ? {
+          kind: "lower-scoring-children",
+          alternatives: [{ arcs: [arc(0, 1)] }, { arcs: [arc(0, 2)] }],
+        }
+        : undefined,
+    }),
+    compareScores: (left, right) => left - right,
+  });
+
+  assert.equal(result.states, 3);
+  assert.equal(result.best, "root");
+  assert.equal(materializations, 1);
+});
+
+test("an explicitly provided undefined candidate remains a valid eager value", () => {
+  const result = searchConstraintExtensions<undefined, number>({
+    axisNodeCounts: [1, 1, 1],
+    inspect: () => ({ type: "candidate", candidate: undefined, score: 1 }),
+    compareScores: (left, right) => left - right,
+  });
+
+  assert.equal(result.completed, true);
+  assert.equal(result.candidateStates, 1);
+  assert.equal(result.best, undefined);
+});
+
+test("extension fingerprints are canonical across branch order and rollback", () => {
+  const firstArc = arc(0, 1);
+  const secondArc = arc(1, 2);
+  const completeFingerprints: string[] = [];
+  const result = searchConstraintExtensions<string, number>({
+    axisNodeCounts: [3, 1, 1],
+    inspect: ({
+      extensionArcs,
+      extensionFingerprintFirst,
+      extensionFingerprintSecond,
+      extensionFingerprintCount,
+    }) => {
+      if (extensionArcs.length === 0) {
+        return {
+          type: "hard-conflict" as const,
+          conflict: {
+            kind: "choose-order",
+            alternatives: [{ arcs: [firstArc] }, { arcs: [secondArc] }],
+          },
+        };
+      }
+      if (extensionArcs.length === 1) {
+        const missing = hasArc(extensionArcs, 0, 1) ? secondArc : firstArc;
+        return {
+          type: "hard-conflict" as const,
+          conflict: { kind: "complete-set", alternatives: [{ arcs: [missing] }] },
+        };
+      }
+      completeFingerprints.push(
+        `${extensionFingerprintCount}:${extensionFingerprintFirst}:${extensionFingerprintSecond}`,
+      );
+      return { type: "candidate" as const, candidate: "complete", score: 1 };
+    },
+    compareScores: (left, right) => left - right,
+  });
+
+  assert.equal(result.completed, true);
+  assert.equal(completeFingerprints.length, 2);
+  assert.equal(completeFingerprints[0], completeFingerprints[1]);
+  assert.match(completeFingerprints[0], /^2:/);
+});

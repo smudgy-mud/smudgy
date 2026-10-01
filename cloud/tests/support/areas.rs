@@ -328,6 +328,10 @@ pub async fn delete_area(
     if area.user_id != viewer {
         return not_found();
     }
+    if st.fail_area_deletes > 0 {
+        st.fail_area_deletes -= 1;
+        return err(500, "injected delete failure");
+    }
 
     st.areas.remove(&area_id);
     // FK SET NULL on (to_area_id, to_room_number): null the destination of

@@ -12,13 +12,17 @@ export interface SnapshotLatencyLanesOptions<Snapshot> {
   snapshotKey(snapshot: Snapshot): string | number;
   /** Runs synchronously and independently of either asynchronous layout lane. */
   followCurrent(snapshot: Snapshot): void;
-  /** Ingest discoveries promptly; this callback must never move existing rooms. */
-  runTopology(snapshot: Snapshot): Promise<void>;
+  /**
+   * Ingest discoveries promptly; stop aborts its signal. This callback must
+   * never move existing rooms.
+   */
+  runTopology(snapshot: Snapshot, signal: AbortSignal): Promise<void>;
   /** Reflow existing rooms only after the configured quiet window. */
   runFullReflow(snapshot: Snapshot, signal: AbortSignal, generation: number): Promise<void>;
   /**
    * Observes an enqueued snapshot displacing the active full reflow, with the
    * snapshot the aborted reflow was processing and the newly enqueued one.
+   * Exclusive work displaces it too, passing the aborted snapshot as both.
    * Called synchronously, at most once per reflow task; `stop()` aborts
    * without notifying because its generation bump already invalidates the run.
    */
@@ -35,6 +39,7 @@ const defaultTimers: SnapshotLaneTimers = {
 
 interface TopologyTask {
   generation: number;
+  controller: AbortController;
 }
 
 interface FullReflowTask<Snapshot> {
@@ -46,7 +51,8 @@ interface FullReflowTask<Snapshot> {
 /**
  * Coordinates the mapper's latency-sensitive work without knowing anything
  * about Smudgy or NukeFire. Topology remains serialized and lossless across
- * distinct centers; only an obsolete full reflow is interruptible.
+ * distinct centers. New snapshots interrupt only obsolete full reflow, while
+ * stop also cancels topology work owned by the ending generation.
  */
 export class SnapshotLatencyLanes<Snapshot> {
   readonly #options: Required<Pick<SnapshotLatencyLanesOptions<Snapshot>, "quietWindowMs">> &
@@ -60,6 +66,8 @@ export class SnapshotLatencyLanes<Snapshot> {
   #quietReady = false;
   #topologyTask: TopologyTask | undefined;
   #fullReflowTask: FullReflowTask<Snapshot> | undefined;
+  readonly #exclusiveWaiters: Array<() => void> = [];
+  #exclusiveActive = false;
   #generation = 0;
   #started = false;
 
@@ -83,6 +91,35 @@ export class SnapshotLatencyLanes<Snapshot> {
     return this.#generation;
   }
 
+  /**
+   * Runs `work` with the maps to itself, holding both lanes back until it
+   * returns. Topology finishes the snapshot it is on and waits. The active
+   * full reflow is displaced as an incoming snapshot would displace it: the
+   * displacement hook observes its snapshot as both the displaced and the
+   * incoming one, and the quiet window starts over once `work` returns.
+   * Exclusive work runs in the order it was asked for, and is let in after
+   * `stop()` too, so that no caller waits forever.
+   */
+  async exclusive<T>(work: () => Promise<T>): Promise<T> {
+    const active = this.#fullReflowTask;
+    const displaced = active !== undefined && !active.controller.signal.aborted;
+    if (displaced) {
+      active.controller.abort();
+      this.#options.onFullReflowAborted?.(active.snapshot, active.snapshot);
+    }
+    await new Promise<void>((enter) => {
+      this.#exclusiveWaiters.push(enter);
+      this.#drive();
+    });
+    try {
+      return await work();
+    } finally {
+      this.#exclusiveActive = false;
+      if (displaced && this.#started) this.#armQuietTimer();
+      this.#drive();
+    }
+  }
+
   start(): void {
     if (this.#started) return;
     this.#started = true;
@@ -99,6 +136,7 @@ export class SnapshotLatencyLanes<Snapshot> {
     this.#reflowSnapshot = undefined;
     this.#quietReady = false;
     this.#clearQuietTimer();
+    this.#topologyTask?.controller.abort();
     this.#fullReflowTask?.controller.abort();
   }
 
@@ -148,7 +186,14 @@ export class SnapshotLatencyLanes<Snapshot> {
   }
 
   #drive(): void {
-    if (!this.#started || this.#topologyTask || this.#fullReflowTask) return;
+    if (this.#exclusiveActive || this.#topologyTask || this.#fullReflowTask) return;
+    const enter = this.#exclusiveWaiters.shift();
+    if (enter) {
+      this.#exclusiveActive = true;
+      enter();
+      return;
+    }
+    if (!this.#started) return;
     if (this.#pendingTopology.length > 0) {
       this.#startTopologyDrain();
       return;
@@ -157,22 +202,28 @@ export class SnapshotLatencyLanes<Snapshot> {
   }
 
   #startTopologyDrain(): void {
-    const task: TopologyTask = { generation: this.#generation };
+    const task: TopologyTask = {
+      generation: this.#generation,
+      controller: new AbortController(),
+    };
     this.#topologyTask = task;
     void this.#drainTopology(task);
   }
 
   async #drainTopology(task: TopologyTask): Promise<void> {
     try {
+      // Exclusive work gets in between snapshots; the rest of the queue
+      // drains once it returns.
       while (
         this.#started &&
         this.#generation === task.generation &&
+        this.#exclusiveWaiters.length === 0 &&
         this.#pendingTopology.length > 0
       ) {
         const snapshot = this.#pendingTopology.shift();
         if (snapshot === undefined) continue;
         try {
-          await this.#options.runTopology(snapshot);
+          await this.#options.runTopology(snapshot, task.controller.signal);
           if (
             this.#started &&
             this.#generation === task.generation &&

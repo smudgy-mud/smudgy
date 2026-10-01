@@ -39,8 +39,9 @@ function stableStringify(value, indent = "") {
   return `{\n${rows.join(",\n")}\n${indent}}`;
 }
 
-/** The quality tuple in its lexicographic comparison order. */
+/** The quality tuple in declaration order. */
 const QUALITY_FIELDS = [
+  "levelViolations",
   "cardinalRayViolations",
   "reciprocalRayViolations",
   "routingViolations",
@@ -48,6 +49,7 @@ const QUALITY_FIELDS = [
   "reciprocalExitPortViolations",
   "roomObstructions",
   "linkCrossings",
+  "levelSlack",
   "footprintArea",
   "footprintPerimeter",
   "cardinalSlack",

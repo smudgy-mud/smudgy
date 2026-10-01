@@ -246,6 +246,34 @@ pub fn repair_after_room_delete(
     });
 }
 
+/// The repair after exits lost their destination because the room they named
+/// was deleted in another area: each cleared exit's Connection is re-derived
+/// by [`reattach_after_update`] as an exit that now leads nowhere, which
+/// leaves a one-member Connection dangling at the exit's origin. `cleared`
+/// holds each cleared exit's topology from before the clear; `exits` holds
+/// every exit in the area after it.
+pub fn repair_after_destinations_cleared(
+    cleared: &[ExitTopology],
+    exits: &[ExitTopology],
+    connections: &mut Vec<Connection>,
+    room_site: impl Fn(RoomNumber) -> Option<RoomSite>,
+) {
+    for before in cleared {
+        let after = ExitTopology {
+            to_room_in_area: None,
+            to_direction: None,
+            leaves_area: false,
+            ..*before
+        };
+        let peers: Vec<ExitTopology> = exits
+            .iter()
+            .filter(|exit| exit.id != before.id)
+            .copied()
+            .collect();
+        reattach_after_update(before, &after, &peers, connections, &room_site);
+    }
+}
+
 /// §3.2 (simplified) after an exit's topology fields changed: a pair that is
 /// no longer reciprocal splits (the edited exit re-attaches fresh, which may
 /// auto-pair elsewhere); a one-member Connection is updated in place —

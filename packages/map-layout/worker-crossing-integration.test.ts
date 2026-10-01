@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import {
+  compactIntegralLayoutPlan,
+  compareLayoutQuality,
+  measureIntegralLayoutQuality,
   planIntegralLayoutAsync,
   type GridPosition,
   type IntegralLayoutPlan,
@@ -52,23 +55,23 @@ class ExecutingWorker implements LayoutWorkerLike {
 afterEach(() => setLayoutWorkerFactoryForTesting());
 
 function deepCrossingFixture(): IntegralLayoutRequest {
-  // The synchronous quick pass and ordinary constraint polish retain one link
-  // crossing. Deep search needs a nested lobe transaction to clear it, making
-  // this a useful boundary fixture rather than another fabricated progress
-  // message.
+  // Every ray holds and no route is blocked, but three links cross. The
+  // synchronous quick pass and ordinary constraint polish keep them; deep
+  // search needs nested lobe transactions to clear them, making this a useful
+  // boundary fixture rather than another fabricated progress message.
   const cells = [
     [-8, 11],
-    [-5, 5],
-    [10, 2],
-    [-2, -3],
-    [-7, -6],
-    [9, -4],
-    [-8, -3],
-    [-8, 5],
-    [8, 4],
-    [1, -6],
-    [5, -10],
-    [-6, 0],
+    [-10, 11],
+    [-10, 12],
+    [-11, 11],
+    [-8, 12],
+    [-9, 12],
+    [-8, 10],
+    [-11, 8],
+    [-10, 9],
+    [-7, 7],
+    [-11, 9],
+    [-7, 9],
   ] as const;
   const parents = [0, 1, 1, 0, 4, 0, 5, 7, 2, 3, 0] as const;
   const directions = [
@@ -258,4 +261,63 @@ test("a real Worker request streams and returns an accepted deep crossing repair
       update.snapshot.phase === "crossing deep improvement" && update.improvement
     ));
   }
+});
+
+test("a quiet polish streams only finished layouts, none of them above its result", async () => {
+  setLayoutWorkerFactoryForTesting(() => new ExecutingWorker());
+  // The same bridge tree stored scattered across the map.
+  const scattered = [
+    [-8, 11], [-5, 5], [10, 2], [-2, -3], [-7, -6], [9, -4],
+    [-8, -3], [-8, 5], [8, 4], [1, -6], [5, -10], [-6, 0],
+  ] as const;
+  const fixture = deepCrossingFixture();
+  const residents = fixture.residents.map((resident, index) => ({
+    ...resident,
+    position: at(scattered[index][0], scattered[index][1]),
+  }));
+  const center = residents[0].position;
+  // The mapper's quiet polish sends its local chart, every room of it a resident.
+  const request: IntegralLayoutRequest = {
+    ...fixture,
+    residents,
+    nodes: residents.map((resident) => ({
+      id: resident.id,
+      relative: {
+        x: resident.position.x - center.x,
+        y: resident.position.y - center.y,
+        level: 0,
+      },
+    })),
+  };
+  const improvements: IntegralLayoutPlan[] = [];
+  const result = await planIntegralLayoutAsync(request, {
+    constraintRepair: {
+      when: "always",
+      maxDurationMs: 10_000,
+      maxRestarts: 1,
+      maxLayouts: 1,
+      maxCrossingWork: 200,
+    },
+    onProgress: (update) => {
+      if (update.improvement) improvements.push(update.improvement);
+    },
+  });
+
+  assert.ok(improvements.length >= 2, "the polish streams the standard plan and its repairs");
+  for (const [index, improvement] of improvements.entries()) {
+    const plan: IntegralLayoutPlan = {
+      positions: improvement.positions,
+      movedExisting: new Set(),
+      quality: measureIntegralLayoutQuality(improvement.positions, request.edges),
+    };
+    assert.equal(
+      compactIntegralLayoutPlan(request, plan, { axisGroupCompaction: false }),
+      plan,
+      `streamed layout ${index} is not at the cheap compaction fixed point`,
+    );
+    assert.ok(compareLayoutQuality(result.quality, improvement.quality) >= 0);
+  }
+  // A streamed layout better than the repaired plan would have replaced it,
+  // report and all.
+  assert.ok(result.constraintRepair, "the repaired plan, with its report, is the result");
 });

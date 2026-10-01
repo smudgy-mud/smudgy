@@ -438,3 +438,44 @@ createAlias("^gocallback$", async () => {
         "callback errors must pass through without submitting drafts: {lines:?}"
     );
 }
+
+/// An area whose room numbers are used up refuses `createRoom` as exhausted,
+/// never as a missing area.
+#[tokio::test]
+async fn create_room_in_an_exhausted_area_reports_the_exhaustion() {
+    const MODULE: &str = r#"
+import { createAlias, echo, mapper } from "smudgy:core";
+
+createAlias("^gofull$", async () => {
+    try {
+        const area = await mapper.createArea("Fulland", { storage: "local" });
+        await mapper.updateRoom(area, 2147483647, { title: "the last number" });
+        try {
+            await mapper.createRoom(area, { title: "one more" });
+            echo("FULL_UNEXPECTED_SUCCESS");
+        } catch (error) {
+            const message = String(error);
+            echo("FULL_ERR exhausted=" + message.includes("exhausted") +
+                " missing=" + message.includes("Area not found"));
+        }
+    } catch (error) {
+        echo("FULL_SETUP_FAIL " + error);
+    }
+});
+"#;
+    let lines = run_module_on(
+        BudgetedBackend::new(usize::MAX),
+        "MutateFullTest",
+        9405,
+        MODULE,
+        "gofull",
+        "FULL_",
+    )
+    .await;
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "FULL_ERR exhausted=true missing=false"),
+        "createRoom must name the exhausted room numbers: {lines:?}"
+    );
+}

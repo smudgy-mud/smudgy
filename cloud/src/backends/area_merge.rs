@@ -92,10 +92,19 @@ pub struct AreaMergePlan {
     /// highest room plus one and covers the destination's reserved numbers
     /// (open drafts), so a draft committed after the merge cannot collide
     /// with a moved room. The numbers strictly between the destination's
-    /// highest room and the floor are the reserved band: a source room
-    /// never keeps one of those. It keeps a free number at or below the
-    /// destination's highest room (a gap) or at or above the floor.
+    /// highest room and the floor are the reserved band: a source room never
+    /// keeps one of those. It keeps a free number at or below the
+    /// destination's highest room (a gap) or at or above the floor, unless
+    /// the number is one of [`Self::vacant_targets`], which allocation passes
+    /// over too.
     pub number_floor: RoomNumber,
+    /// Destination room numbers that some exit leads to but no destination
+    /// room holds, from every exit the planner can see: the destination's
+    /// own, the sources' and every other area's. A moved room never keeps
+    /// or receives one of these, or it would silently become the room those
+    /// exits lead to. A plan without the field names none.
+    #[serde(default)]
+    pub vacant_targets: Vec<RoomNumber>,
 }
 
 impl AreaMergePlan {
@@ -410,12 +419,13 @@ struct Remap {
 /// Hands every moving room its destination number: each room of a whole
 /// source, the listed rooms of a partial one. A room keeps its number
 /// when nothing in the destination (and nothing already handed out) holds
-/// it and it is not in the reserved band, the numbers strictly above the
-/// destination's highest room and strictly below the plan's floor, which
-/// open drafts on the destination may hold; otherwise it takes the lowest
-/// free number at or above the cursor, which starts at
-/// `max(floor, destination max + 1)` and only rises. A free gap at or below
-/// the destination's highest room is kept, never allocated; a number at or
+/// it, no exit leads to it (the plan's vacant targets), and it is not in the
+/// reserved band, the numbers strictly above the destination's highest room
+/// and strictly below the plan's floor, which open drafts on the
+/// destination may hold; otherwise it takes the lowest free number at or
+/// above the cursor, which starts at `max(floor, destination max + 1)` and
+/// only rises, skipping vacant targets too. A free gap at or below the
+/// destination's highest room is kept, never allocated; a number at or
 /// above the floor is kept too, since no draft can hold it.
 /// Reserve all free original numbers first, in source order, so reallocating
 /// one collision cannot displace a later room with a free original number.
@@ -425,7 +435,12 @@ fn allocate_room_numbers(
     sources: &[AreaWithDetails],
     order: &[usize],
 ) -> CloudResult<Remap> {
-    let mut used: HashSet<RoomNumber> = into.rooms.iter().map(|room| room.room_number).collect();
+    let mut used: HashSet<RoomNumber> = into
+        .rooms
+        .iter()
+        .map(|room| room.room_number)
+        .chain(plan.vacant_targets.iter().copied())
+        .collect();
     let destination_max = into
         .rooms
         .iter()
@@ -1178,6 +1193,7 @@ mod tests {
             inbound: inbound.iter().map(|document| document.area.id).collect(),
             expected,
             number_floor: RoomNumber(floor),
+            vacant_targets: Vec::new(),
         }
     }
 
@@ -1491,6 +1507,40 @@ mod tests {
         assert_eq!(remap_of(&outcome, area_id(2)), vec![(1, 4), (2, 2), (3, 3)]);
         assert_eq!(remap_of(&outcome, area_id(3)), vec![(1, 5), (9, 9)]);
         assert_eq!(numbers(&into), vec![1, 2, 3, 4, 5, 9]);
+    }
+
+    /// The destination holds 1, 2 and 4, and exits elsewhere lead to its
+    /// missing rooms 3, 5 and 6: the gap at 3 and the free 6 are not kept by
+    /// the source rooms holding them, and allocation steps over 5, so no
+    /// exit that led nowhere starts leading to a moved room.
+    #[test]
+    fn a_number_an_exit_leads_to_is_never_kept_or_allocated() {
+        let mut into = with_rooms(area_id(1), &[1, 2, 4]);
+        let source = with_rooms(area_id(2), &[1, 3, 6]);
+        let mut plan = plan(&into, &[(&source, Translate::default())], &[], 5);
+        plan.vacant_targets = vec![RoomNumber(3), RoomNumber(5), RoomNumber(6)];
+
+        let outcome = apply_area_merge(&plan, &mut into, &mut [source], &mut []).expect("merge");
+
+        assert_eq!(remap_of(&outcome, area_id(2)), vec![(1, 7), (3, 8), (6, 9)]);
+        assert_eq!(numbers(&into), vec![1, 2, 4, 7, 8, 9]);
+    }
+
+    #[test]
+    fn a_plan_written_without_vacant_targets_parses_with_none() {
+        let into = with_rooms(area_id(1), &[1]);
+        let source = with_rooms(area_id(2), &[1]);
+        let plan = plan(&into, &[(&source, Translate::default())], &[], 2);
+        let mut written = serde_json::to_value(&plan).expect("serialize");
+        written
+            .as_object_mut()
+            .expect("a plan is an object")
+            .remove("vacant_targets");
+
+        let parsed: AreaMergePlan = serde_json::from_value(written).expect("parse");
+
+        assert_eq!(parsed, plan);
+        assert!(parsed.vacant_targets.is_empty());
     }
 
     #[test]
@@ -1884,6 +1934,7 @@ mod tests {
             inbound: vec![],
             expected: vec![(area_id(1), 1)],
             number_floor: RoomNumber(2),
+            vacant_targets: Vec::new(),
         };
 
         let error = apply_area_merge(&plan, &mut into, &mut [], &mut []).expect_err("refused");
@@ -1912,6 +1963,7 @@ mod tests {
             inbound: vec![],
             expected: vec![],
             number_floor: RoomNumber(2),
+            vacant_targets: Vec::new(),
         };
 
         for plan in [same(&[1]), same(&[2, 2])] {

@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import {
   compareLayoutQuality,
+  createLayoutPlanner,
   planIntegralLayout,
   planIntegralLayoutAsync,
   type GridPosition,
   type IntegralLayoutRequest,
+  type LayoutDirection,
   type LayoutTraceEvent,
 } from "./layout.ts";
 import {
@@ -19,6 +21,7 @@ import {
   type ReflowLayoutChange,
 } from "./model.ts";
 import {
+  layoutSnapshotKey,
   planStableLayoutSnapshot,
   sameLayoutSnapshot,
   StaleLayoutSnapshotError,
@@ -146,18 +149,33 @@ test("planner state and request progress expose work, quality, and complete layo
   try {
     const result = await planIntegralLayoutAsync(requestToward("East"), {
       onProgress: (update) => progress.push(update as LayoutPlannerProgress),
+      plannerContext: {
+        source: "test",
+        areaId: "area:1",
+        areaName: "Test Area",
+        contextKey: "coverage",
+      },
     });
     const final = layoutPlannerState.value;
     assert.equal(final.status, "completed");
+    assert.equal(final.terminalReason, "completed");
+    assert.deepEqual(final.context, {
+      source: "test",
+      areaId: "area:1",
+      areaName: "Test Area",
+      contextKey: "coverage",
+    });
     assert.ok(final.work.layoutsConsidered > 0);
     assert.deepEqual(final.currentQuality, {
       cardinalRayViolations: 0,
       reciprocalRayViolations: 0,
+      levelViolations: 0,
       routingViolations: 0,
       exitPortViolations: 0,
       reciprocalExitPortViolations: 0,
       roomObstructions: 0,
       linkCrossings: 0,
+      levelSlack: 0,
       cardinalSlack: 0,
       footprintArea: 1,
       footprintPerimeter: 4,
@@ -169,6 +187,28 @@ test("planner state and request progress expose work, quality, and complete layo
   } finally {
     unsubscribe();
   }
+});
+
+test("a whole-map polish streams its preview as an improvement before the plan", async () => {
+  setLayoutWorkerFactoryForTesting(() => new ExecutingWorker());
+  const updates: LayoutPlannerProgress[] = [];
+  const request: IntegralLayoutRequest = {
+    residents: [
+      { id: "a", position: at(0, 0), movable: false },
+      { id: "b", position: at(5, 0), movable: true },
+    ],
+    nodes: [],
+    edges: [
+      { from: "a", to: "b", direction: "East" },
+      { from: "b", to: "a", direction: "West" },
+    ],
+    allowExistingMoves: true,
+  };
+  const plan = await planIntegralLayoutAsync(request, { onProgress: (update) => updates.push(update) });
+  const previewed = updates.find((update) => update.snapshot.phase === "preview")?.improvement;
+  assert.ok(previewed, "the preview arrives as an improvement");
+  assert.deepEqual(previewed.positions.get("b"), at(1, 0));
+  assert.ok(compareLayoutQuality(plan.quality, previewed.quality) >= 0);
 });
 
 test("planner state receives live axis-compaction candidate counts", async () => {
@@ -315,6 +355,8 @@ test("nested progress cannot regress best quality or whole-operation elapsed tim
 
   repair.onerror?.({ error: new Error("finish fabricated repair") });
   assert.deepEqual(await pending, standard);
+  assert.equal(updates.at(-1)?.snapshot.terminalReason, "degraded");
+  assert.equal(updates.at(-1)?.snapshot.phase, "complete: standard fallback");
 });
 
 test("streamed crossing repair checkpoints expose work and a complete improvement", async () => {
@@ -698,7 +740,7 @@ test("final integral responses reject malformed clone-safe plans", () => {
   assert.equal(isLayoutWorkerResponse(incompleteReport), false);
 });
 
-test("v10 final reports require exact work and termination fields", () => {
+test("v11 final reports require exact work and termination fields", () => {
   const request = constraintConflictRequest();
   const response = executeLayoutWorkerRequest({
     protocol: LAYOUT_WORKER_PROTOCOL_VERSION,
@@ -894,7 +936,7 @@ test("v10 final reports require exact work and termination fields", () => {
   assert.equal(isLayoutWorkerResponse(mismatchedCutoff), false);
 });
 
-test("the v10 boundary accepts telemetry-only quick crossing completion", () => {
+test("the v11 boundary accepts telemetry-only quick crossing completion", () => {
   const plan = planIntegralLayout(requestToward("East"));
   assert.equal(isLayoutWorkerProgress({
     protocol: LAYOUT_WORKER_PROTOCOL_VERSION,
@@ -916,7 +958,7 @@ test("the v10 boundary accepts telemetry-only quick crossing completion", () => 
   }), true);
 });
 
-test("the v10 boundary requires exact constraint counters and clone-safe incumbents", () => {
+test("the v11 boundary requires exact constraint counters and clone-safe incumbents", () => {
   const plan = planIntegralLayout(requestToward("East"));
   const work = {
     rawIncumbents: 3,
@@ -1054,6 +1096,7 @@ test("Worker constraint repair proves the minimum and preserves reciprocal exits
   assert.equal(result.constraintRepair?.reciprocalRelaxedEdges, 0);
   assert.equal(result.constraintRepair?.geometricFixedPoint, true);
   assert.equal(result.constraintRepair?.polishCutoff, "fixed-point");
+  assert.equal(layoutPlannerState.value.terminalReason, "fixed-point");
   assert.ok((result.constraintRepair?.polishPasses ?? 0) > 0);
   assert.equal(
     trace.filter((event) => event.type === "constraint-repair").length,
@@ -1122,7 +1165,91 @@ test("settled-regression constraint repair stays dormant without a regression", 
   });
 
   assert.equal(result.quality.cardinalRayViolations, 1);
-  assert.equal(result.constraintRepair, undefined);
+  assert.equal(result.constraintRepair?.outcome, "no-regression");
+  assert.equal(result.constraintRepair?.selected, false);
+  assert.deepEqual(result.positions, planIntegralLayout(request).positions);
+});
+
+test("a repair that does not search reports why through the Worker, streamed and final", async () => {
+  setLayoutWorkerFactoryForTesting(() => new ExecutingWorker());
+  const events: LayoutTraceEvent[] = [];
+  const clean = await planIntegralLayoutAsync({
+    residents: [
+      { id: "a", position: at(0, 0), movable: true },
+      { id: "b", position: at(1, 0), movable: true },
+    ],
+    nodes: [],
+    edges: [
+      { from: "a", to: "b", direction: "East" },
+      { from: "b", to: "a", direction: "West" },
+    ],
+    allowExistingMoves: true,
+    trace: (event) => events.push(event),
+  }, { constraintRepair: { when: "defects" } });
+  assert.equal(clean.constraintRepair?.outcome, "clean");
+  assert.ok(events.some((event) =>
+    event.type === "constraint-repair" && event.report.outcome === "clean"
+  ));
+
+  // A budget that is not positive still reaches the Worker, which says so.
+  const unbudgeted = await planIntegralLayoutAsync(constraintConflictRequest(), {
+    constraintRepair: { when: "always", maxDurationMs: 0 },
+  });
+  assert.equal(unbudgeted.constraintRepair?.outcome, "no-budget");
+  assert.deepEqual(unbudgeted.positions, planIntegralLayout(constraintConflictRequest()).positions);
+});
+
+test("a repair response carries a report, and one that did not search must say so consistently", () => {
+  const request = constraintConflictRequest();
+  const response = executeLayoutWorkerRequest({
+    protocol: LAYOUT_WORKER_PROTOCOL_VERSION,
+    id: 82,
+    operation: "constraint-repair",
+    collectTrace: false,
+    streamProgress: false,
+    request,
+    standard: encodeIntegralLayoutPlan(planIntegralLayout(request)),
+    options: { when: "settled-regression", maxDurationMs: 1_000 },
+  });
+  assert.equal(response.ok, true);
+  if (!response.ok) return;
+  assert.equal((response.result as IntegralLayoutWirePlan).constraintRepair?.outcome, "no-regression");
+  assert.equal(isLayoutWorkerResponse(response), true);
+
+  const altered = (change: (report: Record<string, unknown>) => void): unknown => {
+    const malformed = structuredClone(response) as unknown as Record<string, unknown>;
+    const result = malformed.result as Record<string, unknown>;
+    change(result.constraintRepair as Record<string, unknown>);
+    return malformed;
+  };
+  const alterations: [why: string, change: (report: Record<string, unknown>) => void][] = [
+    ["the outcome is required", (report) => {
+      delete report.outcome;
+    }],
+    ["the outcome is one the vocabulary names", (report) => {
+      report.outcome = "skipped";
+    }],
+    ["a report that did not search selects nothing", (report) => {
+      report.selected = true;
+    }],
+    ["a report that did not search proves nothing", (report) => {
+      report.constraintOptimal = true;
+      report.optimal = true;
+    }],
+    ["only a searched report has a polish cutoff", (report) => {
+      report.polishCutoff = "fixed-point";
+    }],
+    ["a searched report has one", (report) => {
+      report.outcome = "searched";
+    }],
+  ];
+  for (const [why, change] of alterations) {
+    assert.equal(isLayoutWorkerResponse(altered(change)), false, why);
+  }
+
+  const unreported = structuredClone(response) as unknown as Record<string, unknown>;
+  delete (unreported.result as Record<string, unknown>).constraintRepair;
+  assert.equal(isLayoutWorkerResponse(unreported), false, "every repair reports");
 });
 
 test("violation-regression repair considers newly observed topology", async () => {
@@ -1178,7 +1305,35 @@ test("async model planning preserves the synchronous result without cloning call
   assert.ok(actual.positions instanceof Map);
 });
 
-test("v10 model responses ship no models and validate bounded-search completion", async () => {
+test("explicit model reflow can stage standard planning through constraint repair", async () => {
+  setLayoutWorkerFactoryForTesting(() => new ExecutingWorker());
+  const result = await planLayoutModelAsync(
+    twoRoomModel(),
+    { type: "reflow", anchor: "start" },
+    {
+      constraintRepair: {
+        when: "always",
+        maxDurationMs: Number.POSITIVE_INFINITY,
+        maxRestarts: 4,
+        maxLayouts: 1,
+        maxPolishTournaments: 1,
+        maxPolishPasses: 1,
+        maxExtensionStates: 16,
+        maxMaskDiversifications: 2,
+        maxCrossingWork: 8,
+      },
+    },
+  );
+
+  assert.ok(result.positions instanceof Map);
+  assert.equal(result.constraintRepair?.trigger, "always");
+  assert.equal(layoutPlannerState.value.terminalReason, "ceiling");
+  for (const room of result.after.rooms) {
+    assert.deepEqual(room.position, result.positions.get(room.id));
+  }
+});
+
+test("v11 model responses ship no models and validate bounded-search completion", async () => {
   setLayoutWorkerFactoryForTesting(() => new ExecutingWorker());
   const cases: { change: LayoutChange; options?: PlanLayoutOptions }[] = [
     { change: { type: "add-room", from: "east", direction: "Up", elevation: "projected" } },
@@ -1268,7 +1423,7 @@ test("parent-side model reconstruction is insulated from caller mutation", async
   assert.deepEqual(actual, expected);
 });
 
-test("the v10 boundary refuses progress attributed to model jobs", () => {
+test("the v11 boundary refuses progress attributed to model jobs", () => {
   const progressAs = (operation: string): unknown => ({
     protocol: LAYOUT_WORKER_PROTOCOL_VERSION,
     id: 5,
@@ -1305,6 +1460,118 @@ test("jobs without a stream consumer build and post no trace events", () => {
   assert.equal(streaming.ok, true);
   assert.ok(posted.length > 0, "a requested stream still posts events");
   assert.deepEqual(streaming.traceEvents, [], "streaming alone retains no response trace");
+
+  const bounded: LayoutTraceEvent[] = [];
+  const boundedResponse = executeLayoutWorkerRequest({
+    protocol: LAYOUT_WORKER_PROTOCOL_VERSION,
+    id: 94,
+    operation: "integral",
+    collectTrace: false,
+    streamProgress: true,
+    request: requestToward("East"),
+  }, (event) => bounded.push(event), {
+    now: () => 0,
+    progressIntervalMs: Number.POSITIVE_INFINITY,
+    maxProgressMessages: 2,
+    maxProgressPositionEntries: 0,
+  });
+  assert.equal(boundedResponse.diagnostics.progressMessages, bounded.length);
+  assert.ok(bounded.length <= 2, "the transport enforces its terminal message ceiling");
+  assert.equal(boundedResponse.diagnostics.progressPositionEntries, 0);
+  assert.equal(JSON.stringify(bounded).includes('"positions"'), false);
+  assert.ok(boundedResponse.diagnostics.progressEventsCoalesced > 0);
+  assert.ok(boundedResponse.diagnostics.estimatedProgressBytes > 0);
+});
+
+test("a preview reaches the progress observer at once, ahead of coalesced candidates", () => {
+  const resident = (id: string, x: number, y: number, movable = true) => ({
+    id,
+    position: at(x, y),
+    movable,
+  });
+  const edge = (from: string, to: string, direction: LayoutDirection) => ({ from, to, direction });
+  const posted: LayoutTraceEvent[] = [];
+  const response = executeLayoutWorkerRequest({
+    protocol: LAYOUT_WORKER_PROTOCOL_VERSION,
+    id: 96,
+    operation: "integral",
+    collectTrace: false,
+    streamProgress: true,
+    // A whole-map polish whose quick crossing repair publishes after its preview.
+    request: {
+      centerId: "r0",
+      allowExistingMoves: true,
+      nodes: [],
+      residents: [
+        resident("r0", -6, 7, false),
+        resident("r1", -4, 5, false),
+        resident("r2", -10, -6),
+        resident("r3", -6, 6),
+        resident("r4", 5, 6),
+        resident("r5", -3, 6),
+        resident("r6", 6, 1),
+        resident("r7", 9, 0),
+      ],
+      edges: [
+        edge("r0", "r1", "Other"),
+        edge("r0", "r2", "North"),
+        edge("r2", "r3", "East"), edge("r3", "r2", "West"),
+        edge("r0", "r4", "North"), edge("r4", "r0", "South"),
+        edge("r4", "r5", "North"), edge("r5", "r4", "South"),
+        edge("r4", "r6", "North"), edge("r6", "r4", "South"),
+        edge("r4", "r7", "East"), edge("r7", "r4", "West"),
+      ],
+    },
+  }, (event) => posted.push(event), {
+    // Every other candidate waits behind the first message for the whole run.
+    now: () => 0,
+    progressIntervalMs: Number.POSITIVE_INFINITY,
+  });
+  assert.equal(response.ok, true);
+  assert.ok(
+    posted.some((event) => event.type === "crossing-repair" && event.mode === "quick"),
+    "the fixture publishes a quick crossing candidate",
+  );
+  const previews = posted.filter((event) => event.type === "preview");
+  assert.equal(previews.length, 1, "the preview is posted, not replaced by a later candidate");
+  assert.ok(previews[0].type === "preview" && previews[0].candidate.positions?.length === 8);
+});
+
+test("Worker diagnostics sample optional Deno memory without retaining layouts", () => {
+  const realm = globalThis as unknown as { Deno?: unknown };
+  const previous = realm.Deno;
+  let samples = 0;
+  realm.Deno = {
+    memoryUsage: () => {
+      samples += 1;
+      return {
+        heapUsed: samples * 100,
+        heapTotal: samples * 200,
+        external: samples * 10,
+        rss: samples * 300,
+      };
+    },
+  };
+  try {
+    const response = executeLayoutWorkerRequest({
+      protocol: LAYOUT_WORKER_PROTOCOL_VERSION,
+      id: 95,
+      operation: "integral",
+      collectTrace: false,
+      streamProgress: false,
+      request: requestToward("East"),
+    });
+    const memory = response.diagnostics.memory;
+    assert.ok(memory && memory.samples >= 2);
+    assert.deepEqual(memory.start, { heapUsed: 100, heapTotal: 200, external: 10, rss: 300 });
+    assert.ok(memory.end.heapUsed >= memory.start.heapUsed);
+    assert.ok(memory.peak.heapTotal >= memory.end.heapTotal);
+    assert.ok(memory.peak.rss !== undefined && memory.peak.rss >= (memory.end.rss ?? 0));
+    assert.equal(isLayoutWorkerResponse(response), true);
+  } finally {
+    if (previous === undefined) delete realm.Deno;
+    else realm.Deno = previous;
+  }
 });
 
 test("async planner failures replay the same diagnostic prefix as synchronous failures", async () => {
@@ -1361,6 +1628,32 @@ test("concurrent callers retain FIFO order through the single-active scheduler",
   assert.deepEqual((await east).positions.get("new"), at(1, 0));
   worker.respondAt(0);
   assert.deepEqual((await north).positions.get("new"), at(0, -1));
+});
+
+test("a planner plans on a Worker of its own beside the shared queue until it closes", async () => {
+  const workers: ControlledWorker[] = [];
+  setLayoutWorkerFactoryForTesting(() => {
+    const worker = new ControlledWorker();
+    workers.push(worker);
+    return worker;
+  });
+  const shared = planIntegralLayoutAsync(requestToward("East"));
+  const planner = createLayoutPlanner();
+  assert.equal(workers.length, 1, "a planner starts no Worker before it plans");
+
+  const own = planner.planIntegral(requestToward("North"));
+  assert.equal(workers.length, 2, "the planner's request does not wait behind the shared one");
+  workers[1].respondAt(0);
+  assert.deepEqual((await own).positions.get("new"), at(0, -1));
+  assert.equal(workers[0].requests.length, 1, "the shared request is still running");
+
+  const unfinished = planner.planIntegral(requestToward("East"));
+  planner.close();
+  await assert.rejects(unfinished, /map-layout planner was closed/);
+  assert.equal(workers[1].terminated, true);
+  assert.equal(workers[0].terminated, false, "closing a planner leaves the shared Worker alone");
+  workers[0].respondAt(0);
+  assert.deepEqual((await shared).positions.get("new"), at(1, 0));
 });
 
 test("a serialized planning error rejects only its request and leaves the Worker reusable", async () => {
@@ -1470,12 +1763,25 @@ test("snapshot comparison is order-independent and includes every planning input
     edges: [...model.edges].reverse(),
   };
   assert.equal(sameLayoutSnapshot(model, reordered), true);
+  assert.equal(layoutSnapshotKey(model), layoutSnapshotKey(reordered));
+  assert.doesNotThrow(() => JSON.parse(layoutSnapshotKey(model)));
   assert.equal(sameLayoutSnapshot(model, {
     ...reordered,
     rooms: reordered.rooms.map((room) => room.id === "east"
       ? { ...room, movable: false }
       : room),
   }), false);
+  assert.notEqual(layoutSnapshotKey(model), layoutSnapshotKey({
+    ...reordered,
+    rooms: reordered.rooms.map((room) => room.id === "east"
+      ? { ...room, movable: false }
+      : room),
+  }));
+  // The whole area id is part of the key, not just its first characters.
+  assert.notEqual(
+    layoutSnapshotKey({ ...model, areaId: "area:12" }),
+    layoutSnapshotKey({ ...model, areaId: "area:13" }),
+  );
 });
 
 test("stable snapshot planning retries once and replays only the accepted trace", async () => {

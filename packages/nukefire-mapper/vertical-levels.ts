@@ -1,4 +1,4 @@
-import type { LayoutEdge, LayoutNode } from "./layout.ts";
+import type { GridPosition, LayoutEdge, LayoutNode } from "./layout.ts";
 
 interface VerticalRelation {
   other: string;
@@ -22,13 +22,16 @@ interface VerticalRelation {
  * not authoritative: only Up/Down traversals may change a room's level.
  * Levels between established rooms are never changed here, and a forced
  * stack that would make two new rooms share a chart cell is abandoned rather
- * than risking an unplaceable rigid chart.
+ * than risking an unplaceable rigid chart. When a returning chart has no
+ * durable seam at all, `unanchoredLevel` places its center on Map.Local's
+ * server-reported plane instead of silently merging it into level zero.
  */
 export function stackVerticalTraversals(
   nodes: readonly LayoutNode[],
   edges: readonly LayoutEdge[],
   establishedLevels: ReadonlyMap<string, number>,
   centerId?: string,
+  unanchoredLevel = 0,
 ): LayoutNode[] {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const forced = new Map<string, number>();
@@ -113,7 +116,7 @@ export function stackVerticalTraversals(
     }
   };
   drain();
-  const roots = [...relations.keys()]
+  const roots = [...new Set([...nodes.map((node) => node.id), ...relations.keys()])]
     .filter((id) => !forced.has(id))
     .sort((a, b) => {
       if (a === centerId) return -1;
@@ -122,7 +125,8 @@ export function stackVerticalTraversals(
     });
   for (const root of roots) {
     if (forced.has(root)) continue;
-    enqueue(root, (byId.get(root) as LayoutNode).relative.level);
+    const relativeLevel = byId.get(root)?.relative.level ?? 0;
+    enqueue(root, unanchoredLevel + relativeLevel);
     drain();
   }
 
@@ -144,4 +148,87 @@ export function stackVerticalTraversals(
     cells.add(cell);
   }
   return result;
+}
+
+/**
+ * The general layout engine packs a chart component with no durable seam onto
+ * a zero-based level stack. Restore the absolute server-plane levels prepared
+ * above after that collision-free x/y placement. Components touching any
+ * durable room keep the planner's anchored levels. If restoring a component
+ * would create a cell collision, retain the validated planner result.
+ */
+export function restoreUnanchoredChartLevels(
+  positions: ReadonlyMap<string, GridPosition>,
+  nodes: readonly LayoutNode[],
+  edges: readonly LayoutEdge[],
+  establishedLevels: ReadonlyMap<string, number>,
+  centerId?: string,
+): ReadonlyMap<string, GridPosition> {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const nodeIds = new Set(byId.keys());
+  const adjacency = new Map<string, Set<string>>(
+    nodes.map((node) => [node.id, new Set<string>()]),
+  );
+  const seamNodes = new Set<string>();
+  for (const edge of edges) {
+    const fromNode = nodeIds.has(edge.from);
+    const toNode = nodeIds.has(edge.to);
+    if (fromNode && toNode) {
+      adjacency.get(edge.from)?.add(edge.to);
+      adjacency.get(edge.to)?.add(edge.from);
+    } else if (fromNode && establishedLevels.has(edge.to)) {
+      seamNodes.add(edge.from);
+    } else if (toNode && establishedLevels.has(edge.from)) {
+      seamNodes.add(edge.to);
+    }
+  }
+
+  const restored = new Map(positions);
+  const visited = new Set<string>();
+  let changed = false;
+  const roots = [...nodeIds].sort((a, b) => {
+    if (a === centerId) return -1;
+    if (b === centerId) return 1;
+    return a.localeCompare(b);
+  });
+  for (const root of roots) {
+    if (visited.has(root)) continue;
+    const component: string[] = [];
+    const queue = [root];
+    visited.add(root);
+    while (queue.length > 0) {
+      const id = queue.shift() as string;
+      component.push(id);
+      for (const other of adjacency.get(id) ?? []) {
+        if (visited.has(other)) continue;
+        visited.add(other);
+        queue.push(other);
+      }
+    }
+    if (component.some((id) => establishedLevels.has(id) || seamNodes.has(id))) continue;
+    component.sort((a, b) => {
+      if (a === centerId) return -1;
+      if (b === centerId) return 1;
+      return a.localeCompare(b);
+    });
+    const reference = component.find((id) => restored.has(id) && byId.has(id));
+    if (!reference) continue;
+    const offset = (byId.get(reference) as LayoutNode).relative.level -
+      (restored.get(reference) as GridPosition).level;
+    if (offset === 0) continue;
+    for (const id of component) {
+      const position = restored.get(id);
+      if (position) restored.set(id, { ...position, level: position.level + offset });
+    }
+    changed = true;
+  }
+  if (!changed) return positions;
+
+  const cells = new Set<string>();
+  for (const position of restored.values()) {
+    const cell = `${position.level}:${position.x}:${position.y}`;
+    if (cells.has(cell)) return positions;
+    cells.add(cell);
+  }
+  return restored;
 }

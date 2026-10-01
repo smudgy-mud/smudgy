@@ -59,7 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an optional offset per source. Whole sources are deleted. A source with a
   `rooms` list stays, even if every room moves; its labels, shapes and area
   properties stay with it. The destination keeps its area metadata and properties.
-  Room numbers are preserved where free and unreserved, and otherwise reassigned.
+  Room numbers are preserved where free, unreserved and not named by an existing
+  link, and otherwise reassigned.
   Exits in the same storage tier follow moved rooms, and reciprocal links between
   merged areas become one link. The result lists each room's old and new address;
   your current location follows if its room moved. Local and session maps are
@@ -67,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Invalid offsets, coordinate or level overflow, and exhausted room numbers are
   rejected before maps change. Other sessions see the result together. If a save
   is interrupted, call `mapper.refreshAreas()` or restart Smudgy before retrying.
+- **New maps can start with their properties.** `mapper.createArea(name, { properties })`
+  creates a map with its area properties already set, so `area.data()` and
+  `mapper.findAreasByProperty` see them as soon as the call resolves, with no
+  second call. Local and session maps are saved together with their properties:
+  a package that recognizes its maps by a property never finds one of them
+  without it, even if Smudgy stops right after the map was made. Cloud maps
+  receive their properties right after they are created, before the call
+  resolves; if they cannot be saved, the map is deleted again and the call is
+  rejected. Only when that delete fails too does the map stay, without its
+  properties, and the error names it. A map can start with up to 256
+  properties, and their values must be strings.
 - **Scripts can wait for maps to be ready.** `mapper.ready()` waits for startup
   loading before a script looks up or edits maps.
 - **Batch edit errors identify saved work.** `MutateAreaError` reports the
@@ -108,6 +120,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The connection rule no longer flips to "Disconnected" when a connect attempt
   is replaced mid-dial.** A newer attempt's "Connecting to …" is left alone when
   the attempt it replaced reports its own end.
+- **Links to a deleted room stay gone.** Deleting a room cleared the links your
+  other maps had to it only on screen, unless both were cloud maps. The saved
+  maps kept them, so they came back after a restart, or for a session map the
+  next time it reloaded, still leading to the missing room. Each map's links are
+  now cleared where that map is saved too, in order with the map's other edits,
+  whatever storage either map uses. A new room also never takes the number a
+  link still leads to, whether you place or paste it, a script creates it, or
+  `mapper.mergeAreas` moves it in, so a link left behind by an earlier version
+  keeps leading nowhere instead of quietly leading into a room it was never
+  meant for.
+- **Merging two rooms says why it was refused when one has links to other
+  areas.** It used to report that the map's structure had changed underneath
+  the edit, which it had not.
 
 ## [0.5.7] - 2026-09-13
 

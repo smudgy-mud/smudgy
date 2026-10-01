@@ -7,6 +7,7 @@ import {
   createState,
   createTrigger,
   echo,
+  getSessions,
   link,
   mapper,
   send,
@@ -17,6 +18,7 @@ import {
 import { submit } from "smudgy:events/sys";
 import { compareLayoutQuality, planAreaChange } from "smudgy://kapusniak/map-layout";
 import { nukefire } from "smudgy://kapusniak/nukefire-gmcp";
+import { recordManualPolishResult } from "smudgy:procedures/kapusniak/nukefire-mapper";
 import {
   buildNavigationRoute,
   formatRoute,
@@ -25,6 +27,15 @@ import {
   takeCommandArgument,
   type NavigationStep,
 } from "./navigation.ts";
+import {
+  BOUNDED_REFLOW_PLANNING_PASSES,
+  BOUNDED_REFLOW_TIMEOUT_MS,
+  nukeFirePerfectReflowPolicy,
+  parseReflowMode,
+  perfectRepairPolicyWire,
+  reflowRepairTerminalReason,
+  type NukeFireReflowMode,
+} from "./reflow-command.ts";
 import * as welcome from "./welcome.tsx";
 
 let reflowing = false;
@@ -353,7 +364,8 @@ export function showHelp(): void {
   echo("  nf death                              Show and route to the last death room");
   echo("  nf path <FROM> <TO>                   Publish a route between two mapped rooms");
   echo("  nf welcome                            Open the welcome and multi-session guide");
-  echo("  nf reflow                             Thoroughly search and reflow the current area");
+  echo("  nf reflow                             Bounded reflow of the current area");
+  echo("  nf reflow perfect                     Explicit high-effort search for a perfect layout");
   echo("  nf help                               Show this help text");
   echo("");
   echo("Quote names containing spaces in run/path; separate arrival commands with semicolons.");
@@ -366,7 +378,7 @@ export function showHelp(): void {
   echo("  -4 look               Send from every session except 4");
 }
 
-async function reflowCurrentArea(): Promise<void> {
+async function reflowCurrentArea(mode: NukeFireReflowMode): Promise<void> {
   if (reflowing) {
     echo(style.warn`[nf] A map reflow is already running.`);
     return;
@@ -379,12 +391,29 @@ async function reflowCurrentArea(): Promise<void> {
 
   reflowing = true;
   try {
-    echo("[nf] Searching violation-prioritized anchors for a better layout…");
+    echo(mode === "perfect"
+      ? "[nf] Searching without an automatic time limit for a perfect layout…"
+      : "[nf] Running a bounded search for a better layout…");
+    const liveArea = mapper.getAreaById(location.area);
+    const residentCount = liveArea.room_numbers.length;
+    const edgeCount = liveArea.room_numbers.reduce(
+      (count, number) => count + (liveArea.room(number)?.exits.filter((exit) =>
+        exit.to_area_id ? sameAreaId(exit.to_area_id, location.area) : false
+      ).length ?? 0),
+      0,
+    );
+    const constraintRepair = mode === "perfect"
+      ? nukeFirePerfectReflowPolicy({ residentCount, edgeCount })
+      : undefined;
     const result = await planAreaChange(location.area, {
       type: "reflow",
       anchor: location.room,
     }, {
-      effort: "thorough",
+      effort: mode === "perfect" ? "standard" : "thorough",
+      maxPlanningPasses: mode === "perfect" ? undefined : BOUNDED_REFLOW_PLANNING_PASSES,
+      timeoutMs: mode === "perfect" ? undefined : BOUNDED_REFLOW_TIMEOUT_MS,
+      constraintRepair,
+      includeSnapshotKeys: mode === "perfect",
       // Honor both map-layout's generic lock conventions and the property used
       // by nukefire-mapper's automatic planner.
       isRoomMovable: (room) =>
@@ -411,6 +440,25 @@ async function reflowCurrentArea(): Promise<void> {
       const current = mapper.getCurrentLocation();
       if (current) mapper.setCurrentLocation(current.area, current.room);
     }
+    if (constraintRepair) {
+      if (!result.plannedSnapshotKey) {
+        throw new Error("perfect reflow returned no validated final snapshot key");
+      }
+      const perfect = result.quality.cardinalRayViolations === 0 &&
+        result.quality.routingViolations === 0 &&
+        result.quality.linkCrossings === 0;
+      const finalArea = mapper.getAreaById(location.area);
+      const owner = getSessions()[0];
+      const recorder = owner ? recordManualPolishResult.to(owner) : recordManualPolishResult;
+      recorder.post({
+        areaUuid: finalArea.id,
+        expectedLayoutSnapshotKey: result.plannedSnapshotKey,
+        policy: perfectRepairPolicyWire(constraintRepair),
+        report: result.constraintRepair,
+        terminalReason: perfect ? "perfect" : undefined,
+        centerId: `room:${location.room}`,
+      });
+    }
     const search = result.search;
     const improvementText = search && compareLayoutQuality(result.quality, search.baselineQuality) > 0
       ? ` Improved the regular anchored score (${qualitySummary(search.baselineQuality)} → ` +
@@ -420,11 +468,29 @@ async function reflowCurrentArea(): Promise<void> {
       ? ` Tried ${search.anchorsTried.length} anchors across ${search.planningPasses} passes; ` +
         `selected ${search.selectedAnchor === null ? "the unanchored result" : `room ${search.selectedAnchor} as anchor`}.`
       : "";
+    const repair = result.constraintRepair;
+    const repairTerminal = repair && reflowRepairTerminalReason(repair);
+    const degradedPerfect = mode === "perfect" && !repair &&
+      (result.quality.cardinalRayViolations !== 0 || result.quality.routingViolations !== 0 ||
+        result.quality.linkCrossings !== 0);
+    const repairText = repair
+      ? ` Repair stopped at ${repairTerminal === "fixed-point"
+        ? "fixed point"
+        : repairTerminal === "ceiling"
+        ? `deterministic ceiling (${repair.cutoff}/${repair.polishCutoff})`
+        : repairTerminal === "cancelled"
+        ? "cancellation"
+        : repairTerminal}.`
+      : degradedPerfect
+      ? " Perfect repair failed or was unavailable; kept the validated fallback."
+      : "";
     echo(
-      `[nf] Thorough reflow moved ${updates.length} room${updates.length === 1 ? "" : "s"}; ` +
+      `[nf] ${degradedPerfect ? "Fallback" : mode === "perfect" ? "Perfect" : "Bounded"} reflow moved ${updates.length} room${
+        updates.length === 1 ? "" : "s"
+      }; ` +
         `${result.quality.cardinalRayViolations} directional violation${
           result.quality.cardinalRayViolations === 1 ? "" : "s"
-        } remain.${improvementText}${searchText}`,
+        } remain.${improvementText}${searchText}${repairText}`,
     );
   } catch (caught) {
     const message = caught instanceof Error ? caught.message : String(caught);
@@ -458,7 +524,14 @@ function runUtility(rawArgs: string): void {
       welcome.open();
       break;
     case "reflow":
-      void reflowCurrentArea();
+      {
+        const mode = parseReflowMode(commandArgs);
+        if (!mode) {
+          echo(style.warn`[nf] Usage: nf reflow [perfect]`);
+          break;
+        }
+        void reflowCurrentArea(mode);
+      }
       break;
     default:
       echo(style.warn`[nf] Unknown utility “${command}”.`);

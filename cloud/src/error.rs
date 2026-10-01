@@ -253,6 +253,9 @@ fn merge_refusal_message(reason: &str) -> Option<&'static str> {
         "merge_areas_invalid_translation" => {
             "The translation or a resulting position is outside the supported range. Use finite coordinates and keep levels within the 32-bit integer range."
         }
+        "merge_cross_area_links" => {
+            "The room being merged away has links to or from other areas. Remove those links, then merge the rooms."
+        }
         _ => return None,
     })
 }
@@ -402,6 +405,7 @@ mod tests {
             ("merge_areas_source_changed", "Review the current map"),
             ("merge_areas_room_numbers_exhausted", "room numbers"),
             ("merge_areas_invalid_translation", "supported range"),
+            ("merge_cross_area_links", "other areas"),
         ] {
             let error = if code == "merge_areas_invalid_translation" {
                 CloudError::InvalidInput(code.to_string())
