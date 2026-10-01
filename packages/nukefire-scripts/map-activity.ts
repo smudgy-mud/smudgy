@@ -4,6 +4,11 @@ import type { RouteDirection } from "./map-route.ts";
 export const UNVISITED_STYLE = "unvisited";
 export const TRACK_STYLE = "tracks";
 export const VISITED_STORAGE_KEY = "nf-map-visited-v1";
+/**
+ * Visited rooms by the game's own room number (vnum), which a room keeps when
+ * its map section is combined into another map or its room number changes.
+ */
+export const VISITED_VNUMS_STORAGE_KEY = "nf-map-visited-vnums-v1";
 
 export interface MapLocation {
   areaId: string;
@@ -74,6 +79,44 @@ export function rememberVisitedRoom(
     ...visited,
     [location.areaId]: [...rooms].sort((a, b) => a - b),
   };
+}
+
+/** Visited vnums, unique and sorted; anything that is not a room number is dropped. */
+export function parseVisitedVnums(raw: string | null): number[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return Array.isArray(value)
+      ? [...new Set(value.filter(validRoom))].sort((a, b) => a - b)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The game's room number a mapper stores as a room's external id, if it is one. */
+export function roomVnum(externalId: string | undefined): number | undefined {
+  if (externalId === undefined || !/^\d+$/.test(externalId)) return undefined;
+  const vnum = Number(externalId);
+  return Number.isSafeInteger(vnum) ? vnum : undefined;
+}
+
+/**
+ * The vnums of the rooms `visited` lists that `vnumOf` can still find, so
+ * visits recorded by map and room number also hold once maps are combined.
+ */
+export function visitedRoomVnums(
+  visited: VisitedRooms,
+  vnumOf: (areaId: string, roomNumber: number) => number | undefined,
+): number[] {
+  const vnums = new Set<number>();
+  for (const [areaId, rooms] of Object.entries(visited)) {
+    for (const roomNumber of rooms) {
+      const vnum = vnumOf(areaId, roomNumber);
+      if (vnum !== undefined) vnums.add(vnum);
+    }
+  }
+  return [...vnums].sort((a, b) => a - b);
 }
 
 export function markAreaUnvisited(visited: VisitedRooms, areaId: string): VisitedRooms {

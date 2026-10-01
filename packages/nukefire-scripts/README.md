@@ -26,9 +26,10 @@ gives the central session a Wide vitals header and each right-column session a
 Compact header. Both styles sit directly on the terminal-theme background
 without an extra panel tint.
 
-The Map dims unvisited rooms and their links to 40% opacity. Its **view** menu
-can hide or clear the current session's trail and reset visit history for the
-current area. Connected characters on the same map appear as distinct colored
+The Map dims unvisited rooms and their links to 40% opacity. It remembers
+visits by the game's room numbers, so combining map sections keeps them. Its
+**view** menu can hide or clear the current session's trail and reset visit
+history for the current area. Connected characters on the same map appear as distinct colored
 room outlines; GPS styling takes precedence where it overlaps the trail.
 
 Enable **Show live layout planner state below the map** to add a compact status

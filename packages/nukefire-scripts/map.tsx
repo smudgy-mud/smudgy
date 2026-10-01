@@ -63,13 +63,17 @@ import {
   TRACK_STYLE,
   UNVISITED_STYLE,
   VISITED_STORAGE_KEY,
+  VISITED_VNUMS_STORAGE_KEY,
   advanceTrack,
   clearTracks,
   expandTrackedExitRefs,
   markAreaUnvisited,
   parseVisitedRooms,
+  parseVisitedVnums,
   rememberVisitedRoom,
+  roomVnum,
   trackApplication,
+  visitedRoomVnums,
   type MapExitRef,
   type MapLocation,
   type SessionMapSnapshot,
@@ -158,10 +162,39 @@ function saveVisitedRooms(visited: VisitedRooms): void {
   localStorage.setItem(VISITED_STORAGE_KEY, JSON.stringify(visited));
 }
 
+function loadVisitedVnums(): Set<number> {
+  return new Set(parseVisitedVnums(localStorage.getItem(VISITED_VNUMS_STORAGE_KEY)));
+}
+
+function saveVisitedVnums(vnums: ReadonlySet<number>): void {
+  localStorage.setItem(
+    VISITED_VNUMS_STORAGE_KEY,
+    JSON.stringify([...vnums].sort((a, b) => a - b)),
+  );
+}
+
+function vnumOf(areaId: string, roomNumber: number): number | undefined {
+  return roomVnum(areaById(areaId)?.room(roomNumber)?.externalId);
+}
+
 function rememberLocation(location: MapLocation): void {
   const visited = loadVisitedRooms();
   const next = rememberVisitedRoom(visited, location);
   if (next !== visited) saveVisitedRooms(next);
+  const vnum = location.roomNumber === null ? undefined : vnumOf(location.areaId, location.roomNumber);
+  if (vnum === undefined) return;
+  const vnums = loadVisitedVnums();
+  if (vnums.has(vnum)) return;
+  vnums.add(vnum);
+  saveVisitedVnums(vnums);
+}
+
+/** Records the vnums of rooms visited by map and room number before vnums were kept. */
+function backfillVisitedVnums(): void {
+  const vnums = loadVisitedVnums();
+  const before = vnums.size;
+  for (const vnum of visitedRoomVnums(loadVisitedRooms(), vnumOf)) vnums.add(vnum);
+  if (vnums.size !== before) saveVisitedVnums(vnums);
 }
 
 function traversedExit(
@@ -231,19 +264,25 @@ function expandExitRefs(area: Area, refs: readonly MapExitRef[]): MapExitRef[] {
 
 function unvisitedApplication(area: Area): MapStyleApplication | undefined {
   const visited = loadVisitedRooms();
-  const isVisited = (areaId: string, roomNumber: number): boolean =>
-    (visited[areaId] ?? []).includes(roomNumber);
-  const rooms = area.room_numbers.filter((roomNumber) => !isVisited(area.id, roomNumber));
+  const vnums = loadVisitedVnums();
+  // A room counts as visited by its map and room number, or by its vnum,
+  // which it keeps when maps are combined.
+  const isVisited = (owner: Area, roomNumber: number): boolean => {
+    if ((visited[owner.id] ?? []).includes(roomNumber)) return true;
+    const vnum = roomVnum(owner.room(roomNumber)?.externalId);
+    return vnum !== undefined && vnums.has(vnum);
+  };
+  const rooms = area.room_numbers.filter((roomNumber) => !isVisited(area, roomNumber));
   const exits: MapExitRef[] = [];
 
   for (const roomNumber of area.room_numbers) {
-    const sourceVisited = isVisited(area.id, roomNumber);
+    const sourceVisited = isVisited(area, roomNumber);
     for (const exit of area.room(roomNumber)?.exits ?? []) {
       let destinationVisited = true;
       if (exit.to_area_id !== null && exit.to_room_number !== null) {
         const destinationArea = mapper.areas.find((candidate) => candidate.id === exit.to_area_id);
         if (destinationArea) {
-          destinationVisited = isVisited(destinationArea.id, exit.to_room_number);
+          destinationVisited = isVisited(destinationArea, exit.to_room_number);
         }
       }
       if (!sourceVisited || !destinationVisited) {
@@ -384,6 +423,8 @@ for (const lifecycle of [
 export function initialize(): void {
   if (initialized) return;
   initialized = true;
+  // Visits recorded before vnums were kept carry over once the maps load.
+  void mapper.ready().then(backfillVisitedVnums, () => {});
   const location = currentMapLocation();
   if (location) recordLocation(location);
   else sessionMap.set(ownMapSnapshot() ?? { tracks: {} });
@@ -597,6 +638,13 @@ function mount(): void {
                 const location = ownMapSnapshot()?.location ?? currentMapLocation();
                 if (location) {
                   saveVisitedRooms(markAreaUnvisited(loadVisitedRooms(), location.areaId));
+                  const area = areaById(location.areaId);
+                  const vnums = loadVisitedVnums();
+                  for (const roomNumber of area?.room_numbers ?? []) {
+                    const vnum = roomVnum(area?.room(roomNumber)?.externalId);
+                    if (vnum !== undefined) vnums.delete(vnum);
+                  }
+                  saveVisitedVnums(vnums);
                   refreshMapStyles();
                 }
               }}

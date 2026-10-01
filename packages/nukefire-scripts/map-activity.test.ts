@@ -6,8 +6,11 @@ import {
   expandTrackedExitRefs,
   markAreaUnvisited,
   parseVisitedRooms,
+  parseVisitedVnums,
   rememberVisitedRoom,
+  roomVnum,
   trackApplication,
+  visitedRoomVnums,
 } from "./map-activity.ts";
 
 test("visited rooms survive malformed entries and remain unique", () => {
@@ -16,6 +19,28 @@ test("visited rooms survive malformed entries and remain unique", () => {
   const remembered = rememberVisitedRoom(parsed, { areaId: "area-a", roomNumber: 5 });
   assert.deepEqual(remembered["area-a"], [3, 5, 7]);
   assert.deepEqual(markAreaUnvisited(remembered, "area-a"), {});
+});
+
+test("visited vnums survive malformed entries and remain unique", () => {
+  assert.deepEqual(parseVisitedVnums("[307, 12, 307, \"bad\", 1.5, null]"), [12, 307]);
+  assert.deepEqual(parseVisitedVnums("{\"rooms\":[1]}"), []);
+  assert.deepEqual(parseVisitedVnums("not json"), []);
+  assert.deepEqual(parseVisitedVnums(null), []);
+  assert.equal(roomVnum("4012"), 4012);
+  assert.equal(roomVnum(undefined), undefined);
+  assert.equal(roomVnum("room-7"), undefined);
+  assert.equal(roomVnum(" 7"), undefined);
+});
+
+test("visits by map and room number carry over to the rooms' vnums", () => {
+  const vnums: Record<string, number> = { "area-a:1": 501, "area-a:2": 502, "area-b:9": 900 };
+  assert.deepEqual(
+    visitedRoomVnums(
+      { "area-a": [2, 1, 3], "area-b": [9], "gone": [4] },
+      (areaId, roomNumber) => vnums[`${areaId}:${roomNumber}`],
+    ),
+    [501, 502, 900],
+  );
 });
 
 test("tracks retain rooms and exact traversed exits without duplicates", () => {
