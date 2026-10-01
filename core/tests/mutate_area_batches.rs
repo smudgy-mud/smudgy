@@ -22,6 +22,11 @@ use std::sync::Mutex;
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// The smudgy home is process-wide and the first test to set it wins, so every
+/// test in this file shares it. They run one at a time, each with a server
+/// folder and a map cache of its own.
+static HOME_LOCK: Mutex<()> = Mutex::new(());
+
 /// A single-tier local-flavored backend serving areas from memory. Envelope
 /// execution succeeds for a budgeted number of calls, then fails permanently
 /// with a scripted server verdict — the shape a read-only share produces
@@ -204,6 +209,7 @@ async fn run_module(
     .await
 }
 
+#[allow(clippy::await_holding_lock)] // HOME_LOCK serialises whole sessions, awaits included
 async fn run_module_on(
     backend: BudgetedBackend,
     server: &str,
@@ -212,6 +218,9 @@ async fn run_module_on(
     command: &str,
     sentinel_prefix: &str,
 ) -> Vec<String> {
+    let _home = HOME_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let home = tempfile::tempdir().expect("create temp home");
     let home_path = home.path().to_path_buf();
     std::mem::forget(home);
@@ -226,7 +235,10 @@ async fn run_module_on(
     .unwrap();
 
     let backend: Arc<dyn MapperBackend + Send + Sync> = Arc::new(backend);
-    let mapper = Mapper::new(backend, smudgy_home.join("map-cache"));
+    // A Mapper replays the write-ahead journal in its cache when it starts, so
+    // a cache shared with another test's Mapper would replay or clear that
+    // test's pending mutations.
+    let mapper = Mapper::new(backend, home_path.join("map-cache"));
 
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(session),
