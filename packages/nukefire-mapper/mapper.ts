@@ -2054,6 +2054,8 @@ export class NukeFireMapper {
     this.#assertCurrentRun(runGeneration);
     const planningFinishedAt = performance.now();
 
+    // Read before syncing, which gives each assignment its room.
+    const addsRooms = assignments.some((assignment) => !assignment.room);
     const rooms = new Map<number, RoomMirror>();
     const assignmentsByArea = new Map<string, Assignment[]>();
     for (const assignment of assignments) {
@@ -2117,14 +2119,13 @@ export class NukeFireMapper {
     assertNotAborted(signal);
     this.#assertCurrentRun(runGeneration);
 
-    if (currentWasRepositioned && current) {
-      // SetPlayerLocation also derives the MapView translation from the room's
-      // current coordinates. Repeat the otherwise-deduplicated notification
-      // only after every reflow write has committed so the viewport follows a
-      // player room that the layout moved.
-      if (currentObservation) {
-        this.#setCurrentRoom(current, currentObservation, runGeneration, true);
-      }
+    // Repeat the otherwise-deduplicated location once every write, links
+    // included, has committed. SetPlayerLocation derives the MapView
+    // translation from the room's coordinates, so the viewport follows a player
+    // room the layout moved, and a map restyles what the player has not visited
+    // when it hears the location, so it shows the rooms this snapshot added.
+    if ((currentWasRepositioned || addsRooms) && current && currentObservation) {
+      this.#setCurrentRoom(current, currentObservation, runGeneration, true);
     }
 
     const finishedAt = performance.now();

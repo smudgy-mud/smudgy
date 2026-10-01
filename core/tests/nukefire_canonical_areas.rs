@@ -942,6 +942,74 @@ async fn the_area_name_rules_setting_starts_with_the_default_rules() {
     session.shutdown();
 }
 
+/// A module that reports, each time the player's location is sent, the room
+/// and how many rooms its map holds by then.
+const ROOM_WATCH: &str = r#"
+import { echo, mapper } from "smudgy:core";
+import { room } from "smudgy:events/map";
+
+room.on(({ areaId, roomNumber }) => {
+    if (roomNumber === null) return;
+    const area = mapper.getAreaById(areaId);
+    echo("ROOM " + area.room(roomNumber)?.externalId + " rooms=" + area.room_numbers.length);
+});
+"#;
+
+/// Rooms a chart adds beside the player are announced with the player's
+/// location once they exist, so a map can show them unvisited straight away,
+/// even when the player stepped into a room that was already mapped.
+#[tokio::test]
+async fn rooms_charted_beside_the_player_are_announced_once_they_exist() {
+    let server = "NukeFireAnnouncedRooms";
+    let (mapper, _) = nukefire_store(server).await;
+    std::fs::write(
+        smudgy_home().join(server).join("modules").join("room-watch.ts"),
+        ROOM_WATCH,
+    )
+    .expect("write the location watcher");
+    let west = chart_room(130_001, "West Room", 1300, 0);
+    let middle = chart_room(130_002, "Middle Room", 1300, 1);
+    let east = chart_room(130_003, "East Room", 1300, 2);
+    let links = [
+        ChartLink {
+            from: 130_001,
+            to: 130_002,
+            direction: "east",
+        },
+        ChartLink {
+            from: 130_002,
+            to: 130_003,
+            direction: "east",
+        },
+    ];
+
+    let mut session = start_session(server, 9416, &mapper).await;
+    session.visit("Quiet Fields", &west, &[middle], &links[..1]);
+    let first = session
+        .wait_until(|lines| lines.iter().any(|line| line == "ROOM 130001 rooms=2"))
+        .await;
+    assert!(
+        first,
+        "the first chart was never announced:
+{}",
+        session.transcript()
+    );
+
+    // The player steps into the room the first chart showed, and the next
+    // chart shows one more room beyond it.
+    session.visit("Quiet Fields", &middle, &[west, east], &links);
+    let announced = session
+        .wait_until(|lines| lines.iter().any(|line| line == "ROOM 130002 rooms=3"))
+        .await;
+    assert!(
+        announced,
+        "the new room was mapped without the location being sent again:
+{}",
+        session.transcript()
+    );
+    session.shutdown();
+}
+
 // === Seeding maps as older versions left them ===
 
 /// A mapper over an empty local store of its own, with the packages installed
