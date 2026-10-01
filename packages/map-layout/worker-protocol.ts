@@ -1,5 +1,7 @@
 import type {
   ConstraintRepairOptions,
+  ConstraintRepairOutcome,
+  ConstraintRepairReport,
   GridPosition,
   IntegralLayoutAsyncOptions,
   IntegralLayoutPlan,
@@ -15,7 +17,7 @@ import type {
   PlanLayoutOptions,
 } from "./model.ts";
 
-export const LAYOUT_WORKER_PROTOCOL_VERSION = 10 as const;
+export const LAYOUT_WORKER_PROTOCOL_VERSION = 12 as const;
 
 /**
  * Elbow ceiling for one route amendment, shared by the engine's detour search
@@ -30,7 +32,7 @@ const MAX_ROUTE_AMENDMENTS = 1_024;
 export type IntegralLayoutWireRequest = Omit<IntegralLayoutRequest, "trace">;
 export type IntegralLayoutWireOptions = Omit<
   IntegralLayoutAsyncOptions,
-  "signal" | "timeoutMs" | "onProgress" | "currentQuality"
+  "signal" | "timeoutMs" | "onProgress" | "currentQuality" | "plannerContext"
 >;
 export type PlanLayoutWireOptions = Omit<PlanLayoutOptions, "trace">;
 
@@ -105,6 +107,52 @@ interface LayoutWorkerResponseBase {
   protocol: typeof LAYOUT_WORKER_PROTOCOL_VERSION;
   id: number;
   operation: LayoutWorkerRequest["operation"];
+  diagnostics: LayoutWorkerExecutionDiagnostics;
+}
+
+export type LayoutWorkerTerminalReason = "completed" | "cutoff" | "timeout" | "cancelled" | "failed";
+
+export interface LayoutWorkerMemorySample {
+  heapUsed: number;
+  heapTotal: number;
+  external: number;
+  rss?: number;
+}
+
+export interface LayoutWorkerMemoryDiagnostics {
+  samples: number;
+  start: LayoutWorkerMemorySample;
+  end: LayoutWorkerMemorySample;
+  peak: LayoutWorkerMemorySample;
+}
+
+/**
+ * Small, map-free accounting returned with every terminal Worker response.
+ * Counts describe work observed by the transport trace hook, not retained
+ * trace payloads. `estimatedProgressBytes` deliberately avoids serializing a
+ * second copy merely to measure the structured-clone traffic.
+ */
+export interface LayoutWorkerExecutionDiagnostics {
+  terminalReason: LayoutWorkerTerminalReason;
+  elapsedMs: number;
+  traceEventsObserved: number;
+  traceEventsRetained: number;
+  retainedPositionEntries: number;
+  progressMessages: number;
+  progressEventsCoalesced: number;
+  estimatedProgressBytes: number;
+  progressPositionEntries: number;
+  candidateMaterializations: number;
+  inspectedStates: number;
+  peakLiveSearchNodes?: number;
+  repairCutoff?: ConstraintRepairReport["cutoff"];
+  memory?: LayoutWorkerMemoryDiagnostics;
+  stageMs?: {
+    search: number;
+    compaction: number;
+    polish: number;
+    crossing: number;
+  };
 }
 
 export interface IntegralLayoutWorkerSuccess extends LayoutWorkerResponseBase {
@@ -224,6 +272,62 @@ export function deserializeLayoutWorkerError(value: SerializedLayoutWorkerError)
   return error;
 }
 
+function isLayoutWorkerMemorySample(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const sample = value as Record<string, unknown>;
+  return isNonNegativeFiniteNumber(sample.heapUsed) &&
+    isNonNegativeFiniteNumber(sample.heapTotal) &&
+    isNonNegativeFiniteNumber(sample.external) &&
+    (sample.rss === undefined || isNonNegativeFiniteNumber(sample.rss));
+}
+
+function isLayoutWorkerExecutionDiagnostics(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const diagnostics = value as Record<string, unknown>;
+  if (diagnostics.terminalReason !== "completed" && diagnostics.terminalReason !== "cutoff" &&
+    diagnostics.terminalReason !== "timeout" &&
+    diagnostics.terminalReason !== "cancelled" && diagnostics.terminalReason !== "failed") {
+    return false;
+  }
+  if (!isNonNegativeFiniteNumber(diagnostics.elapsedMs)) return false;
+  for (const field of [
+    "traceEventsObserved",
+    "traceEventsRetained",
+    "retainedPositionEntries",
+    "progressMessages",
+    "progressEventsCoalesced",
+    "estimatedProgressBytes",
+    "progressPositionEntries",
+    "candidateMaterializations",
+    "inspectedStates",
+  ] as const) {
+    if (!isNonNegativeSafeInteger(diagnostics[field])) return false;
+  }
+  if (diagnostics.peakLiveSearchNodes !== undefined &&
+    !isNonNegativeSafeInteger(diagnostics.peakLiveSearchNodes)) return false;
+  if (diagnostics.repairCutoff !== undefined && diagnostics.repairCutoff !== "none" &&
+    diagnostics.repairCutoff !== "time" && diagnostics.repairCutoff !== "restarts" &&
+    diagnostics.repairCutoff !== "layouts" && diagnostics.repairCutoff !== "extensions" &&
+    diagnostics.repairCutoff !== "masks") return false;
+  if (diagnostics.memory !== undefined) {
+    if (!diagnostics.memory || typeof diagnostics.memory !== "object") return false;
+    const memory = diagnostics.memory as Record<string, unknown>;
+    if (!isNonNegativeSafeInteger(memory.samples) || memory.samples < 2 ||
+      !isLayoutWorkerMemorySample(memory.start) ||
+      !isLayoutWorkerMemorySample(memory.end) ||
+      !isLayoutWorkerMemorySample(memory.peak)) return false;
+  }
+  if (diagnostics.stageMs !== undefined) {
+    if (!diagnostics.stageMs || typeof diagnostics.stageMs !== "object") return false;
+    const stage = diagnostics.stageMs as Record<string, unknown>;
+    if (!isNonNegativeFiniteNumber(stage.search) ||
+      !isNonNegativeFiniteNumber(stage.compaction) ||
+      !isNonNegativeFiniteNumber(stage.polish) ||
+      !isNonNegativeFiniteNumber(stage.crossing)) return false;
+  }
+  return true;
+}
+
 export function isLayoutWorkerResponse(value: unknown): value is LayoutWorkerResponse {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
@@ -231,7 +335,8 @@ export function isLayoutWorkerResponse(value: unknown): value is LayoutWorkerRes
     typeof candidate.id !== "number" || !Number.isSafeInteger(candidate.id) ||
     (candidate.operation !== "integral" && candidate.operation !== "constraint-repair" &&
       candidate.operation !== "model") ||
-    typeof candidate.ok !== "boolean") return false;
+    typeof candidate.ok !== "boolean" ||
+    !isLayoutWorkerExecutionDiagnostics(candidate.diagnostics)) return false;
 
   if (!candidate.ok) {
     if (!Array.isArray(candidate.traceEvents) ||
@@ -244,8 +349,10 @@ export function isLayoutWorkerResponse(value: unknown): value is LayoutWorkerRes
   if (!Array.isArray(candidate.traceEvents) ||
     !candidate.result || typeof candidate.result !== "object") return false;
   const result = candidate.result as Record<string, unknown>;
-  if (candidate.operation === "integral" || candidate.operation === "constraint-repair") {
-    return isIntegralLayoutWirePlan(result);
+  if (candidate.operation === "integral") return isIntegralLayoutWirePlan(result);
+  if (candidate.operation === "constraint-repair") {
+    // Every repair reports, whether or not it searched.
+    return isIntegralLayoutWirePlan(result) && result.constraintRepair !== undefined;
   }
   if (!result.patch || typeof result.patch !== "object") return false;
   const patch = result.patch as Record<string, unknown>;
@@ -351,6 +458,19 @@ function isConsistentPolishWork(report: Record<string, unknown>): boolean {
     tournaments * 2 <= passes;
 }
 
+const CONSTRAINT_REPAIR_OUTCOMES: ReadonlySet<unknown> = new Set<ConstraintRepairOutcome>([
+  "searched",
+  "locked",
+  "no-regression",
+  "clean",
+  "no-constraints",
+  "no-budget",
+  "search-failed:analysis",
+  "search-failed:time",
+  "search-failed:work",
+  "no-layout",
+]);
+
 function isConstraintRepairReport(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const report = value as Record<string, unknown>;
@@ -364,6 +484,7 @@ function isConstraintRepairReport(value: unknown): boolean {
     "lowerBound",
     "relaxedEdges",
     "reciprocalRelaxedEdges",
+    "relaxedLevelRelations",
     "standardViolations",
     "finalViolations",
     "beforeViolations",
@@ -390,13 +511,21 @@ function isConstraintRepairReport(value: unknown): boolean {
     "separatorBranches",
     "separatorCyclePrunes",
   ];
+  // A report that did not search selects nothing, proves nothing and never
+  // polished; only a searched one has a polish cutoff.
+  const searched = report.outcome === "searched";
   return (report.trigger === "settled-regression" || report.trigger === "violation-regression" ||
-      report.trigger === "always") &&
+      report.trigger === "defects" || report.trigger === "always") &&
+    CONSTRAINT_REPAIR_OUTCOMES.has(report.outcome) &&
+    (searched || report.selected === false && report.constraintOptimal === false) &&
+    searched === (report.polishCutoff !== "none") &&
     typeof report.selected === "boolean" && typeof report.constraintOptimal === "boolean" &&
     report.optimal === report.constraintOptimal &&
     (report.cutoff === "none" || report.cutoff === "time" || report.cutoff === "restarts" ||
       report.cutoff === "layouts" || report.cutoff === "extensions" || report.cutoff === "masks") &&
     countFields.every((field) => isNonNegativeSafeInteger(report[field])) &&
+    // Every level relation gives up at least one exit.
+    (report.relaxedLevelRelations as number) <= (report.relaxedEdges as number) &&
     (report.firstIncumbentMs === undefined ||
       isNonNegativeFiniteNumber(report.firstIncumbentMs)) &&
     isNonNegativeFiniteNumber(report.searchMs) &&
@@ -418,7 +547,7 @@ function isConstraintRepairReport(value: unknown): boolean {
       report.polishCutoff === "fixed-point") &&
     (report.polishCutoff === "fixed-point" || report.polishCutoff === "time" ||
       report.polishCutoff === "tournaments" || report.polishCutoff === "passes" ||
-      report.polishCutoff === "error") &&
+      report.polishCutoff === "error" || report.polishCutoff === "none") &&
     isNonNegativeFiniteNumber(report.polishMs) &&
     typeof crossing.completed === "boolean" &&
     typeof crossing.cancelled === "boolean" &&
@@ -446,6 +575,12 @@ function isLayoutQuality(value: unknown): boolean {
     (quality.reciprocalRayViolations === undefined ||
       typeof quality.reciprocalRayViolations === "number" &&
         Number.isFinite(quality.reciprocalRayViolations)) &&
+    (quality.levelViolations === undefined ||
+      typeof quality.levelViolations === "number" &&
+        Number.isFinite(quality.levelViolations)) &&
+    (quality.levelSlack === undefined ||
+      typeof quality.levelSlack === "number" &&
+        Number.isFinite(quality.levelSlack)) &&
     (quality.reciprocalExitPortViolations === undefined ||
       typeof quality.reciprocalExitPortViolations === "number" &&
         Number.isFinite(quality.reciprocalExitPortViolations));
@@ -508,6 +643,10 @@ const CONSTRAINT_WORK_FIELDS = [
 
 function isConstraintWork(value: Record<string, unknown>): boolean {
   return CONSTRAINT_WORK_FIELDS.every((field) => isNonNegativeSafeInteger(value[field])) &&
+    (value.peakLiveSearchNodes === undefined ||
+      isNonNegativeSafeInteger(value.peakLiveSearchNodes)) &&
+    (value.candidateMaterializations === undefined ||
+      isNonNegativeSafeInteger(value.candidateMaterializations)) &&
     (value.firstIncumbentMs === undefined ||
       isNonNegativeFiniteNumber(value.firstIncumbentMs));
 }
@@ -565,6 +704,9 @@ export function isLayoutWorkerProgress(value: unknown): value is LayoutWorkerPro
     !candidate.event || typeof candidate.event !== "object") return false;
   const event = candidate.event as Record<string, unknown>;
   if (event.type === "crossing-repair") return isCrossingRepairEvent(event);
+  if (event.type === "preview") {
+    return event.stage === "axis-compaction" && isTraceCandidate(event.candidate, true);
+  }
   if (event.type === "crossing-progress") return isCrossingProgressEvent(event);
   if (event.type === "constraint-progress") return isConstraintProgressEvent(event);
   if (event.type === "constraint-improvement") return isConstraintImprovementEvent(event);

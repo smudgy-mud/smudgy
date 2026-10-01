@@ -541,6 +541,17 @@ interface CreateAreaOptions {
      * Use `storage: "session"` instead.
      */
     ephemeral?: boolean;
+    /**
+     * Area properties the new map starts with, as `area.data()` reads them:
+     * at most 256, each value a string. Local and session maps are saved
+     * together with their properties. A cloud map is created first and
+     * receives them before the call resolves; if they cannot be saved, the
+     * map is deleted again and the call rejects, so a rejected call leaves
+     * no map behind. The one exception is a cloud map that cannot be deleted
+     * either: it remains without the properties, is added to this server's
+     * maps like any new map, and the rejection names it and its id.
+     */
+    properties?: Record<string, string>;
 }
 
 /** An atlas (map folder). Session storage does not support atlases. */

@@ -408,6 +408,13 @@ pub struct MockState {
     /// receipt) but replace their responses with a 500 — a lost response on
     /// an applied mutation, for transport-retry/receipt-dedupe tests.
     pub drop_mutation_responses: u32,
+    /// Test hook: refuse the next N compound mutations with a 400 before
+    /// anything applies — a server verdict the client parks instead of
+    /// retrying.
+    pub refuse_mutations: u32,
+    /// Test hook: fail the next N area deletes with a 500 before anything is
+    /// deleted — an outage the client cannot tell from a lost response.
+    pub fail_area_deletes: u32,
     /// Client-version gate floor, mirroring the server's `MIN_CLIENT_VERSION`.
     /// `None` (the default) leaves the gate disabled for every test.
     pub min_client_version: Option<String>,

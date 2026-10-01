@@ -2,7 +2,12 @@ import {
   compareLayoutQuality,
   directionalViolationEdges,
   planIntegralLayout,
+  planIntegralLayoutAsync,
+  type ConstraintRepairOptions,
+  type ConstraintRepairReport,
   type GridPosition,
+  type IntegralLayoutPlan,
+  type IntegralLayoutRequest,
   type LayoutDirection,
   type LayoutEdge,
   type LayoutNode,
@@ -75,6 +80,11 @@ export interface PlanLayoutOptions {
   trace?: (event: LayoutTraceEvent) => void;
 }
 
+/** Worker-only extension used by an explicit whole-area constraint repair. */
+export interface PlanLayoutAsyncOptions extends PlanLayoutOptions {
+  constraintRepair?: ConstraintRepairOptions;
+}
+
 export interface LayoutMove {
   id: string;
   roomNumber?: number;
@@ -98,6 +108,8 @@ export interface PlannedLayout {
   patch: LayoutPatch;
   positions: ReadonlyMap<string, GridPosition>;
   quality: Readonly<LayoutQuality>;
+  /** Present when an explicit whole-layout repair was requested. */
+  constraintRepair?: Readonly<ConstraintRepairReport>;
   /**
    * Advisory detours for defects every participating room's immovability made
    * permanent. Presentation-layer only: `quality` still scores the straight
@@ -520,8 +532,22 @@ function planLayoutModelOnce(
     centerId: anchor,
     allowExistingMoves: options.allowExistingMoves !== false,
     trace: options.trace,
-  });
+  }, change.type === "connect-rooms"
+    // Its chart holds two rooms already on the map, which makes the request
+    // whole-map in form only: connecting them is a local change, and keeps
+    // new-room placement's latency without the whole-map axis-group pass.
+    ? { axisGroupCompaction: false }
+    : {});
 
+  return materializeIntegralPlan(model, edges, proposedIds, plan);
+}
+
+function materializeIntegralPlan(
+  model: LayoutModel,
+  edges: readonly LayoutEdge[],
+  proposedIds: ReadonlySet<string>,
+  plan: Readonly<IntegralLayoutPlan>,
+): PlannedLayout {
   const moves: LayoutMove[] = [];
   const afterRooms: LayoutModelRoom[] = [];
   for (const room of model.rooms) {
@@ -554,6 +580,7 @@ function planLayoutModelOnce(
     patch: { moves, placements },
     positions: plan.positions,
     quality: plan.quality,
+    ...(plan.constraintRepair ? { constraintRepair: plan.constraintRepair } : {}),
     ...(plan.routeAmendments ? { routeAmendments: plan.routeAmendments } : {}),
   };
 }
@@ -792,10 +819,32 @@ export function planLayoutModel(
 export function planLayoutModelAsync(
   input: LayoutModel,
   change: LayoutChange,
-  options: PlanLayoutOptions = {},
+  options: PlanLayoutAsyncOptions = {},
   control: LayoutWorkerControlOptions = {},
 ): Promise<PlannedLayout> {
-  return planLayoutModelInWorker(input, change, options, control);
+  const { constraintRepair, ...planOptions } = options;
+  if (!constraintRepair) return planLayoutModelInWorker(input, change, planOptions, control);
+  if (change.type !== "reflow") {
+    return Promise.reject(new Error("constraint repair is available only for whole-area reflow"));
+  }
+
+  const model = createLayoutModel(input);
+  const anchor = change.anchor === undefined ? undefined : key(change.anchor);
+  if (anchor && !model.rooms.some((room) => room.id === anchor)) {
+    return Promise.reject(new Error(`layout anchor room ${anchor} does not exist`));
+  }
+  const request: IntegralLayoutRequest = {
+    residents: residentsForPlan(model, anchor, planOptions),
+    nodes: [],
+    edges: model.edges,
+    centerId: anchor,
+    allowExistingMoves: planOptions.allowExistingMoves !== false,
+    trace: planOptions.trace,
+  };
+  return planIntegralLayoutAsync(request, {
+    ...control,
+    constraintRepair,
+  }).then((plan) => materializeIntegralPlan(model, model.edges, new Set(), plan));
 }
 
 /** Optional retained-snapshot API for consumers which map continuously. */

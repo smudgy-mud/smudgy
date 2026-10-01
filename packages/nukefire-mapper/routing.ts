@@ -107,6 +107,29 @@ export function directRoomObstructions(
   return rooms.filter((room) => segmentIntersectsRoom(from, to, room));
 }
 
+/**
+ * Whether a room on one of `cells` would stand on a connection drawn from
+ * `from` through `routePoints` to `to`: on a turn of its route, or across one
+ * of its segments. Cells on another level never do.
+ */
+export function routeCrossesCells(
+  from: GridPosition,
+  to: GridPosition,
+  routePoints: readonly { x: number; y: number }[],
+  cells: readonly GridPosition[],
+): boolean {
+  const level = from.level;
+  const onLevel = cells.filter((cell) => cell.level === level);
+  if (onLevel.length === 0) return false;
+  const turns = routePoints.map((point) => ({ x: Math.round(point.x), y: Math.round(point.y), level }));
+  if (onLevel.some((cell) => turns.some((turn) => turn.x === cell.x && turn.y === cell.y))) return true;
+  const path = [from, ...turns, to];
+  for (let index = 1; index < path.length; index += 1) {
+    if (directRoomObstructions(path[index - 1], path[index], onLevel).length > 0) return true;
+  }
+  return false;
+}
+
 class MinHeap {
   readonly #values: SearchState[] = [];
 

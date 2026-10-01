@@ -8,6 +8,7 @@ import {
   indexRouteAmendments,
   planConnectionRoute,
   routeAroundRooms,
+  routeCrossesCells,
   routeEndSide,
   routeStartSide,
   routeTurnPoints,
@@ -18,6 +19,19 @@ const at = (x: number, y: number, level = 0): GridPosition => ({ x, y, level });
 test("detects rooms crossed by a long straight cardinal link", () => {
   const blocked = directRoomObstructions(at(0, 0), at(5, 0), [at(1, 0), at(3, 0), at(2, 1)]);
   assert.deepEqual(blocked, [at(1, 0), at(3, 0)]);
+});
+
+test("a room stands on a connection across a segment or on a turn, not beside it", () => {
+  // A straight link from (0,0) to (4,0).
+  assert.equal(routeCrossesCells(at(0, 0), at(4, 0), [], [at(2, 0)]), true, "across the segment");
+  assert.equal(routeCrossesCells(at(0, 0), at(4, 0), [], [at(2, 1)]), false, "beside it");
+  assert.equal(routeCrossesCells(at(0, 0), at(4, 0), [], [at(2, 0, 1)]), false, "on another level");
+  assert.equal(routeCrossesCells(at(0, 0), at(4, 0), [], []), false, "no room placed");
+  // A detour from (0,0) up to (0,-2), across to (4,-2) and down to (4,0).
+  const detour = [{ x: 0, y: -2 }, { x: 4, y: -2 }];
+  assert.equal(routeCrossesCells(at(0, 0), at(4, 0), detour, [at(4, -2)]), true, "on a turn");
+  assert.equal(routeCrossesCells(at(0, 0), at(4, 0), detour, [at(2, -2)]), true, "across a leg");
+  assert.equal(routeCrossesCells(at(0, 0), at(4, 0), detour, [at(2, 0)]), false, "where the detour no longer runs");
 });
 
 test("rejects a detour when the preferred endpoint ports are occupied", () => {

@@ -1498,6 +1498,9 @@ impl MapperBackend for LocalBackend {
 
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
         self.transact(move |_| {
+            // The initial properties ride the document's first write, so the
+            // area is never on disk without them.
+            let properties = request.document_properties();
             let area = Area {
                 id: AreaId(Uuid::new_v4()),
                 user_id: None,
@@ -1517,7 +1520,7 @@ impl MapperBackend for LocalBackend {
                 area: area.clone(),
                 format_version: crate::AREA_FORMAT_VERSION,
                 content_hash: None,
-                properties: Vec::new(),
+                properties,
                 rooms: Vec::new(),
                 labels: Vec::new(),
                 shapes: Vec::new(),
@@ -1965,7 +1968,7 @@ mod tests {
         mapper::RoomKey,
         mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
     };
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     #[tokio::test]
     async fn failed_retirement_without_a_journal_reloads_before_the_next_write() {
@@ -2409,6 +2412,7 @@ mod tests {
             name: name.to_string(),
             atlas_id,
             ephemeral: false,
+            properties: BTreeMap::new(),
         }
     }
 
@@ -2470,6 +2474,43 @@ mod tests {
         let listed = reopened.list_areas().await.expect("reopened list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, area.id);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn create_area_writes_initial_properties_with_the_document() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let mut request = new_area_request("The Deathlands", None);
+        request.properties = [
+            ("nukefire.area", "the deathlands"),
+            ("nukefire.mapper", "NukeFire.Map.Local"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        let area = backend.create_area(request).await.expect("create");
+        drop(backend);
+
+        // A fresh backend reads the store from disk. Revision 1 shows the
+        // properties arrived with the creating write, not a later edit.
+        let reopened = LocalBackend::new(&root);
+        reopened.refresh().await.expect("explicit disk refresh");
+        let details = reopened.get_area(&area.id).await.expect("reopened get");
+        assert_eq!(details.area.rev, 1);
+        let properties: Vec<_> = details
+            .properties
+            .iter()
+            .map(|p| (p.name.as_str(), p.value.as_str(), p.is_secret))
+            .collect();
+        assert_eq!(
+            properties,
+            [
+                ("nukefire.area", "the deathlands", false),
+                ("nukefire.mapper", "NukeFire.Map.Local", false),
+            ]
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3088,6 +3129,77 @@ mod tests {
         let exit = &details.rooms[0].exits[0];
         assert_eq!(exit.to_area_id, None, "inbound exit cleared");
         assert_eq!(exit.to_room_number, None);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ===== room deletion across areas =====
+
+    fn blank_room(number: i32) -> AreaMutation {
+        AreaMutation::UpsertRoom {
+            room_number: RoomNumber(number),
+            body: RoomUpdates::default(),
+        }
+    }
+
+    /// Applies `payload` to `area_id` at its stored revision.
+    async fn apply(
+        backend: &LocalBackend,
+        area_id: AreaId,
+        payload: Vec<AreaMutation>,
+    ) -> MutationResult {
+        let rev = backend.get_area(&area_id).await.expect("area").area.rev;
+        backend
+            .execute_mutation(&area_id, &envelope(area_id, rev, payload))
+            .await
+            .expect("envelope applies")
+    }
+
+    /// Deleting A 2 writes A alone: B's link to the room stays as B's own
+    /// edits left it, for an edit in B's own queue to clear, so the store
+    /// never orders one area's edits around another's.
+    #[tokio::test]
+    async fn deleting_a_room_writes_only_its_own_area() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let mut ids = Vec::new();
+        for name in ["A", "B"] {
+            let area = backend
+                .create_area(new_area_request(name, None))
+                .await
+                .expect("create");
+            ids.push(area.id);
+        }
+        let (a, b) = (ids[0], ids[1]);
+        apply(&backend, a, vec![blank_room(1), blank_room(2)]).await;
+        let link = AreaMutation::CreateExit {
+            room_number: RoomNumber(5),
+            body: ExitArgs {
+                from_direction: ExitDirection::North,
+                to_area_id: Some(a),
+                to_room_number: Some(RoomNumber(2)),
+                ..ExitArgs::default()
+            },
+        };
+        apply(&backend, b, vec![blank_room(5), link]).await;
+        let b_bytes = area_bytes(&backend, b);
+
+        let result = apply(
+            &backend,
+            a,
+            vec![AreaMutation::DeleteRoom {
+                room_number: RoomNumber(2),
+            }],
+        )
+        .await;
+
+        let reported: Vec<AreaId> = result
+            .versions
+            .iter()
+            .map(|version| AreaId(version.id))
+            .collect();
+        assert_eq!(reported, vec![a]);
+        assert_eq!(area_bytes(&backend, b), b_bytes, "B is not rewritten");
 
         fs::remove_dir_all(&root).ok();
     }
@@ -4282,6 +4394,7 @@ mod tests {
             inbound: inbound.to_vec(),
             expected,
             number_floor: RoomNumber(floor),
+            vacant_targets: Vec::new(),
         }
     }
 

@@ -62,6 +62,11 @@ async function settle(): Promise<void> {
   await Promise.resolve();
 }
 
+/** Lets every continuation already queued run, however many hops it takes. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 test("full reflow waits for a deterministic quiet window after prompt topology", async () => {
   const timers = new ManualTimers();
   const topology: number[] = [];
@@ -287,6 +292,133 @@ test("stop aborts the active reflow without reporting a displacement", async () 
   blocked.resolve();
   await settle();
   assert.deepEqual(aborts, []);
+});
+
+test("exclusive work displaces the active reflow as its own snapshot and starts once it returns", async () => {
+  const timers = new ManualTimers();
+  const blocked = deferred();
+  const aborts: Array<[number, number]> = [];
+  const signals: AbortSignal[] = [];
+  const events: string[] = [];
+  const lanes = new SnapshotLatencyLanes<Snapshot>({
+    snapshotKey: (snapshot) => snapshot.center,
+    followCurrent: () => {},
+    runTopology: async () => {},
+    runFullReflow: async (_snapshot, signal) => {
+      signals.push(signal);
+      events.push("reflow");
+      if (signals.length === 1) await blocked.promise;
+      events.push("reflow returned");
+    },
+    onFullReflowAborted: (aborted, incoming) =>
+      aborts.push([aborted.center, incoming.center]),
+    quietWindowMs: 300,
+    timers,
+  });
+
+  lanes.start();
+  // With the lanes idle, exclusive work starts at once.
+  assert.equal(await lanes.exclusive(async () => "alone"), "alone");
+  lanes.enqueue({ center: 4, revision: 1 });
+  await flush();
+  timers.advance(300);
+  await flush();
+  assert.equal(lanes.fullReflowActive, true);
+
+  const work = lanes.exclusive(async () => {
+    events.push("exclusive");
+    return 7;
+  });
+  assert.equal(signals[0].aborted, true);
+  assert.deepEqual(aborts, [[4, 4]]);
+  await flush();
+  assert.deepEqual(events, ["reflow"]);
+  blocked.resolve();
+  assert.equal(await work, 7);
+  assert.deepEqual(events, ["reflow", "reflow returned", "exclusive"]);
+
+  // The displaced reflow's quiet window starts over once the work returns.
+  await flush();
+  timers.advance(299);
+  await flush();
+  assert.equal(signals.length, 1);
+  timers.advance(1);
+  await flush();
+  assert.equal(signals.length, 2);
+});
+
+test("exclusive work gets in between topology snapshots and holds the rest back until it returns", async () => {
+  const timers = new ManualTimers();
+  const first = deferred();
+  const inside = deferred();
+  const events: string[] = [];
+  const lanes = new SnapshotLatencyLanes<Snapshot>({
+    snapshotKey: (snapshot) => snapshot.center,
+    followCurrent: () => {},
+    runTopology: async (snapshot) => {
+      events.push(`topology ${snapshot.center}`);
+      if (snapshot.center === 1) await first.promise;
+    },
+    runFullReflow: async () => {},
+    timers,
+  });
+
+  lanes.start();
+  lanes.enqueue({ center: 1, revision: 1 });
+  lanes.enqueue({ center: 2, revision: 1 });
+  const work = lanes.exclusive(async () => {
+    events.push("exclusive");
+    await inside.promise;
+    events.push("exclusive returned");
+  });
+  lanes.enqueue({ center: 3, revision: 1 });
+  await flush();
+  assert.deepEqual(events, ["topology 1"]);
+
+  first.resolve();
+  await flush();
+  assert.deepEqual(events, ["topology 1", "exclusive"]);
+  assert.equal(lanes.pendingTopologyCount, 2);
+
+  inside.resolve();
+  await work;
+  await flush();
+  assert.deepEqual(events, [
+    "topology 1",
+    "exclusive",
+    "exclusive returned",
+    "topology 2",
+    "topology 3",
+  ]);
+});
+
+test("exclusive work runs in the order it was asked for, and after stop too", async () => {
+  const timers = new ManualTimers();
+  const first = deferred();
+  const events: string[] = [];
+  const lanes = new SnapshotLatencyLanes<Snapshot>({
+    snapshotKey: (snapshot) => snapshot.center,
+    followCurrent: () => {},
+    runTopology: async () => {},
+    runFullReflow: async () => {},
+    timers,
+  });
+
+  lanes.start();
+  const one = lanes.exclusive(async () => {
+    events.push("one");
+    await first.promise;
+  });
+  const two = lanes.exclusive(async () => {
+    events.push("two");
+  });
+  await flush();
+  assert.deepEqual(events, ["one"]);
+  lanes.stop();
+  first.resolve();
+  await Promise.all([one, two]);
+  assert.deepEqual(events, ["one", "two"]);
+  assert.equal(await lanes.exclusive(async () => "stopped"), "stopped");
 });
 
 /**
@@ -526,17 +658,22 @@ test("a displaced pass that committed an improvement restarts the budget", async
 
 test("stop and restart invalidates old lane work before draining the new generation", async () => {
   const timers = new ManualTimers();
-  const oldTopology = deferred();
   const started: Array<[number, number]> = [];
   const reflows: Array<[number, number]> = [];
+  let oldTopologySignal: AbortSignal | undefined;
   const lanes = new SnapshotLatencyLanes<Snapshot>({
     snapshotKey: (snapshot) => snapshot.center,
     followCurrent: () => {},
-    runTopology: async (snapshot) => {
+    runTopology: async (snapshot, signal) => {
       // Each call starts synchronously inside its own generation, so the
       // lane's live counter identifies the generation that dispatched it.
       started.push([snapshot.center, lanes.generation]);
-      if (snapshot.center === 1) await oldTopology.promise;
+      if (snapshot.center === 1) {
+        oldTopologySignal = signal;
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
     },
     runFullReflow: async (snapshot, _signal, generation) => {
       reflows.push([snapshot.center, generation]);
@@ -549,13 +686,13 @@ test("stop and restart invalidates old lane work before draining the new generat
   lanes.enqueue({ center: 1, revision: 1 });
   const oldGeneration = lanes.generation;
   lanes.stop();
+  assert.equal(oldTopologySignal?.aborted, true);
   lanes.start();
   lanes.enqueue({ center: 2, revision: 1 });
   assert.notEqual(lanes.generation, oldGeneration);
   assert.deepEqual(started, [[1, oldGeneration]]);
 
   timers.advance(300);
-  oldTopology.resolve();
   await settle();
   assert.deepEqual(started, [
     [1, oldGeneration],

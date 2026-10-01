@@ -14,6 +14,7 @@ use smudgy_cloud::mutation::{
 use smudgy_cloud::{
     AreaId, CloudMapper, CreateAreaRequest, MapperBackend, RoomNumber, RoomUpdates, Uuid,
 };
+use std::collections::BTreeMap;
 use support::{GrantFlags, GrantScope, MockServer};
 
 /// GET `url` with a bearer credential; returns (status, parsed body).
@@ -45,6 +46,7 @@ async fn cloud_mapper_crud_roundtrip() {
             name: "Test Area".to_string(),
             atlas_id: None,
             ephemeral: false,
+            properties: BTreeMap::new(),
         })
         .await
         .expect("create_area");

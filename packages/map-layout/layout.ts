@@ -1,6 +1,10 @@
-import { planIntegralLayoutInWorker } from "./worker-client.ts";
+import {
+  createLayoutWorkerClient,
+  type LayoutWorkerClient,
+  planIntegralLayoutInWorker,
+} from "./worker-client.ts";
 import { MAX_ROUTE_AMENDMENT_WAYPOINTS } from "./worker-protocol.ts";
-import type { LayoutPlannerProgress } from "./planner-state.ts";
+import type { LayoutPlannerContext, LayoutPlannerProgress } from "./planner-state.ts";
 
 /** An integral cell in Smudgy's map grid. */
 export interface GridPosition {
@@ -69,6 +73,12 @@ export interface IntegralLayoutRequest {
 export interface IntegralLayoutControl {
   /** A complete candidate must satisfy this predicate before it can compete or be traced. */
   acceptsPositions?: (positions: ReadonlyMap<string, GridPosition>) => boolean;
+  /**
+   * False skips axis-group compaction (gravity and squeeze), the most
+   * expensive stage of a planner or compaction pass. Constraint repair's
+   * early lane turns it off; it never crosses a Worker boundary.
+   */
+  axisGroupCompaction?: boolean;
 }
 
 /** Synchronous controls for the bounded, compaction-only layout pass. */
@@ -78,8 +88,19 @@ export interface IntegralLayoutCompactionControl extends IntegralLayoutControl {
 }
 
 export interface ConstraintRepairOptions {
-  /** Select which directional-violation regression activates the repair. */
-  when: "settled-regression" | "violation-regression" | "always";
+  /**
+   * Which standard plans the repair runs on. "settled-regression" runs it
+   * when the plan draws the exits between existing rooms worse than those
+   * rooms had them: a higher count of directional and routing violations,
+   * each directional violation weighing `DIRECTIONAL_VIOLATION_WEIGHT`, or
+   * `LEVEL_VIOLATION_WEIGHT` when it is mis-levelled, as in
+   * `compareLayoutQuality`, or an equal count with more mis-levelled, then
+   * directional, violations; "violation-regression" compares every exit the same way, so
+   * newly observed topology counts too. "defects" runs it on any plan with a
+   * directional, routing or crossing defect. "always" runs it on every plan,
+   * and every other mode returns a plan without such defects as it is.
+   */
+  when: "settled-regression" | "violation-regression" | "defects" | "always";
   /** Cooperative search ceiling. The final bounded polish may finish after it. */
   maxDurationMs?: number;
   /**
@@ -105,6 +126,11 @@ export interface ConstraintRepairOptions {
    */
   maxExtensionStates?: number;
   /**
+   * Maximum separator-search nodes retained at once, independently of the
+   * total state budget. Infinity disables the production memory ceiling.
+   */
+  maxLiveSearchNodes?: number;
+  /**
    * Distinct canonical relation-group masks to compact, including the master
    * search incumbent. Infinity continues until masks are exhausted, a perfect
    * plan is found, or the request is cancelled.
@@ -128,6 +154,8 @@ export interface IntegralLayoutAsyncOptions extends LayoutWorkerControlOptions {
   onProgress?: (progress: Readonly<LayoutPlannerProgress>) => void;
   /** Override the pre-plan quality shown by telemetry consumers. */
   currentQuality?: Readonly<LayoutQuality>;
+  /** Map-free caller identity copied into every live planner snapshot. */
+  plannerContext?: Readonly<LayoutPlannerContext>;
 }
 
 export interface ConstraintRepairWorkStats {
@@ -145,12 +173,64 @@ export interface ConstraintRepairWorkStats {
   separatorBranches: number;
   /** Separator choices rejected because they would close an axis cycle. */
   separatorCyclePrunes: number;
+  /** Largest live separator-search frontier, aggregated across compacted masks. */
+  peakLiveSearchNodes?: number;
+  /** Full position snapshots materialized lazily from separator scratch. */
+  candidateMaterializations?: number;
   /** Milliseconds from repair start to the first hard-valid compactor output. */
   firstIncumbentMs?: number;
 }
 
+/**
+ * How a constraint repair ended. "searched": it ran its constraint search and
+ * carried the result through compaction, polish and crossing repair. Every
+ * other value says why it returned the standard plan as it was instead:
+ *
+ * - "locked": the request forbids moving existing rooms.
+ * - "no-regression": the plan does not regress the way `when` asks for.
+ * - "clean": the plan has no directional, routing or crossing defect.
+ * - "no-constraints": no exit is one the search can express, a single step
+ *   along one axis; diagonals and the like are only measured.
+ * - "no-budget": `maxDurationMs` is not positive.
+ * - "search-failed:analysis": the search's first check found the relations
+ *   the standard plan keeps contradictory. A plan that keeps them shows they
+ *   are not, so only an inconsistent plan reaches this, such as one that puts
+ *   two rooms on one cell.
+ * - "search-failed:time": the deadline passed before the search finished its
+ *   first check.
+ * - "search-failed:work": the search's check budget ran out before its first
+ *   check.
+ * - "no-layout": the search ran, but no compaction produced a layout that
+ *   keeps the exits it retained; `cutoff` says whether a deadline or a work
+ *   ceiling stopped it first.
+ *
+ * Every outcome but "search-failed:time", and a "no-layout" whose `cutoff` is
+ * "time", depends only on the map and the request; those two depend on how
+ * fast the machine ran.
+ */
+export type ConstraintRepairOutcome =
+  | "searched"
+  | "locked"
+  | "no-regression"
+  | "clean"
+  | "no-constraints"
+  | "no-budget"
+  | "search-failed:analysis"
+  | "search-failed:time"
+  | "search-failed:work"
+  | "no-layout";
+
+/**
+ * What a constraint repair did. A report whose `outcome` is not "searched"
+ * selects nothing and proves nothing: `selected`, `constraintOptimal` and
+ * `geometricFixedPoint` are false, `polishCutoff` is "none", its final
+ * violation counts are the standard plan's, and its work counts cover only
+ * what ran before the repair stopped.
+ */
 export interface ConstraintRepairReport extends ConstraintRepairWorkStats {
   trigger: ConstraintRepairOptions["when"];
+  /** Whether the repair searched, or why it returned the standard plan instead. */
+  outcome: ConstraintRepairOutcome;
   selected: boolean;
   /** True when the constraint search proved its minimum relaxed-edge objective. */
   constraintOptimal: boolean;
@@ -158,8 +238,22 @@ export interface ConstraintRepairReport extends ConstraintRepairWorkStats {
   optimal: boolean;
   cutoff: "none" | "time" | "restarts" | "layouts" | "extensions" | "masks";
   lowerBound: number;
+  /** Directed exits the winner's relaxation may draw wrong. */
   relaxedEdges: number;
+  /** Those of `relaxedEdges` whose exact reverse exit also exists. */
   reciprocalRelaxedEdges: number;
+  /**
+   * Level relations the winner's relaxation gives up. A level relation is the
+   * shared level of the flat exits between two rooms along one ray (a
+   * reciprocal pair has one). Given up, the rooms may lie on different levels
+   * and those exits, which `relaxedEdges` counts too, are drawn wrong. The
+   * search weighs a level relation as those exits, and of two equally costly
+   * relaxations gives up fewer level relations. Only rooms whose levels the
+   * exits contradict (an Up/Down exit between rooms that flat exits join, or a
+   * cycle of Up/Down exits) or the standard plan already breaks carry level
+   * relations; everywhere else a flat exit's shared level is never given up.
+   */
+  relaxedLevelRelations: number;
   standardViolations: number;
   finalViolations: number;
   beforeViolations: number;
@@ -195,10 +289,16 @@ export interface ConstraintRepairReport extends ConstraintRepairWorkStats {
   polishAnchorsTried: number;
   /** Strict best-so-far improvements published during polishing. */
   polishImprovements: number;
-  /** True only when another complete tournament found no strict quality gain. */
+  /**
+   * True only when another complete tournament found no strict quality gain
+   * and neither the crossing repair nor the final finishing improved on it.
+   */
   geometricFixedPoint: boolean;
-  /** Why geometric polishing stopped independently of the constraint cutoff. */
-  polishCutoff: "fixed-point" | "time" | "tournaments" | "passes" | "error";
+  /**
+   * Why geometric polishing stopped independently of the constraint cutoff;
+   * "none" when the repair returned before polishing (see `outcome`).
+   */
+  polishCutoff: "fixed-point" | "time" | "tournaments" | "passes" | "error" | "none";
   polishMs: number;
   crossingRepair: Readonly<CrossingRepairStats & {
     completed: boolean;
@@ -234,9 +334,14 @@ export interface IntegralLayoutPlan {
   positions: ReadonlyMap<string, GridPosition>;
   /** Resident ids whose durable coordinates changed. */
   movedExisting: ReadonlySet<string>;
-  /** The lexicographic geometry tuple used to select this layout. */
+  /** The geometry tuple `compareLayoutQuality` selected this layout by. */
   quality: Readonly<LayoutQuality>;
-  /** Present when the Worker ran the opt-in whole-layout constraint repair. */
+  /**
+   * Present whenever the opt-in whole-layout constraint repair returned,
+   * including when it did not search. A requested repair that never reported
+   * leaves it absent: a parent-side deadline, a cancellation or a failed
+   * Worker resolves the retained plan instead.
+   */
   constraintRepair?: Readonly<ConstraintRepairReport>;
   /**
    * Advisory detours for this plan's permanent fixed-room defects; see
@@ -267,7 +372,10 @@ export type CrossingRepairProgress =
   | CrossingRepairProgressBase & { kind: "progress" | "complete" }
   | CrossingRepairProgressBase & {
     kind: "improvement";
-    /** Always a complete transaction result, including positions. */
+    /**
+     * Always complete, including positions: a transaction result at the
+     * cheap compaction fixed point.
+     */
     candidate: LayoutTraceCandidate;
   };
 
@@ -280,10 +388,19 @@ export interface CrossingRepairControl {
   onProgress?: (progress: Readonly<CrossingRepairProgress>) => void;
   /** Reject complete transaction candidates before frontier admission or publication. */
   acceptsPositions?: (positions: ReadonlyMap<string, GridPosition>) => boolean;
+  /**
+   * False skips the axis-group compaction in the deep repair's axis heal,
+   * which the macro budget does not bound. Constraint repair's early lane
+   * turns it off; it never crosses a Worker boundary.
+   */
+  axisGroupCompaction?: boolean;
 }
 
 export interface CrossingRepairResult {
-  /** Best complete plan, or the exact supplied seed when no strict improvement exists. */
+  /**
+   * The last layout published, the best complete plan, or the exact supplied
+   * seed when no strict improvement exists.
+   */
   plan: IntegralLayoutPlan;
   /** True when crossings reached zero or the deterministic search space was exhausted. */
   completed: boolean;
@@ -304,6 +421,10 @@ interface RayQuality {
   cardinalRayViolations: number;
   /** Violating directed edges which have an exact protected reverse edge. */
   reciprocalRayViolations: number;
+  /** Violating directed edges whose rooms sit on levels the exit rules out. */
+  levelViolations: number;
+  /** Extra levels that exits drawn right climb or descend. */
+  levelSlack: number;
   cardinalSlack: number;
 }
 
@@ -313,7 +434,8 @@ interface ExitPortQuality {
 }
 
 interface CandidateScore {
-  // Each stage is populated only if every earlier lexicographic stage ties.
+  // Each stage is scored on first use, so a comparison decided early never
+  // pays for the later ones.
   collisions?: number;
   ray?: RayQuality;
   indexed?: PositionIndex;
@@ -446,15 +568,26 @@ function beginCandidateEvaluatorEpoch(
 }
 
 /**
- * A lexicographic description of a layout. Every field is minimized, in
- * declaration order; no amount of compactness can pay for a protected
- * directional exit leaving its proper ray.
+ * A description of a layout. Every field is minimized. `compareLayoutQuality`
+ * ranks layouts by a weighted score of directional violations, mis-levelled
+ * exits among them, routing violations and crossings first, then by the
+ * fields in `QUALITY_FIELDS` order; no amount of compactness can pay for a
+ * protected directional exit leaving its proper ray.
  */
 export interface LayoutQuality {
   /** Legacy field name: violations include every protected directional exit. */
   cardinalRayViolations: number;
   /** Directed violations belonging to reciprocal protected exit pairs. Always returned by 0.2.1+. */
   reciprocalRayViolations?: number;
+  /**
+   * The directional violations whose rooms sit on levels their exit rules
+   * out: an exit on one level, such as a compass exit, joining rooms on
+   * different levels, an Up exit whose room is not higher, or a Down exit
+   * whose room is not lower. Level 2 is above level 1. The exit's own vector
+   * decides, so a projected Up/Down exit drawn on one level is not counted.
+   * Every measured quality has it; a quality without it counts none.
+   */
+  levelViolations?: number;
   /** Obstructed direct links plus blocked cardinal endpoint ports. */
   routingViolations: number;
   /** Directed cardinal exits whose first route cell is occupied by another room. */
@@ -463,6 +596,13 @@ export interface LayoutQuality {
   reciprocalExitPortViolations?: number;
   roomObstructions: number;
   linkCrossings: number;
+  /**
+   * The extra levels that exits drawn right climb or descend: an Up exit to
+   * the room three levels up spans two more than it needs. Part of a map's
+   * size, with its footprint. Every measured quality has it; a quality
+   * without it counts none.
+   */
+  levelSlack?: number;
   /** Sum of the occupied bounding-box areas on each level. */
   footprintArea: number;
   /** Sum of the occupied bounding-box perimeters on each level. */
@@ -472,6 +612,7 @@ export interface LayoutQuality {
 }
 
 const QUALITY_FIELDS: readonly (keyof LayoutQuality)[] = [
+  "levelViolations",
   "cardinalRayViolations",
   "reciprocalRayViolations",
   "routingViolations",
@@ -479,16 +620,68 @@ const QUALITY_FIELDS: readonly (keyof LayoutQuality)[] = [
   "reciprocalExitPortViolations",
   "roomObstructions",
   "linkCrossings",
+  "levelSlack",
   "footprintArea",
   "footprintPerimeter",
   "cardinalSlack",
 ];
 
 /**
- * Compare two public quality tuples using the planner's exact lexicographic
- * ordering. Positive means `a` is better, zero means geometrically tied.
+ * Routing violations and crossings, combined, that one directional violation
+ * is worth in the quality order's primary score. A layout that removes a
+ * directional violation is better only while that costs at most this many
+ * extra routing violations and crossings; one that adds a directional
+ * violation is better once it saves more than this many.
+ */
+export const DIRECTIONAL_VIOLATION_WEIGHT = 8;
+
+/**
+ * A mis-levelled exit's weight in the quality order's primary score, in place
+ * of `DIRECTIONAL_VIOLATION_WEIGHT`: one outweighs 16 routing violations and
+ * crossings combined, and two exits drawn wrong on their own level.
+ */
+export const LEVEL_VIOLATION_WEIGHT = 17;
+
+/**
+ * The quality order's primary score, lower is better. `level` counts the
+ * mis-levelled exits among the `directional` violations.
+ */
+function weightedQualityScore(
+  directional: number,
+  level: number,
+  routing: number,
+  crossings: number,
+): number {
+  return DIRECTIONAL_VIOLATION_WEIGHT * (directional - level) + LEVEL_VIOLATION_WEIGHT * level +
+    routing + crossings;
+}
+
+function layoutQualityScore(quality: LayoutQuality): number {
+  return weightedQualityScore(
+    quality.cardinalRayViolations ?? 0,
+    quality.levelViolations ?? 0,
+    quality.routingViolations ?? 0,
+    quality.linkCrossings ?? 0,
+  );
+}
+
+/**
+ * Compare two public quality tuples in the planner's quality order. Positive
+ * means `a` is better, zero means geometrically tied.
+ *
+ * The primary score weighs each directional violation
+ * `DIRECTIONAL_VIOLATION_WEIGHT`, or `LEVEL_VIOLATION_WEIGHT` when it is
+ * mis-levelled, and adds the routing violations and the crossings, lower
+ * first. A violation is therefore traded for routing violations and
+ * crossings, in either direction, at its weight. Layouts with equal scores
+ * are ranked field by field in `QUALITY_FIELDS` order, fewest mis-levelled
+ * exits first, and after every defect by size: the extra levels exits span,
+ * then footprint. The order is total: it is lexicographic over the score and
+ * then every field, so every sort and pairwise comparison agrees with it.
  */
 export function compareLayoutQuality(a: LayoutQuality, b: LayoutQuality): number {
+  const primary = layoutQualityScore(b) - layoutQualityScore(a);
+  if (primary !== 0) return primary;
   for (const field of QUALITY_FIELDS) {
     const aValue = a[field] ?? 0;
     const bValue = b[field] ?? 0;
@@ -502,10 +695,13 @@ export function measureIntegralLayoutQuality(
   positions: ReadonlyMap<string, GridPosition>,
   edges: readonly LayoutEdge[],
 ): LayoutQuality {
-  const current = new Map(positions);
+  // The scoring pipeline is read-only and its candidate-local indexes never
+  // escape this synchronous call. Avoid cloning the complete position map
+  // twice: constraint repair invokes this entry point for every separator
+  // state and supplies a stable view for the duration of the call.
   return candidateQuality({
-    positions: new Map(current),
-    current,
+    positions: positions as Map<string, GridPosition>,
+    current: positions,
     edges,
     score: {},
   });
@@ -541,6 +737,17 @@ export type LayoutTraceEvent =
     generated: number;
     collisionFree: number;
     best?: LayoutTraceCandidate;
+  }
+  | {
+    /**
+     * A whole-map request's layout as it stands before the axis-group pass,
+     * the standard pass's longest stage, at the cheap compaction fixed point,
+     * so a caller can show it while that pass runs. The plan never ranks below
+     * it. Positions are always present.
+     */
+    type: "preview";
+    stage: "axis-compaction";
+    candidate: LayoutTraceCandidate;
   }
   | {
     type: "selection";
@@ -602,7 +809,10 @@ export type LayoutTraceEvent =
     maxDepth: number;
     visitedStates: number;
     before: LayoutTraceCandidate;
-    /** Accepted complete transaction; positions are always present. */
+    /**
+     * The published layout: an accepted complete transaction, finished as its
+     * request's published layouts are. Positions are always present.
+     */
     after: LayoutTraceCandidate;
   }
   | {
@@ -1121,6 +1331,10 @@ interface PositionIndex {
   entries: [string, GridPosition][];
   rows: Map<CellKey, number[]>;
   columns: Map<CellKey, number[]>;
+  /** Per level, the sorted distinct y of its rows; built by the first diagonal query. */
+  rowLanes?: Map<number, number[]>;
+  /** Per level, the sorted distinct x of its columns; built by the first diagonal query. */
+  columnLanes?: Map<number, number[]>;
   footprintArea: number;
   footprintPerimeter: number;
 }
@@ -1337,6 +1551,16 @@ function linkCrossingCount(edges: readonly ScoredPhysicalEdge[]): number {
   return crossings;
 }
 
+/**
+ * Whether an exit's rooms sit on levels its protected vector rules out: a
+ * vector on one level needs both rooms on one level, and one that climbs or
+ * descends needs the far room higher or lower. A self-loop never is, since
+ * no layout can draw it otherwise. Every such exit is off its ray too.
+ */
+function misLevelled(edge: LayoutEdge, expected: GridPosition, delta: GridPosition): boolean {
+  return edge.from !== edge.to && Math.sign(delta.level) !== Math.sign(expected.level);
+}
+
 function edgeRayQuality(
   positions: ReadonlyMap<string, GridPosition>,
   edge: LayoutEdge,
@@ -1346,12 +1570,31 @@ function edgeRayQuality(
   const to = positions.get(edge.to);
   const expected = protectedVector(edge);
   if (!expected || !from || !to) {
-    return { cardinalRayViolations: 0, reciprocalRayViolations: 0, cardinalSlack: 0 };
+    return {
+      cardinalRayViolations: 0,
+      reciprocalRayViolations: 0,
+      levelViolations: 0,
+      levelSlack: 0,
+      cardinalSlack: 0,
+    };
   }
-  const distance = protectedRayDistance(edge, subtract(to, from));
+  const delta = subtract(to, from);
+  const distance = protectedRayDistance(edge, delta);
   return distance === undefined
-    ? { cardinalRayViolations: 1, reciprocalRayViolations: reciprocal ? 1 : 0, cardinalSlack: 0 }
-    : { cardinalRayViolations: 0, reciprocalRayViolations: 0, cardinalSlack: Math.max(0, distance - 1) };
+    ? {
+      cardinalRayViolations: 1,
+      reciprocalRayViolations: reciprocal ? 1 : 0,
+      levelViolations: misLevelled(edge, expected, delta) ? 1 : 0,
+      levelSlack: 0,
+      cardinalSlack: 0,
+    }
+    : {
+      cardinalRayViolations: 0,
+      reciprocalRayViolations: 0,
+      levelViolations: 0,
+      levelSlack: expected.level === 0 ? 0 : Math.max(0, distance - 1),
+      cardinalSlack: Math.max(0, distance - 1),
+    };
 }
 
 /** Protected directional constraints which are off their required ray. */
@@ -1362,16 +1605,32 @@ export function directionalViolationEdges(
   return edges.filter((edge) => edgeRayQuality(positions, edge).cardinalRayViolations > 0);
 }
 
+/** Protected directional constraints whose rooms sit on levels the exit rules out. */
+export function levelViolationEdges(
+  positions: ReadonlyMap<string, GridPosition>,
+  edges: readonly LayoutEdge[],
+): LayoutEdge[] {
+  return edges.filter((edge) => edgeRayQuality(positions, edge).levelViolations > 0);
+}
+
 function fullRayQuality(
   positions: ReadonlyMap<string, GridPosition>,
   edges: readonly LayoutEdge[],
 ): RayQuality {
-  const result = { cardinalRayViolations: 0, reciprocalRayViolations: 0, cardinalSlack: 0 };
+  const result = {
+    cardinalRayViolations: 0,
+    reciprocalRayViolations: 0,
+    levelViolations: 0,
+    levelSlack: 0,
+    cardinalSlack: 0,
+  };
   const reciprocal = reciprocalProtectedEdges(edges);
   for (const edge of edges) {
     const contribution = edgeRayQuality(positions, edge, reciprocal.has(edge));
     result.cardinalRayViolations += contribution.cardinalRayViolations;
     result.reciprocalRayViolations += contribution.reciprocalRayViolations;
+    result.levelViolations += contribution.levelViolations;
+    result.levelSlack += contribution.levelSlack;
     result.cardinalSlack += contribution.cardinalSlack;
   }
   return result;
@@ -1430,6 +1689,8 @@ interface RigidTranslationContext {
   portEdges?: RigidPortEdges;
   movedCrossingIndex?: RigidCrossingClassIndex;
   stationaryCrossingIndex?: RigidCrossingClassIndex;
+  movedLinkRows?: RigidLinkRows;
+  stationaryLinkRows?: RigidLinkRows;
   affectedCrossingsBefore?: number;
 }
 
@@ -1956,6 +2217,92 @@ function sharesLinkEndpoint(a: IndexedPhysicalLink, bA: string, bB: string): boo
   return a.a === bA || a.a === bB || a.b === bA || a.b === bB;
 }
 
+const RIGID_ZERO_OFFSET: Origin = { x: 0, y: 0, level: 0 };
+
+/** A crossing class's links with their base coordinates as `x1, y1, x2, y2, level` rows. */
+interface RigidLinkRows {
+  links: readonly IndexedPhysicalLink[];
+  rows: Float64Array;
+}
+
+function rigidLinkRows(
+  index: RigidCrossingClassIndex,
+  positions: ReadonlyMap<string, GridPosition>,
+): RigidLinkRows {
+  const links = index.links;
+  const rows = new Float64Array(links.length * 5);
+  for (let at = 0; at < links.length; at += 1) {
+    // Every indexed link has both endpoints on one level.
+    const from = positions.get(links[at].a) as GridPosition;
+    const to = positions.get(links[at].b) as GridPosition;
+    rows[at * 5] = from.x;
+    rows[at * 5 + 1] = from.y;
+    rows[at * 5 + 2] = to.x;
+    rows[at * 5 + 3] = to.y;
+    rows[at * 5 + 4] = from.level;
+  }
+  return { links, rows };
+}
+
+function contextStationaryLinkRows(context: RigidTranslationContext): RigidLinkRows {
+  return context.stationaryLinkRows ??= rigidLinkRows(
+    contextStationaryCrossingIndex(context),
+    context.base.positions,
+  );
+}
+
+function contextMovedLinkRows(context: RigidTranslationContext): RigidLinkRows {
+  return context.movedLinkRows ??= rigidLinkRows(
+    contextMovedCrossingIndex(context),
+    context.base.positions,
+  );
+}
+
+/**
+ * How many links of one class a diagonal segment strictly crosses, with the
+ * class translated by `offset`: exactly the pairs `rigidPairCrosses` counts.
+ * The segment is translated by the negated offset instead, which keeps every
+ * cross product, and a link whose bounding box misses the segment's is
+ * skipped before the exact test.
+ */
+function rigidDiagonalCrossings(
+  { links, rows }: RigidLinkRows,
+  from: GridPosition,
+  to: GridPosition,
+  aId: string,
+  bId: string,
+  offset: Origin,
+): number {
+  const ax = from.x - offset.x;
+  const ay = from.y - offset.y;
+  const bx = to.x - offset.x;
+  const by = to.y - offset.y;
+  const level = from.level - offset.level;
+  const minX = Math.min(ax, bx);
+  const maxX = Math.max(ax, bx);
+  const minY = Math.min(ay, by);
+  const maxY = Math.max(ay, by);
+  let result = 0;
+  for (let at = 0; at < links.length; at += 1) {
+    const row = at * 5;
+    if (rows[row + 4] !== level) continue;
+    const cx = rows[row];
+    const cy = rows[row + 1];
+    const dx = rows[row + 2];
+    const dy = rows[row + 3];
+    if (Math.max(cx, dx) < minX || Math.min(cx, dx) > maxX ||
+      Math.max(cy, dy) < minY || Math.min(cy, dy) > maxY) continue;
+    if (sharesLinkEndpoint(links[at], aId, bId)) continue;
+    const abC = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    const abD = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax);
+    const cdA = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx);
+    const cdB = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx);
+    if (((abC < 0 && abD > 0) || (abC > 0 && abD < 0)) &&
+      ((cdA < 0 && cdB > 0) || (cdA > 0 && cdB < 0))) result += 1;
+  }
+  return result;
+}
+
 /**
  * Crossings among the pairs a rigid translation can affect: group x
  * stationary, and every pair involving a boundary link. Pairs inside the
@@ -2027,10 +2374,16 @@ function rigidAffectedCrossings(context: RigidTranslationContext, offset: Origin
 
   // Boundary links change shape; each pairs against both classes and, once
   // per unordered pair, against the other boundary links.
+  const boundaryFrom: (GridPosition | undefined)[] = [];
+  const boundaryTo: (GridPosition | undefined)[] = [];
+  for (const link of boundary) {
+    boundaryFrom.push(context.movedIds.has(link.a) ? movedAt(link.a) : base.positions.get(link.a));
+    boundaryTo.push(context.movedIds.has(link.b) ? movedAt(link.b) : base.positions.get(link.b));
+  }
   for (let index = 0; index < boundary.length; index += 1) {
     const link = boundary[index];
-    const from = context.movedIds.has(link.a) ? movedAt(link.a) : base.positions.get(link.a);
-    const to = context.movedIds.has(link.b) ? movedAt(link.b) : base.positions.get(link.b);
+    const from = boundaryFrom[index];
+    const to = boundaryTo[index];
     if (!from || !to || from.level !== to.level || samePosition(from, to)) continue;
     const axisAligned = from.y === to.y || from.x === to.x;
     if (axisAligned) {
@@ -2056,36 +2409,23 @@ function rigidAffectedCrossings(context: RigidTranslationContext, offset: Origin
         if (rigidPairCrosses(from, to, movedAt(other.a), movedAt(other.b))) result += 1;
       }
     } else {
-      for (const other of stationaryIndex.links) {
-        if (sharesLinkEndpoint(other, link.a, link.b)) continue;
-        if (rigidPairCrosses(
-          from,
-          to,
-          base.positions.get(other.a),
-          base.positions.get(other.b),
-        )) result += 1;
-      }
-      for (const other of movedIndex.links) {
-        if (sharesLinkEndpoint(other, link.a, link.b)) continue;
-        if (rigidPairCrosses(from, to, movedAt(other.a), movedAt(other.b))) result += 1;
-      }
+      result += rigidDiagonalCrossings(
+        contextStationaryLinkRows(context),
+        from,
+        to,
+        link.a,
+        link.b,
+        RIGID_ZERO_OFFSET,
+      );
+      result += rigidDiagonalCrossings(contextMovedLinkRows(context), from, to, link.a, link.b, offset);
     }
     for (let otherIndex = index + 1; otherIndex < boundary.length; otherIndex += 1) {
-      const other = boundary[otherIndex];
-      if (sharesLinkEndpoint(other, link.a, link.b)) continue;
-      const otherFrom = context.movedIds.has(other.a)
-        ? movedAt(other.a)
-        : base.positions.get(other.a);
-      const otherTo = context.movedIds.has(other.b)
-        ? movedAt(other.b)
-        : base.positions.get(other.b);
-      if (rigidPairCrosses(from, to, otherFrom, otherTo)) result += 1;
+      if (sharesLinkEndpoint(boundary[otherIndex], link.a, link.b)) continue;
+      if (rigidPairCrosses(from, to, boundaryFrom[otherIndex], boundaryTo[otherIndex])) result += 1;
     }
   }
   return result;
 }
-
-const RIGID_ZERO_OFFSET: Origin = { x: 0, y: 0, level: 0 };
 
 function contextAffectedCrossingsBefore(context: RigidTranslationContext): number {
   return context.affectedCrossingsBefore ??= rigidAffectedCrossings(context, RIGID_ZERO_OFFSET);
@@ -2122,6 +2462,8 @@ function candidateRayQuality(value: Candidate): RayQuality {
     const after = edgeRayQuality(value.positions, edge, isReciprocal);
     result.cardinalRayViolations += after.cardinalRayViolations - before.cardinalRayViolations;
     result.reciprocalRayViolations += after.reciprocalRayViolations - before.reciprocalRayViolations;
+    result.levelViolations += after.levelViolations - before.levelViolations;
+    result.levelSlack += after.levelSlack - before.levelSlack;
     result.cardinalSlack += after.cardinalSlack - before.cardinalSlack;
   }
   value.score.ray = result;
@@ -2362,6 +2704,22 @@ function physicalLinkObstructions(
   return result;
 }
 
+function indexLanes(indexed: PositionIndex, byRows: boolean): Map<number, number[]> {
+  const known = byRows ? indexed.rowLanes : indexed.columnLanes;
+  if (known) return known;
+  const coordinates = new Map<number, Set<number>>();
+  for (const [, position] of indexed.entries) {
+    const level = coordinates.get(position.level) ?? new Set<number>();
+    level.add(byRows ? position.y : position.x);
+    coordinates.set(position.level, level);
+  }
+  const result = new Map<number, number[]>();
+  for (const [level, values] of coordinates) result.set(level, [...values].sort((a, b) => a - b));
+  if (byRows) indexed.rowLanes = result;
+  else indexed.columnLanes = result;
+  return result;
+}
+
 function indexedSegmentObstructions(
   indexed: PositionIndex,
   from: GridPosition | undefined,
@@ -2374,9 +2732,28 @@ function indexedSegmentObstructions(
   if (from.x === to.x) {
     return countStrictlyBetween(indexed.columns.get(laneKey(from.level, from.x)), from.y, to.y);
   }
+  // A room's cell reaches less than one unit past its coordinates, so only
+  // rooms inside the segment's box widened by one can meet it. Walking the
+  // index lanes across the box's shorter side and testing each room there
+  // counts exactly the rooms a scan of every entry would.
+  const byRows = Math.abs(to.y - from.y) <= Math.abs(to.x - from.x);
+  const lanes = indexLanes(indexed, byRows).get(from.level);
+  if (!lanes) return 0;
+  const laneMinimum = (byRows ? Math.min(from.y, to.y) : Math.min(from.x, to.x)) - 1;
+  const laneMaximum = (byRows ? Math.max(from.y, to.y) : Math.max(from.x, to.x)) + 1;
+  const spanMinimum = (byRows ? Math.min(from.x, to.x) : Math.min(from.y, to.y)) - 1;
+  const spanMaximum = (byRows ? Math.max(from.x, to.x) : Math.max(from.y, to.y)) + 1;
+  const lists = byRows ? indexed.rows : indexed.columns;
   let result = 0;
-  for (const [, room] of indexed.entries) {
-    if (segmentIntersectsRoomCell(from, to, room)) result += 1;
+  for (let lane = lowerBound(lanes, laneMinimum); lane < lanes.length && lanes[lane] <= laneMaximum; lane += 1) {
+    const coordinate = lanes[lane];
+    const values = lists.get(laneKey(from.level, coordinate)) as number[];
+    for (let index = lowerBound(values, spanMinimum); index < values.length && values[index] <= spanMaximum; index += 1) {
+      const room = byRows
+        ? { x: values[index], y: coordinate, level: from.level }
+        : { x: coordinate, y: values[index], level: from.level };
+      if (segmentIntersectsRoomCell(from, to, room)) result += 1;
+    }
   }
   return result;
 }
@@ -2587,11 +2964,13 @@ function candidateQuality(value: Candidate): LayoutQuality {
   value.score.quality = {
     cardinalRayViolations: ray.cardinalRayViolations,
     reciprocalRayViolations: ray.reciprocalRayViolations,
+    levelViolations: ray.levelViolations,
     routingViolations: roomObstructions + ports.exitPortViolations,
     exitPortViolations: ports.exitPortViolations,
     reciprocalExitPortViolations: ports.reciprocalExitPortViolations,
     roomObstructions,
     linkCrossings,
+    levelSlack: ray.levelSlack,
     cardinalSlack: ray.cardinalSlack,
     footprintArea: footprint.area,
     footprintPerimeter: footprint.perimeter,
@@ -2610,6 +2989,8 @@ function refreshCandidateQuality(value: Candidate): LayoutQuality {
   value.score.ray = {
     cardinalRayViolations: quality.cardinalRayViolations,
     reciprocalRayViolations: quality.reciprocalRayViolations ?? 0,
+    levelViolations: quality.levelViolations ?? 0,
+    levelSlack: quality.levelSlack ?? 0,
     cardinalSlack: quality.cardinalSlack,
   };
   value.score.roomObstructions = quality.roomObstructions;
@@ -2628,13 +3009,16 @@ function refreshCandidateQuality(value: Candidate): LayoutQuality {
 
 /**
  * Positive means `a` is the preferred exploration state. This ordering is
- * deliberately not the public LayoutQuality contract: it ignores exit ports,
- * and ranks slack above footprint, so greedy search can traverse stepping
- * stones the public order rejects on its way to deeper repairs. Every
- * publication seam re-ranks with `comparePublicCandidates`, so a publicly
- * regressing state can be explored but never shipped. Pulling score stages
- * in tuple order is intentional: a candidate that loses early never pays for
- * spatial indexes, link crossings, footprint bounds, or movement accounting.
+ * deliberately not the public LayoutQuality contract: it ranks directional
+ * violations, each mis-levelled one at its own weight, strictly first instead
+ * of weighing them against routing and crossings, ignores exit ports, and
+ * ranks slack above footprint, so greedy
+ * search can traverse stepping stones the public order rejects on its way to
+ * deeper repairs. Every publication seam re-ranks with
+ * `comparePublicCandidates`, so a publicly regressing state can be explored
+ * but never shipped. Pulling score stages in tuple order is intentional: a
+ * candidate that loses early never pays for spatial indexes, link crossings,
+ * footprint bounds, or movement accounting.
  */
 function compareCandidates(a: Candidate, b: Candidate): number {
   const collisionsA = candidateCollisions(a);
@@ -2643,6 +3027,12 @@ function compareCandidates(a: Candidate, b: Candidate): number {
 
   const rayA = candidateRayQuality(a);
   const rayB = candidateRayQuality(b);
+  const rayScoreA = rayQualityScore(rayA);
+  const rayScoreB = rayQualityScore(rayB);
+  if (rayScoreA !== rayScoreB) return rayScoreB - rayScoreA;
+  if (rayA.levelViolations !== rayB.levelViolations) {
+    return rayB.levelViolations - rayA.levelViolations;
+  }
   if (rayA.cardinalRayViolations !== rayB.cardinalRayViolations) {
     return rayB.cardinalRayViolations - rayA.cardinalRayViolations;
   }
@@ -2671,18 +3061,105 @@ function compareCandidates(a: Candidate, b: Candidate): number {
   return candidateMovedExisting(b).size - candidateMovedExisting(a).size;
 }
 
+/** The directional part of the public primary score: weighted directional and mis-levelled exits. */
+function rayQualityScore(ray: RayQuality): number {
+  return weightedQualityScore(ray.cardinalRayViolations, ray.levelViolations, 0, 0);
+}
+
+/** A candidate's primary score in the public quality order; see compareLayoutQuality. */
+function candidateQualityScore(value: Candidate): number {
+  const ray = candidateRayQuality(value);
+  return weightedQualityScore(
+    ray.cardinalRayViolations,
+    ray.levelViolations,
+    candidateRoomObstructions(value) + candidateExitPortQuality(value).exitPortViolations,
+    candidateLinkCrossings(value),
+  );
+}
+
+/**
+ * Whether ray quality `a` loses the quality order's first tie-breaks to `b`
+ * outright: more mis-levelled exits, or as many and more directional
+ * violations.
+ */
+function rayTieLoses(
+  a: Pick<RayQuality, "levelViolations" | "cardinalRayViolations">,
+  b: Pick<RayQuality, "levelViolations" | "cardinalRayViolations">,
+): boolean {
+  return a.levelViolations !== b.levelViolations
+    ? a.levelViolations > b.levelViolations
+    : a.cardinalRayViolations > b.cardinalRayViolations;
+}
+
+/** A term of the public primary score beyond directional and mis-levelled violations. */
+interface PublicScoreTerm {
+  scored(value: Candidate): boolean;
+  score(value: Candidate): number;
+}
+
+/** The score's routing and crossing terms, cheapest to score first. */
+const PUBLIC_SCORE_TERMS: readonly PublicScoreTerm[] = [
+  {
+    scored: (value) => value.score.exitPorts !== undefined,
+    score: (value) => candidateExitPortQuality(value).exitPortViolations,
+  },
+  {
+    scored: (value) => value.score.roomObstructions !== undefined,
+    score: candidateRoomObstructions,
+  },
+  {
+    scored: (value) => value.score.linkCrossings !== undefined,
+    score: candidateLinkCrossings,
+  },
+];
+
+/**
+ * The sign of the public primary score comparison, positive when `a` scores
+ * lower. A term not yet scored counts as zero, the least it can be, so a side
+ * whose partial score already exceeds the other's complete score loses
+ * without scoring the rest; terms are scored cheapest first, and only while
+ * the scores known so far leave the comparison open. An equal score falls to
+ * mis-levelled and then directional violations first, so a partial score that
+ * equals the other's complete score and loses those tie-breaks loses as well.
+ */
+function comparePublicScores(
+  a: Candidate,
+  b: Candidate,
+  rayA: RayQuality,
+  rayB: RayQuality,
+): number {
+  let scoreA = rayQualityScore(rayA);
+  let scoreB = rayQualityScore(rayB);
+  const pendingA: PublicScoreTerm[] = [];
+  const pendingB: PublicScoreTerm[] = [];
+  for (const term of PUBLIC_SCORE_TERMS) {
+    if (term.scored(a)) scoreA += term.score(a);
+    else pendingA.push(term);
+    if (term.scored(b)) scoreB += term.score(b);
+    else pendingB.push(term);
+  }
+  for (let nextA = 0, nextB = 0; ;) {
+    const completeA = nextA === pendingA.length;
+    const completeB = nextB === pendingB.length;
+    if (completeA && completeB) return scoreB - scoreA;
+    if (completeB && (scoreA > scoreB || (scoreA === scoreB && rayTieLoses(rayA, rayB)))) return -1;
+    if (completeA && (scoreB > scoreA || (scoreB === scoreA && rayTieLoses(rayB, rayA)))) return 1;
+    if (!completeA && (completeB || pendingA.length - nextA >= pendingB.length - nextB)) {
+      scoreA += pendingA[nextA++].score(a);
+    } else {
+      scoreB += pendingB[nextB++].score(b);
+    }
+  }
+}
+
 function comparePublicCandidates(a: Candidate, b: Candidate): number {
-  // Pull the public tuple in declaration order so an early loser does not pay
-  // for the remaining spatial scores. This is equivalent to comparing the
-  // complete LayoutQuality objects, but keeps publication-seam ranking lazy.
+  // The same order as comparing the complete LayoutQuality objects. The
+  // primary score is pulled term by term only while it is undecided; the
+  // remaining fields, footprint and movement are paid for only on a tie.
   const rayA = candidateRayQuality(a);
   const rayB = candidateRayQuality(b);
-  if (rayA.cardinalRayViolations !== rayB.cardinalRayViolations) {
-    return rayB.cardinalRayViolations - rayA.cardinalRayViolations;
-  }
-  if (rayA.reciprocalRayViolations !== rayB.reciprocalRayViolations) {
-    return rayB.reciprocalRayViolations - rayA.reciprocalRayViolations;
-  }
+  const primary = comparePublicScores(a, b, rayA, rayB);
+  if (primary !== 0) return primary;
 
   const obstructionsA = candidateRoomObstructions(a);
   const obstructionsB = candidateRoomObstructions(b);
@@ -2690,6 +3167,17 @@ function comparePublicCandidates(a: Candidate, b: Candidate): number {
   const portsB = candidateExitPortQuality(b);
   const routingA = obstructionsA + portsA.exitPortViolations;
   const routingB = obstructionsB + portsB.exitPortViolations;
+  const crossingsA = candidateLinkCrossings(a);
+  const crossingsB = candidateLinkCrossings(b);
+  if (rayA.levelViolations !== rayB.levelViolations) {
+    return rayB.levelViolations - rayA.levelViolations;
+  }
+  if (rayA.cardinalRayViolations !== rayB.cardinalRayViolations) {
+    return rayB.cardinalRayViolations - rayA.cardinalRayViolations;
+  }
+  if (rayA.reciprocalRayViolations !== rayB.reciprocalRayViolations) {
+    return rayB.reciprocalRayViolations - rayA.reciprocalRayViolations;
+  }
   if (routingA !== routingB) return routingB - routingA;
   if (portsA.exitPortViolations !== portsB.exitPortViolations) {
     return portsB.exitPortViolations - portsA.exitPortViolations;
@@ -2698,10 +3186,8 @@ function comparePublicCandidates(a: Candidate, b: Candidate): number {
     return portsB.reciprocalExitPortViolations - portsA.reciprocalExitPortViolations;
   }
   if (obstructionsA !== obstructionsB) return obstructionsB - obstructionsA;
-
-  const crossingsA = candidateLinkCrossings(a);
-  const crossingsB = candidateLinkCrossings(b);
   if (crossingsA !== crossingsB) return crossingsB - crossingsA;
+  if (rayA.levelSlack !== rayB.levelSlack) return rayB.levelSlack - rayA.levelSlack;
   const footprintA = candidateFootprint(a);
   const footprintB = candidateFootprint(b);
   if (footprintA.area !== footprintB.area) return footprintB.area - footprintA.area;
@@ -2872,6 +3358,8 @@ function detachedCandidate(value: Candidate): Candidate {
       ray: {
         cardinalRayViolations: quality.cardinalRayViolations,
         reciprocalRayViolations: quality.reciprocalRayViolations ?? 0,
+        levelViolations: quality.levelViolations ?? 0,
+        levelSlack: quality.levelSlack ?? 0,
         cardinalSlack: quality.cardinalSlack,
       },
       roomObstructions: quality.roomObstructions,
@@ -2892,7 +3380,8 @@ function detachedCandidate(value: Candidate): Candidate {
 
 /**
  * Score temporary changes against a mutable working map, materializing a
- * complete candidate only when it beats the retained winner. Every changed
+ * complete candidate only when `compare` ranks it strictly above the retained
+ * winner, so the retained one keeps its place among equals. Every changed
  * coordinate is restored before returning. This avoids cloning every resident
  * for each translation offset.
  */
@@ -2904,6 +3393,7 @@ function preferTemporaryPlacement(
   derivation: CandidateDerivation,
   retained: Candidate | undefined,
   knownCollisions = candidateCollisions(derivation.base),
+  compare: (a: Candidate, b: Candidate) => number = compareCandidates,
 ): Candidate | undefined {
   const previous = new Map<string, GridPosition>();
   const added = new Set<string>();
@@ -2921,7 +3411,7 @@ function preferTemporaryPlacement(
       score: { collisions: knownCollisions },
       derivation,
     };
-    if (retained && compareCandidates(transient, retained) <= 0) return retained;
+    if (retained && compare(transient, retained) <= 0) return retained;
     const materialized = candidate(new Map(working), current, edges, derivation);
     materialized.score.collisions = knownCollisions;
     return materialized;
@@ -3246,6 +3736,420 @@ function bestStablePlacement(
     }
   }
   return candidate(positions, current, edges);
+}
+
+/** One block of rooms that moves as a unit; `relative` positions are the block's own coordinates. */
+export interface RigidBlock {
+  readonly id: string;
+  readonly rooms: readonly LayoutNode[];
+}
+
+export interface RigidBlockPlacementRequest {
+  /** Rooms already in the destination map; they never move. */
+  readonly residents: readonly LayoutResident[];
+  readonly blocks: readonly RigidBlock[];
+  /** Traversals among residents and block rooms; edges naming unknown ids are ignored. */
+  readonly edges: readonly LayoutEdge[];
+}
+
+/**
+ * An integer offset per block, such that every block room lands on an
+ * unoccupied cell.
+ *
+ * Each block is one rigid component whatever its internal connectivity: every
+ * room lands on `relative + offset`. Blocks are placed one at a time, the block
+ * with the most edges to already placed rooms first and ties by block id, and a
+ * placed block occupies its cells for the next, so a chain of blocks aligns
+ * transitively.
+ *
+ * The candidate offsets are the ones a new chart component is anchored with:
+ * the origin each seam link with a protected direction (cardinal, Up/Down, or
+ * a constraint vector) implies, the nearby shifts of an origin, and islands
+ * past the occupied bounds. Origins are ranked by the seam links they satisfy
+ * and only the best eight are searched, so links that all disagree cost no
+ * more than eight origins do. Among the candidates on which no block room
+ * meets an occupied cell, the `compareLayoutQuality` order chooses: an offset
+ * that satisfies more directions wins unless another saves more blocked
+ * routes, exit ports and crossings than the directions it gives up are worth,
+ * and all of those count before footprint and slack. Candidates are compared
+ * the most satisfied directions first, then in search order (origins by rank,
+ * each with its shifts nearest first and then its islands), and the first of
+ * equals wins; one that satisfies fewer directions is compared only while it
+ * could still win. Comparing a candidate scores the whole map, so fewer are
+ * compared as the map grows: hundreds on a map of a few dozen rooms, the first
+ * eight that fit on a map of thousands.
+ *
+ * A block without such a link to placed rooms becomes an island east of them,
+ * aligned with their top edge and keeping its own levels; with nothing placed
+ * yet it keeps its coordinates. Rooms of one block that share a cell keep
+ * sharing it. Blocks without rooms are omitted; the result lists the others in
+ * request order.
+ *
+ * Room ids must be unique across residents and blocks, and block ids across
+ * blocks. The result depends only on the request, not on the order of its
+ * residents, blocks, rooms or edges. Offsets are exact only while every
+ * coordinate stays a safe integer; a block that no candidate places within
+ * that range on unoccupied cells is an error.
+ */
+export function placeRigidBlocks(request: RigidBlockPlacementRequest): Map<string, GridPosition> {
+  const known = new Set<string>();
+  const claim = (id: string): void => {
+    if (known.has(id)) throw new Error(`layout id ${id} appears more than once`);
+    known.add(id);
+  };
+  const current = new Map<string, GridPosition>();
+  for (const resident of request.residents) {
+    claim(resident.id);
+    current.set(resident.id, integral(resident.position));
+  }
+  const blockIds = new Set<string>();
+  const pending: { id: string; nodes: Map<string, LayoutNode> }[] = [];
+  for (const block of request.blocks) {
+    if (blockIds.has(block.id)) throw new Error(`rigid block ${block.id} appears more than once`);
+    blockIds.add(block.id);
+    const nodes = new Map<string, LayoutNode>();
+    for (const room of block.rooms) {
+      claim(room.id);
+      nodes.set(room.id, { id: room.id, relative: integral(room.relative) });
+    }
+    if (nodes.size > 0) pending.push({ id: block.id, nodes });
+  }
+  const edges = request.edges.filter((edge) => known.has(edge.from) && known.has(edge.to));
+  const incident = topologyIndex(edges).incident;
+
+  const placed = new Map(current);
+  const offsets = new Map<string, GridPosition>();
+  while (pending.length > 0) {
+    let chosen = 0;
+    let chosenLinks = -1;
+    for (const [index, block] of pending.entries()) {
+      let links = 0;
+      for (const id of block.nodes.keys()) {
+        for (const edge of incident.get(id) ?? []) {
+          const inside = block.nodes.has(edge.from);
+          if (inside !== block.nodes.has(edge.to) && placed.has(inside ? edge.to : edge.from)) links += 1;
+        }
+      }
+      if (links > chosenLinks ||
+        (links === chosenLinks && compareStrings(block.id, pending[chosen].id) < 0)) {
+        chosen = index;
+        chosenLinks = links;
+      }
+    }
+    const [block] = pending.splice(chosen, 1);
+    const offset = rigidBlockOffset(block.id, block.nodes, placed, current, edges);
+    offsets.set(block.id, offset);
+    for (const [id, node] of block.nodes) placed.set(id, add(node.relative, offset));
+  }
+
+  const result = new Map<string, GridPosition>();
+  for (const block of request.blocks) {
+    const offset = offsets.get(block.id);
+    if (offset) result.set(block.id, offset);
+  }
+  return result;
+}
+
+/**
+ * The most seam-implied origins one rigid block searches around, as many as
+ * the chart anchors a new component is seeded from. Each origin brings a
+ * radius of nearby shifts and its islands, so without a cap the search would
+ * grow with every seam link that disagrees with the others.
+ */
+const RIGID_SEARCH_ORIGINS = 8;
+
+/**
+ * Rooms and edges that comparing one block's candidates may score, each
+ * candidate counting every room and edge of the map. A map of a few dozen
+ * rooms compares hundreds of candidates; one of thousands compares the
+ * minimum, in search order.
+ */
+const RIGID_TIE_SCORING_BUDGET = 50_000;
+const RIGID_TIE_MINIMUM = 8;
+
+/**
+ * Seam edges between a block and placed rooms, grouped by the block offsets
+ * that keep them on their protected rays: an edge holds exactly when
+ * `offset - base` is a positive multiple of `step`, with that multiple less
+ * one as its slack. Both edges of a two-way link share one ray.
+ */
+interface SeamRay {
+  base: Origin;
+  step: GridPosition;
+  /** Directed seam edges on this ray. */
+  edges: number;
+  /** Those with an exact protected reverse edge. */
+  reciprocal: number;
+}
+
+/** The part of an offset's ray quality that depends on the offset. */
+interface SeamScore {
+  violations: number;
+  reciprocalViolations: number;
+  /** The violations whose rooms sit on levels their exit rules out. */
+  levelViolations: number;
+  slack: number;
+}
+
+function seamRays(
+  nodes: ReadonlyMap<string, LayoutNode>,
+  placed: ReadonlyMap<string, GridPosition>,
+  edges: readonly LayoutEdge[],
+): SeamRay[] {
+  const reciprocal = reciprocalProtectedEdges(edges);
+  const rays = new Map<string, SeamRay>();
+  for (const edge of edges) {
+    const fromNode = nodes.get(edge.from);
+    const toNode = nodes.get(edge.to);
+    if ((fromNode === undefined) === (toNode === undefined)) continue;
+    const other = placed.get(fromNode ? edge.to : edge.from);
+    const vector = protectedVector(edge);
+    if (!other || !vector) continue;
+    // With the block room at `relative + offset`, the edge's `to - from` is
+    // `base - offset` when it leaves the block and `offset - base` when it
+    // enters it; negating both sides of the ray test turns the first into the
+    // second.
+    const base = subtract(other, ((fromNode ?? toNode) as LayoutNode).relative);
+    const step = fromNode ? negatedOrigin(vector) : vector;
+    const key = `${offsetKey(base)}/${offsetKey(step)}`;
+    let ray = rays.get(key);
+    if (!ray) {
+      ray = { base, step, edges: 0, reciprocal: 0 };
+      rays.set(key, ray);
+    }
+    ray.edges += 1;
+    if (reciprocal.has(edge)) ray.reciprocal += 1;
+  }
+  return [...rays.values()];
+}
+
+/**
+ * Only seam edges change their ray quality when a block moves rigidly, so
+ * this orders offsets exactly as the ray fields of the full quality would.
+ */
+function seamScore(rays: readonly SeamRay[], offset: Origin): SeamScore {
+  const delta = { x: 0, y: 0, level: 0 };
+  const score = { violations: 0, reciprocalViolations: 0, levelViolations: 0, slack: 0 };
+  for (const ray of rays) {
+    delta.x = offset.x - ray.base.x;
+    delta.y = offset.y - ray.base.y;
+    delta.level = offset.level - ray.base.level;
+    const distance = vectorRayDistance(ray.step, delta);
+    if (distance === undefined) {
+      score.violations += ray.edges;
+      score.reciprocalViolations += ray.reciprocal;
+      // An edge leaving the block negates both its delta and its step, which
+      // keeps whether their levels agree.
+      if (Math.sign(delta.level) !== Math.sign(ray.step.level)) score.levelViolations += ray.edges;
+    } else {
+      score.slack += ray.edges * (distance - 1);
+    }
+  }
+  return score;
+}
+
+/**
+ * The routing violations and crossings of a block's placement that no offset
+ * changes: those among the placed rooms and their links, and those inside the
+ * block. An offset only adds more, where the block's rooms and links meet the
+ * placed ones.
+ */
+function offsetIndependentRoutingAndCrossings(
+  nodes: ReadonlyMap<string, LayoutNode>,
+  placed: ReadonlyMap<string, GridPosition>,
+  edges: readonly LayoutEdge[],
+): number {
+  const block = new Map([...nodes].map(([id, node]) => [id, node.relative]));
+  let result = 0;
+  for (const positions of [placed, block]) {
+    const inside = edges.filter((edge) => positions.has(edge.from) && positions.has(edge.to));
+    const quality = measureIntegralLayoutQuality(positions, inside);
+    result += quality.routingViolations + quality.linkCrossings;
+  }
+  return result;
+}
+
+/** A seam's part of the primary score: its weighted directional and mis-levelled exits. */
+function seamRayScore(score: SeamScore): number {
+  return weightedQualityScore(score.violations, score.levelViolations, 0, 0);
+}
+
+/**
+ * Positive when `a` is worse in the ray part of the quality order: its
+ * weighted score, then its mis-levelled, directional and reciprocal
+ * violations. Slack is the order's last field.
+ */
+function compareSeamDirections(a: SeamScore, b: SeamScore): number {
+  return seamRayScore(a) - seamRayScore(b) || a.levelViolations - b.levelViolations ||
+    a.violations - b.violations || a.reciprocalViolations - b.reciprocalViolations;
+}
+
+/**
+ * The best collision-free offset for one rigid block. The seam score decides
+ * the ray fields of the quality order by itself, so candidates are taken best
+ * weighted ray score first and scored in full: as translations of the block
+ * from the best origin, rescored from the moved/stationary boundary alone, as
+ * many as the tie budget allows. A worse ray score is scored only while it can
+ * still win, that is while the routing violations and crossings the best
+ * offset has beyond those no offset removes outweigh its extra weighted
+ * directional and mis-levelled violations.
+ */
+function rigidBlockOffset(
+  blockId: string,
+  nodes: ReadonlyMap<string, LayoutNode>,
+  placed: ReadonlyMap<string, GridPosition>,
+  current: ReadonlyMap<string, GridPosition>,
+  edges: readonly LayoutEdge[],
+): Origin {
+  const ids = [...nodes.keys()];
+  const moving = new Set(ids);
+  // Rooms sharing a cell inside the block share it at every offset, so the
+  // fit test probes one room per distinct cell.
+  const cells = new Set<CellKey>();
+  const probe: GridPosition[] = [];
+  for (const node of nodes.values()) {
+    const key = cellKey(node.relative);
+    if (cells.has(key)) continue;
+    cells.add(key);
+    probe.push(node.relative);
+  }
+  // A translation keeps distinct rooms on distinct cells only while every
+  // coordinate stays a safe integer, so the fit test also demands that.
+  const safe = Number.isSafeInteger;
+  const extent = {
+    minX: Infinity, maxX: -Infinity,
+    minY: Infinity, maxY: -Infinity,
+    minLevel: Infinity, maxLevel: -Infinity,
+  };
+  let exact = true;
+  for (const relative of probe) {
+    exact &&= safe(relative.x) && safe(relative.y) && safe(relative.level);
+    extent.minX = Math.min(extent.minX, relative.x);
+    extent.maxX = Math.max(extent.maxX, relative.x);
+    extent.minY = Math.min(extent.minY, relative.y);
+    extent.maxY = Math.max(extent.maxY, relative.y);
+    extent.minLevel = Math.min(extent.minLevel, relative.level);
+    extent.maxLevel = Math.max(extent.maxLevel, relative.level);
+  }
+  const occupied = occupiedCells(placed);
+  const fitsAt = (offset: Origin): boolean => {
+    if (!exact ||
+      !safe(offset.x + extent.minX) || !safe(offset.x + extent.maxX) ||
+      !safe(offset.y + extent.minY) || !safe(offset.y + extent.maxY) ||
+      !safe(offset.level + extent.minLevel) || !safe(offset.level + extent.maxLevel)) return false;
+    for (const relative of probe) {
+      const key = cellKeyAt(relative.x + offset.x, relative.y + offset.y, relative.level + offset.level);
+      if (occupied.has(key)) return false;
+    }
+    return true;
+  };
+  const unplaceable = (): Error =>
+    new Error(`could not find a collision-free offset for rigid block ${blockId}`);
+
+  const rays = seamRays(nodes, placed, edges);
+  if (rays.length === 0) {
+    if (placed.size === 0) return { x: 0, y: 0, level: 0 };
+    // The island an unanchored chart component gets, except that a block's
+    // levels are real map levels and stay as they are.
+    const island = packedOrigin(ids, placed, nodes);
+    const offset = { x: island.x, y: island.y, level: 0 };
+    if (!fitsAt(offset)) throw unplaceable();
+    return offset;
+  }
+
+  // Every origin a seam edge implies, ranked by its own seam score and then
+  // by coordinates, so the ranking ignores the order of the request's edges.
+  const origins = uniqueOffsets(rays.map((ray) => add(ray.base, ray.step)))
+    .map((origin) => ({ origin, score: seamScore(rays, origin) }))
+    .sort((a, b) =>
+      compareSeamDirections(a.score, b.score) || a.score.slack - b.score.slack ||
+      a.origin.level - b.origin.level || a.origin.x - b.origin.x || a.origin.y - b.origin.y
+    )
+    .slice(0, RIGID_SEARCH_ORIGINS)
+    .map(({ origin }) => origin);
+
+  // Nearby origins share most of their shifts; each offset keeps the place
+  // it was first searched at, which breaks ties in the quality order.
+  const searched = new Set<string>();
+  const candidates: { offset: Origin; order: number; score: SeamScore }[] = [];
+  for (const origin of origins) {
+    const islands = farOffsets(probe.map((relative) => add(relative, origin)), placed.values());
+    for (const shift of [...NEARBY_OFFSETS, ...islands]) {
+      const offset = add(origin, shift);
+      const key = offsetKey(offset);
+      if (searched.has(key)) continue;
+      searched.add(key);
+      candidates.push({ offset, order: candidates.length, score: seamScore(rays, offset) });
+    }
+  }
+  candidates.sort((a, b) => compareSeamDirections(a.score, b.score) || a.order - b.order);
+
+  const reference = origins[0];
+  const base = candidate(
+    new Map([...placed, ...componentPositions(ids, nodes, reference)]),
+    current,
+    edges,
+  );
+  const context = rigidTranslationContext(base, moving);
+  const working = new Map(base.positions);
+  const collisions = collisionGroupCount(placed);
+  // Full scoring touches every room and edge of the map, so large maps
+  // compare fewer candidates.
+  const fullScores = Math.max(
+    RIGID_TIE_MINIMUM,
+    Math.floor(RIGID_TIE_SCORING_BUDGET / (placed.size + nodes.size + edges.length)),
+  );
+  let scored = 0;
+  let best: Candidate | undefined;
+  let bestEntry: (typeof candidates)[number] | undefined;
+  let bestScore = 0;
+  let bestRay: RayQuality | undefined;
+  // Only seam edges change their rays when the block moves, so every offset
+  // draws this many other exits wrong, this many of them mis-levelled.
+  let fixedDirectional = 0;
+  let fixedLevel = 0;
+  let fixedRoutingAndCrossings: number | undefined;
+  for (const entry of candidates) {
+    if (scored === fullScores) break;
+    if (bestEntry && bestRay && seamRayScore(entry.score) > seamRayScore(bestEntry.score)) {
+      // Every later candidate's seam scores no better than this one's, which
+      // is worse than the best one's. An offset scores at least its weighted
+      // directional and mis-levelled violations plus the routing violations
+      // and crossings among the placed rooms and inside the block, which are
+      // the same at every offset. An equal score ties, and the tie goes to
+      // fewer mis-levelled, then directional, violations; a later candidate
+      // with this seam score has at least as many of either.
+      const ray = {
+        cardinalRayViolations: fixedDirectional + entry.score.violations,
+        levelViolations: fixedLevel + entry.score.levelViolations,
+      };
+      const leastRay = weightedQualityScore(ray.cardinalRayViolations, ray.levelViolations, 0, 0);
+      const cannotWin = (least: number): boolean =>
+        least > bestScore || (least === bestScore && rayTieLoses(ray, bestRay as RayQuality));
+      if (cannotWin(leastRay)) break;
+      fixedRoutingAndCrossings ??= offsetIndependentRoutingAndCrossings(nodes, placed, edges);
+      if (cannotWin(leastRay + fixedRoutingAndCrossings)) break;
+    }
+    if (!fitsAt(entry.offset)) continue;
+    scored += 1;
+    const preferred = preferTemporaryPlacement(working, componentPositions(ids, nodes, entry.offset), current, edges, {
+      base,
+      changedIds: moving,
+      translation: { offset: subtract(entry.offset, reference), context },
+    }, best, collisions, comparePublicCandidates);
+    if (preferred && preferred !== best) {
+      best = preferred;
+      bestEntry = entry;
+      bestScore = candidateQualityScore(preferred);
+      bestRay = candidateRayQuality(preferred);
+      fixedDirectional = bestRay.cardinalRayViolations - entry.score.violations;
+      fixedLevel = bestRay.levelViolations - entry.score.levelViolations;
+    }
+  }
+  // Each origin's eastern island clears every occupied cell, so only
+  // coordinates past the safe-integer range leave nothing that fits.
+  if (!bestEntry) throw unplaceable();
+  return bestEntry.offset;
 }
 
 function chooseKeeper(
@@ -5120,6 +6024,7 @@ function bridgeLobeVacuum(
 }
 
 const CROSSING_PREFIX_FIELDS: readonly (keyof LayoutQuality)[] = [
+  "levelViolations",
   "cardinalRayViolations",
   "reciprocalRayViolations",
   "routingViolations",
@@ -5194,7 +6099,22 @@ interface CrossingRepairContext {
   cancelled: boolean;
   exhausted: boolean;
   improvements: number;
+  /** The search's own frontier: the best transaction result it has reached. */
   best: Candidate;
+  /**
+   * The last layout published, or the seed, which a deep repair returns. A
+   * deep repair publishes each new `best` finished, so this never ranks below
+   * `best`.
+   */
+  published: Candidate;
+  /**
+   * How a published layout is finished, when set: the cheap compaction fixed
+   * point for a quick repair, which hands its finished result back to the
+   * planner to continue from, and a full compaction for a deep repair, which
+   * keeps searching from the raw transaction and finishes only the layout it
+   * publishes.
+   */
+  finish: ((value: Candidate) => Candidate) | undefined;
   lastProgressAt: number;
 }
 
@@ -5483,16 +6403,30 @@ function crossingPrefixRestored(after: LayoutQuality, before: LayoutQuality): bo
   return CROSSING_PREFIX_FIELDS.every((field) => (after[field] ?? 0) <= (before[field] ?? 0));
 }
 
+/**
+ * A transaction is complete when it removes crossings and the quality order
+ * ranks its layout above its base, which lets it trade a directional or
+ * routing violation for enough crossings. Removing crossings is the repair's
+ * own progress: it bounds how deeply accepted transactions nest.
+ */
 function completedCrossingImprovement(candidateValue: Candidate, base: Candidate): boolean {
   if (candidateCollisions(candidateValue) !== 0) return false;
   const after = candidateQuality(candidateValue);
   const before = candidateQuality(base);
-  return crossingPrefixRestored(after, before) && after.linkCrossings < before.linkCrossings &&
-    compareLayoutQuality(after, before) > 0;
+  return after.linkCrossings < before.linkCrossings && compareLayoutQuality(after, before) > 0;
 }
 
 function crossingStats(context: CrossingRepairContext): CrossingRepairStats {
   return { ...context.stats };
+}
+
+/**
+ * The layout a crossing repair reports as its best: for a deep repair, the
+ * last layout it published, which it returns; for a quick one, its search
+ * frontier.
+ */
+function crossingRepairBest(context: CrossingRepairContext): Candidate {
+  return context.mode === "deep" ? context.published : context.best;
 }
 
 function publishCrossingProgress(
@@ -5505,7 +6439,7 @@ function publishCrossingProgress(
   if (!force && now - context.lastProgressAt < PROGRESS_INTERVAL_MS) return;
   context.lastProgressAt = now;
   const stats = crossingStats(context);
-  const bestQuality = { ...candidateQuality(context.best) };
+  const bestQuality = { ...candidateQuality(crossingRepairBest(context)) };
   context.trace?.({
     type: "crossing-progress",
     stage: "crossing-repair",
@@ -5711,16 +6645,18 @@ function axisPolishCrossingCandidate(
     if (context.control.shouldCancel?.()) context.cancelled = true;
     return working;
   }
-  const compacted = axisGroupCompaction(
-    working,
-    context.current,
-    context.residents,
-    context.edges,
-    context.centerId,
-    undefined,
-    context.control.acceptsPositions,
-    context.control.shouldCancel,
-  );
+  const compacted = context.control.axisGroupCompaction === false
+    ? working
+    : axisGroupCompaction(
+      working,
+      context.current,
+      context.residents,
+      context.edges,
+      context.centerId,
+      undefined,
+      context.control.acceptsPositions,
+      context.control.shouldCancel,
+    );
   let vacuumed = vacuumLayout(
     compacted,
     context.current,
@@ -5908,8 +6844,8 @@ function finalizeCrossingTransactionCandidates(
       context.cancelled = true;
       break;
     }
-    // A raw transaction is already complete when it restores the protected
-    // quality prefix. Preserve it before optional compaction: a later polish
+    // A raw transaction is already complete when the quality order ranks it
+    // above its base. Preserve it before optional compaction: a later polish
     // can legitimately reintroduce the crossing it was meant to heal.
     const acceptedBeforeValue = result.length;
     addCrossingTransactionCandidate(
@@ -6247,22 +7183,30 @@ function emitCrossingImprovement(
   const before = context.best;
   if (compareLayoutQuality(afterQuality, candidateQuality(before)) <= 0) return;
   context.best = after;
+  // The search goes on from the raw transaction; the layout a deep repair
+  // publishes is that transaction compacted. A quick repair finishes its
+  // result before it gets here.
+  const published = context.mode === "deep" && context.finish ? context.finish(after) : after;
+  const publishedQuality = published === after ? afterQuality : refreshCandidateQuality(published);
+  const previous = context.published;
+  if (compareLayoutQuality(publishedQuality, candidateQuality(previous)) <= 0) return;
+  context.published = published;
   context.improvements += 1;
   const stats = crossingStats(context);
-  const traced = traceCandidate(after);
+  const traced = traceCandidate(published);
   context.trace?.({
     type: "crossing-repair",
     stage: "crossing-repair",
     mode: context.mode,
     iteration: context.improvements,
     ...stats,
-    before: traceCandidate(before),
+    before: traceCandidate(context.mode === "deep" ? previous : before),
     after: traced,
   });
   context.control.onProgress?.({
     kind: "improvement",
     ...stats,
-    bestQuality: { ...candidateQuality(context.best) },
+    bestQuality: { ...publishedQuality },
     candidate: traced,
   });
 }
@@ -6281,8 +7225,12 @@ function quickCrossingRepair(seed: Candidate, context: CrossingRepairContext): C
       selected = value.candidate;
     }
   }
-  if (selected !== seed) emitCrossingImprovement(context, selected);
-  return selected;
+  if (selected === seed) return seed;
+  // The planner goes on from what this returns, so the finished layout both
+  // replaces the transaction and is the one published.
+  const finished = context.finish ? context.finish(selected) : selected;
+  emitCrossingImprovement(context, finished);
+  return finished;
 }
 
 function deepCrossingRepair(seed: Candidate, context: CrossingRepairContext, depth: number): void {
@@ -6316,6 +7264,7 @@ function crossingRepairContext(
   trace: IntegralLayoutRequest["trace"],
   control: CrossingRepairControl,
   defaultMaximumWork: number,
+  finish?: (value: Candidate) => Candidate,
 ): CrossingRepairContext {
   const requestedWork = control.maximumWork ?? defaultMaximumWork;
   const maximumWork = requestedWork === Number.POSITIVE_INFINITY
@@ -6354,6 +7303,8 @@ function crossingRepairContext(
     exhausted: false,
     improvements: 0,
     best: seed,
+    published: seed,
+    finish,
     lastProgressAt: now,
   };
 }
@@ -6745,6 +7696,7 @@ export function computeIntegralRouteAmendments(
 type PlanarAxis = "x" | "y";
 
 const QUALITY_THROUGH_FOOTPRINT: readonly (keyof LayoutQuality)[] = [
+  "levelViolations",
   "cardinalRayViolations",
   "reciprocalRayViolations",
   "routingViolations",
@@ -6752,11 +7704,15 @@ const QUALITY_THROUGH_FOOTPRINT: readonly (keyof LayoutQuality)[] = [
   "reciprocalExitPortViolations",
   "roomObstructions",
   "linkCrossings",
+  "levelSlack",
   "footprintArea",
   "footprintPerimeter",
 ];
 
+/** `compareLayoutQuality` without cardinal slack, its last field. */
 function compareQualityThroughFootprint(a: LayoutQuality, b: LayoutQuality): number {
+  const primary = layoutQualityScore(b) - layoutQualityScore(a);
+  if (primary !== 0) return primary;
   for (const field of QUALITY_THROUGH_FOOTPRINT) {
     const aValue = a[field] ?? 0;
     const bValue = b[field] ?? 0;
@@ -7852,8 +8808,8 @@ function evenCardinalSeries(
         candidatesConsidered += 1;
         publishProgress();
         const quality = candidateQuality(evaluated);
-        // This is an aesthetic-only pass: unlike the main lexicographic
-        // planner, it may not trade a later conflict for an earlier gain.
+        // This is an aesthetic-only pass: unlike the planner's quality order,
+        // it never trades one quality field for another.
         if (QUALITY_FIELDS.some((field) =>
           (quality[field] ?? 0) > (beforeQuality[field] ?? 0)
         )) continue;
@@ -7892,12 +8848,67 @@ function evenCardinalSeries(
 }
 
 /**
+ * The cheap compaction fixed point: remove globally empty rows and columns,
+ * evenly space straight cardinal series, and repeat until a pass gains nothing
+ * in `compareCompactionCandidates`. A pass is kept only when it ranks above
+ * its start, so the result never ranks below the seed in the quality order.
+ * For one request, each pass depends only on the positions it starts from, so
+ * finishing a layout this returned gives it back unchanged, unless
+ * cancellation or a pass that revisits an earlier layout ended the loop.
+ */
+function finishCompaction(
+  seed: Candidate,
+  current: ReadonlyMap<string, GridPosition>,
+  residents: ReadonlyMap<string, LayoutResident>,
+  edges: readonly LayoutEdge[],
+  centerId: string | undefined,
+  trace: IntegralLayoutRequest["trace"],
+  acceptsPositions?: IntegralLayoutControl["acceptsPositions"],
+  shouldCancel?: IntegralLayoutCompactionControl["shouldCancel"],
+): Candidate {
+  let working = seed;
+  const seen = new Set([positionMapKey(seed.positions)]);
+  for (;;) {
+    if (shouldCancel?.()) break;
+    let pass = vacuumLayout(working, current, residents, edges, trace, acceptsPositions, shouldCancel);
+    // Vacuum acceptance follows the exploration order, which may trade a
+    // routing or crossing regression for slack. Such a pass goes on from its
+    // own start instead.
+    if (compareQualityThroughFootprint(candidateQuality(pass), candidateQuality(working)) < 0) {
+      pass = working;
+    }
+    if (!shouldCancel?.()) {
+      const spaced = evenCardinalSeries(
+        pass,
+        current,
+        residents,
+        edges,
+        centerId,
+        trace,
+        acceptsPositions,
+        shouldCancel,
+      );
+      if (compareCompactionCandidates(spaced, pass) > 0) pass = spaced;
+    }
+    if (compareCompactionCandidates(pass, working) <= 0) break;
+    const key = positionMapKey(pass.positions);
+    if (seen.has(key)) break;
+    seen.add(key);
+    working = pass;
+  }
+  return working === seed ? seed : detachedCandidate(working);
+}
+
+/**
  * Compact one already-complete integral plan without rerunning placement or
  * topology repair. The first pass removes globally empty rows and columns;
  * the second recursively packs mutually blocking axis groups; a final vacuum
  * closes any global gap exposed by gravity; the third evenly spaces straight
- * cardinal series. The result never regresses public quality, and a quality
- * tie is returned only when the final aesthetic spacing strictly improves.
+ * cardinal series. Every compaction ends at the cheap fixed point of the
+ * first and last passes, repeated until neither gains, which is the whole of
+ * a compaction with `axisGroupCompaction: false`. The result never regresses
+ * public quality, and a quality tie is returned only when the aesthetic
+ * spacing strictly improves.
  */
 export function compactIntegralLayoutPlan(
   request: IntegralLayoutRequest,
@@ -7918,7 +8929,8 @@ export function compactIntegralLayoutPlan(
 
   let working = initial;
   const seen = new Set([positionMapKey(initial.positions)]);
-  for (;;) {
+  // Full passes with axis groups run until one gains nothing.
+  while (control.axisGroupCompaction !== false) {
     const passStart = working;
     let pass = vacuumLayout(
       passStart,
@@ -7981,8 +8993,12 @@ export function compactIntegralLayoutPlan(
     if (control.shouldCancel?.()) break;
 
     // Canonical spacing can align several groups while leaving a newly empty
-    // global line. Pay for another gravity tournament only when a cheap vacuum
-    // proves that the preceding three phases exposed more work.
+    // global line. Adopt that cheap gain immediately when present, then always
+    // begin another complete pass after any strict completed improvement.
+    // Axis compaction can expose a second axis basin without creating an empty
+    // global line; treating a neutral vacuum probe as a fixed-point proof made
+    // a second call visibly compact plans returned by the first. Strict
+    // compaction ordering plus the exact seen-state set terminates the closure.
     const healed = vacuumLayout(
       working,
       current,
@@ -7992,11 +9008,26 @@ export function compactIntegralLayoutPlan(
       control.acceptsPositions,
       control.shouldCancel,
     );
-    if (compareCompactionCandidates(healed, working) <= 0) break;
-    const healedKey = positionMapKey(healed.positions);
-    if (seen.has(healedKey)) break;
-    seen.add(healedKey);
-    working = healed;
+    if (compareCompactionCandidates(healed, working) > 0) {
+      const healedKey = positionMapKey(healed.positions);
+      if (seen.has(healedKey)) break;
+      seen.add(healedKey);
+      working = healed;
+    }
+  }
+  // The probe above stops on a vacuum alone, while spacing a spaced layout
+  // again can still gain once its series have moved.
+  if (!control.shouldCancel?.()) {
+    working = finishCompaction(
+      working,
+      current,
+      residents,
+      request.edges,
+      request.centerId,
+      request.trace,
+      control.acceptsPositions,
+      control.shouldCancel,
+    );
   }
 
   // Cancellation is transactional at this public seam. Internal phases may
@@ -8016,13 +9047,31 @@ export function compactIntegralLayoutPlan(
 }
 
 /**
+ * Whether every room of a request is already on the map: it has no chart node
+ * that is not also a resident. Such a request reflows or polishes the whole
+ * map; one with a chart node of its own places new rooms.
+ */
+function topologyFullyResident(request: IntegralLayoutRequest): boolean {
+  if (request.nodes.length === 0) return true;
+  const residentIds = new Set(request.residents.map((resident) => resident.id));
+  return request.nodes.every((node) => residentIds.has(node.id));
+}
+
+/**
  * Embed a player-relative NukeFire chart in an integral grid.
  *
- * Candidate layouts are compared lexicographically: cardinal and vertical
- * exits stay on their proper rays first, then links avoid rooms and each
- * other, and only then do footprint and link slack matter. It may insert whole
- * rows/columns or translate coherent regions; movement count is only the final
- * tie-breaker.
+ * Candidate layouts are published in the `compareLayoutQuality` order:
+ * cardinal and vertical exits on their proper rays, links clear of rooms and
+ * of each other first, weighed together, and only then footprint and link
+ * slack. It may insert whole rows/columns or translate coherent regions;
+ * movement count is only the final tie-breaker.
+ *
+ * A request that lets existing rooms move and whose chart nodes are all
+ * residents reflows or polishes the whole map. It gets the whole-map
+ * compaction stages, and the layouts its crossing repair publishes and the
+ * plan it returns end at the cheap compaction fixed point of
+ * `compactIntegralLayoutPlan` with `axisGroupCompaction: false`. The plan never
+ * ranks below a layout the crossing repair published.
  */
 export function planIntegralLayout(
   request: IntegralLayoutRequest,
@@ -8121,6 +9170,21 @@ export function planIntegralLayout(
   exactNew = [];
   chartReflow = [];
   CANDIDATE_EVALUATORS.delete(current);
+  // A request whose rooms are all on the map already reflows or polishes the
+  // whole map: it gets the whole-map compaction stages, and every layout it
+  // publishes, its plan included, ends at the cheap compaction fixed point.
+  // New-room placement keeps its low-latency path without either.
+  const fullyResident = topologyFullyResident(request);
+  const finishesLayouts = request.allowExistingMoves !== false && fullyResident;
+  const finishLayout = (value: Candidate): Candidate => finishCompaction(
+    value,
+    current,
+    residents,
+    request.edges,
+    request.centerId,
+    undefined,
+    acceptsPositions,
+  );
   const quickCrossingContext = request.allowExistingMoves === false
     ? undefined
     : crossingRepairContext(
@@ -8131,10 +9195,11 @@ export function planIntegralLayout(
       nodes,
       request.edges,
       request.centerId,
-      request.nodes.length === 0,
+      fullyResident,
       request.trace,
       { acceptsPositions },
       QUICK_CROSSING_WORK,
+      finishesLayouts ? finishLayout : undefined,
     );
   const repairAdoptedCrossings = (value: Candidate): Candidate =>
     quickCrossingContext ? quickCrossingRepair(value, quickCrossingContext) : value;
@@ -8180,16 +9245,14 @@ export function planIntegralLayout(
       // established/current component merely to win on footprint.
       const endpoint = repaired?.endpoint;
       const improvesPrimary = endpoint &&
-        candidateRayQuality(endpoint).cardinalRayViolations <
-          candidateRayQuality(seed).cardinalRayViolations;
+        rayQualityScore(candidateRayQuality(endpoint)) < rayQualityScore(candidateRayQuality(seed));
       if (endpoint && (seed === repairSeed || improvesPrimary)) {
         cardinalRepairs.push(endpoint);
         collisionFree.push(endpoint);
       }
       const publicBest = repaired?.publicBest;
       const publicImprovesPrimary = publicBest &&
-        candidateRayQuality(publicBest).cardinalRayViolations <
-          candidateRayQuality(seed).cardinalRayViolations;
+        candidateQualityScore(publicBest) < candidateQualityScore(seed);
       if (publicBest && (seed === repairSeed ||
         (publicBest !== seed && publicImprovesPrimary))) {
         cardinalPublicFallbacks.push(publicBest);
@@ -8257,7 +9320,15 @@ export function planIntegralLayout(
   // New-room placement already performs its own local repair. The group pass
   // is a final whole-map reflow/constraint-polish stage and is intentionally
   // reserved for requests whose topology is already fully resident.
-  const axisCompactedRaw = request.allowExistingMoves === false || request.nodes.length > 0
+  const runsAxisGroups = request.allowExistingMoves !== false && fullyResident &&
+    control.axisGroupCompaction !== false;
+  // The group pass can take far longer than everything before it, so a caller
+  // watching the plan is shown the layout as it stands first, finished.
+  const preview = runsAxisGroups && request.trace ? finishLayout(vacuumed) : undefined;
+  if (preview) {
+    request.trace?.({ type: "preview", stage: "axis-compaction", candidate: traceCandidate(preview) });
+  }
+  const axisCompactedRaw = !runsAxisGroups
     ? vacuumed
     : axisGroupCompaction(
       vacuumed,
@@ -8300,14 +9371,27 @@ export function planIntegralLayout(
     selected = publicFrontier;
     selectedNeedsFullCompaction = true;
   }
+  // The quick crossing repair's best layout may already be published, and a
+  // plan never ranks below a layout it published.
+  if (quickCrossingContext && comparePublicCandidates(quickCrossingContext.best, selected) > 0) {
+    selected = quickCrossingContext.best;
+    selectedNeedsFullCompaction = true;
+  }
 
-  const compactSelected = (base: Candidate): Candidate => {
+  const compactSelected = (
+    base: Candidate,
+    trace: IntegralLayoutRequest["trace"] = request.trace,
+  ): Candidate => {
     const seedPlan: IntegralLayoutPlan = {
       positions: base.positions,
       movedExisting: candidateMovedExisting(base),
       quality: candidateQuality(base),
     };
-    const plan = compactIntegralLayoutPlan(request, seedPlan, { acceptsPositions });
+    const plan = compactIntegralLayoutPlan(
+      trace === request.trace ? request : { ...request, trace },
+      seedPlan,
+      { acceptsPositions, axisGroupCompaction: control.axisGroupCompaction },
+    );
     if (plan === seedPlan) return base;
     const result = candidate(new Map(plan.positions), current, request.edges);
     result.score.collisions = 0;
@@ -8319,7 +9403,7 @@ export function planIntegralLayout(
   // public fallback, however, must receive the entire transaction because it
   // bypassed the earlier compactor. Otherwise an immediate `nf reflow` can
   // visibly compact the plan we just returned.
-  if (request.allowExistingMoves !== false && request.nodes.length === 0) {
+  if (finishesLayouts) {
     if (selectedNeedsFullCompaction) {
       const compacted = repairAdoptedCrossings(compactSelected(selected));
       if (compareCompactionCandidates(compacted, selected) > 0) selected = compacted;
@@ -8356,7 +9440,24 @@ export function planIntegralLayout(
       const compacted = repairAdoptedCrossings(compactSelected(selected));
       if (compareCompactionCandidates(compacted, selected) > 0) selected = compacted;
     }
+
+    // A quick crossing transaction can be selected after the ordinary axis
+    // closure. Pay for one trace-silent fixed-point compaction only when that
+    // lane actually published an improvement; the common no-crossing-change
+    // path avoids another expensive whole-area axis pass.
+    if ((quickCrossingContext?.improvements ?? 0) > 0) {
+      const postCrossingCompacted = compactSelected(selected, undefined);
+      if (compareCompactionCandidates(postCrossingCompacted, selected) > 0) {
+        selected = postCrossingCompacted;
+      }
+    }
   }
+  if (quickCrossingContext && comparePublicCandidates(quickCrossingContext.best, selected) > 0) {
+    selected = quickCrossingContext.best;
+  }
+  if (preview && comparePublicCandidates(preview, selected) > 0) selected = preview;
+  // The plan ends at the same fixed point as every layout published before it.
+  if (finishesLayouts) selected = finishLayout(selected);
   if (quickCrossingContext) {
     refreshCandidateQuality(quickCrossingContext.best);
     publishCrossingProgress(quickCrossingContext, "complete", true);
@@ -8387,8 +9488,64 @@ export function planIntegralLayout(
 }
 
 /**
+ * One deep crossing transaction as the repair publishes it. Raw bridge pushes
+ * can leave passages of any width, which a later transaction may still need,
+ * so the search keeps the raw layout and only the published copy is compacted:
+ * once per strict global improvement, never per frontier state.
+ */
+function settleDeepCrossingLayout(
+  value: Candidate,
+  request: IntegralLayoutRequest,
+  current: ReadonlyMap<string, GridPosition>,
+  residents: ReadonlyMap<string, LayoutResident>,
+  control: CrossingRepairControl,
+): Candidate {
+  let cancelled = false;
+  const shouldCancel = (): boolean => {
+    cancelled ||= control.shouldCancel?.() === true;
+    return cancelled;
+  };
+  const seed: IntegralLayoutPlan = {
+    positions: value.positions,
+    movedExisting: candidateMovedExisting(value),
+    quality: refreshCandidateQuality(value),
+  };
+  let compacted: IntegralLayoutPlan | undefined;
+  try {
+    compacted = compactIntegralLayoutPlan({ ...request, trace: undefined }, seed, {
+      acceptsPositions: control.acceptsPositions,
+      axisGroupCompaction: control.axisGroupCompaction,
+      shouldCancel,
+    });
+  } catch {
+    // Compaction is cleanup: its failure leaves the cheap fixed point below.
+  }
+  if (!compacted || cancelled) {
+    return finishCompaction(
+      value,
+      current,
+      residents,
+      request.edges,
+      request.centerId,
+      undefined,
+      control.acceptsPositions,
+    );
+  }
+  if (compacted === seed) return value;
+  const result = candidate(new Map(compacted.positions), current, request.edges);
+  result.score.collisions = 0;
+  result.score.quality = { ...compacted.quality };
+  return detachedCandidate(result);
+}
+
+/**
  * Deterministic recursive crossing repair for the deep/ephemeral Worker lane.
  * The synchronous planner uses only its separately bounded quick checkpoints.
+ * The search goes on from raw transactions, while each layout it publishes,
+ * and so the plan it returns, is that transaction at the fixed point of a
+ * trace-silent `compactIntegralLayoutPlan` under `control.acceptsPositions`:
+ * a layout it streams is one compaction leaves as it is. A compaction that
+ * `control.shouldCancel` cuts short leaves the cheap fixed point instead.
  */
 export function repairIntegralLayoutCrossingsDeep(
   request: IntegralLayoutRequest,
@@ -8448,32 +9605,35 @@ export function repairIntegralLayoutCrossingsDeep(
     nodes,
     request.edges,
     request.centerId,
-    request.nodes.length === 0,
+    topologyFullyResident(request),
     request.trace,
     control,
     10_000,
+    (value) => settleDeepCrossingLayout(value, request, current, residents, control),
   );
   deepCrossingRepair(seedCandidate, context, 1);
-  const finalQuality = refreshCandidateQuality(context.best);
+  // Every layout the repair published is finished, and it returns the last.
+  const result = context.published;
+  const finalQuality = refreshCandidateQuality(result);
   publishCrossingProgress(context, "complete", true);
 
-  const improved = context.best !== seedCandidate;
+  const improved = result !== seedCandidate;
   const routeAmendments = computeRouteAmendments(
-    context.best.positions,
+    result.positions,
     request.edges,
     residents,
     finalQuality,
   );
   const plan = improved
     ? {
-      positions: context.best.positions,
-      movedExisting: candidateMovedExisting(context.best),
+      positions: result.positions,
+      movedExisting: candidateMovedExisting(result),
       quality: finalQuality,
       constraintRepair: seed.constraintRepair,
       ...(routeAmendments ? { routeAmendments } : {}),
     }
     : seed;
-  const solved = candidateLinkCrossings(context.best) === 0;
+  const solved = candidateLinkCrossings(context.best) === 0 || candidateLinkCrossings(result) === 0;
   return {
     plan,
     completed: solved || (!context.cancelled && !context.exhausted),
@@ -8491,7 +9651,38 @@ export function planIntegralLayoutAsync(
   request: IntegralLayoutRequest,
   options: IntegralLayoutAsyncOptions = {},
 ): Promise<IntegralLayoutPlan> {
-  if (options.currentQuality) return planIntegralLayoutInWorker(request, options);
+  return planIntegralLayoutOn(undefined, request, options);
+}
+
+/**
+ * Plans as `planIntegralLayoutAsync` does, on Workers of its own instead of
+ * the shared ones: a long search neither waits behind other planning nor
+ * holds it up. `close` ends its Workers and any planning still running.
+ */
+export interface LayoutPlanner {
+  planIntegral(
+    request: IntegralLayoutRequest,
+    options?: IntegralLayoutAsyncOptions,
+  ): Promise<IntegralLayoutPlan>;
+  close(): void;
+}
+
+/** A planner whose Workers start when it first plans and end when it closes. */
+export function createLayoutPlanner(): LayoutPlanner {
+  const client = createLayoutWorkerClient();
+  return {
+    planIntegral: (request, options = {}) => planIntegralLayoutOn(client, request, options),
+    close: () => client.terminate(new Error("map-layout planner was closed")),
+  };
+}
+
+/** Plans on `client`'s Workers, the shared ones when undefined, measuring the current quality if not given. */
+function planIntegralLayoutOn(
+  client: LayoutWorkerClient | undefined,
+  request: IntegralLayoutRequest,
+  options: IntegralLayoutAsyncOptions,
+): Promise<IntegralLayoutPlan> {
+  if (options.currentQuality) return planIntegralLayoutInWorker(request, options, client);
   const residentPositions = new Map(
     request.residents.map((resident) => [resident.id, {
       x: Math.round(resident.position.x),
@@ -8505,5 +9696,5 @@ export function planIntegralLayoutAsync(
   return planIntegralLayoutInWorker(request, {
     ...options,
     currentQuality: measureIntegralLayoutQuality(residentPositions, currentEdges),
-  });
+  }, client);
 }

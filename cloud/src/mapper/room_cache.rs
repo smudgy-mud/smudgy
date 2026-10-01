@@ -1,9 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use ordered_float::OrderedFloat;
 
 use crate::{
-    ExitDirection, ExitId, Property, RoomNumber, RoomUpdates, RoomWithDetails,
+    AreaId, ExitDirection, ExitId, Property, RoomNumber, RoomUpdates, RoomWithDetails,
     mapper::{RoomKey, exit_cache::ExitCache},
     parse_css_color,
 };
@@ -313,19 +313,28 @@ impl RoomCache {
         }
     }
 
-    /// Returns a copy with every exit whose destination is `target` reset to
-    /// no destination, or `None` when no exit pointed there. Mirrors the
-    /// server's inbound-exit cascade when `target` is deleted. Redacted
+    /// Whether `exit` leads to one of `numbers` in `area`.
+    pub(crate) fn exit_leads_into(
+        exit: &ExitCache,
+        area: AreaId,
+        numbers: &HashSet<RoomNumber>,
+    ) -> bool {
+        exit.to_area_id == Some(area)
+            && exit
+                .to_room_number
+                .is_some_and(|number| numbers.contains(&number))
+    }
+
+    /// Returns a copy with every exit leading to one of `numbers` in `area`
+    /// reset to no destination, or `None` when no exit led there. Mirrors the
+    /// server's inbound-exit cascade when those rooms are deleted. Redacted
     /// (`to_unknown`) destinations never match — their `to_*` fields are
     /// already `None` — so they are left intact. The visible-exit bitfield is
     /// unchanged: clearing a destination touches neither `from_direction` nor
     /// `is_hidden`.
     #[must_use]
-    pub fn null_exits_to(&self, target: &RoomKey) -> Option<Self> {
-        let points_to = |exit: &ExitCache| {
-            exit.to_area_id == Some(target.area_id)
-                && exit.to_room_number == Some(target.room_number)
-        };
+    pub fn null_exits_into(&self, area: AreaId, numbers: &HashSet<RoomNumber>) -> Option<Self> {
+        let points_to = |exit: &ExitCache| Self::exit_leads_into(exit, area, numbers);
         if !self.exits.iter().any(points_to) {
             return None;
         }

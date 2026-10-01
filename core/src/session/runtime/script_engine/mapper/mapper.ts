@@ -169,6 +169,8 @@ interface CreateAreaOptions {
      * Use `storage: "session"` instead.
      */
     ephemeral?: boolean;
+    /** Area properties the new map starts with, as `area.data()` reads them (at most 256). */
+    properties?: Record<string, string>;
 }
 
 type MapStorage = "session" | "local" | "cloud";
@@ -248,6 +250,24 @@ function hydrateRooms(refs: [AreaId, RoomNumber][]): Room[] {
     return rooms;
 }
 
+/** Check `createArea`'s initial properties before anything is created. Every own value must
+ * be a string: an `undefined` value is refused rather than dropped, so a map never starts
+ * without a property its caller meant to give it. */
+function propertiesForOp(properties: Record<string, string> | undefined) {
+    if (properties === undefined) return undefined;
+    if (typeof properties !== "object" || properties === null || Array.isArray(properties)) {
+        throw new TypeError("expected createArea properties as an object of strings");
+    }
+    for (const [name, value] of Object.entries(properties)) {
+        if (typeof value !== "string") {
+            throw new TypeError(
+                `expected createArea property ${JSON.stringify(name)} as a string, got ${typeof value}`,
+            );
+        }
+    }
+    return properties;
+}
+
 function destinationForOp(destination: MapDestination) {
     return {
         storage: destination.storage,
@@ -280,6 +300,7 @@ const mapper = {
             storage: options?.storage,
             atlas_id: atlasIdOf(options?.atlas),
             ephemeral: options?.ephemeral,
+            properties: propertiesForOp(options?.properties),
         });
         return new Area(id);
     },

@@ -27,6 +27,7 @@ import {
   type IntegralLayoutWireOptions,
   type IntegralLayoutWireRequest,
   type IntegralLayoutWorkerSuccess,
+  type LayoutWorkerExecutionDiagnostics,
   type LayoutWorkerRequest,
   type LayoutWorkerResponse,
   type ModelLayoutWorkerSuccess,
@@ -35,6 +36,7 @@ import {
   layoutPlannerState,
   type LayoutPlannerProgress,
   type LayoutPlannerSnapshot,
+  type LayoutPlannerTerminalReason,
 } from "./planner-state.ts";
 import { mutableLayoutPlannerState } from "./planner-state-internal.ts";
 
@@ -52,6 +54,87 @@ export interface LayoutWorkerLike {
 
 export type LayoutWorkerPurpose = "persistent" | "constraint-repair";
 export type LayoutWorkerFactory = (purpose?: LayoutWorkerPurpose) => LayoutWorkerLike;
+
+export type LayoutWorkerDisposition = "retained" | "retired";
+
+export interface LayoutWorkerClientDiagnostics extends LayoutWorkerExecutionDiagnostics {
+  requestId: number;
+  operation: LayoutWorkerRequest["operation"];
+  purpose: LayoutWorkerPurpose;
+  workerDisposition: LayoutWorkerDisposition;
+}
+
+export interface LayoutWorkerClientOptions {
+  /** Retire a warm, idle repair isolate after this delay. */
+  repairIdleTimeoutMs?: number;
+  /** Retire a completed repair isolate after it inspects this many separator states. */
+  heavyRepairStateThreshold?: number;
+  /** Receives map-free terminal accounting; observer failures are ignored. */
+  onDiagnostics?: (diagnostics: Readonly<LayoutWorkerClientDiagnostics>) => void;
+}
+
+export type LayoutWorkerDiagnosticsSubscriber = (
+  diagnostics: Readonly<LayoutWorkerClientDiagnostics>,
+) => void;
+
+export interface LayoutWorkerDiagnosticsHandle {
+  readonly value: Readonly<LayoutWorkerClientDiagnostics> | undefined;
+  subscribe(subscriber: LayoutWorkerDiagnosticsSubscriber): () => void;
+}
+
+class MutableLayoutWorkerDiagnostics implements LayoutWorkerDiagnosticsHandle {
+  #value: Readonly<LayoutWorkerClientDiagnostics> | undefined;
+  readonly #subscribers = new Set<LayoutWorkerDiagnosticsSubscriber>();
+
+  get value(): Readonly<LayoutWorkerClientDiagnostics> | undefined {
+    return this.#value;
+  }
+
+  subscribe(subscriber: LayoutWorkerDiagnosticsSubscriber): () => void {
+    this.#subscribers.add(subscriber);
+    if (this.#value) {
+      try {
+        subscriber(this.#value);
+      } catch {
+        // Retained observability cannot affect layout work.
+      }
+    }
+    return () => this.#subscribers.delete(subscriber);
+  }
+
+  publish(diagnostics: LayoutWorkerClientDiagnostics): void {
+    this.#value = Object.freeze({
+      ...diagnostics,
+      ...(diagnostics.stageMs
+        ? { stageMs: Object.freeze({ ...diagnostics.stageMs }) }
+        : {}),
+      ...(diagnostics.memory ? { memory: Object.freeze({
+        ...diagnostics.memory,
+        start: Object.freeze({ ...diagnostics.memory.start }),
+        end: Object.freeze({ ...diagnostics.memory.end }),
+        peak: Object.freeze({ ...diagnostics.memory.peak }),
+      }) } : {}),
+    });
+    for (const subscriber of this.#subscribers) {
+      try {
+        subscriber(this.#value);
+      } catch {
+        // Observability cannot fail or stall the scheduler.
+      }
+    }
+  }
+}
+
+const mutableLayoutWorkerDiagnostics = new MutableLayoutWorkerDiagnostics();
+/** Map-free terminal worker accounting for production diagnostics. */
+export const layoutWorkerDiagnostics: LayoutWorkerDiagnosticsHandle =
+  mutableLayoutWorkerDiagnostics;
+
+export interface IntegralConstraintRepairControlOptions extends LayoutWorkerControlOptions {
+  onProgress?: IntegralLayoutAsyncOptions["onProgress"];
+  currentQuality?: IntegralLayoutAsyncOptions["currentQuality"];
+  plannerContext?: IntegralLayoutAsyncOptions["plannerContext"];
+}
 
 type PersistentLayoutOperation = "integral" | "model";
 type ScheduledState = "queued" | "active" | "settled";
@@ -84,21 +167,20 @@ interface ScheduledConstraintRepair {
   requestTimeout?: ReturnType<typeof setTimeout>;
   repairTimeout?: ReturnType<typeof setTimeout>;
   hardTimeoutMs: number;
+  terminalReason?: LayoutPlannerTerminalReason;
+  terminal?: (reason: LayoutPlannerTerminalReason | undefined) => void;
   state: ScheduledState;
   resolve(result: IntegralLayoutPlan): void;
   reject(reason: unknown): void;
 }
 
 /**
- * How settling a repair leaves the repair-lane Worker. `retain` follows a
- * consumed terminal response: the Worker is idle and stays warm for the next
- * repair. `reclaim` covers every settle that abandons in-flight work — the
- * backstop, caller deadline or abort, transport failure, or malformed
- * traffic — where later messages from the abandoned job would collide with
- * the next repair, so the Worker is terminated and its successor starts
- * fresh.
+ * How settling a repair leaves the repair-lane Worker. `retain` keeps a small
+ * completed job warm, `retire` consumes a terminal response but drops a
+ * perfect/heavy isolate, and `reclaim` abandons in-flight work whose later
+ * messages could collide with the next repair.
  */
-type RepairWorkerDisposition = "retain" | "reclaim";
+type RepairWorkerDisposition = "retain" | "reclaim" | "retire";
 
 interface LayoutWorkerConstructor {
   new (specifier: string | URL, options: { type: "module"; name?: string }): LayoutWorkerLike;
@@ -118,6 +200,8 @@ const DEFAULT_CONSTRAINT_REPAIR_TIMEOUT_MS = 10_000;
 const CONSTRAINT_REPAIR_GRACE_FLOOR_MS = 2_000;
 const CONSTRAINT_REPAIR_GRACE_RATIO = 0.25;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+export const DEFAULT_REPAIR_WORKER_IDLE_TIMEOUT_MS = 15_000;
+export const DEFAULT_HEAVY_REPAIR_STATE_THRESHOLD = 32_768;
 let nextActivitySequence = 1;
 
 type CrossingRepairMode = "quick" | "deep";
@@ -172,6 +256,8 @@ class IntegralLayoutActivity {
     request: IntegralLayoutRequest,
     onProgress?: IntegralLayoutAsyncOptions["onProgress"],
     currentQuality?: IntegralLayoutAsyncOptions["currentQuality"],
+    operation: "integral" | "constraint-repair" = "integral",
+    plannerContext?: IntegralLayoutAsyncOptions["plannerContext"],
   ) {
     this.#onProgress = onProgress;
     this.#expectedIds = new Set([
@@ -182,13 +268,14 @@ class IntegralLayoutActivity {
     this.#snapshot = {
       sequence: nextActivitySequence++,
       status: "queued",
-      operation: "integral",
+      operation,
       phase: "queued",
       startedAt: Date.now(),
       elapsedMs: 0,
       nodes: request.nodes.length,
       residents: request.residents.length,
       edges: request.edges.length,
+      ...(plannerContext ? { context: Object.freeze({ ...plannerContext }) } : {}),
       work: {
         layoutsConsidered: 0,
         compactionAttempts: 0,
@@ -303,6 +390,16 @@ class IntegralLayoutActivity {
       this.#publish(improvement);
       return improvement;
     }
+    if (event.type === "preview") {
+      const improvement = this.#acceptedCandidate(event.candidate);
+      this.#snapshot = {
+        ...this.#snapshot,
+        phase: "preview",
+        bestQuality: this.#bestQuality(improvement?.quality),
+      };
+      this.#publish(improvement);
+      return improvement;
+    }
     if (event.type === "crossing-progress") {
       const crossingWork = this.#recordCrossingWork(event.mode, {
         crossingsConsidered: event.crossingsConsidered,
@@ -376,10 +473,20 @@ class IntegralLayoutActivity {
     }, plan);
   }
 
-  complete(plan: IntegralLayoutPlan): void {
+  complete(plan: IntegralLayoutPlan, fallbackReason?: LayoutPlannerTerminalReason): void {
+    const terminalReason = fallbackReason ?? this.#terminalReason(plan);
     this.#update({
       status: "completed",
-      phase: "complete",
+      phase: terminalReason === "fixed-point"
+        ? "complete: fixed point"
+        : terminalReason === "ceiling"
+        ? "complete: repair ceiling"
+        : terminalReason === "timeout"
+        ? "complete: repair timeout"
+        : terminalReason === "degraded"
+        ? "complete: standard fallback"
+        : "complete",
+      terminalReason,
       bestQuality: this.#bestQuality(plan.quality),
     });
   }
@@ -389,8 +496,25 @@ class IntegralLayoutActivity {
     this.#update({
       status: cancelled ? "cancelled" : "failed",
       phase: cancelled ? "cancelled" : "failed",
+      terminalReason: cancelled ? "cancelled" : "failed",
       message: error instanceof Error ? error.message : String(error),
     });
+  }
+
+  #terminalReason(plan: IntegralLayoutPlan): LayoutPlannerTerminalReason {
+    const report = plan.constraintRepair;
+    if (!report) return "completed";
+    if (report.cutoff === "time" || report.polishCutoff === "time") return "timeout";
+    if (report.extensionSearch.cancelled || report.crossingRepair.cancelled) return "cancelled";
+    // A repair that did not search reports no polish; it stopped at a work
+    // ceiling only when its cutoff says so.
+    if (report.outcome !== "searched") return report.cutoff === "none" ? "completed" : "ceiling";
+    if (report.constraintOptimal && report.geometricFixedPoint &&
+      report.cutoff === "none" && report.polishCutoff === "fixed-point" &&
+      report.crossingRepair.completed) return "fixed-point";
+    if (report.cutoff !== "none" || report.polishCutoff !== "fixed-point" ||
+      !report.crossingRepair.completed) return "ceiling";
+    return "completed";
   }
 
   #finishCrossingRun(mode: CrossingRepairMode): void {
@@ -580,8 +704,14 @@ function remainingTimeout(timeoutMs: number | undefined, startedAt: number): num
  */
 export class LayoutWorkerClient {
   readonly #factory: LayoutWorkerFactory;
+  readonly #repairIdleTimeoutMs: number;
+  readonly #heavyRepairStateThreshold: number;
+  readonly #onDiagnostics: LayoutWorkerClientOptions["onDiagnostics"];
   #worker: LayoutWorkerLike | null = null;
   #repairWorker: LayoutWorkerLike | null = null;
+  #repairIdleTimeout: ReturnType<typeof setTimeout> | undefined;
+  #closed = false;
+  #lastDiagnostics: LayoutWorkerClientDiagnostics | undefined;
   #nextRequestId = 1;
   readonly #usedRequestIds = new Set<number>();
   readonly #queue: ScheduledLayoutRequest[] = [];
@@ -589,8 +719,24 @@ export class LayoutWorkerClient {
   readonly #repairQueue: ScheduledConstraintRepair[] = [];
   #activeRepair: ScheduledConstraintRepair | undefined;
 
-  constructor(factory: LayoutWorkerFactory = defaultLayoutWorkerFactory) {
+  constructor(
+    factory: LayoutWorkerFactory = defaultLayoutWorkerFactory,
+    options: LayoutWorkerClientOptions = {},
+  ) {
     this.#factory = factory;
+    this.#repairIdleTimeoutMs = Math.max(
+      0,
+      options.repairIdleTimeoutMs ?? DEFAULT_REPAIR_WORKER_IDLE_TIMEOUT_MS,
+    );
+    this.#heavyRepairStateThreshold = Math.max(
+      0,
+      options.heavyRepairStateThreshold ?? DEFAULT_HEAVY_REPAIR_STATE_THRESHOLD,
+    );
+    this.#onDiagnostics = options.onDiagnostics;
+  }
+
+  get lastDiagnostics(): Readonly<LayoutWorkerClientDiagnostics> | undefined {
+    return this.#lastDiagnostics;
   }
 
   planIntegral(
@@ -599,8 +745,15 @@ export class LayoutWorkerClient {
   ): Promise<IntegralLayoutPlan> {
     const startedAt = performance.now();
     const { trace, ...wireRequest } = request;
-    const { signal, timeoutMs, onProgress, currentQuality, ...wireOptions } = options;
-    const activity = new IntegralLayoutActivity(request, onProgress, currentQuality);
+    const { signal, timeoutMs, onProgress, currentQuality, plannerContext, ...wireOptions } = options;
+    const activity = new IntegralLayoutActivity(
+      request,
+      onProgress,
+      currentQuality,
+      "integral",
+      plannerContext,
+    );
+    let terminalReason: LayoutPlannerTerminalReason | undefined;
     const cloneSafeOptions: IntegralLayoutWireOptions = wireOptions;
     const standard = this.#request(
       "integral",
@@ -634,9 +787,10 @@ export class LayoutWorkerClient {
           signal,
           timeoutMs: remainingTimeout(timeoutMs, startedAt),
         },
+        (reason) => terminalReason = reason,
       );
     }).then((result) => {
-      activity.complete(result);
+      activity.complete(result, terminalReason);
       return result;
     }, (error) => {
       activity.fail(error);
@@ -683,8 +837,50 @@ export class LayoutWorkerClient {
     );
   }
 
+  /**
+   * Schedule only the optional whole-layout repair stage around an already
+   * validated standard plan. This is the low-level entry point used by manual
+   * perfect-reflow commands without rerunning deterministic placement.
+   */
+  repairIntegral(
+    request: IntegralLayoutRequest,
+    standard: IntegralLayoutPlan,
+    options: NonNullable<IntegralLayoutWireOptions["constraintRepair"]>,
+    control: IntegralConstraintRepairControlOptions = {},
+  ): Promise<IntegralLayoutPlan> {
+    if (this.#closed) return Promise.reject(new Error("map-layout Worker client is shut down"));
+    const { trace, ...wireRequest } = request;
+    const { signal, timeoutMs, onProgress, currentQuality, plannerContext } = control;
+    const activity = new IntegralLayoutActivity(
+      request,
+      onProgress,
+      currentQuality,
+      "constraint-repair",
+      plannerContext,
+    );
+    activity.planning();
+    activity.standard(standard);
+    let terminalReason: LayoutPlannerTerminalReason | undefined;
+    return this.#repairIntegral(
+      wireRequest,
+      standard,
+      options,
+      trace,
+      (event) => activity.event(event),
+      { signal, timeoutMs },
+      (reason) => terminalReason = reason,
+    ).then((result) => {
+      activity.complete(result, terminalReason);
+      return result;
+    }, (error) => {
+      activity.fail(error);
+      throw error;
+    });
+  }
+
   /** Stop all current work. A later request lazily creates a fresh Worker. */
   terminate(reason: Error = new Error("map-layout Worker was terminated")): void {
+    this.#clearRepairIdleTimeout();
     const worker = this.#worker;
     if (worker) this.#retirePersistentWorker(worker);
     const repairWorker = this.#repairWorker;
@@ -704,6 +900,13 @@ export class LayoutWorkerClient {
     for (const repair of repairs) this.#finishRepair(repair, "failure", reason, false);
   }
 
+  /** Permanently close this scheduler and reject queued/active work. */
+  shutdown(reason: Error = new Error("map-layout Worker client was shut down")): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.terminate(reason);
+  }
+
   #request<T>(
     operation: PersistentLayoutOperation,
     createRequest: (id: number) => LayoutWorkerRequest,
@@ -712,6 +915,7 @@ export class LayoutWorkerClient {
     decode: (response: LayoutWorkerResponse) => T,
     control: LayoutWorkerControlOptions,
   ): Promise<T> {
+    if (this.#closed) return Promise.reject(new Error("map-layout Worker client is shut down"));
     const signal = control.signal;
     if (signal?.aborted) return Promise.reject(abortReason(signal));
     if (control.timeoutMs !== undefined && control.timeoutMs <= 0) {
@@ -822,6 +1026,7 @@ export class LayoutWorkerClient {
       );
       return;
     }
+    this.#recordDiagnostics(value.diagnostics, value.id, value.operation, "persistent", "retained");
 
     if (!value.ok) {
       try {
@@ -881,6 +1086,29 @@ export class LayoutWorkerClient {
     }
   }
 
+  #recordDiagnostics(
+    diagnostics: LayoutWorkerExecutionDiagnostics,
+    requestId: number,
+    operation: LayoutWorkerRequest["operation"],
+    purpose: LayoutWorkerPurpose,
+    workerDisposition: LayoutWorkerDisposition,
+  ): void {
+    const value: LayoutWorkerClientDiagnostics = {
+      ...diagnostics,
+      requestId,
+      operation,
+      purpose,
+      workerDisposition,
+    };
+    this.#lastDiagnostics = value;
+    mutableLayoutWorkerDiagnostics.publish(value);
+    try {
+      this.#onDiagnostics?.(value);
+    } catch {
+      // Observability cannot fail or stall the scheduler.
+    }
+  }
+
   #finish(
     request: ScheduledLayoutRequest,
     succeeded: boolean,
@@ -910,7 +1138,9 @@ export class LayoutWorkerClient {
     trace: ((event: LayoutTraceEvent) => void) | undefined,
     progress: ((event: LayoutTraceEvent) => IntegralLayoutPlan | undefined) | undefined,
     control: LayoutWorkerControlOptions,
+    terminal?: (reason: LayoutPlannerTerminalReason | undefined) => void,
   ): Promise<IntegralLayoutPlan> {
+    if (this.#closed) return Promise.reject(new Error("map-layout Worker client is shut down"));
     const signal = control.signal;
     if (signal?.aborted) return Promise.reject(abortReason(signal));
     // Repair is optional polish over an already-delivered standard plan. A
@@ -918,10 +1148,16 @@ export class LayoutWorkerClient {
     // lane's own deadline posture: the retained plan resolves rather than
     // rejecting completed work. Explicit aborts still reject above.
     if (control.timeoutMs !== undefined && control.timeoutMs <= 0) {
+      terminal?.("timeout");
       return Promise.resolve(standard);
     }
-    const hardTimeoutMs = options.maxDurationMs ?? DEFAULT_CONSTRAINT_REPAIR_TIMEOUT_MS;
-    if (hardTimeoutMs <= 0) return Promise.resolve(standard);
+    // A budget that is not positive still reaches the Worker, which reports
+    // "no-budget" the way it reports every other repair it does not search;
+    // its backstop keeps the full grace.
+    const hardTimeoutMs = Math.max(
+      0,
+      options.maxDurationMs ?? DEFAULT_CONSTRAINT_REPAIR_TIMEOUT_MS,
+    );
 
     const id = this.#allocateRequestId();
     return new Promise<IntegralLayoutPlan>((resolve, reject) => {
@@ -934,6 +1170,7 @@ export class LayoutWorkerClient {
         progress,
         signal,
         hardTimeoutMs,
+        terminal,
         state: "queued",
         resolve,
         reject,
@@ -946,7 +1183,10 @@ export class LayoutWorkerClient {
         // Caller-deadline expiry mid-repair keeps already-computed work: the
         // best validated streamed improvement or the retained standard plan.
         scheduled.requestTimeout = setTimeout(
-          () => this.#finishRepair(scheduled, "standard"),
+          () => {
+            scheduled.terminalReason = "timeout";
+            this.#finishRepair(scheduled, "standard");
+          },
           timerDelay(control.timeoutMs),
         );
       }
@@ -958,12 +1198,16 @@ export class LayoutWorkerClient {
   #pumpRepair(): void {
     if (this.#activeRepair) return;
     const repair = this.#repairQueue.shift();
-    if (!repair) return;
+    if (!repair) {
+      this.#scheduleRepairIdleRetirement();
+      return;
+    }
 
     let worker: LayoutWorkerLike;
     try {
       worker = this.#ensureRepairWorker();
     } catch {
+      repair.terminalReason = "degraded";
       this.#finishRepair(repair, "standard");
       return;
     }
@@ -972,7 +1216,10 @@ export class LayoutWorkerClient {
     this.#activeRepair = repair;
     if (Number.isFinite(repair.hardTimeoutMs)) {
       repair.repairTimeout = setTimeout(
-        () => this.#finishRepair(repair, "standard"),
+        () => {
+          repair.terminalReason = "timeout";
+          this.#finishRepair(repair, "standard");
+        },
         timerDelay(constraintRepairBackstopDelayMs(repair.hardTimeoutMs)),
       );
     }
@@ -990,6 +1237,7 @@ export class LayoutWorkerClient {
         options: repair.options,
       } satisfies LayoutWorkerRequest);
     } catch {
+      repair.terminalReason = "degraded";
       this.#finishRepair(repair, "standard");
     }
   }
@@ -1002,6 +1250,7 @@ export class LayoutWorkerClient {
    * repair starts a fresh Worker.
    */
   #ensureRepairWorker(): LayoutWorkerLike {
+    this.#clearRepairIdleTimeout();
     if (this.#repairWorker) return this.#repairWorker;
     const worker = this.#factory("constraint-repair");
     this.#repairWorker = worker;
@@ -1044,10 +1293,20 @@ export class LayoutWorkerClient {
       this.#failRepairWorker(worker);
       return;
     }
+    const disposition = this.#repairDisposition(repair, value.diagnostics);
+    this.#recordDiagnostics(
+      value.diagnostics,
+      value.id,
+      value.operation,
+      "constraint-repair",
+      disposition === "retain" ? "retained" : "retired",
+    );
     if (!value.ok) {
       // The Worker caught and serialized a repair failure itself; it is idle
-      // and healthy, so the retained plan resolves and the Worker stays warm.
-      this.#finishRepair(repair, "standard", undefined, true, "retain");
+      // and healthy; ordinary jobs may stay warm, while perfect/heavy jobs are
+      // retired to release the isolate's high-water heap.
+      repair.terminalReason = "degraded";
+      this.#finishRepair(repair, "standard", undefined, true, disposition);
       return;
     }
     let repaired: IntegralLayoutPlan;
@@ -1056,7 +1315,8 @@ export class LayoutWorkerClient {
         (value as ConstraintRepairWorkerSuccess).result,
       );
     } catch {
-      this.#finishRepair(repair, "standard", undefined, true, "retain");
+      repair.terminalReason = "degraded";
+      this.#finishRepair(repair, "standard", undefined, true, "retire");
       return;
     }
     try {
@@ -1064,7 +1324,7 @@ export class LayoutWorkerClient {
         for (const event of value.traceEvents) repair.trace(event);
       }
     } catch (error) {
-      this.#finishRepair(repair, "failure", error, true, "retain");
+      this.#finishRepair(repair, "failure", error, true, disposition);
       return;
     }
     this.#finishRepair(
@@ -1072,20 +1332,46 @@ export class LayoutWorkerClient {
       "success",
       repaired.constraintRepair ? repaired : repair.standard,
       true,
-      "retain",
+      disposition,
     );
+  }
+
+  #repairDisposition(
+    repair: ScheduledConstraintRepair,
+    diagnostics: Readonly<LayoutWorkerExecutionDiagnostics>,
+  ): RepairWorkerDisposition {
+    const deterministicLimits = [
+      repair.hardTimeoutMs,
+      repair.options.maxRestarts,
+      repair.options.maxLayouts,
+      repair.options.maxPolishTournaments,
+      repair.options.maxPolishPasses,
+      repair.options.maxExtensionStates,
+      repair.options.maxLiveSearchNodes,
+      repair.options.maxMaskDiversifications,
+      repair.options.maxCrossingWork,
+    ];
+    const perfect = deterministicLimits.some((limit) => limit !== undefined &&
+      !Number.isFinite(limit));
+    return perfect || diagnostics.inspectedStates >= this.#heavyRepairStateThreshold
+      ? "retire"
+      : "retain";
   }
 
   #failRepairWorker(worker: LayoutWorkerLike): void {
     if (this.#repairWorker !== worker) return;
     this.#retireRepairWorker(worker);
     const active = this.#activeRepair;
-    if (active) this.#finishRepair(active, "standard");
+    if (active) {
+      active.terminalReason = "degraded";
+      this.#finishRepair(active, "standard");
+    }
     else this.#pumpRepair();
   }
 
   #retireRepairWorker(worker: LayoutWorkerLike): void {
     if (this.#repairWorker !== worker) return;
+    this.#clearRepairIdleTimeout();
     this.#repairWorker = null;
     worker.onmessage = null;
     worker.onmessageerror = null;
@@ -1097,7 +1383,27 @@ export class LayoutWorkerClient {
     }
   }
 
+  #scheduleRepairIdleRetirement(): void {
+    this.#clearRepairIdleTimeout();
+    const worker = this.#repairWorker;
+    if (!worker || this.#activeRepair || this.#repairQueue.length || this.#closed) return;
+    this.#repairIdleTimeout = setTimeout(() => {
+      this.#repairIdleTimeout = undefined;
+      if (this.#repairWorker === worker && !this.#activeRepair && !this.#repairQueue.length) {
+        this.#retireRepairWorker(worker);
+      }
+    }, timerDelay(this.#repairIdleTimeoutMs));
+    (this.#repairIdleTimeout as unknown as { unref?: () => void }).unref?.();
+  }
+
+  #clearRepairIdleTimeout(): void {
+    if (this.#repairIdleTimeout === undefined) return;
+    clearTimeout(this.#repairIdleTimeout);
+    this.#repairIdleTimeout = undefined;
+  }
+
   #cancelRepair(repair: ScheduledConstraintRepair, reason: unknown): void {
+    repair.terminalReason = "cancelled";
     this.#finishRepair(repair, "failure", reason);
   }
 
@@ -1109,7 +1415,7 @@ export class LayoutWorkerClient {
     disposition: RepairWorkerDisposition = "reclaim",
   ): void {
     if (repair.state === "settled") return;
-    const abandonsActiveWork = this.#activeRepair === repair && disposition === "reclaim";
+    const activeWorkerMustRetire = this.#activeRepair === repair && disposition !== "retain";
     if (this.#activeRepair === repair) this.#activeRepair = undefined;
     else if (repair.state === "queued") {
       const index = this.#repairQueue.indexOf(repair);
@@ -1122,16 +1428,16 @@ export class LayoutWorkerClient {
     if (repair.requestTimeout !== undefined) clearTimeout(repair.requestTimeout);
     if (repair.repairTimeout !== undefined) clearTimeout(repair.repairTimeout);
     this.#usedRequestIds.delete(repair.id);
-    // A settle that consumed the Worker's terminal response leaves it idle
-    // and warm for the next repair. Abandoning active work instead reclaims
-    // the Worker: the abandoned job's later messages would collide with the
-    // next repair, so its successor must start fresh.
-    if (abandonsActiveWork) {
+    // Abandoned work must be reclaimed before a queued successor starts.
+    // Completed perfect/heavy work is also retired here, after its terminal
+    // response was consumed, to return the isolate's high-water heap.
+    if (activeWorkerMustRetire) {
       const worker = this.#repairWorker;
       if (worker) this.#retireRepairWorker(worker);
     }
 
     if (pump) this.#pumpRepair();
+    repair.terminal?.(repair.terminalReason);
     if (outcome === "failure") repair.reject(value);
     else if (outcome === "success") {
       const result = value as IntegralLayoutPlan;
@@ -1166,11 +1472,18 @@ function getSharedLayoutWorkerClient(): LayoutWorkerClient {
   return sharedClient ??= new LayoutWorkerClient(sharedFactory);
 }
 
+/** A client with Workers of its own, which start when it first plans and end when it terminates. */
+export function createLayoutWorkerClient(): LayoutWorkerClient {
+  return new LayoutWorkerClient(sharedFactory);
+}
+
+/** Plans on `client`'s Workers, the shared ones by default. */
 export function planIntegralLayoutInWorker(
   request: IntegralLayoutRequest,
   options: IntegralLayoutAsyncOptions = {},
+  client: LayoutWorkerClient = getSharedLayoutWorkerClient(),
 ): Promise<IntegralLayoutPlan> {
-  return getSharedLayoutWorkerClient().planIntegral(request, options);
+  return client.planIntegral(request, options);
 }
 
 export function planLayoutModelInWorker(
@@ -1182,9 +1495,30 @@ export function planLayoutModelInWorker(
   return getSharedLayoutWorkerClient().planModel(model, change, options, control);
 }
 
+export function repairIntegralLayoutInWorker(
+  request: IntegralLayoutRequest,
+  standard: IntegralLayoutPlan,
+  options: NonNullable<IntegralLayoutWireOptions["constraintRepair"]>,
+  control: IntegralConstraintRepairControlOptions = {},
+): Promise<IntegralLayoutPlan> {
+  return getSharedLayoutWorkerClient().repairIntegral(request, standard, options, control);
+}
+
+/**
+ * Stop and forget the shared schedulers. A future request creates fresh
+ * Workers, which lets mapper/package shutdown release isolate memory without
+ * preventing a later restart.
+ */
+export function shutdownLayoutWorkers(
+  reason: Error = new Error("map-layout shared Workers were shut down"),
+): void {
+  const client = sharedClient;
+  sharedClient = undefined;
+  client?.shutdown(reason);
+}
+
 /** Replace the shared transport in Node tests without exposing it from index.ts. */
 export function setLayoutWorkerFactoryForTesting(factory?: LayoutWorkerFactory): void {
-  sharedClient?.terminate(new Error("map-layout Worker test factory changed"));
-  sharedClient = undefined;
+  shutdownLayoutWorkers(new Error("map-layout Worker test factory changed"));
   sharedFactory = factory ?? defaultLayoutWorkerFactory;
 }

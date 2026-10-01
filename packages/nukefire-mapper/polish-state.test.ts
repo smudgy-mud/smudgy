@@ -1,242 +1,126 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  AREA_POLISH_AUTOMATIC_EFFORT,
   AREA_POLISH_EXHAUSTED_FINGERPRINT_PROPERTY,
   AREA_POLISH_MEMO_SCHEMA_VERSION,
   AREA_POLISH_PENDING_PROPERTY,
   AREA_POLISH_PENDING_VALUE,
+  AREA_POLISH_PERFECT_EFFORT,
+  AREA_POLISH_RETRY_COOLDOWN_MS,
+  AREA_POLISH_SEAMS_PROPERTY,
   AREA_POLISH_SEARCH_GENERATION,
   AreaPolishEntryTracker,
+  areaPolishEligibility,
   areaPolishMemo,
   areaPolishMemoPropertyValue,
+  areaPolishNeedsContextEvaluation,
   areaPolishPending,
+  areaPolishSeams,
+  areaPolishSeamsPropertyValue,
+  areaPolishTerminalReason,
   createAreaPolishPlanningContext,
   equivalentSnapshotPayloads,
   MAX_AREA_POLISH_MEMO_CONTEXTS,
+  MAX_AREA_POLISH_SEAMS,
   MAX_FRUITLESS_QUIET_RESUMES,
   polishExhaustedFingerprint,
+  polishNotSearchedReason,
   polishRetrySuppressed,
   QuietPolishClaims,
   QuietResumeBudget,
   reduceAreaPolishMemo,
+  reduceAreaPolishSeams,
   reduceAreaPolishState,
   reportsCeilingExhaustion,
+  reportsUnsearchableGeometry,
   type AreaPolishEvent,
   type AreaPolishMemo,
   type AreaPolishPlanningContext,
   type AreaPolishReport,
+  type AreaPolishSettlement,
 } from "./polish-state.ts";
 
-test("the durable properties have package-owned representations", () => {
+test("durable names stay compatible while schema and search versions are independent", () => {
   assert.equal(AREA_POLISH_PENDING_PROPERTY, "nukefire.layout.polish-pending");
-  assert.equal(AREA_POLISH_PENDING_VALUE, "true");
   assert.equal(
     AREA_POLISH_EXHAUSTED_FINGERPRINT_PROPERTY,
     "nukefire.layout.polish-exhausted-fingerprint",
   );
+  assert.equal(AREA_POLISH_PENDING_VALUE, "true");
+  assert.equal(AREA_POLISH_MEMO_SCHEMA_VERSION, 3);
+  assert.equal(AREA_POLISH_SEARCH_GENERATION, 2);
+  assert.equal(AREA_POLISH_AUTOMATIC_EFFORT, 1);
+  assert.equal(AREA_POLISH_PERFECT_EFFORT, 2);
+  assert.equal(MAX_AREA_POLISH_MEMO_CONTEXTS, 32);
   assert.equal(areaPolishPending(undefined), false);
   assert.equal(areaPolishPending(""), false);
   assert.equal(areaPolishPending("pending"), false);
-  assert.equal(areaPolishPending(" TRUE "), true);
+  assert.equal(areaPolishPending(" TRUE "), true, "legacy true remains pending");
   assert.equal(polishExhaustedFingerprint(undefined), undefined);
   assert.equal(polishExhaustedFingerprint(""), undefined);
   assert.equal(polishExhaustedFingerprint("  "), undefined);
   assert.equal(polishExhaustedFingerprint("[fp]"), "[fp]");
-  assert.equal(AREA_POLISH_MEMO_SCHEMA_VERSION, 2);
-  assert.equal(AREA_POLISH_SEARCH_GENERATION, 1);
-  assert.equal(MAX_AREA_POLISH_MEMO_CONTEXTS, 32);
 });
 
-function planningContext(overrides: {
-  geometryFingerprint?: string;
-  centerId?: string;
+function context(overrides: {
+  geometry?: string;
+  center?: string;
   chartX?: number;
-  edgeVectorX?: number;
-  perfect?: boolean;
   maxLayouts?: number;
-  maxPolishPasses?: number;
+  generation?: number;
+  effort?: number;
 } = {}): AreaPolishPlanningContext {
   return createAreaPolishPlanningContext({
-    geometryFingerprint: overrides.geometryFingerprint ?? "[geometry-1]",
-    centerId: overrides.centerId ?? "room:1",
+    geometryFingerprint: overrides.geometry ?? "geometry-a",
+    centerId: overrides.center ?? "room:1",
     nodes: [
       { id: "room:2", relative: { x: overrides.chartX ?? 1, y: 0, level: 0 } },
       { id: "room:1", relative: { x: 0, y: 0, level: 0 } },
     ],
     edges: [
       { from: "room:2", to: "room:1", direction: "West" },
-      {
-        from: "room:1",
-        to: "room:2",
-        direction: "East",
-        ...(overrides.edgeVectorX === undefined
-          ? {}
-          : { constraintVector: { x: overrides.edgeVectorX, y: 0, level: 0 } }),
-      },
-    ],
-    searchForPerfectLayouts: overrides.perfect ?? true,
-    policy: {
-      when: "always",
-      maxDurationMs: overrides.perfect === false ? 10_000 : Number.POSITIVE_INFINITY,
-      maxRestarts: overrides.perfect === false ? undefined : 32_768,
-      maxLayouts: overrides.maxLayouts ?? 2,
-      maxPolishTournaments: 2,
-      maxPolishPasses: overrides.maxPolishPasses ?? 3,
-      maxExtensionStates: 32_768,
-      maxMaskDiversifications: 64,
-      maxCrossingWork: 512,
-    },
-  });
-}
-
-function contextsMemo(
-  context: Readonly<AreaPolishPlanningContext>,
-  keys: readonly string[] = [context.key],
-): AreaPolishMemo {
-  return {
-    kind: "contexts",
-    geometryFingerprint: context.geometryFingerprint,
-    contextKeys: keys,
-  };
-}
-
-test("planning contexts canonicalize enumeration but include anchor, chart, and policy", () => {
-  const base = planningContext();
-  const reordered = createAreaPolishPlanningContext({
-    geometryFingerprint: base.geometryFingerprint,
-    centerId: "room:1",
-    nodes: [
-      { id: "room:1", relative: { x: 0, y: 0, level: 0 } },
-      { id: "room:2", relative: { x: 1, y: 0, level: 0 } },
-    ],
-    edges: [
       { from: "room:1", to: "room:2", direction: "East" },
-      { from: "room:2", to: "room:1", direction: "West" },
     ],
-    searchForPerfectLayouts: true,
+    searchForPerfectLayouts: false,
     policy: {
       when: "always",
-      maxDurationMs: Number.POSITIVE_INFINITY,
-      maxRestarts: 32_768,
-      maxLayouts: 2,
+      maxDurationMs: 10_000,
+      maxRestarts: 4_096,
+      maxLayouts: overrides.maxLayouts ?? 2,
       maxPolishTournaments: 2,
       maxPolishPasses: 3,
       maxExtensionStates: 32_768,
+      maxLiveSearchNodes: 4_096,
       maxMaskDiversifications: 64,
       maxCrossingWork: 512,
     },
+    searchGeneration: overrides.generation,
+    automaticEffort: overrides.effort,
   });
-  assert.deepEqual(reordered, base);
-  assert.match(base.key, /^[0-9a-f]{32}$/);
-  assert.notEqual(planningContext({ centerId: "room:2" }).key, base.key);
-  assert.notEqual(planningContext({ chartX: 2 }).key, base.key);
-  assert.notEqual(planningContext({ edgeVectorX: 1 }).key, base.key);
-  assert.notEqual(planningContext({ perfect: false }).key, base.key);
-  assert.notEqual(planningContext({ maxLayouts: 3 }).key, base.key);
-  assert.notEqual(planningContext({ maxPolishPasses: 4 }).key, base.key);
-  assert.notEqual(
-    planningContext({ geometryFingerprint: "[geometry-2]" }).geometryFingerprint,
-    base.geometryFingerprint,
-  );
-});
+}
 
-test("structured memos round-trip while legacy and malformed values remain inert", () => {
-  const context = planningContext();
-  const memo = contextsMemo(context);
-  const property = areaPolishMemoPropertyValue(memo);
-  assert.deepEqual(areaPolishMemo(property), memo);
-  assert.equal(polishRetrySuppressed(areaPolishMemo(property), context), true);
+function record(
+  planning: Readonly<AreaPolishPlanningContext>,
+  terminalReason: AreaPolishSettlement["terminalReason"] = "fixed-point",
+): AreaPolishSettlement {
+  return {
+    key: planning.key,
+    searchGeneration: planning.searchGeneration,
+    automaticEffort: planning.automaticEffort,
+    policyKey: planning.policyKey,
+    terminalReason,
+  };
+}
 
-  const legacy = areaPolishMemo("[legacy-geometry]");
-  assert.deepEqual(legacy, { kind: "legacy", propertyValue: "[legacy-geometry]" });
-  assert.equal(polishRetrySuppressed(legacy, context), false);
-  assert.deepEqual(areaPolishMemo("{broken"), {
-    kind: "legacy",
-    propertyValue: "{broken",
-  });
-  const malformedV2 = JSON.stringify({ v: 2, g: "[geometry-1]", c: ["unbounded"] });
-  assert.deepEqual(areaPolishMemo(malformedV2), {
-    kind: "legacy",
-    propertyValue: malformedV2,
-  });
-  assert.equal(areaPolishMemo(""), undefined);
-});
+function memo(
+  planning: Readonly<AreaPolishPlanningContext>,
+  settlements: readonly AreaPolishSettlement[] = [record(planning)],
+): AreaPolishMemo {
+  return { kind: "contexts", geometryFingerprint: planning.geometryFingerprint, settlements };
+}
 
-test("memo parsing deduplicates and bounds valid persisted context keys", () => {
-  const keys = Array.from(
-    { length: MAX_AREA_POLISH_MEMO_CONTEXTS + 8 },
-    (_, index) => index.toString(16).padStart(32, "0"),
-  );
-  assert.deepEqual(
-    areaPolishMemo(JSON.stringify({
-      v: AREA_POLISH_MEMO_SCHEMA_VERSION,
-      g: "[geometry-1]",
-      c: [...keys, keys.at(-1)],
-    })),
-    {
-      kind: "contexts",
-      geometryFingerprint: "[geometry-1]",
-      contextKeys: keys.slice(8),
-    },
-  );
-});
-
-test("deferred topology marks an area pending without redundant writes", () => {
-  assert.deepEqual(reduceAreaPolishState(false, { kind: "topology-deferred" }), {
-    pending: true,
-    propertyValue: "true",
-  });
-  assert.deepEqual(reduceAreaPolishState(true, { kind: "topology-deferred" }), {
-    pending: true,
-    propertyValue: undefined,
-  });
-});
-
-test("starting polish preserves a durable retry", () => {
-  const event: AreaPolishEvent = { kind: "polish-started" };
-  assert.deepEqual(reduceAreaPolishState(false, event), {
-    pending: true,
-    propertyValue: "true",
-  });
-  assert.deepEqual(reduceAreaPolishState(true, event), {
-    pending: true,
-    propertyValue: undefined,
-  });
-});
-
-test("a context-relative geometric fixed point retains area-wide eligibility", () => {
-  assert.deepEqual(reduceAreaPolishState(true, {
-    kind: "polish-completed",
-    report: { geometricFixedPoint: true },
-  }), {
-    pending: true,
-    propertyValue: undefined,
-  });
-  assert.deepEqual(reduceAreaPolishState(false, {
-    kind: "polish-completed",
-    report: { geometricFixedPoint: true },
-  }), {
-    pending: true,
-    propertyValue: "true",
-  });
-});
-
-test("bounded and report-less results remain eligible", () => {
-  assert.deepEqual(reduceAreaPolishState(false, {
-    kind: "polish-completed",
-    report: { geometricFixedPoint: false },
-  }), {
-    pending: true,
-    propertyValue: "true",
-  });
-  assert.deepEqual(reduceAreaPolishState(true, { kind: "polish-completed" }), {
-    pending: true,
-    propertyValue: undefined,
-  });
-});
-
-/** A report whose every stop was a deterministic ceiling, not a deadline. */
-function exhaustedReport(overrides: Partial<AreaPolishReport> = {}): AreaPolishReport {
+function ceilingReport(overrides: Partial<AreaPolishReport> = {}): AreaPolishReport {
   return {
     geometricFixedPoint: false,
     cutoff: "extensions",
@@ -247,235 +131,297 @@ function exhaustedReport(overrides: Partial<AreaPolishReport> = {}): AreaPolishR
   };
 }
 
-test("only deterministic ceiling exhaustion qualifies for the memo", () => {
-  assert.equal(reportsCeilingExhaustion(undefined), false);
-  assert.equal(reportsCeilingExhaustion(exhaustedReport()), true);
-  assert.equal(
-    reportsCeilingExhaustion(exhaustedReport({
-      cutoff: "none",
-      polishCutoff: "passes",
-      extensionSearch: { cancelled: false, exhausted: false },
-    })),
-    true,
-  );
-  assert.equal(
-    reportsCeilingExhaustion(exhaustedReport({
-      cutoff: "none",
-      polishCutoff: "fixed-point",
-      extensionSearch: { cancelled: false, exhausted: false },
-    })),
-    false,
-  );
-  assert.equal(
-    reportsCeilingExhaustion(exhaustedReport({ geometricFixedPoint: true })),
-    false,
-  );
-  assert.equal(reportsCeilingExhaustion(exhaustedReport({ cutoff: "time" })), false);
-  assert.equal(
-    reportsCeilingExhaustion(exhaustedReport({ polishCutoff: "time" })),
-    false,
-  );
-  assert.equal(
-    reportsCeilingExhaustion(exhaustedReport({ polishCutoff: "error" })),
-    false,
-  );
-  assert.equal(
-    reportsCeilingExhaustion(exhaustedReport({ extensionSearch: { cancelled: true } })),
-    false,
-  );
-  assert.equal(
-    reportsCeilingExhaustion(exhaustedReport({ crossingRepair: { cancelled: true } })),
-    false,
-  );
+test("coverage, generation, effort, and policy are distinct planning dimensions", () => {
+  const base = context();
+  assert.notEqual(context({ center: "room:2" }).key, base.key);
+  assert.notEqual(context({ chartX: 2 }).key, base.key);
+  assert.equal(context({ generation: 2 }).key, base.key);
+  assert.equal(context({ effort: 2 }).key, base.key);
+  assert.equal(context({ maxLayouts: 3 }).key, base.key);
+  assert.notEqual(context({ maxLayouts: 3 }).policyKey, base.policyKey);
 });
 
-test("a fruitless deterministic ceiling records its exact context durably", () => {
-  const context = planningContext();
-  const expectedMemo = contextsMemo(context);
+test("v3 evidence round-trips; raw and v2 values migrate without suppressing", () => {
+  const planning = context();
+  const state = memo(planning);
+  assert.deepEqual(areaPolishMemo(areaPolishMemoPropertyValue(state)), state);
+  assert.equal(polishRetrySuppressed(state, planning), true);
+
+  for (const value of [
+    "legacy-geometry",
+    JSON.stringify({ v: 2, g: planning.geometryFingerprint, c: [planning.key] }),
+    "{broken",
+  ]) {
+    const legacy = areaPolishMemo(value);
+    assert.deepEqual(legacy, { kind: "legacy", propertyValue: value });
+    assert.equal(polishRetrySuppressed(legacy, planning), false);
+  }
+});
+
+test("fixed point and deterministic ceiling settle achieved automatic effort", () => {
+  const planning = context();
+  for (const [report, reason] of [
+    [{ geometricFixedPoint: true }, "fixed-point"],
+    [ceilingReport(), "ceiling"],
+  ] as const) {
+    const transition = reduceAreaPolishMemo(undefined, {
+      kind: "polish-completed",
+      report,
+      context: planning,
+    });
+    assert.ok(transition.memo?.kind === "contexts");
+    assert.deepEqual(transition.memo.settlements, [record(planning, reason)]);
+    assert.equal(polishRetrySuppressed(transition.memo, planning), true);
+    assert.deepEqual(reduceAreaPolishState(true, {
+      kind: "polish-completed",
+      report,
+      context: planning,
+    }), { pending: false, propertyValue: "" });
+  }
+});
+
+test("an already-perfect standard plan settles without a repair report", () => {
+  const planning = context();
+  const event = {
+    kind: "polish-completed" as const,
+    terminalReason: "perfect" as const,
+    context: planning,
+  };
+  const transition = reduceAreaPolishMemo(undefined, event);
+  assert.ok(transition.memo?.kind === "contexts");
+  assert.equal(transition.memo.settlements[0]?.terminalReason, "perfect");
+  assert.deepEqual(reduceAreaPolishState(true, event), { pending: false, propertyValue: "" });
+});
+
+test("an improved bounded pass stamps its ceiling on final committed geometry", () => {
+  const old = context();
+  const final = context({ geometry: "geometry-b" });
+  const transition = reduceAreaPolishMemo(memo(old), {
+    kind: "polish-completed",
+    report: ceilingReport(),
+    improved: true,
+    context: final,
+  });
+  assert.deepEqual(transition.memo, memo(final, [record(final, "ceiling")]));
+  assert.equal(polishRetrySuppressed(transition.memo, old), false);
+  assert.equal(polishRetrySuppressed(transition.memo, final), true);
+});
+
+test("A→B→A does not repeat settled automatic work", () => {
+  const tracker = new AreaPolishEntryTracker();
+  const planning = context();
+  const state = memo(planning);
+  const evaluate = areaPolishNeedsContextEvaluation(false, state);
+
+  assert.equal(tracker.observe("area-a", evaluate).retry, true);
+  assert.equal(tracker.consumeRetry("area-a"), true);
+  assert.equal(areaPolishEligibility(state, planning).reason, "settled");
+  assert.equal(tracker.observe("area-b", false).retry, false);
+  assert.equal(tracker.observe("area-a", evaluate).retry, true);
+  assert.equal(areaPolishEligibility(state, planning).eligible, false);
+});
+
+test("automatic settlement is area+geometry scoped across entry/chart coverage", () => {
+  const entranceA = context({ center: "room:1" });
+  const entranceB = context({ center: "room:2", chartX: 2 });
+  const state = memo(entranceA);
+  assert.notEqual(entranceA.key, entranceB.key);
+  assert.equal(areaPolishEligibility(state, entranceB).reason, "settled");
+  assert.equal(polishRetrySuppressed(state, entranceB), true);
+});
+
+test("generation, effort, policy, and geometry changes re-enable automatic work", () => {
+  const planning = context();
+  const state = memo(planning);
+  assert.equal(areaPolishEligibility(
+    state,
+    context({ generation: AREA_POLISH_SEARCH_GENERATION + 1 }),
+  ).reason, "search-generation-changed");
+  assert.equal(areaPolishEligibility(state, context({ effort: 2 })).reason, "effort-increased");
+  assert.equal(areaPolishEligibility(state, context({ maxLayouts: 3 })).reason, "policy-changed");
+  assert.equal(areaPolishEligibility(state, context({ geometry: "geometry-b" })).reason, "geometry-changed");
+});
+
+test("only a stronger zero-defect result settles a different automatic feasible set", () => {
+  const automatic = context();
+  const perfect = context({ effort: AREA_POLISH_PERFECT_EFFORT, maxLayouts: 8 });
+  assert.notEqual(perfect.policyKey, automatic.policyKey);
+  const stronger = memo(perfect, [record(perfect, "perfect")]);
+  assert.equal(areaPolishEligibility(stronger, automatic).reason, "settled");
+  assert.equal(areaPolishEligibility(stronger, automatic).eligible, false);
+
+  for (const terminal of ["fixed-point", "ceiling"] as const) {
+    const incompatible = memo(perfect, [record(perfect, terminal)]);
+    assert.equal(areaPolishEligibility(incompatible, automatic).eligible, true);
+  }
+
+  const equalEffortDifferentPolicy = memo(context({ maxLayouts: 3 }));
+  assert.equal(areaPolishEligibility(equalEffortDifferentPolicy, automatic).reason, "policy-changed");
+  assert.equal(areaPolishEligibility(equalEffortDifferentPolicy, automatic).eligible, true);
+});
+
+test("timeout, cancellation, and error are distinct and area-wide cooled down", () => {
+  const entranceA = context({ center: "room:1" });
+  const entranceB = context({ center: "room:2" });
+  const now = 1_000;
+  const cases = [
+    [ceilingReport({ cutoff: "time", extensionSearch: { cancelled: true } }), "timeout"],
+    [ceilingReport({ extensionSearch: { cancelled: true } }), "cancelled"],
+    [ceilingReport({ polishCutoff: "error" }), "error"],
+  ] as const;
+  for (const [report, reason] of cases) {
+    assert.equal(areaPolishTerminalReason(report), reason);
+    const state = reduceAreaPolishMemo(undefined, {
+      kind: "polish-completed",
+      report,
+      context: entranceA,
+    }, now).memo;
+    const cooled = areaPolishEligibility(state, entranceB, now);
+    assert.equal(cooled.reason, "cooldown");
+    assert.equal(cooled.terminalReason, reason);
+    assert.equal(areaPolishEligibility(
+      state,
+      entranceB,
+      now + AREA_POLISH_RETRY_COOLDOWN_MS,
+    ).eligible, true);
+  }
+
+  const interrupted = reduceAreaPolishMemo(undefined, {
+    kind: "polish-interrupted",
+    reason: "cancelled",
+    context: entranceA,
+  }, now).memo;
+  assert.equal(areaPolishEligibility(interrupted, entranceB, now).terminalReason, "cancelled");
+});
+
+test("same-area movement displacement records no cancellation cooldown", () => {
+  const planning = context({ center: "room:1" });
+  const current = memo(planning);
+  assert.deepEqual(reduceAreaPolishMemo(current, {
+    kind: "polish-interrupted",
+    reason: "cancelled",
+    displacedWithinArea: true,
+    context: planning,
+  }, 1_000), {
+    memo: current,
+    propertyValue: undefined,
+  });
+});
+
+test("retryable outcomes exponentially extend one area-wide cooldown", () => {
+  const firstEntrance = context({ center: "room:1" });
+  const secondEntrance = context({ center: "room:2" });
   const first = reduceAreaPolishMemo(undefined, {
     kind: "polish-completed",
-    report: exhaustedReport(),
-    context,
-  });
-  assert.deepEqual(first, {
-    memo: expectedMemo,
-    propertyValue: areaPolishMemoPropertyValue(expectedMemo),
-  });
-  // Re-recording an identical context needs no durable write.
-  assert.deepEqual(
-    reduceAreaPolishMemo(first.memo, {
-      kind: "polish-completed",
-      report: exhaustedReport(),
-      context,
-    }),
-    { memo: expectedMemo, propertyValue: undefined },
-  );
-
-  // A different resident geometry starts a fresh bounded context set.
-  const changed = planningContext({ geometryFingerprint: "[geometry-2]" });
-  const changedMemo = contextsMemo(changed);
-  assert.deepEqual(
-    reduceAreaPolishMemo(first.memo, {
-      kind: "polish-completed",
-      report: exhaustedReport(),
-      context: changed,
-    }),
-    {
-      memo: changedMemo,
-      propertyValue: areaPolishMemoPropertyValue(changedMemo),
-    },
-  );
-  // Without the exact context there is nothing safe to memoize.
-  assert.deepEqual(
-    reduceAreaPolishMemo(undefined, {
-      kind: "polish-completed",
-      report: exhaustedReport(),
-    }),
-    { memo: undefined, propertyValue: undefined },
-  );
+    report: ceilingReport({ cutoff: "time" }),
+    context: firstEntrance,
+  }, 0).memo;
+  const second = reduceAreaPolishMemo(first, {
+    kind: "polish-completed",
+    report: ceilingReport({ cutoff: "time" }),
+    context: secondEntrance,
+  }, AREA_POLISH_RETRY_COOLDOWN_MS).memo;
+  assert.ok(second?.kind === "contexts");
+  assert.equal(second.settlements.length, 1);
+  assert.equal(second.settlements[0]?.attempts, 2);
+  assert.equal(second.settlements[0]?.retryAfterMs, AREA_POLISH_RETRY_COOLDOWN_MS * 3);
 });
 
-test("fruitless fixed points accumulate by context without retiring the area", () => {
-  const first = planningContext({ centerId: "room:1" });
-  const second = planningContext({ centerId: "room:2" });
-  const firstTransition = reduceAreaPolishMemo(undefined, {
-    kind: "polish-completed",
-    report: { geometricFixedPoint: true },
-    context: first,
-  });
-  const secondTransition = reduceAreaPolishMemo(firstTransition.memo, {
-    kind: "polish-completed",
-    report: { geometricFixedPoint: true },
-    context: second,
-  });
-  assert.ok(secondTransition.memo?.kind === "contexts");
-  assert.deepEqual(secondTransition.memo.contextKeys, [first.key, second.key]);
-  assert.equal(polishRetrySuppressed(secondTransition.memo, first), true);
-  assert.equal(polishRetrySuppressed(secondTransition.memo, second), true);
-  assert.equal(polishRetrySuppressed(secondTransition.memo, planningContext({ chartX: 2 })), false);
-  assert.equal(
-    polishRetrySuppressed(
-      secondTransition.memo,
-      planningContext({ geometryFingerprint: "[geometry-2]", centerId: "room:1" }),
-    ),
-    false,
-  );
-});
+/** A repair report that returned the ordinary plan without searching. */
+function unsearchedReport(outcome: string, cutoff = "none"): AreaPolishReport {
+  return {
+    outcome,
+    geometricFixedPoint: false,
+    cutoff,
+    polishCutoff: "none",
+    extensionSearch: { cancelled: cutoff === "time", exhausted: cutoff === "extensions" },
+    crossingRepair: { cancelled: false, exhausted: false },
+  };
+}
 
-test("a fruitful incomplete pass clears prior contexts and keeps the new geometry eligible", () => {
-  const oldContext = planningContext();
-  const oldMemo = contextsMemo(oldContext);
-  assert.deepEqual(
-    reduceAreaPolishMemo(oldMemo, {
-      kind: "polish-completed",
-      report: exhaustedReport(),
-      context: planningContext({ geometryFingerprint: "[new]" }),
-      improved: true,
-    }),
-    { memo: undefined, propertyValue: "" },
-  );
-  assert.deepEqual(reduceAreaPolishState(true, {
-    kind: "polish-completed",
-    report: exhaustedReport(),
-    improved: true,
-  }), {
-    pending: true,
-    propertyValue: undefined,
-  });
-});
-
-test("a fruitful fixed point replaces old contexts with the proven final geometry", () => {
-  const oldContext = planningContext();
-  const finalContext = planningContext({ geometryFingerprint: "[new]" });
-  const transition = reduceAreaPolishMemo(contextsMemo(oldContext), {
-    kind: "polish-completed",
-    report: { geometricFixedPoint: true },
-    context: finalContext,
-    improved: true,
-  });
-  assert.deepEqual(transition.memo, {
-    kind: "contexts",
-    geometryFingerprint: "[new]",
-    contextKeys: [finalContext.key],
-  });
-  assert.equal(polishRetrySuppressed(transition.memo, oldContext), false);
-  assert.equal(polishRetrySuppressed(transition.memo, finalContext), true);
-});
-
-test("a fruitful fixed point without its rebased context still clears stale contexts", () => {
-  const oldContext = planningContext();
-  assert.deepEqual(reduceAreaPolishMemo(contextsMemo(oldContext), {
-    kind: "polish-completed",
-    report: { geometricFixedPoint: true },
-    improved: true,
-  }), {
-    memo: undefined,
-    propertyValue: "",
-  });
-});
-
-test("the context memo evicts oldest entries deterministically at its bound", () => {
-  const geometryFingerprint = JSON.stringify(Array.from({ length: 97 }, (_, index) => ({
-    id: `room:${index}`,
-    position: { x: index - 48, y: index % 11, level: 0 },
-  })));
-  const contexts = Array.from(
-    { length: MAX_AREA_POLISH_MEMO_CONTEXTS + 2 },
-    (_, index) => planningContext({ geometryFingerprint, centerId: `room:${index}` }),
-  );
-  let memo: AreaPolishMemo | undefined;
-  for (const context of contexts) {
-    memo = reduceAreaPolishMemo(memo, {
-      kind: "polish-completed",
-      report: { geometricFixedPoint: true },
-      context,
-    }).memo;
+test("only a repair that cannot search until the map changes qualifies as unsearchable", () => {
+  for (const outcome of ["clean", "no-regression", "no-constraints", "search-failed:analysis", "no-layout"]) {
+    assert.equal(reportsUnsearchableGeometry(unsearchedReport(outcome)), true, outcome);
   }
-  assert.ok(memo?.kind === "contexts");
-  assert.equal(memo.contextKeys.length, MAX_AREA_POLISH_MEMO_CONTEXTS);
-  assert.deepEqual(memo.contextKeys, contexts.slice(2).map((context) => context.key));
-  assert.ok(
-    areaPolishMemoPropertyValue(memo).length < memo.geometryFingerprint.length * 2 + 1_300,
-    "the chart must be represented by compact keys, not repeated canonical JSON",
-  );
-  assert.equal(polishRetrySuppressed(memo, contexts[0]), false);
-  assert.equal(polishRetrySuppressed(memo, contexts.at(-1) as AreaPolishPlanningContext), true);
+  for (const report of [
+    undefined,
+    unsearchedReport("search-failed:time", "time"),
+    unsearchedReport("no-layout", "time"),
+    unsearchedReport("no-layout", "extensions"),
+    unsearchedReport("search-failed:work", "restarts"),
+    unsearchedReport("no-budget"),
+    unsearchedReport("locked"),
+    { ...ceilingReport(), outcome: "searched" },
+  ]) {
+    assert.equal(reportsUnsearchableGeometry(report), false, `${report?.outcome} ${report?.cutoff}`);
+  }
 });
 
-test("fresh growth clears contexts; incomplete, cancelled, and legacy observations do not add any", () => {
-  const context = planningContext();
-  const memo = contextsMemo(context);
-  assert.deepEqual(reduceAreaPolishMemo(memo, { kind: "topology-deferred" }), {
-    memo: undefined,
-    propertyValue: "",
-  });
-  assert.deepEqual(reduceAreaPolishMemo(undefined, { kind: "topology-deferred" }), {
-    memo: undefined,
-    propertyValue: undefined,
-  });
-  assert.deepEqual(reduceAreaPolishMemo(memo, { kind: "polish-started" }), {
-    memo,
-    propertyValue: undefined,
-  });
-  for (const report of [
-    exhaustedReport({ cutoff: "time" }),
-    exhaustedReport({ polishCutoff: "error" }),
-    exhaustedReport({ extensionSearch: { cancelled: true } }),
-    exhaustedReport({
-      cutoff: "none",
-      polishCutoff: "fixed-point",
-      extensionSearch: { cancelled: false, exhausted: false },
-    }),
-  ]) {
-    assert.deepEqual(
-      reduceAreaPolishMemo(memo, { kind: "polish-completed", report, context }),
-      { memo, propertyValue: undefined },
+test("a repair that could not search settles its geometry until the map changes", () => {
+  const planning = context();
+  for (const outcome of ["search-failed:analysis", "no-constraints", "no-layout"]) {
+    const report = unsearchedReport(outcome);
+    assert.equal(areaPolishTerminalReason(report), "fixed-point", outcome);
+    const { memo: state } = reduceAreaPolishMemo(undefined, {
+      kind: "polish-completed",
+      report,
+      context: planning,
+    });
+    assert.deepEqual(state, memo(planning, [record(planning, "fixed-point")]), outcome);
+    assert.equal(areaPolishEligibility(state, planning).reason, "settled", outcome);
+    assert.equal(
+      areaPolishEligibility(state, context({ geometry: "geometry-b" })).reason,
+      "geometry-changed",
+      "moved rooms fingerprint a new geometry",
     );
   }
+  // A deadline cut proves nothing about the geometry, so a later, longer run
+  // may search; a work ceiling that stopped compaction follows the ceiling
+  // rule, and an empty budget is retried after a cooldown.
+  assert.equal(areaPolishTerminalReason(unsearchedReport("search-failed:time", "time")), "timeout");
+  assert.equal(areaPolishTerminalReason(unsearchedReport("no-layout", "time")), "timeout");
+  assert.equal(areaPolishTerminalReason(unsearchedReport("no-layout", "extensions")), "ceiling");
+  assert.equal(areaPolishTerminalReason(unsearchedReport("no-budget")), "incomplete");
+});
 
+test("a clean ordinary plan is perfect, even after the pass changed the map", () => {
+  assert.equal(areaPolishTerminalReason(unsearchedReport("clean")), "perfect");
+  const old = context();
+  const final = context({ geometry: "geometry-clean" });
+  const transition = reduceAreaPolishMemo(memo(old), {
+    kind: "polish-completed",
+    report: unsearchedReport("clean"),
+    improved: true,
+    context: final,
+  });
+  assert.deepEqual(transition.memo, memo(final, [record(final, "perfect")]));
+  assert.equal(polishRetrySuppressed(transition.memo, final), true);
+  assert.deepEqual(reduceAreaPolishState(true, {
+    kind: "polish-completed",
+    report: unsearchedReport("clean"),
+    context: final,
+  }), { pending: false, propertyValue: "" });
+});
+
+test("the decision log names why a repair did not search, and a clean map is no failure", () => {
+  assert.equal(
+    polishNotSearchedReason(unsearchedReport("search-failed:analysis")),
+    "search-failed:analysis",
+  );
+  assert.equal(
+    polishNotSearchedReason(unsearchedReport("search-failed:time", "time")),
+    "search-failed:time",
+  );
+  assert.equal(polishNotSearchedReason(unsearchedReport("no-constraints")), "no-constraints");
+  assert.equal(polishNotSearchedReason(unsearchedReport("clean")), undefined);
+  assert.equal(polishNotSearchedReason({ ...ceilingReport(), outcome: "searched" }), undefined);
+  assert.equal(polishNotSearchedReason(ceilingReport()), undefined, "a report without an outcome");
+  assert.equal(polishNotSearchedReason(undefined), undefined);
+});
+
+test("the first settlement replaces a legacy memo", () => {
+  const planning = context();
   const legacy = areaPolishMemo("[legacy-geometry]");
-  assert.ok(legacy);
-  assert.equal(polishRetrySuppressed(legacy, context), false);
   assert.deepEqual(reduceAreaPolishMemo(legacy, { kind: "polish-started" }), {
     memo: legacy,
     propertyValue: undefined,
@@ -483,10 +429,111 @@ test("fresh growth clears contexts; incomplete, cancelled, and legacy observatio
   const upgraded = reduceAreaPolishMemo(legacy, {
     kind: "polish-completed",
     report: { geometricFixedPoint: true },
-    context,
+    context: planning,
   });
-  assert.deepEqual(upgraded.memo, contextsMemo(context));
-  assert.equal(upgraded.propertyValue, areaPolishMemoPropertyValue(contextsMemo(context)));
+  assert.deepEqual(upgraded.memo, memo(planning));
+  assert.equal(upgraded.propertyValue, areaPolishMemoPropertyValue(memo(planning)));
+});
+
+test("fresh topology clears settlement and makes the legacy hint pending", () => {
+  const planning = context();
+  assert.deepEqual(reduceAreaPolishMemo(memo(planning), { kind: "topology-deferred" }), {
+    memo: undefined,
+    propertyValue: "",
+  });
+  assert.deepEqual(reduceAreaPolishState(false, { kind: "topology-deferred" }), {
+    pending: true,
+    propertyValue: "true",
+  });
+});
+
+test("settlement history remains bounded", () => {
+  const planning = context();
+  let state: AreaPolishMemo | undefined;
+  for (let effort = 1; effort <= MAX_AREA_POLISH_MEMO_CONTEXTS + 2; effort += 1) {
+    state = reduceAreaPolishMemo(state, {
+      kind: "polish-completed",
+      report: { geometricFixedPoint: true },
+      context: context({ effort }),
+    }).memo;
+  }
+  assert.ok(state?.kind === "contexts");
+  assert.equal(state.settlements.length, MAX_AREA_POLISH_MEMO_CONTEXTS);
+  assert.equal(state.settlements[0]?.automaticEffort, 3);
+  assert.equal(polishRetrySuppressed(state, planning), false);
+});
+
+test("only deterministic ceilings qualify for settlement", () => {
+  assert.equal(reportsCeilingExhaustion(ceilingReport()), true);
+  assert.equal(reportsCeilingExhaustion(ceilingReport({ cutoff: "time" })), false);
+  assert.equal(reportsCeilingExhaustion(ceilingReport({ polishCutoff: "error" })), false);
+  assert.equal(reportsCeilingExhaustion(ceilingReport({ extensionSearch: { cancelled: true } })), false);
+});
+
+test("the seam list is room numbers in a package-owned property", () => {
+  assert.equal(AREA_POLISH_SEAMS_PROPERTY, "nukefire.layout.polish-seams");
+  assert.equal(MAX_AREA_POLISH_SEAMS, 512);
+  assert.deepEqual(areaPolishSeams(undefined), []);
+  assert.deepEqual(areaPolishSeams(""), []);
+  assert.deepEqual(areaPolishSeams("  "), []);
+  assert.deepEqual(areaPolishSeams("[4,1,9]"), [4, 1, 9]);
+  assert.equal(areaPolishSeamsPropertyValue([4, 1, 9]), "[4,1,9]");
+  assert.equal(areaPolishSeamsPropertyValue([]), "");
+});
+
+test("hand-edited seam lists are read defensively", () => {
+  assert.deepEqual(areaPolishSeams("not json"), []);
+  assert.deepEqual(areaPolishSeams("{\"rooms\":[1]}"), []);
+  assert.deepEqual(areaPolishSeams("7"), []);
+  // Entries that are not room numbers go; a repeated room counts where it last appears.
+  assert.deepEqual(areaPolishSeams(' [5, 2, 5, "x", 1.5, null, 9] '), [2, 5, 9]);
+});
+
+test("a merge's seams join the list newest last, and deferred growth leaves it alone", () => {
+  const first = reduceAreaPolishSeams([], { kind: "topology-deferred", seams: [3, 8] });
+  assert.deepEqual(first, { seams: [3, 8], propertyValue: "[3,8]" });
+  const second = reduceAreaPolishSeams(first.seams, { kind: "topology-deferred", seams: [3, 11] });
+  assert.deepEqual(second, { seams: [8, 3, 11], propertyValue: "[8,3,11]" });
+  for (const event of [
+    { kind: "topology-deferred" },
+    { kind: "topology-deferred", seams: [] },
+    { kind: "polish-started" },
+  ] satisfies AreaPolishEvent[]) {
+    assert.deepEqual(reduceAreaPolishSeams(second.seams, event), {
+      seams: second.seams,
+      propertyValue: undefined,
+    });
+  }
+  // A merge's polish request marks the map pending and clears its memo, as growth does.
+  const planning = context();
+  const request: AreaPolishEvent = { kind: "topology-deferred", seams: [3, 8] };
+  assert.deepEqual(reduceAreaPolishState(false, request), { pending: true, propertyValue: "true" });
+  assert.deepEqual(reduceAreaPolishMemo(memo(planning), request), {
+    memo: undefined,
+    propertyValue: "",
+  });
+});
+
+test("the seam list keeps its newest rooms at its bound", () => {
+  const many = Array.from({ length: MAX_AREA_POLISH_SEAMS + 88 }, (_, index) => index + 1);
+  const { seams } = reduceAreaPolishSeams([], { kind: "topology-deferred", seams: many });
+  assert.equal(seams.length, MAX_AREA_POLISH_SEAMS);
+  assert.equal(seams[0], 89);
+  assert.equal(seams.at(-1), MAX_AREA_POLISH_SEAMS + 88);
+  assert.deepEqual(areaPolishSeams(JSON.stringify(many)), seams);
+});
+
+test("a completed whole-map polish clears the seams, whatever it proved", () => {
+  const planning = context();
+  for (const event of [
+    { kind: "polish-completed" },
+    { kind: "polish-completed", improved: true },
+    { kind: "polish-completed", report: { geometricFixedPoint: true }, context: planning },
+    { kind: "polish-completed", report: ceilingReport(), context: planning },
+  ] satisfies AreaPolishEvent[]) {
+    assert.deepEqual(reduceAreaPolishSeams([3, 8], event), { seams: [], propertyValue: "" });
+    assert.deepEqual(reduceAreaPolishSeams([], event), { seams: [], propertyValue: undefined });
+  }
 });
 
 test("entry tracking retries once per area visit", () => {

@@ -1,5 +1,9 @@
 import { echo, mapper, type EventSubscription } from "smudgy:core";
 import {
+  layoutSnapshotKey,
+  loadLayoutModel,
+} from "smudgy://kapusniak/map-layout";
+import {
   nukefire,
   onMessage,
   watchMessage,
@@ -19,30 +23,33 @@ import {
 } from "./model.ts";
 import {
   compareLayoutQuality,
+  computeIntegralRouteAmendments,
+  createLayoutPlanner,
+  measureIntegralLayoutQuality,
   planIntegralLayoutAsync,
   type GridPosition,
   type IntegralLayoutPlan,
+  type IntegralLayoutRequest,
   type LayoutDirection,
   type LayoutEdge,
   type LayoutNode,
+  type LayoutPlanner,
   type LayoutPlannerProgress,
   type LayoutQuality,
   type LayoutResident,
   type LayoutTraceEvent,
   type RouteAmendment,
 } from "./layout.ts";
+import { seamRegion } from "smudgy://kapusniak/map-layout/seam-region.ts";
 import {
   DEFAULT_DECISION_LOG_FILE,
   MappingDecisionLogger,
   type DecisionLogRecord,
 } from "./decision-log.ts";
-import {
-  areaForObservedRoom,
-  findAreaByNukeFireId,
-  findCompatibleAreaByName,
-  isAdoptableStorage,
-  NUKEFIRE_AREA_ID_PROPERTY,
-} from "./area-resolution.ts";
+import { AreaNames } from "./area-names.ts";
+import { NUKEFIRE_MARKS } from "./nukefire-maps.ts";
+import { glimpsedZoneMap, readZoneFacts, type Settlement, settleZone, type ZoneContext } from "./zone-settle.ts";
+import { counted, elapsedClock, polishProgressLine, qualitySummary, zoneNameFromMaps } from "./tidy.ts";
 import {
   afterAreaRefresh,
   createdAtlasDecisionSummary,
@@ -54,6 +61,7 @@ import {
   directRoomObstructions,
   indexRouteAmendments,
   planConnectionRoute,
+  routeCrossesCells,
   type RouteSide,
 } from "./routing.ts";
 import {
@@ -61,7 +69,10 @@ import {
   verticalMapLinks,
   type VerticalExitObservation,
 } from "./room-info.ts";
-import { stackVerticalTraversals } from "./vertical-levels.ts";
+import {
+  restoreUnanchoredChartLevels,
+  stackVerticalTraversals,
+} from "./vertical-levels.ts";
 import { reflowPolicy } from "./reflow-policy.ts";
 import { planningFingerprint } from "./planning-fingerprint.ts";
 import {
@@ -72,7 +83,10 @@ import {
 import { SnapshotLatencyLanes } from "./latency-lanes.ts";
 import { LatestValueQueue } from "./latest-value-queue.ts";
 import { reconciliationUpdates } from "./layout-reconciliation.ts";
-import { nukeFireConstraintRepairPolicy } from "./constraint-policy.ts";
+import {
+  nukeFireAutomaticConstraintRepairPolicy,
+  nukeFirePerfectConstraintRepairPolicy,
+} from "./constraint-policy.ts";
 import {
   CurrentLocationFreshness,
   type CurrentLocationObservation,
@@ -80,36 +94,51 @@ import {
 import {
   disambiguateOneWayArrivalPorts,
   routedEndpointSide,
+  routeIsDormant,
   routeIsManuallyAuthored,
   type OneWayPortConnection,
 } from "./connection-ports.ts";
 import {
   AREA_POLISH_EXHAUSTED_FINGERPRINT_PROPERTY,
   AREA_POLISH_PENDING_PROPERTY,
+  AREA_POLISH_PERFECT_EFFORT,
+  AREA_POLISH_SEAMS_PROPERTY,
   AreaPolishEntryTracker,
+  areaPolishEligibility,
   areaPolishMemo,
+  areaPolishNeedsContextEvaluation,
   areaPolishPending,
+  areaPolishSeams,
+  areaPolishSeamsPropertyValue,
   createAreaPolishPlanningContext,
   MAX_FRUITLESS_QUIET_RESUMES,
+  polishNotSearchedReason,
   polishRetrySuppressed,
   QuietPolishClaims,
   QuietResumeBudget,
   reduceAreaPolishMemo,
+  reduceAreaPolishSeams,
   reduceAreaPolishState,
   type AreaPolishMemo,
   type AreaPolishEvent,
   type AreaPolishPlanningContext,
+  type AreaPolishReport,
+  type AreaPolishTerminalReason,
+  type AreaPolishWorkPolicy,
 } from "./polish-state.ts";
+import {
+  improvesThroughCrossings,
+  keepsSeamPins,
+  SeamPreviews,
+  type SeamRoundPlan,
+} from "./seam-preview.ts";
 import {
   coordinateWriteAllowed,
   reconcilableResidentIds,
 } from "./coordinate-write-policy.ts";
 
-const AREA_SOURCE_PROPERTY = "nukefire.mapper";
-const ROOM_ZONE_PROPERTY = "nukefire.zone";
 const ROOM_TERRAIN_PROPERTY = "terrain";
 const ROOM_LAYOUT_LOCK_PROPERTY = "nukefire.layout.locked";
-const SOURCE_NAME = "NukeFire.Map.Local";
 
 /**
  * Floor between progressive durable applies of one quiet search. Improvements
@@ -121,8 +150,8 @@ const SOURCE_NAME = "NukeFire.Map.Local";
 export const PROGRESSIVE_APPLY_FLOOR_MS = 1_500;
 
 export interface NukeFireMapperOptions {
-  /** Prefix used when Room.Info has not supplied the zone's display name. */
-  areaPrefix?: string;
+  /** Which map each area name belongs in. Defaults to no rules: each name is a map of its own. */
+  names?: AreaNames;
   /** Explicit storage for newly managed areas. Defaults to local. */
   storage?: MapStorage;
   /**
@@ -134,7 +163,7 @@ export interface NukeFireMapperOptions {
   updateCoordinates?: boolean;
   /** Append structured decisions beneath package $DATA, or false to disable. */
   decisionLogFile?: string | false;
-  /** Search far beyond the ordinary reflow until perfect, exhausted, or superseded. Default true. */
+  /** @deprecated Automatic quiet reflow is always bounded. Use `nf reflow perfect` explicitly. */
   searchForPerfectLayouts?: boolean;
 }
 
@@ -194,6 +223,13 @@ interface ConnectionMirror {
   id: ConnectionId;
   endpointA: ConnectionEndpoint;
   endpointB: ConnectionEndpoint | null;
+  /**
+   * The kind the host derives from where the rooms are. An update inside an
+   * edit is checked against the kind the Connection had before the edit, so
+   * route sync keeps this in step with the levels each edit leaves the rooms
+   * on.
+   */
+  kind: ConnectionKind;
   routing: ConnectionRouting;
   segmentShape: ConnectionSegmentShape;
   corner: ConnectionCorner;
@@ -204,11 +240,11 @@ interface AreaMirror {
   id: AreaId;
   name: string;
   storage: MapStorage;
-  zone?: string;
-  source?: string;
   polishPending: boolean;
   /** Bounded exact contexts which already completed fruitlessly on this geometry. */
   polishMemo: AreaPolishMemo | undefined;
+  /** Rooms at the seams of merges the whole-map polish has not yet polished. */
+  polishSeams: readonly RoomNumber[];
   roomsByNumber: Map<RoomNumber, RoomMirror>;
   connections: Map<string, ConnectionMirror>;
 }
@@ -220,6 +256,18 @@ interface DesiredConnectionGeometry {
   segment_shape: ConnectionSegmentShape;
   corner: ConnectionCorner;
   route_points: MapPoint[];
+}
+
+/**
+ * What a pass that moved no room changed: the rooms whose links it created,
+ * and the cells of the rooms it placed. Adding rooms and links can change
+ * only the routes at those rooms, routes an engine amendment redraws, and
+ * routes a placed room now stands on; a new obstacle never opens a better
+ * route for any other Connection.
+ */
+interface RouteSyncScope {
+  readonly rooms: ReadonlySet<RoomNumber>;
+  readonly cells: readonly GridPosition[];
 }
 
 function clone<T>(value: Readonly<T>): T {
@@ -281,6 +329,10 @@ function roundedPosition(x: number, y: number, level: number): GridPosition {
   return { x: Math.round(x), y: Math.round(y), level: Math.round(level) };
 }
 
+function sameGridPosition(a: Readonly<GridPosition>, b: Readonly<GridPosition>): boolean {
+  return a.x === b.x && a.y === b.y && a.level === b.level;
+}
+
 function mirrorPlanningFingerprint(area: AreaMirror): string {
   return planningFingerprint([...area.roomsByNumber.values()].map((room) => ({
     roomNumber: room.roomNumber,
@@ -339,10 +391,16 @@ function assertNotAborted(signal: AbortSignal | undefined): void {
   throw error;
 }
 
+type StalePlanPhase =
+  | "before Worker planning"
+  | "after Worker planning"
+  | "before applying layout"
+  | "before recording the polish";
+
 class StaleNukeFireLayoutPlanError extends Error {
   constructor(
     area: AreaMirror,
-    phase: "before Worker planning" | "after Worker planning" | "before applying layout",
+    phase: StalePlanPhase,
   ) {
     super(
       `NukeFire area ${area.name} (${areaIdKey(area.id)}) changed ${phase}`,
@@ -481,6 +539,7 @@ function copyConnection(connection: Connection): ConnectionMirror {
     id: connection.id,
     endpointA: copyEndpoint(connection.endpoint_a),
     endpointB: connection.endpoint_b ? copyEndpoint(connection.endpoint_b) : null,
+    kind: connection.kind,
     routing: connection.routing,
     segmentShape: connection.segment_shape,
     corner: connection.corner,
@@ -525,17 +584,51 @@ function connectionMirrorKey(id: ConnectionId): string {
   return id;
 }
 
+/** No exit drawn against its direction, no blocked route and no crossing. */
+function hasNoDefects(quality: Readonly<LayoutQuality>): boolean {
+  return quality.cardinalRayViolations === 0 && quality.routingViolations === 0 &&
+    quality.linkCrossings === 0;
+}
+
+/**
+ * The settlement context of an explicit perfect polish of the map as it now
+ * is. Its stronger effort keeps a following automatic visit from repeating
+ * lower-budget work; the coverage key is diagnostic.
+ */
+function perfectPolishContext(
+  geometryFingerprint: string,
+  policy: Readonly<AreaPolishWorkPolicy>,
+  centerId?: string,
+): AreaPolishPlanningContext {
+  return createAreaPolishPlanningContext({
+    geometryFingerprint,
+    centerId,
+    nodes: [],
+    edges: [],
+    searchForPerfectLayouts: true,
+    policy,
+    automaticEffort: AREA_POLISH_PERFECT_EFFORT,
+  });
+}
+
 /**
  * Reconciles NukeFire's authoritative local map snapshots into Smudgy areas.
  * Calls are serialized because mapper mutations acknowledge asynchronously.
  */
 export class NukeFireMapper {
-  readonly #options: Required<Omit<NukeFireMapperOptions, "ephemeral" | "storage">> & {
+  readonly #options: Required<Omit<
+    NukeFireMapperOptions,
+    "ephemeral" | "storage" | "names" | "searchForPerfectLayouts"
+  >> & {
     storage: MapStorage;
   };
   readonly #decisionLogger: MappingDecisionLogger;
+  readonly #names: AreaNames;
   readonly #subscriptions: EventSubscription[] = [];
-  readonly #zoneAreas = new Map<number, AreaMirror>();
+  /** The map each zone's new rooms go to this run; merges can delete maps, so they clear it. */
+  readonly #zoneMaps = new Map<number, AreaId>();
+  /** Zones gathered into their area's map this run. */
+  readonly #settledZones = new Set<number>();
   readonly #areasById = new Map<string, AreaMirror>();
   readonly #roomsByVnum = new Map<number, RoomMirror>();
   readonly #latencyLanes: SnapshotLatencyLanes<NukeFireMapLocal>;
@@ -544,7 +637,10 @@ export class NukeFireMapper {
   readonly #quietPolishClaims = new QuietPolishClaims<NukeFireMapLocal>(
     (aborted, incoming) => this.#snapshotsShareArea(aborted, incoming),
   );
+  readonly #sameAreaPolishDisplacements = new WeakMap<NukeFireMapLocal, Set<string>>();
   readonly #quietResumeBudget = new QuietResumeBudget();
+  /** Each map's seam round and the geometry its whole-map polish plans from. */
+  readonly #seamPreviews = new SeamPreviews<ReadonlyMap<string, GridPosition>>();
   readonly #snapshotCurrentLocations = new WeakMap<
     NukeFireMapLocal,
     CurrentLocationObservation
@@ -562,21 +658,27 @@ export class NukeFireMapper {
   #localAtlasUpsert: Promise<Atlas> | undefined;
   #localAtlasUpsertGeneration: number | undefined;
   #areasReady = false;
-  #areaRefresh: Promise<void> | undefined;
   #runGeneration = 0;
   #started = false;
+  /** Stops the `nfmap tidy` in progress; the quiet polish waits while one runs. */
+  #tidy: AbortController | undefined;
+  /**
+   * The quiet polish's own planner. Movement aborts a quiet polish, and an
+   * aborted search ends its Worker; on this planner that is never the shared
+   * Worker the next new room is placed on.
+   */
+  #quietPlanner: LayoutPlanner | undefined;
   #currentLocation = "";
   #lastError = "";
   #lastDecisionLogError = "";
   #mutationSequence = 0;
 
   constructor(options: NukeFireMapperOptions = {}) {
+    this.#names = options.names ?? new AreaNames([]);
     this.#options = {
-      areaPrefix: options.areaPrefix ?? "NukeFire Zone",
       storage: options.storage ?? (options.ephemeral ? "session" : "local"),
       updateCoordinates: options.updateCoordinates ?? true,
       decisionLogFile: options.decisionLogFile ?? DEFAULT_DECISION_LOG_FILE,
-      searchForPerfectLayouts: options.searchForPerfectLayouts ?? true,
     };
     this.#decisionLogger = new MappingDecisionLogger(this.#options.decisionLogFile, (error) => {
       if (error === this.#lastDecisionLogError) return;
@@ -586,12 +688,12 @@ export class NukeFireMapper {
     this.#latencyLanes = new SnapshotLatencyLanes({
       snapshotKey: (snapshot) => snapshot.center,
       followCurrent: (snapshot) => this.#observeSnapshotCurrentRoom(snapshot),
-      runTopology: (snapshot) => this.#runSnapshotLane(snapshot, false),
+      runTopology: (snapshot, signal) => this.#runSnapshotLane(snapshot, false, signal),
       runFullReflow: (snapshot, signal) => {
         const currentAreaKey = this.#polishEntries.currentAreaKey;
         const snapshotRoom = this.#roomsByVnum.get(snapshot.center);
         if (
-          !currentAreaKey || !snapshotRoom ||
+          this.#tidy || !currentAreaKey || !snapshotRoom ||
           areaIdKey(snapshotRoom.areaId) !== currentAreaKey ||
           !this.#deferredReflowAreas.has(currentAreaKey)
         ) {
@@ -644,6 +746,9 @@ export class NukeFireMapper {
   ): void {
     for (const [claimedAreaKey, claim] of this.#quietPolishClaims.settle(aborted, incoming)) {
       if (this.#polishEntries.currentAreaKey !== claimedAreaKey) continue;
+      const displacedAreas = this.#sameAreaPolishDisplacements.get(aborted) ?? new Set<string>();
+      displacedAreas.add(claimedAreaKey);
+      this.#sameAreaPolishDisplacements.set(aborted, displacedAreas);
       const area = this.#areasById.get(claimedAreaKey);
       if (!this.#quietResumeBudget.allowResume(claimedAreaKey, claim.progressed === true)) {
         this.#logDecision({
@@ -666,6 +771,13 @@ export class NukeFireMapper {
     }
   }
 
+  #takeSameAreaPolishDisplacement(snapshot: NukeFireMapLocal, claimedAreaKey: string): boolean {
+    const displacedAreas = this.#sameAreaPolishDisplacements.get(snapshot);
+    if (!displacedAreas?.delete(claimedAreaKey)) return false;
+    if (displacedAreas.size === 0) this.#sameAreaPolishDisplacements.delete(snapshot);
+    return true;
+  }
+
   #registerRoom(area: AreaMirror, room: RoomMirror): void {
     area.roomsByNumber.set(room.roomNumber, room);
     if (room.vnum !== undefined) this.#roomsByVnum.set(room.vnum, room);
@@ -673,9 +785,26 @@ export class NukeFireMapper {
 
   #registerArea(area: AreaMirror): AreaMirror {
     this.#areasById.set(areaIdKey(area.id), area);
-    const zone = Number(area.zone);
-    if (Number.isSafeInteger(zone)) this.#zoneAreas.set(zone, area);
     return area;
+  }
+
+  /** Drops a deleted map from the mirror. */
+  #forgetArea(id: AreaId): void {
+    const known = this.#areasById.get(areaIdKey(id));
+    if (!known) return;
+    for (const room of known.roomsByNumber.values()) {
+      if (room.vnum !== undefined && this.#roomsByVnum.get(room.vnum) === room) {
+        this.#roomsByVnum.delete(room.vnum);
+      }
+    }
+    this.#areasById.delete(areaIdKey(id));
+    this.#deferredReflowAreas.delete(areaIdKey(id));
+    this.#reconciledPortAreas.delete(areaIdKey(id));
+    this.#seamPreviews.forget(areaIdKey(id));
+  }
+
+  #inTier(area: { storage: MapStorage }): boolean {
+    return area.storage === this.#options.storage;
   }
 
   /**
@@ -693,21 +822,17 @@ export class NukeFireMapper {
           this.#roomsByVnum.delete(room.vnum);
         }
       }
-      for (const [zone, area] of this.#zoneAreas) {
-        if (area === known) this.#zoneAreas.delete(zone);
-      }
     }
 
     const area: AreaMirror = {
       id,
       name: source.name,
       storage: source.storage,
-      zone: source.data(NUKEFIRE_AREA_ID_PROPERTY),
-      source: source.data(AREA_SOURCE_PROPERTY),
       polishPending: areaPolishPending(source.data(AREA_POLISH_PENDING_PROPERTY)),
       polishMemo: areaPolishMemo(
         source.data(AREA_POLISH_EXHAUSTED_FINGERPRINT_PROPERTY),
       ),
+      polishSeams: areaPolishSeams(source.data(AREA_POLISH_SEAMS_PROPERTY)),
       roomsByNumber: new Map(),
       connections: new Map(),
     };
@@ -724,7 +849,7 @@ export class NukeFireMapper {
         color: room.color,
         position: roundedPosition(room.x, room.y, room.level),
         layoutLocked: room.data(ROOM_LAYOUT_LOCK_PROPERTY)?.trim().toLowerCase() === "true",
-        zone: room.data(ROOM_ZONE_PROPERTY),
+        zone: room.data(NUKEFIRE_MARKS.zone),
         terrain: room.data(ROOM_TERRAIN_PROPERTY),
         exits: room.exits.map(copyExit),
       };
@@ -744,6 +869,42 @@ export class NukeFireMapper {
   /** Absolute runtime path of the JSONL decision log, when enabled. */
   get decisionLogPath(): string | undefined {
     return this.#decisionLogger.path;
+  }
+
+  /**
+   * Persist an explicit perfect-reflow result against the area's live final
+   * geometry. The stronger effort prevents a following automatic visit from
+   * immediately repeating lower-budget work; the coverage key is diagnostic.
+   */
+  async recordManualPolishResult(
+    areaId: AreaId,
+    result: {
+      readonly policy: Readonly<AreaPolishWorkPolicy>;
+      readonly report?: Readonly<AreaPolishReport>;
+      readonly terminalReason?: AreaPolishTerminalReason;
+      readonly centerId?: string;
+      /** Canonical final model returned by the stable plan that produced this evidence. */
+      readonly expectedLayoutSnapshotKey: string;
+    },
+  ): Promise<boolean> {
+    return await this.#latencyLanes.exclusive(async () => {
+      const live = mapper.getAreaById(areaId);
+      const currentLayoutKey = layoutSnapshotKey(loadLayoutModel(live, {
+        isRoomMovable: (room) =>
+          !room.hasTag("LAYOUT_LOCKED") &&
+          room.data("layoutLocked") !== "true" &&
+          room.data(ROOM_LAYOUT_LOCK_PROPERTY) !== "true",
+      }));
+      if (currentLayoutKey !== result.expectedLayoutSnapshotKey) return false;
+      const geometryFingerprint = livePlanningFingerprint(live);
+      await this.#persistAreaPolishState(this.#hydrateArea(live, true), {
+        kind: "polish-completed",
+        report: result.report,
+        terminalReason: result.terminalReason,
+        context: perfectPolishContext(geometryFingerprint, result.policy, result.centerId),
+      });
+      return true;
+    });
   }
 
   #logDecision(record: DecisionLogRecord): void {
@@ -880,10 +1041,11 @@ export class NukeFireMapper {
   async #persistAreaPolishState(
     area: AreaMirror,
     event: Readonly<AreaPolishEvent>,
-    runGeneration: number,
+    runGeneration?: number,
   ): Promise<void> {
     const transition = reduceAreaPolishState(area.polishPending, event);
     const memoTransition = reduceAreaPolishMemo(area.polishMemo, event);
+    const seamsTransition = reduceAreaPolishSeams(area.polishSeams, event);
     const writes: [string, string][] = [];
     if (transition.propertyValue !== undefined) {
       writes.push([AREA_POLISH_PENDING_PROPERTY, transition.propertyValue]);
@@ -894,22 +1056,25 @@ export class NukeFireMapper {
         memoTransition.propertyValue,
       ]);
     }
+    if (seamsTransition.propertyValue !== undefined) {
+      writes.push([AREA_POLISH_SEAMS_PROPERTY, seamsTransition.propertyValue]);
+    }
     if (writes.length > 0) {
-      await this.#whileCurrentRun(
-        runGeneration,
-        () => this.#mutateArea(
-          area.id,
-          async (mutation) => {
-            for (const [name, value] of writes) {
-              await mutation.setAreaProperty(name, value);
-            }
-          },
-          `${transition.pending ? "Mark" : "Clear"} passive NukeFire layout polish for ${area.name}`,
-        ),
+      const persist = () => this.#mutateArea(
+        area.id,
+        async (mutation) => {
+          for (const [name, value] of writes) {
+            await mutation.setAreaProperty(name, value);
+          }
+        },
+        `${transition.pending ? "Mark" : "Clear"} passive NukeFire layout polish for ${area.name}`,
       );
+      if (runGeneration === undefined) await persist();
+      else await this.#whileCurrentRun(runGeneration, persist);
     }
     area.polishPending = transition.pending;
     area.polishMemo = memoTransition.memo;
+    area.polishSeams = seamsTransition.seams;
     this.#logDecision({
       kind: "layout-polish-state",
       area: { id: area.id, name: area.name },
@@ -917,9 +1082,27 @@ export class NukeFireMapper {
       pending: transition.pending,
       exhaustedMemo: memoTransition.memo?.kind === "contexts",
       exhaustedContexts: memoTransition.memo?.kind === "contexts"
-        ? memoTransition.memo.contextKeys.length
+        ? memoTransition.memo.settlements.length
         : 0,
+      seams: seamsTransition.seams.length,
+      terminalReason: event.kind === "polish-interrupted"
+        ? event.reason
+        : event.kind === "polish-completed" && memoTransition.memo?.kind === "contexts"
+        ? memoTransition.memo.settlements.at(-1)?.terminalReason
+        : undefined,
       propertyChanged: writes.length > 0,
+    });
+    if (event.kind !== "polish-completed") return;
+    const reason = polishNotSearchedReason(event.report);
+    if (reason === undefined) return;
+    this.#logDecision({
+      kind: "layout-polish-not-searched",
+      area: { id: area.id, name: area.name },
+      reason,
+      cutoff: event.report?.cutoff,
+      // A memoized context is skipped until the map's geometry changes.
+      memoized: event.context !== undefined &&
+        polishRetrySuppressed(memoTransition.memo, event.context),
     });
   }
 
@@ -965,18 +1148,6 @@ export class NukeFireMapper {
     }
   }
 
-  async #refreshAreaProjection(): Promise<void> {
-    const refreshable = mapper as Mapper & { refreshAreas?: () => Promise<void> };
-    if (typeof refreshable.refreshAreas === "function") {
-      await refreshable.refreshAreas();
-    } else {
-      // Older 0.5.3 builds lack refreshAreas, but this empty presence-checked
-      // import still supplies their initial-load barrier. Ownership handoff
-      // refreshes become fully authoritative once the new op is available.
-      await mapper.importAreasIfAbsent([]);
-    }
-  }
-
   #assertCurrentRun(runGeneration: number): void {
     assertCurrentMapperRun(this.#started, this.#runGeneration, runGeneration);
   }
@@ -992,7 +1163,7 @@ export class NukeFireMapper {
     if (area) {
       const entry = this.#polishEntries.observe(
         areaKey(area),
-        area.polishPending,
+        areaPolishNeedsContextEvaluation(area.polishPending, area.polishMemo),
         this.#options.updateCoordinates,
       );
       if (entry.previousAreaKey) {
@@ -1044,7 +1215,7 @@ export class NukeFireMapper {
   #cachedCurrentRoom(vnum: number): RoomMirror | undefined {
     const room = this.#roomsByVnum.get(vnum);
     const area = room && this.#areasById.get(areaIdKey(room.areaId));
-    return room && area && isAdoptableStorage(area.storage, this.#options.storage)
+    return room && area && this.#inTier(area)
       ? room
       : undefined;
   }
@@ -1060,7 +1231,7 @@ export class NukeFireMapper {
     const hostRoom = mapper.findRoomByExternalId(externalId);
     if (hostRoom) {
       const hostArea = mapper.getAreaById(hostRoom.area_id);
-      if (isAdoptableStorage(hostArea.storage, this.#options.storage)) {
+      if (this.#inTier(hostArea)) {
         const area = this.#hydrateArea(hostArea);
         const room = [...area.roomsByNumber.values()].find(
           (candidate) => candidate.vnum === vnum,
@@ -1074,7 +1245,7 @@ export class NukeFireMapper {
     // Room.Info can be retained without a matching Map.Local snapshot. In
     // that case no topology pass will perform the configured-tier fallback.
     for (const hostArea of mapper.areas) {
-      if (!isAdoptableStorage(hostArea.storage, this.#options.storage)) continue;
+      if (!this.#inTier(hostArea)) continue;
       const area = this.#hydrateArea(hostArea);
       const room = [...area.roomsByNumber.values()].find(
         (candidate) => candidate.vnum === vnum,
@@ -1146,9 +1317,8 @@ export class NukeFireMapper {
     );
   }
 
-  async #reloadAreaMirrors(runGeneration: number): Promise<void> {
-    await this.#whileCurrentRun(runGeneration, () => this.#refreshAreaProjection());
-    this.#zoneAreas.clear();
+  #reloadAreaMirrors(): void {
+    this.#zoneMaps.clear();
     this.#areasById.clear();
     this.#roomsByVnum.clear();
     for (const area of mapper.areas) this.#hydrateArea(area);
@@ -1157,7 +1327,7 @@ export class NukeFireMapper {
   #assertLivePlanningFingerprint(
     area: AreaMirror,
     expected: string,
-    phase: "before Worker planning" | "after Worker planning" | "before applying layout",
+    phase: StalePlanPhase,
   ): void {
     let actual: string;
     try {
@@ -1168,20 +1338,14 @@ export class NukeFireMapper {
     if (actual !== expected) throw new StaleNukeFireLayoutPlanError(area, phase);
   }
 
-  async #ensureFreshAreas(): Promise<void> {
+  /** Waits for the session's maps; sessions sharing local maps see each other's writes without a refresh. */
+  async #awaitMapsReady(): Promise<void> {
     if (this.#areasReady) return;
     const generation = this.#runGeneration;
-    const refresh = this.#areaRefresh ??= (
-      this.#refreshAreaProjection()
-    );
-    try {
-      await refresh;
-      if (this.#runGeneration === generation && !this.#areasReady) {
-        this.#areasReady = true;
-        this.#followCurrentRoomAfterRefresh(generation);
-      }
-    } finally {
-      if (this.#areaRefresh === refresh) this.#areaRefresh = undefined;
+    await mapper.ready();
+    if (this.#runGeneration === generation && !this.#areasReady) {
+      this.#areasReady = true;
+      this.#followCurrentRoomAfterRefresh(generation);
     }
   }
 
@@ -1199,22 +1363,21 @@ export class NukeFireMapper {
       echo(`[nukefire-mapper] mapping decisions: ${this.#decisionLogger.path}`);
     }
 
-    // A package can start before the session's initial durable-map load, and
-    // a successor session can inherit mapping ownership with an older cache.
-    // Refresh before any presence-based zone resolution to avoid duplicates.
-    const initialRefresh = this.#ensureFreshAreas();
-    void initialRefresh.catch((caught) => {
+    // A package can start before the session's initial map load. Zone
+    // resolution looks maps up by what they hold, so it waits for them.
+    const mapsReady = this.#awaitMapsReady();
+    void mapsReady.catch((caught) => {
       const message = caught instanceof Error ? caught.message : String(caught);
-      echo(`[nukefire-mapper] failed to refresh existing maps: ${message}`);
+      echo(`[nukefire-mapper] failed to load existing maps: ${message}`);
     });
 
     // The atlas is part of mapper initialization, rather than a side effect of
-    // receiving the first Map.Local snapshot. Let the initial refresh settle
+    // receiving the first Map.Local snapshot. Let the maps finish loading
     // first so an older catalogue publication cannot hide the new atlas.
     // Area creation below awaits this same in-flight upsert, so startup and
     // mapping cannot create duplicates.
     void afterAreaRefresh(
-      initialRefresh,
+      mapsReady,
       () => this.#ensureLocalAtlas(runGeneration),
     ).catch((caught) => {
       if (caught instanceof ObsoleteNukeFireMapperRunError) return;
@@ -1254,10 +1417,14 @@ export class NukeFireMapper {
 
   stop(): void {
     for (const subscription of this.#subscriptions.splice(0)) subscription.off();
+    this.#tidy?.abort();
+    this.#quietPlanner?.close();
+    this.#quietPlanner = undefined;
     this.#started = false;
     this.#runGeneration += 1;
     this.#latencyLanes.stop();
-    this.#zoneAreas.clear();
+    this.#zoneMaps.clear();
+    this.#settledZones.clear();
     this.#areasById.clear();
     this.#roomsByVnum.clear();
     this.#plannedTopology.clear();
@@ -1265,11 +1432,406 @@ export class NukeFireMapper {
     this.#deferredReflowAreas.clear();
     this.#polishEntries.clear();
     this.#quietResumeBudget.clear();
+    this.#seamPreviews.clear();
     this.#pendingVerticalLinks.clear();
     this.#currentLocationFreshness.clear();
     this.#currentLocation = "";
     this.#areasReady = false;
-    this.#areaRefresh = undefined;
+  }
+
+  /**
+   * Settles every zone the mapper's maps name, as visiting it would, then
+   * polishes each of the mapper's maps in turn. `say` hears each zone and map
+   * as it is checked, each combination, and every second how the current
+   * polish is going. One tidy runs at a time, and the quiet polish waits
+   * while it does. Mapping goes on meanwhile: the tidy has the maps to itself
+   * only while it reads or writes one, and it searches on a planner of its
+   * own, never holding up the one mapping plans on. `stopTidy` ends it; a map
+   * it was polishing keeps the best layout already on it.
+   */
+  async tidyAllMaps(say: (line: string) => void): Promise<void> {
+    if (this.#tidy) {
+      say("Already tidying the maps; nfmap stop stops it.");
+      return;
+    }
+    if (!this.#started || !this.#areasReady) {
+      say("The mapper has not loaded the maps yet.");
+      return;
+    }
+    const controller = new AbortController();
+    this.#tidy = controller;
+    const runGeneration = this.#runGeneration;
+    const startedAt = performance.now();
+    const planner = createLayoutPlanner();
+    try {
+      const combined = await this.#tidyZones(say, controller.signal, runGeneration);
+      const { checked, improved } = await this.#tidyPolishAll(
+        say,
+        controller.signal,
+        runGeneration,
+        planner,
+      );
+      say(
+        `Done in ${elapsedClock(performance.now() - startedAt)}: ` +
+          `${counted(combined, "zone")} combined, ${improved} of ${counted(checked, "map")} improved.`,
+      );
+    } catch (error) {
+      if (controller.signal.aborted) {
+        say(`Stopped after ${elapsedClock(performance.now() - startedAt)}.`);
+      } else if (error instanceof ObsoleteNukeFireMapperRunError) {
+        say("Stopped: the mapper restarted.");
+      } else {
+        say(`Stopped by an error: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      planner.close();
+      if (this.#tidy === controller) this.#tidy = undefined;
+    }
+  }
+
+  /** The quiet polish's planner, started with its first search. */
+  #quietPolishPlanner(): LayoutPlanner {
+    return this.#quietPlanner ??= createLayoutPlanner();
+  }
+
+  /** Stops the tidy in progress; false when none is running. */
+  stopTidy(): boolean {
+    const tidy = this.#tidy;
+    if (!tidy || tidy.signal.aborted) return false;
+    tidy.abort();
+    return true;
+  }
+
+  /** The mapper's own maps in its storage tier. */
+  #managedAreas(): Area[] {
+    const { managed } = NUKEFIRE_MARKS;
+    return mapper.areas.filter((area) =>
+      area.storage === this.#options.storage && area.data(managed.property) === managed.value
+    );
+  }
+
+  /**
+   * Settles each zone whose rooms the mapper's maps hold under the name its
+   * maps give it, skipping zones settled this session and zones only
+   * placeholders hold. Each settles with the maps to itself, as a visit's
+   * would. Returns how many zones it gathered rooms of.
+   */
+  async #tidyZones(
+    say: (line: string) => void,
+    signal: AbortSignal,
+    runGeneration: number,
+  ): Promise<number> {
+    const maps = this.#managedAreas();
+    const zones = new Set<number>();
+    for (const area of maps) {
+      for (const room of this.#hydrateArea(area).roomsByNumber.values()) {
+        const zone = Number(room.zone);
+        if (room.zone && Number.isSafeInteger(zone)) zones.add(zone);
+      }
+    }
+    say(`Checking ${counted(zones.size, "zone")} in ${counted(maps.length, "map")}.`);
+    let combined = 0;
+    for (const zone of [...zones].sort((a, b) => a - b)) {
+      assertNotAborted(signal);
+      const name = zoneNameFromMaps(zone, readZoneFacts(zone, this.#zoneContext(runGeneration)));
+      if (name === undefined) {
+        say(`Zone ${zone}: only placeholder maps hold it, so it settles when you visit it.`);
+        continue;
+      }
+      const into = this.#names.resolve(name)?.display ?? name;
+      const label = into === name ? `Zone ${zone} (${name})` : `Zone ${zone} (${name}, in ${into})`;
+      if (this.#settledZones.has(zone)) {
+        say(`${label}: settled already this session.`);
+        continue;
+      }
+      say(`${label}: checking.`);
+      const settlement = await this.#latencyLanes.exclusive(() =>
+        this.#settleZone(zone, name, [], runGeneration)
+      );
+      if (settlement?.kind === "retry") {
+        say(`${label}: its maps were busy, so it settles when you next visit it.`);
+      } else if (settlement?.kind === "player") {
+        const map = mapper.areas.find((area) => sameAreaId(area.id, settlement.map))?.name;
+        say(`${label}: most of it is in a map you made${map ? `, ${map}` : ""}, so it stays there.`);
+      } else if (
+        settlement?.kind === "settled" &&
+        (settlement.deleted.length > 0 || settlement.changed.length > 1)
+      ) {
+        combined += 1;
+      }
+    }
+    return combined;
+  }
+
+  /**
+   * Polishes each of the mapper's maps in turn: how many had anything to
+   * polish, and how many of those it improved.
+   */
+  async #tidyPolishAll(
+    say: (line: string) => void,
+    signal: AbortSignal,
+    runGeneration: number,
+    planner: LayoutPlanner,
+  ): Promise<{ checked: number; improved: number }> {
+    const areas = this.#managedAreas().sort((a, b) => a.name.localeCompare(b.name));
+    say(`Polishing ${counted(areas.length, "map")}.`);
+    let checked = 0;
+    let improved = 0;
+    for (const area of areas) {
+      assertNotAborted(signal);
+      const outcome = await this.#tidyPolish(area.id, say, signal, runGeneration, planner);
+      if (outcome !== "skipped") checked += 1;
+      if (outcome === "improved") improved += 1;
+    }
+    return { checked, improved };
+  }
+
+  /**
+   * One map as the tidy plans it, read from the map as it is now: its rooms,
+   * the exits between them, and the fingerprint its writes must still match.
+   * Undefined when the map is gone.
+   */
+  #tidyPolishInput(areaId: AreaId): {
+    area: AreaMirror;
+    residents: LayoutResident[];
+    edges: LayoutEdge[];
+    fingerprint: string;
+  } | undefined {
+    let area: AreaMirror;
+    try {
+      area = this.#hydrateArea(mapper.getAreaById(areaId), true);
+    } catch {
+      return undefined;
+    }
+    const residents: LayoutResident[] = [];
+    const idByRoomNumber = new Map<RoomNumber, string>();
+    for (const room of area.roomsByNumber.values()) {
+      const id = residentId(room.roomNumber);
+      idByRoomNumber.set(room.roomNumber, id);
+      residents.push({
+        id,
+        position: { ...room.position },
+        movable: room.vnum !== undefined && !room.layoutLocked,
+      });
+    }
+    const edges: LayoutEdge[] = [];
+    const edgeKeys = new Set<string>();
+    for (const room of area.roomsByNumber.values()) {
+      const from = idByRoomNumber.get(room.roomNumber);
+      if (!from || room.vnum === undefined) continue;
+      for (const exit of room.exits) {
+        if (!exit.toAreaId || exit.toRoomNumber === null || !sameAreaId(exit.toAreaId, area.id)) continue;
+        const to = idByRoomNumber.get(exit.toRoomNumber);
+        if (!to || area.roomsByNumber.get(exit.toRoomNumber)?.vnum === undefined) continue;
+        const key = `${from}>${to}:${exit.fromDirection}`;
+        if (edgeKeys.has(key)) continue;
+        edgeKeys.add(key);
+        edges.push({ from, to, direction: exit.fromDirection as LayoutDirection });
+      }
+    }
+    return { area, residents, edges, fingerprint: mirrorPlanningFingerprint(area) };
+  }
+
+  /**
+   * Polishes one whole map as the quiet polish does, without a chart: the
+   * standard pass and then the constraint repair, applying better layouts as
+   * they come and the final one at the end, and saying every second how it
+   * goes. The search runs while the player maps; reading the map, each write
+   * and recording the polish each wait for mapping in flight and hold it
+   * back. A map the player changes meanwhile keeps what is on it.
+   */
+  async #tidyPolish(
+    areaId: AreaId,
+    say: (line: string) => void,
+    signal: AbortSignal,
+    runGeneration: number,
+    planner: LayoutPlanner,
+  ): Promise<"improved" | "unchanged" | "skipped"> {
+    const input = await this.#latencyLanes.exclusive(async () => this.#tidyPolishInput(areaId));
+    if (!input) return "skipped";
+    const { area, residents, edges } = input;
+    if (!residents.some((resident) => resident.movable) || edges.length === 0) {
+      say(`${area.name}: nothing to polish.`);
+      return "skipped";
+    }
+    const currentQuality = measureIntegralLayoutQuality(
+      new Map(residents.map((resident) => [resident.id, resident.position])),
+      edges,
+    );
+    say(
+      `Polishing ${area.name}: ${counted(residents.length, "room")}, ${counted(edges.length, "exit")}, ` +
+        `now ${qualitySummary(currentQuality)} (wrong exits/blocked routes/crossings).`,
+    );
+
+    const policy = nukeFirePerfectConstraintRepairPolicy({
+      residentCount: residents.length,
+      edgeCount: edges.length,
+    });
+    const startedAt = performance.now();
+    let fingerprint = input.fingerprint;
+    let onMap: Readonly<LayoutQuality> = currentQuality;
+    let applied = 0;
+    let latest: LayoutPlannerProgress["snapshot"] | undefined;
+    let failure: unknown;
+    const planning = new AbortController();
+    const stopPlanning = (): void => planning.abort();
+    signal.addEventListener("abort", stopPlanning, { once: true });
+    if (signal.aborted) planning.abort();
+
+    // Each better layout goes to the map as the mapper holds it then, which
+    // mapping may have rebuilt since the search began, so long as the player
+    // has not changed what the search planned.
+    const apply = (plan: IntegralLayoutPlan): Promise<void> =>
+      this.#latencyLanes.exclusive(async () => {
+        assertNotAborted(planning.signal);
+        if (compareLayoutQuality(plan.quality, onMap) <= 0) return;
+        this.#assertLivePlanningFingerprint(area, fingerprint, "before applying layout");
+        const live = this.#hydrateArea(mapper.getAreaById(areaId));
+        const rooms = new Map(
+          [...live.roomsByNumber.values()].map((room) => [residentId(room.roomNumber), room]),
+        );
+        const updates: [RoomNumber, UpdateRoomParams][] = reconciliationUpdates(
+          rooms,
+          plan.positions,
+          (room) => room.roomNumber,
+        ).map((update) => [update.key, {
+          x: update.position.x,
+          y: update.position.y,
+          level: update.position.level,
+        }]);
+        let routeAfterCommit = false;
+        await this.#whileCurrentRun(
+          runGeneration,
+          () => this.#mutateArea(live.id, async (mutation) => {
+            if (updates.length > 0) {
+              await this.#whileCurrentRun(runGeneration, () => mutation.updateRooms(updates));
+              for (const [number, fields] of updates) {
+                const room = live.roomsByNumber.get(number);
+                if (!room) continue;
+                room.position = roundedPosition(
+                  fields.x ?? room.position.x,
+                  fields.y ?? room.position.y,
+                  fields.level ?? room.position.level,
+                );
+              }
+            }
+            routeAfterCommit = await this.#syncAreaConnectionRoutes(
+              live,
+              live.roomsByNumber,
+              plan.positions,
+              runGeneration,
+              mutation,
+              plan.routeAmendments,
+            );
+          }, `Tidy NukeFire area ${live.name}`),
+        );
+        if (routeAfterCommit) {
+          await this.#routeConnectionsAfterCommit(
+            live,
+            live.roomsByNumber,
+            plan.positions,
+            runGeneration,
+            plan.routeAmendments,
+          );
+        }
+        fingerprint = mirrorPlanningFingerprint(live);
+        onMap = plan.quality;
+        applied += 1;
+      });
+    // Writes are paced as the quiet polish paces them, and a better layout
+    // arriving meanwhile replaces the one waiting: the newest is written, never
+    // a stale one. A failed write ends the polish of this map.
+    const writes = new LatestValueQueue<IntegralLayoutPlan>(apply, (error) => {
+      failure = error;
+      planning.abort();
+    }, { minIntervalMs: PROGRESSIVE_APPLY_FLOOR_MS });
+    let offered: Readonly<LayoutQuality> = currentQuality;
+    const offer = (plan: IntegralLayoutPlan): void => {
+      if (compareLayoutQuality(plan.quality, offered) <= 0) return;
+      offered = plan.quality;
+      writes.push(plan);
+    };
+    const progress = setInterval(
+      () => say(polishProgressLine(area.name, performance.now() - startedAt, latest, applied)),
+      1_000,
+    );
+    let plan: IntegralLayoutPlan | undefined;
+    try {
+      plan = await planner.planIntegral({ residents, nodes: [], edges, allowExistingMoves: true }, {
+        signal: planning.signal,
+        currentQuality,
+        constraintRepair: policy,
+        plannerContext: { source: "nukefire:tidy", areaId: areaKey(area), areaName: area.name },
+        onProgress: (update) => {
+          latest = update.snapshot;
+          if (update.improvement) offer(update.improvement);
+        },
+      });
+      offer(plan);
+    } catch {
+      // A stopped tidy, a changed map or a failed planner: the outcome below
+      // says which.
+    } finally {
+      clearInterval(progress);
+      signal.removeEventListener("abort", stopPlanning);
+    }
+    // A stopped tidy writes nothing more; the write in progress finishes.
+    if (signal.aborted) writes.discardPending();
+    try {
+      await writes.flush();
+    } catch {
+      // The failure is recorded; the outcome below reports it.
+    }
+    const elapsed = elapsedClock(performance.now() - startedAt);
+    const outcome = applied > 0 ? "improved" : "unchanged";
+    const kept = `it keeps ${qualitySummary(onMap)}`;
+    if (signal.aborted) {
+      say(`Stopped polishing ${area.name} after ${elapsed}; ${kept}.`);
+      throw new Error("The tidy was stopped.");
+    }
+    if (failure instanceof ObsoleteNukeFireMapperRunError) throw failure;
+    if (failure !== undefined) {
+      say(
+        failure instanceof StaleNukeFireLayoutPlanError
+          ? `${area.name} changed while it was being polished; ${kept}.`
+          : `${area.name}: ${failure instanceof Error ? failure.message : String(failure)}`,
+      );
+      return outcome;
+    }
+    if (!plan) {
+      say(`${area.name}: the planner stopped after ${elapsed}; ${kept}.`);
+      return outcome;
+    }
+    // The search covered the map as it is, unless the player changed it
+    // after the last write; the polish it records must not hide that change.
+    // It settles the map as an explicit perfect polish does.
+    const report = plan.constraintRepair;
+    try {
+      await this.#latencyLanes.exclusive(async () => {
+        this.#assertLivePlanningFingerprint(area, fingerprint, "before recording the polish");
+        await this.#persistAreaPolishState(
+          this.#hydrateArea(mapper.getAreaById(areaId)),
+          {
+            kind: "polish-completed",
+            report,
+            terminalReason: hasNoDefects(onMap) ? "perfect" : undefined,
+            improved: applied > 0,
+            context: perfectPolishContext(fingerprint, policy),
+          },
+          runGeneration,
+        );
+      });
+    } catch (error) {
+      if (!(error instanceof StaleNukeFireLayoutPlanError)) throw error;
+      say(`${area.name} changed while it was being polished; ${kept}.`);
+      return outcome;
+    }
+    say(
+      applied > 0
+        ? `Polished ${area.name} in ${elapsed}: ${qualitySummary(currentQuality)} -> ${qualitySummary(onMap)}.`
+        : `${area.name} needed nothing (${elapsed}); it stays ${qualitySummary(onMap)}.`,
+    );
+    return outcome;
   }
 
   #enqueue(snapshot: NukeFireMapLocal): void {
@@ -1340,7 +1902,7 @@ export class NukeFireMapper {
             `${caught.message} again after one refresh; discarded the stale plan without writing its coordinates`,
           );
         }
-        await this.#reloadAreaMirrors(runGeneration);
+        this.#reloadAreaMirrors();
         assertNotAborted(signal);
         this.#assertCurrentRun(runGeneration);
       }
@@ -1359,7 +1921,7 @@ export class NukeFireMapper {
     signal?: AbortSignal,
   ): Promise<void> {
     assertNotAborted(signal);
-    await this.#whileCurrentRun(runGeneration, () => this.#ensureFreshAreas());
+    await this.#whileCurrentRun(runGeneration, () => this.#awaitMapsReady());
     assertNotAborted(signal);
     const startedAt = performance.now();
     if (!isUsableVnum(snapshot.center)) {
@@ -1378,6 +1940,16 @@ export class NukeFireMapper {
     const currentRoomInfo = this.#lastRoomInfo?.num === snapshot.center
       ? this.#lastRoomInfo
       : undefined;
+    // The chart names the zone of every room it shows, stored with it or not.
+    const chartedIn = (zone: number) =>
+      [...byVnum.values()].filter((room) => room.zone === zone).map((room) => externalRoomId(room.vnum));
+    // Room.Info names the area of the zone the player stands in. That is the
+    // moment the zone's rooms can be gathered into its area's map, before
+    // this snapshot's rooms are looked up or placed.
+    if (currentRoomInfo) {
+      await this.#settleZone(centerSource.zone, currentRoomInfo.area, chartedIn(centerSource.zone), runGeneration);
+      assertNotAborted(signal);
+    }
     const verticalExits = currentRoomInfo
       ? verticalExitObservations(currentRoomInfo.exits)
       : [];
@@ -1399,7 +1971,7 @@ export class NukeFireMapper {
     for (const source of sources) {
       const room = this.#roomsByVnum.get(source.vnum);
       const area = room && this.#areasById.get(areaIdKey(room.areaId));
-      if (room && area && isAdoptableStorage(area.storage, this.#options.storage)) {
+      if (room && area && this.#inTier(area)) {
         existing.set(source.vnum, room);
       }
     }
@@ -1411,14 +1983,14 @@ export class NukeFireMapper {
         if (existing.has(source.vnum)) continue;
         const cached = this.#roomsByVnum.get(source.vnum);
         const cachedArea = cached && this.#areasById.get(areaIdKey(cached.areaId));
-        if (cached && cachedArea && isAdoptableStorage(cachedArea.storage, this.#options.storage)) {
+        if (cached && cachedArea && this.#inTier(cachedArea)) {
           existing.set(source.vnum, cached);
           continue;
         }
         const hostRoom = mapper.findRoomByExternalId(externalRoomId(source.vnum));
         if (!hostRoom) continue;
         const hostArea = mapper.getAreaById(hostRoom.area_id);
-        if (!isAdoptableStorage(hostArea.storage, this.#options.storage)) continue;
+        if (!this.#inTier(hostArea)) continue;
         this.#hydrateArea(hostArea);
         const room = this.#roomsByVnum.get(source.vnum);
         if (room) existing.set(source.vnum, room);
@@ -1430,7 +2002,7 @@ export class NukeFireMapper {
       const wanted = new Set(sources.map((source) => source.vnum));
       for (const hostArea of mapper.areas) {
         if (existing.size >= wanted.size) break;
-        if (!isAdoptableStorage(hostArea.storage, this.#options.storage)) continue;
+        if (!this.#inTier(hostArea)) continue;
         const area = this.#hydrateArea(hostArea);
         for (const room of area.roomsByNumber.values()) {
           if (room.vnum !== undefined && wanted.has(room.vnum) && !existing.has(room.vnum)) {
@@ -1440,42 +2012,18 @@ export class NukeFireMapper {
       }
     }
 
-    const knownAreaByZone = new Map<number, AreaMirror>();
-    const currentExisting = existing.get(snapshot.center);
-    if (currentExisting) {
-      const area = this.#areasById.get(areaIdKey(currentExisting.areaId));
-      if (area) knownAreaByZone.set(centerSource.zone, area);
-    }
-    for (const source of sources) {
-      const room = existing.get(source.vnum);
-      if (room && !knownAreaByZone.has(source.zone)) {
-        const area = this.#areasById.get(areaIdKey(room.areaId));
-        if (area) knownAreaByZone.set(source.zone, area);
-      }
-    }
-
-    const preferredCenterName = this.#lastRoomInfo?.num === snapshot.center
-      ? this.#lastRoomInfo.area.trim()
-      : "";
     const areaByZone = new Map<number, AreaMirror>();
     for (const zone of new Set(sources.map((room) => room.zone))) {
-      const preferredName = zone === centerSource.zone ? preferredCenterName : "";
-      const area = await this.#resolveArea(
-        zone,
-        knownAreaByZone.get(zone),
-        preferredName,
-        runGeneration,
-      );
+      areaByZone.set(zone, await this.#zoneMap(zone, chartedIn(zone), runGeneration));
       assertNotAborted(signal);
-      areaByZone.set(zone, area);
     }
 
     const assignments: Assignment[] = sources.map((source) => {
       const indexedRoom = existing.get(source.vnum);
-      const area = areaForObservedRoom(
-        areaByZone.get(source.zone),
-        indexedRoom && this.#areasById.get(areaIdKey(indexedRoom.areaId)),
-      );
+      // A known room stays where it is: border rooms appear in both zones'
+      // charts, and re-creating one under its other zone would duplicate it.
+      const area = (indexedRoom && this.#areasById.get(areaIdKey(indexedRoom.areaId))) ??
+        areaByZone.get(source.zone);
       if (!area) throw new Error(`could not resolve an area for NukeFire zone ${source.zone}`);
       const room = indexedRoom && sameAreaId(indexedRoom.areaId, area.id)
         ? indexedRoom
@@ -1600,125 +2148,72 @@ export class NukeFireMapper {
     }
   }
 
-  async #resolveArea(
+  /** The map this zone's new rooms go to: its settled map, else the map holding it, else its placeholder. */
+  async #zoneMap(zone: number, charted: readonly string[], runGeneration: number): Promise<AreaMirror> {
+    const remembered = this.#zoneMaps.get(zone);
+    if (remembered !== undefined) {
+      try {
+        return this.#hydrateArea(mapper.getAreaById(remembered));
+      } catch {
+        // The player deleted it; look the zone up again.
+        this.#zoneMaps.delete(zone);
+      }
+    }
+    const id = await this.#whileCurrentRun(
+      runGeneration,
+      () => glimpsedZoneMap(zone, this.#zoneContext(runGeneration), charted),
+    );
+    this.#zoneMaps.set(zone, id);
+    return this.#hydrateArea(mapper.getAreaById(id));
+  }
+
+  /** On a zone's first named visit this run, gathers all of its rooms into the one map for its area name. */
+  /** Settles `zone` under `areaName` once a run; undefined when it already settled or the name has no map. */
+  async #settleZone(
     zone: number,
-    known: AreaMirror | undefined,
-    preferredName: string,
+    areaName: string,
+    charted: readonly string[],
     runGeneration: number,
-  ): Promise<AreaMirror> {
-    this.#assertCurrentRun(runGeneration);
-    const areaId = String(zone);
-    const exact = findAreaByNukeFireId(mapper.areas, this.#options.storage, areaId);
-    let area = exact ? this.#hydrateArea(exact) : undefined;
-    if (!area) {
-      const cached = this.#zoneAreas.get(zone);
-      if (
-        cached && isAdoptableStorage(cached.storage, this.#options.storage) &&
-        (!cached.zone || cached.zone === areaId)
-      ) {
-        area = cached;
-      }
+  ): Promise<Settlement | undefined> {
+    const name = this.#names.resolve(areaName);
+    if (!name || this.#settledZones.has(zone)) return undefined;
+    const settlement = await this.#whileCurrentRun(
+      runGeneration,
+      () => settleZone(zone, name, this.#zoneContext(runGeneration), charted),
+    );
+    if (settlement.kind === "retry") return settlement;
+    this.#settledZones.add(zone);
+    if (settlement.kind === "player") {
+      this.#zoneMaps.set(zone, settlement.map);
+      return settlement;
     }
-    if (
-      !area && known && isAdoptableStorage(known.storage, this.#options.storage) &&
-      (!known.zone || known.zone === areaId)
-    ) {
-      area = known;
-    }
-    if (!area && preferredName) {
-      const source = findCompatibleAreaByName(
-        mapper.areas,
-        this.#options.storage,
-        areaId,
-        preferredName,
-      );
-      if (source) area = this.#hydrateArea(source);
-    }
-    if (!area) {
-      // Re-read durable storage at the decision boundary too. Another mapper
-      // instance may have created this zone since our ownership-start refresh.
-      await this.#whileCurrentRun(runGeneration, () => this.#refreshAreaProjection());
-      const refreshedExact = findAreaByNukeFireId(
-        mapper.areas,
-        this.#options.storage,
-        areaId,
-      );
-      if (refreshedExact) area = this.#hydrateArea(refreshedExact);
-      if (!area && preferredName) {
-        const refreshedByName = findCompatibleAreaByName(
-          mapper.areas,
-          this.#options.storage,
-          areaId,
-          preferredName,
-        );
-        if (refreshedByName) area = this.#hydrateArea(refreshedByName);
-      }
-    }
-    if (!area) {
-      const atlas = await this.#ensureLocalAtlas(runGeneration);
-      const areaName = preferredName || `${this.#options.areaPrefix} ${zone}`;
-      const source = await this.#whileCurrentRun(
-        runGeneration,
-        () => this.#directMutation(
-          undefined,
-          "createArea",
-          `Create NukeFire area ${areaName}`,
-          () => mapper.createArea(areaName, { storage: this.#options.storage, atlas }),
-          (created) => ({
-            areaId: created.id,
-            name: created.name,
-            storage: created.storage,
-          }),
-        ),
-      );
-      area = this.#registerArea({
-        id: source.id,
-        name: source.name,
-        storage: source.storage,
-        polishPending: false,
-        polishMemo: undefined,
-        roomsByNumber: new Map(),
-        connections: new Map(),
-      });
-    }
+    if (settlement.deleted.length > 0) this.#zoneMaps.clear();
+    this.#zoneMaps.set(zone, settlement.into);
+    for (const id of settlement.deleted) this.#forgetArea(id);
+    for (const id of settlement.changed) this.#hydrateArea(mapper.getAreaById(id), true);
+    return settlement;
+  }
 
-    this.#zoneAreas.set(zone, area);
-    if (!area.zone || area.source !== SOURCE_NAME) {
-      await this.#whileCurrentRun(
-        runGeneration,
-        () => this.#mutateArea(area.id, async (mutation) => {
-          if (!area.zone) {
-            await this.#whileCurrentRun(
-              runGeneration,
-              () => mutation.setAreaProperty(NUKEFIRE_AREA_ID_PROPERTY, areaId),
-            );
-          }
-          if (area.source !== SOURCE_NAME) {
-            await this.#whileCurrentRun(
-              runGeneration,
-              () => mutation.setAreaProperty(AREA_SOURCE_PROPERTY, SOURCE_NAME),
-            );
-          }
-        }, `Bind NukeFire zone ${areaId}`),
-      );
-      area.zone = areaId;
-      area.source = SOURCE_NAME;
-    }
-
-    const placeholder = `${this.#options.areaPrefix} ${zone}`;
-    if (preferredName && area.name === placeholder && area.name !== preferredName) {
-      await this.#whileCurrentRun(
-        runGeneration,
-        () => this.#directMutation(
-          area.id,
-          "renameArea",
-          `Rename NukeFire area ${area.name} to ${preferredName}`,
-          () => mapper.renameArea(area.id, preferredName),
+  #zoneContext(runGeneration: number): ZoneContext {
+    return {
+      names: this.#names,
+      marks: NUKEFIRE_MARKS,
+      storage: this.#options.storage,
+      atlas: () => this.#ensureLocalAtlas(runGeneration),
+      mutation: (area, api, description, call, summarize) =>
+        this.#directMutation(area, api, description, call, summarize),
+      // Merged sections are new geometry, exactly as a deferred topology
+      // change is: polish is pending again and no fruitless context applies.
+      // Their seams are remembered for the next polish to preview first.
+      polish: (area, seams) =>
+        this.#persistAreaPolishState(
+          this.#hydrateArea(mapper.getAreaById(area), true),
+          { kind: "topology-deferred", seams },
+          runGeneration,
         ),
-      );
-      area.name = preferredName;
-    }
-    return area;
+      log: (record) => this.#logDecision(record),
+      notice: (text) => echo(`[nukefire-mapper] ${text}`),
+    };
   }
 
   async #planAssignments(
@@ -1834,11 +2329,15 @@ export class NukeFireMapper {
       }
       if (topologyGrowth) stats.topologyGrowthAreas += 1;
       if (policy.deferExistingReflow) {
-        await this.#persistAreaPolishState(area, { kind: "topology-deferred" }, runGeneration);
-        assertNotAborted(signal);
-        // Growth is fresh evidence that polish can gain ground here; the
-        // fruitless-resume allowance starts over with it.
-        this.#quietResumeBudget.reset(areaKey(area));
+        if (topologyGrowth) {
+          await this.#persistAreaPolishState(area, { kind: "topology-deferred" }, runGeneration);
+          assertNotAborted(signal);
+          // Growth is fresh evidence that polish can gain ground here; the
+          // fruitless-resume allowance starts over with it. Merely carrying
+          // already-deferred work must preserve both settlement evidence and
+          // the bounded resume budget.
+          this.#quietResumeBudget.reset(areaKey(area));
+        }
         if (this.#polishEntries.currentAreaKey === areaKey(area)) {
           // Arm the current visit before the rest of topology reconciliation.
           // If a later write fails after a partial commit, the next successful
@@ -1860,6 +2359,9 @@ export class NukeFireMapper {
       let plan: Pick<IntegralLayoutPlan, "positions" | "movedExisting"> &
         Partial<Pick<IntegralLayoutPlan, "constraintRepair" | "routeAmendments">> = identityPlan();
       let polishContext: AreaPolishPlanningContext | undefined;
+      // The whole-map polish ended no better than the seam preview on the
+      // map, which therefore stays as the pass's result.
+      let keptPreview = false;
       if (runPlanner) {
         const chartNodes: LayoutNode[] = group.map((assignment) => ({
           id: assignmentIds.get(assignment.source.vnum) as string,
@@ -1913,27 +2415,57 @@ export class NukeFireMapper {
         // this mapper always stacks vertical traversals across map levels. A
         // cross-level endpoint is necessarily a resident outside Map.Local,
         // so all durable residents are available as immutable level seeds.
-        const nodes = stackVerticalTraversals(chartNodes, edges, establishedLevels, centerId);
-        const constraintRepairPolicy = nukeFireConstraintRepairPolicy(
-          this.#options.searchForPerfectLayouts,
-          {
-            residentCount: residents.length,
-            edgeCount: edges.length,
-          },
-        );
-        const startingFingerprint = mirrorPlanningFingerprint(area);
-        const candidatePolishContext = createAreaPolishPlanningContext({
-          geometryFingerprint: startingFingerprint,
-          centerId,
-          nodes,
+        const nodes = stackVerticalTraversals(
+          chartNodes,
           edges,
-          searchForPerfectLayouts: this.#options.searchForPerfectLayouts,
-          policy: constraintRepairPolicy,
+          establishedLevels,
+          centerId,
+          Number.isSafeInteger(snapshot.plane) ? snapshot.plane : 0,
+        );
+        const constraintRepairPolicy = nukeFireAutomaticConstraintRepairPolicy({
+          residentCount: residents.length,
+          edgeCount: edges.length,
         });
+        const startingFingerprint = mirrorPlanningFingerprint(area);
         // A cached mirror cannot authorize suppression: editor/package writes
         // may have changed live geometry without touching NukeFire's snapshot.
         this.#assertLivePlanningFingerprint(area, startingFingerprint, "before Worker planning");
-        if (moveExisting && polishRetrySuppressed(area.polishMemo, candidatePolishContext)) {
+        // A map with seams first shows a quick polish of them, and its
+        // whole-map polish plans from the geometry that seam round began
+        // with, whose only changes since are the round's own writes. The live
+        // check above proves the latter for a round an earlier pass began.
+        const seamPass = moveExisting && !introducesRoom && area.polishSeams.length > 0
+          ? this.#seamPreviews.begin(
+            areaKey(area),
+            areaPolishSeamsPropertyValue(area.polishSeams),
+            {
+              positions: new Map(residents.map((resident) => [resident.id, resident.position])),
+              fingerprint: startingFingerprint,
+            },
+            () => seamRegion(
+              new Map(residents.map((resident) => [resident.id, resident.position])),
+              edges,
+              area.polishSeams.map((roomNumber) => residentId(roomNumber)),
+            ),
+          )
+          : undefined;
+        const base = seamPass?.base;
+        // The whole-map request: each resident where the base has it, and as
+        // movable as it is now; the fingerprint shows movability unchanged.
+        const planningResidents = base === undefined ? residents : residents.map((resident) => {
+          const position = base.positions.get(resident.id);
+          return position ? { ...resident, position } : resident;
+        });
+        const candidatePolishContext = createAreaPolishPlanningContext({
+          geometryFingerprint: base?.fingerprint ?? startingFingerprint,
+          centerId,
+          nodes,
+          edges,
+          searchForPerfectLayouts: false,
+          policy: constraintRepairPolicy,
+        });
+        const polishEligibility = areaPolishEligibility(area.polishMemo, candidatePolishContext);
+        if (moveExisting && !polishEligibility.eligible) {
           this.#polishEntries.consumeRetry(areaKey(area));
           this.#deferredReflowAreas.delete(areaKey(area));
           runPlanner = false;
@@ -1943,16 +2475,19 @@ export class NukeFireMapper {
             area: { id: area.id, name: area.name },
             vnum: snapshot.center,
             memoContexts: area.polishMemo?.kind === "contexts"
-              ? area.polishMemo.contextKeys.length
+              ? area.polishMemo.settlements.length
               : 0,
+            reason: polishEligibility.reason,
+            terminalReason: polishEligibility.terminalReason,
+            retryAfterMs: polishEligibility.retryAfterMs,
           });
         } else {
           polishContext = candidatePolishContext;
           stats.plannedAreas += 1;
           if (moveExisting) {
-            // An attempt belongs to this exact entry context, not to every
-            // subsequent room movement. Consume it only after the full key is
-            // known not to be memoized, immediately before cancelable work.
+            // Spend at most one automatic attempt per area visit. The durable
+            // settlement itself is area+geometry scoped; the entry/chart key
+            // remains diagnostic rather than authorizing another heavy run.
             this.#quietPolishClaims.record(snapshot, areaKey(area), {
               retryConsumed: this.#polishEntries.consumeRetry(areaKey(area)),
               deferredRemoved: this.#deferredReflowAreas.delete(areaKey(area)),
@@ -2010,7 +2545,7 @@ export class NukeFireMapper {
               centerId,
               allowExistingMoves: moveExisting,
               nodes,
-              residents,
+              residents: planningResidents,
               edges,
             },
           } : undefined;
@@ -2033,6 +2568,14 @@ export class NukeFireMapper {
           else signal?.addEventListener("abort", forwardAbort, { once: true });
           const planningSignal = progressiveController?.signal ?? signal;
           let queuedQuality: Readonly<LayoutQuality> | undefined;
+          // Which layouts the queue is applying: the seam round's, whose
+          // writes the whole-map polish still plans beneath, or the polish's
+          // own. The round flushes the queue before the polish starts.
+          let applyingSeamRound = false;
+          let polishWrote = false;
+          // The quality of the preview on the map when the whole-map polish
+          // starts, when the map shows the round's writes over its base.
+          let displayedQuality: Readonly<LayoutQuality> | undefined;
           const progressive = moveExisting
             ? new LatestValueQueue<IntegralLayoutPlan>(async (candidate) => {
               assertNotAborted(planningSignal);
@@ -2058,6 +2601,7 @@ export class NukeFireMapper {
               if (updates.length === 0) return;
 
               const batchStartedAt = performance.now();
+              let routeAfterCommit = false;
               await this.#whileCurrentRun(
                 runGeneration,
                 () => this.#mutateArea(area.id, async (mutation) => {
@@ -2080,7 +2624,7 @@ export class NukeFireMapper {
                     );
                   }
                   const routeWriteStartedAt = performance.now();
-                  await this.#syncAreaConnectionRoutes(
+                  routeAfterCommit = await this.#syncAreaConnectionRoutes(
                     area,
                     residentRooms,
                     candidate.positions,
@@ -2093,22 +2637,43 @@ export class NukeFireMapper {
                 }, `Apply progressive NukeFire reflow for ${area.name}`),
               );
               for (const update of reconciled) appliedPositionIds.add(update.id);
+              expectedFingerprint = mirrorPlanningFingerprint(area);
+              // The layout is on the map now, even if movement aborts this
+              // pass before the rest of this runs, so whose write it was is
+              // noted first: a later pass must see the preview's own writes
+              // as the preview's, or it would plan from the preview instead
+              // of the merged geometry.
+              if (seamPass && applyingSeamRound) {
+                this.#seamPreviews.previewApplied(areaKey(area), expectedFingerprint);
+              } else if (seamPass) {
+                polishWrote = true;
+                this.#seamPreviews.polishApplied(areaKey(area));
+              }
               // The transaction can move a newer current room which belongs to
               // this area even when this plan's snapshot center is stale.
               this.#refreshMovedCurrentRoom(area, reconciled, runGeneration);
               assertNotAborted(planningSignal);
               stats.batchCommitMs += performance.now() - batchStartedAt;
-              expectedFingerprint = mirrorPlanningFingerprint(area);
               this.#logDecision({
                 kind: "layout-progress-applied",
                 area: { id: area.id, name: area.name },
                 quality: candidate.quality,
                 movedRooms: updates.length,
+                ...(applyingSeamRound ? { seamRound: true } : {}),
               });
               // The durable improvement makes this pass fruitful: an abort now
               // resumes with a fresh allowance, since the ratchet means every
               // retry starts from a strictly better map.
               this.#quietPolishClaims.markProgress(snapshot, areaKey(area));
+              if (routeAfterCommit) {
+                await this.#routeConnectionsAfterCommit(
+                  area,
+                  residentRooms,
+                  candidate.positions,
+                  runGeneration,
+                  candidate.routeAmendments,
+                );
+              }
 
             }, (error) => progressiveController?.abort(error), {
               minIntervalMs: PROGRESSIVE_APPLY_FLOOR_MS,
@@ -2122,28 +2687,167 @@ export class NukeFireMapper {
             queuedQuality = candidate.quality;
             progressive.push(candidate);
           };
+          // The seam round: planner passes that may move only the rooms of
+          // the seam region, each from the best layout so far, while a pass
+          // gains on the quality up to crossings. It runs no constraint
+          // repair, whose search ignores pins. Its layouts go through the
+          // queue like any other, and it flushes the queue before returning.
+          const runSeamRound = async (round: SeamRoundPlan): Promise<void> => {
+            const startedAt = performance.now();
+            const key = areaKey(area);
+            const movableIds = new Set(
+              residents
+                .filter((resident) => resident.movable && round.region.has(resident.id))
+                .map((resident) => resident.id),
+            );
+            // The map as it is: the base, or where an interrupted round left it.
+            let positions: ReadonlyMap<string, GridPosition> = new Map(
+              residents.map((resident) => [resident.id, resident.position]),
+            );
+            const before = measureIntegralLayoutQuality(positions, edges);
+            let best: Readonly<LayoutQuality> = before;
+            let passes = 0;
+            let stop: "passes" | "no-gain" | "nothing-movable" | "failed" = movableIds.size === 0
+              ? "nothing-movable"
+              : "passes";
+            let failure: string | undefined;
+            try {
+              for (let pass = 0; movableIds.size > 0 && pass < round.passesLeft; pass += 1) {
+                const passBefore = best;
+                const request: IntegralLayoutRequest = {
+                  nodes: [],
+                  residents: residents.map((resident) => ({
+                    id: resident.id,
+                    position: positions.get(resident.id) ?? resident.position,
+                    movable: movableIds.has(resident.id),
+                  })),
+                  edges,
+                  allowExistingMoves: true,
+                };
+                const consider = (candidate: IntegralLayoutPlan | undefined): void => {
+                  if (!candidate || !progressive || !keepsSeamPins(request.residents, candidate.positions)) {
+                    return;
+                  }
+                  if (compareLayoutQuality(candidate.quality, best) <= 0) return;
+                  best = candidate.quality;
+                  positions = candidate.positions;
+                  queuedQuality = candidate.quality;
+                  // A detour the round proposes treats the rooms it pinned
+                  // as fixed; route amendments are the whole-map polish's.
+                  progressive.push({
+                    positions: candidate.positions,
+                    movedExisting: candidate.movedExisting,
+                    quality: candidate.quality,
+                  });
+                };
+                let planned: IntegralLayoutPlan;
+                try {
+                  planned = await this.#whileCurrentRun(
+                    runGeneration,
+                    () => this.#quietPolishPlanner().planIntegral(request, {
+                      signal: planningSignal,
+                      onProgress: (progress) => consider(progress.improvement),
+                      currentQuality: best,
+                    }),
+                  );
+                } catch (error) {
+                  if (error instanceof ObsoleteNukeFireMapperRunError || planningSignal?.aborted) {
+                    throw error;
+                  }
+                  // The round only previews: a pass the planner cannot lay
+                  // out ends it, and the whole-map polish runs regardless.
+                  stop = "failed";
+                  failure = error instanceof Error ? error.message : String(error);
+                  break;
+                }
+                consider(planned);
+                passes += 1;
+                this.#seamPreviews.passRan(key);
+                if (!improvesThroughCrossings(best, passBefore, compareLayoutQuality)) {
+                  stop = "no-gain";
+                  break;
+                }
+              }
+              this.#seamPreviews.roundEnded(key);
+              await progressive?.flush();
+            } catch (error) {
+              progressive?.discardPending();
+              await progressive?.flush();
+              throw error;
+            }
+            this.#logDecision({
+              kind: "layout-seam-round",
+              area: { id: area.id, name: area.name },
+              seams: area.polishSeams.filter((roomNumber) => roomById.has(residentId(roomNumber)))
+                .length,
+              region: round.region.size,
+              movable: movableIds.size,
+              resumed: round.resumed,
+              passes,
+              stop,
+              ...(failure === undefined ? {} : { error: failure }),
+              before,
+              after: best,
+              durationMs: performance.now() - startedAt,
+            });
+          };
           try {
+            if (seamPass?.round) {
+              applyingSeamRound = true;
+              try {
+                await runSeamRound(seamPass.round);
+              } finally {
+                applyingSeamRound = false;
+              }
+            }
+            if (base) {
+              // Rooms the map shows away from the base the polish plans from
+              // are the seam round's writes, from this pass or an interrupted
+              // one. Every layout of the polish is complete, so the final
+              // reconciliation diffs them as it diffs rooms it moved itself,
+              // and the polish shows a layout only once it beats the preview.
+              for (const resident of planningResidents) {
+                const shown = roomById.get(resident.id)?.position;
+                if (shown && !sameGridPosition(shown, resident.position)) {
+                  appliedPositionIds.add(resident.id);
+                  displayedQuality ??= queuedQuality ?? measureIntegralLayoutQuality(
+                    new Map([...roomById].map(([id, room]) => [id, room.position])),
+                    edges,
+                  );
+                }
+              }
+              if (displayedQuality) queuedQuality = displayedQuality;
+            }
             const runWorker = async (): Promise<IntegralLayoutPlan> => {
               assertNotAborted(planningSignal);
               const plannerStartedAt = performance.now();
               let planned: IntegralLayoutPlan;
               try {
+                const planningRequest: IntegralLayoutRequest = {
+                  nodes,
+                  residents: planningResidents,
+                  edges,
+                  centerId,
+                  allowExistingMoves: moveExisting,
+                  trace: trace ? (event) => trace.push(event) : undefined,
+                };
                 planned = await this.#whileCurrentRun(
                   runGeneration,
-                  () => planIntegralLayoutAsync({
-                    nodes,
-                    residents,
-                    edges,
-                    centerId,
-                    allowExistingMoves: moveExisting,
-                    trace: trace ? (event) => trace.push(event) : undefined,
-                  }, moveExisting
-                    ? {
+                  () => moveExisting
+                    ? this.#quietPolishPlanner().planIntegral(planningRequest, {
                       signal: planningSignal,
                       onProgress: publishImprovement,
                       constraintRepair: constraintRepairPolicy,
-                    }
-                    : undefined),
+                      plannerContext: {
+                        source: "nukefire:auto-polish",
+                        areaId: areaKey(area),
+                        areaName: area.name,
+                        contextKey: candidatePolishContext.key,
+                      },
+                      // What the map shows before this plan is the preview.
+                      ...(displayedQuality ? { currentQuality: displayedQuality } : {}),
+                    })
+                    : planIntegralLayoutAsync(planningRequest, { signal: planningSignal }),
                 );
                 stats.plannerMs += performance.now() - plannerStartedAt;
                 await progressive?.flush();
@@ -2166,10 +2870,20 @@ export class NukeFireMapper {
               return planned;
             };
 
-            const planned = await runWorker();
+            const workerPlan = await runWorker();
             assertNotAborted(signal);
+            const restoredPositions = restoreUnanchoredChartLevels(
+              workerPlan.positions,
+              nodes,
+              edges,
+              establishedLevels,
+              centerId,
+            );
+            const planned = restoredPositions === workerPlan.positions
+              ? workerPlan
+              : { ...workerPlan, positions: restoredPositions };
             plan = planned;
-            if (diagnosticContext && planned) {
+            if (diagnosticContext) {
               this.#logDecision({
                 kind: "layout-decision",
                 ...diagnosticContext,
@@ -2182,8 +2896,55 @@ export class NukeFireMapper {
                 },
               });
             }
+            if (
+              displayedQuality !== undefined && !polishWrote &&
+              compareLayoutQuality(planned.quality, displayedQuality) <= 0
+            ) {
+              // The whole-map polish ended no better than the preview, so the
+              // map keeps the preview: the pass's plan is what the map shows.
+              keptPreview = true;
+              const positions = new Map([...roomById].map(([id, room]) => [id, room.position]));
+              const routeAmendments = computeIntegralRouteAmendments(
+                { residents, edges, allowExistingMoves: true },
+                { positions, quality: displayedQuality },
+              );
+              plan = {
+                positions,
+                movedExisting: new Set(
+                  planningResidents
+                    .filter((resident) => {
+                      const shown = positions.get(resident.id);
+                      return shown !== undefined && !sameGridPosition(shown, resident.position);
+                    })
+                    .map((resident) => resident.id),
+                ),
+                ...(planned.constraintRepair ? { constraintRepair: planned.constraintRepair } : {}),
+                ...(routeAmendments ? { routeAmendments } : {}),
+              };
+              this.#logDecision({
+                kind: "layout-seam-preview-kept",
+                area: { id: area.id, name: area.name },
+                preview: displayedQuality,
+                polish: planned.quality,
+              });
+            }
           } catch (caught) {
             if (caught instanceof ObsoleteNukeFireMapperRunError) throw caught;
+            if (moveExisting && polishContext) {
+              const interruptedFingerprint = mirrorPlanningFingerprint(area);
+              const displacedWithinArea = signal?.aborted === true &&
+                this.#takeSameAreaPolishDisplacement(snapshot, areaKey(area));
+              await this.#persistAreaPolishState(area, {
+                kind: "polish-interrupted",
+                reason: signal?.aborted ? "cancelled" : "error",
+                displacedWithinArea,
+                improved: interruptedFingerprint !== polishContext.geometryFingerprint,
+                context: {
+                  ...polishContext,
+                  geometryFingerprint: interruptedFingerprint,
+                },
+              }, runGeneration);
+            }
             if (signal?.aborted) throw caught;
             if (diagnosticContext) {
               this.#logDecision({
@@ -2244,6 +3005,7 @@ export class NukeFireMapper {
           "before applying layout",
         );
         const batchStartedAt = performance.now();
+        let routeAfterCommit = false;
         await this.#whileCurrentRun(
           runGeneration,
           () => this.#mutateArea(area.id, async (mutation) => {
@@ -2267,13 +3029,20 @@ export class NukeFireMapper {
               }
             }
             const routeWriteStartedAt = performance.now();
-            await this.#syncAreaConnectionRoutes(
+            const residentIds = new Set([...residentRooms.keys()].map(residentId));
+            routeAfterCommit = await this.#syncAreaConnectionRoutes(
               area,
               residentRooms,
               plan.positions,
               runGeneration,
               mutation,
               plan.routeAmendments,
+              updates.length > 0 ? undefined : {
+                rooms: new Set(),
+                cells: [...plan.positions]
+                  .filter(([id]) => !residentIds.has(id))
+                  .map(([, position]) => position),
+              },
             );
             assertNotAborted(signal);
             stats.routeWriteMs += performance.now() - routeWriteStartedAt;
@@ -2284,6 +3053,16 @@ export class NukeFireMapper {
         this.#reconciledPortAreas.add(areaKey(area));
         assertNotAborted(signal);
         stats.batchCommitMs += performance.now() - batchStartedAt;
+        if (routeAfterCommit) {
+          await this.#routeConnectionsAfterCommit(
+            area,
+            residentRooms,
+            plan.positions,
+            runGeneration,
+            plan.routeAmendments,
+          );
+          assertNotAborted(signal);
+        }
       }
 
       assertNotAborted(signal);
@@ -2294,8 +3073,11 @@ export class NukeFireMapper {
         // A fruitful non-fixed-point pass invalidates every old context. If
         // the same pass proves a fixed point, retain that proof against the
         // final geometry so re-entering through the same chart does not repeat
-        // the completed tournament.
-        const completedContext = polishContext === undefined || !improved
+        // the completed tournament. A kept seam preview is not the geometry
+        // the polish proved anything about, so it records no context.
+        const completedContext = keptPreview
+          ? undefined
+          : polishContext === undefined || !improved
           ? polishContext
           : { ...polishContext, geometryFingerprint: finalFingerprint };
         await this.#persistAreaPolishState(area, {
@@ -2307,9 +3089,11 @@ export class NukeFireMapper {
         assertNotAborted(signal);
         // The attempt is genuinely spent: a later abort over the same
         // snapshot must not resurrect it. Completion is also fresh evidence,
-        // so the fruitless-resume allowance starts over.
+        // so the fruitless-resume allowance starts over. The whole map is
+        // polished, seams included, so their preview is done with too.
         this.#quietPolishClaims.discharge(snapshot, areaKey(area));
         this.#quietResumeBudget.reset(areaKey(area));
+        this.#seamPreviews.forget(areaKey(area));
       }
       if (
         policy.deferExistingReflow &&
@@ -2355,6 +3139,18 @@ export class NukeFireMapper {
       port_offset: 0.5,
       port_mode: "AutoPinned",
     };
+    // Only two rooms on one level may be joined by a drawn route, so a
+    // Connection between levels, or from a room to itself, runs straight.
+    if (roomA === roomB || positionA.level !== positionB.level) {
+      return {
+        endpoint_a: baseA,
+        endpoint_b: baseB,
+        routing: "Simple",
+        segment_shape: "Direct",
+        corner: "Rounded",
+        route_points: [],
+      };
+    }
     const routedStart = routedEndpointSide(baseA, preferredStart) as RouteSide;
     const routedEnd = routedEndpointSide(baseB, preferredEnd) as RouteSide;
     // An engine amendment is the plan's own answer for a defect movement can
@@ -2390,6 +3186,15 @@ export class NukeFireMapper {
     };
   }
 
+  /**
+   * Routes the area's Connections for rooms at `positions`, in `mutation`'s
+   * edit when one is given. With a `scope`, from a pass that moved no room,
+   * only the Connections it can have changed are routed again; every other
+   * one keeps its route, while ports are still settled across the area. True
+   * when a Connection the edit brings onto one level still runs straight,
+   * because the host accepts its route only in a later edit: the caller then
+   * syncs again once this edit has committed.
+   */
   async #syncAreaConnectionRoutes(
     area: AreaMirror,
     residentRooms: ReadonlyMap<RoomNumber, RoomMirror>,
@@ -2397,7 +3202,8 @@ export class NukeFireMapper {
     runGeneration: number,
     mutation?: AreaMutator,
     routeAmendments?: readonly RouteAmendment[],
-  ): Promise<void> {
+    scope?: RouteSyncScope,
+  ): Promise<boolean> {
     this.#assertCurrentRun(runGeneration);
     const byRoomNumber = new Map<RoomNumber, GridPosition>();
     for (const number of residentRooms.keys()) {
@@ -2430,6 +3236,85 @@ export class NukeFireMapper {
       }
     }
 
+    const geometryOf = (
+      connection: ConnectionMirror,
+      endpointB: ConnectionEndpoint,
+    ): DesiredConnectionGeometry => ({
+      endpoint_a: copyEndpoint(connection.endpointA),
+      endpoint_b: copyEndpoint(endpointB),
+      routing: connection.routing,
+      segment_shape: connection.segmentShape,
+      corner: connection.corner,
+      route_points: connection.routePoints.map((point) => ({ ...point })),
+    });
+    const writeGeometry = async (
+      connection: ConnectionMirror,
+      desired: DesiredConnectionGeometry,
+    ): Promise<void> => {
+      await this.#whileCurrentRun(
+        runGeneration,
+        () => mutation
+          ? mutation.setConnection(connection.id, desired)
+          : this.#directMutation(
+            area.id,
+            "setConnection",
+            `Update NukeFire connection ${String(connection.id)}`,
+            () => mapper.setConnection(area.id, connection.id, desired),
+          ),
+      );
+      connection.endpointA = copyEndpoint(desired.endpoint_a);
+      connection.endpointB = copyEndpoint(desired.endpoint_b);
+      connection.routing = desired.routing;
+      connection.segmentShape = desired.segment_shape;
+      connection.corner = desired.corner;
+      connection.routePoints = desired.route_points.map((point) => ({ ...point }));
+    };
+
+    // The host checks every Connection's routing against the kind it derives
+    // from where the edit leaves the Connection's rooms, and only rooms on one
+    // level may be joined by a drawn route. A Connection whose rooms end on
+    // different levels therefore runs straight from here on: the mapper's own
+    // route is dropped, and an author-drawn one stays stored, dormant, for its
+    // author to restore. A Connection whose rooms end on one level after
+    // running between levels keeps running straight until the edit commits,
+    // because inside the edit the host checks an update against the kind the
+    // Connection had before it; the caller routes it in an edit of its own.
+    const levelOf = (number: RoomNumber): number | undefined =>
+      (byRoomNumber.get(number) ?? area.roomsByNumber.get(number)?.position)?.level;
+    const routeAfterCommit = new Set<string>();
+    for (const connection of area.connections.values()) {
+      const endpointB = connection.endpointB;
+      if (!endpointB || endpointB.room_number === connection.endpointA.room_number) continue;
+      const levelA = levelOf(connection.endpointA.room_number);
+      const levelB = levelOf(endpointB.room_number);
+      if (levelA === undefined || levelB === undefined) continue;
+      if (levelA === levelB) {
+        if (connection.kind === "CrossLevel") {
+          if (mutation) routeAfterCommit.add(connectionMirrorKey(connection.id));
+          connection.kind = "Internal";
+        }
+        continue;
+      }
+      connection.kind = "CrossLevel";
+      if (connection.routing !== "Automatic" && connection.routing !== "Manual") continue;
+      const authored = routeIsManuallyAuthored(connection.routing);
+      const before = geometryOf(connection, endpointB);
+      const desired: DesiredConnectionGeometry = {
+        ...before,
+        routing: "Simple",
+        segment_shape: authored ? before.segment_shape : "Direct",
+        route_points: authored ? before.route_points : [],
+      };
+      await writeGeometry(connection, desired);
+      changes.push({
+        connectionId: connection.id,
+        levels: [levelA, levelB],
+        reason: authored ? "authored-route-dormant-between-levels" : "route-dropped-between-levels",
+        before,
+        after: desired,
+      });
+    }
+
     const proposals: {
       key: string;
       connection: ConnectionMirror;
@@ -2451,9 +3336,14 @@ export class NukeFireMapper {
       const endpointB = connection.endpointB;
       if (!endpointB) continue;
       // An author-drawn route is user-owned, exactly as Manual ports are:
-      // recomputation proposes nothing for it, so its geometry survives every
-      // commit while its endpoints still reserve their wall slots below.
-      if (routeIsManuallyAuthored(connection.routing)) continue;
+      // recomputation proposes nothing for it, nor for one left dormant, so
+      // its geometry survives every commit while its endpoints still reserve
+      // their wall slots below.
+      if (
+        routeIsManuallyAuthored(connection.routing) ||
+        routeIsDormant(connection.routing, connection.routePoints)
+      ) continue;
+      if (routeAfterCommit.has(connectionMirrorKey(connection.id))) continue;
       const roomA = residentRooms.get(connection.endpointA.room_number);
       const roomB = residentRooms.get(endpointB.room_number);
       if (!roomA || !roomB || roomA.vnum === undefined || roomB.vnum === undefined) continue;
@@ -2492,7 +3382,6 @@ export class NukeFireMapper {
       const directionB = exitB?.fromDirection ?? exitA?.toDirection ?? "Other";
       const preferredStart = directionSide(directionA, deltaX, deltaY) as RouteSide;
       const preferredEnd = directionSide(directionB, -deltaX, -deltaY) as RouteSide;
-      const obstructions = directRoomObstructions(positionA, positionB, occupied);
       // A matching engine amendment supplies the generated route directly,
       // oriented from this connection's endpoint A toward endpoint B. Manual
       // connections never reach this point, so an amendment can never touch
@@ -2502,19 +3391,26 @@ export class NukeFireMapper {
         connection.endpointA.room_number,
         endpointB.room_number,
       );
-      const desired = this.#desiredConnectionGeometry(
-        roomA.roomNumber,
-        roomB.roomNumber,
-        positionA,
-        positionB,
-        occupied,
-        preferredStart,
-        preferredEnd,
-        connection.endpointA,
-        endpointB,
-        obstructions.length > 0,
-        amendmentWaypoints,
-      );
+      const unchanged = scope !== undefined &&
+        !scope.rooms.has(roomA.roomNumber) && !scope.rooms.has(roomB.roomNumber) &&
+        !(amendmentWaypoints && amendmentWaypoints.length > 0) &&
+        !routeCrossesCells(positionA, positionB, connection.routePoints, scope.cells);
+      const obstructions = unchanged ? [] : directRoomObstructions(positionA, positionB, occupied);
+      const desired = unchanged
+        ? geometryOf(connection, endpointB)
+        : this.#desiredConnectionGeometry(
+          roomA.roomNumber,
+          roomB.roomNumber,
+          positionA,
+          positionB,
+          occupied,
+          preferredStart,
+          preferredEnd,
+          connection.endpointA,
+          endpointB,
+          obstructions.length > 0,
+          amendmentWaypoints,
+        );
       const soleMember = members.length === 1 ? members[0] : undefined;
       const oneWayOriginRoom = soleMember &&
           ((soleMember.room.roomNumber === roomA.roomNumber &&
@@ -2599,31 +3495,8 @@ export class NukeFireMapper {
       }
       const portsChanged = connection.endpointA.port_offset !== desired.endpoint_a.port_offset ||
         currentEndpointB.port_offset !== desired.endpoint_b.port_offset;
-      const before = {
-        endpoint_a: copyEndpoint(connection.endpointA),
-        endpoint_b: copyEndpoint(currentEndpointB),
-        routing: connection.routing,
-        segment_shape: connection.segmentShape,
-        corner: connection.corner,
-        route_points: connection.routePoints.map((point) => ({ ...point })),
-      };
-      await this.#whileCurrentRun(
-        runGeneration,
-        () => mutation
-          ? mutation.setConnection(connection.id, desired)
-          : this.#directMutation(
-            area.id,
-            "setConnection",
-            `Update NukeFire connection ${String(connection.id)}`,
-            () => mapper.setConnection(area.id, connection.id, desired),
-          ),
-      );
-      connection.endpointA = copyEndpoint(desired.endpoint_a);
-      connection.endpointB = copyEndpoint(desired.endpoint_b);
-      connection.routing = desired.routing;
-      connection.segmentShape = desired.segment_shape;
-      connection.corner = desired.corner;
-      connection.routePoints = desired.route_points.map((point) => ({ ...point }));
+      const before = geometryOf(connection, currentEndpointB);
+      await writeGeometry(connection, desired);
       changes.push({
         connectionId: connection.id,
         roomA: {
@@ -2661,6 +3534,34 @@ export class NukeFireMapper {
         changes,
       });
     }
+    return routeAfterCommit.size > 0;
+  }
+
+  /**
+   * Routes, in an edit of their own, the Connections an edit just brought onto
+   * one level: once that edit has committed, the host checks their routes
+   * against their kind between rooms on one level.
+   */
+  async #routeConnectionsAfterCommit(
+    area: AreaMirror,
+    residentRooms: ReadonlyMap<RoomNumber, RoomMirror>,
+    positions: ReadonlyMap<string, GridPosition>,
+    runGeneration: number,
+    routeAmendments?: readonly RouteAmendment[],
+  ): Promise<void> {
+    await this.#whileCurrentRun(
+      runGeneration,
+      () => this.#mutateArea(area.id, async (mutation) => {
+        await this.#syncAreaConnectionRoutes(
+          area,
+          residentRooms,
+          positions,
+          runGeneration,
+          mutation,
+          routeAmendments,
+        );
+      }, `Route NukeFire connections brought onto one level in ${area.name}`),
+    );
   }
 
   async #syncRoom(
@@ -2735,7 +3636,7 @@ export class NukeFireMapper {
     if (room.zone !== String(source.zone)) {
       await this.#whileCurrentRun(
         runGeneration,
-        () => mutation.setRoomProperty(room.roomNumber, ROOM_ZONE_PROPERTY, String(source.zone)),
+        () => mutation.setRoomProperty(room.roomNumber, NUKEFIRE_MARKS.zone, String(source.zone)),
       );
       room.zone = String(source.zone);
     }
@@ -2815,10 +3716,15 @@ export class NukeFireMapper {
           // A Connection created earlier in one host mutation is not visible to
           // a later update operation in that same envelope. Route and port
           // geometry therefore gets its own committed-topology pass.
+          const linkedRooms = new Set<RoomNumber>();
+          for (const work of group) {
+            linkedRooms.add(work.from.roomNumber);
+            if (work.to) linkedRooms.add(work.to.roomNumber);
+          }
           await this.#whileCurrentRun(
             runGeneration,
-            () => this.#mutateArea(areaId, (mutation) =>
-              this.#syncAreaConnectionRoutes(
+            () => this.#mutateArea(areaId, async (mutation) => {
+              await this.#syncAreaConnectionRoutes(
                 area,
                 area.roomsByNumber,
                 new Map([...area.roomsByNumber.values()].map((room) => [
@@ -2827,7 +3733,10 @@ export class NukeFireMapper {
                 ])),
                 runGeneration,
                 mutation,
-              ), "Route NukeFire map links"),
+                undefined,
+                { rooms: linkedRooms, cells: [] },
+              );
+            }, "Route NukeFire map links"),
           );
         }
       } catch (caught) {
@@ -2866,8 +3775,8 @@ export class NukeFireMapper {
           // no-op, because those existing Connections may still need ports.
           await this.#whileCurrentRun(
             runGeneration,
-            () => this.#mutateArea(areaId, (mutation) =>
-              this.#syncAreaConnectionRoutes(
+            () => this.#mutateArea(areaId, async (mutation) => {
+              await this.#syncAreaConnectionRoutes(
                 refreshedArea,
                 refreshedArea.roomsByNumber,
                 new Map([...refreshedArea.roomsByNumber.values()].map((room) => [
@@ -2876,9 +3785,10 @@ export class NukeFireMapper {
                 ])),
                 runGeneration,
                 mutation,
-              ), routesNeedSync
-                ? "Route retried NukeFire map links"
-                : "Route committed NukeFire map links"),
+              );
+            }, routesNeedSync
+              ? "Route retried NukeFire map links"
+              : "Route committed NukeFire map links"),
           );
         }
       }
@@ -3097,6 +4007,11 @@ export class NukeFireMapper {
       id: connectionId,
       endpointA: canonicalGeometry.endpoint_a,
       endpointB: canonicalGeometry.endpoint_b,
+      kind: from.roomNumber === to.roomNumber
+        ? "SelfLoop"
+        : positionA.level === positionB.level
+        ? "Internal"
+        : "CrossLevel",
       routing: canonicalGeometry.routing,
       segmentShape: canonicalGeometry.segment_shape,
       corner: canonicalGeometry.corner,

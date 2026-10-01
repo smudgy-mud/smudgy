@@ -581,6 +581,19 @@ impl MockHandle {
         self.state.lock().drop_mutation_responses = n;
     }
 
+    /// Queue N compound-mutation refusals: each affected request is rejected
+    /// with a 400 before anything applies, a permanent verdict the client
+    /// parks for review instead of retrying.
+    pub fn refuse_next_mutations(&self, n: u32) {
+        self.state.lock().refuse_mutations = n;
+    }
+
+    /// Queue N area-delete failures: each affected `DELETE /areas/{id}`
+    /// answers 500 and deletes nothing.
+    pub fn fail_next_area_deletes(&self, n: u32) {
+        self.state.lock().fail_area_deletes = n;
+    }
+
     /// Every mutation envelope the compound endpoint accepted, in arrival
     /// order: `(operation_id, replayed_from_receipt)`.
     pub fn mutation_requests(&self) -> Vec<(Uuid, bool)> {

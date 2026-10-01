@@ -9,25 +9,37 @@ import {
   resolveElevationGeometry,
   type LayoutChange,
   type LayoutModel,
-  type PlanLayoutOptions,
+  type PlanLayoutAsyncOptions,
   type PlannedLayout,
 } from "./model.ts";
 import {
+  layoutSnapshotKey,
   planStableLayoutSnapshot,
   StaleLayoutSnapshotError,
 } from "./stable-snapshot.ts";
 
-export { StaleLayoutSnapshotError };
+export { layoutSnapshotKey, StaleLayoutSnapshotError };
 
 export interface LoadLayoutModelOptions {
   isRoomMovable?: (room: Room) => boolean;
 }
 
 export interface PlanAreaChangeOptions
-  extends PlanLayoutOptions, LoadLayoutModelOptions, LayoutWorkerControlOptions {}
+  extends PlanLayoutAsyncOptions, LoadLayoutModelOptions, LayoutWorkerControlOptions {
+  /** Return exact source/planned model keys for a later cross-realm commit guard. */
+  includeSnapshotKeys?: boolean;
+}
 
 /** Stateless façade result: the temporary layout model stays private. */
-export type AreaChangePlan = Pick<PlannedLayout, "patch" | "positions" | "quality" | "search">;
+export interface AreaChangePlan extends Pick<
+  PlannedLayout,
+  "patch" | "positions" | "quality" | "search" | "constraintRepair"
+> {
+  /** Exact stable source model accepted after Worker planning. */
+  sourceSnapshotKey?: string;
+  /** Exact source model with the returned moves applied. */
+  plannedSnapshotKey?: string;
+}
 
 function idsMatch(a: AreaId | null, b: AreaId | null): boolean {
   return !!a && !!b && a === b;
@@ -102,6 +114,18 @@ export function loadLayoutModel(
 }
 
 /**
+ * The model `loadLayoutModel` reads back once `planned` is applied: its rooms
+ * where the plan puts them, with Up/Down geometry resolved from those levels
+ * rather than from the levels the plan started at.
+ */
+function reloadedLayoutModel(planned: LayoutModel): LayoutModel {
+  return resolveElevationGeometry(createLayoutModel({
+    ...planned,
+    edges: planned.edges.map(({ constraintVector: _resolved, ...edge }) => edge),
+  }));
+}
+
+/**
  * Stateless Smudgy façade. It snapshots immediately before the expensive
  * operation, plans entirely in V8-owned data, and returns a declarative patch.
  */
@@ -113,12 +137,13 @@ export async function planAreaChange(
   // Always re-resolve a host wrapper by ID. An Area supplied by the caller may
   // itself be an immutable snapshot and cannot validate a later Worker result.
   const liveArea: AreaId = typeof area === "string" ? area : area.id;
-  const planOptions: PlanLayoutOptions = {
+  const planOptions: PlanLayoutAsyncOptions = {
     allowExistingMoves: options.allowExistingMoves,
     fixedRooms: options.fixedRooms,
     defaultElevation: options.defaultElevation,
     effort: options.effort,
     maxPlanningPasses: options.maxPlanningPasses,
+    constraintRepair: options.constraintRepair,
     trace: options.trace,
   };
   const result = await planStableLayoutSnapshot(
@@ -127,6 +152,18 @@ export async function planAreaChange(
     planOptions,
     { signal: options.signal, timeoutMs: options.timeoutMs },
   );
-  const { patch, positions, quality, search } = result;
-  return { patch, positions, quality, search };
+  const { before, after, patch, positions, quality, search, constraintRepair } = result;
+  return {
+    patch,
+    positions,
+    quality,
+    search,
+    ...(options.includeSnapshotKeys
+      ? {
+        sourceSnapshotKey: layoutSnapshotKey(before),
+        plannedSnapshotKey: layoutSnapshotKey(reloadedLayoutModel(after)),
+      }
+      : {}),
+    ...(constraintRepair ? { constraintRepair } : {}),
+  };
 }

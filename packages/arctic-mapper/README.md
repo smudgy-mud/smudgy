@@ -70,8 +70,10 @@ map exit <dir> closed|hidden|locked [true|false]   Set exit flags
 ```
 
 When recording creates a room, the mapper snapshots the area and runs the
-standard integral-grid layout pass. Correct directional lines are protected
-before crossings, link length, or compactness are considered. `map reflow`
+standard integral-grid layout pass. One wrong directional line weighs as much
+as eight crossings and blocked routes, and one that joins rooms on the wrong
+levels as much as seventeen; link length and compactness are considered only
+after all of those. `map reflow`
 adds the bounded thorough tournament: it compares the selected room, an
 unanchored result, rooms around remaining directional violations, and other
 structural anchors before applying one winning patch. The snapshot exists

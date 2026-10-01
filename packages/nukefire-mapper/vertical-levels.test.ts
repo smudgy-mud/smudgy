@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { GridPosition, LayoutEdge, LayoutNode } from "./layout.ts";
-import { stackVerticalTraversals } from "./vertical-levels.ts";
+import {
+  restoreUnanchoredChartLevels,
+  stackVerticalTraversals,
+} from "./vertical-levels.ts";
 
 const at = (x: number, y: number, level = 0): GridPosition => ({ x, y, level });
 const node = (id: string, x: number, y: number, level = 0): LayoutNode => ({
@@ -96,6 +99,67 @@ test("seeds a downward arrival from a resident absent from Map.Local", () => {
   );
 
   assert.deepEqual(relative(result, "arrival"), at(0, 0, -3));
+});
+
+test("uses the server plane when a returning chart has no durable seam", () => {
+  const result = stackVerticalTraversals(
+    [node("arrival", 0, 0), node("east", 1, 0), node("upper", 0, -1)],
+    [edge("arrival", "east", "East"), edge("arrival", "upper", "Up")],
+    new Map([levels("old-area-room", 0)]),
+    "arrival",
+    3,
+  );
+
+  assert.deepEqual(relative(result, "arrival"), at(0, 0, 3));
+  assert.deepEqual(relative(result, "east"), at(1, 0, 3));
+  assert.deepEqual(relative(result, "upper"), at(0, -1, 4));
+});
+
+test("uses the server plane for an isolated returning room", () => {
+  const result = stackVerticalTraversals(
+    [node("arrival", 0, 0)],
+    [],
+    new Map([levels("old-area-room", 0)]),
+    "arrival",
+    -2,
+  );
+
+  assert.deepEqual(relative(result, "arrival"), at(0, 0, -2));
+});
+
+test("restores an unanchored server plane after the planner packs it at zero", () => {
+  const result = restoreUnanchoredChartLevels(
+    new Map([
+      ["old-area-room", at(0, 0)],
+      ["arrival", at(4, 0)],
+      ["east", at(5, 0)],
+    ]),
+    [node("arrival", 0, 0, 3), node("east", 1, 0, 3)],
+    [edge("arrival", "east", "East")],
+    new Map([levels("old-area-room", 0)]),
+    "arrival",
+  );
+
+  assert.deepEqual(result.get("arrival"), at(4, 0, 3));
+  assert.deepEqual(result.get("east"), at(5, 0, 3));
+  assert.deepEqual(result.get("old-area-room"), at(0, 0));
+});
+
+test("does not restore a chart component anchored through a durable seam", () => {
+  const packed = new Map([
+    ["resident", at(0, 0, 4)],
+    ["arrival", at(0, 0, 5)],
+  ]);
+  const result = restoreUnanchoredChartLevels(
+    packed,
+    [node("arrival", 0, 0, 9)],
+    [edge("resident", "arrival", "Up")],
+    new Map([levels("resident", 4)]),
+    "arrival",
+  );
+
+  assert.equal(result, packed);
+  assert.deepEqual(result.get("arrival"), at(0, 0, 5));
 });
 
 test("mirrors durable level differences between established rooms", () => {

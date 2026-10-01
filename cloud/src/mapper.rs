@@ -37,14 +37,14 @@ use crate::mutation::{
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, LabelArgs, LabelId,
-    LabelUpdates, MapDestination, MapStorage, RoomNumber, RoomUpdates, ShapeArgs, ShapeId,
-    ShapeUpdates,
+    LabelUpdates, MapDestination, MapStorage, Property, RoomNumber, RoomUpdates, ShapeArgs,
+    ShapeId, ShapeUpdates,
 };
 
 use arc_swap::ArcSwap;
 use log::warn;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -165,6 +165,27 @@ enum PairedExitPolicy {
     Split,
 }
 
+/// Where an area's envelopes are delivered.
+#[derive(Debug, Clone, Copy)]
+struct Lane {
+    /// To the server, as the active viewer: a cloud area.
+    to_server: bool,
+    /// Journaled for the local store: a local area.
+    local_durable: bool,
+}
+
+/// Links from cloud areas into cloud rooms a staged envelope deletes. The
+/// server clears them in the deletion's own transaction, so the session only
+/// clears them on screen.
+struct ServerClearedLinks {
+    /// The area the rooms are deleted from.
+    area_id: AreaId,
+    /// The deleted rooms' numbers.
+    rooms: HashSet<RoomNumber>,
+    /// The cloud areas holding exits into them.
+    linking: Vec<AreaId>,
+}
+
 /// Composite key for room lookups
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RoomKey {
@@ -188,6 +209,14 @@ impl RoomKey {
 #[must_use]
 pub fn normalize_tag(tag: &str) -> String {
     tag.trim().to_uppercase()
+}
+
+/// An allocated room number, or the refusal of an area whose room numbers
+/// are used up.
+fn room_number_within_range(number: i64) -> CloudResult<RoomNumber> {
+    i32::try_from(number)
+        .map(RoomNumber)
+        .map_err(|_| CloudError::InvalidInput("room number space is exhausted".into()))
 }
 
 fn normalize_exit_updates(current: &Exit, mut body: ExitUpdates) -> ExitUpdates {
@@ -998,8 +1027,8 @@ pub struct Inner {
 /// Per-area reservation state: the next number a reservation would take and
 /// the tokens (one per open mutator, one per in-flight merge) holding
 /// numbers below it. The entry is dropped when the last holder releases,
-/// returning allocation to the cache maximum — an aborted mutator's numbers
-/// and a failed merge's band become available again.
+/// returning allocation to the area's own floor — an aborted mutator's
+/// numbers and a failed merge's band become available again.
 #[derive(Debug, Default)]
 struct RoomReservations {
     floor: i64,
@@ -1014,6 +1043,83 @@ pub struct AreasImportedIfAbsent {
     pub added: Vec<AreaId>,
     /// Names skipped because a resident area already bears them.
     pub skipped: Vec<String>,
+}
+
+/// Why [`Mapper::create_area_with_properties`] or
+/// [`Mapper::create_area_at_with_properties`] failed. The create is all or
+/// nothing: every failure but [`Self::AreaKept`] leaves no map behind.
+#[derive(Debug, Clone)]
+pub enum CreateAreaError {
+    /// Nothing was created: the request was refused before anything was
+    /// made, or the backend did not create the map.
+    NotCreated(CloudError),
+    /// The cloud map was created, but its initial properties could not be
+    /// saved, so it was deleted again.
+    PropertiesNotSaved {
+        /// Why the properties were not saved.
+        reason: String,
+    },
+    /// As [`Self::PropertiesNotSaved`], except that deleting the map failed
+    /// as well: the map remains, without the properties.
+    AreaKept {
+        area_id: AreaId,
+        name: String,
+        /// Why the properties were not saved.
+        reason: String,
+        /// Why the map could not be deleted.
+        removal: CloudError,
+    },
+}
+
+impl CreateAreaError {
+    /// The map the failed create left behind, if any.
+    #[must_use]
+    pub const fn kept_area(&self) -> Option<AreaId> {
+        match self {
+            Self::AreaKept { area_id, .. } => Some(*area_id),
+            Self::NotCreated(_) | Self::PropertiesNotSaved { .. } => None,
+        }
+    }
+}
+
+impl From<CloudError> for CreateAreaError {
+    fn from(error: CloudError) -> Self {
+        Self::NotCreated(error)
+    }
+}
+
+impl std::fmt::Display for CreateAreaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCreated(error) => error.fmt(f),
+            Self::PropertiesNotSaved { reason } => write!(
+                f,
+                "Could not save the new map's properties ({reason}); the map was removed"
+            ),
+            Self::AreaKept {
+                area_id,
+                name,
+                reason,
+                removal,
+            } => write!(
+                f,
+                "Could not save the properties of new map \"{name}\" ({area_id}): {reason}. \
+                 Removing the map also failed ({removal}); it remains without them"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CreateAreaError {}
+
+/// A new area, already published to the atlas cache.
+struct CreatedArea {
+    id: AreaId,
+    name: String,
+    /// Initial properties the area still lacks. A cloud create carries none,
+    /// so they follow as one area mutation; the local and session tiers
+    /// stored them with the area, leaving this empty.
+    unsaved_properties: Vec<Property>,
 }
 
 impl std::fmt::Debug for Mapper {
@@ -1276,6 +1382,19 @@ impl Mapper {
         self.inner.create_area(name)
     }
 
+    /// [`Self::create_area`] for an area that starts with `properties`. See
+    /// [`Self::create_area_at_with_properties`] for how they are saved.
+    ///
+    /// # Errors
+    /// As [`Self::create_area_at_with_properties`].
+    pub fn create_area_with_properties(
+        &self,
+        name: String,
+        properties: BTreeMap<String, String>,
+    ) -> impl Future<Output = Result<AreaId, CreateAreaError>> {
+        self.inner.create_area_with_properties(name, properties)
+    }
+
     /// Create an area in the session-lifetime ephemeral tier: in-memory,
     /// never persisted or synced, gone when the session closes. The default
     /// landing zone for protocol-driven auto-mapping; keeping one is an
@@ -1307,6 +1426,30 @@ impl Mapper {
         self.inner.create_area_at(name, destination)
     }
 
+    /// [`Self::create_area_at`] for an area that starts with `properties`,
+    /// all or nothing. Local and session areas are written with them, so the
+    /// area never exists without them. A cloud area is created first and then
+    /// receives them as one area mutation; this resolves once the backend
+    /// acknowledges it. If they cannot be saved, the area is deleted again
+    /// before this returns.
+    ///
+    /// # Errors
+    /// [`CreateAreaError::NotCreated`] when nothing was made: more properties
+    /// than one area mutation carries (on every tier), a session destination
+    /// filed into an atlas, or the backend's create error.
+    /// [`CreateAreaError::PropertiesNotSaved`] when a cloud area's properties
+    /// were not saved and the area was deleted again, and
+    /// [`CreateAreaError::AreaKept`] when that delete failed too.
+    pub fn create_area_at_with_properties(
+        &self,
+        name: String,
+        destination: MapDestination,
+        properties: BTreeMap<String, String>,
+    ) -> impl Future<Output = Result<AreaId, CreateAreaError>> {
+        self.inner
+            .create_area_at_with_properties(name, destination, properties)
+    }
+
     /// Whether `area_id` lives in the ephemeral (session-lifetime) tier.
     #[must_use]
     #[deprecated(
@@ -1320,13 +1463,7 @@ impl Mapper {
     /// The authoritative storage tier for a loaded area.
     #[must_use]
     pub fn area_storage(&self, area_id: &AreaId) -> MapStorage {
-        if self.inner.backend.ephemeral_area_ids().contains(area_id) {
-            MapStorage::Session
-        } else if self.inner.is_local_projection(*area_id) {
-            MapStorage::Local
-        } else {
-            MapStorage::Cloud
-        }
+        self.inner.area_storage(*area_id)
     }
 
     /// The authoritative storage tier for an atlas in the last successful
@@ -1336,55 +1473,73 @@ impl Mapper {
         self.inner.atlas_storage_by_id.lock().get(atlas_id).copied()
     }
 
-    /// The next free room number for an area, skipping numbers reserved by
-    /// open scripted mutators. Every ambient creation path (script
-    /// `createRoom`, the map editor's place/paste gestures) must allocate
-    /// through this rather than the raw cache maximum, or a concurrent
-    /// mutator draft and the ambient create would silently merge into one
-    /// room. Returns `None` when the area is not loaded or numbers are exhausted.
+    /// The next free room number for an area: the lowest number above the
+    /// area's highest room that no open scripted mutator has reserved and no
+    /// exit anywhere in the atlas leads to. Every ambient creation path
+    /// (script `createRoom`, the map editor's place/paste gestures) must
+    /// allocate through this rather than the raw cache maximum, or a
+    /// concurrent mutator draft and the ambient create would silently merge
+    /// into one room, and a new room could silently become the destination
+    /// of an exit that named a deleted one. Returns `None` when the area is
+    /// not loaded or has no room number left; [`Self::try_next_room_number`]
+    /// tells the two apart.
     #[must_use]
     pub fn next_room_number(&self, area_id: &AreaId) -> Option<RoomNumber> {
-        let base = self
-            .inner
-            .atlas_cache
-            .load()
-            .get_area(area_id)?
+        self.try_next_room_number(area_id).ok()
+    }
+
+    /// [`Self::next_room_number`], with the reason when there is none.
+    ///
+    /// # Errors
+    /// [`CloudError::AreaNotFound`] when the area is not loaded.
+    /// [`CloudError::InvalidInput`] when no further room number is representable.
+    pub fn try_next_room_number(&self, area_id: &AreaId) -> CloudResult<RoomNumber> {
+        let cache = self.inner.atlas_cache.load();
+        let floor = cache
+            .get_area(area_id)
+            .ok_or(CloudError::AreaNotFound(*area_id))?
             .room_number_floor();
-        let reservations = self.inner.room_reservations.lock();
-        let floor = reservations.get(area_id).map_or(base, |state| state.floor);
-        i32::try_from(base.max(floor)).ok().map(RoomNumber)
+        let from = self
+            .inner
+            .room_reservations
+            .lock()
+            .get(area_id)
+            .map_or(floor, |state| floor.max(state.floor));
+        room_number_within_range(cache.first_unnamed_room_number(area_id, from))
     }
 
     /// Reserve the next free room number for an open scripted mutator.
     /// The number is provisional: no room exists until the mutator's batch
     /// commits, but ambient allocation skips it until every reservation
     /// held under `token` is released. Releasing without committing (an
-    /// aborted mutator) returns the numbers to the allocator.
+    /// aborted mutator) returns the numbers to the allocator. Like
+    /// [`Self::next_room_number`], it never hands out a number an exit
+    /// leads to.
     ///
     /// # Errors
     /// [`CloudError::AreaNotFound`] when the area is not loaded.
     /// [`CloudError::InvalidInput`] when no further room number is representable.
     pub fn reserve_room_number(&self, area_id: &AreaId, token: Uuid) -> CloudResult<RoomNumber> {
-        let base = self
-            .inner
-            .atlas_cache
-            .load()
+        let cache = self.inner.atlas_cache.load();
+        let floor = cache
             .get_area(area_id)
             .ok_or(CloudError::AreaNotFound(*area_id))?
             .room_number_floor();
         let mut reservations = self.inner.room_reservations.lock();
+        let from = reservations
+            .get(area_id)
+            .map_or(floor, |state| floor.max(state.floor));
+        let number = cache.first_unnamed_room_number(area_id, from);
+        let allocated = room_number_within_range(number)?;
         let state = reservations.entry(*area_id).or_default();
-        let number = base.max(state.floor);
-        let allocated = i32::try_from(number)
-            .map_err(|_| CloudError::InvalidInput("room number space is exhausted".into()))?;
         state.floor = number + 1;
         *state.holders.entry(token).or_insert(0) += 1;
-        Ok(RoomNumber(allocated))
+        Ok(allocated)
     }
 
     /// Release every room-number reservation held under `token` for an
     /// area. Idempotent; when the last holder releases, allocation falls
-    /// back to the cache maximum.
+    /// back to the area's own floor.
     pub fn release_room_reservations(&self, area_id: &AreaId, token: Uuid) {
         self.inner.release_room_reservations(area_id, token);
     }
@@ -2623,6 +2778,26 @@ impl Inner {
         self.create_area_in(name, atlas_id).await
     }
 
+    /// [`Self::create_area`] for an area that starts with `properties`.
+    ///
+    /// # Errors
+    /// As [`Mapper::create_area_at_with_properties`].
+    pub async fn create_area_with_properties(
+        &self,
+        name: String,
+        properties: BTreeMap<String, String>,
+    ) -> Result<AreaId, CreateAreaError> {
+        let atlas_id = Option::<&AtlasId>::cloned(self.atlas_id.load().as_ref().as_ref());
+        let request = CreateAreaRequest {
+            name,
+            atlas_id,
+            ephemeral: false,
+            properties,
+        };
+        let created = self.create_area_from_request(request).await?;
+        self.save_initial_properties(created).await
+    }
+
     /// Create a new area filed into an explicit atlas (or loose).
     ///
     /// # Errors
@@ -2638,28 +2813,62 @@ impl Inner {
             name,
             atlas_id,
             ephemeral: false,
+            properties: BTreeMap::new(),
         };
-        self.create_area_from_request(request).await
+        Ok(self.create_area_from_request(request).await?.id)
     }
 
     /// Create an area in an explicit storage tier and optional atlas.
+    ///
+    /// # Errors
+    /// A session destination filed into an atlas, or the backend's create
+    /// error.
     pub async fn create_area_at(
         &self,
         name: String,
         destination: MapDestination,
     ) -> CloudResult<AreaId> {
+        let request = Self::request_at(name, destination, BTreeMap::new())?;
+        Ok(self
+            .create_area_from_request_at(request, destination.storage)
+            .await?
+            .id)
+    }
+
+    /// [`Self::create_area_at`] for an area that starts with `properties`.
+    ///
+    /// # Errors
+    /// As [`Mapper::create_area_at_with_properties`].
+    pub async fn create_area_at_with_properties(
+        &self,
+        name: String,
+        destination: MapDestination,
+        properties: BTreeMap<String, String>,
+    ) -> Result<AreaId, CreateAreaError> {
+        let request = Self::request_at(name, destination, properties)?;
+        let created = self
+            .create_area_from_request_at(request, destination.storage)
+            .await?;
+        self.save_initial_properties(created).await
+    }
+
+    /// The request for an area created at `destination`.
+    fn request_at(
+        name: String,
+        destination: MapDestination,
+        properties: BTreeMap<String, String>,
+    ) -> CloudResult<CreateAreaRequest> {
         if destination.storage == MapStorage::Session && destination.atlas_id.is_some() {
             return Err(CloudError::InvalidInput(
                 "session maps cannot be filed into atlases".to_string(),
             ));
         }
-        let request = CreateAreaRequest {
+        Ok(CreateAreaRequest {
             name,
             atlas_id: destination.atlas_id,
             ephemeral: destination.storage == MapStorage::Session,
-        };
-        self.create_area_from_request_at(request, destination.storage)
-            .await
+            properties,
+        })
     }
 
     /// Create an area in the ephemeral tier (see [`Mapper::create_area_ephemeral`]).
@@ -2675,13 +2884,19 @@ impl Inner {
         &self,
         request: CreateAreaRequest,
         storage: MapStorage,
-    ) -> CloudResult<AreaId> {
+    ) -> CloudResult<CreatedArea> {
+        let properties = Self::initial_properties(&request)?;
         let backend_area = self.backend.create_area_at(request, storage).await?;
-        self.finish_created_area(backend_area, storage == MapStorage::Local)
-            .await
+        Ok(self
+            .finish_created_area(backend_area, storage == MapStorage::Local, properties)
+            .await)
     }
 
-    async fn create_area_from_request(&self, request: CreateAreaRequest) -> CloudResult<AreaId> {
+    async fn create_area_from_request(
+        &self,
+        request: CreateAreaRequest,
+    ) -> CloudResult<CreatedArea> {
+        let properties = Self::initial_properties(&request)?;
         // Resolve local routing before capturing the intended tier. A local
         // area may already be deleted again when its create response arrives.
         self.backend.subscribe_local().await?;
@@ -2691,17 +2906,50 @@ impl Inner {
                 |id| self.backend.local_atlas_ids().contains(&id),
             );
         let backend_area = self.backend.create_area(request).await?;
-        self.finish_created_area(backend_area, local).await
+        Ok(self
+            .finish_created_area(backend_area, local, properties)
+            .await)
     }
 
-    async fn finish_created_area(&self, backend_area: Area, local: bool) -> CloudResult<AreaId> {
-        let area_id = backend_area.id;
+    /// The initial properties of `request` as an area document stores them.
+    /// A cloud area receives them as one area mutation, so no tier accepts
+    /// more than one mutation carries: a create that works on one tier works
+    /// on every tier, and one refused here leaves nothing behind.
+    fn initial_properties(request: &CreateAreaRequest) -> CloudResult<Vec<Property>> {
+        let count = request.properties.len();
+        if count > MAX_MUTATION_OPERATIONS {
+            return Err(CloudError::InvalidInput(format!(
+                "a new map can start with at most {MAX_MUTATION_OPERATIONS} properties, not {count}"
+            )));
+        }
+        Ok(request.document_properties())
+    }
+
+    /// Publishes a newly created area with its initial `properties`. The
+    /// local and session tiers wrote them into the document they created, so
+    /// the area first appears with them. A cloud create carries none: the
+    /// area appears as the server made it, and the properties are left for
+    /// [`Self::save_initial_properties`].
+    async fn finish_created_area(
+        &self,
+        backend_area: Area,
+        local: bool,
+        properties: Vec<Property>,
+    ) -> CreatedArea {
+        let id = backend_area.id;
+        let name = backend_area.name.clone();
+        let cloud = !local && self.area_storage(id) == MapStorage::Cloud;
+        let (stored, unsaved_properties) = if cloud {
+            (Vec::new(), properties)
+        } else {
+            (properties, Vec::new())
+        };
 
         let details = AreaWithDetails {
             area: backend_area,
             format_version: crate::AREA_FORMAT_VERSION,
             content_hash: None,
-            properties: vec![],
+            properties: stored,
             rooms: vec![],
             labels: vec![],
             shapes: vec![],
@@ -2710,8 +2958,94 @@ impl Inner {
         };
         self.publish_committed(CommittedChange::Documents(&[details], &[]), local)
             .await;
+        CreatedArea {
+            id,
+            name,
+            unsaved_properties,
+        }
+    }
 
-        Ok(area_id)
+    /// Completes a create by saving the initial properties a new cloud area
+    /// still lacks. When they cannot be saved the area is deleted again, so
+    /// the create has no effect; only if that delete fails too does an area
+    /// remain, and the error names it.
+    async fn save_initial_properties(
+        &self,
+        created: CreatedArea,
+    ) -> Result<AreaId, CreateAreaError> {
+        let CreatedArea {
+            id,
+            name,
+            unsaved_properties,
+        } = created;
+        if unsaved_properties.is_empty() {
+            return Ok(id);
+        }
+        let Err(reason) = self
+            .save_created_cloud_properties(id, unsaved_properties)
+            .await
+        else {
+            return Ok(id);
+        };
+        match self.remove_unsaved_cloud_area(id).await {
+            Ok(()) => Err(CreateAreaError::PropertiesNotSaved { reason }),
+            Err(removal) => {
+                warn!("New cloud map {id} stays without its properties: {removal}");
+                Err(CreateAreaError::AreaKept {
+                    area_id: id,
+                    name,
+                    reason,
+                    removal,
+                })
+            }
+        }
+    }
+
+    /// Saves a new cloud area's initial properties the way
+    /// [`Self::set_area_property`] saves one: a single area mutation through
+    /// the pending queue, awaited until the backend acknowledges it. The
+    /// error says why the save did not complete; a save the backend refused
+    /// stays parked in the area's queue.
+    async fn save_created_cloud_properties(
+        &self,
+        area_id: AreaId,
+        properties: Vec<Property>,
+    ) -> Result<(), String> {
+        let operations = properties
+            .into_iter()
+            .map(|property| AreaMutation::UpsertAreaProperty {
+                name: property.name,
+                value: property.value,
+                is_secret: None,
+            })
+            .collect();
+        let submission = self
+            .mutate_area(
+                area_id,
+                operations,
+                "Set area properties".to_string(),
+                PairedExitPolicy::Reject,
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(operation_id) = submission.operation_id() {
+            self.pending.wait_for_completion(operation_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes a new cloud area whose initial properties were not saved,
+    /// through the acknowledged delete, which also drops the area from the
+    /// atlas cache and the backend's cache. The failed save is discarded
+    /// first, as the Discard choice would: a delete refuses an area whose
+    /// edits await review, and should the delete fail, the discard has
+    /// already rebuilt the displayed area without the unsaved properties.
+    async fn remove_unsaved_cloud_area(&self, area_id: AreaId) -> CloudResult<()> {
+        match self.pending.save_status(area_id) {
+            AreaSaveStatus::CouldNotSave { .. } => self.resolve_failed(area_id, false).await?,
+            AreaSaveStatus::ConflictNeedsReview => self.resolve_conflict(area_id, false).await?,
+            AreaSaveStatus::Saved | AreaSaveStatus::Saving(_) | AreaSaveStatus::Offline(_) => {}
+        }
+        self.delete_area_and_wait(area_id).await
     }
 
     /// Import a set of full areas into the LOCAL tier in one shot — the JSON-import fast path.
@@ -3277,34 +3611,17 @@ impl Inner {
             area_id,
             room_number,
         } = room_key;
+        // The envelope's own document loses the room and the exits that led
+        // to it within the area; the exits of other areas that led to it are
+        // cleared by edits of those areas, queued behind it (see
+        // `stage_link_clears`).
         let description = format!("Delete room {room_number}");
-        let result = self.mutate_area(
+        self.mutate_area(
             area_id,
             vec![AreaMutation::DeleteRoom { room_number }],
-            description.clone(),
+            description,
             PairedExitPolicy::Reject,
-        )?;
-
-        // The server deletion also clears inbound links in other aggregates.
-        // Mirror that cascade only after the source deletion's durable commit
-        // point, so a reset can never leave an unjournaled optimistic edit.
-        let target = RoomKey::new(area_id, room_number);
-        self.atlas_cache.rcu(|cache| {
-            let updated: Vec<_> = cache
-                .areas()
-                .filter(|area| *area.get_id() != area_id)
-                .filter_map(|area| {
-                    area.null_inbound_exits(&target)
-                        .map(|updated| (*area.get_id(), Arc::new(updated)))
-                })
-                .collect();
-            if updated.is_empty() {
-                cache.clone()
-            } else {
-                Arc::new(cache.with_areas_updated(updated))
-            }
-        });
-        Ok(result)
+        )
     }
 
     #[allow(clippy::needless_pass_by_value)] // the by-value key is the established public signature
@@ -3750,7 +4067,7 @@ impl Inner {
         let mut working = HashMap::<AreaId, AreaWithDetails>::new();
         let mut staged = Vec::<(AreaId, PendingEnvelope)>::new();
         let mut submissions = Vec::with_capacity(batches.len());
-        let mut deleted_rooms = Vec::<RoomKey>::new();
+        let mut server_cleared = Vec::<ServerClearedLinks>::new();
 
         for batch in batches {
             let AreaMutationBatch {
@@ -3802,13 +4119,7 @@ impl Inner {
                 submissions.push(MutationSubmission::NoChange);
                 continue;
             }
-            deleted_rooms.extend(operations.iter().filter_map(|operation| {
-                if let AreaMutation::DeleteRoom { room_number } = operation {
-                    Some(RoomKey::new(area_id, *room_number))
-                } else {
-                    None
-                }
-            }));
+            let deleted = area_edits::deleted_rooms(&operations);
 
             let structural_preconditions = operations
                 .iter()
@@ -3843,47 +4154,26 @@ impl Inner {
             area_edits::validate_connection_graph(&mut details)?;
             details.area.rev += 1;
 
-            let local_area = self.is_local_projection(area_id);
-            let ephemeral_area = self.backend.ephemeral_area_ids().contains(&area_id);
-            let non_cloud = !self.backend.supports_sync() || local_area || ephemeral_area;
-            let local_durable = local_area
-                || (!self.backend.supports_sync()
-                    && !ephemeral_area
-                    && self.backend.local_snapshot().is_none());
-            let (viewer_id, auth_generation) = if non_cloud {
-                (None, self.backend.auth_generation())
-            } else {
-                let (viewer_id, auth_generation) =
-                    self.pending.active_viewer().ok_or_else(|| {
-                        CloudError::PendingOperations(
-                            "cloud map identity is not ready for this edit".to_string(),
-                        )
-                    })?;
-                (Some(viewer_id), auth_generation)
-            };
-
-            staged.push((
-                area_id,
-                PendingEnvelope {
-                    operation_id,
-                    ops: operations,
-                    description,
-                    structural_preconditions,
-                    attempts: 0,
-                    viewer_id,
-                    local_durable,
-                    auth_generation,
-                    sequence: 0,
-                    queued_at: chrono::Utc::now(),
-                    journal_path: None,
-                    receipt_expired: false,
-                    published: false,
-                    journal_batch_id: None,
-                    delete_intent: false,
-                },
-            ));
+            let envelope = self.pending_envelope(
+                self.lane_of(area_id),
+                operation_id,
+                operations,
+                description,
+                structural_preconditions,
+            )?;
+            staged.push((area_id, envelope));
             working.insert(area_id, details);
             submissions.push(MutationSubmission::Queued(operation_id));
+            if !deleted.is_empty() {
+                self.stage_link_clears(
+                    area_id,
+                    &deleted,
+                    &cache,
+                    &mut working,
+                    &mut staged,
+                    &mut server_cleared,
+                );
+            }
         }
 
         let queued: Vec<_> = staged
@@ -3896,13 +4186,18 @@ impl Inner {
                 .into_iter()
                 .map(|(area_id, details)| (area_id, Arc::new(AreaCache::new_with_area(details))))
                 .collect::<Vec<_>>();
+            // Links between cloud areas are cleared by the server in the
+            // deletion's own transaction; the session mirrors that on screen
+            // and the next refetch brings the server's copy.
             self.atlas_cache.rcu(|latest| {
                 let mut next = latest.with_areas_updated(updates.clone());
-                for target in &deleted_rooms {
-                    let inbound_updates: Vec<_> = next
-                        .areas()
+                for cleared in &server_cleared {
+                    let inbound_updates: Vec<_> = cleared
+                        .linking
+                        .iter()
+                        .filter_map(|area_id| next.get_area(area_id))
                         .filter_map(|area| {
-                            area.null_inbound_exits(target)
+                            area.null_inbound_exits(cleared.area_id, &cleared.rooms)
                                 .map(|updated| (*area.get_id(), Arc::new(updated)))
                         })
                         .collect();
@@ -3926,6 +4221,220 @@ impl Inner {
         drop(pending_by_area);
         self.pending.publish_staged(publication);
         Ok(submissions)
+    }
+
+    /// Where `area_id`'s envelopes are delivered.
+    fn lane_of(&self, area_id: AreaId) -> Lane {
+        let local_area = self.is_local_projection(area_id);
+        let ephemeral_area = self.backend.ephemeral_area_ids().contains(&area_id);
+        let syncs = self.backend.supports_sync();
+        Lane {
+            to_server: syncs && !local_area && !ephemeral_area,
+            local_durable: local_area
+                || (!syncs && !ephemeral_area && self.backend.local_snapshot().is_none()),
+        }
+    }
+
+    /// The queue record of an envelope compiled for an area in `lane`. A
+    /// cloud envelope is sent as the active viewer, which must be known.
+    fn pending_envelope(
+        &self,
+        lane: Lane,
+        operation_id: OperationId,
+        ops: Vec<AreaMutation>,
+        description: String,
+        structural_preconditions: Vec<StructuralPrecondition>,
+    ) -> CloudResult<PendingEnvelope> {
+        let (viewer_id, auth_generation) = if lane.to_server {
+            let (viewer_id, auth_generation) = self.pending.active_viewer().ok_or_else(|| {
+                CloudError::PendingOperations(
+                    "cloud map identity is not ready for this edit".to_string(),
+                )
+            })?;
+            (Some(viewer_id), auth_generation)
+        } else {
+            (None, self.backend.auth_generation())
+        };
+        Ok(PendingEnvelope {
+            operation_id,
+            ops,
+            description,
+            structural_preconditions,
+            attempts: 0,
+            viewer_id,
+            local_durable: lane.local_durable,
+            auth_generation,
+            sequence: 0,
+            queued_at: chrono::Utc::now(),
+            journal_path: None,
+            receipt_expired: false,
+            published: false,
+            journal_batch_id: None,
+            delete_intent: false,
+        })
+    }
+
+    /// Stages, right behind an envelope of `area_id` that deleted the rooms
+    /// numbered `deleted`, an edit of every other area whose exits led to one
+    /// of those rooms, clearing the exits' destinations as the server clears
+    /// them when a room is deleted. Each edit joins its own area's queue like
+    /// any other, so it is stored after that area's earlier edits and before
+    /// its later ones, whichever area's queue reaches its store first: a link
+    /// queued before the deletion is stored cleared, and a re-link queued
+    /// after it, as an undo sends, is stored re-linked.
+    ///
+    /// Links from a cloud area into a cloud area's deleted room are the
+    /// server's to clear, in the deletion's own transaction; they are only
+    /// cleared on screen (`server_cleared`) and a refetch brings the server's
+    /// copy. An area whose edit cannot be queued keeps its links on screen
+    /// as its store does, so room allocation keeps passing over them.
+    fn stage_link_clears(
+        &self,
+        area_id: AreaId,
+        deleted: &HashSet<RoomNumber>,
+        cache: &AtlasCache,
+        working: &mut HashMap<AreaId, AreaWithDetails>,
+        staged: &mut Vec<(AreaId, PendingEnvelope)>,
+        server_cleared: &mut Vec<ServerClearedLinks>,
+    ) {
+        let leads_into = |to_area: Option<AreaId>, to_room: Option<RoomNumber>| {
+            to_area == Some(area_id) && to_room.is_some_and(|number| deleted.contains(&number))
+        };
+        // Every other area's exits into the deleted rooms, read from the
+        // document this gesture already staged for the area when there is
+        // one, else from the session's copy.
+        let mut linking: Vec<(AreaId, Vec<ExitId>)> = Vec::new();
+        for (id, details) in working.iter().filter(|(id, _)| **id != area_id) {
+            let exits: Vec<ExitId> = details
+                .rooms
+                .iter()
+                .flat_map(|room| &room.exits)
+                .filter(|exit| leads_into(exit.to_area_id, exit.to_room_number))
+                .map(|exit| exit.id)
+                .collect();
+            if !exits.is_empty() {
+                linking.push((*id, exits));
+            }
+        }
+        // The session's copies hold such an exit only when the atlas counts
+        // one leading into a deleted room.
+        if cache.is_linked_from_elsewhere(&area_id, deleted) {
+            for area in cache.areas() {
+                let id = *area.get_id();
+                if id == area_id || working.contains_key(&id) {
+                    continue;
+                }
+                let exits: Vec<ExitId> = area
+                    .get_rooms()
+                    .iter()
+                    .flat_map(|room| room.get_exits())
+                    .filter(|exit| leads_into(exit.to_area_id, exit.to_room_number))
+                    .map(|exit| exit.id)
+                    .collect();
+                if !exits.is_empty() {
+                    linking.push((id, exits));
+                }
+            }
+        }
+        if linking.is_empty() {
+            return;
+        }
+        linking.sort_by_key(|(id, _)| id.0);
+
+        let deleted_on_server = self.lane_of(area_id).to_server;
+        let description = match deleted.iter().next() {
+            Some(room_number) if deleted.len() == 1 => {
+                format!("Clear links to deleted room {room_number}")
+            }
+            _ => format!("Clear links to {} deleted rooms", deleted.len()),
+        };
+        let mut left_to_server = Vec::new();
+        for (id, exits) in linking {
+            let lane = self.lane_of(id);
+            if deleted_on_server && lane.to_server {
+                left_to_server.push(id);
+                continue;
+            }
+            let document = match working.get(&id) {
+                Some(details) => details.clone(),
+                None => match cache.get_area(&id) {
+                    Some(area) => area.to_details(),
+                    None => continue,
+                },
+            };
+            match self.link_clear_envelopes(id, lane, &exits, &description, document) {
+                Ok((document, envelopes)) if !envelopes.is_empty() => {
+                    staged.extend(envelopes.into_iter().map(|envelope| (id, envelope)));
+                    working.insert(id, document);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        "links from map {id} to rooms deleted from map {area_id} are kept: {error}"
+                    );
+                }
+            }
+        }
+        if !left_to_server.is_empty() {
+            server_cleared.push(ServerClearedLinks {
+                area_id,
+                rooms: deleted.clone(),
+                linking: left_to_server,
+            });
+        }
+    }
+
+    /// The envelopes clearing the destinations of `exits` in area `id`,
+    /// [`MAX_MUTATION_OPERATIONS`] exits apiece, each compiled against
+    /// `document` as the ones before it leave it, and the document they
+    /// leave. Refused when the area is fenced for a delete or move, is a
+    /// cloud area the viewer cannot edit, or its document refuses the edit.
+    fn link_clear_envelopes(
+        &self,
+        id: AreaId,
+        lane: Lane,
+        exits: &[ExitId],
+        description: &str,
+        mut document: AreaWithDetails,
+    ) -> CloudResult<(AreaWithDetails, Vec<PendingEnvelope>)> {
+        if self.pending.is_delete_fenced(id) {
+            return Err(CloudError::PendingOperations(
+                "the map is being moved or deleted".to_string(),
+            ));
+        }
+        if lane.to_server && !document.area.effective_access().can_edit {
+            return Err(CloudError::PermissionDenied(
+                "the map is not editable".to_string(),
+            ));
+        }
+        let mut envelopes = Vec::new();
+        for chunk in exits.chunks(MAX_MUTATION_OPERATIONS) {
+            let operations = chunk
+                .iter()
+                .map(|exit_id| AreaMutation::UpdateExit {
+                    exit_id: *exit_id,
+                    body: ExitUpdates {
+                        clear_to: Some(true),
+                        ..ExitUpdates::default()
+                    },
+                })
+                .collect();
+            let operations =
+                compile_area_mutations(&mut document, operations, PairedExitPolicy::Reject)?;
+            if operations.is_empty() {
+                continue;
+            }
+            area_edits::validate_connection_graph(&mut document)?;
+            document.area.rev += 1;
+            envelopes.push(self.pending_envelope(
+                lane,
+                Uuid::new_v4(),
+                operations,
+                description.to_string(),
+                Vec::new(),
+            )?);
+        }
+        Ok((document, envelopes))
     }
 
     /// Spawns the pending-queue worker: one task draining ready envelopes
@@ -4257,6 +4766,17 @@ impl Inner {
                 .backend
                 .local_snapshot()
                 .is_some_and(|snapshot| snapshot.contains_area(area_id))
+    }
+
+    /// See [`Mapper::area_storage`].
+    fn area_storage(&self, area_id: AreaId) -> MapStorage {
+        if self.backend.ephemeral_area_ids().contains(&area_id) {
+            MapStorage::Session
+        } else if self.is_local_projection(area_id) {
+            MapStorage::Local
+        } else {
+            MapStorage::Cloud
+        }
     }
 
     fn backend_for_area(&self, area_id: AreaId) -> &dyn MapperBackend {
@@ -4594,8 +5114,24 @@ mod tests {
 
     #[async_trait]
     impl MapperBackend for FixedBackend {
-        async fn create_area(&self, _request: CreateAreaRequest) -> CloudResult<Area> {
-            Err(CloudError::NetworkError("read-only".to_string()))
+        /// Mints an empty owned area the way the server does: the request's
+        /// client-only fields never reach it.
+        async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
+            let mut details = sample_area(AreaId(Uuid::new_v4()), "");
+            details.area.name = request.name;
+            details.rooms.clear();
+            let area = details.area.clone();
+            self.areas.lock().insert(area.id, details);
+            Ok(area)
+        }
+
+        async fn create_area_at(
+            &self,
+            request: CreateAreaRequest,
+            storage: MapStorage,
+        ) -> CloudResult<Area> {
+            assert_eq!(storage, MapStorage::Cloud, "served areas read as cloud");
+            self.create_area(request).await
         }
 
         async fn import_local_area(&self, _details: AreaWithDetails) -> CloudResult<()> {
@@ -5948,6 +6484,549 @@ mod tests {
         assert_eq!(cross.to_room_number, None);
     }
 
+    /// An area's rooms, exits and connections in a canonical order, for
+    /// comparing a stored document with the session's copy of it.
+    fn canonical_content(mut details: AreaWithDetails) -> serde_json::Value {
+        details.rooms.sort_by_key(|room| room.room_number);
+        for room in &mut details.rooms {
+            room.exits.sort_by_key(|exit| exit.id.0);
+            room.properties.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        details.connections.sort_by_key(|connection| connection.id);
+        serde_json::json!({ "rooms": details.rooms, "connections": details.connections })
+    }
+
+    fn heading(exit: Exit, from_direction: crate::ExitDirection) -> Exit {
+        Exit {
+            from_direction,
+            ..exit
+        }
+    }
+
+    fn exit_destination(
+        details: &AreaWithDetails,
+        exit: u128,
+    ) -> (Option<AreaId>, Option<RoomNumber>) {
+        details
+            .rooms
+            .iter()
+            .flat_map(|room| &room.exits)
+            .find(|candidate| candidate.id == ExitId(Uuid::from_u128(exit)))
+            .map(|exit| (exit.to_area_id, exit.to_room_number))
+            .expect("exit present")
+    }
+
+    /// B's room 5 leads to A 2 and A 3, which are deleted, and to A 1; B's
+    /// rooms 5 and 6 are also linked both ways within B. Clearing B's links
+    /// with the exit updates a queued edit of B carries leaves the same
+    /// rooms, exits and connections as the on-screen mirror of the server's
+    /// cascade that links between cloud areas get: each cleared exit's
+    /// connection dangles at its origin.
+    #[test]
+    fn clearing_links_by_exit_update_leaves_what_the_on_screen_cascade_shows() {
+        use crate::ExitDirection::{East, North, South, West};
+        let (a, b) = (AreaId(Uuid::new_v4()), AreaId(Uuid::new_v4()));
+        let document = area_with_rooms(
+            b,
+            vec![
+                room_with_exits(
+                    5,
+                    vec![
+                        exit_to(1, a, 2),
+                        heading(exit_to(2, a, 3), East),
+                        heading(exit_to(3, a, 1), West),
+                        Exit {
+                            to_direction: Some(North),
+                            ..heading(exit_to(4, b, 6), South)
+                        },
+                    ],
+                ),
+                room_with_exits(6, vec![exit_to(5, b, 5)]),
+            ],
+        );
+        let deleted: HashSet<RoomNumber> = [RoomNumber(2), RoomNumber(3)].into_iter().collect();
+
+        let mut updated = document.clone();
+        let clears = [1, 2]
+            .map(|seed| AreaMutation::UpdateExit {
+                exit_id: ExitId(Uuid::from_u128(seed)),
+                body: ExitUpdates {
+                    clear_to: Some(true),
+                    ..ExitUpdates::default()
+                },
+            })
+            .to_vec();
+        let compiled = compile_area_mutations(&mut updated, clears, PairedExitPolicy::Reject)
+            .expect("a link to another area is never one of a pair");
+        area_edits::validate_connection_graph(&mut updated).expect("a valid graph");
+        let cached = AreaCache::new_with_area(document.clone())
+            .null_inbound_exits(a, &deleted)
+            .expect("the cache clears the same links");
+
+        assert_eq!(compiled.len(), 2);
+        assert_eq!(
+            canonical_content(AreaCache::new_with_area(updated.clone()).to_details()),
+            canonical_content(cached.to_details())
+        );
+        assert_eq!(exit_destination(&updated, 1), (None, None));
+        assert_eq!(exit_destination(&updated, 2), (None, None));
+        assert_eq!(
+            exit_destination(&updated, 3),
+            (Some(a), Some(RoomNumber(1)))
+        );
+        assert_eq!(
+            exit_destination(&updated, 4),
+            (Some(b), Some(RoomNumber(6)))
+        );
+        let cleared_connection = updated
+            .rooms
+            .iter()
+            .flat_map(|room| &room.exits)
+            .find(|exit| exit.id == ExitId(Uuid::from_u128(1)))
+            .map(|exit| exit.connection_id)
+            .expect("exit present");
+        let connection = updated
+            .connections
+            .iter()
+            .find(|connection| connection.id == cleared_connection)
+            .expect("the cleared exit keeps its connection");
+        assert_eq!(connection.kind, crate::ConnectionKind::Dangling);
+        assert!(connection.endpoint_b.is_none());
+    }
+
+    /// Local maps A (rooms 1, 2 and 3) and B, whose room 5 leads to A 2
+    /// (exit 3), A 3 (exit 4) and A 1 (exit 5).
+    fn linked_documents(a: AreaId, b: AreaId) -> Vec<AreaWithDetails> {
+        use crate::ExitDirection::{East, West};
+        vec![
+            area_with_rooms(
+                a,
+                vec![
+                    room_with_exits(1, vec![]),
+                    room_with_exits(2, vec![]),
+                    room_with_exits(3, vec![]),
+                ],
+            ),
+            area_with_rooms(
+                b,
+                vec![room_with_exits(
+                    5,
+                    vec![
+                        exit_to(3, a, 2),
+                        heading(exit_to(4, a, 3), East),
+                        heading(exit_to(5, a, 1), West),
+                    ],
+                )],
+            ),
+        ]
+    }
+
+    /// Deleting A 2, then A 3 in a batch with an unrelated edit, clears B's
+    /// links to them in the session and on disk alike. B's confirmed
+    /// revision is the store's, so a later edit to B saves without a
+    /// conflict.
+    #[tokio::test]
+    async fn deleting_rooms_keeps_other_local_maps_in_step_with_the_store() {
+        let root = temp_cache_dir();
+        let backend = Arc::new(LocalBackend::new(root.join("local")));
+        let (a, b) = (AreaId(Uuid::new_v4()), AreaId(Uuid::new_v4()));
+        for document in linked_documents(a, b) {
+            backend
+                .import_local_area(document)
+                .await
+                .expect("store the fixture");
+        }
+        let mapper = Mapper::new(backend.clone(), root.join("cache"));
+        mapper.load_all_areas().await.expect("load");
+        let stored_b = || {
+            backend
+                .local_snapshot()
+                .expect("the store is loaded")
+                .area(b)
+                .expect("B is stored")
+                .clone()
+        };
+        let b_rev = stored_b().area.rev;
+
+        mapper
+            .delete_room(RoomKey::new(a, RoomNumber(2)))
+            .expect("delete a room");
+        mapper
+            .mutate_batches(vec![AreaMutationBatch::strict(
+                a,
+                vec![
+                    AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(1),
+                        body: RoomUpdates {
+                            title: Some("Kept".to_string()),
+                            ..RoomUpdates::default()
+                        },
+                    },
+                    AreaMutation::DeleteRoom {
+                        room_number: RoomNumber(3),
+                    },
+                ],
+                "Delete room 3",
+            )])
+            .expect("delete in a batch");
+        wait_until(|| {
+            mapper.inner.pending.total_pending() == 0
+                && mapper.inner.pending.confirmed_rev(b).0 == Some(stored_b().area.rev)
+        })
+        .await;
+
+        let stored = stored_b();
+        assert_eq!(stored.area.rev, b_rev + 2, "each envelope advances B once");
+        assert_eq!(exit_destination(&stored, 3), (None, None));
+        assert_eq!(exit_destination(&stored, 4), (None, None));
+        assert_eq!(exit_destination(&stored, 5), (Some(a), Some(RoomNumber(1))));
+        let cached = mapper.get_current_atlas().get_area(&b).expect("B cached");
+        assert_eq!(
+            canonical_content(cached.to_details()),
+            canonical_content(stored.clone()),
+            "the session shows what the store holds"
+        );
+
+        mapper
+            .upsert_room(
+                RoomKey::new(b, RoomNumber(5)),
+                RoomUpdates {
+                    title: Some("Still linked to A 1".to_string()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .expect("edit B");
+        wait_until(|| {
+            mapper.inner.pending.total_pending() == 0
+                && stored_b().rooms[0].title == "Still linked to A 1"
+        })
+        .await;
+        assert!(mapper.conflicted_operation_id(b).is_none());
+        assert!(mapper.failed_operation_id(b).is_none());
+
+        let reopened = LocalBackend::new(root.join("local"));
+        reopened.refresh().await.expect("reread the store");
+        let read_back = reopened.get_area(&b).await.expect("B on disk");
+        assert_eq!(exit_destination(&read_back, 3), (None, None));
+        assert_eq!(exit_destination(&read_back, 4), (None, None));
+
+        drop(mapper);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The session tier: deleting A 2 clears B's link to it in the backend
+    /// as in the cache, and B's confirmed revision is the backend's.
+    #[tokio::test]
+    async fn deleting_a_room_keeps_other_session_maps_in_step_with_the_store() {
+        use crate::backends::EphemeralBackend;
+
+        let backend = Arc::new(EphemeralBackend::new());
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        let session = || MapDestination::loose(MapStorage::Session);
+        let a = mapper
+            .create_area_at("A".to_string(), session())
+            .await
+            .expect("create A");
+        let b = mapper
+            .create_area_at("B".to_string(), session())
+            .await
+            .expect("create B");
+        let room = |number: i32| AreaMutation::UpsertRoom {
+            room_number: RoomNumber(number),
+            body: RoomUpdates::default(),
+        };
+        let link = |seed: u128, from_direction, to: i32| AreaMutation::CreateExit {
+            room_number: RoomNumber(5),
+            body: ExitArgs {
+                id: Some(ExitId(Uuid::from_u128(seed))),
+                from_direction,
+                to_area_id: Some(a),
+                to_room_number: Some(RoomNumber(to)),
+                ..ExitArgs::default()
+            },
+        };
+        mapper
+            .mutate_area(a, vec![room(1), room(2)], "seed A")
+            .expect("seed A");
+        mapper
+            .mutate_area(
+                b,
+                vec![
+                    room(5),
+                    link(3, crate::ExitDirection::North, 2),
+                    link(5, crate::ExitDirection::West, 1),
+                ],
+                "seed B",
+            )
+            .expect("seed B");
+        wait_until(|| mapper.inner.pending.total_pending() == 0).await;
+        let b_rev = backend.get_area(&b).await.expect("B").area.rev;
+
+        mapper
+            .delete_room(RoomKey::new(a, RoomNumber(2)))
+            .expect("delete a room");
+        wait_until(|| {
+            mapper.inner.pending.total_pending() == 0
+                && mapper.inner.pending.confirmed_rev(b).0 == Some(b_rev + 1)
+        })
+        .await;
+
+        let stored = backend.get_area(&b).await.expect("B");
+        assert_eq!(stored.area.rev, b_rev + 1);
+        assert_eq!(exit_destination(&stored, 3), (None, None));
+        assert_eq!(exit_destination(&stored, 5), (Some(a), Some(RoomNumber(1))));
+        let cached = mapper.get_current_atlas().get_area(&b).expect("B cached");
+        assert_eq!(
+            canonical_content(cached.to_details()),
+            canonical_content(stored)
+        );
+    }
+
+    fn blank_room(number: i32) -> AreaMutation {
+        AreaMutation::UpsertRoom {
+            room_number: RoomNumber(number),
+            body: RoomUpdates::default(),
+        }
+    }
+
+    /// Exit `seed` from room `from` to room `to.1` of area `to.0`.
+    fn link_to(from: i32, seed: u128, to: (AreaId, i32)) -> AreaMutation {
+        AreaMutation::CreateExit {
+            room_number: RoomNumber(from),
+            body: ExitArgs {
+                id: Some(ExitId(Uuid::from_u128(seed))),
+                from_direction: crate::ExitDirection::North,
+                to_area_id: Some(to.0),
+                to_room_number: Some(RoomNumber(to.1)),
+                weight: 1.0,
+                ..ExitArgs::default()
+            },
+        }
+    }
+
+    /// A mapper over a fresh local store under `root` holding map A, with
+    /// rooms 1 and 2, and map B, with room 5 and `b_exits`, everything
+    /// saved.
+    async fn local_maps_a_and_b(
+        root: &std::path::Path,
+        b_exits: impl FnOnce(AreaId) -> Vec<AreaMutation>,
+    ) -> (Mapper, AreaId, AreaId) {
+        let mapper = Mapper::new(
+            Arc::new(LocalBackend::new(root.join("local"))),
+            root.join("cache"),
+        );
+        mapper.ready().await.expect("ready");
+        let local = || MapDestination::loose(MapStorage::Local);
+        let a = mapper
+            .create_area_at("A".to_string(), local())
+            .await
+            .expect("create A");
+        let b = mapper
+            .create_area_at("B".to_string(), local())
+            .await
+            .expect("create B");
+        mapper
+            .mutate_area(a, vec![blank_room(1), blank_room(2)], "seed A")
+            .expect("seed A");
+        let mut seed_b = vec![blank_room(5)];
+        seed_b.extend(b_exits(a));
+        mapper.mutate_area(b, seed_b, "seed B").expect("seed B");
+        wait_until(|| mapper.inner.pending.total_pending() == 0).await;
+        (mapper, a, b)
+    }
+
+    /// Where exit `seed` of `area` leads in the session, and in the local
+    /// store under `root` as a fresh process reads it.
+    async fn session_and_stored_destination(
+        mapper: &Mapper,
+        root: &std::path::Path,
+        area: AreaId,
+        seed: u128,
+    ) -> [(Option<AreaId>, Option<RoomNumber>); 2] {
+        let cached = mapper
+            .get_current_atlas()
+            .get_area(&area)
+            .expect("area cached")
+            .to_details();
+        let reopened = LocalBackend::new(root.join("local"));
+        reopened.refresh().await.expect("reread the store");
+        let stored = reopened.get_area(&area).await.expect("area stored");
+        [
+            exit_destination(&cached, seed),
+            exit_destination(&stored, seed),
+        ]
+    }
+
+    /// B edits room 5 and links it to A 2, then A 2 is deleted, in one
+    /// gesture, and A's queue reaches the store first: the deletion is
+    /// stored before B's link. The edit clearing the link is queued behind
+    /// the link in B's own queue, so B's store ends with the link cleared,
+    /// as the session shows it, and A's next room cannot become its
+    /// destination.
+    #[tokio::test]
+    async fn a_link_queued_before_a_deletion_is_stored_cleared_though_stored_after_it() {
+        let root = temp_cache_dir();
+        let (mapper, a, b) = local_maps_a_and_b(&root, |_| Vec::new()).await;
+
+        mapper.inner.pending.hold_sending(b, true);
+        mapper
+            .mutate_batches(vec![
+                AreaMutationBatch::strict(
+                    b,
+                    vec![AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(5),
+                        body: RoomUpdates {
+                            title: Some("Edited".to_string()),
+                            ..RoomUpdates::default()
+                        },
+                    }],
+                    "edit B",
+                ),
+                AreaMutationBatch::strict(b, vec![link_to(5, 99, (a, 2))], "link B to A 2"),
+                AreaMutationBatch::strict(
+                    a,
+                    vec![AreaMutation::DeleteRoom {
+                        room_number: RoomNumber(2),
+                    }],
+                    "delete A 2",
+                ),
+            ])
+            .expect("stage the gesture");
+        wait_until(|| mapper.inner.pending.queued_len(a) == 0).await;
+        mapper.inner.pending.hold_sending(b, false);
+        wait_until(|| mapper.inner.pending.total_pending() == 0).await;
+
+        let [cached, stored] = session_and_stored_destination(&mapper, &root, b, 99).await;
+        assert_eq!(cached, (None, None));
+        assert_eq!(
+            stored,
+            (None, None),
+            "the store holds what the session shows"
+        );
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(2)));
+
+        drop(mapper);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A 2 is deleted, clearing B's link to it, and the deletion is undone
+    /// as the map editor undoes it: A 2 comes back and B's exit is linked
+    /// to it again. B's queue reaches the store first, so the re-link is
+    /// stored before the deletion. The deletion leaves B's store alone, and
+    /// the re-link stands on disk as in the session.
+    #[tokio::test]
+    async fn an_undone_deletion_keeps_its_relink_though_the_relink_is_stored_first() {
+        let root = temp_cache_dir();
+        let (mapper, a, b) = local_maps_a_and_b(&root, |a| vec![link_to(5, 99, (a, 2))]).await;
+
+        mapper.inner.pending.hold_sending(a, true);
+        mapper
+            .delete_room(RoomKey::new(a, RoomNumber(2)))
+            .expect("delete A 2");
+        mapper
+            .mutate_batches(vec![
+                AreaMutationBatch::strict(a, vec![blank_room(2)], "restore A 2"),
+                AreaMutationBatch::strict(
+                    b,
+                    vec![AreaMutation::UpdateExit {
+                        exit_id: ExitId(Uuid::from_u128(99)),
+                        body: ExitUpdates {
+                            to_area_id: Some(a),
+                            to_room_number: Some(RoomNumber(2)),
+                            ..ExitUpdates::default()
+                        },
+                    }],
+                    "relink B",
+                ),
+            ])
+            .expect("undo the deletion");
+        wait_until(|| mapper.inner.pending.queued_len(b) == 0).await;
+        mapper.inner.pending.hold_sending(a, false);
+        wait_until(|| mapper.inner.pending.total_pending() == 0).await;
+
+        let restored = (Some(a), Some(RoomNumber(2)));
+        let [cached, stored] = session_and_stored_destination(&mapper, &root, b, 99).await;
+        assert_eq!(cached, restored);
+        assert_eq!(stored, restored, "the deletion cleared nothing on disk");
+
+        drop(mapper);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A holds rooms 1 to 3, and B's exits lead to A 4 and A 5, rooms since
+    /// deleted, and to A 9. The next room and a draft's reservation pass
+    /// over 4 and 5 and take the free numbers below 9; rooms created at the
+    /// numbers handed out leave every stale exit leading nowhere. An exit
+    /// to A 20 changes nothing until allocation reaches 20.
+    #[tokio::test]
+    async fn new_rooms_never_take_a_number_a_stale_exit_leads_to() {
+        use crate::ExitDirection::{East, West};
+        let (a, b) = (AreaId(Uuid::new_v4()), AreaId(Uuid::new_v4()));
+        let backend = Arc::new(FixedBackend::new(vec![
+            area_with_rooms(
+                a,
+                vec![
+                    room_with_exits(1, vec![]),
+                    room_with_exits(2, vec![]),
+                    room_with_exits(3, vec![]),
+                ],
+            ),
+            area_with_rooms(
+                b,
+                vec![room_with_exits(
+                    5,
+                    vec![
+                        exit_to(1, a, 4),
+                        heading(exit_to(2, a, 5), East),
+                        heading(exit_to(3, a, 9), West),
+                    ],
+                )],
+            ),
+        ]));
+        let mapper = Mapper::new(backend, temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(6)));
+        let draft = Uuid::new_v4();
+        assert_eq!(
+            mapper.reserve_room_number(&a, draft).expect("reserve"),
+            RoomNumber(6)
+        );
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(7)));
+        mapper.release_room_reservations(&a, draft);
+        for expected in [6, 7, 8, 10] {
+            let created = mapper.next_room_number(&a).expect("A is loaded");
+            assert_eq!(created, RoomNumber(expected));
+            mapper
+                .create_room(RoomKey::new(a, created), RoomUpdates::default())
+                .expect("create a room");
+        }
+
+        let atlas = mapper.get_current_atlas();
+        for number in [4, 5, 9] {
+            assert!(
+                atlas
+                    .get_room(&RoomKey::new(a, RoomNumber(number)))
+                    .is_none()
+            );
+        }
+        assert_eq!(exit_target(&atlas, b, 5, 1), (Some(a), Some(RoomNumber(4))));
+
+        mapper
+            .create_exit(
+                RoomKey::new(b, RoomNumber(5)),
+                ExitArgs {
+                    from_direction: crate::ExitDirection::South,
+                    to_area_id: Some(a),
+                    to_room_number: Some(RoomNumber(20)),
+                    ..ExitArgs::default()
+                },
+            )
+            .await
+            .expect("link B to A 20");
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(11)));
+    }
+
     #[tokio::test]
     async fn scope_exclusion_hides_area_without_touching_the_manual_axis() {
         let a_id = AreaId(Uuid::new_v4());
@@ -6089,6 +7168,192 @@ mod tests {
                 .iter()
                 .any(|room| room.room_number == RoomNumber(2))
         );
+    }
+
+    fn initial_properties(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    /// Local and session areas are written with their initial properties, so
+    /// the property index finds them as soon as the create resolves, and no
+    /// follow-up edit is sent.
+    #[tokio::test]
+    async fn created_local_and_session_areas_appear_with_their_properties() {
+        use crate::backends::{CompositeBackend, EphemeralBackend};
+
+        let root = temp_cache_dir();
+        let backend = Arc::new(CompositeBackend::new(
+            Arc::new(LocalBackend::new(root.join("local"))),
+            Arc::new(EphemeralBackend::new()),
+        ));
+        let mapper = Mapper::new(backend, root.join("cache"));
+        mapper.ready().await.unwrap();
+
+        for (storage, key) in [
+            (MapStorage::Local, "the deathlands"),
+            (MapStorage::Session, "zone 315"),
+        ] {
+            let id = mapper
+                .create_area_at_with_properties(
+                    key.to_string(),
+                    MapDestination::loose(storage),
+                    initial_properties(&[("nukefire.area", key)]),
+                )
+                .await
+                .expect("create with properties");
+            assert_eq!(mapper.area_storage(&id), storage);
+            let atlas = mapper.get_current_atlas();
+            assert_eq!(
+                atlas
+                    .get_areas_by_property("nukefire.area", key)
+                    .collect::<Vec<_>>(),
+                [id]
+            );
+            assert_eq!(
+                atlas.get_area(&id).unwrap().get_property("nukefire.area"),
+                Some(key)
+            );
+        }
+        assert_eq!(mapper.get_sync_stats().operations_sent(), 0);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A cloud create sends no properties: the area is created, then receives
+    /// them as exactly one mutation, acknowledged before the call resolves.
+    #[tokio::test]
+    async fn cloud_create_saves_properties_as_one_acknowledged_mutation() {
+        let backend = Arc::new(FixedBackend::new(vec![]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+
+        let id = mapper
+            .create_area_at_with_properties(
+                "The Deathlands".to_string(),
+                MapDestination::loose(MapStorage::Cloud),
+                initial_properties(&[
+                    ("nukefire.area", "the deathlands"),
+                    ("nukefire.mapper", "NukeFire.Map.Local"),
+                ]),
+            )
+            .await
+            .expect("create with properties");
+
+        assert_eq!(mapper.area_storage(&id), MapStorage::Cloud);
+        let envelopes: Vec<usize> = backend
+            .mutations
+            .lock()
+            .iter()
+            .map(|(_, operations)| *operations)
+            .collect();
+        assert_eq!(envelopes, [2], "one mutation with both upserts");
+        let stored: Vec<(String, String)> = backend.areas.lock()[&id]
+            .properties
+            .iter()
+            .map(|property| (property.name.clone(), property.value.clone()))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("nukefire.area".to_string(), "the deathlands".to_string()),
+                (
+                    "nukefire.mapper".to_string(),
+                    "NukeFire.Map.Local".to_string()
+                ),
+            ]
+        );
+        assert_eq!(mapper.inner.pending.confirmed_rev(id).0, Some(2));
+        assert_eq!(
+            mapper
+                .get_current_atlas()
+                .get_areas_by_property("nukefire.mapper", "NukeFire.Map.Local")
+                .collect::<Vec<_>>(),
+            [id]
+        );
+    }
+
+    /// A refused property save undoes the create: the refused edit is
+    /// discarded, the area is deleted again, and nothing of it is left in
+    /// the backend, the atlas cache, or the pending queue.
+    #[tokio::test]
+    async fn cloud_create_deletes_the_area_when_its_properties_are_refused() {
+        let backend = Arc::new(FixedBackend::new(vec![]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+        backend.fail_mutations_with(Some(CloudError::InvalidInput("refused".to_string())));
+
+        let result = mapper
+            .create_area_at_with_properties(
+                "Keyed".to_string(),
+                MapDestination::loose(MapStorage::Cloud),
+                initial_properties(&[("nukefire.area", "keyed")]),
+            )
+            .await;
+        let Err(CreateAreaError::PropertiesNotSaved { reason }) = &result else {
+            panic!("expected the area to be removed: {result:?}");
+        };
+        assert!(reason.contains("refused"), "{reason}");
+        assert_eq!(result.unwrap_err().kept_area(), None);
+
+        assert_eq!(backend.mutations.lock().len(), 1, "one refused save");
+        assert_eq!(*backend.deletes.lock(), [None], "one unconditioned delete");
+        assert!(backend.areas.lock().is_empty(), "the backend holds no area");
+        assert_eq!(mapper.get_current_atlas().areas().count(), 0);
+        assert_eq!(mapper.inner.pending.total_pending(), 0);
+        assert!(mapper.inner.pending_by_area.lock().is_empty());
+        assert_eq!(mapper.get_sync_stats().pending_operations(), 0);
+    }
+
+    /// When the area cannot be deleted either, it stays as the backend holds
+    /// it, without the properties, and the error names it for the caller.
+    #[tokio::test]
+    async fn cloud_create_names_the_area_it_could_not_delete() {
+        let backend = Arc::new(FixedBackend::new(vec![]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+        backend.fail_mutations_with(Some(CloudError::InvalidInput("refused".to_string())));
+        backend.refuse_deletes_with_conflict(true);
+
+        let error = mapper
+            .create_area_at_with_properties(
+                "Keyed".to_string(),
+                MapDestination::loose(MapStorage::Cloud),
+                initial_properties(&[("nukefire.area", "keyed")]),
+            )
+            .await
+            .expect_err("the properties were refused");
+        let CreateAreaError::AreaKept {
+            area_id,
+            name,
+            removal,
+            ..
+        } = &error
+        else {
+            panic!("expected the area to stay: {error:?}");
+        };
+        assert_eq!(error.kept_area(), Some(*area_id));
+        assert_eq!(name, "Keyed");
+        assert!(matches!(removal, CloudError::RevisionConflict { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("\"Keyed\"") && message.contains(&area_id.to_string()),
+            "{message}"
+        );
+
+        assert!(backend.areas.lock()[area_id].properties.is_empty());
+        let cached = mapper
+            .get_current_atlas()
+            .get_area(area_id)
+            .expect("the kept area stays in the atlas cache");
+        assert_eq!(
+            cached.get_property("nukefire.area"),
+            None,
+            "the unsaved properties are no longer displayed"
+        );
+        assert_eq!(mapper.area_save_status(*area_id), AreaSaveStatus::Saved);
     }
 
     #[tokio::test]
@@ -6948,6 +8213,7 @@ mod tests {
                 name: "Original".into(),
                 atlas_id: None,
                 ephemeral: false,
+                properties: BTreeMap::new(),
             })
             .await
             .unwrap();
@@ -6964,9 +8230,8 @@ mod tests {
         local_projection::adopt(&mapper.inner);
         mapper
             .inner
-            .finish_created_area(created.clone(), true)
-            .await
-            .unwrap();
+            .finish_created_area(created.clone(), true, Vec::new())
+            .await;
         assert_eq!(
             mapper
                 .get_current_atlas()
@@ -6979,9 +8244,8 @@ mod tests {
         local_projection::adopt(&mapper.inner);
         mapper
             .inner
-            .finish_created_area(created.clone(), true)
-            .await
-            .unwrap();
+            .finish_created_area(created.clone(), true, Vec::new())
+            .await;
         assert!(mapper.get_current_atlas().get_area(&created.id).is_none());
         std::fs::remove_dir_all(root).ok();
     }
@@ -7072,6 +8336,7 @@ mod tests {
                     .map(|details| (details.area.id, details.area.rev))
                     .collect(),
                 number_floor: RoomNumber(4),
+                vacant_targets: Vec::new(),
             })
             .await
             .unwrap();
@@ -7118,6 +8383,7 @@ mod tests {
                     .map(|details| (details.area.id, details.area.rev))
                     .collect(),
                 number_floor: RoomNumber(4),
+                vacant_targets: Vec::new(),
             })
             .await
             .unwrap();
@@ -7279,6 +8545,7 @@ mod tests {
                 name: "Delete".into(),
                 atlas_id: None,
                 ephemeral: false,
+                properties: BTreeMap::new(),
             })
             .await
             .unwrap();
@@ -7324,6 +8591,7 @@ mod tests {
                 .map(|details| (details.area.id, details.area.rev))
                 .collect(),
             number_floor: RoomNumber(4),
+            vacant_targets: Vec::new(),
         };
         writer.merge_areas(&plan).await.unwrap();
         local_projection::adopt(&observer.inner);
@@ -8284,6 +9552,81 @@ mod tests {
             Some(RoomNumber(6)),
             "with the draft gone, allocation follows the merged cache"
         );
+    }
+
+    /// A holds rooms 1, 2 and 4, and C's exits lead to A 3 and A 6, rooms
+    /// since deleted. B holds rooms 3 and 6, a gap and a free number that a
+    /// moved room would otherwise keep. The plan names 3 and 6 as vacant
+    /// targets, so B's rooms land at 5 and 7, passing over 6, and C's exits
+    /// still lead nowhere. A draft opened mid-commit lands above both moved
+    /// rooms: the merge holds the number it passes over as well.
+    #[tokio::test]
+    async fn merging_never_lands_a_moved_room_on_a_number_a_stale_exit_leads_to() {
+        let (a, b, c) = (
+            AreaId(Uuid::new_v4()),
+            AreaId(Uuid::new_v4()),
+            AreaId(Uuid::new_v4()),
+        );
+        let backend = Arc::new(FixedBackend::new(vec![
+            area_with_rooms(
+                a,
+                vec![
+                    room_with_exits(1, vec![]),
+                    room_with_exits(2, vec![]),
+                    room_with_exits(4, vec![]),
+                ],
+            ),
+            area_with_rooms(
+                b,
+                vec![room_with_exits(3, vec![]), room_with_exits(6, vec![])],
+            ),
+            area_with_rooms(
+                c,
+                vec![room_with_exits(
+                    1,
+                    vec![
+                        exit_to(1, a, 3),
+                        heading(exit_to(2, a, 6), crate::ExitDirection::East),
+                    ],
+                )],
+            ),
+        ]));
+        backend.session_ids.lock().extend([a, b, c]);
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.expect("load");
+
+        backend.hold_merges(true);
+        let merging = {
+            let mapper = mapper.clone();
+            tokio::spawn(async move { mapper.merge_areas(a, vec![merge_source(b)]).await })
+        };
+        wait_until(|| !backend.merge_plans.lock().is_empty()).await;
+        let draft = Uuid::new_v4();
+        let reserved = mapper.reserve_room_number(&a, draft).expect("A is loaded");
+        backend.hold_merges(false);
+        let commit = merging.await.expect("merge task").expect("merge");
+
+        let plan = backend.merge_plans.lock()[0].clone();
+        assert_eq!(plan.vacant_targets, vec![RoomNumber(3), RoomNumber(6)]);
+        assert_eq!(plan.number_floor, RoomNumber(5));
+        let remap: Vec<(i32, i32)> = commit
+            .outcome
+            .rooms
+            .iter()
+            .map(|room| (room.from.room_number.0, room.to.0))
+            .collect();
+        assert_eq!(remap, vec![(3, 5), (6, 7)]);
+        assert_eq!(
+            reserved,
+            RoomNumber(8),
+            "the draft lands above the merged rooms"
+        );
+        mapper.release_room_reservations(&a, draft);
+        let atlas = mapper.get_current_atlas();
+        assert_eq!(sorted_rooms(&atlas, a), vec![1, 2, 4, 5, 7]);
+        assert_eq!(exit_target(&atlas, c, 1, 1), (Some(a), Some(RoomNumber(3))));
+        assert_eq!(exit_target(&atlas, c, 1, 2), (Some(a), Some(RoomNumber(6))));
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(8)));
     }
 
     /// A failed merge releases its hold on the destination's floor: the

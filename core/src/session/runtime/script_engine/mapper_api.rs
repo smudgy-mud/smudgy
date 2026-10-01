@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use deno_core::{
     GarbageCollected, OpState, op2, thiserror,
@@ -10,13 +10,13 @@ use super::ops::SmudgyGrants;
 use super::script_uuid::ScriptUuid;
 use crate::session::runtime::action::{ActionQueue, RuntimeAction};
 use smudgy_cloud::{
-    AreaId, AreaMergeSource, AreaWithDetails, AtlasId, Connection, ConnectionArgs, ConnectionDash,
-    ConnectionEndpoint, ConnectionId, ConnectionKind, ConnectionRouting, ConnectionUpdates,
-    CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, ExitArgs, ExitDirection,
-    ExitId, ExitUpdates, HorizontalAlignment, Label, LabelArgs, LabelId, LabelUpdates,
-    MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode, RoomNumber, RoomRemap,
-    RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId, ShapeType, ShapeUpdates,
-    Translate, Uuid, VerticalAlignment,
+    AreaId, AreaMergeSource, AreaWithDetails, AtlasId, CloudError, Connection, ConnectionArgs,
+    ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind, ConnectionRouting,
+    ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS,
+    ExitArgs, ExitDirection, ExitId, ExitUpdates, HorizontalAlignment, Label, LabelArgs, LabelId,
+    LabelUpdates, MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode,
+    RoomNumber, RoomRemap, RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId,
+    ShapeType, ShapeUpdates, Translate, Uuid, VerticalAlignment,
     mapper::{
         AreaMutationBatch, MutationSubmission, RoomKey, area_cache::AreaCache,
         room_cache::RoomCache,
@@ -375,28 +375,48 @@ async fn op_smudgy_mapper_create_area(
         }
         let storage = resolve_create_storage(options.storage, options.ephemeral)
             .or_else(|| atlas_id.and_then(|id| mapper.atlas_storage(&id)));
-        let id = if let Some(storage) = storage {
+        let created = if let Some(storage) = storage {
             mapper
-                .create_area_at(name, MapDestination { storage, atlas_id })
+                .create_area_at_with_properties(
+                    name,
+                    MapDestination { storage, atlas_id },
+                    options.properties,
+                )
                 .await
         } else {
             // No tier was requested: create durable in the default tier —
             // cloud when signed in, local otherwise.
-            mapper.create_area(name).await
-        }
-        .map_err(|e| MapperError::FailedToCreate(e.to_string()))?;
-
+            mapper
+                .create_area_with_properties(name, options.properties)
+                .await
+        };
         // A non-ephemeral (cloud-tier) area created from a session is associated
         // with that session's server entry — nothing user-created starts
         // unassigned. Ephemeral areas are session-scoped by nature and get no
         // association. The daemon gates the association on the area actually
         // being cloud-tier (signed in), so a local-tier create is harmless.
-        if mapper.area_storage(&id) == MapStorage::Cloud {
+        let associate = |area_id| {
             state
                 .borrow()
                 .borrow::<ActionQueue>()
                 .borrow_mut()
-                .push_back(RuntimeAction::AssociateCreatedArea(id));
+                .push_back(RuntimeAction::AssociateCreatedArea(area_id));
+        };
+        let id = match created {
+            Ok(id) => id,
+            Err(error) => {
+                // A cloud map whose properties could not be saved, and that
+                // could not be deleted again either, still exists: it is
+                // associated like any created map, so the player finds it in
+                // this server's maps and can remove it.
+                if let Some(kept) = error.kept_area() {
+                    associate(kept);
+                }
+                return Err(MapperError::FailedToCreate(error.to_string()));
+            }
+        };
+        if mapper.area_storage(&id) == MapStorage::Cloud {
+            associate(id);
         }
 
         return mapper
@@ -419,6 +439,9 @@ struct JsCreateAreaOptions {
     /// the fully supported storage-less default arrives as `None`.
     #[serde(default)]
     ephemeral: Option<bool>,
+    /// Area properties the new map starts with; absent means none.
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
 }
 
 /// Parse one `CARGO_PKG_VERSION_*` component at compile time.
@@ -1111,7 +1134,10 @@ fn op_smudgy_mapper_reserve_room_number(
     mapper
         .reserve_room_number(&area_id, token)
         .map(|number| number.0)
-        .map_err(|_| MapperError::AreaNotFound)
+        .map_err(|error| match error {
+            CloudError::AreaNotFound(_) => MapperError::AreaNotFound,
+            other => operation_failed("reserve a room number")(other),
+        })
 }
 
 /// Release every room-number reservation held under `token` for an area.
@@ -1673,9 +1699,12 @@ async fn op_smudgy_mapper_create_room(
         // Reservation-aware allocation: numbers drafted by an open
         // `mutateArea` callback are skipped, so an ambient create landing
         // mid-callback cannot silently merge with a draft.
-        let Some(room_number) = mapper.next_room_number(&area_id) else {
-            return Err(MapperError::AreaNotFound);
-        };
+        let room_number = mapper
+            .try_next_room_number(&area_id)
+            .map_err(|error| match error {
+                CloudError::AreaNotFound(_) => MapperError::AreaNotFound,
+                other => MapperError::FailedToCreate(other.to_string()),
+            })?;
 
         // Create-only submission: a cross-client race on this number is
         // refused (`room_number_exists`) instead of silently merging two

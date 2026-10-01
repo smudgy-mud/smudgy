@@ -1,11 +1,12 @@
 /**
  * The realistic-map quality ratchet. `realistic-ratchet.json` records the
  * full public quality tuple each fixture/pipeline last achieved; this test
- * requires the live engine to be EQUAL OR BETTER, lexicographically, on every
- * scenario. A strictly better result passes — and prompts a deliberate
- * regeneration (`node realistic-ratchet-update.mjs`) so the improvement is
- * banked and can never silently erode. A worse result fails, naming the first
- * tuple field that regressed.
+ * requires the live engine to be EQUAL OR BETTER in the engine's quality order
+ * (`compareLayoutQuality`) on every scenario. A strictly better result passes
+ * — and prompts a deliberate regeneration (`node realistic-ratchet-update.mjs`)
+ * so the improvement is banked and can never silently erode. A worse result
+ * fails, naming what regressed: the weighted score, or the first tuple field
+ * when the scores are equal.
  *
  * Each record also carries the fixture's `aspiration` — the layout the
  * fixture exists to reach. Aspirations are data, never asserted; the gap
@@ -16,7 +17,12 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { compareLayoutQuality, type LayoutQuality } from "./layout.ts";
+import {
+  compareLayoutQuality,
+  DIRECTIONAL_VIOLATION_WEIGHT,
+  LEVEL_VIOLATION_WEIGHT,
+  type LayoutQuality,
+} from "./layout.ts";
 import {
   normalizedQuality,
   QUALITY_TUPLE_FIELDS,
@@ -47,10 +53,23 @@ function digest(quality: Record<string, number>): string {
   return `[${QUALITY_TUPLE_FIELDS.map((field) => quality[field] ?? 0).join(",")}]`;
 }
 
-function firstRegressedField(
+function score(quality: Record<string, number>): number {
+  const directional = quality.cardinalRayViolations ?? 0;
+  const level = quality.levelViolations ?? 0;
+  return DIRECTIONAL_VIOLATION_WEIGHT * (directional - level) + LEVEL_VIOLATION_WEIGHT * level +
+    (quality.routingViolations ?? 0) + (quality.linkCrossings ?? 0);
+}
+
+/** What made `current` rank below `recorded`. */
+function regression(
   current: Record<string, number>,
   recorded: Record<string, number>,
 ): string | undefined {
+  if (score(current) !== score(recorded)) {
+    return score(current) > score(recorded)
+      ? `the score (${score(recorded)} -> ${score(current)})`
+      : undefined;
+  }
   for (const field of QUALITY_TUPLE_FIELDS) {
     const currentValue = current[field] ?? 0;
     const recordedValue = recorded[field] ?? 0;
@@ -98,7 +117,7 @@ for (const scenario of scenarios) {
     );
     if (comparison < 0) {
       assert.fail(
-        `${scenario.name} regressed at ${firstRegressedField(current, record.quality)}: ` +
+        `${scenario.name} regressed at ${regression(current, record.quality)}: ` +
           `recorded ${digest(record.quality)}, current ${digest(current)}`,
       );
     }

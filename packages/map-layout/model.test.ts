@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compareLayoutQuality } from "./layout.ts";
+import { compareLayoutQuality, type LayoutTraceEvent } from "./layout.ts";
 import {
   createLayoutModel,
   createLayoutWorkspace,
@@ -178,6 +178,37 @@ test("reflows two existing rooms into an exact new directional connection", () =
   assert.equal(result.quality.cardinalSlack, 0);
 });
 
+test("connecting two existing rooms keeps the local path, without the whole-map axis pass", () => {
+  // Spread rows the whole-map pass would gather: a reflow of this map
+  // reports axis-group progress, and connecting two of its rooms must not.
+  const trace: LayoutTraceEvent[] = [];
+  const result = planLayoutModel(createLayoutModel({
+    rooms: [
+      { id: "a", position: at(0, 0), movable: true },
+      { id: "b", position: at(6, 0), movable: true },
+      { id: "c", position: at(12, 0), movable: true },
+      { id: "d", position: at(0, 5), movable: true },
+      { id: "e", position: at(6, 5), movable: true },
+    ],
+    edges: [
+      { from: "a", to: "b", direction: "East" },
+      { from: "b", to: "a", direction: "West" },
+      { from: "b", to: "c", direction: "East" },
+      { from: "c", to: "b", direction: "West" },
+      { from: "d", to: "e", direction: "East" },
+      { from: "e", to: "d", direction: "West" },
+    ],
+  }), {
+    type: "connect-rooms",
+    from: "a",
+    to: "d",
+    direction: "South",
+  }, { trace: (event) => trace.push(event) });
+
+  assert.equal(result.quality.cardinalRayViolations, 0);
+  assert.equal(trace.some((event) => event.type === "axis-progress"), false);
+});
+
 test("thorough reflow prioritizes violation neighborhoods and beats one anchored pass", () => {
   const model = createLayoutModel({
     rooms: [
@@ -233,7 +264,7 @@ test("thorough reflow prioritizes violation neighborhoods and beats one anchored
     ["8", "0", "2", "6"],
     "the requested anchor is followed by endpoints of its remaining directional violations",
   );
-  assert.equal(thorough.search?.selectedAnchor, null);
+  assert.equal(thorough.search?.selectedAnchor, "7");
   assert.equal(thorough.search?.completed, true);
   assert.ok((thorough.search?.planningPasses ?? 0) > (thorough.search?.anchorsTried.length ?? 0));
   for (const move of thorough.patch.moves) {

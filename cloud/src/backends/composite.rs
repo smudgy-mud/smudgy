@@ -743,7 +743,7 @@ mod tests {
     };
     use chrono::Utc;
     use parking_lot::Mutex;
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     /// Minimal cloud-tier double: scriptable `list_areas`/`get_area`/`sync_state`
     /// and a fixed credential flag. Methods the composite tests don't exercise
@@ -853,6 +853,7 @@ mod tests {
             inbound: Vec::new(),
             expected: vec![into, source],
             number_floor: RoomNumber(1),
+            vacant_targets: Vec::new(),
         }
     }
 
@@ -899,6 +900,7 @@ mod tests {
                 name: "Local".to_string(),
                 atlas_id: None,
                 ephemeral: false,
+                properties: BTreeMap::new(),
             })
             .await
             .expect("local create");
@@ -1046,6 +1048,7 @@ mod tests {
                 name: "Session map".to_string(),
                 atlas_id: None,
                 ephemeral: true,
+                properties: BTreeMap::new(),
             })
             .await
             .expect("ephemeral create");
@@ -1098,6 +1101,40 @@ mod tests {
             composite.get_area(&area.id).await,
             Err(CloudError::NotFoundOrNoAccess)
         ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Initial properties reach the tier that stores the new area, whether
+    /// the tier is explicit or follows sign-in state (signed out: local).
+    #[tokio::test]
+    async fn create_forwards_initial_properties_to_the_owning_tier() {
+        let root = temp_root();
+        let local = Arc::new(LocalBackend::new(&root));
+        let composite = CompositeBackend::new(local, Arc::new(StubCloud::new(false)));
+
+        for storage in [None, Some(MapStorage::Local), Some(MapStorage::Session)] {
+            let label = storage.map_or_else(|| "default".to_string(), |s| s.to_string());
+            let mut request = CreateAreaRequest {
+                name: label.clone(),
+                atlas_id: None,
+                ephemeral: false,
+                properties: BTreeMap::new(),
+            };
+            request.properties.insert("tier".to_string(), label.clone());
+            let area = match storage {
+                Some(storage) => composite.create_area_at(request, storage).await,
+                None => composite.create_area(request).await,
+            }
+            .expect("create");
+
+            let details = composite.get_area(&area.id).await.expect("get");
+            assert_eq!(details.properties.len(), 1, "{label}");
+            assert_eq!(details.properties[0].name, "tier");
+            assert_eq!(details.properties[0].value, label);
+        }
+        assert_eq!(composite.local_area_ids().len(), 2);
+        assert_eq!(composite.ephemeral_area_ids().len(), 1);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1189,6 +1226,7 @@ mod tests {
                 name: "Session".to_string(),
                 atlas_id: None,
                 ephemeral: true,
+                properties: BTreeMap::new(),
             })
             .await
             .expect("ephemeral create");
@@ -1245,6 +1283,7 @@ mod tests {
                 name: "Source".to_string(),
                 atlas_id: None,
                 ephemeral: false,
+                properties: BTreeMap::new(),
             })
             .await
             .expect("local source")
@@ -1288,6 +1327,7 @@ mod tests {
                     name: name.to_string(),
                     atlas_id: None,
                     ephemeral: true,
+                    properties: BTreeMap::new(),
                 })
                 .await
                 .expect("ephemeral create");

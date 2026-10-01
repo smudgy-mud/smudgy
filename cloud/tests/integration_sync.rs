@@ -8,10 +8,13 @@
 //! `sync_now`).
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
+#[path = "integration_sync/create_area_properties.rs"]
+mod create_area_properties;
 #[path = "integration_sync/local_queue_regressions.rs"]
 mod local_queue_regressions;
 mod support;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -253,6 +256,7 @@ async fn local_generation_adoption_does_not_request_cloud_sync() {
             name: "Local only".into(),
             atlas_id: None,
             ephemeral: false,
+            properties: BTreeMap::new(),
         })
         .await
         .unwrap();

@@ -31,7 +31,9 @@ pub use connection::{
     THICKNESS_RANGE, default_anchor_for_bearing, default_anchor_for_direction,
 };
 pub use error::{CloudError, CloudResult};
-pub use mapper::{AreaImportDocument, AreaLoadSource, AreaLoadStat, LoadMapsSummary, Mapper};
+pub use mapper::{
+    AreaImportDocument, AreaLoadSource, AreaLoadStat, CreateAreaError, LoadMapsSummary, Mapper,
+};
 pub use package_api::{
     CheckUpdatesEntry, CheckUpdatesHave, CheckUpdatesResponse, CheckUpdatesResult, CommentView,
     DependencyKind, ModuleMetaView, PackageApiClient, PackageDetail, PackageGrantView,
@@ -49,6 +51,7 @@ pub use store_node::{ArrayNode, Node, ObjectNode, Usage};
 // Re-export data structures that match the backend API
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 pub use uuid::Uuid;
 
 /// Whether the running script isolate may create/alter on-screen widgets — the `widgets`
@@ -944,6 +947,27 @@ pub struct CreateAreaRequest {
     /// wire, and single-tier backends ignore it.
     #[serde(skip)]
     pub ephemeral: bool,
+    /// Area properties the new area starts with. Client-side only — never on
+    /// the wire: the local and ephemeral backends write them into the document
+    /// they create, and the mapper saves them to a cloud area with a follow-up
+    /// area mutation.
+    #[serde(skip)]
+    pub properties: BTreeMap<String, String>,
+}
+
+impl CreateAreaRequest {
+    /// The initial properties as an area document stores them.
+    #[must_use]
+    pub fn document_properties(&self) -> Vec<Property> {
+        self.properties
+            .iter()
+            .map(|(name, value)| Property {
+                name: name.clone(),
+                value: value.clone(),
+                is_secret: false,
+            })
+            .collect()
+    }
 }
 
 /// Area update data.
@@ -994,8 +1018,26 @@ pub struct RoomConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::{AreaUpdates, AtlasId, MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION, Uuid};
+    use super::{
+        AreaUpdates, AtlasId, CreateAreaRequest, MAP_STORAGE_COMPATIBILITY_REMOVAL_VERSION, Uuid,
+    };
     use serde_json::json;
+
+    /// The create body is the server's contract; routing and initial
+    /// properties stay client-side.
+    #[test]
+    fn create_area_request_keeps_client_fields_off_the_wire() {
+        let request = CreateAreaRequest {
+            name: "The Deathlands".to_string(),
+            atlas_id: None,
+            ephemeral: true,
+            properties: [("nukefire.area".to_string(), "the deathlands".to_string())].into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            json!({ "name": "The Deathlands", "atlas_id": null })
+        );
+    }
 
     /// Regression: a name-only rename must not carry `atlas_id` on the wire,
     /// and the move cases must (present+uuid = set, present+null = make loose).
