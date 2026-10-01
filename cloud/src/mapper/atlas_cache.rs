@@ -5,11 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use imbl::HashMap as PersistentMap;
+use imbl::{HashMap as PersistentMap, OrdMap};
 use ordered_float::OrderedFloat;
 
 use crate::{
-    AreaId, AtlasId, ExitDirection,
+    AreaId, AtlasId, ExitDirection, RoomNumber, Uuid,
     mapper::{
         RoomKey,
         area_cache::AreaCache,
@@ -115,10 +115,11 @@ pub struct ElsewhereMatch {
 /// exclusion axis — which re-place *every* area at once — rebuild the tables
 /// from scratch; those are rare, user-initiated toggles.
 ///
-/// The from-scratch build is itself the incremental insert applied to an empty
-/// cache once per area, so the two paths cannot drift: any sequence of
+/// The from-scratch build is the incremental per-room insert applied to an
+/// empty cache once per area, so the two paths cannot drift: any sequence of
 /// area-level edits leaves the tables exactly as a full rebuild of the final
-/// area set would.
+/// area set would. Only the exit-target counts are gathered in one sorted pass
+/// instead, since they are the same sums whichever order the exits arrive in.
 #[derive(Clone)]
 pub struct AtlasCache {
     areas: HashMap<AreaId, Arc<AreaCache>>,
@@ -170,6 +171,21 @@ pub struct AtlasCache {
     /// terms as its rooms contribute to the room tables.
     areas_by_property_name: PersistentMap<String, AreaMatches>,
     areas_by_property_name_and_value: PersistentMap<(String, String), AreaMatches>,
+    /// Every room an exit in another area leads to, keyed by the area it
+    /// leads into and the room number, with how many such exits lead there;
+    /// the number need not belong to a room. An exit that names a room which
+    /// no longer exists would silently lead to whatever room later takes
+    /// that number, so room allocation passes over the numbers exits name,
+    /// here and among the area's own exits, and merges keep clear of the
+    /// vacant ones (see [`Self::first_unnamed_room_number`] and
+    /// [`Self::vacant_exit_targets`]). An area's exits into its own rooms
+    /// are read from the area itself when a number is wanted: they are most
+    /// of a map's exits, and the area's own edits keep them leading to rooms
+    /// that exist. Every area's exits count, turned off or not, so an
+    /// exclusion change carries the index over as it is. Maintained per room
+    /// like the tables above, counted in one pass when the tables are built
+    /// from scratch, and ordered so every question is a range read.
+    exit_targets: OrdMap<(Uuid, RoomNumber), u32>,
     /// Areas the viewer owns, for own-beats-shared precedence in lookups and
     /// routing. Maintained alongside the tables; lookups are O(1).
     owned_areas: HashSet<AreaId>,
@@ -197,6 +213,17 @@ impl AtlasCache {
     }
 
     fn new_with_exclusions(areas: HashMap<AreaId, Arc<AreaCache>>, exclusions: Exclusions) -> Self {
+        let exit_targets = count_exit_targets(&areas);
+        Self::new_with_exit_targets(areas, exclusions, exit_targets)
+    }
+
+    /// Builds every table for `areas` from scratch, over `exit_targets`, the
+    /// exit-target counts of exactly those areas.
+    fn new_with_exit_targets(
+        areas: HashMap<AreaId, Arc<AreaCache>>,
+        exclusions: Exclusions,
+        exit_targets: OrdMap<(Uuid, RoomNumber), u32>,
+    ) -> Self {
         let mut cache = Self {
             areas: HashMap::with_capacity(areas.len()),
             rooms_by_title_description_and_visible_exits: PersistentMap::new(),
@@ -210,11 +237,20 @@ impl AtlasCache {
             rooms_by_tag: PersistentMap::new(),
             areas_by_property_name: PersistentMap::new(),
             areas_by_property_name_and_value: PersistentMap::new(),
+            exit_targets,
             owned_areas: HashSet::new(),
             exclusions,
         };
         for (area_id, area) in areas {
-            cache.apply_insert(area_id, area);
+            let placement = cache.placement(&area_id, &area);
+            if placement.owned {
+                cache.owned_areas.insert(area_id);
+            }
+            for room in area.get_rooms() {
+                cache.index_room(area_id, room, placement);
+            }
+            cache.add_area_properties(area_id, &area, placement);
+            cache.areas.insert(area_id, area);
         }
         cache
     }
@@ -343,7 +379,32 @@ impl AtlasCache {
         }
     }
 
+    /// The rooms in other areas that exits of `room`, a room of `area_id`,
+    /// lead to, as [`Self::exit_targets`] keys.
+    fn exit_target_keys(
+        area_id: AreaId,
+        room: &RoomCache,
+    ) -> impl Iterator<Item = (Uuid, RoomNumber)> + '_ {
+        room.get_exits().iter().filter_map(move |exit| {
+            exit.to_area_id
+                .filter(|to_area| *to_area != area_id)
+                .zip(exit.to_room_number)
+                .map(|(to_area, number)| (to_area.0, number))
+        })
+    }
+
     fn add_room(&mut self, area_id: AreaId, room: &Arc<RoomCache>, placement: AreaPlacement) {
+        // An exit is real in an area the viewer has turned off too, so the
+        // exit targets ignore placement.
+        for key in Self::exit_target_keys(area_id, room) {
+            *self.exit_targets.entry(key).or_insert(0) += 1;
+        }
+        self.index_room(area_id, room, placement);
+    }
+
+    /// Adds `room` to every lookup table its placement admits it to; the
+    /// exit targets are the caller's.
+    fn index_room(&mut self, area_id: AreaId, room: &Arc<RoomCache>, placement: AreaPlacement) {
         if placement.identified {
             insert_match(
                 &mut self.rooms_by_title_description_and_visible_exits,
@@ -432,6 +493,14 @@ impl AtlasCache {
     }
 
     fn remove_room(&mut self, area_id: AreaId, room: &Arc<RoomCache>, placement: AreaPlacement) {
+        for key in Self::exit_target_keys(area_id, room) {
+            if let Some(count) = self.exit_targets.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.exit_targets.remove(&key);
+                }
+            }
+        }
         let room_number = room.get_room_number();
         if placement.identified {
             remove_match(
@@ -556,34 +625,38 @@ impl AtlasCache {
 
     /// Same areas, different manual-disable set — scope exclusions preserved.
     /// An exclusion change re-places every area at once, so this is the full
-    /// from-scratch rebuild; toggles are rare.
+    /// from-scratch rebuild of the lookup tables; toggles are rare. The exit
+    /// targets ignore placement and carry over as they are.
     #[must_use]
     pub(super) fn with_disabled_areas(&self, disabled_areas: Arc<HashSet<AreaId>>) -> Self {
-        Self::new_with_exclusions(
+        Self::new_with_exit_targets(
             self.areas.clone(),
             Exclusions {
                 disabled: disabled_areas,
                 ..self.exclusions.clone()
             },
+            self.exit_targets.clone(),
         )
     }
 
     /// Same areas, different per-server scope-exclusion sets — the manual
     /// disable axis preserved. An exclusion change re-places every area at
-    /// once, so this is the full from-scratch rebuild; scope changes are rare.
+    /// once, so this is the full from-scratch rebuild of the lookup tables;
+    /// scope changes are rare. The exit targets carry over as they are.
     #[must_use]
     pub(super) fn with_scope_exclusions(
         &self,
         excluded_atlases: Arc<HashSet<AtlasId>>,
         excluded_areas: Arc<HashSet<AreaId>>,
     ) -> Self {
-        Self::new_with_exclusions(
+        Self::new_with_exit_targets(
             self.areas.clone(),
             Exclusions {
                 disabled: self.exclusions.disabled.clone(),
                 atlases: excluded_atlases,
                 areas: excluded_areas,
             },
+            self.exit_targets.clone(),
         )
     }
 
@@ -726,6 +799,81 @@ impl AtlasCache {
             .get(&room_key.area_id)?
             .get_room(&room_key.room_number)
             .cloned()
+    }
+
+    /// The lowest number at or above `from` that no exit anywhere in the atlas
+    /// leads to in `area_id`. A new room at a number an exit names would
+    /// silently become that exit's destination, so allocation passes over the
+    /// named numbers and takes the first one left; an exit naming a number
+    /// far above the area's rooms costs nothing until allocation reaches it.
+    /// Wider than a room number so an exhausted area stays representable.
+    #[must_use]
+    pub(crate) fn first_unnamed_room_number(&self, area_id: &AreaId, from: i64) -> i64 {
+        let Ok(start) = i32::try_from(from.max(i64::from(i32::MIN))) else {
+            return from;
+        };
+        let mut named = self.numbers_named_in(area_id, RoomNumber(start));
+        named.sort_unstable();
+        named.dedup();
+        let mut number = i64::from(start);
+        for named in named {
+            if i64::from(named.0) != number {
+                break;
+            }
+            number += 1;
+        }
+        number
+    }
+
+    /// The room numbers of `area_id` that an exit somewhere in the atlas
+    /// leads to but no room of the area holds, ascending. A room that took
+    /// one of them would silently become the destination of every such
+    /// exit.
+    #[must_use]
+    pub fn vacant_exit_targets(&self, area_id: &AreaId) -> Vec<RoomNumber> {
+        let Some(area) = self.areas.get(area_id) else {
+            return Vec::new();
+        };
+        let mut vacant = self.numbers_named_in(area_id, RoomNumber(i32::MIN));
+        vacant.retain(|number| area.get_room(number).is_none());
+        vacant.sort_unstable();
+        vacant.dedup();
+        vacant
+    }
+
+    /// Whether an exit in another area leads to one of `numbers` in
+    /// `area_id`.
+    #[must_use]
+    pub(crate) fn is_linked_from_elsewhere(
+        &self,
+        area_id: &AreaId,
+        numbers: &HashSet<RoomNumber>,
+    ) -> bool {
+        numbers
+            .iter()
+            .any(|number| self.exit_targets.contains_key(&(area_id.0, *number)))
+    }
+
+    /// Every number of `area_id` at or above `from` that an exit leads to,
+    /// unordered and possibly repeated: the other areas' exits from the
+    /// index, the area's own exits from the area.
+    fn numbers_named_in(&self, area_id: &AreaId, from: RoomNumber) -> Vec<RoomNumber> {
+        let mut named: Vec<RoomNumber> = self
+            .exit_targets
+            .range((area_id.0, from)..=(area_id.0, RoomNumber(i32::MAX)))
+            .map(|((_, number), _)| *number)
+            .collect();
+        if let Some(area) = self.areas.get(area_id) {
+            named.extend(
+                area.get_rooms()
+                    .iter()
+                    .flat_map(|room| room.get_exits())
+                    .filter(|exit| exit.to_area_id == Some(*area_id))
+                    .filter_map(|exit| exit.to_room_number)
+                    .filter(|number| *number >= from),
+            );
+        }
+        named
     }
 
     /// Whether the viewer owns the given area (false for shared areas and
@@ -1081,6 +1229,22 @@ fn remove_binding(
     if bindings.is_empty() {
         table.remove(external_id);
     }
+}
+
+/// [`AtlasCache::exit_targets`] for a whole set of areas at once: every key
+/// gathered in one pass, sorted, counted and inserted in key order, which
+/// costs a fraction of counting them one exit at a time into the tree.
+fn count_exit_targets(areas: &HashMap<AreaId, Arc<AreaCache>>) -> OrdMap<(Uuid, RoomNumber), u32> {
+    let mut keys: Vec<(Uuid, RoomNumber)> = Vec::new();
+    for (area_id, area) in areas {
+        for room in area.get_rooms() {
+            keys.extend(AtlasCache::exit_target_keys(*area_id, room));
+        }
+    }
+    keys.sort_unstable();
+    keys.chunk_by(|left, right| left == right)
+        .map(|run| (run[0], u32::try_from(run.len()).unwrap_or(u32::MAX)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2470,5 +2634,138 @@ mod tests {
                 .get_room(&RoomKey::new(b_id, RoomNumber(3)))
                 .is_none()
         );
+    }
+
+    /// A holds rooms 1 and 2, and room 2 has an exit to A 6, which does not
+    /// exist. Two of B's exits lead to A 3, one to A 4 and one to A 9, none
+    /// of which exist either. Counting up from A's next number, allocation
+    /// passes over 3, 4, 6 and 9 but takes the free numbers between them,
+    /// whether B is turned off or not, and until the last exit leading to a
+    /// number is gone; an atlas edited room by room holds the same exit
+    /// targets as one built from scratch over its final areas.
+    #[test]
+    fn new_room_numbers_pass_over_every_number_an_exit_leads_to() {
+        let (a_id, b_id) = (area_id(1), area_id(2));
+        let (_, a) = cache_area(
+            a_id,
+            true,
+            vec![
+                room(1, "One", Vec::new()),
+                room(2, "Two", vec![exit(8, a_id, 6, 1.0)]),
+            ],
+        );
+        let b = |exits: Vec<Exit>| cache_area(b_id, true, vec![room(1, "Lost", exits)]).1;
+        let areas: HashMap<_, _> = [
+            (a_id, a),
+            (
+                b_id,
+                b(vec![
+                    exit(9, a_id, 3, 1.0),
+                    exit(10, a_id, 3, 1.0),
+                    exit(11, a_id, 4, 1.0),
+                    exit(12, a_id, 9, 1.0),
+                ]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let atlas = atlas(areas.clone());
+        assert_eq!(atlas.first_unnamed_room_number(&a_id, 3), 5);
+        assert_eq!(atlas.first_unnamed_room_number(&a_id, 6), 7);
+        assert_eq!(atlas.first_unnamed_room_number(&a_id, 8), 8);
+        assert_eq!(atlas.first_unnamed_room_number(&a_id, 9), 10);
+        assert_eq!(
+            atlas.vacant_exit_targets(&a_id),
+            vec![RoomNumber(3), RoomNumber(4), RoomNumber(6), RoomNumber(9)]
+        );
+        assert_eq!(
+            atlas_with_disabled(areas, [b_id]).first_unnamed_room_number(&a_id, 3),
+            5,
+            "an exit counts in an area that is turned off"
+        );
+
+        let atlas = atlas.insert_area(b_id, b(vec![exit(10, a_id, 3, 1.0)]));
+        assert_eq!(
+            atlas.first_unnamed_room_number(&a_id, 3),
+            4,
+            "one exit still leads to 3"
+        );
+        let atlas = atlas.insert_area(b_id, b(vec![exit(13, a_id, 1, 1.0)]));
+        assert_eq!(atlas.first_unnamed_room_number(&a_id, 3), 3);
+        assert_eq!(
+            atlas.vacant_exit_targets(&a_id),
+            vec![RoomNumber(6)],
+            "A's own exit still leads to 6"
+        );
+        let from_scratch = atlas.rebuild_with_areas(atlas.areas.clone());
+        assert_eq!(atlas.exit_targets, from_scratch.exit_targets);
+        let toggled = atlas.with_disabled_areas(Arc::new([b_id].into_iter().collect()));
+        assert_eq!(atlas.exit_targets, toggled.exit_targets);
+
+        let atlas = atlas.delete_area(b_id);
+        assert!(atlas.exit_targets.is_empty());
+    }
+
+    /// Counting exit targets in one pass over a whole area set, with several
+    /// exits from several areas naming one room and one exit naming a
+    /// number no room holds, gives exactly the counts the per-room path
+    /// keeps. Exits into their own area's rooms are the area's to answer
+    /// for and count in neither.
+    #[test]
+    fn exit_targets_counted_in_bulk_match_the_counts_kept_room_by_room() {
+        let (a_id, b_id, c_id) = (area_id(1), area_id(2), area_id(3));
+        let areas: HashMap<AreaId, Arc<AreaCache>> = [
+            cache_area(
+                a_id,
+                true,
+                vec![
+                    room(
+                        1,
+                        "A1",
+                        vec![
+                            exit(1, a_id, 2, 1.0),
+                            exit(2, b_id, 7, 1.0),
+                            exit(3, c_id, 1, 1.0),
+                        ],
+                    ),
+                    room(2, "A2", vec![exit(4, a_id, 1, 1.0), exit(5, b_id, 7, 1.0)]),
+                ],
+            ),
+            cache_area(
+                b_id,
+                false,
+                vec![room(
+                    7,
+                    "B7",
+                    vec![exit(6, a_id, 2, 1.0), exit(7, a_id, 9, 1.0)],
+                )],
+            ),
+            cache_area(
+                c_id,
+                true,
+                vec![room(
+                    1,
+                    "C1",
+                    vec![exit(8, b_id, 7, 1.0), exit(9, c_id, 1, 1.0)],
+                )],
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let incremental = areas
+            .iter()
+            .fold(atlas(HashMap::new()), |atlas, (id, area)| {
+                atlas.insert_area(*id, area.clone())
+            });
+        let bulk = atlas(areas);
+
+        assert_eq!(bulk.exit_targets.get(&(b_id.0, RoomNumber(7))), Some(&3));
+        assert_eq!(bulk.exit_targets.get(&(a_id.0, RoomNumber(2))), Some(&1));
+        assert_eq!(bulk.exit_targets.get(&(a_id.0, RoomNumber(9))), Some(&1));
+        assert_eq!(bulk.exit_targets.get(&(c_id.0, RoomNumber(1))), Some(&1));
+        assert_eq!(bulk.exit_targets.get(&(a_id.0, RoomNumber(1))), None);
+        assert_eq!(incremental.exit_targets, bulk.exit_targets);
     }
 }

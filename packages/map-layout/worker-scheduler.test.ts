@@ -8,6 +8,7 @@ import {
   type IntegralLayoutRequest,
 } from "./layout.ts";
 import {
+  layoutWorkerDiagnostics,
   LayoutWorkerClient,
   type LayoutWorkerLike,
   type LayoutWorkerPurpose,
@@ -66,10 +67,12 @@ class ManualWorker implements LayoutWorkerLike {
     this.terminated = true;
   }
 
-  respond(): void {
+  respond(inspectedStates?: number): void {
     const request = this.requests.shift();
     assert.ok(request, "missing fake Worker request");
-    this.onmessage?.({ data: structuredClone(executeLayoutWorkerRequest(request)) });
+    const response = executeLayoutWorkerRequest(request);
+    if (inspectedStates !== undefined) response.diagnostics.inspectedStates = inspectedStates;
+    this.onmessage?.({ data: structuredClone(response) });
   }
 }
 
@@ -143,7 +146,9 @@ test("a queued request can abort without disturbing active or later FIFO work", 
   const client = new LayoutWorkerClient(() => worker);
   const queuedAbort = new AbortController();
 
-  const first = client.planIntegral(requestToward("East"));
+  const first = client.planIntegral(requestToward("East"), {
+    plannerContext: { source: "test", areaId: "area:1" },
+  });
   const aborted = client.planIntegral(requestToward("North"), {
     signal: queuedAbort.signal,
     timeoutMs: 1_000,
@@ -157,6 +162,11 @@ test("a queued request can abort without disturbing active or later FIFO work", 
   assert.equal(worker.requests.length, 1);
   assert.equal("signal" in (worker.requests[0] as unknown as Record<string, unknown>), false);
   assert.equal("timeoutMs" in (worker.requests[0] as unknown as Record<string, unknown>), false);
+  assert.equal(
+    "plannerContext" in (worker.requests[0] as unknown as Record<string, unknown>),
+    false,
+    "telemetry attribution stays in the parent realm",
+  );
   assert.equal(
     worker.requests[0].streamProgress,
     false,
@@ -365,9 +375,13 @@ test("a full-budget repair completing within the grace window returns its report
   const request = conflictingRequest();
   const standard = planIntegralLayout(request);
 
+  // The in-process repair measures its budget on the real clock, so the budget
+  // must be generous enough that a slow machine still finishes the repair
+  // inside it; only the parent's timers are mocked.
+  const budgetMs = 60_000;
   let settled = false;
   const planning = client.planIntegral(request, {
-    constraintRepair: { when: "always", maxDurationMs: 10 },
+    constraintRepair: { when: "always", maxDurationMs: budgetMs },
   });
   planning.then(() => {
     settled = true;
@@ -375,7 +389,7 @@ test("a full-budget repair completing within the grace window returns its report
     settled = true;
   });
   await until(() => workers.length === 2);
-  context.mock.timers.tick(10);
+  context.mock.timers.tick(budgetMs);
   for (let attempt = 0; attempt < 5; attempt += 1) await Promise.resolve();
   assert.equal(settled, false, "the parent no longer terminates at exactly the Worker budget");
   workers[1].worker.respond();
@@ -400,10 +414,16 @@ test("a caller timeout during optional repair resolves with the retained plan", 
   });
   const request = conflictingRequest();
   const standard = planIntegralLayout(request);
+  let terminalReason: string | undefined;
+  let terminalPhase: string | undefined;
 
   const planning = client.planIntegral(request, {
     timeoutMs: 5_000,
     constraintRepair: { when: "always", maxDurationMs: Number.POSITIVE_INFINITY },
+    onProgress: ({ snapshot }) => {
+      terminalReason = snapshot.terminalReason;
+      terminalPhase = snapshot.phase;
+    },
   });
   await until(() => workers.length === 2);
   const repairWorker = workers[1].worker;
@@ -417,6 +437,8 @@ test("a caller timeout during optional repair resolves with the retained plan", 
   assert.equal(actual.constraintRepair, undefined);
   assert.ok(compareLayoutQuality(actual.quality, standard.quality) > 0);
   assert.equal(repairWorker.terminated, true);
+  assert.equal(terminalReason, "timeout");
+  assert.equal(terminalPhase, "complete: repair timeout");
 });
 
 test("a caller timeout during ordinary planning still rejects", async (context) => {
@@ -605,6 +627,136 @@ test("sequential successful repairs reuse one warm repair Worker", async () => {
   assert.equal(workers[1].worker.terminated, false);
 });
 
+test("a successful perfect repair retires its Worker and queued work gets a fresh one", async () => {
+  const workers: { purpose: LayoutWorkerPurpose; worker: ManualWorker }[] = [];
+  const client = new LayoutWorkerClient((purpose = "persistent") => {
+    const worker = purpose === "persistent" ? new AutoWorker() : new ManualWorker();
+    workers.push({ purpose, worker });
+    return worker;
+  });
+  const request = conflictingRequest();
+  const first = client.planIntegral(request, {
+    constraintRepair: { when: "always", maxDurationMs: Number.POSITIVE_INFINITY },
+  });
+  const second = client.planIntegral(request, {
+    constraintRepair: { when: "always", maxDurationMs: 1_000 },
+  });
+
+  await until(() => workers.length === 2 && workers[1].worker.requests.length === 1);
+  await Promise.resolve();
+  const perfectWorker = workers[1].worker;
+  perfectWorker.respond();
+  await until(() => workers.length === 3 && workers[2].worker.requests.length === 1);
+  assert.equal(perfectWorker.terminated, true);
+  assert.equal(workers[2].purpose, "constraint-repair");
+
+  workers[2].worker.respond();
+  await Promise.all([first, second]);
+  assert.equal(workers[2].worker.terminated, false, "the small queued repair remains reusable");
+});
+
+test("a successful repair crossing the state threshold retires its Worker", async () => {
+  const workers: { purpose: LayoutWorkerPurpose; worker: ManualWorker }[] = [];
+  const client = new LayoutWorkerClient((purpose = "persistent") => {
+    const worker = purpose === "persistent" ? new AutoWorker() : new ManualWorker();
+    workers.push({ purpose, worker });
+    return worker;
+  }, { heavyRepairStateThreshold: 100 });
+
+  const planning = client.planIntegral(conflictingRequest(), {
+    constraintRepair: { when: "always", maxDurationMs: 1_000 },
+  });
+  await until(() => workers.length === 2);
+  workers[1].worker.respond(100);
+  await planning;
+
+  assert.equal(workers[1].worker.terminated, true);
+  assert.equal(client.lastDiagnostics?.inspectedStates, 100);
+  assert.equal(client.lastDiagnostics?.workerDisposition, "retired");
+});
+
+test("public terminal diagnostics expose production worker accounting", async () => {
+  const observed: unknown[] = [];
+  const unsubscribe = layoutWorkerDiagnostics.subscribe((value) => observed.push(value));
+  try {
+    const client = new LayoutWorkerClient(() => new AutoWorker());
+    await client.planIntegral(requestToward("East"));
+    const latest = observed.at(-1);
+    assert.deepEqual(latest, client.lastDiagnostics);
+    assert.doesNotThrow(() => structuredClone(latest));
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("an unbounded live-node policy retires its Worker", async () => {
+  const workers: { purpose: LayoutWorkerPurpose; worker: ManualWorker }[] = [];
+  const client = new LayoutWorkerClient((purpose = "persistent") => {
+    const worker = purpose === "persistent" ? new AutoWorker() : new ManualWorker();
+    workers.push({ purpose, worker });
+    return worker;
+  });
+
+  const planning = client.planIntegral(conflictingRequest(), {
+    constraintRepair: {
+      when: "always",
+      maxDurationMs: 1_000,
+      maxLiveSearchNodes: Number.POSITIVE_INFINITY,
+    },
+  });
+  await until(() => workers.length === 2);
+  workers[1].worker.respond();
+  await planning;
+
+  assert.equal(workers[1].worker.terminated, true);
+  assert.equal(client.lastDiagnostics?.workerDisposition, "retired");
+});
+
+test("an idle repair Worker retires after the configured short TTL", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const workers: { purpose: LayoutWorkerPurpose; worker: ManualWorker }[] = [];
+  const client = new LayoutWorkerClient((purpose = "persistent") => {
+    const worker = purpose === "persistent" ? new AutoWorker() : new ManualWorker();
+    workers.push({ purpose, worker });
+    return worker;
+  }, { repairIdleTimeoutMs: 25 });
+
+  const planning = client.planIntegral(conflictingRequest(), {
+    constraintRepair: { when: "always", maxDurationMs: 1_000 },
+  });
+  await until(() => workers.length === 2);
+  workers[1].worker.respond();
+  await planning;
+  context.mock.timers.tick(24);
+  assert.equal(workers[1].worker.terminated, false);
+  context.mock.timers.tick(1);
+  assert.equal(workers[1].worker.terminated, true);
+});
+
+test("shutdown rejects active and queued work, retires both lanes, and stays closed", async () => {
+  const workers: { purpose: LayoutWorkerPurpose; worker: ManualWorker }[] = [];
+  let factoryCalls = 0;
+  const client = new LayoutWorkerClient((purpose = "persistent") => {
+    factoryCalls += 1;
+    const worker = purpose === "persistent" ? new AutoWorker() : new ManualWorker();
+    workers.push({ purpose, worker });
+    return worker;
+  });
+  const first = client.planIntegral(conflictingRequest(), {
+    constraintRepair: { when: "always", maxDurationMs: 1_000 },
+  });
+  await until(() => workers.length === 2);
+  const second = client.planIntegral(requestToward("East"));
+  const reason = new Error("package stopped");
+  client.shutdown(reason);
+
+  await assert.rejects(first, (error) => error === reason);
+  await assert.rejects(second, (error) => error === reason);
+  assert.ok(workers.every(({ worker }) => worker.terminated));
+  await assert.rejects(client.planIntegral(requestToward("North")), /shut down/);
+  assert.equal(factoryCalls, 2, "closed clients never spawn replacement Workers");
+});
+
 test("a backstopped repair Worker is reclaimed and the next repair starts fresh", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   const workers: { purpose: LayoutWorkerPurpose; worker: ManualWorker }[] = [];
@@ -687,6 +839,10 @@ test("a serialized repair failure degrades to the retained plan and keeps the Wo
     ok: false,
     error: { name: "Error", message: "repair failed inside the Worker" },
     traceEvents: [],
+    diagnostics: {
+      ...executeLayoutWorkerRequest(posted).diagnostics,
+      terminalReason: "failed",
+    },
   } });
   // The fabricated response consumed the job; drop its request from the fake.
   repairWorker.requests.shift();

@@ -6,24 +6,53 @@ export const AREA_POLISH_PENDING_VALUE = "true";
 
 /**
  * Durable memo beside the pending hint. The historical property name remains
- * stable, but v2 stores one resident-geometry fingerprint plus a bounded set
- * of exact, compact entry-context keys. An empty value is the logical clear
- * state.
+ * stable, but v3 stores one resident-geometry fingerprint plus bounded,
+ * versioned settlement evidence. An empty value is the logical clear state.
  */
 export const AREA_POLISH_EXHAUSTED_FINGERPRINT_PROPERTY =
   "nukefire.layout.polish-exhausted-fingerprint";
 
-/** Structured memo schema; legacy single-geometry values remain readable but inert. */
-export const AREA_POLISH_MEMO_SCHEMA_VERSION = 2;
+/** Durable settlement schema; older values remain readable but never suppress work. */
+export const AREA_POLISH_MEMO_SCHEMA_VERSION = 3;
 
 /**
  * Bump when identical planner inputs can explore a materially different
- * deterministic search. Exact per-request budgets are also part of the key.
+ * deterministic search. Storage schema and effort revisions are independent.
+ * Generation 2 ranks layouts by map-layout's weighted quality order, which
+ * weighs a mis-levelled exit above 16 crossings, frees levels to change, and
+ * compacts every layout a polish publishes, so no settlement of generation
+ * 1's search suppresses it.
  */
-export const AREA_POLISH_SEARCH_GENERATION = 1;
+export const AREA_POLISH_SEARCH_GENERATION = 2;
 
-/** Bounded recency set of fruitless entry contexts retained for one geometry. */
+/**
+ * Monotonic automatic-search effort. Increase this when the bounded automatic
+ * budget is deliberately expanded; old settlements then become eligible.
+ */
+export const AREA_POLISH_AUTOMATIC_EFFORT = 1;
+
+/** Stronger effort stamped only after an explicit `nf reflow perfect` result. */
+export const AREA_POLISH_PERFECT_EFFORT = 2;
+
+/** Initial durable backoff after a machine-dependent or interrupted attempt. */
+export const AREA_POLISH_RETRY_COOLDOWN_MS = 15 * 60 * 1_000;
+
+/** Backoff is exponential, but never prevents a later manual/user-triggered visit forever. */
+export const MAX_AREA_POLISH_RETRY_COOLDOWN_MS = 24 * 60 * 60 * 1_000;
+
+/** Bounded recency set of generation/effort/policy settlements for one geometry. */
 export const MAX_AREA_POLISH_MEMO_CONTEXTS = 32;
+
+/**
+ * Durable list beside the pending hint: the rooms at the seams that merging
+ * map sections left, which the next polish of the map previews first. Room
+ * numbers as a JSON array, oldest to newest. An empty value is the logical
+ * clear state.
+ */
+export const AREA_POLISH_SEAMS_PROPERTY = "nukefire.layout.polish-seams";
+
+/** Seam rooms retained for one map; the newest are kept. */
+export const MAX_AREA_POLISH_SEAMS = 512;
 
 export interface AreaPolishChartNode {
   readonly id: string;
@@ -49,15 +78,43 @@ export interface AreaPolishWorkPolicy {
   readonly maxPolishTournaments?: number;
   readonly maxPolishPasses?: number;
   readonly maxExtensionStates?: number;
+  readonly maxLiveSearchNodes?: number;
   readonly maxMaskDiversifications?: number;
   readonly maxCrossingWork?: number;
 }
 
-/** Exact deterministic input scope for one passive polish attempt. */
+/** Geometry, diagnostic coverage, and explicit effort for one passive attempt. */
 export interface AreaPolishPlanningContext {
   readonly geometryFingerprint: string;
-  /** 128-bit hash of the canonical center/chart/policy input. */
+  /** 128-bit hash of the canonical center/chart coverage, independent of effort. */
   readonly key: string;
+  /** Planner behavior generation, intentionally separate from the storage schema. */
+  readonly searchGeneration: number;
+  /** Monotonic automatic effort achieved/requested. */
+  readonly automaticEffort: number;
+  /** Exact bounded policy hash; catches budget changes even before an effort bump. */
+  readonly policyKey: string;
+}
+
+export type AreaPolishTerminalReason =
+  | "perfect"
+  | "fixed-point"
+  | "ceiling"
+  | "timeout"
+  | "cancelled"
+  | "error"
+  | "incomplete";
+
+export interface AreaPolishSettlement {
+  readonly key: string;
+  readonly searchGeneration: number;
+  readonly automaticEffort: number;
+  readonly policyKey: string;
+  readonly terminalReason: AreaPolishTerminalReason;
+  /** Present only for retryable outcomes. */
+  readonly retryAfterMs?: number;
+  /** Consecutive retryable outcomes for exponential backoff. */
+  readonly attempts?: number;
 }
 
 export type AreaPolishMemo =
@@ -65,10 +122,10 @@ export type AreaPolishMemo =
     readonly kind: "contexts";
     readonly geometryFingerprint: string;
     /** Oldest to newest, with deterministic oldest-first eviction. */
-    readonly contextKeys: readonly string[];
+    readonly settlements: readonly AreaPolishSettlement[];
   }
   | {
-    /** Pre-v2 values keyed only resident geometry and are unsafe to suppress. */
+    /** Pre-v3 values lack complete settlement evidence and are unsafe to suppress. */
     readonly kind: "legacy";
     readonly propertyValue: string;
   };
@@ -102,10 +159,10 @@ function contextKey(canonical: string): string {
 }
 
 /**
- * Canonicalize every request-local input which can change a bounded passive
- * search despite identical resident geometry. Node/edge enumeration order is
- * irrelevant; the anchor, chart, perfect-search mode, generation, and exact
- * budgets are not.
+ * Canonicalize a request into independent coverage and effort identities.
+ * Node/edge enumeration order is irrelevant. Search generation, automatic
+ * effort, and exact policy are retained as explicit settlement evidence rather
+ * than being hidden inside the coverage key.
  */
 export function createAreaPolishPlanningContext(input: {
   readonly geometryFingerprint: string;
@@ -114,6 +171,8 @@ export function createAreaPolishPlanningContext(input: {
   readonly edges: readonly AreaPolishChartEdge[];
   readonly searchForPerfectLayouts: boolean;
   readonly policy: Readonly<AreaPolishWorkPolicy>;
+  readonly searchGeneration?: number;
+  readonly automaticEffort?: number;
 }): AreaPolishPlanningContext {
   const nodes = input.nodes
     .map((node) => [
@@ -135,11 +194,12 @@ export function createAreaPolishPlanningContext(input: {
     .sort((a, b) => compareCodeUnits(JSON.stringify(a), JSON.stringify(b)));
   const policy = input.policy;
   const canonical = JSON.stringify([
-    AREA_POLISH_SEARCH_GENERATION,
     input.centerId ?? null,
     nodes,
     edges,
     input.searchForPerfectLayouts,
+  ]);
+  const policyCanonical = JSON.stringify([
     policy.when,
     finiteOrToken(policy.maxDurationMs),
     finiteOrToken(policy.maxRestarts),
@@ -147,23 +207,35 @@ export function createAreaPolishPlanningContext(input: {
     finiteOrToken(policy.maxPolishTournaments),
     finiteOrToken(policy.maxPolishPasses),
     finiteOrToken(policy.maxExtensionStates),
+    finiteOrToken(policy.maxLiveSearchNodes),
     finiteOrToken(policy.maxMaskDiversifications),
     finiteOrToken(policy.maxCrossingWork),
   ]);
   return {
     geometryFingerprint: input.geometryFingerprint,
     key: contextKey(canonical),
+    searchGeneration: input.searchGeneration ?? AREA_POLISH_SEARCH_GENERATION,
+    automaticEffort: input.automaticEffort ?? AREA_POLISH_AUTOMATIC_EFFORT,
+    policyKey: contextKey(policyCanonical),
   };
 }
 
 /**
  * The composite fixed-point bit incorporates unfinished constraint, separator,
- * mask, polish, and crossing frontiers. It is an exact-context proof, not an
- * area-global proof. The optional cutoff and cancellation fields distinguish
- * deterministic ceiling exhaustion — the other outcome worth memoizing —
- * from wall-deadline, cancellation, and error stops.
+ * mask, polish, and crossing frontiers. Automatic planning runs over the live
+ * resident area; its settlement is therefore attached to that final geometry,
+ * while the entry/chart context remains diagnostic. The optional cutoff and
+ * cancellation fields distinguish deterministic ceiling exhaustion — another
+ * outcome worth settling — from wall-deadline, cancellation, and error stops,
+ * and the outcome says whether the repair searched at all.
  */
 export interface AreaPolishReport {
+  /**
+   * map-layout's repair outcome: "searched", or why the repair returned the
+   * ordinary plan without searching, such as "clean" or
+   * "search-failed:analysis".
+   */
+  readonly outcome?: string;
   readonly geometricFixedPoint: boolean;
   /** "time" marks a machine-speed wall-deadline stop; ceilings use other values. */
   readonly cutoff?: string;
@@ -174,14 +246,28 @@ export interface AreaPolishReport {
 }
 
 export type AreaPolishEvent =
-  | { readonly kind: "topology-deferred" }
+  | {
+    readonly kind: "topology-deferred";
+    /** Rooms at the seams of a merge that brought this new geometry. */
+    readonly seams?: readonly number[];
+  }
   | { readonly kind: "polish-started" }
   | {
     readonly kind: "polish-completed";
     readonly report?: Readonly<AreaPolishReport>;
+    /** Caller-observed terminal when no repair report is needed (for example, already perfect). */
+    readonly terminalReason?: AreaPolishTerminalReason;
     /** True when this attempt durably changed resident geometry. */
     readonly improved?: boolean;
     /** Exact starting context; used only when completion was fruitless. */
+    readonly context?: Readonly<AreaPolishPlanningContext>;
+  }
+  | {
+    readonly kind: "polish-interrupted";
+    readonly reason: "cancelled" | "error";
+    /** Ordinary movement displaced the pass but did not finish an attempt. */
+    readonly displacedWithinArea?: boolean;
+    readonly improved?: boolean;
     readonly context?: Readonly<AreaPolishPlanningContext>;
   };
 
@@ -204,17 +290,17 @@ export function areaPolishPending(propertyValue: string | undefined): boolean {
 /**
  * Reduce one planning observation into the durable eligibility hint.
  *
- * A Worker fixed point is relative to one entry anchor and Map.Local chart, so
- * it cannot retire area-wide eligibility. Every observation therefore keeps
- * the durable hint; the bounded context memo suppresses only exact fruitless
- * repetitions. An attempt cancelled, aborted, or failed mid-flight never
- * reaches this reducer at all, which likewise retains the hint.
+ * `polish-pending=true` remains the migration/eligibility hint. A deterministic
+ * fixed point or ceiling clears that legacy bit; the v3 settlement still asks
+ * the mapper to evaluate new contexts without repeating a settled one.
  */
 export function reduceAreaPolishState(
   currentPending: boolean,
-  _event: Readonly<AreaPolishEvent>,
+  event: Readonly<AreaPolishEvent>,
 ): AreaPolishTransition {
-  const pending = true;
+  const pending = event.kind === "polish-completed" && event.context
+    ? !isSettledTerminalReason(event.terminalReason ?? areaPolishTerminalReason(event.report))
+    : true;
   return {
     pending,
     propertyValue: pending === currentPending
@@ -233,20 +319,61 @@ export function polishExhaustedFingerprint(
   return value ? value : undefined;
 }
 
-function boundedUniqueContextKeys(values: readonly string[]): string[] {
+function settlementIdentity(value: Readonly<AreaPolishSettlement>): string {
+  // Automatic settlement is area+geometry scoped. The entry/chart key is
+  // retained as diagnostic evidence, not as permission for another heavy run.
+  return `${value.searchGeneration}:${value.automaticEffort}:${value.policyKey}`;
+}
+
+function boundedUniqueSettlements(
+  values: readonly AreaPolishSettlement[],
+): AreaPolishSettlement[] {
   const seen = new Set<string>();
-  const newestFirst: string[] = [];
+  const newestFirst: AreaPolishSettlement[] = [];
   for (let index = values.length - 1; index >= 0; index -= 1) {
     const value = values[index];
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
+    const identity = settlementIdentity(value);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
     newestFirst.push(value);
     if (newestFirst.length >= MAX_AREA_POLISH_MEMO_CONTEXTS) break;
   }
   return newestFirst.reverse();
 }
 
-/** Parse a durable v2 context set; legacy and malformed nonblank values stay inert. */
+function validTerminalReason(value: unknown): value is AreaPolishTerminalReason {
+  return value === "perfect" || value === "fixed-point" || value === "ceiling" || value === "timeout" ||
+    value === "cancelled" || value === "error" || value === "incomplete";
+}
+
+function parseSettlement(value: unknown): AreaPolishSettlement | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.k !== "string" || !/^[0-9a-f]{32}$/.test(record.k) ||
+    typeof record.s !== "number" || !Number.isSafeInteger(record.s) || record.s < 1 ||
+    typeof record.e !== "number" || !Number.isSafeInteger(record.e) || record.e < 1 ||
+    typeof record.p !== "string" || !/^[0-9a-f]{32}$/.test(record.p) ||
+    !validTerminalReason(record.t)) return undefined;
+  if (record.r !== undefined &&
+    (typeof record.r !== "number" || !Number.isFinite(record.r) || record.r < 0)) {
+    return undefined;
+  }
+  if (record.n !== undefined &&
+    (typeof record.n !== "number" || !Number.isSafeInteger(record.n) || record.n < 1)) {
+    return undefined;
+  }
+  return {
+    key: record.k,
+    searchGeneration: record.s as number,
+    automaticEffort: record.e as number,
+    policyKey: record.p,
+    terminalReason: record.t,
+    ...(record.r === undefined ? {} : { retryAfterMs: record.r as number }),
+    ...(record.n === undefined ? {} : { attempts: record.n as number }),
+  };
+}
+
+/** Parse durable v3 evidence; v1/v2 and malformed nonblank values stay inert. */
 export function areaPolishMemo(propertyValue: string | undefined): AreaPolishMemo | undefined {
   const value = polishExhaustedFingerprint(propertyValue);
   if (!value) return undefined;
@@ -256,15 +383,15 @@ export function areaPolishMemo(propertyValue: string | undefined): AreaPolishMem
       const record = parsed as Record<string, unknown>;
       if (record.v === AREA_POLISH_MEMO_SCHEMA_VERSION &&
         typeof record.g === "string" && record.g.length > 0 &&
-        Array.isArray(record.c) && record.c.every((entry) =>
-          typeof entry === "string" && /^[0-9a-f]{32}$/.test(entry)
-        )) {
-        const contexts = boundedUniqueContextKeys(record.c as string[]);
-        if (contexts.length > 0) {
+        Array.isArray(record.c)) {
+        const parsedSettlements = record.c.map(parseSettlement);
+        if (parsedSettlements.every((entry) => entry !== undefined)) {
+          const settlements = boundedUniqueSettlements(parsedSettlements as AreaPolishSettlement[]);
+          if (settlements.length === 0) return { kind: "legacy", propertyValue: value };
           return {
             kind: "contexts",
             geometryFingerprint: record.g,
-            contextKeys: contexts,
+            settlements,
           };
         }
       }
@@ -282,8 +409,42 @@ export function areaPolishMemoPropertyValue(memo: Readonly<AreaPolishMemo>): str
     : JSON.stringify({
       v: AREA_POLISH_MEMO_SCHEMA_VERSION,
       g: memo.geometryFingerprint,
-      c: memo.contextKeys,
+      c: memo.settlements.map((settlement) => ({
+        k: settlement.key,
+        s: settlement.searchGeneration,
+        e: settlement.automaticEffort,
+        p: settlement.policyKey,
+        t: settlement.terminalReason,
+        ...(settlement.retryAfterMs === undefined ? {} : { r: settlement.retryAfterMs }),
+        ...(settlement.attempts === undefined ? {} : { n: settlement.attempts }),
+      })),
     });
+}
+
+/**
+ * How a completed attempt ended. A repair that found the ordinary plan clean
+ * had nothing to improve, which is perfect, and one that could not search the
+ * geometry would return it unchanged until the map changes, which settles it
+ * as a fixed point does.
+ */
+export function areaPolishTerminalReason(
+  report: Readonly<AreaPolishReport> | undefined,
+): AreaPolishTerminalReason {
+  if (report?.outcome === "clean") return "perfect";
+  if (report?.geometricFixedPoint === true || reportsUnsearchableGeometry(report)) {
+    return "fixed-point";
+  }
+  if (report?.cutoff === "time" || report?.polishCutoff === "time") return "timeout";
+  if (report?.extensionSearch?.cancelled === true || report?.crossingRepair?.cancelled === true) {
+    return "cancelled";
+  }
+  if (report?.polishCutoff === "error") return "error";
+  if (reportsCeilingExhaustion(report)) return "ceiling";
+  return report === undefined ? "error" : "incomplete";
+}
+
+export function isSettledTerminalReason(reason: AreaPolishTerminalReason): boolean {
+  return reason === "perfect" || reason === "fixed-point" || reason === "ceiling";
 }
 
 /**
@@ -310,6 +471,48 @@ export function reportsCeilingExhaustion(
     report.crossingRepair?.cancelled !== true;
 }
 
+/**
+ * Repair outcomes that return the ordinary plan without searching for a reason
+ * only a change to the map removes: nothing to repair, no exit the search can
+ * express, exits that contradict each other, or no layout that keeps them.
+ */
+const UNSEARCHABLE_GEOMETRY_OUTCOMES: ReadonlySet<string> = new Set([
+  "no-regression",
+  "clean",
+  "no-constraints",
+  "search-failed:analysis",
+  "no-layout",
+]);
+
+/**
+ * True when a completed attempt's repair did not search for a reason that
+ * holds until the map's geometry changes. A stop that a deadline or a work
+ * ceiling cut is left to the rules for those cutoffs: a deadline depends on
+ * machine speed, so a later run may search. An empty budget, or a request
+ * that forbids moving rooms, is never one either.
+ */
+export function reportsUnsearchableGeometry(
+  report: Readonly<AreaPolishReport> | undefined,
+): boolean {
+  return report?.outcome !== undefined &&
+    UNSEARCHABLE_GEOMETRY_OUTCOMES.has(report.outcome) &&
+    report.cutoff === "none";
+}
+
+/**
+ * Why a completed attempt's repair did not search, for the decision log:
+ * undefined when it searched or the map had nothing to repair.
+ */
+export function polishNotSearchedReason(
+  report: Readonly<AreaPolishReport> | undefined,
+): string | undefined {
+  const outcome = report?.outcome;
+  return outcome === undefined || outcome === "searched" || outcome === "clean" ||
+      outcome === "no-regression"
+    ? undefined
+    : outcome;
+}
+
 export interface AreaPolishMemoTransition {
   /** Bounded context set to retain in the area mirror, or undefined when clear. */
   readonly memo: AreaPolishMemo | undefined;
@@ -324,44 +527,58 @@ export interface AreaPolishMemoTransition {
 /**
  * Reduce one planning observation into the durable exhausted-attempt memo.
  *
- * A context-relative fixed point records the exact final context it proved;
- * a fruitless deterministic ceiling records the exact starting context it
- * exhausted. Durable improvement without a fixed-point proof clears every old
- * context because the next attempt starts from new geometry. Fresh prompt-lane
- * growth also clears the memo. Every other observation leaves it untouched,
- * so a cancelled or wall-deadlined pass can never add a suppression a genuine
- * polish opportunity does not deserve.
+ * Every completed/interrupted attempt records its final resident geometry and
+ * achieved automatic effort. Deterministic outcomes settle that geometry;
+ * machine-dependent outcomes carry a retry cooldown. The entry/chart key is
+ * diagnostic only: automatic budgets and cooldowns are area-wide. Fresh
+ * prompt-lane growth clears all earlier evidence.
  */
 export function reduceAreaPolishMemo(
   currentMemo: Readonly<AreaPolishMemo> | undefined,
   event: Readonly<AreaPolishEvent>,
+  nowMs = Date.now(),
 ): AreaPolishMemoTransition {
   let memo = currentMemo as AreaPolishMemo | undefined;
   if (event.kind === "topology-deferred") {
     memo = undefined;
-  } else if (event.kind === "polish-completed") {
-    const fixedPoint = event.report?.geometricFixedPoint === true;
-    const memoizableCeiling = event.improved !== true && reportsCeilingExhaustion(event.report);
-    if (event.improved === true) {
-      memo = undefined;
-    }
-    if (event.context && (fixedPoint || memoizableCeiling)) {
-      const currentContexts = event.improved !== true &&
-          currentMemo?.kind === "contexts" &&
-          currentMemo.geometryFingerprint === event.context.geometryFingerprint
-        ? currentMemo.contextKeys
-        : [];
-      if (!currentContexts.includes(event.context.key)) {
-        memo = {
-          kind: "contexts",
-          geometryFingerprint: event.context.geometryFingerprint,
-          contextKeys: boundedUniqueContextKeys([
-            ...currentContexts,
-            event.context.key,
-          ]),
-        };
-      }
-    }
+  } else if ((event.kind === "polish-completed" || event.kind === "polish-interrupted") &&
+    event.context && !(event.kind === "polish-interrupted" && event.displacedWithinArea)) {
+    const context = event.context;
+    const reason = event.kind === "polish-interrupted"
+      ? event.reason
+      : event.terminalReason ?? areaPolishTerminalReason(event.report);
+    const currentSettlements = currentMemo?.kind === "contexts" &&
+        currentMemo.geometryFingerprint === context.geometryFingerprint
+      ? currentMemo.settlements
+      : [];
+    const identity = (settlement: Readonly<AreaPolishSettlement>): boolean =>
+      settlement.searchGeneration === context.searchGeneration &&
+      settlement.automaticEffort === context.automaticEffort &&
+      settlement.policyKey === context.policyKey;
+    const previous = [...currentSettlements].reverse().find(identity);
+    const attempts = isSettledTerminalReason(reason) ? undefined : (previous?.attempts ?? 0) + 1;
+    const retryAfterMs = attempts === undefined
+      ? undefined
+      : nowMs + Math.min(
+        MAX_AREA_POLISH_RETRY_COOLDOWN_MS,
+        AREA_POLISH_RETRY_COOLDOWN_MS * (2 ** Math.min(10, attempts - 1)),
+      );
+    const settlement: AreaPolishSettlement = {
+      key: context.key,
+      searchGeneration: context.searchGeneration,
+      automaticEffort: context.automaticEffort,
+      policyKey: context.policyKey,
+      terminalReason: reason,
+      ...(retryAfterMs === undefined ? {} : { retryAfterMs, attempts }),
+    };
+    memo = {
+      kind: "contexts",
+      geometryFingerprint: context.geometryFingerprint,
+      settlements: boundedUniqueSettlements([
+        ...currentSettlements.filter((entry) => !identity(entry)),
+        settlement,
+      ]),
+    };
   }
   const before = currentMemo && areaPolishMemoPropertyValue(currentMemo);
   const after = memo && areaPolishMemoPropertyValue(memo);
@@ -371,14 +588,163 @@ export function reduceAreaPolishMemo(
   };
 }
 
-/** Suppress only a context whose geometry, anchor/chart, generation, and budgets all match. */
+export type AreaPolishEligibilityReason =
+  | "no-evidence"
+  | "legacy-evidence"
+  | "geometry-changed"
+  | "search-generation-changed"
+  | "effort-increased"
+  | "policy-changed"
+  | "settled"
+  | "cooldown";
+
+export interface AreaPolishEligibility {
+  readonly eligible: boolean;
+  readonly reason: AreaPolishEligibilityReason;
+  readonly terminalReason?: AreaPolishTerminalReason;
+  readonly retryAfterMs?: number;
+}
+
+/** Derive automatic eligibility from geometry, generation, effort, policy, and outcome. */
+export function areaPolishEligibility(
+  memo: Readonly<AreaPolishMemo> | undefined,
+  context: Readonly<AreaPolishPlanningContext>,
+  nowMs = Date.now(),
+): AreaPolishEligibility {
+  if (!memo) return { eligible: true, reason: "no-evidence" };
+  if (memo.kind === "legacy") return { eligible: true, reason: "legacy-evidence" };
+  if (memo.geometryFingerprint !== context.geometryFingerprint) {
+    return { eligible: true, reason: "geometry-changed" };
+  }
+  const generation = memo.settlements.filter(
+    (entry) => entry.searchGeneration === context.searchGeneration,
+  );
+  if (generation.length === 0) return { eligible: true, reason: "search-generation-changed" };
+  // Only a genuinely zero-defect result at stronger effort subsumes a lower
+  // tier with a different anchor/lock feasible set. A stronger fixed point or
+  // ceiling is retained as evidence, but cannot certify the automatic policy.
+  // At equal effort, the exact policy remains part of eligibility.
+  const strongerSettlement = [...generation].reverse().find((entry) =>
+    entry.automaticEffort > context.automaticEffort &&
+    entry.terminalReason === "perfect"
+  );
+  if (strongerSettlement) {
+    return {
+      eligible: false,
+      reason: "settled",
+      terminalReason: strongerSettlement.terminalReason,
+    };
+  }
+  const effort = generation.filter(
+    (entry) => entry.automaticEffort === context.automaticEffort,
+  );
+  if (effort.length === 0) {
+    const maximumAchieved = Math.max(...generation.map((entry) => entry.automaticEffort));
+    return maximumAchieved < context.automaticEffort
+      ? { eligible: true, reason: "effort-increased" }
+      : { eligible: true, reason: "no-evidence" };
+  }
+  const policy = [...effort].reverse().find((entry) => entry.policyKey === context.policyKey);
+  if (!policy) return { eligible: true, reason: "policy-changed" };
+  if (isSettledTerminalReason(policy.terminalReason)) {
+    return { eligible: false, reason: "settled", terminalReason: policy.terminalReason };
+  }
+  if ((policy.retryAfterMs ?? 0) > nowMs) {
+    return {
+      eligible: false,
+      reason: "cooldown",
+      terminalReason: policy.terminalReason,
+      retryAfterMs: policy.retryAfterMs,
+    };
+  }
+  return { eligible: true, reason: "no-evidence", terminalReason: policy.terminalReason };
+}
+
+/** Suppress an achieved deterministic effort or a retryable outcome still cooling down. */
 export function polishRetrySuppressed(
   memo: Readonly<AreaPolishMemo> | undefined,
   context: Readonly<AreaPolishPlanningContext>,
+  nowMs = Date.now(),
 ): boolean {
-  return memo?.kind === "contexts" &&
-    memo.geometryFingerprint === context.geometryFingerprint &&
-    memo.contextKeys.includes(context.key);
+  return !areaPolishEligibility(memo, context, nowMs).eligible;
+}
+
+/** v3 evidence must be evaluated on entry even after the legacy pending bit is cleared. */
+export function areaPolishNeedsContextEvaluation(
+  pending: boolean,
+  memo: Readonly<AreaPolishMemo> | undefined,
+): boolean {
+  return pending || memo?.kind === "contexts";
+}
+
+/** Each room once, where it last appears, keeping the newest `MAX_AREA_POLISH_SEAMS`. */
+function boundedSeams(values: readonly number[]): number[] {
+  const seen = new Set<number>();
+  const newestFirst: number[] = [];
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const value = values[index];
+    if (seen.has(value)) continue;
+    seen.add(value);
+    newestFirst.push(value);
+    if (newestFirst.length >= MAX_AREA_POLISH_SEAMS) break;
+  }
+  return newestFirst.reverse();
+}
+
+/**
+ * Read the seam list defensively across hand-edited maps: a value that is not
+ * a JSON array reads as no seams, and entries that are not room numbers are
+ * dropped.
+ */
+export function areaPolishSeams(propertyValue: string | undefined): number[] {
+  const value = propertyValue?.trim();
+  if (!value) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return boundedSeams(parsed.filter((entry): entry is number => Number.isSafeInteger(entry)));
+}
+
+/** Canonical durable representation used for semantic no-op write detection. */
+export function areaPolishSeamsPropertyValue(seams: readonly number[]): string {
+  return seams.length === 0 ? "" : JSON.stringify(seams);
+}
+
+export interface AreaPolishSeamsTransition {
+  /** The seam rooms to retain in the area mirror, oldest to newest. */
+  readonly seams: readonly number[];
+  /**
+   * Value for `AreaMutator.setAreaProperty`, or undefined when no durable
+   * write is needed. The empty string makes an existing property logically
+   * clear.
+   */
+  readonly propertyValue?: string;
+}
+
+/**
+ * Reduce one planning observation into the durable seam list. A merge's new
+ * geometry adds its seam rooms as the newest, and a completed polish of the
+ * whole map has polished every seam, so it clears the list. Every other
+ * observation leaves it as it is: growth elsewhere polishes no seam, and a
+ * cancelled or failed pass never reaches the reducer.
+ */
+export function reduceAreaPolishSeams(
+  currentSeams: readonly number[],
+  event: Readonly<AreaPolishEvent>,
+): AreaPolishSeamsTransition {
+  let seams = currentSeams;
+  if (event.kind === "topology-deferred" && event.seams && event.seams.length > 0) {
+    seams = boundedSeams([...currentSeams, ...event.seams]);
+  } else if (event.kind === "polish-completed") {
+    seams = [];
+  }
+  const before = areaPolishSeamsPropertyValue(currentSeams);
+  const after = areaPolishSeamsPropertyValue(seams);
+  return { seams, propertyValue: before === after ? undefined : after };
 }
 
 export interface AreaPolishEntryObservation {

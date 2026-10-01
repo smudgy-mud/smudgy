@@ -108,7 +108,7 @@ impl Inner {
 
     /// Releases every reservation held under `token` for an area.
     /// Idempotent; when the last holder releases, allocation falls back to
-    /// the cache maximum.
+    /// the area's own floor.
     pub(super) fn release_room_reservations(&self, area_id: &AreaId, token: Uuid) {
         let mut reservations = self.room_reservations.lock();
         if let Some(state) = reservations.get_mut(area_id) {
@@ -243,12 +243,15 @@ impl Inner {
     /// the caller re-derives rather than the merge chasing a moving target),
     /// the revision each document stands on at the backend (the last
     /// acknowledged one when known, else the cached document's, which a
-    /// drained queue leaves equal), and the destination's allocation floor
-    /// including numbers reserved by open drafts.
+    /// drained queue leaves equal), the destination's allocation floor
+    /// including numbers reserved by open drafts, and the destination
+    /// numbers exits lead to that no room holds, which no moved room may
+    /// take.
     ///
     /// Building the plan also holds the destination's floor under `hold`
-    /// past every number the merge can place: the floor plus one per source
-    /// room bounds what allocation hands out, and a source number at or
+    /// past every number the merge can place: counting one number per source
+    /// room up from the floor, passing over the vacant targets as allocation
+    /// does, bounds what allocation hands out, and a source number at or
     /// above the floor is kept as is, so the hold is the larger of those
     /// two bounds. This is where the merged rooms would push the floor
     /// anyway once they are in the cache; the hold only makes it true
@@ -318,17 +321,28 @@ impl Inner {
             return Err(Self::merge_refusal("merge_areas_room_numbers_exhausted"));
         }
         let number_floor = RoomNumber(i32::try_from(floor).unwrap_or(i32::MAX));
-        self.hold_room_number_floor(
-            into,
-            hold,
-            (floor + source_rooms).max(i64::from(source_max) + 1),
-        );
+        let vacant_targets = cache.vacant_exit_targets(&into);
+        // One number per moving room from the floor up, and one more for
+        // every vacant target allocation passes over on the way.
+        let mut placed_below = floor + source_rooms;
+        for vacant in vacant_targets
+            .iter()
+            .map(|number| i64::from(number.0))
+            .filter(|number| *number >= floor)
+        {
+            if vacant >= placed_below {
+                break;
+            }
+            placed_below += 1;
+        }
+        self.hold_room_number_floor(into, hold, placed_below.max(i64::from(source_max) + 1));
         Ok(AreaMergePlan {
             into,
             sources,
             inbound,
             expected,
             number_floor,
+            vacant_targets,
         })
     }
 

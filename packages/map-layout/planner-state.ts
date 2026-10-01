@@ -10,6 +10,15 @@ export type LayoutPlannerStatus =
   | "cancelled"
   | "failed";
 
+export type LayoutPlannerTerminalReason =
+  | "completed"
+  | "fixed-point"
+  | "ceiling"
+  | "timeout"
+  | "cancelled"
+  | "degraded"
+  | "failed";
+
 export interface LayoutPlannerWork {
   /** Candidate layouts generated or polished during this operation. */
   layoutsConsidered: number;
@@ -45,6 +54,15 @@ export interface LayoutPlannerWork {
   visitedStates: number;
 }
 
+/** Optional caller-owned identity for attributing an otherwise generic layout operation. */
+export interface LayoutPlannerContext {
+  source?: string;
+  areaId?: string;
+  areaName?: string;
+  /** Stable caller planning/coverage identity; never contains room geometry. */
+  contextKey?: string;
+}
+
 /** JSON-safe live telemetry for the most recently active layout operation. */
 export interface LayoutPlannerSnapshot {
   sequence: number;
@@ -57,6 +75,8 @@ export interface LayoutPlannerSnapshot {
   nodes: number;
   residents: number;
   edges: number;
+  /** Map-free caller identity, when supplied by the planner integration. */
+  context?: Readonly<LayoutPlannerContext>;
   work: Readonly<LayoutPlannerWork>;
   /** Milliseconds from repair start to the first hard-valid compactor output. */
   firstIncumbentMs?: number;
@@ -66,6 +86,8 @@ export interface LayoutPlannerSnapshot {
   standardQuality?: Readonly<LayoutQuality>;
   /** Best complete layout found so far. */
   bestQuality?: Readonly<LayoutQuality>;
+  /** Why this operation stopped; optional for backward-compatible consumers. */
+  terminalReason?: LayoutPlannerTerminalReason;
   message?: string;
 }
 

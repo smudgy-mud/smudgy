@@ -3134,6 +3134,7 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
               const list = mapper.listRoomsByTitleAndDescription("t", "d");
               const list2 = mapper.listRoomsByTitleDescriptionAndVisibleExits("t", "d", ["North"]);
               const newArea: Area = await mapper.createArea("Town");
+              const keyedArea: Area = await mapper.createArea("The Deathlands", { storage: "local", properties: { "nukefire.area": "the deathlands" } });
               const runtimeCheck: boolean = newArea instanceof Area;
               const newRoom: RoomNumber = await mapper.createRoom(room.area_id, { title: "x" });
               const batchIds: OperationId[] = await mapper.mutateArea(room.area_id, async (mutation) => {
@@ -3159,7 +3160,7 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
               await mapper.setRoomTitle(room.area_id, room.room_number, "t");
               await mapper.setRoomDescription(room.area_id, room.room_number, "d");
               await mapper.renameArea(room.area_id, "n");
-              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void runtimeCheck; void newRoom; void batchIds; void updateId; void mergeId; void merged;
+              void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void keyedArea; void runtimeCheck; void newRoom; void batchIds; void updateId; void mergeId; void merged;
             }
             export { useRoom, useArea, useExit, useMapper, savedBeforeFailure };
             "##

@@ -13,6 +13,7 @@ use smudgy_cloud::{
     AreaId, AtlasId, CloudApiClient, CloudError, CloudMapper, CreateAreaRequest, Credential,
     CredentialSource, ExitId, LabelId, MapperBackend, RoomNumber, ShapeId,
 };
+use std::collections::BTreeMap;
 use support::{GrantFlags, GrantScope, MockHandle, MockServer, TestUser};
 use uuid::Uuid;
 
@@ -810,6 +811,7 @@ async fn clone_flow() {
             name: "Member One".to_string(),
             atlas_id: Some(AtlasId(atlas)),
             ephemeral: false,
+            properties: BTreeMap::new(),
         })
         .await
         .expect("member one");
@@ -818,6 +820,7 @@ async fn clone_flow() {
             name: "Member Two".to_string(),
             atlas_id: Some(AtlasId(atlas)),
             ephemeral: false,
+            properties: BTreeMap::new(),
         })
         .await
         .expect("member two");

@@ -12,6 +12,8 @@
 //! single-user and always cleared, so there is no secrecy gating or
 //! redaction anywhere in this module.
 
+use std::collections::HashSet;
+
 use uuid::Uuid;
 
 use crate::{
@@ -163,8 +165,9 @@ fn upsert_room_details<'a>(
 
 /// Deletes a room and mirrors the server's cascade within the area:
 /// inbound destinations are nulled, orphaned Connections deleted, and
-/// Connections kept alive by a surviving member converted to dangling
-/// (cross-area links are the live cache's concern).
+/// Connections kept alive by a surviving member converted to dangling.
+/// Exits in other areas that led to the room are cleared by edits of those
+/// areas, which the mapper queues behind the deletion.
 pub(super) fn delete_room(area: &mut AreaWithDetails, area_id: AreaId, number: RoomNumber) {
     area.rooms.retain(|r| r.room_number != number);
     for room in &mut area.rooms {
@@ -178,6 +181,18 @@ pub(super) fn delete_room(area: &mut AreaWithDetails, area_id: AreaId, number: R
     }
     let survivors = exit_topologies(area, None);
     connection_lifecycle::repair_after_room_delete(number, &survivors, &mut area.connections);
+}
+
+/// The rooms an envelope deletes: the room of every `DeleteRoom` among its
+/// operations.
+pub(crate) fn deleted_rooms(operations: &[AreaMutation]) -> HashSet<RoomNumber> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            AreaMutation::DeleteRoom { room_number } => Some(*room_number),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Materializes an exit from its creation args as a member of `connection_id`

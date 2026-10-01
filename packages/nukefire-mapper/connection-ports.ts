@@ -37,6 +37,20 @@ export function routeIsManuallyAuthored(routing: ConnectionRouting): boolean {
   return routing === "Manual";
 }
 
+/**
+ * A Connection that runs straight but still stores route points keeps a drawn
+ * route dormant, for switching back to restore. The mapper stores points only
+ * with its own `Automatic` routes and drops them when it straightens one, so
+ * dormant points are an author's, and route recomputation leaves them alone
+ * as it does a `Manual` route.
+ */
+export function routeIsDormant(
+  routing: ConnectionRouting,
+  routePoints: readonly unknown[],
+): boolean {
+  return (routing === "Simple" || routing === "Stub") && routePoints.length > 0;
+}
+
 /** Manual ports keep their authored wall; only AutoPinned ports follow routing. */
 export function routedEndpointSide(
   endpoint: Readonly<ConnectionEndpoint>,

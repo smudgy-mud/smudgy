@@ -111,11 +111,13 @@ export function linkReciprocity(edges: readonly LayoutEdge[]): {
 }
 
 /**
- * The public quality tuple's fields in the engine's exact lexicographic
- * comparison order, for ratchet records and human-readable digests. The
- * comparison itself always goes through the engine's `compareLayoutQuality`.
+ * The public quality tuple's fields in declaration order, the order the
+ * engine compares them in once their weighted scores are equal, for ratchet
+ * records and human-readable digests. The comparison itself always goes
+ * through the engine's `compareLayoutQuality`.
  */
 export const QUALITY_TUPLE_FIELDS: readonly (keyof LayoutQuality)[] = [
+  "levelViolations",
   "cardinalRayViolations",
   "reciprocalRayViolations",
   "routingViolations",
@@ -123,6 +125,7 @@ export const QUALITY_TUPLE_FIELDS: readonly (keyof LayoutQuality)[] = [
   "reciprocalExitPortViolations",
   "roomObstructions",
   "linkCrossings",
+  "levelSlack",
   "footprintArea",
   "footprintPerimeter",
   "cardinalSlack",

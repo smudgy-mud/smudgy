@@ -353,6 +353,10 @@ pub async fn area_mutations(
             "too many operations (max {MAX_MUTATION_OPERATIONS})"
         ));
     }
+    if st.refuse_mutations > 0 {
+        st.refuse_mutations -= 1;
+        return bad_request("injected refusal");
+    }
 
     let request_hash = request_hash(area_id, &envelope.payload);
 

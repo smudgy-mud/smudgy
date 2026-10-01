@@ -72,6 +72,7 @@ impl MapperBackend for EphemeralBackend {
     // ===== AREA OPERATIONS =====
 
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
+        let properties = request.document_properties();
         let area = Area {
             id: AreaId(Uuid::new_v4()),
             user_id: None,
@@ -92,7 +93,7 @@ impl MapperBackend for EphemeralBackend {
             area: area.clone(),
             format_version: crate::AREA_FORMAT_VERSION,
             content_hash: None,
-            properties: Vec::new(),
+            properties,
             rooms: Vec::new(),
             labels: Vec::new(),
             shapes: Vec::new(),
@@ -241,12 +242,14 @@ mod tests {
         mapper::RoomKey,
         mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
     };
+    use std::collections::BTreeMap;
 
     fn request(name: &str) -> CreateAreaRequest {
         CreateAreaRequest {
             name: name.to_string(),
             atlas_id: None,
             ephemeral: true,
+            properties: BTreeMap::new(),
         }
     }
 
@@ -277,6 +280,23 @@ mod tests {
             Err(CloudError::InvalidInput(_))
         ));
         assert!(backend.list_areas().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_area_stores_initial_properties_with_the_area() {
+        let backend = EphemeralBackend::new();
+        let mut session = request("Session");
+        session
+            .properties
+            .insert("nukefire.zone".to_string(), "315".to_string());
+        let area = backend.create_area(session).await.expect("create");
+
+        let details = backend.get_area(&area.id).await.expect("get");
+        assert_eq!(details.area.rev, 1, "no follow-up edit");
+        assert_eq!(details.properties.len(), 1);
+        assert_eq!(details.properties[0].name, "nukefire.zone");
+        assert_eq!(details.properties[0].value, "315");
+        assert!(!details.properties[0].is_secret);
     }
 
     #[tokio::test]
@@ -378,6 +398,64 @@ mod tests {
         assert_eq!(
             details.rooms[0].exits[0].to_area_id, None,
             "inbound exit cleared"
+        );
+    }
+
+    /// Deleting A 2 changes A alone: B's link to the room stays as B's own
+    /// edits left it, for an edit in B's own queue to clear.
+    #[tokio::test]
+    async fn deleting_a_room_changes_only_its_own_area() {
+        let backend = EphemeralBackend::new();
+        let a = backend.create_area(request("A")).await.expect("create").id;
+        let b = backend.create_area(request("B")).await.expect("create").id;
+        let room = |number: i32| AreaMutation::UpsertRoom {
+            room_number: RoomNumber(number),
+            body: RoomUpdates::default(),
+        };
+        backend
+            .execute_mutation(&a, &envelope(a, 1, vec![room(1), room(2)]))
+            .await
+            .expect("seed A");
+        let link = AreaMutation::CreateExit {
+            room_number: RoomNumber(5),
+            body: ExitArgs {
+                from_direction: ExitDirection::North,
+                to_area_id: Some(a),
+                to_room_number: Some(RoomNumber(2)),
+                ..ExitArgs::default()
+            },
+        };
+        backend
+            .execute_mutation(&b, &envelope(b, 1, vec![room(5), link]))
+            .await
+            .expect("seed B");
+        let b_before =
+            serde_json::to_string(&backend.get_area(&b).await.expect("B")).expect("serialize");
+
+        let result = backend
+            .execute_mutation(
+                &a,
+                &envelope(
+                    a,
+                    2,
+                    vec![AreaMutation::DeleteRoom {
+                        room_number: RoomNumber(2),
+                    }],
+                ),
+            )
+            .await
+            .expect("delete");
+
+        let reported: Vec<AreaId> = result
+            .versions
+            .iter()
+            .map(|version| AreaId(version.id))
+            .collect();
+        assert_eq!(reported, vec![a]);
+        assert_eq!(
+            serde_json::to_string(&backend.get_area(&b).await.expect("B")).expect("serialize"),
+            b_before,
+            "B is not rewritten"
         );
     }
 
@@ -1091,6 +1169,7 @@ mod tests {
             inbound: vec![third],
             expected: vec![(into, 2), (source, 2), (third, 2)],
             number_floor: RoomNumber(2),
+            vacant_targets: Vec::new(),
         }
     }
 

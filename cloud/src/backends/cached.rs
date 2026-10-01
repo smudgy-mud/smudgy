@@ -1473,6 +1473,7 @@ mod tests {
                 (third, expected_rev),
             ],
             number_floor: RoomNumber(1),
+            vacant_targets: Vec::new(),
         }
     }
 

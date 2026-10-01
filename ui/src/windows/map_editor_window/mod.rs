@@ -64,6 +64,10 @@ const ICON_UNLOCK: &str = "\u{F600}";
 /// periodic [`Message::Tick`]).
 const ROOM_COPY_NOTICE_TTL: Duration = Duration::from_secs(5);
 
+/// The notice for a gesture that needs a new room in an area whose room
+/// numbers are used up.
+const NO_ROOM_NUMBERS_LEFT: &str = "This area has no room numbers left.";
+
 /// The copy/paste clipboard, swappable so every editor window can be handed
 /// one shared instance.
 pub type SharedClipboard = Arc<ArcSwap<commands::EntityClipboard>>;
@@ -1184,6 +1188,22 @@ impl MapEditorWindow {
         self.active_access().is_some_and(|access| access.can_edit)
     }
 
+    /// The number a new room in `area_id` takes. Allocation is
+    /// reservation-aware and passes over numbers links lead to, so every
+    /// placing gesture asks here rather than the area's own maximum. `None`
+    /// when the area is gone, or, with a notice saying so, when it has no
+    /// room numbers left.
+    fn new_room_number(&mut self, area_id: AreaId) -> Option<RoomNumber> {
+        match self.mapper.try_next_room_number(&area_id) {
+            Ok(number) => Some(number),
+            Err(CloudError::AreaNotFound(_)) => None,
+            Err(_) => {
+                self.editor_notice = Some((Instant::now(), NO_ROOM_NUMBERS_LEFT.to_string()));
+                None
+            }
+        }
+    }
+
     /// Whether the share dialog applies to the active area: owners always,
     /// plus grantees holding `can_reshare`.
     fn can_share_active_area(&self) -> bool {
@@ -1394,30 +1414,27 @@ impl MapEditorWindow {
         let Some((operation_id, draft, _)) = &self.recovering_new_room_link else {
             return;
         };
+        let area_id = draft.area_id;
         if expected.is_some_and(|expected| expected != *operation_id)
-            || self
-                .mapper
-                .is_operation_pending(draft.area_id, *operation_id)
+            || self.mapper.is_operation_pending(area_id, *operation_id)
             || self.modal.is_some()
-            || self.editor.area_id() != Some(draft.area_id)
+            || self.editor.area_id() != Some(area_id)
             || !self.can_edit_active_area()
         {
             return;
         }
-        let atlas = self.mapper.get_current_atlas();
-        let Some(area) = atlas.get_area(&draft.area_id) else {
+        if self.mapper.get_current_atlas().get_area(&area_id).is_none() {
             self.recovering_new_room_link = None;
             self.editor_notice = Some((
                 Instant::now(),
                 "The link was discarded because its area is no longer available.".to_string(),
             ));
             return;
+        }
+        let Some(new_number) = self.new_room_number(area_id) else {
+            self.recovering_new_room_link = None;
+            return;
         };
-        // Reservation-aware: skips numbers held by open scripted mutators.
-        let new_number = self
-            .mapper
-            .next_room_number(&draft.area_id)
-            .unwrap_or_else(|| area.next_room_number());
         let Some((_, mut draft, old_number)) = self.recovering_new_room_link.take() else {
             return;
         };
@@ -1460,16 +1477,9 @@ impl MapEditorWindow {
                 update
             }
             MutationRequest::PlaceRoom { at } => {
-                let atlas = self.mapper.get_current_atlas();
-                let Some(area) = atlas.get_area(&area_id) else {
+                let Some(room_number) = self.new_room_number(area_id) else {
                     return Update::none();
                 };
-                // Reservation-aware: skips numbers held by open scripted
-                // mutators.
-                let room_number = self
-                    .mapper
-                    .next_room_number(&area_id)
-                    .unwrap_or_else(|| area.next_room_number());
                 let update = self.push_command(Some(commands::create_room(
                     area_id,
                     room_number,
@@ -1506,14 +1516,11 @@ impl MapEditorWindow {
                 let target = match to {
                     ExitTarget::Room(room_number) => commands::NewExitTarget::Room(room_number),
                     ExitTarget::Empty(at) => {
-                        let Some(area) = atlas.get_area(&area_id) else {
+                        let Some(room_number) = self.new_room_number(area_id) else {
                             return Update::none();
                         };
                         commands::NewExitTarget::NewRoom {
-                            room_number: self
-                                .mapper
-                                .next_room_number(&area_id)
-                                .unwrap_or_else(|| area.next_room_number()),
+                            room_number,
                             at,
                             level: self.editor.level(),
                         }
@@ -1773,6 +1780,14 @@ impl MapEditorWindow {
         if clipboard.is_empty() || !self.can_edit_active_area() {
             return Update::none();
         }
+        let next_room_number = if clipboard.rooms.is_empty() {
+            None
+        } else {
+            let Some(number) = self.new_room_number(area_id) else {
+                return Update::none();
+            };
+            Some(number)
+        };
 
         // Same-area pastes cascade so copies don't land exactly on their
         // sources; cross-area pastes preserve exact positions (and source
@@ -1793,9 +1808,7 @@ impl MapEditorWindow {
             &clipboard,
             self.editor.level(),
             offset,
-            // Reservation-aware allocation base: skips numbers held by open
-            // scripted mutators.
-            self.mapper.next_room_number(&area_id),
+            next_room_number,
         );
         if skipped_connections > 0 {
             self.editor_notice = Some((

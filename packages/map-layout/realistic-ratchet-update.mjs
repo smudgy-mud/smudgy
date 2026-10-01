@@ -5,8 +5,8 @@
  *
  * The ratchet records each fixture/pipeline's full public quality tuple; the
  * companion test (`realistic-ratchet.test.ts`) requires the live engine to be
- * equal or better, lexicographically, so rewriting the file is how a genuine
- * improvement is banked. The per-scenario summary below shows every old→new
+ * equal or better in the engine's quality order, so rewriting the file is how
+ * a genuine improvement is banked. The per-scenario summary below shows every old→new
  * tuple for human review before the new records are committed. Output is
  * stable — sorted keys, two-space indent, LF endings — so a regeneration diff
  * shows exactly which fields moved.

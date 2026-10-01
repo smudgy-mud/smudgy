@@ -1,11 +1,12 @@
 export interface NukeFireConstraintRepairPolicy {
-  when: "always";
+  when: "defects" | "always";
   maxDurationMs: number;
   maxRestarts?: number;
   maxLayouts?: number;
   maxPolishTournaments?: number;
   maxPolishPasses?: number;
   maxExtensionStates?: number;
+  maxLiveSearchNodes?: number;
   maxMaskDiversifications?: number;
   maxCrossingWork: number;
 }
@@ -21,6 +22,7 @@ interface DeterministicRepairLimits {
   maxPolishTournaments: number;
   maxPolishPasses: number;
   maxExtensionStates: number;
+  maxLiveSearchNodes: number;
   maxMaskDiversifications: number;
   maxCrossingWork: number;
 }
@@ -32,6 +34,7 @@ const SMALL_MAP_CEILINGS: DeterministicRepairLimits = {
   maxPolishTournaments: 16,
   maxPolishPasses: 16,
   maxExtensionStates: 4_194_304,
+  maxLiveSearchNodes: 32_768,
   maxMaskDiversifications: 512,
   maxCrossingWork: 4_096,
 };
@@ -43,6 +46,7 @@ const LARGEST_MAP_FLOORS: DeterministicRepairLimits = {
   maxPolishTournaments: 2,
   maxPolishPasses: 3,
   maxExtensionStates: 32_768,
+  maxLiveSearchNodes: 4_096,
   maxMaskDiversifications: 64,
   maxCrossingWork: 512,
 };
@@ -56,10 +60,9 @@ const LARGEST_MAP_PRESSURE = 262_144;
 
 /**
  * How expensive one unit of search is on this map. Work per separator state
- * grows with residents + edges (feasibility checks walk both), and each
- * retained state carries O(residents) coordinates, so the product
- * residents × (residents + edges) tracks both the time and the memory cost
- * of a fixed state budget.
+ * grows with residents + edges (feasibility and scoring inspect the graph),
+ * so residents × (residents + edges) is a conservative work-pressure proxy.
+ * Retained frontier memory is bounded independently by maxLiveSearchNodes.
  */
 function planningPressure(scale: Readonly<NukeFireLayoutScale>): number {
   const residents = Math.max(1, Math.floor(scale.residentCount));
@@ -70,10 +73,9 @@ function planningPressure(scale: Readonly<NukeFireLayoutScale>): number {
 /**
  * budget = clamp(floor(F × P_max / pressure), F, C), with F the largest-map
  * floor and C the small-map ceiling. Dividing a constant by the pressure
- * keeps total work and retained state near a fixed envelope — for extension
- * states, budget × residents ≈ F × P_max / (residents + edges) coordinates
- * retained, shrinking as maps grow. The formula is monotonically
- * non-increasing in residents and edges, and every quantity stays an exact
+ * keeps total work near a fixed envelope; maxLiveSearchNodes applies the same
+ * pressure curve to the independently bounded retained frontier. The formula
+ * is monotonically non-increasing in residents and edges, and every quantity stays an exact
  * IEEE-754 integer far below 2^53, so identical inputs yield identical
  * budgets on every machine.
  */
@@ -100,31 +102,52 @@ function perfectRepairLimits(
     maxPolishTournaments: budget("maxPolishTournaments"),
     maxPolishPasses: budget("maxPolishPasses"),
     maxExtensionStates: budget("maxExtensionStates"),
+    maxLiveSearchNodes: budget("maxLiveSearchNodes"),
     maxMaskDiversifications: budget("maxMaskDiversifications"),
     maxCrossingWork: budget("maxCrossingWork"),
   };
 }
 
-/** Worker repair limits for the opt-in perfect search and bounded fallback. */
+/**
+ * Bounded limits used by passive quiet reflow. A map whose ordinary plan has
+ * no defect is left as it is, without a search.
+ */
+export function nukeFireAutomaticConstraintRepairPolicy(
+  _scale: Readonly<NukeFireLayoutScale> = { residentCount: 0, edgeCount: 0 },
+): NukeFireConstraintRepairPolicy {
+  return {
+    when: "defects",
+    maxDurationMs: 10_000,
+    maxRestarts: 4_096,
+    maxLayouts: 2,
+    maxPolishTournaments: 2,
+    maxPolishPasses: 3,
+    maxExtensionStates: 32_768,
+    maxLiveSearchNodes: 4_096,
+    maxMaskDiversifications: 64,
+    maxCrossingWork: 512,
+  };
+}
+
+/** Explicit high-effort policy used only by user-requested perfect reflow and tidying. */
+export function nukeFirePerfectConstraintRepairPolicy(
+  scale: Readonly<NukeFireLayoutScale> = { residentCount: 0, edgeCount: 0 },
+): NukeFireConstraintRepairPolicy {
+  return {
+    // No wall deadline: deterministic frontier limits make the result
+    // independent of machine speed while retaining a finite memory envelope.
+    when: "always",
+    maxDurationMs: Number.POSITIVE_INFINITY,
+    ...perfectRepairLimits(scale),
+  };
+}
+
+/** @deprecated Prefer the explicit automatic/perfect policy functions. */
 export function nukeFireConstraintRepairPolicy(
   searchForPerfectLayouts: boolean,
   scale: Readonly<NukeFireLayoutScale> = { residentCount: 0, edgeCount: 0 },
 ): NukeFireConstraintRepairPolicy {
-  if (searchForPerfectLayouts) {
-    return {
-      // Keep the search independent of machine speed while bounding every
-      // frontier that can retain or generate work without limit.
-      when: "always",
-      maxDurationMs: Number.POSITIVE_INFINITY,
-      ...perfectRepairLimits(scale),
-    };
-  }
-  return {
-    // Engine defaults also cap separator states and diversified masks. The
-    // wall deadline remains authoritative for this ordinary fallback, while
-    // crossing work has its own deterministic post-constraint ceiling.
-    when: "always",
-    maxDurationMs: 10_000,
-    maxCrossingWork: 512,
-  };
+  return searchForPerfectLayouts
+    ? nukeFirePerfectConstraintRepairPolicy(scale)
+    : nukeFireAutomaticConstraintRepairPolicy(scale);
 }
