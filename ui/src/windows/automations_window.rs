@@ -59,6 +59,7 @@ mod package_tabs;
 mod packages;
 mod palette;
 mod param_values;
+mod readme;
 mod settings_history;
 mod sharing_status;
 mod sidebar;

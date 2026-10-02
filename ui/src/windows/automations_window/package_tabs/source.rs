@@ -180,18 +180,9 @@ impl AutomationsWindow {
 
         let right: Elem<'a> = if self.owned_selected_file.is_none() {
             if let Some(readme) = &self.local_readme {
-                let settings = markdown::Settings::with_text_size(
-                    13.0,
-                    markdown::Style::from_palette(iced::theme::Palette::DARK),
-                );
-                scrollable(
-                    container(
-                        markdown::view(readme.items(), settings).map(Message::OpenReadmeLink),
-                    )
-                    .padding(10.0),
-                )
-                .height(Length::Fixed(340.0))
-                .into()
+                scrollable(readme::view(readme))
+                    .height(Length::Fixed(340.0))
+                    .into()
             } else {
                 container(
                     text(crate::i18n::t!("package-select-file-edit"))
