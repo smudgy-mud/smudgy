@@ -136,6 +136,10 @@ test('command separators and verbatim prefix follow native syntax and update liv
     aliases: [{ pattern: '^n$', command: 'north' }],
   }, { commandSyntax: { separator: ';;', raw_prefix: '!' } });
   await waitForOpen(request, 'syntax');
+  // The server handshake can finish before the worker processes its onopen.
+  await expect.poll(async () => (await workerState(page, 'syntax')).frames.at(-1)?.connection, {
+    message: 'syntax worker must report Connected before input',
+  }).toBe(2);
   await postWorker(page, 'syntax', { kind: 'input', text: 'a;b;;n' });
   await postWorker(page, 'syntax', { kind: 'input', text: '!n;;n' });
   await postWorker(page, 'syntax', { kind: 'input', text: '=n;;n' });
