@@ -963,7 +963,10 @@ async fn rooms_charted_beside_the_player_are_announced_once_they_exist() {
     let server = "NukeFireAnnouncedRooms";
     let (mapper, _) = nukefire_store(server).await;
     std::fs::write(
-        smudgy_home().join(server).join("modules").join("room-watch.ts"),
+        smudgy_home()
+            .join(server)
+            .join("modules")
+            .join("room-watch.ts"),
         ROOM_WATCH,
     )
     .expect("write the location watcher");
@@ -1007,6 +1010,423 @@ async fn rooms_charted_beside_the_player_are_announced_once_they_exist() {
 {}",
         session.transcript()
     );
+    session.shutdown();
+}
+
+/// Review regression: observers must see a link-only chart after the link exists.
+#[tokio::test]
+async fn review_link_only_chart_notifies_map_observers() {
+    let server = "NukeFireReviewLinkOnly";
+    let (mapper, atlas) = nukefire_store(server).await;
+    let map = settled_map(&mapper, atlas, "Link Fields", "link fields").await;
+    add_rooms(&mapper, map, 1900, &[190_001, 190_002]).await;
+    std::fs::write(
+        smudgy_home()
+            .join(server)
+            .join("modules")
+            .join("link-watch.ts"),
+        r#"
+import { echo, mapper } from "smudgy:core";
+import { room } from "smudgy:events/map";
+room.on(({ areaId, roomNumber }) => {
+    const current = mapper.getAreaById(areaId).room(roomNumber);
+    echo("LINK-WATCH " + current?.exits.length);
+});
+"#,
+    )
+    .unwrap();
+    let west = chart_room(190_001, "West", 1900, 0);
+    let east = chart_room(190_002, "East", 1900, 1);
+    let mut session = start_session(server, 9490, &mapper).await;
+    session.visit("Link Fields", &west, &[east], &[]);
+    assert!(
+        session
+            .wait_until(|lines| lines.iter().any(|line| line == "LINK-WATCH 0"))
+            .await
+    );
+    session.run_for(Duration::from_millis(500)).await;
+    session.visit(
+        "Link Fields",
+        &west,
+        &[east],
+        &[ChartLink {
+            from: 190_001,
+            to: 190_002,
+            direction: "east",
+        }],
+    );
+    session.run_for(Duration::from_millis(1200)).await;
+    assert_eq!(
+        exit_target(&mapper, 190_001, East),
+        Some(room_key(&mapper, 190_002))
+    );
+    let notifications = session
+        .lines
+        .iter()
+        .filter(|line| line.starts_with("LINK-WATCH "))
+        .count();
+    session.visit(
+        "Link Fields",
+        &west,
+        &[east],
+        &[ChartLink {
+            from: 190_001,
+            to: 190_002,
+            direction: "east",
+        }],
+    );
+    session.run_for(Duration::from_millis(500)).await;
+    assert_eq!(
+        session
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("LINK-WATCH "))
+            .count(),
+        notifications,
+        "an unchanged chart should not notify map observers again:\n{}",
+        session.transcript()
+    );
+    session.shutdown();
+    assert!(
+        session.lines.iter().any(|line| line == "LINK-WATCH 1"),
+        "link committed but map:room observers never saw it:\n{}",
+        session.transcript()
+    );
+}
+
+async fn seed_manual_level_reflow(mapper: &Mapper, atlas: AtlasId) -> AreaId {
+    let map = settled_map(mapper, atlas, "Manual Levels", "manual levels").await;
+    let vnums = [191_001, 191_002, 191_003, 191_004, 191_005, 191_006];
+    add_rooms(mapper, map, 1910, &vnums).await;
+    let coordinates = vnums
+        .iter()
+        .enumerate()
+        .map(|(index, &vnum)| AreaMutation::UpsertRoom {
+            room_number: room_key(mapper, vnum).room_number,
+            body: RoomUpdates {
+                x: Some([0.0, 1.0, 2.0][index % 3]),
+                y: Some([0.0, 1.0][index / 3]),
+                level: Some(i32::from(index % 2 == 0)),
+                ..RoomUpdates::default()
+            },
+        })
+        .collect();
+    apply(mapper, map, coordinates).await;
+    let edges = [
+        (4, 1, Down),
+        (1, 2, South),
+        (2, 4, Down),
+        (5, 4, South),
+        (6, 4, Down),
+        (3, 4, North),
+        (2, 5, West),
+        (5, 1, South),
+    ];
+    for (from, to, direction) in edges {
+        apply(
+            mapper,
+            map,
+            vec![AreaMutation::CreateExit {
+                room_number: RoomNumber(from),
+                body: ExitArgs {
+                    from_direction: direction,
+                    to_area_id: Some(map),
+                    to_room_number: Some(RoomNumber(to)),
+                    ..ExitArgs::default()
+                },
+            }],
+        )
+        .await;
+    }
+    let routes = connections_between(mapper, 191_006, 191_004);
+    apply(
+        mapper,
+        map,
+        routes
+            .iter()
+            .map(|&connection_id| AreaMutation::UpdateConnection {
+                connection_id,
+                body: ConnectionUpdates {
+                    routing: Some(ConnectionRouting::Automatic),
+                    ..ConnectionUpdates::default()
+                },
+            })
+            .collect(),
+    )
+    .await;
+    map
+}
+
+/// Run the authored command function with real layout and mapper APIs, without
+/// installing the unrelated panels and navigation aliases.
+#[tokio::test]
+async fn review_perfect_reflow_keeps_cross_level_connection_routing_valid() {
+    let server = "NukeFireReviewPerfectRouting";
+    let (mapper, atlas) = nukefire_store(server).await;
+    let map = seed_manual_level_reflow(&mapper, atlas).await;
+    let modules = smudgy_home().join(server).join("modules");
+    let module = format!(
+        r#"
+import {{ createAlias, echo, mapper }} from "smudgy:core";
+import {{ planAreaChange }} from "smudgy://local/map-layout";
+import {{ NukeFireMapper }} from "smudgy://local/nukefire-mapper/mapper.ts";
+import {{ nukeFirePerfectReflowPolicy }} from "./review-policy.ts";
+const writer = new NukeFireMapper();
+writer.start();
+createAlias(/^nf-review-reflow$/, () => void (async () => {{
+  try {{
+    const result = await planAreaChange("{map}", {{ type: "reflow", anchor: 1 }}, {{
+      includeSnapshotKeys: true,
+      constraintRepair: nukeFirePerfectReflowPolicy({{ residentCount: 6, edgeCount: 8 }}),
+    }});
+    await writer.applyManualLayout({{
+      requestId: "regression", areaUuid: "{map}", sourceSnapshotKey: result.sourceSnapshotKey,
+      plannedSnapshotKey: result.plannedSnapshotKey,
+      moves: result.patch.moves.map(move => ({{ roomNumber: move.roomNumber, ...move.to }})),
+    }});
+    echo("Perfect reflow moved " + result.patch.moves.length);
+  }} catch (error) {{ echo("Reflow failed: " + error.message); }}
+}})());
+createAlias(/^nf-review-locate$/, () => {{
+  mapper.setCurrentLocation("{map}", 1);
+  echo("REVIEW-LOCATED");
+}});
+"#
+    );
+    std::fs::write(modules.join("review-reflow.ts"), module).unwrap();
+    std::fs::write(
+        modules.join("review-policy.ts"),
+        include_str!("../../packages/nukefire-scripts/reflow-command.ts"),
+    )
+    .unwrap();
+    let mut session = start_session(server, 9491, &mapper).await;
+    session.send("nf-review-locate");
+    assert!(
+        session
+            .wait_until(|lines| lines.iter().any(|line| line == "REVIEW-LOCATED"))
+            .await
+    );
+    session.send("nf-review-reflow");
+    let finished = session
+        .wait_until(|lines| {
+            lines
+                .iter()
+                .any(|line| line.contains("reflow moved") || line.contains("Reflow failed:"))
+        })
+        .await;
+    session.shutdown();
+    assert!(
+        finished,
+        "command never finished:\n{}",
+        session.transcript()
+    );
+    assert!(
+        !session.transcript().contains("Reflow failed:"),
+        "manual reflow rejected its own connection geometry:\n{}",
+        session.transcript()
+    );
+}
+
+#[tokio::test]
+async fn review_tidy_recenters_a_player_room_it_moves() {
+    let server = "NukeFireReviewTidyLocation";
+    let (mapper, atlas) = nukefire_store(server).await;
+    let map = settled_map(&mapper, atlas, "Tidy Fields", "tidy fields").await;
+    add_rooms(&mapper, map, 1920, &[192_001, 192_002]).await;
+    apply(
+        &mapper,
+        map,
+        vec![AreaMutation::UpsertRoom {
+            room_number: RoomNumber(2),
+            body: RoomUpdates {
+                x: Some(20.0),
+                ..RoomUpdates::default()
+            },
+        }],
+    )
+    .await;
+    link(&mapper, 192_001, East, 192_002, West).await;
+    std::fs::write(
+        smudgy_home()
+            .join(server)
+            .join("modules")
+            .join("cell-watch.ts"),
+        r#"
+import { echo, mapper } from "smudgy:core";
+import { room } from "smudgy:events/map";
+room.on(({ areaId, roomNumber }) => {
+    const current = mapper.getAreaById(areaId).room(roomNumber);
+    echo("CELL-WATCH " + current?.x);
+});
+"#,
+    )
+    .unwrap();
+    let mut session = start_session(server, 9492, &mapper).await;
+    visit(&mut session, &mapper, "Tidy Fields", 192_002, 1920).await;
+    assert!(
+        session
+            .wait_until(|lines| lines.iter().any(|line| line == "CELL-WATCH 20"))
+            .await
+    );
+    session.send("nfmap tidy");
+    assert!(
+        session
+            .wait_until(|lines| lines.iter().any(|line| line.starts_with("[nfmap] Done in")))
+            .await,
+        "tidy did not finish:\n{}",
+        session.transcript()
+    );
+    let moved = cell(&mapper, 192_002).0;
+    session.shutdown();
+    assert_ne!(moved, 20, "fixture must move the player's room");
+    assert!(
+        session
+            .lines
+            .iter()
+            .any(|line| line == &format!("CELL-WATCH {moved}")),
+        "tidy moved the player to {moved} without recentering:\n{}",
+        session.transcript()
+    );
+}
+
+#[tokio::test]
+async fn review_merge_follows_a_stationary_sibling_session() {
+    let server = "NukeFireReviewSiblingLocation";
+    let (mapper, atlas) = nukefire_store(server).await;
+    let destination = legacy_map(&mapper, atlas, "Sibling Fields", 1930).await;
+    add_rooms(&mapper, destination, 1930, &[193_001, 193_002, 193_003]).await;
+    let source = legacy_map(&mapper, atlas, "Sibling Fields", 1931).await;
+    add_rooms(&mapper, source, 1931, &[193_101, 193_102]).await;
+    std::fs::write(smudgy_home().join(server).join("modules").join("location-watch.ts"), r#"
+import { createAlias, echo, mapper } from "smudgy:core";
+createAlias(/^nf-review-location$/, () => echo("LOCATION-WATCH " + JSON.stringify(mapper.getCurrentLocation())));
+"#).unwrap();
+    let mut owner = start_session(server, 9493, &mapper).await;
+    visit(&mut owner, &mapper, "Sibling Fields", 193_001, 1930).await;
+    let mut sibling = start_session(server, 9494, &mapper).await;
+    sibling.gmcp(
+        "Room.Info",
+        &support::nukefire::room_info(&chart_room(193_101, "Sibling", 1931, 0), "Sibling Fields"),
+    );
+    sibling.run_for(Duration::from_millis(400)).await;
+    sibling.send("nf-review-location");
+    assert!(
+        sibling
+            .wait_until(|lines| lines.iter().any(|line| line.contains(&source.to_string())))
+            .await,
+        "sibling was never located:\n{}",
+        sibling.transcript()
+    );
+    visit(&mut owner, &mapper, "Sibling Fields", 193_101, 1931).await;
+    assert!(!exists(&mapper, source), "owner must remove the source");
+    sibling.lines.clear();
+    sibling.send("nf-review-location");
+    assert!(
+        sibling
+            .wait_until(|lines| lines.iter().any(|line| line.starts_with("LOCATION-WATCH")))
+            .await
+    );
+    owner.shutdown();
+    sibling.shutdown();
+    assert!(
+        sibling
+            .lines
+            .iter()
+            .any(|line| line.contains(&destination.to_string())),
+        "stationary sibling still names the deleted source:\n{}",
+        sibling.transcript()
+    );
+}
+
+/// Review coverage: authored and dormant routes survive both level transitions.
+#[tokio::test]
+async fn review_level_polish_preserves_authored_and_dormant_routes() {
+    let server = "NukeFireReviewAuthoredRoutes";
+    let (mapper, atlas) = nukefire_store(server).await;
+    let map = settled_map(&mapper, atlas, "Authored Steps", "authored steps").await;
+    add_rooms(&mapper, map, 1940, &[194_001, 194_002, 194_003, 194_004]).await;
+    link(&mapper, 194_001, Up, 194_002, Down).await;
+    link(&mapper, 194_003, East, 194_004, West).await;
+    let stairs = connections_between(&mapper, 194_001, 194_002);
+    let slope = connections_between(&mapper, 194_003, 194_004);
+    assert!(!stairs.is_empty() && !slope.is_empty());
+    let points = vec![smudgy_cloud::MapPoint::new(7.0, 8.0)];
+    let mut edits = vec![
+        AreaMutation::UpsertRoom {
+            room_number: RoomNumber(4),
+            body: RoomUpdates {
+                level: Some(1),
+                ..RoomUpdates::default()
+            },
+        },
+        AreaMutation::UpsertAreaProperty {
+            name: "nukefire.layout.polish-pending".to_string(),
+            value: "true".to_string(),
+            is_secret: None,
+        },
+    ];
+    for (&id, routing) in stairs
+        .iter()
+        .map(|id| (id, ConnectionRouting::Manual))
+        .chain(slope.iter().map(|id| (id, ConnectionRouting::Simple)))
+    {
+        edits.push(AreaMutation::UpdateConnection {
+            connection_id: id,
+            body: ConnectionUpdates {
+                routing: Some(routing),
+                segment_shape: Some(smudgy_cloud::SegmentShape::Direct),
+                route_points: Some(points.clone()),
+                ..ConnectionUpdates::default()
+            },
+        });
+    }
+    apply(&mapper, map, edits).await;
+    let old_cells = {
+        let initial = mapper.get_current_atlas();
+        let area = initial.get_area(&map).unwrap();
+        [1, 2, 3, 4].map(|number| {
+            let room = area.get_room(&RoomNumber(number)).unwrap();
+            (room.get_x(), room.get_y())
+        })
+    };
+    shared_packages::save_param_value(server, MAPPER_SPEC, "debugMappingDecisions", json!(true))
+        .unwrap();
+    let mut session = start_session(server, 9495, &mapper).await;
+    visit(&mut session, &mapper, "Authored Steps", 194_001, 1940).await;
+    expect_logged(&mut session, server, "authored route polish", |record| {
+        record["kind"] == "layout-polish-state" && record["event"] == "polish-completed"
+    })
+    .await;
+    expect_no_failed_edit(&session, server);
+    assert_ne!(level(&mapper, 194_001), level(&mapper, 194_002));
+    assert_eq!(level(&mapper, 194_003), level(&mapper, 194_004));
+    for &id in stairs.iter().chain(&slope) {
+        let snapshot = mapper.get_current_atlas();
+        let area = snapshot.get_area(&map).unwrap();
+        let route = area.get_connection(id).unwrap();
+        assert_eq!(route.routing, ConnectionRouting::Simple);
+        assert_eq!(route.segment_shape, smudgy_cloud::SegmentShape::Direct);
+        let delta = |number: RoomNumber| {
+            let room = area.get_room(&number).unwrap();
+            let old = old_cells[usize::try_from(number.0 - 1).unwrap()];
+            (room.get_x() - old.0, room.get_y() - old.1)
+        };
+        let delta_a = delta(route.endpoint_a.room_number);
+        let delta_b = delta(route.endpoint_b.unwrap().room_number);
+        let shift = if delta_a == delta_b {
+            delta_a
+        } else {
+            (0.0, 0.0)
+        };
+        let expected: Vec<_> = points
+            .iter()
+            .map(|point| smudgy_cloud::MapPoint::new(point.x + shift.0, point.y + shift.1))
+            .collect();
+        assert_eq!(
+            route.route_points, expected,
+            "only the host's shared translation may move authored points"
+        );
+    }
     session.shutdown();
 }
 

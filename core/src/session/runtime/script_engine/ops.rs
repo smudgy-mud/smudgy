@@ -211,6 +211,7 @@ deno_core::extension!(
     // writes it (alongside emitting the UI marker action) and `op_smudgy_mapper_get_current_location`
     // reads it — a current-session read (the value lives on this thread, not the `Mapper`).
     current_location: crate::session::runtime::CurrentLocation,
+    mapper_events: crate::session::runtime::mapper_events::SharedMapperEvents,
     // The script-visible settings snapshot, shared with the runtime. `op_smudgy_get_settings`
     // reads it for `getSettings()`; the `ApplySettings` dispatch handler is the writer.
     settings_snapshot: crate::session::runtime::SettingsSnapshot,
@@ -332,6 +333,7 @@ deno_core::extension!(
     state.put::<std::rc::Weak<Cell<usize>>>(options.emitted_line_count);
     state.put::<crate::session::runtime::RecentLines>(options.recent_lines);
     state.put::<crate::session::runtime::CurrentLocation>(options.current_location);
+    state.put::<crate::session::runtime::mapper_events::SharedMapperEvents>(options.mapper_events);
     state.put::<crate::session::runtime::SettingsSnapshot>(options.settings_snapshot);
     state.put::<crate::session::runtime::gmcp::SharedGmcpEnabled>(options.gmcp_enabled);
     state.put::<crate::session::runtime::SharedPaneRegistry>(options.pane_registry);
@@ -8368,19 +8370,23 @@ fn op_smudgy_mapper_set_current_location(
 }
 
 /// Record the session's current mapper location: the shared cell
-/// `getCurrentLocation` reads back, and the `SetCurrentLocation` action that
+/// `getCurrentLocation` reads back, and the queued location action that
 /// moves the UI marker and fires `map:room`. The cell is written here because
 /// the marker the action fans out is write-only and not readable cross-thread.
-/// Every path that moves the location goes through this so the two never
-/// disagree, including a mapper op that relocates the room the session stands in.
+/// Committed room remaps reconcile the same cell and pending marker actions.
 pub(super) fn set_current_location(state: &mut OpState, area_id: AreaId, room_number: Option<i32>) {
+    // Observe preceding commits before registering this explicit address. A
+    // setter made after a room number is reused must not follow an older remap.
+    let events = state.borrow::<crate::session::runtime::mapper_events::SharedMapperEvents>();
+    crate::session::runtime::mapper_events::observe(
+        events,
+        state.borrow::<crate::session::runtime::CurrentLocation>(),
+    );
+    let action = crate::session::runtime::mapper_events::marker(events, area_id, room_number);
     *state
         .borrow::<crate::session::runtime::CurrentLocation>()
         .borrow_mut() = Some((area_id, room_number));
-    queue_own_action(
-        state,
-        RuntimeAction::SetCurrentLocation(area_id, room_number),
-    );
+    queue_own_action(state, action);
 }
 
 /// A mapper location as serialized to JS: the area id string plus an optional room

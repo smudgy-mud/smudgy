@@ -28,6 +28,7 @@ impl Inner {
         into: AreaId,
         sources: Vec<AreaMergeSource>,
     ) -> CloudResult<AreaMergeCommit> {
+        local_projection::ensure_room_remaps(self).await?;
         let (tier, inbound) = self.merge_third_parties(into, &sources)?;
         let deleted: Vec<AreaId> = sources
             .iter()
@@ -89,7 +90,11 @@ impl Inner {
             .await;
             recovery.finish(self);
         }
-        self.pending.emit(event);
+        if tier != MapStorage::Local || self.local_room_remaps.get().is_some_and(Option::is_none) {
+            // Legacy decorators retain issuer delivery after publication.
+            // Store-wide delivery requires forwarding the remap capability.
+            self.pending.emit(event);
+        }
         Ok(commit)
     }
 

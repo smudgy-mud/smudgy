@@ -121,6 +121,8 @@ pub struct PendingEnvelope {
     /// the wire operation itself is an upsert. They are checked after a
     /// revision-conflict refetch and never serialized to the API.
     pub(crate) structural_preconditions: Vec<StructuralPrecondition>,
+    /// Exact client-side address changes caused by this durable gesture.
+    pub(crate) room_remap: Option<crate::backends::local::LocalRoomRemap>,
     /// Transport attempts so far.
     pub attempts: u32,
     /// Authenticated cloud viewer this work belongs to. `None` for local and
@@ -281,6 +283,21 @@ pub enum MapperEvent {
     },
 }
 
+/// Lossless address changes for one active session. Ordinary save-status
+/// traffic uses the bounded UI broadcast and cannot evict these migrations.
+#[derive(Default)]
+pub struct RoomRemapSubscription {
+    events: Mutex<VecDeque<MapperEvent>>,
+}
+
+impl RoomRemapSubscription {
+    /// Consume every committed migration queued for this subscriber, in order.
+    #[must_use]
+    pub fn take(&self) -> Vec<MapperEvent> {
+        self.events.lock().drain(..).collect()
+    }
+}
+
 /// Verdict of [`PendingQueue::transport_failure`]. All terminal accounting
 /// keys off this returned verdict — never off a later status re-read, which
 /// a concurrent resolution could race.
@@ -392,6 +409,8 @@ struct DurablePendingBody {
     ops: Vec<AreaMutation>,
     description: String,
     structural_preconditions: Vec<StructuralPrecondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    room_remap: Option<crate::backends::local::LocalRoomRemap>,
     /// Absent only on schema-v2 records written before batch commit markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     batch_id: Option<Uuid>,
@@ -487,6 +506,8 @@ pub struct PendingQueue {
     pub(crate) notify: Notify,
     projection_notify: Arc<Notify>,
     events: broadcast::Sender<MapperEvent>,
+    event_notify: Arc<Notify>,
+    remap_subscribers: Mutex<Vec<std::sync::Weak<RoomRemapSubscription>>>,
 }
 
 impl Default for PendingQueue {
@@ -519,6 +540,8 @@ impl PendingQueue {
             notify: Notify::new(),
             projection_notify: Arc::new(Notify::new()),
             events,
+            event_notify: Arc::new(Notify::new()),
+            remap_subscribers: Mutex::new(Vec::new()),
         };
         queue.cleanup_retired_records();
         queue.restore_local_records();
@@ -547,7 +570,27 @@ impl PendingQueue {
     }
 
     pub(crate) fn emit(&self, event: MapperEvent) {
+        if matches!(event, MapperEvent::AreasMerged { .. }) {
+            self.remap_subscribers.lock().retain(|subscriber| {
+                let Some(queue) = subscriber.upgrade() else {
+                    return false;
+                };
+                queue.events.lock().push_back(event.clone());
+                true
+            });
+        }
         let _ = self.events.send(event);
+        self.event_notify.notify_waiters();
+    }
+
+    pub(crate) fn event_notifications(&self) -> Arc<Notify> {
+        Arc::clone(&self.event_notify)
+    }
+
+    pub(crate) fn subscribe_room_remaps(&self) -> Arc<RoomRemapSubscription> {
+        let queue = Arc::new(RoomRemapSubscription::default());
+        self.remap_subscribers.lock().push(Arc::downgrade(&queue));
+        queue
     }
 
     /// Appends an envelope to its area's queue and wakes the worker.
@@ -1100,6 +1143,7 @@ impl PendingQueue {
             ops: envelope.ops.clone(),
             description: envelope.description.clone(),
             structural_preconditions: envelope.structural_preconditions.clone(),
+            room_remap: envelope.room_remap.clone(),
             batch_id: Some(batch_id),
         };
         let record = DurablePendingRecord {
@@ -1457,6 +1501,7 @@ impl PendingQueue {
                     ops: record.body.ops,
                     description: record.body.description,
                     structural_preconditions: record.body.structural_preconditions,
+                    room_remap: record.body.room_remap,
                     attempts: 0,
                     viewer_id: Some(viewer_id),
                     local_durable: false,
@@ -1572,6 +1617,7 @@ impl PendingQueue {
                     ops: record.body.ops,
                     description: record.body.description,
                     structural_preconditions: record.body.structural_preconditions,
+                    room_remap: record.body.room_remap,
                     attempts: 0,
                     viewer_id: None,
                     local_durable: true,
@@ -3205,6 +3251,7 @@ mod tests {
             }],
             description: desc.to_string(),
             structural_preconditions: Vec::new(),
+            room_remap: None,
             attempts: 0,
             viewer_id: None,
             local_durable: false,
@@ -3549,6 +3596,69 @@ mod tests {
             local_durable: true,
             ..envelope(desc)
         }
+    }
+
+    #[test]
+    fn local_join_remaps_survive_pending_journal_recovery() {
+        let root = journal_test_root();
+        let area = AreaId(Uuid::new_v4());
+        let mut joining = local_durable_envelope("Join duplicate room");
+        joining.room_remap = Some(crate::backends::local::LocalRoomRemap {
+            into: area,
+            deleted: Vec::new(),
+            rooms: vec![RoomRemap {
+                from: crate::mapper::RoomKey::new(area, RoomNumber(2)),
+                to: RoomNumber(1),
+            }],
+        });
+        let operation = joining.operation_id;
+        let queue = PendingQueue::with_journal(root.clone());
+        queue.enqueue(area, joining).unwrap();
+        drop(queue);
+        let reopened = PendingQueue::with_journal(root.clone());
+        let pending = reopened.pending_for(area);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].operation_id, operation);
+        let remap = pending[0]
+            .room_remap
+            .as_ref()
+            .expect("recovered exact remap");
+        assert_eq!(remap.into, area);
+        assert_eq!(remap.rooms[0].from.room_number, RoomNumber(2));
+        assert_eq!(remap.rooms[0].to, RoomNumber(1));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn migration_subscribers_are_lossless_across_unrelated_event_bursts() {
+        let queue = PendingQueue::new();
+        let subscriber = queue.subscribe_room_remaps();
+        let into = AreaId(Uuid::new_v4());
+        queue.emit(MapperEvent::AreasMerged {
+            into,
+            deleted: Vec::new(),
+            rooms: Vec::new(),
+        });
+        for _ in 0..1_000 {
+            queue.emit(MapperEvent::AreaStatusChanged { area_id: into });
+        }
+        let events = subscriber.take();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], MapperEvent::AreasMerged { into: area, .. } if area == into));
+        assert!(
+            subscriber.take().is_empty(),
+            "consumption is shared by runtime and ops"
+        );
+        drop(subscriber);
+        queue.emit(MapperEvent::AreasMerged {
+            into,
+            deleted: Vec::new(),
+            rooms: Vec::new(),
+        });
+        assert!(
+            queue.remap_subscribers.lock().is_empty(),
+            "dropped sessions retire their queue"
+        );
     }
 
     #[test]

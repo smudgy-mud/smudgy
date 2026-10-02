@@ -26,7 +26,9 @@
 //! gates serialize their respective operations; backend writer locks belong to
 //! the stores. Store commits finish before session publication takes its locks.
 
-use crate::backends::{AreaMergeCommit, AreaMergePlan, AreaMergeSource, MapperBackend, area_edits};
+use crate::backends::{
+    AreaMergeCommit, AreaMergePlan, AreaMergeSource, MapperBackend, RoomRemap, area_edits,
+};
 use crate::error::CloudResult;
 use crate::mapper::area_cache::AreaCache;
 use crate::mapper::exit_cache::ExitCache;
@@ -983,6 +985,8 @@ pub struct Inner {
     sync_notify: Arc<Notify>,
     local_projection: Mutex<local_projection::LocalProjection>,
     local_published: tokio::sync::watch::Sender<u64>,
+    local_room_remaps:
+        tokio::sync::OnceCell<Option<Arc<crate::backends::local::LocalRoomRemapQueue>>>,
     recovery: Mutex<SessionRecovery>,
     background_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     /// In-flight local write operations per area; the sync engine defers
@@ -1203,6 +1207,7 @@ impl Mapper {
             sync_notify: Arc::new(Notify::new()),
             local_projection: Mutex::new(local_projection::LocalProjection::default()),
             local_published: tokio::sync::watch::channel(0).0,
+            local_room_remaps: tokio::sync::OnceCell::new(),
             recovery: Mutex::new(SessionRecovery::default()),
             background_tasks: Mutex::new(Vec::new()),
             pending_by_area: Arc::new(Mutex::new(pending_by_area)),
@@ -1819,6 +1824,7 @@ impl Mapper {
     /// # Errors
     /// Reports a failed initial map load.
     pub async fn ready(&self) -> CloudResult<()> {
+        local_projection::ensure_room_remaps(&self.inner).await?;
         self.load_initial_areas().await?;
         local_projection::adopt_and_wait(&self.inner).await;
         Ok(())
@@ -2356,6 +2362,19 @@ impl Mapper {
     #[must_use]
     pub fn subscribe_mapper_events(&self) -> tokio::sync::broadcast::Receiver<MapperEvent> {
         self.inner.pending.subscribe()
+    }
+
+    /// Wake every event consumer without consuming another consumer's event.
+    #[must_use]
+    pub fn mapper_event_notifications(&self) -> Arc<tokio::sync::Notify> {
+        self.inner.pending.event_notifications()
+    }
+
+    /// A dedicated lossless migration subscription. Its queue is retired when
+    /// the subscriber drops, and no unrelated save-status events enter it.
+    #[must_use]
+    pub fn subscribe_room_remaps(&self) -> Arc<pending::RoomRemapSubscription> {
+        self.inner.pending.subscribe_room_remaps()
     }
 
     /// Journal files that could not be recovered (corrupt, unknown schema,
@@ -3787,12 +3806,25 @@ impl Inner {
         let operations =
             merge_room_operations(&area.to_details(), keep_room_number, remove_room_number)?;
         drop(cache);
-        self.mutate_area_locked(
-            area_id,
-            operations,
-            format!("Merge room {remove_room_number} into room {keep_room_number}"),
-            PairedExitPolicy::Split,
-        )
+        let mut result = self.mutate_batches_locked(
+            vec![AreaMutationBatch {
+                area_id,
+                operations,
+                description: format!(
+                    "Merge room {remove_room_number} into room {keep_room_number}"
+                ),
+                paired_policy: PairedExitPolicy::Split,
+            }],
+            Some(&crate::backends::local::LocalRoomRemap {
+                into: area_id,
+                deleted: Vec::new(),
+                rooms: vec![RoomRemap {
+                    from: RoomKey::new(area_id, remove_room_number),
+                    to: keep_room_number,
+                }],
+            }),
+        )?;
+        Ok(result.pop().unwrap_or(MutationSubmission::NoChange))
     }
 
     #[allow(clippy::needless_pass_by_value)] // the by-value key is the established public signature
@@ -4040,7 +4072,7 @@ impl Inner {
         batches: Vec<AreaMutationBatch>,
     ) -> CloudResult<Vec<MutationSubmission>> {
         let _mutation_guard = self.mutation_gate.lock();
-        self.mutate_batches_locked(batches)
+        self.mutate_batches_locked(batches, None)
     }
 
     fn mutate_area_locked(
@@ -4050,18 +4082,22 @@ impl Inner {
         description: String,
         paired_policy: PairedExitPolicy,
     ) -> CloudResult<MutationSubmission> {
-        let mut submissions = self.mutate_batches_locked(vec![AreaMutationBatch {
-            area_id,
-            operations,
-            description,
-            paired_policy,
-        }])?;
+        let mut submissions = self.mutate_batches_locked(
+            vec![AreaMutationBatch {
+                area_id,
+                operations,
+                description,
+                paired_policy,
+            }],
+            None,
+        )?;
         Ok(submissions.pop().unwrap_or(MutationSubmission::NoChange))
     }
 
     fn mutate_batches_locked(
         &self,
         batches: Vec<AreaMutationBatch>,
+        room_remap: Option<&crate::backends::local::LocalRoomRemap>,
     ) -> CloudResult<Vec<MutationSubmission>> {
         let cache = self.atlas_cache.load_full();
         let mut working = HashMap::<AreaId, AreaWithDetails>::new();
@@ -4154,13 +4190,14 @@ impl Inner {
             area_edits::validate_connection_graph(&mut details)?;
             details.area.rev += 1;
 
-            let envelope = self.pending_envelope(
+            let mut envelope = self.pending_envelope(
                 self.lane_of(area_id),
                 operation_id,
                 operations,
                 description,
                 structural_preconditions,
             )?;
+            envelope.room_remap = room_remap.filter(|remap| remap.into == area_id).cloned();
             staged.push((area_id, envelope));
             working.insert(area_id, details);
             submissions.push(MutationSubmission::Queued(operation_id));
@@ -4260,6 +4297,7 @@ impl Inner {
             ops,
             description,
             structural_preconditions,
+            room_remap: None,
             attempts: 0,
             viewer_id,
             local_durable: lane.local_durable,
@@ -4525,7 +4563,13 @@ impl Inner {
             payload: envelope.ops,
         };
         let result = if envelope.local_durable {
-            self.backend.execute_local_mutation(&area_id, &wire).await
+            self.backend
+                .execute_local_mutation_with_room_remap(
+                    &area_id,
+                    &wire,
+                    envelope.room_remap.clone(),
+                )
+                .await
         } else if viewer_id.is_some() {
             self.backend
                 .execute_mutation_at_generation(&area_id, &wire, auth_generation)
@@ -4583,6 +4627,19 @@ impl Inner {
                         .operations_succeeded
                         .fetch_add(1, Ordering::Relaxed);
                     self.settle_pending(area_id, 1);
+                    if (!envelope.local_durable
+                        || self.local_room_remaps.get().is_some_and(Option::is_none))
+                        && let Some(remap) = envelope.room_remap
+                    {
+                        if envelope.local_durable {
+                            local_projection::adopt_and_wait(self).await;
+                        }
+                        self.pending.emit(MapperEvent::AreasMerged {
+                            into: remap.into,
+                            deleted: remap.deleted,
+                            rooms: remap.rooms,
+                        });
+                    }
                 }
 
                 // A compound mutation can move aggregates beyond its own
@@ -5628,6 +5685,7 @@ mod tests {
             }],
             description: "durable edit before ambiguous delete".to_string(),
             structural_preconditions: Vec::new(),
+            room_remap: None,
             attempts: 0,
             viewer_id: None,
             local_durable: true,
@@ -8430,6 +8488,7 @@ mod tests {
                 }],
                 description: "edit before interrupted delete".into(),
                 structural_preconditions: Vec::new(),
+                room_remap: None,
                 attempts: 0,
                 viewer_id: None,
                 local_durable: true,
@@ -8574,7 +8633,8 @@ mod tests {
         }
         let observer_backend = Arc::new(LocalBackend::new(root.join("local").join(".")));
         let observer = Mapper::new(observer_backend, root.join("observer"));
-        observer.load_all_areas().await.unwrap();
+        observer.ready().await.unwrap();
+        let mut migrations = observer.subscribe_mapper_events();
         observer.set_area_enabled(fixture.c, false);
         local_projection::adopt(&observer.inner);
         let retained = observer.get_current_atlas();
@@ -8600,6 +8660,12 @@ mod tests {
             vec![1, 2, 3]
         );
         assert!(observer.get_current_atlas().get_area(&fixture.b).is_some());
+        while let Ok(event) = migrations.try_recv() {
+            assert!(
+                !matches!(event, MapperEvent::AreasMerged { .. }),
+                "a fenced projection must withhold its remap"
+            );
+        }
         {
             let reload = observer.load_all_areas();
             tokio::pin!(reload);
@@ -8621,6 +8687,18 @@ mod tests {
                 .unwrap();
         }
         wait_until(|| observer.get_current_atlas().get_area(&fixture.b).is_none()).await;
+        let remaps = std::iter::from_fn(|| migrations.try_recv().ok())
+            .filter_map(|event| {
+                if let MapperEvent::AreasMerged { into, rooms, .. } = event {
+                    Some((into, rooms))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(remaps.len(), 1, "adoption publishes one migration");
+        assert_eq!(remaps[0].0, fixture.a);
+        assert_eq!(remaps[0].1.len(), 2);
         let current = observer.get_current_atlas();
         assert_eq!(sorted_rooms(&current, fixture.a), vec![1, 2, 3, 4, 5]);
         assert_eq!(
@@ -9475,6 +9553,7 @@ mod tests {
         let mapper = Mapper::new(backend, root.join("cache"));
         mapper.load_all_areas().await.unwrap();
         local_projection::adopt(&mapper.inner);
+        let mut migrations = mapper.subscribe_mapper_events();
         let blocked = local.join("areas-v2").join(format!("{}.json", fixture.c));
         std::fs::remove_file(&blocked).unwrap();
         std::fs::create_dir(&blocked).unwrap();
@@ -9490,8 +9569,18 @@ mod tests {
         }
         assert!(mapper.get_current_atlas().get_area(&fixture.b).is_some());
         assert!(!mapper.inner.room_reservations.lock().is_empty());
+        while let Ok(event) = migrations.try_recv() {
+            assert!(
+                !matches!(event, MapperEvent::AreasMerged { .. }),
+                "a decided but unreadable merge has no visible remap yet"
+            );
+        }
         std::fs::remove_dir(blocked).unwrap();
         mapper.refresh_local_store().await.unwrap();
+        let remaps = std::iter::from_fn(|| migrations.try_recv().ok())
+            .filter(|event| matches!(event, MapperEvent::AreasMerged { .. }))
+            .count();
+        assert_eq!(remaps, 1, "recovery publishes the retained migration once");
         assert!(mapper.get_current_atlas().get_area(&fixture.b).is_none());
         assert_eq!(
             sorted_rooms(&mapper.get_current_atlas(), fixture.a),

@@ -86,6 +86,7 @@ export function perfectRepairPolicyWire(
 }
 
 export interface ReflowRepairReport {
+  readonly outcome?: string;
   readonly geometricFixedPoint: boolean;
   readonly cutoff?: string;
   readonly polishCutoff?: string;
@@ -95,6 +96,8 @@ export interface ReflowRepairReport {
 
 export type ReflowRepairTerminal =
   | "fixed-point"
+  | "clean"
+  | "not-searched"
   | "ceiling"
   | "timeout"
   | "cancelled"
@@ -113,7 +116,36 @@ export function reflowRepairTerminalReason(
     report.cutoff === "extensions" || report.cutoff === "masks" ||
     report.polishCutoff === "tournaments" || report.polishCutoff === "passes" ||
     report.extensionSearch?.exhausted === true || report.crossingRepair?.exhausted === true;
-  return ceiling ? "ceiling" : "incomplete";
+  if (ceiling) return "ceiling";
+  if (report.outcome === "clean") return "clean";
+  if (report.outcome !== undefined && report.outcome !== "searched") return "not-searched";
+  return "incomplete";
+}
+
+/** Explain an unchanged plan without claiming the search proved a fixed point. */
+export function reflowRepairStatusText(report: Readonly<ReflowRepairReport>): string {
+  const terminal = reflowRepairTerminalReason(report);
+  if (terminal === "clean") return " No repair needed: the layout is clean.";
+  if (terminal === "not-searched") {
+    const reasons: Record<string, string> = {
+      locked: "room movement is disabled",
+      "no-regression": "the layout has no qualifying regression",
+      "no-constraints": "no exits can be expressed by the constraint search",
+      "no-budget": "the repair budget is empty",
+      "search-failed:analysis": "constraint analysis failed",
+      "search-failed:work": "constraint analysis reached its work ceiling",
+      "no-layout": "no admissible layout was produced",
+    };
+    return ` Repair skipped: ${reasons[report.outcome!] ?? report.outcome}.`;
+  }
+  const reason = terminal === "fixed-point"
+    ? "fixed point"
+    : terminal === "ceiling"
+    ? `deterministic ceiling (${report.cutoff}/${report.polishCutoff})`
+    : terminal === "cancelled"
+    ? "cancellation"
+    : terminal;
+  return ` Repair stopped at ${reason}.`;
 }
 
 /** Empty arguments select the ordinary bounded command; `perfect` is explicit. */

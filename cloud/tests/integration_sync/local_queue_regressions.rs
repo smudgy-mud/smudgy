@@ -112,6 +112,13 @@ impl MapperBackend for GatedBackend {
         self.backend.delete_area(area).await
     }
 
+    async fn merge_areas(
+        &self,
+        plan: &smudgy_cloud::backends::AreaMergePlan,
+    ) -> CloudResult<smudgy_cloud::backends::AreaMergeCommit> {
+        self.backend.merge_areas(plan).await
+    }
+
     async fn execute_local_mutation(
         &self,
         area: &AreaId,
@@ -263,4 +270,73 @@ async fn foreign_commit_with_local_edits_queued_never_decreases_displayed_revisi
         );
         last_revision = revision;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_decorators_without_remap_capability_keep_issuer_merge_and_join_events() {
+    let server = MockServer::spawn().await;
+    let directory = TempCacheDir::new("legacy-wrapper-remaps");
+    let (writer, other, gate, into) = two_mappers(&server, directory.path()).await;
+    let source = other
+        .create_area_at("Source".into(), MapDestination::loose(MapStorage::Local))
+        .await
+        .unwrap();
+    for area in [into, source] {
+        let operation = queue_room(&other, area, 1, "Room");
+        other.wait_for_mutation(operation).await.unwrap();
+    }
+    writer.ready().await.unwrap();
+    let events = writer.subscribe_room_remaps();
+    let outcome = writer
+        .merge_areas(
+            into,
+            vec![smudgy_cloud::backends::AreaMergeSource {
+                id: source,
+                translate: smudgy_cloud::backends::Translate::default(),
+                rooms: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let moved = outcome.outcome.rooms[0].to;
+    let first = events.take();
+    assert!(
+        matches!(first.as_slice(), [smudgy_cloud::mapper::MapperEvent::AreasMerged { into: target, rooms, .. }] if *target == into && rooms[0].to == moved)
+    );
+    assert!(writer.get_current_atlas().get_area(&source).is_none());
+    assert!(!gate.local_snapshot().unwrap().contains_area(source));
+
+    // The new optional API must use the decorator's old mutation hook, and
+    // its issuer fallback must survive independently of a script op waiter.
+    let submission = writer.merge_rooms(into, RoomNumber(1), moved).unwrap();
+    gate.wait_for_write().await;
+    gate.permits.add_permits(1);
+    writer
+        .wait_for_mutation(submission.operation_id().unwrap())
+        .await
+        .unwrap();
+    let mut joined = Vec::new();
+    wait_until(|| {
+        joined.extend(events.take());
+        !joined.is_empty()
+    })
+    .await;
+    assert!(
+        matches!(joined.as_slice(), [smudgy_cloud::mapper::MapperEvent::AreasMerged { into: target, rooms, .. }] if *target == into && rooms[0].from.room_number == moved && rooms[0].to == RoomNumber(1))
+    );
+    assert!(
+        writer
+            .get_current_atlas()
+            .get_room(&RoomKey::new(into, moved))
+            .is_none()
+    );
+    assert!(
+        gate.local_snapshot()
+            .unwrap()
+            .area(into)
+            .unwrap()
+            .rooms
+            .iter()
+            .all(|room| room.room_number != moved)
+    );
 }

@@ -189,6 +189,34 @@ struct LocalMultiWriteTransaction {
     /// Ordinary writes and recovery preserve newer on-disk documents.
     #[serde(default)]
     exact: bool,
+    /// Address changes accompany the durable decision, including recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    room_remap: Option<LocalRoomRemap>,
+}
+
+/// A committed room migration, shared only with mappers mounting this store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRoomRemap {
+    pub into: AreaId,
+    pub deleted: Vec<AreaId>,
+    pub rooms: Vec<super::area_merge::RoomRemap>,
+}
+
+/// Each mapper has its own lossless queue. Dropping the mapper retires it.
+#[derive(Default)]
+pub struct LocalRoomRemapQueue {
+    events: parking_lot::Mutex<std::collections::VecDeque<(u64, Arc<LocalRoomRemap>)>>,
+}
+
+impl LocalRoomRemapQueue {
+    pub(crate) fn take_published(&self, generation: u64) -> Vec<Arc<LocalRoomRemap>> {
+        let mut events = self.events.lock();
+        let mut published = Vec::new();
+        while events.front().is_some_and(|(at, _)| *at <= generation) {
+            published.push(events.pop_front().expect("queued remap").1);
+        }
+        published
+    }
 }
 
 /// A published local generation. Documents are committed, readable state;
@@ -203,6 +231,8 @@ pub struct LocalSnapshot {
     pub(crate) recovery_error: Option<CloudError>,
     blocked_atlases: imbl::HashSet<AtlasId>,
     journaled_operations: imbl::HashSet<(AreaId, Uuid)>,
+    /// Decided migrations held until their complete post-images are readable.
+    unpublished_room_remaps: Vec<LocalRoomRemap>,
 }
 
 impl LocalSnapshot {
@@ -297,6 +327,9 @@ impl LocalSnapshot {
     }
 
     fn apply(&mut self, transaction: LocalMultiWriteTransaction) {
+        if let Some(remap) = transaction.room_remap {
+            self.unpublished_room_remaps.push(remap);
+        }
         for document in transaction.writes {
             let id = document.details.area.id;
             self.errors.remove(&id);
@@ -322,6 +355,7 @@ struct LocalStore {
     needs_reload: AtomicBool,
     snapshot: ArcSwap<LocalSnapshot>,
     changed: tokio::sync::watch::Sender<u64>,
+    remap_subscribers: parking_lot::Mutex<Vec<std::sync::Weak<LocalRoomRemapQueue>>>,
     #[cfg(test)]
     write_faults: std::sync::atomic::AtomicU32,
     #[cfg(test)]
@@ -341,6 +375,7 @@ impl LocalStore {
             needs_reload: AtomicBool::new(false),
             snapshot: ArcSwap::from_pointee(LocalSnapshot::default()),
             changed: tokio::sync::watch::channel(0).0,
+            remap_subscribers: parking_lot::Mutex::new(Vec::new()),
             #[cfg(test)]
             write_faults: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -355,8 +390,30 @@ impl LocalStore {
     fn publish(&self, mut snapshot: LocalSnapshot) {
         snapshot.generation = self.snapshot.load().generation + 1;
         let generation = snapshot.generation;
+        let remaps = if snapshot.recovery_error.is_none() {
+            std::mem::take(&mut snapshot.unpublished_room_remaps)
+        } else {
+            Vec::new()
+        };
         self.snapshot.store(Arc::new(snapshot));
+        for remap in remaps {
+            self.publish_room_remap(generation, remap);
+        }
         self.changed.send_replace(generation);
+    }
+
+    fn publish_room_remap(&self, generation: u64, remap: LocalRoomRemap) {
+        let remap = Arc::new(remap);
+        self.remap_subscribers.lock().retain(|subscriber| {
+            let Some(queue) = subscriber.upgrade() else {
+                return false;
+            };
+            queue
+                .events
+                .lock()
+                .push_back((generation, Arc::clone(&remap)));
+            true
+        });
     }
 
     /// Recovery must finish before a writer derives or validates its inputs.
@@ -412,6 +469,7 @@ impl LocalStore {
         let backup = self.root.join("areas-v1-backup");
         let documents = scan_areas(&areas, &legacy, migrate_legacy.then_some(backup.as_path()))?;
         let mut snapshot = LocalSnapshot {
+            unpublished_room_remaps: self.snapshot.load().unpublished_room_remaps.clone(),
             documents: documents
                 .into_iter()
                 .map(|(id, document)| (id, Arc::new(document)))
@@ -540,6 +598,9 @@ impl LocalStore {
     ) -> CloudError {
         let mut snapshot = self.snapshot.load_full().as_ref().clone();
         snapshot.recovery_error = Some(CloudError::InternalError(message.clone()));
+        if let Some(remap) = transaction.room_remap.clone() {
+            snapshot.unpublished_room_remaps.push(remap);
+        }
         snapshot.remember_journaled(transaction);
         self.publish(snapshot);
         CloudError::LocalCommitPending {
@@ -1627,6 +1688,16 @@ impl MapperBackend for LocalBackend {
         area_id: &AreaId,
         envelope: &MutationEnvelope,
     ) -> CloudResult<MutationResult> {
+        self.execute_local_mutation_with_room_remap(area_id, envelope, None)
+            .await
+    }
+
+    async fn execute_local_mutation_with_room_remap(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+        room_remap: Option<LocalRoomRemap>,
+    ) -> CloudResult<MutationResult> {
         let id = *area_id;
         let envelope = envelope.clone();
         self.transact(move |snapshot| {
@@ -1640,6 +1711,7 @@ impl MapperBackend for LocalBackend {
             Ok((
                 LocalMultiWriteTransaction {
                     writes: vec![document],
+                    room_remap,
                     ..Default::default()
                 },
                 result,
@@ -1720,7 +1792,12 @@ impl MapperBackend for LocalBackend {
             Ok((
                 LocalMultiWriteTransaction {
                     writes,
-                    deletes,
+                    deletes: deletes.clone(),
+                    room_remap: Some(LocalRoomRemap {
+                        into: plan.into,
+                        deleted: deletes,
+                        rooms: outcome.rooms.clone(),
+                    }),
                     ..Default::default()
                 },
                 AreaMergeCommit { outcome, documents },
@@ -1854,6 +1931,13 @@ impl MapperBackend for LocalBackend {
 
     async fn subscribe_local(&self) -> CloudResult<Option<tokio::sync::watch::Receiver<u64>>> {
         Ok(Some(self.ensure_loaded().await?.changed.subscribe()))
+    }
+
+    async fn subscribe_local_room_remaps(&self) -> CloudResult<Option<Arc<LocalRoomRemapQueue>>> {
+        let store = self.resolve().await?;
+        let queue = Arc::new(LocalRoomRemapQueue::default());
+        store.remap_subscribers.lock().push(Arc::downgrade(&queue));
+        Ok(Some(queue))
     }
 
     async fn refresh_local(&self) -> CloudResult<()> {

@@ -4,6 +4,7 @@
 
 import {
   createAlias,
+  createEvent,
   createProcedure,
   createState,
   echo,
@@ -22,6 +23,7 @@ import { externalRoomId, isUsableVnum } from "./model.ts";
 import { NukeFireMapper } from "./mapper.ts";
 import { resolveFollowedLocation } from "./location-follow.ts";
 import { ownsSharedMapping } from "./ownership.ts";
+import { validManualLayoutRequest, type ManualLayoutReply, type ManualLayoutRequest } from "./manual-layout.ts";
 import {
   layoutPlannerState,
   layoutWorkerDiagnostics,
@@ -103,6 +105,7 @@ export interface ManualPolishPolicyPayload {
 }
 
 export interface ManualPolishReportPayload {
+  readonly outcome?: string;
   readonly geometricFixedPoint: boolean;
   readonly cutoff?: string;
   readonly polishCutoff?: string;
@@ -164,6 +167,27 @@ export const recordManualPolishResult = createProcedure<RecordManualPolishResult
     });
   },
 );
+
+/** The caller waits for this receipt before announcing a completed reflow. */
+export const manualLayoutApplied = createEvent<ManualLayoutReply>();
+
+export const applyManualLayout = createProcedure<ManualLayoutRequest>(async (result, caller) => {
+  // Trusted packages run in the main isolate, whose host-stamped origin is
+  // "user" and which already has unrestricted mapper access.
+  if ((caller.origin !== "smudgy://kapusniak/nukefire-scripts" && caller.origin !== "user") ||
+    typeof result?.requestId !== "string") return;
+  let accepted = false;
+  let error: string | undefined;
+  try {
+    if (!validManualLayoutRequest(result)) throw new Error("Invalid manual reflow request.");
+    if (!ownsMapping()) throw new Error("The mapping owner changed; run nf reflow again.");
+    await nukefireMapper.applyManualLayout(result);
+    accepted = true;
+  } catch (caught) {
+    error = caught instanceof Error ? caught.message : String(caught);
+  }
+  manualLayoutApplied.emit({ requestId: result.requestId, sessionId: caller.session.id, accepted, error });
+});
 
 let ownershipTimer: ReturnType<typeof setTimeout> | undefined;
 

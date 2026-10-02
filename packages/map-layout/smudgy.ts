@@ -33,7 +33,7 @@ export interface PlanAreaChangeOptions
 /** Stateless façade result: the temporary layout model stays private. */
 export interface AreaChangePlan extends Pick<
   PlannedLayout,
-  "patch" | "positions" | "quality" | "search" | "constraintRepair"
+  "patch" | "positions" | "quality" | "search" | "constraintRepair" | "routeAmendments"
 > {
   /** Exact stable source model accepted after Worker planning. */
   sourceSnapshotKey?: string;
@@ -152,7 +152,7 @@ export async function planAreaChange(
     planOptions,
     { signal: options.signal, timeoutMs: options.timeoutMs },
   );
-  const { before, after, patch, positions, quality, search, constraintRepair } = result;
+  const { before, after, patch, positions, quality, search, constraintRepair, routeAmendments } = result;
   return {
     patch,
     positions,
@@ -165,5 +165,6 @@ export async function planAreaChange(
       }
       : {}),
     ...(constraintRepair ? { constraintRepair } : {}),
+    ...(routeAmendments ? { routeAmendments } : {}),
   };
 }

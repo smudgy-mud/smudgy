@@ -27,8 +27,15 @@ Compact header. Both styles sit directly on the terminal-theme background
 without an extra panel tint.
 
 The Map dims unvisited rooms and their links to 40% opacity. It remembers
-visits by the game's room numbers, so combining map sections keeps them. Its
-**view** menu can hide or clear the current session's trail and reset visit
+visits by the game's room numbers, so combining map sections keeps them. The
+session trail and other-session outlines follow committed whole or partial
+section merges, including room renumbering and duplicate-room joins. Numeric
+game identities take precedence over old map addresses. Visits from before the
+VNUM store are converted once; installations that already have that store
+discard numeric legacy addresses because they may refer to a reused number.
+The first conversion can only resolve surviving addresses: if a number was
+already reused before conversion, the original game identity is unavailable.
+The **view** menu can hide or clear the current session's trail and reset visit
 history for the current area. Connected characters on the same map appear as distinct colored
 room outlines; GPS styling takes precedence where it overlaps the trail.
 
@@ -62,9 +69,17 @@ then records its exact final geometry at a stronger effort tier. A zero-defect
 result suppresses a redundant lower-budget automatic pass; non-perfect results
 do not cross-certify the command's different anchor and lock set.
 
+Both reflow commands send their validated plan to the mapping owner, which
+rechecks the source and final room geometry, commits room moves with compatible
+connection routing, and retains the engine's detours for fixed-room defects.
+The command announces completion after the owner acknowledges the commit. A
+missing acknowledgement reports an unknown result; inspect the map before
+retrying. NukeFire Scripts 0.5.7 requires mapper 0.18.4 and Smudgy 0.5.8.
+
 When **Show live layout planner state** is enabled, the panel also attributes
 automatic work to its area, shows the terminal reason, and exposes map-free
 Worker counts plus optional peak heap/RSS samples and retirement disposition.
+Memory fields show `unavailable` when the Worker host supplies no sample.
 
 Quote room names containing spaces in `run` and `path`. Routes use learned map
 topology and special-exit commands, but intentionally do not open doors or

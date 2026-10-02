@@ -6,6 +6,7 @@
 //  never rebuilds — the MapView keeps its zoom and pan across room changes.
 
 import {
+  createDerived,
   createState,
   getSessions,
   getSettings,
@@ -16,7 +17,7 @@ import {
   type EventSubscription,
   type StateConsumer,
 } from "smudgy:core";
-import { room as mapRoomChanged } from "smudgy:events/map";
+import { merged as mapsMerged, room as mapRoomChanged } from "smudgy:events/map";
 import {
   connected as sessionConnected,
   created as sessionCreated,
@@ -67,18 +68,22 @@ import {
   advanceTrack,
   clearTracks,
   expandTrackedExitRefs,
+  isRoomVisited,
   markAreaUnvisited,
+  migrateVisitedRooms,
   parseVisitedRooms,
   parseVisitedVnums,
   rememberVisitedRoom,
+  remapTracks,
+  remapVisitedRooms,
   roomVnum,
   trackApplication,
-  visitedRoomVnums,
   type MapExitRef,
   type MapLocation,
   type SessionMapSnapshot,
   type VisitedRooms,
 } from "./map-activity.ts";
+import { memorySampleText } from "./layout-telemetry.ts";
 import { sessionMap } from "./index.ts";
 
 const PANE = "Map";
@@ -106,10 +111,16 @@ const mapApply = createState<MapStyleApplication[]>("mapApply");
 mapApply.set([]);
 const mapControls = createState<{ menuHeight: number; tracksVisible: boolean }>("mapControls");
 mapControls.set({ menuHeight: 0, tracksVisible: true });
+const workerMemory = createDerived("workerMemory", layoutDiagnostics, (diagnostics) => ({
+  heap: memorySampleText(diagnostics.memory?.peak?.heapUsed),
+  rss: memorySampleText(diagnostics.memory?.peak?.rss),
+}));
 
 let latestGps: Readonly<CharGps> | undefined;
 let initialized = false;
 let mounted = false;
+// Capture this before recording the current room can create the VNUM store.
+let importLegacyVisits = localStorage.getItem(VISITED_VNUMS_STORAGE_KEY) === null;
 
 interface DirectedMapState {
   view: BoundStateConsumer<SessionMapSnapshot>;
@@ -121,10 +132,20 @@ const directedMaps = new Map<number, DirectedMapState>();
 
 function currentMappedRoom(): Room | undefined {
   const location = mapper.getCurrentLocation();
-  if (location?.room !== undefined) {
-    return mapper.getAreaById(location.area).room(location.room);
-  }
   const vnum = nukefire.value?.Room?.Info?.num;
+  if (location?.room !== undefined) {
+    try {
+      const current = mapper.getAreaById(location.area).room(location.room);
+      const currentVnum = roomVnum(current?.externalId);
+      // A retained address can disappear or acquire another occupant during
+      // migration. Room.Info remains the player's stable game identity.
+      if (current && (!Number.isSafeInteger(vnum) || currentVnum === undefined || currentVnum === vnum)) {
+        return current;
+      }
+    } catch {
+      // The committed merge may already have removed this source area.
+    }
+  }
   return Number.isSafeInteger(vnum)
     ? mapper.findRoomByExternalId(String(vnum))
     : undefined;
@@ -179,22 +200,37 @@ function vnumOf(areaId: string, roomNumber: number): number | undefined {
 
 function rememberLocation(location: MapLocation): void {
   const visited = loadVisitedRooms();
-  const next = rememberVisitedRoom(visited, location);
-  if (next !== visited) saveVisitedRooms(next);
   const vnum = location.roomNumber === null ? undefined : vnumOf(location.areaId, location.roomNumber);
-  if (vnum === undefined) return;
+  if (vnum === undefined) {
+    const next = rememberVisitedRoom(visited, location);
+    if (next !== visited) saveVisitedRooms(next);
+    return;
+  }
   const vnums = loadVisitedVnums();
-  if (vnums.has(vnum)) return;
-  vnums.add(vnum);
-  saveVisitedVnums(vnums);
+  if (!vnums.has(vnum)) {
+    vnums.add(vnum);
+    saveVisitedVnums(vnums);
+  }
+  const remaining = (visited[location.areaId] ?? []).filter((room) => room !== location.roomNumber);
+  if (remaining.length !== (visited[location.areaId] ?? []).length) {
+    if (remaining.length) visited[location.areaId] = remaining;
+    else delete visited[location.areaId];
+    saveVisitedRooms(visited);
+  }
 }
 
-/** Records the vnums of rooms visited by map and room number before vnums were kept. */
+/** Convert the pre-VNUM store once; later addresses cannot certify identity. */
 function backfillVisitedVnums(): void {
-  const vnums = loadVisitedVnums();
-  const before = vnums.size;
-  for (const vnum of visitedRoomVnums(loadVisitedRooms(), vnumOf)) vnums.add(vnum);
-  if (vnums.size !== before) saveVisitedVnums(vnums);
+  const migrated = migrateVisitedRooms(
+    loadVisitedRooms(),
+    loadVisitedVnums(),
+    vnumOf,
+    importLegacyVisits,
+  );
+  saveVisitedVnums(migrated.vnums);
+  saveVisitedRooms(migrated.visited);
+  importLegacyVisits = false;
+  if (mounted) refreshMapStyles();
 }
 
 function traversedExit(
@@ -265,13 +301,9 @@ function expandExitRefs(area: Area, refs: readonly MapExitRef[]): MapExitRef[] {
 function unvisitedApplication(area: Area): MapStyleApplication | undefined {
   const visited = loadVisitedRooms();
   const vnums = loadVisitedVnums();
-  // A room counts as visited by its map and room number, or by its vnum,
-  // which it keeps when maps are combined.
-  const isVisited = (owner: Area, roomNumber: number): boolean => {
-    if ((visited[owner.id] ?? []).includes(roomNumber)) return true;
-    const vnum = roomVnum(owner.room(roomNumber)?.externalId);
-    return vnum !== undefined && vnums.has(vnum);
-  };
+  const isVisited = (owner: Area, roomNumber: number): boolean => isRoomVisited(
+    visited, vnums, owner.id, roomNumber, roomVnum(owner.room(roomNumber)?.externalId),
+  );
   const rooms = area.room_numbers.filter((roomNumber) => !isVisited(area, roomNumber));
   const exits: MapExitRef[] = [];
 
@@ -384,6 +416,14 @@ watchMessage("Char.GPS", updateGps);
 updateGps(nukefire.value?.Char?.GPS);
 
 mapRoomChanged.on(({ areaId, roomNumber }) => recordLocation({ areaId, roomNumber }));
+mapsMerged.on((merge) => {
+  sessionMap.set(remapTracks(ownMapSnapshot(), merge));
+  // Compose addresses without re-reading their occupants: when several merges
+  // are queued, an earlier destination may already have moved again. Only the
+  // initial ready-time conversion may import pre-VNUM legacy identities.
+  saveVisitedRooms(remapVisitedRooms(loadVisitedRooms(), merge));
+  if (mounted) refreshMapStyles();
+});
 
 function syncDirectedMaps(): void {
   const sessions = getSessions();
@@ -553,10 +593,10 @@ function mount(): void {
                 {layoutDiagnostics.bind("workerDisposition", { fallback: "" })}
               </Text>
               <Text size={widgetTextSize(9)} color={UI.dim}>
-                heap {layoutDiagnostics.bind("memory.peak.heapUsed", { fallback: 0 })} B
+                heap {workerMemory.bind("heap", { fallback: "unavailable" })}
               </Text>
               <Text size={widgetTextSize(9)} color={UI.dim}>
-                rss {layoutDiagnostics.bind("memory.peak.rss", { fallback: 0 })} B
+                rss {workerMemory.bind("rss", { fallback: "unavailable" })}
               </Text>
             </Row>
             <Row spacing={10}>

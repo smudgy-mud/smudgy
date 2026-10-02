@@ -27,6 +27,7 @@ use tokio::{
 };
 
 mod captures;
+pub(crate) mod mapper_events;
 mod matcher;
 mod trigger;
 #[cfg(not(feature = "bench-api"))]
@@ -1499,6 +1500,7 @@ impl Runtime {
             // The session's current mapper location, mirrored here from `SetCurrentLocation`
             // and read back by `getCurrentLocation`. Preserved across reload (cloned below).
             let current_location: CurrentLocation = Rc::new(RefCell::new(None));
+            let mapper_events = mapper_events::subscribe(mapper.as_ref());
 
             let pane_registry = local_pane_registry;
 
@@ -1627,6 +1629,7 @@ impl Runtime {
                 emitted_line_count: Rc::downgrade(&emitted_line_count),
                 recent_lines: recent_lines.clone(),
                 current_location: current_location.clone(),
+                mapper_events: mapper_events.clone(),
                 settings_snapshot: settings_snapshot.clone(),
                 pane_registry: pane_registry.clone(),
                 line_routing: line_routing.clone(),
@@ -1684,6 +1687,7 @@ impl Runtime {
                 profile_name: &local_profile_name,
                 mapper: mapper.clone(),
                 session_runtime_rx,
+                mapper_events: mapper_events.clone(),
                 session_runtime_tx: local_session_runtime_tx.clone(),
                 spawned_actions: spawned_actions.clone(),
                 ui_tx: local_ui_tx.clone(),
@@ -2012,6 +2016,7 @@ impl Runtime {
                     emitted_line_count: Rc::downgrade(&emitted_line_count),
                     recent_lines: recent_lines.clone(),
                     current_location: current_location.clone(),
+                    mapper_events: mapper_events.clone(),
                     settings_snapshot: settings_snapshot.clone(),
                     pane_registry: pane_registry.clone(),
                     line_routing: line_routing.clone(),
@@ -2099,6 +2104,7 @@ impl Runtime {
                     server_name: &local_server_name,
                     profile_name: &local_profile_name,
                     session_runtime_rx: old_session_runtime_rx,
+                    mapper_events: mapper_events.clone(),
                     session_runtime_tx: local_session_runtime_tx.clone(),
                     spawned_actions: spawned_actions.clone(),
                     ui_tx: local_ui_tx.clone(),
@@ -2404,6 +2410,7 @@ struct Inner<'a> {
     server_name: &'a Arc<String>,
     profile_name: &'a Arc<String>,
     session_runtime_rx: UnboundedReceiver<RuntimeAction>,
+    mapper_events: mapper_events::SharedMapperEvents,
     session_runtime_tx: UnboundedSender<RuntimeAction>,
     spawned_actions: ActionQueue,
     ui_tx: Sender<TaggedSessionEvent>,
@@ -4060,10 +4067,28 @@ impl Inner<'_> {
         // work, so immediate socket input could beat trigger/state-watch registrations.
         action_stack.push(self.spawned_actions.borrow_mut().drain(..).collect());
         let mut runtime_ready_pending = true;
+        let mapper_event_notify = self
+            .mapper
+            .as_ref()
+            .map(Mapper::mapper_event_notifications)
+            .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new()));
 
         info!("Starting session event loop");
 
         loop {
+            // Arm before checking the subscriber, so publication between the
+            // drain and idle select cannot lose a wakeup.
+            let mapper_event_wake = mapper_event_notify.notified();
+            tokio::pin!(mapper_event_wake);
+            mapper_event_wake.as_mut().enable();
+            let remaps = mapper_events::drain(&self.mapper_events, &self.current_location);
+            if !remaps.is_empty() {
+                if let Some(frame) = action_stack.last_mut() {
+                    mapper_events::insert_remaps(frame, remaps);
+                } else {
+                    action_stack.push(remaps);
+                }
+            }
             // A receiver can disappear between any two actions. Stop after the
             // first failed delivery instead of leaving a registry-visible
             // runtime that repeatedly executes against a dead UI channel.
@@ -4153,6 +4178,18 @@ impl Inner<'_> {
             // appends — a delivery never overtakes the turn that caused it.
             self.flush_session_store();
 
+            // Pumping a lazy mapper op may have adopted a commit and staged
+            // native callbacks. Splice them before dispatching any newly
+            // queued marker, using the same ordering as the pre-pump drain.
+            let remaps = mapper_events::drain(&self.mapper_events, &self.current_location);
+            if !remaps.is_empty() {
+                if let Some(frame) = action_stack.last_mut() {
+                    mapper_events::insert_remaps(frame, remaps);
+                } else {
+                    action_stack.push(remaps);
+                }
+            }
+
             // Phase 2: Get next action to process
             let action = if let Some(current_frame) = action_stack.last_mut() {
                 if let Some(spawned_action) = current_frame.pop_front() {
@@ -4222,6 +4259,7 @@ impl Inner<'_> {
                 let catalogue_resend_at = self.catalogue_resend_at;
                 select! {
                     biased;
+                    () = &mut mapper_event_wake => { continue; }
                     Some(external_action) = rx.recv() => {
                         trace!("Handling external action: {external_action:?}");
                         Some(external_action)

@@ -2269,7 +2269,7 @@ pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'stat
             ("receive", "receive"),
             ("submit", "input"),
         ],
-        "map" => &[("room", "room")],
+        "map" => &[("room", "room"), ("merged", "merged")],
         "gmcp" | "msdp" => &[("ready", "ready"), ("closed", "closed")],
         // MSSP has no negotiation lifecycle scripts can see — the one event is the
         // snapshot merge (`smudgy:state/mssp` holds the merged variables).

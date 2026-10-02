@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use super::{Inner, ReplayMode, area_cache::AreaCache};
+use super::{Inner, MapperEvent, ReplayMode, area_cache::AreaCache};
 use crate::{AreaId, AreaWithDetails, backends::local::LocalSnapshot};
 
 #[derive(Default)]
@@ -18,6 +18,15 @@ pub(super) fn spawn(inner: &Arc<Inner>) {
     let backend = inner.backend.clone();
     let notify = inner.pending.projection_changes();
     let task = tokio::spawn(async move {
+        {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if let Err(error) = ensure_room_remaps(&inner).await {
+                log::warn!("Could not subscribe to local room migrations: {error}");
+                return;
+            }
+        }
         let mut changed = loop {
             match backend.subscribe_local().await {
                 Ok(Some(changed)) => break changed,
@@ -80,6 +89,27 @@ pub(super) fn spawn(inner: &Arc<Inner>) {
         }
     });
     inner.background_tasks.lock().push(task.abort_handle());
+}
+
+pub(super) async fn ensure_room_remaps(inner: &Inner) -> crate::CloudResult<()> {
+    inner
+        .local_room_remaps
+        .get_or_try_init(|| inner.backend.subscribe_local_room_remaps())
+        .await?;
+    Ok(())
+}
+
+fn publish_room_remaps(inner: &Inner, generation: u64) {
+    let Some(Some(queue)) = inner.local_room_remaps.get() else {
+        return;
+    };
+    for remap in queue.take_published(generation) {
+        inner.pending.emit(MapperEvent::AreasMerged {
+            into: remap.into,
+            deleted: remap.deleted.clone(),
+            rooms: remap.rooms.clone(),
+        });
+    }
 }
 
 /// Completion promises wait for session visibility without holding any
@@ -147,6 +177,9 @@ fn reconcile_locked(
     }
     if unchanged {
         recovery.finish_published(inner, &snapshot);
+        if snapshot.recovery_error.is_none() {
+            publish_room_remaps(inner, snapshot.generation);
+        }
         return None;
     }
     let previous = projection.snapshot.as_ref();
@@ -176,18 +209,10 @@ fn reconcile_locked(
         .chain(removed.iter().copied());
     // Degraded startup must expose its scanned survivors without settling
     // delete intents. Only a healthy recovery may release those write fences.
-    if touched.clone().any(|id| {
-        (snapshot.recovery_error.is_none()
-            && inner.pending.blocks_publication(id)
-            && !recovered_fences.contains(&id))
-            || inner
-                .metadata_writes_by_area
-                .lock()
-                .get(&id)
-                .copied()
-                .unwrap_or(0)
-                > 0
-    }) {
+    if touched
+        .clone()
+        .any(|id| area_blocks_publication(inner, &snapshot, id, &recovered_fences))
+    {
         // The caller can still classify its conflict, but must not publish
         // one area while the full generation is waiting behind another fence.
         return replay_deferred(inner, &snapshot, replay);
@@ -228,9 +253,30 @@ fn reconcile_locked(
     }
     recovery.finish_published(inner, &snapshot);
     let generation = snapshot.generation;
+    if snapshot.recovery_error.is_none() {
+        publish_room_remaps(inner, generation);
+    }
     projection.snapshot = Some(snapshot);
     inner.local_published.send_replace(generation);
     target_failure
+}
+
+fn area_blocks_publication(
+    inner: &Inner,
+    snapshot: &LocalSnapshot,
+    id: AreaId,
+    recovered_fences: &HashSet<AreaId>,
+) -> bool {
+    (snapshot.recovery_error.is_none()
+        && inner.pending.blocks_publication(id)
+        && !recovered_fences.contains(&id))
+        || inner
+            .metadata_writes_by_area
+            .lock()
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
+            > 0
 }
 
 impl LocalProjection {

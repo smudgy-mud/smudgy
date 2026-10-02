@@ -10,15 +10,18 @@ import {
   getSessions,
   link,
   mapper,
+  session,
   send,
   sendRaw,
   style,
   submission,
 } from "smudgy:core";
 import { submit } from "smudgy:events/sys";
-import { compareLayoutQuality, planAreaChange } from "smudgy://kapusniak/map-layout";
+import { compareLayoutQuality, layoutSnapshotKey, loadLayoutModel, planAreaChange } from "smudgy://kapusniak/map-layout";
 import { nukefire } from "smudgy://kapusniak/nukefire-gmcp";
-import { recordManualPolishResult } from "smudgy:procedures/kapusniak/nukefire-mapper";
+import { applyManualLayout } from "smudgy:procedures/kapusniak/nukefire-mapper";
+import { manualLayoutApplied } from "smudgy:events/kapusniak/nukefire-mapper";
+import { serializeManualRouteAmendments, waitForManualLayoutCommit } from "./manual-layout.ts";
 import {
   buildNavigationRoute,
   formatRoute,
@@ -33,12 +36,13 @@ import {
   nukeFirePerfectReflowPolicy,
   parseReflowMode,
   perfectRepairPolicyWire,
-  reflowRepairTerminalReason,
+  reflowRepairStatusText,
   type NukeFireReflowMode,
 } from "./reflow-command.ts";
 import * as welcome from "./welcome.tsx";
 
 let reflowing = false;
+let manualLayoutSequence = 0;
 
 interface RoomSummary {
   vnum: number | null;
@@ -405,6 +409,11 @@ async function reflowCurrentArea(mode: NukeFireReflowMode): Promise<void> {
     const constraintRepair = mode === "perfect"
       ? nukeFirePerfectReflowPolicy({ residentCount, edgeCount })
       : undefined;
+    // Both reads must use the same generic and NukeFire-specific lock policy.
+    const isRoomMovable = (room: Room) =>
+      !room.hasTag("LAYOUT_LOCKED") &&
+      room.data("layoutLocked") !== "true" &&
+      room.data("nukefire.layout.locked") !== "true";
     const result = await planAreaChange(location.area, {
       type: "reflow",
       anchor: location.room,
@@ -413,13 +422,10 @@ async function reflowCurrentArea(mode: NukeFireReflowMode): Promise<void> {
       maxPlanningPasses: mode === "perfect" ? undefined : BOUNDED_REFLOW_PLANNING_PASSES,
       timeoutMs: mode === "perfect" ? undefined : BOUNDED_REFLOW_TIMEOUT_MS,
       constraintRepair,
-      includeSnapshotKeys: mode === "perfect",
+      includeSnapshotKeys: true,
       // Honor both map-layout's generic lock conventions and the property used
       // by nukefire-mapper's automatic planner.
-      isRoomMovable: (room) =>
-        !room.hasTag("LAYOUT_LOCKED") &&
-        room.data("layoutLocked") !== "true" &&
-        room.data("nukefire.layout.locked") !== "true",
+      isRoomMovable,
     });
     const updates: [RoomNumber, UpdateRoomParams][] = result.patch.moves.map((move) => {
       if (move.roomNumber === undefined) {
@@ -431,33 +437,43 @@ async function reflowCurrentArea(mode: NukeFireReflowMode): Promise<void> {
         level: move.to.level,
       }];
     });
-    if (updates.length > 0) {
-      await mapper.mutateArea(location.area, (mutation) => mutation.updateRooms(updates), {
-        description: "Reflow NukeFire rooms",
-      });
-      // Re-sending the active location makes mounted MapViews derive their
-      // translation from the player's newly committed room coordinates.
-      const current = mapper.getCurrentLocation();
-      if (current) mapper.setCurrentLocation(current.area, current.room);
+    if (!result.sourceSnapshotKey || !result.plannedSnapshotKey) {
+      throw new Error("reflow returned no validated source and final snapshot keys");
     }
-    if (constraintRepair) {
-      if (!result.plannedSnapshotKey) {
-        throw new Error("perfect reflow returned no validated final snapshot key");
-      }
-      const perfect = result.quality.cardinalRayViolations === 0 &&
-        result.quality.routingViolations === 0 &&
-        result.quality.linkCrossings === 0;
-      const finalArea = mapper.getAreaById(location.area);
-      const owner = getSessions()[0];
-      const recorder = owner ? recordManualPolishResult.to(owner) : recordManualPolishResult;
-      recorder.post({
-        areaUuid: finalArea.id,
-        expectedLayoutSnapshotKey: result.plannedSnapshotKey,
-        policy: perfectRepairPolicyWire(constraintRepair),
-        report: result.constraintRepair,
-        terminalReason: perfect ? "perfect" : undefined,
-        centerId: `room:${location.room}`,
-      });
+    const sourceModel = loadLayoutModel(location.area, { isRoomMovable });
+    if (layoutSnapshotKey(sourceModel) !== result.sourceSnapshotKey) {
+      throw new Error("Map changed after reflow planning; run the command again.");
+    }
+    const routeAmendments = serializeManualRouteAmendments(result.routeAmendments, sourceModel.rooms);
+    const owner = getSessions()[0];
+    if (!owner) throw new Error("No NukeFire mapping session is available.");
+    const requestId = `${session.id}:${Date.now()}:${++manualLayoutSequence}`;
+    const perfect = result.quality.cardinalRayViolations === 0 &&
+      result.quality.routingViolations === 0 && result.quality.linkCrossings === 0;
+    await waitForManualLayoutCommit(requestId, session.id,
+      (receive) => manualLayoutApplied.from(owner).on(receive),
+      () => applyManualLayout.to(owner).post({
+        requestId,
+        areaUuid: location.area,
+        sourceSnapshotKey: result.sourceSnapshotKey!,
+        plannedSnapshotKey: result.plannedSnapshotKey!,
+        moves: updates.map(([roomNumber, position]) => ({
+          roomNumber, x: position.x!, y: position.y!, level: position.level!,
+        })),
+        routeAmendments,
+        centerId: location.room === undefined ? undefined : `room:${location.room}`,
+        ...(constraintRepair ? {
+          policy: perfectRepairPolicyWire(constraintRepair), report: result.constraintRepair,
+          terminalReason: perfect ? "perfect" as const : undefined,
+        } : {}),
+      }),
+    );
+    // The writer may be another session; refresh this caller's moved current room too.
+    if (owner.id !== session.id) {
+      await mapper.ready();
+      const current = mapper.getCurrentLocation();
+      if (current?.room !== undefined && current.area === location.area &&
+        updates.some(([number]) => number === current.room)) mapper.setCurrentLocation(current.area, current.room);
     }
     const search = result.search;
     const improvementText = search && compareLayoutQuality(result.quality, search.baselineQuality) > 0
@@ -469,18 +485,11 @@ async function reflowCurrentArea(mode: NukeFireReflowMode): Promise<void> {
         `selected ${search.selectedAnchor === null ? "the unanchored result" : `room ${search.selectedAnchor} as anchor`}.`
       : "";
     const repair = result.constraintRepair;
-    const repairTerminal = repair && reflowRepairTerminalReason(repair);
     const degradedPerfect = mode === "perfect" && !repair &&
       (result.quality.cardinalRayViolations !== 0 || result.quality.routingViolations !== 0 ||
         result.quality.linkCrossings !== 0);
     const repairText = repair
-      ? ` Repair stopped at ${repairTerminal === "fixed-point"
-        ? "fixed point"
-        : repairTerminal === "ceiling"
-        ? `deterministic ceiling (${repair.cutoff}/${repair.polishCutoff})`
-        : repairTerminal === "cancelled"
-        ? "cancellation"
-        : repairTerminal}.`
+      ? reflowRepairStatusText(repair)
       : degradedPerfect
       ? " Perfect repair failed or was unavailable; kept the validated fallback."
       : "";

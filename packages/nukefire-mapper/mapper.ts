@@ -1,8 +1,12 @@
 import { echo, mapper, type EventSubscription } from "smudgy:core";
 import {
+  createLayoutModel,
   layoutSnapshotKey,
   loadLayoutModel,
+  resolveElevationGeometry,
 } from "smudgy://kapusniak/map-layout";
+import type { ManualLayoutRequest } from "./manual-layout.ts";
+import { maintainAuthoredRoutePoints } from "./authored-route-maintenance.ts";
 import {
   nukefire,
   onMessage,
@@ -907,6 +911,231 @@ export class NukeFireMapper {
     });
   }
 
+  /** The owner validates and commits a manual plan between topology writes. */
+  async applyManualLayout(result: Readonly<ManualLayoutRequest>): Promise<void> {
+    await this.#latencyLanes.exclusive(async () => {
+      const runGeneration = this.#runGeneration;
+      this.#assertCurrentRun(runGeneration);
+      const source = mapper.areas.find((area) => area.id === result.areaUuid);
+      if (!source) throw new Error("The reflow map is no longer active.");
+      const before = loadLayoutModel(source, {
+        isRoomMovable: (room) =>
+          !room.hasTag("LAYOUT_LOCKED") && room.data("layoutLocked") !== "true" &&
+          room.data(ROOM_LAYOUT_LOCK_PROPERTY) !== "true",
+      });
+      if (layoutSnapshotKey(before) !== result.sourceSnapshotKey) {
+        throw new Error("Map changed while reflow was planning; run nf reflow again.");
+      }
+      const moves = new Map(result.moves.map((move) => [move.roomNumber, move]));
+      const numbers = new Set(before.rooms.map((room) => room.roomNumber));
+      if (result.moves.some((move) => !numbers.has(move.roomNumber))) {
+        throw new Error("The reflow refers to a missing room.");
+      }
+      const planned = resolveElevationGeometry(createLayoutModel({
+        ...before,
+        rooms: before.rooms.map((room) => {
+          const move = room.roomNumber === undefined ? undefined : moves.get(room.roomNumber);
+          if (!move) return room;
+          if (room.movable === false && (move.x !== room.position.x || move.y !== room.position.y ||
+            move.level !== room.position.level)) throw new Error("The reflow moves a locked room.");
+          return { ...room, position: { x: move.x, y: move.y, level: move.level } };
+        }),
+        // Up/Down geometry must describe the final levels, just as the facade's key does.
+        edges: before.edges.map(({ constraintVector: _resolved, ...edge }) => edge),
+      }));
+      if (layoutSnapshotKey(planned) !== result.plannedSnapshotKey) {
+        throw new Error("The reflow moves do not match its final snapshot.");
+      }
+      const positions = new Map(planned.rooms.flatMap((room) => room.roomNumber === undefined ? [] :
+        [[residentId(room.roomNumber), room.position] as const]));
+      const routeAmendments: RouteAmendment[] | undefined = result.routeAmendments?.map((amendment) => {
+        const from = residentId(amendment.fromRoomNumber);
+        const to = residentId(amendment.toRoomNumber);
+        const fromPosition = positions.get(from);
+        const toPosition = positions.get(to);
+        if (!fromPosition || !toPosition || fromPosition.level !== toPosition.level ||
+          amendment.waypoints.some((point) => point.level !== fromPosition.level)) {
+          throw new Error("The reflow detour does not match its final rooms.");
+        }
+        return { from, to, waypoints: amendment.waypoints };
+      });
+      const updates: [RoomNumber, UpdateRoomParams][] = result.moves.map((move) => [move.roomNumber, {
+        x: move.x, y: move.y, level: move.level,
+      }]);
+      const committed = await this.#commitLayoutMoves(
+        this.#hydrateArea(source, true), positions, updates, runGeneration,
+        "Reflow NukeFire rooms", routeAmendments,
+      );
+      const after = loadLayoutModel(mapper.getAreaById(source.id), {
+        isRoomMovable: (room) =>
+          !room.hasTag("LAYOUT_LOCKED") && room.data("layoutLocked") !== "true" &&
+          room.data(ROOM_LAYOUT_LOCK_PROPERTY) !== "true",
+      });
+      if (layoutSnapshotKey(after) !== result.plannedSnapshotKey) {
+        throw new Error("Map changed during the reflow commit; no settlement was recorded.");
+      }
+      if (result.policy) {
+        const { maxDurationMs: _durationToken, ...policy } = result.policy;
+        await this.#persistAreaPolishState(committed, {
+          kind: "polish-completed", report: result.report, terminalReason: result.terminalReason,
+          context: perfectPolishContext(livePlanningFingerprint(mapper.getAreaById(source.id)), {
+            ...policy, maxDurationMs: Number.POSITIVE_INFINITY,
+          }, result.centerId),
+        }, runGeneration);
+      }
+    });
+  }
+
+  /** Every host envelope must remain valid while a large move is split into batches. */
+  async #commitLayoutMoves(
+    area: AreaMirror,
+    positions: ReadonlyMap<string, GridPosition>,
+    updates: readonly [RoomNumber, UpdateRoomParams][],
+    runGeneration: number,
+    description: string,
+    routeAmendments?: readonly RouteAmendment[],
+    timings?: { coordinateWriteMs: number; routeWriteMs: number },
+    routeScope?: RouteSyncScope,
+  ): Promise<AreaMirror> {
+    const restores: { id: ConnectionId; routing: ConnectionRouting; points?: MapPoint[] }[] = [];
+    const fieldsByNumber = new Map(updates);
+    const source = mapper.getAreaById(area.id);
+    const storedPositions = new Map<RoomNumber, GridPosition>();
+    const storedPosition = (number: RoomNumber): GridPosition | undefined => {
+      const cached = storedPositions.get(number);
+      if (cached) return cached;
+      const room = source.room(number);
+      if (!room) return undefined;
+      // Authored points follow actual stored coordinates, including fractional
+      // editor positions which the integral planning mirror rounds.
+      const position = { x: room.x, y: room.y, level: room.level };
+      storedPositions.set(number, position);
+      return position;
+    };
+    const levelChanges = new Set(updates.filter(([number, fields]) =>
+      fields.level !== undefined && fields.level !== area.roomsByNumber.get(number)?.position.level
+    ).map(([number]) => number));
+    let routeAfterCommit = false;
+    const routeStartedAt = performance.now();
+    let coordinateWriteMs = 0;
+    await this.#whileCurrentRun(runGeneration, () => this.#mutateArea(area.id, async (mutation) => {
+      // Routing changes precede ALL coordinates. The host stages ordered 256-op
+      // envelopes, so endpoints can briefly be on different levels even when
+      // the completed plan brings both to the same new level.
+      for (const connection of area.connections.values()) {
+        const endpointB = connection.endpointB;
+        if (!endpointB) continue;
+        const authored = routeIsManuallyAuthored(connection.routing);
+        const dormant = routeIsDormant(connection.routing, connection.routePoints);
+        const preservePoints = (authored || dormant) &&
+          (fieldsByNumber.has(connection.endpointA.room_number) || fieldsByNumber.has(endpointB.room_number));
+        const beforeA = preservePoints ? storedPosition(connection.endpointA.room_number) : undefined;
+        const beforeB = preservePoints ? storedPosition(endpointB.room_number) : undefined;
+        const fieldsA = fieldsByNumber.get(connection.endpointA.room_number);
+        const fieldsB = fieldsByNumber.get(endpointB.room_number);
+        const afterA = beforeA ? {
+          x: fieldsA?.x ?? beforeA.x, y: fieldsA?.y ?? beforeA.y, level: fieldsA?.level ?? beforeA.level,
+        } : undefined;
+        const afterB = beforeB ? {
+          x: fieldsB?.x ?? beforeB.x, y: fieldsB?.y ?? beforeB.y, level: fieldsB?.level ?? beforeB.level,
+        } : undefined;
+        const deltaA = beforeA && afterA ? { x: afterA.x - beforeA.x, y: afterA.y - beforeA.y } : undefined;
+        const deltaB = beforeB && afterB ? { x: afterB.x - beforeB.x, y: afterB.y - beforeB.y } : undefined;
+        const points = (authored || dormant) && beforeA && beforeB && afterA && afterB && deltaA && deltaB &&
+          (deltaA.x !== 0 || deltaA.y !== 0 || deltaB.x !== 0 || deltaB.y !== 0)
+          ? maintainAuthoredRoutePoints({
+            points: connection.routePoints, endpointA: connection.endpointA, endpointB,
+            beforeA, beforeB, afterA, afterB, segmentShape: connection.segmentShape,
+            authored: authored && afterA.level === afterB.level,
+          })
+          : undefined;
+        const demote = (levelChanges.has(connection.endpointA.room_number) ||
+          levelChanges.has(endpointB.room_number)) && (connection.routing === "Automatic" || authored);
+        if (points || demote && authored) restores.push({ id: connection.id, routing: connection.routing, points });
+        if (!demote) continue;
+        await mutation.setConnection(connection.id, {
+          routing: "Simple",
+          ...(authored ? {} : { segment_shape: "Direct", route_points: [] }),
+        });
+        connection.routing = "Simple";
+        if (!authored) { connection.segmentShape = "Direct"; connection.routePoints = []; }
+      }
+      if (updates.length > 0) {
+        const coordinateStartedAt = performance.now();
+        await this.#whileCurrentRun(runGeneration, () => mutation.updateRooms([...updates]));
+        coordinateWriteMs += performance.now() - coordinateStartedAt;
+        for (const [number, fields] of updates) {
+          const room = area.roomsByNumber.get(number);
+          if (room) room.position = roundedPosition(
+            fields.x ?? room.position.x, fields.y ?? room.position.y, fields.level ?? room.position.level,
+          );
+        }
+      }
+      // The host maintains stored points after room moves, including points
+      // explicitly set in that envelope. Generate final routes afterward so
+      // a shared endpoint translation cannot shift a new detour twice.
+      routeAfterCommit = updates.length > 0 || await this.#syncAreaConnectionRoutes(
+        area, area.roomsByNumber, positions, runGeneration, mutation, routeAmendments, routeScope,
+      );
+    }, description));
+    // Topology growth plans before creating its new rooms. Its assignments
+    // must keep the registered mirror they will populate afterward. With no
+    // moves, route sync already updated that mirror and no host point
+    // maintenance needs to be read back.
+    if (updates.length === 0 && !routeAfterCommit && restores.length === 0) {
+      if (timings) timings.routeWriteMs += performance.now() - routeStartedAt;
+      return area;
+    }
+    // The host may translate stored authored points when both endpoints move together.
+    let committed = this.#hydrateArea(mapper.getAreaById(area.id), true);
+    if (restores.length > 0) {
+      await this.#whileCurrentRun(runGeneration, () => this.#mutateArea(area.id, async (mutation) => {
+        for (const restore of restores) {
+          const connection = committed.connections.get(connectionMirrorKey(restore.id));
+          if (!connection) continue;
+          await mutation.setConnection(restore.id, {
+            routing: connection.kind === "CrossLevel" ? "Simple" : restore.routing,
+            ...(restore.points ? { route_points: restore.points } : {}),
+          });
+        }
+      }, `Preserve authored NukeFire routes in ${area.name}`));
+      committed = this.#hydrateArea(mapper.getAreaById(area.id), true);
+    }
+    if (routeAfterCommit) {
+      await this.#routeConnectionsAfterCommit(
+        committed, committed.roomsByNumber, positions, runGeneration, routeAmendments,
+      );
+      committed = this.#hydrateArea(mapper.getAreaById(area.id), true);
+    }
+    // Progressive callers retain their resident objects for reconciliation.
+    // Refresh their fields as well as the mapper cache's newly hydrated mirror.
+    const retainedRooms = new Map(area.roomsByNumber);
+    area.roomsByNumber.clear();
+    for (const [number, room] of committed.roomsByNumber) {
+      const existing = retainedRooms.get(number);
+      this.#registerRoom(area, existing ? Object.assign(existing, room) : room);
+    }
+    area.name = committed.name;
+    area.storage = committed.storage;
+    area.polishPending = committed.polishPending;
+    area.polishMemo = committed.polishMemo;
+    area.polishSeams = committed.polishSeams;
+    area.connections = committed.connections;
+    this.#registerArea(area);
+    if (timings) {
+      timings.coordinateWriteMs += coordinateWriteMs;
+      timings.routeWriteMs += performance.now() - routeStartedAt - coordinateWriteMs;
+    }
+    const refreshed = this.#refreshMovedCurrentRoom(
+      area, updates.map(([number]) => ({ id: residentId(number) })), runGeneration,
+    );
+    // A manual command can select a room without a Room.Info observation in the owner.
+    const current = mapper.getCurrentLocation();
+    if (!refreshed && current?.room !== undefined && current.area === area.id &&
+      updates.some(([number]) => number === current.room)) mapper.setCurrentLocation(current.area, current.room);
+    return area;
+  }
+
   #logDecision(record: DecisionLogRecord): void {
     const error = this.#decisionLogger.append(record);
     if (!error) {
@@ -1276,8 +1505,8 @@ export class NukeFireMapper {
     area: AreaMirror,
     reconciled: readonly { readonly id: string }[],
     runGeneration: number,
-  ): void {
-    this.#currentLocationFreshness.publishIfCurrent(
+  ): boolean {
+    return this.#currentLocationFreshness.publishIfCurrent(
       (vnum) => {
         const room = this.#roomsByVnum.get(vnum);
         if (!room || !sameAreaId(room.areaId, area.id)) return undefined;
@@ -1699,42 +1928,10 @@ export class NukeFireMapper {
           y: update.position.y,
           level: update.position.level,
         }]);
-        let routeAfterCommit = false;
-        await this.#whileCurrentRun(
-          runGeneration,
-          () => this.#mutateArea(live.id, async (mutation) => {
-            if (updates.length > 0) {
-              await this.#whileCurrentRun(runGeneration, () => mutation.updateRooms(updates));
-              for (const [number, fields] of updates) {
-                const room = live.roomsByNumber.get(number);
-                if (!room) continue;
-                room.position = roundedPosition(
-                  fields.x ?? room.position.x,
-                  fields.y ?? room.position.y,
-                  fields.level ?? room.position.level,
-                );
-              }
-            }
-            routeAfterCommit = await this.#syncAreaConnectionRoutes(
-              live,
-              live.roomsByNumber,
-              plan.positions,
-              runGeneration,
-              mutation,
-              plan.routeAmendments,
-            );
-          }, `Tidy NukeFire area ${live.name}`),
+        const committed = await this.#commitLayoutMoves(
+          live, plan.positions, updates, runGeneration, `Tidy NukeFire area ${live.name}`, plan.routeAmendments,
         );
-        if (routeAfterCommit) {
-          await this.#routeConnectionsAfterCommit(
-            live,
-            live.roomsByNumber,
-            plan.positions,
-            runGeneration,
-            plan.routeAmendments,
-          );
-        }
-        fingerprint = mirrorPlanningFingerprint(live);
+        fingerprint = mirrorPlanningFingerprint(committed);
         onMap = plan.quality;
         applied += 1;
       });
@@ -2104,7 +2301,7 @@ export class NukeFireMapper {
     }
 
     assertNotAborted(signal);
-    await this.#syncLinks(links, rooms, runGeneration);
+    const linksChanged = await this.#syncLinks(links, rooms, runGeneration);
     assertNotAborted(signal);
     this.#assertCurrentRun(runGeneration);
     for (const [key, link] of this.#pendingVerticalLinks) {
@@ -2115,7 +2312,9 @@ export class NukeFireMapper {
         this.#pendingVerticalLinks.delete(key);
       }
     }
-    await this.#syncClosedVerticalExits(verticalExits, rooms.get(snapshot.center), runGeneration);
+    const closedExitsChanged = await this.#syncClosedVerticalExits(
+      verticalExits, rooms.get(snapshot.center), runGeneration,
+    );
     assertNotAborted(signal);
     this.#assertCurrentRun(runGeneration);
 
@@ -2124,7 +2323,7 @@ export class NukeFireMapper {
     // translation from the room's coordinates, so the viewport follows a player
     // room the layout moved, and a map restyles what the player has not visited
     // when it hears the location, so it shows the rooms this snapshot added.
-    if ((currentWasRepositioned || addsRooms) && current && currentObservation) {
+    if ((currentWasRepositioned || addsRooms || linksChanged || closedExitsChanged) && current && currentObservation) {
       this.#setCurrentRoom(current, currentObservation, runGeneration, true);
     }
 
@@ -2602,41 +2801,12 @@ export class NukeFireMapper {
               if (updates.length === 0) return;
 
               const batchStartedAt = performance.now();
-              let routeAfterCommit = false;
-              await this.#whileCurrentRun(
-                runGeneration,
-                () => this.#mutateArea(area.id, async (mutation) => {
-                  assertNotAborted(planningSignal);
-                  const coordinateWriteStartedAt = performance.now();
-                  await this.#whileCurrentRun(
-                    runGeneration,
-                    () => mutation.updateRooms(updates),
-                  );
-                  assertNotAborted(planningSignal);
-                  stats.coordinateWriteMs += performance.now() - coordinateWriteStartedAt;
-                  stats.movedRooms += updates.length;
-                  for (const [number, fields] of updates) {
-                    const room = residentRooms.get(number);
-                    if (!room) continue;
-                    room.position = roundedPosition(
-                      fields.x ?? room.position.x,
-                      fields.y ?? room.position.y,
-                      fields.level ?? room.position.level,
-                    );
-                  }
-                  const routeWriteStartedAt = performance.now();
-                  routeAfterCommit = await this.#syncAreaConnectionRoutes(
-                    area,
-                    residentRooms,
-                    candidate.positions,
-                    runGeneration,
-                    mutation,
-                    candidate.routeAmendments,
-                  );
-                  assertNotAborted(planningSignal);
-                  stats.routeWriteMs += performance.now() - routeWriteStartedAt;
-                }, `Apply progressive NukeFire reflow for ${area.name}`),
+              assertNotAborted(planningSignal);
+              await this.#commitLayoutMoves(
+                area, candidate.positions, updates, runGeneration,
+                `Apply progressive NukeFire reflow for ${area.name}`, candidate.routeAmendments, stats,
               );
+              stats.movedRooms += updates.length;
               for (const update of reconciled) appliedPositionIds.add(update.id);
               expectedFingerprint = mirrorPlanningFingerprint(area);
               // The layout is on the map now, even if movement aborts this
@@ -2652,7 +2822,6 @@ export class NukeFireMapper {
               }
               // The transaction can move a newer current room which belongs to
               // this area even when this plan's snapshot center is stale.
-              this.#refreshMovedCurrentRoom(area, reconciled, runGeneration);
               assertNotAborted(planningSignal);
               stats.batchCommitMs += performance.now() - batchStartedAt;
               this.#logDecision({
@@ -2666,15 +2835,6 @@ export class NukeFireMapper {
               // resumes with a fresh allowance, since the ratchet means every
               // retry starts from a strictly better map.
               this.#quietPolishClaims.markProgress(snapshot, areaKey(area));
-              if (routeAfterCommit) {
-                await this.#routeConnectionsAfterCommit(
-                  area,
-                  residentRooms,
-                  candidate.positions,
-                  runGeneration,
-                  candidate.routeAmendments,
-                );
-              }
 
             }, (error) => progressiveController?.abort(error), {
               minIntervalMs: PROGRESSIVE_APPLY_FLOOR_MS,
@@ -3006,64 +3166,19 @@ export class NukeFireMapper {
           "before applying layout",
         );
         const batchStartedAt = performance.now();
-        let routeAfterCommit = false;
-        await this.#whileCurrentRun(
-          runGeneration,
-          () => this.#mutateArea(area.id, async (mutation) => {
-            if (updates.length > 0) {
-              const coordinateWriteStartedAt = performance.now();
-              await this.#whileCurrentRun(
-                runGeneration,
-                () => mutation.updateRooms(updates),
-              );
-              assertNotAborted(signal);
-              stats.coordinateWriteMs += performance.now() - coordinateWriteStartedAt;
-              stats.movedRooms += updates.length;
-              for (const [number, fields] of updates) {
-                const room = residentRooms.get(number);
-                if (!room) continue;
-                room.position = roundedPosition(
-                  fields.x ?? room.position.x,
-                  fields.y ?? room.position.y,
-                  fields.level ?? room.position.level,
-                );
-              }
-            }
-            const routeWriteStartedAt = performance.now();
-            const residentIds = new Set([...residentRooms.keys()].map(residentId));
-            routeAfterCommit = await this.#syncAreaConnectionRoutes(
-              area,
-              residentRooms,
-              plan.positions,
-              runGeneration,
-              mutation,
-              plan.routeAmendments,
-              updates.length > 0 ? undefined : {
-                rooms: new Set(),
-                cells: [...plan.positions]
-                  .filter(([id]) => !residentIds.has(id))
-                  .map(([, position]) => position),
-              },
-            );
-            assertNotAborted(signal);
-            stats.routeWriteMs += performance.now() - routeWriteStartedAt;
-          }, `Reflow NukeFire area ${area.name}`),
+        const residentIds = new Set([...residentRooms.keys()].map(residentId));
+        await this.#commitLayoutMoves(
+          area, plan.positions, updates, runGeneration, `Reflow NukeFire area ${area.name}`,
+          plan.routeAmendments, stats, updates.length > 0 ? undefined : {
+            rooms: new Set(),
+            cells: [...plan.positions].filter(([id]) => !residentIds.has(id)).map(([, position]) => position),
+          },
         );
+        stats.movedRooms += updates.length;
         for (const update of reconciled) appliedPositionIds.add(update.id);
-        this.#refreshMovedCurrentRoom(area, reconciled, runGeneration);
         this.#reconciledPortAreas.add(areaKey(area));
         assertNotAborted(signal);
         stats.batchCommitMs += performance.now() - batchStartedAt;
-        if (routeAfterCommit) {
-          await this.#routeConnectionsAfterCommit(
-            area,
-            residentRooms,
-            plan.positions,
-            runGeneration,
-            plan.routeAmendments,
-          );
-          assertNotAborted(signal);
-        }
       }
 
       assertNotAborted(signal);
@@ -3655,8 +3770,9 @@ export class NukeFireMapper {
     links: readonly NukeFireMapLink[],
     rooms: Map<number, RoomMirror>,
     runGeneration: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     this.#assertCurrentRun(runGeneration);
+    let changed = false;
     const processed = new Set<string>();
     const batchable = new Map<string, {
       link: NukeFireMapLink;
@@ -3712,6 +3828,7 @@ export class NukeFireMapper {
             }
           }, "Apply NukeFire map links"),
         );
+        changed ||= routesNeedSync;
         const area = this.#areasById.get(areaIdKey(areaId));
         if (routesNeedSync && area) {
           // A Connection created earlier in one host mutation is not visible to
@@ -3742,6 +3859,8 @@ export class NukeFireMapper {
         }
       } catch (caught) {
         if (caught instanceof ObsoleteNukeFireMapperRunError) throw caught;
+        // A failed response can follow a durable topology write; refresh after recovery.
+        changed = true;
         // A drafted createLink cannot discover a host topology rejection until
         // submission. The failed batch has already rehydrated this area, so retry
         // each link against fresh mirrors and preserve the established traversal
@@ -3795,8 +3914,9 @@ export class NukeFireMapper {
       }
     }
     for (const work of crossArea) {
-      await this.#syncLink(work.link, work.from, work.to, work.mapped, runGeneration);
+      changed = await this.#syncLink(work.link, work.from, work.to, work.mapped, runGeneration) || changed;
     }
+    return changed;
   }
 
   /**
@@ -3808,9 +3928,9 @@ export class NukeFireMapper {
     observations: readonly VerticalExitObservation[],
     room: RoomMirror | undefined,
     runGeneration: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     this.#assertCurrentRun(runGeneration);
-    if (!room) return;
+    if (!room) return false;
     const pending: {
       observation: VerticalExitObservation;
       existing?: ExitMirror;
@@ -3830,7 +3950,7 @@ export class NukeFireMapper {
       }
       pending.push({ observation, existing });
     }
-    if (pending.length === 0) return;
+    if (pending.length === 0) return false;
 
     await this.#whileCurrentRun(
       runGeneration,
@@ -3863,6 +3983,7 @@ export class NukeFireMapper {
         }
       }, `Apply NukeFire vertical exits for room ${room.roomNumber}`),
     );
+    return true;
   }
 
   async #syncLink(

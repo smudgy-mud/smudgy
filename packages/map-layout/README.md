@@ -77,6 +77,13 @@ With `includeSnapshotKeys: true`, the result's `sourceSnapshotKey` and
 final models, so later proof/metadata posts can reject a live area that no
 longer matches the plan. Ordinary callers pay no allocation for these keys.
 
+The façade also returns `routeAmendments`, when planning discovers grid
+waypoints for a connection detour. These use the source model's room IDs.
+The temporary `before` model stays private; a later commit tool can reload
+`loadLayoutModel` with the same movability policy, verify its
+`layoutSnapshotKey` against `sourceSnapshotKey`, and use its room numbers
+to serialize the detours along with the move patch.
+
 Two existing rooms can be connected while planning the reflow required by the
 new topology:
 
@@ -111,6 +118,24 @@ Async calls accept an optional `AbortSignal` and parent-side `timeoutMs`.
 Canceling queued work does not disturb the active job. Canceling active work
 terminates that Worker, rejects only that request, and resumes queued work on a
 fresh Worker.
+
+The synchronous `compactIntegralLayoutPlan` also accepts `shouldCancel` for
+cooperative deadlines. Packing polls between axis, group and spacing trials,
+and within recursive gravity closures. Once a poll observes cancellation,
+the public call returns its original seed plan; an unfinished packing
+transaction cannot become a published layout. Preparation and scoring can
+still delay a poll, so this control does not promise an exact wall-clock
+ceiling or provide resumable work. Parent-side Worker cancellation remains
+the way to interrupt an asynchronous job.
+
+Gravity trials reuse swept-link geometry while their candidate positions
+remain unchanged. Adopting a move prepares fresh geometry. Closure checks,
+quality admission and compaction to a fixed point retain their existing
+ordering and rules.
+
+Rigid translation trials also reuse the obstruction totals for their unchanged
+base geometry and moving group. Each trial still queries the translated rooms
+and links and uses the same full quality order when choosing a layout.
 
 The shared Workers run one request at a time, so a long search delays every
 request queued behind it. `createLayoutPlanner()` returns a planner whose
