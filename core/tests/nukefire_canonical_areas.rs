@@ -1042,7 +1042,9 @@ room.on(({ areaId, roomNumber }) => {
     assert!(
         session
             .wait_until(|lines| lines.iter().any(|line| line == "LINK-WATCH 0"))
-            .await
+            .await,
+        "the initial room notification never arrived:\n{}",
+        session.transcript()
     );
     session.run_for(Duration::from_millis(500)).await;
     session.visit(
@@ -1055,10 +1057,19 @@ room.on(({ areaId, roomNumber }) => {
             direction: "east",
         }],
     );
-    session.run_for(Duration::from_millis(1200)).await;
-    assert_eq!(
+    let expected_target = room_key(&mapper, 190_002);
+    let completed = session
+        .wait_until(|lines| {
+            exit_target(&mapper, 190_001, East).as_ref() == Some(&expected_target)
+                && lines.iter().any(|line| line == "LINK-WATCH 1")
+        })
+        .await;
+    assert!(
+        completed,
+        "link-only chart did not commit and notify map observers; expected East target \
+         {expected_target:?}, actual {:?}:\n{}",
         exit_target(&mapper, 190_001, East),
-        Some(room_key(&mapper, 190_002))
+        session.transcript()
     );
     let notifications = session
         .lines
@@ -1087,11 +1098,6 @@ room.on(({ areaId, roomNumber }) => {
         session.transcript()
     );
     session.shutdown();
-    assert!(
-        session.lines.iter().any(|line| line == "LINK-WATCH 1"),
-        "link committed but map:room observers never saw it:\n{}",
-        session.transcript()
-    );
 }
 
 async fn seed_manual_level_reflow(mapper: &Mapper, atlas: AtlasId) -> AreaId {
