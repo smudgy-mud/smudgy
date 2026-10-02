@@ -4,8 +4,9 @@
 //! earlier envelopes were acknowledged surfaces the committed prefix on the
 //! thrown error's `committedOperations` property.
 
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -212,11 +213,14 @@ async fn run_module_on(
     command: &str,
     sentinel_prefix: &str,
 ) -> Vec<String> {
-    let home = tempfile::tempdir().expect("create temp home");
-    let home_path = home.path().to_path_buf();
-    std::mem::forget(home);
-    smudgy_core::set_smudgy_home(&home_path);
-    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    // The home override is process-wide; initialize it once for parallel tests.
+    // Keep it alive after returning because session shutdown is asynchronous.
+    static SMUDGY_HOME: OnceLock<PathBuf> = OnceLock::new();
+    let smudgy_home = SMUDGY_HOME.get_or_init(|| {
+        let home_path = tempfile::tempdir().expect("create temp home").keep();
+        smudgy_core::set_smudgy_home(&home_path);
+        smudgy_core::get_smudgy_home().expect("smudgy home")
+    });
     std::fs::create_dir_all(smudgy_home.join(server).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(server).join("logs")).unwrap();
     std::fs::write(
@@ -226,7 +230,9 @@ async fn run_module_on(
     .unwrap();
 
     let backend: Arc<dyn MapperBackend + Send + Sync> = Arc::new(backend);
-    let mapper = Mapper::new(backend, smudgy_home.join("map-cache"));
+    // Each test uses a distinct server name. Independent mappers must not share
+    // a journal: startup recovery can quarantine another mapper's pending writes.
+    let mapper = Mapper::new(backend, smudgy_home.join(server).join("map-cache"));
 
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(session),
@@ -372,7 +378,8 @@ createAlias("^gocollide$", async () => {
             const committed = error instanceof MutateAreaError ? error.committedOperations : undefined;
             const named = String(error).includes("room_number_exists");
             echo("COLLIDE_ERR named=" + named + " committed=" +
-                (Array.isArray(committed) ? committed.length : "missing"));
+                (Array.isArray(committed) ? committed.length : "missing") +
+                " error=" + String(error));
         }
     } catch (error) {
         echo("COLLIDE_SETUP_FAIL " + error);
@@ -392,7 +399,7 @@ createAlias("^gocollide$", async () => {
     assert!(
         lines
             .iter()
-            .any(|line| line == "COLLIDE_ERR named=true committed=0"),
+            .any(|line| line.starts_with("COLLIDE_ERR named=true committed=0 error=")),
         "the refusal must read as the room-number collision with no committed prefix.\n{transcript}"
     );
 }
