@@ -4,8 +4,9 @@
 //! earlier envelopes were acknowledged surfaces the committed prefix on the
 //! thrown error's `committedOperations` property.
 
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,11 +22,6 @@ use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams,
 use std::sync::Mutex;
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// The smudgy home is process-wide and the first test to set it wins, so every
-/// test in this file shares it. They run one at a time, each with a server
-/// folder and a map cache of its own.
-static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 /// A single-tier local-flavored backend serving areas from memory. Envelope
 /// execution succeeds for a budgeted number of calls, then fails permanently
@@ -209,7 +205,6 @@ async fn run_module(
     .await
 }
 
-#[allow(clippy::await_holding_lock)] // HOME_LOCK serialises whole sessions, awaits included
 async fn run_module_on(
     backend: BudgetedBackend,
     server: &str,
@@ -218,14 +213,14 @@ async fn run_module_on(
     command: &str,
     sentinel_prefix: &str,
 ) -> Vec<String> {
-    let _home = HOME_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let home = tempfile::tempdir().expect("create temp home");
-    let home_path = home.path().to_path_buf();
-    std::mem::forget(home);
-    smudgy_core::set_smudgy_home(&home_path);
-    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    // The home override is process-wide; initialize it once for parallel tests.
+    // Keep it alive after returning because session shutdown is asynchronous.
+    static SMUDGY_HOME: OnceLock<PathBuf> = OnceLock::new();
+    let smudgy_home = SMUDGY_HOME.get_or_init(|| {
+        let home_path = tempfile::tempdir().expect("create temp home").keep();
+        smudgy_core::set_smudgy_home(&home_path);
+        smudgy_core::get_smudgy_home().expect("smudgy home")
+    });
     std::fs::create_dir_all(smudgy_home.join(server).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(server).join("logs")).unwrap();
     std::fs::write(
@@ -235,10 +230,9 @@ async fn run_module_on(
     .unwrap();
 
     let backend: Arc<dyn MapperBackend + Send + Sync> = Arc::new(backend);
-    // A Mapper replays the write-ahead journal in its cache when it starts, so
-    // a cache shared with another test's Mapper would replay or clear that
-    // test's pending mutations.
-    let mapper = Mapper::new(backend, home_path.join("map-cache"));
+    // Each test uses a distinct server name. Independent mappers must not share
+    // a journal: startup recovery can quarantine another mapper's pending writes.
+    let mapper = Mapper::new(backend, smudgy_home.join(server).join("map-cache"));
 
     let params = Arc::new(SessionParams {
         session_id: SessionId::from(session),
@@ -384,7 +378,8 @@ createAlias("^gocollide$", async () => {
             const committed = error instanceof MutateAreaError ? error.committedOperations : undefined;
             const named = String(error).includes("room_number_exists");
             echo("COLLIDE_ERR named=" + named + " committed=" +
-                (Array.isArray(committed) ? committed.length : "missing"));
+                (Array.isArray(committed) ? committed.length : "missing") +
+                " error=" + String(error));
         }
     } catch (error) {
         echo("COLLIDE_SETUP_FAIL " + error);
@@ -404,7 +399,7 @@ createAlias("^gocollide$", async () => {
     assert!(
         lines
             .iter()
-            .any(|line| line == "COLLIDE_ERR named=true committed=0"),
+            .any(|line| line.starts_with("COLLIDE_ERR named=true committed=0 error=")),
         "the refusal must read as the room-number collision with no committed prefix.\n{transcript}"
     );
 }

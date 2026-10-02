@@ -29,6 +29,8 @@ const TIMEOUT: Duration = Duration::from_mins(1);
 /// marker echo, plus the end-of-case marker. The alias and the echo ride the same ordered
 /// queue as the action the verb routes, so seeing a marker means the verb's own dispatch has
 /// already happened — which is what lets a case assert that *no* event was emitted.
+/// Buffer updates can be batched while transport events are delivered immediately, so
+/// their UI arrival order need not preserve that dispatch interleave.
 ///
 /// The markers are echoes rather than the sent text itself: a send that fails reports the
 /// failure and stops, so it never reaches the local echo a marker would depend on.
@@ -345,36 +347,50 @@ async fn connect_and_disconnect_are_no_ops_against_the_state_already_held() {
     })
     .await;
 
-    let markers: Vec<&Seen> = seen
+    let transport_events: Vec<&Seen> = seen
         .iter()
         .filter(|entry| {
-            matches!(entry, Seen::Line(line)
-                if line.contains("PROBED") || line.contains("TRANSPORT_DONE"))
-                || !matches!(
-                    entry,
-                    Seen::Line(_) | Seen::System(_) | Seen::SystemReplaced(_)
-                )
+            !matches!(
+                entry,
+                Seen::Line(_) | Seen::System(_) | Seen::SystemReplaced(_)
+            )
         })
         .collect();
 
     assert_eq!(
-        markers,
+        transport_events,
         vec![
             &Seen::Connected,
-            // connect() while connected: nothing between the marker and the one before it.
-            &Seen::Line("CONNECT_PROBED".to_string()),
             &Seen::DisconnectRequested,
-            &Seen::Line("DISCONNECT_PROBED".to_string()),
             &Seen::Disconnected,
-            // disconnect() while disconnected: nothing.
-            &Seen::Line("DISCONNECT_PROBED".to_string()),
             &Seen::ConnectRequested {
                 only_if_intended: false
             },
-            &Seen::Line("CONNECT_PROBED".to_string()),
-            &Seen::Line("TRANSPORT_DONE".to_string()),
         ],
-        "transcript:\n{seen:#?}"
+        "transport requests must retain their order without extra no-op requests:\n{seen:#?}"
+    );
+
+    // Every probe completed in dispatch order, even when echoes reached the UI
+    // together after the immediately delivered transport events.
+    let markers: Vec<&str> = seen
+        .iter()
+        .filter_map(|entry| match entry {
+            Seen::Line(line) if line.contains("PROBED") || line.contains("TRANSPORT_DONE") => {
+                Some(line.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        markers,
+        vec![
+            "CONNECT_PROBED",
+            "DISCONNECT_PROBED",
+            "DISCONNECT_PROBED",
+            "CONNECT_PROBED",
+            "TRANSPORT_DONE",
+        ],
+        "probe completion markers must retain their order:\n{seen:#?}"
     );
 }
 
