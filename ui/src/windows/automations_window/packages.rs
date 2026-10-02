@@ -53,6 +53,7 @@ use super::model::{
     CreatorAutomations, DepEdge, NodeStatus, package_display_name, parse_specifier, specifier_for,
 };
 use super::param_values::{self, ParamTarget, ParamValueEdit, ParamValueState, ScalarEdit};
+use super::readme;
 use super::{
     AutomationsWindow, DiscoverScope, Elem, Event, InstalledPackageTab, InstalledReadmeState,
     LocalPackageTab, Message, Pane, PendingActivationCascade, Selection,
@@ -8610,15 +8611,7 @@ impl AutomationsWindow {
             );
         }
         if let Some(readme) = &self.discover_readme {
-            let settings = markdown::Settings::with_text_size(
-                13.0,
-                markdown::Style::from_palette(iced::theme::Palette::DARK),
-            );
-            col = col.push(
-                container(markdown::view(readme.items(), settings).map(Message::OpenReadmeLink))
-                    .padding(10.0)
-                    .style(common::code_surface_style),
-            );
+            col = col.push(readme::view(readme));
         }
 
         // Rate — an account-only write, so the star control shows only when signed in.

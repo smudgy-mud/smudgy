@@ -71,15 +71,7 @@ impl AutomationsWindow {
             )
             .padding(10.0)
             .into(),
-            InstalledReadmeState::Loaded(Some(readme)) => {
-                let settings = markdown::Settings::with_text_size(
-                    13.0,
-                    markdown::Style::from_palette(iced::theme::Palette::DARK),
-                );
-                container(markdown::view(readme.items(), settings).map(Message::OpenReadmeLink))
-                    .width(Length::Fill)
-                    .into()
-            }
+            InstalledReadmeState::Loaded(Some(readme)) => readme::view(readme),
             InstalledReadmeState::Loaded(None) => container(
                 text(crate::i18n::t!("package-no-readme"))
                     .size(13.0)

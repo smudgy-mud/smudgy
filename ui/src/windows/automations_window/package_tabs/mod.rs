@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use iced::Length;
 use iced::alignment::Vertical;
 use iced::widget::{
-    Column, Id, button, column, container, markdown, pick_list, radio, row, text, text_input,
+    Column, Id, button, column, container, pick_list, radio, row, text, text_input,
 };
 use smudgy_cloud::DependencyKind;
 use smudgy_core::models::profile_activation::ProfileActivation;
@@ -30,6 +30,7 @@ use super::packages::{
     local_package_tab_button, metric, publish_output_panel, publish_verdict, rating_metric,
     star_rate_row,
 };
+use super::readme;
 use super::{AutomationsWindow, Elem, InstalledPackageTab, LocalPackageTab, Message, Selection};
 
 /// How the open package reaches a package listed under Dependencies: imported into its own
@@ -762,14 +763,7 @@ impl AutomationsWindow {
         if tab == LocalPackageTab::About
             && let Some(readme) = &self.local_readme
         {
-            let settings = markdown::Settings::with_text_size(
-                13.0,
-                markdown::Style::from_palette(iced::theme::Palette::DARK),
-            );
-            body = body.push(
-                container(markdown::view(readme.items(), settings).map(Message::OpenReadmeLink))
-                    .width(Length::Fill),
-            );
+            body = body.push(readme::view(readme));
         }
 
         // Rename affordance — the folder name is the package's identity (the manifest has no name),
