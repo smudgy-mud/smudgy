@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790848789634,
+  "lastUpdate": 1790912899689,
   "repoUrl": "https://github.com/smudgy-mud/smudgy",
   "entries": {
     "smudgy / main / m8a.2xlarge / Rust 1.97.1": [
@@ -231118,6 +231118,2214 @@ window.BENCHMARK_DATA = {
             "range": "18023.9..18030.3",
             "unit": "ns/iter",
             "extra": "Run: main push\nSource: 4ab225f421d0ceb300e039cb11e84242bbc445f3\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 18023.9..18030.3 ns/iter\nThroughput input: {\"Elements\": 16}"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "ping@walter.dev",
+            "name": "wbk",
+            "username": "wbk"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d941371ac1394838156550b0950348a90bac7983",
+          "message": "Merge pull request #241 from smudgy-mud/fix/mutate-area-test-isolation\n\nIsolate mapper journals in parallel integration tests",
+          "timestamp": "2026-10-01T19:38:31-07:00",
+          "tree_id": "74e5a1e657d044d7b06c048b50ff9b6854cd13f0",
+          "url": "https://github.com/smudgy-mud/smudgy/commit/d941371ac1394838156550b0950348a90bac7983"
+        },
+        "date": 1790912898833,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "atlas_build/cold/10k",
+            "value": 7850848.8765625,
+            "range": "7.83899e+06..7.86385e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 7.83899e+06..7.86385e+06 ns/iter\nThroughput input: {\"Elements\": 10000}"
+          },
+          {
+            "name": "atlas_build/cold/1k",
+            "value": 713430.7635581061,
+            "range": "712728..714067",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 712728..714067 ns/iter\nThroughput input: {\"Elements\": 1000}"
+          },
+          {
+            "name": "atlas_build/cold/50k",
+            "value": 96833148.11666667,
+            "range": "9.62362e+07..9.73922e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 9.62362e+07..9.73922e+07 ns/iter\nThroughput input: {\"Elements\": 50000}"
+          },
+          {
+            "name": "automap_step/create_room/100k",
+            "value": 12267057.162307693,
+            "range": "1.08328e+07..1.37163e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.08328e+07..1.37163e+07 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "automap_step/create_room/10k",
+            "value": 11571584.540123457,
+            "range": "9.89677e+06..1.32957e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 9.89677e+06..1.32957e+07 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "build/aho_corasick",
+            "value": 6406751.610389611,
+            "range": "6.40348e+06..6.4089e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 6.40348e+06..6.4089e+06 ns/iter"
+          },
+          {
+            "name": "build/regex_filtered",
+            "value": 119740845.93506494,
+            "range": "1.19187e+08..1.20099e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1.19187e+08..1.20099e+08 ns/iter"
+          },
+          {
+            "name": "build/regex_set",
+            "value": 52162956.64025974,
+            "range": "5.20937e+07..5.22273e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 5.20937e+07..5.22273e+07 ns/iter"
+          },
+          {
+            "name": "build/tiered",
+            "value": 32621616.14112554,
+            "range": "3.25963e+07..3.26428e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3.25963e+07..3.26428e+07 ns/iter"
+          },
+          {
+            "name": "catalogue/sample/dynamic/small",
+            "value": 95.35010151412938,
+            "range": "95.264..95.4356",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 95.264..95.4356 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/sample/subscribed/large",
+            "value": 6405.333702665212,
+            "range": "6398.08..6412.11",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 6398.08..6412.11 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/sample/subscribed/small",
+            "value": 297.48584454453453,
+            "range": "297.073..297.904",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 297.073..297.904 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/sample/unsubscribed/large",
+            "value": 96.19158959014257,
+            "range": "96.1468..96.2336",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 96.1468..96.2336 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/sample/unsubscribed/small",
+            "value": 87.55232774480073,
+            "range": "87.4556..87.6523",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 87.4556..87.6523 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/snapshot/entries_128",
+            "value": 72933.6016800017,
+            "range": "72832.6..73040.9",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 72832.6..73040.9 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/snapshot/entries_512",
+            "value": 303728.67447982857,
+            "range": "303568..303901",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 303568..303901 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/snapshot/entries_8",
+            "value": 4467.071526911868,
+            "range": "4462.88..4471.49",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 4462.88..4471.49 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/snapshot/leaves_4096",
+            "value": 4568.8644226964825,
+            "range": "4564.65..4573.02",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 4564.65..4573.02 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/snapshot/leaves_64",
+            "value": 4213.137910059536,
+            "range": "4208.76..4217.64",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 4208.76..4217.64 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "catalogue/snapshot/leaves_65536",
+            "value": 4656.2902312901115,
+            "range": "4651.6..4660.76",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 4651.6..4660.76 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "churn_packet/clean",
+            "value": 41113.860204337994,
+            "range": "40842..41424.9",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 40842..41424.9 ns/iter\nThroughput input: {\"Elements\": 100}"
+          },
+          {
+            "name": "churn_packet/create_delete20",
+            "value": 148795092.875,
+            "range": "1.48681e+08..1.48917e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.48681e+08..1.48917e+08 ns/iter\nThroughput input: {\"Elements\": 100}"
+          },
+          {
+            "name": "churn_packet/create_delete20_x4pkg",
+            "value": 154035199.425,
+            "range": "1.5394e+08..1.54141e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.5394e+08..1.54141e+08 ns/iter\nThroughput input: {\"Elements\": 100}"
+          },
+          {
+            "name": "churn_packet/register_plain20",
+            "value": 149629229.775,
+            "range": "1.49539e+08..1.49726e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.49539e+08..1.49726e+08 ns/iter\nThroughput input: {\"Elements\": 100}"
+          },
+          {
+            "name": "churn_packet/register_styled20",
+            "value": 149745010.65,
+            "range": "1.49686e+08..1.49799e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.49686e+08..1.49799e+08 ns/iter\nThroughput input: {\"Elements\": 100}"
+          },
+          {
+            "name": "churn_packet/toggle20",
+            "value": 53480.53393482645,
+            "range": "53144.3..53821.4",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 53144.3..53821.4 ns/iter\nThroughput input: {\"Elements\": 100}"
+          },
+          {
+            "name": "churn_residue/full/10000",
+            "value": 155512363.95,
+            "range": "1.55318e+08..1.55675e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.55318e+08..1.55675e+08 ns/iter\nThroughput input: {\"Elements\": 300000}"
+          },
+          {
+            "name": "churn_residue/literal_absent/1000",
+            "value": 161592365.375,
+            "range": "1.61467e+08..1.61726e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.61467e+08..1.61726e+08 ns/iter\nThroughput input: {\"Elements\": 300000}"
+          },
+          {
+            "name": "churn_residue/literal_absent/5000",
+            "value": 151415531.325,
+            "range": "1.5134e+08..1.5149e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.5134e+08..1.5149e+08 ns/iter\nThroughput input: {\"Elements\": 300000}"
+          },
+          {
+            "name": "churn_residue/literal_disabled/1000",
+            "value": 159078726.175,
+            "range": "1.58845e+08..1.59332e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.58845e+08..1.59332e+08 ns/iter\nThroughput input: {\"Elements\": 300000}"
+          },
+          {
+            "name": "churn_residue/literal_disabled/5000",
+            "value": 159901149.375,
+            "range": "1.59576e+08..1.60213e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.59576e+08..1.60213e+08 ns/iter\nThroughput input: {\"Elements\": 300000}"
+          },
+          {
+            "name": "churn_residue/regex_absent/25",
+            "value": 102642367.7,
+            "range": "1.02482e+08..1.02802e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.02482e+08..1.02802e+08 ns/iter\nThroughput input: {\"Elements\": 300000}"
+          },
+          {
+            "name": "churn_residue/regex_disabled/25",
+            "value": 112092488.54,
+            "range": "1.12004e+08..1.12225e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.12004e+08..1.12225e+08 ns/iter\nThroughput input: {\"Elements\": 300000}"
+          },
+          {
+            "name": "creator_parse/package",
+            "value": 283.01365169866426,
+            "range": "282.829..283.209",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 282.829..283.209 ns/iter"
+          },
+          {
+            "name": "creator_parse/user",
+            "value": 52.391247193860735,
+            "range": "52.3519..52.4342",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 52.3519..52.4342 ns/iter"
+          },
+          {
+            "name": "engine_build/dirty_rebuild/1000",
+            "value": 19479160.16153846,
+            "range": "1.94708e+07..1.94872e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.94708e+07..1.94872e+07 ns/iter"
+          },
+          {
+            "name": "engine_build/dirty_rebuild/10000",
+            "value": 109110115.64000002,
+            "range": "1.09041e+08..1.09184e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.09041e+08..1.09184e+08 ns/iter"
+          },
+          {
+            "name": "engine_build/dirty_rebuild_styled/1000",
+            "value": 19488116.26923077,
+            "range": "1.94753e+07..1.95017e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.94753e+07..1.95017e+07 ns/iter"
+          },
+          {
+            "name": "engine_build/dirty_rebuild_styled/10000",
+            "value": 109820608.75999999,
+            "range": "1.09668e+08..1.09974e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.09668e+08..1.09974e+08 ns/iter"
+          },
+          {
+            "name": "engine_color_filter/capture_rich_100_occurrences_final_hit",
+            "value": 7338.485558282629,
+            "range": "7336.8..7340.15",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 7336.8..7340.15 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/capture_rich_one_occurrence",
+            "value": 360.0944112540016,
+            "range": "360.011..360.191",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 360.011..360.191 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/color_only_empty_pattern_two_spans",
+            "value": 1089.890269564761,
+            "range": "1089.69..1090.08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1089.69..1090.08 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/exact_one_occurrence",
+            "value": 159.57727331267333,
+            "range": "159.424..159.727",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 159.424..159.727 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/exact_one_occurrence_color_miss",
+            "value": 67.07822407193031,
+            "range": "67.0556..67.103",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 67.0556..67.103 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/filtered_100_matches",
+            "value": 3898.113271330985,
+            "range": "3896.67..3899.74",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3896.67..3899.74 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/filtered_text_miss",
+            "value": 28.69800851450428,
+            "range": "28.6522..28.7421",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 28.6522..28.7421 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/hsv_one_occurrence",
+            "value": 166.60719715839443,
+            "range": "166.504..166.704",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 166.504..166.704 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/hsv_one_occurrence_color_miss",
+            "value": 74.64454089789385,
+            "range": "74.6212..74.6728",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 74.6212..74.6728 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/hsv_range_100_matches_two_spans",
+            "value": 3912.3559360462255,
+            "range": "3911.28..3913.68",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3911.28..3913.68 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/unfiltered_first_match",
+            "value": 2324.8270143660343,
+            "range": "2323.59..2326.15",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 2323.59..2326.15 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/unfiltered_one_occurrence",
+            "value": 126.90105641881368,
+            "range": "126.788..127.029",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 126.788..127.029 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter/unfiltered_text_miss",
+            "value": 29.783053034362542,
+            "range": "29.696..29.8597",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 29.696..29.8597 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_miss_candidates/1",
+            "value": 166.1118878538013,
+            "range": "165.835..166.373",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 165.835..166.373 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_miss_candidates/100",
+            "value": 6753.482498740888,
+            "range": "6752.25..6754.86",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 6752.25..6754.86 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_miss_candidates/1000",
+            "value": 129825.96252623023,
+            "range": "129800..129852",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 129800..129852 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_64_spans_1",
+            "value": 117.75827228070015,
+            "range": "117.734..117.783",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 117.734..117.783 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_64_spans_2",
+            "value": 119.0321657430624,
+            "range": "119.008..119.06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 119.008..119.06 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_64_spans_32",
+            "value": 177.15192069157146,
+            "range": "177.108..177.2",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 177.108..177.2 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_65536_spans_1",
+            "value": 87430.55081572336,
+            "range": "87420.5..87441.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 87420.5..87441.1 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_65536_spans_2",
+            "value": 87414.36539431555,
+            "range": "87407.7..87421.2",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 87407.7..87421.2 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_65536_spans_32",
+            "value": 87479.37741121127,
+            "range": "87472.2..87486.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 87472.2..87486.8 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_8192_spans_1",
+            "value": 10955.138117983686,
+            "range": "10954.2..10956.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 10954.2..10956.1 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_8192_spans_2",
+            "value": 10964.582900273954,
+            "range": "10963.2..10966.2",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 10963.2..10966.2 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/color_only_miss/bytes_8192_spans_32",
+            "value": 11027.354904027716,
+            "range": "11026.4..11028.2",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 11026.4..11028.2 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_1000_spans_1",
+            "value": 37679.021601125285,
+            "range": "37661.9..37698.2",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 37661.9..37698.2 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_1000_spans_100",
+            "value": 37965.53091933074,
+            "range": "37953.4..37978.9",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 37953.4..37978.9 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_1000_spans_32",
+            "value": 39267.62682746882,
+            "range": "39247..39290.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 39247..39290.1 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_100_spans_1",
+            "value": 3897.970472912085,
+            "range": "3893.47..3902.68",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3893.47..3902.68 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_100_spans_100",
+            "value": 3944.649492892918,
+            "range": "3943.18..3946.33",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3943.18..3946.33 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_100_spans_32",
+            "value": 3907.9542694572665,
+            "range": "3904.67..3911.67",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3904.67..3911.67 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_10_spans_1",
+            "value": 626.6675809616257,
+            "range": "626.389..626.974",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 626.389..626.974 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_10_spans_100",
+            "value": 648.2570365062779,
+            "range": "647.913..648.629",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 647.913..648.629 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_10_spans_32",
+            "value": 636.5521039442508,
+            "range": "636.339..636.775",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 636.339..636.775 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_1_spans_1",
+            "value": 256.4778153702169,
+            "range": "256.363..256.597",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 256.363..256.597 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_1_spans_100",
+            "value": 281.2408412554425,
+            "range": "281.147..281.328",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 281.147..281.328 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/exact/occurrences_1_spans_32",
+            "value": 260.2638186211384,
+            "range": "260.134..260.402",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 260.134..260.402 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_1000_spans_1",
+            "value": 38406.48987964468,
+            "range": "38395.9..38418.2",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 38395.9..38418.2 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_1000_spans_100",
+            "value": 38996.60687908515,
+            "range": "38984.1..39009.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 38984.1..39009.8 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_1000_spans_32",
+            "value": 38003.39695099858,
+            "range": "37993.5..38014.7",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 37993.5..38014.7 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_100_spans_1",
+            "value": 3903.1076679271087,
+            "range": "3900.54..3905.84",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3900.54..3905.84 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_100_spans_100",
+            "value": 3976.806286544137,
+            "range": "3975.07..3978.76",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3975.07..3978.76 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_100_spans_32",
+            "value": 3930.014268204006,
+            "range": "3927.47..3932.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3927.47..3932.8 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_10_spans_1",
+            "value": 627.2818112857765,
+            "range": "627.062..627.501",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 627.062..627.501 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_10_spans_100",
+            "value": 652.7759131030529,
+            "range": "652.54..653.008",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 652.54..653.008 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_10_spans_32",
+            "value": 637.3222304759964,
+            "range": "637.144..637.513",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 637.144..637.513 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_1_spans_1",
+            "value": 255.51936286233112,
+            "range": "255.437..255.607",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 255.437..255.607 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_1_spans_100",
+            "value": 280.27253050569107,
+            "range": "280.103..280.439",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 280.103..280.439 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_color_filter_scaling/hsv/occurrences_1_spans_32",
+            "value": 260.34154424020755,
+            "range": "260.238..260.461",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 260.238..260.461 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/all_matched_last_qualifies/1",
+            "value": 209.6746295326954,
+            "range": "209.522..209.841",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 209.522..209.841 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/all_matched_last_qualifies/64",
+            "value": 4317.940085142191,
+            "range": "4316.96..4318.97",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 4316.96..4318.97 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/all_matched_last_qualifies/8",
+            "value": 663.0810930195797,
+            "range": "662.331..663.785",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 662.331..663.785 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/equivalent_plain_veto",
+            "value": 75.73864761639707,
+            "range": "75.7131..75.7654",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 75.7131..75.7654 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/one_matched_index_color_miss/1",
+            "value": 306.4786627322592,
+            "range": "306.369..306.597",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 306.369..306.597 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/one_matched_index_color_miss/64",
+            "value": 433.38743408122275,
+            "range": "433.279..433.509",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 433.279..433.509 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/one_matched_index_color_miss/8",
+            "value": 383.6129542837592,
+            "range": "383.437..383.808",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 383.437..383.808 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/prefilter_miss/1",
+            "value": 149.28327424981305,
+            "range": "149.215..149.357",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 149.215..149.357 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/prefilter_miss/64",
+            "value": 151.23176273553605,
+            "range": "151.192..151.278",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 151.192..151.278 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_colored_anti_filter/prefilter_miss/8",
+            "value": 151.2442173055215,
+            "range": "151.189..151.308",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 151.189..151.308 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "engine_mixed_styled_population/styled_entries/0",
+            "value": 2807.450353197396,
+            "range": "2806.58..2808.27",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2806.58..2808.27 ns/iter\nThroughput input: {\"Elements\": 57}"
+          },
+          {
+            "name": "engine_mixed_styled_population/styled_entries/1",
+            "value": 2818.051136918344,
+            "range": "2817.19..2819.03",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2817.19..2819.03 ns/iter\nThroughput input: {\"Elements\": 57}"
+          },
+          {
+            "name": "engine_mixed_styled_population/styled_entries/100",
+            "value": 2828.907242254258,
+            "range": "2827.72..2829.91",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2827.72..2829.91 ns/iter\nThroughput input: {\"Elements\": 57}"
+          },
+          {
+            "name": "engine_scan/mudlet-osc8-docs.log/bytes",
+            "value": 2871.695960183979,
+            "range": "2870.85..2872.4",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2870.85..2872.4 ns/iter\nThroughput input: {\"BytesDecimal\": 7957}"
+          },
+          {
+            "name": "engine_scan/mudlet-osc8-docs.log/lines",
+            "value": 2874.5831693673954,
+            "range": "2873.86..2875.35",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2873.86..2875.35 ns/iter\nThroughput input: {\"Elements\": 57}"
+          },
+          {
+            "name": "engine_scan/osc8-features.log/bytes",
+            "value": 29296.47668992203,
+            "range": "29290.4..29302.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 29290.4..29302.1 ns/iter\nThroughput input: {\"BytesDecimal\": 31921}"
+          },
+          {
+            "name": "engine_scan/osc8-features.log/lines",
+            "value": 29292.04161636289,
+            "range": "29284.6..29299.7",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 29284.6..29299.7 ns/iter\nThroughput input: {\"Elements\": 135}"
+          },
+          {
+            "name": "engine_scan/synthetic-long-session.log/bytes",
+            "value": 149504172.65,
+            "range": "1.49168e+08..1.49854e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.49168e+08..1.49854e+08 ns/iter\nThroughput input: {\"BytesDecimal\": 16269045}"
+          },
+          {
+            "name": "engine_scan/synthetic-long-session.log/lines",
+            "value": 148913902.7,
+            "range": "1.48823e+08..1.49016e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.48823e+08..1.49016e+08 ns/iter\nThroughput input: {\"Elements\": 300000}"
+          },
+          {
+            "name": "extend_line/at_capacity",
+            "value": 901.9755633704974,
+            "range": "901.78..902.193",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 901.78..902.193 ns/iter\nThroughput input: {\"Elements\": 57}"
+          },
+          {
+            "name": "extend_line/frag16",
+            "value": 49384.131380581726,
+            "range": "49365.2..49401.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 49365.2..49401.1 ns/iter\nThroughput input: {\"Elements\": 57}"
+          },
+          {
+            "name": "extend_line/frag4",
+            "value": 10499.395510859207,
+            "range": "10497.3..10501",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 10497.3..10501 ns/iter\nThroughput input: {\"Elements\": 57}"
+          },
+          {
+            "name": "extend_line/whole_lines",
+            "value": 631.7623710810635,
+            "range": "631.435..632.083",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 631.435..632.083 ns/iter\nThroughput input: {\"Elements\": 57}"
+          },
+          {
+            "name": "flush_coalesced/J1/W0",
+            "value": 187.56448197345654,
+            "range": "187.434..187.688",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 187.434..187.688 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "flush_coalesced/J1/W64",
+            "value": 5165.17041757689,
+            "range": "5162.36..5167.69",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 5162.36..5167.69 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "flush_coalesced/J1/W8",
+            "value": 756.5066929990037,
+            "range": "756.086..756.967",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 756.086..756.967 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "flush_coalesced/J128/W0",
+            "value": 16756.03627510651,
+            "range": "16745.9..16766.5",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 16745.9..16766.5 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "flush_coalesced/J128/W64",
+            "value": 172574.16357947435,
+            "range": "172374..172745",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 172374..172745 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "flush_coalesced/J128/W8",
+            "value": 37311.292519796385,
+            "range": "37293.5..37330.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 37293.5..37330.8 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "flush_coalesced/J16/W0",
+            "value": 1888.4618203487494,
+            "range": "1887.53..1889.43",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1887.53..1889.43 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "flush_coalesced/J16/W64",
+            "value": 26100.649073889665,
+            "range": "26085.1..26117.9",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 26085.1..26117.9 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "flush_coalesced/J16/W8",
+            "value": 4916.317382193127,
+            "range": "4903.09..4934.14",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 4903.09..4934.14 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "flush_mixed/J1/W64",
+            "value": 6189.117679991246,
+            "range": "6180.45..6197.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 6180.45..6197.8 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "flush_mixed/J1/W8",
+            "value": 783.7036858572562,
+            "range": "783.248..784.223",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 783.248..784.223 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "flush_mixed/J128/W64",
+            "value": 500188.6358677686,
+            "range": "499661..500637",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 499661..500637 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "flush_mixed/J128/W8",
+            "value": 78679.66205173427,
+            "range": "78583.5..78780.9",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 78583.5..78780.9 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "flush_mixed/J16/W64",
+            "value": 65395.23627198627,
+            "range": "65357.5..65432.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 65357.5..65432.8 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "flush_mixed/J16/W8",
+            "value": 10228.790913789919,
+            "range": "10220..10238.4",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 10220..10238.4 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "flush_per_write/J1/W0",
+            "value": 189.7835598713525,
+            "range": "189.608..189.986",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 189.608..189.986 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "flush_per_write/J1/W64",
+            "value": 6192.535047748414,
+            "range": "6186.71..6199.25",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 6186.71..6199.25 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "flush_per_write/J1/W8",
+            "value": 804.7609612164572,
+            "range": "804.252..805.25",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 804.252..805.25 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "flush_per_write/J128/W0",
+            "value": 17121.326718653807,
+            "range": "17114.9..17127.9",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 17114.9..17127.9 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "flush_per_write/J128/W64",
+            "value": 822047.0225714284,
+            "range": "821740..822375",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 821740..822375 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "flush_per_write/J128/W8",
+            "value": 118769.33309576838,
+            "range": "118685..118861",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 118685..118861 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "flush_per_write/J16/W0",
+            "value": 1908.2736660512346,
+            "range": "1906.1..1909.84",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1906.1..1909.84 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "flush_per_write/J16/W64",
+            "value": 101861.01788877082,
+            "range": "101801..101917",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 101801..101917 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "flush_per_write/J16/W8",
+            "value": 14694.63731945277,
+            "range": "14683.4..14706.4",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 14683.4..14706.4 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "fold/lower",
+            "value": 21.07258168339198,
+            "range": "21.0429..21.1028",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 21.0429..21.1028 ns/iter"
+          },
+          {
+            "name": "fold/mixed",
+            "value": 21.053526347801892,
+            "range": "21.0285..21.0795",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 21.0285..21.0795 ns/iter"
+          },
+          {
+            "name": "follow/find_room_by_external_id/100k",
+            "value": 92.4030165750357,
+            "range": "92.1704..92.6318",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 92.1704..92.6318 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "follow/find_room_by_external_id/10k",
+            "value": 91.03065059295409,
+            "range": "90.9536..91.0891",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 90.9536..91.0891 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "frame_proxy/10k",
+            "value": 185052.48034789047,
+            "range": "184996..185119",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 184996..185119 ns/iter\nThroughput input: {\"Elements\": 32440}"
+          },
+          {
+            "name": "identification/by_title_and_description/10k",
+            "value": 15336.564394475377,
+            "range": "15331.2..15342.7",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 15331.2..15342.7 ns/iter\nThroughput input: {\"Elements\": 44}"
+          },
+          {
+            "name": "image_ensure_keyed_hit/N1",
+            "value": 68.54702284795378,
+            "range": "68.4613..68.6372",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 68.4613..68.6372 ns/iter"
+          },
+          {
+            "name": "image_ensure_keyed_hit/N64",
+            "value": 70.3114616580966,
+            "range": "70.2439..70.3747",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 70.2439..70.3747 ns/iter"
+          },
+          {
+            "name": "image_memo_key/data_2mb",
+            "value": 3770.465064951192,
+            "range": "3764.84..3776.19",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3764.84..3776.19 ns/iter"
+          },
+          {
+            "name": "image_memo_key/inline_34b",
+            "value": 8.693496769650014,
+            "range": "8.68078..8.70665",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 8.68078..8.70665 ns/iter"
+          },
+          {
+            "name": "image_resolve_cold/data_2mb",
+            "value": 1080085.0146271815,
+            "range": "1.07893e+06..1.08104e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1.07893e+06..1.08104e+06 ns/iter"
+          },
+          {
+            "name": "image_resolve_cold/https",
+            "value": 160.22635721636263,
+            "range": "160.001..160.471",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 160.001..160.471 ns/iter"
+          },
+          {
+            "name": "image_resolve_cold/relative",
+            "value": 187.6953148497542,
+            "range": "187.289..188.137",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 187.289..188.137 ns/iter"
+          },
+          {
+            "name": "image_state_read",
+            "value": 42.83607521532271,
+            "range": "42.7616..42.912",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 42.7616..42.912 ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/ansi_heavy",
+            "value": 366284961.35,
+            "range": "3.6562e+08..3.66932e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.6562e+08..3.66932e+08 ns/iter\nThroughput input: {\"Bytes\": 35014271}"
+          },
+          {
+            "name": "ingest_pipeline/ansi_heavy/no_raw",
+            "value": 322482741.35,
+            "range": "3.21652e+08..3.23366e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.21652e+08..3.23366e+08 ns/iter\nThroughput input: {\"Bytes\": 35014271}"
+          },
+          {
+            "name": "ingest_pipeline/ansi_light",
+            "value": 194299379.4,
+            "range": "1.93966e+08..1.94644e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.93966e+08..1.94644e+08 ns/iter\nThroughput input: {\"Bytes\": 19876170}"
+          },
+          {
+            "name": "ingest_pipeline/ansi_light/no_raw",
+            "value": 151076183.75,
+            "range": "1.50709e+08..1.51417e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.50709e+08..1.51417e+08 ns/iter\nThroughput input: {\"Bytes\": 19876170}"
+          },
+          {
+            "name": "ingest_pipeline/iac_dense",
+            "value": 327673725.7,
+            "range": "3.26496e+08..3.28776e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.26496e+08..3.28776e+08 ns/iter\nThroughput input: {\"Bytes\": 20722866}"
+          },
+          {
+            "name": "ingest_pipeline/iac_dense/no_raw",
+            "value": 266128060,
+            "range": "2.65703e+08..2.66504e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2.65703e+08..2.66504e+08 ns/iter\nThroughput input: {\"Bytes\": 20722866}"
+          },
+          {
+            "name": "ingest_scaling/encoded_c1/no_raw/1024",
+            "value": 9416.783508925475,
+            "range": "9414.47..9420",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 9414.47..9420 ns/iter\nThroughput input: {\"Bytes\": 1025}"
+          },
+          {
+            "name": "ingest_scaling/encoded_c1/no_raw/16384",
+            "value": 146741.92457951565,
+            "range": "146686..146798",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 146686..146798 ns/iter\nThroughput input: {\"Bytes\": 16385}"
+          },
+          {
+            "name": "ingest_scaling/encoded_c1/no_raw/4096",
+            "value": 37024.87708464086,
+            "range": "37012.2..37040.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 37012.2..37040.1 ns/iter\nThroughput input: {\"Bytes\": 4097}"
+          },
+          {
+            "name": "ingest_scaling/encoded_c1/no_raw/65536",
+            "value": 608648.0041724739,
+            "range": "608197..609150",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 608197..609150 ns/iter\nThroughput input: {\"Bytes\": 65537}"
+          },
+          {
+            "name": "ingest_scaling/encoded_c1/raw/1024",
+            "value": 10593.155458818297,
+            "range": "10589.3..10598.4",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 10589.3..10598.4 ns/iter\nThroughput input: {\"Bytes\": 1025}"
+          },
+          {
+            "name": "ingest_scaling/encoded_c1/raw/16384",
+            "value": 154369.5446190257,
+            "range": "154202..154515",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 154202..154515 ns/iter\nThroughput input: {\"Bytes\": 16385}"
+          },
+          {
+            "name": "ingest_scaling/encoded_c1/raw/4096",
+            "value": 40607.00058296442,
+            "range": "40592.7..40621.5",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 40592.7..40621.5 ns/iter\nThroughput input: {\"Bytes\": 4097}"
+          },
+          {
+            "name": "ingest_scaling/encoded_c1/raw/65536",
+            "value": 632839.1313320826,
+            "range": "632622..633100",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 632622..633100 ns/iter\nThroughput input: {\"Bytes\": 65537}"
+          },
+          {
+            "name": "ingest_scaling/invalid/no_raw/1024",
+            "value": 3807.396239223175,
+            "range": "3798.84..3816.34",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3798.84..3816.34 ns/iter\nThroughput input: {\"Bytes\": 1025}"
+          },
+          {
+            "name": "ingest_scaling/invalid/no_raw/16384",
+            "value": 56360.562397344336,
+            "range": "56331.6..56399.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 56331.6..56399.1 ns/iter\nThroughput input: {\"Bytes\": 16385}"
+          },
+          {
+            "name": "ingest_scaling/invalid/no_raw/4096",
+            "value": 14299.636338402579,
+            "range": "14291.9..14308.9",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 14291.9..14308.9 ns/iter\nThroughput input: {\"Bytes\": 4097}"
+          },
+          {
+            "name": "ingest_scaling/invalid/no_raw/65536",
+            "value": 224957.86366116625,
+            "range": "224939..224980",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 224939..224980 ns/iter\nThroughput input: {\"Bytes\": 65537}"
+          },
+          {
+            "name": "ingest_scaling/invalid/raw/1024",
+            "value": 6509.076167515264,
+            "range": "6504.39..6513.35",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 6504.39..6513.35 ns/iter\nThroughput input: {\"Bytes\": 1025}"
+          },
+          {
+            "name": "ingest_scaling/invalid/raw/16384",
+            "value": 97772.92113011939,
+            "range": "97754.2..97790.4",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 97754.2..97790.4 ns/iter\nThroughput input: {\"Bytes\": 16385}"
+          },
+          {
+            "name": "ingest_scaling/invalid/raw/4096",
+            "value": 24741.75044377146,
+            "range": "24738.3..24745.2",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 24738.3..24745.2 ns/iter\nThroughput input: {\"Bytes\": 4097}"
+          },
+          {
+            "name": "ingest_scaling/invalid/raw/65536",
+            "value": 391401.23476894957,
+            "range": "391283..391519",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 391283..391519 ns/iter\nThroughput input: {\"Bytes\": 65537}"
+          },
+          {
+            "name": "ingest_scaling/mixed_invalid/no_raw/1024",
+            "value": 7039.782026833179,
+            "range": "7024.33..7049.69",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 7024.33..7049.69 ns/iter\nThroughput input: {\"Bytes\": 1025}"
+          },
+          {
+            "name": "ingest_scaling/mixed_invalid/no_raw/16384",
+            "value": 109843.19805231298,
+            "range": "109769..109908",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 109769..109908 ns/iter\nThroughput input: {\"Bytes\": 16385}"
+          },
+          {
+            "name": "ingest_scaling/mixed_invalid/no_raw/4096",
+            "value": 27570.047311718918,
+            "range": "27565..27574.5",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 27565..27574.5 ns/iter\nThroughput input: {\"Bytes\": 4097}"
+          },
+          {
+            "name": "ingest_scaling/mixed_invalid/no_raw/65536",
+            "value": 437888.06134938233,
+            "range": "437643..438181",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 437643..438181 ns/iter\nThroughput input: {\"Bytes\": 65537}"
+          },
+          {
+            "name": "ingest_scaling/mixed_invalid/raw/1024",
+            "value": 9372.30750075448,
+            "range": "9368.26..9376.99",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 9368.26..9376.99 ns/iter\nThroughput input: {\"Bytes\": 1025}"
+          },
+          {
+            "name": "ingest_scaling/mixed_invalid/raw/16384",
+            "value": 152214.50875841323,
+            "range": "151605..152573",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 151605..152573 ns/iter\nThroughput input: {\"Bytes\": 16385}"
+          },
+          {
+            "name": "ingest_scaling/mixed_invalid/raw/4096",
+            "value": 38433.921405604044,
+            "range": "38414.4..38458.7",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 38414.4..38458.7 ns/iter\nThroughput input: {\"Bytes\": 4097}"
+          },
+          {
+            "name": "ingest_scaling/mixed_invalid/raw/65536",
+            "value": 597718.2538030085,
+            "range": "593735..600349",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 593735..600349 ns/iter\nThroughput input: {\"Bytes\": 65537}"
+          },
+          {
+            "name": "ingest_scaling/plain/no_raw/1024",
+            "value": 367.33518538242674,
+            "range": "366.887..367.816",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 366.887..367.816 ns/iter\nThroughput input: {\"Bytes\": 1025}"
+          },
+          {
+            "name": "ingest_scaling/plain/no_raw/16384",
+            "value": 1766.4241543742557,
+            "range": "1764.82..1768.28",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1764.82..1768.28 ns/iter\nThroughput input: {\"Bytes\": 16385}"
+          },
+          {
+            "name": "ingest_scaling/plain/no_raw/4096",
+            "value": 678.7274470961753,
+            "range": "678.054..679.301",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 678.054..679.301 ns/iter\nThroughput input: {\"Bytes\": 4097}"
+          },
+          {
+            "name": "ingest_scaling/plain/no_raw/65536",
+            "value": 6223.7761733213065,
+            "range": "6215.21..6233.94",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 6215.21..6233.94 ns/iter\nThroughput input: {\"Bytes\": 65537}"
+          },
+          {
+            "name": "ingest_scaling/plain/raw/1024",
+            "value": 384.5655030432371,
+            "range": "383.722..385.282",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 383.722..385.282 ns/iter\nThroughput input: {\"Bytes\": 1025}"
+          },
+          {
+            "name": "ingest_scaling/plain/raw/16384",
+            "value": 2096.068172139126,
+            "range": "2091.55..2099.75",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 2091.55..2099.75 ns/iter\nThroughput input: {\"Bytes\": 16385}"
+          },
+          {
+            "name": "ingest_scaling/plain/raw/4096",
+            "value": 779.2941893934438,
+            "range": "778.369..780.139",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 778.369..780.139 ns/iter\nThroughput input: {\"Bytes\": 4097}"
+          },
+          {
+            "name": "ingest_scaling/plain/raw/65536",
+            "value": 7247.915904192862,
+            "range": "7238.71..7257.29",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 7238.71..7257.29 ns/iter\nThroughput input: {\"Bytes\": 65537}"
+          },
+          {
+            "name": "ingest_scaling/unicode/no_raw/1024",
+            "value": 428.37451983638323,
+            "range": "427.375..429.313",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 427.375..429.313 ns/iter\nThroughput input: {\"Bytes\": 1021}"
+          },
+          {
+            "name": "ingest_scaling/unicode/no_raw/16384",
+            "value": 2537.1292320301873,
+            "range": "2532.03..2542.37",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 2532.03..2542.37 ns/iter\nThroughput input: {\"Bytes\": 16381}"
+          },
+          {
+            "name": "ingest_scaling/unicode/no_raw/4096",
+            "value": 940.5340248949477,
+            "range": "938.101..942.744",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 938.101..942.744 ns/iter\nThroughput input: {\"Bytes\": 4093}"
+          },
+          {
+            "name": "ingest_scaling/unicode/no_raw/65536",
+            "value": 9416.9390469407,
+            "range": "9399.23..9435.74",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 9399.23..9435.74 ns/iter\nThroughput input: {\"Bytes\": 65533}"
+          },
+          {
+            "name": "ingest_scaling/unicode/raw/1024",
+            "value": 445.6572663160799,
+            "range": "444.793..446.554",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 444.793..446.554 ns/iter\nThroughput input: {\"Bytes\": 1021}"
+          },
+          {
+            "name": "ingest_scaling/unicode/raw/16384",
+            "value": 2808.927177988071,
+            "range": "2803.25..2815.37",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 2803.25..2815.37 ns/iter\nThroughput input: {\"Bytes\": 16381}"
+          },
+          {
+            "name": "ingest_scaling/unicode/raw/4096",
+            "value": 985.1278354468091,
+            "range": "983.171..987.249",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 983.171..987.249 ns/iter\nThroughput input: {\"Bytes\": 4093}"
+          },
+          {
+            "name": "ingest_scaling/unicode/raw/65536",
+            "value": 10453.20223675339,
+            "range": "10434.2..10471.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 10434.2..10471.1 ns/iter\nThroughput input: {\"Bytes\": 65533}"
+          },
+          {
+            "name": "interop_delivery/emit_cross_isolate/S1",
+            "value": 107162.59095207392,
+            "range": "107053..107281",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 107053..107281 ns/iter\nThroughput input: {\"Elements\": 32}"
+          },
+          {
+            "name": "interop_delivery/emit_fanout/S1",
+            "value": 105537.19801705757,
+            "range": "105425..105637",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 105425..105637 ns/iter\nThroughput input: {\"Elements\": 32}"
+          },
+          {
+            "name": "interop_delivery/emit_fanout/S64",
+            "value": 3292289.3328947364,
+            "range": "3.28745e+06..3.29977e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.28745e+06..3.29977e+06 ns/iter\nThroughput input: {\"Elements\": 2048}"
+          },
+          {
+            "name": "interop_delivery/emit_fanout/S8",
+            "value": 455013.56859504135,
+            "range": "453964..456369",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 453964..456369 ns/iter\nThroughput input: {\"Elements\": 256}"
+          },
+          {
+            "name": "interop_delivery/emit_payload/P16k",
+            "value": 853616.3629692834,
+            "range": "853032..854174",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 853032..854174 ns/iter\nThroughput input: {\"Elements\": 256}"
+          },
+          {
+            "name": "interop_delivery/emit_payload/P64",
+            "value": 419192.99262981577,
+            "range": "418816..419583",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 418816..419583 ns/iter\nThroughput input: {\"Elements\": 256}"
+          },
+          {
+            "name": "interop_delivery/watch_coalesced/W64",
+            "value": 1182190.3971631206,
+            "range": "1.18173e+06..1.18264e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.18173e+06..1.18264e+06 ns/iter\nThroughput input: {\"Elements\": 1024}"
+          },
+          {
+            "name": "interop_delivery/watch_coalesced/W8",
+            "value": 188660.82596371882,
+            "range": "188595..188732",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 188595..188732 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_delivery/watch_per_write/W8",
+            "value": 286590.5110348771,
+            "range": "286144..286992",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 286144..286992 ns/iter\nThroughput input: {\"Elements\": 256}"
+          },
+          {
+            "name": "interop_ops/package/emit128",
+            "value": 160118.53989818643,
+            "range": "159714..160517",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 159714..160517 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_ops/package/get128",
+            "value": 64293.4430453698,
+            "range": "63278.4..65232.2",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 63278.4..65232.2 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_ops/package/set128",
+            "value": 134213.45121495327,
+            "range": "134121..134307",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 134121..134307 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_ops/package/set_per_turn64",
+            "value": 433027.55537261703,
+            "range": "432626..433515",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 432626..433515 ns/iter\nThroughput input: {\"Elements\": 64}"
+          },
+          {
+            "name": "interop_ops/user/emit128",
+            "value": 160310.35056215868,
+            "range": "160088..160540",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 160088..160540 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_ops/user/get128",
+            "value": 59977.971547763,
+            "range": "59885.1..60080.7",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 59885.1..60080.7 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_ops/user/set128",
+            "value": 97972.07226148409,
+            "range": "97900.9..98032.3",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 97900.9..98032.3 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_ops/user/set_per_turn64",
+            "value": 392744.7141398272,
+            "range": "392446..393004",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 392446..393004 ns/iter\nThroughput input: {\"Elements\": 64}"
+          },
+          {
+            "name": "interop_read/keys_32k",
+            "value": 69000.95872884855,
+            "range": "68910.8..69104.6",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 68910.8..69104.6 ns/iter\nThroughput input: {\"Elements\": 32}"
+          },
+          {
+            "name": "interop_read/materialize_32k",
+            "value": 11396140.527906977,
+            "range": "1.12974e+07..1.14994e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.12974e+07..1.14994e+07 ns/iter\nThroughput input: {\"Elements\": 8}"
+          },
+          {
+            "name": "interop_read/value_leaf/1k",
+            "value": 57340.14754773065,
+            "range": "57220.3..57440",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 57220.3..57440 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_read/value_leaf/1m",
+            "value": 57353.87362104778,
+            "range": "57251.1..57445.3",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 57251.1..57445.3 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_read/value_leaf/depth1",
+            "value": 57779.465053825676,
+            "range": "57657.8..57890.6",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 57657.8..57890.6 ns/iter\nThroughput input: {\"Elements\": 128}"
+          },
+          {
+            "name": "interop_read/value_leaf/depth4",
+            "value": 53408.193590841,
+            "range": "53345.4..53476.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 53345.4..53476.8 ns/iter\nThroughput input: {\"Elements\": 32}"
+          },
+          {
+            "name": "line_operations/replace_and_highlight",
+            "value": 10719.052749607765,
+            "range": "10715.5..10722.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 10715.5..10722.8 ns/iter\nThroughput input: {\"Elements\": 88}"
+          },
+          {
+            "name": "local_save/metadata/10000_rooms/5000_touched",
+            "value": 136039965.375,
+            "range": "1.36008e+08..1.36077e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.36008e+08..1.36077e+08 ns/iter"
+          },
+          {
+            "name": "local_save/metadata/10000_rooms/500_touched",
+            "value": 19396029.227272727,
+            "range": "1.93909e+07..1.94014e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.93909e+07..1.94014e+07 ns/iter"
+          },
+          {
+            "name": "local_save/metadata/1000_rooms/500_touched",
+            "value": 19615982.76875,
+            "range": "1.96094e+07..1.9623e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.96094e+07..1.9623e+07 ns/iter"
+          },
+          {
+            "name": "local_save/metadata/50000_rooms/500_touched",
+            "value": 19180708.99090909,
+            "range": "1.91759e+07..1.9187e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.91759e+07..1.9187e+07 ns/iter"
+          },
+          {
+            "name": "local_save/room/10000_rooms/5000_touched",
+            "value": 137448539.625,
+            "range": "1.37266e+08..1.37635e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.37266e+08..1.37635e+08 ns/iter"
+          },
+          {
+            "name": "local_save/room/10000_rooms/500_touched",
+            "value": 36915336.87142857,
+            "range": "3.67163e+07..3.70977e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.67163e+07..3.70977e+07 ns/iter"
+          },
+          {
+            "name": "local_save/room/1000_rooms/500_touched",
+            "value": 35811550.25333334,
+            "range": "3.55621e+07..3.60461e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.55621e+07..3.60461e+07 ns/iter"
+          },
+          {
+            "name": "local_save/room/50000_rooms/500_touched",
+            "value": 42134961.96153846,
+            "range": "4.17626e+07..4.24947e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 4.17626e+07..4.24947e+07 ns/iter"
+          },
+          {
+            "name": "path_parse/bracket",
+            "value": 75.09890621312692,
+            "range": "75.0105..75.1884",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 75.0105..75.1884 ns/iter"
+          },
+          {
+            "name": "path_parse/depth1",
+            "value": 50.470888769952374,
+            "range": "50.3993..50.5461",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 50.3993..50.5461 ns/iter"
+          },
+          {
+            "name": "path_parse/depth4",
+            "value": 87.04959281300225,
+            "range": "86.9225..87.1822",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 86.9225..87.1822 ns/iter"
+          },
+          {
+            "name": "pathfinding/nearest_tag_hit/10k",
+            "value": 526203.9747102213,
+            "range": "525993..526417",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 525993..526417 ns/iter"
+          },
+          {
+            "name": "pathfinding/nearest_tag_hit/50k",
+            "value": 459302.40081743867,
+            "range": "456121..463118",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 456121..463118 ns/iter"
+          },
+          {
+            "name": "pathfinding/nearest_tag_miss/10k",
+            "value": 3159525.6480769236,
+            "range": "3.13568e+06..3.18374e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.13568e+06..3.18374e+06 ns/iter"
+          },
+          {
+            "name": "pathfinding/nearest_tag_miss/50k",
+            "value": 27052591.631578945,
+            "range": "2.70372e+07..2.70719e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2.70372e+07..2.70719e+07 ns/iter"
+          },
+          {
+            "name": "pathfinding/path_across/10k",
+            "value": 2654814.2746031745,
+            "range": "2.65429e+06..2.65537e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2.65429e+06..2.65537e+06 ns/iter"
+          },
+          {
+            "name": "pathfinding/path_across/50k",
+            "value": 19035633.342307694,
+            "range": "1.90248e+07..1.90455e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.90248e+07..1.90455e+07 ns/iter"
+          },
+          {
+            "name": "per_emit_composite/package",
+            "value": 441.125350548241,
+            "range": "440.587..441.67",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 440.587..441.67 ns/iter"
+          },
+          {
+            "name": "per_set_composite/package",
+            "value": 374.25106008442214,
+            "range": "373.669..374.883",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 373.669..374.883 ns/iter"
+          },
+          {
+            "name": "per_set_composite/user",
+            "value": 137.63138336636115,
+            "range": "137.435..137.829",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 137.435..137.829 ns/iter"
+          },
+          {
+            "name": "producer_parse/package",
+            "value": 46.4386068868752,
+            "range": "46.3697..46.5079",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 46.3697..46.5079 ns/iter"
+          },
+          {
+            "name": "producer_parse/user",
+            "value": 3.8705589029132375,
+            "range": "3.86785..3.87348",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 3.86785..3.87348 ns/iter"
+          },
+          {
+            "name": "rebuild/room_connections/10k",
+            "value": 87479429.18571429,
+            "range": "8.61095e+07..8.87554e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 8.61095e+07..8.87554e+07 ns/iter\nThroughput input: {\"Elements\": 10000}"
+          },
+          {
+            "name": "rebuild/room_connections/1k",
+            "value": 14050001.875675678,
+            "range": "1.39867e+07..1.41341e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.39867e+07..1.41341e+07 ns/iter\nThroughput input: {\"Elements\": 1000}"
+          },
+          {
+            "name": "rebuild/room_connections/50k",
+            "value": 693727294.8,
+            "range": "6.8496e+08..7.02433e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 6.8496e+08..7.02433e+08 ns/iter\nThroughput input: {\"Elements\": 50000}"
+          },
+          {
+            "name": "scan_literals/aho_corasick_leftmost",
+            "value": 15940673.942424243,
+            "range": "1.58094e+07..1.60354e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1.58094e+07..1.60354e+07 ns/iter\nThroughput input: {\"Bytes\": 16269045}"
+          },
+          {
+            "name": "scan_literals/aho_corasick_overlapping",
+            "value": 17181198.27186147,
+            "range": "1.71757e+07..1.71859e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1.71757e+07..1.71859e+07 ns/iter\nThroughput input: {\"Bytes\": 16269045}"
+          },
+          {
+            "name": "scan_literals/regex_filtered",
+            "value": 202475137.9666667,
+            "range": "2.02435e+08..2.02517e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2.02435e+08..2.02517e+08 ns/iter\nThroughput input: {\"Bytes\": 16269045}"
+          },
+          {
+            "name": "scan_literals/regex_set_current",
+            "value": 30830175110.8,
+            "range": "3.08082e+10..3.08636e+10",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.08082e+10..3.08636e+10 ns/iter\nThroughput input: {\"Bytes\": 1084294}"
+          },
+          {
+            "name": "scan_literals/tiered",
+            "value": 52692351.68831169,
+            "range": "5.2673e+07..5.27173e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 5.2673e+07..5.27173e+07 ns/iter\nThroughput input: {\"Bytes\": 16269045}"
+          },
+          {
+            "name": "scan_mixed/regex_filtered",
+            "value": 296447574.15,
+            "range": "2.96402e+08..2.96493e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2.96402e+08..2.96493e+08 ns/iter\nThroughput input: {\"Bytes\": 16269045}"
+          },
+          {
+            "name": "scan_mixed/regex_set_current",
+            "value": 32117248708.1,
+            "range": "3.20973e+10..3.21327e+10",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3.20973e+10..3.21327e+10 ns/iter\nThroughput input: {\"Bytes\": 1084294}"
+          },
+          {
+            "name": "scan_mixed/tiered",
+            "value": 139787082.7038961,
+            "range": "1.39714e+08..1.39833e+08",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1.39714e+08..1.39833e+08 ns/iter\nThroughput input: {\"Bytes\": 16269045}"
+          },
+          {
+            "name": "script_dispatch/baseline",
+            "value": 182422.94654731458,
+            "range": "182118..182764",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 182118..182764 ns/iter\nThroughput input: {\"Elements\": 500}"
+          },
+          {
+            "name": "script_dispatch/fire0",
+            "value": 423894.9878813559,
+            "range": "423430..424417",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 423430..424417 ns/iter\nThroughput input: {\"Elements\": 500}"
+          },
+          {
+            "name": "script_dispatch/fire20",
+            "value": 459094.6307479224,
+            "range": "458482..459565",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 458482..459565 ns/iter\nThroughput input: {\"Elements\": 500}"
+          },
+          {
+            "name": "script_dispatch/fire5",
+            "value": 435299.3979999999,
+            "range": "435145..435435",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 435145..435435 ns/iter\nThroughput input: {\"Elements\": 500}"
+          },
+          {
+            "name": "sgr/process/bold_color",
+            "value": 8.758708416543906,
+            "range": "8.75761..8.75981",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 8.75761..8.75981 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "sgr/process/color_256",
+            "value": 10.965291722050637,
+            "range": "10.9624..10.9682",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 10.9624..10.9682 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "sgr/process/reset",
+            "value": 6.981655435577159,
+            "range": "6.97903..6.98411",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 6.97903..6.98411 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "sgr/process/simple_color",
+            "value": 7.477863107710015,
+            "range": "7.47673..7.47897",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 7.47673..7.47897 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "sgr/process/truecolor",
+            "value": 12.464315728923962,
+            "range": "12.4569..12.4747",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 12.4569..12.4747 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "spatial_query/connections/viewport_full/10k",
+            "value": 81519.36953048581,
+            "range": "81512..81527.4",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 81512..81527.4 ns/iter\nThroughput input: {\"Elements\": 19802}"
+          },
+          {
+            "name": "spatial_query/connections/viewport_full/50k",
+            "value": 433966.1712673611,
+            "range": "433758..434188",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 433758..434188 ns/iter\nThroughput input: {\"Elements\": 99557}"
+          },
+          {
+            "name": "spatial_query/connections/viewport_medium/10k",
+            "value": 19202.17618426604,
+            "range": "19173..19231.4",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 19173..19231.4 ns/iter\nThroughput input: {\"Elements\": 4418}"
+          },
+          {
+            "name": "spatial_query/connections/viewport_medium/50k",
+            "value": 91184.99241956006,
+            "range": "91110.9..91257.7",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 91110.9..91257.7 ns/iter\nThroughput input: {\"Elements\": 21025}"
+          },
+          {
+            "name": "spatial_query/connections/viewport_small/10k",
+            "value": 3207.6125601190934,
+            "range": "3195.63..3219.87",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 3195.63..3219.87 ns/iter\nThroughput input: {\"Elements\": 578}"
+          },
+          {
+            "name": "spatial_query/connections/viewport_small/50k",
+            "value": 11007.46659865422,
+            "range": "10957.2..11052.9",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 10957.2..11052.9 ns/iter\nThroughput input: {\"Elements\": 2359}"
+          },
+          {
+            "name": "spatial_query/rooms/viewport_full/10k",
+            "value": 38926.77736349454,
+            "range": "38915.6..38940.3",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 38915.6..38940.3 ns/iter\nThroughput input: {\"Elements\": 10000}"
+          },
+          {
+            "name": "spatial_query/rooms/viewport_full/50k",
+            "value": 197205.2033911672,
+            "range": "196898..197517",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 196898..197517 ns/iter\nThroughput input: {\"Elements\": 50000}"
+          },
+          {
+            "name": "spatial_query/rooms/viewport_medium/10k",
+            "value": 9591.512861274443,
+            "range": "9581.3..9599.77",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 9581.3..9599.77 ns/iter\nThroughput input: {\"Elements\": 2070}"
+          },
+          {
+            "name": "spatial_query/rooms/viewport_medium/50k",
+            "value": 41271.41510395267,
+            "range": "41248.4..41293",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 41248.4..41293 ns/iter\nThroughput input: {\"Elements\": 10306}"
+          },
+          {
+            "name": "spatial_query/rooms/viewport_small/10k",
+            "value": 1326.3954190631084,
+            "range": "1321.08..1331.49",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1321.08..1331.49 ns/iter\nThroughput input: {\"Elements\": 240}"
+          },
+          {
+            "name": "spatial_query/rooms/viewport_small/50k",
+            "value": 5396.409123168498,
+            "range": "5382.02..5411.55",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 5382.02..5411.55 ns/iter\nThroughput input: {\"Elements\": 1146}"
+          },
+          {
+            "name": "styled_line/new_no_raw/long_plain",
+            "value": 20.489584036590912,
+            "range": "20.4819..20.4976",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 20.4819..20.4976 ns/iter\nThroughput input: {\"Bytes\": 200}"
+          },
+          {
+            "name": "styled_line/new_no_raw/long_styled",
+            "value": 22.417651228602523,
+            "range": "22.4108..22.4246",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 22.4108..22.4246 ns/iter\nThroughput input: {\"Bytes\": 200}"
+          },
+          {
+            "name": "styled_line/new_no_raw/short_plain",
+            "value": 19.713328508486168,
+            "range": "19.7042..19.7222",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 19.7042..19.7222 ns/iter\nThroughput input: {\"Bytes\": 40}"
+          },
+          {
+            "name": "styled_line/new_with_raw/long_plain",
+            "value": 106.16371046802325,
+            "range": "106.03..106.277",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 106.03..106.277 ns/iter\nThroughput input: {\"Bytes\": 400}"
+          },
+          {
+            "name": "styled_line/new_with_raw/long_styled",
+            "value": 119.24285687106352,
+            "range": "119.207..119.283",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 119.207..119.283 ns/iter\nThroughput input: {\"Bytes\": 464}"
+          },
+          {
+            "name": "styled_line/new_with_raw/short_plain",
+            "value": 36.55175578404633,
+            "range": "36.5291..36.5748",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 36.5291..36.5748 ns/iter\nThroughput input: {\"Bytes\": 80}"
+          },
+          {
+            "name": "styled_line/new_with_raw_text/long_plain",
+            "value": 28.06630307488354,
+            "range": "28.0532..28.0804",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 28.0532..28.0804 ns/iter\nThroughput input: {\"Bytes\": 400}"
+          },
+          {
+            "name": "styled_line/new_with_raw_text/long_styled",
+            "value": 34.4714166295067,
+            "range": "34.416..34.5201",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 34.416..34.5201 ns/iter\nThroughput input: {\"Bytes\": 464}"
+          },
+          {
+            "name": "styled_line/new_with_raw_text/short_plain",
+            "value": 25.445641801407024,
+            "range": "25.4324..25.4585",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 25.4324..25.4585 ns/iter\nThroughput input: {\"Bytes\": 80}"
+          },
+          {
+            "name": "telnet_receive/ansi_light",
+            "value": 298395.60846245533,
+            "range": "297809..299035",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 297809..299035 ns/iter\nThroughput input: {\"Bytes\": 19876170}"
+          },
+          {
+            "name": "telnet_receive/iac_dense",
+            "value": 4399324.192982456,
+            "range": "4.39697e+06..4.40171e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 4.39697e+06..4.40171e+06 ns/iter\nThroughput input: {\"Bytes\": 20722866}"
+          },
+          {
+            "name": "to_spans/by_span_count/1",
+            "value": 72.65504907977196,
+            "range": "72.5702..72.7283",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 72.5702..72.7283 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "to_spans/by_span_count/32",
+            "value": 4742.090757232227,
+            "range": "4737.51..4746.55",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 4737.51..4746.55 ns/iter\nThroughput input: {\"Elements\": 32}"
+          },
+          {
+            "name": "to_spans/by_span_count/8",
+            "value": 1226.4146440288735,
+            "range": "1226.04..1226.8",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1226.04..1226.8 ns/iter\nThroughput input: {\"Elements\": 8}"
+          },
+          {
+            "name": "tree_churn/inner",
+            "value": 1713774.2017614895,
+            "range": "1.71265e+06..1.71491e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1.71265e+06..1.71491e+06 ns/iter"
+          },
+          {
+            "name": "tree_churn/top_level",
+            "value": 2940659.136470588,
+            "range": "2.93883e+06..2.9425e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 2.93883e+06..2.9425e+06 ns/iter"
+          },
+          {
+            "name": "tree_deep/2",
+            "value": 442.0113384211472,
+            "range": "441.901..442.13",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 441.901..442.13 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_deep/8",
+            "value": 8042.406756913294,
+            "range": "8039.67..8045.45",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 8039.67..8045.45 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_gates/2000x3/closed",
+            "value": 17.108420330114456,
+            "range": "17.0936..17.1239",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 17.0936..17.1239 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_gates/2000x3/matching",
+            "value": 155156.82229432752,
+            "range": "155067..155266",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 155067..155266 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_gates/200x3/closed",
+            "value": 18.007823530692782,
+            "range": "17.9953..18.022",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 17.9953..18.022 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_gates/200x3/matching",
+            "value": 702.5557769716307,
+            "range": "702.225..702.949",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 702.225..702.949 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_unlimited/20_outers_1000_lines",
+            "value": 1441835.254041673,
+            "range": "1.44076e+06..1.44303e+06",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1.44076e+06..1.44303e+06 ns/iter\nThroughput input: {\"Elements\": 1000}"
+          },
+          {
+            "name": "tree_watching/1",
+            "value": 50.53935455553116,
+            "range": "50.52..50.56",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 50.52..50.56 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_watching/50",
+            "value": 3721.448539425699,
+            "range": "2851.09..4713.7",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 2851.09..4713.7 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_wide/10",
+            "value": 431.11169179915885,
+            "range": "430.71..431.517",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 430.71..431.517 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_wide/100",
+            "value": 458.9604687641735,
+            "range": "458.582..459.299",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 458.582..459.299 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "tree_wide/1000",
+            "value": 1096.9722028608182,
+            "range": "1096.13..1098.02",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: slope\nSampling: Linear\n95% CI: 1096.13..1098.02 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "trigger_verbs/empty",
+            "value": 373982.96806282725,
+            "range": "373758..374207",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 373758..374207 ns/iter\nThroughput input: {\"Elements\": 500}"
+          },
+          {
+            "name": "trigger_verbs/gag",
+            "value": 374422.3517215569,
+            "range": "374308..374533",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 374308..374533 ns/iter\nThroughput input: {\"Elements\": 500}"
+          },
+          {
+            "name": "trigger_verbs/highlight",
+            "value": 698320.8930167597,
+            "range": "697896..698747",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 697896..698747 ns/iter\nThroughput input: {\"Elements\": 500}"
+          },
+          {
+            "name": "trigger_verbs/read_echo",
+            "value": 650939.6244473342,
+            "range": "649409..652480",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 649409..652480 ns/iter\nThroughput input: {\"Elements\": 500}"
+          },
+          {
+            "name": "upsert_room/single/10k",
+            "value": 14399843.705555554,
+            "range": "1.42666e+07..1.45931e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.42666e+07..1.45931e+07 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "upsert_room/single/1k",
+            "value": 12932082.841463415,
+            "range": "1.28572e+07..1.30009e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.28572e+07..1.30009e+07 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "upsert_room/single/50k",
+            "value": 18716840.41481481,
+            "range": "1.85611e+07..1.89181e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.85611e+07..1.89181e+07 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "upsert_rooms/batch_10k/1",
+            "value": 14526953.973529413,
+            "range": "1.44703e+07..1.46022e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.44703e+07..1.46022e+07 ns/iter\nThroughput input: {\"Elements\": 1}"
+          },
+          {
+            "name": "upsert_rooms/batch_10k/16",
+            "value": 14530320.694285715,
+            "range": "1.45081e+07..1.45544e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.45081e+07..1.45544e+07 ns/iter\nThroughput input: {\"Elements\": 16}"
+          },
+          {
+            "name": "upsert_rooms/batch_10k/256",
+            "value": 15111558.884375,
+            "range": "1.49595e+07..1.52924e+07",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 1.49595e+07..1.52924e+07 ns/iter\nThroughput input: {\"Elements\": 256}"
+          },
+          {
+            "name": "write_and_flush/J16/W8_mixed",
+            "value": 18320.14505245458,
+            "range": "18302.4..18340.1",
+            "unit": "ns/iter",
+            "extra": "Run: main push\nSource: d941371ac1394838156550b0950348a90bac7983\nAMI: ami-0cd54adbad90ecaa2\nCriterion statistic: mean\nSampling: Flat\n95% CI: 18302.4..18340.1 ns/iter\nThroughput input: {\"Elements\": 16}"
           }
         ]
       }
