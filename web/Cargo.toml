@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_web_client"
-version = "0.1.0"
+version = "0.5.8-ptb.7"
 edition = "2024"
 
 [[bin]]

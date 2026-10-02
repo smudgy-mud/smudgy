@@ -1,6 +1,6 @@
 [package]
 name = "smudgy_session_model"
-version = "0.1.0"
+version = "0.5.8-ptb.7"
 edition = "2024"
 
 [dependencies]
