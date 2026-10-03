@@ -23,7 +23,7 @@
 //!
 //! - **marker** (`smudgy:///owner/name[/subpath]`) — version-less, what
 //!   `resolve()` returns for a `smudgy://…` import. It carries the package coordinate in
-//!   a form `url` round-trips losslessly, and `load()` decodes it back.
+//!   a form `url` round-trips, with ASCII-folded coordinates and unchanged module paths.
 //! - **canonical** (`smudgy-pkg:///owner/name/version/module-file`) — the
 //!   version-pinned module identity `load()` redirects to. Because the resolved
 //!   version is baked into the path, two imports of the same package resolve to the
@@ -31,6 +31,7 @@
 //!   against it and stay within the package.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use deno_core::error::ModuleLoaderError;
@@ -70,10 +71,28 @@ pub const PROCEDURES_SCHEME: &str = "smudgy-procedures";
 /// key. `owner` is the publisher's globally unique nickname. The registry reserves
 /// `name` globally across publishers, while the full coordinate keeps the owner so
 /// published identities remain stable and attributable.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Identity comparisons and hash keys ignore ASCII case; the strings retain their spelling.
+#[derive(Debug, Clone)]
 pub struct PackageKey {
     pub owner: String,
     pub name: String,
+}
+
+// The registry compares both coordinate segments without ASCII case. Retain their
+// spelling for display and local paths, but use the same identity in every resolver map.
+impl PartialEq for PackageKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
+    }
+}
+
+impl Eq for PackageKey {}
+
+impl Hash for PackageKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.owner.to_ascii_lowercase().hash(state);
+        self.name.to_ascii_lowercase().hash(state);
+    }
 }
 
 impl PackageKey {
@@ -122,7 +141,7 @@ pub struct SmudgySpecifier {
 
 impl SmudgySpecifier {
     /// Parse `smudgy://owner/name[/subpath]`. Parsed by hand (not `url::Url`) so the
-    /// marker/canonical URL spaces stay path-based and round-trip losslessly.
+    /// marker/canonical URL spaces stay path-based. URL identities fold only owner/name.
     ///
     /// # Errors
     /// Returns [`SmudgySpecifierError`] for a missing scheme, an empty component, or an
@@ -208,7 +227,11 @@ impl SmudgySpecifier {
     /// while two coexisting versions of the importer select independently.
     #[must_use]
     pub fn to_marker_url(&self) -> ModuleSpecifier {
-        let mut path = format!("/{}/{}", self.owner, self.name);
+        let mut path = format!(
+            "/{}/{}",
+            self.owner.to_ascii_lowercase(),
+            self.name.to_ascii_lowercase()
+        );
         if let Some(sub) = &self.subpath {
             path.push('/');
             path.push_str(sub);
@@ -220,7 +243,9 @@ impl SmudgySpecifier {
                 "referrer",
                 &format!(
                     "{}/{}@{}",
-                    referrer.key.owner, referrer.key.name, referrer.version
+                    referrer.key.owner.to_ascii_lowercase(),
+                    referrer.key.name.to_ascii_lowercase(),
+                    referrer.version
                 ),
             );
         }
@@ -326,6 +351,7 @@ pub struct CanonicalCoords {
 /// Build the version-pinned canonical module URL for a concrete module file.
 #[must_use]
 pub fn canonical_url(key: &PackageKey, version: &str, module_subpath: &str) -> ModuleSpecifier {
+    let key = key.folded();
     let module_subpath = module_subpath.trim_start_matches('/');
     let path = format!("/{}/{}/{}/{}", key.owner, key.name, version, module_subpath);
     ModuleSpecifier::parse(&format!("{CANONICAL_SCHEME}://{path}"))
@@ -1827,7 +1853,7 @@ pub(crate) async fn load_marker_module(
     // isolate trust: trust grants permissions, it does not bypass another package's import-deny.
     if !fetched.manifest.importable {
         if let Some(referrer) = spec.referrer() {
-            if referrer.key.owner != fetched.key.owner {
+            if !referrer.key.owner.eq_ignore_ascii_case(&fetched.key.owner) {
                 return Err(crate::generic_loader_error(format!(
                     "package {}/{} is not importable: it declares \"importable\": false, so {}/{} may not `import` it — consume it via the package's `requires` + its events/types instead",
                     fetched.key.owner, fetched.key.name, referrer.key.owner, referrer.key.name
@@ -2957,6 +2983,49 @@ impl PackageProvider for InMemoryPackageProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mixed_case_keys_and_urls_share_identity_but_keep_module_paths() {
+        use std::collections::HashSet;
+        let key = super::PackageKey {
+            owner: "Rich_E".into(),
+            name: "Speedwalks".into(),
+        };
+        assert_eq!(key, key.folded());
+        assert_eq!(HashSet::from([key.clone(), key.folded()]).len(), 1);
+        assert_ne!(
+            key,
+            super::PackageKey {
+                owner: "someone_else".into(),
+                name: key.name.clone()
+            }
+        );
+        let url = super::canonical_url(&key, "1.0.0", "Lib/Util.ts");
+        assert_eq!(
+            url,
+            super::canonical_url(&key.folded(), "1.0.0", "Lib/Util.ts")
+        );
+        assert_ne!(url, super::canonical_url(&key, "1.0.0", "lib/util.ts"));
+        assert_ne!(url, super::canonical_url(&key, "2.0.0", "Lib/Util.ts"));
+        assert_eq!(
+            super::parse_canonical(&url).unwrap().module_subpath,
+            "Lib/Util.ts"
+        );
+        let marker = super::SmudgySpecifier::parse("smudgy://Rich_E/Speedwalks/Lib/Util.ts")
+            .unwrap()
+            .to_marker_url();
+        assert_eq!(
+            marker,
+            super::SmudgySpecifier::parse("smudgy://rich_e/speedwalks/Lib/Util.ts")
+                .unwrap()
+                .to_marker_url()
+        );
+        assert_ne!(
+            marker,
+            super::SmudgySpecifier::parse("smudgy://rich_e/speedwalks/lib/util.ts")
+                .unwrap()
+                .to_marker_url()
+        );
+    }
     use super::*;
 
     fn spec(raw: &str) -> SmudgySpecifier {
@@ -3270,10 +3339,9 @@ mod tests {
                 "marker {marker} must round-trip as a URL"
             );
             let recovered = SmudgySpecifier::from_marker_url(&marker).expect("marker decodes back");
-            assert_eq!(
-                recovered, original,
-                "marker for {raw} must decode losslessly"
-            );
+            assert_eq!(recovered.package_key(), original.package_key());
+            assert_eq!(recovered.subpath, original.subpath);
+            assert_eq!(recovered.referrer, original.referrer);
         }
     }
 

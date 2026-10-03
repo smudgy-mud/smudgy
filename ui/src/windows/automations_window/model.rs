@@ -110,7 +110,12 @@ impl LiveAutomations {
         self.by_origin
             .iter()
             .find_map(|(origin, creator)| match origin {
-                Origin::Package(pkg) if pkg.owner == owner && pkg.name == name => Some(creator),
+                Origin::Package(pkg)
+                    if pkg.owner.eq_ignore_ascii_case(owner)
+                        && pkg.name.eq_ignore_ascii_case(name) =>
+                {
+                    Some(creator)
+                }
                 _ => None,
             })
     }
@@ -1662,7 +1667,9 @@ pub fn specifier_for(owner: &str, name: &str) -> String {
 /// Whether `owner/name` is present in the lockfile list.
 pub fn is_installed(installed: &[LockedPackage], owner: &str, name: &str) -> bool {
     let specifier = specifier_for(owner, name);
-    installed.iter().any(|p| p.specifier == specifier)
+    installed
+        .iter()
+        .any(|p| p.specifier.eq_ignore_ascii_case(&specifier))
 }
 
 /// Required-parameter completeness per profile for the open profile-scoped package. Computing

@@ -856,7 +856,9 @@ fn op_smudgy_param_get(
         });
     let declared = state.borrow::<DeclaredPackageParams>().0.borrow();
     if let Some(parameter) = declared
-        .get(&state_specifier)
+        .iter()
+        .find(|(specifier, _)| specifier.eq_ignore_ascii_case(&state_specifier))
+        .map(|(_, params)| params)
         .and_then(|params| params.iter().find(|p| p.key == key))
     {
         return crate::models::shared_packages::get_declared_param_for_profile_checked(
@@ -888,7 +890,9 @@ fn op_smudgy_param_set(
     let state_specifier = param_state_specifier(state, &isolate, specifier)?;
     let declared = state.borrow::<DeclaredPackageParams>().0.borrow();
     let param = declared
-        .get(&state_specifier)
+        .iter()
+        .find(|(specifier, _)| specifier.eq_ignore_ascii_case(&state_specifier))
+        .map(|(_, params)| params)
         .and_then(|params| params.iter().find(|param| param.key == key))
         .ok_or_else(|| ParamSetError(format!("parameter '{key}' is not declared")))?
         .clone();
@@ -908,13 +912,15 @@ fn op_smudgy_param_set(
 
 /// Whether the `isolate` making an [`op_smudgy_param_get`] call may read `specifier`'s params.
 /// The Main isolate is trusted and may read any namespace; a sandboxed package may read only its
-/// own `smudgy://owner/name` — the exact string the `smudgy:params` binding bakes in for it (its
+/// own `smudgy://owner/name` — the case-insensitive identity the `smudgy:params` binding bakes in (its
 /// owner/name, never the resolved version). This is the confidentiality boundary the per-importer
 /// binding only *approximates*; enforcing it in the op is what makes the boundary real.
 fn param_read_allowed(isolate: &IsolateId, specifier: &str) -> bool {
     match isolate {
         IsolateId::Main => true,
-        IsolateId::Package(pkg) => specifier == format!("smudgy://{}/{}", pkg.owner, pkg.name),
+        IsolateId::Package(pkg) => {
+            specifier.eq_ignore_ascii_case(&format!("smudgy://{}/{}", pkg.owner, pkg.name))
+        }
     }
 }
 
@@ -9091,6 +9097,22 @@ mod tests {
             "smudgy://anyone/anything"
         ));
         assert!(param_read_allowed(&IsolateId::Main, "smudgy://wbk/mapper"));
+    }
+
+    #[test]
+    fn mixed_case_parameter_gate_accepts_only_the_own_package_identity() {
+        let isolate = IsolateId::package("Rich_E", "Speedwalks", "1.0.0");
+        assert!(param_read_allowed(&isolate, "smudgy://rich_e/speedwalks"));
+        assert!(param_read_allowed(&isolate, "smudgy://RICH_E/SPEEDWALKS"));
+        assert!(!param_read_allowed(
+            &isolate,
+            "smudgy://someone_else/Speedwalks"
+        ));
+        assert!(!param_read_allowed(&isolate, "smudgy://Rich_E/other"));
+        assert!(!param_read_allowed(
+            &isolate,
+            "smudgy://Rich_E/Speedwalks@1.0.0"
+        ));
     }
 
     #[test]
