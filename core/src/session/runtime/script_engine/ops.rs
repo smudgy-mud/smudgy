@@ -184,6 +184,9 @@ deno_core::extension!(
     op_smudgy_store_remote_bind,
     op_smudgy_procedure_on,
     op_smudgy_procedure_post,
+    op_smudgy_procedure_init,
+    op_smudgy_procedure_call,
+    op_smudgy_procedure_reply,
     op_smudgy_interop_declare,
     op_smudgy_data_dir,
     op_smudgy_broadcast_allowed,
@@ -1539,6 +1542,13 @@ impl From<NotCapable> for StoreOpError {
     }
 }
 
+impl From<crate::session::runtime::procedure_calls::ProcedureCallFailure> for StoreOpError {
+    fn from(error: crate::session::runtime::procedure_calls::ProcedureCallFailure) -> Self {
+        // Keep the existing JS exception format; only this FFI boundary needs it.
+        Self(error.to_string())
+    }
+}
+
 /// Resolve a consumer-side producer spec (`"user"`, `"gmcp"`, or `"smudgy://owner/name"`) or
 /// throw.
 fn parse_producer(spec: &str) -> Result<store::ProducerKey, StoreOpError> {
@@ -2518,12 +2528,11 @@ fn op_smudgy_store_remote_bind(
 }
 
 // ============================================================================
-// Procedures (`docs/interop.md` §6): directed, fire-and-forget delivery of asks to a
-// package's home instance. Receipt (registering the implementation) is an interop write
-// (interop.md §3), so it passes the same home gate as `set`/`emit`; posting stamps the
-// poster's origin host-side (unforgeable), rides the action queue, and shares the event
-// system's depth cap. A post with no implementation on an addressable procedure is buffered
-// briefly (bounded) and drained when the implementation registers — see `message_bus.rs`.
+// Procedures: directed delivery to a package's home instance. Registration and
+// posting require interop write; calls require both read and write. The host stamps
+// caller identity and queues delivery. Posts ignore results and briefly buffer
+// missing implementations (`message_bus.rs`); calls reject missing implementations
+// and track replies, ancestry, deadlines, and storage bounds (`procedure_calls.rs`).
 // ============================================================================
 
 /// The canonical routing key for `(producer, procedure name)` — the folded
@@ -2764,6 +2773,176 @@ fn op_smudgy_procedure_post(
         );
     }
     Ok(())
+}
+
+/// Register one private settlement function per heap. No per-call V8 handles.
+#[op2(fast)]
+fn op_smudgy_procedure_init<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &mut OpState,
+    f: v8::Local<'s, v8::Function>,
+) {
+    let function = RegisteredFunction::new(scope, f);
+    let functions = state.borrow::<Rc<RefCell<Vec<RegisteredFunction>>>>();
+    let id = FunctionId(functions.borrow().len());
+    functions.borrow_mut().push(function);
+    let instance = state.borrow::<IsolateInstance>().0;
+    state
+        .borrow::<crate::session::runtime::SharedMessageBus>()
+        .borrow_mut()
+        .calls
+        .register_settler(
+            instance,
+            crate::session::runtime::message_bus::MessageReceiver {
+                isolate: current_isolate(state),
+                function_id: id,
+            },
+        );
+}
+
+/// Admission is synchronous; only `.call` allocates a JS promise. An internal
+/// continuation-local ticket carries ancestry, and is validated against this heap.
+#[op2(fast)]
+fn op_smudgy_procedure_call(
+    state: &mut OpState,
+    root_id: u32,
+    #[string] name: &str,
+    #[string] payload: &str,
+    target_session: u32,
+    timeout_ms: u32,
+    parent: u32,
+) -> Result<u32, StoreOpError> {
+    use crate::session::runtime::procedure_calls::{
+        MAX_PAYLOAD_BYTES, ProcedureCallFailure, ProcedureCallKey, ProcedureRequest,
+    };
+    ensure(grants(state).interop_read, "interop:read")?;
+    ensure(grants(state).interop_write, "interop:write")?;
+    if payload.len() > MAX_PAYLOAD_BYTES || name.len() > 4096 {
+        return Err(ProcedureCallFailure::new(
+            "RequestTooLarge",
+            "procedure request exceeds the payload or name limit",
+        )
+        .into());
+    }
+    let instance = state.borrow::<IsolateInstance>().0;
+    let bus = state
+        .borrow::<crate::session::runtime::SharedMessageBus>()
+        .clone();
+    let ancestry = bus.borrow().calls.ancestry(
+        instance,
+        parent,
+        state.borrow::<SharedCallState>().depth.get(),
+        timeout_ms,
+    )?;
+    let root = interned_root(state, root_id)?;
+    let session = *state.borrow::<SessionId>();
+    let target = SessionId::from(target_session);
+    if target != session {
+        ensure(grants(state).reach_others, "reach-others")?;
+    }
+    let target_runtime = registry::get_runtime(target).ok_or(ProcedureCallFailure::new(
+        "Closed",
+        "the target session is no longer live",
+    ))?;
+    if target_runtime.server_name.as_str() != state.borrow::<ServerName>().0.as_str() {
+        return Err(ProcedureCallFailure::new(
+            "Unavailable",
+            "procedures cannot cross configured server entries",
+        )
+        .into());
+    }
+    let caller_runtime = registry::get_runtime(session).ok_or(ProcedureCallFailure::new(
+        "Closed",
+        "the calling session is no longer live",
+    ))?;
+    let caller = registry::snapshot(session).ok_or(ProcedureCallFailure::new(
+        "Closed",
+        "the calling session is no longer live",
+    ))?;
+    let origin: Arc<str> = match current_isolate(state) {
+        IsolateId::Main => Arc::from("user"),
+        IsolateId::Package(pkg) => Arc::from(format!(
+            "smudgy://{}/{}",
+            pkg.owner.to_ascii_lowercase(),
+            pkg.name.to_ascii_lowercase()
+        )),
+    };
+    let id = bus.borrow_mut().calls.allocate_id()?;
+    let canonical = canonical_procedure(&root.producer, name);
+    let memory = bus.borrow().calls.memory.clone();
+    let allocation = memory.reserve(
+        payload.len() + canonical.len() + root.producer_spec.len() + name.len() + origin.len(),
+    )?;
+    let request = Arc::new(ProcedureRequest {
+        key: ProcedureCallKey {
+            session,
+            instance,
+            id,
+        },
+        target,
+        canonical: Arc::from(canonical),
+        producer: Arc::clone(&root.producer_spec),
+        name: Arc::from(name),
+        payload: Arc::from(payload),
+        origin: Arc::clone(&origin),
+        caller,
+        ancestry,
+        reply_tx: caller_runtime.tx.clone(),
+        memory,
+        allocation,
+    });
+    bus.borrow_mut().calls.insert_call(Arc::clone(&request))?;
+    state
+        .borrow::<crate::session::runtime::SharedCatalogue>()
+        .borrow_mut()
+        .sample_dynamic(
+            &root.producer_spec,
+            crate::session::runtime::catalogue::CatalogueKind::Procedure,
+            name,
+            &origin,
+            payload,
+        );
+    queue_own_action(state, RuntimeAction::ForwardProcedureCall(request));
+    Ok(id)
+}
+
+/// Only the heap running an admitted invocation can reply. Expired tickets
+/// are ignored: a late result cannot settle another request or survive reload.
+#[op2(fast)]
+fn op_smudgy_procedure_reply(
+    state: &mut OpState,
+    ticket: u32,
+    status: u32,
+    #[string] payload: &str,
+) {
+    use crate::session::runtime::procedure_calls::{
+        MAX_PAYLOAD_BYTES, ProcedureOutcome, ProcedureReplyStatus,
+    };
+    let outcome = if payload.len() > MAX_PAYLOAD_BYTES {
+        ProcedureOutcome::error("ResponseTooLarge", "procedure response exceeds 1 MiB")
+    } else {
+        match ProcedureReplyStatus::decode(status) {
+            ProcedureReplyStatus::Value => ProcedureOutcome::Value(Arc::from(payload)),
+            ProcedureReplyStatus::Void => ProcedureOutcome::Void,
+            ProcedureReplyStatus::Error => ProcedureOutcome::EncodedError(Arc::from(payload)),
+        }
+    };
+    let instance = state.borrow::<IsolateInstance>().0;
+    let reply = state
+        .borrow::<crate::session::runtime::SharedMessageBus>()
+        .borrow_mut()
+        .calls
+        .prepare_reply(ticket, instance, outcome);
+    if let Some(reply) = reply {
+        queue_own_action(
+            state,
+            RuntimeAction::ForwardProcedureReply {
+                ticket,
+                instance,
+                reply,
+            },
+        );
+    }
 }
 
 /// `interopDeclare(creatorId, kind, name)` — tier-1 runtime confirmation for the catalogue
