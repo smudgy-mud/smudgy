@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = ROOT / ".github" / "scripts"
@@ -61,6 +62,40 @@ class ScopeSelectionTests(unittest.TestCase):
             "PR measurement budget",
             [entry["rule"] for entry in result["coverage"]],
         )
+
+    def test_procedure_controls_survive_the_broad_change_budget(self) -> None:
+        result = self.selector.select(self.config, ["bench/Cargo.toml"])
+        self.assertTrue({"script_dispatch", "procedures", "interop_ops"}.issubset(
+            result["criterion_targets"]
+        ))
+        self.assertNotIn("procedure_calls", result["criterion_targets"])
+        self.assertEqual(result["candidate_only_criterion_targets"], ["procedure_calls"])
+
+    def test_procedure_runtime_paths_are_covered(self) -> None:
+        for path in (
+            "core/src/session/runtime/action.rs",
+            "core/src/session/runtime/dispatch.rs",
+            "core/src/session/runtime/js/smudgy.ts",
+            "core/src/session/runtime/procedure_calls.rs",
+            "core/src/session/runtime/message_bus.rs",
+        ):
+            with self.subTest(path=path):
+                result = self.selector.select(self.config, [path])
+                self.assertTrue({"script_dispatch", "procedures"}.issubset(
+                    result["criterion_targets"]
+                ))
+                self.assertEqual(result["uncovered_files"], [])
+                self.assertEqual(result["candidate_only_criterion_targets"], ["procedure_calls"])
+
+    def test_rpc_harness_changes_select_its_paired_controls(self) -> None:
+        result = self.selector.select(self.config, ["bench/benches/procedure_calls.rs"])
+        self.assertEqual(result["criterion_targets"], ["runner_control", "procedures"])
+        self.assertEqual(result["candidate_only_criterion_targets"], ["procedure_calls"])
+        self.assertEqual(result["uncovered_files"], [])
+
+    def test_unrelated_changes_do_not_select_rpc_timings(self) -> None:
+        result = self.selector.select(self.config, ["core/src/session/connection.rs"])
+        self.assertEqual(result["candidate_only_criterion_targets"], [])
 
     def test_explicit_rules_override_generic_file_filters(self) -> None:
         for path in (
@@ -120,6 +155,85 @@ class ScopeSelectionTests(unittest.TestCase):
         self.assertEqual(result["coverage_status"], "gap")
         self.assertFalse(result["file_list_complete"])
         self.assertTrue(result["scope_gaps"])
+
+
+class CandidateOnlyTests(unittest.TestCase):
+    def test_rpc_timings_are_prebuilt_but_excluded_from_paired_measurements(self) -> None:
+        runner = load_script("run-paired-criterion.py")
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            for arm in ("baseline", "candidate"):
+                (directory / arm).mkdir()
+                (directory / arm / "Cargo.toml").touch()
+            output = directory / "output"
+            commands = []
+
+            def fake_run(command, *, cwd, env, log_path):
+                commands.append((command, cwd))
+                log_path.write_text("ok", encoding="utf-8")
+                if "SMUDGY_BENCH_AVAILABILITY_REPORT" in env:
+                    Path(env["SMUDGY_BENCH_AVAILABILITY_REPORT"]).write_text(
+                        '{"available":true}', encoding="utf-8"
+                    )
+                if "--output" in command:
+                    Path(command[command.index("--output") + 1]).write_text(
+                        "[]", encoding="utf-8"
+                    )
+
+            argv = [
+                "run-paired-criterion.py", "--baseline-dir", str(directory / "baseline"),
+                "--candidate-dir", str(directory / "candidate"),
+                "--target-root", str(directory / "targets"), "--output-dir", str(output),
+                "--converter", str(SCRIPTS / "criterion-to-benchmark-json.py"),
+                "--target", "procedures", "--candidate-only-target", "procedure_calls",
+                "--settle-seconds", "0",
+            ]
+            with patch.object(sys, "argv", argv), patch.object(runner, "run", fake_run), \
+                    patch.object(runner.time, "sleep"), patch.object(runner, "health_snapshot", return_value={}):
+                runner.main()
+            manifest = json.loads((output / "paired-manifest.json").read_text())
+            self.assertEqual(manifest["targets"], ["procedures"])
+            self.assertEqual(len(manifest["measurements"]), 8)
+            self.assertTrue(all("candidate-only" not in m["results"] for m in manifest["measurements"]))
+            self.assertTrue((output / "candidate-only-procedure_calls.json").is_file())
+            rpc = [(command, cwd) for command, cwd in commands if "procedure_calls" in command]
+            self.assertEqual(len(rpc), 2)
+            self.assertTrue(all(cwd == directory / "candidate" for _, cwd in rpc))
+            self.assertIn("--no-run", rpc[0][0])
+            first_measurement = next(i for i, (cmd, _) in enumerate(commands) if "--noplot" in cmd)
+            self.assertTrue(all("--no-run" in cmd for cmd, _ in commands[:first_measurement]))
+
+    def run_with_availability(self, report: str | None) -> tuple[list, bool]:
+        runner = load_script("run-paired-criterion.py")
+        commands = []
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            stale_result = directory / "candidate-only-procedure_calls.json"
+            stale_result.write_text("stale", encoding="utf-8")
+
+            def fake_run(command, *, cwd, env, log_path):
+                commands.append(command)
+                if report is not None and "SMUDGY_BENCH_AVAILABILITY_REPORT" in env:
+                    Path(env["SMUDGY_BENCH_AVAILABILITY_REPORT"]).write_text(report, encoding="utf-8")
+
+            with patch.object(runner, "run", fake_run), patch.object(runner.time, "sleep"), \
+                    patch.object(runner, "health_snapshot", return_value={}):
+                runner.run_candidate_only(
+                    targets=["procedure_calls"], source=directory, target_dir=directory / "target",
+                    output_dir=directory, converter=SCRIPTS / "criterion-to-benchmark-json.py",
+                    cpu_list=None, settle_seconds=0, base_env={},
+                )
+            return commands, stale_result.exists()
+
+    def test_unavailable_api_skips_conversion_and_removes_stale_estimates(self) -> None:
+        commands, stale = self.run_with_availability('{"available":false}')
+        self.assertEqual(len(commands), 1)
+        self.assertFalse(stale)
+
+    def test_missing_or_invalid_availability_is_a_failure(self) -> None:
+        for report in (None, "broken", '{"available":1}', "[]"):
+            with self.subTest(report=report), self.assertRaises(SystemExit):
+                self.run_with_availability(report)
 
 
 class AggregationTests(unittest.TestCase):
@@ -216,6 +330,22 @@ class AggregationTests(unittest.TestCase):
             self.assertEqual(result["verdict"], "confirmed_regression_signal")
             self.assertTrue(result["environment"]["passed"])
             self.assertEqual(result["counts"]["confirmed_slower"], 1)
+
+    def test_candidate_only_cases_cannot_enter_a_paired_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            manifest = self.write_paired_fixture(directory)
+            result_path = directory / "result-2.json"
+            results = json.loads(result_path.read_text())
+            results.append({"name": "procedure_calls/new_api", "unit": "ns/iter", "value": 10})
+            result_path.write_text(json.dumps(results), encoding="utf-8")
+            process = subprocess.run(
+                [sys.executable, str(SCRIPTS / "aggregate-paired-criterion.py"),
+                 "--manifest", str(manifest), "--output", str(directory / "aggregate.json")],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("benchmark set changed", process.stderr)
 
     def test_bimodal_replicates_are_inconclusive(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -555,6 +685,10 @@ class WorkflowDefinitionTests(unittest.TestCase):
     def test_pr_file_count_is_passed_to_scope_selector(self) -> None:
         self.assertIn("changed_file_count=$(jq -r .changed_files", self.workflow)
         self.assertIn("--expected-file-count", self.workflow)
+
+    def test_candidate_only_suites_are_forwarded_to_the_runner(self) -> None:
+        self.assertIn("'.candidate_only_criterion_targets[]'", self.workflow)
+        self.assertIn('--candidate-only-target "${target}"', self.workflow)
 
     def test_artifact_failure_is_propagated_to_reporter(self) -> None:
         self.assertIn("id: measurements", self.workflow)

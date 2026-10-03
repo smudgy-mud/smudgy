@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prebuild and run targeted Criterion suites in balanced ABBA/BAAB blocks."""
+"""Run balanced comparisons, then record candidate-only suites separately."""
 
 from __future__ import annotations
 
@@ -112,6 +112,66 @@ def cargo_command(cpu_list: str | None, arguments: list[str]) -> list[str]:
     return command
 
 
+def run_candidate_only(
+    *,
+    targets: list[str],
+    source: Path,
+    target_dir: Path,
+    output_dir: Path,
+    converter: Path,
+    cpu_list: str | None,
+    settle_seconds: float,
+    base_env: dict[str, str],
+) -> None:
+    """Availability is explicit; these estimates never enter the paired manifest."""
+    for target in targets:
+        criterion_dir = checked_child(target_dir, "criterion")
+        if criterion_dir.exists():
+            shutil.rmtree(criterion_dir)
+        availability = output_dir / f"candidate-only-{target}-availability.json"
+        availability.unlink(missing_ok=True)
+        result_path = output_dir / f"candidate-only-{target}.json"
+        result_path.unlink(missing_ok=True)
+        env = {
+            **base_env,
+            "CARGO_TARGET_DIR": str(target_dir),
+            "SMUDGY_BENCH_AVAILABILITY_REPORT": str(availability),
+        }
+        time.sleep(settle_seconds)
+        before = health_snapshot()
+        run(
+            cargo_command(
+                cpu_list,
+                ["bench", "--locked", "-p", "smudgy_bench", "--features",
+                 "pr-benchmarks", "--bench", target, "--", "--noplot"],
+            ),
+            cwd=source,
+            env=env,
+            log_path=output_dir / f"candidate-only-{target}.txt",
+        )
+        after = health_snapshot()
+        try:
+            status = json.loads(availability.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(f"missing or invalid availability report for {target}") from error
+        if not isinstance(status, dict) or not isinstance(status.get("available"), bool):
+            raise SystemExit(f"invalid availability report for {target}: {status!r}")
+        status.update({"health_before": before, "health_after": after})
+        availability.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+        if not status["available"]:
+            print(f"{target}: API unavailable; candidate-only timings skipped", flush=True)
+            continue
+        run(
+            [sys.executable, str(converter.resolve()), "--criterion-root",
+             str(criterion_dir), "--output",
+             str(result_path), "--extra",
+             "Candidate-only timing; no baseline comparison"],
+            cwd=Path.cwd(),
+            env={**base_env, "PYTHONUTF8": "1"},
+            log_path=output_dir / f"convert-candidate-only-{target}.txt",
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-dir", type=Path, required=True)
@@ -120,6 +180,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--converter", type=Path, required=True)
     parser.add_argument("--target", action="append", required=True)
+    parser.add_argument("--candidate-only-target", action="append", default=[])
     parser.add_argument("--blocks", type=int, default=2)
     parser.add_argument("--cpu-list")
     parser.add_argument("--settle-seconds", type=float, default=2.0)
@@ -130,9 +191,12 @@ def main() -> None:
     if args.settle_seconds < 0:
         raise SystemExit("--settle-seconds cannot be negative")
     targets = list(dict.fromkeys(args.target))
-    invalid = [target for target in targets if not TARGET_RE.fullmatch(target)]
+    candidate_only = list(dict.fromkeys(args.candidate_only_target))
+    invalid = [target for target in [*targets, *candidate_only] if not TARGET_RE.fullmatch(target)]
     if invalid:
         raise SystemExit(f"invalid benchmark target names: {', '.join(invalid)}")
+    if set(targets) & set(candidate_only):
+        raise SystemExit("paired and candidate-only targets must be separate")
 
     sources = {
         "baseline": args.baseline_dir.resolve(),
@@ -156,7 +220,8 @@ def main() -> None:
 
     for arm in ("baseline", "candidate"):
         env = {**base_env, "CARGO_TARGET_DIR": str(target_dirs[arm])}
-        for target in targets:
+        prebuild_targets = targets + (candidate_only if arm == "candidate" else [])
+        for target in prebuild_targets:
             run(
                 cargo_command(
                     args.cpu_list,
@@ -275,6 +340,16 @@ def main() -> None:
     manifest_path = output_dir / "paired-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {len(manifest['measurements'])} measurements to {manifest_path}")
+    run_candidate_only(
+        targets=candidate_only,
+        source=sources["candidate"],
+        target_dir=target_dirs["candidate"],
+        output_dir=output_dir,
+        converter=args.converter,
+        cpu_list=args.cpu_list,
+        settle_seconds=args.settle_seconds,
+        base_env=base_env,
+    )
 
 
 if __name__ == "__main__":

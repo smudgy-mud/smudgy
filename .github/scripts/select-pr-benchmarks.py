@@ -42,6 +42,10 @@ def select(
 ) -> dict[str, Any]:
     all_criterion = config["criterion_targets"]
     all_callgrind = config["callgrind_targets"]
+    # Map candidate-only harnesses to the paired suite that selects them.
+    candidate_only = config.get("candidate_only_criterion_targets", {})
+    if any(parent not in all_criterion for parent in candidate_only.values()):
+        raise SystemExit("candidate-only targets must name a paired parent suite")
     if not all(isinstance(value, str) for value in [*all_criterion, *all_callgrind]):
         raise SystemExit("benchmark target lists must contain strings")
     max_criterion = config.get("max_pr_criterion_targets")
@@ -85,7 +89,8 @@ def select(
                 criterion.update(all_criterion)
             criterion.update(rule.get("criterion", []))
             if rule.get("criterion_from_filename"):
-                target = Path(path).stem
+                filename = Path(path).stem
+                target = candidate_only.get(filename, filename)
                 if target in all_criterion:
                     criterion.add(target)
                 elif target == "ingest_callgrind":
@@ -169,6 +174,9 @@ def select(
         "criterion_targets": ordered(
             criterion, ["runner_control", *all_criterion]
         ),
+        "candidate_only_criterion_targets": [
+            target for target, parent in candidate_only.items() if parent in criterion
+        ],
         "omitted_criterion_targets": omitted_criterion,
         "callgrind_targets": ordered(callgrind, all_callgrind),
         "coverage_status": status,
