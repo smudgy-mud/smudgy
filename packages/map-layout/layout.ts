@@ -81,9 +81,13 @@ export interface IntegralLayoutControl {
   axisGroupCompaction?: boolean;
 }
 
-/** Synchronous controls for the bounded, compaction-only layout pass. */
+/**
+ * Cooperative controls inside the synchronous compaction pass. Worker-client
+ * AbortSignal cancellation separately retires its active Worker; these polls
+ * let in-engine deadlines stop between smaller units of packing work.
+ */
 export interface IntegralLayoutCompactionControl extends IntegralLayoutControl {
-  /** Stop between gravity/vacuum transactions and return the best complete plan found so far. */
+  /** Stop at cooperative phase/trial boundaries; cancelled public compaction returns its seed. */
   shouldCancel?: () => boolean;
 }
 
@@ -1692,6 +1696,8 @@ interface RigidTranslationContext {
   movedLinkRows?: RigidLinkRows;
   stationaryLinkRows?: RigidLinkRows;
   affectedCrossingsBefore?: number;
+  /** Offset-independent obstruction terms subtracted by every group trial. */
+  roomObstructionsBefore?: number;
 }
 
 interface RigidLinkClasses {
@@ -2039,6 +2045,12 @@ function rigidRoomObstructions(
   const movedIndex = contextMovedIndex(context);
   const { moved, stationary, boundary } = contextLinkClasses(context);
   let result = candidateRoomObstructions(base);
+  const collectBefore = context.roomObstructionsBefore === undefined;
+  let beforeTotal = 0;
+  // The first offset retains the existing query and accumulation order. Its
+  // three loops collect the invariant sum without another traversal; later
+  // offsets subtract that sum once and only query the changed geometry.
+  if (!collectBefore) result -= context.roomObstructionsBefore as number;
 
   for (const link of moved) {
     const from = base.positions.get(link.a);
@@ -2046,8 +2058,11 @@ function rigidRoomObstructions(
     if (!from || !to || from.level !== to.level) continue;
     const afterFrom = add(from, offset);
     const afterTo = add(to, offset);
-    const beforeStationary = indexedSegmentObstructions(baseIndex, from, to) -
-      indexedSegmentObstructions(movedIndex, from, to);
+    const beforeStationary = collectBefore
+      ? indexedSegmentObstructions(baseIndex, from, to) -
+        indexedSegmentObstructions(movedIndex, from, to)
+      : 0;
+    if (collectBefore) beforeTotal += beforeStationary;
     const afterStationary = indexedSegmentObstructions(baseIndex, afterFrom, afterTo) -
       indexedSegmentObstructions(movedIndex, afterFrom, afterTo);
     result += afterStationary - beforeStationary;
@@ -2059,15 +2074,18 @@ function rigidRoomObstructions(
     if (!from || !to || from.level !== to.level) continue;
     // Moved rooms sit on this fixed segment after the move exactly when their
     // base positions sit on the segment translated backwards.
-    result += indexedSegmentObstructions(movedIndex, add(from, negated), add(to, negated)) -
-      indexedSegmentObstructions(movedIndex, from, to);
+    const after = indexedSegmentObstructions(movedIndex, add(from, negated), add(to, negated));
+    const before = collectBefore ? indexedSegmentObstructions(movedIndex, from, to) : 0;
+    if (collectBefore) beforeTotal += before;
+    result += after - before;
   }
 
   for (const link of boundary) {
     const beforeFrom = base.positions.get(link.a);
     const beforeTo = base.positions.get(link.b);
     if (!beforeFrom || !beforeTo) continue;
-    const before = indexedSegmentObstructions(baseIndex, beforeFrom, beforeTo);
+    const before = collectBefore ? indexedSegmentObstructions(baseIndex, beforeFrom, beforeTo) : 0;
+    if (collectBefore) beforeTotal += before;
     const afterFrom = context.movedIds.has(link.a) ? add(beforeFrom, offset) : beforeFrom;
     const afterTo = context.movedIds.has(link.b) ? add(beforeTo, offset) : beforeTo;
     let after = 0;
@@ -2078,6 +2096,7 @@ function rigidRoomObstructions(
     }
     result += after - before;
   }
+  if (collectBefore) context.roomObstructionsBefore = beforeTotal;
   return result;
 }
 
@@ -4555,6 +4574,32 @@ function translateIndexedRooms(
   }
 }
 
+interface PushSweepGeometry {
+  links: readonly IndexedPhysicalLink[];
+  positions: readonly GridPosition[];
+}
+
+/** Geometry-dependent link preparation; mutable push paths rebuild on every step. */
+function pushSweepGeometry(
+  positions: ReadonlyMap<string, GridPosition>,
+  physical: readonly IndexedPhysicalLink[],
+): PushSweepGeometry {
+  const links: IndexedPhysicalLink[] = [];
+  const endpoints: GridPosition[] = [];
+  for (const link of physical) {
+    const from = positions.get(link.a);
+    const to = positions.get(link.b);
+    if (!from || !to || from.level !== to.level || from.x === to.x || from.y === to.y) continue;
+    links.push(link);
+    endpoints.push(from, to);
+  }
+  return { links, positions: endpoints };
+}
+
+// Cancellation is separate from an infeasible closure: the caller must stop
+// its transaction, rather than trying another group as though this one failed.
+const PUSH_CLOSURE_CANCELLED = Symbol("push-closure-cancelled");
+
 function safePushClosure(
   positions: ReadonlyMap<string, GridPosition>,
   roots: ReadonlySet<string>,
@@ -4563,21 +4608,38 @@ function safePushClosure(
   edges: readonly LayoutEdge[],
   offset: Origin,
   indexedOccupants?: RoomOccupantIndex,
-): Set<string> | undefined {
+  preparedSweep?: PushSweepGeometry,
+): Set<string> | undefined;
+function safePushClosure(
+  positions: ReadonlyMap<string, GridPosition>,
+  roots: ReadonlySet<string>,
+  protectedIds: ReadonlySet<string>,
+  residents: ReadonlyMap<string, LayoutResident>,
+  edges: readonly LayoutEdge[],
+  offset: Origin,
+  indexedOccupants: RoomOccupantIndex | undefined,
+  preparedSweep: PushSweepGeometry | undefined,
+  shouldCancel: IntegralLayoutCompactionControl["shouldCancel"],
+): Set<string> | undefined | typeof PUSH_CLOSURE_CANCELLED;
+function safePushClosure(
+  positions: ReadonlyMap<string, GridPosition>,
+  roots: ReadonlySet<string>,
+  protectedIds: ReadonlySet<string>,
+  residents: ReadonlyMap<string, LayoutResident>,
+  edges: readonly LayoutEdge[],
+  offset: Origin,
+  indexedOccupants?: RoomOccupantIndex,
+  preparedSweep?: PushSweepGeometry,
+  shouldCancel?: IntegralLayoutCompactionControl["shouldCancel"],
+): Set<string> | undefined | typeof PUSH_CLOSURE_CANCELLED {
   const topology = topologyIndex(edges);
   const occupants = indexedOccupants?.cells ?? roomOccupantIndex(positions).cells;
   // An integral one-cell cardinal push cannot strictly cross an axis-aligned
   // link: an integral row/column can only meet at an endpoint or collinearly.
   // Only diagonal links need the substantially more expensive segment test.
-  const sweptLinks: IndexedPhysicalLink[] = [];
-  const sweptLinkPositions: GridPosition[] = [];
-  for (const link of topology.physical) {
-    const from = positions.get(link.a);
-    const to = positions.get(link.b);
-    if (!from || !to || from.level !== to.level || from.x === to.x || from.y === to.y) continue;
-    sweptLinks.push(link);
-    sweptLinkPositions.push(from, to);
-  }
+  const sweep = preparedSweep ?? pushSweepGeometry(positions, topology.physical);
+  const sweptLinks = sweep.links;
+  const sweptLinkPositions = sweep.positions;
 
   const closure = new Set<string>();
   const queued = new Set<string>();
@@ -4597,6 +4659,7 @@ function safePushClosure(
   for (const id of roots) enqueue(id);
 
   while (queueIndex < queue.length) {
+    if ((queueIndex & 0x3f) === 0 && shouldCancel?.()) return PUSH_CLOSURE_CANCELLED;
     const id = queue[queueIndex++];
     const position = positions.get(id);
     if (!position) continue;
@@ -4652,6 +4715,7 @@ function safePushClosure(
     // A push must not sweep a room through an existing link. Pull both link
     // endpoints into the closure, matching Arctic's recursive map-push rule.
     for (let linkIndex = 0; linkIndex < sweptLinks.length; linkIndex += 1) {
+      if ((linkIndex & 0x3f) === 0 && shouldCancel?.()) return PUSH_CLOSURE_CANCELLED;
       const link = sweptLinks[linkIndex];
       if (link.a === id || link.b === id ||
         protectedIds.has(link.a) || protectedIds.has(link.b)) continue;
@@ -8147,8 +8211,10 @@ function axisGroupCompaction(
     // this base; group trials exclude their own rooms by membership.
     const baseOccupants = roomOccupantIndex(base.positions);
     for (const axis of ["x", "y"] as const) {
+      if (shouldCancel?.()) return;
       const lanes = axisLaneIndex(base.positions, axis);
       for (const moving of axisTranslationGroups(base.positions, edges, axis)) {
+        if (shouldCancel?.()) return;
         if (centerId && moving.has(centerId)) continue;
         if (!movableRegion(moving, residents)) continue;
         let minimum = Number.NEGATIVE_INFINITY;
@@ -8177,6 +8243,7 @@ function axisGroupCompaction(
         // group, so index builds amortize across the whole scan.
         const translationContext = rigidTranslationContext(base, moving);
         for (const distance of distances) {
+          if (shouldCancel?.()) return;
           const evaluated = translatedAxisCandidate(
             base,
             current,
@@ -8230,6 +8297,17 @@ function axisGroupCompaction(
     return { groups, byId };
   };
   const unprotected = new Set<string>();
+  // Gravity never mutates an adopted candidate's positions. Root expansion
+  // and rejected groups therefore share its exact swept-link preparation;
+  // an accepted move adopts a new candidate and gets fresh geometry.
+  const gravitySweeps = new WeakMap<Candidate, PushSweepGeometry>();
+  const gravitySweep = (base: Candidate): PushSweepGeometry => {
+    const known = gravitySweeps.get(base);
+    if (known) return known;
+    const result = pushSweepGeometry(base.positions, topologyIndex(edges).physical);
+    gravitySweeps.set(base, result);
+    return result;
+  };
   const directionalGravity = (
     positions: ReadonlyMap<string, GridPosition>,
     orientation: GravityOrientation,
@@ -8247,7 +8325,8 @@ function axisGroupCompaction(
     sign: GravitySign,
     occupants: RoomOccupantIndex,
     groupById: ReadonlyMap<string, ReadonlySet<string>>,
-  ): Set<string> | undefined => {
+    sweep: PushSweepGeometry,
+  ): Set<string> | undefined | typeof PUSH_CLOSURE_CANCELLED => {
     const offset: Origin = axis === "x"
       ? { x: sign, y: 0, level: 0 }
       : { x: 0, y: sign, level: 0 };
@@ -8261,7 +8340,10 @@ function axisGroupCompaction(
         edges,
         offset,
         occupants,
+        sweep,
+        shouldCancel,
       );
+      if (closure === PUSH_CLOSURE_CANCELLED) return closure;
       if (!closure) return undefined;
       let expanded = false;
       for (const id of closure) {
@@ -8302,7 +8384,9 @@ function axisGroupCompaction(
             sign,
             occupants,
             gravityGroups.byId[axis],
+            gravitySweep(working),
           );
+          if (closure === PUSH_CLOSURE_CANCELLED) return working;
           if (!closure || (centerId && closure.has(centerId))) continue;
 
           let insideBounds = true;
@@ -8454,6 +8538,7 @@ function axisGroupCompaction(
       if (shouldCancel?.()) return;
       let selected = base;
       for (const evaluated of candidates(base)) {
+        if (shouldCancel?.()) return;
         if (comparePublicCandidates(evaluated, selected) > 0) selected = evaluated;
       }
       if (selected === base) break;
@@ -8915,7 +9000,14 @@ export function compactIntegralLayoutPlan(
   seed: IntegralLayoutPlan,
   control: IntegralLayoutCompactionControl = {},
 ): IntegralLayoutPlan {
-  if (request.allowExistingMoves === false || control.shouldCancel?.()) return seed;
+  const pollCancellation = control.shouldCancel;
+  let cancelled = false;
+  // Once observed, cancellation cannot turn a later partial phase into a
+  // completed transaction, even when the caller's predicate is momentary.
+  const shouldCancel = pollCancellation
+    ? (): boolean => cancelled ||= pollCancellation()
+    : undefined;
+  if (request.allowExistingMoves === false || shouldCancel?.()) return seed;
 
   const residents = new Map(request.residents.map((resident) => [resident.id, {
     ...resident,
@@ -8939,7 +9031,7 @@ export function compactIntegralLayoutPlan(
       request.edges,
       request.trace,
       control.acceptsPositions,
-      control.shouldCancel,
+      shouldCancel,
     );
     // Vacuum acceptance follows the exploration order, which may trade a
     // routing or crossing regression for slack. Compaction publishes, so a
@@ -8947,7 +9039,7 @@ export function compactIntegralLayoutPlan(
     if (compareQualityThroughFootprint(candidateQuality(pass), candidateQuality(passStart)) < 0) {
       pass = passStart;
     }
-    if (!control.shouldCancel?.()) {
+    if (!shouldCancel?.()) {
       pass = axisGroupCompaction(
         pass,
         current,
@@ -8956,10 +9048,10 @@ export function compactIntegralLayoutPlan(
         request.centerId,
         request.trace,
         control.acceptsPositions,
-        control.shouldCancel,
+        shouldCancel,
       );
     }
-    if (!control.shouldCancel?.()) {
+    if (!shouldCancel?.()) {
       const vacuumed = vacuumLayout(
         pass,
         current,
@@ -8967,11 +9059,11 @@ export function compactIntegralLayoutPlan(
         request.edges,
         request.trace,
         control.acceptsPositions,
-        control.shouldCancel,
+        shouldCancel,
       );
       if (compareCompactionCandidates(vacuumed, pass) > 0) pass = vacuumed;
     }
-    if (!control.shouldCancel?.()) {
+    if (!shouldCancel?.()) {
       const spaced = evenCardinalSeries(
         pass,
         current,
@@ -8980,7 +9072,7 @@ export function compactIntegralLayoutPlan(
         request.centerId,
         request.trace,
         control.acceptsPositions,
-        control.shouldCancel,
+        shouldCancel,
       );
       if (compareCompactionCandidates(spaced, pass) > 0) pass = spaced;
     }
@@ -8990,7 +9082,7 @@ export function compactIntegralLayoutPlan(
     if (seen.has(key)) break;
     seen.add(key);
     working = pass;
-    if (control.shouldCancel?.()) break;
+    if (shouldCancel?.()) break;
 
     // Canonical spacing can align several groups while leaving a newly empty
     // global line. Adopt that cheap gain immediately when present, then always
@@ -9006,7 +9098,7 @@ export function compactIntegralLayoutPlan(
       request.edges,
       request.trace,
       control.acceptsPositions,
-      control.shouldCancel,
+      shouldCancel,
     );
     if (compareCompactionCandidates(healed, working) > 0) {
       const healedKey = positionMapKey(healed.positions);
@@ -9017,7 +9109,7 @@ export function compactIntegralLayoutPlan(
   }
   // The probe above stops on a vacuum alone, while spacing a spaced layout
   // again can still gain once its series have moved.
-  if (!control.shouldCancel?.()) {
+  if (!shouldCancel?.()) {
     working = finishCompaction(
       working,
       current,
@@ -9026,14 +9118,14 @@ export function compactIntegralLayoutPlan(
       request.centerId,
       request.trace,
       control.acceptsPositions,
-      control.shouldCancel,
+      shouldCancel,
     );
   }
 
   // Cancellation is transactional at this public seam. Internal phases may
   // retain a last complete candidate for their own progress, but callers that
   // cancel compaction must never receive a partially completed transaction.
-  if (control.shouldCancel?.()) return seed;
+  if (shouldCancel?.()) return seed;
 
   const selected = compareCompactionCandidates(working, initial) > 0 ? working : initial;
   if (selected === initial) return seed;
@@ -9044,6 +9136,19 @@ export function compactIntegralLayoutPlan(
     quality: { ...quality },
     constraintRepair: seed.constraintRepair,
   };
+}
+
+/**
+ * Whether compaction may pack axis groups for `request`: only for a whole-map
+ * request that sends no chart, such as a reflow. Packing can take minutes on a
+ * large map, so a request that sends a chart, such as a mapper's quiet polish,
+ * ends at the cheap compaction fixed point instead.
+ */
+export function packsAxisGroups(
+  request: Pick<IntegralLayoutRequest, "nodes">,
+  control: { readonly axisGroupCompaction?: boolean } = {},
+): boolean {
+  return request.nodes.length === 0 && control.axisGroupCompaction !== false;
 }
 
 /**
@@ -9171,11 +9276,12 @@ export function planIntegralLayout(
   chartReflow = [];
   CANDIDATE_EVALUATORS.delete(current);
   // A request whose rooms are all on the map already reflows or polishes the
-  // whole map: it gets the whole-map compaction stages, and every layout it
-  // publishes, its plan included, ends at the cheap compaction fixed point.
-  // New-room placement keeps its low-latency path without either.
+  // whole map: every layout it publishes, its plan included, ends at the cheap
+  // compaction fixed point, and one that sends no chart also packs axis
+  // groups. New-room placement keeps its low-latency path without either.
   const fullyResident = topologyFullyResident(request);
   const finishesLayouts = request.allowExistingMoves !== false && fullyResident;
+  const packsGroups = packsAxisGroups(request, control);
   const finishLayout = (value: Candidate): Candidate => finishCompaction(
     value,
     current,
@@ -9318,10 +9424,8 @@ export function planIntegralLayout(
     );
   const vacuumed = repairAdoptedCrossings(vacuumedRaw);
   // New-room placement already performs its own local repair. The group pass
-  // is a final whole-map reflow/constraint-polish stage and is intentionally
-  // reserved for requests whose topology is already fully resident.
-  const runsAxisGroups = request.allowExistingMoves !== false && fullyResident &&
-    control.axisGroupCompaction !== false;
+  // is a final whole-map stage, reserved for a request that sends no chart.
+  const runsAxisGroups = request.allowExistingMoves !== false && packsGroups;
   // The group pass can take far longer than everything before it, so a caller
   // watching the plan is shown the layout as it stands first, finished.
   const preview = runsAxisGroups && request.trace ? finishLayout(vacuumed) : undefined;
@@ -9390,7 +9494,7 @@ export function planIntegralLayout(
     const plan = compactIntegralLayoutPlan(
       trace === request.trace ? request : { ...request, trace },
       seedPlan,
-      { acceptsPositions, axisGroupCompaction: control.axisGroupCompaction },
+      { acceptsPositions, axisGroupCompaction: packsGroups },
     );
     if (plan === seedPlan) return base;
     const result = candidate(new Map(plan.positions), current, request.edges);
@@ -9544,7 +9648,8 @@ function settleDeepCrossingLayout(
  * The search goes on from raw transactions, while each layout it publishes,
  * and so the plan it returns, is that transaction at the fixed point of a
  * trace-silent `compactIntegralLayoutPlan` under `control.acceptsPositions`:
- * a layout it streams is one compaction leaves as it is. A compaction that
+ * a layout it streams is one compaction leaves as it is. That compaction packs
+ * axis groups only where `packsAxisGroups` allows, and one that
  * `control.shouldCancel` cuts short leaves the cheap fixed point instead.
  */
 export function repairIntegralLayoutCrossingsDeep(
@@ -9594,6 +9699,11 @@ export function repairIntegralLayoutCrossingsDeep(
     position: integral(resident.position),
   }]));
   const current = new Map([...residents].map(([id, resident]) => [id, resident.position]));
+  // A request that sends a chart keeps to the cheap compaction fixed point,
+  // in the axis heal and in every layout the repair publishes alike.
+  const crossingControl: CrossingRepairControl = packsAxisGroups(request, control)
+    ? control
+    : { ...control, axisGroupCompaction: false };
   const seedCandidate = candidate(new Map(seed.positions), current, request.edges);
   seedCandidate.score.collisions = 0;
   seedCandidate.score.quality = { ...seed.quality };
@@ -9607,9 +9717,9 @@ export function repairIntegralLayoutCrossingsDeep(
     request.centerId,
     topologyFullyResident(request),
     request.trace,
-    control,
+    crossingControl,
     10_000,
-    (value) => settleDeepCrossingLayout(value, request, current, residents, control),
+    (value) => settleDeepCrossingLayout(value, request, current, residents, crossingControl),
   );
   deepCrossingRepair(seedCandidate, context, 1);
   // Every layout the repair published is finished, and it returns the last.

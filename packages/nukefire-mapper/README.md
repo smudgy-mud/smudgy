@@ -8,9 +8,9 @@ A room you reach by going up or down is always mapped one level above or below
 the room you left, even when the game charts both on the same plane. Rooms a
 zone re-entry charts with no connection to any mapped room keep the level
 `Map.Local.plane` gives them, so a newly discovered floor is not merged into
-level zero. Reflow normalizes any link that becomes cross-level to a
-compatible non-routed display mode in the same area mutation, avoiding a
-partially applied layout.
+level zero. Before reflow changes levels, it puts affected routed links into a
+compatible display mode; generated routes are recomputed from the committed
+room coordinates. Author-drawn waypoints remain protected.
 The mapper also follows your current location and displays GPS routes. New
 maps are saved in a local `Nukefire` atlas, survive restarts, and are not
 synced to the cloud.
@@ -45,10 +45,12 @@ retained search state while remaining independent of machine speed. The final
 result is recorded at a stronger effort tier. A genuinely zero-defect result
 subsumes the lower automatic pass; a fixed point or ceiling under the
 command's different anchor/lock set remains evidence but does not silence a
-feasible automatic improvement. The cross-package settlement post from
-`nf reflow perfect` carries the exact canonical final model from the validated
-plan; the mapper ignores it if any room, coordinate, lock, or internal edge
-changed before the post is handled.
+feasible automatic improvement. Both manual reflow commands send the mapping
+owner the validated source and final snapshot keys, room moves, and advisory detours.
+The owner rejects a changed source, checks room locks and final coordinates,
+then commits the layout and records any perfect-effort settlement against the
+live final model. The command announces completion after its correlated
+acknowledgement; a missing receipt reports an unknown result.
 
 The mapper stores `nukefire.layout.polish-pending` on an area whenever prompt
 topology work or an unsettled quiet pass leaves possible polish work, and
@@ -113,6 +115,10 @@ invalidate the map. Their turns are drawn with rounded corners. Generated
 routes are stored as solver-produced `Automatic` routing; a route drawn by
 hand — `Manual` routing in the map editor — is user-owned and is never
 overwritten by route recomputation.
+
+Reflow and tidy refresh the player's location after moving its room. A chart
+that adds rooms or changes exits also refreshes the map display, including
+link-only changes; repeating an unchanged chart does not trigger that refresh.
 
 When the layout engine reports that a crossing or obstruction sits between
 rooms it is not allowed to move — a user-locked neighborhood, for example —

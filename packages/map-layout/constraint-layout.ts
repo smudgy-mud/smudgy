@@ -8,6 +8,7 @@ import {
   levelViolationEdges,
   measureIntegralLayoutQuality,
   measureLayoutRoutingQuality,
+  packsAxisGroups,
   planIntegralLayout,
   repairIntegralLayoutCrossingsDeep,
   withIntegralLayoutCandidateAdmission,
@@ -4506,6 +4507,7 @@ function repairIntegralLayoutConstraintsWithRuntime(
           trace: undefined,
         }, plan, {
           acceptsPositions: acceptsCompactedPositions,
+          axisGroupCompaction: packsAxisGroups(request),
           shouldCancel: () => Number.isFinite(deadline) && now() >= deadline,
         });
         const compactedQuality = measureIntegralLayoutQuality(compacted.positions, request.edges);

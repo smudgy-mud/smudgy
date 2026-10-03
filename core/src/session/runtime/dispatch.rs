@@ -289,6 +289,28 @@ impl Inner<'_> {
         Ok(bound.state)
     }
 
+    /// Publish the resolved address to both the readable location and marker.
+    /// Pending script markers are remapped before reaching this shared path.
+    async fn publish_current_location(
+        &mut self,
+        id: smudgy_cloud::AreaId,
+        room_number: Option<i32>,
+    ) -> Result<ActionResult, anyhow::Error> {
+        *self.current_location.borrow_mut() = Some((id, room_number));
+        let payload = serde_json::json!({
+            "areaId": id.to_string(),
+            "roomNumber": room_number,
+        })
+        .to_string();
+        self.ui_tx
+            .send(TaggedSessionEvent {
+                session_id: self.session_id,
+                event: SessionEvent::SetCurrentLocation(id, room_number),
+            })
+            .await?;
+        Ok(self.run_host_event("map:room", &payload))
+    }
+
     #[allow(clippy::unused_async)]
     pub(super) async fn handle_action(
         &mut self,
@@ -1955,25 +1977,22 @@ impl Inner<'_> {
                     .await?;
                 Ok(ActionResult::None)
             }
-            RuntimeAction::SetCurrentLocation(id, room_number) => {
-                // Mirror into the shared cell so `getCurrentLocation` reads the latest value
-                // even when the action arrives by a path other than the op (the op also writes it,
-                // but this keeps the runtime the single source of truth).
-                *self.current_location.borrow_mut() = Some((id, room_number));
-                // map:room — the host emits it at the location-change site so
-                // any package gets room events even without the mapper package installed.
+            RuntimeAction::MapperRoomsMerged { into, rooms } => {
                 let payload = serde_json::json!({
-                    "areaId": id.to_string(),
-                    "roomNumber": room_number,
-                })
-                .to_string();
-                self.ui_tx
-                    .send(TaggedSessionEvent {
-                        session_id: self.session_id,
-                        event: SessionEvent::SetCurrentLocation(id, room_number),
-                    })
-                    .await?;
-                Ok(self.run_host_event("map:room", &payload))
+                    "into": into.to_string(),
+                    "rooms": rooms.iter().map(|moved| serde_json::json!({
+                        "from": { "area": moved.from.area_id.to_string(), "room": moved.from.room_number.0 },
+                        "to": moved.to.0,
+                    })).collect::<Vec<_>>(),
+                }).to_string();
+                Ok(self.run_host_event("map:merged", &payload))
+            }
+            RuntimeAction::SetCurrentLocation(id, room_number) => {
+                self.publish_current_location(id, room_number).await
+            }
+            RuntimeAction::SetPendingCurrentLocation(location) => {
+                let (id, room_number) = *location.lock().unwrap();
+                self.publish_current_location(id, room_number).await
             }
             RuntimeAction::NoteMapperNavigation(area_id) => {
                 // Advisory scope hint: forward to the UI daemon, which owns the

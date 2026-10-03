@@ -71,6 +71,29 @@ pub trait MapperBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Subscribe to exact address changes before loading the local projection.
+    /// Decorators opt into store-wide remaps by forwarding both this method
+    /// and `execute_local_mutation_with_room_remap`. Without this capability,
+    /// Mapper still publishes issuer-only remaps after successful commits.
+    async fn subscribe_local_room_remaps(
+        &self,
+    ) -> CloudResult<Option<std::sync::Arc<local::LocalRoomRemapQueue>>> {
+        Ok(None)
+    }
+
+    /// Client-side address metadata joins the local redo decision; it never
+    /// enters the HTTP mutation contract.
+    async fn execute_local_mutation_with_room_remap(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+        _remap: Option<local::LocalRoomRemap>,
+    ) -> CloudResult<MutationResult> {
+        // Decorators may gate, authorize or instrument this entry point.
+        // Backends supporting durable remap metadata opt in explicitly.
+        self.execute_local_mutation(area_id, envelope).await
+    }
+
     /// Explicitly reload local files modified outside this process.
     async fn refresh_local(&self) -> CloudResult<()> {
         Ok(())

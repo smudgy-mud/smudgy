@@ -15,8 +15,8 @@ use smudgy_cloud::{
     ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS,
     ExitArgs, ExitDirection, ExitId, ExitUpdates, HorizontalAlignment, Label, LabelArgs, LabelId,
     LabelUpdates, MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode,
-    RoomNumber, RoomRemap, RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId,
-    ShapeType, ShapeUpdates, Translate, Uuid, VerticalAlignment,
+    RoomNumber, RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId, ShapeType,
+    ShapeUpdates, Translate, Uuid, VerticalAlignment,
     mapper::{
         AreaMutationBatch, MutationSubmission, RoomKey, area_cache::AreaCache,
         room_cache::RoomCache,
@@ -1889,18 +1889,31 @@ async fn op_smudgy_mapper_merge_rooms(
     keep_room_number: i32,
     remove_room_number: i32,
 ) -> Result<Option<ScriptUuid>, MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, true)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
-        drop(state);
+    let mapper = {
+        let state = state.borrow();
+        ensure_mapper(&state, true)?;
+        state.try_borrow::<Mapper>().cloned()
+    };
+    if let Some(mapper) = mapper {
+        let area_id = AreaId(parse_id(&area_id)?);
+        mapper
+            .ready()
+            .await
+            .map_err(operation_failed("load maps before joining rooms"))?;
         let submission = mapper
             .merge_rooms(
-                AreaId(parse_id(&area_id)?),
+                area_id,
                 RoomNumber(keep_room_number),
                 RoomNumber(remove_room_number),
             )
             .map_err(operation_failed("merge rooms"))?;
-        await_mapper_submission(&mapper, submission).await
+        let result = await_mapper_submission(&mapper, submission).await?;
+        mapper
+            .ready()
+            .await
+            .map_err(operation_failed("publish joined room"))?;
+        drain_mapper_events(&state.borrow());
+        Ok(result)
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -1991,7 +2004,7 @@ async fn op_smudgy_mapper_merge_areas(
         .await
         .map_err(operation_failed("merge areas"))?;
     let rooms = commit.outcome.rooms;
-    follow_merged_current_location(&mut state.borrow_mut(), into, &rooms);
+    drain_mapper_events(&state.borrow());
     Ok(rooms
         .into_iter()
         .map(|remap| JsMergedRoom {
@@ -2004,24 +2017,13 @@ async fn op_smudgy_mapper_merge_areas(
         .collect())
 }
 
-/// Carry the session's current location along with a merge: standing in a moved room means
-/// standing at its new address afterwards, with the same cell write and `SetCurrentLocation`
-/// action `setCurrentLocation` performs. A location in a non-source area, one naming a source
-/// area without a room, or one whose room the remap does not carry is left as it is.
-fn follow_merged_current_location(state: &mut OpState, into: AreaId, rooms: &[RoomRemap]) {
-    let current = *state
-        .borrow::<crate::session::runtime::CurrentLocation>()
-        .borrow();
-    let Some((area_id, Some(room_number))) = current else {
-        return;
-    };
-    let Some(moved) = rooms
-        .iter()
-        .find(|remap| remap.from.area_id == area_id && remap.from.room_number.0 == room_number)
-    else {
-        return;
-    };
-    super::ops::set_current_location(state, into, Some(moved.to.0));
+/// Adopt pending committed remaps for this session and all of its isolates.
+/// Readable locations and queued markers move before native callbacks run.
+fn drain_mapper_events(state: &OpState) {
+    crate::session::runtime::mapper_events::observe(
+        state.borrow::<crate::session::runtime::mapper_events::SharedMapperEvents>(),
+        state.borrow::<crate::session::runtime::CurrentLocation>(),
+    );
 }
 
 #[op2(async(lazy), fast)]

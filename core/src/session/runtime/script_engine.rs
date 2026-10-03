@@ -166,6 +166,7 @@ pub struct ScriptEngineParams<'a> {
     pub recent_lines: super::RecentLines,
     /// Current mapper location, shared into every isolate's `getCurrentLocation` read op.
     pub current_location: super::CurrentLocation,
+    pub(crate) mapper_events: super::mapper_events::SharedMapperEvents,
     /// Script-visible settings snapshot, shared into every isolate's `getSettings()` read op.
     pub settings_snapshot: super::SettingsSnapshot,
     /// The session's pane registry, shared into every isolate's pane ops (mutated
@@ -1368,6 +1369,7 @@ impl<'a> ScriptEngine<'a> {
         let recent_lines = params.recent_lines.clone();
         // The same current-location `Rc` is bound into every isolate's read op.
         let current_location = params.current_location.clone();
+        let mapper_events = params.mapper_events.clone();
         // The same settings snapshot `Rc` is bound into every isolate's `getSettings()` read op.
         let settings_snapshot = params.settings_snapshot.clone();
         // The same GMCP enabled cell is bound into every isolate's `gmcp.enabled` read op.
@@ -1575,6 +1577,7 @@ impl<'a> ScriptEngine<'a> {
                         recent_lines.clone(),
                         // The `getCurrentLocation` read op resolves against this shared cell.
                         current_location.clone(),
+                        mapper_events.clone(),
                         // The `getSettings` read op resolves against this shared snapshot.
                         settings_snapshot.clone(),
                         // The `gmcp.enabled` read op resolves against this shared cell.

@@ -187,6 +187,23 @@ impl MapperBackend for CompositeBackend {
         self.local.subscribe_local().await
     }
 
+    async fn subscribe_local_room_remaps(
+        &self,
+    ) -> CloudResult<Option<Arc<super::local::LocalRoomRemapQueue>>> {
+        self.local.subscribe_local_room_remaps().await
+    }
+
+    async fn execute_local_mutation_with_room_remap(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+        remap: Option<super::local::LocalRoomRemap>,
+    ) -> CloudResult<MutationResult> {
+        self.local
+            .execute_local_mutation_with_room_remap(area_id, envelope, remap)
+            .await
+    }
+
     async fn refresh_local(&self) -> CloudResult<()> {
         self.local.refresh_local().await
     }

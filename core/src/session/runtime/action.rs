@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::RangeFull;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use deno_core::v8;
 use smudgy_cloud::{AreaId, AtlasId};
@@ -475,6 +475,14 @@ pub enum RuntimeAction {
         id: HotkeyId,
     },
     SetCurrentLocation(AreaId, Option<i32>),
+    /// A script or migration marker that has not reached dispatch yet. Its
+    /// address follows later committed remaps while the action remains queued.
+    SetPendingCurrentLocation(Arc<Mutex<(AreaId, Option<i32>)>>),
+    /// Durable address changes, delivered before the relocated marker event.
+    MapperRoomsMerged {
+        into: AreaId,
+        rooms: Arc<[smudgy_cloud::RoomRemap]>,
+    },
     /// A mapper navigation op (speedwalk / find-nearest) resolved a destination
     /// in this area — a demonstrated navigation intent the UI daemon weighs for
     /// per-server map scoping (bind-on-use). Advisory only; carries no map

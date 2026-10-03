@@ -3355,6 +3355,15 @@ declare module "smudgy:events/sys" {
 declare module "smudgy:events/map" {
   import type { EventConsumer } from "smudgy:core";
 
+  /** Exact room address changes after a durable merge or join. The session
+   * has adopted the committed generation before delivery; a later migration
+   * may already have moved those destinations again. Fires in sessions mounting the
+   * same local store, or sharing the same session mapper, even when its current
+   * room did not move. Queued remaps arrive in commit order before `room`
+   * for the final relocated current location.
+   * Use these remaps to migrate trails and other address-based state. */
+  export const merged: EventConsumer<{ into: AreaId; rooms: MergedRoom[] }>;
+
   /**
    * Fires when the current map location changes, whether or not a mapper
    * package is installed. `areaId` is the area's id; `roomNumber` is the room

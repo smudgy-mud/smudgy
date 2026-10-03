@@ -6,6 +6,7 @@ import {
   computeIntegralRouteAmendments,
   measureIntegralLayoutQuality,
   measureLayoutRoutingQuality,
+  packsAxisGroups,
   planIntegralLayout,
   repairIntegralLayoutCrossingsDeep,
   safePushRepairs,
@@ -1631,9 +1632,10 @@ test("streams a stable top-eight obstruction frontier without changing trace ord
   );
   assert.equal(repairs.length, 8);
   assert.equal(repairs.at(-1)?.after.quality.roomObstructions, 2);
-  // Every chart node is a resident, so the whole-map compaction stages clear
-  // the two obstructions the eight-wide frontier leaves.
-  assert.equal(first.result.quality.roomObstructions, 0);
+  // The request sends a chart, so it ends at the cheap compaction fixed point
+  // without packing axis groups: the two obstructions the eight-wide frontier
+  // leaves stay.
+  assert.equal(first.result.quality.roomObstructions, 2);
   assert.deepEqual(
     first.trace
       .filter((event) => event.type === "obstruction-candidates")
@@ -1987,7 +1989,8 @@ test("deep crossing progress compacts raw bridge passages before publication", (
   for (const withNewNode of [false, true]) {
     // A new node disables crossing DFS's internal axis polish. The public
     // settlement boundary must still compact the raw transaction in both
-    // modes rather than exposing a giant bridge passage.
+    // modes rather than exposing a giant bridge passage: fully for a reflow,
+    // at the cheap fixed point for a request that sends a chart.
     const request: IntegralLayoutRequest = withNewNode
       ? {
         ...residentOnly,
@@ -2003,6 +2006,7 @@ test("deep crossing progress compacts raw bridge passages before publication", (
       movedExisting: new Set(),
       quality: measureIntegralLayoutQuality(positions, request.edges),
     };
+    const compaction = packsAxisGroups(request) ? {} : { axisGroupCompaction: false };
     let previous = seed.quality;
     let improvements = 0;
     const result = repairIntegralLayoutCrossingsDeep(request, seed, {
@@ -2020,7 +2024,7 @@ test("deep crossing progress compacts raw bridge passages before publication", (
           quality: progress.candidate.quality,
         };
         assert.equal(
-          compactIntegralLayoutPlan(request, checkpoint),
+          compactIntegralLayoutPlan(request, checkpoint, compaction),
           checkpoint,
           `a progressive crossing checkpoint withNewNode=${withNewNode} must be compacted`,
         );
@@ -2032,9 +2036,11 @@ test("deep crossing progress compacts raw bridge passages before publication", (
 
     assert.ok(improvements > 0);
     assert.equal(result.plan.quality.routingViolations, 0);
-    assert.equal(result.plan.quality.linkCrossings, 0);
-    assert.equal(result.plan.quality.footprintArea, 15);
-    assert.equal(compactIntegralLayoutPlan(request, result.plan), result.plan);
+    if (!withNewNode) {
+      assert.equal(result.plan.quality.linkCrossings, 0);
+      assert.equal(result.plan.quality.footprintArea, 15);
+    }
+    assert.equal(compactIntegralLayoutPlan(request, result.plan, compaction), result.plan);
   }
 });
 
