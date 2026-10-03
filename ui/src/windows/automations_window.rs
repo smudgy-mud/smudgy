@@ -6439,6 +6439,149 @@ mod tab_traversal_tests {
         .expect("create test profile");
     }
 
+    fn window_with_install_consent(
+        specifier: &str,
+        required_roots: Vec<packages::RequiredRoot>,
+    ) -> AutomationsWindow {
+        use_temp_smudgy_home();
+        let server_name = format!("install-consent-{}", Uuid::new_v4());
+        create_test_server(&server_name, &[]);
+        let mut window = AutomationsWindow::new(
+            window::Id::unique(),
+            server_name,
+            crate::cloud_account::test_handles_signed_in("recipient"),
+            SessionId::from(1),
+        );
+        window.pane = Pane::Shared;
+        window.selection = Selection::Shared;
+        let (owner, name) = model::parse_specifier(specifier).unwrap();
+        let resolution = InstallResolution {
+            specifier: specifier.into(),
+            owner,
+            name,
+            version: "1.0.0".into(),
+            available_with_smudgy_upgrade: None,
+            permissions: PackagePermissions::default(),
+            params: Vec::new(),
+            closure: Vec::new(),
+            required_roots,
+            conflict: None,
+            needs_smudgy: None,
+            required_unavailable: None,
+            expected_lock: SharedPackageLock::default(),
+            expected_local_manifests: HashMap::new(),
+        };
+        let _ = window.install_resolved(
+            window.install_seq,
+            window.account_read_fence(),
+            Ok(resolution),
+        );
+        assert!(window.discover_error.is_none());
+        assert!(window.consent_prompt.is_some());
+        window
+    }
+
+    #[test]
+    fn consent_install_accepts_mixed_case_coordinates() {
+        use smudgy_core::models::shared_packages;
+
+        for (specifier, required_specifier, enable) in [
+            ("smudgy://Rich_E/speedwalks", None, true),
+            ("smudgy://publisher/Speedwalks", None, false),
+            ("smudgy://Rich_E/Speedwalks", None, true),
+            (
+                "smudgy://publisher/tools",
+                Some("smudgy://Rich_E/Speedwalks"),
+                true,
+            ),
+        ] {
+            let required = required_specifier
+                .map(|specifier| packages::RequiredRoot {
+                    specifier: specifier.into(),
+                    name: model::package_display_name(specifier).into(),
+                    version: "1.0.0".into(),
+                    permissions: PackagePermissions::default(),
+                    params: Vec::new(),
+                    closure: Vec::new(),
+                    already_satisfied: false,
+                    is_upgrade: false,
+                })
+                .into_iter()
+                .collect();
+            let mut window = window_with_install_consent(specifier, required);
+            let _ = window.update(Message::ConsentGrant { enable });
+            assert!(window.consent_busy);
+            let update = window.update(Message::ConsentCachePrepared {
+                seq: window.install_seq,
+                account_fence: window.account_read_fence(),
+                enable,
+                result: Ok(PreparedConsentCache),
+            });
+            assert!(
+                window.consent_prompt.is_none(),
+                "{specifier}: {:?}",
+                window
+                    .consent_prompt
+                    .as_ref()
+                    .and_then(|prompt| prompt.error.as_ref())
+            );
+            assert!(matches!(update.event, Some(Event::ScriptsChanged { .. })));
+            let lock = shared_packages::load_lock(&window.server_name).unwrap();
+            let root = lock
+                .find(specifier)
+                .expect("the reviewed root is installed");
+            assert_eq!(root.specifier, specifier);
+            assert_eq!(root.staged_version(), Some("1.0.0"));
+            assert_eq!(root.is_enabled_for("default"), enable);
+            assert_eq!(
+                root.consented_permissions,
+                Some(PackagePermissions::default())
+            );
+            if let Some(required_specifier) = required_specifier {
+                let required = lock
+                    .find(required_specifier)
+                    .expect("the required root is installed");
+                assert_eq!(required.specifier, required_specifier);
+                assert!(required.required_by.contains(specifier));
+                assert!(lock.is_effectively_enabled_for(required_specifier, "default"));
+            }
+        }
+    }
+
+    #[test]
+    fn consent_install_rejects_a_local_shadow_created_during_cache_preparation() {
+        use smudgy_core::models::{local_packages, shared_packages};
+
+        let specifier = "smudgy://Rich_E/Speedwalks";
+        let mut window = window_with_install_consent(specifier, Vec::new());
+        let _ = window.update(Message::ConsentGrant { enable: true });
+        assert!(window.consent_busy);
+        local_packages::scaffold_local_package_with_state(
+            &window.server_name,
+            "speedwalks",
+            "local",
+        )
+        .unwrap();
+        let update = window.update(Message::ConsentCachePrepared {
+            seq: window.install_seq,
+            account_fence: window.account_read_fence(),
+            enable: true,
+            result: Ok(PreparedConsentCache),
+        });
+        let prompt = window
+            .consent_prompt
+            .as_ref()
+            .expect("keep the rejected review open");
+        assert_eq!(
+            prompt.error,
+            Some(crate::i18n::t!("package-install-plan-changed"))
+        );
+        assert!(update.event.is_none());
+        let lock = shared_packages::load_lock(&window.server_name).unwrap();
+        assert!(lock.find(specifier).is_none());
+        assert!(lock.find("smudgy://local/speedwalks").is_some());
+    }
+
     fn selected(profiles: &[&str]) -> ProfileActivation {
         ProfileActivation::Selected {
             profiles: profiles.iter().map(|name| (*name).to_string()).collect(),

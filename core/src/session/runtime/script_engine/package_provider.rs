@@ -934,6 +934,16 @@ impl SmudgyPackageProvider {
         {
             return Ok(local);
         }
+        if self
+            .lock
+            .borrow()
+            .has_ambiguous_identity(&key.to_user_specifier())
+        {
+            return Err(CloudError::InvalidInput(format!(
+                "multiple installed rows for {}; uninstall the aliases and review a new install",
+                key.to_user_specifier()
+            )));
+        }
         if let Some(version) = version
             && let Some(meta) = self
                 .disk_cache
@@ -999,15 +1009,15 @@ impl SmudgyPackageProvider {
                 None => {}
             }
         };
-        let known_install = self
-            .lock
-            .borrow()
-            .packages
-            .iter()
-            .any(|p| p.specifier == specifier);
+        let known_install = self.lock.borrow().find(specifier).is_some();
         let mut stage_pending = false;
         let persisted = shared_packages::mutate_lock(&self.server_name, |disk| {
-            if let Some(entry) = disk.packages.iter_mut().find(|p| p.specifier == specifier) {
+            if disk.has_ambiguous_identity(specifier) {
+                anyhow::bail!(
+                    "multiple installed rows for {specifier}; uninstall the aliases and review a new install"
+                );
+            }
+            if let Some(entry) = disk.find_mut(specifier) {
                 let staged_elsewhere = entry.integrity.is_none()
                     && entry
                         .last_resolved_version
@@ -1032,7 +1042,7 @@ impl SmudgyPackageProvider {
                     disk,
                     std::iter::once(specifier),
                 )?;
-                disk.upsert(fresh_entry());
+                disk.upsert(fresh_entry())?;
                 Ok(((), true))
             }
         });
@@ -1043,7 +1053,7 @@ impl SmudgyPackageProvider {
             return;
         }
         let mut lock = self.lock.borrow_mut();
-        if let Some(entry) = lock.packages.iter_mut().find(|p| p.specifier == specifier) {
+        if let Some(entry) = lock.find_mut(specifier) {
             // An AUTO package that resolved to a new version since last load: record a
             // notice (a pin, or a first-ever resolve with no prior, never notifies).
             if matches!(entry.mode, UpdateMode::Auto)
@@ -1057,8 +1067,8 @@ impl SmudgyPackageProvider {
                 ));
             }
             apply(entry);
-        } else {
-            lock.upsert(fresh_entry());
+        } else if let Err(error) = lock.upsert(fresh_entry()) {
+            warn!("Failed to record package resolution for {specifier}: {error:#}");
         }
     }
 
@@ -1362,6 +1372,9 @@ impl SmudgyPackageProvider {
 
         let (pin, staged) = {
             let lock = self.lock.borrow();
+            if lock.has_ambiguous_identity(specifier) {
+                return Err(CapRefusal::NoVersions);
+            }
             let entry = lock.find(specifier);
             (
                 entry.and_then(|locked| locked.pinned_version().map(str::to_string)),
@@ -1659,6 +1672,11 @@ impl SmudgyPackageProvider {
         // awaits below).
         let (pinned, staged) = {
             let lock = self.lock.borrow();
+            if lock.has_ambiguous_identity(&state_specifier) {
+                return Err(PackageError::InvalidManifest(format!(
+                    "multiple installed rows for {state_specifier}; uninstall the aliases and review a new install"
+                )));
+            }
             let entry = lock.find(&state_specifier);
             (
                 entry.and_then(|p| p.pinned_version().map(str::to_string)),
@@ -2108,6 +2126,131 @@ fn fetch_error(specifier: &str, module: &ResolvedModuleWire, err: &CloudError) -
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn mixed_case_duplicate_installs_refuse_resolution() {
+        use_temp_smudgy_home();
+        let provider = test_provider();
+        provider.lock.borrow_mut().packages = vec![
+            LockedPackage::new(
+                "smudgy://Rich_E/Speedwalks",
+                UpdateMode::Pinned {
+                    version: "1.0.0".into(),
+                },
+            ),
+            LockedPackage::new("smudgy://rich_e/speedwalks", UpdateMode::Auto),
+        ];
+        let key = PackageKey {
+            owner: "Rich_E".into(),
+            name: "Speedwalks".into(),
+        };
+        for alias in [key.clone(), key.folded()] {
+            let error = provider.resolve_package(&alias, None).await.unwrap_err();
+            assert!(error.to_string().contains("multiple installed rows"));
+        }
+    }
+    #[tokio::test]
+    async fn mixed_case_import_keeps_installed_pin_and_one_lock_row() {
+        let registry = spawn_registry(&[
+            MockPackage {
+                owner: "Rich_E",
+                name: "Speedwalks",
+                version: "1.0.0",
+                manifest_extra: "",
+                deps: &[],
+                body: "export const version = 1;",
+            },
+            MockPackage {
+                owner: "Rich_E",
+                name: "Speedwalks",
+                version: "2.0.0",
+                manifest_extra: "",
+                deps: &[],
+                body: "export const version = 2;",
+            },
+        ]);
+        let provider = provider_for(&registry);
+        let entry = LockedPackage::new(
+            "smudgy://Rich_E/Speedwalks",
+            UpdateMode::Pinned {
+                version: "1.0.0".into(),
+            },
+        );
+        persist_installed_entry(&provider, entry);
+        let key = PackageKey {
+            owner: "Rich_E".into(),
+            name: "Speedwalks".into(),
+        };
+        assert_eq!(
+            provider
+                .resolve_package(&key.folded(), None)
+                .await
+                .unwrap()
+                .resolved_version,
+            "1.0.0"
+        );
+        let changed_case = provider.resolve_package(&key, None).await.unwrap();
+        assert_eq!(changed_case.resolved_version, "1.0.0");
+        let lock = shared_packages::load_lock(&provider.server_name).unwrap();
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.packages[0].specifier, "smudgy://Rich_E/Speedwalks");
+        assert_eq!(lock.packages[0].pinned_version(), Some("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn mixed_case_import_reuses_one_cached_instance_and_module_identity() {
+        let registry = spawn_registry(&[MockPackage {
+            owner: "Rich_E",
+            name: "Speedwalks",
+            version: "1.0.0",
+            manifest_extra: "",
+            deps: &[],
+            body: "export const version = 1;",
+        }]);
+        let provider = provider_for(&registry);
+        let key = PackageKey {
+            owner: "Rich_E".into(),
+            name: "Speedwalks".into(),
+        };
+        let first = provider.resolve_package(&key, None).await.unwrap();
+        let second = provider.resolve_package(&key.folded(), None).await.unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        let first_url = canonical_url(&first.key, &first.resolved_version, "index.ts");
+        let second_url = canonical_url(&second.key, &second.resolved_version, "index.ts");
+        assert_eq!(first_url, second_url);
+    }
+
+    #[test]
+    fn mixed_case_referrer_and_target_keep_exact_dependency_pin() {
+        use_temp_smudgy_home();
+        let provider = test_provider();
+        provider.store_locked_deps(
+            &pkg_key("app"),
+            "1.0.0",
+            &[dep("Speedwalks", "=1.0.0", "1.0.0")],
+        );
+        let importer = ReferrerRef {
+            key: PackageKey {
+                owner: "WBK".into(),
+                name: "APP".into(),
+            },
+            version: "1.0.0".into(),
+        };
+        assert!(
+            provider
+                .referrer_locked_version(&importer, &pkg_key("Speedwalks"))
+                .is_some()
+        );
+        let pin = provider
+            .referrer_locked_version(&importer, &pkg_key("speedwalks"))
+            .unwrap();
+        assert_eq!(pin.version, "1.0.0");
+        assert!(pin.is_exact_pin);
+        assert!(
+            provider
+                .referrer_locked_version(&importer, &pkg_key("speedwalks"))
+                .is_some()
+        );
+    }
     use super::*;
     use smudgy_cloud::{Credential, CredentialSource};
 
@@ -3170,7 +3313,7 @@ mod tests {
         staged.last_resolved_version = Some("1.3.0".into());
         staged.integrity = None;
         shared_packages::mutate_lock(server, |lock| {
-            lock.upsert(staged);
+            lock.upsert(staged).unwrap();
             Ok(((), true))
         })
         .expect("seed the staged entry");
@@ -3216,7 +3359,7 @@ mod tests {
         loaded.last_resolved_version = Some("1.3.0".into());
         loaded.integrity = Some("verified-1.3.0".into());
         shared_packages::mutate_lock(server, |lock| {
-            lock.upsert(loaded.clone());
+            lock.upsert(loaded.clone()).unwrap();
             Ok(((), true))
         })
         .expect("seed the stamped entry");
@@ -3233,11 +3376,11 @@ mod tests {
         let fresh = "smudgy://wbk/fresh";
         let fresh_entry = LockedPackage::new(fresh, UpdateMode::Auto);
         shared_packages::mutate_lock(server, |lock| {
-            lock.upsert(fresh_entry.clone());
+            lock.upsert(fresh_entry.clone()).unwrap();
             Ok(((), true))
         })
         .expect("seed the fresh install");
-        provider.lock.borrow_mut().upsert(fresh_entry);
+        provider.lock.borrow_mut().upsert(fresh_entry).unwrap();
         provider.record_resolution(fresh, "0.1.0", Some("verified-0.1.0"));
         let disk = shared_packages::load_lock(server).expect("lock loads");
         let entry = disk.find(fresh).expect("the entry survives");
@@ -3398,8 +3541,22 @@ mod tests {
             let wire = format!(
                 r#"{{"data":{{"package_id":"00000000-0000-0000-0000-000000000001","owner_nickname":"{owner}","name":"{name}","version":"{version}","manifest":{{"name":"{name}","version":"{version}"{extra}}},"modules":[{{"subpath":"index.ts","content_hash":"{hash}","media_type":"application/typescript","content_url":"{base_url}/blob/{hash}"}}],"dependencies":[{deps}]}}}}"#
             );
-            resolves.insert((owner.into(), name.into(), version.into()), wire.clone());
-            resolves.insert((owner.into(), name.into(), "latest".into()), wire);
+            resolves.insert(
+                (
+                    owner.to_ascii_lowercase(),
+                    name.to_ascii_lowercase(),
+                    version.into(),
+                ),
+                wire.clone(),
+            );
+            resolves.insert(
+                (
+                    owner.to_ascii_lowercase(),
+                    name.to_ascii_lowercase(),
+                    "latest".into(),
+                ),
+                wire,
+            );
         }
 
         let resolve_hits = Arc::new(AtomicUsize::new(0));
@@ -3438,7 +3595,11 @@ mod tests {
                         }
                     }
                     resolves
-                        .get(&(owner.to_string(), name.to_string(), version.to_string()))
+                        .get(&(
+                            owner.to_ascii_lowercase(),
+                            name.to_ascii_lowercase(),
+                            version.to_string(),
+                        ))
                         .cloned()
                 } else if let Some(hash) = path.strip_prefix("/blob/") {
                     body_count.fetch_add(1, Ordering::SeqCst);

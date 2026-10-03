@@ -232,6 +232,39 @@ fn same_package_imported_twice_is_one_instance() -> Result<()> {
 }
 
 #[test]
+fn mixed_case_install_and_import_evaluate_one_instance() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut package = resolved(
+        "Speedwalks",
+        "1.0.0",
+        &[(
+            "index.js",
+            "globalThis.__evals = (globalThis.__evals ?? 0) + 1; export const stamp = {};",
+        )],
+    );
+    package.key.owner = "Rich_E".into();
+    let (tokio, mut rt) = runtime_with_packages(temp.path(), vec![package])?;
+    tokio.block_on(rt.load_modules(&ModuleSet {
+        local_modules: vec![],
+        packages: vec!["smudgy://Rich_E/Speedwalks".into()],
+    }))?;
+    assert!(eval_module_ok(
+        &tokio,
+        &mut rt,
+        temp.path(),
+        "case_instance.js",
+        r#"
+        import * as original from "smudgy://Rich_E/Speedwalks";
+        import * as folded from "smudgy://rich_e/speedwalks";
+        import * as upper from "smudgy://RICH_E/SPEEDWALKS";
+        export const ok = globalThis.__evals === 1
+            && original.stamp === folded.stamp && original.stamp === upper.stamp;
+    "#
+    )?);
+    Ok(())
+}
+
+#[test]
 fn package_relative_submodule_resolves() -> Result<()> {
     // A package whose entry imports a sibling module via a relative path: the relative
     // import must join against the canonical URL and stay within the package@version.

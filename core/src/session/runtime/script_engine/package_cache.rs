@@ -8,7 +8,8 @@
 //!   SHA-256, so the provider only re-downloads bodies it doesn't already have, and
 //!   identical bodies dedupe across packages/versions.
 //! - **metadata** (`meta/<owner>/<name>/<version>.json`): the manifest + module
-//!   list for a concrete version, so a *pinned* package resolves fully offline.
+//!   list for a concrete version, so a *pinned* package resolves fully offline. Owner
+//!   and name are ASCII-folded; unique directories from the old layout remain readable.
 //!
 //! Bodies are written only after the provider verified their hash on fetch. Reads verify the
 //! hash again: a content-addressed filename does not protect against later disk corruption or
@@ -16,7 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use semver::Version;
@@ -244,11 +245,34 @@ impl PackageCache {
     }
 
     fn meta_path(&self, key: &PackageKey, version: &str) -> PathBuf {
+        let key = key.folded();
         self.root
             .join("meta")
             .join(&key.owner)
             .join(&key.name)
             .join(format!("{version}.json"))
+    }
+
+    /// Old caches used the requested spelling. Find a unique legacy directory on
+    /// case-sensitive filesystems without changing module filenames or versions.
+    fn legacy_meta_path(&self, key: &PackageKey, version: &str) -> Option<PathBuf> {
+        fn directory(parent: &Path, name: &str) -> Option<PathBuf> {
+            let mut matches = fs::read_dir(parent)
+                .ok()?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.file_type().is_ok_and(|kind| kind.is_dir())
+                        && entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+                });
+            let path = matches.next()?.path();
+            matches.next().is_none().then_some(path)
+        }
+        let owner = directory(&self.root.join("meta"), &key.owner)?;
+        let package = directory(&owner, &key.name)?;
+        Some(package.join(format!("{version}.json")))
     }
 
     /// Whether a module body is already cached and still matches its content hash.
@@ -330,7 +354,13 @@ impl PackageCache {
     #[must_use]
     pub fn read_meta(&self, key: &PackageKey, version: &str) -> Option<CachedResolution> {
         validate_cache_identity(key, version).ok()?;
-        let content = fs::read_to_string(self.meta_path(key, version)).ok()?;
+        let path = self.meta_path(key, version);
+        let path = if path.exists() {
+            path
+        } else {
+            self.legacy_meta_path(key, version)?
+        };
+        let content = fs::read_to_string(path).ok()?;
         let value: serde_json::Value = serde_json::from_str(&content).ok()?;
         let kind_less: Vec<usize> = value
             .get("dependencies")
@@ -445,6 +475,39 @@ impl PackageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_case_cache_coordinates_reuse_new_and_legacy_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let key = PackageKey {
+            owner: "Rich_E".into(),
+            name: "Speedwalks".into(),
+        };
+        let resolution = CachedResolution {
+            version: "1.0.0".into(),
+            integrity: "sum".into(),
+            manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
+            modules: vec![],
+            dependencies: vec![],
+        };
+        // Plant the pre-fix layout directly. On case-sensitive filesystems the
+        // folded request must discover the legacy directory spelling.
+        let legacy = cache.root.join("meta/Rich_E/Speedwalks/1.0.0.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, serde_json::to_vec(&resolution).unwrap()).unwrap();
+        assert_eq!(
+            cache.read_meta(&key.folded(), "1.0.0").unwrap().integrity,
+            "sum"
+        );
+        assert_eq!(
+            cache.meta_path(&key, "1.0.0"),
+            cache.meta_path(&key.folded(), "1.0.0")
+        );
+        cache.write_meta(&key, "1.0.0", &resolution).unwrap();
+        assert!(cache.read_meta(&key.folded(), "1.0.0").is_some());
+        assert!(cache.read_meta(&key, "2.0.0").is_none());
+    }
 
     fn sha256_hex(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))

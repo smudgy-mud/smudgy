@@ -321,11 +321,34 @@ impl SharedPackageLock {
     /// The installed package matching `specifier`, if any.
     #[must_use]
     pub fn find(&self, specifier: &str) -> Option<&LockedPackage> {
-        self.packages.iter().find(|p| p.specifier == specifier)
+        self.unique_index(specifier)
+            .map(|index| &self.packages[index])
     }
 
-    fn find_mut(&mut self, specifier: &str) -> Option<&mut LockedPackage> {
-        self.packages.iter_mut().find(|p| p.specifier == specifier)
+    pub(crate) fn find_mut(&mut self, specifier: &str) -> Option<&mut LockedPackage> {
+        let index = self.unique_index(specifier)?;
+        self.packages.get_mut(index)
+    }
+
+    fn unique_index(&self, specifier: &str) -> Option<usize> {
+        let mut matches = self
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| package.specifier.eq_ignore_ascii_case(specifier));
+        let (index, _) = matches.next()?;
+        matches.next().is_none().then_some(index)
+    }
+
+    /// Multiple saved rows for one identity must not lend each other pins, trust or consent.
+    #[must_use]
+    pub fn has_ambiguous_identity(&self, specifier: &str) -> bool {
+        self.packages
+            .iter()
+            .filter(|package| package.specifier.eq_ignore_ascii_case(specifier))
+            .take(2)
+            .count()
+            > 1
     }
 
     /// Resolves a persistent package coordinate to the one row that governs its leaf.
@@ -395,7 +418,9 @@ impl SharedPackageLock {
                 _ => false,
             };
         plan_specifiers.into_iter().all(|specifier| {
-            same_row(self.find(specifier), expected.find(specifier))
+            !self.has_ambiguous_identity(specifier)
+                && !expected.has_ambiguous_identity(specifier)
+                && same_row(self.find(specifier), expected.find(specifier))
                 && same_row(
                     self.governing_package(specifier, true),
                     expected.governing_package(specifier, true),
@@ -434,18 +459,32 @@ impl SharedPackageLock {
     }
 
     /// Insert or replace an installed package by specifier.
-    pub fn upsert(&mut self, package: LockedPackage) {
+    /// # Errors
+    /// Refuses conflicting aliases rather than choosing their trust, consent or settings.
+    pub fn upsert(&mut self, package: LockedPackage) -> Result<()> {
+        if self.has_ambiguous_identity(&package.specifier) {
+            anyhow::bail!(
+                "multiple installed rows for {}; uninstall the aliases and review a new install",
+                package.specifier
+            );
+        }
         if let Some(existing) = self.find_mut(&package.specifier) {
+            // Settings and keyring slots are keyed by the saved spelling. An alias is
+            // the same row, not a rename of its durable namespace.
+            let specifier = existing.specifier.clone();
             *existing = package;
+            existing.specifier = specifier;
         } else {
             self.packages.push(package);
         }
+        Ok(())
     }
 
     /// Remove an installed package by specifier. Returns whether one was removed.
     pub fn remove(&mut self, specifier: &str) -> bool {
         let before = self.packages.len();
-        self.packages.retain(|p| p.specifier != specifier);
+        self.packages
+            .retain(|p| !p.specifier.eq_ignore_ascii_case(specifier));
         self.packages.len() != before
     }
 
@@ -475,25 +514,28 @@ impl SharedPackageLock {
         removing: &str,
         requires_of: &HashMap<String, Vec<String>>,
     ) -> Vec<String> {
-        let mut doomed: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        doomed.insert(removing);
+        let requires_of = folded_relationships(requires_of);
+        let mut doomed = std::collections::HashSet::from([removing.to_ascii_lowercase()]);
         loop {
             let next = self.packages.iter().find(|p| {
-                !doomed.contains(p.specifier.as_str())
+                !doomed.contains(&p.specifier.to_ascii_lowercase())
                     && requires_of
-                        .get(&p.specifier)
-                        .is_some_and(|reqs| reqs.iter().any(|r| doomed.contains(r.as_str())))
+                        .get(&p.specifier.to_ascii_lowercase())
+                        .is_some_and(|reqs| reqs.iter().any(|r| doomed.contains(r)))
             });
             match next {
                 Some(p) => {
-                    doomed.insert(p.specifier.as_str());
+                    doomed.insert(p.specifier.to_ascii_lowercase());
                 }
                 None => break,
             }
         }
         self.packages
             .iter()
-            .filter(|p| p.specifier != removing && doomed.contains(p.specifier.as_str()))
+            .filter(|p| {
+                !p.specifier.eq_ignore_ascii_case(removing)
+                    && doomed.contains(&p.specifier.to_ascii_lowercase())
+            })
             .map(|p| p.specifier.clone())
             .collect()
     }
@@ -559,24 +601,29 @@ impl SharedPackageLock {
         seeds: &std::collections::HashSet<&str>,
         requires_of: &HashMap<String, Vec<String>>,
     ) -> Vec<String> {
-        let mut removed: std::collections::HashSet<&str> = seeds.clone();
+        let requires_of = folded_relationships(requires_of);
+        let seeds = seeds
+            .iter()
+            .map(|specifier| specifier.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let mut removed = seeds.clone();
         loop {
             let still_required: std::collections::HashSet<&str> = self
                 .packages
                 .iter()
-                .filter(|p| !removed.contains(p.specifier.as_str()))
-                .filter_map(|p| requires_of.get(&p.specifier))
+                .filter(|p| !removed.contains(&p.specifier.to_ascii_lowercase()))
+                .filter_map(|p| requires_of.get(&p.specifier.to_ascii_lowercase()))
                 .flatten()
                 .map(String::as_str)
                 .collect();
             let next = self.packages.iter().find(|p| {
                 p.installed_as_requirement
-                    && !removed.contains(p.specifier.as_str())
-                    && !still_required.contains(p.specifier.as_str())
+                    && !removed.contains(&p.specifier.to_ascii_lowercase())
+                    && !still_required.contains(p.specifier.to_ascii_lowercase().as_str())
             });
             match next {
                 Some(p) => {
-                    removed.insert(p.specifier.as_str());
+                    removed.insert(p.specifier.to_ascii_lowercase());
                 }
                 None => break,
             }
@@ -584,11 +631,23 @@ impl SharedPackageLock {
         self.packages
             .iter()
             .filter(|p| {
-                !seeds.contains(p.specifier.as_str()) && removed.contains(p.specifier.as_str())
+                !seeds.contains(&p.specifier.to_ascii_lowercase())
+                    && removed.contains(&p.specifier.to_ascii_lowercase())
             })
             .map(|p| p.specifier.clone())
             .collect()
     }
+}
+
+fn folded_relationships(graph: &HashMap<String, Vec<String>>) -> HashMap<String, Vec<String>> {
+    let mut folded: HashMap<String, Vec<String>> = HashMap::new();
+    for (parent, children) in graph {
+        folded
+            .entry(parent.to_ascii_lowercase())
+            .or_default()
+            .extend(children.iter().map(|child| child.to_ascii_lowercase()));
+    }
+    folded
 }
 
 /// The outcome of [`SharedPackageLock::plan_removal`] — what a single uninstall entails.
@@ -845,7 +904,9 @@ fn row_is_current(
     lock: &SharedPackageLock,
     expected: &LockedPackage,
 ) -> Result<bool> {
-    if authoritative_governing_specifier(server_name, &expected.specifier)? != expected.specifier {
+    if !authoritative_governing_specifier(server_name, &expected.specifier)?
+        .eq_ignore_ascii_case(&expected.specifier)
+    {
         return Ok(false);
     }
     Ok(lock.find(&expected.specifier) == Some(expected)
@@ -871,6 +932,11 @@ pub fn install_package(
     enabled: bool,
 ) -> Result<()> {
     mutate_lock(server_name, |lock| {
+        if lock.has_ambiguous_identity(specifier) {
+            anyhow::bail!(
+                "multiple installed rows for {specifier}; uninstall the aliases and review a new install"
+            );
+        }
         ensure_new_package_rows_have_no_retired_parameter_state(
             server_name,
             lock,
@@ -885,7 +951,7 @@ pub fn install_package(
         // An explicit install means the user owns this package: clear the auto-installed mark so a
         // later orphan sweep never offers to remove it.
         package.installed_as_requirement = false;
-        lock.upsert(package);
+        lock.upsert(package)?;
         Ok(((), true))
     })
 }
@@ -923,7 +989,7 @@ pub fn install_package_with_activation_if_unchanged(
     activation: ProfileActivation,
 ) -> Result<Cas> {
     let _guard = guard(server_name);
-    if authoritative_governing_specifier(server_name, specifier)? != specifier {
+    if !authoritative_governing_specifier(server_name, specifier)?.eq_ignore_ascii_case(specifier) {
         return Ok(Cas::StateChanged);
     }
     mutate_lock(server_name, |lock| {
@@ -942,7 +1008,7 @@ pub fn install_package_with_activation_if_unchanged(
         let mut package = LockedPackage::new(specifier, mode);
         package.set_activation(activation);
         package.installed_as_requirement = false;
-        lock.upsert(package);
+        lock.upsert(package)?;
         Ok((Cas::Applied, true))
     })
 }
@@ -1009,9 +1075,9 @@ pub fn install_package_with_requirements_if_unchanged(
         root.installed_as_requirement = false;
         root.consented_permissions = Some(root_permissions.clone());
         root.stage(&root_version);
-        lock.upsert(root);
+        lock.upsert(root)?;
 
-        apply_required_rows(lock, required);
+        apply_required_rows(lock, required)?;
         // Replace this root's flattened relationship set, including satisfied rows. Links on
         // dormant same-leaf fallbacks are intentionally retained so deleting a local override can
         // restore the published package without losing its install provenance.
@@ -1085,7 +1151,10 @@ fn validate_satisfied_required_rows(
     Ok(())
 }
 
-fn apply_required_rows(lock: &mut SharedPackageLock, required: &[RequiredPackageInstall]) {
+fn apply_required_rows(
+    lock: &mut SharedPackageLock,
+    required: &[RequiredPackageInstall],
+) -> Result<()> {
     for item in required.iter().filter(|item| !item.already_satisfied) {
         let (mut package, is_new) = match lock.find(&item.specifier) {
             Some(existing) => (existing.clone(), false),
@@ -1098,8 +1167,9 @@ fn apply_required_rows(lock: &mut SharedPackageLock, required: &[RequiredPackage
         }
         package.consented_permissions = Some(item.permissions.clone());
         package.stage(&item.version);
-        lock.upsert(package);
+        lock.upsert(package)?;
     }
+    Ok(())
 }
 
 fn replace_required_links(
@@ -1109,7 +1179,7 @@ fn replace_required_links(
 ) -> Result<()> {
     let required_specifiers = required
         .iter()
-        .map(|item| item.specifier.as_str())
+        .map(|item| item.specifier.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     for specifier in &required_specifiers {
         if lock.find(specifier).is_none() {
@@ -1117,8 +1187,14 @@ fn replace_required_links(
         }
     }
     for package in &mut lock.packages {
-        let had_link = package.required_by.remove(root_specifier);
-        let needs_link = required_specifiers.contains(package.specifier.as_str());
+        let had_link = package
+            .required_by
+            .iter()
+            .any(|parent| parent.eq_ignore_ascii_case(root_specifier));
+        package
+            .required_by
+            .retain(|parent| !parent.eq_ignore_ascii_case(root_specifier));
+        let needs_link = required_specifiers.contains(&package.specifier.to_ascii_lowercase());
         if needs_link {
             package.required_by.insert(root_specifier.to_string());
         }
@@ -1147,7 +1223,7 @@ pub fn set_required_closure_if_unchanged(
 ) -> Result<RequiredClosureCommit> {
     let required = required_specifiers
         .iter()
-        .map(String::as_str)
+        .map(|specifier| specifier.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     mutate_lock(server_name, |lock| {
         let relevant_leaves = std::iter::once(root_specifier)
@@ -1157,7 +1233,12 @@ pub fn set_required_closure_if_unchanged(
                 expected_lock
                     .packages
                     .iter()
-                    .filter(|package| package.required_by.contains(root_specifier))
+                    .filter(|package| {
+                        package
+                            .required_by
+                            .iter()
+                            .any(|parent| parent.eq_ignore_ascii_case(root_specifier))
+                    })
                     .map(|package| package.specifier.as_str()),
             )
             .filter_map(|specifier| smudgy_script::SmudgySpecifier::parse(specifier).ok())
@@ -1168,7 +1249,10 @@ pub fn set_required_closure_if_unchanged(
                 .packages
                 .iter()
                 .filter(|package| {
-                    package.required_by.contains(root_specifier)
+                    package
+                        .required_by
+                        .iter()
+                        .any(|parent| parent.eq_ignore_ascii_case(root_specifier))
                         || smudgy_script::SmudgySpecifier::parse(&package.specifier).is_ok_and(
                             |specifier| {
                                 relevant_leaves.contains(&specifier.name.to_ascii_lowercase())
@@ -1179,7 +1263,10 @@ pub fn set_required_closure_if_unchanged(
                     (
                         package.specifier.clone(),
                         package.staged_version().map(str::to_string),
-                        package.required_by.contains(root_specifier),
+                        package
+                            .required_by
+                            .iter()
+                            .any(|parent| parent.eq_ignore_ascii_case(root_specifier)),
                     )
                 })
                 .collect::<BTreeSet<_>>()
@@ -1194,8 +1281,14 @@ pub fn set_required_closure_if_unchanged(
         }
         let mut changed = false;
         for package in &mut lock.packages {
-            let had_link = package.required_by.remove(root_specifier);
-            let needs_link = required.contains(package.specifier.as_str());
+            let had_link = package
+                .required_by
+                .iter()
+                .any(|parent| parent.eq_ignore_ascii_case(root_specifier));
+            package
+                .required_by
+                .retain(|parent| !parent.eq_ignore_ascii_case(root_specifier));
+            let needs_link = required.contains(&package.specifier.to_ascii_lowercase());
             if needs_link {
                 package.required_by.insert(root_specifier.to_string());
             }
@@ -1225,16 +1318,29 @@ pub fn set_required_closure_if_unchanged(
 pub fn uninstall_package(server_name: &str, specifier: &str) -> Result<()> {
     let _guard = guard(server_name);
     let removed = mutate_lock(server_name, |lock| {
-        let removed = lock.remove(specifier);
-        if removed {
+        let removed = lock
+            .packages
+            .iter()
+            .filter(|package| package.specifier.eq_ignore_ascii_case(specifier))
+            .map(|package| package.specifier.clone())
+            .collect::<Vec<_>>();
+        if lock.remove(specifier) {
             for package in &mut lock.packages {
-                package.required_by.remove(specifier);
+                package
+                    .required_by
+                    .retain(|parent| !parent.eq_ignore_ascii_case(specifier));
             }
         }
-        Ok((removed, removed))
+        let changed = !removed.is_empty();
+        Ok((removed, changed))
     })?;
-    if removed || package_param_state_exists(server_name, specifier)? {
-        remove_package_param_state(server_name, specifier).with_context(|| {
+    let cleanup = if removed.is_empty() {
+        vec![specifier.to_string()]
+    } else {
+        removed
+    };
+    for saved in cleanup {
+        remove_package_param_state(server_name, &saved).with_context(|| {
             format!(
                 "package {specifier} was removed, but its settings still need cleanup; retry the uninstall or installation"
             )
@@ -1263,13 +1369,19 @@ pub fn commit_uninstall_if_unchanged(
         if lock != expected {
             return Ok(((UninstallCommit::Stale, Vec::new()), false));
         }
+        let ambiguous = lock.has_ambiguous_identity(specifier);
         let target = lock
             .find(specifier)
+            .or_else(|| {
+                lock.packages
+                    .iter()
+                    .find(|package| package.specifier == specifier)
+            })
             .with_context(|| format!("package {specifier} is not installed"))?;
-        if !target.has_direct_activation() {
+        if !target.has_direct_activation() && !ambiguous {
             anyhow::bail!("package {specifier} has no direct install to remove");
         }
-        if !target.required_by.is_empty() {
+        if !target.required_by.is_empty() && !ambiguous {
             let target = lock.find_mut(specifier).expect("target was found above");
             target.installed_as_requirement = true;
             target.requirement_lineage_known = true;
@@ -1282,13 +1394,22 @@ pub fn commit_uninstall_if_unchanged(
         if remove_orphans {
             removed.extend(plan.orphans);
         }
-        let removed_set = removed.iter().cloned().collect::<BTreeSet<_>>();
+        let removed_set = removed
+            .iter()
+            .map(|specifier| specifier.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let removed = lock
+            .packages
+            .iter()
+            .filter(|package| removed_set.contains(&package.specifier.to_ascii_lowercase()))
+            .map(|package| package.specifier.clone())
+            .collect::<Vec<_>>();
         lock.packages
-            .retain(|package| !removed_set.contains(&package.specifier));
+            .retain(|package| !removed_set.contains(&package.specifier.to_ascii_lowercase()));
         for package in &mut lock.packages {
             package
                 .required_by
-                .retain(|parent| !removed_set.contains(parent));
+                .retain(|parent| !removed_set.contains(&parent.to_ascii_lowercase()));
         }
         Ok((
             (UninstallCommit::PackagesRemoved(removed.clone()), removed),
@@ -1487,7 +1608,9 @@ pub fn set_governing_trusted_if_unchanged(
     trusted: bool,
 ) -> Result<Cas> {
     let _guard = guard(server_name);
-    if authoritative_governing_specifier(server_name, requested_specifier)? != expected.specifier {
+    if !authoritative_governing_specifier(server_name, requested_specifier)?
+        .eq_ignore_ascii_case(&expected.specifier)
+    {
         return Ok(Cas::StateChanged);
     }
     mutate_row_if_unchanged(server_name, expected, |package| package.trusted = trusted)
@@ -1523,7 +1646,9 @@ pub fn set_governing_activation_if_unchanged(
     activation: ProfileActivation,
 ) -> Result<Cas> {
     let _guard = guard(server_name);
-    if authoritative_governing_specifier(server_name, requested_specifier)? != expected.specifier {
+    if !authoritative_governing_specifier(server_name, requested_specifier)?
+        .eq_ignore_ascii_case(&expected.specifier)
+    {
         return Ok(Cas::StateChanged);
     }
     mutate_row_if_unchanged(server_name, expected, |package| {
@@ -1899,7 +2024,7 @@ pub(crate) fn rename_local_package_state(
     });
     if let Some(row) = new_row.clone() {
         mutate_lock(server_name, |lock| {
-            lock.upsert(row);
+            lock.upsert(row)?;
             Ok(((), true))
         })?;
     }
@@ -2063,7 +2188,7 @@ fn commit_local_manifest_inner(
             &lock,
             required.iter().map(|item| item.specifier.as_str()),
         )?;
-        apply_required_rows(&mut lock, required);
+        apply_required_rows(&mut lock, required)?;
         replace_required_links(&mut lock, &governing_specifier, required)?;
     }
 
@@ -2476,6 +2601,19 @@ fn configured_param_scope<'a>(
     })
 }
 
+// Ordinary settings, history and keyring slots keep their existing spelling. Resolve
+// runtime aliases back to that namespace instead of migrating or duplicating user data.
+fn stored_package_specifier(server_name: &str, specifier: &str) -> Result<String> {
+    let lock = load_lock_in(&server_dir(server_name)?)?;
+    if lock.has_ambiguous_identity(specifier) {
+        anyhow::bail!("ambiguous package settings identity {specifier}");
+    }
+    Ok(lock.find(specifier).map_or_else(
+        || specifier.to_string(),
+        |package| package.specifier.clone(),
+    ))
+}
+
 /// Checked required-parameter gate for one running profile.
 ///
 /// # Errors
@@ -2487,6 +2625,8 @@ pub fn missing_required_params_for_profile_checked(
     specifier: &str,
     params: &[PackageParameter],
 ) -> Result<Vec<String>> {
+    let stored = stored_package_specifier(server_name, specifier)?;
+    let specifier = stored.as_str();
     if let Some(row) = load_lock(server_name)?.find(specifier).cloned() {
         prepare_package_parameters(server_name, &row, params)?;
     }
@@ -2523,6 +2663,8 @@ pub fn get_param_value_for_profile_checked(
     key: &str,
 ) -> Result<Option<serde_json::Value>> {
     let _guard = guard(server_name);
+    let stored = stored_package_specifier(server_name, specifier)?;
+    let specifier = stored.as_str();
     let scope = configured_param_scope(server_name, profile_name, specifier)?;
     if let Some(value) = get_param_value_scoped_checked(server_name, scope, specifier, key)? {
         return Ok(Some(value));
@@ -2544,6 +2686,8 @@ pub fn get_declared_param_for_profile_checked(
     parameter: &PackageParameter,
 ) -> Result<Option<serde_json::Value>> {
     let _guard = guard(server_name);
+    let stored = stored_package_specifier(server_name, specifier)?;
+    let specifier = stored.as_str();
     let scope = configured_param_scope(server_name, profile_name, specifier)?;
     if parameter.secret {
         Ok(
@@ -2654,6 +2798,8 @@ pub fn save_package_param_for_profile(
     value: serde_json::Value,
 ) -> Result<()> {
     let _guard = guard(server_name);
+    let stored = stored_package_specifier(server_name, specifier)?;
+    let specifier = stored.as_str();
     validate_package_param_value(param, &value)?;
     let scope = configured_param_scope(server_name, profile_name, specifier)?;
     if param.secret {
@@ -3646,6 +3792,199 @@ fn remove_secret_from_file(dir: &Path, slot: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mixed_case_lock_operations_preserve_the_saved_namespace() {
+        let saved = "smudgy://Rich_E/Speedwalks";
+        let alias = "smudgy://rich_e/speedwalks";
+        let mut package = LockedPackage::new(
+            saved,
+            UpdateMode::Pinned {
+                version: "1.0.0".into(),
+            },
+        );
+        package.trusted = true;
+        let mut lock = SharedPackageLock {
+            packages: vec![package],
+        };
+        assert_eq!(lock.find(alias).unwrap().pinned_version(), Some("1.0.0"));
+        let mut update = lock.find(alias).unwrap().clone();
+        update.specifier = alias.into();
+        update.last_resolved_version = Some("1.0.0".into());
+        lock.upsert(update).unwrap();
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.find(alias).unwrap().specifier, saved);
+        assert!(lock.find(alias).unwrap().trusted);
+        assert!(lock.remove(alias));
+        assert!(lock.packages.is_empty());
+    }
+
+    #[test]
+    fn mixed_case_duplicate_rows_do_not_choose_a_pin_or_consent() {
+        let alias = "smudgy://rich_e/speedwalks";
+        let mut lock = SharedPackageLock {
+            packages: vec![
+                LockedPackage::new(
+                    "smudgy://Rich_E/Speedwalks",
+                    UpdateMode::Pinned {
+                        version: "1.0.0".into(),
+                    },
+                ),
+                LockedPackage::new(alias, UpdateMode::Auto),
+            ],
+        };
+        assert!(lock.has_ambiguous_identity(alias));
+        assert!(lock.find(alias).is_none());
+        assert!(!lock.plan_rows_match(&lock, [alias]));
+        assert!(
+            lock.upsert(LockedPackage::new(alias, UpdateMode::Auto))
+                .is_err()
+        );
+        assert!(lock.remove(alias));
+        assert!(lock.packages.is_empty());
+    }
+
+    #[test]
+    fn mixed_case_requirement_links_use_existing_rows() {
+        let root = "smudgy://Tools/App";
+        let dependency = "smudgy://Rich_E/Speedwalks";
+        let mut lock = SharedPackageLock {
+            packages: vec![
+                LockedPackage::new(root, UpdateMode::Auto),
+                LockedPackage::new(dependency, UpdateMode::Auto),
+            ],
+        };
+        lock.find_mut(dependency)
+            .unwrap()
+            .set_activation(ProfileActivation::None);
+        replace_required_links(
+            &mut lock,
+            root,
+            &[RequiredPackageInstall {
+                specifier: dependency.to_ascii_lowercase(),
+                version: "1.0.0".into(),
+                permissions: PackagePermissions::default(),
+                already_satisfied: true,
+            }],
+        )
+        .unwrap();
+        assert!(lock.find(dependency).unwrap().required_by.contains(root));
+        assert!(lock.is_effectively_enabled_for(&dependency.to_ascii_lowercase(), "Default"));
+    }
+
+    #[test]
+    fn mixed_case_runtime_parameters_keep_existing_values_and_history() {
+        let server = test_server("case-params");
+        let saved = "smudgy://Rich_E/Speedwalks";
+        let alias = "smudgy://rich_e/speedwalks";
+        install_package(&server, saved, UpdateMode::Auto, true).unwrap();
+        let expected = load_lock(&server).unwrap().find(saved).unwrap().clone();
+        assert_eq!(
+            set_governing_activation_if_unchanged(
+                &server,
+                alias,
+                &expected,
+                ProfileActivation::None
+            )
+            .unwrap(),
+            Cas::Applied
+        );
+        save_param_value(&server, saved, "destination", serde_json::json!("home")).unwrap();
+        assert_eq!(
+            get_param_value_for_profile_checked(&server, "Default", alias, "destination").unwrap(),
+            Some(serde_json::json!("home"))
+        );
+        let param: PackageParameter =
+            serde_json::from_value(serde_json::json!({"key":"destination"})).unwrap();
+        save_package_param_for_profile(
+            &server,
+            "Default",
+            alias,
+            &param,
+            serde_json::json!("town"),
+        )
+        .unwrap();
+        assert_eq!(
+            get_param_value_for_profile_checked(&server, "Default", saved, "destination").unwrap(),
+            Some(serde_json::json!("town"))
+        );
+        let values = load_param_values_scoped(&server, ParamValueScope::Global).unwrap();
+        assert!(values.contains_key(saved));
+        assert!(!values.contains_key(alias));
+        let history = settings_history(&server, ParamValueScope::Global, saved, &[]).unwrap();
+        assert!(!history.is_empty());
+        assert!(history.iter().all(|entry| entry.snapshot.package == saved));
+    }
+
+    #[test]
+    fn mixed_case_uninstall_cleans_saved_aliases_and_requirement_links() {
+        let server = test_server("case-uninstall");
+        let root = "smudgy://Tools/App";
+        let dependency = "smudgy://Rich_E/Speedwalks";
+        let mut required = LockedPackage::new(dependency, UpdateMode::Auto);
+        required.installed_as_requirement = true;
+        required.required_by.insert(root.to_ascii_lowercase());
+        let lock = SharedPackageLock {
+            packages: vec![LockedPackage::new(root, UpdateMode::Auto), required],
+        };
+        save_lock(&server, &lock).unwrap();
+        save_param_value(&server, root, "destination", serde_json::json!("home")).unwrap();
+        assert_eq!(
+            lock.plan_removal_from_links(&dependency.to_ascii_lowercase())
+                .breaks,
+            vec![root]
+        );
+        assert_eq!(
+            lock.plan_removal_from_links(&root.to_ascii_lowercase())
+                .orphans,
+            vec![dependency]
+        );
+        assert_eq!(
+            commit_uninstall_if_unchanged(&server, &lock, &root.to_ascii_lowercase(), true)
+                .unwrap(),
+            UninstallCommit::PackagesRemoved(vec![root.into(), dependency.into()])
+        );
+        assert!(load_lock(&server).unwrap().packages.is_empty());
+        // Check the ordinary parameter's store without probing the host credential service.
+        assert!(
+            get_declared_param_for_profile_checked(
+                &server,
+                "Default",
+                root,
+                &param("destination", false, false),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn confirmed_uninstall_repairs_duplicate_aliases_without_merging_authority() {
+        let server = test_server("case-duplicate-uninstall");
+        let first = "smudgy://Rich_E/Speedwalks";
+        let second = "smudgy://rich_e/speedwalks";
+        let mut trusted = LockedPackage::new(
+            first,
+            UpdateMode::Pinned {
+                version: "1.0.0".into(),
+            },
+        );
+        trusted.trusted = true;
+        let lock = SharedPackageLock {
+            packages: vec![trusted, LockedPackage::new(second, UpdateMode::Auto)],
+        };
+        save_lock(&server, &lock).unwrap();
+        assert!(install_package(&server, second, UpdateMode::Auto, true).is_err());
+        assert_eq!(
+            commit_uninstall_if_unchanged(&server, &lock, first, false).unwrap(),
+            UninstallCommit::PackagesRemoved(vec![first.into(), second.into()])
+        );
+        install_package(&server, first, UpdateMode::Auto, true).unwrap();
+        let repaired = load_lock(&server).unwrap();
+        assert_eq!(repaired.packages.len(), 1);
+        assert!(!repaired.packages[0].trusted);
+        assert!(repaired.packages[0].consented_permissions.is_none());
+    }
+
     fn use_temp_smudgy_home() {
         static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         TEST_HOME.get_or_init(|| {
@@ -3724,12 +4063,12 @@ mod tests {
         let mut lock = SharedPackageLock::default();
         let mut published = LockedPackage::new("smudgy://wbk/mapper", UpdateMode::Auto);
         published.set_activation(ProfileActivation::All);
-        lock.upsert(published);
+        lock.upsert(published).unwrap();
         assert!(lock.is_effectively_enabled_for("smudgy://wbk/mapper", "Main"));
 
         let mut local = LockedPackage::new("smudgy://local/mapper", UpdateMode::Auto);
         local.set_activation(selected(&["Alt"]));
-        lock.upsert(local);
+        lock.upsert(local).unwrap();
         assert_eq!(
             lock.governing_specifier("smudgy://wbk/mapper"),
             Some("smudgy://local/mapper")
@@ -3743,13 +4082,13 @@ mod tests {
         let mut lock = SharedPackageLock::default();
         let mut root = LockedPackage::new("smudgy://a/root", UpdateMode::Auto);
         root.set_activation(selected(&["Main"]));
-        lock.upsert(root);
+        lock.upsert(root).unwrap();
         let mut dep = LockedPackage::new("smudgy://a/dep", UpdateMode::Auto);
         dep.set_activation(ProfileActivation::None);
         dep.installed_as_requirement = true;
         dep.requirement_lineage_known = true;
         dep.required_by.insert("smudgy://a/root".into());
-        lock.upsert(dep);
+        lock.upsert(dep).unwrap();
         assert!(lock.is_effectively_enabled_for("smudgy://a/dep", "Main"));
         assert!(!lock.is_effectively_enabled_for("smudgy://a/dep", "Alt"));
 
@@ -4023,7 +4362,8 @@ mod tests {
         // So does a new row contending for the plan row's leaf.
         let snapshot = load_lock(&server).unwrap();
         mutate_lock(&server, |lock| {
-            lock.upsert(LockedPackage::new("smudgy://b/other", UpdateMode::Auto));
+            lock.upsert(LockedPackage::new("smudgy://b/other", UpdateMode::Auto))
+                .unwrap();
             Ok(((), true))
         })
         .unwrap();

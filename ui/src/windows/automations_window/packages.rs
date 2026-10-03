@@ -1503,7 +1503,18 @@ async fn plan_required_root(
     installed: &[LockedPackage],
 ) -> Result<(ResolvedPackageWire, RequiredRoot), RequiredRefusal> {
     let specifier = specifier_for(owner, name);
-    let entry = installed.iter().find(|p| p.specifier == specifier);
+    let lock = SharedPackageLock {
+        packages: installed.to_vec(),
+    };
+    if lock.has_ambiguous_identity(&specifier) {
+        return Err(required_unavailable(
+            name,
+            &CloudError::InvalidInput(format!(
+                "multiple installed rows for {specifier}; uninstall the aliases and review a new install"
+            )),
+        ));
+    }
+    let entry = lock.find(&specifier);
     // The installed version, if any: an explicit pin wins over the previous resolution. An Auto
     // entry reuses its staged immutable version; only a never-resolved entry needs discovery.
     let existing = if let Some(p) = entry {
@@ -2017,7 +2028,7 @@ impl AutomationsWindow {
         let expected_package = self
             .installed_packages
             .iter()
-            .find(|package| package.specifier == specifier)
+            .find(|package| package.specifier.eq_ignore_ascii_case(&specifier))
             .cloned();
         let inserting_governing_row =
             matches!(self.pane, Pane::OwnedPackage) && expected_package.is_none();
@@ -2760,7 +2771,7 @@ impl AutomationsWindow {
             || self
                 .installed_packages
                 .iter()
-                .find(|package| package.specifier == spec)
+                .find(|package| package.specifier.eq_ignore_ascii_case(spec))
                 .map(|package| package.staged_version())
                 != Some(expected_staged)
         {
@@ -2876,7 +2887,7 @@ impl AutomationsWindow {
             let blocked = self
                 .installed_packages
                 .iter()
-                .find(|p| p.specifier == spec)
+                .find(|p| p.specifier.eq_ignore_ascii_case(spec))
                 .is_some_and(|p| {
                     !p.trusted
                         && !union.is_within(&p.consented_permissions.clone().unwrap_or_default())
@@ -3047,7 +3058,7 @@ impl AutomationsWindow {
         let locked = self
             .installed_packages
             .iter()
-            .find(|p| p.specifier == specifier)
+            .find(|p| p.specifier.eq_ignore_ascii_case(&specifier))
             .cloned();
         // Open the pane even for a package that isn't a direct lockfile install (e.g. a transitive
         // dependency) so it can be inspected and forked ("Edit a copy"). The synthetic lock entry
@@ -3119,13 +3130,13 @@ impl AutomationsWindow {
         let staged = self
             .installed_packages
             .iter()
-            .find(|p| p.specifier == specifier)
+            .find(|p| p.specifier.eq_ignore_ascii_case(specifier))
             .and_then(|p| p.staged_version().map(str::to_string))
             .or_else(|| self.graph.resolved.get(specifier).cloned());
         let compare_latest = self
             .installed_packages
             .iter()
-            .find(|package| package.specifier == specifier)
+            .find(|package| package.specifier.eq_ignore_ascii_case(specifier))
             .is_some_and(|package| matches!(package.mode, UpdateMode::Auto));
         let (account_fence, client) = self.frozen_package_client();
         let latest_client = client.clone();
@@ -3475,7 +3486,7 @@ impl AutomationsWindow {
         let Some(current) = self
             .installed_packages
             .iter()
-            .find(|package| package.specifier == specifier)
+            .find(|package| package.specifier.eq_ignore_ascii_case(&specifier))
             .cloned()
         else {
             self.clear_selection();
@@ -3565,7 +3576,7 @@ impl AutomationsWindow {
                     if let Some(package) = self
                         .installed_packages
                         .iter_mut()
-                        .find(|package| package.specifier == specifier)
+                        .find(|package| package.specifier.eq_ignore_ascii_case(&specifier))
                     {
                         package.consented_permissions = Some(permissions.clone());
                     }
@@ -3865,11 +3876,16 @@ impl AutomationsWindow {
                 return Update::none();
             }
         };
-        let Some(target) = lock.find(&specifier) else {
+        let ambiguous = lock.has_ambiguous_identity(&specifier);
+        let Some(target) = lock.find(&specifier).or_else(|| {
+            lock.packages
+                .iter()
+                .find(|package| package.specifier == specifier)
+        }) else {
             self.manage_feedback = Some(crate::i18n::t!("package-install-plan-changed"));
             return Update::with_task(Task::done(Message::LoadInstalledPackages));
         };
-        if !target.has_direct_activation() {
+        if !target.has_direct_activation() && !ambiguous {
             let needed_by = target.required_by.iter().cloned().collect::<Vec<_>>();
             self.manage_feedback = Some(crate::i18n::t!(
                 "package-required-managed",
@@ -3877,7 +3893,7 @@ impl AutomationsWindow {
             ));
             return Update::none();
         }
-        if target.required_by.is_empty() {
+        if target.required_by.is_empty() || ambiguous {
             let plan = lock.plan_removal_from_links(&specifier);
             self.uninstall_breaks = plan.breaks;
             self.uninstall_orphans = plan.orphans;
@@ -4603,7 +4619,7 @@ impl AutomationsWindow {
         let mut expected_package = self
             .installed_packages
             .iter()
-            .find(|package| package.specifier == own_spec)
+            .find(|package| package.specifier.eq_ignore_ascii_case(&own_spec))
             .cloned();
         let in_lock = expected_package.is_some();
         if unsandboxed && !in_lock {
@@ -4642,7 +4658,7 @@ impl AutomationsWindow {
             expected_package = self
                 .installed_packages
                 .iter()
-                .find(|package| package.specifier == own_spec)
+                .find(|package| package.specifier.eq_ignore_ascii_case(&own_spec))
                 .cloned();
         }
         if in_lock || unsandboxed {
@@ -6833,8 +6849,13 @@ impl AutomationsWindow {
         // A local package created while this consent window was open can take over a leaf. The
         // resolved remote plan is then stale and must be reviewed again; never grant remote
         // permissions or activation to newly-created mutable local code.
+        // Governing specifiers may be ASCII-folded for a new install, while cloud coordinates
+        // retain the publisher's casing. Case alone does not change the reviewed identity.
         let requirement_plan_changed = prompt.required_roots.iter().any(|root| {
-            if self.governing_specifier(&root.specifier) != root.specifier {
+            if !self
+                .governing_specifier(&root.specifier)
+                .eq_ignore_ascii_case(&root.specifier)
+            {
                 return true;
             }
             parse_specifier(&root.specifier).is_some_and(|(owner, name)| {
@@ -6845,7 +6866,11 @@ impl AutomationsWindow {
                         .is_none()
             })
         });
-        if self.governing_specifier(&specifier) != specifier || requirement_plan_changed {
+        if !self
+            .governing_specifier(&specifier)
+            .eq_ignore_ascii_case(&specifier)
+            || requirement_plan_changed
+        {
             if let Some(prompt) = self.consent_prompt.as_mut() {
                 prompt.error = Some(crate::i18n::t!("package-install-plan-changed"));
             }
@@ -7547,7 +7572,7 @@ impl AutomationsWindow {
                 self.installed_open = self
                     .installed_packages
                     .iter()
-                    .find(|package| package.specifier == specifier)
+                    .find(|package| package.specifier.eq_ignore_ascii_case(&specifier))
                     .cloned()
                     .map(Box::new);
             }
@@ -7638,7 +7663,7 @@ impl AutomationsWindow {
         let expected_package = self
             .installed_packages
             .iter()
-            .find(|package| package.specifier == specifier)
+            .find(|package| package.specifier.eq_ignore_ascii_case(&specifier))
             .cloned();
         let unavailable = self.package_state_error().or_else(|| {
             expected_package.is_none().then(|| {
@@ -9442,6 +9467,78 @@ fn cached_fork_body(cache: Option<&PackageCache>, content_hash: &str) -> Option<
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn mixed_case_required_planner_reuses_satisfying_installed_pin() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let target = request.split_whitespace().nth(1).unwrap_or_default();
+                let body = if target.contains("/versions") {
+                serde_json::json!({"data":[
+                    {"version":"1.0.0","yanked":false,"deleted":false,"published_at":"2026-01-01T00:00:00Z"},
+                    {"version":"1.5.0","yanked":false,"deleted":false,"published_at":"2026-01-02T00:00:00Z"}
+                ]})
+            } else {
+                let version = if target.contains("version=1.0.0") { "1.0.0" } else { "1.5.0" };
+                serde_json::json!({"data":{
+                    "package_id":"00000000-0000-0000-0000-000000000001",
+                    "owner_nickname":"Rich_E","name":"Speedwalks","version":version,
+                    "manifest":{"version":version},"modules":[],"dependencies":[]
+                }})
+            }.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let client = PackageApiClient::new(
+            format!("http://127.0.0.1:{port}"),
+            smudgy_cloud::CredentialSource::new(Some(smudgy_cloud::Credential::ApiKey(
+                "test".into(),
+            ))),
+        );
+        let installed = [LockedPackage::new(
+            "smudgy://Rich_E/Speedwalks",
+            UpdateMode::Pinned {
+                version: "1.0.0".into(),
+            },
+        )];
+        let ranges = [RequirerRange {
+            requirer: "tools".into(),
+            range: Some("^1.0".into()),
+        }];
+        let (_, control) = plan_required_root(&client, "Rich_E", "Speedwalks", &ranges, &installed)
+            .await
+            .unwrap_or_else(|_| panic!("control resolution failed"));
+        assert!(control.already_satisfied);
+        assert_eq!(control.version, "1.0.0");
+        let (_, changed_case) =
+            plan_required_root(&client, "rich_e", "speedwalks", &ranges, &installed)
+                .await
+                .unwrap_or_else(|_| panic!("case-variant resolution failed"));
+        assert!(changed_case.already_satisfied);
+        assert!(!changed_case.is_upgrade);
+        assert_eq!(changed_case.version, "1.0.0");
+    }
     use iced::Size;
     use iced::advanced::layout;
     use iced::advanced::widget::tree::Tree;

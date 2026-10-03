@@ -1155,6 +1155,74 @@ mod npm_resolution_tests {
 
 #[cfg(test)]
 mod dep_gating_tests {
+    #[test]
+    fn mixed_case_declared_dependency_is_allowed() {
+        let loader =
+            loader_with_app(r#"{"version":"1.0.0","dependencies":["smudgy://Rich_E/Speedwalks"]}"#);
+        assert!(
+            loader
+                .resolve(
+                    "smudgy://Rich_E/Speedwalks",
+                    APP_REFERRER,
+                    ResolutionKind::Import
+                )
+                .is_ok()
+        );
+        assert!(
+            loader
+                .resolve(
+                    "smudgy://rich_e/speedwalks",
+                    APP_REFERRER,
+                    ResolutionKind::Import
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mixed_case_self_import_does_not_need_a_dependency_declaration() {
+        let loader = loader_with_app(r#"{"version":"1.0.0"}"#);
+        assert!(
+            loader
+                .resolve(
+                    "smudgy://WBK/APP/Lib/Util.ts",
+                    APP_REFERRER,
+                    ResolutionKind::Import
+                )
+                .is_ok()
+        );
+        assert!(
+            loader
+                .resolve("smudgy://other/app", APP_REFERRER, ResolutionKind::Import)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mixed_case_requires_allows_all_interop_schemes() {
+        let loader =
+            loader_with_app(r#"{"version":"1.0.0","requires":["smudgy://Rich_E/Speedwalks"]}"#);
+        for scheme in ["state", "events", "procedures"] {
+            for coordinate in ["Rich_E/Speedwalks", "rich_e/speedwalks"] {
+                assert!(
+                    loader
+                        .resolve(
+                            &format!("smudgy:{scheme}/{coordinate}"),
+                            APP_REFERRER,
+                            ResolutionKind::Import
+                        )
+                        .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_case_same_owner_may_import_private_package() {
+        assert!(load_lib(false, Some(("gandalf", "other", "1.0.0"))).is_ok());
+        assert!(load_lib(false, Some(("Gandalf", "other", "1.0.0"))).is_ok());
+        assert!(load_lib(false, Some(("other", "other", "1.0.0"))).is_err());
+    }
     use super::*;
     use crate::package_resolver::{
         InMemoryPackageProvider, PackageKey, PackageManifest, PackageModuleSource, ResolvedPackage,
