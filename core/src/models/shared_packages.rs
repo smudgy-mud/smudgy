@@ -3944,10 +3944,16 @@ mod tests {
             UninstallCommit::PackagesRemoved(vec![root.into(), dependency.into()])
         );
         assert!(load_lock(&server).unwrap().packages.is_empty());
+        // Check the ordinary parameter's store without probing the host credential service.
         assert!(
-            get_param_value_for_profile_checked(&server, "Default", root, "destination")
-                .unwrap()
-                .is_none()
+            get_declared_param_for_profile_checked(
+                &server,
+                "Default",
+                root,
+                &param("destination", false, false),
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
