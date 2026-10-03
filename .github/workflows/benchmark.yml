@@ -631,8 +631,8 @@ jobs:
         run: |
           set -euo pipefail
           comment_id=$(gh api --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-            --jq 'first(.[][] | select((.body // "") | contains("<!-- smudgy-benchmark-comparison -->")) | .id) // empty')
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" |
+            jq -r 'first(.[][] | select((.body // "") | contains("<!-- smudgy-benchmark-comparison -->")) | .id) // empty')
           if [[ -n "${comment_id}" ]]; then
             jq -n --rawfile body benchmark-artifacts/pr-comment.md \
               '{body: $body}' > benchmark-artifacts/comment-update.json

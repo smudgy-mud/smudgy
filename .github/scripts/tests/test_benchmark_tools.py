@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -696,12 +699,64 @@ class WorkflowDefinitionTests(unittest.TestCase):
         self.assertIn("report_status=artifact_failure", self.workflow)
 
     def test_comment_lookup_is_paginated_and_slurped(self) -> None:
-        lookup = self.workflow[
+        self.assertIn("--paginate", self.comment_lookup())
+        self.assertIn("--slurp", self.comment_lookup())
+
+    def comment_lookup(self) -> str:
+        return textwrap.dedent(self.workflow[
             self.workflow.index("comment_id=$(gh api"):
             self.workflow.index('if [[ -n "${comment_id}"')
-        ]
-        self.assertIn("--paginate", lookup)
-        self.assertIn("--slurp", lookup)
+        ])
+
+    def run_comment_lookup(
+        self, pages: list, *, api_status: int = 0
+    ) -> subprocess.CompletedProcess[str]:
+        bash = shutil.which("bash")
+        if not bash or not shutil.which("jq"):
+            self.skipTest("comment lookup integration tests require bash and jq")
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Path(temp) / "pages.json"
+            fixture.write_text(json.dumps(pages), encoding="utf-8")
+            # Reject unsupported gh arguments, then let real jq process all pages.
+            script = """
+set -euo pipefail
+gh() {
+  [[ "$#" == 4 && "$1" == api && "$2" == --paginate && "$3" == --slurp &&
+     "$4" == "repos/smudgy-mud/smudgy/issues/246/comments?per_page=100" ]] || return 64
+  [[ "${API_STATUS}" == 0 ]] || return "${API_STATUS}"
+  cat "${COMMENT_PAGES}"
+}
+""" + self.comment_lookup() + '\nprintf "%s" "${comment_id}"\n'
+            return subprocess.run(
+                [bash, "-c", script], capture_output=True, text=True,
+                env=os.environ | {
+                    "GITHUB_REPOSITORY": "smudgy-mud/smudgy", "PR_NUMBER": "246",
+                    "COMMENT_PAGES": fixture.as_posix(), "API_STATUS": str(api_status),
+                },
+            )
+
+    def test_comment_lookup_finds_first_matching_comment_across_pages(self) -> None:
+        marker = "<!-- smudgy-benchmark-comparison -->"
+        result = self.run_comment_lookup([
+            [{"id": 1, "body": None}, {"id": 2, "body": "unrelated"}],
+            [{"id": 3}, {"id": 4, "body": f"{marker}\nreport"},
+             {"id": 5, "body": marker}],
+            [{"id": 6, "body": marker}],
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "4")
+
+    def test_comment_lookup_returns_empty_when_no_comment_matches(self) -> None:
+        for pages in ([[]], [[{"id": 1, "body": "unrelated"}], []]):
+            with self.subTest(pages=pages):
+                result = self.run_comment_lookup(pages)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_comment_lookup_propagates_api_failure(self) -> None:
+        result = self.run_comment_lookup([[]], api_status=7)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":
