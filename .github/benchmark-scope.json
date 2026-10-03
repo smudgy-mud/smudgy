@@ -1,13 +1,14 @@
 {
   "criterion_targets": [
+    "script_dispatch",
+    "procedures",
+    "interop_ops",
     "ingest",
     "trigger_engine",
-    "interop_ops",
     "store_fanout",
     "mapper_scale",
     "terminal_buffer",
     "trigger_matching",
-    "script_dispatch",
     "gmcp_automap",
     "map_spatial",
     "identity_tax",
@@ -120,6 +121,9 @@
       "name": "runtime interop",
       "globs": [
         "core/src/session/runtime.rs",
+        "core/src/session/runtime/action.rs",
+        "core/src/session/runtime/dispatch.rs",
+        "core/src/session/runtime/js/smudgy.ts",
         "core/src/session/runtime/script_engine.rs",
         "core/src/session/runtime/script_engine/**",
         "script/**",
@@ -127,6 +131,7 @@
       ],
       "criterion": [
         "script_dispatch",
+        "procedures",
         "identity_tax",
         "interop_ops",
         "interop_read",
@@ -138,6 +143,20 @@
       "coverage": "partial",
       "reason": "Exercises the principal scripting and host-interop hot paths.",
       "limitation": "Target selection cannot prove coverage for every Deno runtime behavior."
+    },
+    {
+      "name": "procedure delivery",
+      "globs": [
+        "core/src/session/runtime/procedure_calls.rs",
+        "core/src/session/runtime/message_bus.rs"
+      ],
+      "criterion": [
+        "script_dispatch",
+        "procedures"
+      ],
+      "coverage": "partial",
+      "reason": "Measures completed posts and trigger dispatch before, during, and after a waiting call; RPC timings are recorded separately.",
+      "limitation": "Does not exercise every admission limit, failure path, or package lifecycle transition."
     },
     {
       "name": "session store",
@@ -195,5 +214,8 @@
       "reason": "Exercises display-buffer work below rendering.",
       "limitation": "Does not measure GPU rendering or full iced frame latency."
     }
-  ]
+  ],
+  "candidate_only_criterion_targets": {
+    "procedure_calls": "procedures"
+  }
 }

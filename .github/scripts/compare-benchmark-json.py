@@ -91,6 +91,15 @@ def render_coverage(scope: dict[str, Any]) -> list[str]:
             + "."
         )
     ]
+    candidate_only = scope.get("candidate_only_criterion_targets", [])
+    if candidate_only:
+        lines.extend([
+            "",
+            "Candidate-only suites: "
+            + ", ".join(f"`{target}`" for target in candidate_only)
+            + ". When the API is available, timings are stored in workflow artifacts "
+              "and excluded from baseline deltas.",
+        ])
     limitations = sorted(
         {
             entry["limitation"]

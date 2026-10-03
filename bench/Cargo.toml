@@ -87,6 +87,15 @@ name = "script_dispatch"
 harness = false
 
 [[bench]]
+name = "procedures"
+harness = false
+
+[[bench]]
+name = "procedure_calls"
+harness = false
+required-features = ["pr-benchmarks"]
+
+[[bench]]
 name = "terminal_buffer"
 harness = false
 

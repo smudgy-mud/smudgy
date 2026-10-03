@@ -113,6 +113,22 @@ declared by the map. If a broad change maps to more, the report names every
 omitted target and marks coverage partial. The canonical main/weekly/release
 run remains uncapped.
 
+Procedure changes prioritize `script_dispatch`, `procedures`, and `interop_ops`
+within that budget. The `procedures` harness always emits five paired cells:
+completed cross-isolate posts, idle triggers, triggers after the first call,
+triggers while a call waits, and triggers after it completes. On revisions
+without `.call()`, the three call transitions remain idle, preserving identical
+case names without inventing baseline RPC timings.
+
+The selected `procedures` suite also requests candidate-only `procedure_calls`
+timings for 1/64/256 concurrent calls with 0/1/8 KiB payloads. That harness is
+prebuilt before the paired runs and measured afterward; its JSON, logs, explicit
+API availability, and environment telemetry stay separate from the paired
+manifest and performance verdict. Revisions without `.call()` explicitly skip
+it. Run it locally with `cargo bench -p smudgy_bench --features pr-benchmarks
+--bench procedure_calls`. These harnesses and trusted workflow changes must land
+on `main` before measuring the PR that introduces `.call()`.
+
 For selected Criterion targets, both revisions are compiled before measurement
 and pinned to CPUs 2-7. The runner executes two balanced blocks, `ABBA` then
 `BAAB`, where A is current `main` and B is the PR. Each block independently

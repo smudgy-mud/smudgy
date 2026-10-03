@@ -410,6 +410,12 @@ jobs:
           for target in "${targets[@]}"; do
             args+=(--target "${target}")
           done
+          mapfile -t candidate_only_targets < <(
+            jq -r '.candidate_only_criterion_targets[]' benchmark-artifacts/benchmark-scope.json
+          )
+          for target in "${candidate_only_targets[@]}"; do
+            args+=(--candidate-only-target "${target}")
+          done
           python3 trusted/.github/scripts/run-paired-criterion.py \
             --baseline-dir baseline \
             --candidate-dir candidate \
