@@ -382,21 +382,36 @@ declare module "smudgy:core" {
     readonly __smudgyProcedure?: (args: A) => R;
   }
 
+  /** Options for a procedure request. Nested calls inherit the earlier deadline. */
+  export interface ProcedureCallOptions {
+    /** Integer milliseconds, 1..60000; defaults to 10000. */
+    timeoutMs?: number;
+  }
+
   /**
    * The caller's side of another package's {@link ProcedureHandle}. What
    * `import { … } from "smudgy:procedures/<owner>/<pkg>"` gives you.
    */
   export interface ProcedureConsumer<A = unknown, R = void> {
     /**
-     * Sends arguments to the implementer, fire-and-forget: there is no
-     * reply or receipt, and posting to a producer that isn't installed does
-     * nothing. Arguments are serialized as JSON, like event payloads.
-     * Answers, when a procedure has any, come back as state the producer
-     * publishes or an event it emits.
+     * Sends arguments to the implementation in the current session without
+     * waiting for a result or receipt. Posting to a producer that isn't
+     * installed does nothing. Arguments are serialized as JSON, like event
+     * payloads. Use call() to await the implementation's result.
      */
-    /** Posts to the implementation in the current session. */
     post(args: A): void;
-    /** Direct posts to one session. The returned consumer is terminal. */
+    /**
+     * Awaits the implementation's JSON result (undefined for void).
+     * Requires interop:read and interop:write. Rejects before RuntimeReady,
+     * for missing implementations, errors, timeouts, or capacity limits.
+     * Calls are bounded to 256 per isolate, 1024 per session, 64 nested
+     * hops, 1 MiB per payload, and 8 MiB of queued payloads per caller
+     * session. Timeout stops waiting; producer work may continue.
+     * Host errors have name ProcedureCallError and a string code; producer
+     * errors preserve their name and message with code ImplementationError.
+     */
+    call(args: A, options?: ProcedureCallOptions): Promise<Awaited<R>>;
+    /** Direct posts and calls to one session. The returned consumer is terminal. */
     to(session: Session): BoundProcedureConsumer<A, R>;
     /** Type carrier only; no runtime member exists. */
     readonly __smudgyProcedure?: (args: A) => R;
@@ -405,6 +420,7 @@ declare module "smudgy:core" {
   /** A terminal procedure consumer directed at one session. */
   export interface BoundProcedureConsumer<A = unknown, R = void> {
     post(args: A): void;
+    call(args: A, options?: ProcedureCallOptions): Promise<Awaited<R>>;
     readonly __smudgyProcedure?: (args: A) => R;
   }
 
@@ -412,7 +428,7 @@ declare module "smudgy:core" {
   export interface ProcedureCaller {
     /** `user` for main-isolate code, or a sandboxed caller package's `smudgy://owner/name` spec. */
     readonly origin: string;
-    /** The session in which the caller posted. */
+    /** The session in which the caller posted or called. */
     readonly session: Session;
   }
 
@@ -547,8 +563,9 @@ declare module "smudgy:core" {
    * Direct function calls cannot cross sandbox boundaries, so a procedure is
    * the public entry point for an operation implemented by another package.
    *
-   * Calls are delivered asynchronously and are fire-and-forget. Publish a
-   * state or emit an event if the caller needs to observe an outcome.
+   * Consumers use post() for notifications or call() for a Promise of the
+   * result. Async implementations are awaited by call(); post() ignores
+   * results and logs async implementation failures.
    *
    * ```ts
    * import { createProcedure } from "smudgy:core";

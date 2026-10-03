@@ -50,6 +50,7 @@ mod message_bus;
 mod msdp;
 mod mssp;
 pub mod pane;
+mod procedure_calls;
 mod remote_interop;
 mod row_ledger;
 mod script_action;
@@ -130,6 +131,7 @@ pub use origin::{
     AutomationBody, AutomationDelta, AutomationEvent, AutomationKind, AutomationSummary, IsolateId,
     Origin, PackageIsolate, PackageOrigin, SingletonKey, SingletonOrigin, SingletonRegistry,
 };
+pub use procedure_calls::{ProcedureCallKey, ProcedureReply, ProcedureRequest};
 
 /// Cap on host-routed delivery recursion (event emit chains and session-store watch chains
 /// alike — the store's watch dispatch deliberately shares the event system's depth cap): a
@@ -4202,6 +4204,8 @@ impl Inner<'_> {
                     if runtime_ready_pending {
                         debug_assert!(action_stack.is_empty());
                         runtime_ready_pending = false;
+                        self.script_engine
+                            .enable_procedure_calls(self.session_runtime_tx.clone());
                         if let Err(e) = self
                             .ui_tx
                             .send(TaggedSessionEvent {

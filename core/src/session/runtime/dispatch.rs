@@ -394,6 +394,50 @@ impl Inner<'_> {
                 ));
                 Ok(ActionResult::Run(actions))
             }
+            RuntimeAction::ProcedureCall(request) => Ok(ActionResult::Run(
+                self.script_engine.deliver_procedure_call(&request),
+            )),
+            RuntimeAction::ForwardProcedureCall(request) => {
+                match crate::session::registry::get_runtime(request.target) {
+                    Some(runtime) if runtime.server_name.as_str() == self.server_name.as_str() => {
+                        if runtime
+                            .tx
+                            .send(RuntimeAction::ProcedureCall(Arc::clone(&request)))
+                            .is_err()
+                        {
+                            request
+                                .fail("Closed", "target session closed before procedure delivery");
+                        }
+                    }
+                    _ => request.fail("Closed", "target session is no longer live on this server"),
+                }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::ProcedureReply(reply) => Ok(ActionResult::Run(
+                self.script_engine.deliver_procedure_reply(&reply),
+            )),
+            RuntimeAction::ForwardProcedureReply {
+                ticket,
+                instance,
+                reply,
+            } => {
+                if self
+                    .script_engine
+                    .accept_procedure_reply_for_forwarding(ticket, instance)
+                {
+                    let _ = reply
+                        .tx
+                        .send(RuntimeAction::ProcedureReply(Arc::clone(&reply)));
+                }
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::CancelProcedureCall(key) => {
+                self.script_engine.cancel_procedure_call(key);
+                Ok(ActionResult::None)
+            }
+            RuntimeAction::ExpireProcedureCalls => Ok(ActionResult::Run(
+                self.script_engine.expire_procedure_calls(),
+            )),
             RuntimeAction::ProcedurePost(post) => Ok(ActionResult::Run(
                 self.script_engine.deliver_procedure_post(&post),
             )),

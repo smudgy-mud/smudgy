@@ -7,8 +7,8 @@
 //! `smudgy:procedures/<owner>/<pkg>` and `post(args)`; the host stamps the poster's origin
 //! as the unforgeable `sender`, so implementations apply their own stranger policy.
 //! Delivery rides the action queue like events (JSON payloads, async next-pump dispatch,
-//! depth-capped). `.call` — the correlated-reply ask — is deferred (interop.md §14) and
-//! will layer on this same bus.
+//! depth-capped). Correlated replies for `.call` use the bounded broker in
+//! [`super::procedure_calls`], sharing this receiver registry.
 //!
 //! **Queue-briefly semantics**: a post that finds no registered implementation for an
 //! *addressable* procedure is buffered — bounded per name, oldest dropped — and drained
@@ -55,6 +55,7 @@ pub const PENDING_POST_CAP: usize = 64;
 pub struct MessageBus {
     receivers: HashMap<String, Vec<MessageReceiver>>,
     pending: HashMap<String, VecDeque<PendingPost>>,
+    pub(crate) calls: super::procedure_calls::ProcedureCalls,
 }
 
 impl MessageBus {
@@ -102,6 +103,7 @@ impl MessageBus {
     /// posts survive — the queue-briefly semantics that carry a post across a reload window.
     pub fn reset_engine_state(&mut self) {
         self.receivers.clear();
+        self.calls.reset();
     }
 }
 

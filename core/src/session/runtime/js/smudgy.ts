@@ -32,6 +32,12 @@
 // runtime init, snapshot or not, and extension ESM evaluates after that
 // binding but before bootstrap scrubs `core` off the public `Deno` surface.
 const __smudgy_ops = (globalThis as any).Deno.core.ops;
+const __smudgy_procedure_AsyncVariable = (globalThis as any).Deno.core.AsyncVariable as {
+    new(): ProcedureInvocationContext;
+};
+const __smudgy_procedure_restore_context = (globalThis as any).Deno.core.setAsyncContext as (
+    prior: unknown,
+) => void;
 
 // Ops are an untyped FFI boundary; treat the table as `any`. Type-checking value lives in
 // the public surface below (Session/Line/the api object), not in the op calls.
@@ -171,6 +177,9 @@ const {
     op_smudgy_store_remote_bind,
     op_smudgy_procedure_on,
     op_smudgy_procedure_post,
+    op_smudgy_procedure_init,
+    op_smudgy_procedure_call,
+    op_smudgy_procedure_reply,
     op_smudgy_interop_declare,
     op_smudgy_broadcast_allowed,
     op_smudgy_workers_allowed,
@@ -5425,17 +5434,21 @@ interface BoundEventConsumer<T> {
     once(handler: (payload: Readonly<T>, source: Session) => void): EventSubscription;
 }
 
-/** The consumer's view of a procedure: post (fire-and-forget), never implement. The
- *  correlated-reply ask (`.call`) is deferred (interop.md 14); the phantom member keeps the
- *  return type ready for it. */
+interface ProcedureCallOptions {
+    timeoutMs?: number;
+}
+
+/** The consumer's view: post a notification or await a correlated reply. */
 interface ProcedureConsumer<A, R = void> {
     post(args: A): void;
+    call(args: A, options?: ProcedureCallOptions): Promise<Awaited<R>>;
     to(target: Session): BoundProcedureConsumer<A, R>;
     readonly __smudgyProcedure?: (args: A) => R;
 }
 
 interface BoundProcedureConsumer<A, R = void> {
     post(args: A): void;
+    call(args: A, options?: ProcedureCallOptions): Promise<Awaited<R>>;
     readonly __smudgyProcedure?: (args: A) => R;
 }
 
@@ -5901,11 +5914,142 @@ function __smudgy_make_event_producer<T>(creatorId: number, name: string): Event
     });
 }
 
-/** Register a procedure's implementation at construction (interop.md 6): receipt is the
- *  producer's seat, home-gated in the op layer like `set`/`emit`. The implementation's
- *  return VALUE is ignored until `.call` (the correlated-reply ask) ships -- but a rejecting
- *  async implementation is caught and logged with the procedure's name, so an async impl's
- *  failure is attributed instead of surfacing as an anonymous unhandled rejection. */
+// Numeric reply protocol, mirrored by ProcedureReplyStatus in procedure_calls.rs.
+const __smudgy_procedure_reply_value = 0;
+const __smudgy_procedure_reply_void = 1;
+const __smudgy_procedure_reply_error = 2;
+
+interface ProcedureInvocationContext {
+    enter(ticket: number): unknown;
+    get(): number | undefined;
+}
+
+interface ProcedurePendingCall {
+    resolve(value: unknown): void;
+    reject(error: unknown): void;
+}
+
+interface ProcedureFailure {
+    code: string;
+    name: string;
+    message: string;
+}
+
+interface ProcedureSettlementMessage {
+    id: string;
+    kind: "value" | "void" | "error";
+    payload: string;
+}
+
+interface ProcedureInvocationMessage {
+    payload: string;
+    origin: string;
+    session: string;
+    ticket?: string;
+}
+
+interface ProcedureCallerSnapshot {
+    id?: number;
+    profile?: Profile;
+    tombstone?: boolean;
+}
+
+// Lazily allocated: notification-only consumers keep paying no promise-map or
+// async-context costs. All resolvers remain inside their owning heap.
+let __smudgy_procedure_pending: Map<number, ProcedurePendingCall> | undefined;
+let __smudgy_procedure_context: ProcedureInvocationContext | undefined;
+
+function __smudgy_procedure_failure(error: unknown, code: string): ProcedureFailure {
+    try {
+        const e = error as { name?: unknown; message?: unknown } | null | undefined;
+        const name = e?.name;
+        const message = e?.message;
+        return {
+            code,
+            name: typeof name === "string" ? name : "ProcedureCallError",
+            message: typeof message === "string" ? message : String(error),
+        };
+    } catch {
+        return {
+            code,
+            name: "ProcedureCallError",
+            message: "Procedure failed with an unreadable error",
+        };
+    }
+}
+
+function __smudgy_procedure_rejection(error: unknown): Error {
+    const details = __smudgy_procedure_failure(error, "CallFailed");
+    const host = /^([A-Za-z]+): (.*)$/s.exec(details.message);
+    // Native op exceptions encode the failure code in their message at the FFI boundary.
+    if (host) {
+        details.code = host[1];
+        details.message = host[2];
+    }
+    return Object.assign(new Error(details.message), { name: "ProcedureCallError", code: details.code });
+}
+
+function __smudgy_procedure_fail(
+    ticket: number,
+    error: unknown,
+    code: "ImplementationError" | "Serialization",
+): void {
+    let payload: string;
+    try {
+        payload = JSON.stringify(__smudgy_procedure_failure(error, code));
+        if (typeof payload !== "string") {
+            throw new TypeError("Invalid procedure error encoding");
+        }
+    } catch {
+        // Error getters and user-modified JSON hooks must not strand a call.
+        // These literals do not invoke any producer-controlled conversion.
+        payload = code === "Serialization"
+            ? '{"code":"Serialization","name":"ProcedureCallError","message":"Procedure failed with an unreadable error"}'
+            : '{"code":"ImplementationError","name":"ProcedureCallError","message":"Procedure failed with an unreadable error"}';
+    }
+    op_smudgy_procedure_reply(ticket, __smudgy_procedure_reply_error, payload);
+}
+
+function __smudgy_procedure_answer(ticket: number, value: unknown): void {
+    try {
+        if (value === undefined) {
+            op_smudgy_procedure_reply(ticket, __smudgy_procedure_reply_void, "");
+            return;
+        }
+        const payload = JSON.stringify(value);
+        if (typeof payload !== "string") {
+            throw new TypeError("Procedure result must be JSON data or undefined");
+        }
+        op_smudgy_procedure_reply(ticket, __smudgy_procedure_reply_value, payload);
+    } catch (e) {
+        __smudgy_procedure_fail(ticket, e, "Serialization");
+    }
+}
+
+op_smudgy_procedure_init((m: ProcedureSettlementMessage) => {
+    const id = Number(m.id);
+    const pending = __smudgy_procedure_pending?.get(id);
+    if (pending === undefined) {
+        return;
+    }
+    __smudgy_procedure_pending!.delete(id);
+    try {
+        if (m.kind === "void") {
+            pending.resolve(undefined);
+        } else if (m.kind === "value") {
+            pending.resolve(JSON.parse(m.payload));
+        } else {
+            const error = JSON.parse(m.payload) as ProcedureFailure;
+            pending.reject(Object.assign(new Error(error.message), { name: error.name, code: error.code }));
+        }
+    } catch (e) {
+        pending.reject(__smudgy_procedure_rejection(e));
+    }
+});
+
+/** Receipt is home-gated; `.post` ignores results and `.call` returns data.
+ *  Keep this wrapper synchronous so notifications and immediate results need
+ *  no extra promises. Strings never escape to the outgoing-command dispatcher. */
 function __smudgy_register_procedure_impl(
     creatorId: number,
     name: string,
@@ -5914,11 +6058,19 @@ function __smudgy_register_procedure_impl(
     op_smudgy_procedure_on(
         creatorId,
         name,
-        (m: { payload: string; origin: string; session: string }) => {
+        (m: ProcedureInvocationMessage) => {
             let args: any = null;
-            try { args = JSON.parse(m.payload); } catch { args = null; }
-            let meta: any = {};
-            try { meta = JSON.parse(m.session); } catch { meta = {}; }
+            try {
+                args = JSON.parse(m.payload);
+            } catch {
+                args = null;
+            }
+            let meta: ProcedureCallerSnapshot = {};
+            try {
+                meta = JSON.parse(m.session);
+            } catch {
+                meta = {};
+            }
             const caller = Object.freeze({
                 origin: m.origin,
                 session: new Session(Number(meta.id), null, {
@@ -5926,6 +6078,31 @@ function __smudgy_register_procedure_impl(
                     tombstone: meta.tombstone === true,
                 }),
             });
+            if (m.ticket !== undefined) {
+                const ticket = Number(m.ticket);
+                try {
+                    __smudgy_procedure_context ??= new __smudgy_procedure_AsyncVariable();
+                    const prior = __smudgy_procedure_context.enter(ticket);
+                    try {
+                        const result = impl(args, caller);
+                        if (result !== null && (typeof result === "object" || typeof result === "function")
+                            && typeof (result as any).then === "function") {
+                            // Assimilate thenables while the invocation context is active too.
+                            Promise.resolve(result).then(
+                                value => __smudgy_procedure_answer(ticket, value),
+                                error => __smudgy_procedure_fail(ticket, error, "ImplementationError"),
+                            );
+                        } else {
+                            __smudgy_procedure_answer(ticket, result);
+                        }
+                    } finally {
+                        __smudgy_procedure_restore_context(prior);
+                    }
+                } catch (e) {
+                    __smudgy_procedure_fail(ticket, e, "ImplementationError");
+                }
+                return;
+            }
             const result = impl(args, caller);
             if (result !== null && typeof result === "object" && typeof (result as any).then === "function") {
                 (result as Promise<unknown>).then(undefined, (e: unknown) => {
@@ -5941,9 +6118,12 @@ function __smudgy_make_procedure_consumer<A>(
     name: string,
     target?: Session,
 ): ProcedureConsumer<A> | BoundProcedureConsumer<A> {
-    // The target root resolves lazily (memoized) at the first post, so an unaddressable
-    // spec fails at the post -- where it always failed -- not at scheme import time.
-    const consumer: any = {
+    // Resolve the target root lazily (memoized) on the first post or call.
+    const consumer: {
+        post(args: A): void;
+        call(args: A, options?: ProcedureCallOptions): Promise<unknown>;
+        to?(session: Session): BoundProcedureConsumer<A>;
+    } = {
         post: (args: A): void =>
             op_smudgy_procedure_post(
                 __smudgy_consumer_root_id(spec, ""),
@@ -5951,10 +6131,40 @@ function __smudgy_make_procedure_consumer<A>(
                 JSON.stringify(args ?? null),
                 target?.id ?? op_smudgy_get_current_session(),
             ),
+        call: (args: A, options?: ProcedureCallOptions): Promise<unknown> => {
+            try {
+                const timeout = options?.timeoutMs ?? 10000;
+                if (!Number.isInteger(timeout) || timeout < 1 || timeout > 60000) {
+                    throw new RangeError("InvalidTimeout: timeoutMs must be an integer between 1 and 60000");
+                }
+                let payload: string | undefined;
+                try {
+                    payload = JSON.stringify(args ?? null);
+                } catch (e) {
+                    throw new TypeError("Serialization: " + __smudgy_procedure_failure(e, "Serialization").message);
+                }
+                if (typeof payload !== "string") {
+                    throw new TypeError("Serialization: Procedure arguments must be JSON data");
+                }
+                const id = op_smudgy_procedure_call(
+                    __smudgy_consumer_root_id(spec, ""), name, payload,
+                    target?.id ?? op_smudgy_get_current_session(), timeout,
+                    __smudgy_procedure_context?.get() ?? 0,
+                ) as number;
+                __smudgy_procedure_pending ??= new Map();
+                return new Promise<unknown>((resolve, reject) => {
+                    __smudgy_procedure_pending!.set(id, { resolve, reject });
+                });
+            } catch (e) {
+                return Promise.reject(__smudgy_procedure_rejection(e));
+            }
+        },
     };
     if (target === undefined) {
         consumer.to = (session: Session): BoundProcedureConsumer<A> => {
-            if (!(session instanceof Session)) throw new TypeError("to() expects a Session");
+            if (!(session instanceof Session)) {
+                throw new TypeError("to() expects a Session");
+            }
             return __smudgy_make_procedure_consumer<A>(spec, name, session) as BoundProcedureConsumer<A>;
         };
     }
@@ -6363,7 +6573,7 @@ function __smudgy_make_api(creator: { kind: string }) {
         // Procedures (interop.md 6): a directed ask of this package. The implementation is
         // the constructor argument -- registered at construction, home-gated in the op layer
         // -- and the handle carries no verbs. Consumers import from smudgy:procedures/...
-        // and `.post()` (fire-and-forget today; `.call` is the deferred correlated ask).
+        // and use `.post()` for notifications or `.call()` for an awaited result.
         createProcedure: <A = unknown, R = void>(
             nameOrImpl?: string | ((args: A, caller: ProcedureCaller) => R | Promise<R>),
             maybeImpl?: (args: A, caller: ProcedureCaller) => R | Promise<R>,

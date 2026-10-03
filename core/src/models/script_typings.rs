@@ -806,7 +806,7 @@ fn consumer_type_for(
             InteropKind::State => "import(\"smudgy:core\").StateConsumer<unknown>".to_string(),
             InteropKind::Event => "import(\"smudgy:core\").EventConsumer<unknown>".to_string(),
             InteropKind::Procedure => {
-                "import(\"smudgy:core\").ProcedureConsumer<unknown>".to_string()
+                "import(\"smudgy:core\").ProcedureConsumer<unknown, unknown>".to_string()
             }
         },
     }
@@ -2740,6 +2740,61 @@ userAutomations.triggers.save("danger", { patterns: [style.red(/danger/)] });
             "smudgy.ts impl does not type-check / conform to smudgy-core.d.ts:\n{:#?}",
             out.diagnostics
         );
+    }
+
+    #[test]
+    fn procedure_calls_infer_awaited_results_and_preserve_argument_types() {
+        use std::collections::BTreeMap;
+
+        let ambient = BTreeMap::from([
+            ("smudgy-core.d.ts".into(), SMUDGY_CORE_DTS.into()),
+            ("smudgy-mapper.d.ts".into(), SMUDGY_MAPPER_DTS.into()),
+        ]);
+        let sources = BTreeMap::from([
+            (
+                "producer.ts".into(),
+                r#"
+import { createProcedure } from "smudgy:core";
+export const sync = createProcedure("sync", (p: { n: number }) => p.n);
+export const asyncValue = createProcedure("asyncValue", async (p: { text: string }) => ({ text: p.text }));
+export const empty = createProcedure("empty", (_: null) => {});
+"#
+                .into(),
+            ),
+            (
+                "consumer.ts".into(),
+                r#"
+import { session } from "smudgy:core";
+import type { ConsumerOf, ProcedureConsumer } from "smudgy:core";
+import type * as Producer from "./producer.ts";
+declare const sync: ConsumerOf<typeof Producer.sync>;
+declare const asyncValue: ConsumerOf<typeof Producer.asyncValue>;
+declare const empty: ConsumerOf<typeof Producer.empty>;
+declare const fallback: ProcedureConsumer<unknown, unknown>;
+export const a: Promise<number> = sync.call({ n: 1 });
+export const b: Promise<{ text: string }> = asyncValue.call({ text: "x" }, { timeoutMs: 500 });
+export const c: Promise<void> = empty.call(null);
+export const d: Promise<number> = sync.to(session).call({ n: 2 });
+export const e: Promise<unknown> = fallback.call({ anything: true });
+// @ts-expect-error Arguments still have the producer's type.
+sync.call({ n: "x" });
+// @ts-expect-error Bound calls keep that type too.
+sync.to(session).call({});
+// @ts-expect-error Async results are unwrapped.
+const nested: Promise<Promise<{ text: string }>> = asyncValue.call({ text: "x" });
+// @ts-expect-error Results are not widened to any.
+const wrong: Promise<string> = sync.call({ n: 1 });
+// @ts-expect-error Untyped procedures cannot promise a particular result.
+const unknownResult: Promise<number> = fallback.call(null);
+// @ts-expect-error A directed handle is terminal.
+sync.to(session).to(session);
+"#
+                .into(),
+            ),
+        ]);
+        let out = smudgy_script::dts::generate_declarations(&sources, &ambient)
+            .expect("compile typed procedure callers");
+        assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
     }
 
     /// Drift guard for the MAP types: the mapper runtime impl (`mapper.ts`) and the

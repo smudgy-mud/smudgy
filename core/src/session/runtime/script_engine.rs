@@ -698,6 +698,7 @@ struct PlatformEventKeys {
 
 impl Drop for ScriptEngine<'_> {
     fn drop(&mut self) {
+        self.message_bus.borrow_mut().calls.reset();
         // Each isolate is left "exited" between operations (Model B), but rusty_v8's
         // `OwnedIsolate::Drop` still does real v8 teardown + an `exit()` that require the isolate
         // to be the thread's *current* one. So enter each isolate immediately before dropping it;
@@ -2790,6 +2791,106 @@ impl<'a> ScriptEngine<'a> {
         self.remote_state_registry
             .borrow_mut()
             .source_destroyed(source)
+    }
+
+    pub fn enable_procedure_calls(
+        &self,
+        runtime_tx: tokio::sync::mpsc::UnboundedSender<super::RuntimeAction>,
+    ) {
+        self.message_bus.borrow_mut().calls.enable(runtime_tx);
+    }
+
+    pub fn expire_procedure_calls(&self) -> Vec<super::RuntimeAction> {
+        self.message_bus.borrow_mut().calls.expire()
+    }
+
+    pub fn cancel_procedure_call(&self, key: super::ProcedureCallKey) {
+        self.message_bus.borrow_mut().calls.cancel(key);
+    }
+
+    pub fn accept_procedure_reply_for_forwarding(&self, ticket: u32, instance: u64) -> bool {
+        self.message_bus
+            .borrow_mut()
+            .calls
+            .accept_reply_for_forwarding(ticket, instance)
+    }
+
+    pub fn deliver_procedure_reply(
+        &self,
+        reply: &super::ProcedureReply,
+    ) -> Vec<super::RuntimeAction> {
+        self.message_bus
+            .borrow_mut()
+            .calls
+            .complete(reply)
+            .into_iter()
+            .collect()
+    }
+
+    pub fn deliver_procedure_call(
+        &self,
+        request: &Arc<super::ProcedureRequest>,
+    ) -> Vec<super::RuntimeAction> {
+        if request.reply_tx.is_closed() {
+            return Vec::new();
+        }
+        self.catalogue.borrow_mut().sample_dynamic(
+            &request.producer,
+            super::catalogue::CatalogueKind::Procedure,
+            &request.name,
+            &request.origin,
+            &request.payload,
+        );
+        let receiver = self
+            .message_bus
+            .borrow()
+            .receivers(&request.canonical)
+            .into_iter()
+            .next();
+        let Some(receiver) = receiver else {
+            request.fail("Unavailable", "procedure has no live implementation");
+            return Vec::new();
+        };
+        let Some(bundle) = self.isolates.get(&receiver.isolate) else {
+            request.fail("Unavailable", "procedure isolate is no longer live");
+            return Vec::new();
+        };
+        let ticket = match self
+            .message_bus
+            .borrow_mut()
+            .calls
+            .start_invocation(Arc::clone(request), bundle.instance)
+        {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                request.fail(error.code, error.message);
+                return Vec::new();
+            }
+        };
+        vec![super::RuntimeAction::CallJavascriptFunction {
+            isolate: receiver.isolate,
+            id: receiver.function_id,
+            matches: Arc::new(vec![
+                MatchCapture {
+                    name: Some("payload".into()),
+                    value: request.payload.to_string(),
+                },
+                MatchCapture {
+                    name: Some("origin".into()),
+                    value: request.origin.to_string(),
+                },
+                MatchCapture {
+                    name: Some("session".into()),
+                    value: request.caller.to_json(false),
+                },
+                MatchCapture {
+                    name: Some("ticket".into()),
+                    value: ticket.to_string(),
+                },
+            ]),
+            depth: request.ancestry.hops,
+            is_captured: None,
+        }]
     }
 
     /// Resolve a directed procedure post through this engine's local receiver.

@@ -124,6 +124,18 @@ pub enum RuntimeAction {
     InteropEvent(Arc<InteropEventBody>),
     /// A directed procedure post. The target resolves its own receiver.
     ProcedurePost(Arc<ProcedurePostBody>),
+    /// Data-only asks and replies. Settlement is external input, so it never
+    /// resumes a caller inside an unrelated line's depth-first expansion.
+    ProcedureCall(Arc<super::ProcedureRequest>),
+    ForwardProcedureCall(Arc<super::ProcedureRequest>),
+    ProcedureReply(Arc<super::ProcedureReply>),
+    ForwardProcedureReply {
+        ticket: u32,
+        instance: u64,
+        reply: Arc<super::ProcedureReply>,
+    },
+    CancelProcedureCall(super::ProcedureCallKey),
+    ExpireProcedureCalls,
     /// A directed procedure post waiting on the caller runtime's queue. Like
     /// script-event fan-out, forwarding happens after the caller's store
     /// journal is flushed so the target observes preceding state writes.
