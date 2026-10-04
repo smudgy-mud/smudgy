@@ -19,6 +19,10 @@ import tomllib
 
 REPOSITORY = "smudgy-mud/smudgy"
 BASE_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-ptb")
+# Main publishes nightlies only while its version is in a PTB series. Any other
+# version (a dev cycle or a release) means there is nothing to publish; a
+# malformed PTB version still fails in next_version.
+PTB_SERIES_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-ptb")
 TAG_RE = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+-ptb)(?:[.-]?([1-9][0-9]*))?")
 ANNOTATION = "Smudgy-Nightly: "
 
@@ -155,6 +159,9 @@ def make_plan():
     if source != git("rev-parse", "refs/remotes/origin/main"):
         raise ValueError("Coordinator checkout must be origin/main")
     base = tomllib.loads(Path("ui/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+    if not PTB_SERIES_RE.match(base):
+        return {"source_sha": source, "version": base, "tag": None, "action": "skip",
+                "reason": f"main is {base}, outside a PTB series; no nightly to publish."}
     tags = git("tag", "--list", "v*-ptb*").splitlines()
     version = next_version(base, tags)
     matches = []
