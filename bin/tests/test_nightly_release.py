@@ -166,6 +166,31 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(plan["tag"], "v0.5.7-ptb.6")
         api.assert_not_called()
 
+    def test_main_outside_ptb_series_skips_without_reading_tags(self):
+        def git(*args):
+            if args[0] == "rev-parse":
+                return SOURCE
+            raise AssertionError(args)
+
+        for base in ["0.5.8-dev", "0.5.8", "0.5.8-rc1"]:
+            manifest = f'[package]\nversion = "{base}"\n'
+            with self.subTest(base=base), working_directory(ROOT), patch.object(nightly.Path, "read_text", return_value=manifest), patch.object(nightly, "git", side_effect=git):
+                plan = nightly.make_plan()
+                self.assertEqual(plan["action"], "skip")
+                self.assertIsNone(plan["tag"])
+                self.assertEqual(plan["version"], base)
+
+    def test_malformed_ptb_series_on_main_still_fails(self):
+        def git(*args):
+            if args[0] == "rev-parse":
+                return SOURCE
+            return ""
+
+        manifest = '[package]\nversion = "0.5.8-ptb.3"\n'
+        with working_directory(ROOT), patch.object(nightly.Path, "read_text", return_value=manifest), patch.object(nightly, "git", side_effect=git):
+            with self.assertRaises(ValueError):
+                nightly.make_plan()
+
     def test_prepare_pushes_only_tag_and_keeps_source_parent(self):
         plan = {"action": "create", "source_sha": SOURCE, "version": VERSION, "tag": TAG}
         with patch.object(nightly, "validate_bump", return_value=["Cargo.lock"]), patch.object(nightly, "git") as git:
