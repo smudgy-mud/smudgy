@@ -10,6 +10,8 @@
 
 #[path = "integration_sync/create_area_properties.rs"]
 mod create_area_properties;
+#[path = "integration_sync/legacy_recovery.rs"]
+mod legacy_recovery;
 #[path = "integration_sync/link_clears.rs"]
 mod link_clears;
 #[path = "integration_sync/links.rs"]

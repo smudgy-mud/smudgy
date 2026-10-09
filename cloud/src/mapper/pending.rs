@@ -49,7 +49,7 @@ const COMMIT_SCHEMA_VERSION: u32 = 1;
 const DELETE_TOMBSTONE_SCHEMA_VERSION: u32 = 1;
 const RECEIPT_RETENTION_DAYS: i64 = 60;
 
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
+pub(super) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let _ = directory;
@@ -63,7 +63,7 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 
 /// Rename whose return is the durable commit point. NTFS needs
 /// `MOVEFILE_WRITE_THROUGH`; Unix needs an fsync of the containing directory.
-fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(super) fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let source = fs::canonicalize(source)?;
@@ -438,6 +438,8 @@ struct State {
 #[derive(Debug, Serialize, Deserialize)]
 struct DurablePendingBody {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    map_format: Option<u32>,
     server_namespace: String,
     viewer_id: Uuid,
     auth_generation_at_enqueue: u64,
@@ -468,6 +470,8 @@ struct DurablePendingRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct DurableCommitMember {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    map_format: Option<u32>,
     server_namespace: String,
     viewer_id: Uuid,
     sequence: u64,
@@ -559,6 +563,8 @@ pub struct PendingQueue {
     server_namespace: String,
     next_sequence: AtomicU64,
     recovery_errors: Mutex<Vec<String>>,
+    recovery_cache: Option<PathBuf>,
+    legacy_recovery: Mutex<Option<super::LegacyCloudRecovery>>,
     pub(crate) notify: Notify,
     projection_notify: Arc<Notify>,
     events: broadcast::Sender<MapperEvent>,
@@ -585,6 +591,14 @@ impl PendingQueue {
 
     #[must_use]
     pub fn with_journal_namespace(journal_root: PathBuf, server_namespace: String) -> Self {
+        Self::with_recovery_cache(journal_root, server_namespace, None)
+    }
+
+    pub(crate) fn with_recovery_cache(
+        journal_root: PathBuf,
+        server_namespace: String,
+        recovery_cache: Option<PathBuf>,
+    ) -> Self {
         let (events, _) = broadcast::channel(256);
         let queue = Self {
             state: Mutex::new(State::default()),
@@ -593,6 +607,8 @@ impl PendingQueue {
             server_namespace,
             next_sequence: AtomicU64::new(1),
             recovery_errors: Mutex::new(Vec::new()),
+            recovery_cache,
+            legacy_recovery: Mutex::new(None),
             notify: Notify::new(),
             projection_notify: Arc::new(Notify::new()),
             events,
@@ -858,12 +874,17 @@ impl PendingQueue {
         encoded
     }
 
-    fn viewer_directory(&self, viewer_id: Uuid) -> PathBuf {
+    fn viewer_root(&self, viewer_id: Uuid) -> PathBuf {
         self.journal_root
             .join("servers")
             .join(self.namespace_key())
             .join("viewers")
             .join(viewer_id.to_string())
+    }
+
+    fn viewer_directory(&self, viewer_id: Uuid) -> PathBuf {
+        // Pre-upgrade queues are recovery input only, even if archiving fails.
+        self.viewer_root(viewer_id).join("format-3")
     }
 
     fn local_directory(&self) -> PathBuf {
@@ -875,7 +896,8 @@ impl PendingQueue {
     }
 
     fn active_member_path(&self, member: &DurableCommitMember) -> PathBuf {
-        let directory = if member.server_namespace == "local" && member.viewer_id == Uuid::nil() {
+        let mut directory = if member.server_namespace == "local" && member.viewer_id == Uuid::nil()
+        {
             self.local_directory()
         } else {
             self.journal_root
@@ -884,6 +906,9 @@ impl PendingQueue {
                 .join("viewers")
                 .join(member.viewer_id.to_string())
         };
+        if let Some(format) = member.map_format {
+            directory = directory.join(format!("format-{format}"));
+        }
         directory.join(format!(
             "{:020}-{}.json",
             member.sequence, member.operation_id
@@ -1189,6 +1214,7 @@ impl PendingQueue {
             };
         let body = DurablePendingBody {
             schema_version: JOURNAL_SCHEMA_VERSION,
+            map_format: envelope.viewer_id.map(|_| 3),
             server_namespace,
             viewer_id,
             auth_generation_at_enqueue,
@@ -1223,6 +1249,7 @@ impl PendingQueue {
         Ok(Some((
             final_path,
             DurableCommitMember {
+                map_format: record.body.map_format,
                 server_namespace: record.body.server_namespace,
                 viewer_id: record.body.viewer_id,
                 sequence: record.body.sequence,
@@ -1264,6 +1291,7 @@ impl PendingQueue {
                 committed.contains(&CommittedRecordKey {
                     batch_id,
                     member: DurableCommitMember {
+                        map_format: record.body.map_format,
                         server_namespace: record.body.server_namespace.clone(),
                         viewer_id: record.body.viewer_id,
                         sequence: record.body.sequence,
@@ -1504,6 +1532,13 @@ impl PendingQueue {
                     continue;
                 }
             };
+            if record.body.map_format != Some(3) {
+                self.quarantine_record(
+                    &path,
+                    "missing or unsupported cloud map format".to_string(),
+                );
+                continue;
+            }
             if !matches!(
                 record.body.schema_version,
                 LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
@@ -1748,6 +1783,7 @@ impl PendingQueue {
         if self.state.lock().active_viewer == active {
             return ViewerActivation::default();
         }
+        *self.legacy_recovery.lock() = viewer.and_then(|viewer| self.archive_legacy(viewer));
         let records = viewer.map_or_else(Vec::new, |viewer_id| {
             self.load_viewer_records(viewer_id, auth_generation)
         });
@@ -1847,6 +1883,29 @@ impl PendingQueue {
         }
         self.changed();
         activation
+    }
+
+    fn archive_legacy(&self, viewer: Uuid) -> Option<super::LegacyCloudRecovery> {
+        if self.journal_root.as_os_str().is_empty() {
+            return None;
+        }
+        super::legacy_recovery::archive(
+            &self.viewer_root(viewer),
+            &self.commit_directory(),
+            self.recovery_cache.as_deref(),
+            &self.server_namespace,
+            viewer,
+        )
+    }
+
+    pub(crate) fn legacy_cloud_recovery(&self) -> Option<super::LegacyCloudRecovery> {
+        self.legacy_recovery.lock().clone()
+    }
+
+    pub(crate) fn retry_legacy_cloud_recovery(&self) {
+        if let Some((viewer, _)) = self.active_viewer() {
+            *self.legacy_recovery.lock() = self.archive_legacy(viewer);
+        }
     }
 
     fn park_expired_head(area: &mut AreaQueue) {
@@ -3808,6 +3867,198 @@ mod tests {
             local_durable: true,
             ..envelope(desc)
         }
+    }
+
+    #[test]
+    fn legacy_committed_batches_and_followers_are_archived_as_a_whole() {
+        let root = journal_test_root();
+        let viewer = Uuid::new_v4();
+        let queue = PendingQueue::with_journal(root.clone());
+        let directory = queue.viewer_root(viewer);
+        fs::create_dir_all(&directory).unwrap();
+        let batch = Uuid::new_v4();
+        let area_a = AreaId(Uuid::new_v4());
+        let area_b = AreaId(Uuid::new_v4());
+        let mut members = Vec::new();
+        let mut originals = Vec::new();
+        for (sequence, area) in [(1, area_a), (2, area_b), (3, area_a)] {
+            let body = DurablePendingBody {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                map_format: None,
+                server_namespace: "test-backend".into(),
+                viewer_id: viewer,
+                auth_generation_at_enqueue: 1,
+                area_id: area,
+                sequence,
+                queued_at: Utc::now(),
+                operation_id: Uuid::new_v4(),
+                ops: envelope("old").ops,
+                description: "legacy ordinary edit".into(),
+                structural_preconditions: Vec::new(),
+                room_remap: None,
+                batch_id: Some(batch),
+                source: SourceId::Map,
+            };
+            let checksum = PendingQueue::checksum(&body).unwrap();
+            members.push(DurableCommitMember {
+                map_format: None,
+                server_namespace: body.server_namespace.clone(),
+                viewer_id: viewer,
+                sequence,
+                operation_id: body.operation_id,
+                record_checksum: checksum.clone(),
+            });
+            let path = queue.active_member_path(members.last().unwrap());
+            let bytes = serde_json::to_vec(&DurablePendingRecord { checksum, body }).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            originals.push((path, bytes));
+        }
+        queue.write_commit_marker(batch, &members).unwrap();
+        let marker = fs::read(queue.commit_directory().join(format!("{batch}.commit"))).unwrap();
+        drop(queue);
+        let restarted = PendingQueue::with_journal(root.clone());
+        restarted.activate_viewer(Some(viewer), 2);
+        assert_eq!(restarted.total_pending(), 0);
+        let notice = restarted.legacy_cloud_recovery().unwrap();
+        assert!(!notice.incomplete);
+        for (path, bytes) in originals {
+            assert!(!path.exists());
+            assert_eq!(
+                fs::read(
+                    notice
+                        .folder
+                        .join("journal")
+                        .join(path.file_name().unwrap())
+                )
+                .unwrap(),
+                bytes
+            );
+        }
+        assert_eq!(
+            fs::read(
+                notice
+                    .folder
+                    .join("commits")
+                    .join(format!("{batch}.commit"))
+            )
+            .unwrap(),
+            marker
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_cloud_recovery_preserves_raw_bytes_and_new_queues_survive_restart() {
+        let root = journal_test_root();
+        let cache = root.join("cache");
+        let viewer = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let area = AreaId(Uuid::new_v4());
+        let queue = PendingQueue::with_recovery_cache(
+            root.clone(),
+            "test-backend".into(),
+            Some(cache.clone()),
+        );
+        let legacy = queue.viewer_root(viewer);
+        fs::create_dir_all(&legacy).unwrap();
+        // Preserve even unknown mutation variants, old secrecy fields, and
+        // invalid JSON. No typed decoder or commit validation may eat them.
+        let originals: &[(&str, &[u8])] = &[
+            (
+                "0001.json",
+                br#"{"ops":[{"old_operation":{"is_secret":true}}]}"#,
+            ),
+            ("0002.json", b"{corrupt-but-recoverable"),
+            ("delete.intent", b"old delete intent"),
+        ];
+        for (name, bytes) in originals {
+            fs::write(legacy.join(name), bytes).unwrap();
+        }
+        let old_cache = cache.join("v2").join(viewer.to_string());
+        fs::create_dir_all(&old_cache).unwrap();
+        fs::write(old_cache.join("map.json"), b"private cached map").unwrap();
+        let other_root = queue.viewer_root(other);
+        fs::create_dir_all(&other_root).unwrap();
+        fs::write(other_root.join("other.json"), b"other viewer").unwrap();
+        let foreign = PendingQueue::with_journal_namespace(root.clone(), "another-origin".into());
+        fs::create_dir_all(foreign.viewer_root(viewer)).unwrap();
+        fs::write(
+            foreign.viewer_root(viewer).join("foreign.json"),
+            b"other origin",
+        )
+        .unwrap();
+        let local = local_durable_envelope("local edit");
+        let local_id = local.operation_id;
+        let local_area = AreaId(Uuid::new_v4());
+        queue.enqueue(local_area, local).unwrap();
+        queue.activate_viewer(Some(viewer), 1);
+        let notice = queue.legacy_cloud_recovery().unwrap();
+        assert!(!notice.incomplete);
+        for (name, bytes) in originals {
+            assert_eq!(
+                fs::read(notice.folder.join("journal").join(name)).unwrap(),
+                *bytes
+            );
+            assert!(!legacy.join(name).exists());
+        }
+        assert_eq!(
+            fs::read(notice.folder.join("cache/v2/map.json")).unwrap(),
+            b"private cached map"
+        );
+        assert!(other_root.join("other.json").exists());
+        assert!(foreign.viewer_root(viewer).join("foreign.json").exists());
+        assert!(queue.pending_for(area).is_empty());
+        let fresh = durable_envelope("new edit", viewer, 1);
+        let fresh_id = fresh.operation_id;
+        queue.enqueue(area, fresh).unwrap();
+        drop(queue);
+        let reopened =
+            PendingQueue::with_recovery_cache(root.clone(), "test-backend".into(), Some(cache));
+        assert_eq!(reopened.pending_for(local_area)[0].operation_id, local_id);
+        reopened.activate_viewer(Some(viewer), 2);
+        assert_eq!(reopened.pending_for(area)[0].operation_id, fresh_id);
+        assert_eq!(reopened.legacy_cloud_recovery(), Some(notice));
+        reopened.activate_viewer(None, 3);
+        assert!(reopened.legacy_cloud_recovery().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_or_interrupted_legacy_archive_never_blocks_new_edits_or_replays_old_ones() {
+        let root = journal_test_root();
+        let viewer = Uuid::new_v4();
+        let queue = PendingQueue::with_journal(root.clone());
+        let legacy = queue.viewer_root(viewer);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("old.json"), b"original bytes").unwrap();
+        fs::write(legacy.join("recovery"), b"blocks directory creation").unwrap();
+        queue.activate_viewer(Some(viewer), 1);
+        assert!(queue.legacy_cloud_recovery().unwrap().incomplete);
+        assert_eq!(queue.total_pending(), 0);
+        assert_eq!(
+            fs::read(legacy.join("old.json")).unwrap(),
+            b"original bytes"
+        );
+        let area = AreaId(Uuid::new_v4());
+        queue
+            .enqueue(area, durable_envelope("new edit", viewer, 1))
+            .unwrap();
+        assert_eq!(queue.total_pending(), 1);
+        fs::remove_file(legacy.join("recovery")).unwrap();
+        // Simulate interruption after copying one record but before its retirement.
+        let archive = legacy.join("recovery/pre-format-3/journal");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("old.json"), b"original bytes").unwrap();
+        fs::write(legacy.join("follower.json"), b"dependent old edit").unwrap();
+        queue.retry_legacy_cloud_recovery();
+        assert!(!queue.legacy_cloud_recovery().unwrap().incomplete);
+        assert_eq!(
+            fs::read(archive.join("follower.json")).unwrap(),
+            b"dependent old edit"
+        );
+        assert!(!legacy.join("old.json").exists());
+        assert_eq!(queue.total_pending(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -26,53 +26,10 @@ fn has_json_extension(name: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
-/// The versioned sub-namespace all cache files live under. Bumped with the
-/// area document format ([`crate::AREA_FORMAT_VERSION`]): cloud cache files
-/// are disposable, so a format change simply abandons the old namespace and
-/// refetches — a cache file of an older format is never deserialized as the
-/// current one.
-pub const CACHE_FORMAT_NAMESPACE: &str = "v4";
-
-/// Removes cache state from earlier formats: pre-viewer-namespace files
-/// (`{area_id}-{rev}.json` directly in the cache root) and the pre-`v2/`
-/// per-viewer directories (any subdirectory other than the current
-/// namespace). Old files are never read by the current scheme and may hold
-/// map data in a superseded format (or that per-viewer isolation now
-/// guards); best-effort, synchronous (runs once at construction, before any
-/// async context exists).
-fn remove_legacy_cache_files(cache_dir: &Path) {
-    let Ok(entries) = fs::read_dir(cache_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_legacy_file = path.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(has_json_extension);
-        if is_legacy_file {
-            if let Err(err) = fs::remove_file(&path) {
-                warn!(
-                    "Failed to remove legacy cache file {}: {err}",
-                    path.display()
-                );
-            }
-            continue;
-        }
-        let is_old_namespace = path.is_dir()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name != CACHE_FORMAT_NAMESPACE);
-        if is_old_namespace && let Err(err) = fs::remove_dir_all(&path) {
-            warn!(
-                "Failed to remove old-format cache directory {}: {err}",
-                path.display()
-            );
-        }
-    }
-}
+/// Current cloud cache namespace. Older namespaces stay on disk for upgrade
+/// recovery, but are never read into the current projection. In particular, v4
+/// can contain optimistic overlays from queues written before recovery existed.
+pub const CACHE_FORMAT_NAMESPACE: &str = "v5";
 
 /// What we last learned about an area's server-side state: the token over
 /// the caller's projection, which moves with content and with access alike.
@@ -146,7 +103,6 @@ where
     #[must_use]
     pub fn new(inner: T, cache_dir: impl Into<PathBuf>) -> Self {
         let cache_dir = cache_dir.into();
-        remove_legacy_cache_files(&cache_dir);
         if inner.supports_sync() {
             // Cloud bytes are written only after `/me` proves their viewer
             // namespace. Remove anonymous files left by older clients so
@@ -1171,11 +1127,10 @@ where
 /// outlive it on this computer and whose queued writes can never be sent.
 /// Best-effort: a missing directory is fine, and other failures are logged.
 pub fn forget_viewer_on_disk(cache_dir: &Path, journal_roots: &[PathBuf], viewer: Uuid) {
-    let mut doomed = vec![
-        cache_dir
-            .join(CACHE_FORMAT_NAMESPACE)
-            .join(viewer.to_string()),
-    ];
+    let mut doomed: Vec<_> = ["", "v2", "v3", "v4", CACHE_FORMAT_NAMESPACE]
+        .into_iter()
+        .map(|version| cache_dir.join(version).join(viewer.to_string()))
+        .collect();
     for root in journal_roots {
         doomed.extend(crate::mapper::pending::viewer_journal_directories(
             root, viewer,
@@ -1219,6 +1174,10 @@ mod forget_viewer_tests {
             cache.join(CACHE_FORMAT_NAMESPACE).join(kept.to_string()),
             viewer_journal(gone),
             viewer_journal(kept),
+            viewer_journal(gone).join("recovery/pre-format-3/journal"),
+            viewer_journal(kept).join("recovery/pre-format-3/journal"),
+            cache.join("v2").join(gone.to_string()),
+            cache.join("v2").join(kept.to_string()),
             journal.join("local").join("active"),
         ] {
             fs::create_dir_all(&directory).unwrap();
@@ -1234,6 +1193,13 @@ mod forget_viewer_tests {
                 .exists()
         );
         assert!(!viewer_journal(gone).exists());
+        assert!(!cache.join("v2").join(gone.to_string()).exists());
+        assert!(cache.join("v2").join(kept.to_string()).exists());
+        assert!(
+            viewer_journal(kept)
+                .join("recovery/pre-format-3/journal/x.json")
+                .exists()
+        );
         assert!(
             cache
                 .join(CACHE_FORMAT_NAMESPACE)
@@ -1763,11 +1729,9 @@ mod tests {
         fs::remove_dir_all(cache_dir).ok();
     }
 
-    /// Cache files are disposable: construction abandons pre-`v2/` state
-    /// (root-level files and old per-viewer directories) best-effort, and
-    /// fresh fetches land inside the `v2/` namespace.
+    /// Old bytes remain available for recovery; fresh reads use a new namespace.
     #[tokio::test]
-    async fn construction_discards_the_old_cache_namespace() {
+    async fn construction_preserves_but_does_not_load_old_cache_namespaces() {
         let area_id = AreaId(Uuid::new_v4());
         let backend = MockBackend::new(vec![sample_area_with_rev(area_id, 1)]);
         let cache_dir = temp_cache_dir();
@@ -1781,12 +1745,12 @@ mod tests {
 
         let cached = CachedBackend::new(backend.clone(), cache_dir.clone());
         assert!(
-            !old_viewer_dir.exists(),
-            "the old per-viewer namespace is discarded"
+            old_viewer_dir.exists(),
+            "the old per-viewer namespace is preserved"
         );
         assert!(
-            !cache_dir.join(format!("{area_id}-1.json")).exists(),
-            "pre-namespace root files are discarded"
+            cache_dir.join(format!("{area_id}-1.json")).exists(),
+            "unattributed files are preserved without loading them"
         );
 
         cached.list_areas().await.expect("list ok");
@@ -1798,7 +1762,7 @@ mod tests {
             )
             .len(),
             1,
-            "fresh fetches land inside the v2 namespace"
+            "fresh fetches land inside the current namespace"
         );
 
         fs::remove_dir_all(cache_dir).ok();

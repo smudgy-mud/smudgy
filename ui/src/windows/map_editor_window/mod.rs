@@ -19,6 +19,7 @@ mod default_atlases;
 mod document;
 mod folder_picker;
 mod inspector;
+mod legacy_recovery;
 mod legend;
 mod link_commands;
 mod link_panel;
@@ -133,6 +134,10 @@ pub enum Hotkey {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    OpenLegacyRecovery,
+    RetryLegacyRecovery,
+    DismissLegacyRecovery,
+    LegacyRecoveryActionFinished(Result<(), String>),
     Editor(map_editor::Message),
     PaneResized(pane_grid::ResizeEvent),
     AreaSelected(AreaId),
@@ -530,6 +535,7 @@ pub struct MapEditorWindow {
     /// transient banner under the toolbar until the tick expires it.
     /// Short non-modal feedback for collaboration-driven selection changes.
     editor_notice: Option<(Instant, String)>,
+    dismissed_legacy_recovery: Option<std::path::PathBuf>,
     automatic_route_generation: u64,
     pending_automatic_route: Option<PendingAutomaticRoute>,
     automatic_route_preview: Option<AutomaticRoutePreview>,
@@ -888,6 +894,7 @@ impl MapEditorWindow {
             clipboard_reposition_in_flight: None,
             consecutive_pastes: 0,
             editor_notice: None,
+            dismissed_legacy_recovery: None,
             automatic_route_generation: 0,
             pending_automatic_route: None,
             automatic_route_preview: None,
@@ -2642,6 +2649,25 @@ impl MapEditorWindow {
 
     fn update_window(&mut self, message: Message) -> Update<Message, Event> {
         match message {
+            Message::OpenLegacyRecovery => legacy_recovery::open(self),
+            Message::RetryLegacyRecovery => legacy_recovery::retry(self),
+            Message::DismissLegacyRecovery => {
+                self.dismissed_legacy_recovery = self
+                    .mapper
+                    .legacy_cloud_recovery()
+                    .map(|notice| notice.folder);
+                Update::none()
+            }
+            Message::LegacyRecoveryActionFinished(result) => {
+                if let Err(error) = result {
+                    log::warn!("Could not open cloud recovery folder: {error}");
+                    self.editor_notice = Some((
+                        Instant::now(),
+                        crate::i18n::t!("mapper-recovery-open-failed"),
+                    ));
+                }
+                Update::none()
+            }
             Message::Editor(message) => {
                 let update = self.editor.update(message).map_message(Message::Editor);
 
@@ -4460,6 +4486,9 @@ impl MapEditorWindow {
             }
         };
 
+        if let Some(notice) = legacy_recovery::view(self) {
+            panel = panel.push(notice);
+        }
         panel
             .push(container(body).width(Length::Fill).height(Length::Fill))
             .push(legend::view(

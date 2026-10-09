@@ -1396,6 +1396,12 @@ mapper-paste-links-skipped = { $count ->
 }
 mapper-paste-too-large = That's too much to paste at once.
 mapper-edits-not-recovered = Some unsaved edits couldn't be recovered.
+mapper-legacy-recovery-complete = Older queued cloud edits were saved for recovery and will not be uploaded. Cloud maps reload from the migrated service. Changes that had not reached the old service need manual recovery; new edits sync normally.
+mapper-legacy-recovery-incomplete = Older queued cloud edits will not be uploaded. Archiving could not finish; the original files are preserved. Free disk space or restore folder access, then retry recovery. New edits use a separate queue.
+mapper-open-recovery-folder = Open recovery folder
+mapper-retry-recovery = Retry recovery
+mapper-dismiss-recovery = Dismiss
+mapper-recovery-open-failed = Could not open the recovery folder. See the application log for details.
 mapper-selection-removed = Something you had selected was removed by someone else.
 inspector-route-too-many-points = That route has too many points to make orthogonal.
 legend-move-freely = move freely

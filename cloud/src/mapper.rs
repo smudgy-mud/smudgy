@@ -60,7 +60,9 @@ use uuid::Uuid;
 pub mod area_cache;
 pub mod atlas_cache;
 pub mod exit_cache;
+mod legacy_recovery;
 mod local_projection;
+pub use legacy_recovery::LegacyCloudRecovery;
 mod merge;
 #[cfg(test)]
 use merge::MERGE_DRAIN_TIMEOUT;
@@ -1848,9 +1850,10 @@ impl Mapper {
         } else {
             SyncState::Disabled
         };
-        let pending = Arc::new(PendingQueue::with_journal_namespace(
+        let pending = Arc::new(PendingQueue::with_recovery_cache(
             journal_dir.into(),
             journal_namespace,
+            Some(cache_dir.clone()),
         ));
         let recovered_local = pending.recovered_local_operations();
         let mut pending_by_area = HashMap::new();
@@ -3517,6 +3520,25 @@ impl Mapper {
     /// user. Detailed paths remain available in the application log.
     pub fn take_mutation_recovery_errors(&self) -> Vec<String> {
         self.inner.pending.take_recovery_errors()
+    }
+
+    /// Upgrade recovery for the verified current account only. The notice
+    /// survives restart; it does not imply that these edits reached the server.
+    #[must_use]
+    pub fn legacy_cloud_recovery(&self) -> Option<LegacyCloudRecovery> {
+        let (_, generation) = self.inner.pending.active_viewer()?;
+        (generation == self.inner.backend.auth_generation())
+            .then(|| self.inner.pending.legacy_cloud_recovery())
+            .flatten()
+    }
+
+    /// Retry copying recovery data. Legacy records are never replayed, even
+    /// when this fails. Current-format writes use their own journal directory.
+    pub fn retry_legacy_cloud_recovery(&self) {
+        let _guard = self.inner.mutation_gate.lock();
+        if self.legacy_cloud_recovery().is_some() {
+            self.inner.pending.retry_legacy_cloud_recovery();
+        }
     }
 
     /// The area-specific save status derived from its pending queue.
