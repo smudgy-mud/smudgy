@@ -7,9 +7,9 @@
 //! and package grants. All three share one [`CredentialSource`] and the
 //! `{success, data, error}` envelope.
 //!
-//! A package's name is global, so its address is the name: `smudgy:@name`.
-//! `smudgy://owner/name` is a compatibility spelling of the same package; the server
-//! checks the owner's form and otherwise ignores it. Addresses are a *client-side*
+//! A published package's name is global, so its modern address is `smudgy:@name`.
+//! Owner-scoped `smudgy://owner/name` remains supported through 0.6.0 and the server
+//! checks the owning user's nickname. Addresses are a *client-side*
 //! construct: on the wire an address is an optional `owner` and a `name`, never the URI.
 //! Every owner field on this wire is optional: a clan's package, and a package whose owner
 //! has no nickname, has none.
@@ -841,12 +841,12 @@ impl PackageApiClient {
         self.get("/packages/shared-with-me").await
     }
 
-    /// Creates (or returns) the caller's package `name` (`POST /packages`). Names are
-    /// global and reserved forever: a name any other package holds or held is refused.
+    /// Creates (or returns) the caller's package `name` (`POST /packages`). Draft names
+    /// are unique within an owner. The first publication reserves the global name.
     ///
     /// # Errors
     /// Returns a [`CloudError`] on auth failure, a verification gate (403),
-    /// [`CloudError::PackageNameUnavailable`] for a name another package holds, or
+    /// invalid input, or
     /// transport/parse failure.
     pub async fn create_package(&self, name: &str, description: &str) -> CloudResult<PackageView> {
         let body = json!({ "name": name, "description": description });

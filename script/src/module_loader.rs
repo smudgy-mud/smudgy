@@ -536,6 +536,11 @@ impl ModuleLoader for ScriptModuleLoader {
             // imports are not dependency-gated. This keeps the manifest's smudgy:// dep list
             // authoritative for the backend's permission closure.
             self.enforce_declared_smudgy_dep(&spec, referrer, DepGate::CodeImport)?;
+            if !spec.owner.is_empty() && referrer != crate::SYNTHETIC_ENTRY_SPECIFIER {
+                if let Some(provider) = &self.package_provider {
+                    provider.note_legacy_import(&spec, referrer);
+                }
+            }
             // A user-level (file://) code import of a package: recorded so the host can warn
             // when the target declares interop handles — on main, a trusted package's home
             // load can't be scrubbed, so this import hands out live producer handles

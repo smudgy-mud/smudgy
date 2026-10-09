@@ -1682,6 +1682,14 @@ impl<'a> ScriptEngine<'a> {
             local_package_snapshots,
             local_catalog_error.clone(),
         );
+        if let Some(provider) = &smudgy_provider {
+            let ui_tx = params.ui_tx.clone();
+            let session_id = params.session_id;
+            let emitted_line_count = params.emitted_line_count.clone();
+            provider.set_import_notice(Rc::new(move |message| {
+                Self::emit_session_notice(&ui_tx, session_id, &emitted_line_count, message);
+            }));
+        }
         // Whether sandboxed isolates have any way to resolve `smudgy://` — a cloud base to fork, or
         // a test override factory. With neither, the untrusted installs can't load (handled below).
         let have_resolver = smudgy_provider.is_some() || params.package_provider_override.is_some();

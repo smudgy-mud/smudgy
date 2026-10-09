@@ -8,8 +8,8 @@
 //! shared `tests/support` `MockState`. Its fidelity reference is the registry Worker: the
 //! bundle frame rules, the `want` bitmap, the always-upload rule, the 400s and 413s, and
 //! signed, expiring upload and download URLs all follow the package-bundle contract. So do
-//! global names reserved forever (409 `package_name_unavailable`), clan-owned packages,
-//! addresses whose owner is optional and ignored once well-formed (resolve, check-updates,
+//! names reserved forever on first publication (409 `package_name_unavailable`), clan-owned packages,
+//! addresses whose optional owner constrains legacy resolution (resolve, check-updates,
 //! publish edges), and the upload refused while garbage collection deletes one of its
 //! bodies (409 `body_being_collected`, or the older 500).
 #![allow(
@@ -336,9 +336,22 @@ const PACKAGE_ACTIONS: [&str; 6] = [
 impl MockState {
     /// The package an address names: by name, ignoring ASCII case, whoever owns it.
     fn named(&self, name: &str) -> Option<&MockPackage> {
-        self.packages
+        let (_, holder) = self
+            .claims
             .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .find(|(claimed, _)| claimed.eq_ignore_ascii_case(name))?;
+        self.packages.iter().find(|p| p.id == *holder)
+    }
+
+    fn addressed(&self, owner: Option<&str>, name: &str) -> Option<&MockPackage> {
+        self.named(name).filter(|p| {
+            owner.is_none_or(|owner| {
+                owner.trim().is_empty()
+                    || p.owner
+                        .nickname()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(owner.trim()))
+            })
+        })
     }
 
     /// Whether the caller holds `action` in `clan`.
@@ -394,8 +407,8 @@ fn envelope(status: u16, data: Value) -> Response {
 // --- mock handlers (mirror smudgy-api/src/packages) ------------------------
 
 /// `POST /packages` — create, or get the caller's package of that name. A `clan_id` makes
-/// the package the clan's, for a member holding `package.create` (404 otherwise). Names are
-/// global: one another package holds, or a deleted one held, is a 409.
+/// the package the clan's, for a member holding `package.create` (404 otherwise).
+/// Draft names are owner-scoped; the first publication reserves the global name.
 async fn create_package(State(state): State<Shared>, body: String) -> Response {
     let req: Value = serde_json::from_str(&body).unwrap();
     let name = req["name"].as_str().unwrap().to_string();
@@ -418,23 +431,12 @@ async fn create_package(State(state): State<Shared>, body: String) -> Response {
             "invalid package name (alphanumeric, _.- , <=64, must start alphanumeric)",
         );
     }
-    let key = name.to_ascii_lowercase();
-    if let Some(&(_, holder)) = st.claims.iter().find(|(claimed, _)| *claimed == key) {
-        return match st
-            .packages
-            .iter()
-            .find(|p| p.id == holder && p.owner == owner)
-        {
-            Some(existing) => envelope(201, package_view(existing)),
-            None => (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "success": false, "data": null,
-                    "error": format!("package_name_unavailable: {name}"),
-                })),
-            )
-                .into_response(),
-        };
+    if let Some(existing) = st
+        .packages
+        .iter()
+        .find(|p| p.owner == owner && p.name.eq_ignore_ascii_case(&name))
+    {
+        return envelope(201, package_view(existing));
     }
     let owner_id = match &owner {
         MockOwner::Clan(clan) => *clan,
@@ -451,9 +453,15 @@ async fn create_package(State(state): State<Shared>, body: String) -> Response {
         retired: Vec::new(),
     };
     let view = package_view(&pkg);
-    st.claims.push((key, pkg.id));
     st.packages.push(pkg);
     envelope(201, view)
+}
+
+fn mock_name_conflict(st: &MockState, pkg: &MockPackage) -> Option<Response> {
+    st.claims.iter().any(|(name, holder)| name.eq_ignore_ascii_case(&pkg.name) && *holder != pkg.id).then(|| (
+        StatusCode::CONFLICT,
+        Json(json!({ "success": false, "data": null, "error": format!("package_name_unavailable: {}", pkg.name) })),
+    ).into_response())
 }
 
 /// The server's edge validation, `dependencies` then `requires`: an owner, when given, is a
@@ -470,7 +478,7 @@ fn mock_validate_edges(st: &MockState, package_id: Uuid, req: &Value) -> Option<
                 )));
             }
             let address = address_of(owner.map(str::trim), name);
-            let Some(target) = st.named(name) else {
+            let Some(target) = st.addressed(owner, name) else {
                 return Some(mock_bad_request(&format!("unknown {kind}: {address}")));
             };
             if target.id == package_id {
@@ -571,6 +579,9 @@ async fn begin_version(
         return envelope(404, Value::Null);
     }
     // Build metadata is precedence-noise and never stored — reject it (mirrors the server).
+    if let Some(error) = mock_name_conflict(&st, &st.packages[pkg]) {
+        return error;
+    }
     if version.contains('+') {
         return mock_bad_request("build metadata not allowed");
     }
@@ -752,6 +763,7 @@ async fn upload_bundle(
 /// `…/versions/finalize` — every module's body must be recorded for the caller's live
 /// pending publish of this number, then the version commits and the publish clears. The
 /// reservation/duplicate guard runs here too (authoritative).
+#[allow(clippy::too_many_lines)]
 async fn finalize_version(
     State(state): State<Shared>,
     Path(id): Path<Uuid>,
@@ -835,6 +847,13 @@ async fn finalize_version(
         });
     }
     let version_id = Uuid::new_v4();
+    if let Some(error) = mock_name_conflict(&st, &st.packages[pkg]) {
+        return error;
+    }
+    let name = st.packages[pkg].name.to_ascii_lowercase();
+    if !st.claims.iter().any(|(_, holder)| *holder == id) {
+        st.claims.push((name, id));
+    }
     if let Some(pending) = pending {
         st.publishes.remove(pending);
     }
@@ -1042,11 +1061,11 @@ async fn resolve(
         .get("x-smudgy-package-compatibility")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    // The owner is optional and, once well-formed, ignored: the name finds the package.
+    // A legacy owner constrains the globally claimed name.
     if name.is_empty() || !valid_address_owner(params.get("owner").map(String::as_str)) {
         return envelope(404, Value::Null);
     }
-    let Some(pkg) = st.named(&name) else {
+    let Some(pkg) = st.addressed(params.get("owner").map(String::as_str), &name) else {
         return envelope(404, Value::Null);
     };
     let version = if range == "latest" {
@@ -1213,12 +1232,17 @@ async fn check_updates(State(state): State<Shared>, body: String) -> Response {
     if have_in.len() > 512 {
         return mock_bad_request("too many have entries");
     }
-    // A `have` row matches by name, ignoring ASCII case, and exact version; its owner is
-    // ignored.
-    let have: std::collections::HashSet<(String, String)> = have_in
+    // A legacy `have` row matches only the named owner; modern rows match by name.
+    let have: std::collections::HashSet<(String, String, String)> = have_in
         .iter()
+        .filter(|h| valid_address_owner(h["owner"].as_str()))
         .map(|h| {
             (
+                h["owner"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase(),
                 h["name"].as_str().unwrap_or_default().to_ascii_lowercase(),
                 h["version"].as_str().unwrap_or_default().to_string(),
             )
@@ -1237,7 +1261,9 @@ async fn check_updates(State(state): State<Shared>, body: String) -> Response {
             }
             result
         };
-        let pkg = valid_address_owner(owner).then(|| st.named(name)).flatten();
+        let pkg = valid_address_owner(owner)
+            .then(|| st.addressed(owner, name))
+            .flatten();
         let Some(pkg) = pkg else {
             results.push(echo(json!({
                 "name": name, "status": "not_found",
@@ -1294,7 +1320,19 @@ async fn check_updates(State(state): State<Shared>, body: String) -> Response {
                         continue;
                     };
                     queue.extend(dep_targets(&dep_v.dependencies));
-                    if have.contains(&(dep_name.to_ascii_lowercase(), dep_version.clone())) {
+                    if have.contains(&(
+                        String::new(),
+                        dep_name.to_ascii_lowercase(),
+                        dep_version.clone(),
+                    )) || have.contains(&(
+                        dep_pkg
+                            .owner
+                            .nickname()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase(),
+                        dep_name.to_ascii_lowercase(),
+                        dep_version.clone(),
+                    )) {
                         continue;
                     }
                     let mut node = json!({
@@ -2845,17 +2883,28 @@ async fn package_names_are_global_and_reserved_forever() {
         .expect("create-or-get");
     assert_eq!(again.id, mine.id);
 
-    // Anyone else asking for it, in any case, is told the name is taken.
+    publish_into(&api, mine.id, "mapper", "1.0.0", &[])
+        .await
+        .expect("private publication claims name");
+    // Another owner may keep a draft but cannot publish the claimed name.
     act_as(&state, "alice");
-    match api.create_package("MAPPER", "").await {
+    let draft = api
+        .create_package("MAPPER", "")
+        .await
+        .expect("same-name draft");
+    match publish_into(&api, draft.id, "MAPPER", "1.0.0", &[]).await {
         Err(CloudError::PackageNameUnavailable(name)) => assert_eq!(name, "MAPPER"),
-        other => panic!("another owner's name must be a 409, got {other:?}"),
+        other => panic!("publishing another owner's name must be a 409, got {other:?}"),
     }
 
     // A deleted package keeps its claim: not even its former owner can take it again.
     act_as(&state, "wbk");
     state.lock().unwrap().packages.retain(|p| p.id != mine.id);
-    match api.create_package("mapper", "").await {
+    let draft = api
+        .create_package("mapper", "")
+        .await
+        .expect("replacement draft");
+    match publish_into(&api, draft.id, "mapper", "1.0.0", &[]).await {
         Err(CloudError::PackageNameUnavailable(_)) => {}
         other => panic!("a deleted package's name stays claimed, got {other:?}"),
     }
@@ -2891,12 +2940,12 @@ async fn a_clan_package_has_no_owner_and_resolves_by_name() {
         .expect("resolve by name");
     assert_eq!(resolved.package_id, pkg.id);
     assert_eq!(resolved.owner_nickname, None);
-    // `smudgy://anyone/guild-tools` is the same package: a well-formed owner is ignored.
-    let spelled = api
-        .resolve_package(Some("anyone"), "Guild-Tools", None)
-        .await
-        .expect("an ignored owner segment");
-    assert_eq!(spelled.package_id, pkg.id);
+    // A clan package cannot be addressed as if it belonged to a user.
+    assert!(matches!(
+        api.resolve_package(Some("anyone"), "Guild-Tools", None)
+            .await,
+        Err(CloudError::NotFoundOrNoAccess)
+    ));
     // A malformed owner segment is the uniform 404.
     for owner in ["no", "has space", "a/b"] {
         assert!(
@@ -2914,9 +2963,10 @@ async fn a_clan_package_has_no_owner_and_resolves_by_name() {
         api.create_clan_package(clan, "alice-tools", "").await,
         Err(CloudError::NotFoundOrNoAccess)
     ));
-    // Nor take the clan's name for themselves.
+    // A draft is allowed, but its publication cannot take the clan's name.
+    let draft = api.create_package("guild-tools", "").await.unwrap();
     assert!(matches!(
-        api.create_package("guild-tools", "").await,
+        publish_into(&api, draft.id, "guild-tools", "1.0.0", &[]).await,
         Err(CloudError::PackageNameUnavailable(_))
     ));
 }
@@ -3052,7 +3102,7 @@ async fn ownerless_edges_publish_and_come_back_naming_the_targets_owner() {
     publish_simple(&api, "util", "1.0.0", &[]).await;
 
     let app = api.create_package("app", "").await.expect("app");
-    let edges = [
+    let mut edges = [
         // `smudgy:@guild-lib`: no owner on the wire.
         PublishDependency {
             owner_nickname: None,
@@ -3060,7 +3110,7 @@ async fn ownerless_edges_publish_and_come_back_naming_the_targets_owner() {
             range: "^1".to_string(),
             resolved_version: "1.2.0".to_string(),
         },
-        // `smudgy://someone/util`: a well-formed owner the server ignores.
+        // A well-formed but different legacy owner must be rejected.
         PublishDependency {
             owner_nickname: Some("someone".to_string()),
             name: "util".to_string(),
@@ -3068,9 +3118,14 @@ async fn ownerless_edges_publish_and_come_back_naming_the_targets_owner() {
             resolved_version: "1.0.0".to_string(),
         },
     ];
+    assert!(matches!(
+        publish_into(&api, app.id, "app", "1.0.0", &edges).await,
+        Err(CloudError::InvalidInput(_))
+    ));
+    edges[1].owner_nickname = Some("wbk".to_string());
     publish_into(&api, app.id, "app", "1.0.0", &edges)
         .await
-        .expect("publish with ownerless and foreign-owner edges");
+        .expect("publish with ownerless and matching-owner edges");
 
     let resolved = api
         .resolve_package(None, "app", None)
@@ -3152,7 +3207,7 @@ async fn check_updates_takes_ownerless_entries_and_have_rows() {
             name: "app".to_string(),
             installed: Some("1.0.0".to_string()),
         },
-        // `smudgy://wbk/guild-lib`: the clan's package under a compatibility spelling.
+        // A legacy user address cannot select a clan-owned package.
         CheckUpdatesEntry {
             owner: Some("wbk".to_string()),
             name: "guild-lib".to_string(),
@@ -3190,7 +3245,7 @@ async fn check_updates_takes_ownerless_entries_and_have_rows() {
         Some("wbk"),
         "the owner is echoed"
     );
-    assert_eq!(lib_result.status, "ok");
+    assert_eq!(lib_result.status, "not_found");
     assert_eq!(malformed.status, "not_found");
 
     // A `have` row without an owner elides the node it names.

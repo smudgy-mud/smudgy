@@ -1,10 +1,11 @@
 //! The package module scheme: shared-package resolution for the session isolate.
 //!
 //! A package's name is global, so its address is the name: `smudgy:@name[/subpath]`.
-//! `smudgy://owner/name[/subpath]` is a compatibility spelling of the same package: the
-//! owner segment is checked for form and otherwise ignored, because the registry resolves
-//! every address by name. A [`PackageKey`] keeps the spelling it was given (an empty owner
-//! for `smudgy:@name`) and compares by name alone.
+//! `smudgy://owner/name[/subpath]` remains supported through 0.6.0. The parser checks the
+//! owner segment's form; the provider and registry require it to match the publisher,
+//! except for local development overrides. A [`PackageKey`] keeps the spelling it was
+//! given (an empty owner for `smudgy:@name`) and compares by name alone. Providers must
+//! validate legacy owners before reusing a published package by that shared identity.
 //!
 //! Mirrors [`crate::npm_resolver`] in shape: `resolve()` keeps the request cheap and
 //! synchronous, `load()` does the async fetch + a redirect to a canonical URL (see
@@ -131,8 +132,9 @@ fn owner_from_segment(segment: &str) -> String {
 /// A package coordinate without version or subpath — the version-cache and lockfile key.
 /// `owner` is the owner segment the address was spelled with (`smudgy://owner/name`), or
 /// empty for the canonical `smudgy:@name`. The registry reserves `name` globally and
-/// resolves every address by it, so identity is the name: comparisons and hash keys ignore
-/// the owner and ASCII case, while the strings retain their spelling for display and paths.
+/// uses it as identity: comparisons and hash keys ignore the owner and ASCII case, while
+/// the strings retain their spelling for display and paths. Legacy owner constraints are
+/// validated separately during resolution; equality does not prove a valid address.
 #[derive(Debug, Clone)]
 pub struct PackageKey {
     pub owner: String,
@@ -1815,6 +1817,9 @@ impl ResolvedPackage {
 /// like the npm stack — never under a nested `block_on`.
 #[async_trait::async_trait(?Send)]
 pub trait PackageProvider {
+    /// Report an authored legacy import. Synthetic boot imports do not call this hook.
+    fn note_legacy_import(&self, _specifier: &SmudgySpecifier, _referrer: &str) {}
+
     /// Canonical runtime identity for a requested package coordinate. Most providers return
     /// `key` unchanged. A provider with a local leaf-name override returns the local owner's
     /// coordinate so module identity, provenance, parameters, storage, and trust cannot inherit
@@ -2025,7 +2030,8 @@ pub(crate) async fn load_marker_module(
     // isolate trust: trust grants permissions, it does not bypass another package's import-deny.
     //
     // Owners are the registry's ([`PackageProvider::package_owner`]), never an address's owner
-    // segment: every spelling of a package names the same package and the same owner.
+    // segment: the provider has already validated the requested legacy owner or resolved
+    // a local development override to its separate identity.
     if !fetched.manifest.importable {
         if let Some(referrer) = spec.referrer() {
             let importer_owner = provider

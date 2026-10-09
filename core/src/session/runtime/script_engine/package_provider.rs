@@ -39,6 +39,14 @@ use super::package_cache::{PackageCache, is_code_module, package_integrity, reso
 use super::package_solver::{self, DepEdge, DepRequirement, Solve};
 use crate::models::shared_packages::{self, LockedPackage, SharedPackageLock, UpdateMode};
 
+type ImportNotice = Rc<dyn Fn(&str)>;
+
+#[derive(Default)]
+struct LegacyImportNotices {
+    seen: HashSet<(String, String)>,
+    emit: Option<ImportNotice>,
+}
+
 /// Builds the **main isolate's** package provider from an optional cloud client (the engine
 /// [`fork`](SmudgyPackageProvider::fork)s a sibling per sandboxed isolate). Returns `None`
 /// (disabling `smudgy://` imports) when the session has no cloud client. Returns the **concrete**
@@ -219,6 +227,7 @@ pub struct SmudgyPackageProvider {
     /// User-facing warnings produced when an unconditional local leaf-name override does not
     /// satisfy a requesting dependency range or root pin. Drained after the isolate loads.
     local_override_warnings: RefCell<Vec<String>>,
+    legacy_import_notices: Rc<RefCell<LegacyImportNotices>>,
     /// Each top-level install's declared params `(specifier, params)`, collected during the
     /// `solve_closure` pre-pass so the host can run the required-param load-gate before
     /// evaluation. Published installs only; a local dev package is the author's own.
@@ -417,6 +426,7 @@ impl SmudgyPackageProvider {
             top_level_solved: RefCell::new(HashMap::new()),
             duplicate_warnings: RefCell::new(Vec::new()),
             local_override_warnings: RefCell::new(Vec::new()),
+            legacy_import_notices: Rc::default(),
             installed_params: RefCell::new(Vec::new()),
             installed_min_versions: RefCell::new(Vec::new()),
             closure_permission_union: RefCell::new(PackagePermissions::default()),
@@ -485,6 +495,7 @@ impl SmudgyPackageProvider {
             top_level_solved: RefCell::new(HashMap::new()),
             duplicate_warnings: RefCell::new(Vec::new()),
             local_override_warnings: RefCell::new(Vec::new()),
+            legacy_import_notices: Rc::clone(&self.legacy_import_notices),
             installed_params: RefCell::new(Vec::new()),
             installed_min_versions: RefCell::new(Vec::new()),
             closure_permission_union: RefCell::new(PackagePermissions::default()),
@@ -514,10 +525,14 @@ impl SmudgyPackageProvider {
         })
     }
 
+    pub fn set_import_notice(&self, emit: ImportNotice) {
+        self.legacy_import_notices.borrow_mut().emit = Some(emit);
+    }
+
     /// The canonical local identity and package snapshot for `key`'s leaf name, if that package
     /// exists and parsed successfully.
     ///
-    /// Package names are globally unique in the service. A local package is therefore an
+    /// Published package names are globally unique in the service. A local package is therefore an
     /// unconditional npm-link-style override by leaf name: `smudgy://any-author/tools`
     /// resolves to this user's local `tools`. Returning the local owner here is load-bearing:
     /// foreign trust, parameters, storage, permissions, and provenance must never be attached
@@ -539,10 +554,9 @@ impl SmudgyPackageProvider {
     }
 
     /// Canonical runtime identity for a requested coordinate. An existing local same-leaf
-    /// package always returns the local identity. A published package's name is global, so
-    /// every spelling of it (`smudgy:@name`, `smudgy://any-owner/name`) takes the spelling of
-    /// its installed row, where its persistent state lives; an uninstalled one keeps the
-    /// requested spelling.
+    /// package always returns the local identity. Modern imports and matching legacy imports
+    /// take the installed row's spelling, where its persistent state lives. A different
+    /// legacy owner keeps its spelling and is refused before cached code can be served.
     #[must_use]
     pub fn canonical_key(&self, key: &PackageKey) -> PackageKey {
         match self.local_snapshot(key) {
@@ -570,7 +584,36 @@ impl SmudgyPackageProvider {
         let row = lock.find(&specifier)?;
         SmudgySpecifier::parse(&row.specifier)
             .ok()
+            .filter(|installed| {
+                key.owner.is_empty() || key.owner.eq_ignore_ascii_case(&installed.owner)
+            })
             .map(|installed| installed.package_key())
+    }
+
+    /// A legacy address must not borrow another publisher's installed version,
+    /// settings, or cached code. Local development overrides keep their separate state.
+    fn check_legacy_owner(
+        &self,
+        requested: &PackageKey,
+        owner: Option<&PackageOwner>,
+    ) -> Result<(), PackageError> {
+        if requested.owner.is_empty() || self.is_local_override(requested) {
+            return Ok(());
+        }
+        if owner.is_some_and(|owner| *owner != PackageOwner::user(&requested.owner)) {
+            return Err(PackageError::NotFound(requested.to_user_specifier()));
+        }
+        if let Some(installed) = self
+            .lock
+            .borrow()
+            .find(&requested.to_user_specifier())
+            .and_then(|row| SmudgySpecifier::parse(&row.specifier).ok())
+            && !installed.owner.is_empty()
+            && !installed.owner.eq_ignore_ascii_case(&requested.owner)
+        {
+            return Err(PackageError::NotFound(requested.to_user_specifier()));
+        }
+        Ok(())
     }
 
     /// Resolve any package coordinate with a locally-authored same-leaf package from
@@ -913,6 +956,8 @@ impl SmudgyPackageProvider {
         key: &PackageKey,
         version: Option<&str>,
     ) -> Result<Rc<ResolvedPackageWire>, CloudError> {
+        self.check_legacy_owner(key, self.owners.borrow().get(key))
+            .map_err(|_| CloudError::NotFoundOrNoAccess)?;
         if let Some(version) = version {
             let memoized = self
                 .wire_memo
@@ -929,6 +974,14 @@ impl SmudgyPackageProvider {
                 .resolve_package(Some(&key.owner), &key.name, version)
                 .await?,
         );
+        if !key.owner.is_empty()
+            && !wire
+                .owner_nickname
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(&key.owner))
+        {
+            return Err(CloudError::NotFoundOrNoAccess);
+        }
         let owner = self.learn_owner(key, &wire).await;
         self.write_meta_for_wire(key, &wire, owner);
         self.wire_memo.borrow_mut().insert(
@@ -1001,6 +1054,8 @@ impl SmudgyPackageProvider {
         key: &PackageKey,
         version: Option<&str>,
     ) -> Result<WalkMeta, CloudError> {
+        self.check_legacy_owner(key, self.owners.borrow().get(key))
+            .map_err(|_| CloudError::NotFoundOrNoAccess)?;
         if let LocalSnapshot::Invalid(error) = self.local_snapshot(key) {
             return Err(CloudError::InvalidInput(format!(
                 "local package {} is invalid: {error}",
@@ -1033,6 +1088,8 @@ impl SmudgyPackageProvider {
                 .as_ref()
                 .and_then(|cache| cache.read_meta(key, version))
         {
+            self.check_legacy_owner(key, meta.owner.as_ref())
+                .map_err(|_| CloudError::NotFoundOrNoAccess)?;
             return Ok(WalkMeta {
                 key: key.clone(),
                 state_specifier: key.to_user_specifier(),
@@ -1738,6 +1795,7 @@ impl SmudgyPackageProvider {
         referrer: Option<&ReferrerRef>,
         track: bool,
     ) -> Result<Rc<ResolvedPackage>, PackageError> {
+        self.check_legacy_owner(requested_key, self.owners.borrow().get(requested_key))?;
         if let LocalSnapshot::Invalid(error) = self.local_snapshot(requested_key) {
             let local = PackageKey {
                 owner: self.local_owner().to_string(),
@@ -1797,6 +1855,14 @@ impl SmudgyPackageProvider {
         // ([`LockedPackage::staged_version`]). `None` only when discovery genuinely
         // needs the cloud — a never-resolved Auto root with no solve entry.
         let determined = selected.clone().or_else(|| staged.clone());
+        if let Some(version) = &determined {
+            let cached_owner = self
+                .disk_cache
+                .as_ref()
+                .and_then(|cache| cache.read_meta(&key, version))
+                .and_then(|meta| meta.owner);
+            self.check_legacy_owner(requested_key, cached_owner.as_ref())?;
+        }
 
         // Already resolved this version this session → reuse that instance. Keyed by the
         // *selected* version, so two importers that locked different versions coexist (two
@@ -2083,6 +2149,30 @@ impl SmudgyPackageProvider {
 
 #[async_trait::async_trait(?Send)]
 impl PackageProvider for SmudgyPackageProvider {
+    fn note_legacy_import(&self, specifier: &SmudgySpecifier, referrer: &str) {
+        if specifier.owner.is_empty() {
+            return;
+        }
+        let legacy = specifier.to_user_specifier();
+        let mut modern = specifier.clone();
+        modern.owner.clear();
+        let emit = {
+            let mut notices = self.legacy_import_notices.borrow_mut();
+            if notices.emit.is_none()
+                || !notices.seen.insert((legacy.clone(), referrer.to_string()))
+            {
+                return;
+            }
+            notices.emit.clone()
+        };
+        if let Some(emit) = emit {
+            emit(&format!(
+                "[package] Deprecated import {legacy} in {referrer}. Owner-scoped imports are supported through 0.6.0. Use \"{}\" instead.",
+                modern.to_user_specifier()
+            ));
+        }
+    }
+
     fn canonical_key(&self, key: &PackageKey) -> PackageKey {
         Self::canonical_key(self, key)
     }
@@ -2254,13 +2344,13 @@ fn fetch_error(specifier: &str, modules: &[&ResolvedModuleWire], err: &CloudErro
 #[cfg(test)]
 mod tests {
     #[test]
-    fn every_spelling_of_an_installed_package_takes_its_rows_spelling() {
+    fn modern_and_matching_legacy_imports_take_the_installed_spelling() {
         let provider = test_provider();
         provider.lock.borrow_mut().packages = vec![LockedPackage::new(
             "smudgy://Rich_E/Speedwalks",
             UpdateMode::Auto,
         )];
-        for spelling in ["smudgy:@speedwalks", "smudgy://someone/SPEEDWALKS"] {
+        for spelling in ["smudgy:@speedwalks", "smudgy://rich_e/SPEEDWALKS"] {
             let requested = SmudgySpecifier::parse(spelling).unwrap().package_key();
             let canonical = provider.canonical_key(&requested);
             assert_eq!(canonical.owner, "Rich_E", "{spelling}");
@@ -2270,7 +2360,7 @@ mod tests {
                 "{spelling}"
             );
         }
-        // An ownerless install keeps its ownerless spelling for every alias.
+        // A legacy import stays owner-scoped instead of redirecting to an ownerless row.
         provider.lock.borrow_mut().packages =
             vec![LockedPackage::new("smudgy:@guild-lib", UpdateMode::Auto)];
         let requested = SmudgySpecifier::parse("smudgy://wbk/guild-lib")
@@ -2278,7 +2368,7 @@ mod tests {
             .package_key();
         assert_eq!(
             provider.canonical_key(&requested).to_user_specifier(),
-            "smudgy:@guild-lib"
+            "smudgy://wbk/guild-lib"
         );
         // An uninstalled package keeps the requested spelling.
         let elsewhere = SmudgySpecifier::parse("smudgy:@elsewhere")
@@ -2288,6 +2378,51 @@ mod tests {
             provider.canonical_key(&elsewhere).to_user_specifier(),
             "smudgy:@elsewhere"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_import_cannot_redirect_to_another_installed_owner() {
+        let provider = test_provider();
+        provider.lock.borrow_mut().packages = vec![LockedPackage::new(
+            "smudgy://survivor/tools",
+            UpdateMode::Auto,
+        )];
+        let removed = SmudgySpecifier::parse("smudgy://removed/tools")
+            .unwrap()
+            .package_key();
+        assert!(matches!(
+            provider.resolve_package(&removed, None).await,
+            Err(PackageError::NotFound(_))
+        ));
+        assert!(matches!(
+            provider.resolve_package_for_stub(&removed).await,
+            Err(PackageError::NotFound(_))
+        ));
+        assert!(provider.loaded_packages().is_empty());
+        assert_eq!(
+            provider.lock.borrow().packages[0].specifier,
+            "smudgy://survivor/tools"
+        );
+    }
+
+    #[test]
+    fn legacy_import_warning_preserves_subpath_and_deduplicates_across_isolates() {
+        let provider = test_provider();
+        let messages = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&messages);
+        provider.set_import_notice(Rc::new(move |text| {
+            sink.borrow_mut().push(text.to_string());
+        }));
+        let spec = SmudgySpecifier::parse("smudgy://wbk/tools/lib/util").unwrap();
+        provider.note_legacy_import(&spec, "file:///user.ts");
+        provider.fork().note_legacy_import(&spec, "file:///user.ts");
+        provider.note_legacy_import(
+            &SmudgySpecifier::parse("smudgy:@tools").unwrap(),
+            "file:///user.ts",
+        );
+        assert_eq!(messages.borrow().len(), 1);
+        assert!(messages.borrow()[0].contains("smudgy:@tools/lib/util"));
+        assert!(messages.borrow()[0].contains("through 0.6.0"));
     }
 
     #[tokio::test]
@@ -2741,6 +2876,14 @@ mod tests {
         assert_eq!(resolved.key, canonical);
         assert_eq!(resolved.resolved_version, "2.3.4");
         assert_eq!(resolved.integrity, "local");
+        let modern = SmudgySpecifier::parse("smudgy:@tools")
+            .unwrap()
+            .package_key();
+        let modern_resolved = provider.resolve_package(&modern, None).await.unwrap();
+        assert!(
+            Rc::ptr_eq(&resolved, &modern_resolved),
+            "modern imports reuse the local instance before the installed foreign package"
+        );
         assert_eq!(provider.loaded_packages(), vec![canonical]);
 
         let warnings = provider.take_local_override_warnings();
