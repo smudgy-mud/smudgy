@@ -45,6 +45,8 @@ use smudgy_cloud::{
 
 /// The registry's bundle size cap: a bundle past it is refused at `begin` with 413.
 const BUNDLE_CAP: u64 = 95_000_000;
+/// The registry's per-version module cap, including generated declarations and assets.
+const MAX_MODULES: usize = 4096;
 /// The lifetime of every signed URL the registry issues.
 const SIGNED_URL_TTL_SECS: i64 = 15 * 60;
 /// The key the mock signs its upload and bundle URLs with.
@@ -521,8 +523,11 @@ fn mock_too_large(msg: &str) -> Response {
 /// error response to short-circuit, or `None` if valid. Keeps the mock a faithful fidelity
 /// reference for the client's cap behavior.
 fn mock_validate(modules: &[Value], manifest: &Value) -> Option<Response> {
-    if modules.len() > 128 {
-        return Some(mock_bad_request("too many modules"));
+    if modules.len() > MAX_MODULES {
+        return Some(mock_bad_request(&format!(
+            "too many modules: {} (max {MAX_MODULES})",
+            modules.len()
+        )));
     }
     if serde_json::to_vec(manifest).map_or(usize::MAX, |v| v.len()) > 256 * 1024 {
         return Some(mock_too_large("manifest too large"));
@@ -1675,6 +1680,49 @@ async fn pre_finalize_check_stops_the_immutable_version_commit() {
     );
 }
 
+#[tokio::test]
+async fn large_library_publishes_at_the_module_cap() {
+    let (base_url, _state) = spawn_mock().await;
+    let api = client(&base_url);
+    let package = api.create_package("large-library", "").await.unwrap();
+    let content = b"export const effect = 1;";
+    let manifest = json!({ "entry": "index.ts" });
+    let modules: Vec<PublishModule> = (0..4096)
+        .map(|index| PublishModule {
+            subpath: if index == 0 {
+                "index.ts".to_string()
+            } else {
+                format!("effects/effect-{index}.ts")
+            },
+            content: content.to_vec(),
+            media_type: "application/typescript".to_string(),
+            is_entry: index == 0,
+        })
+        .collect();
+    api.publish_version(package.id, "1.0.0", &manifest, &modules, &[], None)
+        .await
+        .expect("4096 modules may be published");
+    let resolved = api
+        .resolve_package(Some("wbk"), "large-library", None)
+        .await
+        .unwrap();
+    assert_eq!(resolved.modules.len(), 4096);
+    assert_eq!(
+        resolved.bodies.len(),
+        1,
+        "identical bodies stay deduplicated"
+    );
+    let body = api
+        .fetch_body(
+            &resolved.bundle_url,
+            &resolved.bodies,
+            &module_hash(&resolved, "effects/effect-4095.ts"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body, content);
+}
+
 /// A logged-out client (no credential) resolves + fetches a public package: the
 /// public read surface omits the auth header rather than short-circuiting with
 /// `Unauthorized`, so cloud-averse users can install and run public packages.
@@ -2272,8 +2320,8 @@ async fn over_cap_publish_is_rejected() {
     let (base_url, _state) = spawn_mock().await;
     let api = client(&base_url);
     let pkg = api.create_package("mapper", "").await.unwrap();
-    // 129 modules > the 128 cap — begin rejects it before any upload.
-    let modules: Vec<PublishModule> = (0..129)
+    // The 4097th module is rejected at begin, before any upload.
+    let modules: Vec<PublishModule> = (0..4097)
         .map(|i| PublishModule {
             subpath: format!("m{i}.ts"),
             content: format!("// {i}").into_bytes(),
@@ -2281,10 +2329,16 @@ async fn over_cap_publish_is_rejected() {
             is_entry: i == 0,
         })
         .collect();
-    let result = api
+    match api
         .publish_version(pkg.id, "1.0.0", &json!({}), &modules, &[], None)
-        .await;
-    assert!(result.is_err(), "an over-cap publish is rejected at begin");
+        .await
+    {
+        Err(CloudError::InvalidInput(message)) => {
+            assert_eq!(message, "too many modules: 4097 (max 4096)");
+        }
+        other => panic!("the 4097th module must be rejected, got {other:?}"),
+    }
+    assert!(api.list_versions(pkg.id).await.unwrap().is_empty());
 }
 
 #[tokio::test]
