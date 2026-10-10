@@ -6339,8 +6339,6 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff144a999b0ca0f8a10257934500060240825c42e950ec0ebee9c8ae30561c13"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
@@ -11562,9 +11560,11 @@ version = "0.5.8-dev"
 dependencies = [
  "derive_more",
  "log",
+ "naga 27.0.3",
  "serde",
  "serde_json",
  "thiserror 2.0.12",
+ "web-time",
 ]
 
 [[package]]
@@ -11596,6 +11596,7 @@ dependencies = [
  "iced_anim",
  "iced_graphics",
  "iced_runtime",
+ "iced_tiny_skia",
  "iced_winit",
  "image",
  "imara-diff",
@@ -11624,6 +11625,7 @@ dependencies = [
  "smudgy_widgets",
  "sys-locale",
  "tempfile",
+ "tiny-skia",
  "tokio",
  "tokio-stream",
  "unicode-segmentation",
@@ -11642,7 +11644,10 @@ dependencies = [
  "encoding_rs",
  "iced",
  "iced_runtime",
+ "iced_tiny_skia",
+ "iced_wgpu",
  "log",
+ "naga 27.0.3",
  "regex",
  "rustc-hash 2.1.1",
  "serde",
@@ -11651,6 +11656,7 @@ dependencies = [
  "smudgy_protocol",
  "smudgy_session_model",
  "smudgy_theme",
+ "tiny-skia",
  "unicode-segmentation",
 ]
 
@@ -11693,7 +11699,9 @@ dependencies = [
  "serde_json",
  "smudgy_cloud",
  "smudgy_map_widget",
+ "smudgy_session_model",
  "smudgy_theme",
+ "smudgy_ui_shared",
  "thiserror 2.0.12",
  "tokio",
 ]

@@ -33,12 +33,25 @@ use smudgy_session_model::styled_line::{
 use smudgy_session_model::system_row::{Severity, SystemRow, SystemRowKind};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(test)]
+#[path = "terminal_pane/inline_tests.rs"]
+mod inline_tests;
 mod spans;
 
 use crate::terminal_buffer::selection::{BufferPosition, LineSelection, Selection, word_span_at};
 use spans::Spans;
 
 type Link = SpanMetadata;
+use smudgy_session_model::inline_content::InlineDecoration;
+type EffectRegions = Arc<
+    Vec<(
+        InlineDecoration,
+        Rectangle,
+        Option<crate::text_effect::Input>,
+    )>,
+>;
+type EffectForeground<P> = Option<(Vec<usize>, bool, bool, P)>;
+const MAX_EFFECT_FRAGMENTS: usize = 512;
 
 /// 100 '0's shaped once per prefs generation to measure the monospace cell
 /// advance for the column-based line-length clamp.
@@ -367,6 +380,8 @@ struct ParagraphCache<P: text::Paragraph> {
     paragraph: P,
     hidden_blink_paragraphs: Rc<RefCell<HiddenBlinkParagraphs<P>>>,
     blink_modes: u8,
+    effects: Option<EffectRegions>,
+    effect_foreground: RefCell<EffectForeground<P>>,
     /// The client-authored row this paragraph shows, if it is one.
     system: Option<Arc<SystemRow>>,
     /// Whether a group row was baked unfolded (its children on lines below).
@@ -1364,8 +1379,11 @@ fn draw_link_menu<Renderer>(
 /// State specific to the TerminalPane widget instance.
 #[derive(Debug, Clone)]
 pub(super) struct State<P: text::Paragraph> {
+    bottom_offset: f32,
     pub last_line_number: usize,
     cache: Vec<ParagraphCache<P>>,
+    effects_below: Vec<ParagraphCache<P>>,
+    effects_above: Vec<ParagraphCache<P>>,
     pub is_focused: bool,
     /// Measured `(prefs generation, effective font size, monospace cell
     /// advance)` — the font size composes because a per-pane override changes
@@ -1421,7 +1439,10 @@ impl<P: text::Paragraph> Default for State<P> {
     fn default() -> Self {
         Self {
             last_line_number: 0,
+            bottom_offset: 0.0,
             cache: Vec::new(),
+            effects_below: Vec::new(),
+            effects_above: Vec::new(),
             is_focused: false,
             advance: None,
             modifiers: keyboard::Modifiers::default(),
@@ -1446,6 +1467,33 @@ impl<P: text::Paragraph> Default for State<P> {
 }
 
 impl<P: text::Paragraph> State<P> {
+    /// A preserved but hidden terminal half must not reserve GPU admission.
+    pub(super) fn retire_effect_inputs(&self) {
+        for cache in self
+            .cache
+            .iter()
+            .chain(&self.effects_above)
+            .chain(&self.effects_below)
+        {
+            if let Some(effects) = &cache.effects {
+                for (_, _, input) in effects.iter() {
+                    if let Some(input) = input {
+                        input.retire();
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn row_height_at(&self, line: usize) -> Option<f32> {
+        self.cache
+            .iter()
+            .chain(&self.effects_above)
+            .chain(&self.effects_below)
+            .find(|c| c.line_number == line)
+            .map(ParagraphCache::row_height)
+    }
+
     fn invalidate_link_styles(&mut self) {
         self.visual_generation = self.visual_generation.wrapping_add(1);
     }
@@ -1545,7 +1593,7 @@ impl<P: text::Paragraph> State<P> {
     }
 
     pub(super) fn hit_test(&self, bounds: Rectangle, point: iced::Point) -> Option<BufferPosition> {
-        let mut line_top = bounds.height;
+        let mut line_top = bounds.height + self.bottom_offset;
 
         for line in &self.cache {
             let line_number = line.line_number;
@@ -1632,7 +1680,7 @@ impl<P: text::Paragraph> State<P> {
         begin: usize,
         end: usize,
     ) -> Option<Point> {
-        let mut y = bounds.y + bounds.height;
+        let mut y = bounds.y + bounds.height + self.bottom_offset;
         for cache in &self.cache {
             y -= cache.row_height();
             if cache.line_number != line {
@@ -1768,6 +1816,7 @@ pub struct TerminalPane<'a, Message> {
     selection: Rc<RefCell<Selection>>,
     search_selection: Rc<Cell<bool>>,
     last_line_number: Option<usize>,
+    bottom_fraction: f32,
     /// Maps a clicked link span into the hosting session's message. Publishing
     /// through the widget shell defers session mutation until the terminal's
     /// immutable scrollback borrow has been released.
@@ -1777,11 +1826,20 @@ pub struct TerminalPane<'a, Message> {
     /// Per-pane terminal font override (`docs/panes.md`); `None` follows the
     /// global preference.
     font_size: Option<f32>,
+    shrink: bool,
+    inline_resolver: Option<crate::inline_object::Resolver>,
 }
 
 impl<'a, Message> TerminalPane<'a, Message> {
     pub fn new(buffer: Ref<'a, TerminalBuffer>, selection: Rc<RefCell<Selection>>) -> Self {
-        log::debug!("TerminalPane::new() called");
+        Self::with_selection(buffer, selection, Rc::new(Cell::new(false)))
+    }
+
+    pub(crate) fn with_selection(
+        buffer: Ref<'a, TerminalBuffer>,
+        selection: Rc<RefCell<Selection>>,
+        search_selection: Rc<Cell<bool>>,
+    ) -> Self {
         let buffer_link_state = buffer.link_state();
         let link_protocol_state = buffer.link_protocol_state();
         Self {
@@ -1789,14 +1847,38 @@ impl<'a, Message> TerminalPane<'a, Message> {
             link_protocol_state,
             buffer_link_state,
             selection,
-            search_selection: Rc::new(Cell::new(false)),
+            search_selection,
             last_line_number: None,
+            bottom_fraction: 0.0,
             on_link: None,
             on_link_tooltip: None,
             font_size: None,
+            shrink: false,
+            inline_resolver: None,
         }
     }
 
+    pub fn inline_widgets(mut self, resolver: Option<crate::inline_object::Resolver>) -> Self {
+        self.inline_resolver = resolver;
+        self
+    }
+
+    pub fn shrink(mut self) -> Self {
+        self.shrink = true;
+        self
+    }
+
+    pub fn last_line_position(mut self, value: f64) -> Self {
+        if self.terminal_buffer.has_inline_objects() {
+            self.last_line_number = Some(value.ceil() as usize);
+            self.bottom_fraction = (value.ceil() - value) as f32;
+        } else {
+            self.last_line_number = Some(value as usize);
+        }
+        self
+    }
+
+    #[cfg(test)]
     pub fn last_line_number(mut self, last_line_number: usize) -> Self {
         self.last_line_number = Some(last_line_number);
         self
@@ -1893,11 +1975,38 @@ impl<'a, Message> TerminalPane<'a, Message> {
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for TerminalPane<'a, Message>
 where
-    Renderer: text::Renderer<Font = iced::Font> + 'a,
+    Renderer: text::Renderer<Font = iced::Font> + 'static,
     Renderer::Paragraph:
         iced::advanced::text::Paragraph<Font = iced::Font> + Clone + std::fmt::Debug + 'static,
-    Theme: iced::widget::text::Catalog + 'a,
+    Theme: iced::widget::text::Catalog + 'static,
+    Message: 'static,
 {
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn advanced::widget::Operation,
+    ) {
+        if let Some(host) = crate::inline_object::Host::<Message, Theme, Renderer>::get_mut(tree) {
+            host.operate(layout, renderer, operation);
+        }
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: iced::Vector,
+    ) -> Option<advanced::overlay::Element<'b, Message, Theme, Renderer>> {
+        crate::inline_object::Host::<Message, Theme, Renderer>::get_mut(tree)?.overlay(
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
     fn size(&self) -> iced::Size<iced::Length> {
         iced::Size::new(iced::Length::Fill, iced::Length::Fill)
     }
@@ -1920,6 +2029,12 @@ where
         _renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
+        crate::text_effect::register_renderer(_renderer);
+        let mut inline = if self.inline_resolver.is_some() || !tree.children.is_empty() {
+            Some(crate::inline_object::Host::<Message, Theme, Renderer>::init(&mut tree.children))
+        } else {
+            None
+        };
         let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
         state.hidden_lines = {
             let live_links = self.buffer_link_state.borrow();
@@ -1978,19 +2093,34 @@ where
         let mut new_cache: Vec<ParagraphCache<Renderer::Paragraph>> =
             Vec::with_capacity(state.cache.len());
 
-        let mut i = 0;
+        // Rows move between the visible and overscan bands during scrolling.
+        // Reuse by line identity so that movement does not reshape unchanged
+        // text or rebuild its glyph capture. The pool lives only for this layout.
+        let mut previous: rustc_hash::FxHashMap<_, _> = std::mem::take(&mut state.cache)
+            .into_iter()
+            .chain(std::mem::take(&mut state.effects_below))
+            .chain(std::mem::take(&mut state.effects_above))
+            .map(|cache| (cache.line_number, cache))
+            .collect();
 
+        state.bottom_offset = 0.0;
         let mut available_y = limits.max().height;
+        let mut below = Vec::new();
+        let mut above = Vec::new();
 
         state.last_line_number = self
             .last_line_number
             .unwrap_or(self.terminal_buffer.last_line_number());
 
-        for (line_number, line) in self
-            .terminal_buffer
-            .iter_rev_with_line_number(self.last_line_number)
-        {
-            if available_y < 0.0 {
+        // Rows just outside the viewport are shaped only as far as something in
+        // the buffer can actually paint into it.
+        let overscan = self.terminal_buffer.inline_outset(limits.max().height);
+        let start = self.last_line_number.map(|last| {
+            (last + (overscan / line_height.max(1.0)).ceil() as usize)
+                .min(self.terminal_buffer.last_line_number())
+        });
+        for (line_number, line) in self.terminal_buffer.iter_rev_with_line_number(start) {
+            if available_y < -overscan {
                 break;
             }
 
@@ -2001,6 +2131,7 @@ where
                 continue;
             }
 
+            let above_viewport = available_y < 0.0 && line_number <= state.last_line_number;
             let line_selection = selection.for_line(line_number);
             let line_search_selection = search_selection && line_selection.is_some();
 
@@ -2033,8 +2164,14 @@ where
                 } else {
                     (font_size, line_height)
                 };
-            let row_bounds =
-                iced::Size::new((text_bounds.width - inset).max(1.0), text_bounds.height);
+            let row_bounds = iced::Size::new(
+                (text_bounds.width - inset).max(1.0),
+                if line.styled_line.objects.is_some() {
+                    f32::INFINITY
+                } else {
+                    text_bounds.height
+                },
+            );
 
             let dynamic_links = line.styled_line.links.iter().any(|link| {
                 link.style.as_ref().is_some_and(|style| style.has_states())
@@ -2050,11 +2187,8 @@ where
                 (0, 0, 0)
             };
 
-            // look for a matching cached Paragraph in state.paragraphs[i] or state.paragraphs[i + 1],
-            // advancing i by 1 if a match is found; entries shaped under an
-            // older prefs generation — or a different effective font size —
-            // are always misses
-            if let Some(cache) = state.cache.get_mut(i)
+            // Identity alone is insufficient after selection, style or source edits.
+            if let Some(mut cache) = previous.remove(&line_number)
                 && cache.generation == prefs.generation
                 && cache.font_size == font_size
                 && cache.visual_generation == visual_generation
@@ -2062,14 +2196,32 @@ where
                 && cache.selection == line_selection
                 && cache.search_selection == line_search_selection
                 && cache.expanded == expanded
+                // An object row re-views its widgets every layout; its paragraph
+                // is reused only while every glyph slot keeps its size.
+                && (line.styled_line.objects.is_none()
+                    || inline.as_mut().is_none_or(|host| {
+                        host.refresh(
+                            &line.styled_line,
+                            line_number,
+                            self.inline_resolver.as_ref(),
+                            _renderer,
+                            row_bounds.width,
+                        )
+                    }))
             {
-                i += 1;
-
                 if row_bounds.width > cache.max_valid_width
                     || row_bounds.width < cache.paragraph.min_bounds().width
                 {
                     cache.paragraph.resize(row_bounds);
+                    cache.effects = effect_regions(
+                        &cache.paragraph,
+                        &cache.spans.spans(),
+                        &cache.offsets,
+                        &cache.source,
+                        crate::text_effect::supported(_renderer),
+                    );
                     *cache.hidden_blink_paragraphs.borrow_mut() = HiddenBlinkParagraphs::default();
+                    *cache.effect_foreground.borrow_mut() = None;
                     if let Some(shimmer) = &cache.shimmer_paragraph {
                         *shimmer.borrow_mut() = None;
                     }
@@ -2085,14 +2237,25 @@ where
                     cache.paragraph.min_width(),
                 );
 
-                new_cache.push(cache.clone());
-
-                available_y -= cache.row_height();
+                if line_number > state.last_line_number {
+                    below.push(cache.clone());
+                } else {
+                    if above_viewport {
+                        above.push(cache.clone());
+                    } else {
+                        new_cache.push(cache.clone());
+                    }
+                    if line_number == state.last_line_number {
+                        state.bottom_offset = cache.row_height() * self.bottom_fraction;
+                        available_y += state.bottom_offset;
+                    }
+                    available_y -= cache.row_height();
+                }
                 continue;
             }
 
             let mut chip_spans = Vec::new();
-            let rendered = if let Some(row) = &line.system {
+            let mut rendered = if let Some(row) = &line.system {
                 let (rendered, chips) = system_rendered_spans(row, expanded, &prefs);
                 chip_spans = chips;
                 rendered
@@ -2132,6 +2295,39 @@ where
             } else {
                 line.rendered_spans()
             };
+            if let Some(fonts) = &line.styled_line.fonts {
+                rendered.spans = crate::inline_fonts::apply(
+                    &rendered.spans,
+                    &rendered.offsets,
+                    fonts,
+                    row_font_size,
+                    row_line_height,
+                );
+            }
+            if let Some(host) = inline.as_mut() {
+                rendered = host.prepare(
+                    &line.styled_line,
+                    line_number,
+                    rendered,
+                    self.inline_resolver.as_ref(),
+                    _renderer,
+                    row_bounds.width,
+                );
+            }
+            // cosmic-text takes the maximum explicit glyph line-height. Give
+            // actual text its own metrics so small objects cannot shrink it;
+            // an object-only row still uses only the object's measured height.
+            if line.styled_line.objects.is_some() || line.styled_line.fonts.is_some() {
+                for span in Rc::make_mut(&mut rendered.spans) {
+                    if !span.link.is_some_and(|metadata| metadata.object.is_some()) {
+                        span.line_height
+                            .get_or_insert(LineHeight::Absolute(Pixels(row_line_height)));
+                    }
+                }
+            }
+            if let Some(effects) = &line.styled_line.decorations {
+                rendered.spans = split_effect_spans(&rendered.spans, &rendered.offsets, effects);
+            }
             let rendered_selection = rendered.offsets.map_selection(line_selection);
             let spans = Spans::with_selection_color(
                 rendered.spans,
@@ -2163,13 +2359,36 @@ where
             // the text's left edge, and one offset keeps decorations,
             // selection and hit testing agreeing with the glyphs.
             let text_x = system_text_x(inset, is_rule, row_bounds.width, paragraph.min_width());
-            available_y -= paragraph.min_height() + extra_height;
+            if line_number <= state.last_line_number {
+                if line_number == state.last_line_number {
+                    state.bottom_offset =
+                        (paragraph.min_height() + extra_height) * self.bottom_fraction;
+                    available_y += state.bottom_offset;
+                }
+                available_y -= paragraph.min_height() + extra_height;
+            }
 
-            new_cache.push(ParagraphCache {
+            let effects = effect_regions(
+                &paragraph,
+                &spans_vec,
+                &rendered.offsets,
+                &line.styled_line,
+                crate::text_effect::supported(_renderer),
+            );
+            let destination = if line_number > state.last_line_number {
+                &mut below
+            } else if above_viewport {
+                &mut above
+            } else {
+                &mut new_cache
+            };
+            destination.push(ParagraphCache {
                 line_number,
                 source: line.styled_line.clone(),
                 spans,
                 offsets: rendered.offsets,
+                effects,
+                effect_foreground: RefCell::new(None),
                 paragraph,
                 hidden_blink_paragraphs: Rc::new(RefCell::new(HiddenBlinkParagraphs::default())),
                 blink_modes,
@@ -2193,6 +2412,42 @@ where
         }
 
         state.cache = new_cache;
+        state.effects_below = below;
+        state.effects_above = above;
+
+        if let Some(host) = inline.as_mut() {
+            let bottom = if self.shrink {
+                state.cache.iter().map(ParagraphCache::row_height).sum()
+            } else {
+                limits.max().height + state.bottom_offset
+            };
+            let mut y = bottom;
+            for cache in state.cache.iter().chain(state.effects_above.iter()) {
+                y -= cache.row_height();
+                host.position(
+                    &cache.paragraph,
+                    cache.line_number,
+                    &cache.spans.spans(),
+                    Point::new(cache.text_x, y + cache.text_offset()),
+                );
+            }
+            let mut y = bottom
+                + state
+                    .effects_below
+                    .iter()
+                    .map(ParagraphCache::row_height)
+                    .sum::<f32>();
+            for cache in &state.effects_below {
+                y -= cache.row_height();
+                host.position(
+                    &cache.paragraph,
+                    cache.line_number,
+                    &cache.spans.spans(),
+                    Point::new(cache.text_x, y + cache.text_offset()),
+                );
+            }
+            host.finish();
+        }
 
         // A keyboard tooltip must not keep owning tooltip state after its link
         // scrolls outside this terminal half. Otherwise it draws nowhere yet
@@ -2205,7 +2460,19 @@ where
             state.link_tooltip_hover = None;
         }
 
-        layout::atomic(limits, iced::Length::Fill, iced::Length::Fill)
+        if self.shrink {
+            let size = Size::new(
+                state
+                    .cache
+                    .iter()
+                    .map(|c| c.paragraph.min_width())
+                    .fold(0.0, f32::max),
+                state.cache.iter().map(ParagraphCache::row_height).sum(),
+            );
+            layout::Node::new(limits.resolve(iced::Length::Shrink, iced::Length::Shrink, size))
+        } else {
+            layout::atomic(limits, iced::Length::Fill, iced::Length::Fill)
+        }
     }
 
     fn draw(
@@ -2221,7 +2488,51 @@ where
         let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
         let prefs = crate::prefs::current();
 
+        let effect_viewport = if self.shrink {
+            *viewport
+        } else {
+            layout.bounds().intersection(viewport).unwrap_or_default()
+        };
+        if self.terminal_buffer.has_inline_effects() {
+            let remaining = draw_effects(
+                &state.cache,
+                layout.bounds() + iced::Vector::new(0.0, state.bottom_offset),
+                effect_viewport,
+                renderer,
+                MAX_EFFECT_FRAGMENTS,
+            );
+            let below_height: f32 = state
+                .effects_below
+                .iter()
+                .map(ParagraphCache::row_height)
+                .sum();
+            let remaining = draw_effects(
+                &state.effects_below,
+                layout.bounds() + iced::Vector::new(0.0, below_height + state.bottom_offset),
+                effect_viewport,
+                renderer,
+                remaining,
+            );
+            let height = state
+                .cache
+                .iter()
+                .map(ParagraphCache::row_height)
+                .sum::<f32>();
+            draw_effects(
+                &state.effects_above,
+                layout.bounds() + iced::Vector::new(0.0, -height + state.bottom_offset),
+                effect_viewport,
+                renderer,
+                remaining,
+            );
+        }
         if let Some(clipped_viewport) = layout.bounds().intersection(viewport) {
+            // Effects have their own layers. Returning to the parent layer would
+            // paint these glyphs underneath them, regardless of call order.
+            let foreground_layer = self.terminal_buffer.has_inline_effects();
+            if foreground_layer {
+                renderer.start_layer(clipped_viewport);
+            }
             // One phase for every shimmering row this frame, off the blink
             // timebase so the sweep is continuous across frames.
             let shimmer_phase = (Instant::now()
@@ -2229,7 +2540,7 @@ where
                 .as_secs_f32()
                 / SHIMMER_PERIOD_SECS)
                 .fract();
-            let mut y = layout.bounds().y + layout.bounds().height;
+            let mut y = layout.bounds().y + layout.bounds().height + state.bottom_offset;
             for cache in state.cache.iter() {
                 y -= cache.row_height();
                 let text_top = y + cache.text_offset();
@@ -2374,6 +2685,56 @@ where
                 let hide_slow = cache.blink_modes & SLOW_BLINK != 0 && !state.slow_blink_visible;
                 let hide_fast = cache.blink_modes & FAST_BLINK != 0 && !state.fast_blink_visible;
                 let at = iced::Point::new(layout.bounds().x + cache.text_x, text_top);
+                let draw_text = |renderer: &mut Renderer, paragraph: &Renderer::Paragraph| {
+                    // Replace only effected glyph spans. Cache this paragraph until the
+                    // active ranges or blink phase change; selection keeps original geometry.
+                    let hidden = if crate::text_effect::supported(renderer) {
+                        replacement_spans(cache, Instant::now())
+                    } else {
+                        Vec::new()
+                    };
+                    if !hidden.is_empty() {
+                        let mut foreground = cache.effect_foreground.borrow_mut();
+                        if foreground.as_ref().is_none_or(|(indices, slow, fast, _)| {
+                            indices != &hidden || *slow != hide_slow || *fast != hide_fast
+                        }) {
+                            let mut spans = hidden_blink_spans(
+                                cache.spans.spans().as_slice(),
+                                hide_slow,
+                                hide_fast,
+                            );
+                            for index in &hidden {
+                                spans[*index].color = Some(iced::Color::TRANSPARENT);
+                            }
+                            let paragraph =
+                                Renderer::Paragraph::with_spans(iced::advanced::text::Text {
+                                    content: spans.as_slice(),
+                                    bounds: cache.paragraph.bounds(),
+                                    size: cache.paragraph.size(),
+                                    font: cache.paragraph.font(),
+                                    line_height: cache.paragraph.line_height(),
+                                    align_x: cache.paragraph.align_x(),
+                                    align_y: cache.paragraph.align_y(),
+                                    shaping: cache.paragraph.shaping(),
+                                    wrapping: cache.paragraph.wrapping(),
+                                });
+                            *foreground = Some((hidden, hide_slow, hide_fast, paragraph));
+                        }
+                        renderer.fill_paragraph(
+                            &foreground.as_ref().unwrap().3,
+                            at,
+                            iced::Color::WHITE,
+                            clipped_viewport,
+                        );
+                    } else {
+                        renderer.fill_paragraph(
+                            paragraph,
+                            at,
+                            iced::Color::WHITE,
+                            clipped_viewport,
+                        );
+                    }
+                };
                 if let Some(shimmer) = cache
                     .shimmer_paragraph
                     .as_ref()
@@ -2395,7 +2756,7 @@ where
                     });
                     let mut slot = shimmer.borrow_mut();
                     let paragraph = slot.insert(paragraph);
-                    renderer.fill_paragraph(paragraph, at, iced::Color::WHITE, clipped_viewport);
+                    draw_text(renderer, paragraph);
                 } else if hide_slow || hide_fast {
                     let mut hidden = cache.hidden_blink_paragraphs.borrow_mut();
                     let paragraph = match (hide_slow, hide_fast) {
@@ -2422,14 +2783,9 @@ where
                             wrapping: cache.paragraph.wrapping(),
                         })
                     });
-                    renderer.fill_paragraph(paragraph, at, iced::Color::WHITE, clipped_viewport);
+                    draw_text(renderer, paragraph);
                 } else {
-                    renderer.fill_paragraph(
-                        &cache.paragraph,
-                        at,
-                        iced::Color::WHITE,
-                        clipped_viewport,
-                    );
+                    draw_text(renderer, &cache.paragraph);
                 }
             }
 
@@ -2476,6 +2832,12 @@ where
                     );
                 }
             }
+            if foreground_layer {
+                renderer.end_layer();
+            }
+        }
+        if let Some(host) = crate::inline_object::Host::<Message, Theme, Renderer>::get(tree) {
+            host.draw(renderer, _theme, _style_defaults, layout, cursor, viewport);
         }
     }
 
@@ -2487,6 +2849,11 @@ where
         viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
+        if let Some(interaction) = crate::inline_object::Host::<Message, Theme, Renderer>::get(tree)
+            .and_then(|host| host.interaction(layout, cursor, viewport, _renderer))
+        {
+            return interaction;
+        }
         if cursor.is_over(layout.bounds()) {
             let state = tree.state.downcast_ref::<State<Renderer::Paragraph>>();
             // A foldable group row takes a pointer: the whole row is its toggle.
@@ -2549,10 +2916,58 @@ where
         shell: &mut advanced::Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Some(host) = crate::inline_object::Host::<Message, Theme, Renderer>::get_mut(tree) {
+            host.update(event, layout, cursor, _renderer, clipboard, shell, viewport);
+            if shell.is_event_captured() {
+                return;
+            }
+        }
         let cursor_moved = matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }));
         let mut mouse_tooltip_request = None;
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
             let state = tree.state.downcast_mut::<State<Renderer::Paragraph>>();
+            if self.terminal_buffer.has_inline_effects() {
+                let clip = if self.shrink {
+                    *viewport
+                } else {
+                    layout.bounds().intersection(viewport).unwrap_or_default()
+                };
+                let below_height = state
+                    .effects_below
+                    .iter()
+                    .map(ParagraphCache::row_height)
+                    .sum::<f32>();
+                if effects_need_frame(
+                    &state.cache,
+                    layout.bounds() + iced::Vector::new(0.0, state.bottom_offset),
+                    clip,
+                    *now,
+                    _renderer,
+                ) || effects_need_frame(
+                    &state.effects_below,
+                    layout.bounds() + iced::Vector::new(0.0, below_height + state.bottom_offset),
+                    clip,
+                    *now,
+                    _renderer,
+                ) || effects_need_frame(
+                    &state.effects_above,
+                    layout.bounds()
+                        + iced::Vector::new(
+                            0.0,
+                            state.bottom_offset
+                                - state
+                                    .cache
+                                    .iter()
+                                    .map(ParagraphCache::row_height)
+                                    .sum::<f32>(),
+                        ),
+                    clip,
+                    *now,
+                    _renderer,
+                ) {
+                    shell.request_redraw();
+                }
+            }
             let (next, visibility_changed) = self
                 .buffer_link_state
                 .borrow_mut()
@@ -4065,4 +4480,215 @@ mod tests {
         );
         assert!(!protocol_state.borrow().selected(&selection));
     }
+}
+
+fn split_effect_spans(
+    spans: &Rc<Vec<Span<'static, Link>>>,
+    offsets: &RenderedOffsets,
+    effects: &[InlineDecoration],
+) -> Rc<Vec<Span<'static, Link>>> {
+    let boundaries = effects.iter().flat_map(|e| {
+        [
+            offsets.source_to_rendered(e.range.start),
+            offsets.source_to_rendered(e.range.end),
+        ]
+    });
+    let mut result = Vec::with_capacity(spans.len() + effects.len() * 2);
+    crate::span_cuts::split_at(spans, boundaries, |_, part| result.push(part));
+    Rc::new(result)
+}
+
+fn effect_regions<P: text::Paragraph + 'static>(
+    paragraph: &P,
+    spans: &[Span<'static, Link>],
+    offsets: &RenderedOffsets,
+    line: &StyledLine,
+    gpu_effects: bool,
+) -> Option<EffectRegions> {
+    let effects = line.decorations.as_ref()?;
+    let mut result: Vec<(InlineDecoration, Rectangle)> = Vec::new();
+    'spans: for (index, range, _) in crate::span_cuts::ranges(spans) {
+        for effect in effects.iter() {
+            if range.start >= offsets.source_to_rendered(effect.range.start)
+                && range.end <= offsets.source_to_rendered(effect.range.end)
+            {
+                for bounds in paragraph.span_bounds(index) {
+                    if result.len() == MAX_EFFECT_FRAGMENTS {
+                        break 'spans;
+                    }
+                    if let Some((_, previous)) = result.iter_mut().find(|(e, r)| {
+                        e.id == effect.id
+                            && (r.y - bounds.y).abs() < 0.5
+                            && (r.x + r.width - bounds.x).abs() < 1.0
+                    }) {
+                        *previous = previous.union(&bounds);
+                    } else {
+                        result.push((effect.clone(), bounds));
+                    }
+                }
+            }
+        }
+    }
+    Some(Arc::new(
+        result
+            .into_iter()
+            .map(|(effect, region)| {
+                let fuel = gpu_effects
+                    .then(|| crate::text_effect::Input::from_paragraph(paragraph, region))
+                    .flatten();
+                (effect, region, fuel)
+            })
+            .collect(),
+    ))
+}
+
+fn draw_effects<P: text::Paragraph>(
+    cache: &[ParagraphCache<P>],
+    bounds: Rectangle,
+    viewport: Rectangle,
+    renderer: &mut (impl iced::advanced::Renderer + 'static),
+    mut budget: usize,
+) -> usize {
+    let now = Instant::now();
+    let mut y = bounds.y + bounds.height;
+    for cache in cache {
+        y -= cache.row_height();
+        if let Some(effects) = &cache.effects {
+            let offset = iced::Vector::new(bounds.x + cache.text_x, y + cache.text_offset());
+            let mut seen = HashSet::new();
+            for (effect, _, _) in effects.iter() {
+                if !seen.insert(effect.id) {
+                    continue;
+                }
+                let group: Vec<_> = effects
+                    .iter()
+                    .filter(|(e, _, _)| e.id == effect.id)
+                    .collect();
+                let visible = viewport.width > 0.0
+                    && viewport.height > 0.0
+                    && effect.elapsed(now).is_some()
+                    && group.iter().any(|(_, region, _)| {
+                        crate::inline_effects::paint_bounds(*region + offset, effect)
+                            .intersection(&viewport)
+                            .is_some()
+                    });
+                // Preflight every wrapped fragment before admission/foreground suppression.
+                // Do not short-circuit: every visible fragment of a static cold effect
+                // must retain a pending-frame request while the pipeline is compiling.
+                if visible {
+                    let settings = &effect.effect.shader;
+                    let ready = group.iter().fold(true, |previous, (_, _, input)| {
+                        input.as_ref().is_some_and(|input| {
+                            crate::text_effect::ready(renderer, input, settings)
+                        }) && previous
+                    });
+                    if !ready {
+                        continue;
+                    }
+                }
+                // Admit a wrapped effect as a unit: never hide glyphs from a
+                // fragment whose shader could not acquire a resource slot.
+                if !visible
+                    || group.len() > budget
+                    || (!group.iter().all(|(_, _, input)| {
+                        input.as_ref().is_some_and(crate::text_effect::Input::admit)
+                    }))
+                {
+                    for (_, _, input) in group {
+                        if let Some(input) = input {
+                            input.retire();
+                        }
+                    }
+                    continue;
+                }
+                budget -= group.len();
+                for (effect, region, input) in group {
+                    crate::inline_effects::draw_with_fuel(
+                        renderer,
+                        effect,
+                        *region + offset,
+                        viewport,
+                        now,
+                        input.as_ref(),
+                    );
+                }
+            }
+        }
+    }
+    budget
+}
+
+fn effects_need_frame<P: text::Paragraph>(
+    cache: &[ParagraphCache<P>],
+    bounds: Rectangle,
+    viewport: Rectangle,
+    now: Instant,
+    renderer: &dyn std::any::Any,
+) -> bool {
+    if viewport.width <= 0.0 || viewport.height <= 0.0 {
+        return false;
+    }
+    let gpu_effects = crate::text_effect::supported(renderer);
+    let mut y = bounds.y + bounds.height;
+    cache.iter().any(|cache| {
+        y -= cache.row_height();
+        cache.effects.as_ref().is_some_and(|effects| {
+            effects.iter().any(|(effect, region, input)| {
+                let visible = effect.elapsed(now).is_some()
+                    && crate::inline_effects::paint_bounds(
+                        *region
+                            + iced::Vector::new(bounds.x + cache.text_x, y + cache.text_offset()),
+                        effect,
+                    )
+                    .intersection(&viewport)
+                    .is_some();
+                if !visible {
+                    return false;
+                }
+                gpu_effects
+                    && input.as_ref().is_some_and(|input| {
+                        if !input.can_admit(
+                            effects
+                                .iter()
+                                .filter(|(candidate, _, _)| candidate.id == effect.id)
+                                .count(),
+                        ) {
+                            return false;
+                        }
+                        // iced updates before drawing. Start a cold static program
+                        // here so the very first frame schedules its completion frame.
+                        let prepared =
+                            crate::text_effect::ready(renderer, input, &effect.effect.shader);
+                        input.pending() || (prepared && effect.animated(now))
+                    })
+            })
+        })
+    })
+}
+
+fn replacement_spans<P: text::Paragraph>(cache: &ParagraphCache<P>, now: Instant) -> Vec<usize> {
+    let Some(effects) = &cache.effects else {
+        return Vec::new();
+    };
+    let mut position = 0;
+    cache
+        .spans
+        .spans()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, span)| {
+            let end = position + span.text.len();
+            let hidden = effects.iter().any(|(effect, _, input)| {
+                input
+                    .as_ref()
+                    .is_some_and(crate::text_effect::Input::admitted)
+                    && effect.elapsed(now).is_some()
+                    && effect.effect.shader.replace
+                    && position >= cache.offsets.source_to_rendered(effect.range.start)
+                    && end <= cache.offsets.source_to_rendered(effect.range.end)
+            });
+            position = end;
+            hidden.then_some(index)
+        })
+        .collect()
 }

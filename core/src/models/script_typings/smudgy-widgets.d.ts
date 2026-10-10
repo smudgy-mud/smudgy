@@ -26,6 +26,10 @@
 interface SmudgyElement {
     /** @internal opaque brand -- do not access. */
     readonly __smudgyWidgetElement: true;
+    /** echo(`Text ${widget}`) and line edits recover native widgets from these
+     * opaque strings. The most recent 1024 interpolated elements are retained
+     * per isolate; keep a Span element for long-lived reusable content. */
+    [Symbol.toPrimitive](hint: string): string;
 }
 
 /** A size: a number of pixels, `"fill"` (take all available space), or
@@ -38,6 +42,7 @@ type WidgetLength = number | "fill" | "shrink";
  *  works), plus arrays of the above (flattened). */
 type WidgetChild =
     | SmudgyElement
+    | import("smudgy:core").StyledText
     | string
     | number
     | boolean
@@ -69,8 +74,13 @@ declare module "smudgy:widgets" {
     /** Vertical alignment within a container. */
     export type VerticalAlign = "top" | "start" | "center" | "bottom" | "end";
 
+    /** Optional readable projection for terminal copy, search and logs. Layout boxes
+     * use the same widget implementation as createWidget. Descendant text is the default;
+     * non-text leaves default to "[widget]". Projection is a snapshot at construction. */
+    export interface TerminalWidgetProps { terminalText?: string; }
+
     /** Props common to the linear layout containers. */
-    export interface ColumnProps {
+    export interface ColumnProps extends TerminalWidgetProps {
         width?: Bindable<WidgetLength>;
         height?: Bindable<WidgetLength>;
         /** Gap between children, in pixels. */
@@ -83,14 +93,14 @@ declare module "smudgy:widgets" {
     export type RowProps = ColumnProps;
 
     /** Props for the layering container (children stack front-to-back). */
-    export interface StackProps {
+    export interface StackProps extends TerminalWidgetProps {
         width?: Bindable<WidgetLength>;
         height?: Bindable<WidgetLength>;
         children?: WidgetChildren;
     }
 
     /** Props for the single-child wrapper. Only the first child is used. */
-    export interface ContainerProps {
+    export interface ContainerProps extends TerminalWidgetProps {
         width?: Bindable<WidgetLength>;
         height?: Bindable<WidgetLength>;
         align_x?: HorizontalAlign;
@@ -100,8 +110,57 @@ declare module "smudgy:widgets" {
         children?: WidgetChildren;
     }
 
+    /** Selectable terminal text, including styled/link fragments and nested inline effects.
+     * The transcript uses its text directly for wrapping, copying, search and logs.
+     * Newlines and live store bindings are not accepted. */
+    export interface SpanProps extends TerminalWidgetProps {
+        /** Logical pixels (integer 1..512). Text contributes its own line height. */
+        fontSize?: number;
+        /** Alias for fontSize, matching Text's size prop. */
+        size?: number;
+        fontWeight?: "normal" | "bold" | 100 | 200 | 300 | 400 | 500 | 600 | 700 | 800 | 900;
+        fontStyle?: "normal" | "italic" | "oblique";
+        /** Installed/bundled family name, or monospace, sans-serif, serif. */
+        fontFace?: string;
+        style?: import("smudgy:core").LineColorOptions | import("smudgy:core").StyleBuilder;
+        children?: WidgetChildren;
+    }
+    /** Text fragments, or exactly one Span. JSX erases component identity, so
+     * element children are checked at runtime; Button, Text, Container, etc. fail. */
+    export type TextEffectText = string | number | boolean | null | undefined | import("smudgy:core").StyledText;
+    export type TextEffectChildren = TextEffectText | TextEffectText[] | SmudgyElement | [SmudgyElement];
+    /** Opaque validated WGSL module, produced by importing a .wgsl file.
+     *  Sandboxed packages require permissions.smudgy.widgets: ["shaders"]. */
+    export interface TextShader { readonly __textShader: unique symbol; }
+    export type ShaderUniforms = Record<string, number | readonly number[]>;
+    /** A text-only GPU shader. Its Span supplies typography, links and selection. */
+    export interface TextEffectProps {
+        shader: TextShader;
+        /** Pane paints across the containing viewport while the anchor is visible. */
+        overflow?: "bounds" | "pane";
+        /** Named parameters must match the WGSL uniform struct exactly. */
+        uniforms?: ShaderUniforms;
+        /** Milliseconds, 0..3600000. Zero continues until removed. */
+        duration?: number;
+        /** Effect geometry, 0.25..4; shaders read text.effect_scale. Does not alter native text layout. */
+        scale?: number;
+        /** Glyph resolution multiplier, 1..8, default 1. Cached once and capped by the input texture budget. */
+        captureScale?: number;
+        /** Attack/release in milliseconds. Overlapping fades are shortened to fit duration. */
+        fadeIn?: number;
+        fadeOut?: number;
+        /** Logical pixels, 0..2048, default 32. Does not enlarge line layout. */
+        outset?: number;
+        composite?: "underlay" | "replace";
+        finish?: "hold" | "remove";
+        /** Continuous motion; finite lifetimes and fade-in still schedule frames. */
+        animated?: boolean;
+        children?: TextEffectChildren;
+    }
+    export type InlineElement = SmudgyElement & SmudgyInlineElement;
+
     /** Props for a run of text. The children are concatenated as the text content. */
-    export interface TextProps {
+    export interface TextProps extends TerminalWidgetProps {
         /** A CSS color string. */
         color?: Bindable<string>;
         /** Text size in pixels. */
@@ -110,7 +169,7 @@ declare module "smudgy:widgets" {
     }
 
     /** Props for a progress/health bar (a leaf -- children are ignored). */
-    export interface ProgressBarProps {
+    export interface ProgressBarProps extends TerminalWidgetProps {
         /** Range minimum (default 0). */
         min?: Bindable<number>;
         /** Range maximum (default 100). */
@@ -127,12 +186,31 @@ declare module "smudgy:widgets" {
         vertical?: boolean;
     }
 
+    /** A horizontal numeric slider. Children are ignored. */
+    export interface SliderProps extends TerminalWidgetProps {
+        /** Range minimum (default 0). */
+        min?: Bindable<number>;
+        /** Range maximum (default 100). */
+        max?: Bindable<number>;
+        /** Controlled value, clamped to the range (default min). */
+        value?: Bindable<number>;
+        /** Positive step size (default 1). */
+        step?: Bindable<number>;
+        width?: Bindable<WidgetLength>;
+        /** Height in pixels (default 16). */
+        height?: Bindable<number>;
+        /** Update the value or its bound state while dragging. Receives a number. */
+        onChange: (value: number) => void;
+        /** Called once when a mouse or touch drag finishes. */
+        onRelease?: () => void;
+    }
+
     /** A button emphasis variant, mapping to the theme's named button styles. */
     export type ButtonVariant = "primary" | "secondary" | "subtle" | "link";
 
     /** Props for a clickable button. A single non-text child is used as the label element;
      *  otherwise the text children are rendered as the label. */
-    export interface ButtonProps {
+    export interface ButtonProps extends TerminalWidgetProps {
         width?: Bindable<WidgetLength>;
         height?: Bindable<WidgetLength>;
         /** Emphasis style. Default "subtle". */
@@ -143,7 +221,7 @@ declare module "smudgy:widgets" {
     }
 
     /** Props for a multi-line text editor (a leaf -- children are ignored). */
-    export interface TextEditorProps {
+    export interface TextEditorProps extends TerminalWidgetProps {
         /** A stable identity for the editing buffer: two editors with different
          *  ids edit independently. Omitted, sibling editors are still kept
          *  distinct. */
@@ -167,7 +245,7 @@ declare module "smudgy:widgets" {
 
     /** Props for a modal: a dimmed, input-blocking backdrop under a centered content box. The
      *  single child is the content box (style it with a Container). */
-    export interface ModalProps {
+    export interface ModalProps extends TerminalWidgetProps {
         /** Called when the backdrop is clicked. If omitted, the backdrop blocks
          *  input but does not dismiss. */
         onDismiss?: () => void;
@@ -233,7 +311,7 @@ declare module "smudgy:widgets" {
     /** Props for the map view (a leaf). The static styles palette names each look
      *  once; apply associates palette entries with rooms/exits and is the intended
      *  store-bound hot path (small payloads, no re-mount, zoom/pan preserved). */
-    export interface MapViewProps {
+    export interface MapViewProps extends TerminalWidgetProps {
         // View-global knobs, meaningless per-item, so not in MapStyle.
         /** Multiply room coordinates while keeping room glyphs the same size. Default 1. */
         roomSpacing?: Bindable<number>;
@@ -253,7 +331,7 @@ declare module "smudgy:widgets" {
     export type ScrollDirection = "vertical" | "horizontal" | "both";
 
     /** Props for a scrollable single-child viewport. Only the first child is used. */
-    export interface ScrollableProps {
+    export interface ScrollableProps extends TerminalWidgetProps {
         width?: Bindable<WidgetLength>;
         height?: Bindable<WidgetLength>;
         /** Scroll axis. Default "vertical". */
@@ -284,7 +362,7 @@ declare module "smudgy:widgets" {
      *
      *  Real URLs (`<http://...>`) stay ordinary links, and inline `code` / fenced code blocks are
      *  left literal. */
-    export interface MarkdownProps {
+    export interface MarkdownProps extends TerminalWidgetProps {
         /** Base text size in pixels; heading sizes scale from it. Default 16.
          *  The Markdown source itself cannot be bound (it is parsed once);
          *  render live values with `Text`. */
@@ -307,7 +385,7 @@ declare module "smudgy:widgets" {
 
     /** Props for empty layout space (a leaf; children are ignored). Place
      *  `<Space width="fill"/>` between Row children to create a flexible gap. */
-    export interface SpaceProps {
+    export interface SpaceProps extends TerminalWidgetProps {
         /** Default "shrink". */
         width?: Bindable<WidgetLength>;
         /** Default "shrink". */
@@ -342,7 +420,7 @@ declare module "smudgy:widgets" {
      *  binding's producer (e.g. the game, via GMCP) is not the widget's author.
      *  Failed or denied sources render the empty placeholder and log one warning; SVG
      *  sources are not supported yet. */
-    export interface ImageProps {
+    export interface ImageProps extends TerminalWidgetProps {
         /** The image source (see the grammar above). Bindable: a store binding swaps
          *  the displayed image as the bound value changes. */
         src: Bindable<string>;
@@ -389,7 +467,7 @@ declare module "smudgy:widgets" {
      *  Without `onToggle`, the checkbox is disabled and can be used as a read-only
      *  indicator. If `checked` is a fixed value, a click still calls `onToggle`, but
      *  the displayed value changes only when the caller supplies a different value. */
-    export interface CheckboxProps {
+    export interface CheckboxProps extends TerminalWidgetProps {
         /** Whether the box is checked. Default false. */
         checked?: Bindable<boolean>;
         /** Called with the new state on click. Omitted, the checkbox renders disabled. */
@@ -422,7 +500,7 @@ declare module "smudgy:widgets" {
      *    </Row>
      *  );
      *  ``` */
-    export interface RadioProps {
+    export interface RadioProps extends TerminalWidgetProps {
         /** This radio's own value. Selection compares it (as a string) against
          *  `selected`. */
         value: string | number;
@@ -446,7 +524,7 @@ declare module "smudgy:widgets" {
     /** Props for a hover tooltip. The first child is the hover target. A string,
      *  number, or binding renders in the standard tooltip style. An element uses the
      *  styles declared by that element. */
-    export interface TooltipProps {
+    export interface TooltipProps extends TerminalWidgetProps {
         /** The tooltip content. A `false` or null value suppresses the tooltip, so a
          *  conditional expression such as `tip={cond && "hint"}` is supported. */
         tip: string | number | Binding<any> | SmudgyElement | false | null;
@@ -488,7 +566,7 @@ declare module "smudgy:widgets" {
      *  changes. Re-mount the widget when rows are added, removed, or reordered. A row with
      *  more cells than columns is invalid; a shorter row is padded with empty cells. Wrap
      *  a tall table in `Scrollable`. */
-    export interface TableProps {
+    export interface TableProps extends TerminalWidgetProps {
         /** The columns, in order. Required and non-empty. */
         columns: TableColumnSpec[];
         /** The rows, each an array of cells in column order. */
@@ -788,11 +866,17 @@ declare module "smudgy:widgets" {
      *  complexity limit or contains duplicate animation IDs, Smudgy reports an error and
      *  continues displaying the previous valid scene.
      *
-     *  Drawing is clipped to the canvas bounds, including animated shapes. A canvas without
+     *  Drawing is clipped to the canvas bounds plus any explicit overflow. A canvas without
      *  `onPointer` does not capture pointer input from content behind it. With a `view_box`,
      *  a `"fill"`-sized canvas rescales the scene when its pane changes size. Fixed numeric
      *  dimensions keep a fixed widget size. Without a `view_box`, scene units are pixels. */
-    export interface CanvasProps {
+    export interface CanvasProps extends TerminalWidgetProps {
+        /** Paint this many pixels beyond the layout box in each direction (0..2048).
+         * Default 0. The terminal pane / clipping ancestors still clip the result.
+         * "pane" can paint across the entire viewport. Its anchor is retained up to one
+         * viewport above/below the visible area; distant anchors do not animate.
+         * Pointer input remains confined to the layout box. Animation follows the presentation cadence. */
+        overflow?: number | "pane";
         /** Default "fill". */
         width?: Bindable<WidgetLength>;
         /** Default "fill". */
@@ -823,10 +907,17 @@ declare module "smudgy:widgets" {
     export function Stack(props?: StackProps, children?: WidgetChildren): SmudgyElement;
     /** A single-child wrapper with alignment/background. Only the first child is used. */
     export function Container(props?: ContainerProps, children?: WidgetChildren): SmudgyElement;
+    /** Selectable terminal text: styled/link fragments plus nested inline effects. */
+    export function Span(props?: SpanProps, children?: WidgetChildren): InlineElement;
+    /** Run an imported WGSL shader on text or one Span. Typography and interaction
+     * use the native text layout. Effects require a GPU; text stays readable without one. */
+    export function TextEffect(props: TextEffectProps, children?: TextEffectChildren): InlineElement;
     /** A run of (optionally colored) text. */
     export function Text(props?: TextProps, children?: WidgetChildren): SmudgyElement;
     /** A progress/health bar. */
     export function ProgressBar(props?: ProgressBarProps, children?: WidgetChildren): SmudgyElement;
+    /** A horizontal numeric slider with optional drag-completion callback. */
+    export function Slider(props: SliderProps, children?: WidgetChildren): SmudgyElement;
     /** A scrollable single-child viewport. Only the first child is used. */
     export function Scrollable(props?: ScrollableProps, children?: WidgetChildren): SmudgyElement;
     /** A rendered Markdown document. Children are concatenated as the Markdown source. */
@@ -894,7 +985,10 @@ declare module "smudgy:widgets" {
         Stack: typeof Stack;
         Container: typeof Container;
         Text: typeof Text;
+        Span: typeof Span;
+        TextEffect: typeof TextEffect;
         ProgressBar: typeof ProgressBar;
+        Slider: typeof Slider;
         Scrollable: typeof Scrollable;
         Markdown: typeof Markdown;
         Modal: typeof Modal;
@@ -933,4 +1027,11 @@ declare module "smudgy:widgets/jsx-runtime" {
             children: {};
         }
     }
+}
+
+/** WGSL imports evaluate to opaque, validated native text shader handles.
+ *  Sandboxed packages require permissions.smudgy.widgets: ["shaders"]. */
+declare module "*.wgsl" {
+    const shader: import("smudgy:widgets").TextShader;
+    export default shader;
 }

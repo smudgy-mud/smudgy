@@ -30,7 +30,14 @@ const {
     op_smudgy_widget_build_row,
     op_smudgy_widget_build_stack,
     op_smudgy_widget_build_text,
+    op_smudgy_widget_build_span,
+    op_smudgy_widget_join_spans,
+    op_smudgy_widget_compile_text_shader,
+    op_smudgy_widget_build_text_effect,
+    op_smudgy_widget_export_inline,
+    op_smudgy_widget_terminal_metadata,
     op_smudgy_widget_build_progress_bar,
+    op_smudgy_widget_build_slider,
     op_smudgy_widget_build_button,
     op_smudgy_widget_build_scrollable,
     op_smudgy_widget_build_markdown,
@@ -56,6 +63,134 @@ const {
     // (untyped: Deno.core is deno's private bootstrap namespace, no type decls)
 } = (globalThis as any).Deno.core.ops;
 
+const widgetElements = new WeakSet<object>();
+const inlineElements = new WeakSet<object>();
+const spanElements = new WeakSet<object>();
+const terminalMetadata = new WeakMap<object, {text: string, outset: number}>();
+// One default for the effect op and the terminal metadata its ancestors inherit.
+const TEXT_EFFECT_DEFAULT_OUTSET = 32;
+// Ordinary template literals coerce interpolations to strings. Keep a bounded,
+// isolate-local bridge so echo/line edits can recover the genuine native element.
+// Saved strings remain reusable while their references are in this LRU; retain a
+// Span element instead when content must survive arbitrary subsequent output.
+const interpolationMarker = "\uE000smudgy-widget:";
+const interpolations = new Map<string, any>();
+const interpolationIds = new WeakMap<object, string>();
+let interpolationPrefix: string | undefined;
+let nextInterpolation = 0;
+function interpolateElement(element: any): string {
+    interpolationPrefix ??= interpolationMarker + crypto.randomUUID() + ":";
+    let key = interpolationIds.get(element);
+    if (key === undefined) {
+        key = interpolationPrefix + (++nextInterpolation) + "\uE001";
+        interpolationIds.set(element, key);
+    }
+    interpolations.delete(key);
+    interpolations.set(key, element);
+    if (interpolations.size > 1024) interpolations.delete(interpolations.keys().next().value!);
+    return key;
+}
+function interpolatedParts(value: any): any[] | undefined {
+    if (typeof value !== "string" || !value.includes(interpolationMarker)) return undefined;
+    const parts: any[] = [];
+    let start = 0;
+    for (;;) {
+        const begin = value.indexOf(interpolationMarker, start);
+        if (begin < 0) { parts.push(value.slice(start)); return parts; }
+        if (interpolationPrefix === undefined || !value.startsWith(interpolationPrefix, begin))
+            throw new TypeError("Widget interpolation belongs to another isolate or an earlier script reload; rebuild it in this isolate");
+        const end = value.indexOf("\uE001", begin);
+        if (end < 0) throw new TypeError("Incomplete widget interpolation");
+        const key = value.slice(begin, end + 1);
+        const element = interpolations.get(key);
+        if (element === undefined) throw new TypeError("Widget interpolation expired from the 1024-entry cache; rebuild the string or retain a Span element for long-lived content");
+        interpolations.delete(key); interpolations.set(key, element);
+        parts.push(value.slice(start, begin), element);
+        start = end + 1;
+    }
+}
+function recordFactory(factory: any) {
+    return (props: any, children: any = props?.children) => {
+        const value = factory(props, children);
+        const kids = normalizeChildren(children);
+        const separator = ["Column", "Row", "Table"].includes(factory.name) ? " " : "";
+        const fallback = kids.map((child: any) => typeof child === "object" && child !== null
+            ? (terminalMetadata.get(child)?.text ?? (child.__smudgyStyled === true ? String(child) : ""))
+            : String(child)).join(separator);
+        // Keep truncation from leaving half of a UTF-16 surrogate pair in copy/log text.
+        const text = props?.terminalText ?? fallback.replace(/[\r\n]/g, " ").slice(0, 1024).replace(/[\uD800-\uDBFF]$/, "");
+        const paneOverflow = ["Canvas", "TextEffect"].includes(factory.name) && props?.overflow === "pane";
+        const ownOutset = paneOverflow ? 65535 : factory.name === "Canvas" ? (props?.overflow ?? 0)
+            : factory.name === "TextEffect" ? (props?.outset ?? TEXT_EFFECT_DEFAULT_OUTSET) : 0;
+        if (!Number.isInteger(ownOutset) || ownOutset < 0 || (ownOutset > 2048 && !paneOverflow))
+            throw new TypeError("Widget paint overflow must be 0..2048 pixels or \"pane\"");
+        const outset = kids.reduce((max: number, child: any) => Math.max(max, terminalMetadata.get(child)?.outset ?? 0), ownOutset);
+        terminalMetadata.set(value, {text, outset});
+        widgetElements.add(value);
+        Object.defineProperty(value, Symbol.toPrimitive, { value: () => interpolateElement(value) });
+        return value;
+    };
+}
+function terminalElement(element: any) {
+    if (inlineElements.has(element)) return element;
+    const metadata = terminalMetadata.get(element);
+    return metadata ? op_smudgy_widget_terminal_metadata(element, metadata.text, metadata.outset) : element;
+}
+function markInline(element: any) { inlineElements.add(element); return element; }
+Object.defineProperty(globalThis, "__smudgy_inline_content", { value: (element: any, values: any[] = []) => {
+    if (Array.isArray(element) && Array.isArray(element.raw)) {
+        const children = element.flatMap((text: string, index: number) => index < values.length ? [text, values[index]] : [text]);
+        if (!children.some(child => inlineElements.has(child) || widgetElements.has(child) || (typeof child === "string" && child.includes(interpolationMarker)))) return undefined;
+        element = spanElement({}, children);
+    } else {
+        const parts = interpolatedParts(element);
+        if (parts !== undefined) element = spanElement({}, parts);
+    }
+    return (inlineElements.has(element) || widgetElements.has(element)) ? op_smudgy_widget_export_inline(terminalElement(element)) : undefined;
+} });
+
+function spanElement(props: any, children: any): any {
+    const kids = normalizeChildren(children).flatMap(child => interpolatedParts(child) ?? [child]);
+    const parts: any[] = [];
+    let text: any[] = [];
+    const flush = () => {
+        if (text.length) {
+            const token = (globalThis as any).__smudgy_prepare_span(text, props?.style ?? {});
+            parts.push(op_smudgy_widget_build_span(token)); text = [];
+        }
+    };
+    for (const child of kids) {
+        if (inlineElements.has(child) || widgetElements.has(child)) { flush(); parts.push(terminalElement(child)); }
+        else {
+            text.push(child);
+        }
+    }
+    flush();
+    const base = (globalThis as any).__smudgy_prepare_span([" "], props?.style ?? {});
+    const p = props ?? {};
+    const font = {
+        fontSize: p.fontSize ?? p.size,
+        fontWeight: p.fontWeight === "normal" ? 400 : p.fontWeight === "bold" ? 700 : p.fontWeight,
+        fontStyle: p.fontStyle,
+        fontFace: p.fontFace,
+    };
+    if (font.fontSize !== undefined && (!Number.isInteger(font.fontSize) || font.fontSize < 1 || font.fontSize > 512))
+        throw new TypeError("Span fontSize must be an integer from 1 to 512 pixels");
+    const span = markInline(op_smudgy_widget_join_spans(buildChildList(parts), base, font));
+    spanElements.add(span);
+    return span;
+}
+// A Span is a source of styled text/font metadata, not a captured widget tree.
+function textEffectChild(children: any): any {
+    const kids = normalizeChildren(children).flatMap(child => interpolatedParts(child) ?? [child]);
+    if (kids.some(child => widgetElements.has(child) || inlineElements.has(child))) {
+        const content = kids.filter(child => child !== "");
+        if (content.length !== 1 || !spanElements.has(content[0]))
+            throw new TypeError("TextEffect accepts text or one Span child; put mixed text inside a single Span");
+        return content[0];
+    }
+    return spanElement({}, kids);
+}
 // Normalize any children value -- a bare child, an array (jsxs / inline), nested
 // Fragment arrays, or undefined -- into one flat, filtered array. `jsx`/`jsxs` pass a
 // bare-or-array child; inline authors pass an array; Fragment returns its children
@@ -202,11 +337,31 @@ function makeWidgets(creator: { kind: string } | string, module?: string) {
     const Container = (props: Record<string, any>, children: any) =>
         op_smudgy_widget_build_container(props || {}, firstChild(children));
 
+    const Span = spanElement;
+    const TextEffect = (props: any, children: any) => {
+        const p = props ?? {};
+        const child = textEffectChild(children);
+        return markInline(op_smudgy_widget_build_text_effect(child, p.shader, {
+            uniforms: p.uniforms ?? {}, duration: p.duration ?? 0, outset: p.outset ?? TEXT_EFFECT_DEFAULT_OUTSET,
+            overflow: p.overflow ?? "bounds", scale: p.scale ?? 1, fadeIn: p.fadeIn ?? 0, fadeOut: p.fadeOut ?? 0,
+            captureScale: p.captureScale ?? 1,
+            composite: p.composite ?? "underlay", finish: p.finish ?? "remove", animated: p.animated ?? true,
+        }));
+    };
+
     const Text = (props: Record<string, any>, children: any) =>
         op_smudgy_widget_build_text(props || {}, textParts(children));
 
     const ProgressBar = (props: Record<string, any>, _children?: any) =>
         op_smudgy_widget_build_progress_bar(props || {});
+
+    const Slider = (props: Record<string, any>, _children?: any) => {
+        const p = props || {};
+        if (typeof p.onChange !== "function") throw new TypeError("widgets: Slider requires an onChange handler");
+        return op_smudgy_widget_build_slider({
+            ...p, onChange: (raw: string) => p.onChange(Number(raw)),
+        }, isolateToken);
+    };
 
     const Scrollable = (props: Record<string, any>, children: any) =>
         op_smudgy_widget_build_scrollable(props || {}, firstChild(children));
@@ -440,25 +595,28 @@ function makeWidgets(creator: { kind: string } | string, module?: string) {
         createWidget,
         removeWidget,
         extractMarkdownLinks,
-        Column,
-        Row,
-        Stack,
-        Container,
-        Text,
-        ProgressBar,
-        Scrollable,
-        Markdown,
-        Modal,
-        TextEditor,
-        Button,
-        MapView,
-        Canvas,
-        Space,
-        Image,
-        Checkbox,
-        Radio,
-        Tooltip,
-        Table,
+        Column: recordFactory(Column),
+        Row: recordFactory(Row),
+        Stack: recordFactory(Stack),
+        Container: recordFactory(Container),
+        Text: recordFactory(Text),
+        Span: recordFactory(Span),
+        TextEffect: recordFactory(TextEffect),
+        ProgressBar: recordFactory(ProgressBar),
+        Slider: recordFactory(Slider),
+        Scrollable: recordFactory(Scrollable),
+        Markdown: recordFactory(Markdown),
+        Modal: recordFactory(Modal),
+        TextEditor: recordFactory(TextEditor),
+        Button: recordFactory(Button),
+        MapView: recordFactory(MapView),
+        Canvas: recordFactory(Canvas),
+        Space: recordFactory(Space),
+        Image: recordFactory(Image),
+        Checkbox: recordFactory(Checkbox),
+        Radio: recordFactory(Radio),
+        Tooltip: recordFactory(Tooltip),
+        Table: recordFactory(Table),
         jsx,
         jsxs,
         Fragment,
@@ -483,7 +641,10 @@ if ((globalThis as any).__smudgy_user_api) {
         Stack: w.Stack,
         Container: w.Container,
         Text: w.Text,
+        Span: w.Span,
+        TextEffect: w.TextEffect,
         ProgressBar: w.ProgressBar,
+        Slider: w.Slider,
         Scrollable: w.Scrollable,
         Markdown: w.Markdown,
         Modal: w.Modal,
@@ -499,3 +660,5 @@ if ((globalThis as any).__smudgy_user_api) {
         Table: w.Table,
     });
 }
+
+Object.defineProperty(globalThis, "__smudgy_compile_text_shader", { value: op_smudgy_widget_compile_text_shader });

@@ -8,7 +8,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use deno_core::v8;
 use smudgy_cloud::{AreaId, AtlasId};
 
 use crate::models::aliases::AliasDefinition;
@@ -361,18 +360,16 @@ pub enum RuntimeAction {
         depth: u32,
         is_captured: Option<Arc<AtomicBool>>,
     },
-    /// Runs a raw v8 function handle (a `smudgy_widgets` widget callback). The handle is
-    /// isolate-bound; `isolate` + `instance` name the exact isolate *instantiation* that
-    /// created the callback, and the engine invokes the handle only under that instantiation.
-    /// A mismatch — the widget outlived an engine rebuild, so the handle's host heap is
-    /// disposed — is dropped at dispatch without touching v8.
-    ExecuteJavascriptFunction {
-        /// The isolate role that created the callback (its v8 handle is bound there).
+    /// Resolves a widget callback lease in the creating isolate's registry. The
+    /// isolate role and instance nonce must both match before touching V8. Trees
+    /// and queued messages contain only leases and may outlive the old isolate.
+    ExecuteWidgetCallback {
+        /// The isolate role that owns the callback registry.
         isolate: IsolateId,
         /// The creating isolate's instantiation nonce, parsed from the widget routing token
         /// alongside `isolate` ([`IsolateId::from_widget_token`]).
         instance: u64,
-        function: Arc<v8::Global<v8::Function>>,
+        function: smudgy_session_model::native_callback::CallbackLease,
         /// Positional string arguments forwarded to the JS function: empty for a no-arg
         /// `onPress`, a single clicked URL for a `Markdown` `onLink`.
         args: Vec<String>,
@@ -933,13 +930,13 @@ unsafe impl Sync for RuntimeAction {}
 
 impl RuntimeAction {
     /// Whether this action names a specific script/function of the *current* engine — a
-    /// `ScriptId`/`FunctionId` index into an isolate's registry, or a raw `v8::Global` handle.
+    /// `ScriptId`/`FunctionId` index or widget lease into an isolate's registry.
     /// Such an action is only meaningful to the engine that minted it: after an engine rebuild
     /// (reload) the id indexes the fresh registry and would invoke an unrelated handler (or
     /// error). These actions transit the session channel — watch deliveries and async event
     /// forwards ride it — so any left queued behind a `Reload` must be dropped during the
     /// rebuild rather than dispatched into the new engine (`interop.md` §3, reload hygiene).
-    /// `ExecuteJavascriptFunction` carries its own instantiation nonce and is already dropped at
+    /// `ExecuteWidgetCallback` carries its own instantiation nonce and is already dropped at
     /// dispatch on mismatch, but it is filtered here too so the rule has one home.
     pub(crate) fn references_engine_state(&self) -> bool {
         matches!(
@@ -947,7 +944,7 @@ impl RuntimeAction {
             Self::EvalJavascript { .. }
                 | Self::CallJavascriptFunction { .. }
                 | Self::RunAutomation { .. }
-                | Self::ExecuteJavascriptFunction { .. }
+                | Self::ExecuteWidgetCallback { .. }
                 | Self::AddScriptTrigger(_)
         )
     }
@@ -961,7 +958,7 @@ impl RuntimeAction {
     pub(crate) fn target_isolate(&self) -> Option<&IsolateId> {
         match self {
             Self::EvalJavascript { isolate, .. }
-            | Self::ExecuteJavascriptFunction { isolate, .. }
+            | Self::ExecuteWidgetCallback { isolate, .. }
             | Self::CallJavascriptFunction { isolate, .. }
             | Self::AddHotkey { isolate, .. }
             | Self::AddAlias { isolate, .. }

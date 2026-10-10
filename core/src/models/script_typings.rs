@@ -1264,6 +1264,8 @@ fn write_embedded_dir(target: &Path, dir: &Dir<'_>) -> Result<()> {
 }
 
 #[cfg(test)]
+mod inline_widget_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -2529,6 +2531,8 @@ export function make() { return createEvent('dynamic'); }
     /// internally consistent — i.e. that `<Column/>`-style authoring type-checks against the
     /// component prop shapes and that no host string tags leak in (empty `IntrinsicElements`).
     #[test]
+    // Keep positive and negative consumers of the shipped surface in one compilation.
+    #[allow(clippy::too_many_lines)]
     fn real_smudgy_widgets_dts_types_a_tsx_consumer() {
         use std::collections::BTreeMap;
 
@@ -2546,7 +2550,7 @@ export function make() { return createEvent('dynamic'); }
         let mut sources = BTreeMap::new();
         sources.insert(
             "ui.tsx".to_string(),
-            "import { createWidget, Column, Row, Text, ProgressBar, Button, MapView } from \"smudgy:widgets\";\n\
+            "import { createWidget, Column, Row, Text, ProgressBar, Slider, Button, MapView } from \"smudgy:widgets\";\n\
              import type { MapStyleApplication, MapDoorState } from \"smudgy:widgets\";\n\
              import { session, createState } from \"smudgy:core\";\n\
              interface Vitals { hp: number; maxhp: number; name: string }\n\
@@ -2560,6 +2564,8 @@ export function make() { return createEvent('dynamic'); }
                    <Text color=\"red\" size={18}>Hello</Text>\n\
                    <Row spacing={2}>\n\
                      <ProgressBar min={0} max={100} value={42} vertical={false} />\n\
+                     <Slider min={0} max={2000} value={vitals.bind('hp')} step={1} width=\"fill\" height={20}\n\
+                             onChange={(value) => { vitals.value.hp = value; }} onRelease={() => {}} />\n\
                      <Button onPress={() => {}}>Click</Button>\n\
                    </Row>\n\
                    {false && <Text>conditional</Text>}\n\

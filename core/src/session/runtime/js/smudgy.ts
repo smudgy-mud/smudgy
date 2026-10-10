@@ -64,6 +64,9 @@ const {
     op_smudgy_trigger_exists,
     op_smudgy_session_echo,
     op_smudgy_session_echo_styled,
+    op_smudgy_prepare_span,
+    op_smudgy_echo_inline,
+    op_smudgy_splice_inline,
     op_smudgy_session_reload,
     op_smudgy_session_connect,
     op_smudgy_session_disconnect,
@@ -1664,10 +1667,35 @@ function __styled_splice_args(
     return { runs, callbacks };
 }
 
+// Optional native element adapter supplied by the widgets extension. The core-only
+// runtime never needs to load widget ops. The adapter returns a single-use native
+// exchange token only for genuine elements with terminal metadata.
+interface InlineElementLike { readonly __smudgyWidgetElement: true; }
+
+function __inline_content_token(value: unknown, values: unknown[] = []): number | undefined {
+    if (typeof value === "string") {
+        if (!value.includes("\uE000smudgy-widget:")) return undefined;
+    } else if (typeof value !== "object" || value === null) return undefined;
+    return (globalThis as any).__smudgy_inline_content?.(value, values);
+}
+
+Object.defineProperty(globalThis, "__smudgy_prepare_span", { value: (
+    children: unknown[], options: ColorOptions | StyleBuilder = {},
+): number => {
+    if (children.some(value => typeof value === "object" && value !== null && !__is_styled_text(value))) {
+        throw new TypeError("Span children must be text, styled text, or an inline element");
+    }
+    const strings = Array(children.length + 1).fill("") as any;
+    strings.raw = strings.slice();
+    const fragment = __styled_from_template(null, null, null, null, strings, children);
+    const { runs, callbacks } = __styled_splice_args(fragment, __line_options(options, false));
+    return op_smudgy_prepare_span(runs, callbacks);
+} });
+
 /** The two call shapes every echo mirror accepts: a value (string or fragment), or a
  *  direct tagged-template use. Returns what should be delivered. */
 function __styled_echo_arg(
-    first: string | StyledTextLike | TemplateStringsArray,
+    first: string | StyledTextLike | InlineElementLike | TemplateStringsArray,
     values: unknown[],
 ): string | StyledTextImpl {
     if (__is_template_strings(first)) {
@@ -2191,7 +2219,12 @@ class Pane {
     /** Write whole lines into this pane's terminal (throws on widgets-only panes).
      *  Accepts a string or a `style`/`link` fragment, and is directly usable as a
      *  template tag. */
-    echo(text: string | StyledTextLike | TemplateStringsArray, ...values: unknown[]): void {
+    echo(text: string | StyledTextLike | InlineElementLike | TemplateStringsArray, ...values: unknown[]): void {
+        const inlineToken = __inline_content_token(text, values);
+        if (inlineToken !== undefined) {
+            op_smudgy_echo_inline(this._sessionId, inlineToken, this._name);
+            return;
+        }
         const arg = __styled_echo_arg(text, values);
         if (__is_styled_text(arg)) {
             const packed = __styled_echo_packed(arg);
@@ -3001,7 +3034,12 @@ class Session {
     /** Echo a line of text to this session's terminal (local; not sent to the MUD).
      *  Accepts a string or a `style`/`link` fragment, and is directly usable as a
      *  template tag. */
-    echo(line: string | StyledTextLike | TemplateStringsArray, ...values: unknown[]): void {
+    echo(line: string | StyledTextLike | InlineElementLike | TemplateStringsArray, ...values: unknown[]): void {
+        const inlineToken = __inline_content_token(line, values);
+        if (inlineToken !== undefined) {
+            op_smudgy_echo_inline(this.id, inlineToken, null);
+            return;
+        }
         const arg = __styled_echo_arg(line, values);
         if (__is_styled_text(arg)) {
             const { text, records, advancedLinks, callbacks } = __styled_echo_packed(arg);
@@ -3405,7 +3443,7 @@ const sendRaw = (data: string | BufferSource): void => getCurrentSession().sendR
  *  `style`/`link` fragment, and is directly usable as a template tag:
  *  `` echo`hi ${style.red`there`}` ``. */
 const echo = (
-    line: string | StyledTextLike | TemplateStringsArray,
+    line: string | StyledTextLike | InlineElementLike | TemplateStringsArray,
     ...values: unknown[]
 ): void => getCurrentSession().echo(line, ...values);
 
@@ -4779,14 +4817,22 @@ class Line {
     /** Inserts text at the specified position with optional styling (plain
      *  options or a style chain); whatever `options` leaves unset inherits the
      *  style at the insertion point. Styled text splices with its own colors
-     *  and links; `options` is then the base its unset colors inherit from. */
+     *  and links; `options` is then the base its unset colors inherit from.
+     *  Inline content keeps its fonts and effects; style it with Span instead
+     *  of passing `options`. */
     insert(
-        text: string | StyledTextLike,
+        text: string | StyledTextLike | InlineElementLike,
         begin: number,
         end: number = begin,
         options: ColorOptions | StyleBuilder = {},
     ): void {
         options = __line_options(options, false);
+        const inlineToken = __inline_content_token(text);
+        if (inlineToken !== undefined) {
+            if (Object.keys(options).length > 0) throw new TypeError("Style inline content with Span's style prop before insertion");
+            op_smudgy_splice_inline(inlineToken, this._lineNumber, begin, end);
+            return;
+        }
         if (__is_styled_text(text)) {
             this._splice(text, begin, end, options);
             return;
@@ -4815,7 +4861,12 @@ class Line {
 
     /** Replaces text in the specified byte range. Styled text splices with its own
      *  colors and links; its unstyled parts inherit the style at the splice point. */
-    replaceAt(text: string | StyledTextLike, begin: number, end: number): void {
+    replaceAt(text: string | StyledTextLike | InlineElementLike, begin: number, end: number): void {
+        const inlineToken = __inline_content_token(text);
+        if (inlineToken !== undefined) {
+            op_smudgy_splice_inline(inlineToken, this._lineNumber, begin, end);
+            return;
+        }
         if (__is_styled_text(text)) {
             this._splice(text, begin, end, {});
             return;
@@ -4909,9 +4960,10 @@ class Line {
         }
     }
 
-    /** Replaces every occurrence of `oldStr` with `newStr` (plain or styled).
+    /** Replaces every occurrence of `oldStr` with `newStr` (plain, styled, or
+     *  inline content). Each inline occurrence gets its own effect instance.
      *  The search side is always plain text. Returns whether anything matched. */
-    replace(oldStr: string, newStr: string | StyledTextLike): boolean {
+    replace(oldStr: string, newStr: string | StyledTextLike | InlineElementLike): boolean {
         const ranges = __occurrenceByteRanges(this.text, oldStr);
         // Right to left: each edit reflows the line, but ranges before the edit
         // point keep their offsets.

@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use arc_swap::ArcSwap;
-use deno_core::v8;
 use iced::{
     Subscription,
     futures::{SinkExt, channel::mpsc::Sender},
@@ -11,7 +10,7 @@ use smudgy_cloud::WidgetIsolate;
 use smudgy_map_widget::map_view;
 
 type ElementFn<'a, Theme, Renderer> =
-    Arc<dyn Fn() -> iced::Element<'a, WidgetMessage, Theme, Renderer>>;
+    Arc<dyn Fn() -> iced::Element<'a, WidgetMessage, Theme, Renderer> + Send + Sync>;
 
 /// One mounted widget: its render closure, whether it is currently shown (`enabled = false`
 /// hides it without dropping the tree), and which pane hosts it. `target` is the pane's
@@ -61,13 +60,15 @@ impl<Theme, Renderer> std::fmt::Debug for WidgetRoot<'_, Theme, Renderer> {
 
 #[derive(Debug, Clone)]
 pub enum WidgetMessage {
-    /// A widget callback (e.g. a button `onPress` or a `Markdown` `onLink`). `callback` is a v8
-    /// handle bound to the isolate that built it; `isolate` is that isolate's token so `core` can
+    TerminalLink(smudgy_ui_shared::terminal_buffer::LinkClickEvent),
+    TerminalTooltip(smudgy_session_model::styled_line::LinkTooltipCallback),
+    /// A widget callback (e.g. a button `onPress` or a `Markdown` `onLink`). `callback` is a
+    /// thread-safe lease into the creating isolate's registry; `isolate` is that isolate's token so `core` can
     /// dispatch the call back into it instead of always `main`. `args` are positional string
     /// arguments forwarded to the JS function — empty for a no-arg `onPress`, a single clicked URL
     /// for a `Markdown` `onLink`.
     InvokeCallback {
-        callback: Arc<v8::Global<v8::Function>>,
+        callback: crate::WidgetCallback,
         isolate: WidgetIsolate,
         args: Vec<String>,
     },
@@ -81,7 +82,7 @@ pub enum WidgetMessage {
     TextEditorAction {
         key: String,
         action: iced::widget::text_editor::Action,
-        on_change: Option<Arc<v8::Global<v8::Function>>>,
+        on_change: Option<crate::WidgetCallback>,
         isolate: WidgetIsolate,
     },
     MapMessage {
@@ -89,8 +90,6 @@ pub enum WidgetMessage {
         message: map_view::Message,
     },
 }
-unsafe impl Send for WidgetMessage {}
-unsafe impl Sync for WidgetMessage {}
 
 /// Widgets are keyed by `(creator, name)` so two packages' `createWidget("hud")` cannot clobber
 /// each other (`creator` is the importer's provenance JSON; a package's creator maps 1:1 to its
@@ -100,9 +99,6 @@ unsafe impl Sync for WidgetMessage {}
 struct Inner<'a, Theme, Renderer> {
     elements: BTreeMap<(String, String), Entry<'a, Theme, Renderer>>,
 }
-
-unsafe impl<Theme, Renderer> Send for WidgetRoot<'_, Theme, Renderer> {}
-unsafe impl<Theme, Renderer> Sync for WidgetRoot<'_, Theme, Renderer> {}
 
 impl<Theme, Renderer> Clone for WidgetRoot<'_, Theme, Renderer> {
     fn clone(&self) -> Self {
@@ -226,11 +222,11 @@ where
 
     /// Drop every mounted widget, across all creators and panes. The embedder calls this when
     /// the script engine whose isolates minted the mounted callbacks is torn down (an engine
-    /// rebuild): every entry's render closure holds `v8::Global` callbacks bound to the dead
-    /// isolates, so the widgets it draws can no longer do anything. Reloaded modules re-mount
-    /// theirs; dynamically created widgets are gone, as they would never be re-minted. Dropping
-    /// a `v8::Global` whose isolate is already disposed is a no-op, so the swap is safe from
-    /// any thread once those isolates are down.
+    /// rebuild): callbacks carry leases into the retired isolate's registry, so the
+    /// widgets it draws can no longer do anything. Reloaded modules re-mount
+    /// theirs; dynamically created widgets are gone, as they would never be re-minted.
+    /// Render closures and callback leases contain no V8 handles and may be released
+    /// on either thread.
     pub fn clear(&self) {
         self.inner.swap(Arc::new(Inner {
             elements: BTreeMap::new(),

@@ -22,6 +22,14 @@ pub fn transpile(
     module_specifier: &ModuleSpecifier,
     code: &str,
 ) -> Result<ModuleContents, deno_ast::TranspileError> {
+    if module_specifier.path().ends_with(".wgsl") {
+        let label = serde_json::to_string(module_specifier.as_str()).unwrap();
+        let source = serde_json::to_string(code).unwrap();
+        return Ok((
+            format!("export default globalThis.__smudgy_compile_text_shader({label}, {source});"),
+            None,
+        ));
+    }
     let media_type = if module_specifier.as_str().starts_with("node:") {
         MediaType::TypeScript
     } else {
@@ -87,6 +95,16 @@ mod tests {
     fn emit(name: &str, code: &str) -> String {
         let spec = ModuleSpecifier::parse(&format!("file:///{name}")).expect("valid url");
         transpile(&spec, code).expect("transpiles").0
+    }
+
+    #[test]
+    fn wgsl_imports_preserve_source_and_url_as_data() {
+        let source =
+            "// ` ${notJavascript} \" quote\nfn effect(p: vec2f) -> vec4f { return vec4f(0.0); }";
+        let output = emit("effect.wgsl", source);
+        assert!(output.contains("__smudgy_compile_text_shader"));
+        assert!(output.contains(&serde_json::to_string(source).unwrap()));
+        assert!(output.contains("file:///effect.wgsl"));
     }
 
     #[test]

@@ -1173,17 +1173,14 @@ impl Inner<'_> {
 
                 Ok(result)
             }
-            RuntimeAction::ExecuteJavascriptFunction {
+            RuntimeAction::ExecuteWidgetCallback {
                 isolate,
                 instance,
                 function,
                 args,
-            } => self.script_engine.execute_javascript_function(
-                &isolate,
-                instance,
-                function.as_ref(),
-                &args,
-            ),
+            } => self
+                .script_engine
+                .execute_widget_callback(&isolate, instance, &function, &args),
             RuntimeAction::InvokeLinkCallback {
                 session,
                 isolate,
@@ -2000,6 +1997,11 @@ impl Inner<'_> {
                 line_number,
                 operation,
             } => {
+                // The row may still be in the output batch. Deliver its append (and
+                // any earlier replacements/clears) before the edit reaches the UI.
+                if let Some(fut) = self.flush_buffer_updates()? {
+                    fut.await?;
+                }
                 // Write consistency: apply the SAME deterministic op to the ring entry (if
                 // the target line is still within the window) so a later `buffer.line(n).text`
                 // reflects the edit, then forward `PerformLineOperation` to the UI.

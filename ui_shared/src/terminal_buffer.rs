@@ -26,6 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SpanMetadata {
+    pub object: Option<u64>,
     pub blink: Blink,
     pub underline: LinkDecoration,
     pub overline: LinkDecoration,
@@ -1381,6 +1382,7 @@ fn make_resolved_span_with_rewrite(
         span = span.background(Background::Color(bg));
     }
     let metadata = SpanMetadata {
+        object: None,
         blink: attributes.blink,
         underline,
         overline,
@@ -1585,6 +1587,10 @@ pub struct TerminalBuffer {
     /// mutation — so the per-frame hover path can skip hit testing entirely on
     /// the (overwhelmingly common) linkless buffer via [`Self::has_links`].
     lines_with_links: usize,
+    /// Lines carrying text effects, by the widest paint outset among them.
+    decorated_lines: ObjectIndex,
+    /// Lines carrying inline objects, by the widest paint outset among them.
+    object_lines: ObjectIndex,
     /// Bumped whenever keyboard focus returns to this pane's command editor.
     /// Terminal widget instances observe the epoch and drop their independent
     /// link-navigation focus before processing further keyboard input.
@@ -1658,11 +1664,39 @@ impl TerminalBuffer {
             last_line_number: 0,
             span_generation: crate::prefs::current().generation,
             lines_with_links: 0,
+            decorated_lines: Default::default(),
+            object_lines: Default::default(),
             link_navigation_reset_epoch: 0,
             link_state: Rc::new(RefCell::new(BufferLinkState::new(protocol_state))),
             open_line_replacement: None,
             system_rows: HashMap::new(),
         }
+    }
+
+    /// How far beyond the viewport a row may still paint: the widest object or
+    /// effect outset held anywhere in the buffer, so a single small effect does
+    /// not turn on the maximum overscan band.
+    pub(crate) fn inline_outset(&self, height: f32) -> f32 {
+        self.object_lines
+            .outset(height)
+            .max(self.decorated_lines.outset(height))
+    }
+
+    pub(crate) fn has_inline_objects(&self) -> bool {
+        !self.object_lines.is_empty()
+    }
+
+    pub(crate) fn has_inline_effects(&self) -> bool {
+        !self.decorated_lines.is_empty()
+    }
+
+    fn note_decorations(&mut self, line: usize, text: &StyledLine) {
+        note_inline_extents(
+            &mut self.object_lines,
+            &mut self.decorated_lines,
+            line,
+            text,
+        );
     }
 
     pub fn note_visibility_input(&self) {
@@ -1702,6 +1736,7 @@ impl TerminalBuffer {
 
     /// Account for `line` entering the buffer (call beside every push).
     fn note_added(&mut self, line_number: usize, line: &BufferLine) {
+        self.note_decorations(line_number, &line.styled_line);
         if line.styled_line.links.is_empty() {
             return;
         }
@@ -1713,6 +1748,8 @@ impl TerminalBuffer {
 
     /// Account for `line` leaving the buffer (call on every pop).
     fn note_removed(&mut self, line_number: usize, line: &BufferLine) {
+        self.decorated_lines.remove(&line_number);
+        self.object_lines.remove(&line_number);
         if line.styled_line.links.is_empty() {
             return;
         }
@@ -1783,6 +1820,7 @@ impl TerminalBuffer {
                 .borrow_mut()
                 .replace_line(line_number, Some(&replacement.styled_line));
         }
+        self.note_decorations(line_number, &replacement.styled_line);
         self.lines[index] = replacement;
     }
 
@@ -1865,6 +1903,7 @@ impl TerminalBuffer {
                             .borrow_mut()
                             .replace_line(self.last_line_number, Some(&joined.styled_line));
                     }
+                    self.note_decorations(self.last_line_number, &joined.styled_line);
                     self.lines.push_back(joined);
                 }
                 None => {
@@ -1893,6 +1932,8 @@ impl TerminalBuffer {
             return;
         };
 
+        self.decorated_lines.remove(&self.last_line_number);
+        self.object_lines.remove(&self.last_line_number);
         let detached = if old.styled_line.links.is_empty() {
             DetachedLinks::default()
         } else {
@@ -1935,6 +1976,7 @@ impl TerminalBuffer {
             detached,
             Some(&replacement.styled_line),
         );
+        self.note_decorations(self.last_line_number, &replacement.styled_line);
         self.lines.push_back(replacement);
         self.line_terminated = false;
     }
@@ -2401,6 +2443,12 @@ impl TerminalBuffer {
             let old = Arc::clone(&line.styled_line);
             line.styled_line = operation.apply(&old);
             line.invalidate_spans();
+            note_inline_extents(
+                &mut self.object_lines,
+                &mut self.decorated_lines,
+                absolute_line_number,
+                &line.styled_line,
+            );
             // An edit can add or drop a line's links; keep the O(1) count true.
             let has_links = !line.styled_line.links.is_empty();
             if has_links && !had_links {
@@ -2439,6 +2487,8 @@ impl TerminalBuffer {
         }
         self.link_state.borrow_mut().retire_all();
         self.lines.clear();
+        self.decorated_lines.clear();
+        self.object_lines.clear();
         self.lines_with_links = 0;
         self.line_terminated = true;
         self.system_rows.clear();
@@ -4325,5 +4375,165 @@ mod tests {
             .update_visibility_timers(Instant::now() + Duration::from_millis(1));
         assert!(!link_state.borrow().line_concealed(1));
         assert!(link_state.borrow().contains(key));
+    }
+}
+
+/// Records (or clears) a line's membership in both outset indexes.
+fn note_inline_extents(
+    objects: &mut ObjectIndex,
+    decorations: &mut ObjectIndex,
+    line: usize,
+    text: &StyledLine,
+) {
+    match &text.objects {
+        Some(held) => objects.insert(line, held.iter().map(|o| o.paint_outset).max().unwrap_or(0)),
+        None => objects.remove(&line),
+    }
+    match &text.decorations {
+        // A pane effect paints only while its anchor row is in the viewport, so
+        // it never needs the overscan band; its outset is irrelevant here.
+        Some(held) => decorations.insert(
+            line,
+            held.iter()
+                .map(|e| {
+                    if e.effect.shader.pane {
+                        0
+                    } else {
+                        e.effect.outset
+                    }
+                })
+                .max()
+                .unwrap_or(0),
+        ),
+        None => decorations.remove(&line),
+    }
+}
+
+/// Sparse line membership plus counted extents: querying overscan must not scan
+/// scrollback even when one reusable widget has been echoed onto 100,000 lines.
+#[derive(Debug, Default)]
+struct ObjectIndex {
+    lines: std::collections::BTreeMap<usize, u16>,
+    extents: std::collections::BTreeMap<u16, usize>,
+}
+impl ObjectIndex {
+    fn insert(&mut self, line: usize, extent: u16) {
+        if self.lines.get(&line) == Some(&extent) {
+            return;
+        }
+        self.remove(&line);
+        self.lines.insert(line, extent);
+        *self.extents.entry(extent).or_default() += 1;
+    }
+    fn remove(&mut self, line: &usize) {
+        if let Some(extent) = self.lines.remove(line) {
+            let count = self.extents.get_mut(&extent).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                self.extents.remove(&extent);
+            }
+        }
+    }
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.extents.clear();
+    }
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+    fn outset(&self, height: f32) -> f32 {
+        let numeric = self
+            .extents
+            .range(..u16::MAX)
+            .next_back()
+            .map_or(0.0, |(extent, _)| f32::from(*extent));
+        if self.extents.contains_key(&u16::MAX) {
+            numeric.max(if height.is_finite() { height } else { 2048.0 })
+        } else {
+            numeric
+        }
+    }
+}
+
+#[cfg(test)]
+mod object_index_tests {
+    use super::{ObjectIndex, TerminalBuffer};
+    use smudgy_session_model::{
+        StyledLine,
+        inline_content::{InlineDecoration, InlineOwner, TextEffect},
+        text_shader::{Shader, ShaderEffect},
+    };
+    use std::sync::Arc;
+
+    fn decorated(outset: u16, pane: bool) -> Arc<StyledLine> {
+        let shader = Shader::compile(
+            "identity.wgsl",
+            "fn effect(p: vec2f) -> vec4f { return sampleText(p); }",
+        )
+        .unwrap();
+        let uniforms = shader.uniforms(&Default::default()).unwrap();
+        let mut line = StyledLine::from_styled_runs(
+            &[("glowing", smudgy_session_model::Style::DEFAULT, None)],
+            smudgy_session_model::Style::DEFAULT,
+        );
+        line.decorations = Some(Arc::new(vec![InlineDecoration::new(
+            0..7,
+            TextEffect {
+                shader: Arc::new(ShaderEffect {
+                    pane,
+                    scale: Default::default(),
+                    capture_scale: Default::default(),
+                    fade_in_ms: 0,
+                    fade_out_ms: 0,
+                    shader,
+                    uniforms,
+                    replace: false,
+                    hold: false,
+                    animated: true,
+                }),
+                duration_ms: 0,
+                outset,
+            },
+            InlineOwner::default(),
+        )]));
+        Arc::new(line)
+    }
+
+    #[test]
+    fn overscan_follows_the_widest_effect_actually_held() {
+        let mut buffer = TerminalBuffer::new();
+        buffer.push_line(decorated(8, false));
+        for _ in 0..100 {
+            buffer.push_line(Arc::new(StyledLine::from_styled_runs(
+                &[("plain", smudgy_session_model::Style::DEFAULT, None)],
+                smudgy_session_model::Style::DEFAULT,
+            )));
+        }
+        assert!(buffer.has_inline_effects());
+        assert_eq!(buffer.inline_outset(600.0), 8.0);
+        // A pane effect only paints while its row is in the viewport.
+        buffer.push_line(decorated(2048, true));
+        assert_eq!(buffer.inline_outset(600.0), 8.0);
+        buffer.push_line(decorated(300, false));
+        assert_eq!(buffer.inline_outset(600.0), 300.0);
+    }
+
+    #[test]
+    fn repeated_instances_share_counted_extents_and_clear_releases_membership() {
+        let mut index = ObjectIndex::default();
+        for line in 0..100_000 {
+            index.insert(line, 32);
+        }
+        index.insert(3, u16::MAX);
+        index.insert(4, 2048);
+        assert_eq!(index.extents.len(), 3);
+        assert_eq!(index.outset(3000.0), 3000.0);
+        index.remove(&3);
+        assert_eq!(index.outset(3000.0), 2048.0);
+        index.remove(&4);
+        assert_eq!(index.outset(3000.0), 32.0);
+        index.clear();
+        assert!(index.is_empty());
+        assert_eq!(index.outset(3000.0), 0.0);
     }
 }

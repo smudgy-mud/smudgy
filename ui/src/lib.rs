@@ -38,6 +38,8 @@ mod application_audio;
 mod assets;
 mod cloud_account;
 mod discord_presence;
+#[cfg(feature = "profiling")]
+mod frame_probe;
 mod i18n;
 mod images;
 mod package_requirements;
@@ -1286,6 +1288,8 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
         }
     }
 
+    #[cfg(feature = "profiling")]
+    subs.push(frame_probe::subscription());
     Subscription::batch(subs)
 }
 
@@ -2152,7 +2156,7 @@ pub(crate) fn spike_forensics_enabled() -> bool {
 
 /// QA hook (debug builds only): `SMUDGY_SPIKE_AUTOSESSION=<n>` (1 or 2)
 /// makes the first smudgy window open that many offline sessions at startup
-/// (no connect-modal driving needed) and opens a second, empty smudgy
+/// (no connect-modal driving needed). Also opens a second, empty smudgy
 /// window — the exact arrangement the scripted drag matrix requires.
 #[cfg(debug_assertions)]
 fn spike_autosession_count() -> usize {

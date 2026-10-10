@@ -32,7 +32,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use deno_core::v8;
 use iced::widget::canvas;
 use iced::{Color, Point, Radians, Rectangle, Size, Vector, mouse, window};
 use smudgy_cloud::image_source::{
@@ -2051,7 +2050,7 @@ impl Default for SceneMemo {
 /// token, exactly the Button `onPress` shape.
 #[derive(Clone)]
 pub(crate) struct PointerHandler {
-    pub callback: Arc<v8::Global<v8::Function>>,
+    pub callback: crate::WidgetCallback,
     pub isolate: WidgetIsolate,
 }
 
@@ -2094,6 +2093,7 @@ pub(crate) enum ViewFit {
 #[derive(Clone)]
 pub(crate) struct SceneProgram {
     pub scene: SceneSource,
+    pub started: Option<Instant>,
     pub view_box: Option<Rectangle>,
     pub fit: ViewFit,
     pub on_pointer: Option<PointerHandler>,
@@ -2268,13 +2268,25 @@ impl canvas::Program<WidgetMessage, smudgy_theme::Theme> for SceneProgram {
     ) -> Option<canvas::Action<WidgetMessage>> {
         match event {
             iced::Event::Window(window::Event::RedrawRequested(now)) => {
+                let first = state.epoch.is_none();
+                if first {
+                    state.epoch = self.started;
+                }
                 state.tick(*now);
                 let parsed = self.current();
                 let generation = Arc::as_ptr(&parsed) as usize;
                 if state.reconciled != generation {
                     state.reconciled = generation;
                     state.cache.clear();
-                    reconcile_clocks(&parsed.records, &mut state.clocks, state.now_s);
+                    reconcile_clocks(
+                        &parsed.records,
+                        &mut state.clocks,
+                        if first && self.started.is_some() {
+                            0.0
+                        } else {
+                            state.now_s
+                        },
+                    );
                 }
                 // An image load landing anywhere bumps the store's completion generation;
                 // a scene that draws images must re-record its cached geometry to show it
@@ -2735,6 +2747,38 @@ mod tests {
         assert!((mid.a - 0.5).abs() < 1e-6);
     }
 
+    #[test]
+    fn inline_canvas_does_not_restart_a_completed_transient_after_virtualization() {
+        use canvas::Program;
+        let now = Instant::now();
+        let scene = accepted(
+            serde_json::json!([{"kind":"circle","id":"pulse","r":3,"transient":true,"animate":{"r":{"to":1000,"duration":100}}}]),
+        );
+        let program = SceneProgram {
+            started: Some(now.checked_sub(std::time::Duration::from_secs(3)).unwrap()),
+            scene: SceneSource::Static(Arc::new(scene)),
+            view_box: None,
+            fit: ViewFit::Fill,
+            on_pointer: None,
+            image_store: None,
+        };
+        let mut state = CanvasState::default();
+        assert!(
+            program
+                .update(
+                    &mut state,
+                    &iced::Event::Window(window::Event::RedrawRequested(now)),
+                    Rectangle::with_size(Size::new(12.0, 12.0)),
+                    mouse::Cursor::Unavailable
+                )
+                .is_none()
+        );
+        assert!(!any_animation_live(&state.clocks, state.now_s));
+        assert!(
+            resolve_record(&program.current().records[0], 0, &state.clocks, state.now_s).is_none()
+        );
+    }
+
     // ---- clocks: identity across generations ----------------------------------------------
 
     fn ring_scene(radius_to: f64) -> ParsedScene {
@@ -3137,6 +3181,7 @@ mod tests {
     #[test]
     fn view_box_maps_pointer_coordinates_into_scene_space() {
         let program = SceneProgram {
+            started: None,
             scene: SceneSource::Static(Arc::new(ParsedScene::default())),
             view_box: Some(Rectangle::new(
                 Point::new(10.0, 20.0),
@@ -3163,6 +3208,7 @@ mod tests {
     #[test]
     fn contain_fit_scales_uniformly_and_centers() {
         let program = SceneProgram {
+            started: None,
             scene: SceneSource::Static(Arc::new(ParsedScene::default())),
             view_box: Some(Rectangle::new(Point::ORIGIN, Size::new(480.0, 480.0))),
             fit: ViewFit::Contain,
@@ -3194,6 +3240,7 @@ mod tests {
             { "kind": "rect", "width": 1, "height": 1 },
         ])));
         let program = SceneProgram {
+            started: None,
             scene: SceneSource::Bound {
                 cell: cell.clone(),
                 memo: Arc::new(Mutex::new(SceneMemo::default())),
@@ -3230,5 +3277,140 @@ mod tests {
         // A null snapshot (absent path) serves the binding's fallback scene (empty here).
         cell.set(json!(null));
         assert!(program.current().records.is_empty());
+    }
+}
+
+// The terminal supplies each attachment's mount clock during factory invocation.
+// This also preserves transient completion when virtualization reconstructs a tree.
+thread_local! { static INLINE_START: std::cell::Cell<Option<Instant>> = const {std::cell::Cell::new(None)}; }
+pub(crate) fn with_inline_start<T>(started: Instant, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INLINE_START.set(self.0);
+        }
+    }
+    let _restore = Restore(INLINE_START.replace(Some(started)));
+    f()
+}
+pub(crate) fn inline_start() -> Option<Instant> {
+    INLINE_START.get()
+}
+
+/// The canvas frame covers its declared paint bounds, while layout and pointer
+/// input keep the authored small box. Both GPU and software damage tracking see
+/// the real geometry extent, including pixels outside that box.
+pub(crate) struct OverflowCanvas {
+    pub program: SceneProgram,
+    pub width: iced::Length,
+    pub height: iced::Length,
+    pub overflow: u16,
+}
+impl OverflowCanvas {
+    fn paint_bounds(&self, bounds: Rectangle, viewport: &Rectangle) -> Option<Rectangle> {
+        if self.overflow == u16::MAX {
+            bounds
+                .expand(viewport.height)
+                .intersects(viewport)
+                .then_some(*viewport)
+        } else {
+            bounds
+                .expand(f32::from(self.overflow))
+                .intersection(viewport)
+        }
+    }
+}
+impl iced::advanced::Widget<WidgetMessage, smudgy_theme::Theme, iced::Renderer> for OverflowCanvas {
+    fn size(&self) -> Size<iced::Length> {
+        Size::new(self.width, self.height)
+    }
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<CanvasState>()
+    }
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(CanvasState::default())
+    }
+    fn layout(
+        &mut self,
+        _: &mut iced::advanced::widget::Tree,
+        _: &iced::Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        iced::advanced::layout::atomic(limits, self.width, self.height)
+    }
+    fn update(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: mouse::Cursor,
+        _: &iced::Renderer,
+        _: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, WidgetMessage>,
+        viewport: &Rectangle,
+    ) {
+        use canvas::Program;
+        let bounds = layout.bounds();
+        if self.paint_bounds(bounds, viewport).is_none() {
+            return;
+        }
+        if let Some(action) = self.program.update(
+            tree.state.downcast_mut::<CanvasState>(),
+            event,
+            bounds,
+            cursor,
+        ) {
+            let (message, redraw, status) = action.into_inner();
+            // Bounded native cadence; no JS callback runs for animation frames.
+            // Preserve Canvas's next-frame request so native tweens follow the
+            // presentation cadence, including high-refresh displays.
+            shell.request_redraw_at(redraw);
+            if let Some(message) = message {
+                shell.publish(message);
+            }
+            if status == iced::event::Status::Captured {
+                shell.capture_event();
+            }
+        }
+    }
+    fn draw(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        renderer: &mut iced::Renderer,
+        _: &smudgy_theme::Theme,
+        _: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        _: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        use iced::advanced::{Renderer as _, graphics::geometry::Renderer as _};
+        let bounds = layout.bounds();
+        let Some(paint) = self.paint_bounds(bounds, viewport) else {
+            return;
+        };
+        if paint.width < 1.0 || paint.height < 1.0 {
+            return;
+        }
+        let state = tree.state.downcast_ref::<CanvasState>();
+        let parsed = self.program.current();
+        let mut frame = canvas::Frame::new(renderer, paint.size());
+        frame.translate(Vector::new(bounds.x - paint.x, bounds.y - paint.y));
+        if let Some((view_box, scale, offset)) = self.program.view_mapping(bounds.size()) {
+            frame.translate(offset);
+            frame.scale_nonuniform(scale);
+            frame.translate(Vector::new(-view_box.x, -view_box.y));
+        }
+        draw_records(
+            &mut frame,
+            &parsed.records,
+            &state.clocks,
+            state.now_s,
+            &mut 0,
+        );
+        renderer.with_layer(paint, |renderer| {
+            renderer.with_translation(Vector::new(paint.x, paint.y), |renderer| {
+                renderer.draw_geometry(frame.into_geometry());
+            });
+        });
     }
 }

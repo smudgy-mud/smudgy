@@ -1,3 +1,6 @@
+/** Terminal-compatible ordinary widget. Construct with Span or an inline effect. */
+interface SmudgyInlineElement { readonly __smudgyWidgetElement: true; }
+
 // =============================================================================
 //  smudgy:core — TypeScript declarations  (GENERATED — DO NOT EDIT)
 // =============================================================================
@@ -1202,7 +1205,7 @@ declare module "smudgy:core" {
     readonly created?: boolean;
     /** Write whole lines into this pane's terminal. Throws on widgets-only panes.
      *  Takes styled text too, and works directly as a template tag. */
-    echo(text: string | StyledText): void;
+    echo(text: string | StyledText | SmudgyInlineElement): void;
     echo(text: TemplateStringsArray, ...values: unknown[]): void;
     /** Clear this pane's terminal scrollback (works on main). Throws on widgets-only panes. */
     clear(): void;
@@ -1532,7 +1535,7 @@ declare module "smudgy:core" {
     readonly profile: Profile;
     /** Echo a line into this session's output (local; not sent to the MUD).
      *  Takes styled text too, and works directly as a template tag. */
-    echo(line: string | StyledText): void;
+    echo(line: string | StyledText | SmudgyInlineElement): void;
     echo(text: TemplateStringsArray, ...values: unknown[]): void;
     /** Send a command to this session's MUD (alias processing + command splitting). */
     send(line: string): void;
@@ -2081,7 +2084,7 @@ declare module "smudgy:core" {
    * echo`hi ${style.red`there`}`;
    * ```
    */
-  export function echo(line: string | StyledText): void;
+  export function echo(line: string | StyledText | SmudgyInlineElement): void;
   export function echo(text: TemplateStringsArray, ...values: unknown[]): void;
   /** Send a command to the MUD as if you typed it: aliases run, and the command
    *  separator (e.g. `;`) splits it into multiple commands. */
@@ -2981,23 +2984,28 @@ declare module "smudgy:core" {
    *
    * The text-search methods (`replace`, `highlight`, `remove`) act on every
    * occurrence of their target string; the `*At` forms take byte offsets
-   * (e.g. from `styles`).
+   * (e.g. from `styles`). `insert`, `replaceAt`, and `replace` also accept
+   * inline content such as `Span` and `TextEffect`, directly or interpolated
+   * into a template string. Font settings, effects, links, and selectable text
+   * are preserved on both current and already-printed lines. Each inserted
+   * occurrence gets its own effect instance.
    */
   export interface Line {
     /** Insert `text` at byte offset `begin` (replacing up to `end` if given),
      *  with optional colors (plain options or a style chain); whatever
      *  `options` leaves unset inherits the style at the insertion point.
      *  Styled text keeps its own colors and links; `options` then supplies
-     *  the colors its unstyled parts get. */
+     *  the colors its unstyled parts get. For inline content, put colors on
+     *  `Span`'s `style` prop and leave `options` unset. */
     insert(
-      text: string | StyledText,
+      text: string | StyledText | SmudgyInlineElement,
       begin: number,
       end?: number,
       options?: LineColorOptions | StyleBuilder,
     ): void;
     /** Replace the byte range `[begin, end)` with `text`. Styled text keeps its
      *  own colors and links; its unstyled parts blend into the surrounding style. */
-    replaceAt(text: string | StyledText, begin: number, end: number): void;
+    replaceAt(text: string | StyledText | SmudgyInlineElement, begin: number, end: number): void;
     /** Restyle the byte range `[begin, end)`: what `options` sets changes,
      *  and everything it leaves unset keeps what each span already had — so
      *  `{ fg: "red" }` recolors without touching backgrounds or bold, and
@@ -3012,9 +3020,10 @@ declare module "smudgy:core" {
     ): void;
     /** Remove the byte range `[begin, end)`. */
     removeAt(begin: number, end: number): void;
-    /** Replace every occurrence of `oldStr` with `newStr` (plain or styled;
-     *  the search side is always plain text). Returns `true` if any was found. */
-    replace(oldStr: string, newStr: string | StyledText): boolean;
+    /** Replace every occurrence of `oldStr` with `newStr` (plain text, styled
+     *  text, or inline content; the search side is always plain text).
+     *  Returns `true` if any was found. */
+    replace(oldStr: string, newStr: string | StyledText | SmudgyInlineElement): boolean;
     /** Restyle every occurrence of `str` (see {@link Line.highlightAt}: unset
      *  options are left untouched, and a style chain like `style.red.bold`
      *  or a link tag like `link("kill goblin")` works directly as the
@@ -3147,7 +3156,7 @@ declare module "smudgy:core" {
    * named export of the same name.
    */
   export interface SmudgyApi {
-    echo(line: string | StyledText): void;
+    echo(line: string | StyledText | SmudgyInlineElement): void;
     echo(text: TemplateStringsArray, ...values: unknown[]): void;
     readonly style: StyleBuilder;
     readonly link: typeof link;

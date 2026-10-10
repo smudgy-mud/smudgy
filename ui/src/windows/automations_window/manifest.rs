@@ -237,6 +237,7 @@ pub enum Cap {
     MapperRead,
     MapperWrite,
     Widgets,
+    WidgetShaders,
     InteropRead,
     InteropWrite,
     InteropBroadcast,
@@ -882,6 +883,7 @@ fn set_cap(caps: &mut SmudgyCapabilities, cap: Cap, on: bool) {
             }
         }
         Cap::Widgets => caps.widgets = on,
+        Cap::WidgetShaders => caps.widget_shaders = on,
         Cap::InteropRead => caps.interop_read = on,
         Cap::InteropWrite => caps.interop_write = on,
         Cap::InteropBroadcast => caps.interop_broadcast = on,
@@ -1895,6 +1897,12 @@ fn granted_cap_labels(caps: SmudgyCapabilities) -> Vec<String> {
     if caps.widgets {
         out.push(cap_summary("widgets", "manifest-cap-widgets"));
     }
+    if caps.widget_shaders {
+        out.push(cap_summary(
+            "WGSL / TextEffect",
+            "manifest-cap-widget-shaders",
+        ));
+    }
     if caps.interop_write {
         out.push(cap_summary("emit / set", "manifest-cap-interop-write"));
     }
@@ -2376,6 +2384,7 @@ fn granted_cap_count(caps: SmudgyCapabilities) -> usize {
         caps.mapper_read,
         caps.mapper_write,
         caps.widgets,
+        caps.widget_shaders,
         caps.interop_read,
         caps.interop_write,
         caps.interop_broadcast,
@@ -2905,6 +2914,11 @@ fn manifest_capabilities<'a>(caps: SmudgyCapabilities) -> Elem<'a> {
                 crate::i18n::ts!("manifest-cap-widgets"),
                 caps.widgets,
                 Cap::Widgets
+            ), cap_check(
+                "WGSL / TextEffect",
+                crate::i18n::ts!("manifest-cap-widget-shaders"),
+                caps.widget_shaders,
+                Cap::WidgetShaders
             ),]
         ),
         cap_group(

@@ -1167,6 +1167,7 @@ pub fn view<'a>(
                                 }),
                                 None,
                                 ScrolledLayout::SplitWithLiveTail,
+                                None,
                             );
                             Some(
                                 column![
@@ -1194,6 +1195,7 @@ pub fn view<'a>(
                                 None,
                                 None,
                                 ScrolledLayout::SplitWithLiveTail,
+                                None,
                             ))
                         }
                     })

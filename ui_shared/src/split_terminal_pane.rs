@@ -19,7 +19,7 @@ use iced::{
 use smudgy_session_model::styled_line::LinkTooltipCallback;
 
 mod scroll_bar;
-mod terminal_pane;
+pub(crate) mod terminal_pane;
 
 use terminal_pane::{TerminalPane, terminal_pane};
 
@@ -95,6 +95,7 @@ impl ScrolledLayout {
 
 struct SplitTerminalPane<'a, Message> {
     pub view: TerminalViewHandle,
+    inline_resolver: Option<crate::inline_object::Resolver>,
     pub buffer: Ref<'a, TerminalBuffer>,
     pub on_link: Option<Rc<dyn Fn(LinkClickEvent) -> Message>>,
     pub on_link_tooltip: Option<Rc<dyn Fn(LinkTooltipCallback)>>,
@@ -119,6 +120,7 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
     ) -> Self {
         Self {
             view,
+            inline_resolver: None,
             buffer,
             on_link: None,
             on_link_tooltip: None,
@@ -134,6 +136,7 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
             .on_link(self.on_link.clone())
             .on_link_tooltip(self.on_link_tooltip.clone())
             .font_size(self.font_size)
+            .inline_widgets(self.inline_resolver.clone())
     }
 
     /// The pane's effective line height (see
@@ -147,8 +150,8 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
         visible_lines: f32,
         state: Option<rc::Weak<RefCell<State>>>,
     ) -> Element<'a, Message, Theme, Renderer> {
-        let max_line = self.buffer.last_line_number() as f32;
-        let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f32;
+        let max_line = self.buffer.last_line_number() as f64;
+        let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f64;
         let local_state = state.clone();
 
         let last_line = state
@@ -168,23 +171,28 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
             })
             .unwrap_or(max_line);
 
-        scroll_bar::scroll_bar(min_line, max_line, visible_lines, last_line)
-            .on_change(move |value| {
-                local_state.as_ref().map(|state| {
-                    state.upgrade().map(|state| {
-                        let mut state = state.borrow_mut();
+        scroll_bar::scroll_bar(
+            min_line as f32,
+            max_line as f32,
+            visible_lines,
+            last_line as f32,
+        )
+        .on_change(move |value| {
+            local_state.as_ref().map(|state| {
+                state.upgrade().map(|state| {
+                    let mut state = state.borrow_mut();
 
-                        let value = if max_line < visible_lines {
-                            max_line
-                        } else {
-                            value
-                        };
-                        state.scroll_bar_value = value;
-                        state.is_split = value < max_line;
-                    })
-                });
-            })
-            .into()
+                    let value = if max_line < f64::from(visible_lines) {
+                        max_line
+                    } else {
+                        f64::from(value)
+                    };
+                    state.scroll_bar_value = value;
+                    state.is_split = value < max_line;
+                })
+            });
+        })
+        .into()
     }
 
     /// Vertical distance from the cursor to the nearest pane edge while the
@@ -253,8 +261,8 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
                     let lines = state.autoscroll_debt.trunc();
                     state.autoscroll_debt -= lines;
 
-                    let max_line = self.buffer.last_line_number() as f32;
-                    let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f32;
+                    let max_line = self.buffer.last_line_number() as f64;
+                    let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f64;
 
                     // Same lazy init as the wheel handler: while pinned to the
                     // bottom the stored value isn't kept up to date.
@@ -265,7 +273,7 @@ impl<'a, Message> SplitTerminalPane<'a, Message> {
 
                     let before = state.scroll_bar_value;
                     state.scroll_bar_value =
-                        (state.scroll_bar_value + lines).clamp(min_line, max_line);
+                        (state.scroll_bar_value + f64::from(lines)).clamp(min_line, max_line);
                     state.is_split = state.scroll_bar_value < max_line;
                     scrolled = state.scroll_bar_value != before;
                 }
@@ -375,7 +383,7 @@ const AUTOSCROLL_MAX_TICK_SECS: f32 = 0.1;
 #[derive(Default)]
 struct State {
     visible_lines: f32,
-    scroll_bar_value: f32,
+    scroll_bar_value: f64,
     is_split: bool,
     /// Timestamp of the previous auto-scroll tick while a drag is past an edge.
     autoscroll_tick: Option<Instant>,
@@ -420,8 +428,8 @@ impl State {
 fn apply_scroll_request(
     state: &mut State,
     request: ScrollRequest,
-    min_line: f32,
-    max_line: f32,
+    min_line: f64,
+    max_line: f64,
     visible_lines: f32,
     split_visible_lines: f32,
 ) {
@@ -431,8 +439,8 @@ fn apply_scroll_request(
         return;
     }
 
-    let page = visible_lines.floor().max(1.0);
-    let split_page = split_visible_lines.floor().max(1.0).min(page);
+    let page = f64::from(visible_lines.floor().max(1.0));
+    let split_page = f64::from(split_visible_lines.floor().max(1.0)).min(page);
     let current = if state.is_split {
         state.scroll_bar_value.clamp(min_line, max_line)
     } else {
@@ -449,19 +457,19 @@ fn apply_scroll_request(
         }
         ScrollRequest::PageDown => (current + split_page).min(max_line),
         ScrollRequest::Pages(pages) if pages < 0 => {
-            let count = pages.unsigned_abs() as f32;
+            let count = f64::from(pages.unsigned_abs());
             let first_step = if state.is_split { split_page } else { page };
             (current - first_step - split_page * (count - 1.0)).max(oldest_full_page)
         }
         ScrollRequest::Pages(pages) if pages > 0 => {
-            (current + split_page * pages as f32).min(max_line)
+            (current + split_page * f64::from(pages)).min(max_line)
         }
         ScrollRequest::Pages(_) => current,
-        ScrollRequest::Lines(lines) => (current + lines as f32).clamp(min_line + 1.0, max_line),
+        ScrollRequest::Lines(lines) => (current + f64::from(lines)).clamp(min_line + 1.0, max_line),
         ScrollRequest::Home => oldest_full_page,
         ScrollRequest::End => max_line,
         ScrollRequest::RevealLine(line) => {
-            let line = (line as f32).clamp(min_line + 1.0, max_line);
+            let line = (line as f64).clamp(min_line + 1.0, max_line);
             let visible_top = current - page + 1.0;
             if !state.is_split && line >= visible_top {
                 current
@@ -478,11 +486,53 @@ fn apply_scroll_request(
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for SplitTerminalPane<'a, Message>
 where
-    Renderer: iced::advanced::Renderer + iced::advanced::text::Renderer<Font = iced::Font> + 'a,
+    Renderer:
+        iced::advanced::Renderer + iced::advanced::text::Renderer<Font = iced::Font> + 'static,
     Renderer::Paragraph:
         iced::advanced::text::Paragraph<Font = iced::Font> + Clone + std::fmt::Debug + 'static,
-    Theme: iced::widget::text::Catalog + 'a,
+    Theme: iced::widget::text::Catalog + 'static,
+    Message: 'static,
 {
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        for (child, layout) in tree.children.iter_mut().take(2).zip(layout.children()) {
+            if let Some(host) =
+                crate::inline_object::Host::<Message, Theme, Renderer>::get_mut(child)
+            {
+                host.operate(layout, renderer, operation);
+            }
+        }
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
+        let overlays: Vec<_> = tree
+            .children
+            .iter_mut()
+            .take(2)
+            .zip(layout.children())
+            .filter_map(|(child, layout)| {
+                crate::inline_object::Host::<Message, Theme, Renderer>::get_mut(child)?.overlay(
+                    layout,
+                    renderer,
+                    viewport,
+                    translation,
+                )
+            })
+            .collect();
+        (!overlays.is_empty())
+            .then(|| iced::advanced::overlay::Group::with_children(overlays).overlay())
+    }
     fn children(&self) -> Vec<tree::Tree> {
         vec![
             Tree::new(Element::<Message, Theme, Renderer>::new(
@@ -535,10 +585,44 @@ where
         let split_visible_lines = (full_height - live_tail_height) / line_height;
 
         {
-            let max_line = self.buffer.last_line_number() as f32;
-            let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f32;
+            let max_line = self.buffer.last_line_number() as f64;
+            let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f64;
             let mut state = state.borrow_mut();
             for request in self.view.scroll.take_requests() {
+                let pixel_delta = self
+                    .buffer
+                    .has_inline_objects()
+                    .then(|| {
+                        object_scroll_delta(
+                            request,
+                            state.is_split,
+                            full_height,
+                            live_tail_height,
+                            line_height,
+                        )
+                    })
+                    .flatten();
+                if let Some(delta) = pixel_delta {
+                    if !state.is_split {
+                        state.scroll_bar_value = max_line;
+                    }
+                    state.scroll_bar_value =
+                        scroll_pixels(state.scroll_bar_value, delta, min_line, max_line, |line| {
+                            [
+                                scrollback_pane_tree
+                                    .state
+                                    .downcast_ref::<terminal_pane::State<Renderer::Paragraph>>(),
+                                main_pane_tree
+                                    .state
+                                    .downcast_ref::<terminal_pane::State<Renderer::Paragraph>>(),
+                            ]
+                            .iter()
+                            .find_map(|s| s.row_height_at(line))
+                            .unwrap_or(line_height)
+                        });
+                    state.is_split = state.scroll_bar_value < max_line;
+                    continue;
+                }
                 apply_scroll_request(
                     &mut state,
                     request,
@@ -571,7 +655,7 @@ where
                 <TerminalPane<'_, Message> as Widget<Message, Theme, Renderer>>::layout(
                     &mut self
                         .terminal_pane()
-                        .last_line_number(state.borrow().scroll_bar_value as usize),
+                        .last_line_position(state.borrow().scroll_bar_value),
                     scrollback_pane_tree,
                     renderer,
                     &scrollback_pane_limits,
@@ -582,6 +666,10 @@ where
 
             (main_pane_node, scrollback_pane_node)
         } else {
+            scrollback_pane_tree
+                .state
+                .downcast_ref::<terminal_pane::State<Renderer::Paragraph>>()
+                .retire_effect_inputs();
             let main_pane_node =
                 <TerminalPane<'_, Message> as Widget<Message, Theme, Renderer>>::layout(
                     &mut self.terminal_pane(),
@@ -741,12 +829,38 @@ where
     ) {
         let state = tree.state.downcast_ref::<Rc<RefCell<State>>>();
 
+        // A native scrollable inside a terminal line gets first refusal on wheel
+        // input. If it cannot scroll, the terminal handles the event normally.
+        // This is the hosts' only delivery: the fan-out below skips the terminal
+        // halves for wheel events, whose own update would hand it to them again.
+        let wheel = matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }));
+        if wheel {
+            for (child, child_layout) in tree.children.iter_mut().take(2).zip(layout.children()) {
+                if let Some(host) =
+                    crate::inline_object::Host::<Message, Theme, Renderer>::get_mut(child)
+                {
+                    host.update(
+                        event,
+                        child_layout,
+                        cursor,
+                        renderer,
+                        clipboard,
+                        shell,
+                        viewport,
+                    );
+                    if shell.is_event_captured() {
+                        return;
+                    }
+                }
+            }
+        }
+
         if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event
             && cursor.position_in(layout.bounds()).is_some()
         {
             let mut state = state.borrow_mut();
-            let max_line = self.buffer.last_line_number() as f32;
-            let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f32;
+            let max_line = self.buffer.last_line_number() as f64;
+            let min_line = (self.buffer.last_line_number() - self.buffer.len()) as f64;
 
             // We don't update the scroll bar position when new lines come in, so if we're not split (it's fixed to the bottom),
             // update it lazily now before we do any arithmetic dependant on its value
@@ -754,9 +868,34 @@ where
                 state.scroll_bar_value = max_line;
             }
 
+            if self.buffer.has_inline_objects() {
+                let pixels = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y * self.line_height(),
+                    mouse::ScrollDelta::Pixels { y, .. } => *y,
+                };
+                state.scroll_bar_value =
+                    scroll_pixels(state.scroll_bar_value, pixels, min_line, max_line, |line| {
+                        tree.children
+                            .iter()
+                            .take(2)
+                            .find_map(|child| {
+                                child
+                                    .state
+                                    .downcast_ref::<terminal_pane::State<Renderer::Paragraph>>()
+                                    .row_height_at(line)
+                            })
+                            .unwrap_or(self.line_height())
+                    });
+                state.is_split = state.scroll_bar_value < max_line;
+                shell.invalidate_layout();
+                shell.request_redraw();
+                shell.capture_event();
+                return;
+            }
+
             match delta {
                 mouse::ScrollDelta::Lines { y, .. } => {
-                    state.scroll_bar_value -= y;
+                    state.scroll_bar_value -= f64::from(*y);
                     state.scroll_bar_value = state.scroll_bar_value.clamp(min_line, max_line);
                     state.is_split = state.scroll_bar_value < max_line;
                     shell.invalidate_layout();
@@ -766,7 +905,7 @@ where
                 mouse::ScrollDelta::Pixels { y, .. } => {
                     // Positive y scrolls up (toward older lines); cap the
                     // per-event step at one line in either direction.
-                    state.scroll_bar_value -= (*y / 10.0).clamp(-1.0, 1.0);
+                    state.scroll_bar_value -= f64::from((*y / 10.0).clamp(-1.0, 1.0));
                     state.scroll_bar_value = state.scroll_bar_value.clamp(min_line, max_line);
                     state.is_split = state.scroll_bar_value < max_line;
                     shell.invalidate_layout();
@@ -790,6 +929,7 @@ where
         .iter_mut()
         .zip(&mut tree.children)
         .zip(layout.children())
+        .skip(if wheel { 2 } else { 0 })
         .map(|((child, state), layout)| {
             child.as_widget_mut().update(
                 state, event, layout, cursor, renderer, clipboard, shell, viewport,
@@ -799,6 +939,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     buffer: Ref<'a, TerminalBuffer>,
     view: TerminalViewHandle,
@@ -807,15 +948,17 @@ pub fn split_terminal_pane<'a, Message, Theme, Renderer>(
     on_grid_change: Option<Rc<dyn Fn(u16, u16)>>,
     font_size: Option<f32>,
     scrolled_layout: ScrolledLayout,
+    inline_resolver: Option<crate::inline_object::Resolver>,
 ) -> Element<'a, Message, Theme, Renderer>
 where
-    Renderer: text::Renderer<Font = iced::Font> + 'a,
+    Renderer: text::Renderer<Font = iced::Font> + 'static,
     Renderer::Paragraph:
         iced::advanced::text::Paragraph<Font = iced::Font> + Clone + std::fmt::Debug + 'static,
-    Theme: iced::widget::text::Catalog + 'a,
-    Message: 'a,
+    Theme: iced::widget::text::Catalog + 'static,
+    Message: 'static,
 {
     let mut pane = SplitTerminalPane::new(buffer, view, scrolled_layout);
+    pane.inline_resolver = inline_resolver;
     pane.on_link = on_link;
     pane.on_link_tooltip = on_link_tooltip;
     pane.on_grid_change = on_grid_change;
@@ -823,11 +966,224 @@ where
     Element::new(pane)
 }
 
+fn object_scroll_delta(
+    request: ScrollRequest,
+    split: bool,
+    full: f32,
+    tail: f32,
+    line_height: f32,
+) -> Option<f32> {
+    let historical = (full - tail).max(line_height);
+    let first = if split { historical } else { full };
+    match request {
+        ScrollRequest::PageUp => Some(first),
+        ScrollRequest::PageDown => Some(-historical),
+        ScrollRequest::Pages(pages) if pages < 0 => {
+            Some(first + historical * (pages.unsigned_abs() as f32 - 1.0))
+        }
+        ScrollRequest::Pages(pages) => Some(-historical * pages as f32),
+        ScrollRequest::Lines(lines) => Some(-(lines as f32) * line_height),
+        _ => None,
+    }
+}
+
+/// A logical-line scrollbar can address the interior of a tall row through its
+/// fractional part. Input is measured in pixels, using cached visible row heights.
+fn scroll_pixels(
+    mut value: f64,
+    pixels: f32,
+    min: f64,
+    max: f64,
+    height: impl Fn(usize) -> f32,
+) -> f64 {
+    let mut pixels = f64::from(pixels);
+    for _ in 0..4096 {
+        if pixels.abs() < 0.01 {
+            break;
+        }
+        if pixels > 0.0 {
+            if value <= min {
+                break;
+            }
+            let line = value.ceil();
+            let h = f64::from(height(line as usize).max(1.0));
+            let remaining = (value - (line - 1.0)) * h;
+            let step = pixels.min(remaining);
+            value -= step / h;
+            pixels -= step;
+        } else {
+            if value >= max {
+                break;
+            }
+            let line = value.floor() + 1.0;
+            let h = f64::from(height(line as usize).max(1.0));
+            let remaining = (line - value) * h;
+            let step = (-pixels).min(remaining);
+            value += step / h;
+            pixels += step;
+        }
+    }
+    value.clamp(min, max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         SPLIT_LIVE_TAIL_MAX_HEIGHT, ScrollRequest, ScrolledLayout, State, apply_scroll_request,
     };
+
+    /// A widget that counts the wheel events it is handed.
+    struct WheelCounter(std::rc::Rc<std::cell::Cell<u32>>);
+    impl iced::advanced::Widget<(), smudgy_theme::Theme, iced_tiny_skia::Renderer> for WheelCounter {
+        fn size(&self) -> iced::Size<iced::Length> {
+            iced::Size::new(iced::Length::Fixed(40.0), iced::Length::Fixed(20.0))
+        }
+        fn layout(
+            &mut self,
+            _: &mut iced::advanced::widget::Tree,
+            _: &iced_tiny_skia::Renderer,
+            _: &iced::advanced::layout::Limits,
+        ) -> iced::advanced::layout::Node {
+            iced::advanced::layout::Node::new(iced::Size::new(40.0, 20.0))
+        }
+        fn draw(
+            &self,
+            _: &iced::advanced::widget::Tree,
+            _: &mut iced_tiny_skia::Renderer,
+            _: &smudgy_theme::Theme,
+            _: &iced::advanced::renderer::Style,
+            _: iced::advanced::Layout<'_>,
+            _: iced::advanced::mouse::Cursor,
+            _: &iced::Rectangle,
+        ) {
+        }
+        fn update(
+            &mut self,
+            _: &mut iced::advanced::widget::Tree,
+            event: &iced::Event,
+            _: iced::advanced::Layout<'_>,
+            _: iced::advanced::mouse::Cursor,
+            _: &iced_tiny_skia::Renderer,
+            _: &mut dyn iced::advanced::Clipboard,
+            _: &mut iced::advanced::Shell<'_, ()>,
+            _: &iced::Rectangle,
+        ) {
+            if matches!(
+                event,
+                iced::Event::Mouse(iced::advanced::mouse::Event::WheelScrolled { .. })
+            ) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn wheel_input_reaches_an_inline_widget_once_wherever_the_cursor_is() {
+        use crate::terminal_buffer::TerminalBuffer;
+        use iced::advanced::{Layout, Shell, Widget, layout, mouse, widget::Tree};
+        use iced::{Point, Rectangle, Size};
+        use smudgy_session_model::{
+            Style, StyledLine,
+            inline_content::{InlineObject, InlineOwner},
+        };
+        use std::{cell::RefCell, rc::Rc, sync::Arc};
+        type Painter = iced_tiny_skia::Renderer;
+
+        iced_tiny_skia::graphics::text::font_system()
+            .write()
+            .unwrap()
+            .load_font(crate::assets::GEIST_MONO_BYTES.into());
+        let renderer = Painter::new(crate::assets::GEIST_MONO, iced::Pixels(16.0));
+        let buffer = RefCell::new(TerminalBuffer::new());
+        let mut line =
+            StyledLine::from_styled_runs(&[("widget", Style::DEFAULT, None)], Style::DEFAULT);
+        line.objects = Some(Arc::new(vec![InlineObject::new(
+            0..6,
+            Arc::new(()),
+            InlineOwner::default(),
+        )]));
+        buffer.borrow_mut().push_line(Arc::new(line));
+        let count = Rc::new(std::cell::Cell::new(0));
+        let seen = count.clone();
+        let mut pane = super::SplitTerminalPane::<()>::new(
+            buffer.borrow(),
+            super::TerminalViewHandle::default(),
+            ScrolledLayout::SplitWithLiveTail,
+        );
+        pane.inline_resolver = Some(crate::inline_object::resolver::<
+            (),
+            smudgy_theme::Theme,
+            Painter,
+        >(move |_| {
+            Some(iced::Element::new(WheelCounter(seen.clone())))
+        }));
+        type Pane<'a> = super::SplitTerminalPane<'a, ()>;
+        let mut tree = Tree::new(&pane as &dyn Widget<(), smudgy_theme::Theme, Painter>);
+        let size = Size::new(400.0, 200.0);
+        let node = <Pane<'_> as Widget<(), smudgy_theme::Theme, Painter>>::layout(
+            &mut pane,
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let viewport = Rectangle::new(Point::ORIGIN, size);
+        let event = iced::Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        });
+        let mut clipboard = iced::advanced::clipboard::Null;
+        for cursor in [
+            mouse::Cursor::Available(Point::new(10.0, 190.0)),
+            mouse::Cursor::Available(Point::new(-50.0, -50.0)),
+            mouse::Cursor::Unavailable,
+        ] {
+            count.set(0);
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            <Pane<'_> as Widget<(), smudgy_theme::Theme, Painter>>::update(
+                &mut pane,
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            assert_eq!(count.get(), 1, "cursor {cursor:?}");
+        }
+    }
+
+    #[test]
+    fn paging_a_tall_object_does_not_skip_the_live_tail_height() {
+        assert_eq!(
+            super::object_scroll_delta(ScrollRequest::PageUp, false, 560.0, 200.0, 20.0),
+            Some(560.0)
+        );
+        assert_eq!(
+            super::object_scroll_delta(ScrollRequest::PageUp, true, 560.0, 200.0, 20.0),
+            Some(360.0)
+        );
+        assert_eq!(
+            super::object_scroll_delta(ScrollRequest::PageDown, true, 560.0, 200.0, 20.0),
+            Some(-360.0)
+        );
+        assert_eq!(
+            super::object_scroll_delta(ScrollRequest::Pages(-2), false, 560.0, 200.0, 20.0),
+            Some(920.0)
+        );
+    }
+
+    #[test]
+    fn pixel_scrolling_reaches_the_interior_of_a_tall_row() {
+        let height = |line| if line == 10 { 1000.0 } else { 20.0 };
+        let late = super::scroll_pixels(1000000.0, 16.0, 0.0, 1000000.0, |_| 4096.0);
+        assert!((late - (1000000.0 - 16.0 / 4096.0)).abs() < 1e-8);
+        let value = super::scroll_pixels(10.0, 100.0, 0.0, 10.0, height);
+        assert!((value - 9.9).abs() < 0.001);
+        assert!((super::scroll_pixels(value, -100.0, 0.0, 10.0, height) - 10.0).abs() < 0.001);
+        assert!((super::scroll_pixels(10.0, 1020.0, 0.0, 10.0, height) - 8.0).abs() < 0.001);
+    }
 
     #[test]
     fn full_pane_scrollback_reserves_no_live_tail() {

@@ -359,6 +359,9 @@ fn smudgy_can_lines(caps: &SmudgyCapabilities) -> Vec<PermissionLine> {
     if caps.widgets {
         out.push(cap_line(crate::i18n::ts!("permission-can-widgets")));
     }
+    if caps.widget_shaders {
+        out.push(cap_line(crate::i18n::ts!("permission-can-widget-shaders")));
+    }
     if caps.interop_write {
         out.push(cap_line(crate::i18n::ts!("permission-can-interop-write")));
     }
@@ -466,6 +469,20 @@ pub(crate) fn consent_can_row<'a, M: 'a>(line: &PermissionLine) -> Element<'a, M
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shader_permission_is_disclosed_separately_from_widget_creation() {
+        let mut permissions = smudgy_core::models::shared_packages::PackagePermissions::default();
+        permissions.smudgy.widget_shaders = true;
+        let lines = super::permission_can_lines(&permissions);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].head,
+            crate::i18n::t!("permission-can-widget-shaders")
+        );
+        permissions.smudgy.widgets = true;
+        assert_eq!(super::permission_can_lines(&permissions).len(), 2);
+    }
+
     use super::*;
 
     #[test]
