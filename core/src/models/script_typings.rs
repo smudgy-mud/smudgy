@@ -2,8 +2,8 @@
 //! autocomplete for the `smudgy:core` module surface and for installed
 //! `smudgy://` packages.
 //!
-//! smudgy scripts are authored as ES modules, and serious authors edit them in VS Code
-//! — whose TypeScript language service has no idea what `smudgy:core` is. This module
+//! smudgy scripts are authored as ES modules. External TypeScript language services
+//! need declarations and paths for Smudgy's module specifiers. This module
 //! drops a small managed TypeScript project at the **server directory**, the common
 //! parent of both `modules/` (user scripts) and `packages/` (locally-authored
 //! packages), so the editor types files in either subtree.
@@ -32,7 +32,13 @@ use crate::models::state_exposure::{BoundPath, KnownGlobal, ResolvedExposure, St
 use crate::session::runtime::{PlatformProducer, ProducerKey};
 use anyhow::{Context, Result};
 use include_dir::{Dir, DirEntry, File, include_dir};
-use std::{borrow::Cow, fs, path::Path, sync::LazyLock};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
+};
 
 /// The managed ambient declarations for the `smudgy:core` module. Embedded at build
 /// time, rewritten into each server's `.smudgy/types/` on session start.
@@ -494,13 +500,30 @@ fn append_embedded_type_dir_filtered(
 const RUNTIME_TYPES_VERSION: &str = "deno-v2.9.5+node-26.0.1+3";
 
 const MANAGED_README: &str = "\
-This folder is generated and managed by smudgy. It gives VS Code (and any\n\
-TypeScript-aware editor) type information for the `smudgy:core` module so the\n\
+This folder is generated and managed by smudgy. It gives TypeScript-aware\n\
+editors type information for the `smudgy:core` module so the\n\
 scripts in `modules/` and the packages in `packages/` get autocomplete and\n\
 type-checking.\n\
 \n\
-Everything in here is overwritten every time a smudgy session starts. Do not edit\n\
-it — edit your scripts (and `../tsconfig.json`, which smudgy creates once and never\n\
+Installed Smudgy packages have `@name` and `@name/subpath` aliases, equivalent\n\
+to `smudgy:@name` and `smudgy:@name/subpath`. These aliases take precedence\n\
+throughout this editor project, including inside npm declaration files. At\n\
+runtime, imports inside npm packages still use npm resolution.\n\
+\n\
+Smudgy downloads npm packages automatically when imports load. After a successful\n\
+`npm:` import, it adds an editor path for that exact specifier in the background and materializes\n\
+the selected package and dependency graph under `npm/` in this folder. No\n\
+separate npm install is required. Version selectors and npm `exports` are\n\
+resolved by Smudgy before the editor path is written. Hints become available\n\
+after this background work finishes, including for dynamic imports. A package must ship its\n\
+declarations to supply explicit types; otherwise the editor can infer from JS.\n\
+The editor project has one mapping per npm specifier. Use versioned specifiers\n\
+when different isolates select different versions of the same package. If you set\n\
+`compilerOptions.paths` in `../tsconfig.json`, include all needed aliases: TypeScript replaces\n\
+the inherited paths map rather than merging it.\n\
+\n\
+Smudgy refreshes these files as sessions start and imports load. Do not edit\n\
+them — edit your scripts (and `../tsconfig.json`, which smudgy creates once and never\n\
 overwrites) instead.\n";
 
 /// One installed `smudgy://` package the editor project types: the tsconfig `paths` map
@@ -561,10 +584,13 @@ impl InstalledPackageTypes {
 
 /// Builds the managed base tsconfig. Compiler options are kept permissive so existing
 /// plain-JS scripts don't light up with errors, while TS authors still get strict checks.
-/// When `packages` is non-empty, a `compilerOptions.paths` block maps each
-/// `smudgy://owner/name` (and `…/*` subpaths) to its materialized `.d.ts` — resolved
-/// relative to this file's `.smudgy/` directory.
-fn tsconfig_base(packages: &[InstalledPackageTypes]) -> Result<String> {
+/// Maps installed Smudgy addresses and shorthand to their source or declarations,
+/// and successful `npm:` imports to the runtime's editor view of its cache. Smudgy
+/// paths are relative to `.smudgy/`; npm targets are absolute generated paths.
+fn tsconfig_base(
+    packages: &[InstalledPackageTypes],
+    npm_paths: &BTreeMap<String, PathBuf>,
+) -> Result<String> {
     let mut compiler_options = serde_json::json!({
         "target": "ESNext",
         "module": "ESNext",
@@ -594,28 +620,32 @@ fn tsconfig_base(packages: &[InstalledPackageTypes]) -> Result<String> {
         "jsx": "react-jsx",
         "jsxImportSource": "smudgy:widgets"
     });
-    if !packages.is_empty() {
-        let mut paths = serde_json::Map::new();
-        for pkg in packages {
-            // A package's name is global: its canonical `smudgy:@name` address types the same
-            // as the spelling it was installed under.
-            let mut addresses = vec![smudgy_script::package_address(&pkg.owner, &pkg.name)];
-            if !pkg.owner.is_empty() {
-                addresses.push(smudgy_script::package_address("", &pkg.name));
-            }
-            for address in addresses {
-                paths.insert(
-                    address.clone(),
-                    serde_json::json!([format!("{}/{}", pkg.dir_from_managed(), pkg.entry_module)]),
-                );
-                paths.insert(
-                    format!("{address}/*"),
-                    serde_json::json!([format!("{}/*", pkg.dir_from_managed())]),
-                );
-            }
-        }
-        compiler_options["paths"] = serde_json::Value::Object(paths);
+    let mut paths = serde_json::Map::new();
+    for (specifier, target) in npm_paths {
+        paths.insert(specifier.clone(), serde_json::json!([editor_path(target)]));
     }
+    for pkg in packages {
+        // A package's name is global: its canonical `smudgy:@name` address types the same
+        // as the spelling it was installed under.
+        let mut addresses = vec![
+            smudgy_script::package_address(&pkg.owner, &pkg.name),
+            format!("@{}", pkg.name),
+        ];
+        if !pkg.owner.is_empty() {
+            addresses.push(smudgy_script::package_address("", &pkg.name));
+        }
+        for address in addresses {
+            paths.insert(
+                address.clone(),
+                serde_json::json!([format!("{}/{}", pkg.dir_from_managed(), pkg.entry_module)]),
+            );
+            paths.insert(
+                format!("{address}/*"),
+                serde_json::json!([format!("{}/*", pkg.dir_from_managed())]),
+            );
+        }
+    }
+    compiler_options["paths"] = serde_json::Value::Object(paths);
     let base = serde_json::json!({ "compilerOptions": compiler_options });
     let body = serde_json::to_string_pretty(&base).context("serialize tsconfig.base.json")?;
     Ok(format!(
@@ -623,6 +653,81 @@ fn tsconfig_base(packages: &[InstalledPackageTypes]) -> Result<String> {
          // Shared compiler options for smudgy scripts; your ../tsconfig.json extends this.\n\
          {body}\n"
     ))
+}
+
+static EDITOR_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+fn editor_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if let Some(unc) = path.strip_prefix("//?/UNC/") {
+        format!("//{unc}")
+    } else {
+        path.strip_prefix("//?/").unwrap_or(&path).to_string()
+    }
+}
+
+fn read_npm_paths(managed: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    let contents = match fs::read(managed.join("npm-paths.json")) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths: BTreeMap<String, PathBuf> = match serde_json::from_slice(&contents) {
+        Ok(paths) => paths,
+        Err(error) => {
+            log::warn!(
+                "Ignoring corrupt generated npm editor paths in {}: {error}",
+                managed.display()
+            );
+            return Ok(BTreeMap::new());
+        }
+    };
+    paths.retain(|specifier, path| specifier.starts_with("npm:") && path.is_file());
+    Ok(paths)
+}
+
+/// Records imports as the runtime downloads npm packages. The observer also runs
+/// for dynamic imports, so opening an editor never needs a separate npm install.
+pub(crate) fn npm_types_observer(server_dir: PathBuf) -> smudgy_script::NpmTypeObserver {
+    std::sync::Arc::new(move |specifier, target| {
+        if let Err(error) = record_npm_path(&server_dir, specifier, target) {
+            log::warn!("Could not refresh npm editor path for {specifier}: {error:#}");
+        }
+    })
+}
+
+fn record_npm_path(server_dir: &Path, specifier: &str, target: &Path) -> Result<()> {
+    let _guard = EDITOR_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    anyhow::ensure!(
+        specifier.starts_with("npm:") && target.is_file(),
+        "invalid npm editor path"
+    );
+    let managed = server_dir.join(".smudgy");
+    let mut paths = read_npm_paths(&managed)?;
+    paths.insert(specifier.to_string(), target.to_path_buf());
+    let config_path = managed.join("tsconfig.base.json");
+    let text = fs::read_to_string(&config_path)?;
+    let body = text.lines().skip(2).collect::<Vec<_>>().join("\n");
+    let mut config: serde_json::Value = serde_json::from_str(&body)?;
+    let entries = config["compilerOptions"]["paths"]
+        .as_object_mut()
+        .context("managed paths map")?;
+    entries.retain(|name, _| !name.starts_with("npm:"));
+    for (name, target) in &paths {
+        entries.insert(name.clone(), serde_json::json!([editor_path(target)]));
+    }
+    let header = text.lines().take(2).collect::<Vec<_>>().join("\n");
+    let updated = format!("{header}\n{}\n", serde_json::to_string_pretty(&config)?);
+    crate::models::persistence::write_atomic(
+        &managed.join("npm-paths.json"),
+        &serde_json::to_vec_pretty(&paths)?,
+    )?;
+    if text != updated {
+        crate::models::persistence::write_atomic(&config_path, updated.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Header for the generated `installed-events.d.ts` barrel (below). The `paths` map
@@ -1014,6 +1119,9 @@ fn ensure_script_tsconfig_in_with_web_audio(
     packages: &[InstalledPackageTypes],
     web_audio_available: bool,
 ) -> Result<()> {
+    let _guard = EDITOR_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let managed_dir = server_dir.join(".smudgy");
     let types_dir = managed_dir.join("types");
     fs::create_dir_all(&types_dir).with_context(|| format!("create {}", types_dir.display()))?;
@@ -1021,7 +1129,7 @@ fn ensure_script_tsconfig_in_with_web_audio(
     write_if_changed(&managed_dir.join("README.md"), MANAGED_README)?;
     write_if_changed(
         &managed_dir.join("tsconfig.base.json"),
-        &tsconfig_base(packages)?,
+        &tsconfig_base(packages, &read_npm_paths(&managed_dir)?)?,
     )?;
     write_if_changed(&types_dir.join("smudgy-core.d.ts"), SMUDGY_CORE_DTS)?;
     write_if_changed(&types_dir.join("smudgy-params.d.ts"), SMUDGY_PARAMS_DTS)?;
@@ -1478,6 +1586,83 @@ mod tests {
     }
 
     #[test]
+    fn generated_paths_give_editors_smudgy_precedence_and_explicit_npm_types() {
+        let packages = [
+            InstalledPackageTypes {
+                owner: "author".to_string(),
+                name: "tools".to_string(),
+                entry_module: "index.d.ts".to_string(),
+                handles: Vec::new(),
+                local: false,
+            },
+            InstalledPackageTypes {
+                owner: String::new(),
+                name: "local".to_string(),
+                entry_module: "index.ts".to_string(),
+                handles: Vec::new(),
+                local: true,
+            },
+        ];
+        // Match the startup snapshot used by other isolates in this test process.
+        let directory = tempfile::tempdir().unwrap();
+        let mut runtime = smudgy_script::ScriptRuntime::new(smudgy_script::ScriptRuntimeOptions {
+            extensions: Vec::new(),
+            data_dir: directory.path().to_path_buf(),
+            webstorage_dir: None,
+            module_policy: smudgy_script::ModulePolicy::default(),
+            inspector: None,
+            tokio: std::rc::Rc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            ),
+            package_provider: None,
+            permissions: None,
+            broadcast_channel: None,
+            workers: smudgy_script::WorkerMode::Disabled,
+            max_live_workers_override: None,
+        })
+        .unwrap();
+        let runtime = runtime.deno_runtime();
+        runtime
+            .execute_script(
+                "typescript-shim.js",
+                "globalThis.module = { exports: {} }; globalThis.exports = module.exports;",
+            )
+            .unwrap();
+        runtime
+            .execute_script(
+                "typescript.js",
+                include_str!("../../../script/vendor/typescript/lib/typescript.js"),
+            )
+            .expect("load the vendored TypeScript compiler");
+        let npm_paths = BTreeMap::from([
+            (
+                "npm:@tools/feature".to_string(),
+                PathBuf::from("/server/.smudgy/npm/tools/types.d.ts"),
+            ),
+            (
+                "npm:consumer".to_string(),
+                PathBuf::from("/server/.smudgy/npm/consumer/index.d.ts"),
+            ),
+        ]);
+        let config = serde_json::to_string(&tsconfig_base(&packages, &npm_paths).unwrap()).unwrap();
+        runtime
+            .execute_script(
+                "editor-config.js",
+                format!("globalThis.ts = module.exports; globalThis.managedConfig = {config};"),
+            )
+            .unwrap();
+        runtime
+            .execute_script(
+                "editor-resolution-test.js",
+                include_str!("script_typings/editor_resolution_test.js"),
+            )
+            .expect("the generated project must provide correct module paths and type hints");
+    }
+
+    #[test]
     fn base_tsconfig_wires_paths_for_installed_packages() {
         let dir = temp_server_dir("paths");
         let packages = [InstalledPackageTypes {
@@ -1491,6 +1676,16 @@ mod tests {
 
         let base = fs::read_to_string(dir.join(".smudgy/tsconfig.base.json")).unwrap();
         assert!(base.contains("\"paths\""), "paths block missing:\n{base}");
+        let json = base.lines().skip(2).collect::<Vec<_>>().join("\n");
+        let config: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let paths = &config["compilerOptions"]["paths"];
+        assert_eq!(paths["@arctic-prompt"], paths["smudgy:@arctic-prompt"]);
+        assert_eq!(paths["@arctic-prompt/*"], paths["smudgy:@arctic-prompt/*"]);
+        assert!(
+            paths.get("npm:*").is_none(),
+            "npm types must use resolved cache paths"
+        );
+        assert!(paths["@arctic-prompt"].is_array());
         assert!(
             base.contains("\"smudgy://kapusniak/arctic-prompt\""),
             "specifier path missing:\n{base}"
@@ -1504,15 +1699,62 @@ mod tests {
             "subpath wildcard missing:\n{base}"
         );
 
-        // With no packages, the base carries no `paths`.
+        // Removing the last Smudgy package removes its aliases.
         ensure_script_tsconfig_in(&dir, &[]).expect("ensure empty");
-        let bare = fs::read_to_string(dir.join(".smudgy/tsconfig.base.json")).unwrap();
+        let empty_config = fs::read_to_string(dir.join(".smudgy/tsconfig.base.json")).unwrap();
         assert!(
-            !bare.contains("\"paths\""),
-            "unexpected paths block:\n{bare}"
+            !empty_config.contains("arctic-prompt"),
+            "stale Smudgy aliases:\n{empty_config}"
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn imported_npm_paths_survive_refresh_and_do_not_replace_user_config() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        ensure_script_tsconfig_in(directory, &[]).unwrap();
+        let user = fs::read_to_string(directory.join("tsconfig.json")).unwrap();
+        let declaration = directory.join(".smudgy/npm/fixture.d.ts");
+        fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        fs::write(&declaration, "export declare const value: number;").unwrap();
+        record_npm_path(directory, "npm:@scope/lib@1", &declaration).unwrap();
+        record_npm_path(directory, "npm:@scope/lib@1/subpath", &declaration).unwrap();
+        ensure_script_tsconfig_in(directory, &[]).unwrap();
+        let base = fs::read_to_string(directory.join(".smudgy/tsconfig.base.json")).unwrap();
+        assert!(base.contains("npm:@scope/lib@1\""));
+        assert!(base.contains("npm:@scope/lib@1/subpath"));
+        assert_eq!(
+            fs::read_to_string(directory.join("tsconfig.json")).unwrap(),
+            user
+        );
+        fs::remove_file(&declaration).unwrap();
+        ensure_script_tsconfig_in(directory, &[]).unwrap();
+        let base = fs::read_to_string(directory.join(".smudgy/tsconfig.base.json")).unwrap();
+        assert!(
+            !base.contains("npm:@scope/lib"),
+            "discard paths whose cached types were removed"
+        );
+    }
+
+    #[test]
+    fn corrupt_npm_index_does_not_block_editor_project_refresh() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        let managed = directory.join(".smudgy");
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(managed.join("npm-paths.json"), "{truncated").unwrap();
+        ensure_script_tsconfig_in(directory, &[]).unwrap();
+        assert!(managed.join("types/smudgy-core.d.ts").is_file());
+        assert!(directory.join("tsconfig.json").is_file());
+        let declaration = managed.join("npm-fixture.d.ts");
+        fs::write(&declaration, "export {};").unwrap();
+        record_npm_path(directory, "npm:fixture", &declaration).unwrap();
+        assert_eq!(
+            read_npm_paths(&managed).unwrap()["npm:fixture"],
+            declaration
+        );
     }
 
     /// A local dev-override package's typings point at the live authored folder under

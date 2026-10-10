@@ -8,8 +8,8 @@
 //! `{success, data, error}` envelope.
 //!
 //! A published package's name is global, so its modern address is `smudgy:@name`.
-//! Owner-scoped `smudgy://owner/name` remains supported through 0.6.0 and the server
-//! checks the owning user's nickname. Addresses are a *client-side*
+//! Legacy `smudgy://owner/name` remains supported through 0.6.0; the server checks the
+//! owner's syntax and resolves by name alone. Addresses are a *client-side*
 //! construct: on the wire an address is an optional `owner` and a `name`, never the URI.
 //! Every owner field on this wire is optional: a clan's package, and a package whose owner
 //! has no nickname, has none.

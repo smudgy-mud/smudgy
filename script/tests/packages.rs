@@ -140,6 +140,52 @@ fn package_loads_and_evaluates() -> Result<()> {
 }
 
 #[test]
+fn shorthand_imports_and_reexports_share_the_explicit_package_instance() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let package = resolved(
+        "counter",
+        "1.0.0",
+        &[
+            (
+                "index.js",
+                "globalThis.__loads = (globalThis.__loads ?? 0) + 1; export default {};",
+            ),
+            ("util.js", "export const value = 42;"),
+        ],
+    );
+    let mut consumer = resolved(
+        "consumer",
+        "1.0.0",
+        &[(
+            "index.js",
+            r#"
+        export { default } from '@counter';
+        export { value } from '@counter/util';
+    "#,
+        )],
+    );
+    consumer.manifest =
+        PackageManifest::parse(r#"{"version":"1.0.0","dependencies":["smudgy:@counter"]}"#)?;
+    let (tokio, mut rt) = runtime_with_packages(temp.path(), vec![package, consumer])?;
+    assert!(eval_module_ok(
+        &tokio,
+        &mut rt,
+        temp.path(),
+        "shorthand.js",
+        r#"
+        import short from '@counter';
+        import explicit from 'smudgy:@counter';
+        import forwarded, { value } from '@consumer';
+        const dynamic = await import('@counter');
+        const util = await import('@counter/util');
+        export const ok = short === explicit && short === forwarded && short === dynamic.default
+            && value === 42 && util.value === 42 && globalThis.__loads === 1;
+    "#
+    )?);
+    Ok(())
+}
+
+#[test]
 fn package_json_module_imports_with_attribute() -> Result<()> {
     // A package's `.json` module is importable with `with { type: "json" }`: the transpiler
     // preserves the attribute, the loader serves ModuleType::Json for the nested subpath, and

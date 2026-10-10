@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -70,6 +71,7 @@ type SmudgyNpmModuleLoader = NpmModuleLoader<
 >;
 
 pub struct SmudgyNpmServices {
+    editor: RefCell<Option<crate::npm_editor::NpmEditor>>,
     pub in_npm_package_checker: DenoInNpmPackageChecker,
     pub npm_resolver: SmudgyNpmResolver,
     node_resolver: SmudgyNodeResolverRc,
@@ -90,6 +92,16 @@ pub struct SmudgyNpmServices {
 impl SmudgyNpmServices {
     pub fn new(
         data_dir: PathBuf,
+    ) -> Result<(
+        Rc<Self>,
+        NodeExtInitServices<DenoInNpmPackageChecker, SmudgyNpmResolver, RealSys>,
+    )> {
+        Self::new_with_cache_setting(data_dir, NpmCacheSetting::Use)
+    }
+
+    fn new_with_cache_setting(
+        data_dir: PathBuf,
+        cache_setting: NpmCacheSetting,
     ) -> Result<(
         Rc<Self>,
         NodeExtInitServices<DenoInNpmPackageChecker, SmudgyNpmResolver, RealSys>,
@@ -197,7 +209,7 @@ impl SmudgyNpmServices {
         let npm_cache = Arc::new(NpmCache::new(
             npm_cache_dir,
             sys.clone(),
-            NpmCacheSetting::Use,
+            cache_setting,
             npmrc.clone(),
         ));
         let http_client = Arc::new(ReqwestNpmCacheHttpClient);
@@ -216,6 +228,7 @@ impl SmudgyNpmServices {
         ));
 
         let services = Rc::new(Self {
+            editor: RefCell::new(None),
             in_npm_package_checker: in_npm_package_checker.clone(),
             npm_resolver: npm_resolver.clone(),
             node_resolver: node_resolver.clone(),
@@ -266,6 +279,9 @@ impl SmudgyNpmServices {
             ))
         })?;
         let (module_type, source) = self.load_npm_module(&file_url, Some(referrer)).await?;
+        if let Err(error) = self.queue_editor_types(&req_ref, specifier, referrer, &file_url) {
+            log::warn!("Could not refresh npm editor types for {specifier}: {error:#}");
+        }
         // Requested as `npm:...` but found at `file_url`, so its internal imports
         // resolve relative to the real installed file path.
         Ok(ModuleSource::new_with_redirect(
@@ -279,6 +295,69 @@ impl SmudgyNpmServices {
 
     pub fn is_npm_package_specifier(&self, specifier: &ModuleSpecifier) -> bool {
         node_resolver::InNpmPackageChecker::in_npm_package(&self.in_npm_package_checker, specifier)
+    }
+
+    pub(crate) fn enable_editor_types(
+        &self,
+        directory: PathBuf,
+        observer: crate::npm_editor::NpmTypeObserver,
+    ) {
+        *self.editor.borrow_mut() = Some(crate::npm_editor::NpmEditor {
+            directory,
+            observer,
+        });
+    }
+
+    fn queue_editor_types(
+        &self,
+        request: &NpmPackageReqReference,
+        specifier: &ModuleSpecifier,
+        referrer: &ModuleSpecifier,
+        execution_url: &ModuleSpecifier,
+    ) -> Result<()> {
+        let Some(editor) = self.editor.borrow().clone() else {
+            return Ok(());
+        };
+        // Types-mode resolution honors conditional exports, renamed subpaths, and
+        // version selectors. A package without declarations still gets JS inference.
+        let target = self
+            .req_resolver
+            .resolve_req_reference(
+                request,
+                referrer,
+                ResolutionMode::Import,
+                node_resolver::NodeResolutionKind::Types,
+            )
+            .ok()
+            .and_then(|resolved| resolved.into_url().ok())
+            .unwrap_or_else(|| execution_url.clone())
+            .to_file_path()
+            .map_err(|()| anyhow::anyhow!("npm type target is not a file"))?;
+        let snapshot = self
+            .npm_resolution
+            .snapshot()
+            .subset(std::slice::from_ref(request.req()));
+        let resolver = self
+            .npm_resolver
+            .as_managed()
+            .context("managed npm resolver")?;
+        let packages = snapshot
+            .all_system_packages(&self.npm_system_info)
+            .into_iter()
+            .map(|package| {
+                Ok(crate::npm_editor::EditorPackage {
+                    id: package.id.as_serialized().to_string(),
+                    directory: resolver.resolve_pkg_folder_from_pkg_id(&package.id)?,
+                    dependencies: package
+                        .dependencies
+                        .iter()
+                        .map(|(name, id)| (name.to_string(), id.as_serialized().to_string()))
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        editor.enqueue(packages, target, specifier.as_str().to_string());
+        Ok(())
     }
 
     /// Resolve an ESM import using Node semantics when its referrer is inside the managed npm
@@ -898,6 +977,223 @@ mod tests {
             .expect("npm referrer should use Node resolution");
         let expected = ModuleSpecifier::from_file_path(dependency_dir.join("index.mjs")).unwrap();
         assert_eq!(resolved, expected);
+    }
+
+    fn cached_editor_fixture(root: &Path) -> Rc<SmudgyNpmServices> {
+        // Cache-only mode makes any accidental network dependency fail the test.
+        let (services, _node_services) =
+            SmudgyNpmServices::new_with_cache_setting(root.to_path_buf(), NpmCacheSetting::Only)
+                .unwrap();
+        let package = root.join("npm/registry.npmjs.org/@scope/library/1.0.0");
+        std::fs::create_dir_all(package.join("dist")).unwrap();
+        std::fs::write(
+            package.parent().unwrap().join("registry.json"),
+            r#"{
+            "name":"@scope/library", "dist-tags":{"latest":"1.0.0"},
+            "time":{"1.0.0":"2020-01-01T00:00:00.000Z"},
+            "versions":{"1.0.0":{"name":"@scope/library","version":"1.0.0",
+                "dist":{"tarball":"https://registry.invalid/library.tgz"}}}
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{
+            "name":"@scope/library", "version":"1.0.0", "type":"module",
+            "exports":{"./feature":{"types":"./dist/renamed.d.ts","default":"./dist/runtime.js"}}
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("dist/runtime.js"), "export const value = 42;").unwrap();
+        std::fs::write(
+            package.join("dist/renamed.d.ts"),
+            "export declare const value: 42;",
+        )
+        .unwrap();
+        services
+    }
+
+    #[tokio::test]
+    async fn loaded_npm_types_use_cached_exports_and_versioned_specifiers() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let services = cached_editor_fixture(&root);
+        let (published, mut received) = tokio::sync::mpsc::unbounded_channel();
+        services.enable_editor_types(
+            root.join("editor"),
+            Arc::new(move |name, path| {
+                published
+                    .send((name.to_string(), path.to_path_buf()))
+                    .unwrap();
+            }),
+        );
+        let specifier = ModuleSpecifier::parse("npm:@scope/library@1/feature").unwrap();
+        let referrer = ModuleSpecifier::from_file_path(root.join("user.ts")).unwrap();
+        services
+            .load_npm_async(&specifier, &referrer)
+            .await
+            .unwrap();
+        let (name, path) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(name, specifier.as_str());
+        assert!(path.ends_with("dist/renamed.d.ts"));
+        assert!(path.starts_with(root.join("editor")));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "export declare const value: 42;"
+        );
+        assert!(
+            !root.join("node_modules").exists(),
+            "no separate npm install"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_io_does_not_delay_npm_module_loading() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let services = cached_editor_fixture(&root);
+        let (started, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        let paused = Mutex::new(paused);
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = finished.clone();
+        let (done, mut completed) = tokio::sync::mpsc::unbounded_channel();
+        services.enable_editor_types(
+            root.join("editor"),
+            Arc::new(move |_, _| {
+                started.send(()).unwrap();
+                let _ = paused.lock().unwrap().recv_timeout(Duration::from_secs(15));
+                observed.store(true, Ordering::SeqCst);
+                done.send(()).unwrap();
+            }),
+        );
+        let specifier = ModuleSpecifier::parse("npm:@scope/library@1/feature").unwrap();
+        let referrer = ModuleSpecifier::from_file_path(root.join("user.ts")).unwrap();
+        let loaded = tokio::time::timeout(
+            Duration::from_secs(5),
+            services.load_npm_async(&specifier, &referrer),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let was_waiting = !finished.load(Ordering::SeqCst);
+        let _ = release.send(());
+        tokio::time::timeout(Duration::from_secs(5), completed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded.unwrap().is_ok());
+        assert!(
+            was_waiting,
+            "the module must finish loading while editor IO is still pending"
+        );
+    }
+
+    fn write_esm_fixture(root: &std::path::Path, name: &str, source: &str) -> ModuleSpecifier {
+        let dir = root.join("npm/registry.npmjs.org").join(name).join("1.0.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            serde_json::json!({
+                "name": name, "version": "1.0.0", "type": "module", "exports": "./index.mjs"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("index.mjs"), source).unwrap();
+        ModuleSpecifier::from_file_path(dir.join("index.mjs")).unwrap()
+    }
+
+    #[test]
+    fn smudgy_shorthand_does_not_intercept_transitive_scoped_npm_imports() {
+        use crate::package_resolver::{
+            InMemoryPackageProvider, PackageKey, PackageManifest, ResolvedPackage,
+        };
+        use deno_core::{ModuleLoader, ResolutionKind};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (npm, _node_services) = SmudgyNpmServices::new(root.clone()).unwrap();
+        let app_id = NpmPackageId::from_serialized("fixture-app@1.0.0").unwrap();
+        let dep_id = NpmPackageId::from_serialized("@scope/dependency@1.0.0").unwrap();
+        let transitive_id = NpmPackageId::from_serialized("@scope/transitive@1.0.0").unwrap();
+        let snapshot = SerializedNpmResolutionSnapshot {
+            root_packages: HashMap::from([(
+                PackageReq::from_str("fixture-app@1").unwrap(),
+                app_id.clone(),
+            )]),
+            packages: vec![
+                snapshot_package(&app_id, &[("@scope/dependency", &dep_id)]),
+                snapshot_package(&dep_id, &[("@scope/transitive", &transitive_id)]),
+                snapshot_package(&transitive_id, &[]),
+            ],
+        };
+        npm.npm_resolution
+            .set_snapshot(NpmResolutionSnapshot::new(snapshot.into_valid().unwrap()));
+        let app = write_esm_fixture(&root, "fixture-app", "import '@scope/dependency';");
+        let dep = write_esm_fixture(&root, "@scope/dependency", "import '@scope/transitive';");
+        let transitive = write_esm_fixture(&root, "@scope/transitive", "export const value = 42;");
+
+        let mut packages = InMemoryPackageProvider::new();
+        packages.insert(ResolvedPackage {
+            key: PackageKey {
+                owner: "local".into(),
+                name: "scope".into(),
+            },
+            resolved_version: "1.0.0".into(),
+            manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
+            integrity: "local".into(),
+            modules: vec![],
+        });
+        let loader = crate::module_loader::ScriptModuleLoader::with_npm_and_packages(
+            root.clone(),
+            crate::ModulePolicy::default(),
+            npm,
+            Some(Rc::new(packages)),
+            deno_permissions::PermissionsContainer::allow_all(crate::permission_descriptor_parser()),
+        );
+        for (address, referrer, expected) in [
+            ("@scope/dependency", &app, &dep),
+            ("@scope/transitive", &dep, &transitive),
+        ] {
+            assert_eq!(
+                loader
+                    .resolve(address, referrer.as_str(), ResolutionKind::Import)
+                    .unwrap(),
+                *expected
+            );
+        }
+        // A Node miss must stay a miss even with a local Smudgy package named scope.
+        assert!(
+            loader
+                .resolve("@scope/missing", dep.as_str(), ResolutionKind::Import)
+                .is_err()
+        );
+        let user = ModuleSpecifier::from_file_path(root.join("user.ts")).unwrap();
+        assert_eq!(
+            loader
+                .resolve("@scope/dependency", user.as_str(), ResolutionKind::Import)
+                .unwrap(),
+            loader
+                .resolve(
+                    "smudgy:@scope/dependency",
+                    user.as_str(),
+                    ResolutionKind::Import
+                )
+                .unwrap(),
+        );
     }
 
     #[test]

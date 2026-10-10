@@ -1,11 +1,12 @@
 //! The package module scheme: shared-package resolution for the session isolate.
 //!
 //! A package's name is global, so its address is the name: `smudgy:@name[/subpath]`.
+//! In authored scripts and Smudgy package modules, the loader expands `@name[/subpath]`
+//! to this address before parsing. Imports inside npm packages keep Node resolution.
 //! `smudgy://owner/name[/subpath]` remains supported through 0.6.0. The parser checks the
-//! owner segment's form; the provider and registry require it to match the publisher,
-//! except for local development overrides. A [`PackageKey`] keeps the spelling it was
-//! given (an empty owner for `smudgy:@name`) and compares by name alone. Providers must
-//! validate legacy owners before reusing a published package by that shared identity.
+//! owner segment's form, but resolution ignores it and prefers a local package with the
+//! same name before the published package. A [`PackageKey`] keeps the spelling it was
+//! given (an empty owner for `smudgy:@name`) and compares by name alone.
 //!
 //! Mirrors [`crate::npm_resolver`] in shape: `resolve()` keeps the request cheap and
 //! synchronous, `load()` does the async fetch + a redirect to a canonical URL (see
@@ -133,8 +134,7 @@ fn owner_from_segment(segment: &str) -> String {
 /// `owner` is the owner segment the address was spelled with (`smudgy://owner/name`), or
 /// empty for the canonical `smudgy:@name`. The registry reserves `name` globally and
 /// uses it as identity: comparisons and hash keys ignore the owner and ASCII case, while
-/// the strings retain their spelling for display and paths. Legacy owner constraints are
-/// validated separately during resolution; equality does not prove a valid address.
+/// the strings retain their spelling for display and paths.
 #[derive(Debug, Clone)]
 pub struct PackageKey {
     pub owner: String,
@@ -2030,8 +2030,8 @@ pub(crate) async fn load_marker_module(
     // isolate trust: trust grants permissions, it does not bypass another package's import-deny.
     //
     // Owners are the registry's ([`PackageProvider::package_owner`]), never an address's owner
-    // segment: the provider has already validated the requested legacy owner or resolved
-    // a local development override to its separate identity.
+    // segment: every address spelling selects the same published package, while a local
+    // development override has its separate identity.
     if !fetched.manifest.importable {
         if let Some(referrer) = spec.referrer() {
             let importer_owner = provider

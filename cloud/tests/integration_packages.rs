@@ -9,7 +9,7 @@
 //! bundle frame rules, the `want` bitmap, the always-upload rule, the 400s and 413s, and
 //! signed, expiring upload and download URLs all follow the package-bundle contract. So do
 //! names reserved forever on first publication (409 `package_name_unavailable`), clan-owned packages,
-//! addresses whose optional owner constrains legacy resolution (resolve, check-updates,
+//! addresses whose optional owner does not constrain name resolution (resolve, check-updates,
 //! publish edges), and the upload refused while garbage collection deletes one of its
 //! bodies (409 `body_being_collected`, or the older 500).
 #![allow(
@@ -343,17 +343,6 @@ impl MockState {
         self.packages.iter().find(|p| p.id == *holder)
     }
 
-    fn addressed(&self, owner: Option<&str>, name: &str) -> Option<&MockPackage> {
-        self.named(name).filter(|p| {
-            owner.is_none_or(|owner| {
-                owner.trim().is_empty()
-                    || p.owner
-                        .nickname()
-                        .is_some_and(|actual| actual.eq_ignore_ascii_case(owner.trim()))
-            })
-        })
-    }
-
     /// Whether the caller holds `action` in `clan`.
     fn clan_allows(&self, clan: Uuid, action: &str) -> bool {
         self.clans
@@ -478,7 +467,7 @@ fn mock_validate_edges(st: &MockState, package_id: Uuid, req: &Value) -> Option<
                 )));
             }
             let address = address_of(owner.map(str::trim), name);
-            let Some(target) = st.addressed(owner, name) else {
+            let Some(target) = st.named(name) else {
                 return Some(mock_bad_request(&format!("unknown {kind}: {address}")));
             };
             if target.id == package_id {
@@ -1061,11 +1050,11 @@ async fn resolve(
         .get("x-smudgy-package-compatibility")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    // A legacy owner constrains the globally claimed name.
+    // Every valid address resolves the globally claimed name, regardless of owner.
     if name.is_empty() || !valid_address_owner(params.get("owner").map(String::as_str)) {
         return envelope(404, Value::Null);
     }
-    let Some(pkg) = st.addressed(params.get("owner").map(String::as_str), &name) else {
+    let Some(pkg) = st.named(&name) else {
         return envelope(404, Value::Null);
     };
     let version = if range == "latest" {
@@ -1232,17 +1221,12 @@ async fn check_updates(State(state): State<Shared>, body: String) -> Response {
     if have_in.len() > 512 {
         return mock_bad_request("too many have entries");
     }
-    // A legacy `have` row matches only the named owner; modern rows match by name.
-    let have: std::collections::HashSet<(String, String, String)> = have_in
+    // Every `have` row matches by name and version, regardless of owner.
+    let have: std::collections::HashSet<(String, String)> = have_in
         .iter()
         .filter(|h| valid_address_owner(h["owner"].as_str()))
         .map(|h| {
             (
-                h["owner"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase(),
                 h["name"].as_str().unwrap_or_default().to_ascii_lowercase(),
                 h["version"].as_str().unwrap_or_default().to_string(),
             )
@@ -1261,9 +1245,7 @@ async fn check_updates(State(state): State<Shared>, body: String) -> Response {
             }
             result
         };
-        let pkg = valid_address_owner(owner)
-            .then(|| st.addressed(owner, name))
-            .flatten();
+        let pkg = valid_address_owner(owner).then(|| st.named(name)).flatten();
         let Some(pkg) = pkg else {
             results.push(echo(json!({
                 "name": name, "status": "not_found",
@@ -1320,19 +1302,7 @@ async fn check_updates(State(state): State<Shared>, body: String) -> Response {
                         continue;
                     };
                     queue.extend(dep_targets(&dep_v.dependencies));
-                    if have.contains(&(
-                        String::new(),
-                        dep_name.to_ascii_lowercase(),
-                        dep_version.clone(),
-                    )) || have.contains(&(
-                        dep_pkg
-                            .owner
-                            .nickname()
-                            .unwrap_or_default()
-                            .to_ascii_lowercase(),
-                        dep_name.to_ascii_lowercase(),
-                        dep_version.clone(),
-                    )) {
+                    if have.contains(&(dep_name.to_ascii_lowercase(), dep_version.clone())) {
                         continue;
                     }
                     let mut node = json!({
@@ -2940,12 +2910,14 @@ async fn a_clan_package_has_no_owner_and_resolves_by_name() {
         .expect("resolve by name");
     assert_eq!(resolved.package_id, pkg.id);
     assert_eq!(resolved.owner_nickname, None);
-    // A clan package cannot be addressed as if it belonged to a user.
-    assert!(matches!(
+    // A legacy owner segment does not prevent resolving a clan package by name.
+    assert_eq!(
         api.resolve_package(Some("anyone"), "Guild-Tools", None)
-            .await,
-        Err(CloudError::NotFoundOrNoAccess)
-    ));
+            .await
+            .unwrap()
+            .package_id,
+        pkg.id
+    );
     // A malformed owner segment is the uniform 404.
     for owner in ["no", "has space", "a/b"] {
         assert!(
@@ -3102,7 +3074,7 @@ async fn ownerless_edges_publish_and_come_back_naming_the_targets_owner() {
     publish_simple(&api, "util", "1.0.0", &[]).await;
 
     let app = api.create_package("app", "").await.expect("app");
-    let mut edges = [
+    let edges = [
         // `smudgy:@guild-lib`: no owner on the wire.
         PublishDependency {
             owner_nickname: None,
@@ -3110,7 +3082,7 @@ async fn ownerless_edges_publish_and_come_back_naming_the_targets_owner() {
             range: "^1".to_string(),
             resolved_version: "1.2.0".to_string(),
         },
-        // A well-formed but different legacy owner must be rejected.
+        // A well-formed legacy owner is ignored when resolving the global name.
         PublishDependency {
             owner_nickname: Some("someone".to_string()),
             name: "util".to_string(),
@@ -3118,14 +3090,9 @@ async fn ownerless_edges_publish_and_come_back_naming_the_targets_owner() {
             resolved_version: "1.0.0".to_string(),
         },
     ];
-    assert!(matches!(
-        publish_into(&api, app.id, "app", "1.0.0", &edges).await,
-        Err(CloudError::InvalidInput(_))
-    ));
-    edges[1].owner_nickname = Some("wbk".to_string());
     publish_into(&api, app.id, "app", "1.0.0", &edges)
         .await
-        .expect("publish with ownerless and matching-owner edges");
+        .expect("publish with ownerless and legacy-owner edges");
 
     let resolved = api
         .resolve_package(None, "app", None)
@@ -3207,7 +3174,7 @@ async fn check_updates_takes_ownerless_entries_and_have_rows() {
             name: "app".to_string(),
             installed: Some("1.0.0".to_string()),
         },
-        // A legacy user address cannot select a clan-owned package.
+        // A legacy owner segment still resolves the clan package by name.
         CheckUpdatesEntry {
             owner: Some("wbk".to_string()),
             name: "guild-lib".to_string(),
@@ -3245,15 +3212,15 @@ async fn check_updates_takes_ownerless_entries_and_have_rows() {
         Some("wbk"),
         "the owner is echoed"
     );
-    assert_eq!(lib_result.status, "not_found");
+    assert_eq!(lib_result.status, "ok");
     assert_eq!(malformed.status, "not_found");
 
-    // A `have` row without an owner elides the node it names.
+    // A `have` row with any valid owner elides the node it names.
     let response = api
         .check_updates(
             &entries[..1],
             &[CheckUpdatesHave {
-                owner: None,
+                owner: Some("former-owner".to_string()),
                 name: "GUILD-LIB".to_string(),
                 version: "1.2.0".to_string(),
             }],

@@ -57,6 +57,8 @@ log = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
+tempfile = "3"
 smudgy_session_model = { workspace = true }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 # Web Audio builds use deno_audio at runtime to match the snapshot's recorded

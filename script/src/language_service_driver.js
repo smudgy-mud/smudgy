@@ -431,6 +431,8 @@
   function isRuntimePackageSpecifier(value) {
     return (value.startsWith("npm:") && value.length > "npm:".length) ||
       (value.startsWith("jsr:") && value.length > "jsr:".length) ||
+      (value.startsWith("@") && value.length > 1) ||
+      (value.startsWith("smudgy:@") && value.length > "smudgy:@".length) ||
       (value.startsWith("smudgy://") && value.length > "smudgy://".length);
   }
 
@@ -457,7 +459,7 @@
   function authoredDiagnostics(fileName) {
     const program = service.getProgram();
     const sourceFile = program && program.getSourceFile(fileName);
-    // npm:, jsr:, and smudgy:// are resolved asynchronously by Smudgy's runtime. This
+    // npm:, jsr:, and Smudgy package imports (including @name) resolve at runtime. This
     // synchronous, snapshot-only TypeScript host cannot ask those resolvers to fetch a
     // package, so TS2307 would be a false claim that valid runtime syntax is missing.
     // Exact ambient/package declarations still participate normally and provide their
