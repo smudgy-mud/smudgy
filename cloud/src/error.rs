@@ -39,6 +39,12 @@ pub enum CloudError {
     /// Network/HTTP error
     NetworkError(String),
 
+    /// 503 — the service holds writes for a moment: a transfer's seal on
+    /// the subject (`write_freeze`), or a hold on every write. A transport
+    /// failure that retrying outlasts, so queued writes wait for it without
+    /// spending their attempts.
+    ServiceUnavailable(String),
+
     /// Serialization error
     SerializationError(String),
 
@@ -88,6 +94,22 @@ pub enum CloudError {
     /// deleted (delete is the heavy, two-step action). Yank it first.
     VersionNotYanked,
 
+    /// 409 `package_name_unavailable` — another package holds this name, or held
+    /// it once: package names are global and reserved forever, so the remedy is
+    /// another name. Carries the name.
+    PackageNameUnavailable(String),
+
+    /// 409 `body_being_collected` on a bundle upload — garbage collection was
+    /// deleting one of the publish's bodies, and the upload stored nothing. A
+    /// publish begins again once; this surfaces when that retry met it too.
+    BodyBeingCollected,
+
+    /// 413 — the request is over one of the server's size caps (a package's
+    /// manifest, README, module, version, or publish bundle). Carries the
+    /// server's message naming the cap. Permanent: retrying the same request
+    /// cannot succeed.
+    TooLarge(String),
+
     /// 409 `revision_conflict` — the aggregate moved past the mutation's
     /// precondition. Carries what the caller expected and where the server's
     /// projection of the aggregate now stands; the pending queue refetches
@@ -125,12 +147,50 @@ pub enum CloudError {
     /// this cloud operation was queued. The viewer-scoped journal retains it
     /// until identity is resolved again.
     CredentialChanged,
+
+    /// A room merge would delete map room `0`, on which a Secret (or the
+    /// caller's Private additions) keeps data or which one of its exits
+    /// leads to: deleting the room deletes every source's hold on it.
+    SecretKeepsRoomData(crate::RoomNumber),
+
+    /// 409 `last_owner` — the clan's last owner tried to leave or give up
+    /// ownership. A clan always has an owner: make someone else one first.
+    LastOwner,
+
+    /// 409 `clan_not_empty` — a clan that still owns maps (in its folders)
+    /// cannot be dissolved.
+    ClanNotEmpty,
+
+    /// 409 `clan_dissolving` — the clan is being dissolved: no map enters it
+    /// (creating a map there, accepting a transfer into it, or accepting an
+    /// offer to make a map Clan-owned), and its membership and its
+    /// Member-owned maps hold still (demoting, removing or an owner leaving;
+    /// writing, moving, renaming, refiling or deleting such a map, or its
+    /// Secrets; accepting an ownership offer on it). Promotions still go
+    /// through.
+    ClanDissolving,
+
+    /// 409 `atlas_not_empty` — a clan folder that still holds the clan's maps
+    /// cannot be deleted.
+    AtlasNotEmpty,
+
+    /// 409 `already_member` — the invited user is already a member.
+    AlreadyMember,
+
+    /// 409 `name_in_use` — the clan already has a group with that name,
+    /// ignoring case.
+    NameInUse,
+
+    /// 409 `transfer_already_pending` — the map or folder already has an
+    /// offer waiting: it has one live offer at a time.
+    TransferAlreadyPending,
 }
 
 impl fmt::Display for CloudError {
+    #[allow(clippy::too_many_lines)] // one arm per variant
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Self::InvalidInput(reason) | Self::StructuralConflict(reason) = self
-            && let Some(message) = merge_refusal_message(reason)
+            && let Some(message) = refusal_message(reason)
         {
             // Scripts use these stable codes to identify refusals.
             return write!(f, "{message} ({reason})");
@@ -163,6 +223,9 @@ impl fmt::Display for CloudError {
             CloudError::InvalidInput(msg) => write!(f, "Invalid input: {msg}"),
             CloudError::DatabaseError(msg) => write!(f, "Database error: {msg}"),
             CloudError::NetworkError(msg) => write!(f, "Network error: {msg}"),
+            CloudError::ServiceUnavailable(msg) => {
+                write!(f, "The map service is briefly holding changes: {msg}")
+            }
             CloudError::SerializationError(msg) => write!(f, "Serialization error: {msg}"),
             CloudError::AuthenticationError(msg) => write!(f, "Authentication error: {msg}"),
             CloudError::PermissionDenied(msg) => write!(f, "Permission denied: {msg}"),
@@ -185,6 +248,15 @@ impl fmt::Display for CloudError {
                 }
             }
             CloudError::VersionNotYanked => write!(f, "Yank this version before deleting it"),
+            CloudError::PackageNameUnavailable(name) => write!(
+                f,
+                "The package name {name} is taken; choose another. (package_name_unavailable)"
+            ),
+            CloudError::BodyBeingCollected => write!(
+                f,
+                "The server was tidying package storage; publish again in a minute. (body_being_collected)"
+            ),
+            CloudError::TooLarge(msg) => write!(f, "Too large to upload: {msg}"),
             CloudError::RevisionConflict {
                 expected_rev,
                 current_rev,
@@ -214,13 +286,37 @@ impl fmt::Display for CloudError {
             CloudError::CredentialChanged => {
                 write!(f, "Map credential changed before the edit was sent")
             }
+            CloudError::SecretKeepsRoomData(room) => write!(
+                f,
+                "A Secret keeps data for room {room}. Move or remove it first. \
+                 (merge_secret_room_data)"
+            ),
+            CloudError::LastOwner => write!(f, "Make someone else an owner first. (last_owner)"),
+            CloudError::ClanNotEmpty => {
+                write!(
+                    f,
+                    "Move or delete the maps in its folders first. (clan_not_empty)"
+                )
+            }
+            CloudError::ClanDissolving => {
+                write!(f, "This clan is being dissolved. (clan_dissolving)")
+            }
+            CloudError::AtlasNotEmpty => {
+                write!(f, "Move or delete its maps first. (atlas_not_empty)")
+            }
+            CloudError::AlreadyMember => write!(f, "Already a member. (already_member)"),
+            CloudError::NameInUse => write!(f, "Name already in use. (name_in_use)"),
+            CloudError::TransferAlreadyPending => write!(
+                f,
+                "It already has an offer waiting. (transfer_already_pending)"
+            ),
         }
     }
 }
 
 impl std::error::Error for CloudError {}
 
-fn merge_refusal_message(reason: &str) -> Option<&'static str> {
+fn refusal_message(reason: &str) -> Option<&'static str> {
     Some(match reason {
         "merge_areas_no_sources" => "Choose at least one source area to merge.",
         "merge_areas_same_area" => {
@@ -238,9 +334,6 @@ fn merge_refusal_message(reason: &str) -> Option<&'static str> {
         "merge_areas_unsupported_storage" => {
             "This storage does not support area merges. Use supported local or session storage."
         }
-        "merge_requires_full_projection" => {
-            "Merging requires full access to every affected area, including areas with links into the merge."
-        }
         "merge_areas_busy" => {
             "An affected area has pending edits or another operation in progress. Finish or resolve those operations before merging."
         }
@@ -255,6 +348,32 @@ fn merge_refusal_message(reason: &str) -> Option<&'static str> {
         }
         "merge_cross_area_links" => {
             "The room being merged away has links to or from other areas. Remove those links, then merge the rooms."
+        }
+        "move_busy" => {
+            "The map has pending edits or another operation in progress. Wait for them to finish, then move again."
+        }
+        "move_drops_places" => {
+            "Session maps can't hold Secrets or Private additions, so moving this map there would lose them. Copy it instead; the original keeps them."
+        }
+        "move_splits_links" => {
+            "An exit or connection joins content being moved to content staying behind. Move both ends together."
+        }
+        "room_number_exists" => "A room with that number already exists there.",
+        "secret_area_level" => "A Secret is managed in the map editor.",
+        "secret_view_only" => "This Secret is view only.",
+        "secret_unavailable" => "That Secret is no longer available to you.",
+        "secret_cannot_add" => "You can't add to this Secret.",
+        "secret_cannot_edit" => "You can't change this Secret's content.",
+        "secret_cannot_remove" => "You can't remove anything from this Secret.",
+        "secret_linked_map_rooms" => {
+            "A clan's Secret on a map filed in the clan by link keeps only its own rooms. It can't hold data on the map's rooms, lead into them, or trade rooms with the map."
+        }
+        "secret_link_between_secrets" => "A link can't join two Secrets.",
+        "secret_link_into_other_map" => {
+            "A link into another map's Secret leads to one of its rooms, and no link leads into another map's Private additions."
+        }
+        "secret_map_exit_retarget" => {
+            "A map exit can't lead into a Secret's room. Link from the Secret instead."
         }
         _ => return None,
     })
@@ -309,6 +428,13 @@ impl CloudError {
                     .to_string(),
             },
             (409, "operation_id_reused") => Self::OperationIdReused,
+            (409, "last_owner") => Self::LastOwner,
+            (409, "clan_not_empty") => Self::ClanNotEmpty,
+            (409, "clan_dissolving") => Self::ClanDissolving,
+            (409, "atlas_not_empty") => Self::AtlasNotEmpty,
+            (409, "already_member") => Self::AlreadyMember,
+            (409, "name_in_use") => Self::NameInUse,
+            (409, "transfer_already_pending") => Self::TransferAlreadyPending,
             (409, "structural_conflict") => Self::StructuralConflict(
                 details
                     .and_then(|d| d.get("reason"))
@@ -333,8 +459,16 @@ impl CloudError {
                 Self::VersionUnavailable(version)
             }
             (409, m) if m.contains("version_not_yanked") => Self::VersionNotYanked,
+            (409, m) if m.starts_with("package_name_unavailable") => Self::PackageNameUnavailable(
+                m.split_once(':')
+                    .map(|(_, name)| name.trim().to_string())
+                    .unwrap_or_default(),
+            ),
+            (409, m) if m.starts_with("body_being_collected") => Self::BodyBeingCollected,
             (409, _) => Self::NameUnavailable(message.to_string()),
+            (413, _) => Self::TooLarge(message.to_string()),
             (426, _) => Self::UpgradeRequired,
+            (503, _) => Self::ServiceUnavailable(message.to_string()),
             _ => Self::NetworkError(format!("HTTP {status}: {message}")),
         }
     }
@@ -350,7 +484,7 @@ impl CloudError {
     /// off (offline, DNS, timeouts) as opposed to server verdicts.
     #[must_use]
     pub const fn is_transport_error(&self) -> bool {
-        matches!(self, Self::NetworkError(_))
+        matches!(self, Self::NetworkError(_) | Self::ServiceUnavailable(_))
     }
 
     /// True when the server rejected this client as too old (426). The only
@@ -400,12 +534,28 @@ mod tests {
             ("merge_areas_room_not_found", "Check the room numbers"),
             ("merge_areas_mixed_tiers", "same storage"),
             ("merge_areas_unsupported_storage", "local or session"),
-            ("merge_requires_full_projection", "full access"),
             ("merge_areas_busy", "pending edits"),
             ("merge_areas_source_changed", "Review the current map"),
             ("merge_areas_room_numbers_exhausted", "room numbers"),
             ("merge_areas_invalid_translation", "supported range"),
             ("merge_cross_area_links", "other areas"),
+            ("move_busy", "pending edits"),
+            ("move_drops_places", "Copy it instead"),
+            ("move_splits_links", "Move both ends together"),
+            ("room_number_exists", "already exists"),
+            ("secret_area_level", "map editor"),
+            ("secret_view_only", "view only"),
+            ("secret_unavailable", "no longer available"),
+            ("secret_cannot_add", "add to this Secret"),
+            ("secret_cannot_edit", "change this Secret"),
+            ("secret_cannot_remove", "remove anything"),
+            ("secret_linked_map_rooms", "only its own rooms"),
+            ("secret_link_between_secrets", "two Secrets"),
+            (
+                "secret_link_into_other_map",
+                "another map's Private additions",
+            ),
+            ("secret_map_exit_retarget", "Link from the Secret"),
         ] {
             let error = if code == "merge_areas_invalid_translation" {
                 CloudError::InvalidInput(code.to_string())
@@ -423,6 +573,34 @@ mod tests {
     }
 
     #[test]
+    fn clan_conflicts_keep_their_own_variants() {
+        for (code, expected) in [
+            ("last_owner", CloudError::LastOwner),
+            ("clan_not_empty", CloudError::ClanNotEmpty),
+            ("clan_dissolving", CloudError::ClanDissolving),
+            ("atlas_not_empty", CloudError::AtlasNotEmpty),
+            ("already_member", CloudError::AlreadyMember),
+            ("name_in_use", CloudError::NameInUse),
+            (
+                "transfer_already_pending",
+                CloudError::TransferAlreadyPending,
+            ),
+        ] {
+            let error = CloudError::from_status(409, code);
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected),
+                "{code}"
+            );
+            assert!(error.to_string().ends_with(&format!("({code})")), "{error}");
+        }
+        assert!(matches!(
+            CloudError::from_status(409, "That nickname is taken; please choose another."),
+            CloudError::NameUnavailable(_)
+        ));
+    }
+
+    #[test]
     fn unrelated_and_unknown_refusals_keep_their_diagnostics() {
         for reason in ["link_target_missing", "merge_areas_future_reason"] {
             assert_eq!(
@@ -434,5 +612,55 @@ mod tests {
             CloudError::InvalidInput("invalid UUID".to_string()).to_string(),
             "Invalid input: invalid UUID"
         );
+    }
+
+    #[test]
+    fn package_conflicts_keep_their_own_variants() {
+        let error = CloudError::from_status(409, "package_name_unavailable: My-Lib");
+        assert!(
+            matches!(&error, CloudError::PackageNameUnavailable(name) if name == "My-Lib"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("My-Lib"), "{error}");
+        for message in ["body_being_collected", "body_being_collected: 0123abcd"] {
+            assert!(
+                matches!(
+                    CloudError::from_status(409, message),
+                    CloudError::BodyBeingCollected
+                ),
+                "{message}"
+            );
+        }
+        assert!(matches!(
+            CloudError::from_status(409, "version_unavailable: 1.0.0"),
+            CloudError::VersionUnavailable(version) if version == "1.0.0"
+        ));
+    }
+
+    #[test]
+    fn a_write_freeze_is_a_transport_failure_never_a_sign_out() {
+        let error = CloudError::from_status(503, "Service temporarily unavailable");
+        assert!(
+            matches!(&error, CloudError::ServiceUnavailable(_)),
+            "{error:?}"
+        );
+        assert!(error.is_transport_error(), "retried as a network failure");
+        assert!(!error.is_auth_error());
+        assert!(!error.is_upgrade_required());
+    }
+
+    #[test]
+    fn a_size_cap_is_a_permanent_verdict_that_keeps_the_servers_message() {
+        let message = "bundle too large: 95000001 bytes (max 95000000)";
+        let error = CloudError::from_status(413, message);
+        assert!(
+            matches!(&error, CloudError::TooLarge(kept) if kept == message),
+            "{error:?}"
+        );
+        assert!(
+            !error.is_transport_error(),
+            "retrying cannot shrink the request"
+        );
+        assert!(error.to_string().contains("95000000"), "{error}");
     }
 }

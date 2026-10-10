@@ -536,7 +536,11 @@ impl InstalledPackageTypes {
         if self.local {
             format!("../packages/{}", self.name)
         } else {
-            format!("./packages/{}/{}", self.owner, self.name)
+            format!(
+                "./packages/{}/{}",
+                smudgy_script::owner_segment(&self.owner),
+                self.name
+            )
         }
     }
 
@@ -546,7 +550,11 @@ impl InstalledPackageTypes {
         if self.local {
             format!("../../packages/{}", self.name)
         } else {
-            format!("../packages/{}/{}", self.owner, self.name)
+            format!(
+                "../packages/{}/{}",
+                smudgy_script::owner_segment(&self.owner),
+                self.name
+            )
         }
     }
 }
@@ -589,14 +597,22 @@ fn tsconfig_base(packages: &[InstalledPackageTypes]) -> Result<String> {
     if !packages.is_empty() {
         let mut paths = serde_json::Map::new();
         for pkg in packages {
-            paths.insert(
-                format!("smudgy://{}/{}", pkg.owner, pkg.name),
-                serde_json::json!([format!("{}/{}", pkg.dir_from_managed(), pkg.entry_module)]),
-            );
-            paths.insert(
-                format!("smudgy://{}/{}/*", pkg.owner, pkg.name),
-                serde_json::json!([format!("{}/*", pkg.dir_from_managed())]),
-            );
+            // A package's name is global: its canonical `smudgy:@name` address types the same
+            // as the spelling it was installed under.
+            let mut addresses = vec![smudgy_script::package_address(&pkg.owner, &pkg.name)];
+            if !pkg.owner.is_empty() {
+                addresses.push(smudgy_script::package_address("", &pkg.name));
+            }
+            for address in addresses {
+                paths.insert(
+                    address.clone(),
+                    serde_json::json!([format!("{}/{}", pkg.dir_from_managed(), pkg.entry_module)]),
+                );
+                paths.insert(
+                    format!("{address}/*"),
+                    serde_json::json!([format!("{}/*", pkg.dir_from_managed())]),
+                );
+            }
         }
         compiler_options["paths"] = serde_json::Value::Object(paths);
     }
@@ -704,7 +720,11 @@ fn interop_handles_dts(packages: &[InstalledPackageTypes]) -> String {
             if handles.is_empty() {
                 continue;
             }
-            let module = format!("smudgy:{scheme}/{}/{}", pkg.owner, pkg.name);
+            let module = if pkg.owner.is_empty() {
+                format!("smudgy:{scheme}/@{}", pkg.name)
+            } else {
+                format!("smudgy:{scheme}/{}/{}", pkg.owner, pkg.name)
+            };
             let twin_names: std::collections::HashSet<&str> = handles
                 .iter()
                 .filter(|h| is_type_alias_name(&h.name))
@@ -748,7 +768,7 @@ fn interop_handles_dts(packages: &[InstalledPackageTypes]) -> String {
                 let _ = writeln!(
                     out,
                     "  export type {{ {name} }} from {};",
-                    quote_ts(&format!("smudgy://{}/{}", pkg.owner, pkg.name))
+                    quote_ts(&smudgy_script::package_address(&pkg.owner, &pkg.name))
                 );
             }
             let _ = writeln!(out, "}}");
@@ -793,7 +813,7 @@ fn consumer_type_for(
     handle: &smudgy_script::interop_extract::InteropHandle,
 ) -> String {
     use smudgy_script::interop_extract::InteropKind;
-    let entry = quote_ts(&format!("smudgy://{}/{}", pkg.owner, pkg.name));
+    let entry = quote_ts(&smudgy_script::package_address(&pkg.owner, &pkg.name));
     if handle.exported && is_ts_ident(&handle.const_name) {
         return format!(
             "import(\"smudgy:core\").ConsumerOf<typeof import({entry}).{}>",
@@ -2824,13 +2844,17 @@ sync.to(session).to(session);
         sources.insert(
             "check.ts".to_string(),
             "import { Area, MutateAreaError } from \"smudgy:core\";\n\
-             import type { MapperImpl, AreaConstructorImpl, MutateAreaErrorConstructorImpl, AreaImpl, RoomImpl, ExitImpl } from \"./impl.ts\";\n\
+             import type { MapperImpl, AreaConstructorImpl, MutateAreaErrorConstructorImpl, AreaImpl, RoomImpl, ExitImpl, SecretImpl, SecretRegistryImpl, RoomViewImpl, AreaViewImpl } from \"./impl.ts\";\n\
              declare const m: MapperImpl;\n\
              declare const errorConstructor: MutateAreaErrorConstructorImpl;\n\
              declare const areaConstructor: AreaConstructorImpl;\n\
              declare const a: AreaImpl;\n\
              declare const r: RoomImpl;\n\
              declare const e: ExitImpl;\n\
+             declare const s: SecretImpl;\n\
+             declare const registry: SecretRegistryImpl;\n\
+             declare const roomView: RoomViewImpl;\n\
+             declare const areaView: AreaViewImpl;\n\
              // The runtime impl must fulfill the published global map-type contract.\n\
              export const __mapper: Mapper = m;\n\
              export const __errorConstructor: typeof MutateAreaError = errorConstructor;\n\
@@ -2838,6 +2862,10 @@ sync.to(session).to(session);
              export const __area: Area = a;\n\
              export const __room: Room = r;\n\
              export const __exit: Exit = e;\n\
+             export const __secret: Secret = s;\n\
+             export const __registry: SecretRegistry = registry;\n\
+             export const __roomView: RoomView = roomView;\n\
+             export const __areaView: AreaView = areaView;\n\
              export const __instanceof: boolean = a instanceof Area;\n"
                 .to_string(),
         );
@@ -2852,10 +2880,12 @@ sync.to(session).to(session);
     }
 
     /// The compatibility catalog is deliberately finite: the `ephemeral`
-    /// creation flag, the `isEphemeral` read, and `Area.uuid` (an alias for
-    /// `id` since ids became canonical UUID strings). These assertions do three
-    /// jobs together: old scripts still type-check during 0.5.x, every
-    /// compatibility member carries an editor-visible deprecation, and the
+    /// creation flag, the `isEphemeral` read, `Area.uuid` (an alias for `id`
+    /// since ids became canonical UUID strings), and the `snake_case` names the
+    /// API used before every name became camelCase (one note in the contract,
+    /// one table in the runtime; the names themselves stay out of the typings).
+    /// These assertions do three jobs together: old scripts still type-check
+    /// during 0.5.x, every compatibility member carries a deprecation, and the
     /// test itself blocks the first 0.6 build until the shims are removed.
     /// Creating with no storage choice at all is NOT in the catalog: it is
     /// the supported default (durable, cloud when signed in, local
@@ -2878,21 +2908,21 @@ sync.to(session).to(session);
             .expect("Cargo package versions are valid semver");
         assert!(
             (running.major, running.minor) < (0, 6),
-            "remove the mapper's `ephemeral` creation flag, `isEphemeral` and the \
-             `uuid` alias before building the 0.6 release line"
+            "remove the mapper's `ephemeral` creation flag, `isEphemeral`, the \
+             `uuid` alias and the snake_case names before building the 0.6 release line"
         );
 
         assert_eq!(
             SMUDGY_MAPPER_DTS.matches(DEPRECATION).count(),
-            3,
+            4,
             "the compatibility catalog is exactly: CreateAreaOptions.ephemeral, \
-             Area.isEphemeral and Area.uuid"
+             Area.isEphemeral, Area.uuid and the snake_case names' note"
         );
         assert_eq!(
             SMUDGY_MAPPER_TS.matches(DEPRECATION).count(),
-            3,
+            4,
             "the runtime implementation must mark its ephemeral option, its \
-             ephemeral getter and the `uuid` alias"
+             ephemeral getter, the `uuid` alias and its snake_case names table"
         );
         let nukefire_mapper = include_str!("../../../packages/nukefire-mapper/mapper.ts");
         assert_eq!(
@@ -2930,6 +2960,35 @@ sync.to(session).to(session);
             out.diagnostics.is_empty(),
             "a supported creation form or a 0.5 compatibility form stopped type-checking:\n{:#?}",
             out.diagnostics
+        );
+    }
+
+    /// Every name the mapper contract declares is camelCase: outside comments, no identifier
+    /// and no string literal carries an underscore (the type-only `__id` brand aside). The
+    /// `snake_case` names earlier versions used live on only in the runtime's 0.5 aliases and
+    /// the one deprecation note.
+    #[test]
+    fn mapper_contract_names_are_camel_case() {
+        let mut code = String::with_capacity(SMUDGY_MAPPER_DTS.len());
+        let mut rest = SMUDGY_MAPPER_DTS;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("//") {
+                rest = after.find('\n').map_or("", |end| &after[end..]);
+            } else if let Some(after) = rest.strip_prefix("/*") {
+                rest = after.find("*/").map_or("", |end| &after[end + 2..]);
+            } else {
+                let mut chars = rest.chars();
+                code.extend(chars.next());
+                rest = chars.as_str();
+            }
+        }
+        let offenders: Vec<&str> = code
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| word.contains('_') && !word.starts_with("__"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the mapper contract declares snake_case names: {offenders:?}"
         );
     }
 
@@ -2981,6 +3040,14 @@ sync.to(session).to(session);
         assert_covered(&smudgy_cloud::SegmentShape::ALL, "SegmentShape");
         assert_covered(&smudgy_cloud::CornerStyle::ALL, "CornerStyle");
         assert_covered(&smudgy_cloud::ConnectionDash::ALL, "ConnectionDash");
+        assert_covered(
+            &[
+                smudgy_cloud::DoorState::Open,
+                smudgy_cloud::DoorState::Closed,
+                smudgy_cloud::DoorState::Locked,
+            ],
+            "DoorState",
+        );
     }
 
     /// The id-typing contract, in both directions at once.
@@ -3010,6 +3077,7 @@ sync.to(session).to(session);
         const PRELUDE: &str = r#"import { mapper } from "smudgy:core";
             declare const area: Area;
             declare const exit: Exit;
+            declare const secret: Secret;
             declare const fromParam: string;
             declare const fromJson: any;
         "#;
@@ -3049,15 +3117,15 @@ sync.to(session).to(session);
             ),
             // Ids nested in an options/args object rather than passed directly. A widening
             // pass over parameter *lines* cannot reach these, which is how
-            // `ExitArgs.to_area_id` and `CreateAreaOptions.atlas` first shipped branded-only.
+            // `ExitArgs.toAreaId` and `CreateAreaOptions.atlas` first shipped branded-only.
             (
                 "a plain string as a cross-area exit target",
-                r#"void mapper.createRoomExit(area, 1, { from_direction: "North", to_area_id: fromParam });"#,
+                r#"void mapper.createRoomExit(area, 1, { fromDirection: "North", toAreaId: fromParam });"#,
                 true,
             ),
             (
                 "a plain string as an exit update target",
-                r#"void mapper.setRoomExit(area, 1, exit.id, { to_area_id: fromParam });"#,
+                r"void mapper.setRoomExit(area, 1, exit.id, { toAreaId: fromParam });",
                 true,
             ),
             (
@@ -3072,7 +3140,7 @@ sync.to(session).to(session);
             ),
             (
                 "a wrong-kind id nested in an options object",
-                r#"void mapper.createRoomExit(area, 1, { from_direction: "North", to_area_id: exit.id });"#,
+                r#"void mapper.createRoomExit(area, 1, { fromDirection: "North", toAreaId: exit.id });"#,
                 false,
             ),
             // The three that must NOT compile.
@@ -3089,6 +3157,63 @@ sync.to(session).to(session);
             (
                 "an ExitId stored as an AreaId",
                 "const bad: AreaId = exit.id; void bad;",
+                false,
+            ),
+            // Places: a Secret's id names its own area, and a place is a keyword, a
+            // Secret handle, or a Secret's id, which no keyword can be mistaken for.
+            (
+                "a Secret's id as its area",
+                "void mapper.getAreaById(secret.id);",
+                true,
+            ),
+            (
+                "a Secret handle as a place",
+                r#"void area.room(1)?.in(secret).data("notes");"#,
+                true,
+            ),
+            (
+                "a stored Secret id as a place",
+                r#"void area.room(1)?.in(fromParam).data("notes");"#,
+                true,
+            ),
+            (
+                "the Private keyword in a mutateArea",
+                r#"void mapper.mutateArea(area, (m) => m.setAreaProperty("a", "b"), { in: "private" });"#,
+                true,
+            ),
+            (
+                "a search narrowed to a place",
+                r#"void mapper.findRoomsWithTag("inn", { in: secret });"#,
+                true,
+            ),
+            (
+                "an ExitId as a place",
+                "void area.room(1)?.in(exit.id);",
+                false,
+            ),
+            (
+                "the old source wrapper",
+                "void area.room(1)?.in({ secret: fromParam });",
+                false,
+            ),
+            (
+                "the old source option",
+                r#"void area.room(1)?.data("notes", { source: "private" });"#,
+                false,
+            ),
+            (
+                "an action from the API's vocabulary",
+                r#"const can: boolean = secret.actions.includes("manageAccess"); void can;"#,
+                true,
+            ),
+            (
+                "an action in the wire's spelling",
+                r#"const can: boolean = secret.actions.includes("manage_access"); void can;"#,
+                false,
+            ),
+            (
+                "a snake_case name",
+                "void area.room(1)?.room_number;",
                 false,
             ),
         ];
@@ -3146,8 +3271,8 @@ sync.to(session).to(session);
             }
 
             function useRoom(room: Room): void {
-              const aid: AreaId = room.area_id;
-              const n: RoomNumber = room.room_number;
+              const aid: AreaId = room.areaId;
+              const n: RoomNumber = room.roomNumber;
               const t: string = room.title;
               const d: string = room.description;
               const x: number = room.x; const y: number = room.y; const l: number = room.level;
@@ -3156,65 +3281,82 @@ sync.to(session).to(session);
               const tags: string[] = room.tags;
               const has: boolean = room.hasTag("INN");
               const notes: string | undefined = room.data("notes");
+              const place: MapPlace = room.place;
+              const mine: string | undefined = room.in("private").data("notes");
+              const versions: RoomPlaceData[] = room.combinedData("notes");
+              const all: RoomPlaceEntry[] = room.combinedData();
+              const byPlace: RoomPlaceTag[] = room.combinedTags();
+              const behind: Room | undefined = room.exits[0]?.toRoom;
+              const keeper: MapPlace | undefined = room.exits[0]?.place;
               void aid; void n; void t; void d; void x; void y; void l; void c; void exits; void tags; void has; void notes;
+              void place; void mine; void versions; void all; void byPlace; void behind; void keeper;
             }
             function useArea(area: Area): void {
               const id: AreaId = area.id;
               const uuid: string = area.uuid;
               const name: string = area.name;
-              const nums: RoomNumber[] = area.room_numbers;
-              const next: RoomNumber = area.next_room_number;
+              const nums: RoomNumber[] = area.roomNumbers;
+              const next: RoomNumber = area.nextRoomNumber;
               const r: Room | undefined = area.room(1);
               const p: string | undefined = area.data("notes");
-              void id; void uuid; void name; void nums; void next; void r; void p;
+              const places: MapPlace[] = area.places;
+              const secrets: Secret[] = area.secrets.list();
+              const narrowed: Room[] = area.in("map").findRoomsWithTag("INN");
+              const quest: string | undefined = area.in(secrets[0] ?? "map").data("quest");
+              void id; void uuid; void name; void nums; void next; void r; void p; void places; void secrets; void narrowed; void quest;
             }
             function useExit(e: Exit): void {
               const id: ExitId = e.id;
-              const fd = e.from_direction;
-              const fa: AreaId = e.from_area_id;
-              const fr: RoomNumber = e.from_room_number;
-              const ta = e.to_area_id; const tr = e.to_room_number; const td = e.to_direction;
-              const closed: boolean = e.is_closed; const hidden: boolean = e.is_hidden; const locked: boolean = e.is_locked;
+              const fd = e.fromDirection;
+              const fa: AreaId = e.fromAreaId;
+              const fr: RoomNumber = e.fromRoomNumber;
+              const ta = e.toAreaId; const tr = e.toRoomNumber; const td = e.toDirection;
+              const hidden: boolean = e.isHidden;
+              const door: Door | null = e.door;
+              const state: DoorState | undefined = door?.state;
+              const opensWith: string | null | undefined = door?.opensWith;
+              const named: string | null | undefined = door?.name;
               const w: number = e.weight; const cmd = e.command;
-              void id; void fd; void fa; void fr; void ta; void tr; void td; void closed; void hidden; void locked; void w; void cmd;
+              void id; void fd; void fa; void fr; void ta; void tr; void td; void hidden; void door; void state; void opensWith; void named; void w; void cmd;
             }
             async function useMapper(room: Room): Promise<void> {
               const areas: Area[] = mapper.areas;
-              const a: Area = mapper.getAreaById(room.area_id);
-              const path: [AreaId, RoomNumber][] = mapper.getPathBetweenRooms(room.area_id, room.room_number, room.area_id, room.room_number);
+              const a: Area = mapper.getAreaById(room.areaId);
+              const path: [AreaId, RoomNumber][] = mapper.getPathBetweenRooms(room.areaId, room.roomNumber, room.areaId, room.roomNumber);
               const near: Room | undefined = mapper.findNearestRoomWithTags(room, { all: ["INN"], none: ["PEACE"] });
               const near1: Room | undefined = mapper.findNearestRoomWithTag(room, "INN");
-              const near2: Room | undefined = mapper.findNearestRoomInArea(room, room.area_id);
+              const near2: Room | undefined = mapper.findNearestRoomInArea(room, room.areaId);
               const near3: Room | undefined = mapper.findNearestRoomInArea(room, a);
               const list = mapper.listRoomsByTitleAndDescription("t", "d");
               const list2 = mapper.listRoomsByTitleDescriptionAndVisibleExits("t", "d", ["North"]);
               const newArea: Area = await mapper.createArea("Town");
               const keyedArea: Area = await mapper.createArea("The Deathlands", { storage: "local", properties: { "nukefire.area": "the deathlands" } });
               const runtimeCheck: boolean = newArea instanceof Area;
-              const newRoom: RoomNumber = await mapper.createRoom(room.area_id, { title: "x" });
-              const batchIds: OperationId[] = await mapper.mutateArea(room.area_id, async (mutation) => {
+              const newRoom: RoomNumber = await mapper.createRoom(room.areaId, { title: "x" });
+              const batchIds: OperationId[] = await mapper.mutateArea(room.areaId, async (mutation) => {
                 const batchedRoom: RoomNumber = await mutation.createRoom({ title: "batch" });
                 await mutation.setRoomProperty(batchedRoom, "terrain", "city");
-                await mutation.createRoomExit(batchedRoom, { from_direction: "South" });
+                await mutation.createRoomExit(batchedRoom, { fromDirection: "South" });
               }, { description: "typed batch" });
-              const exitId: ExitId = await mapper.createRoomExit(room.area_id, room.room_number, { from_direction: "North" });
-              const updateId: OperationId | null = await mapper.setRoomExit(room.area_id, room.room_number, exitId, { command: "enter hole" });
-              const mergeId: OperationId | null = await mapper.mergeRooms(room.area_id, room.room_number, room.room_number + 1);
-              const merged: MergedRoom[] = await mapper.mergeAreas(room.area_id, [a, newArea.id, { area: a, translate: { x: 40 } }, { area: a, rooms: [room.room_number], translate: { y: 8 } }]);
-              await mapper.deleteRoomExit(room.area_id, room.room_number, exitId);
-              await mapper.deleteRoom(room.area_id, room.room_number);
-              mapper.setCurrentLocation(room.area_id, room.room_number);
-              await mapper.setRoomProperty(room.area_id, room.room_number, "k", "v");
-              await mapper.setAreaProperty(room.area_id, "k", "v");
-              await mapper.addRoomTag(room.area_id, room.room_number, "INN");
-              await mapper.removeRoomTag(room.area_id, room.room_number, "INN");
-              await mapper.setRoomColor(room.area_id, room.room_number, "#fff");
-              await mapper.setRoomX(room.area_id, room.room_number, 1);
-              await mapper.setRoomY(room.area_id, room.room_number, 1);
-              await mapper.setRoomLevel(room.area_id, room.room_number, 1);
-              await mapper.setRoomTitle(room.area_id, room.room_number, "t");
-              await mapper.setRoomDescription(room.area_id, room.room_number, "d");
-              await mapper.renameArea(room.area_id, "n");
+              const exitId: ExitId = await mapper.createRoomExit(room.areaId, room.roomNumber, { fromDirection: "North", door: { state: "locked", name: "gate", opensWith: "unlock gate" } });
+              const updateId: OperationId | null = await mapper.setRoomExit(room.areaId, room.roomNumber, exitId, { command: "enter hole", door: { state: "open" } });
+              await mapper.setRoomExit(room.areaId, room.roomNumber, exitId, { door: null });
+              const mergeId: OperationId | null = await mapper.mergeRooms(room.areaId, room.roomNumber, room.roomNumber + 1);
+              const merged: MergedRoom[] = await mapper.mergeAreas(room.areaId, [a, newArea.id, { area: a, translate: { x: 40 } }, { area: a, rooms: [room.roomNumber], translate: { y: 8 } }]);
+              await mapper.deleteRoomExit(room.areaId, room.roomNumber, exitId);
+              await mapper.deleteRoom(room.areaId, room.roomNumber);
+              mapper.setCurrentLocation(room.areaId, room.roomNumber);
+              await mapper.setRoomProperty(room.areaId, room.roomNumber, "k", "v");
+              await mapper.setAreaProperty(room.areaId, "k", "v");
+              await mapper.addRoomTag(room.areaId, room.roomNumber, "INN");
+              await mapper.removeRoomTag(room.areaId, room.roomNumber, "INN");
+              await mapper.setRoomColor(room.areaId, room.roomNumber, "#fff");
+              await mapper.setRoomX(room.areaId, room.roomNumber, 1);
+              await mapper.setRoomY(room.areaId, room.roomNumber, 1);
+              await mapper.setRoomLevel(room.areaId, room.roomNumber, 1);
+              await mapper.setRoomTitle(room.areaId, room.roomNumber, "t");
+              await mapper.setRoomDescription(room.areaId, room.roomNumber, "d");
+              await mapper.renameArea(room.areaId, "n");
               void areas; void a; void path; void near; void near1; void list; void list2; void newArea; void keyedArea; void runtimeCheck; void newRoom; void batchIds; void updateId; void mergeId; void merged;
             }
             export { useRoom, useArea, useExit, useMapper, savedBeforeFailure };

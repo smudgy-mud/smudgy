@@ -29,7 +29,7 @@ use crate::{
     RoomNumber, RoomWithDetails, Shape,
     connection_lifecycle::{self, ExitTopology},
     mapper::RoomKey,
-    mutation::{ResourceKind, VersionInfo},
+    mutation::VersionInfo,
 };
 
 /// The rigid offset applied to everything in one source before it lands in
@@ -275,10 +275,8 @@ pub fn apply_area_merge(
 
 fn version(id: AreaId, rev: i64, deleted: bool) -> VersionInfo {
     VersionInfo {
-        resource: ResourceKind::Area,
-        id: id.0,
-        rev,
         deleted,
+        ..VersionInfo::map_source(id.0, rev)
     }
 }
 
@@ -588,7 +586,7 @@ fn move_content(
         for exit in &room.exits {
             before.insert(
                 exit.id,
-                area_edits::exit_topology(into_id, room.room_number, exit),
+                area_edits::exit_topology(into_id, room.room_number.into(), exit),
             );
         }
     }
@@ -613,7 +611,7 @@ fn move_content(
             for exit in &room.exits {
                 before.insert(
                     exit.id,
-                    area_edits::exit_topology(source_id, room.room_number, exit),
+                    area_edits::exit_topology(source_id, room.room_number.into(), exit),
                 );
             }
         }
@@ -869,7 +867,7 @@ fn reattach_changed_exits(into: &mut AreaWithDetails, before: &HashMap<ExitId, E
             .is_some_and(|before| connection_lifecycle::topology_differs(before, after))
         {
             connection_lifecycle::retarget_in_place(connection, after, &|number| {
-                sites.get(&number).copied()
+                sites.get(&number.number).copied()
             });
         }
     }
@@ -978,8 +976,8 @@ fn pair_cross_area_halves(
 struct ReciprocalCandidates {
     buckets: HashMap<
         (
-            RoomNumber,
-            RoomNumber,
+            crate::RoomAddress,
+            crate::RoomAddress,
             crate::ExitDirection,
             Option<crate::ExitDirection>,
         ),
@@ -1061,7 +1059,10 @@ mod tests {
 
     fn area(id: AreaId, rev: i64) -> AreaWithDetails {
         AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: Area {
+                projection_token: None,
                 id,
                 user_id: None,
                 atlas_id: None,
@@ -1075,9 +1076,12 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
             },
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: vec![],
             rooms: vec![],
             labels: vec![],
@@ -1099,7 +1103,6 @@ mod tests {
             properties: vec![],
             exits: vec![],
             tags: BTreeSet::new(),
-            is_secret: false,
             external_id: None,
         }
     }
@@ -1342,12 +1345,12 @@ mod tests {
                 let topology = ExitTopology {
                     id: ExitId(Uuid::from_u128(n + 1)),
                     connection_id: ConnectionId(Uuid::from_u128(n + 1)),
-                    from_room: RoomNumber(i32::try_from(draw(4)).unwrap()),
+                    from_room: RoomNumber(i32::try_from(draw(4)).unwrap()).into(),
                     from_direction: ExitDirection::ALL[draw(14)],
                     to_room_in_area: if draw(8) == 0 {
                         None
                     } else {
-                        Some(RoomNumber(i32::try_from(draw(4)).unwrap()))
+                        Some(RoomNumber(i32::try_from(draw(4)).unwrap()).into())
                     },
                     to_direction: if draw(3) == 0 {
                         None
@@ -1596,7 +1599,6 @@ mod tests {
             background_color: String::new(),
             font_size: 12,
             font_weight: 400,
-            is_secret: false,
         });
         source.shapes.push(Shape {
             id: ShapeId(Uuid::from_u128(21)),
@@ -1610,7 +1612,6 @@ mod tests {
             shape_type: ShapeType::Rectangle,
             border_radius: 0.0,
             stroke_width: 1.0,
-            is_secret: false,
         });
         assert_valid(&mut source);
         let plan = plan(&into, &[(&source, shift(100.0, 50.0, 2))], &[], 2);
@@ -1748,12 +1749,11 @@ mod tests {
         let connection = connection_in(third, connection_id);
         assert_eq!(connection.kind, ConnectionKind::External);
         assert!(connection.endpoint_b.is_none());
-        assert!(outcome.versions.contains(&VersionInfo {
-            resource: ResourceKind::Area,
-            id: area_id(3).0,
-            rev: 8,
-            deleted: false,
-        }));
+        assert!(
+            outcome
+                .versions
+                .contains(&VersionInfo::map_source(area_id(3).0, 8))
+        );
     }
 
     #[test]
@@ -2112,22 +2112,18 @@ mod tests {
         into.properties.push(Property {
             name: "zone".to_string(),
             value: "keep".to_string(),
-            is_secret: false,
         });
         let mut source = with_rooms(area_id(2), &[1]);
         source.properties.push(Property {
             name: "zone".to_string(),
             value: "drop".to_string(),
-            is_secret: false,
         });
         source.rooms[0].properties.push(Property {
             name: "kind".to_string(),
             value: "inn".to_string(),
-            is_secret: true,
         });
         source.rooms[0].tags.insert("SAFE".to_string());
         source.rooms[0].external_id = Some("r-1".to_string());
-        source.rooms[0].is_secret = true;
         source.rooms[0].color = "#ff0000".to_string();
         source.rooms[0].description = "cozy".to_string();
         let exit = add_exit(&mut source, 1, ExitDirection::North, None, 10);
@@ -2144,10 +2140,8 @@ mod tests {
         assert_eq!(moved.description, "cozy");
         assert_eq!(moved.color, "#ff0000");
         assert_eq!(moved.properties.len(), 1);
-        assert!(moved.properties[0].is_secret);
         assert!(moved.tags.contains("SAFE"));
         assert_eq!(moved.external_id.as_deref(), Some("r-1"));
-        assert!(moved.is_secret);
         assert_eq!(moved.exits[0].id, exit);
         assert_eq!(moved.exits[0].connection_id, connection_id);
         assert!(into.connections.iter().any(|c| c.id == connection_id));
@@ -2174,7 +2168,6 @@ mod tests {
             background_color: String::new(),
             font_size: 12,
             font_weight: 400,
-            is_secret: false,
         }
     }
 
@@ -2191,7 +2184,6 @@ mod tests {
             shape_type: ShapeType::Rectangle,
             border_radius: 0.0,
             stroke_width: 1.0,
-            is_secret: false,
         }
     }
 

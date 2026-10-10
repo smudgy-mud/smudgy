@@ -152,7 +152,8 @@ pub enum HomeIsolate {
     OwnSandbox,
 }
 
-/// Per-engine map of installed package → home isolate, keyed by ASCII-folded `(owner, name)`.
+/// Per-engine map of installed package → home isolate, keyed by the package's ASCII-folded
+/// name (its identity, whichever owner an address spells).
 /// Built from the lockfile before any module evaluates, then *pruned* of packages the load gates
 /// (required-params / `min_smudgy_version`) subsequently refuse — so a blocked package is home
 /// nowhere and a code-imported copy of it can't publish in its name. The `RefCell` exists for
@@ -165,7 +166,7 @@ pub enum HomeIsolate {
 /// engine's life — the interning table and the JS closures holding its ids die together on
 /// rebuild. If the deferred runtime home registration above ever lands, those cached verdicts
 /// must be invalidated (or the ops must resolve the verdict late) alongside the mutation.
-pub(crate) type HomeRegistry = Rc<std::cell::RefCell<HashMap<(String, String), HomeIsolate>>>;
+pub(crate) type HomeRegistry = Rc<std::cell::RefCell<HashMap<String, HomeIsolate>>>;
 
 /// Whether `isolate` is `producer`'s home under `homes` — the write gate for `set` and `emit`.
 /// User/module code is home exactly in the main isolate; a package is home in the isolate its
@@ -178,18 +179,14 @@ pub(crate) fn is_home(homes: &HomeRegistry, producer: &ProducerKey, isolate: &Is
         // (`docs/gmcp.md` §3.1), writing through `SessionStore::set` directly — the
         // op-layer seat machinery can never mint a producer seat for one.
         ProducerKey::Platform(_) => false,
-        ProducerKey::Package { owner, name } => {
-            match homes.borrow().get(&(owner.clone(), name.clone())) {
-                Some(HomeIsolate::Main) => *isolate == IsolateId::Main,
-                Some(HomeIsolate::OwnSandbox) => match isolate {
-                    IsolateId::Package(iso) => {
-                        iso.owner.eq_ignore_ascii_case(owner) && iso.name.eq_ignore_ascii_case(name)
-                    }
-                    IsolateId::Main => false,
-                },
-                None => false,
-            }
-        }
+        ProducerKey::Package { name, .. } => match homes.borrow().get(&name.to_ascii_lowercase()) {
+            Some(HomeIsolate::Main) => *isolate == IsolateId::Main,
+            Some(HomeIsolate::OwnSandbox) => match isolate {
+                IsolateId::Package(iso) => iso.name.eq_ignore_ascii_case(name),
+                IsolateId::Main => false,
+            },
+            None => false,
+        },
     }
 }
 
@@ -200,8 +197,8 @@ pub(crate) fn is_addressable(homes: &HomeRegistry, producer: &ProducerKey) -> bo
     match producer {
         ProducerKey::User => true,
         ProducerKey::Platform(_) => false,
-        ProducerKey::Package { owner, name } => {
-            homes.borrow().contains_key(&(owner.clone(), name.clone()))
+        ProducerKey::Package { name, .. } => {
+            homes.borrow().contains_key(&name.to_ascii_lowercase())
         }
     }
 }
@@ -238,7 +235,11 @@ impl PlatformProducer {
 /// survives package updates) and ASCII-folded (the uniform fold applies everywhere names are
 /// structural). `User` is the shared subtree for all main-isolate non-package code — user
 /// scripts and local modules alike (`smudgy:state/user` in the consumer scheme, later).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// A package producer's identity is its name: `smudgy:@name` and `smudgy://owner/name` are
+/// spellings of one package, so equality and hashing ignore `owner`, which keeps the spelling
+/// for messages only.
+#[derive(Clone, Debug)]
 pub enum ProducerKey {
     User,
     /// A host-maintained subtree (consumer address = the platform name, e.g. `"gmcp"`).
@@ -247,6 +248,32 @@ pub enum ProducerKey {
         owner: String,
         name: String,
     },
+}
+
+impl PartialEq for ProducerKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::User, Self::User) => true,
+            (Self::Platform(a), Self::Platform(b)) => a == b,
+            (Self::Package { name: a, .. }, Self::Package { name: b, .. }) => {
+                a.eq_ignore_ascii_case(b)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ProducerKey {}
+
+impl std::hash::Hash for ProducerKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::User => {}
+            Self::Platform(platform) => platform.hash(state),
+            Self::Package { name, .. } => name.to_ascii_lowercase().hash(state),
+        }
+    }
 }
 
 impl ProducerKey {
@@ -263,9 +290,24 @@ impl ProducerKey {
         }
     }
 
+    /// The producer's identity as one string, whichever owner its address spelled: `user`,
+    /// the platform name, or `smudgy:@name` for a package. Event and procedure routing keys
+    /// and the catalogue's producers are built from it, so every spelling of a package meets
+    /// in one place; [`Display`](std::fmt::Display) keeps the spelling, for messages.
+    /// `__smudgy_producer_identity` in `smudgy.ts` is its script-side twin.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        match self {
+            Self::User | Self::Platform(_) => self.to_string(),
+            Self::Package { name, .. } => {
+                smudgy_script::package_address("", &name.to_ascii_lowercase())
+            }
+        }
+    }
+
     /// Parse a consumer-side producer address: `user`, a platform store producer (`gmcp`),
-    /// or a package as `smudgy://owner/name` (`owner/name` also accepted). Folded like every
-    /// structural name.
+    /// or a package as `smudgy:@name` or `smudgy://owner/name` (`owner/name` also accepted).
+    /// Folded like every structural name; the owner is empty for `smudgy:@name`.
     #[must_use]
     pub fn parse(spec: &str) -> Option<Self> {
         let spec = spec.trim();
@@ -280,6 +322,15 @@ impl ProducerKey {
         }
         if spec.eq_ignore_ascii_case(PlatformProducer::Mssp.as_str()) {
             return Some(Self::Platform(PlatformProducer::Mssp));
+        }
+        if let Some(name) = spec.strip_prefix(smudgy_script::ADDRESS_PREFIX) {
+            if name.is_empty() || name.contains('/') {
+                return None;
+            }
+            return Some(Self::Package {
+                owner: String::new(),
+                name: name.to_ascii_lowercase(),
+            });
         }
         let coords = spec.strip_prefix("smudgy://").unwrap_or(spec);
         let (owner, name) = coords.split_once('/')?;
@@ -298,7 +349,9 @@ impl std::fmt::Display for ProducerKey {
         match self {
             Self::User => write!(f, "user"),
             Self::Platform(platform) => write!(f, "{}", platform.as_str()),
-            Self::Package { owner, name } => write!(f, "smudgy://{owner}/{name}"),
+            Self::Package { owner, name } => {
+                write!(f, "{}", smudgy_script::package_address(owner, name))
+            }
         }
     }
 }
@@ -2643,14 +2696,8 @@ mod tests {
     #[test]
     fn is_home_matches_the_registry() {
         let homes: HomeRegistry = Rc::new(std::cell::RefCell::new(HashMap::from([
-            (
-                ("wbk".to_string(), "sandboxed".to_string()),
-                HomeIsolate::OwnSandbox,
-            ),
-            (
-                ("wbk".to_string(), "trusted".to_string()),
-                HomeIsolate::Main,
-            ),
+            ("sandboxed".to_string(), HomeIsolate::OwnSandbox),
+            ("trusted".to_string(), HomeIsolate::Main),
         ])));
         let sandboxed = ProducerKey::Package {
             owner: "wbk".into(),
@@ -2677,6 +2724,26 @@ mod tests {
         assert!(!is_home(&homes, &trusted, &pkg_isolate("wbk", "trusted")));
         // An uninstalled package is home nowhere.
         assert!(!is_home(&homes, &uninstalled, &IsolateId::Main));
+        // Every spelling of an installed package is that package.
+        for owner in ["", "WBK", "someone-else"] {
+            let spelled = |name: &str| ProducerKey::Package {
+                owner: owner.into(),
+                name: name.into(),
+            };
+            assert!(is_home(
+                &homes,
+                &spelled("Sandboxed"),
+                &pkg_isolate("wbk", "sandboxed")
+            ));
+            assert!(is_home(
+                &homes,
+                &spelled("sandboxed"),
+                &pkg_isolate(owner, "sandboxed")
+            ));
+            assert!(is_home(&homes, &spelled("trusted"), &IsolateId::Main));
+            assert!(is_addressable(&homes, &spelled("trusted")));
+            assert!(!is_addressable(&homes, &spelled("ghost")));
+        }
         assert!(!is_home(&homes, &uninstalled, &pkg_isolate("wbk", "ghost")));
         // User/module code is home exactly on main.
         assert!(is_home(&homes, &ProducerKey::User, &IsolateId::Main));
@@ -3054,6 +3121,28 @@ mod tests {
     }
 
     #[test]
+    fn producer_key_identity_is_the_package_name() {
+        use std::collections::HashSet;
+        let spellings = [
+            "smudgy:@Tracker",
+            "smudgy://wbk/tracker",
+            "smudgy://other/TRACKER",
+        ];
+        let keys: Vec<ProducerKey> = spellings
+            .iter()
+            .map(|spec| ProducerKey::parse(spec).expect(spec))
+            .collect();
+        for key in &keys {
+            assert_eq!(key, &keys[0]);
+        }
+        assert_eq!(keys.iter().cloned().collect::<HashSet<_>>().len(), 1);
+        assert_ne!(keys[0], ProducerKey::parse("smudgy:@other").unwrap());
+        assert_ne!(keys[0], ProducerKey::User);
+        // The spelling stays for messages.
+        assert_eq!(keys[1].to_string(), "smudgy://wbk/tracker");
+    }
+
+    #[test]
     fn producer_key_parses_specs_and_folds() {
         assert_eq!(ProducerKey::parse("user"), Some(ProducerKey::User));
         assert_eq!(
@@ -3072,6 +3161,17 @@ mod tests {
         );
         assert_eq!(ProducerKey::parse("nonsense"), None);
         assert_eq!(ProducerKey::parse("a/b/c"), None);
+        let ownerless = ProducerKey::parse("smudgy:@Tracker").expect("an ownerless producer");
+        assert_eq!(
+            ownerless,
+            ProducerKey::Package {
+                owner: String::new(),
+                name: "tracker".into()
+            }
+        );
+        assert_eq!(ownerless.to_string(), "smudgy:@tracker");
+        assert_eq!(ProducerKey::parse("smudgy:@"), None);
+        assert_eq!(ProducerKey::parse("smudgy:@a/b"), None);
     }
 
     #[test]

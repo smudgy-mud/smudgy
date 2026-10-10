@@ -224,7 +224,7 @@ impl CatalogueEntry {
 /// snapshot's node identifies unchanged subtrees across generations.
 #[derive(Clone, Debug)]
 pub struct ProducerView {
-    /// `"user"` / `"smudgy://owner/name"`.
+    /// The producer's identity: `"user"`, a platform name, or `"smudgy:@name"`.
     pub producer: String,
     pub tree: Node,
     pub entries: u64,
@@ -549,7 +549,7 @@ impl RuntimeCatalogue {
             .snapshot_producers()
             .into_iter()
             .map(|(producer, tree, usage)| ProducerView {
-                producer: producer.to_string(),
+                producer: producer.identity(),
                 tree,
                 entries: usage.entries,
                 bytes: usage.bytes,

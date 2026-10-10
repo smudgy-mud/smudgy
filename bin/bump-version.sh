@@ -106,7 +106,7 @@ elif [[ "$PRE_ID" =~ ^[Nn][Ii][Gg][Hh][Tt][Ll][Yy]($|[-.+0-9]) ]]; then
     API_BASE_URL="https://api.smudgy.org"
     CHANNEL="nightly"
 elif [[ -n "$PRERELEASE" || -n "$BUILD" ]]; then
-    API_BASE_URL="https://api.dev.smudgy.org"
+    API_BASE_URL="https://api.staging.smudgy.org"
     CHANNEL="dev / pre-release"
 else
     API_BASE_URL="https://api.smudgy.org"

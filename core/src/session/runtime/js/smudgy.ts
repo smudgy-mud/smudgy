@@ -5781,21 +5781,36 @@ function __smudgy_freeze_snapshot<T>(value: T): T {
     return value;
 }
 
+/** A (folded) producer spec's identity, whichever owner it spells: a package is its name,
+ *  so `smudgy://owner/name`, `owner/name` and `smudgy:@name` all become `smudgy:@name`;
+ *  `user` and the platform names stay as they are. The host's `ProducerKey::identity`. */
+function __smudgy_producer_identity(spec: string): string {
+    if (spec.startsWith("smudgy:@")) return spec;
+    const coords = spec.startsWith("smudgy://") ? spec.slice("smudgy://".length) : spec;
+    const slash = coords.indexOf("/");
+    if (slash > 0 && slash < coords.length - 1 && coords.indexOf("/", slash + 1) < 0) {
+        return `smudgy:@${coords.slice(slash + 1)}`;
+    }
+    return spec;
+}
+
 /** The canonical event-registry name for `(producer spec, handle name)`: platform producers
- *  use their `sys:`/`map:` prefixes; user/package producers use the stamped `#` form. */
+ *  use their `sys:`/`map:` prefixes; user/package producers use the stamped `#` form under
+ *  the producer's identity. */
 function __smudgy_canonical_event(spec: string, name: string): string {
     // Platform producers key their events `producer:name` -- the form the host's
     // `host_emit` registers and emits ("sys:receive", "gmcp:ready", "input:change");
     // package events use the meatball form.
     return spec === "sys" || spec === "map" || spec === "gmcp" || spec === "msdp" || spec === "mssp" || spec === "input" || spec === "pane" || spec === "sessions"
         ? `${spec}:${name}`
-        : `${spec}#${name}`;
+        : `${__smudgy_producer_identity(spec)}#${name}`;
 }
 
 /** The store producer spec for a creator descriptor: packages publish under their own
- *  subtree; user scripts and local modules share the `user` producer. */
+ *  subtree, named by the package's identity; user scripts and local modules share the
+ *  `user` producer. */
 function __smudgy_producer_spec(creator: { kind: string; owner?: string; name?: string }): string {
-    return creator.kind === "package" ? `smudgy://${creator.owner}/${creator.name}` : "user";
+    return creator.kind === "package" ? `smudgy:@${__smudgy_fold_name(String(creator.name))}` : "user";
 }
 
 // ---- Interned interop identity ids (docs/interop.md 3) ------------------------------
@@ -6653,13 +6668,14 @@ function __smudgy_make_api(creator: { kind: string }) {
             });
         },
         // The one dynamic escape hatch (plan 11): generic tooling that knows a producer and
-        // event name only at runtime gets an untyped consumer handle. `producer` is
-        // "smudgy://owner/name", "user", or a platform name ("sys"/"map").
+        // event name only at runtime gets an untyped consumer handle. `producer` is a
+        // package address in either spelling ("smudgy:@name", "smudgy://owner/name"; both
+        // name one package), "user", or a platform name ("sys"/"map").
         events: Object.freeze({
             lookup: (producer: string, name: string): EventConsumer<unknown> =>
                 __smudgy_make_event_consumer(
                     __smudgy_canonical_event(
-                        __smudgy_fold_name(String(producer)),
+                        __smudgy_fold_name(String(producer).trim()),
                         __smudgy_fold_name(String(name)),
                     ),
                     String(name),
@@ -6883,7 +6899,7 @@ Object.defineProperty(globalThis, "__smudgy_store", {
 });
 
 // Host hook for the synthesized smudgy:state/, smudgy:events/, and smudgy:procedures/ scheme
-// modules: given a producer spec ("smudgy://owner/name" or a platform name like "sys"),
+// modules: given a producer spec (a package address in either spelling, or a platform name like "sys"),
 // returns the per-kind consumer-handle factories the stubs export from. Consumer handles are addressers over
 // (producer, name) -- they never touch the producer's live objects, so importing one never
 // evaluates (or waits on) the producer. Not part of the public smudgy:core contract.

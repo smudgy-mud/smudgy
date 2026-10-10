@@ -6,7 +6,8 @@
 //! before any map exists; and the local map's saved document carries them.
 //! Against a cloud tier that refuses every property save, the new map is
 //! deleted again, and one that cannot be deleted stays: associated with the
-//! session's server like any new map, and named in the rejection.
+//! session's server like any new map, and named in the rejection. A saved map
+//! named into no atlas goes in the server's default atlas for its storage.
 
 use std::{
     path::PathBuf,
@@ -18,11 +19,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::StreamExt;
 use smudgy_cloud::{
-    AREA_FORMAT_VERSION, Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, CloudError,
-    CloudMapper, CloudResult, CompositeBackend, CreateAreaRequest, LocalBackend, Mapper,
-    MapperBackend, Uuid,
+    AREA_FORMAT_VERSION, Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId,
+    CloudError, CloudMapper, CloudResult, CompositeBackend, CreateAreaRequest, LocalBackend,
+    MapStorage, Mapper, MapperBackend, Uuid,
     mutation::{MutationEnvelope, MutationResult},
 };
+use smudgy_core::models::default_atlases::default_atlas;
 use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
 
@@ -141,18 +143,41 @@ echo(failures.length === 0 ? `CLOUD_CREATE_OK ${kept.id}` : `CLOUD_CREATE_FAIL $
 
 /// A single-tier cloud stand-in: every map it creates reads as cloud-owned,
 /// every property save is refused, and a map named "Kept" cannot be deleted.
+/// It makes atlases, since a saved map goes in one.
 #[derive(Default)]
 struct RefusingCloud {
     areas: Mutex<Vec<Area>>,
+    atlases: Mutex<Vec<Atlas>>,
 }
 
 #[async_trait]
 impl MapperBackend for RefusingCloud {
+    async fn create_atlas_at(&self, name: &str, _storage: MapStorage) -> CloudResult<Atlas> {
+        let atlas = Atlas {
+            id: AtlasId(Uuid::new_v4()),
+            user_id: None,
+            clan_id: None,
+            name: name.to_string(),
+            created_at: Utc::now(),
+            rev: 1,
+        };
+        self.atlases.lock().unwrap().push(atlas.clone());
+        Ok(atlas)
+    }
+
+    async fn create_area_at(
+        &self,
+        request: CreateAreaRequest,
+        _storage: MapStorage,
+    ) -> CloudResult<Area> {
+        self.create_area(request).await
+    }
+
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
         let area = Area {
             id: AreaId(Uuid::new_v4()),
             user_id: None,
-            atlas_id: None,
+            atlas_id: request.atlas_id,
             name: request.name,
             created_at: Utc::now(),
             rev: 1,
@@ -162,7 +187,12 @@ impl MapperBackend for RefusingCloud {
             copied_from_rev: None,
             copied_at: None,
             family_token: None,
+            clan_id: None,
+            clan_name: None,
+            actions: None,
+            clan_ownership: smudgy_cloud::clan_maps::ClanOwnership::default(),
             atlas_name: None,
+            projection_token: None,
         };
         self.areas.lock().unwrap().push(area.clone());
         Ok(area)
@@ -182,15 +212,16 @@ impl MapperBackend for RefusingCloud {
             .cloned()
             .ok_or(CloudError::NotFoundOrNoAccess)?;
         Ok(AreaWithDetails {
+            room_data: Vec::new(),
             area,
             format_version: AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: vec![],
             rooms: vec![],
             labels: vec![],
             shapes: vec![],
             connections: vec![],
             linked_areas: vec![],
+            sources: vec![],
         })
     }
 
@@ -238,6 +269,8 @@ struct Transcript {
     lines: Vec<String>,
     /// The maps the session asked the UI to associate with its server.
     associated: Vec<AreaId>,
+    /// The atlases it asked the UI to show on its server.
+    associated_atlases: Vec<AtlasId>,
 }
 
 fn collect(updates: &[BufferUpdate], lines: &mut Vec<String>) {
@@ -261,6 +294,12 @@ async fn run_module(
     let modules = smudgy_home.join(server).join("modules");
     std::fs::create_dir_all(&modules).expect("create modules directory");
     std::fs::create_dir_all(smudgy_home.join(server).join("logs")).expect("create logs directory");
+    // The session's server, whose settings say where its new maps go.
+    std::fs::write(
+        smudgy_home.join(server).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .expect("write server settings");
     std::fs::write(modules.join("create.ts"), module).expect("write create module");
 
     let params = Arc::new(SessionParams {
@@ -278,6 +317,7 @@ async fn run_module(
     let mut transcript = Transcript {
         lines: Vec::new(),
         associated: Vec::new(),
+        associated_atlases: Vec::new(),
     };
     let mut runtime = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -304,6 +344,7 @@ async fn run_module(
             SessionEvent::RuntimeReady(tx) => runtime = Some(tx),
             SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut transcript.lines),
             SessionEvent::MapAreaCreated(area_id) => transcript.associated.push(area_id),
+            SessionEvent::MapAtlasCreated(atlas_id) => transcript.associated_atlases.push(atlas_id),
             _ => {}
         }
     }
@@ -337,6 +378,37 @@ async fn create_area_starts_local_and_session_maps_with_their_properties() {
             .any(|line| line == "CREATE_PROPERTIES_OK"),
         "createArea did not start the maps with their properties:\n{}",
         transcript.lines.join("\n")
+    );
+
+    // A saved map named into no atlas goes in the server's default atlas for
+    // its storage, made as "Loose maps" and stored in the server's settings;
+    // a session map is in none, and a named atlas keeps its map.
+    let atlas = mapper.get_current_atlas();
+    let folder_of = |name: &str| {
+        atlas
+            .areas()
+            .find(|area| area.get_name() == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .meta()
+            .atlas_id
+    };
+    let loose = folder_of("Plain").expect("Plain is filed");
+    let listed = mapper.list_atlases().await.expect("folders");
+    let name_of = |id| {
+        listed
+            .iter()
+            .find(|folder| folder.id == id)
+            .map(|folder| folder.name.clone())
+    };
+    assert_eq!(name_of(loose).as_deref(), Some("Loose maps"));
+    assert_eq!(
+        default_atlas(SERVER, MapStorage::Local).expect("server settings"),
+        Some(loose)
+    );
+    assert_eq!(folder_of("NukeFire Zone 315"), None);
+    assert_eq!(
+        name_of(folder_of("The Deathlands").expect("filed")).as_deref(),
+        Some("Nukefire")
     );
 
     // The local map's saved document carries them: an explicit refresh
@@ -403,4 +475,27 @@ async fn a_cloud_map_whose_properties_fail_is_deleted_or_associated_and_named() 
         .map(|area| area.name.clone())
         .collect();
     assert_eq!(names, ["Kept"], "the other map was deleted again");
+
+    // Both went in the server's cloud default, made once for the first map,
+    // named for the server, stored in its settings and shown on it.
+    let atlases = backend.atlases.lock().unwrap().clone();
+    assert_eq!(atlases.len(), 1, "one default atlas for both maps");
+    assert_eq!(
+        atlases[0].name,
+        format!("Loose maps ({CLOUD_SERVER})"),
+        "the cloud default carries the server's name"
+    );
+    assert_eq!(
+        default_atlas(CLOUD_SERVER, MapStorage::Cloud).expect("server settings"),
+        Some(atlases[0].id)
+    );
+    assert_eq!(transcript.associated_atlases, [atlases[0].id]);
+    let kept_atlas = backend
+        .areas
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|area| area.id == kept)
+        .and_then(|area| area.atlas_id);
+    assert_eq!(kept_atlas, Some(atlases[0].id));
 }

@@ -603,6 +603,7 @@ async fn polish_moves_rooms_between_levels_together_with_their_connections() {
     link(&mapper, 150_003, East, 150_004, West).await;
     let mut edits = vec![
         AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: room_key(&mapper, 150_004).room_number,
             body: RoomUpdates {
                 level: Some(1),
@@ -612,7 +613,6 @@ async fn polish_moves_rooms_between_levels_together_with_their_connections() {
         AreaMutation::UpsertAreaProperty {
             name: "nukefire.layout.polish-pending".to_string(),
             value: "true".to_string(),
-            is_secret: None,
         },
     ];
     let stairs = connections_between(&mapper, 150_001, 150_002);
@@ -689,6 +689,7 @@ async fn a_charted_exit_between_levels_joins_its_rooms_with_a_straight_connectio
         &mapper,
         map,
         vec![AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: room_key(&mapper, 151_002).room_number,
             body: RoomUpdates {
                 level: Some(1),
@@ -1108,6 +1109,7 @@ async fn seed_manual_level_reflow(mapper: &Mapper, atlas: AtlasId) -> AreaId {
         .iter()
         .enumerate()
         .map(|(index, &vnum)| AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: room_key(mapper, vnum).room_number,
             body: RoomUpdates {
                 x: Some([0.0, 1.0, 2.0][index % 3]),
@@ -1133,6 +1135,7 @@ async fn seed_manual_level_reflow(mapper: &Mapper, atlas: AtlasId) -> AreaId {
             mapper,
             map,
             vec![AreaMutation::CreateExit {
+                room_source: None,
                 room_number: RoomNumber(from),
                 body: ExitArgs {
                     from_direction: direction,
@@ -1243,6 +1246,7 @@ async fn review_tidy_recenters_a_player_room_it_moves() {
         &mapper,
         map,
         vec![AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(2),
             body: RoomUpdates {
                 x: Some(20.0),
@@ -1359,6 +1363,7 @@ async fn review_level_polish_preserves_authored_and_dormant_routes() {
     let points = vec![smudgy_cloud::MapPoint::new(7.0, 8.0)];
     let mut edits = vec![
         AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(4),
             body: RoomUpdates {
                 level: Some(1),
@@ -1368,7 +1373,6 @@ async fn review_level_polish_preserves_authored_and_dormant_routes() {
         AreaMutation::UpsertAreaProperty {
             name: "nukefire.layout.polish-pending".to_string(),
             value: "true".to_string(),
-            is_secret: None,
         },
     ];
     for (&id, routing) in stairs
@@ -1494,7 +1498,6 @@ async fn seed_map(
         .map(|&(name, value)| AreaMutation::UpsertAreaProperty {
             name: name.to_string(),
             value: value.to_string(),
-            is_secret: None,
         })
         .collect();
     if !edits.is_empty() {
@@ -1523,6 +1526,7 @@ async fn add_stored_rooms(mapper: &Mapper, map: AreaId, zone: Option<u32>, vnums
         let number = i32::try_from(first + index + 1).expect("a small map");
         let column = i16::try_from(number).expect("a small map");
         edits.push(AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(number),
             body: RoomUpdates {
                 title: Some(format!("Room {vnum}")),
@@ -1535,10 +1539,10 @@ async fn add_stored_rooms(mapper: &Mapper, map: AreaId, zone: Option<u32>, vnums
         });
         if let Some(zone) = zone {
             edits.push(AreaMutation::UpsertRoomProperty {
+                room_source: None,
                 room_number: RoomNumber(number),
                 name: ZONE.to_string(),
                 value: zone.to_string(),
-                is_secret: None,
             });
         }
     }
@@ -1560,6 +1564,7 @@ async fn seed_shuffled_grid(mapper: &Mapper, map: AreaId, zone: u32, first_vnum:
         let cell = (index * 7 + 3) % count;
         let vnum = first_vnum + u64::from(index);
         rooms.push(AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: number(index),
             body: RoomUpdates {
                 title: Some(format!("Room {vnum}")),
@@ -1571,10 +1576,10 @@ async fn seed_shuffled_grid(mapper: &Mapper, map: AreaId, zone: u32, first_vnum:
             },
         });
         rooms.push(AreaMutation::UpsertRoomProperty {
+            room_source: None,
             room_number: number(index),
             name: ZONE.to_string(),
             value: zone.to_string(),
-            is_secret: None,
         });
     }
     let mut exits = Vec::new();
@@ -1590,6 +1595,7 @@ async fn seed_shuffled_grid(mapper: &Mapper, map: AreaId, zone: u32, first_vnum:
                 (neighbour, index, back, direction),
             ] {
                 exits.push(AreaMutation::CreateExit {
+                    room_source: None,
                     room_number: number(from),
                     body: ExitArgs {
                         from_direction: there,
@@ -1618,6 +1624,7 @@ async fn link(mapper: &Mapper, from: u64, direction: ExitDirection, to: u64, bac
         [(&from, direction, &to, back), (&to, back, &from, direction)]
     {
         let exit = AreaMutation::CreateExit {
+            room_source: None,
             room_number: at.room_number,
             body: ExitArgs {
                 from_direction: direction,

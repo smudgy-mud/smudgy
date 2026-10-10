@@ -55,6 +55,8 @@ use deno_core::url::Url;
 
 mod fire_state;
 mod mapper_api;
+mod mapper_names;
+mod mapper_places;
 mod matches;
 use super::captures::OuterCaptures;
 use super::script_action::ScriptAction;
@@ -390,6 +392,9 @@ struct Isolate {
     /// two handle operations before any user code ran. Dropped with the bundle, ahead of the
     /// runtime that owns the heap, like the other cached handles above.
     context: v8::Global<v8::Context>,
+    /// This isolate's op state, which the host consults when an event's payload depends on what
+    /// the receiving isolate may see (a `map:room` location in a Secret's room).
+    op_state: Rc<RefCell<deno_core::OpState>>,
 }
 
 /// The auto-load set partitioned by target isolate (`build_isolate_plan`): the main isolate's
@@ -430,7 +435,7 @@ struct IsolatePlan {
     /// own sandbox. Built *before* any module evaluates so top-level store writes already
     /// pass the home gate; a package absent here (uninstalled — e.g. a copy embedded in
     /// another package's closure) is home nowhere and cannot write.
-    homes: HashMap<(String, String), crate::session::runtime::store::HomeIsolate>,
+    homes: HashMap<String, crate::session::runtime::store::HomeIsolate>,
     /// The installed packages' typing materialization — carried out of the plan so the same
     /// static extraction that fed the typings also registers the catalogue's tier-1 declared
     /// index (interop.md §10) without a second parse.
@@ -444,7 +449,7 @@ struct PackageRootPlan {
     trusted: Vec<String>,
     sandboxed: Vec<String>,
     conflicts: Vec<String>,
-    homes: HashMap<(String, String), crate::session::runtime::store::HomeIsolate>,
+    homes: HashMap<String, crate::session::runtime::store::HomeIsolate>,
 }
 
 fn partition_package_roots(
@@ -516,7 +521,7 @@ fn partition_package_roots(
             let specifier = format!("smudgy://{local_owner}/{local_name}");
             let is_trusted = local_entry.is_some_and(|package| package.trusted);
             plan.homes.insert(
-                (local_owner.to_ascii_lowercase(), leaf),
+                leaf,
                 if is_trusted {
                     crate::session::runtime::store::HomeIsolate::Main
                 } else {
@@ -540,7 +545,7 @@ fn partition_package_roots(
         if active.len() > 1 {
             let name = &active[0].1.name;
             let message = format!(
-                "[package] {name} was not loaded because conflicting package identities are active. Remove the stale package entry."
+                "[package] {name} was not loaded because it is installed twice under different addresses. Uninstall the stale entry; the other keeps its settings."
             );
             warn!("{message}");
             plan.conflicts.push(message);
@@ -550,10 +555,7 @@ fn partition_package_roots(
             continue;
         };
         plan.homes.insert(
-            (
-                spec.owner.to_ascii_lowercase(),
-                spec.name.to_ascii_lowercase(),
-            ),
+            spec.name.to_ascii_lowercase(),
             if package.trusted {
                 crate::session::runtime::store::HomeIsolate::Main
             } else {
@@ -817,7 +819,9 @@ fn materialize_installed_typings(
         let entry_source = entry_source_subpath(entry, &module_subpaths);
         let entry_dts = entry_dts_subpath(entry);
 
-        let pkg_dir = packages_root.join(&spec.owner).join(&spec.name);
+        let pkg_dir = packages_root
+            .join(smudgy_script::owner_segment(&spec.owner))
+            .join(&spec.name);
         let mut wrote_any = false;
         let mut entry_text: Option<String> = None;
         for module in &meta.modules {
@@ -1473,7 +1477,7 @@ impl<'a> ScriptEngine<'a> {
                     owner: pkg.owner.to_ascii_lowercase(),
                     name: pkg.name.to_ascii_lowercase(),
                 }
-                .to_string();
+                .identity();
                 for handle in &pkg.handles {
                     let kind = match handle.kind {
                         smudgy_script::interop_extract::InteropKind::State => {
@@ -1678,6 +1682,14 @@ impl<'a> ScriptEngine<'a> {
             local_package_snapshots,
             local_catalog_error.clone(),
         );
+        if let Some(provider) = &smudgy_provider {
+            let ui_tx = params.ui_tx.clone();
+            let session_id = params.session_id;
+            let emitted_line_count = params.emitted_line_count.clone();
+            provider.set_import_notice(Rc::new(move |message| {
+                Self::emit_session_notice(&ui_tx, session_id, &emitted_line_count, message);
+            }));
+        }
         // Whether sandboxed isolates have any way to resolve `smudgy://` — a cloud base to fork, or
         // a test override factory. With neither, the untrusted installs can't load (handled below).
         let have_resolver = smudgy_provider.is_some() || params.package_provider_override.is_some();
@@ -1733,10 +1745,7 @@ impl<'a> ScriptEngine<'a> {
                 {
                     let mut homes = home_registry.borrow_mut();
                     for key in &blocked {
-                        homes.remove(&(
-                            key.owner.to_ascii_lowercase(),
-                            key.name.to_ascii_lowercase(),
-                        ));
+                        homes.remove(&key.name.to_ascii_lowercase());
                     }
                 }
                 main_set.packages.retain(|specifier| {
@@ -1759,8 +1768,8 @@ impl<'a> ScriptEngine<'a> {
                 .filter(|(_, home)| {
                     matches!(home, crate::session::runtime::store::HomeIsolate::Main)
                 })
-                .map(|((owner, name), _)| smudgy_script::PackageKey {
-                    owner: owner.clone(),
+                .map(|(name, _)| smudgy_script::PackageKey {
+                    owner: String::new(),
                     name: name.clone(),
                 })
                 .collect();
@@ -1875,6 +1884,7 @@ impl<'a> ScriptEngine<'a> {
         let main_waker = build_demux_waker(IsolateId::Main, &ready, &parent);
         let main_call_state = shared_call_state(main_runtime.deno_runtime());
         let main_context = main_runtime.deno_runtime().main_context();
+        let main_op_state = main_runtime.deno_runtime().op_state();
         isolates.insert(
             IsolateId::Main,
             Isolate {
@@ -1889,6 +1899,7 @@ impl<'a> ScriptEngine<'a> {
                 waker: main_waker,
                 seeded: Cell::new(false),
                 context: main_context,
+                op_state: main_op_state,
             },
         );
         // Seed: arm `Main` on the first pump. At construction `parent` is still
@@ -2467,6 +2478,7 @@ impl<'a> ScriptEngine<'a> {
                     .insert(isolate_id.clone());
                 let call_state = shared_call_state(runtime.deno_runtime());
                 let isolate_context = runtime.deno_runtime().main_context();
+                let isolate_op_state = runtime.deno_runtime().op_state();
                 isolates.insert(
                     isolate_id,
                     Isolate {
@@ -2481,6 +2493,7 @@ impl<'a> ScriptEngine<'a> {
                         waker: package_waker,
                         seeded: Cell::new(false),
                         context: isolate_context,
+                        op_state: isolate_op_state,
                     },
                 );
                 // Hold the concrete provider so its per-isolate notices can be drained after load.
@@ -2747,29 +2760,63 @@ impl<'a> ScriptEngine<'a> {
             .get(ops::fold_name(canonical).as_ref())
             .map_or_else(Vec::new, Clone::clone);
         let source_json = source.to_json(false);
+        // Each isolate's view of a map event is decided here, as it is emitted, against the
+        // places the atlas holds or has held: a location in a Secret's or Private additions'
+        // own room reaches an isolate that cannot see them as a location somewhere unmapped on
+        // their map, rooms moved into or out of them as rooms leaving or joining the map, and a
+        // click on one of their rooms not at all.
+        let folded = ops::fold_name(canonical);
+        let (located, merged, clicked) = (
+            folded.as_ref() == "map:room",
+            folded.as_ref() == "map:merged",
+            folded.as_ref() == "map:click",
+        );
         subscribers
             .into_iter()
             .filter(|subscriber| subscriber.source.accepts(self.session_id, source.id))
-            .map(|subscriber| super::RuntimeAction::CallJavascriptFunction {
-                isolate: subscriber.isolate,
-                id: subscriber.function_id,
-                matches: Arc::new(vec![
-                    MatchCapture {
-                        name: Some(std::borrow::Cow::Borrowed("event")),
-                        value: stamped.to_string(),
-                    },
-                    MatchCapture {
-                        name: Some(std::borrow::Cow::Borrowed("payload")),
-                        value: payload_json.to_string(),
-                    },
-                    MatchCapture {
-                        name: Some(std::borrow::Cow::Borrowed("source")),
-                        value: source_json.clone(),
-                    },
-                ]),
-                depth,
-                is_captured: None,
+            .filter_map(|subscriber| {
+                let payload = match self.isolates.get(&subscriber.isolate) {
+                    // A map event is never delivered unchecked: an isolate whose state is
+                    // busy misses it.
+                    Some(isolate) if located => {
+                        let state = isolate.op_state.try_borrow().ok()?;
+                        mapper_places::map_room_payload_for(&state, payload_json).into_owned()
+                    }
+                    Some(isolate) if merged => {
+                        let state = isolate.op_state.try_borrow().ok()?;
+                        mapper_places::map_merged_payload_for(&state, payload_json)?.into_owned()
+                    }
+                    Some(isolate) if clicked => {
+                        let state = isolate.op_state.try_borrow().ok()?;
+                        mapper_places::map_click_payload_for(&state, payload_json)?.into_owned()
+                    }
+                    None if clicked => return None,
+                    _ => payload_json.to_string(),
+                };
+                Some((subscriber, payload))
             })
+            .map(
+                |(subscriber, payload)| super::RuntimeAction::CallJavascriptFunction {
+                    isolate: subscriber.isolate,
+                    id: subscriber.function_id,
+                    matches: Arc::new(vec![
+                        MatchCapture {
+                            name: Some(std::borrow::Cow::Borrowed("event")),
+                            value: stamped.to_string(),
+                        },
+                        MatchCapture {
+                            name: Some(std::borrow::Cow::Borrowed("payload")),
+                            value: payload,
+                        },
+                        MatchCapture {
+                            name: Some(std::borrow::Cow::Borrowed("source")),
+                            value: source_json.clone(),
+                        },
+                    ]),
+                    depth,
+                    is_captured: None,
+                },
+            )
             .collect()
     }
 
@@ -4440,10 +4487,7 @@ mod package_root_plan_tests {
         assert!(plan.trusted.is_empty(), "published trust must not transfer");
         assert_eq!(plan.sandboxed, ["smudgy://developer/tools"]);
         assert!(plan.conflicts.is_empty());
-        assert_eq!(
-            plan.homes.get(&("developer".into(), "tools".into())),
-            Some(&HomeIsolate::OwnSandbox)
-        );
+        assert_eq!(plan.homes.get("tools"), Some(&HomeIsolate::OwnSandbox));
         assert_eq!(plan.homes.len(), 1, "the remote alias has no separate home");
     }
 
@@ -4523,14 +4567,8 @@ mod package_root_plan_tests {
         assert_eq!(plan.trusted, ["smudgy://publisher/app"]);
         assert_eq!(plan.sandboxed, ["smudgy://other/helper"]);
         assert!(plan.conflicts.is_empty());
-        assert_eq!(
-            plan.homes.get(&("publisher".into(), "app".into())),
-            Some(&HomeIsolate::Main)
-        );
-        assert_eq!(
-            plan.homes.get(&("other".into(), "helper".into())),
-            Some(&HomeIsolate::OwnSandbox)
-        );
+        assert_eq!(plan.homes.get("app"), Some(&HomeIsolate::Main));
+        assert_eq!(plan.homes.get("helper"), Some(&HomeIsolate::OwnSandbox));
     }
 
     #[test]

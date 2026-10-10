@@ -3,6 +3,7 @@
 use crate::get_smudgy_home;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use smudgy_cloud::{AtlasId, MapStorage};
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -78,6 +79,14 @@ pub struct ServerConfig {
     /// populated for server identity and backwards-compatible metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wss_url: Option<String>,
+    /// The cloud atlas a script's new map goes in when it names no atlas
+    /// (see [`super::default_atlases`]). The id is the identity: renaming
+    /// the atlas keeps it the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cloud_atlas: Option<AtlasId>,
+    /// The local atlas a script's new map goes in when it names no atlas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_local_atlas: Option<AtlasId>,
 }
 
 const fn default_true() -> bool {
@@ -104,6 +113,28 @@ impl ServerConfig {
             tls: false,
             tls_verify: true,
             wss_url: None,
+            default_cloud_atlas: None,
+            default_local_atlas: None,
+        }
+    }
+
+    /// The atlas set for new maps in `storage`; a session map has none.
+    #[must_use]
+    pub const fn default_atlas(&self, storage: MapStorage) -> Option<AtlasId> {
+        match storage {
+            MapStorage::Cloud => self.default_cloud_atlas,
+            MapStorage::Local => self.default_local_atlas,
+            MapStorage::Session => None,
+        }
+    }
+
+    /// Sets the atlas for new maps in `storage`. A session map has none, so
+    /// that is ignored.
+    pub const fn set_default_atlas(&mut self, storage: MapStorage, atlas: Option<AtlasId>) {
+        match storage {
+            MapStorage::Cloud => self.default_cloud_atlas = atlas,
+            MapStorage::Local => self.default_local_atlas = atlas,
+            MapStorage::Session => {}
         }
     }
 
@@ -718,6 +749,29 @@ mod link_trust_tests {
         let old: ServerConfig = serde_json::from_str(r#"{"host":"h","port":1}"#).unwrap();
         assert!(old.trusted_link_hosts.is_empty());
         assert!(!old.trust_all_links);
+    }
+
+    #[test]
+    fn default_atlases_round_trip_per_storage() {
+        use smudgy_cloud::{AtlasId, MapStorage, Uuid};
+
+        let cloud = AtlasId(Uuid::from_u128(1));
+        let local = AtlasId(Uuid::from_u128(2));
+        let mut c = ServerConfig::new("h".to_string(), 1);
+        c.set_default_atlas(MapStorage::Cloud, Some(cloud));
+        c.set_default_atlas(MapStorage::Local, Some(local));
+        c.set_default_atlas(MapStorage::Session, Some(cloud));
+        assert_eq!(c.default_atlas(MapStorage::Cloud), Some(cloud));
+        assert_eq!(c.default_atlas(MapStorage::Local), Some(local));
+        assert_eq!(c.default_atlas(MapStorage::Session), None);
+
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<ServerConfig>(&json).unwrap(), c);
+        // None set: neither is written, and older files read as none.
+        let plain = serde_json::to_string(&ServerConfig::new("h".to_string(), 1)).unwrap();
+        assert!(!plain.contains("default_"));
+        let old: ServerConfig = serde_json::from_str(r#"{"host":"h","port":1}"#).unwrap();
+        assert_eq!(old.default_atlas(MapStorage::Cloud), None);
     }
 
     #[test]

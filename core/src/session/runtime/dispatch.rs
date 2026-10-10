@@ -289,14 +289,13 @@ impl Inner<'_> {
         Ok(bound.state)
     }
 
-    /// Publish the resolved address to both the readable location and marker.
-    /// Pending script markers are remapped before reaching this shared path.
+    /// Publish the resolved address, already written to the readable location, to the marker
+    /// and `map:room`. Pending script markers are remapped before reaching this shared path.
     async fn publish_current_location(
         &mut self,
         id: smudgy_cloud::AreaId,
         room_number: Option<i32>,
     ) -> Result<ActionResult, anyhow::Error> {
-        *self.current_location.borrow_mut() = Some((id, room_number));
         let payload = serde_json::json!({
             "areaId": id.to_string(),
             "roomNumber": room_number,
@@ -2031,11 +2030,24 @@ impl Inner<'_> {
                 }).to_string();
                 Ok(self.run_host_event("map:merged", &payload))
             }
+            RuntimeAction::MapRoomClicked {
+                area_id,
+                room_number,
+            } => {
+                let payload = serde_json::json!({
+                    "areaId": area_id.to_string(),
+                    "roomNumber": room_number,
+                })
+                .to_string();
+                Ok(self.run_host_event("map:click", &payload))
+            }
             RuntimeAction::SetCurrentLocation(id, room_number) => {
+                self.current_location.set((id, room_number));
                 self.publish_current_location(id, room_number).await
             }
             RuntimeAction::SetPendingCurrentLocation(location) => {
                 let (id, room_number) = *location.lock().unwrap();
+                self.current_location.settle((id, room_number));
                 self.publish_current_location(id, room_number).await
             }
             RuntimeAction::NoteMapperNavigation(area_id) => {

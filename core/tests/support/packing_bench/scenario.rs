@@ -64,17 +64,14 @@ async fn synthetic(mapper: &Mapper) -> AreaWithDetails {
                     AreaMutation::UpsertAreaProperty {
                         name: "nukefire.mapper".into(),
                         value: "NukeFire.Map.Local".into(),
-                        is_secret: None,
                     },
                     AreaMutation::UpsertAreaProperty {
                         name: "nukefire.zone".into(),
                         value: "1".into(),
-                        is_secret: None,
                     },
                     AreaMutation::UpsertAreaProperty {
                         name: "nukefire.area".into(),
                         value: "Synthetic benchmark".into(),
-                        is_secret: None,
                     },
                 ],
                 "Synthetic benchmark metadata",
@@ -86,10 +83,10 @@ async fn synthetic(mapper: &Mapper) -> AreaWithDetails {
     seed_synthetic_links(mapper, id).await;
     let properties = (1..=16)
         .map(|number| AreaMutation::UpsertRoomProperty {
+            room_source: None,
             room_number: RoomNumber(number),
             name: "nukefire.zone".into(),
             value: "1".into(),
-            is_secret: None,
         })
         .collect();
     durable(
@@ -273,7 +270,9 @@ fn chart(fixture: &Fixture, index: usize, include_discovery: bool) -> Value {
             links.push(
                 json!({"from":vnum(room).unwrap(),"to":vnum(target).unwrap(),
                 "direction":exit.from_direction.to_string().to_lowercase(),"bidirectional":false,
-                "closed":exit.is_closed,"locked":exit.is_locked,"route":false}),
+                "closed":exit.door.as_ref().is_some_and(|door| door.state.is_shut()),
+                "locked":exit.door.as_ref().is_some_and(|door| door.state == smudgy_cloud::DoorState::Locked),
+                "route":false}),
             );
         }
     }

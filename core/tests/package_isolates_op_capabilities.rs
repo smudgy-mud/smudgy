@@ -869,6 +869,75 @@ async fn mapper_write_gates_merge_areas() {
     );
 }
 
+/// `secrets` gates the calls that name a map's Secrets or Private additions, on top of the
+/// mapper capability each already needs: a package consented the whole map but not `secrets`
+/// is refused naming `secrets-read`, and the map's own place is not gated; consented them,
+/// the same calls pass the gate and fail on (or answer without) the absent mapper instead.
+/// The write and manage gates sit behind map handles; `mapper_script_sources.rs` runs them
+/// against a real map.
+#[tokio::test]
+async fn secrets_gate_place_naming_mapper_calls() {
+    let src = r#"
+        import { echo, mapper } from "smudgy:core";
+        const secret = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        const probe = async (label, run) => {
+            try { await run(); echo(label + ":OK"); }
+            catch (e) { echo(label + ":" + (e?.message ?? String(e))); }
+        };
+        await probe("GET", () => mapper.getSecretById(secret));
+        await probe("PRIVATE", () => mapper.findRoomsWithTag("inn", { in: "private" }));
+        await probe("SECRET", () => mapper.findRoomsWithProperty("notes", { in: secret }));
+        await probe("MAP", () => mapper.findRoomsWithTag("inn", { in: "map" }));
+        echo("DONE");
+    "#;
+    let denied = run_capability_case(
+        9693,
+        "pi_caps_secrets_deny",
+        "smudgy://wbk/keeper",
+        Some(consent_with(|s| {
+            s.mapper_read = true;
+            s.mapper_write = true;
+        })),
+        make_package("wbk", "keeper", "1.0.0", src),
+    )
+    .await;
+    let refused = "smudgy: this package did not request the 'secrets-read' capability";
+    assert!(
+        has_line(&denied, &format!("GET:{refused}"))
+            && has_line(&denied, &format!("PRIVATE:{refused}"))
+            && has_line(&denied, &format!("SECRET:{refused}"))
+            && has_line(&denied, "MAP:OK")
+            && has_line(&denied, "DONE"),
+        "without secrets, naming a Secret or Private additions must be refused by capability, \
+         and the map's own place must not be; transcript:\n{denied:#?}"
+    );
+
+    let allowed = run_capability_case(
+        9694,
+        "pi_caps_secrets_allow",
+        "smudgy://wbk/keeper",
+        Some(consent_with(|s| {
+            s.mapper_read = true;
+            s.mapper_write = true;
+            s.secrets_read = true;
+            s.secrets_write = true;
+            s.secrets_manage = true;
+        })),
+        make_package("wbk", "keeper", "1.0.0", src),
+    )
+    .await;
+    assert!(
+        has_line(&allowed, "GET:Mapper not enabled")
+            && has_line(&allowed, "PRIVATE:OK")
+            && has_line(&allowed, "SECRET:OK")
+            && has_line(&allowed, "MAP:OK")
+            && !has_line(&allowed, "secrets-")
+            && has_line(&allowed, "DONE"),
+        "with secrets consented the gates open and the calls fail on the missing mapper; \
+         transcript:\n{allowed:#?}"
+    );
+}
+
 /// `set_*_enabled` is gated on create-aliases AND own-origin-scoped: a package granted
 /// `create_aliases` can create its own alias and toggle it (the toggle is keyed by
 /// `(this isolate, this package's origin, name)`, so it can only ever reach the package's OWN

@@ -142,7 +142,7 @@ pub async fn run_session_check(client: PackageApiClient, ctx: CheckContext) -> C
         let entries: Vec<CheckUpdatesEntry> = chunk
             .iter()
             .map(|(entry, owner, name)| CheckUpdatesEntry {
-                owner: owner.clone(),
+                owner: wire_owner(owner),
                 name: name.clone(),
                 installed: entry.staged_version().map(str::to_string),
             })
@@ -162,23 +162,15 @@ pub async fn run_session_check(client: PackageApiClient, ctx: CheckContext) -> C
                 break 'cycles;
             }
         };
-        // Results come back in request order, but match defensively by identity.
-        let by_key: HashMap<(String, String), &CheckUpdatesResult> = response
+        // Results come back in request order, but match defensively by identity: the name,
+        // which is global.
+        let by_key: HashMap<String, &CheckUpdatesResult> = response
             .results
             .iter()
-            .map(|result| {
-                (
-                    (
-                        result.owner.to_ascii_lowercase(),
-                        result.name.to_ascii_lowercase(),
-                    ),
-                    result,
-                )
-            })
+            .map(|result| (result.name.to_ascii_lowercase(), result))
             .collect();
         for (entry, owner, name) in chunk {
-            let Some(result) = by_key.get(&(owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
-            else {
+            let Some(result) = by_key.get(&name.to_ascii_lowercase()) else {
                 continue;
             };
             // Park the registry facts first: they hold regardless of what this
@@ -709,7 +701,16 @@ fn fold_offer_closure(
     > = result
         .closure
         .iter()
-        .map(|node| (folded_triple(&node.owner, &node.name, &node.version), node))
+        .map(|node| {
+            (
+                folded_triple(
+                    node.owner.as_deref().unwrap_or_default(),
+                    &node.name,
+                    &node.version,
+                ),
+                node,
+            )
+        })
         .collect();
     let mut stack: Vec<(String, String, String)> = latest
         .dependencies
@@ -717,7 +718,7 @@ fn fold_offer_closure(
         .filter(|dep| dep.kind == "dependency")
         .map(|dep| {
             (
-                dep.owner.clone(),
+                owner_text(dep.owner.as_deref()),
                 dep.name.clone(),
                 dep.resolved_version.clone(),
             )
@@ -740,7 +741,7 @@ fn fold_offer_closure(
                 .filter(|dep| dep.kind == "dependency")
             {
                 stack.push((
-                    dep.owner.clone(),
+                    owner_text(dep.owner.as_deref()),
                     dep.name.clone(),
                     dep.resolved_version.clone(),
                 ));
@@ -755,7 +756,7 @@ fn fold_offer_closure(
             // locked import-closure edges, exactly the ones this walk follows.
             for dep in &meta.dependencies {
                 stack.push((
-                    dep.owner_nickname.clone(),
+                    owner_text(dep.owner_nickname.as_deref()),
                     dep.name.clone(),
                     dep.resolved_version.clone(),
                 ));
@@ -790,7 +791,16 @@ fn collect_closure_refs(
     > = result
         .closure
         .iter()
-        .map(|node| (folded_triple(&node.owner, &node.name, &node.version), node))
+        .map(|node| {
+            (
+                folded_triple(
+                    node.owner.as_deref().unwrap_or_default(),
+                    &node.name,
+                    &node.version,
+                ),
+                node,
+            )
+        })
         .collect();
     let mut stack: Vec<(String, String, String)> = latest
         .dependencies
@@ -798,7 +808,7 @@ fn collect_closure_refs(
         .filter(|dep| dep.kind == "dependency")
         .map(|dep| {
             (
-                dep.owner.clone(),
+                owner_text(dep.owner.as_deref()),
                 dep.name.clone(),
                 dep.resolved_version.clone(),
             )
@@ -818,7 +828,7 @@ fn collect_closure_refs(
                 .filter(|dep| dep.kind == "dependency")
             {
                 stack.push((
-                    dep.owner.clone(),
+                    owner_text(dep.owner.as_deref()),
                     dep.name.clone(),
                     dep.resolved_version.clone(),
                 ));
@@ -826,7 +836,7 @@ fn collect_closure_refs(
         } else if let Some(meta) = cached_meta(&owner, &name, &version) {
             for dep in &meta.dependencies {
                 stack.push((
-                    dep.owner_nickname.clone(),
+                    owner_text(dep.owner_nickname.as_deref()),
                     dep.name.clone(),
                     dep.resolved_version.clone(),
                 ));
@@ -841,14 +851,24 @@ fn collect_closure_refs(
     closure
 }
 
-/// Case-folded closure-walk key: owner nicknames and package names are
-/// case-insensitive identities on the registry.
-fn folded_triple(owner: &str, name: &str, version: &str) -> (String, String, String) {
+/// Case-folded closure-walk key. Package names are global and case-insensitive on the
+/// registry, so the owner segment an edge was spelled with never distinguishes two nodes.
+fn folded_triple(_owner: &str, name: &str, version: &str) -> (String, String, String) {
     (
-        owner.to_ascii_lowercase(),
+        String::new(),
         name.to_ascii_lowercase(),
         version.to_string(),
     )
+}
+
+/// An optional wire owner as the walk's owner text: empty for none.
+fn owner_text(owner: Option<&str>) -> String {
+    owner.unwrap_or_default().to_string()
+}
+
+/// An owner text as an optional wire owner: empty is none.
+fn wire_owner(owner: &str) -> Option<String> {
+    Some(owner.to_string()).filter(|owner| !owner.is_empty())
 }
 
 /// Whether `candidate` names a strictly newer version than `baseline` — semver order
@@ -889,13 +909,13 @@ pub(crate) fn cached_have(
             };
             for dep in &meta.dependencies {
                 stack.push((
-                    dep.owner_nickname.clone(),
+                    owner_text(dep.owner_nickname.as_deref()),
                     dep.name.clone(),
                     dep.resolved_version.clone(),
                 ));
             }
             have.push(CheckUpdatesHave {
-                owner,
+                owner: wire_owner(&owner),
                 name,
                 version,
             });
@@ -995,10 +1015,11 @@ pub async fn prefetch_version(
     {
         return Ok(());
     }
+    let address = smudgy_script::package_address(owner, name);
     let wire = client
-        .resolve_package(owner, name, Some(version))
+        .resolve_package(Some(owner), name, Some(version))
         .await
-        .map_err(|e| format!("failed to resolve {owner}/{name}@{version}: {e}"))?;
+        .map_err(|e| format!("failed to resolve {address}@{version}: {e}"))?;
     if wire.version != version {
         return Err(format!(
             "registry returned {owner}/{name}@{} when {version} was requested",
@@ -1020,31 +1041,30 @@ pub async fn prefetch_version(
     cache
         .refresh_meta(&key, &wire.version, &meta)
         .map_err(|e| format!("failed to cache {owner}/{name}@{version}: {e}"))?;
-    for module in wire
+    // Only the code bodies the cache lacks travel, in one bundle request.
+    let missing: Vec<&str> = wire
         .modules
         .iter()
         .filter(|module| is_code_module(&module.media_type, &module.subpath))
-    {
-        if cache.has_blob(&module.content_hash) {
-            continue;
-        }
-        let body = client
-            .fetch_module_bytes(&module.content_url, &module.content_hash)
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to fetch {owner}/{name}@{version} {}: {e}",
-                    module.subpath
-                )
-            })?;
-        cache
-            .write_blob_bytes(&module.content_hash, &body)
-            .map_err(|e| {
-                format!(
-                    "failed to cache {owner}/{name}@{version} {}: {e}",
-                    module.subpath
-                )
-            })?;
+        .map(|module| module.content_hash.as_str())
+        .filter(|hash| !cache.has_blob(hash))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let fetched = client
+        .fetch_bodies(&wire.bundle_url, &wire.bodies, &missing)
+        .await
+        .map_err(|e| format!("failed to fetch {owner}/{name}@{version}: {e}"))?;
+    for (hash, body) in fetched {
+        cache.write_blob_bytes(&hash, &body).map_err(|e| {
+            let subpath = wire
+                .modules
+                .iter()
+                .find(|module| module.content_hash == hash)
+                .map_or(hash.as_str(), |module| module.subpath.as_str());
+            format!("failed to cache {owner}/{name}@{version} {subpath}: {e}")
+        })?;
     }
     Ok(())
 }
@@ -1223,7 +1243,7 @@ mod tests {
 
     fn ok_result(latest: Option<UpdateCheckLatest>) -> CheckUpdatesResult {
         CheckUpdatesResult {
-            owner: "wbk".into(),
+            owner: Some("wbk".into()),
             name: "mapper".into(),
             status: "ok".into(),
             installed: Some(UpdateCheckInstalled {
@@ -1389,7 +1409,7 @@ mod tests {
         // reach the fold.
         let mut result = ok_result(Some(UpdateCheckLatest {
             dependencies: vec![UpdateCheckDependency {
-                owner: "wbk".into(),
+                owner: Some("wbk".into()),
                 name: "core".into(),
                 range: "^1".into(),
                 resolved_version: "1.0.0".into(),
@@ -1414,7 +1434,7 @@ mod tests {
         e.trusted = true;
         let result = ok_result(Some(UpdateCheckLatest {
             dependencies: vec![UpdateCheckDependency {
-                owner: "wbk".into(),
+                owner: Some("wbk".into()),
                 name: "core".into(),
                 range: "^1".into(),
                 resolved_version: "1.0.0".into(),
@@ -1571,7 +1591,7 @@ mod tests {
         // staging, and the rest of the batch is unaffected (entries are independent).
         let result = ok_result(Some(UpdateCheckLatest {
             dependencies: vec![UpdateCheckDependency {
-                owner: "wbk".into(),
+                owner: Some("wbk".into()),
                 name: "core".into(),
                 range: "^1".into(),
                 resolved_version: "1.0.0".into(),
@@ -1597,7 +1617,7 @@ mod tests {
         let result = ok_result(Some(UpdateCheckLatest {
             manifest: serde_json::json!({"version": "1.3.0", "requires": ["smudgy://wbk/companion@^1"]}),
             dependencies: vec![UpdateCheckDependency {
-                owner: "wbk".into(),
+                owner: Some("wbk".into()),
                 name: "companion".into(),
                 range: "^1".into(),
                 resolved_version: "1.0.0".into(),
@@ -1631,6 +1651,7 @@ mod tests {
                 manifest: PackageManifest::parse(r#"{"version":"1.2.0"}"#).unwrap(),
                 modules: Vec::new(),
                 dependencies: Vec::new(),
+                owner: None,
             })
         };
         for trusted in [false, true] {
@@ -1644,7 +1665,7 @@ mod tests {
     #[test]
     fn unchanged_requires_edges_do_not_join_the_import_closure() {
         let dependency = UpdateCheckDependency {
-            owner: "wbk".into(),
+            owner: Some("wbk".into()),
             name: "companion".into(),
             range: "^1".into(),
             resolved_version: "1.0.0".into(),
@@ -1663,12 +1684,13 @@ mod tests {
                     .unwrap(),
                 modules: Vec::new(),
                 dependencies: vec![smudgy_cloud::ResolvedDependency {
-                    owner_nickname: "WBK".into(),
+                    owner_nickname: Some("WBK".into()),
                     name: "Companion".into(),
                     range: "^1".into(),
                     resolved_version: "1.0.0".into(),
                     kind: DependencyKind::Requires,
                 }],
+                owner: None,
             })
         };
         let plan = evaluate_entry(
@@ -1693,7 +1715,7 @@ mod tests {
         // latest → dep-a (inlined in the response) → dep-b (elided; cached meta).
         let result = CheckUpdatesResult {
             closure: vec![UpdateCheckClosureNode {
-                owner: "wbk".into(),
+                owner: Some("wbk".into()),
                 name: "dep-a".into(),
                 version: "1.0.0".into(),
                 manifest: serde_json::json!({
@@ -1701,7 +1723,7 @@ mod tests {
                     "permissions": { "net": ["a.example"] }
                 }),
                 dependencies: vec![UpdateCheckDependency {
-                    owner: "wbk".into(),
+                    owner: Some("wbk".into()),
                     name: "dep-b".into(),
                     range: "^2".into(),
                     resolved_version: "2.0.0".into(),
@@ -1710,7 +1732,7 @@ mod tests {
             }],
             ..ok_result(Some(UpdateCheckLatest {
                 dependencies: vec![UpdateCheckDependency {
-                    owner: "wbk".into(),
+                    owner: Some("wbk".into()),
                     name: "dep-a".into(),
                     range: "^1".into(),
                     resolved_version: "1.0.0".into(),
@@ -1730,6 +1752,7 @@ mod tests {
                 .unwrap(),
                 modules: Vec::new(),
                 dependencies: Vec::new(),
+                owner: None,
             })
         };
         let plan = evaluate_entry(
@@ -1849,7 +1872,7 @@ mod tests {
             let (deps, known) = match (owner, name, version) {
                 ("wbk", "mapper", "1.2.0") => (
                     vec![smudgy_cloud::ResolvedDependency {
-                        owner_nickname: "wbk".into(),
+                        owner_nickname: Some("wbk".into()),
                         name: "dep-a".into(),
                         range: "^1".into(),
                         resolved_version: "1.0.0".into(),
@@ -1866,6 +1889,7 @@ mod tests {
                 manifest: PackageManifest::parse(r#"{ "name": "x", "version": "0.0.0" }"#).unwrap(),
                 modules: Vec::new(),
                 dependencies: deps,
+                owner: None,
             })
         };
         let entries = vec![(
@@ -1875,7 +1899,14 @@ mod tests {
         )];
         let mut have: Vec<String> = cached_have(&entries, &cached)
             .into_iter()
-            .map(|h| format!("{}/{}@{}", h.owner, h.name, h.version))
+            .map(|h| {
+                format!(
+                    "{}/{}@{}",
+                    h.owner.as_deref().unwrap_or_default(),
+                    h.name,
+                    h.version
+                )
+            })
             .collect();
         have.sort();
         assert_eq!(have, ["wbk/dep-a@1.0.0", "wbk/mapper@1.2.0"]);
@@ -1913,6 +1944,7 @@ mod tests {
                         is_entry: true,
                     }],
                     dependencies: Vec::new(),
+                    owner: None,
                 },
             )
             .unwrap();

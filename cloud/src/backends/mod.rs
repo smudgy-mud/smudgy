@@ -1,7 +1,8 @@
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CloudError, CloudResult, CreateAreaRequest, MapStorage, SyncRow,
-    mutation::{MutationEnvelope, MutationResult},
+    CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
+    cloud_api::{SecretChange, SecretGrant, SecretSummary},
+    mutation::{MoveRequest, MoveResult, MutationEnvelope, MutationResult},
 };
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -15,6 +16,8 @@ pub mod composite;
 pub mod ephemeral;
 pub mod local;
 pub mod local_migration;
+pub(crate) mod local_privacy;
+pub(crate) mod source_document;
 
 pub use area_merge::{
     AreaMergeCommit, AreaMergeOutcome, AreaMergePlan, AreaMergeSource, RoomRemap, Translate,
@@ -26,10 +29,10 @@ pub use composite::CompositeBackend;
 pub use ephemeral::EphemeralBackend;
 pub use local::LocalBackend;
 
-/// Fingerprint sentinel synthesized for areas served without an access block
-/// (legacy servers). Pairs with a client-side fingerprint of `None`; caching
-/// layers normalize the two representations when comparing.
-pub const LEGACY_ACCESS_FINGERPRINT: &str = "legacy";
+/// The refusal every backend without Secrets gives.
+fn secrets_unsupported() -> CloudError {
+    CloudError::InvalidInput("only cloud maps have Secrets".to_string())
+}
 
 /// Core trait defining all mapping operations
 #[async_trait]
@@ -152,7 +155,7 @@ pub trait MapperBackend: Send + Sync {
 
     // ===== SYNC / IDENTITY =====
 
-    /// One row per viewable area: shared revision + access fingerprint.
+    /// One row per viewable area: its projection token and source revisions.
     /// `Ok(None)` means the backend has no `/sync` support and callers should
     /// fall back to `list_areas` reconciliation.
     async fn sync_state(&self) -> CloudResult<Option<Vec<SyncRow>>> {
@@ -195,6 +198,11 @@ pub trait MapperBackend: Send + Sync {
         true
     }
 
+    /// Where a map created with no folder and no storage named lives.
+    fn default_storage(&self) -> MapStorage {
+        MapStorage::Cloud
+    }
+
     /// Drop every cached copy of an area (memory and disk). Default no-op for
     /// backends without a cache.
     async fn purge_area(&self, _area_id: &AreaId) {}
@@ -220,6 +228,30 @@ pub trait MapperBackend: Send + Sync {
     async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()>;
 
     async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()>;
+
+    /// Review a personal cloud map's sharing for a move to local storage.
+    async fn review_local_move(
+        &self,
+        _area_id: &AreaId,
+        _auth_generation: u64,
+    ) -> CloudResult<crate::relocation::LocalMoveReview> {
+        Err(CloudError::InvalidInput(
+            "this backend does not support guarded cloud-to-local moves".into(),
+        ))
+    }
+
+    /// Delete only the exact cloud snapshot copied and reviewed. Backends must
+    /// opt in: falling back to ordinary DELETE can destroy uncopied content.
+    async fn finish_local_move(
+        &self,
+        _area_id: &AreaId,
+        _guard: &crate::relocation::LocalMoveGuard,
+        _auth_generation: u64,
+    ) -> CloudResult<()> {
+        Err(CloudError::InvalidInput(
+            "this backend does not support guarded cloud-to-local moves".into(),
+        ))
+    }
 
     /// Delete an area only while its authoritative revision still equals
     /// `expected_rev` (`None` = unconditional, exactly [`Self::delete_area`]).
@@ -300,7 +332,7 @@ pub trait MapperBackend: Send + Sync {
     // ===== VERSIONED MUTATIONS (the CAS envelope) =====
 
     /// Applies one mutation envelope to an area atomically, honoring its
-    /// preconditions (revision + access fingerprint) and its idempotent
+    /// precondition (the written source's revision) and its idempotent
     /// operation id. This is the one write path every mapper content
     /// mutation compiles to.
     async fn execute_mutation(
@@ -350,6 +382,185 @@ pub trait MapperBackend: Send + Sync {
         ))
     }
 
+    // ===== SECRETS AND MOVES =====
+    //
+    // A Secret is a named source of a cloud map. Only the cloud tier keeps
+    // them; every other backend inherits the refusals. Each call is bound to
+    // the credential generation the caller captured, like the mutation path.
+
+    /// `POST /areas/{id}/secrets`: creates an owner Secret on a map, drawn in
+    /// `color` (`#rrggbb`) or, with `None`, in the palette's color.
+    async fn create_secret(
+        &self,
+        area_id: &AreaId,
+        name: &str,
+        color: Option<&str>,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        self.create_secret_as(
+            area_id,
+            &crate::clan_secrets::NewSecret::owner(name, color),
+            auth_generation,
+        )
+        .await
+    }
+
+    /// `POST /areas/{id}/secrets`: creates a Secret owned as `secret` says:
+    /// an owner Secret, or a Member-owned or Clan-owned Clan Secret.
+    async fn create_secret_as(
+        &self,
+        area_id: &AreaId,
+        secret: &crate::clan_secrets::NewSecret,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        let _ = (area_id, secret, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `PATCH /secrets/{id}`: renames and recolors one of a map's Secrets
+    /// in one request.
+    async fn update_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        change: &SecretChange,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        let _ = (area_id, secret, change, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `PATCH /secrets/{id}`: renames one of a map's Secrets.
+    async fn rename_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        name: &str,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        let _ = (area_id, secret, name, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `PATCH /secrets/{id}` with `{color}`: sets a Secret's color
+    /// (`#rrggbb`), or with `None` leaves it to the palette.
+    async fn recolor_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        color: Option<&str>,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        let _ = (area_id, secret, color, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `DELETE /secrets/{id}`: deletes one of a map's Secrets and everything
+    /// it holds.
+    async fn delete_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let _ = (area_id, secret, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `GET /secrets/{id}/grants`: the Secret's grants the caller may see.
+    async fn secret_grants(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        auth_generation: u64,
+    ) -> CloudResult<Vec<SecretGrant>> {
+        let _ = (area_id, secret, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `POST /secrets/{id}/grants`: shares a Secret with a friend, replacing
+    /// the caller's earlier grant to them.
+    async fn grant_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grantee_id: Uuid,
+        actions: &[&str],
+        auth_generation: u64,
+    ) -> CloudResult<SecretGrant> {
+        let _ = (area_id, secret, grantee_id, actions, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `PATCH /secrets/{id}/grants/{grant}`: replaces a grant's actions.
+    async fn update_secret_grant(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grant_id: Uuid,
+        actions: &[&str],
+        auth_generation: u64,
+    ) -> CloudResult<SecretGrant> {
+        let _ = (area_id, secret, grant_id, actions, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `DELETE /secrets/{id}/grants/{grant}`: revokes a grant.
+    async fn revoke_secret_grant(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grant_id: Uuid,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let _ = (area_id, secret, grant_id, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// `POST /areas/{id}/moves`: moves rooms, labels and shapes between two
+    /// sources of one map as one transaction.
+    async fn move_content(
+        &self,
+        area_id: &AreaId,
+        request: &MoveRequest,
+        auth_generation: u64,
+    ) -> CloudResult<MoveResult> {
+        let _ = (area_id, request, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    /// Reviews the exact transfer request, without moving its content.
+    async fn review_move_content(
+        &self,
+        area_id: &AreaId,
+        request: &MoveRequest,
+        auth_generation: u64,
+    ) -> CloudResult<crate::access_review::AccessReview> {
+        let _ = (area_id, request, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    async fn review_filing(
+        &self,
+        area_id: &AreaId,
+        atlas_id: Option<AtlasId>,
+        auth_generation: u64,
+    ) -> CloudResult<crate::access_review::AccessReview> {
+        let _ = (area_id, atlas_id, auth_generation);
+        Err(secrets_unsupported())
+    }
+
+    async fn commit_reviewed_filing(
+        &self,
+        area_id: &AreaId,
+        atlas_id: Option<AtlasId>,
+        token: &str,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let _ = (area_id, atlas_id, token, auth_generation);
+        Err(secrets_unsupported())
+    }
+
     // ===== ATLAS (FOLDER) OPERATIONS =====
     //
     // Atlases are folders grouping the viewer's *own* areas. Only owned
@@ -360,6 +571,21 @@ pub trait MapperBackend: Send + Sync {
     /// List the viewer's own atlases. Default: none.
     async fn list_atlases(&self) -> CloudResult<Vec<AtlasListItem>> {
         Ok(Vec::new())
+    }
+
+    /// List the atlases in one durable `storage`, failing when that storage
+    /// can't be read rather than leaving it out. Default: a single tier's
+    /// list, split the way [`Self::local_atlas_ids`] splits it.
+    async fn list_atlases_in(&self, storage: MapStorage) -> CloudResult<Vec<AtlasListItem>> {
+        if storage == MapStorage::Session {
+            return Ok(Vec::new());
+        }
+        let atlases = self.list_atlases().await?;
+        let local = self.local_atlas_ids();
+        Ok(atlases
+            .into_iter()
+            .filter(|atlas| local.contains(&atlas.id) == (storage == MapStorage::Local))
+            .collect())
     }
 
     /// Create an empty atlas (folder). Default: unsupported.
@@ -397,6 +623,17 @@ pub trait MapperBackend: Send + Sync {
     async fn delete_atlas(&self, _atlas_id: &AtlasId) -> CloudResult<()> {
         Err(CloudError::InvalidInput(
             "this backend does not support atlases".to_string(),
+        ))
+    }
+
+    /// Finish moving a personal cloud atlas only if it is still empty.
+    async fn finish_local_atlas_move(
+        &self,
+        _atlas_id: &AtlasId,
+        _auth_generation: u64,
+    ) -> CloudResult<()> {
+        Err(CloudError::InvalidInput(
+            "this backend does not support guarded cloud-to-local atlas moves".into(),
         ))
     }
 

@@ -25,13 +25,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smudgy_cloud::{DependencyKind, ResolvedDependency, package_api::ResolvedModuleWire};
 pub use smudgy_script::PackageKey;
-use smudgy_script::{PackageManifest, SmudgySpecifier};
+use smudgy_script::{PackageManifest, PackageOwner, SmudgySpecifier};
 
 use crate::get_smudgy_home;
 use crate::models::naming::validate_package_name;
 use crate::models::persistence::write_atomic;
 
-/// A cached resolution of a concrete package version (no presigned URLs — those are
+/// A cached resolution of a concrete package version (no signed bundle URLs — those are
 /// ephemeral; bodies live in the blob cache, keyed by `content_hash`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedResolution {
@@ -47,6 +47,10 @@ pub struct CachedResolution {
     /// [`PackageCache::read_meta`].
     #[serde(default)]
     pub dependencies: Vec<ResolvedDependency>,
+    /// Who owns the package, as the registry reported it when this version was resolved.
+    /// `None` in files written before owners were recorded, and when the owner is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<PackageOwner>,
 }
 
 /// One module's metadata within a [`CachedResolution`].
@@ -184,12 +188,16 @@ pub fn resolution_from_wire(
             })
             .collect(),
         dependencies: dependencies.to_vec(),
+        owner: None,
     })
 }
 
 /// Rejects identities and versions that would escape (or alias) the cache's on-disk layout.
 fn validate_cache_identity(key: &PackageKey, version: &str) -> Result<()> {
-    validate_package_name(&key.owner).map_err(|error| anyhow!("invalid package owner: {error}"))?;
+    if !key.owner.is_empty() {
+        validate_package_name(&key.owner)
+            .map_err(|error| anyhow!("invalid package owner: {error}"))?;
+    }
     validate_package_name(&key.name).map_err(|error| anyhow!("invalid package name: {error}"))?;
     let parsed = SmudgySpecifier::parse(&key.to_user_specifier())?;
     if parsed.subpath.is_some()
@@ -244,18 +252,55 @@ impl PackageCache {
         self.root.join("blobs").join(a).join(b).join(hash)
     }
 
+    /// Where a version's metadata lives: under its name alone, since a package's identity is
+    /// its name and every spelling of its address (`smudgy:@name`, `smudgy://owner/name`)
+    /// names it, whoever owns it now.
     fn meta_path(&self, key: &PackageKey, version: &str) -> PathBuf {
-        let key = key.folded();
         self.root
             .join("meta")
-            .join(&key.owner)
-            .join(&key.name)
+            .join(smudgy_script::owner_segment(""))
+            .join(key.name.to_ascii_lowercase())
             .join(format!("{version}.json"))
     }
 
-    /// Old caches used the requested spelling. Find a unique legacy directory on
-    /// case-sensitive filesystems without changing module filenames or versions.
+    /// Old caches kept metadata under the owner segment an address was spelled with. Look in
+    /// the requested spelling's directory first, then in the one owner directory holding this
+    /// name and version, if exactly one does. Directory names match ignoring ASCII case, so
+    /// case-sensitive filesystems find them too.
     fn legacy_meta_path(&self, key: &PackageKey, version: &str) -> Option<PathBuf> {
+        self.spelled_legacy_meta_path(key, version)
+            .filter(|path| path.exists())
+            .or_else(|| self.any_owner_legacy_meta_path(key, version))
+    }
+
+    /// The legacy metadata file under any owner directory, if exactly one holds `key`'s name
+    /// at `version`.
+    fn any_owner_legacy_meta_path(&self, key: &PackageKey, version: &str) -> Option<PathBuf> {
+        let file = format!("{version}.json");
+        let mut found = fs::read_dir(self.root.join("meta"))
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|owner| owner.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|owner| {
+                fs::read_dir(owner.path())
+                    .ok()?
+                    .filter_map(Result::ok)
+                    .find(|package| {
+                        package.file_type().is_ok_and(|kind| kind.is_dir())
+                            && package
+                                .file_name()
+                                .to_str()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&key.name))
+                    })
+                    .map(|package| package.path().join(&file))
+            })
+            .filter(|path| path.is_file());
+        let path = found.next()?;
+        found.next().is_none().then_some(path)
+    }
+
+    /// The legacy metadata file under the owner segment `key` spells.
+    fn spelled_legacy_meta_path(&self, key: &PackageKey, version: &str) -> Option<PathBuf> {
         fn directory(parent: &Path, name: &str) -> Option<PathBuf> {
             let mut matches = fs::read_dir(parent)
                 .ok()?
@@ -270,7 +315,10 @@ impl PackageCache {
             let path = matches.next()?.path();
             matches.next().is_none().then_some(path)
         }
-        let owner = directory(&self.root.join("meta"), &key.owner)?;
+        let owner = directory(
+            &self.root.join("meta"),
+            smudgy_script::owner_segment(&key.owner),
+        )?;
         let package = directory(&owner, &key.name)?;
         Some(package.join(format!("{version}.json")))
     }
@@ -376,25 +424,18 @@ impl PackageCache {
             .unwrap_or_default();
         let mut resolution: CachedResolution = serde_json::from_value(value).ok()?;
         if !kind_less.is_empty() {
-            let requires: BTreeSet<(String, String)> = resolution
+            // Names are global: an edge names a `requires` root when the names agree.
+            let requires: BTreeSet<String> = resolution
                 .manifest
                 .smudgy_requires()
                 .into_iter()
-                .map(|required| {
-                    (
-                        required.key.owner.to_ascii_lowercase(),
-                        required.key.name.to_ascii_lowercase(),
-                    )
-                })
+                .map(|required| required.key.name.to_ascii_lowercase())
                 .collect();
             for index in kind_less {
                 let Some(dependency) = resolution.dependencies.get_mut(index) else {
                     continue;
                 };
-                let edge = (
-                    dependency.owner_nickname.to_ascii_lowercase(),
-                    dependency.name.to_ascii_lowercase(),
-                );
+                let edge = dependency.name.to_ascii_lowercase();
                 dependency.kind = if requires.contains(&edge) {
                     DependencyKind::Requires
                 } else {
@@ -464,7 +505,8 @@ impl PackageCache {
             let missing_deps =
                 cached.dependencies.is_empty() && !resolution.dependencies.is_empty();
             let missing_modules = cached.modules.len() < resolution.modules.len();
-            if !missing_deps && !missing_modules {
+            let missing_owner = cached.owner.is_none() && resolution.owner.is_some();
+            if !missing_deps && !missing_modules && !missing_owner {
                 return Ok(());
             }
         }
@@ -490,6 +532,7 @@ mod tests {
             manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
             modules: vec![],
             dependencies: vec![],
+            owner: None,
         };
         // Plant the pre-fix layout directly. On case-sensitive filesystems the
         // folded request must discover the legacy directory spelling.
@@ -507,6 +550,88 @@ mod tests {
         cache.write_meta(&key, "1.0.0", &resolution).unwrap();
         assert!(cache.read_meta(&key.folded(), "1.0.0").is_some());
         assert!(cache.read_meta(&key, "2.0.0").is_none());
+    }
+
+    #[test]
+    fn metadata_is_found_by_name_whatever_the_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let spelled = |owner: &str| PackageKey {
+            owner: owner.into(),
+            name: "Mapper".into(),
+        };
+        let resolution = CachedResolution {
+            version: "1.0.0".into(),
+            integrity: "new".into(),
+            manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
+            modules: vec![],
+            dependencies: vec![],
+            owner: Some(PackageOwner::user("Alice")),
+        };
+        cache
+            .write_meta(&spelled("alice"), "1.0.0", &resolution)
+            .unwrap();
+        // The package moved to another owner (a renamed nickname, a clan): every spelling of
+        // its address still finds the version.
+        for owner in ["", "alice", "Bob", "someone-else"] {
+            let meta = cache.read_meta(&spelled(owner), "1.0.0");
+            assert_eq!(
+                meta.map(|meta| meta.integrity).as_deref(),
+                Some("new"),
+                "{owner:?}"
+            );
+        }
+        assert_eq!(
+            cache
+                .read_meta(&spelled(""), "1.0.0")
+                .and_then(|meta| meta.owner),
+            Some(PackageOwner::user("alice"))
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_under_another_owner_is_found_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let legacy = |owner: &str, integrity: &str| {
+            let path = cache.root.join(format!("meta/{owner}/mapper/1.0.0.json"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let resolution = CachedResolution {
+                version: "1.0.0".into(),
+                integrity: integrity.into(),
+                manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
+                modules: vec![],
+                dependencies: vec![],
+                owner: None,
+            };
+            fs::write(&path, serde_json::to_vec(&resolution).unwrap()).unwrap();
+        };
+        let key = |owner: &str| PackageKey {
+            owner: owner.into(),
+            name: "mapper".into(),
+        };
+        legacy("alice", "alice's");
+        for owner in ["", "alice", "clan-now"] {
+            assert_eq!(
+                cache
+                    .read_meta(&key(owner), "1.0.0")
+                    .map(|meta| meta.integrity)
+                    .as_deref(),
+                Some("alice's"),
+                "{owner:?}"
+            );
+        }
+        assert!(cache.read_meta(&key(""), "2.0.0").is_none());
+        // Two owner directories holding the name: only the spelled one is trusted.
+        legacy("bob", "bob's");
+        assert_eq!(
+            cache
+                .read_meta(&key("bob"), "1.0.0")
+                .map(|meta| meta.integrity)
+                .as_deref(),
+            Some("bob's")
+        );
+        assert!(cache.read_meta(&key("carol"), "1.0.0").is_none());
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -577,6 +702,7 @@ mod tests {
                 is_entry: true,
             }],
             dependencies: Vec::new(),
+            owner: None,
         };
         assert!(!cache.has_all_code_blobs(&resolution));
     }
@@ -586,7 +712,6 @@ mod tests {
         let module = |subpath: &str, hash: &str| ResolvedModuleWire {
             subpath: subpath.into(),
             content_hash: hash.into(),
-            content_url: String::new(),
             media_type: "text/plain".into(),
             byte_size: 0,
             is_entry: false,
@@ -627,6 +752,7 @@ mod tests {
                 },
             ],
             dependencies: Vec::new(),
+            owner: None,
         };
         assert!(cache.read_meta(&key(), "1.4.0").is_none());
         cache.write_meta(&key(), "1.4.0", &resolution).unwrap();
@@ -654,6 +780,7 @@ mod tests {
                 .unwrap(),
             modules: Vec::new(),
             dependencies: Vec::new(),
+            owner: None,
         };
         // Plant torn files at the final content-addressed paths.
         let meta_path = cache.meta_path(&key(), "1.4.0");
@@ -693,11 +820,12 @@ mod tests {
             manifest: manifest.clone(),
             modules: Vec::new(),
             dependencies: Vec::new(),
+            owner: None,
         };
         cache.write_meta(&key(), "1.4.0", &legacy).unwrap();
         let full = CachedResolution {
             dependencies: vec![ResolvedDependency {
-                owner_nickname: "wbk".into(),
+                owner_nickname: Some("wbk".into()),
                 name: "base".into(),
                 range: "^1".into(),
                 resolved_version: "1.0.0".into(),
@@ -793,6 +921,7 @@ mod tests {
             manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
             modules: Vec::new(),
             dependencies: Vec::new(),
+            owner: None,
         };
         assert!(cache.write_meta(&unsafe_key, "1.0.0", &resolution).is_err());
         assert!(cache.read_meta(&unsafe_key, "1.0.0").is_none());

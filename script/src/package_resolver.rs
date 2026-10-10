@@ -1,4 +1,11 @@
-//! The `smudgy://` module scheme: shared-package resolution for the session isolate.
+//! The package module scheme: shared-package resolution for the session isolate.
+//!
+//! A package's name is global, so its address is the name: `smudgy:@name[/subpath]`.
+//! `smudgy://owner/name[/subpath]` remains supported through 0.6.0. The parser checks the
+//! owner segment's form; the provider and registry require it to match the publisher,
+//! except for local development overrides. A [`PackageKey`] keeps the spelling it was
+//! given (an empty owner for `smudgy:@name`) and compares by name alone. Providers must
+//! validate legacy owners before reusing a published package by that shared identity.
 //!
 //! Mirrors [`crate::npm_resolver`] in shape: `resolve()` keeps the request cheap and
 //! synchronous, `load()` does the async fetch + a redirect to a canonical URL (see
@@ -67,22 +74,76 @@ pub const EVENTS_SCHEME: &str = "smudgy-events";
 /// procedure twin of [`STATE_SCHEME`] (interop.md §6). No platform procedures exist.
 pub const PROCEDURES_SCHEME: &str = "smudgy-procedures";
 
-/// A package coordinate without version or subpath — the version-cache and lockfile
-/// key. `owner` is the publisher's globally unique nickname. The registry reserves
-/// `name` globally across publishers, while the full coordinate keeps the owner so
-/// published identities remain stable and attributable.
-/// Identity comparisons and hash keys ignore ASCII case; the strings retain their spelling.
+/// The prefix of a package's canonical address, `smudgy:@name`.
+pub const ADDRESS_PREFIX: &str = "smudgy:@";
+/// The prefix of the compatibility spelling `smudgy://owner/name`.
+pub const OWNER_ADDRESS_PREFIX: &str = "smudgy://";
+/// The owner segment internal URLs carry for an address without an owner. A nickname never
+/// contains `@`.
+const NO_OWNER_SEGMENT: &str = "@";
+
+/// Whether `raw` is a package address in either spelling (`smudgy:@name` or
+/// `smudgy://owner/name`), as opposed to a `smudgy:` virtual module or anything else.
+#[must_use]
+pub fn is_package_address(raw: &str) -> bool {
+    raw.starts_with(ADDRESS_PREFIX) || raw.starts_with(OWNER_ADDRESS_PREFIX)
+}
+
+/// The address of package `name`: `smudgy:@name` with no owner, else the compatibility
+/// spelling `smudgy://owner/name`.
+#[must_use]
+pub fn package_address(owner: &str, name: &str) -> String {
+    if owner.is_empty() {
+        format!("{ADDRESS_PREFIX}{name}")
+    } else {
+        format!("{OWNER_ADDRESS_PREFIX}{owner}/{name}")
+    }
+}
+
+/// Whether `owner` has a nickname's form: ASCII letters, digits, `_` and `-`. The
+/// registry also bounds a nickname's length and answers the uniform 404 outside it.
+#[must_use]
+pub fn is_address_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The owner as an internal URL path segment, and as a directory name: `@` for none.
+#[must_use]
+pub fn owner_segment(owner: &str) -> &str {
+    if owner.is_empty() {
+        NO_OWNER_SEGMENT
+    } else {
+        owner
+    }
+}
+
+/// The inverse of [`owner_segment`].
+fn owner_from_segment(segment: &str) -> String {
+    if segment == NO_OWNER_SEGMENT {
+        String::new()
+    } else {
+        segment.to_string()
+    }
+}
+
+/// A package coordinate without version or subpath — the version-cache and lockfile key.
+/// `owner` is the owner segment the address was spelled with (`smudgy://owner/name`), or
+/// empty for the canonical `smudgy:@name`. The registry reserves `name` globally and
+/// uses it as identity: comparisons and hash keys ignore the owner and ASCII case, while
+/// the strings retain their spelling for display and paths. Legacy owner constraints are
+/// validated separately during resolution; equality does not prove a valid address.
 #[derive(Debug, Clone)]
 pub struct PackageKey {
     pub owner: String,
     pub name: String,
 }
 
-// The registry compares both coordinate segments without ASCII case. Retain their
-// spelling for display and local paths, but use the same identity in every resolver map.
 impl PartialEq for PackageKey {
     fn eq(&self, other: &Self) -> bool {
-        self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
+        self.name.eq_ignore_ascii_case(&other.name)
     }
 }
 
@@ -90,7 +151,6 @@ impl Eq for PackageKey {}
 
 impl Hash for PackageKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.owner.to_ascii_lowercase().hash(state);
         self.name.to_ascii_lowercase().hash(state);
     }
 }
@@ -106,11 +166,44 @@ impl PackageKey {
         }
     }
 
-    /// The package-level user specifier, e.g. `smudgy://wbk/mapper`.
+    /// The package-level address as spelled: `smudgy:@mapper`, or `smudgy://wbk/mapper`.
     #[must_use]
     pub fn to_user_specifier(&self) -> String {
-        format!("{MARKER_SCHEME}://{}/{}", self.owner, self.name)
+        package_address(&self.owner, &self.name)
     }
+}
+
+/// Who owns a published package, as the registry reports it. An address's owner segment is
+/// spelling and never this: `smudgy:@lib` and `smudgy://anyone/lib` name one package with one
+/// owner, whoever the spelling names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "lowercase")]
+pub enum PackageOwner {
+    /// A user, by their nickname folded to ASCII lowercase.
+    User(String),
+    /// A clan, by its ID folded to ASCII lowercase.
+    Clan(String),
+}
+
+impl PackageOwner {
+    /// A user owner by nickname, compared ignoring ASCII case.
+    #[must_use]
+    pub fn user(nickname: &str) -> Self {
+        Self::User(nickname.to_ascii_lowercase())
+    }
+
+    /// A clan owner by ID.
+    #[must_use]
+    pub fn clan(id: &str) -> Self {
+        Self::Clan(id.to_ascii_lowercase())
+    }
+}
+
+/// Whether two packages share an owner, judged on the owners the registry reports. An owner
+/// the provider does not know never matches, so an unknown owner is judged a different one.
+#[must_use]
+pub fn same_package_owner(a: Option<&PackageOwner>, b: Option<&PackageOwner>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a == b)
 }
 
 /// The importing package *instance* a referrer-aware import comes from: its
@@ -125,9 +218,10 @@ pub struct ReferrerRef {
     pub version: String,
 }
 
-/// A parsed user specifier `smudgy://owner/name[/subpath]`.
+/// A parsed package import, `smudgy:@name[/subpath]` or `smudgy://owner/name[/subpath]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmudgySpecifier {
+    /// The owner segment of `smudgy://owner/name`; empty for `smudgy:@name`.
     pub owner: String,
     pub name: String,
     /// Module within a multi-module package; `None` addresses the entry module.
@@ -140,24 +234,32 @@ pub struct SmudgySpecifier {
 }
 
 impl SmudgySpecifier {
-    /// Parse `smudgy://owner/name[/subpath]`. Parsed by hand (not `url::Url`) so the
-    /// marker/canonical URL spaces stay path-based. URL identities fold only owner/name.
+    /// Parse `smudgy:@name[/subpath]` or `smudgy://owner/name[/subpath]`. Parsed by hand
+    /// (not `url::Url`) so the marker/canonical URL spaces stay path-based. URL identities
+    /// fold only owner/name.
     ///
     /// # Errors
-    /// Returns [`SmudgySpecifierError`] for a missing scheme, an empty component, or an
-    /// unsafe subpath (`..`/backslash).
+    /// Returns [`SmudgySpecifierError`] for a missing scheme, an empty component, an owner
+    /// segment without a nickname's form, or an unsafe subpath (`..`/backslash).
     pub fn parse(raw: &str) -> Result<Self, SmudgySpecifierError> {
-        let rest = raw
-            .strip_prefix("smudgy://")
-            .ok_or(SmudgySpecifierError::MissingScheme)?;
-
-        // owner / name [/ subpath...]
-        let (owner, path) = rest
-            .split_once('/')
-            .ok_or(SmudgySpecifierError::EmptyComponent("name"))?;
-        if owner.is_empty() {
-            return Err(SmudgySpecifierError::EmptyComponent("owner"));
-        }
+        let (owner, path) = if let Some(path) = raw.strip_prefix(ADDRESS_PREFIX) {
+            ("", path)
+        } else {
+            let rest = raw
+                .strip_prefix(OWNER_ADDRESS_PREFIX)
+                .ok_or(SmudgySpecifierError::MissingScheme)?;
+            // owner / name [/ subpath...]
+            let (owner, path) = rest
+                .split_once('/')
+                .ok_or(SmudgySpecifierError::EmptyComponent("name"))?;
+            if owner.is_empty() {
+                return Err(SmudgySpecifierError::EmptyComponent("owner"));
+            }
+            if !is_address_owner(owner) {
+                return Err(SmudgySpecifierError::InvalidOwner(owner.to_string()));
+            }
+            (owner, path)
+        };
 
         let path = path.trim_end_matches('/');
         let (name, subpath) = match path.split_once('/') {
@@ -208,10 +310,11 @@ impl SmudgySpecifier {
         self.referrer.as_ref()
     }
 
-    /// Re-canonicalized user specifier (normalized, no trailing slash).
+    /// Re-canonicalized user specifier (normalized, no trailing slash), in the spelling it
+    /// was parsed from.
     #[must_use]
     pub fn to_user_specifier(&self) -> String {
-        let mut out = format!("smudgy://{}/{}", self.owner, self.name);
+        let mut out = package_address(&self.owner, &self.name);
         if let Some(sub) = &self.subpath {
             out.push('/');
             out.push_str(sub);
@@ -220,16 +323,17 @@ impl SmudgySpecifier {
     }
 
     /// The version-less marker URL `resolve()` returns. Path-based + empty-authority so
-    /// `url` round-trips it losslessly; [`Self::from_marker_url`] is the inverse. When a
-    /// referrer is attached it is encoded as a `?referrer=owner%2Fname%40version`
-    /// query so deno keys the module on `(target, referrer-instance)`: the same target
-    /// imported from the same importer instance resolves to one marker (one selection),
-    /// while two coexisting versions of the importer select independently.
+    /// `url` round-trips it losslessly; [`Self::from_marker_url`] is the inverse. An
+    /// address without an owner carries `@` in the owner segment. When a referrer is
+    /// attached it is encoded as a `?referrer=owner%2Fname%40version` query so deno keys
+    /// the module on `(target, referrer-instance)`: the same target imported from the same
+    /// importer instance resolves to one marker (one selection), while two coexisting
+    /// versions of the importer select independently.
     #[must_use]
     pub fn to_marker_url(&self) -> ModuleSpecifier {
         let mut path = format!(
             "/{}/{}",
-            self.owner.to_ascii_lowercase(),
+            owner_segment(&self.owner).to_ascii_lowercase(),
             self.name.to_ascii_lowercase()
         );
         if let Some(sub) = &self.subpath {
@@ -243,7 +347,7 @@ impl SmudgySpecifier {
                 "referrer",
                 &format!(
                     "{}/{}@{}",
-                    referrer.key.owner.to_ascii_lowercase(),
+                    owner_segment(&referrer.key.owner).to_ascii_lowercase(),
                     referrer.key.name.to_ascii_lowercase(),
                     referrer.version
                 ),
@@ -260,7 +364,11 @@ impl SmudgySpecifier {
             return None;
         }
         let mut segments = url.path_segments()?;
-        let owner = segments.next()?.to_string();
+        let owner_segment = segments.next()?;
+        if owner_segment.is_empty() {
+            return None;
+        }
+        let owner = owner_from_segment(owner_segment);
         let name = segments.next()?.to_string();
         let rest: Vec<&str> = segments.filter(|s| !s.is_empty()).collect();
         let subpath = if rest.is_empty() {
@@ -268,7 +376,7 @@ impl SmudgySpecifier {
         } else {
             Some(rest.join("/"))
         };
-        if owner.is_empty() || name.is_empty() {
+        if name.is_empty() {
             return None;
         }
         let referrer = url
@@ -294,20 +402,21 @@ fn parse_referrer(raw: &str) -> Option<ReferrerRef> {
     }
     Some(ReferrerRef {
         key: PackageKey {
-            owner: owner.to_string(),
+            owner: owner_from_segment(owner),
             name: name.to_string(),
         },
         version: version.to_string(),
     })
 }
 
-/// A parsed `smudgy://` dependency from a manifest's `dependencies` list: a package
+/// A parsed package dependency from a manifest's `dependencies` list: a package
 /// coordinate plus an optional semver range. Unlike an *import* specifier (which never
 /// carries a version — the version comes from the importing package's locked deps or the
 /// lockfile), a *dependency declaration* may pin its range with `@`:
-/// `smudgy://owner/name@^1.2`. A range-less dependency means "any version" (resolved
-/// to whatever the dependency tree locks). The raw range string is kept unparsed here;
-/// `core`'s resolution engine parses + matches it (this crate stays semver-policy-free).
+/// `smudgy:@name@^1.2` or `smudgy://owner/name@^1.2`. A range-less dependency means "any
+/// version" (resolved to whatever the dependency tree locks). The raw range string is kept
+/// unparsed here; `core`'s resolution engine parses + matches it (this crate stays
+/// semver-policy-free).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageDependency {
     pub key: PackageKey,
@@ -316,19 +425,25 @@ pub struct PackageDependency {
 }
 
 impl PackageDependency {
-    /// Parse one `dependencies` entry. Returns `None` if it isn't a `smudgy://`
-    /// dependency (jsr:/npm:/relative deps are resolved by their own stacks);
-    /// `Some(Err(_))` if it is a `smudgy://` entry but malformed.
+    /// Parse one `dependencies` entry. Returns `None` if it isn't a package address
+    /// (jsr:/npm:/relative deps are resolved by their own stacks); `Some(Err(_))` if it is
+    /// one but malformed.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Result<Self, SmudgySpecifierError>> {
-        if !raw.starts_with("smudgy://") {
+        let prefix = if raw.starts_with(ADDRESS_PREFIX) {
+            ADDRESS_PREFIX.len()
+        } else if raw.starts_with(OWNER_ADDRESS_PREFIX) {
+            OWNER_ADDRESS_PREFIX.len()
+        } else {
             return None;
-        }
-        // The only `@` in a well-formed entry separates the trailing range — the owner
-        // handle and name never contain one — so split on the last `@`. (A range itself,
-        // e.g. `^1.2 || ^2`, contains no `@`.)
-        let (spec_part, range) = match raw.rsplit_once('@') {
-            Some((spec, range)) if !range.is_empty() => (spec, Some(range.to_string())),
+        };
+        // After the address's prefix, the only `@` in a well-formed entry separates the
+        // trailing range — the owner handle and name never contain one — so split on the last
+        // `@`. (A range itself, e.g. `^1.2 || ^2`, contains no `@`.)
+        let (spec_part, range) = match raw[prefix..].rsplit_once('@') {
+            Some((spec, range)) if !range.is_empty() => {
+                (&raw[..prefix + spec.len()], Some(range.to_string()))
+            }
             _ => (raw, None),
         };
         Some(SmudgySpecifier::parse(spec_part).map(|spec| Self {
@@ -353,7 +468,13 @@ pub struct CanonicalCoords {
 pub fn canonical_url(key: &PackageKey, version: &str, module_subpath: &str) -> ModuleSpecifier {
     let key = key.folded();
     let module_subpath = module_subpath.trim_start_matches('/');
-    let path = format!("/{}/{}/{}/{}", key.owner, key.name, version, module_subpath);
+    let path = format!(
+        "/{}/{}/{}/{}",
+        owner_segment(&key.owner),
+        key.name,
+        version,
+        module_subpath
+    );
     ModuleSpecifier::parse(&format!("{CANONICAL_SCHEME}://{path}"))
         .expect("canonical URL is well-formed for validated components")
 }
@@ -365,7 +486,7 @@ pub fn parse_canonical(url: &ModuleSpecifier) -> Option<CanonicalCoords> {
         return None;
     }
     let mut segments = url.path_segments()?;
-    let owner = segments.next()?.to_string();
+    let owner = segments.next()?;
     let name = segments.next()?.to_string();
     let version = segments.next()?.to_string();
     let module_subpath = segments.collect::<Vec<_>>().join("/");
@@ -373,7 +494,10 @@ pub fn parse_canonical(url: &ModuleSpecifier) -> Option<CanonicalCoords> {
         return None;
     }
     Some(CanonicalCoords {
-        key: PackageKey { owner, name },
+        key: PackageKey {
+            owner: owner_from_segment(owner),
+            name,
+        },
         version,
         module_subpath,
     })
@@ -387,7 +511,7 @@ pub fn parse_canonical(url: &ModuleSpecifier) -> Option<CanonicalCoords> {
 #[must_use]
 pub fn params_module_url(importer: Option<&PackageKey>) -> ModuleSpecifier {
     let path = match importer {
-        Some(key) => format!("/{}/{}", key.owner, key.name),
+        Some(key) => format!("/{}/{}", owner_segment(&key.owner), key.name),
         None => "/".to_string(),
     };
     ModuleSpecifier::parse(&format!("{PARAMS_SCHEME}://{path}"))
@@ -404,7 +528,7 @@ pub fn parse_params_url(url: &ModuleSpecifier) -> Option<Option<PackageKey>> {
     let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
     match segments.as_slice() {
         [owner, name] => Some(Some(PackageKey {
-            owner: (*owner).to_string(),
+            owner: owner_from_segment(owner),
             name: (*name).to_string(),
         })),
         [] => Some(None),
@@ -1087,6 +1211,16 @@ pub struct SmudgyCapabilities {
     /// `workers: ["spawn"]` — construct Web Workers: off-thread reduced-op compute
     /// realms with a message-only bridge (no network, file, or smudgy ops inside them).
     pub workers: bool,
+    /// `secrets: ["read"]` — read a cloud map's Secrets and the user's Private additions
+    /// through the place-naming mapper calls (implied by `secrets_write` and
+    /// `secrets_manage`). Reads still need `mapper_read`.
+    pub secrets_read: bool,
+    /// `secrets: ["write"]` — change Secret and Private content (implies `secrets_read`).
+    /// Writes still need `mapper_write`.
+    pub secrets_write: bool,
+    /// `secrets: ["manage"]` — create, update (rename and recolor) and delete Secrets (implies
+    /// `secrets_read`, not `secrets_write`).
+    pub secrets_manage: bool,
 }
 
 impl SmudgyCapabilities {
@@ -1112,6 +1246,9 @@ impl SmudgyCapabilities {
             gmcp_send: true,
             input: true,
             workers: true,
+            secrets_read: true,
+            secrets_write: true,
+            secrets_manage: true,
         }
     }
 
@@ -1143,6 +1280,9 @@ impl SmudgyCapabilities {
         self.gmcp_send |= other.gmcp_send;
         self.input |= other.input;
         self.workers |= other.workers;
+        self.secrets_read |= other.secrets_read;
+        self.secrets_write |= other.secrets_write;
+        self.secrets_manage |= other.secrets_manage;
     }
 
     /// Whether `self` requests **nothing beyond** `ceiling` — every capability `self` wants is also
@@ -1171,6 +1311,9 @@ impl SmudgyCapabilities {
             && (!self.gmcp_send || ceiling.gmcp_send)
             && (!self.input || ceiling.input)
             && (!self.workers || ceiling.workers)
+            && (!self.secrets_read || ceiling.secrets_read)
+            && (!self.secrets_write || ceiling.secrets_write)
+            && (!self.secrets_manage || ceiling.secrets_manage)
     }
 
     /// The capabilities requested by `self` (a newly-resolved closure union) but **not** by
@@ -1197,6 +1340,9 @@ impl SmudgyCapabilities {
             gmcp_send: self.gmcp_send && !baseline.gmcp_send,
             input: self.input && !baseline.input,
             workers: self.workers && !baseline.workers,
+            secrets_read: self.secrets_read && !baseline.secrets_read,
+            secrets_write: self.secrets_write && !baseline.secrets_write,
+            secrets_manage: self.secrets_manage && !baseline.secrets_manage,
         }
     }
 }
@@ -1227,6 +1373,8 @@ struct SmudgyCapabilitiesWire {
     input: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     workers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    secrets: Vec<String>,
 }
 
 /// Whether `tokens` contains `tok` (trimmed, case-insensitive — manifest authors shouldn't be
@@ -1238,6 +1386,8 @@ fn has_token(tokens: &[String], tok: &str) -> bool {
 impl From<SmudgyCapabilitiesWire> for SmudgyCapabilities {
     fn from(wire: SmudgyCapabilitiesWire) -> Self {
         let mapper_write = has_token(&wire.mapper, "write");
+        let secrets_write = has_token(&wire.secrets, "write");
+        let secrets_manage = has_token(&wire.secrets, "manage");
         Self {
             create_aliases: has_token(&wire.automations, "aliases"),
             create_triggers: has_token(&wire.automations, "triggers"),
@@ -1257,6 +1407,10 @@ impl From<SmudgyCapabilitiesWire> for SmudgyCapabilities {
             gmcp_send: has_token(&wire.gmcp, "send"),
             input: has_token(&wire.input, "access"),
             workers: has_token(&wire.workers, "spawn"),
+            // `write` and `manage` each imply `read`; `manage` does not imply `write`.
+            secrets_read: has_token(&wire.secrets, "read") || secrets_write || secrets_manage,
+            secrets_write,
+            secrets_manage,
         }
     }
 }
@@ -1324,6 +1478,17 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
         if caps.workers {
             workers.push("spawn".to_string());
         }
+        // `write` and `manage` each re-imply `read`, so `read` is emitted only on its own.
+        let mut secrets = Vec::new();
+        if caps.secrets_write {
+            secrets.push("write".to_string());
+        }
+        if caps.secrets_manage {
+            secrets.push("manage".to_string());
+        }
+        if caps.secrets_read && secrets.is_empty() {
+            secrets.push("read".to_string());
+        }
         Self {
             automations,
             session,
@@ -1335,6 +1500,7 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
             gmcp,
             input,
             workers,
+            secrets,
         }
     }
 }
@@ -1651,6 +1817,9 @@ impl ResolvedPackage {
 /// like the npm stack — never under a nested `block_on`.
 #[async_trait::async_trait(?Send)]
 pub trait PackageProvider {
+    /// Report an authored legacy import. Synthetic boot imports do not call this hook.
+    fn note_legacy_import(&self, _specifier: &SmudgySpecifier, _referrer: &str) {}
+
     /// Canonical runtime identity for a requested package coordinate. Most providers return
     /// `key` unchanged. A provider with a local leaf-name override returns the local owner's
     /// coordinate so module identity, provenance, parameters, storage, and trust cannot inherit
@@ -1673,6 +1842,14 @@ pub trait PackageProvider {
         key: &PackageKey,
         referrer: Option<&ReferrerRef>,
     ) -> Result<Rc<ResolvedPackage>, PackageError>;
+
+    /// Who owns `key`'s package (whose `version` this provider resolved), as the registry
+    /// reports it: never the owner segment an address spells. A provider may ask the registry
+    /// when it has not recorded the owner yet. `None` when unknown; the `importable: false`
+    /// judgement then counts the owner as different from any other. The default knows none.
+    async fn package_owner(&self, _key: &PackageKey, _version: &str) -> Option<PackageOwner> {
+        None
+    }
 
     /// In-memory lookup of an already-fetched set (no I/O). Used by the canonical-URL
     /// load path, which only runs after `resolve_package` populated the set.
@@ -1851,12 +2028,25 @@ pub(crate) async fn load_marker_module(
     // present when the importer is itself a package; user/top-level modules carry no referrer
     // and are exempt (the user may import their own installed packages). This is independent of
     // isolate trust: trust grants permissions, it does not bypass another package's import-deny.
+    //
+    // Owners are the registry's ([`PackageProvider::package_owner`]), never an address's owner
+    // segment: the provider has already validated the requested legacy owner or resolved
+    // a local development override to its separate identity.
     if !fetched.manifest.importable {
         if let Some(referrer) = spec.referrer() {
-            if !referrer.key.owner.eq_ignore_ascii_case(&fetched.key.owner) {
+            let importer_owner = provider
+                .package_owner(&referrer.key, &referrer.version)
+                .await;
+            let imported_owner = provider
+                .package_owner(&fetched.key, &fetched.resolved_version)
+                .await;
+            if referrer.key != fetched.key
+                && !same_package_owner(importer_owner.as_ref(), imported_owner.as_ref())
+            {
                 return Err(crate::generic_loader_error(format!(
-                    "package {}/{} is not importable: it declares \"importable\": false, so {}/{} may not `import` it — consume it via the package's `requires` + its events/types instead",
-                    fetched.key.owner, fetched.key.name, referrer.key.owner, referrer.key.name
+                    "package {} is not importable: it declares \"importable\": false, so {} may not `import` it — consume it via the package's `requires` + its events/types instead",
+                    package_address("", &fetched.key.name),
+                    package_address("", &referrer.key.name)
                 )));
             }
         }
@@ -2295,7 +2485,7 @@ pub fn platform_event_catalog(producer: &str) -> &'static [(&'static str, &'stat
             ("receive", "receive"),
             ("submit", "input"),
         ],
-        "map" => &[("room", "room"), ("merged", "merged")],
+        "map" => &[("room", "room"), ("merged", "merged"), ("click", "click")],
         "gmcp" | "msdp" => &[("ready", "ready"), ("closed", "closed")],
         // MSSP has no negotiation lifecycle scripts can see — the one event is the
         // snapshot merge (`smudgy:state/mssp` holds the merged variables).
@@ -2381,6 +2571,24 @@ pub(crate) fn kind_scheme_url(
                     ));
                 }
             }
+        } else if let Some(name) = segments[0].strip_prefix('@') {
+            // `<scheme>/@<package>[/<handle>]`: a producer addressed by name alone.
+            SmudgySpecifier::parse(&package_address("", name))
+                .map_err(|err| format!("invalid producer in {display}/{rest}: {err}"))?;
+            if name.is_empty() || segments.len() > 2 {
+                return Err(format!(
+                    "{display}/{rest} is not a producer: {display}/@<package>[/<handle>]"
+                ));
+            }
+            let key = PackageKey {
+                owner: String::new(),
+                name: name.to_string(),
+            };
+            (
+                vec!["pkg", NO_OWNER_SEGMENT, name],
+                segments.get(1).map(String::as_str),
+                Some(key),
+            )
         } else {
             match segments.as_slice() {
                 [_owner] => {
@@ -2438,7 +2646,7 @@ pub(crate) fn parse_kind_scheme_url(url: &ModuleSpecifier) -> Option<KindSchemeR
     let target = match segments.as_slice() {
         [marker, producer] if marker == "host" => KindSchemeTarget::Platform(producer.clone()),
         [marker, owner, name] if marker == "pkg" => KindSchemeTarget::Package(PackageKey {
-            owner: owner.clone(),
+            owner: owner_from_segment(owner),
             name: name.clone(),
         }),
         _ => return None,
@@ -2699,18 +2907,26 @@ pub(crate) async fn load_kind_scheme_module(
 // Errors
 // ---------------------------------------------------------------------------
 
-/// A malformed `smudgy://` specifier.
+/// A malformed package address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmudgySpecifierError {
     MissingScheme,
     EmptyComponent(&'static str),
+    /// The owner segment of `smudgy://owner/name` is not a nickname's form.
+    InvalidOwner(String),
     InvalidSubpath(String),
 }
 
 impl std::fmt::Display for SmudgySpecifierError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingScheme => write!(f, "not a smudgy:// specifier"),
+            Self::MissingScheme => {
+                write!(
+                    f,
+                    "not a package address (smudgy:@name or smudgy://owner/name)"
+                )
+            }
+            Self::InvalidOwner(owner) => write!(f, "invalid owner: {owner}"),
             Self::EmptyComponent(c) => write!(f, "empty {c}"),
             Self::InvalidSubpath(s) => write!(f, "invalid subpath: {s}"),
         }
@@ -2807,6 +3023,9 @@ fn subpath_candidates(sub: &str) -> Vec<String> {
 pub struct InMemoryPackageProvider {
     by_version: HashMap<(PackageKey, String), Rc<ResolvedPackage>>,
     latest: HashMap<PackageKey, String>,
+    /// Each package's registry owner: the owner segment it was inserted under, or the owner
+    /// [`Self::insert_owned`] names.
+    owners: HashMap<PackageKey, PackageOwner>,
     /// Package instances served through this provider (resolve or canonical-load hits), in
     /// first-served order. Version stays in the key so a worker-source snapshot preserves
     /// coexisting versions; [`PackageProvider::loaded_packages`] folds it back to package keys.
@@ -2828,8 +3047,24 @@ impl InMemoryPackageProvider {
         Self::default()
     }
 
-    /// Insert a package version, marking it the latest for its key.
+    /// Insert a package version, marking it the latest for its key. Its key's owner segment,
+    /// when it has one, is the package's registry owner (a user).
     pub fn insert(&mut self, package: ResolvedPackage) {
+        if !package.key.owner.is_empty() && !self.owners.contains_key(&package.key) {
+            self.owners
+                .insert(package.key.clone(), PackageOwner::user(&package.key.owner));
+        }
+        self.insert_version(package);
+    }
+
+    /// Insert a package version owned by `owner` (a clan's package, say), marking it the
+    /// latest for its key.
+    pub fn insert_owned(&mut self, package: ResolvedPackage, owner: PackageOwner) {
+        self.owners.insert(package.key.clone(), owner);
+        self.insert_version(package);
+    }
+
+    fn insert_version(&mut self, package: ResolvedPackage) {
         let key = package.key.clone();
         let version = package.resolved_version.clone();
         self.latest.insert(key.clone(), version.clone());
@@ -2848,6 +3083,10 @@ impl InMemoryPackageProvider {
 
 #[async_trait::async_trait(?Send)]
 impl PackageProvider for InMemoryPackageProvider {
+    async fn package_owner(&self, key: &PackageKey, _version: &str) -> Option<PackageOwner> {
+        self.owners.get(key).cloned()
+    }
+
     async fn resolve_package(
         &self,
         key: &PackageKey,
@@ -2992,11 +3231,19 @@ mod tests {
         };
         assert_eq!(key, key.folded());
         assert_eq!(HashSet::from([key.clone(), key.folded()]).len(), 1);
-        assert_ne!(
+        // Names are global: another owner segment spells the same package.
+        assert_eq!(
             key,
             super::PackageKey {
                 owner: "someone_else".into(),
                 name: key.name.clone()
+            }
+        );
+        assert_ne!(
+            key,
+            super::PackageKey {
+                owner: key.owner.clone(),
+                name: "Other".into()
             }
         );
         let url = super::canonical_url(&key, "1.0.0", "Lib/Util.ts");
@@ -3280,6 +3527,124 @@ mod tests {
         assert_eq!(s.owner, "wbk");
         assert_eq!(s.name, "mapper");
         assert_eq!(s.subpath, None);
+    }
+
+    #[test]
+    fn parses_the_canonical_ownerless_address() {
+        let s = spec("smudgy:@mapper");
+        assert_eq!(s.owner, "");
+        assert_eq!(s.name, "mapper");
+        assert_eq!(s.subpath, None);
+        assert_eq!(s.to_user_specifier(), "smudgy:@mapper");
+
+        let sub = spec("smudgy:@mapper/lib/util/");
+        assert_eq!(sub.name, "mapper");
+        assert_eq!(sub.subpath.as_deref(), Some("lib/util"));
+        assert_eq!(sub.to_user_specifier(), "smudgy:@mapper/lib/util");
+
+        assert!(matches!(
+            SmudgySpecifier::parse("smudgy:@"),
+            Err(SmudgySpecifierError::EmptyComponent("name"))
+        ));
+        assert!(matches!(
+            SmudgySpecifier::parse("smudgy:@mapper/../x"),
+            Err(SmudgySpecifierError::InvalidSubpath(_))
+        ));
+    }
+
+    #[test]
+    fn an_owner_segment_must_have_a_nicknames_form() {
+        for owner in ["has space", "dot.ted", "at@sign", "per%cent"] {
+            assert!(
+                matches!(
+                    SmudgySpecifier::parse(&format!("smudgy://{owner}/mapper")),
+                    Err(SmudgySpecifierError::InvalidOwner(_))
+                ),
+                "{owner}"
+            );
+        }
+        assert_eq!(spec("smudgy://Some_User-1/mapper").owner, "Some_User-1");
+    }
+
+    #[test]
+    fn both_spellings_name_one_package() {
+        let ownerless = spec("smudgy:@Mapper").package_key();
+        let spelled = spec("smudgy://wbk/mapper").package_key();
+        assert_eq!(ownerless, spelled, "identity is the name");
+        let hash = |key: &PackageKey| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&ownerless), hash(&spelled));
+        assert_ne!(ownerless, spec("smudgy:@speedwalk").package_key());
+        // Each keeps its spelling.
+        assert_eq!(ownerless.to_user_specifier(), "smudgy:@Mapper");
+        assert_eq!(spelled.to_user_specifier(), "smudgy://wbk/mapper");
+    }
+
+    #[test]
+    fn ownerless_internal_urls_round_trip() {
+        let original = spec("smudgy:@guild-lib/lib/util");
+        let marker = original.to_marker_url();
+        assert_eq!(marker.as_str(), "smudgy:///@/guild-lib/lib/util");
+        let recovered = SmudgySpecifier::from_marker_url(&marker).expect("marker decodes back");
+        assert_eq!(recovered.owner, "");
+        assert_eq!(recovered.name, "guild-lib");
+        assert_eq!(recovered.subpath.as_deref(), Some("lib/util"));
+
+        let importer = PackageKey {
+            owner: String::new(),
+            name: "guild-app".into(),
+        };
+        let with_referrer = spec("smudgy:@guild-lib").with_referrer(importer.clone(), "1.0.0");
+        let recovered =
+            SmudgySpecifier::from_marker_url(&with_referrer.to_marker_url()).expect("decodes");
+        let referrer = recovered.referrer().expect("referrer kept");
+        assert_eq!(referrer.key.owner, "");
+        assert_eq!(referrer.key.name, "guild-app");
+        assert_eq!(referrer.version, "1.0.0");
+
+        let canonical = canonical_url(&importer, "1.0.0", "index.ts");
+        let coords = parse_canonical(&canonical).expect("canonical decodes back");
+        assert_eq!(coords.key.owner, "");
+        assert_eq!(coords.key.name, "guild-app");
+        assert_eq!(coords.module_subpath, "index.ts");
+
+        let params = params_module_url(Some(&importer));
+        let Some(Some(key)) = parse_params_url(&params) else {
+            panic!("params URL decodes back");
+        };
+        assert_eq!(key.owner, "");
+        assert_eq!(key.name, "guild-app");
+    }
+
+    #[test]
+    fn ownerless_dependencies_parse_with_and_without_a_range() {
+        let bare = PackageDependency::parse("smudgy:@lib").unwrap().unwrap();
+        assert_eq!(bare.key.owner, "");
+        assert_eq!(bare.key.name, "lib");
+        assert_eq!(bare.range, None);
+
+        let ranged = PackageDependency::parse("smudgy:@lib@^1.2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ranged.key.name, "lib");
+        assert_eq!(ranged.range.as_deref(), Some("^1.2"));
+
+        let spelled = PackageDependency::parse("smudgy://wbk/lib@^1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(spelled.key.owner, "wbk");
+        assert_eq!(spelled.range.as_deref(), Some("^1"));
+
+        assert!(PackageDependency::parse("smudgy:core").is_none());
+        assert!(PackageDependency::parse("jsr:@std/path").is_none());
+        assert!(
+            PackageDependency::parse("smudgy://bad owner/lib")
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
@@ -4940,6 +5305,34 @@ mod tests {
         assert!(!caps.is_within(&none));
         assert!(caps.added_since(&none).input);
         assert!(caps.is_within(&SmudgyCapabilities::all()));
+    }
+
+    #[test]
+    fn smudgy_secrets_tokens_imply_read_and_round_trip() {
+        let read = perms_with_smudgy(r#"{ "secrets": ["read"] }"#).smudgy;
+        assert!(read.secrets_read && !read.secrets_write && !read.secrets_manage);
+        let write = perms_with_smudgy(r#"{ "secrets": ["write"] }"#).smudgy;
+        assert!(write.secrets_read && write.secrets_write && !write.secrets_manage);
+        let manage = perms_with_smudgy(r#"{ "secrets": ["manage"] }"#).smudgy;
+        assert!(
+            manage.secrets_read && manage.secrets_manage && !manage.secrets_write,
+            "manage implies read, not write"
+        );
+        assert!(
+            !write.mapper_read && !write.mapper_write,
+            "secrets grant nothing on the map itself"
+        );
+        for caps in [read, write, manage] {
+            let json = serde_json::to_string(&caps).expect("serialize");
+            let back: SmudgyCapabilities = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, caps, "secrets tokens round-trip: {json}");
+        }
+        // An older consent record without the capability does not cover the ask, so
+        // requesting it goes through the permission-expansion prompt.
+        let mapper_only = perms_with_smudgy(r#"{ "mapper": ["write"] }"#).smudgy;
+        assert!(!write.is_within(&mapper_only));
+        assert!(write.added_since(&mapper_only).secrets_write);
+        assert!(write.is_within(&SmudgyCapabilities::all()));
     }
 
     #[test]

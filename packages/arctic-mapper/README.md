@@ -62,11 +62,12 @@ map room show                    Print title/description/coords/exits
 map room flag set|clear <flag>   Set or clear a room flag (e.g. SPIN)
 map room automerge               Merge the nearest duplicate room into this one
 
-map exit <dir>                   Show the exit's commands and flags
-map exit <dir> open <cmd>        Command sent before moving (e.g. "open n", "part brush")
+map exit <dir>                   Show the exit's door, commands and flags
+map exit <dir> open <cmd>        Command that opens the exit's door (e.g. "unlock n;open n", "part brush")
 map exit <dir> command <cmd>     Command sent instead of the direction (e.g. "enter hole")
-map exit <dir> clear open|command    Remove the open/movement command
-map exit <dir> closed|hidden|locked [true|false]   Set exit flags
+map exit <dir> clear open|command|door   Remove the open command, the movement command, or the door
+map exit <dir> closed|locked [true|false]   Set the door's state
+map exit <dir> hidden [true|false]          Set the hidden flag
 ```
 
 When recording creates a room, the mapper snapshots the area and runs the
@@ -112,8 +113,8 @@ Three ways to traverse an exit, and how to model each:
 | `enter hole` (no direction works) | `map exit n command enter hole` |
 
 In `map active` mode, typing `n` (or any abbreviation) checks the mapped
-exit: the open command goes out first when the exit is flagged closed or has
-an explicit open command, then the direction — or the exit's movement command
+exit: the open command goes out first when the exit's door is closed or has
+its own open command, then the direction — or the exit's movement command
 in its place. Multi-step commands can be separated with `;`. The move is
 still recorded as a step in that direction, so tracking works as usual.
 Anything sent through aliases/speedwalks that types directions benefits too;
@@ -123,11 +124,15 @@ Live door state is read from the prompt: in `Exits:(E)S>`, the parenthesized
 E exit is currently closed. Active mode uses this to skip the open command
 when the prompt shows the door already open, and to open doors the map
 doesn't know about; hidden exits never appear in the prompt, so their open
-commands are always sent. `map record` and `map refresh` flag parenthesized
-exits as closed when creating them.
+commands are always sent. `map record` and `map refresh` give parenthesized
+exits a closed door when creating them.
 
-Open commands are stored as room properties named `open_<d>_command`
-(e.g. `open_n_command`); movement commands live on the exit itself.
+Each exit keeps its own door: its state (open, closed or locked; locked
+implies closed) and the command that opens it. `map exit <dir> open <cmd>`
+on an exit without a door gives it a closed door with that command, and
+changing the state keeps the door's open command. `closed false` leaves an
+open door; `clear door` removes the door with its open command. The movement
+command lives on the exit itself, apart from the door.
 
 The `SPIN` flag matters to following: rooms flagged `SPIN` let the movement
 tracker consider every exit, not just the direction you moved.  Generally,

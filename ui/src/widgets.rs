@@ -2,6 +2,7 @@
 pub mod audio_gain;
 pub mod bounds_probe;
 pub use smudgy_ui_shared::crt_cat;
+pub mod dialog;
 pub mod drag_overlay;
 pub mod dropdown;
 pub mod hotkey_input;

@@ -1,5 +1,5 @@
 {
-  "version": "0.5.7",
+  "version": "0.5.8",
   "description": "NukeFire widgets deck: vitals, maps + GPS, comms and more",
   "entry": "index.ts",
   "min_smudgy_version": "0.5.8",
@@ -9,7 +9,7 @@
   ],
   "requires": [
     "smudgy://kapusniak/nukefire-gmcp",
-    "smudgy://kapusniak/nukefire-mapper@^0.18.4"
+    "smudgy://kapusniak/nukefire-mapper@^0.18.5"
   ],
   "hosts": [
     "tdome.nukefire.org"

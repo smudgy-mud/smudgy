@@ -222,11 +222,22 @@ impl std::fmt::Display for RoomSide {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionEndpoint {
     pub room_number: crate::RoomNumber,
+    /// Present only for a room the bundle's own source holds; absent names
+    /// a map room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::SourceId>,
     pub side: RoomSide,
     /// Position along the wall, inclusive `0.0..=1.0`. Horizontal walls run
     /// west→east; vertical walls run north→south.
     pub port_offset: f32,
     pub port_mode: PortMode,
+}
+
+impl ConnectionEndpoint {
+    #[must_use]
+    pub fn address(self) -> crate::RoomAddress {
+        crate::RoomAddress::from_wire(self.source, self.room_number)
+    }
 }
 
 /// Shared visual geometry for one or two member exits. See the module docs
@@ -550,12 +561,14 @@ mod tests {
         let connection = Connection {
             id: ConnectionId::new(),
             endpoint_a: ConnectionEndpoint {
+                source: None,
                 room_number: crate::RoomNumber(1),
                 side: RoomSide::East,
                 port_offset: 0.5,
                 port_mode: PortMode::AutoPinned,
             },
             endpoint_b: Some(ConnectionEndpoint {
+                source: None,
                 room_number: crate::RoomNumber(2),
                 side: RoomSide::West,
                 port_offset: 0.25,

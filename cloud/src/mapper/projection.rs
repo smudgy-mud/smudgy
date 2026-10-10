@@ -44,6 +44,23 @@ impl Inner {
         }
     }
 
+    /// [`Self::publish_committed`] for a new cloud map as its create reply
+    /// describes it. A copy of the map already published stays: only a read
+    /// from the server, landing before the reply did, publishes one, and it
+    /// says more about the map than the reply does.
+    pub(super) async fn publish_created_cloud_area(&self, details: AreaWithDetails) {
+        let generation = {
+            let _gate = self.mutation_gate.lock();
+            if self.atlas_cache.load().get_area(&details.area.id).is_some() {
+                return;
+            }
+            self.publish_committed_locked(CommittedChange::Documents(&[details], &[]), false)
+        };
+        if let Some(generation) = generation {
+            local_projection::wait_until_published(self, generation).await;
+        }
+    }
+
     pub(super) fn publish_committed_locked(
         &self,
         change: CommittedChange<'_>,
@@ -67,14 +84,11 @@ impl Inner {
                 let updates: Vec<_> = documents
                     .iter()
                     .map(|details| {
-                        self.pending.note_confirmed_rev(
-                            details.area.id,
-                            details.area.rev,
-                            details.area.access.map(|access| access.fingerprint()),
-                        );
+                        self.pending
+                            .note_confirmed_rev(details.area.id, details.area.rev);
                         (
                             details.area.id,
-                            Arc::new(AreaCache::new_with_area(details.clone())),
+                            self.area_cache_of(details.clone(), &self.atlas_cache.load()),
                         )
                     })
                     .collect();
@@ -117,7 +131,22 @@ impl Inner {
         if mode == ReplayMode::StopAtFailure {
             self.pending.record_replay_result(id, failed);
         }
-        (Arc::new(AreaCache::new_with_area(details)), failed)
+        (
+            self.area_cache_of(details, &self.atlas_cache.load()),
+            failed,
+        )
+    }
+
+    /// The cache of `details` as the active viewer reads it, keeping what
+    /// `atlas`'s copy of the map holds of each source that did not change.
+    pub(super) fn area_cache_of(
+        &self,
+        details: AreaWithDetails,
+        atlas: &AtlasCache,
+    ) -> Arc<AreaCache> {
+        let previous = atlas.get_area(&details.area.id);
+        let viewer = self.pending.active_viewer().map(|(viewer, _)| viewer);
+        Arc::new(AreaCache::for_viewer(details, viewer, previous.as_deref()))
     }
 
     pub(super) fn publish_areas(&self, updates: &[(AreaId, Arc<AreaCache>)], deleted: &[AreaId]) {

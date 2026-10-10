@@ -6,7 +6,7 @@ use iced::{
     widget::{Canvas, canvas, container},
 };
 use smudgy_cloud::{
-    AreaId, ExitDirection, Mapper, RoomNumber,
+    AreaId, ExitDirection, Mapper, RoomAddress, RoomNumber,
     mapper::{
         RoomKey,
         room_connection::{RoomConnection, RoomConnectionEnd},
@@ -17,7 +17,7 @@ use iced_anim::{Animated, spring::Motion, transition::Easing};
 
 use crate::{
     CrossAreaLabelVisibility, MapExitRef, MapViewPresentation, ResolvedPresentation, Update,
-    presentation::DEFAULT_DOOR_COLOR, render, viewport::Viewport,
+    presentation::DEFAULT_DOOR_COLOR, render, sources, viewport::Viewport,
 };
 use iced::event::Event as IcedEvent;
 use std::time::{Duration, Instant};
@@ -59,6 +59,8 @@ pub enum Message {
     Translated(Vector),
     Scaled(f32, Option<Vector>),
     SetHoveredRoom(Option<RoomKey>),
+    /// A room clicked: pressed and released with the left button over it.
+    RoomClicked(RoomKey),
     /// Advance both in-flight animations (pan spring + area fade) to `now`.
     /// Published by the canvas program on any event while animating; the
     /// publish schedules a redraw, whose `RedrawRequested` produces the next
@@ -69,6 +71,9 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub enum Event {
     HoveredRoomChanged(Option<RoomKey>),
+    /// A room clicked, keyed as the view picks it (a place's own room by
+    /// its own area). The host decides who hears of it.
+    RoomClicked(RoomKey),
 }
 
 const FADE_EPSILON: f32 = 0.02;
@@ -152,9 +157,17 @@ impl MapView {
     }
 
     fn rooms_at_point(&self, point: &Point, bounds: &Size) -> Box<[RoomKey]> {
-        let atlas = self.mapper.get_current_atlas();
+        self.rooms_at(self.viewport().project(*point, *bounds))
+    }
 
-        let point = self.viewport().project(*point, *bounds);
+    /// The rooms on the current level under `point` (in spaced map units),
+    /// topmost first: a Secret's or Private's own rooms, which draw over the
+    /// map's, the last layer's first, then the map's own. A place's room is
+    /// keyed by its own area, as the editor selects it. Hover stays in the
+    /// view (it reveals a room's labels); a click is reported as
+    /// [`Event::RoomClicked`].
+    fn rooms_at(&self, point: Point) -> Box<[RoomKey]> {
+        let atlas = self.mapper.get_current_atlas();
         let spacing = self.resolved.room_spacing;
         let lookup = Point::new(point.x / spacing, point.y / spacing);
         let half_size = render::MAP_ROOM_SIZE / 2.0;
@@ -164,17 +177,33 @@ impl MapView {
         let max_x = lookup.x + lookup_half;
         let max_y = lookup.y + lookup_half;
 
+        let under = |room: &smudgy_cloud::mapper::room_cache::RoomCache| {
+            room.get_level() == self.level
+                && room.get_x() * spacing - half_size < point.x
+                && room.get_x() * spacing + half_size > point.x
+                && room.get_y() * spacing - half_size < point.y
+                && room.get_y() * spacing + half_size > point.y
+        };
+
         atlas
             .get_area(&self.active_area_id)
             .map(|area| {
                 let mut hits: Vec<RoomKey> = Vec::new();
+                for layer in area.source_layers().iter().rev() {
+                    layer
+                        .content()
+                        .with_rooms_in(min_x, min_y, max_x, max_y, |room| {
+                            let number = room.get_room_number();
+                            if under(room) {
+                                hits.push(RoomKey {
+                                    area_id: layer.area_id(),
+                                    room_number: number,
+                                });
+                            }
+                        });
+                }
                 area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
-                    if room.get_level() == self.level
-                        && room.get_x() * spacing - half_size < point.x
-                        && room.get_x() * spacing + half_size > point.x
-                        && room.get_y() * spacing - half_size < point.y
-                        && room.get_y() * spacing + half_size > point.y
-                    {
+                    if under(room) {
                         hits.push(RoomKey {
                             area_id: self.active_area_id,
                             room_number: room.get_room_number(),
@@ -205,11 +234,17 @@ impl MapView {
                 Update::none()
             }
             Message::SetPlayerLocation(area_id, room_number) => {
-                let area_changed = area_id != self.active_area_id;
+                // A room of one of the map's Secrets is shown on its map.
+                let shown = self
+                    .mapper
+                    .get_current_atlas()
+                    .map_of(&area_id)
+                    .unwrap_or(area_id);
+                let area_changed = shown != self.active_area_id;
 
                 if area_changed {
                     let mut pending = PendingAreaChange {
-                        area_id,
+                        area_id: shown,
                         player_location: None,
                         level: 0,
                         translation: *self.translation.value(),
@@ -298,6 +333,7 @@ impl MapView {
                 self.hovered_room = room_key.clone();
                 Update::with_event(Event::HoveredRoomChanged(room_key))
             }
+            Message::RoomClicked(room_key) => Update::with_event(Event::RoomClicked(room_key)),
         }
     }
 
@@ -411,11 +447,13 @@ pub enum Interaction {
     },
 }
 
-/// Canvas-local state: the in-flight interaction plus the last known
+/// Canvas-local state: the in-flight interaction, the room a left press
+/// landed on (a release over the same room clicks it), plus the last known
 /// keyboard modifiers (tracked so scroll gestures can branch on them).
 #[derive(Default)]
 pub struct ProgramState {
     interaction: Interaction,
+    pressed_room: Option<RoomKey>,
     modifiers: keyboard::Modifiers,
 }
 
@@ -455,6 +493,31 @@ impl MapView {
 }
 
 impl MapView {
+    /// The left button at `at` (canvas coordinates): a press over a room is
+    /// the map's and may click it, and released over the room it was
+    /// `pressed` on, it clicks it. A press anywhere else falls through like
+    /// the other buttons'.
+    fn left_button(
+        &self,
+        state: &mut ProgramState,
+        event: &mouse::Event,
+        at: Point,
+        size: Size,
+        pressed: Option<RoomKey>,
+    ) -> Option<canvas::Action<Message>> {
+        let room_at = || self.rooms_at_point(&at, &size).first().cloned();
+        if matches!(event, mouse::Event::ButtonPressed(_)) {
+            state.pressed_room = room_at();
+            return state
+                .pressed_room
+                .is_some()
+                .then(|| canvas::Action::request_redraw().and_capture());
+        }
+        let pressed = pressed?;
+        (room_at().as_ref() == Some(&pressed))
+            .then(|| canvas::Action::publish(Message::RoomClicked(pressed)).and_capture())
+    }
+
     fn handle_event(
         &self,
         state: &mut ProgramState,
@@ -465,6 +528,14 @@ impl MapView {
         if let IcedEvent::Mouse(mouse::Event::ButtonReleased(_)) = event {
             state.interaction = Interaction::None;
         }
+        // A left release ends a press wherever it lands, outside the canvas
+        // too.
+        let pressed_room = match event {
+            IcedEvent::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                state.pressed_room.take()
+            }
+            _ => None,
+        };
 
         // Track modifiers before the cursor gate so the state stays fresh
         // even while the cursor is outside the canvas.
@@ -493,6 +564,14 @@ impl MapView {
 
                     Some(canvas::Action::request_redraw().and_capture())
                 }
+                mouse::Event::ButtonPressed(mouse::Button::Left)
+                | mouse::Event::ButtonReleased(mouse::Button::Left) => self.left_button(
+                    state,
+                    mouse_event,
+                    cursor_position,
+                    bounds.size(),
+                    pressed_room,
+                ),
                 // The map does nothing with other buttons; let the press
                 // fall through to whatever is beneath the canvas (e.g.
                 // the terminal scrollbar under an overlaid minimap).
@@ -560,14 +639,33 @@ impl MapView {
         let resolved = &self.resolved;
         let spacing = resolved.room_spacing;
 
-        let player_room_number = self.player_location.as_ref().and_then(|room_key| {
-            (room_key.area_id == self.active_area_id).then_some(room_key.room_number)
+        // The player's room, when the shown map holds it: one of its own,
+        // or one of its Secrets', drawn over the map.
+        let player_room = self.player_location.as_ref().and_then(|room_key| {
+            let map = atlas.map_of(&room_key.area_id).unwrap_or(room_key.area_id);
+            (map == self.active_area_id)
+                .then(|| atlas.get_room(room_key))
+                .flatten()
         });
 
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
 
         if let Some(area) = atlas.get_area(&self.active_area_id) {
+            let layers = sources::colored_layers(&area);
+            // A place's link into another map names it as a map link does:
+            // under the default style's policy, its anchor room hovered. A
+            // link the place keeps on a map room anchors on that map room.
+            let layer_label = |layer: &smudgy_cloud::mapper::area_cache::SourceLayer,
+                               connection: &RoomConnection| {
+                let key = layer.room_key(connection.room.address());
+                cross_area_label_visible(
+                    resolved.base_conn.cross_area_label_visibility,
+                    self.hovered_room.as_ref(),
+                    key.area_id,
+                    key.room_number,
+                )
+            };
             frame.with_save(|frame| {
                 frame.translate(center);
                 frame.scale(self.scaling);
@@ -584,9 +682,7 @@ impl MapView {
                 // connections (labels and shapes stay on their own level),
                 // drawn faintly and nudged diagonally so the stack reads as
                 // depth. Farthest levels first so nearer ghosts (and the
-                // current floor) layer on top. The widget never indicates
-                // secrets, so secret rooms ghost like any other — hence
-                // `show_secrets: false`.
+                // current floor) layer on top.
                 for distance in (1..=GHOST_LEVEL_SPREAD).rev() {
                     for delta in [-distance, distance] {
                         let ghost_level = self.level + delta;
@@ -611,11 +707,12 @@ impl MapView {
                                     if connection.from_level == ghost_level {
                                         let connection = connection.with_room_spacing(spacing);
                                         let paint = resolved.base_conn;
+                                        let anchor = map_connection_anchor(&area, connection.room.address());
                                         let label_visible = cross_area_label_visible(
                                             paint.cross_area_label_visibility,
                                             self.hovered_room.as_ref(),
-                                            self.active_area_id,
-                                            connection.room.get_room_number(),
+                                            anchor.area_id,
+                                            anchor.room_number,
                                         );
                                         let connection_opacity =
                                             ghost_opacity * paint.opacity.unwrap_or(1.0);
@@ -624,7 +721,6 @@ impl MapView {
                                             &atlas,
                                             &connection,
                                             connection_opacity,
-                                            false,
                                             true,
                                             None,
                                             None,
@@ -642,6 +738,17 @@ impl MapView {
                                     }
                                 },
                             );
+                            sources::draw_connections_labelled(
+                                frame,
+                                &atlas,
+                                &layers,
+                                ghost_level,
+                                (min_x, min_y, max_x, max_y),
+                                spacing,
+                                ghost_opacity,
+                                &|_| false,
+                                &layer_label,
+                            );
                             area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                                 if room.get_level() == ghost_level {
                                     render::draw_room_styled(
@@ -651,7 +758,6 @@ impl MapView {
                                         room.get_y() * spacing,
                                         ghost_opacity
                                             * resolved.base_room.opacity.unwrap_or(1.0),
-                                        false,
                                         // Ghost floors take the defaultStyle
                                         // base only; per-room apply entries
                                         // accent the current floor.
@@ -659,13 +765,21 @@ impl MapView {
                                     );
                                 }
                             });
+                            sources::draw_rooms(
+                                frame,
+                                &layers,
+                                ghost_level,
+                                (min_x, min_y, max_x, max_y),
+                                spacing,
+                                ghost_opacity,
+                    &|_, _| false,
+                            );
                             for (connection, background, connection_opacity) in &cross_area_labels {
                                 render::draw_cross_area_connection_label(
                                     frame,
                                     &atlas,
                                     connection,
                                     *connection_opacity,
-                                    false,
                                     *background,
                                 );
                             }
@@ -678,7 +792,7 @@ impl MapView {
                         let mut shape = shape.clone();
                         shape.x *= spacing;
                         shape.y *= spacing;
-                        render::draw_shape(frame, &shape, opacity, false);
+                        render::draw_shape(frame, &shape, opacity);
                     }
                 }
 
@@ -687,9 +801,10 @@ impl MapView {
                         let mut label = label.clone();
                         label.x *= spacing;
                         label.y *= spacing;
-                        render::draw_label(frame, &label, opacity, false);
+                        render::draw_label(frame, &label, opacity);
                     }
                 }
+                sources::draw_drawings(frame, &layers, self.level, spacing, opacity, &|_| false);
 
                 // Connections draw in spatial-query order; a style accent
                 // changes a connection's paint, not its z-order, so a
@@ -706,17 +821,22 @@ impl MapView {
                         let (anchor, far) = connection_exit_keys(&connection);
                         let paint = resolved.conn_paint(anchor, far);
                         let connection_opacity = opacity * paint.opacity.unwrap_or(1.0);
+                        let anchor_room = map_connection_anchor(&area, connection.room.address());
                         let label_visible = cross_area_label_visible(
                             paint.cross_area_label_visibility,
                             self.hovered_room.as_ref(),
-                            self.active_area_id,
-                            connection.room.get_room_number(),
+                            anchor_room.area_id,
+                            anchor_room.room_number,
                         );
                         let door = resolved.show_doors.then(|| {
                             let state = resolved.door_override(anchor, far);
                             (
-                                state.closed.unwrap_or(connection.is_closed),
-                                state.locked.unwrap_or(connection.is_locked),
+                                state.closed.unwrap_or(
+                                    connection.door.is_some_and(smudgy_cloud::DoorState::is_shut),
+                                ),
+                                state.locked.unwrap_or(
+                                    connection.door == Some(smudgy_cloud::DoorState::Locked),
+                                ),
                                 paint.door_color.unwrap_or(DEFAULT_DOOR_COLOR),
                             )
                         });
@@ -725,7 +845,6 @@ impl MapView {
                             &atlas,
                             &connection,
                             connection_opacity,
-                            false,
                             false,
                             paint.color,
                             paint.width,
@@ -744,6 +863,18 @@ impl MapView {
                     }
                 });
 
+                sources::draw_connections_labelled(
+                    frame,
+                    &atlas,
+                    &layers,
+                    self.level,
+                    (min_x, min_y, max_x, max_y),
+                    spacing,
+                    opacity,
+                    &|_| false,
+                    &layer_label,
+                );
+
                 let rooms_drawn = Cell::new(0_usize);
                 area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                     if room.get_level() == self.level {
@@ -754,12 +885,21 @@ impl MapView {
                             room.get_x() * spacing,
                             room.get_y() * spacing,
                             opacity * paint.opacity.unwrap_or(1.0),
-                            false,
                             &paint,
                         );
                         rooms_drawn.set(rooms_drawn.get() + 1);
                     }
                 });
+
+                sources::draw_rooms(
+                    frame,
+                    &layers,
+                    self.level,
+                    (min_x, min_y, max_x, max_y),
+                    spacing,
+                    opacity,
+                    &|_, _| false,
+                );
 
                 // Destination labels are an overlay: their optional
                 // backgrounds and text must remain legible even when the
@@ -770,13 +910,11 @@ impl MapView {
                         &atlas,
                         connection,
                         *connection_opacity,
-                        false,
                         *background,
                     );
                 }
 
-                if let Some(player_room_number) = player_room_number
-                    && let Some(room) = area.get_room(&player_room_number)
+                if let Some(room) = &player_room
                         && room.get_level() == self.level {
                             render::draw_player_indicator_styled(
                                 frame,
@@ -816,16 +954,29 @@ impl MapView {
 }
 
 /// Resolve one connection style's label policy against the currently hovered
-/// in-area anchor room. The default remains the legacy always-visible mode.
+/// anchor room, `anchor_room` of `anchor_area` (the map's, or a place's own
+/// area). The default remains the legacy always-visible mode.
 fn cross_area_label_visible(
     visibility: Option<CrossAreaLabelVisibility>,
     hovered_room: Option<&RoomKey>,
-    active_area_id: AreaId,
+    anchor_area: AreaId,
     anchor_room: RoomNumber,
 ) -> bool {
     let anchor_hovered = hovered_room
-        .is_some_and(|room| room.area_id == active_area_id && room.room_number == anchor_room);
+        .is_some_and(|room| room.area_id == anchor_area && room.room_number == anchor_room);
     visibility.unwrap_or_default().is_visible(anchor_hovered)
+}
+
+/// Map-owned connections can remain attached to rooms now owned by a Secret.
+/// Hover follows the anchor's qualified address, independent of the connection's owner.
+fn map_connection_anchor(
+    area: &smudgy_cloud::mapper::area_cache::AreaCache,
+    address: RoomAddress,
+) -> RoomKey {
+    area.map_document_layer().map_or_else(
+        || RoomKey::new(*area.get_id(), address.number),
+        |layer| layer.room_key(address),
+    )
 }
 
 fn is_cross_area_connection(connection: &RoomConnection) -> bool {
@@ -1327,6 +1478,314 @@ mod tests {
         assert_eq!(
             view.resolved.conns[&exit(1, ExitDirection::North)].color,
             smudgy_cloud::parse_css_color("#00ff00")
+        );
+    }
+
+    /// A cloud map with room 1 at the origin and one Secret whose own room
+    /// 2 sits at (5, 7) on level 1, served as the cloud serves it.
+    struct SecretCloud {
+        details: smudgy_cloud::AreaWithDetails,
+    }
+
+    #[async_trait::async_trait]
+    impl smudgy_cloud::MapperBackend for SecretCloud {
+        async fn create_area(
+            &self,
+            _request: smudgy_cloud::CreateAreaRequest,
+        ) -> smudgy_cloud::CloudResult<smudgy_cloud::Area> {
+            Err(smudgy_cloud::CloudError::NotFoundOrNoAccess)
+        }
+
+        async fn list_areas(&self) -> smudgy_cloud::CloudResult<Vec<smudgy_cloud::Area>> {
+            Ok(vec![self.details.area.clone()])
+        }
+
+        async fn get_area(
+            &self,
+            _area_id: &AreaId,
+        ) -> smudgy_cloud::CloudResult<smudgy_cloud::AreaWithDetails> {
+            Ok(self.details.clone())
+        }
+
+        async fn update_area(
+            &self,
+            _area_id: &AreaId,
+            _updates: smudgy_cloud::AreaUpdates,
+        ) -> smudgy_cloud::CloudResult<()> {
+            Ok(())
+        }
+
+        async fn delete_area(&self, _area_id: &AreaId) -> smudgy_cloud::CloudResult<()> {
+            Ok(())
+        }
+
+        async fn execute_mutation(
+            &self,
+            _area_id: &AreaId,
+            _envelope: &smudgy_cloud::mutation::MutationEnvelope,
+        ) -> smudgy_cloud::CloudResult<smudgy_cloud::mutation::MutationResult> {
+            Err(smudgy_cloud::CloudError::NotFoundOrNoAccess)
+        }
+    }
+
+    fn placed(number: i32, x: f32, y: f32, level: i32) -> smudgy_cloud::RoomWithDetails {
+        smudgy_cloud::RoomWithDetails {
+            room_number: RoomNumber(number),
+            title: String::new(),
+            description: String::new(),
+            level,
+            x,
+            y,
+            color: String::new(),
+            properties: Vec::new(),
+            exits: Vec::new(),
+            tags: Default::default(),
+            external_id: None,
+        }
+    }
+
+    async fn map_view_over_a_secret() -> (MapView, AreaId, AreaId) {
+        map_view_over_a_secret_at(5.0, 7.0, 1).await
+    }
+
+    /// Map room 1 at the origin on level 0; the Secret's own room 2 where
+    /// asked.
+    async fn map_view_over_a_secret_at(x: f32, y: f32, level: i32) -> (MapView, AreaId, AreaId) {
+        map_view_with_secret_and_attachment(x, y, level, false).await
+    }
+
+    async fn map_view_with_secret_and_attachment(
+        x: f32,
+        y: f32,
+        level: i32,
+        retained: bool,
+    ) -> (MapView, AreaId, AreaId) {
+        let map = AreaId(Uuid::new_v4());
+        let secret = Uuid::new_v4();
+        let mut details = smudgy_cloud::AreaWithDetails {
+            room_data: Vec::new(),
+            area: smudgy_cloud::Area {
+                id: map,
+                user_id: None,
+                atlas_id: None,
+                atlas_name: None,
+                name: "Library".to_string(),
+                created_at: Default::default(),
+                rev: 1,
+                projection_token: Some("p_view".to_string()),
+                access: None,
+                owner_nickname: None,
+                copied_from_area_id: None,
+                copied_from_rev: None,
+                copied_at: None,
+                family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: smudgy_cloud::clan_maps::ClanOwnership::default(),
+            },
+            format_version: smudgy_cloud::AREA_FORMAT_VERSION,
+            properties: Vec::new(),
+            rooms: vec![placed(1, 0.0, 0.0, 0)],
+            labels: Vec::new(),
+            shapes: Vec::new(),
+            connections: Vec::new(),
+            linked_areas: Vec::new(),
+            sources: vec![smudgy_cloud::SourceBundle {
+                source: smudgy_cloud::SourceId::Secret(secret),
+                name: Some("Bookcase".to_string()),
+                ownership: Some("owner".to_string()),
+                clan_id: None,
+                color: None,
+                rev: 1,
+                actions: ["read".to_string()].into_iter().collect(),
+                properties: Vec::new(),
+                rooms: vec![placed(2, x, y, level)],
+                room_data: Vec::new(),
+                labels: Vec::new(),
+                shapes: Vec::new(),
+                connections: Vec::new(),
+            }],
+        };
+        if retained {
+            details.rooms.push(placed(2, 1.0, 0.0, 0));
+            details.room_data.push(smudgy_cloud::RoomData {
+                room_number: RoomNumber(2),
+                room_source: Some(smudgy_cloud::SourceId::Secret(secret)),
+                properties: vec![smudgy_cloud::Property {
+                    name: "notes".into(),
+                    value: "Map-owned".into(),
+                }],
+                tags: Default::default(),
+                exits: Vec::new(),
+            });
+        }
+        let cache_dir = std::env::temp_dir()
+            .join("smudgy-map-widget-test")
+            .join(format!("secret-{}", Uuid::new_v4()));
+        let mapper = Mapper::new(Arc::new(SecretCloud { details }), cache_dir);
+        mapper.load_all_areas().await.expect("load the map");
+        (MapView::new(mapper, map), map, AreaId(secret))
+    }
+
+    /// A left press and release over the same room clicks it (the press is
+    /// the map's); a release elsewhere clicks nothing, and a press where no
+    /// room is falls through to whatever lies beneath the map.
+    #[tokio::test]
+    async fn map_owned_attachment_hover_uses_the_secret_room_not_its_map_namesake() {
+        let (view, map, secret) = map_view_with_secret_and_attachment(5.0, 7.0, 0, true).await;
+        let area = view.mapper.get_current_atlas().get_area(&map).unwrap();
+        let address = RoomAddress::new(smudgy_cloud::SourceId::Secret(secret.0), RoomNumber(2));
+        assert!(
+            area.map_document_layer()
+                .unwrap()
+                .attachment(address)
+                .is_some()
+        );
+        let anchor = map_connection_anchor(&area, address);
+        assert_eq!(anchor, RoomKey::new(secret, RoomNumber(2)));
+        let hover = Some(CrossAreaLabelVisibility::Hover);
+        assert!(cross_area_label_visible(
+            hover,
+            Some(&anchor),
+            anchor.area_id,
+            anchor.room_number
+        ));
+        assert!(!cross_area_label_visible(
+            hover,
+            Some(&RoomKey::new(map, RoomNumber(2))),
+            anchor.area_id,
+            anchor.room_number
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_room_is_clicked_by_a_press_and_release_over_it() {
+        let (mut view, map, _) = map_view_over_a_secret().await;
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 200.0));
+        view.last_viewport_size.set(Some(bounds.size()));
+        let at = |x: f32, y: f32| {
+            mouse::Cursor::Available(view.viewport().unproject(Point::new(x, y), bounds.size()))
+        };
+        let (on_room, off_room) = (at(0.0, 0.0), at(2.0, 2.0));
+        let press = IcedEvent::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = IcedEvent::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let outcome = |action: Option<canvas::Action<Message>>| {
+            action.map(|action| {
+                let (message, _, status) = action.into_inner();
+                (message, status)
+            })
+        };
+        let mut state = ProgramState::default();
+
+        let pressed = outcome(view.handle_event(&mut state, &press, bounds, on_room));
+        assert!(matches!(
+            pressed,
+            Some((None, iced::event::Status::Captured))
+        ));
+        let clicked = outcome(view.handle_event(&mut state, &release, bounds, on_room));
+        let Some((Some(Message::RoomClicked(room)), iced::event::Status::Captured)) = clicked
+        else {
+            panic!("a click: {clicked:?}");
+        };
+        assert_eq!(room, RoomKey::new(map, RoomNumber(1)));
+        let update = view.update(Message::RoomClicked(room.clone()));
+        assert!(matches!(update.event, Some(Event::RoomClicked(clicked)) if clicked == room));
+
+        let _ = view.handle_event(&mut state, &press, bounds, on_room);
+        let moved_off = outcome(view.handle_event(&mut state, &release, bounds, off_room));
+        assert!(moved_off.is_none(), "released elsewhere: {moved_off:?}");
+        assert!(
+            view.handle_event(&mut state, &press, bounds, off_room)
+                .is_none(),
+            "no room under the press: it falls through"
+        );
+        assert!(
+            view.handle_event(&mut state, &release, bounds, off_room)
+                .is_none()
+        );
+    }
+
+    /// The pointer finds a Secret's own room as the editor does: on its
+    /// level, keyed by the Secret's area, and over the map room it covers.
+    #[tokio::test]
+    async fn a_secrets_own_room_is_picked_over_the_map_room_it_covers() {
+        let (mut view, map, secret) = map_view_over_a_secret().await;
+        let spacing = view.resolved.room_spacing;
+        assert_eq!(
+            &*view.rooms_at(Point::ORIGIN),
+            [RoomKey::new(map, RoomNumber(1))]
+        );
+        assert!(
+            view.rooms_at(Point::new(5.0 * spacing, 7.0 * spacing))
+                .is_empty(),
+            "the Secret's room is on another level"
+        );
+        view.level = 1;
+        assert_eq!(
+            &*view.rooms_at(Point::new(5.0 * spacing, 7.0 * spacing)),
+            [RoomKey::new(secret, RoomNumber(2))]
+        );
+        assert!(view.rooms_at(Point::ORIGIN).is_empty());
+
+        let (view, map, secret) = map_view_over_a_secret_at(0.0, 0.0, 0).await;
+        assert_eq!(
+            &*view.rooms_at(Point::ORIGIN),
+            [
+                RoomKey::new(secret, RoomNumber(2)),
+                RoomKey::new(map, RoomNumber(1))
+            ],
+            "the Secret's room draws over the map's and is picked first"
+        );
+        // Hovering it reveals its own links' labels, not the map room's.
+        let hovered = RoomKey::new(secret, RoomNumber(2));
+        let hover = Some(CrossAreaLabelVisibility::Hover);
+        assert!(cross_area_label_visible(
+            hover,
+            Some(&hovered),
+            secret,
+            RoomNumber(2)
+        ));
+        assert!(!cross_area_label_visible(
+            hover,
+            Some(&hovered),
+            map,
+            RoomNumber(2)
+        ));
+    }
+
+    #[tokio::test]
+    async fn standing_in_a_secret_room_keeps_its_map_and_marks_the_room() {
+        let (mut view, map, secret) = map_view_over_a_secret().await;
+
+        let _ = view.update(Message::SetPlayerLocation(secret, Some(2)));
+
+        assert_eq!(view.active_area_id, map, "the map stays shown");
+        assert!(view.pending_area_change.is_none(), "no fade to another map");
+        assert_eq!(
+            view.player_location,
+            Some(RoomKey::new(secret, RoomNumber(2)))
+        );
+        assert_eq!(view.level, 1);
+        assert_eq!(
+            *view.translation.value(),
+            Vector::new(
+                -5.0 * view.resolved.room_spacing,
+                -7.0 * view.resolved.room_spacing
+            )
+        );
+
+        // From another map, the switch goes to the Secret's map.
+        let other = AreaId(Uuid::new_v4());
+        let _ = view.update(Message::SetPlayerLocation(other, None));
+        view.area_opacity.settle_at(0.0);
+        view.handle_fade_progress();
+        let _ = view.update(Message::SetPlayerLocation(secret, Some(2)));
+        assert_eq!(
+            view.pending_area_change
+                .as_ref()
+                .map(|pending| (pending.area_id, pending.player_location.clone())),
+            Some((map, Some(RoomKey::new(secret, RoomNumber(2)))))
         );
     }
 }

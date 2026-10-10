@@ -1,4 +1,5 @@
-//! The v1 → v2 area-document migration (§8.3/§8.4 of the Connection plan):
+//! The area-document migrations. Doors (v2 → v3, below) and, first, the
+//! v1 → v2 migration (§8.3/§8.4 of the Connection plan):
 //! an explicit legacy DTO for the pre-Connection `AreaWithDetails` shape and
 //! [`migrate_v1`], the Rust mirror of the cloud backfill
 //! (`smudgy-web/smudgy-api/migrations/20260721000000_connections.sql`).
@@ -28,6 +29,16 @@
 //!   never redistributed to make room for wall-mates — endpoints sharing a
 //!   slot simply coincide until an author moves one by hand, so an exit's
 //!   port never depends on what else the room has.
+//!
+//! **Doors** (v2 → v3, [`doors_from_flags`] then [`adopt_open_commands`])
+//! mirror the cloud's Library migration 15 (format-3 §6.1): an exit's
+//! `is_locked` gives it a locked door, otherwise `is_closed` a closed one,
+//! otherwise none; and arctic-mapper's `open_<d>_command` room properties
+//! move onto the exits leaving that room in that direction. Every door
+//! stays one `update_exit` could write ([`clamp_doors`], Library schema 21).
+//!
+//! Versioned local and import readers also preserve legacy `is_secret`
+//! classifications as Private content, including whole linked exit pairs.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -36,10 +47,163 @@ use serde::Deserialize;
 use crate::{
     Area, AreaWithDetails, Connection, ConnectionDash, ConnectionEndpoint, ConnectionId,
     ConnectionKind, ConnectionRouting, CornerStyle, DEFAULT_CONNECTION_COLOR,
-    DEFAULT_CONNECTION_THICKNESS, Exit, ExitDirection, ExitId, Label, LinkedAreaInfo, MapPoint,
-    PortMode, Property, RoomNumber, RoomSide, RoomWithDetails, SegmentShape, Shape,
+    DEFAULT_CONNECTION_THICKNESS, DOOR_COMMAND_LIMIT, DOOR_NAME_LIMIT, Door, DoorState, Exit,
+    ExitDirection, ExitId, Label, LinkedAreaInfo, MapPoint, PortMode, Property, RoomNumber,
+    RoomSide, RoomWithDetails, SegmentShape, Shape,
     connection::{MAX_COLOR_LEN, default_anchor_for_direction},
 };
+
+/// The document format whose exits carry `is_closed` and `is_locked`
+/// instead of a door.
+pub const DOORLESS_FORMAT_VERSION: u32 = 2;
+
+/// The door an exit written before doors takes from its flags: locked
+/// gives a locked door, otherwise closed a closed one, otherwise none.
+/// Neither has a name or a command yet.
+#[must_use]
+pub fn door_of_flags(is_closed: bool, is_locked: bool) -> Option<Door> {
+    if is_locked {
+        Some(Door::new(DoorState::Locked))
+    } else if is_closed {
+        Some(Door::new(DoorState::Closed))
+    } else {
+        None
+    }
+}
+
+/// Rewrites every exit in a doorless document (`format_version` 2) as JSON,
+/// wherever it appears (rooms, and the echoes of stored receipts): its
+/// `is_closed` and `is_locked` give way to a `door` ([`door_of_flags`]).
+/// An exit is an object with `from_direction` and `connection_id`.
+pub fn doors_from_flags(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if fields.contains_key("from_direction") && fields.contains_key("connection_id") {
+                let flag = |name: &str| {
+                    fields
+                        .get(name)
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                };
+                let door = door_of_flags(flag("is_closed"), flag("is_locked"));
+                fields.remove("is_closed");
+                fields.remove("is_locked");
+                fields
+                    .entry("door")
+                    .or_insert_with(|| serde_json::to_value(door).unwrap_or_default());
+            }
+            for field in fields.values_mut() {
+                doors_from_flags(field);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                doors_from_flags(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The direction arctic-mapper's open-command room property names:
+/// `open_<d>_command`, `<d>` one of `n`, `e`, `s`, `w`, `u` and `d`, in that
+/// exact lower case.
+pub(super) fn open_command_direction(name: &str) -> Option<ExitDirection> {
+    match name.strip_prefix("open_")?.strip_suffix("_command")? {
+        "n" => Some(ExitDirection::North),
+        "e" => Some(ExitDirection::East),
+        "s" => Some(ExitDirection::South),
+        "w" => Some(ExitDirection::West),
+        "u" => Some(ExitDirection::Up),
+        "d" => Some(ExitDirection::Down),
+        _ => None,
+    }
+}
+
+/// Moves arctic-mapper's door open commands onto the exits they open. A
+/// room property `open_<d>_command` on a room that also keeps exits leaving
+/// in that direction gives each of them its value as their door's
+/// `opens_with`, a closed door where they had none, and goes; an empty
+/// value gives no command and leaves the exits as they were, and its
+/// property goes too. A property with no exit in its direction stays.
+/// Whether anything changed.
+pub fn adopt_open_commands(rooms: &mut [RoomWithDetails]) -> bool {
+    let mut changed = false;
+    for room in rooms {
+        let RoomWithDetails {
+            properties, exits, ..
+        } = room;
+        properties.retain(|property| {
+            let Some(direction) = open_command_direction(&property.name) else {
+                return true;
+            };
+            let mut opened = exits
+                .iter_mut()
+                .filter(|exit| exit.from_direction == direction)
+                .peekable();
+            if opened.peek().is_none() {
+                return true;
+            }
+            if !property.value.is_empty() {
+                let command = clamped(&property.value, DOOR_COMMAND_LIMIT);
+                for exit in opened {
+                    let door = exit
+                        .door
+                        .get_or_insert_with(|| Door::new(DoorState::Closed));
+                    door.opens_with = Some(command.clone());
+                }
+            }
+            changed = true;
+            false
+        });
+    }
+    changed
+}
+
+/// `value`'s first `limit` code points.
+fn clamped(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+/// Keeps every door one `update_exit` could write, as the cloud's Library
+/// schema 21 does: an open command keeps its first 255 code points, a name
+/// its first 64. Whether anything changed.
+pub fn clamp_doors(rooms: &mut [RoomWithDetails]) -> bool {
+    let mut changed = false;
+    for door in rooms
+        .iter_mut()
+        .flat_map(|room| room.exits.iter_mut())
+        .filter_map(|exit| exit.door.as_mut())
+    {
+        for (value, limit) in [
+            (&mut door.opens_with, DOOR_COMMAND_LIMIT),
+            (&mut door.name, DOOR_NAME_LIMIT),
+        ] {
+            if let Some(text) = value
+                && text.chars().nth(limit).is_some()
+            {
+                *text = clamped(text, limit);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// A doorless document (`format_version` 2), as JSON, in the current
+/// format: [`doors_from_flags`], then [`adopt_open_commands`].
+///
+/// # Errors
+/// The document does not parse once its exits have doors.
+pub fn migrate_doorless(mut value: serde_json::Value) -> serde_json::Result<AreaWithDetails> {
+    let privacy = super::local_privacy::LegacyPrivacy::read(&value)?;
+    doors_from_flags(&mut value);
+    let mut details: AreaWithDetails = serde_json::from_value(value)?;
+    adopt_open_commands(&mut details.rooms);
+    privacy.apply(&mut details);
+    details.format_version = crate::AREA_FORMAT_VERSION;
+    Ok(details)
+}
 
 /// The pre-Connection (v1) `AreaWithDetails` document shape: no
 /// `format_version`, no `connections`, and exits that carry their own
@@ -85,8 +249,6 @@ pub struct LegacyRoomV1 {
     #[serde(default)]
     pub tags: BTreeSet<String>,
     #[serde(default)]
-    pub is_secret: bool,
-    #[serde(default)]
     pub external_id: Option<String>,
 }
 
@@ -125,8 +287,6 @@ pub struct LegacyExitV1 {
     pub to_unknown: bool,
     #[serde(default)]
     pub to_area_token: Option<String>,
-    #[serde(default)]
-    pub is_secret: bool,
 }
 
 fn default_weight() -> f32 {
@@ -206,6 +366,7 @@ fn side_ordinal(side: RoomSide) -> usize {
 
 fn endpoint(room_number: RoomNumber, side: RoomSide, port_offset: f32) -> ConnectionEndpoint {
     ConnectionEndpoint {
+        source: None,
         room_number,
         side,
         port_offset,
@@ -287,7 +448,6 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
                 properties: Vec::new(),
                 exits: Vec::new(),
                 tags: BTreeSet::new(),
-                is_secret: false,
                 external_id: None,
             });
         }
@@ -555,6 +715,7 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
                 .exits
                 .into_iter()
                 .map(|exit| Exit {
+                    to_source: None,
                     connection_id: membership[&exit.id],
                     id: exit.id,
                     from_direction: exit.from_direction,
@@ -563,33 +724,232 @@ pub fn migrate_v1(legacy: LegacyAreaV1) -> AreaWithDetails {
                     to_direction: exit.to_direction,
                     path: exit.path,
                     is_hidden: exit.is_hidden,
-                    is_closed: exit.is_closed,
-                    is_locked: exit.is_locked,
+                    door: door_of_flags(exit.is_closed, exit.is_locked),
                     weight: exit.weight,
                     command: exit.command,
                     to_unknown: exit.to_unknown,
                     to_area_token: exit.to_area_token,
-                    is_secret: exit.is_secret,
                 })
                 .collect(),
             tags: room.tags,
-            is_secret: room.is_secret,
             external_id: room.external_id,
         })
         .collect();
 
+    // Doors came after the v1 format: its flags give them, and the open
+    // commands arctic-mapper kept as room properties move onto them.
+    let mut rooms = rooms;
+    adopt_open_commands(&mut rooms);
+
     AreaWithDetails {
+        room_data: Vec::new(),
+        sources: Vec::new(),
         area: legacy.area,
         format_version: crate::AREA_FORMAT_VERSION,
         // A v1 content hash described the v1 projection; the migrated
         // document has none until a server projects it again.
-        content_hash: None,
         properties: legacy.properties,
         rooms,
         labels: legacy.labels,
         shapes: legacy.shapes,
         connections,
         linked_areas: legacy.linked_areas,
+    }
+}
+
+#[cfg(test)]
+mod door_tests {
+    use super::*;
+
+    #[test]
+    fn flags_give_doors_wherever_an_exit_appears() {
+        let mut value = serde_json::json!({
+            "rooms": [{ "exits": [
+                { "from_direction": "North", "connection_id": "c", "is_closed": true, "is_locked": true },
+                { "from_direction": "East", "connection_id": "c", "is_closed": true },
+                { "from_direction": "West", "connection_id": "c", "is_closed": false, "is_locked": false }
+            ]}],
+            "_smudgy_applied_operations": [{ "result": { "data": [{
+                "entity": "exit",
+                "exit": { "from_direction": "Up", "connection_id": "c", "is_closed": true }
+            }]}}],
+            "labels": [{ "is_closed": true }]
+        });
+        doors_from_flags(&mut value);
+        let exits = &value["rooms"][0]["exits"];
+        assert_eq!(exits[0]["door"]["state"], "locked");
+        assert_eq!(exits[1]["door"]["state"], "closed");
+        assert_eq!(exits[2]["door"], serde_json::Value::Null);
+        assert_eq!(
+            value["_smudgy_applied_operations"][0]["result"]["data"][0]["exit"]["door"]["state"],
+            "closed"
+        );
+        assert!(exits[0].get("is_closed").is_none() && exits[0].get("is_locked").is_none());
+        assert_eq!(value["labels"][0]["is_closed"], true, "only exits change");
+    }
+
+    #[test]
+    fn an_overlong_open_command_keeps_what_update_exit_could_write() {
+        let mut rooms = vec![RoomWithDetails {
+            room_number: RoomNumber(1),
+            title: String::new(),
+            description: String::new(),
+            level: 0,
+            x: 0.0,
+            y: 0.0,
+            color: String::new(),
+            properties: vec![Property {
+                name: "open_n_command".to_string(),
+                // Multi-byte code points, so bytes and characters differ.
+                value: "é".repeat(DOOR_COMMAND_LIMIT + 9),
+            }],
+            exits: vec![Exit {
+                id: ExitId::new(),
+                from_direction: ExitDirection::North,
+                to_area_id: None,
+                to_room_number: None,
+                to_direction: None,
+                path: String::new(),
+                is_hidden: false,
+                door: None,
+                weight: 1.0,
+                command: String::new(),
+                connection_id: ConnectionId::new(),
+                to_unknown: false,
+                to_area_token: None,
+                to_source: None,
+            }],
+            tags: BTreeSet::new(),
+            external_id: None,
+        }];
+        assert!(adopt_open_commands(&mut rooms));
+        let door = rooms[0].exits[0].door.clone().expect("a closed door");
+        assert_eq!(
+            door.opens_with.as_deref(),
+            Some("é".repeat(DOOR_COMMAND_LIMIT).as_str())
+        );
+        door.check().expect("a door the client may send again");
+
+        // A door stored too long before this rule reads clamped, its name
+        // too.
+        let door = rooms[0].exits[0].door.as_mut().unwrap();
+        door.opens_with = Some("x".repeat(DOOR_COMMAND_LIMIT + 1));
+        door.name = Some("ü".repeat(DOOR_NAME_LIMIT + 1));
+        assert!(clamp_doors(&mut rooms));
+        let door = rooms[0].exits[0].door.clone().unwrap();
+        assert_eq!(
+            door.opens_with.map(|c| c.chars().count()),
+            Some(DOOR_COMMAND_LIMIT)
+        );
+        assert_eq!(
+            door.name.as_deref(),
+            Some("ü".repeat(DOOR_NAME_LIMIT).as_str())
+        );
+        assert!(!clamp_doors(&mut rooms), "a second pass changes nothing");
+    }
+
+    #[test]
+    fn every_exit_in_the_direction_takes_the_open_command() {
+        let exit = |direction: ExitDirection, door: Option<Door>| Exit {
+            id: ExitId::new(),
+            from_direction: direction,
+            to_area_id: None,
+            to_room_number: None,
+            to_direction: None,
+            path: String::new(),
+            is_hidden: false,
+            door,
+            weight: 1.0,
+            command: String::new(),
+            connection_id: ConnectionId::new(),
+            to_unknown: false,
+            to_area_token: None,
+            to_source: None,
+        };
+        let mut rooms = vec![RoomWithDetails {
+            room_number: RoomNumber(1),
+            title: String::new(),
+            description: String::new(),
+            level: 0,
+            x: 0.0,
+            y: 0.0,
+            color: String::new(),
+            properties: vec![
+                Property {
+                    name: "open_u_command".to_string(),
+                    value: "climb rope".to_string(),
+                },
+                Property {
+                    name: "open_d_command".to_string(),
+                    value: "dive".to_string(),
+                },
+            ],
+            exits: vec![
+                exit(ExitDirection::Up, None),
+                exit(ExitDirection::Up, Some(Door::new(DoorState::Locked))),
+            ],
+            tags: BTreeSet::new(),
+            external_id: None,
+        }];
+        assert!(adopt_open_commands(&mut rooms));
+        let doors: Vec<_> = rooms[0]
+            .exits
+            .iter()
+            .map(|exit| exit.door.clone())
+            .collect();
+        assert_eq!(
+            doors,
+            [
+                Some(Door {
+                    state: DoorState::Closed,
+                    name: None,
+                    opens_with: Some("climb rope".to_string())
+                }),
+                Some(Door {
+                    state: DoorState::Locked,
+                    name: None,
+                    opens_with: Some("climb rope".to_string())
+                }),
+            ]
+        );
+        assert_eq!(
+            rooms[0].properties.len(),
+            1,
+            "no Down exit keeps its property"
+        );
+        assert_eq!(rooms[0].properties[0].name, "open_d_command");
+        assert!(
+            !adopt_open_commands(&mut rooms),
+            "a second pass changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_v1_document_takes_doors_and_open_commands() {
+        let legacy: LegacyAreaV1 = serde_json::from_value(serde_json::json!({
+            "id": "123e4567-e89b-12d3-a456-426614174000", "user_id": null, "atlas_id": null,
+            "name": "Old", "created_at": "2025-01-01T00:00:00Z", "rev": 1,
+            "rooms": [{
+                "room_number": 1,
+                "properties": [{ "name": "open_s_command", "value": "turn key" }],
+                "exits": [{
+                    "id": "00000000-0000-4000-8000-000000000001", "from_direction": "South",
+                    "is_locked": true
+                }]
+            }]
+        }))
+        .expect("a v1 document");
+        let migrated = migrate_v1(legacy);
+        let room = &migrated.rooms[0];
+        assert!(room.properties.is_empty());
+        assert_eq!(
+            room.exits[0].door,
+            Some(Door {
+                state: DoorState::Locked,
+                name: None,
+                opens_with: Some("turn key".to_string())
+            })
+        );
     }
 }
 
@@ -630,7 +990,7 @@ mod tests {
             }
         }
 
-        fn room(mut self, number: i32, x: f32, y: f32, level: i32, is_secret: bool) -> Self {
+        fn room(mut self, number: i32, x: f32, y: f32, level: i32) -> Self {
             self.rooms.push(LegacyRoomV1 {
                 room_number: RoomNumber(number),
                 title: format!("room {number}"),
@@ -642,7 +1002,6 @@ mod tests {
                 properties: Vec::new(),
                 exits: Vec::new(),
                 tags: BTreeSet::new(),
-                is_secret,
                 external_id: None,
             });
             self
@@ -658,7 +1017,6 @@ mod tests {
             to_direction: Option<ExitDirection>,
             style: &str,
             color: &str,
-            is_secret: bool,
         ) -> Self {
             let exit = LegacyExitV1 {
                 id: fx_exit_id(self.fx, n),
@@ -676,7 +1034,6 @@ mod tests {
                 color: color.to_string(),
                 to_unknown: false,
                 to_area_token: None,
-                is_secret,
             };
             self.rooms
                 .iter_mut()
@@ -690,6 +1047,7 @@ mod tests {
         fn build(self) -> LegacyAreaV1 {
             LegacyAreaV1 {
                 area: Area {
+                    projection_token: None,
                     id: fx_area_id(self.fx),
                     user_id: None,
                     atlas_id: None,
@@ -703,6 +1061,10 @@ mod tests {
                     copied_from_rev: None,
                     copied_at: None,
                     family_token: None,
+                    clan_id: None,
+                    clan_name: None,
+                    actions: None,
+                    clan_ownership: crate::clan_maps::ClanOwnership::default(),
                 },
                 content_hash: Some("stale-v1-hash".to_string()),
                 properties: Vec::new(),
@@ -720,7 +1082,6 @@ mod tests {
     /// ports in range), `format_version` 2.
     fn assert_backfill_invariants(migrated: &AreaWithDetails, expected_exits: usize) {
         assert_eq!(migrated.format_version, crate::AREA_FORMAT_VERSION);
-        assert!(migrated.content_hash.is_none(), "v1 hash must not survive");
         let all_exits: Vec<&Exit> = migrated
             .rooms
             .iter()
@@ -819,8 +1180,8 @@ mod tests {
     fn fixture_a_clean_reciprocal_pair() {
         let migrated = migrate_v1(
             FixtureBuilder::new(0x01)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 2.0, 0.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 2.0, 0.0, 0)
                 .exit(
                     1,
                     1,
@@ -829,7 +1190,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -839,7 +1199,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -867,8 +1226,8 @@ mod tests {
     fn fixture_b_missing_arrival_directions_still_pair() {
         let migrated = migrate_v1(
             FixtureBuilder::new(0x02)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 2.0, 0.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 2.0, 0.0, 0)
                 .exit(
                     1,
                     1,
@@ -877,7 +1236,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -887,7 +1245,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -903,8 +1260,8 @@ mod tests {
     fn fixture_c_contradictory_directions_do_not_pair() {
         let migrated = migrate_v1(
             FixtureBuilder::new(0x03)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 2.0, 0.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 2.0, 0.0, 0)
                 .exit(
                     1,
                     1,
@@ -913,7 +1270,6 @@ mod tests {
                     Some(ExitDirection::South),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -923,7 +1279,6 @@ mod tests {
                     Some(ExitDirection::North),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -947,8 +1302,8 @@ mod tests {
         // Room 2 north of room 1 (map space: +y South).
         let migrated = migrate_v1(
             FixtureBuilder::new(0x04)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 0.0, -2.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 0.0, -2.0, 0)
                 .exit(
                     1,
                     1,
@@ -957,7 +1312,6 @@ mod tests {
                     Some(ExitDirection::South),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -967,7 +1321,6 @@ mod tests {
                     Some(ExitDirection::North),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     3,
@@ -977,7 +1330,6 @@ mod tests {
                     Some(ExitDirection::North),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1000,8 +1352,8 @@ mod tests {
     fn fixture_e_two_links_between_same_rooms() {
         let migrated = migrate_v1(
             FixtureBuilder::new(0x05)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 2.0, -2.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 2.0, -2.0, 0)
                 .exit(
                     1,
                     1,
@@ -1010,7 +1362,6 @@ mod tests {
                     Some(ExitDirection::South),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -1020,7 +1371,6 @@ mod tests {
                     Some(ExitDirection::North),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     3,
@@ -1030,7 +1380,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     4,
@@ -1040,7 +1389,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1064,10 +1412,10 @@ mod tests {
     fn fixture_f_plain_one_way() {
         let migrated = migrate_v1(
             FixtureBuilder::new(0x06)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 2.0, 0.0, 0, false)
-                .room(3, 0.0, 2.0, 0, false)
-                .room(4, 0.0, 4.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 2.0, 0.0, 0)
+                .room(3, 0.0, 2.0, 0)
+                .room(4, 0.0, 4.0, 0)
                 .exit(
                     1,
                     1,
@@ -1076,7 +1424,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -1086,7 +1433,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1114,8 +1460,8 @@ mod tests {
     fn fixture_g_self_loops() {
         let migrated = migrate_v1(
             FixtureBuilder::new(0x07)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 3.0, 0.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 3.0, 0.0, 0)
                 .exit(
                     1,
                     1,
@@ -1124,7 +1470,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -1134,7 +1479,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     3,
@@ -1144,7 +1488,6 @@ mod tests {
                     Some(ExitDirection::North),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1200,19 +1543,10 @@ mod tests {
         // builder cannot express it, so it is patched by hand.
         let foreign = fx_area_id(0x09);
         let mut legacy = FixtureBuilder::new(0x08)
-            .room(1, 0.0, 0.0, 0, false)
-            .exit(1, 1, ExitDirection::East, None, None, "Normal", "", false)
-            .exit(2, 1, ExitDirection::South, None, None, "Normal", "", false)
-            .exit(
-                3,
-                1,
-                ExitDirection::Northwest,
-                None,
-                None,
-                "Normal",
-                "",
-                false,
-            )
+            .room(1, 0.0, 0.0, 0)
+            .exit(1, 1, ExitDirection::East, None, None, "Normal", "")
+            .exit(2, 1, ExitDirection::South, None, None, "Normal", "")
+            .exit(3, 1, ExitDirection::Northwest, None, None, "Normal", "")
             .build();
         legacy.rooms[0].exits[1].to_area_id = Some(foreign);
         let migrated = migrate_v1(legacy);
@@ -1250,7 +1584,7 @@ mod tests {
         let other = fx_area_id(0x0b);
         let migrated = migrate_v1(
             FixtureBuilder::new(0x0a)
-                .room(1, 0.0, 0.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
                 .exit(
                     1,
                     1,
@@ -1259,7 +1593,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1276,8 +1609,8 @@ mod tests {
     fn fixture_j_cross_level_pair() {
         let migrated = migrate_v1(
             FixtureBuilder::new(0x0c)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 0.0, 0.0, 1, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 0.0, 0.0, 1)
                 .exit(
                     1,
                     1,
@@ -1286,7 +1619,6 @@ mod tests {
                     Some(ExitDirection::Down),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -1296,7 +1628,6 @@ mod tests {
                     Some(ExitDirection::Up),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1333,12 +1664,12 @@ mod tests {
         let area = fx_area_id(0x0d);
         let migrated = migrate_v1(
             FixtureBuilder::new(0x0d)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 4.0, -3.0, 0, false)
-                .room(3, 4.0, -1.0, 0, false)
-                .room(4, 4.0, 1.0, 0, true)
-                .room(5, 4.0, 3.0, 0, false)
-                .room(6, 4.0, 5.0, 0, true)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 4.0, -3.0, 0)
+                .room(3, 4.0, -1.0, 0)
+                .room(4, 4.0, 1.0, 0)
+                .room(5, 4.0, 3.0, 0)
+                .room(6, 4.0, 5.0, 0)
                 .exit(
                     1,
                     1,
@@ -1347,7 +1678,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -1357,7 +1687,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    true,
                 )
                 .exit(
                     3,
@@ -1367,7 +1696,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     4,
@@ -1377,7 +1705,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     5,
@@ -1387,7 +1714,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     6,
@@ -1397,7 +1723,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1433,14 +1758,14 @@ mod tests {
         let area = fx_area_id(0x0f);
         let migrated = migrate_v1(
             FixtureBuilder::new(0x0f)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 2.0, 0.0, 0, false)
-                .room(3, 0.0, 2.0, 0, false)
-                .room(4, 2.0, 2.0, 0, false)
-                .room(5, 0.0, 4.0, 0, false)
-                .room(6, 2.0, 4.0, 0, false)
-                .room(7, 0.0, 6.0, 0, false)
-                .room(8, 2.0, 6.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 2.0, 0.0, 0)
+                .room(3, 0.0, 2.0, 0)
+                .room(4, 2.0, 2.0, 0)
+                .room(5, 0.0, 4.0, 0)
+                .room(6, 2.0, 4.0, 0)
+                .room(7, 0.0, 6.0, 0)
+                .room(8, 2.0, 6.0, 0)
                 .exit(
                     1,
                     1,
@@ -1449,7 +1774,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Dashed",
                     "#ff0000",
-                    false,
                 )
                 .exit(
                     2,
@@ -1459,7 +1783,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Dotted",
                     "#0000ff",
-                    false,
                 )
                 .exit(
                     3,
@@ -1469,7 +1792,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     4,
@@ -1479,7 +1801,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Stub",
                     "",
-                    false,
                 )
                 .exit(
                     5,
@@ -1489,7 +1810,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     6,
@@ -1499,7 +1819,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Normal",
                     "#00ff00",
-                    false,
                 )
                 .exit(
                     7,
@@ -1509,7 +1828,6 @@ mod tests {
                     Some(ExitDirection::West),
                     "Stub",
                     "",
-                    false,
                 )
                 .exit(
                     8,
@@ -1519,7 +1837,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Dashed",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1560,11 +1877,11 @@ mod tests {
         let long_color = "a".repeat(70);
         let migrated = migrate_v1(
             FixtureBuilder::new(0x10)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, 0.0, 2.0, 0, false)
-                .room(3, 0.0, 4.0, 0, false)
-                .room(4, 0.0, 6.0, 0, false)
-                .room(5, 0.0, 8.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, 0.0, 2.0, 0)
+                .room(3, 0.0, 4.0, 0)
+                .room(4, 0.0, 6.0, 0)
+                .room(5, 0.0, 8.0, 0)
                 .exit(
                     1,
                     1,
@@ -1573,39 +1890,11 @@ mod tests {
                     None,
                     "Normal",
                     "not a color!!",
-                    false,
                 )
-                .exit(
-                    2,
-                    2,
-                    ExitDirection::East,
-                    None,
-                    None,
-                    "Normal",
-                    &long_color,
-                    false,
-                )
-                .exit(
-                    3,
-                    3,
-                    ExitDirection::East,
-                    None,
-                    None,
-                    "Normal",
-                    "red",
-                    false,
-                )
-                .exit(4, 4, ExitDirection::East, None, None, "Normal", "", false)
-                .exit(
-                    5,
-                    5,
-                    ExitDirection::East,
-                    None,
-                    None,
-                    "Normal",
-                    "#AbC",
-                    false,
-                )
+                .exit(2, 2, ExitDirection::East, None, None, "Normal", &long_color)
+                .exit(3, 3, ExitDirection::East, None, None, "Normal", "red")
+                .exit(4, 4, ExitDirection::East, None, None, "Normal", "")
+                .exit(5, 5, ExitDirection::East, None, None, "Normal", "#AbC")
                 .build(),
         );
         assert_backfill_invariants(&migrated, 5);
@@ -1634,10 +1923,10 @@ mod tests {
         let area = fx_area_id(0x11);
         let migrated = migrate_v1(
             FixtureBuilder::new(0x11)
-                .room(1, 0.0, 0.0, 0, false)
-                .room(2, -3.0, -4.0, 0, false)
-                .room(3, 0.0, -4.0, 0, false)
-                .room(4, 3.0, -4.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
+                .room(2, -3.0, -4.0, 0)
+                .room(3, 0.0, -4.0, 0)
+                .room(4, 3.0, -4.0, 0)
                 .exit(
                     1,
                     1,
@@ -1646,7 +1935,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     2,
@@ -1656,7 +1944,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     3,
@@ -1666,7 +1953,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .exit(
                     4,
@@ -1676,7 +1962,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1716,8 +2001,8 @@ mod tests {
         let area = fx_area_id(0x12);
         let migrated = migrate_v1(
             FixtureBuilder::new(0x12)
-                .room(5, 0.0, 0.0, 0, false)
-                .room(6, 2.0, 0.0, 0, false)
+                .room(5, 0.0, 0.0, 0)
+                .room(6, 2.0, 0.0, 0)
                 .exit(
                     1,
                     6,
@@ -1726,7 +2011,6 @@ mod tests {
                     Some(ExitDirection::East),
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );
@@ -1747,7 +2031,7 @@ mod tests {
         let area = fx_area_id(0x20);
         let migrated = migrate_v1(
             FixtureBuilder::new(0x20)
-                .room(1, 0.0, 0.0, 0, false)
+                .room(1, 0.0, 0.0, 0)
                 .exit(
                     1,
                     1,
@@ -1756,7 +2040,6 @@ mod tests {
                     None,
                     "Normal",
                     "",
-                    false,
                 )
                 .build(),
         );

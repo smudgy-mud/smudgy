@@ -115,6 +115,7 @@ fn cache_package(
             is_entry: true,
         }],
         dependencies: deps.to_vec(),
+        owner: None,
     };
     let key = PackageKey {
         owner: owner.to_string(),
@@ -140,7 +141,7 @@ fn record_consent(server: &str, specifier: &str, manifest_json: &str) {
 
 fn dep(owner: &str, name: &str, range: &str, version: &str) -> ResolvedDependency {
     ResolvedDependency {
-        owner_nickname: owner.to_string(),
+        owner_nickname: Some(owner.to_string()),
         name: name.to_string(),
         range: range.to_string(),
         resolved_version: version.to_string(),

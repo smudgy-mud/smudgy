@@ -266,8 +266,8 @@ pub async fn delete_request(
     no_content()
 }
 
-/// DELETE /friends/{user_id} — unfriend; deletes the pair's grants in BOTH
-/// directions (subtrees cascade). Idempotent 204.
+/// DELETE /friends/{user_id} — unfriend; deletes the pair's map and Secret
+/// grants in BOTH directions (subtrees cascade). Idempotent 204.
 pub async fn unfriend(
     State(state): State<Shared>,
     Path(raw_id): Path<String>,
@@ -296,6 +296,7 @@ pub async fn unfriend(
         .map(|g| g.id)
         .collect();
     st.delete_grants_cascading(&doomed);
+    st.revoke_secret_grants(viewer, other, false);
     super::transfers::cancel_live_transfers_between(&mut st, viewer, other);
     no_content()
 }
@@ -305,7 +306,8 @@ pub async fn unfriend(
 // ---------------------------------------------------------------------------
 
 /// PUT /blocks/{user_id} — idempotent; deletes the pair friendship, the pair
-/// grants both directions, AND the owner-wide grant cascade both directions.
+/// grants both directions, AND the owner-wide grant cascade both directions,
+/// for map and Secret grants alike.
 pub async fn block(
     State(state): State<Shared>,
     Path(raw_id): Path<String>,
@@ -339,6 +341,7 @@ pub async fn block(
         .map(|g| g.id)
         .collect();
     st.delete_grants_cascading(&doomed);
+    st.revoke_secret_grants(viewer, target, true);
     super::transfers::cancel_live_transfers_between(&mut st, viewer, target);
 
     let already = st

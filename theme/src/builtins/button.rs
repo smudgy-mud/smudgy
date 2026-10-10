@@ -123,6 +123,25 @@ pub fn toolbar(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Active variant of [`toolbar`]: a quiet filled pill, so the open pane's
+/// button reads as current without boxed chrome.
+#[must_use]
+pub fn toolbar_active(theme: &Theme, status: button::Status) -> button::Style {
+    let fill = match status {
+        button::Status::Hovered | button::Status::Pressed => 0.16,
+        _ => 0.12,
+    };
+    button::Style {
+        background: Some(Color::from_rgba8(255, 255, 255, fill).into()),
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        text_color: theme.styles.text.normal,
+        ..Default::default()
+    }
+}
+
 /// Low-emphasis filled button: translucent fill with a hairline border.
 /// Suits small inline actions (session reconnect, script-spawned overlay
 /// buttons) that shouldn't shout like `primary`.
@@ -185,6 +204,22 @@ pub fn quiet_link(theme: &Theme, status: button::Status) -> button::Style {
         },
         ..Default::default()
     }
+}
+
+/// A destructive action: the [`secondary`] button's shape, its text and
+/// border in the error hue.
+#[must_use]
+pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = secondary(theme, status);
+    let error = theme.styles.text.error;
+    let error = if matches!(status, button::Status::Disabled) {
+        error.scale_alpha(0.4)
+    } else {
+        error
+    };
+    style.text_color = error;
+    style.border = style.border.color(error);
+    style
 }
 
 /// The destructive variant of [`quiet_link`]: the error hue, lifted on hover.

@@ -9,13 +9,30 @@ use imbl::{HashMap as PersistentMap, OrdMap};
 use ordered_float::OrderedFloat;
 
 use crate::{
-    AreaId, AtlasId, ExitDirection, RoomNumber, Uuid,
+    AreaId, AtlasId, ExitDirection, RoomNumber, SourceId, Uuid,
     mapper::{
         RoomKey,
         area_cache::AreaCache,
+        exit_cache::ExitCache,
+        places::Sources,
         room_cache::{ExitBitfield, RoomCache},
     },
 };
+
+/// The exits a source keeps on map rooms, by map room.
+type AnchoredExits = Arc<HashMap<RoomKey, Vec<ExitCache>>>;
+
+/// One of a map's Secrets, or the caller's Private additions, as an area of
+/// its own: the map it belongs to, its source, and the area and anchored
+/// exits its layer holds (shared with the map's cache, so an unchanged
+/// rebuild is told by pointer).
+#[derive(Clone)]
+struct SourceArea {
+    map: AreaId,
+    source: SourceId,
+    area: Arc<AreaCache>,
+    anchored: AnchoredExits,
+}
 
 /// The two independent axes that keep an area out of the room-identification
 /// lookup tables and out of routing. Exclusion is **one behavior with two
@@ -173,18 +190,18 @@ pub struct AtlasCache {
     areas_by_property_name_and_value: PersistentMap<(String, String), AreaMatches>,
     /// Every room an exit in another area leads to, keyed by the area it
     /// leads into and the room number, with how many such exits lead there;
-    /// the number need not belong to a room. An exit that names a room which
-    /// no longer exists would silently lead to whatever room later takes
-    /// that number, so room allocation passes over the numbers exits name,
-    /// here and among the area's own exits, and merges keep clear of the
-    /// vacant ones (see [`Self::first_unnamed_room_number`] and
-    /// [`Self::vacant_exit_targets`]). An area's exits into its own rooms
-    /// are read from the area itself when a number is wanted: they are most
-    /// of a map's exits, and the area's own edits keep them leading to rooms
-    /// that exist. Every area's exits count, turned off or not, so an
-    /// exclusion change carries the index over as it is. Maintained per room
-    /// like the tables above, counted in one pass when the tables are built
-    /// from scratch, and ordered so every question is a range read.
+    /// the number need not belong to a room. Deleting rooms reads it to find
+    /// the other areas' exits to clear, and merges and pastes keep a room
+    /// off a vacant number one still names (see
+    /// [`Self::vacant_exit_targets`]). A room that goes clears every exit
+    /// into it, here and at the server (map wire format 3 §4.2), so plain
+    /// allocation never consults it. An area's exits into its own rooms are
+    /// read from the area itself when a number is wanted: they are most of a
+    /// map's exits, and the area's own edits keep them leading to rooms that
+    /// exist. Every area's exits count, turned off or not, so an exclusion
+    /// change carries the index over as it is. Maintained per room like the
+    /// tables above, counted in one pass when the tables are built from
+    /// scratch, and ordered so every question is a range read.
     exit_targets: OrdMap<(Uuid, RoomNumber), u32>,
     /// Areas the viewer owns, for own-beats-shared precedence in lookups and
     /// routing. Maintained alongside the tables; lookups are O(1).
@@ -196,6 +213,17 @@ pub struct AtlasCache {
     /// and may contain ids not (yet) in `areas` — exclusion survives the area
     /// landing later.
     exclusions: Exclusions,
+    /// Every map's Secrets and the caller's Private additions, each an area
+    /// of its own, by area id. Each is placed as its map is (turned off,
+    /// out of scope and owned with it) and is replaced and dropped with its
+    /// map. `areas` holds maps only.
+    source_areas: HashMap<AreaId, SourceArea>,
+    /// Every area that has been a map's Secret or Private additions in this
+    /// atlas or any atlas it was derived from, with its map. It only grows:
+    /// a Secret that leaves (revoked, deleted, or purged with its map until a
+    /// refetch) keeps reading as a place to callers that hide places, so an
+    /// id still held for it never shows as an ordinary area.
+    places_ever: PersistentMap<AreaId, AreaId>,
 }
 
 impl AtlasCache {
@@ -240,6 +268,8 @@ impl AtlasCache {
             exit_targets,
             owned_areas: HashSet::new(),
             exclusions,
+            source_areas: HashMap::new(),
+            places_ever: PersistentMap::new(),
         };
         for (area_id, area) in areas {
             let placement = cache.placement(&area_id, &area);
@@ -250,6 +280,19 @@ impl AtlasCache {
                 cache.index_room(area_id, room, placement);
             }
             cache.add_area_properties(area_id, &area, placement);
+            for layer in area.source_layers() {
+                let id = layer.area_id();
+                if placement.owned {
+                    cache.owned_areas.insert(id);
+                }
+                for room in layer.area().get_rooms() {
+                    cache.index_room(id, room, placement);
+                }
+                cache.places_ever.insert(id, area_id);
+                cache
+                    .source_areas
+                    .insert(id, SourceArea::of(area_id, layer));
+            }
             cache.areas.insert(area_id, area);
         }
         cache
@@ -275,6 +318,9 @@ impl AtlasCache {
     fn apply_insert(&mut self, area_id: AreaId, area: Arc<AreaCache>) {
         let old = self.areas.get(&area_id).cloned();
         let new_placement = self.placement(&area_id, &area);
+        let old_placement = old
+            .as_ref()
+            .map(|old_area| self.placement(&area_id, old_area));
 
         match old {
             Some(ref old_area) if self.placement(&area_id, old_area) == new_placement => {
@@ -304,8 +350,8 @@ impl AtlasCache {
                 }
             }
             _ => {
-                if let Some(old_area) = old {
-                    self.remove_area_contribution(area_id, &old_area);
+                if let Some(old_area) = &old {
+                    self.remove_area_contribution(area_id, old_area);
                 }
                 if new_placement.owned {
                     self.owned_areas.insert(area_id);
@@ -319,7 +365,139 @@ impl AtlasCache {
             }
         }
 
+        self.sync_source_areas(area_id, old.as_deref(), old_placement, &area, new_placement);
         self.areas.insert(area_id, area);
+    }
+
+    /// Brings map `map_id`'s source areas in line with `new_map`, its new
+    /// snapshot, placed `new_placement`, replacing `old_map`, placed
+    /// `old_placement`. A source whose area and anchored exits survived the
+    /// rebuild under an unchanged placement costs nothing; a rebuilt one
+    /// has only its changed rooms re-indexed.
+    fn sync_source_areas(
+        &mut self,
+        map_id: AreaId,
+        old_map: Option<&AreaCache>,
+        old_placement: Option<AreaPlacement>,
+        new_map: &AreaCache,
+        new_placement: AreaPlacement,
+    ) {
+        if let Some(layer) = old_map.and_then(AreaCache::map_document_layer) {
+            self.count_anchored_targets(layer.anchored_shared(), false);
+        }
+        if let Some(layer) = new_map.map_document_layer() {
+            self.count_anchored_targets(layer.anchored_shared(), true);
+        }
+        if let (Some(old_map), Some(old_placement)) = (old_map, old_placement) {
+            for layer in old_map.source_layers() {
+                let id = layer.area_id();
+                if old_placement != new_placement || new_map.source_layer(&id).is_none() {
+                    self.remove_source_area(id, old_placement);
+                }
+            }
+        }
+        for layer in new_map.source_layers() {
+            let id = layer.area_id();
+            let next = SourceArea::of(map_id, layer);
+            match self.source_areas.get(&id).cloned() {
+                Some(current) if current.map == map_id => {
+                    self.replace_source_area(id, &current, next, new_placement);
+                }
+                Some(_) => {
+                    // An area id held by another map: the later map wins.
+                    let placement = self.source_placement(&id);
+                    if let Some(placement) = placement {
+                        self.remove_source_area(id, placement);
+                    }
+                    self.add_source_area(id, next, new_placement);
+                }
+                None => self.add_source_area(id, next, new_placement),
+            }
+        }
+    }
+
+    /// The placement `area_id`, a source area, was indexed under: its map's.
+    fn source_placement(&self, area_id: &AreaId) -> Option<AreaPlacement> {
+        let entry = self.source_areas.get(area_id)?;
+        let map = self.areas.get(&entry.map)?;
+        Some(self.placement(&entry.map, map))
+    }
+
+    fn add_source_area(&mut self, id: AreaId, entry: SourceArea, placement: AreaPlacement) {
+        if placement.owned {
+            self.owned_areas.insert(id);
+        } else {
+            self.owned_areas.remove(&id);
+        }
+        for room in entry.area.get_rooms() {
+            self.add_room(id, room, placement);
+        }
+        self.count_anchored_targets(&entry.anchored, true);
+        self.places_ever.insert(id, entry.map);
+        self.source_areas.insert(id, entry);
+    }
+
+    fn remove_source_area(&mut self, id: AreaId, placement: AreaPlacement) {
+        let Some(entry) = self.source_areas.remove(&id) else {
+            return;
+        };
+        for room in entry.area.get_rooms() {
+            self.remove_room(id, room, placement);
+        }
+        self.count_anchored_targets(&entry.anchored, false);
+        self.owned_areas.remove(&id);
+    }
+
+    /// Replaces a source area held under an unchanged placement, editing
+    /// only the entries of rooms whose `Arc` did not survive.
+    fn replace_source_area(
+        &mut self,
+        id: AreaId,
+        current: &SourceArea,
+        next: SourceArea,
+        placement: AreaPlacement,
+    ) {
+        if !Arc::ptr_eq(&current.area, &next.area) {
+            for old_room in current.area.get_rooms() {
+                let survives = next
+                    .area
+                    .get_room(&old_room.get_room_number())
+                    .is_some_and(|new_room| Arc::ptr_eq(old_room, new_room));
+                if !survives {
+                    self.remove_room(id, old_room, placement);
+                }
+            }
+            for new_room in next.area.get_rooms() {
+                let survives = current
+                    .area
+                    .get_room(&new_room.get_room_number())
+                    .is_some_and(|old_room| Arc::ptr_eq(old_room, new_room));
+                if !survives {
+                    self.add_room(id, new_room, placement);
+                }
+            }
+        }
+        if !Arc::ptr_eq(&current.anchored, &next.anchored) {
+            self.count_anchored_targets(&current.anchored, false);
+            self.count_anchored_targets(&next.anchored, true);
+        }
+        self.source_areas.insert(id, next);
+    }
+
+    /// Counts (or uncounts) where a source's anchored exits lead in the
+    /// exit targets. They leave map rooms, so every destination counts,
+    /// the source's own rooms included.
+    fn count_anchored_targets(&mut self, anchored: &AnchoredExits, add: bool) {
+        for key in anchored_target_keys(anchored) {
+            if add {
+                *self.exit_targets.entry(key).or_insert(0) += 1;
+            } else if let Some(count) = self.exit_targets.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.exit_targets.remove(&key);
+                }
+            }
+        }
     }
 
     /// Removes every table entry contributed by this snapshot of the area,
@@ -565,7 +743,23 @@ impl AtlasCache {
     /// areas are omitted (external-id resolution is room identification).
     #[must_use]
     pub fn find_room_by_external_id(&self, external_id: &str) -> Option<(RoomKey, Arc<RoomCache>)> {
-        let key = self.rooms_by_external_id.get(external_id)?.first()?;
+        self.find_room_by_external_id_with(external_id, Sources::Shown)
+    }
+
+    /// [`Self::find_room_by_external_id`] for a caller who sees `sources`:
+    /// without Secrets and Private additions, the first binding outside them
+    /// wins, as it would were they never there.
+    #[must_use]
+    pub fn find_room_by_external_id_with(
+        &self,
+        external_id: &str,
+        sources: Sources,
+    ) -> Option<(RoomKey, Arc<RoomCache>)> {
+        let key = self
+            .rooms_by_external_id
+            .get(external_id)?
+            .iter()
+            .find(|key| self.sees(sources, &key.area_id))?;
         self.get_room(key).map(|room| (key.clone(), room))
     }
 
@@ -578,17 +772,95 @@ impl AtlasCache {
     /// addressable) exactly as before.
     #[must_use]
     pub fn find_room_elsewhere_by_external_id(&self, external_id: &str) -> Option<ElsewhereMatch> {
+        self.find_room_elsewhere_by_external_id_with(external_id, Sources::Shown)
+    }
+
+    /// [`Self::find_room_elsewhere_by_external_id`] for a caller who sees
+    /// `sources`.
+    #[must_use]
+    pub fn find_room_elsewhere_by_external_id_with(
+        &self,
+        external_id: &str,
+        sources: Sources,
+    ) -> Option<ElsewhereMatch> {
         let key = self
             .rooms_by_external_id_excluded
             .get(external_id)?
-            .first()?
+            .iter()
+            .find(|key| self.sees(sources, &key.area_id))?
             .clone();
-        let meta = self.areas.get(&key.area_id).map(|area| area.meta());
+        // A Secret's room is filed where its map is.
+        let meta = self
+            .areas
+            .get(&self.placed_by(&key.area_id))
+            .map(|area| area.meta());
         Some(ElsewhereMatch {
             room_key: key,
             atlas_id: meta.and_then(|m| m.atlas_id),
             atlas_name: meta.and_then(|m| m.atlas_name.clone()),
         })
+    }
+
+    /// Whether a caller who sees `sources` sees area `area_id` at all: a
+    /// Secret's or Private additions' own area is invisible without them.
+    #[must_use]
+    pub fn sees(&self, sources: Sources, area_id: &AreaId) -> bool {
+        sources == Sources::Shown || !self.source_areas.contains_key(area_id)
+    }
+
+    /// The rooms with this title and description whose visible exits leave
+    /// by exactly `directions`, as a caller who sees `sources` reads them.
+    /// Without Secrets, a room's exits into other maps' Secret rooms are no
+    /// exits at all, so its visible exits are the rest.
+    #[must_use]
+    pub fn rooms_by_title_description_and_visible_exits_for(
+        &self,
+        title: &str,
+        description: &str,
+        directions: &[ExitDirection],
+        sources: Sources,
+    ) -> Vec<(AreaId, Arc<RoomCache>)> {
+        if sources == Sources::Shown {
+            return self
+                .get_rooms_by_title_description_and_visible_exits(title, description, directions)
+                .collect();
+        }
+        let wanted = ExitBitfield::from(directions);
+        self.get_rooms_by_title_and_description(title, description)
+            .filter(|(area_id, room)| {
+                self.sees(sources, area_id)
+                    && ExitBitfield::from(
+                        room.get_exits()
+                            .iter()
+                            .filter(|exit| !exit.is_hidden)
+                            .map(|exit| &exit.from_direction),
+                    ) == wanted
+            })
+            .collect()
+    }
+
+    /// Whether the destination of an already readable exit may be followed.
+    /// Exit content belongs to its own source; this check must not hide that
+    /// content merely because its destination is unavailable.
+    #[must_use]
+    pub fn can_follow_exit(&self, sources: Sources, exit: &ExitCache) -> bool {
+        if exit.to_unknown {
+            return false;
+        }
+        if let Some(map) = exit.to_private_map {
+            return sources == Sources::Shown
+                && exit.to_area_id.and_then(|area| self.source_of(&area))
+                    == Some((map, SourceId::Private));
+        }
+        match exit.foreign_secret() {
+            Some((map, secret)) => {
+                sources == Sources::Shown
+                    && self
+                        .source_of(&AreaId(secret))
+                        .is_some_and(|(held, place)| held == map && place.is_secret())
+            }
+            None => exit.to_area_id.is_none_or(|to| self.sees(sources, &to)),
+        }
     }
 
     #[must_use]
@@ -616,7 +888,15 @@ impl AtlasCache {
     #[must_use]
     pub(super) fn delete_area(&self, area_id: AreaId) -> Self {
         let mut next = self.clone();
-        if let Some(area) = next.areas.remove(&area_id) {
+        if let Some(area) = next.areas.get(&area_id).cloned() {
+            let placement = next.placement(&area_id, &area);
+            if let Some(layer) = area.map_document_layer() {
+                next.count_anchored_targets(layer.anchored_shared(), false);
+            }
+            for layer in area.source_layers() {
+                next.remove_source_area(layer.area_id(), placement);
+            }
+            next.areas.remove(&area_id);
             next.remove_area_contribution(area_id, &area);
             next.owned_areas.remove(&area_id);
         }
@@ -637,6 +917,7 @@ impl AtlasCache {
             },
             self.exit_targets.clone(),
         )
+        .remembering_places_of(self)
     }
 
     /// Same areas, different per-server scope-exclusion sets — the manual
@@ -658,16 +939,78 @@ impl AtlasCache {
             },
             self.exit_targets.clone(),
         )
+        .remembering_places_of(self)
     }
 
+    /// This atlas, remembering every place `earlier` remembers as well.
+    fn remembering_places_of(mut self, earlier: &Self) -> Self {
+        self.places_ever = earlier.places_ever.clone().union(self.places_ever);
+        self
+    }
+
+    /// Every map. A map's Secrets and Private additions are reached
+    /// through [`Self::get_area`] and the map's source layers.
     #[must_use]
     pub fn areas(&self) -> impl ExactSizeIterator<Item = Arc<AreaCache>> {
         self.areas.values().cloned()
     }
 
+    /// A map, or a Secret's or Private additions' own area, by id.
     #[must_use]
     pub fn get_area(&self, area_id: &AreaId) -> Option<Arc<AreaCache>> {
-        self.areas.get(area_id).cloned()
+        self.area_ref(area_id).cloned()
+    }
+
+    fn area_ref(&self, area_id: &AreaId) -> Option<&Arc<AreaCache>> {
+        self.areas
+            .get(area_id)
+            .or_else(|| self.source_areas.get(area_id).map(|entry| &entry.area))
+    }
+
+    /// The map `area_id` belongs to: itself for a map, its map for a
+    /// Secret's or Private additions' area. `None` for an id the atlas does
+    /// not hold.
+    #[must_use]
+    pub fn map_of(&self, area_id: &AreaId) -> Option<AreaId> {
+        if self.areas.contains_key(area_id) {
+            return Some(*area_id);
+        }
+        self.source_areas.get(area_id).map(|entry| entry.map)
+    }
+
+    /// The map of `area_id` when it is, or has been, a Secret's or Private
+    /// additions' own area in this atlas or one it was derived from: such an
+    /// area stays a place after it leaves the atlas. `None` for a map and
+    /// for an id never seen as a place.
+    #[must_use]
+    pub fn place_map(&self, area_id: &AreaId) -> Option<AreaId> {
+        self.source_areas
+            .get(area_id)
+            .map(|entry| entry.map)
+            .or_else(|| self.places_ever.get(area_id).copied())
+    }
+
+    /// For a Secret's or Private additions' area, its map and its source.
+    #[must_use]
+    pub fn source_of(&self, area_id: &AreaId) -> Option<(AreaId, SourceId)> {
+        self.source_areas
+            .get(area_id)
+            .map(|entry| (entry.map, entry.source))
+    }
+
+    /// Every map's Secrets and Private additions: each one's map, its
+    /// source, and the area id it reads under.
+    pub(crate) fn source_places(&self) -> impl Iterator<Item = (AreaId, SourceId, AreaId)> + '_ {
+        self.source_areas
+            .iter()
+            .map(|(area_id, entry)| (entry.map, entry.source, *area_id))
+    }
+
+    /// `area_id`'s map when it is a source area, else `area_id` itself.
+    fn placed_by(&self, area_id: &AreaId) -> AreaId {
+        self.source_areas
+            .get(area_id)
+            .map_or(*area_id, |entry| entry.map)
     }
 
     pub fn get_rooms_by_title_description_and_visible_exits<'a>(
@@ -795,34 +1138,18 @@ impl AtlasCache {
     /// room table to maintain.
     #[must_use]
     pub fn get_room(&self, room_key: &RoomKey) -> Option<Arc<RoomCache>> {
-        self.areas
-            .get(&room_key.area_id)?
+        self.area_ref(&room_key.area_id)?
             .get_room(&room_key.room_number)
             .cloned()
     }
 
-    /// The lowest number at or above `from` that no exit anywhere in the atlas
-    /// leads to in `area_id`. A new room at a number an exit names would
-    /// silently become that exit's destination, so allocation passes over the
-    /// named numbers and takes the first one left; an exit naming a number
-    /// far above the area's rooms costs nothing until allocation reaches it.
-    /// Wider than a room number so an exhausted area stays representable.
+    /// One above the highest room of `area_id`, a map or one of a map's
+    /// Secrets or Private additions: where allocation in it starts. Each
+    /// place numbers its own rooms, so an empty one starts at 1. `None` when
+    /// the atlas does not hold `area_id`.
     #[must_use]
-    pub(crate) fn first_unnamed_room_number(&self, area_id: &AreaId, from: i64) -> i64 {
-        let Ok(start) = i32::try_from(from.max(i64::from(i32::MIN))) else {
-            return from;
-        };
-        let mut named = self.numbers_named_in(area_id, RoomNumber(start));
-        named.sort_unstable();
-        named.dedup();
-        let mut number = i64::from(start);
-        for named in named {
-            if i64::from(named.0) != number {
-                break;
-            }
-            number += 1;
-        }
-        number
+    pub(crate) fn room_number_floor(&self, area_id: &AreaId) -> Option<i64> {
+        self.area_ref(area_id).map(|area| area.room_number_floor())
     }
 
     /// The room numbers of `area_id` that an exit somewhere in the atlas
@@ -831,7 +1158,7 @@ impl AtlasCache {
     /// exit.
     #[must_use]
     pub fn vacant_exit_targets(&self, area_id: &AreaId) -> Vec<RoomNumber> {
-        let Some(area) = self.areas.get(area_id) else {
+        let Some(area) = self.area_ref(area_id) else {
             return Vec::new();
         };
         let mut vacant = self.numbers_named_in(area_id, RoomNumber(i32::MIN));
@@ -863,7 +1190,7 @@ impl AtlasCache {
             .range((area_id.0, from)..=(area_id.0, RoomNumber(i32::MAX)))
             .map(|((_, number), _)| *number)
             .collect();
-        if let Some(area) = self.areas.get(area_id) {
+        if let Some(area) = self.area_ref(area_id) {
             named.extend(
                 area.get_rooms()
                     .iter()
@@ -890,7 +1217,7 @@ impl AtlasCache {
     /// for "does this area participate in room identification/routing".
     #[must_use]
     pub fn is_area_enabled(&self, area_id: &AreaId) -> bool {
-        !self.exclusions.disabled.contains(area_id)
+        !self.exclusions.disabled.contains(&self.placed_by(area_id))
     }
 
     /// Whether the area participates in room identification and routing: not
@@ -904,11 +1231,12 @@ impl AtlasCache {
     /// Whether either axis excludes `area_id` from identification/routing. The
     /// atlas axis is resolved by looking the area up to read its `atlas_id`.
     fn area_is_excluded(&self, area_id: &AreaId) -> bool {
-        if self.exclusions.disabled.contains(area_id) || self.exclusions.areas.contains(area_id) {
+        let map_id = self.placed_by(area_id);
+        if self.exclusions.disabled.contains(&map_id) || self.exclusions.areas.contains(&map_id) {
             return true;
         }
         self.areas
-            .get(area_id)
+            .get(&map_id)
             .and_then(|area| area.meta().atlas_id)
             .is_some_and(|atlas| self.exclusions.atlases.contains(&atlas))
     }
@@ -926,7 +1254,77 @@ impl AtlasCache {
     /// scope-excluded or disabled area.
     #[must_use]
     pub(super) fn rebuild_with_areas(&self, areas: HashMap<AreaId, Arc<AreaCache>>) -> Self {
-        Self::new_with_exclusions(areas, self.exclusions.clone())
+        Self::new_with_exclusions(areas, self.exclusions.clone()).remembering_places_of(self)
+    }
+
+    /// Every room one step from `room_key`, with the step's cost: the
+    /// room's own exits and, on a map room, the exits the map's Secrets and
+    /// Private additions keep there. A Secret's rooms lead back into the map
+    /// through their own exits, so routes pass through Secrets like any
+    /// other rooms; an exit into a room of another map's Secret steps into
+    /// that Secret's own area while the atlas holds it ([`Self::can_follow_exit`]).
+    /// With [`Sources::Hidden`] there are no Secrets or Private
+    /// additions at all: no hidden door, and no step into or out of their
+    /// rooms, so routes run as on maps without them.
+    ///
+    /// Excluded areas (manually disabled or per-server scope-excluded, a
+    /// Secret with its map) are walls, not penalties: no step enters one
+    /// unless `open` admits it, as the routing calls admit the maps of the
+    /// rooms a caller named. Own-beats-shared: steps into areas the viewer
+    /// does not own cost [`SHARED_AREA_WEIGHT_PENALTY`] times more, so a
+    /// route only crosses a friend's map when no comparable owned one
+    /// exists.
+    fn successors(
+        &self,
+        room_key: &RoomKey,
+        open: impl Fn(&AreaId) -> bool,
+        sources: Sources,
+    ) -> Vec<(RoomKey, OrderedFloat<f32>)> {
+        let shown = sources == Sources::Shown;
+        if !shown && self.source_areas.contains_key(&room_key.area_id) {
+            return Vec::new();
+        }
+        let Some(area) = self.area_ref(&room_key.area_id) else {
+            return Vec::new();
+        };
+        let Some(room) = area.get_room(&room_key.room_number) else {
+            return Vec::new();
+        };
+        let map = area
+            .map_id()
+            .and_then(|id| self.area_ref(&id))
+            .unwrap_or(area);
+        let layers = if shown { map.source_layers() } else { &[] };
+        let anchored = layers
+            .iter()
+            .chain(map.map_document_layer())
+            .flat_map(|layer| layer.exits_on(room_key).iter());
+        room.get_exits()
+            .iter()
+            .chain(anchored)
+            .filter(|exit| self.can_follow_exit(sources, exit))
+            .filter_map(|exit| {
+                let to = exit.to_area_id.zip(exit.to_room_number)?;
+                Some((RoomKey::new(to.0, to.1), OrderedFloat(exit.weight)))
+            })
+            .filter(|(key, _)| shown || !self.source_areas.contains_key(&key.area_id))
+            .filter(|(key, _)| !self.area_is_excluded(&key.area_id) || open(&key.area_id))
+            .map(|(key, weight)| {
+                if self.owned_areas.contains(&key.area_id) {
+                    (key, weight)
+                } else {
+                    (key, OrderedFloat(weight.0 * SHARED_AREA_WEIGHT_PENALTY))
+                }
+            })
+            .collect()
+    }
+
+    /// Whether `area_id` belongs to the same map as one of `named`'s areas
+    /// (a map and its Secrets count as one): the routing calls keep those
+    /// open through any exclusion.
+    fn shares_a_map(&self, area_id: &AreaId, named: &[&AreaId]) -> bool {
+        let map = self.placed_by(area_id);
+        named.iter().any(|named| self.placed_by(named) == map)
     }
 
     #[must_use]
@@ -935,38 +1333,21 @@ impl AtlasCache {
         from_room_key: &RoomKey,
         to_room_key: &RoomKey,
     ) -> Option<Vec<RoomKey>> {
+        self.get_path_between_rooms_with(from_room_key, to_room_key, Sources::Shown)
+    }
+
+    /// [`Self::get_path_between_rooms`] for a caller who sees `sources`.
+    #[must_use]
+    pub fn get_path_between_rooms_with(
+        &self,
+        from_room_key: &RoomKey,
+        to_room_key: &RoomKey,
+        sources: Sources,
+    ) -> Option<Vec<RoomKey>> {
+        let named = [&from_room_key.area_id, &to_room_key.area_id];
         pathfinding::prelude::dijkstra(
             from_room_key,
-            |room| {
-                let successors = self.get_room(room).map_or_else(Vec::new, |r| {
-                    r.linked_room_keys_and_weights()
-                        .into_iter()
-                        // Excluded areas (manually disabled or per-server
-                        // scope-excluded) are walls, not penalties: never route
-                        // *through* one. Edges into the endpoints' own areas
-                        // stay open so an explicitly named room in an excluded
-                        // area is still reachable (and routable within).
-                        .filter(|(key, _)| {
-                            !self.area_is_excluded(&key.area_id)
-                                || key.area_id == to_room_key.area_id
-                                || key.area_id == from_room_key.area_id
-                        })
-                        // Own-beats-shared: edges into shared areas cost
-                        // SHARED_AREA_WEIGHT_PENALTY times more, so routing
-                        // only crosses into a friend's map when no
-                        // comparable owned route exists.
-                        .map(|(key, weight)| {
-                            if self.owned_areas.contains(&key.area_id) {
-                                (key, weight)
-                            } else {
-                                let penalized = OrderedFloat(weight.0 * SHARED_AREA_WEIGHT_PENALTY);
-                                (key, penalized)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                });
-                successors.into_iter()
-            },
+            |room| self.successors(room, |area| self.shares_a_map(area, &named), sources),
             |room_key| *room_key == *to_room_key,
         )
         .map(|(path, _)| path)
@@ -988,31 +1369,38 @@ impl AtlasCache {
     where
         F: Fn(&RoomCache) -> bool,
     {
+        let named = [&from_room_key.area_id];
         pathfinding::prelude::dijkstra(
             from_room_key,
-            |room| {
-                let successors = self.get_room(room).map_or_else(Vec::new, |r| {
-                    r.linked_room_keys_and_weights()
-                        .into_iter()
-                        .filter(|(key, _)| {
-                            !self.area_is_excluded(&key.area_id)
-                                || key.area_id == from_room_key.area_id
-                        })
-                        .map(|(key, weight)| {
-                            if self.owned_areas.contains(&key.area_id) {
-                                (key, weight)
-                            } else {
-                                (key, OrderedFloat(weight.0 * SHARED_AREA_WEIGHT_PENALTY))
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                });
-                successors.into_iter()
-            },
+            |room| self.successors(room, |area| self.shares_a_map(area, &named), Sources::Shown),
             |room_key| {
                 self.get_room(room_key)
                     .is_some_and(|r| predicate(r.as_ref()))
             },
+        )
+        .and_then(|(path, _cost)| path.last().cloned())
+    }
+
+    /// The nearest reachable room whose key satisfies `predicate`, by the same
+    /// traversal as [`Self::find_nearest_room_with_predicate`] for a caller who
+    /// sees `sources`: a caller that has already looked its candidates up in
+    /// an index names them by key, so the walk tests set membership rather
+    /// than room contents. A key naming no room never matches.
+    #[must_use]
+    pub fn find_nearest_room_where<F>(
+        &self,
+        from_room_key: &RoomKey,
+        sources: Sources,
+        predicate: F,
+    ) -> Option<RoomKey>
+    where
+        F: Fn(&RoomKey) -> bool,
+    {
+        let named = [&from_room_key.area_id];
+        pathfinding::prelude::dijkstra(
+            from_room_key,
+            |room| self.successors(room, |area| self.shares_a_map(area, &named), sources),
+            |room_key| predicate(room_key) && self.get_room(room_key).is_some(),
         )
         .and_then(|(path, _cost)| path.last().cloned())
     }
@@ -1073,28 +1461,21 @@ impl AtlasCache {
         from_room_key: &RoomKey,
         target_area_id: &AreaId,
     ) -> Option<RoomKey> {
+        self.find_nearest_room_in_area_with(from_room_key, target_area_id, Sources::Shown)
+    }
+
+    /// [`Self::find_nearest_room_in_area`] for a caller who sees `sources`.
+    #[must_use]
+    pub fn find_nearest_room_in_area_with(
+        &self,
+        from_room_key: &RoomKey,
+        target_area_id: &AreaId,
+        sources: Sources,
+    ) -> Option<RoomKey> {
+        let named = [&from_room_key.area_id, target_area_id];
         pathfinding::prelude::dijkstra(
             from_room_key,
-            |room| {
-                let successors = self.get_room(room).map_or_else(Vec::new, |r| {
-                    r.linked_room_keys_and_weights()
-                        .into_iter()
-                        .filter(|(key, _)| {
-                            !self.area_is_excluded(&key.area_id)
-                                || key.area_id == *target_area_id
-                                || key.area_id == from_room_key.area_id
-                        })
-                        .map(|(key, weight)| {
-                            if self.owned_areas.contains(&key.area_id) {
-                                (key, weight)
-                            } else {
-                                (key, OrderedFloat(weight.0 * SHARED_AREA_WEIGHT_PENALTY))
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                });
-                successors.into_iter()
-            },
+            |room| self.successors(room, |area| self.shares_a_map(area, &named), sources),
             // Existence-guarded: an exit can dangle into the target area at a
             // room number the cache has never seen; such a key must not "win".
             |room_key| room_key.area_id == *target_area_id && self.get_room(room_key).is_some(),
@@ -1231,14 +1612,46 @@ fn remove_binding(
     }
 }
 
+/// Where a source's anchored exits lead, as [`AtlasCache::exit_targets`]
+/// keys: every destination, the source's own rooms included, since the exits
+/// leave map rooms.
+fn anchored_target_keys(anchored: &AnchoredExits) -> impl Iterator<Item = (Uuid, RoomNumber)> + '_ {
+    anchored.values().flatten().filter_map(|exit| {
+        exit.to_area_id
+            .zip(exit.to_room_number)
+            .map(|(to_area, number)| (to_area.0, number))
+    })
+}
+
+impl SourceArea {
+    fn of(map: AreaId, layer: &crate::mapper::area_cache::SourceLayer) -> Self {
+        Self {
+            map,
+            source: layer.source(),
+            area: layer.area().clone(),
+            anchored: layer.anchored_shared().clone(),
+        }
+    }
+}
+
 /// [`AtlasCache::exit_targets`] for a whole set of areas at once: every key
 /// gathered in one pass, sorted, counted and inserted in key order, which
 /// costs a fraction of counting them one exit at a time into the tree.
 fn count_exit_targets(areas: &HashMap<AreaId, Arc<AreaCache>>) -> OrdMap<(Uuid, RoomNumber), u32> {
     let mut keys: Vec<(Uuid, RoomNumber)> = Vec::new();
     for (area_id, area) in areas {
+        if let Some(layer) = area.map_document_layer() {
+            keys.extend(anchored_target_keys(layer.anchored_shared()));
+        }
         for room in area.get_rooms() {
             keys.extend(AtlasCache::exit_target_keys(*area_id, room));
+        }
+        for layer in area.source_layers() {
+            let source_area_id = layer.area_id();
+            for room in layer.area().get_rooms() {
+                keys.extend(AtlasCache::exit_target_keys(source_area_id, room));
+            }
+            keys.extend(anchored_target_keys(layer.anchored_shared()));
         }
     }
     keys.sort_unstable();
@@ -1298,7 +1711,10 @@ mod tests {
         rooms: Vec<RoomWithDetails>,
     ) -> (AreaId, Arc<AreaCache>) {
         let details = AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: Area {
+                projection_token: None,
                 id,
                 user_id: None,
                 atlas_id: atlas,
@@ -1311,10 +1727,13 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
                 atlas_name: None,
             },
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: Vec::new(),
             rooms,
             labels: Vec::new(),
@@ -1348,7 +1767,6 @@ mod tests {
             properties: Vec::new(),
             exits,
             tags: Default::default(),
-            is_secret: false,
             external_id: None,
         }
     }
@@ -1366,7 +1784,6 @@ mod tests {
                 .map(|(name, value)| crate::Property {
                     name: (*name).to_string(),
                     value: (*value).to_string(),
-                    is_secret: false,
                 })
                 .collect(),
             tags: tags
@@ -1665,6 +2082,7 @@ mod tests {
 
     fn exit(id: u128, to_area: AreaId, to_room: i32, weight: f32) -> Exit {
         Exit {
+            to_source: None,
             id: ExitId(Uuid::from_u128(id)),
             from_direction: crate::ExitDirection::North,
             to_area_id: Some(to_area),
@@ -1672,14 +2090,12 @@ mod tests {
             to_direction: None,
             path: String::new(),
             is_hidden: false,
-            is_closed: false,
-            is_locked: false,
+            door: None,
             weight,
             command: String::new(),
             connection_id: crate::ConnectionId::new(),
             to_unknown: false,
             to_area_token: None,
-            is_secret: false,
         }
     }
 
@@ -1689,7 +2105,10 @@ mod tests {
         rooms: Vec<RoomWithDetails>,
     ) -> (AreaId, Arc<AreaCache>) {
         let details = AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: Area {
+                projection_token: None,
                 id,
                 user_id: None,
                 atlas_id: None,
@@ -1702,10 +2121,13 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
                 atlas_name: None,
             },
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: Vec::new(),
             rooms,
             labels: Vec::new(),
@@ -2638,13 +3060,14 @@ mod tests {
 
     /// A holds rooms 1 and 2, and room 2 has an exit to A 6, which does not
     /// exist. Two of B's exits lead to A 3, one to A 4 and one to A 9, none
-    /// of which exist either. Counting up from A's next number, allocation
-    /// passes over 3, 4, 6 and 9 but takes the free numbers between them,
-    /// whether B is turned off or not, and until the last exit leading to a
-    /// number is gone; an atlas edited room by room holds the same exit
-    /// targets as one built from scratch over its final areas.
+    /// of which exist either. The vacant targets are 3, 4, 6 and 9, whether
+    /// B is turned off or not, until the last exit leading to a number is
+    /// gone, while allocation starts at 3 throughout: a room that goes
+    /// clears the exits into it, so a number no room holds is free. An atlas
+    /// edited room by room holds the same exit targets as one built from
+    /// scratch over its final areas.
     #[test]
-    fn new_room_numbers_pass_over_every_number_an_exit_leads_to() {
+    fn vacant_exit_targets_name_every_number_an_exit_leads_to() {
         let (a_id, b_id) = (area_id(1), area_id(2));
         let (_, a) = cache_area(
             a_id,
@@ -2671,33 +3094,30 @@ mod tests {
         .collect();
 
         let atlas = atlas(areas.clone());
-        assert_eq!(atlas.first_unnamed_room_number(&a_id, 3), 5);
-        assert_eq!(atlas.first_unnamed_room_number(&a_id, 6), 7);
-        assert_eq!(atlas.first_unnamed_room_number(&a_id, 8), 8);
-        assert_eq!(atlas.first_unnamed_room_number(&a_id, 9), 10);
+        assert_eq!(atlas.room_number_floor(&a_id), Some(3));
         assert_eq!(
             atlas.vacant_exit_targets(&a_id),
             vec![RoomNumber(3), RoomNumber(4), RoomNumber(6), RoomNumber(9)]
         );
         assert_eq!(
-            atlas_with_disabled(areas, [b_id]).first_unnamed_room_number(&a_id, 3),
-            5,
+            atlas_with_disabled(areas, [b_id]).vacant_exit_targets(&a_id),
+            vec![RoomNumber(3), RoomNumber(4), RoomNumber(6), RoomNumber(9)],
             "an exit counts in an area that is turned off"
         );
 
         let atlas = atlas.insert_area(b_id, b(vec![exit(10, a_id, 3, 1.0)]));
         assert_eq!(
-            atlas.first_unnamed_room_number(&a_id, 3),
-            4,
+            atlas.vacant_exit_targets(&a_id),
+            vec![RoomNumber(3), RoomNumber(6)],
             "one exit still leads to 3"
         );
         let atlas = atlas.insert_area(b_id, b(vec![exit(13, a_id, 1, 1.0)]));
-        assert_eq!(atlas.first_unnamed_room_number(&a_id, 3), 3);
         assert_eq!(
             atlas.vacant_exit_targets(&a_id),
             vec![RoomNumber(6)],
             "A's own exit still leads to 6"
         );
+        assert_eq!(atlas.room_number_floor(&a_id), Some(3));
         let from_scratch = atlas.rebuild_with_areas(atlas.areas.clone());
         assert_eq!(atlas.exit_targets, from_scratch.exit_targets);
         let toggled = atlas.with_disabled_areas(Arc::new([b_id].into_iter().collect()));
@@ -2767,5 +3187,529 @@ mod tests {
         assert_eq!(bulk.exit_targets.get(&(c_id.0, RoomNumber(1))), Some(&1));
         assert_eq!(bulk.exit_targets.get(&(a_id.0, RoomNumber(1))), None);
         assert_eq!(incremental.exit_targets, bulk.exit_targets);
+    }
+
+    /// A Secret of map `map` holding `rooms`. It keeps an exit on map room
+    /// 1 into its own room 1, and its room 1 leads back to map room 1.
+    fn secret_bundle(
+        map: AreaId,
+        secret: Uuid,
+        rooms: Vec<RoomWithDetails>,
+    ) -> crate::SourceBundle {
+        let source = SourceId::Secret(secret);
+        let rooms = rooms
+            .into_iter()
+            .map(|mut room| {
+                if room.room_number == RoomNumber(1) {
+                    room.exits.push(exit(0x51, map, 1, 1.0));
+                }
+                room
+            })
+            .collect();
+        crate::SourceBundle {
+            source,
+            name: Some("Bookcase".to_string()),
+            ownership: Some("owner".to_string()),
+            clan_id: None,
+            color: None,
+            rev: 1,
+            actions: ["read", "add", "edit", "remove"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            properties: Vec::new(),
+            rooms,
+            room_data: vec![crate::RoomData {
+                room_source: None,
+                room_number: RoomNumber(1),
+                properties: Vec::new(),
+                tags: std::collections::BTreeSet::default(),
+                exits: vec![Exit {
+                    to_source: Some(source),
+                    ..exit(0x50, map, 1, 1.0)
+                }],
+            }],
+            labels: Vec::new(),
+            shapes: Vec::new(),
+            connections: Vec::new(),
+        }
+    }
+
+    /// Map `id`'s document: `rooms`, with `sources` beside them.
+    fn map_details(
+        id: AreaId,
+        owned: bool,
+        rooms: Vec<RoomWithDetails>,
+        sources: Vec<crate::SourceBundle>,
+    ) -> AreaWithDetails {
+        AreaWithDetails {
+            room_data: Vec::new(),
+            sources,
+            area: Area {
+                projection_token: None,
+                id,
+                user_id: None,
+                atlas_id: None,
+                name: format!("area {id}"),
+                created_at: Utc::now(),
+                rev: 1,
+                access: Some(access(owned)),
+                owner_nickname: (!owned).then(|| "friend".to_string()),
+                copied_from_area_id: None,
+                copied_from_rev: None,
+                copied_at: None,
+                family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
+                atlas_name: None,
+            },
+            format_version: crate::AREA_FORMAT_VERSION,
+            properties: Vec::new(),
+            rooms,
+            labels: Vec::new(),
+            shapes: Vec::new(),
+            connections: Vec::new(),
+            linked_areas: Vec::new(),
+        }
+    }
+
+    fn titled(atlas: &AtlasCache, title: &str) -> Vec<(AreaId, i32)> {
+        let mut found = room_numbers(atlas.get_rooms_by_title(title));
+        found.sort_by_key(|(area_id, number)| (area_id.0, *number));
+        found
+    }
+
+    fn with_external_id(mut room: RoomWithDetails, external_id: &str) -> RoomWithDetails {
+        room.external_id = Some(external_id.to_string());
+        room
+    }
+
+    #[test]
+    fn a_secret_is_an_area_of_its_own_and_its_rooms_are_identified() {
+        let map_id = area_id(1);
+        let secret = Uuid::from_u128(0x5ec);
+        let secret_id = AreaId(secret);
+        let details = map_details(
+            map_id,
+            true,
+            vec![room(1, "Library", Vec::new())],
+            vec![secret_bundle(
+                map_id,
+                secret,
+                vec![with_external_id(room(1, "Vault", Vec::new()), "v-1")],
+            )],
+        );
+        let atlas = atlas(HashMap::from([(
+            map_id,
+            Arc::new(AreaCache::new_with_area(details)),
+        )]));
+
+        let (key, room) = atlas
+            .find_room_by_external_id("v-1")
+            .expect("the Secret's room is identified by its external id");
+        assert_eq!(key, RoomKey::new(secret_id, RoomNumber(1)));
+        assert_eq!(room.get_title(), "Vault");
+        assert_eq!(titled(&atlas, "Vault"), vec![(secret_id, 1)]);
+        assert_eq!(atlas.map_of(&secret_id), Some(map_id));
+        assert_eq!(atlas.map_of(&map_id), Some(map_id));
+        assert_eq!(
+            atlas.source_of(&secret_id),
+            Some((map_id, SourceId::Secret(secret)))
+        );
+        let area = atlas.get_area(&secret_id).expect("addressable");
+        assert_eq!(area.get_name(), "Bookcase");
+        assert_eq!(area.map_id(), Some(map_id));
+        assert_eq!(atlas.areas().count(), 1, "areas() lists maps only");
+        assert!(atlas.is_area_owned(&secret_id), "owned with its map");
+        let back = &room.get_exits()[0];
+        assert_eq!(
+            (back.to_area_id, back.to_room_number),
+            (Some(map_id), Some(RoomNumber(1))),
+            "an exit into a map room names the map"
+        );
+        let map = atlas.get_area(&map_id).expect("the map");
+        let door = &map.source_layers()[0].anchored_exits(RoomNumber(1))[0];
+        assert_eq!(
+            (door.to_area_id, door.to_room_number),
+            (Some(secret_id), Some(RoomNumber(1))),
+            "an exit into the Secret's own room names the Secret"
+        );
+    }
+
+    #[test]
+    fn a_turned_off_map_hides_its_secrets() {
+        let map_id = area_id(1);
+        let secret = Uuid::from_u128(0x5ec);
+        let secret_id = AreaId(secret);
+        let details = map_details(
+            map_id,
+            true,
+            vec![room(1, "Library", Vec::new())],
+            vec![secret_bundle(
+                map_id,
+                secret,
+                vec![with_external_id(room(1, "Vault", Vec::new()), "v-1")],
+            )],
+        );
+        let areas = HashMap::from([(map_id, Arc::new(AreaCache::new_with_area(details)))]);
+
+        let off = atlas_with_disabled(areas.clone(), [map_id]);
+        assert!(off.find_room_by_external_id("v-1").is_none());
+        assert!(titled(&off, "Vault").is_empty());
+        assert!(!off.is_area_included(&secret_id));
+        assert!(!off.is_area_enabled(&secret_id));
+        assert!(off.get_area(&secret_id).is_some(), "still addressable");
+
+        let toggled = atlas(areas).with_disabled_areas(Arc::new([map_id].into_iter().collect()));
+        assert!(toggled.find_room_by_external_id("v-1").is_none());
+        let back_on = toggled.with_disabled_areas(Arc::new(HashSet::new()));
+        assert_eq!(titled(&back_on, "Vault"), vec![(secret_id, 1)]);
+    }
+
+    #[test]
+    fn incremental_edits_with_secrets_match_a_full_rebuild() {
+        let (a_id, b_id) = (area_id(1), area_id(2));
+        let secret = Uuid::from_u128(0x5ec);
+        let secret_id = AreaId(secret);
+        let map_rooms = || vec![room(1, "Library", Vec::new()), room(2, "Hall", Vec::new())];
+        let secret_rooms = |second: &str| {
+            vec![
+                with_external_id(room(1, "Vault", Vec::new()), "v-1"),
+                room(2, second, Vec::new()),
+            ]
+        };
+        let cellar = secret_bundle(a_id, secret, secret_rooms("Cellar"));
+        let crypt = secret_bundle(a_id, secret, secret_rooms("Crypt"));
+        let a = |rooms: Vec<RoomWithDetails>,
+                 bundle: &crate::SourceBundle,
+                 previous: Option<&AreaCache>| {
+            Arc::new(AreaCache::for_viewer(
+                map_details(a_id, true, rooms, vec![bundle.clone()]),
+                None,
+                previous,
+            ))
+        };
+        let (_, b) = cache_area(
+            b_id,
+            false,
+            vec![room(5, "Cellar", vec![exit(0x60, secret_id, 2, 1.0)])],
+        );
+
+        let atlas = atlas(HashMap::new())
+            .insert_area(a_id, a(map_rooms(), &cellar, None))
+            .insert_area(b_id, b);
+        // The Secret's room 2 retitled.
+        let previous = atlas.get_area(&a_id).expect("a");
+        let atlas = atlas.insert_area(a_id, a(map_rooms(), &crypt, Some(&previous)));
+        // A map edit leaves the Secret as it was: the same area, unindexed.
+        let before = atlas.get_area(&secret_id).expect("the Secret");
+        let previous = atlas.get_area(&a_id).expect("a");
+        let mut retitled = map_rooms();
+        retitled[1].title = "Great Hall".to_string();
+        let atlas = atlas.insert_area(a_id, a(retitled, &crypt, Some(&previous)));
+        assert!(Arc::ptr_eq(
+            &before,
+            &atlas.get_area(&secret_id).expect("the Secret")
+        ));
+        // A Secret that is gone takes its rooms with it.
+        let previous = atlas.get_area(&a_id).expect("a");
+        let without: Arc<AreaCache> = Arc::new(AreaCache::for_viewer(
+            map_details(a_id, true, map_rooms(), Vec::new()),
+            None,
+            Some(&previous),
+        ));
+        let gone = atlas.insert_area(a_id, without);
+        assert!(gone.get_area(&secret_id).is_none());
+        assert!(gone.find_room_by_external_id("v-1").is_none());
+        assert!(titled(&gone, "Vault").is_empty());
+        assert!(!gone.is_area_owned(&secret_id));
+
+        let rebuilt = atlas.rebuild_with_areas(atlas.areas.clone());
+        for title in ["Library", "Hall", "Great Hall", "Vault", "Cellar", "Crypt"] {
+            assert_eq!(titled(&atlas, title), titled(&rebuilt, title), "{title}");
+        }
+        assert_eq!(titled(&atlas, "Crypt"), vec![(secret_id, 2)]);
+        assert!(titled(&atlas, "Cellar").iter().all(|(id, _)| *id == b_id));
+        assert_eq!(
+            atlas.find_room_by_external_id("v-1").map(|(key, _)| key),
+            rebuilt.find_room_by_external_id("v-1").map(|(key, _)| key)
+        );
+        assert_eq!(atlas.exit_targets, rebuilt.exit_targets);
+        assert_eq!(
+            atlas.exit_targets.get(&(secret_id.0, RoomNumber(2))),
+            Some(&1),
+            "B's exit into the Secret's room 2"
+        );
+        assert_eq!(
+            atlas.exit_targets.get(&(secret_id.0, RoomNumber(1))),
+            Some(&1),
+            "the door on map room 1"
+        );
+        assert_eq!(
+            atlas.exit_targets.get(&(a_id.0, RoomNumber(1))),
+            Some(&1),
+            "the way back"
+        );
+        let deleted = atlas.delete_area(a_id);
+        assert!(deleted.get_area(&secret_id).is_none());
+        assert!(deleted.find_room_by_external_id("v-1").is_none());
+        assert_eq!(
+            deleted.exit_targets,
+            deleted
+                .rebuild_with_areas(deleted.areas.clone())
+                .exit_targets
+        );
+    }
+
+    /// Map rooms 1 and 3 have no exit between them; a Secret's hidden door
+    /// on map room 1 leads into its room 1, whose exit leads on to map room
+    /// 3 (and back to map room 1). The Secret's room 1 is an inn.
+    fn map_with_a_way_through_a_secret(map_id: AreaId, secret: Uuid) -> Arc<AreaCache> {
+        let mut inn = tagged_room(1, "Hidden inn", &[], &["inn"]);
+        inn.exits.push(exit(0x52, map_id, 3, 1.0));
+        Arc::new(AreaCache::new_with_area(map_details(
+            map_id,
+            true,
+            vec![
+                room(1, "Library", Vec::new()),
+                room(3, "Garden", Vec::new()),
+            ],
+            vec![secret_bundle(map_id, secret, vec![inn])],
+        )))
+    }
+
+    #[test]
+    fn routes_pass_through_a_secret_and_find_rooms_in_it() {
+        let map_id = area_id(1);
+        let secret = Uuid::from_u128(0x5ec);
+        let secret_id = AreaId(secret);
+        let areas = HashMap::from([(map_id, map_with_a_way_through_a_secret(map_id, secret))]);
+        let atlas = atlas(areas.clone());
+        let library = RoomKey::new(map_id, RoomNumber(1));
+        let garden = RoomKey::new(map_id, RoomNumber(3));
+        let inn = RoomKey::new(secret_id, RoomNumber(1));
+
+        assert_eq!(
+            atlas.get_path_between_rooms(&library, &garden),
+            Some(vec![library.clone(), inn.clone(), garden.clone()]),
+            "map, then Secret, then map"
+        );
+        assert_eq!(
+            atlas.get_path_between_rooms(&garden, &inn),
+            None,
+            "no way into the Secret from the garden"
+        );
+        assert_eq!(
+            atlas.find_nearest_room_with_tag(&library, "INN"),
+            Some(inn.clone())
+        );
+        assert_eq!(
+            atlas.find_nearest_room_in_area(&library, &secret_id),
+            Some(inn.clone())
+        );
+
+        // A turned-off map is a wall for its Secrets too, but a route a
+        // caller names inside it still runs through them.
+        let other = area_id(2);
+        let (_, outside) = cache_area(
+            other,
+            true,
+            vec![room(1, "Road", vec![exit(0x53, map_id, 1, 1.0)])],
+        );
+        let mut areas = areas;
+        areas.insert(other, outside);
+        let off = atlas_with_disabled(areas, [map_id]);
+        let road = RoomKey::new(other, RoomNumber(1));
+        assert_eq!(off.find_nearest_room_with_tag(&road, "INN"), None);
+        assert_eq!(
+            off.get_path_between_rooms(&road, &garden),
+            Some(vec![road, library, inn, garden])
+        );
+    }
+
+    /// A map snapshot without its Secret takes the Secret's ways with it:
+    /// no route through its door, no room found in it, no number held for
+    /// where its exits led, exactly as if it had never been read.
+    #[test]
+    fn losing_a_secret_takes_its_routes_and_door_targets_with_it() {
+        let map_id = area_id(1);
+        let secret = Uuid::from_u128(0x5ec);
+        let secret_id = AreaId(secret);
+        let with = map_with_a_way_through_a_secret(map_id, secret);
+        let atlas = atlas(HashMap::from([(map_id, with.clone())]));
+        let library = RoomKey::new(map_id, RoomNumber(1));
+        let garden = RoomKey::new(map_id, RoomNumber(3));
+        assert!(atlas.get_path_between_rooms(&library, &garden).is_some());
+        assert!(
+            atlas
+                .exit_targets
+                .keys()
+                .any(|(area, _)| *area == secret_id.0)
+        );
+
+        let without = Arc::new(AreaCache::for_viewer(
+            map_details(
+                map_id,
+                true,
+                vec![
+                    room(1, "Library", Vec::new()),
+                    room(3, "Garden", Vec::new()),
+                ],
+                Vec::new(),
+            ),
+            None,
+            Some(&with),
+        ));
+        let lost = atlas.insert_area(map_id, without.clone());
+        assert_eq!(lost.get_path_between_rooms(&library, &garden), None);
+        assert_eq!(lost.find_nearest_room_with_tag(&library, "INN"), None);
+        assert_eq!(lost.find_nearest_room_in_area(&library, &secret_id), None);
+        assert!(lost.get_area(&secret_id).is_none());
+        assert_eq!(lost.map_of(&secret_id), None);
+        assert!(titled(&lost, "Hidden inn").is_empty());
+        let never = self::atlas(HashMap::from([(map_id, without)]));
+        assert_eq!(lost.exit_targets, never.exit_targets);
+        assert!(
+            !lost
+                .exit_targets
+                .keys()
+                .any(|(area, _)| *area == secret_id.0)
+        );
+        assert_eq!(
+            lost.vacant_exit_targets(&map_id),
+            never.vacant_exit_targets(&map_id)
+        );
+    }
+
+    #[test]
+    fn private_additions_read_under_an_id_of_the_map_and_the_viewer() {
+        let map_id = area_id(1);
+        let private = crate::SourceBundle {
+            source: SourceId::Private,
+            name: None,
+            ..secret_bundle(map_id, Uuid::nil(), vec![room(1, "Nook", Vec::new())])
+        };
+        let read_by = |viewer: u128| {
+            let cache = AreaCache::for_viewer(
+                map_details(map_id, true, Vec::new(), vec![private.clone()]),
+                Some(Uuid::from_u128(viewer)),
+                None,
+            );
+            cache.source_layers()[0].area_id()
+        };
+        assert_eq!(read_by(7), read_by(7), "stable for one viewer");
+        assert_ne!(read_by(7), read_by(8), "different for every viewer");
+        assert_ne!(read_by(7), map_id);
+        assert_eq!(
+            Some(read_by(7)),
+            crate::mapper::area_cache::source_area_id(
+                map_id,
+                SourceId::Private,
+                Some(Uuid::from_u128(7))
+            )
+        );
+    }
+
+    #[test]
+    fn cross_map_private_destinations_dont_route_to_ordinary_rooms_with_the_same_room_number() {
+        let origin = area_id(1);
+        let target = area_id(2);
+        let viewer = Some(Uuid::from_u128(7));
+        let private_id =
+            crate::mapper::area_cache::source_area_id(target, SourceId::Private, viewer).unwrap();
+        let mut private = crate::SourceBundle {
+            source: SourceId::Private,
+            name: None,
+            ..secret_bundle(
+                target,
+                Uuid::nil(),
+                vec![room(1, "Private room", Vec::new())],
+            )
+        };
+        private.room_data.clear();
+        for room in &mut private.rooms {
+            room.exits.clear();
+        }
+        let mut doorway = exit(0xabc, target, 1, 1.0);
+        doorway.to_source = Some(SourceId::Private);
+        doorway.command = "enter".into();
+        let origin_cache = Arc::new(AreaCache::for_viewer(
+            map_details(
+                origin,
+                true,
+                vec![room(1, "Origin", vec![doorway])],
+                Vec::new(),
+            ),
+            viewer,
+            None,
+        ));
+        let target_cache = Arc::new(AreaCache::for_viewer(
+            map_details(
+                target,
+                true,
+                vec![room(1, "Ordinary room", Vec::new())],
+                vec![private],
+            ),
+            viewer,
+            None,
+        ));
+        let atlas = atlas(HashMap::from([
+            (origin, origin_cache),
+            (target, target_cache),
+        ]));
+        let start = RoomKey::new(origin, RoomNumber(1));
+        assert!(
+            atlas
+                .get_path_between_rooms(&start, &RoomKey::new(private_id, RoomNumber(1)))
+                .is_some()
+        );
+        assert!(
+            atlas
+                .get_path_between_rooms(&start, &RoomKey::new(target, RoomNumber(1)))
+                .is_none()
+        );
+        let cached_room = atlas.get_room(&start).unwrap();
+        let cached = &cached_room.get_exits()[0];
+        assert!(!atlas.can_follow_exit(Sources::Hidden, cached));
+        let written = cached.to_exit();
+        assert_eq!(written.to_area_id, Some(target));
+        assert_eq!(written.to_source, Some(SourceId::Private));
+        let edited = crate::ExitUpdates {
+            command: Some("enter quietly".into()),
+            ..Default::default()
+        }
+        .apply(cached);
+        assert_eq!(edited.to_area_id, Some(private_id));
+        assert_eq!(edited.to_exit().to_source, Some(SourceId::Private));
+
+        let mut hidden = written;
+        hidden.to_area_id = None;
+        hidden.to_room_number = None;
+        hidden.to_source = None;
+        hidden.to_unknown = true;
+        let hidden_cache = Arc::new(AreaCache::for_viewer(
+            map_details(
+                origin,
+                true,
+                vec![room(1, "Origin", vec![hidden])],
+                Vec::new(),
+            ),
+            viewer,
+            None,
+        ));
+        let redacted = atlas.insert_area(origin, hidden_cache);
+        assert!(
+            redacted
+                .get_path_between_rooms(&start, &RoomKey::new(private_id, RoomNumber(1)))
+                .is_none()
+        );
+        assert_eq!(
+            redacted.get_room(&start).unwrap().get_exits()[0]
+                .command
+                .as_deref(),
+            Some("enter")
+        );
     }
 }

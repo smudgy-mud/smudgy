@@ -28,25 +28,27 @@
 
 use crate::backends::{
     AreaMergeCommit, AreaMergePlan, AreaMergeSource, MapperBackend, RoomRemap, area_edits,
+    source_document::{EditContext, SourceDocument, exits},
 };
+use crate::cloud_api::{SecretGrant, SecretSummary};
 use crate::error::CloudResult;
 use crate::mapper::area_cache::AreaCache;
 use crate::mapper::exit_cache::ExitCache;
 use crate::mutation::{
-    AreaMutation, MAX_MUTATION_OPERATIONS, MutationEnvelope, OperationId, Precondition,
+    AreaMutation, MAX_MUTATION_OPERATIONS, MoveResult, MutationEnvelope, OperationId, Precondition,
     ResourceKind,
 };
 use crate::{
     Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
     CloudError, CreateAreaRequest, Exit, ExitArgs, ExitId, ExitUpdates, LabelArgs, LabelId,
     LabelUpdates, MapDestination, MapStorage, Property, RoomNumber, RoomUpdates, ShapeArgs,
-    ShapeId, ShapeUpdates,
+    ShapeId, ShapeUpdates, SourceId,
 };
 
 use arc_swap::ArcSwap;
 use log::warn;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,16 +60,22 @@ use uuid::Uuid;
 pub mod area_cache;
 pub mod atlas_cache;
 pub mod exit_cache;
+mod legacy_recovery;
 mod local_projection;
+pub use legacy_recovery::LegacyCloudRecovery;
 mod merge;
 #[cfg(test)]
 use merge::MERGE_DRAIN_TIMEOUT;
 mod projection;
 mod recovery;
+mod secrets;
 use projection::{CommittedChange, MetadataChange};
 use recovery::{MergeRecovery, SessionRecovery};
+pub use secrets::MovedContent;
 pub mod pending;
+pub mod places;
 pub mod room_cache;
+use places::Sources;
 pub mod room_connection;
 pub mod sync_engine;
 pub use atlas_cache::{AtlasCache, ElsewhereMatch};
@@ -116,6 +124,7 @@ impl MutationSubmission {
 #[derive(Debug, Clone)]
 pub struct AreaMutationBatch {
     area_id: AreaId,
+    source: SourceId,
     operations: Vec<AreaMutation>,
     description: String,
     paired_policy: PairedExitPolicy,
@@ -130,10 +139,21 @@ impl AreaMutationBatch {
     ) -> Self {
         Self {
             area_id,
+            source: SourceId::Map,
             operations,
             description: description.into(),
             paired_policy: PairedExitPolicy::Reject,
         }
+    }
+
+    /// The same batch written to another source of the map: one of its
+    /// Secrets, or the caller's Private additions. Operations address that
+    /// source's own rooms with `room_source` and map rooms without it. Only
+    /// cloud maps have other sources.
+    #[must_use]
+    pub fn in_source(mut self, source: SourceId) -> Self {
+        self.source = source;
+        self
     }
 
     /// The staged operations, exposed for envelope-boundary assertions.
@@ -152,10 +172,533 @@ impl AreaMutationBatch {
     ) -> Self {
         Self {
             area_id,
+            source: SourceId::Map,
             operations,
             description: description.into(),
             paired_policy: PairedExitPolicy::Split,
         }
+    }
+}
+
+/// One envelope's worth of a batch after [`resolve_source_batches`], with
+/// the caller's batch it came from.
+struct ResolvedBatch {
+    origin: usize,
+    batch: AreaMutationBatch,
+}
+
+fn refusal(code: &str) -> CloudError {
+    CloudError::InvalidInput(code.to_string())
+}
+
+/// Resolves source-area addresses and routes edits to the existing exit owner.
+/// Creating an exit never gives ownership to its destination. Each attachment
+/// stays in the selected source; its anchor and destination require Read alone.
+fn resolve_source_batches(
+    cache: &AtlasCache,
+    batches: Vec<AreaMutationBatch>,
+) -> CloudResult<Vec<ResolvedBatch>> {
+    let mut resolved = Vec::with_capacity(batches.len());
+    for (origin, batch) in batches.into_iter().enumerate() {
+        let map = cache
+            .source_of(&batch.area_id)
+            .map_or(batch.area_id, |(map, _)| map);
+        let operations = batch
+            .operations
+            .into_iter()
+            .map(|operation| into_source_destination(cache, map, batch.area_id, operation))
+            .collect::<CloudResult<Vec<_>>>()?;
+        let batch = AreaMutationBatch {
+            operations,
+            ..batch
+        };
+        if let Some((map, source)) = cache.source_of(&batch.area_id) {
+            if !batch.source.is_map() && batch.source != source {
+                return Err(CloudError::InvalidInput(
+                    "a write to a Secret's area cannot name another source".to_string(),
+                ));
+            }
+            ensure_writable(cache, map, source, &batch.operations)?;
+            let area = batch.area_id;
+            let operations = batch
+                .operations
+                .into_iter()
+                .map(|operation| {
+                    refuse_other_sources(cache, &operation, Some(source), map)?;
+                    Ok(into_source_addressing(operation, map, area, source))
+                })
+                .collect::<CloudResult<Vec<_>>>()?;
+            refuse_map_rooms_on_link(cache, map, source, &operations)?;
+            resolved.push(ResolvedBatch {
+                origin,
+                batch: AreaMutationBatch {
+                    area_id: map,
+                    source,
+                    operations,
+                    ..batch
+                },
+            });
+        } else if !batch.source.is_map() {
+            ensure_writable(cache, batch.area_id, batch.source, &batch.operations)?;
+            for operation in &batch.operations {
+                refuse_other_sources(cache, operation, Some(batch.source), batch.area_id)?;
+            }
+            refuse_map_rooms_on_link(cache, batch.area_id, batch.source, &batch.operations)?;
+            resolved.push(ResolvedBatch { origin, batch });
+        } else {
+            for operation in &batch.operations {
+                refuse_other_sources(cache, operation, None, batch.area_id)?;
+            }
+            resolved.extend(
+                route_exit_edits(cache, batch)?
+                    .into_iter()
+                    .map(|batch| ResolvedBatch { origin, batch }),
+            );
+        }
+    }
+    Ok(resolved)
+}
+
+/// Refuses a write to `source` of `map` unless the caller holds the action
+/// each of `operations` needs there (`add`, `edit` or `remove`, judged per
+/// operation as the server does). Private additions with no bundle yet
+/// (before their first write) are writable; a Secret with no bundle is one
+/// the caller does not read, or no longer reads, and is refused.
+fn ensure_writable(
+    cache: &AtlasCache,
+    map: AreaId,
+    source: SourceId,
+    operations: &[AreaMutation],
+) -> CloudResult<()> {
+    let Some(area) = cache.get_area(&map) else {
+        return if source == SourceId::Private {
+            Ok(())
+        } else {
+            Err(refusal("secret_unavailable"))
+        };
+    };
+    let Some(bundle) = area
+        .meta()
+        .sources
+        .iter()
+        .find(|bundle| bundle.source == source)
+    else {
+        return if source == SourceId::Private {
+            Ok(())
+        } else {
+            Err(refusal("secret_unavailable"))
+        };
+    };
+    if !["add", "edit", "remove"].iter().any(|act| bundle.can(act)) {
+        return Err(refusal("secret_view_only"));
+    }
+    match operations
+        .iter()
+        .map(AreaMutation::required_action)
+        .find(|action| !bundle.can(action))
+    {
+        None => Ok(()),
+        Some("add") => Err(refusal("secret_cannot_add")),
+        Some("remove") => Err(refusal("secret_cannot_remove")),
+        Some(_) => Err(refusal("secret_cannot_edit")),
+    }
+}
+
+/// Refuses a write of a clan's Secret on a map filed in the clan by link
+/// that touches the map's rooms: data on a map room (properties, tags,
+/// exits from it), or an exit into one. Such a Secret holds only its own
+/// content; the server refuses the rest.
+fn refuse_map_rooms_on_link(
+    cache: &AtlasCache,
+    map: AreaId,
+    source: SourceId,
+    operations: &[AreaMutation],
+) -> CloudResult<()> {
+    if !cache
+        .get_area(&map)
+        .is_some_and(|area| area.keeps_only_own_rooms(source))
+    {
+        return Ok(());
+    }
+    let into_map_room = |to_area: Option<AreaId>, to_source: Option<SourceId>| {
+        to_area.is_none_or(|to| to == map) && to_source.is_none_or(|source| source.is_map())
+    };
+    let touches = operations.iter().any(|operation| match operation {
+        AreaMutation::UpsertRoom { room_source, .. }
+        | AreaMutation::CreateRoom { room_source, .. }
+        | AreaMutation::DeleteRoom { room_source, .. }
+        | AreaMutation::AssertMergeSafe { room_source, .. }
+        | AreaMutation::UpsertRoomProperty { room_source, .. }
+        | AreaMutation::DeleteRoomProperty { room_source, .. }
+        | AreaMutation::AddRoomTag { room_source, .. }
+        | AreaMutation::RemoveRoomTag { room_source, .. } => {
+            room_source.is_none_or(|source| source.is_map())
+        }
+        AreaMutation::CreateExit {
+            room_source, body, ..
+        } => {
+            room_source.is_none_or(|source| source.is_map())
+                || (body.to_room_number.is_some() && into_map_room(body.to_area_id, body.to_source))
+        }
+        AreaMutation::UpdateExit { body, .. } => {
+            body.to_room_number.is_some()
+                && into_map_room(body.to_area_id, body.to_source.flatten())
+        }
+        _ => false,
+    });
+    if touches {
+        Err(refusal("secret_linked_map_rooms"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The sources besides the map whose rooms `operation`, written to map
+/// `map`, names on the wire: a `room_source`, an exit's `to_source` within
+/// the map, a connection endpoint's `source`. A `to_source` with another
+/// map's `to_area_id` names that map's Secret, not one of `map`'s sources.
+fn named_sources(operation: &AreaMutation, map: AreaId) -> Vec<SourceId> {
+    let within = |to_area: Option<AreaId>| to_area.is_none_or(|to| to == map);
+    let mut named = Vec::new();
+    match operation {
+        AreaMutation::UpsertRoom { room_source, .. }
+        | AreaMutation::CreateRoom { room_source, .. }
+        | AreaMutation::DeleteRoom { room_source, .. }
+        | AreaMutation::AssertMergeSafe { room_source, .. }
+        | AreaMutation::UpsertRoomProperty { room_source, .. }
+        | AreaMutation::DeleteRoomProperty { room_source, .. }
+        | AreaMutation::AddRoomTag { room_source, .. }
+        | AreaMutation::RemoveRoomTag { room_source, .. } => named.extend(*room_source),
+        AreaMutation::CreateExit {
+            room_source, body, ..
+        } => {
+            named.extend(*room_source);
+            if within(body.to_area_id) {
+                named.extend(body.to_source);
+            }
+        }
+        AreaMutation::UpdateExit { body, .. } => {
+            if within(body.to_area_id) {
+                named.extend(body.to_source.flatten());
+            }
+        }
+        AreaMutation::CreateConnection { body } => {
+            named.extend(body.endpoint_a.source);
+            named.extend(body.endpoint_b.and_then(|endpoint| endpoint.source));
+        }
+        AreaMutation::UpdateConnection { body, .. } => {
+            for endpoint in body.endpoint_a.iter().chain(body.endpoint_b.iter()) {
+                named.extend(endpoint.source);
+            }
+        }
+        _ => {}
+    }
+    named.retain(|source| !source.is_map());
+    named
+}
+
+/// References can name any readable source, but room fields still belong to
+/// the room's source. An attachment's source owns its properties, tags and links;
+/// naming the anchor does not grant access to edit the anchor room.
+fn refuse_other_sources(
+    cache: &AtlasCache,
+    operation: &AreaMutation,
+    own: Option<SourceId>,
+    map: AreaId,
+) -> CloudResult<()> {
+    let named = named_sources(operation, map);
+    if matches!(
+        operation,
+        AreaMutation::UpsertRoom { .. }
+            | AreaMutation::CreateRoom { .. }
+            | AreaMutation::DeleteRoom { .. }
+            | AreaMutation::AssertMergeSafe { .. }
+    ) && named.iter().any(|source| Some(*source) != own)
+    {
+        return Err(refusal("cannot_edit_other_source_room"));
+    }
+    for source in named {
+        if Some(source) != own
+            && !cache.get_area(&map).is_some_and(|area| {
+                area.meta()
+                    .sources
+                    .iter()
+                    .any(|bundle| bundle.source == source)
+            })
+        {
+            return Err(refusal("referenced_room_unavailable"));
+        }
+    }
+    Ok(())
+}
+
+/// Exit `exit_id` as the cache holds it in area `area_id`: among its rooms'
+/// exits and, on a map, its places' rooms and the exits they keep on its
+/// rooms.
+fn cached_exit(cache: &AtlasCache, area_id: AreaId, exit_id: ExitId) -> Option<ExitCache> {
+    let area = cache.get_area(&area_id)?;
+    let in_rooms = |area: &AreaCache| {
+        area.get_rooms()
+            .iter()
+            .flat_map(|room| room.get_exits().iter())
+            .find(|exit| exit.id == exit_id)
+            .cloned()
+    };
+    in_rooms(&area).or_else(|| {
+        area.document_layer(SourceId::Map)
+            .into_iter()
+            .chain(area.source_layers())
+            .find_map(|layer| {
+                in_rooms(layer.area()).or_else(|| {
+                    layer
+                        .all_anchored_exits()
+                        .flat_map(|(_, exits)| exits.iter())
+                        .find(|exit| exit.id == exit_id)
+                        .cloned()
+                })
+            })
+    })
+}
+
+/// Converts a destination named through a source's virtual area into the
+/// map and source named on the wire. This never changes the exit's owner.
+fn into_source_destination(
+    cache: &AtlasCache,
+    map: AreaId,
+    area_id: AreaId,
+    operation: AreaMutation,
+) -> CloudResult<AreaMutation> {
+    let destination = |to: Option<AreaId>| to.and_then(|to| cache.source_of(&to));
+    Ok(match operation {
+        AreaMutation::CreateExit {
+            room_number,
+            room_source,
+            mut body,
+        } => {
+            if let Some((to_map, secret)) = destination(body.to_area_id) {
+                if body.to_room_number.is_none() {
+                    return Err(refusal("secret_link_into_other_map"));
+                }
+                body.to_area_id = Some(to_map);
+                body.to_source = Some(secret);
+            }
+            AreaMutation::CreateExit {
+                room_number,
+                room_source,
+                body,
+            }
+        }
+        AreaMutation::UpdateExit { exit_id, mut body } => {
+            if let Some((to_map, secret)) = destination(body.to_area_id) {
+                let room = body.to_room_number.or_else(|| {
+                    cached_exit(cache, area_id, exit_id)
+                        .or_else(|| cached_exit(cache, map, exit_id))
+                        .and_then(|exit| exit.to_room_number)
+                });
+                let Some(room) = room else {
+                    return Err(refusal("secret_link_into_other_map"));
+                };
+                body.to_area_id = Some(to_map);
+                body.to_room_number = Some(room);
+                body.to_source = Some(Some(secret));
+            }
+            AreaMutation::UpdateExit { exit_id, body }
+        }
+        other => other,
+    })
+}
+
+/// The source of `map` keeping exit `exit_id` on one of the map's rooms,
+/// with that source's area.
+fn anchored_holder(cache: &AtlasCache, map: AreaId, exit_id: ExitId) -> Option<(SourceId, AreaId)> {
+    let area = cache.get_area(&map)?;
+    area.source_layers()
+        .iter()
+        .find(|layer| {
+            layer
+                .all_anchored_exits()
+                .any(|(_, exits)| exits.iter().any(|exit| exit.id == exit_id))
+        })
+        .map(|layer| (layer.source(), layer.area_id()))
+}
+
+/// Legacy calls can name an existing source-owned exit through its anchor's
+/// map room. Route those edits to the owner by identity; keep new exits in Map.
+fn route_exit_edits(
+    cache: &AtlasCache,
+    batch: AreaMutationBatch,
+) -> CloudResult<Vec<AreaMutationBatch>> {
+    let map = batch.area_id;
+    let mut kept = Vec::with_capacity(batch.operations.len());
+    let mut moved: Vec<(SourceId, Vec<AreaMutation>)> = Vec::new();
+    for operation in batch.operations {
+        let held = match &operation {
+            AreaMutation::UpdateExit { exit_id, .. } | AreaMutation::DeleteExit { exit_id } => {
+                anchored_holder(cache, map, *exit_id)
+            }
+            _ => None,
+        };
+        if let Some((source, _)) = held {
+            match moved.iter_mut().find(|(holder, _)| *holder == source) {
+                Some((_, operations)) => operations.push(operation),
+                None => moved.push((source, vec![operation])),
+            }
+            continue;
+        }
+        kept.push(operation);
+    }
+    let mut batches = Vec::with_capacity(1 + moved.len());
+    for (source, operations) in &moved {
+        ensure_writable(cache, map, *source, operations)?;
+        refuse_map_rooms_on_link(cache, map, *source, operations)?;
+    }
+    if !kept.is_empty() || moved.is_empty() {
+        batches.push(AreaMutationBatch {
+            operations: kept,
+            description: batch.description.clone(),
+            ..batch
+        });
+    }
+    batches.extend(
+        moved
+            .into_iter()
+            .map(|(source, operations)| AreaMutationBatch {
+                area_id: map,
+                source,
+                operations,
+                description: batch.description.clone(),
+                paired_policy: batch.paired_policy,
+            }),
+    );
+    Ok(batches)
+}
+
+/// `operation`, addressed to a source's own area `area` (every room it names
+/// is the source's own, its exits into the source's rooms name `area`), as a
+/// write of `source` on `map`.
+#[allow(clippy::too_many_lines)] // one arm per operation
+fn into_source_addressing(
+    operation: AreaMutation,
+    map: AreaId,
+    area: AreaId,
+    source: SourceId,
+) -> AreaMutation {
+    let own = Some(source);
+    let endpoint = |mut endpoint: crate::ConnectionEndpoint| {
+        // Legacy area addressing defaults an unqualified endpoint to this
+        // source. A retained attachment may explicitly name another source.
+        endpoint.source = endpoint.source.or(own);
+        endpoint
+    };
+    match operation {
+        AreaMutation::UpsertRoom {
+            room_number, body, ..
+        } => AreaMutation::UpsertRoom {
+            room_number,
+            room_source: own,
+            body,
+        },
+        AreaMutation::CreateRoom {
+            room_number, body, ..
+        } => AreaMutation::CreateRoom {
+            room_number,
+            room_source: own,
+            body,
+        },
+        AreaMutation::DeleteRoom { room_number, .. } => AreaMutation::DeleteRoom {
+            room_number,
+            room_source: own,
+        },
+        AreaMutation::AssertMergeSafe {
+            keep_room_number,
+            remove_room_number,
+            ..
+        } => AreaMutation::AssertMergeSafe {
+            keep_room_number,
+            remove_room_number,
+            room_source: own,
+        },
+        AreaMutation::UpsertRoomProperty {
+            room_number,
+            name,
+            value,
+            room_source,
+        } => AreaMutation::UpsertRoomProperty {
+            room_number,
+            room_source: room_source.or(own),
+            name,
+            value,
+        },
+        AreaMutation::DeleteRoomProperty {
+            room_number,
+            name,
+            room_source,
+        } => AreaMutation::DeleteRoomProperty {
+            room_number,
+            room_source: room_source.or(own),
+            name,
+        },
+        AreaMutation::AddRoomTag {
+            room_number,
+            tag,
+            room_source,
+        } => AreaMutation::AddRoomTag {
+            room_number,
+            room_source: room_source.or(own),
+            tag,
+        },
+        AreaMutation::RemoveRoomTag {
+            room_number,
+            tag,
+            room_source,
+        } => AreaMutation::RemoveRoomTag {
+            room_number,
+            room_source: room_source.or(own),
+            tag,
+        },
+        AreaMutation::CreateExit {
+            room_number,
+            mut body,
+            room_source,
+        } => {
+            if body.to_area_id == Some(area) {
+                body.to_area_id = Some(map);
+                body.to_source = own;
+            }
+            AreaMutation::CreateExit {
+                room_number,
+                room_source: room_source.or(own),
+                body,
+            }
+        }
+        AreaMutation::UpdateExit { exit_id, mut body } => {
+            if body.to_area_id == Some(area) {
+                body.to_area_id = Some(map);
+                body.to_source = Some(own);
+            } else if body.to_area_id == Some(map) {
+                body.to_source.get_or_insert(None);
+            }
+            AreaMutation::UpdateExit { exit_id, body }
+        }
+        AreaMutation::CreateConnection { body } => AreaMutation::CreateConnection {
+            body: crate::ConnectionArgs {
+                endpoint_a: endpoint(body.endpoint_a),
+                endpoint_b: body.endpoint_b.map(endpoint),
+                ..body
+            },
+        },
+        AreaMutation::UpdateConnection {
+            connection_id,
+            body,
+        } => AreaMutation::UpdateConnection {
+            connection_id,
+            body: crate::ConnectionUpdates {
+                endpoint_a: body.endpoint_a.map(endpoint),
+                endpoint_b: body.endpoint_b.map(endpoint),
+                ..body
+            },
+        },
+        other => other,
     }
 }
 
@@ -231,11 +774,8 @@ fn normalize_exit_updates(current: &Exit, mut body: ExitUpdates) -> ExitUpdates 
     if body.is_hidden == Some(current.is_hidden) {
         body.is_hidden = None;
     }
-    if body.is_closed == Some(current.is_closed) {
-        body.is_closed = None;
-    }
-    if body.is_locked == Some(current.is_locked) {
-        body.is_locked = None;
+    if body.door.as_ref() == Some(&current.door) {
+        body.door = None;
     }
     if body.weight == Some(current.weight) {
         body.weight = None;
@@ -243,15 +783,13 @@ fn normalize_exit_updates(current: &Exit, mut body: ExitUpdates) -> ExitUpdates 
     if body.command.as_deref() == Some(current.command.as_str()) {
         body.command = None;
     }
-    if body.is_secret == Some(current.is_secret) {
-        body.is_secret = None;
-    }
 
     if body.clear_to == Some(true) {
         // `clear_to` wins over every supplied destination field.
         body.to_area_id = None;
         body.to_room_number = None;
         body.to_direction = None;
+        body.to_source = None;
         if current.to_area_id.is_none()
             && current.to_room_number.is_none()
             && current.to_direction.is_none()
@@ -261,14 +799,41 @@ fn normalize_exit_updates(current: &Exit, mut body: ExitUpdates) -> ExitUpdates 
         }
     } else {
         body.clear_to = None;
-        if body.to_area_id == current.to_area_id {
+        // A room number is kept while the destination changes place, since
+        // only the whole of `to_area_id`, `to_room_number` and `to_source`
+        // says which room it names.
+        let area_changes = body
+            .to_area_id
+            .is_some_and(|area| Some(area) != current.to_area_id);
+        let source_changes = body
+            .to_source
+            .is_some_and(|source| source != current.to_source);
+        if !area_changes {
             body.to_area_id = None;
         }
-        if body.to_room_number == current.to_room_number {
+        if !area_changes && !source_changes && body.to_room_number == current.to_room_number {
             body.to_room_number = None;
+        }
+        if !source_changes {
+            body.to_source = None;
         }
         if body.to_direction == current.to_direction {
             body.to_direction = None;
+        }
+        // An absent `to_source` keeps the destination's source, so leaving
+        // a room of another map's Secret for anywhere else names a map room
+        // explicitly.
+        if area_changes
+            && body.to_source.is_none()
+            && (current.foreign_secret().is_some() || current.to_source == Some(SourceId::Private))
+        {
+            body.to_source = Some(None);
+        }
+        // A `to_source` naming another map's Secret travels with its map and
+        // room.
+        if let Some(Some(SourceId::Secret(_) | SourceId::Private)) = body.to_source {
+            body.to_area_id = body.to_area_id.or(current.to_area_id);
+            body.to_room_number = body.to_room_number.or(current.to_room_number);
         }
     }
 
@@ -281,18 +846,19 @@ fn exit_updates_are_empty(body: &ExitUpdates) -> bool {
         && body.to_room_number.is_none()
         && body.to_direction.is_none()
         && body.path.is_none()
+        && body.to_source.is_none()
         && body.is_hidden.is_none()
-        && body.is_closed.is_none()
-        && body.is_locked.is_none()
+        && body.door.is_none()
         && body.weight.is_none()
         && body.command.is_none()
-        && body.is_secret.is_none()
         && body.clear_to.is_none()
 }
 
-fn exit_topology_changed(current: &Exit, updated: &ExitCache) -> bool {
+fn exit_topology_changed(current: &ExitCache, updated: &ExitCache) -> bool {
     current.from_direction != updated.from_direction
         || current.to_area_id != updated.to_area_id
+        || current.to_secret_map != updated.to_secret_map
+        || current.to_private_map != updated.to_private_map
         || current.to_room_number != updated.to_room_number
         || current.to_direction != updated.to_direction
         || current.to_unknown != updated.to_unknown
@@ -309,18 +875,21 @@ fn exit_topology_changed(current: &Exit, updated: &ExitCache) -> bool {
 /// it. Compiling in place (rather than against a scratch clone) is what
 /// keeps relocation-scale batch staging from copying the whole document per
 /// envelope.
-fn compile_area_mutations(
+fn compile_source_mutations(
     details: &mut AreaWithDetails,
     operations: Vec<AreaMutation>,
     paired_policy: PairedExitPolicy,
+    context: &EditContext,
 ) -> CloudResult<Vec<AreaMutation>> {
     let mut compiled = Vec::with_capacity(operations.len());
 
-    for operation in operations {
+    for mut operation in operations {
+        canonicalize_map_sources(&mut operation);
         let expanded = match operation {
             AreaMutation::CreateExit {
                 room_number,
                 mut body,
+                room_source,
             } => {
                 let exit_id = body.id.unwrap_or_else(ExitId::new);
                 body.id = Some(exit_id);
@@ -331,17 +900,17 @@ fn compile_area_mutations(
                     // The server must never independently mint the identity
                     // of a Connection the durable client already references.
                     let mut preview = details.clone();
-                    area_edits::apply_mutation(
+                    area_edits::apply_mutation_in(
                         &mut preview,
                         &AreaMutation::CreateExit {
+                            room_source,
                             room_number,
                             body: body.clone(),
                         },
+                        context,
                     )?;
-                    let resolved_connection_id = preview
-                        .rooms
-                        .iter()
-                        .flat_map(|room| room.exits.iter())
+                    let resolved_connection_id = exits(&preview, context.source)
+                        .map(|(_, exit)| exit)
                         .find(|exit| exit.id == exit_id)
                         .map(|exit| exit.connection_id)
                         .ok_or(CloudError::ExitNotFound(exit_id))?;
@@ -356,13 +925,15 @@ fn compile_area_mutations(
                     }
                 }
 
-                vec![AreaMutation::CreateExit { room_number, body }]
+                vec![AreaMutation::CreateExit {
+                    room_source,
+                    room_number,
+                    body,
+                }]
             }
             AreaMutation::UpdateExit { exit_id, body } => {
-                let current = details
-                    .rooms
-                    .iter()
-                    .flat_map(|room| room.exits.iter())
+                let current = exits(details, context.source)
+                    .map(|(_, exit)| exit)
                     .find(|exit| exit.id == exit_id)
                     .cloned()
                     .ok_or(CloudError::ExitNotFound(exit_id))?;
@@ -370,12 +941,11 @@ fn compile_area_mutations(
                 if exit_updates_are_empty(&body) {
                     Vec::new()
                 } else {
-                    let updated = body.clone().apply(&ExitCache::from(current.clone()));
-                    let topology_changed = exit_topology_changed(&current, &updated);
-                    let member_count = details
-                        .rooms
-                        .iter()
-                        .flat_map(|room| room.exits.iter())
+                    let cached = ExitCache::from(current.clone());
+                    let updated = body.clone().apply(&cached);
+                    let topology_changed = exit_topology_changed(&cached, &updated);
+                    let member_count = exits(details, context.source)
+                        .map(|(_, exit)| exit)
                         .filter(|exit| exit.connection_id == current.connection_id)
                         .count();
                     if topology_changed && member_count == 2 {
@@ -402,12 +972,65 @@ fn compile_area_mutations(
         };
 
         for operation in expanded {
-            area_edits::apply_mutation(details, &operation)?;
+            area_edits::apply_mutation_in(details, &operation, context)?;
             compiled.push(operation);
         }
     }
 
     Ok(compiled)
+}
+
+/// Keep the established wire spelling: an omitted source denotes Map.
+/// This changes no room identity, number, or content ownership.
+fn canonicalize_map_sources(operation: &mut AreaMutation) {
+    let canonicalize = |source: &mut Option<SourceId>| {
+        if *source == Some(SourceId::Map) {
+            *source = None;
+        }
+    };
+    match operation {
+        AreaMutation::UpsertRoom { room_source, .. }
+        | AreaMutation::CreateRoom { room_source, .. }
+        | AreaMutation::DeleteRoom { room_source, .. }
+        | AreaMutation::AssertMergeSafe { room_source, .. }
+        | AreaMutation::UpsertRoomProperty { room_source, .. }
+        | AreaMutation::DeleteRoomProperty { room_source, .. }
+        | AreaMutation::AddRoomTag { room_source, .. }
+        | AreaMutation::RemoveRoomTag { room_source, .. }
+        | AreaMutation::CreateExit { room_source, .. } => canonicalize(room_source),
+        _ => {}
+    }
+    match operation {
+        AreaMutation::CreateExit { body, .. } => canonicalize(&mut body.to_source),
+        AreaMutation::UpdateExit { body, .. } => {
+            if let Some(source) = &mut body.to_source {
+                canonicalize(source);
+            }
+        }
+        AreaMutation::CreateConnection { body } => {
+            canonicalize(&mut body.endpoint_a.source);
+            if let Some(endpoint) = &mut body.endpoint_b {
+                canonicalize(&mut endpoint.source);
+            }
+        }
+        AreaMutation::UpdateConnection { body, .. } => {
+            for endpoint in [&mut body.endpoint_a, &mut body.endpoint_b]
+                .into_iter()
+                .flatten()
+            {
+                canonicalize(&mut endpoint.source);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compile_area_mutations(
+    details: &mut AreaWithDetails,
+    operations: Vec<AreaMutation>,
+    paired_policy: PairedExitPolicy,
+) -> CloudResult<Vec<AreaMutation>> {
+    compile_source_mutations(details, operations, paired_policy, &EditContext::default())
 }
 
 fn same_exit_destination(left: &Exit, right: &Exit) -> bool {
@@ -425,6 +1048,7 @@ fn merge_room_operations(
     details: &AreaWithDetails,
     keep_room_number: RoomNumber,
     remove_room_number: RoomNumber,
+    sources: Sources,
 ) -> CloudResult<Vec<AreaMutation>> {
     if keep_room_number == remove_room_number {
         return Err(CloudError::InvalidInput(
@@ -442,11 +1066,11 @@ fn merge_room_operations(
         .iter()
         .find(|room| room.room_number == remove_room_number)
         .ok_or_else(|| CloudError::RoomNotFound(RoomKey::new(area_id, remove_room_number)))?;
-    if remove
-        .exits
-        .iter()
-        .any(|exit| exit.to_area_id.is_some_and(|target| target != area_id))
-    {
+    // An exit into another map's Secret room goes with the room on the
+    // server and never refuses a merge; the merge carries it over.
+    if remove.exits.iter().any(|exit| {
+        exit.foreign_secret().is_none() && exit.to_area_id.is_some_and(|target| target != area_id)
+    }) {
         return Err(CloudError::StructuralConflict(
             "merge_cross_area_links".to_string(),
         ));
@@ -456,15 +1080,21 @@ fn merge_room_operations(
             "cannot merge a room whose exits include a redacted destination".to_string(),
         ));
     }
-
-    let can_set_secrets =
-        details.area.effective_access().is_owner || details.area.effective_access().include_secrets;
-    if !can_set_secrets {
-        return Err(CloudError::InvalidInput(
-            "room merge requires a full secret-cleared area projection".to_string(),
-        ));
+    // Deleting the removed room would delete what each of the map's other
+    // sources keeps on it, or leave its exits into the room dangling. To a
+    // caller who does not see those sources the map has none: the server
+    // takes their data with the room, as it does for anyone who cannot read
+    // them, and a refusal here would tell of them.
+    if sources == Sources::Shown
+        && details.sources.iter().any(|bundle| {
+            crate::backends::source_document::mentions_map_room(bundle, area_id, remove_room_number)
+        })
+    {
+        return Err(CloudError::SecretKeepsRoomData(remove_room_number));
     }
+
     let mut operations = vec![AreaMutation::AssertMergeSafe {
+        room_source: None,
         keep_room_number,
         remove_room_number,
     }];
@@ -547,21 +1177,22 @@ fn merge_room_operations(
                 body: ExitUpdates {
                     to_area_id: exit.to_area_id,
                     to_room_number: exit.to_room_number,
+                    to_source: exit.to_source.map(Some),
                     to_direction: exit.to_direction,
                     path: Some(exit.path.clone()),
                     is_hidden: Some(exit.is_hidden),
-                    is_closed: Some(exit.is_closed),
-                    is_locked: Some(exit.is_locked),
+                    door: Some(exit.door.clone()),
                     weight: Some(exit.weight),
                     command: Some(exit.command.clone()),
-                    is_secret: can_set_secrets.then_some(exit.is_secret),
                     ..ExitUpdates::default()
                 },
             });
         } else {
             operations.push(AreaMutation::CreateExit {
+                room_source: None,
                 room_number: keep_room_number,
                 body: ExitArgs {
+                    to_source: exit.to_source,
                     id: Some(ExitId(Uuid::new_v4())),
                     connection_id: None,
                     new_connection_id: None,
@@ -571,17 +1202,16 @@ fn merge_room_operations(
                     to_direction: exit.to_direction,
                     path: Some(exit.path.clone()),
                     is_hidden: exit.is_hidden,
-                    is_closed: exit.is_closed,
-                    is_locked: exit.is_locked,
+                    door: exit.door.clone(),
                     weight: exit.weight,
                     command: Some(exit.command.clone()),
-                    is_secret: can_set_secrets.then_some(exit.is_secret),
                 },
             });
         }
         planned_outgoing.push(exit.clone());
     }
     operations.push(AreaMutation::DeleteRoom {
+        room_source: None,
         room_number: remove_room_number,
     });
     Ok(operations)
@@ -594,19 +1224,46 @@ fn merge_room_operations(
 ///   [`crate::backends::local_migration::LegacyAreaV1`] DTO and migrated by
 ///   [`crate::backends::local_migration::migrate_v1`] (which reports
 ///   reciprocal-looking pairs that stayed one-way through the log channel);
-/// - **2** — taken verbatim ([`Mapper::import_areas`] still runs the
+/// - **2** — doorless, migrated by
+///   [`crate::backends::local_migration::migrate_doorless`];
+/// - **3** — taken verbatim ([`Mapper::import_areas`] still runs the
 ///   invariant checks before any write);
 /// - **newer** — rejected outright, without a partial import.
 ///
 /// The v2 types themselves never tolerate v1 input; this wrapper is the one
 /// place the two formats meet.
 #[derive(Debug, Clone)]
-pub struct AreaImportDocument(pub AreaWithDetails);
+pub struct AreaImportDocument(pub AreaWithDetails, Option<BTreeSet<RoomNumber>>);
 
 impl AreaImportDocument {
     #[must_use]
     pub fn into_inner(self) -> AreaWithDetails {
         self.0
+    }
+
+    /// Resolve legacy cross-map room addresses before freshening an import
+    /// set. Current-format documents already name the destination source.
+    #[must_use]
+    pub fn into_documents(documents: Vec<Self>) -> Vec<AreaWithDetails> {
+        let aliases = documents
+            .iter()
+            .flat_map(|document| {
+                document
+                    .1
+                    .iter()
+                    .flatten()
+                    .map(|number| (document.0.area.id, *number))
+            })
+            .collect();
+        documents
+            .into_iter()
+            .map(|mut document| {
+                if document.1.is_some() {
+                    crate::backends::local_privacy::qualify_legacy_exits(&mut document.0, &aliases);
+                }
+                document.0
+            })
+            .collect()
     }
 }
 
@@ -620,15 +1277,30 @@ impl<'de> serde::Deserialize<'de> for AreaImportDocument {
         let version = value
             .get("format_version")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1);
+            .map_or(Ok(1), u32::try_from)
+            .map_err(D::Error::custom)?;
         match version {
             1 => {
+                let privacy = crate::backends::local_privacy::LegacyPrivacy::read(&value)
+                    .map_err(D::Error::custom)?;
                 let legacy: crate::backends::local_migration::LegacyAreaV1 =
                     serde_json::from_value(value).map_err(D::Error::custom)?;
-                Ok(Self(crate::backends::local_migration::migrate_v1(legacy)))
+                let mut details = crate::backends::local_migration::migrate_v1(legacy);
+                privacy.apply(&mut details);
+                Ok(Self(details, Some(privacy.private_rooms())))
             }
-            2 => serde_json::from_value(value)
-                .map(Self)
+            crate::backends::local_migration::DOORLESS_FORMAT_VERSION => {
+                let privacy = crate::backends::local_privacy::LegacyPrivacy::read(&value)
+                    .map_err(D::Error::custom)?;
+                crate::backends::local_migration::migrate_doorless(value)
+                    .map(|details| Self(details, Some(privacy.private_rooms())))
+                    .map_err(D::Error::custom)
+            }
+            crate::AREA_FORMAT_VERSION => serde_json::from_value(value)
+                .map(|mut details: AreaWithDetails| {
+                    crate::backends::local_migration::clamp_doors(&mut details.rooms);
+                    Self(details, None)
+                })
                 .map_err(D::Error::custom),
             newer => Err(D::Error::custom(format!(
                 "area document format v{newer} is newer than this client \
@@ -959,6 +1631,7 @@ impl AreaMoveFence {
 pub struct Mapper {
     inner: Arc<Inner>,
 }
+
 pub struct Inner {
     atlas_id: ArcSwap<Option<AtlasId>>,
     atlas_cache: ArcSwap<AtlasCache>,
@@ -968,6 +1641,9 @@ pub struct Inner {
     /// Cloud atlas ids are not represented in the area cache, so absence from
     /// the local-id set alone cannot prove that an arbitrary id is cloud-owned.
     atlas_storage_by_id: Mutex<HashMap<AtlasId, MapStorage>>,
+    /// The clan of each clan folder in the last atlas inventory, so a map
+    /// created in one is created in the clan.
+    atlas_clan_by_id: Mutex<HashMap<AtlasId, Uuid>>,
     /// Serializes authoritative atlas listings with direct atlas mutations so
     /// a list snapshot cannot erase a concurrently-created id from the tier map.
     atlas_catalog_gate: tokio::sync::Mutex<()>,
@@ -1174,9 +1850,10 @@ impl Mapper {
         } else {
             SyncState::Disabled
         };
-        let pending = Arc::new(PendingQueue::with_journal_namespace(
+        let pending = Arc::new(PendingQueue::with_recovery_cache(
             journal_dir.into(),
             journal_namespace,
+            Some(cache_dir.clone()),
         ));
         let recovered_local = pending.recovered_local_operations();
         let mut pending_by_area = HashMap::new();
@@ -1195,6 +1872,7 @@ impl Mapper {
             atlas_cache: ArcSwap::from_pointee(cache),
             backend,
             atlas_storage_by_id: Mutex::new(HashMap::new()),
+            atlas_clan_by_id: Mutex::new(HashMap::new()),
             atlas_catalog_gate: tokio::sync::Mutex::new(()),
             sync_stats,
             sync_status: ArcSwap::from_pointee(SyncStatus {
@@ -1431,6 +2109,18 @@ impl Mapper {
         self.inner.create_area_at(name, destination)
     }
 
+    /// [`Self::create_area_at`] in a clan's folder, with whose the new map
+    /// is: Clan-owned (the server's default), or Member-owned with the
+    /// caller its first owner, which needs `area.create_member_owned` there.
+    pub fn create_clan_area_at(
+        &self,
+        name: String,
+        destination: MapDestination,
+        ownership: crate::clan_maps::MapOwnership,
+    ) -> impl Future<Output = CloudResult<AreaId>> {
+        self.inner.create_clan_area_at(name, destination, ownership)
+    }
+
     /// [`Self::create_area_at`] for an area that starts with `properties`,
     /// all or nothing. Local and session areas are written with them, so the
     /// area never exists without them. A cloud area is created first and then
@@ -1479,15 +2169,18 @@ impl Mapper {
     }
 
     /// The next free room number for an area: the lowest number above the
-    /// area's highest room that no open scripted mutator has reserved and no
-    /// exit anywhere in the atlas leads to. Every ambient creation path
-    /// (script `createRoom`, the map editor's place/paste gestures) must
-    /// allocate through this rather than the raw cache maximum, or a
-    /// concurrent mutator draft and the ambient create would silently merge
-    /// into one room, and a new room could silently become the destination
-    /// of an exit that named a deleted one. Returns `None` when the area is
+    /// area's highest room that no open scripted mutator has reserved. Every
+    /// ambient creation path (script `createRoom`, the map editor's
+    /// place/paste gestures) must allocate through this rather than the raw
+    /// cache maximum, or a concurrent mutator draft and the ambient create
+    /// would silently merge into one room. Returns `None` when the area is
     /// not loaded or has no room number left; [`Self::try_next_room_number`]
-    /// tells the two apart.
+    /// tells the two apart. Each place of a cloud map numbers its own rooms:
+    /// the map, each Secret and the Private additions each start at 1, and
+    /// one place never passes over another's numbers. No exit names a number
+    /// its place does not hold (a room that goes clears every exit into it,
+    /// map wire format 3 §4.2), so a number above the highest room is free
+    /// and a new room under it starts with no links into it.
     #[must_use]
     pub fn next_room_number(&self, area_id: &AreaId) -> Option<RoomNumber> {
         self.try_next_room_number(area_id).ok()
@@ -1501,25 +2194,22 @@ impl Mapper {
     pub fn try_next_room_number(&self, area_id: &AreaId) -> CloudResult<RoomNumber> {
         let cache = self.inner.atlas_cache.load();
         let floor = cache
-            .get_area(area_id)
-            .ok_or(CloudError::AreaNotFound(*area_id))?
-            .room_number_floor();
+            .room_number_floor(area_id)
+            .ok_or(CloudError::AreaNotFound(*area_id))?;
         let from = self
             .inner
             .room_reservations
             .lock()
             .get(area_id)
             .map_or(floor, |state| floor.max(state.floor));
-        room_number_within_range(cache.first_unnamed_room_number(area_id, from))
+        room_number_within_range(from)
     }
 
     /// Reserve the next free room number for an open scripted mutator.
     /// The number is provisional: no room exists until the mutator's batch
     /// commits, but ambient allocation skips it until every reservation
     /// held under `token` is released. Releasing without committing (an
-    /// aborted mutator) returns the numbers to the allocator. Like
-    /// [`Self::next_room_number`], it never hands out a number an exit
-    /// leads to.
+    /// aborted mutator) returns the numbers to the allocator.
     ///
     /// # Errors
     /// [`CloudError::AreaNotFound`] when the area is not loaded.
@@ -1527,14 +2217,12 @@ impl Mapper {
     pub fn reserve_room_number(&self, area_id: &AreaId, token: Uuid) -> CloudResult<RoomNumber> {
         let cache = self.inner.atlas_cache.load();
         let floor = cache
-            .get_area(area_id)
-            .ok_or(CloudError::AreaNotFound(*area_id))?
-            .room_number_floor();
+            .room_number_floor(area_id)
+            .ok_or(CloudError::AreaNotFound(*area_id))?;
         let mut reservations = self.inner.room_reservations.lock();
-        let from = reservations
+        let number = reservations
             .get(area_id)
             .map_or(floor, |state| floor.max(state.floor));
-        let number = cache.first_unnamed_room_number(area_id, from);
         let allocated = room_number_within_range(number)?;
         let state = reservations.entry(*area_id).or_default();
         state.floor = number + 1;
@@ -1617,6 +2305,9 @@ impl Mapper {
     /// per-area loads could interleave with concurrent edits and produce a
     /// mutually inconsistent snapshot set.
     pub(crate) fn snapshot_areas(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaWithDetails>> {
+        for area_id in area_ids {
+            self.inner.refuse_source_area(*area_id)?;
+        }
         let cache = self.inner.atlas_cache.load();
         area_ids
             .iter()
@@ -1725,6 +2416,7 @@ impl Mapper {
         name: &str,
         atlas_id: Option<AtlasId>,
     ) -> CloudResult<Option<Area>> {
+        self.inner.refuse_source_area(source)?;
         self.inner
             .backend
             .copy_cloud_area(&source, name, atlas_id)
@@ -1788,11 +2480,76 @@ impl Mapper {
             .await
     }
 
+    pub(crate) async fn local_move_reviews(
+        &self,
+        area_ids: &[AreaId],
+    ) -> CloudResult<Vec<crate::relocation::LocalMoveReview>> {
+        let generation = self.inner.backend.auth_generation();
+        let mut reviews = Vec::new();
+        for area_id in area_ids {
+            if self.area_storage(area_id) != crate::MapStorage::Cloud {
+                continue;
+            }
+            let mut review = self
+                .inner
+                .backend
+                .review_local_move(area_id, generation)
+                .await?;
+            review.auth_generation = generation;
+            reviews.push(review);
+        }
+        Ok(reviews)
+    }
+
+    pub(crate) fn local_move_generation(&self) -> u64 {
+        self.inner.backend.auth_generation()
+    }
+
+    pub(crate) async fn finish_local_atlas_move(
+        &self,
+        atlas_id: AtlasId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let _gate = self.inner.atlas_catalog_gate.lock().await;
+        self.inner
+            .backend
+            .finish_local_atlas_move(&atlas_id, auth_generation)
+            .await?;
+        self.inner
+            .publish_committed(CommittedChange::DeleteAtlas(atlas_id), false)
+            .await;
+        self.inner.atlas_storage_by_id.lock().remove(&atlas_id);
+        Ok(())
+    }
+
+    pub(crate) async fn commit_local_area_move(
+        &self,
+        fence: AreaMoveFence,
+        guard: &crate::relocation::LocalMoveGuard,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let area_id = fence.area_id();
+        self.inner
+            .delete_area_with_fence_at_generation(
+                area_id,
+                fence.into_delete_fence(),
+                Some(auth_generation),
+                None,
+                Some(guard),
+            )
+            .await
+    }
+
     /// The last backend-acknowledged revision for an area, when one is
     /// known. Optimistic cache revisions (which run ahead while envelopes
     /// are queued) never surface here.
     pub(crate) fn confirmed_area_rev(&self, area_id: AreaId) -> Option<i64> {
-        self.inner.pending.confirmed_rev(area_id).0
+        self.inner.pending.confirmed_rev(area_id)
+    }
+
+    /// [`Self::confirmed_area_rev`] for any source of the map.
+    pub(crate) fn confirmed_source_rev(&self, area_id: AreaId, source: SourceId) -> Option<i64> {
+        self.inner.pending.confirmed_source_rev(area_id, source)
     }
 
     /// The viewer's effective access for an area, or `None` if it isn't in the current atlas.
@@ -1806,16 +2563,13 @@ impl Mapper {
     }
 
     /// Load startup maps once, sharing work with scripts that await readiness.
-    /// Explicit `load_all_areas` calls still load again.
+    /// An incomplete load fails within 30 seconds; background cloud sync can
+    /// still populate the cache. Explicit `load_all_areas` calls load again.
     ///
     /// # Errors
     /// Returns the initial map load error.
     pub async fn load_initial_areas(&self) -> CloudResult<LoadMapsSummary> {
-        let _gate = self.inner.load_gate.lock().await;
-        if let Some(Ok(summary)) = self.inner.initial_load.borrow().as_ref() {
-            return Ok(summary.clone());
-        }
-        self.inner.load_areas().await
+        self.inner.load_initial_areas(Duration::from_secs(30)).await
     }
 
     /// Wait for initial loading and make current local changes visible here.
@@ -1880,8 +2634,6 @@ impl Mapper {
     /// - `merge_areas_unsupported_storage`: the areas are cloud areas.
     /// - `merge_areas_mixed_tiers`: the touched areas do not all live in
     ///   one storage tier.
-    /// - `merge_requires_full_projection`: a touched area is a redacted
-    ///   projection.
     /// - `merge_areas_busy`: a touched area holds edits parked for review or
     ///   an in-flight metadata write, or edits keep arriving faster than the
     ///   merge can fence them.
@@ -1904,6 +2656,256 @@ impl Mapper {
         tokio::spawn(async move { inner.merge_areas(into, sources).await })
             .await
             .map_err(|error| CloudError::InternalError(error.to_string()))?
+    }
+
+    // === SECRETS AND MOVES ===
+    //
+    // A Secret is a named source of a cloud map. Each call resolves once the
+    // server has accepted the write and the map is republished: the server's
+    // projection plus whatever edits remain queued.
+    //
+    // Every call refuses with [`CloudError::AreaNotFound`] for a map that is
+    // not loaded, [`CloudError::InvalidInput`] for one that is not a cloud
+    // map, and [`CloudError::PendingOperations`] while the map is being
+    // moved or deleted. A Secret the caller cannot administer is
+    // [`CloudError::NotFoundOrNoAccess`], as the server reports it.
+
+    /// Creates an owner Secret on a cloud map, drawn in `color`
+    /// (`#rrggbb`) or, with `None`, in the palette's color. One request
+    /// carries both.
+    ///
+    /// # Errors
+    /// See the section comment.
+    pub async fn create_secret(
+        &self,
+        area_id: AreaId,
+        name: &str,
+        color: Option<&str>,
+    ) -> CloudResult<SecretSummary> {
+        self.inner
+            .create_secret(area_id, &crate::clan_secrets::NewSecret::owner(name, color))
+            .await
+    }
+
+    /// Creates a Secret on a cloud map owned as `secret` says: an owner
+    /// Secret on the caller's own map, or a Clan Secret of a clan whose map
+    /// it is or whose folder holds the map by link.
+    ///
+    /// # Errors
+    /// See the section comment. A creation action the caller lacks, a clan
+    /// the map is not in and an unknown creation policy are all
+    /// [`CloudError::NotFoundOrNoAccess`].
+    pub async fn create_secret_as(
+        &self,
+        area_id: AreaId,
+        secret: &crate::clan_secrets::NewSecret,
+    ) -> CloudResult<SecretSummary> {
+        self.inner.create_secret(area_id, secret).await
+    }
+
+    /// Renames and recolors one of a cloud map's Secrets in one request:
+    /// whatever `change` names changes, and nothing else does.
+    ///
+    /// # Errors
+    /// See the section comment. A change that names nothing is
+    /// [`CloudError::InvalidInput`], refused before anything is sent.
+    pub async fn update_secret(
+        &self,
+        area_id: AreaId,
+        secret: &SourceId,
+        change: &crate::cloud_api::SecretChange,
+    ) -> CloudResult<SecretSummary> {
+        if change.is_empty() {
+            return Err(CloudError::InvalidInput(
+                "give a new name, a new color or both".to_string(),
+            ));
+        }
+        self.inner.update_secret(area_id, secret, change).await
+    }
+
+    /// Renames one of a cloud map's Secrets.
+    ///
+    /// # Errors
+    /// See the section comment.
+    pub async fn rename_secret(
+        &self,
+        area_id: AreaId,
+        secret: &SourceId,
+        name: &str,
+    ) -> CloudResult<SecretSummary> {
+        self.inner.rename_secret(area_id, secret, name).await
+    }
+
+    /// Sets the color a cloud map's Secret draws in (`#rrggbb`), or with
+    /// `None` leaves it to the palette.
+    ///
+    /// # Errors
+    /// See the section comment.
+    pub async fn recolor_secret(
+        &self,
+        area_id: AreaId,
+        secret: &SourceId,
+        color: Option<&str>,
+    ) -> CloudResult<SecretSummary> {
+        self.inner.recolor_secret(area_id, secret, color).await
+    }
+
+    /// Deletes one of a cloud map's Secrets and everything it holds.
+    ///
+    /// # Errors
+    /// See the section comment.
+    pub async fn delete_secret(&self, area_id: AreaId, secret: &SourceId) -> CloudResult<()> {
+        self.inner.delete_secret(area_id, secret).await
+    }
+
+    /// The grants on one of a cloud map's Secrets, oldest first: every grant
+    /// for its owner and holders of `manage_access`, the grants naming the
+    /// caller for any other reader.
+    ///
+    /// # Errors
+    /// See the section comment.
+    pub async fn secret_grants(
+        &self,
+        area_id: AreaId,
+        secret: &SourceId,
+    ) -> CloudResult<Vec<SecretGrant>> {
+        self.inner.secret_grants(area_id, secret).await
+    }
+
+    /// Shares one of a cloud map's Secrets with a friend: `read` and
+    /// `actions` (see [`secret_action`](crate::cloud_api::secret_action)).
+    /// A second grant from the caller to the same friend replaces the first.
+    /// The grant confers nothing while the friend cannot read the map.
+    ///
+    /// # Errors
+    /// See the section comment. Every refusal past the request's shape,
+    /// including a grantee who is not a friend and an action beyond the
+    /// caller's own, is [`CloudError::NotFoundOrNoAccess`].
+    pub async fn grant_secret(
+        &self,
+        area_id: AreaId,
+        secret: &SourceId,
+        grantee_id: Uuid,
+        actions: &[&str],
+    ) -> CloudResult<SecretGrant> {
+        self.inner
+            .grant_secret(area_id, secret, grantee_id, actions)
+            .await
+    }
+
+    /// Replaces the actions of a grant on one of a cloud map's Secrets.
+    ///
+    /// # Errors
+    /// As [`Self::grant_secret`].
+    pub async fn update_secret_grant(
+        &self,
+        area_id: AreaId,
+        secret: &SourceId,
+        grant_id: Uuid,
+        actions: &[&str],
+    ) -> CloudResult<SecretGrant> {
+        self.inner
+            .update_secret_grant(area_id, secret, grant_id, actions)
+            .await
+    }
+
+    /// Revokes a grant on one of a cloud map's Secrets.
+    ///
+    /// # Errors
+    /// As [`Self::grant_secret`].
+    pub async fn revoke_secret_grant(
+        &self,
+        area_id: AreaId,
+        secret: &SourceId,
+        grant_id: Uuid,
+    ) -> CloudResult<()> {
+        self.inner
+            .revoke_secret_grant(area_id, secret, grant_id)
+            .await
+    }
+
+    /// Moves rooms, labels and shapes between two sources of a cloud map as
+    /// one transaction. A room takes the number it asks for
+    /// ([`MovedContent::asked`], its own by default) unless the destination
+    /// already uses it; then it takes the destination's next free number. The
+    /// result's `renumbered` names every room whose number changed, and every
+    /// holder of a handle on it is told ([`MapperEvent::AreasMerged`]). Undo
+    /// asks for each room's number before the move it reverses, so a room
+    /// that was renumbered returns under its old number when that is free.
+    /// The source's exits and connections touching a moved room travel with
+    /// it. Other sources retain their attachments, hidden while their readers
+    /// cannot read the room in its destination source.
+    ///
+    /// The map's queued edits land first, and new edits are refused until
+    /// the map is republished, so both sources' revision preconditions
+    /// describe what the server holds.
+    ///
+    /// # Errors
+    /// Besides the section comment's refusals, each a
+    /// [`CloudError::StructuralConflict`] that changed nothing:
+    /// - `move_busy`: edits kept arriving faster than the map could be
+    ///   fenced, or its queue could not drain in time.
+    /// - `access_review_required`: prepare and explicitly acknowledge the
+    ///   review with [`Self::review_move_content`] and [`Self::commit_reviewed_move`].
+    /// - `stale_access_review`: repeat the review after an access change.
+    /// - `move_property_conflict`: explicitly resolve differing property values.
+    ///
+    /// A source another writer changed first is
+    /// [`CloudError::RevisionConflict`]; the map is republished as the
+    /// server then holds it, so the same move asked again stands on that.
+    pub async fn move_content(
+        &self,
+        area_id: AreaId,
+        from: SourceId,
+        to: SourceId,
+        content: MovedContent,
+    ) -> CloudResult<MoveResult> {
+        let inner = self.inner.clone();
+        // The fence is released by the task, even if the caller goes away.
+        tokio::spawn(async move { inner.move_content(area_id, from, to, content, None).await })
+            .await
+            .map_err(|error| CloudError::InternalError(error.to_string()))?
+    }
+
+    /// Prepares a transfer for review without moving content or retaining an edit fence.
+    ///
+    /// # Errors
+    /// Returns source, revision, permission, credential, or network failures.
+    pub async fn review_move_content(
+        &self,
+        area_id: AreaId,
+        from: SourceId,
+        to: SourceId,
+        content: MovedContent,
+    ) -> CloudResult<crate::access_review::ReviewedMove> {
+        let inner = self.inner.clone();
+        tokio::spawn(async move { inner.review_move_content(area_id, from, to, content).await })
+            .await
+            .map_err(|error| CloudError::InternalError(error.to_string()))?
+    }
+
+    /// Commits the exact reviewed request after its caller acknowledges the review.
+    ///
+    /// # Errors
+    /// Returns a conflict if content or reviewed access changed, and refuses an account change.
+    pub async fn commit_reviewed_move(
+        &self,
+        review: crate::access_review::ReviewedMove,
+    ) -> CloudResult<MoveResult> {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            inner
+                .move_content(
+                    review.area_id,
+                    review.request.from,
+                    review.request.to,
+                    review.content.clone(),
+                    Some(review),
+                )
+                .await
+        })
+        .await
+        .map_err(|error| CloudError::InternalError(error.to_string()))?
     }
 
     // === ATLAS (FOLDER) OPERATIONS ===
@@ -1930,6 +2932,53 @@ impl Mapper {
                 (atlas.id, tier)
             }));
             drop(storage);
+            let mut clans = inner.atlas_clan_by_id.lock();
+            clans.clear();
+            clans.extend(
+                atlases
+                    .iter()
+                    .filter_map(|atlas| atlas.clan_id.map(|clan| (atlas.id, clan))),
+            );
+            drop(clans);
+            Ok(atlases)
+        }
+    }
+
+    /// List the atlases in one durable `storage`, read fresh. Where
+    /// [`Self::list_atlases`] leaves out a cloud it couldn't read, this
+    /// fails, so an atlas missing from the result is known to be absent.
+    ///
+    /// # Errors
+    /// The storage couldn't be read (signed out, network, disk).
+    pub fn list_atlases_in(
+        &self,
+        storage: MapStorage,
+    ) -> impl Future<Output = CloudResult<Vec<AtlasListItem>>> {
+        let inner = self.inner.clone();
+        async move {
+            let _gate = inner.atlas_catalog_gate.lock().await;
+            let atlases = inner.backend.list_atlases_in(storage).await?;
+            let mut gone = Vec::new();
+            let mut tiers = inner.atlas_storage_by_id.lock();
+            tiers.retain(|id, tier| {
+                let kept = *tier != storage;
+                if !kept {
+                    gone.push(*id);
+                }
+                kept
+            });
+            tiers.extend(atlases.iter().map(|atlas| (atlas.id, storage)));
+            drop(tiers);
+            let mut clans = inner.atlas_clan_by_id.lock();
+            for id in gone {
+                clans.remove(&id);
+            }
+            clans.extend(
+                atlases
+                    .iter()
+                    .filter_map(|atlas| atlas.clan_id.map(|clan| (atlas.id, clan))),
+            );
+            drop(clans);
             Ok(atlases)
         }
     }
@@ -1994,6 +3043,13 @@ impl Mapper {
             inner.sync_revision.fetch_add(1, Ordering::AcqRel);
             Ok(atlas)
         }
+    }
+
+    /// Where a map goes when no folder or storage is named: the cloud when
+    /// signed in, else this device (a session-only mapper: the session).
+    #[must_use]
+    pub fn default_storage(&self) -> MapStorage {
+        self.inner.backend.default_storage()
     }
 
     /// Create an atlas in an explicit durable storage tier.
@@ -2067,6 +3123,57 @@ impl Mapper {
     ) -> CloudResult<()> {
         self.inner
             .move_area_to_atlas_and_wait(area_id, atlas_id)
+            .await
+    }
+
+    /// Reviews a filing without changing the map. Cloud reviews always carry the filing notice.
+    ///
+    /// # Errors
+    /// Propagates authorization, source identity, credential and backend failures.
+    pub async fn review_filing(
+        &self,
+        area_id: AreaId,
+        atlas_id: Option<AtlasId>,
+    ) -> CloudResult<crate::access_review::ReviewedFiling> {
+        self.inner.refuse_source_area(area_id)?;
+        let generation = self.inner.metadata_auth_generation(area_id);
+        let review = if let Some(generation) = generation {
+            self.inner
+                .backend
+                .review_filing(&area_id, atlas_id, generation)
+                .await?
+        } else {
+            crate::access_review::AccessReview {
+                token: String::new(),
+                requires_confirmation: false,
+                destination_notice: false,
+                changes: Vec::new(),
+                property_conflicts: Vec::new(),
+                preserves_undo: true,
+            }
+        };
+        Ok(crate::access_review::ReviewedFiling {
+            review,
+            area_id,
+            atlas_id,
+            generation,
+        })
+    }
+
+    /// Applies the exact filing whose access changes the caller has acknowledged.
+    ///
+    /// # Errors
+    /// A changed review or account is refused. Backend failures leave the cached filing unchanged.
+    pub async fn commit_reviewed_filing(
+        &self,
+        review: crate::access_review::ReviewedFiling,
+    ) -> CloudResult<()> {
+        self.inner
+            .update_metadata_reviewed(
+                review.area_id,
+                MetadataChange::Move(review.atlas_id),
+                Some(&review),
+            )
             .await
     }
 
@@ -2220,8 +3327,33 @@ impl Mapper {
         keep_room_number: RoomNumber,
         remove_room_number: RoomNumber,
     ) -> CloudResult<MutationSubmission> {
+        self.inner.merge_rooms(
+            area_id,
+            keep_room_number,
+            remove_room_number,
+            Sources::Shown,
+        )
+    }
+
+    /// [`Self::merge_rooms`] for a caller who sees the map's Secrets and
+    /// Private additions as `sources` says. One who does not is answered as
+    /// on a map without them: what those places keep on the removed room
+    /// never refuses the merge, and goes with the room as the server takes
+    /// it.
+    ///
+    /// # Errors
+    /// As [`Self::merge_rooms`]: an unknown area or room, a room merged into
+    /// itself, links to or from other maps, and, with Secrets shown, data a
+    /// Secret keeps on the removed room.
+    pub fn merge_rooms_as(
+        &self,
+        area_id: AreaId,
+        keep_room_number: RoomNumber,
+        remove_room_number: RoomNumber,
+        sources: Sources,
+    ) -> CloudResult<MutationSubmission> {
         self.inner
-            .merge_rooms(area_id, keep_room_number, remove_room_number)
+            .merge_rooms(area_id, keep_room_number, remove_room_number, sources)
     }
 
     /// Creates an exit with a client-minted id: the cache updates
@@ -2390,10 +3522,37 @@ impl Mapper {
         self.inner.pending.take_recovery_errors()
     }
 
+    /// Upgrade recovery for the verified current account only. The notice
+    /// survives restart; it does not imply that these edits reached the server.
+    #[must_use]
+    pub fn legacy_cloud_recovery(&self) -> Option<LegacyCloudRecovery> {
+        let (_, generation) = self.inner.pending.active_viewer()?;
+        (generation == self.inner.backend.auth_generation())
+            .then(|| self.inner.pending.legacy_cloud_recovery())
+            .flatten()
+    }
+
+    /// Retry copying recovery data. Legacy records are never replayed, even
+    /// when this fails. Current-format writes use their own journal directory.
+    pub fn retry_legacy_cloud_recovery(&self) {
+        let _guard = self.inner.mutation_gate.lock();
+        if self.legacy_cloud_recovery().is_some() {
+            self.inner.pending.retry_legacy_cloud_recovery();
+        }
+    }
+
     /// The area-specific save status derived from its pending queue.
     #[must_use]
     pub fn area_save_status(&self, area_id: AreaId) -> AreaSaveStatus {
         self.inner.pending.save_status(area_id)
+    }
+
+    /// The server's refusal that parked this area's writes for Retry or
+    /// Discard, for a reason in the viewer's language; `None` when nothing
+    /// is parked or the park is not a refusal.
+    #[must_use]
+    pub fn parked_error(&self, area_id: AreaId) -> Option<CloudError> {
+        self.inner.pending.parked_error(area_id)
     }
 
     /// The operation currently paused for conflict review in this area.
@@ -2557,6 +3716,33 @@ impl Inner {
         self.load_areas().await
     }
 
+    async fn load_initial_areas(&self, timeout: Duration) -> CloudResult<LoadMapsSummary> {
+        let load = async {
+            let _gate = self.load_gate.lock().await;
+            if let Some(Ok(summary)) = self.initial_load.borrow().as_ref() {
+                return Ok(summary.clone());
+            }
+            self.load_areas().await
+        };
+        if let Ok(result) = tokio::time::timeout(timeout, load).await {
+            result
+        } else {
+            let error = CloudError::NetworkError("map loading timed out".into());
+            // Never call a partial inventory ready: presence-checked imports
+            // must fail instead of seeding duplicates into an unknown atlas.
+            // A concurrent loader may already have completed successfully.
+            self.initial_load.send_if_modified(|outcome| {
+                if matches!(outcome, Some(Ok(_))) {
+                    return false;
+                }
+                *outcome = Some(Err(error.clone()));
+                true
+            });
+            self.request_sync();
+            Err(error)
+        }
+    }
+
     async fn load_areas(&self) -> CloudResult<LoadMapsSummary> {
         let result = self.load_all_areas_inner().await;
         if result.is_ok() {
@@ -2694,11 +3880,7 @@ impl Inner {
             self.pending.abort_recovered_delete(area_id)?;
             // A full load buffers several GETs; an ACK may have advanced this
             // area's revision while another document was still loading.
-            self.pending.note_confirmed_rev(
-                area_id,
-                details.area.rev,
-                details.area.access.map(|access| access.fingerprint()),
-            );
+            self.pending.note_confirmed_rev(area_id, details.area.rev);
             let (area, _) = self.project_confirmed(
                 &details,
                 ReplayMode::StopAtFailure,
@@ -2810,6 +3992,8 @@ impl Inner {
         let request = CreateAreaRequest {
             name,
             atlas_id,
+            clan_id: None,
+            ownership: None,
             ephemeral: false,
             properties,
         };
@@ -2831,6 +4015,8 @@ impl Inner {
         let request = CreateAreaRequest {
             name,
             atlas_id,
+            clan_id: None,
+            ownership: None,
             ephemeral: false,
             properties: BTreeMap::new(),
         };
@@ -2848,6 +4034,24 @@ impl Inner {
         destination: MapDestination,
     ) -> CloudResult<AreaId> {
         let request = Self::request_at(name, destination, BTreeMap::new())?;
+        Ok(self
+            .create_area_from_request_at(request, destination.storage)
+            .await?
+            .id)
+    }
+
+    /// [`Self::create_area_at`] with whose the new clan map is.
+    ///
+    /// # Errors
+    /// As [`Self::create_area_at`].
+    pub async fn create_clan_area_at(
+        &self,
+        name: String,
+        destination: MapDestination,
+        ownership: crate::clan_maps::MapOwnership,
+    ) -> CloudResult<AreaId> {
+        let mut request = Self::request_at(name, destination, BTreeMap::new())?;
+        request.ownership = Some(ownership);
         Ok(self
             .create_area_from_request_at(request, destination.storage)
             .await?
@@ -2885,6 +4089,8 @@ impl Inner {
         Ok(CreateAreaRequest {
             name,
             atlas_id: destination.atlas_id,
+            clan_id: None,
+            ownership: None,
             ephemeral: destination.storage == MapStorage::Session,
             properties,
         })
@@ -2899,11 +4105,22 @@ impl Inner {
             .await
     }
 
+    /// `request` made in its folder's clan, when the folder is a clan's.
+    fn in_folder_clan(&self, mut request: CreateAreaRequest) -> CreateAreaRequest {
+        if request.clan_id.is_none() {
+            request.clan_id = request
+                .atlas_id
+                .and_then(|atlas| self.atlas_clan_by_id.lock().get(&atlas).copied());
+        }
+        request
+    }
+
     async fn create_area_from_request_at(
         &self,
         request: CreateAreaRequest,
         storage: MapStorage,
     ) -> CloudResult<CreatedArea> {
+        let request = self.in_folder_clan(request);
         let properties = Self::initial_properties(&request)?;
         let backend_area = self.backend.create_area_at(request, storage).await?;
         Ok(self
@@ -2915,6 +4132,7 @@ impl Inner {
         &self,
         request: CreateAreaRequest,
     ) -> CloudResult<CreatedArea> {
+        let request = self.in_folder_clan(request);
         let properties = Self::initial_properties(&request)?;
         // Resolve local routing before capturing the intended tier. A local
         // area may already be deleted again when its create response arrives.
@@ -2949,9 +4167,16 @@ impl Inner {
     /// the area first appears with them. A cloud create carries none: the
     /// area appears as the server made it, and the properties are left for
     /// [`Self::save_initial_properties`].
+    ///
+    /// A clan's map says nothing in its create reply of what the caller may
+    /// do with it. Its creator starts as Editor
+    /// ([`crate::clans::MAP_CREATOR_ACTIONS`]), so the map appears with that
+    /// access (never owned: nobody owns a clan's map) until the server's own
+    /// copy, read right after, replaces it. Should that read fail, the sync
+    /// engine reads it again.
     async fn finish_created_area(
         &self,
-        backend_area: Area,
+        mut backend_area: Area,
         local: bool,
         properties: Vec<Property>,
     ) -> CreatedArea {
@@ -2963,11 +4188,26 @@ impl Inner {
         } else {
             (properties, Vec::new())
         };
+        let created = CreatedArea {
+            id,
+            name,
+            unsaved_properties,
+        };
+        let clan_map = cloud && backend_area.clan_id.is_some();
+        if clan_map && backend_area.access.is_none() && backend_area.actions.is_none() {
+            backend_area.actions = Some(
+                crate::clans::MAP_CREATOR_ACTIONS
+                    .iter()
+                    .map(|action| (*action).to_string())
+                    .collect(),
+            );
+        }
 
         let details = AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: backend_area,
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: stored,
             rooms: vec![],
             labels: vec![],
@@ -2975,13 +4215,20 @@ impl Inner {
             connections: vec![],
             linked_areas: vec![],
         };
-        self.publish_committed(CommittedChange::Documents(&[details], &[]), local)
-            .await;
-        CreatedArea {
-            id,
-            name,
-            unsaved_properties,
+        if cloud {
+            self.publish_created_cloud_area(details).await;
+        } else {
+            self.publish_committed(CommittedChange::Documents(&[details], &[]), local)
+                .await;
         }
+        if clan_map {
+            let auth_generation = self.backend.auth_generation();
+            if let Err(error) = sync_engine::refetch_area(self, &id, auth_generation).await {
+                warn!("Could not read new clan map {id}; the sync engine reads it: {error}");
+                self.request_sync();
+            }
+        }
+        created
     }
 
     /// Completes a create by saving the initial properties a new cloud area
@@ -3035,7 +4282,6 @@ impl Inner {
             .map(|property| AreaMutation::UpsertAreaProperty {
                 name: property.name,
                 value: property.value,
-                is_secret: None,
             })
             .collect();
         let submission = self
@@ -3062,7 +4308,10 @@ impl Inner {
         match self.pending.save_status(area_id) {
             AreaSaveStatus::CouldNotSave { .. } => self.resolve_failed(area_id, false).await?,
             AreaSaveStatus::ConflictNeedsReview => self.resolve_conflict(area_id, false).await?,
-            AreaSaveStatus::Saved | AreaSaveStatus::Saving(_) | AreaSaveStatus::Offline(_) => {}
+            AreaSaveStatus::Saved
+            | AreaSaveStatus::Saving(_)
+            | AreaSaveStatus::Offline(_)
+            | AreaSaveStatus::Held(_) => {}
         }
         self.delete_area_and_wait(area_id).await
     }
@@ -3103,7 +4352,7 @@ impl Inner {
             &mut areas,
             &id_map,
             &crate::relocation::FreshenOptions {
-                scrub_secrets: true,
+                stamp_local_owner: true,
             },
         );
 
@@ -3177,7 +4426,9 @@ impl Inner {
 
     /// Serialize an area to its full [`AreaWithDetails`] — the JSON-export path. The bytes are the
     /// viewer-scoped, secret-redacted projection the backend already holds, so this can only ever
-    /// emit what the viewer can see; the `can_copy` gate is enforced by the caller.
+    /// emit what the viewer can see; the `can_copy` gate is enforced by the caller. Of a cloud
+    /// map's Secrets it carries those a copy carries (format-3.md §5.2): the ones the viewer
+    /// holds `copy` on, besides their Private additions.
     ///
     /// §8.4: the export is v2 with `connections` stably id-sorted (the
     /// server already serves them sorted; local documents are sorted here)
@@ -3187,13 +4438,19 @@ impl Inner {
     /// # Errors
     /// Propagates the backend's read error.
     pub async fn export_area(&self, area_id: AreaId) -> CloudResult<AreaWithDetails> {
+        self.refuse_source_area(area_id)?;
         let cloud_area = !self.is_local_projection(area_id)
             && !self.backend.ephemeral_area_ids().contains(&area_id);
         let mut details = if cloud_area {
             let auth_generation = self.backend.auth_generation();
-            self.backend
+            let mut details = self
+                .backend
                 .get_area_at_generation(&area_id, auth_generation)
-                .await?
+                .await?;
+            // An export is a copy: it carries the Secrets a copy would.
+            details.keep_copyable_sources();
+            details.retain_linked_areas_of_exits();
+            details
         } else {
             self.backend_for_area(area_id).get_area(&area_id).await?
         };
@@ -3231,6 +4488,9 @@ impl Inner {
     }
 
     fn begin_area_move(&self, area_ids: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
+        for area_id in area_ids {
+            self.refuse_source_area(*area_id)?;
+        }
         let _mutation_guard = self.mutation_gate.lock();
         let metadata = self.metadata_writes_by_area.lock();
         if let Some(area_id) = area_ids
@@ -3262,8 +4522,14 @@ impl Inner {
             .pop()
             .expect("one requested delete produces one fence")
             .into_delete_fence();
-        self.delete_area_with_fence_at_generation(area_id, delete_fence, auth_generation, None)
-            .await
+        self.delete_area_with_fence_at_generation(
+            area_id,
+            delete_fence,
+            auth_generation,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn delete_area_with_fence(
@@ -3278,6 +4544,7 @@ impl Inner {
             delete_fence,
             auth_generation,
             expected_rev,
+            None,
         )
         .await
     }
@@ -3288,6 +4555,7 @@ impl Inner {
         mut delete_fence: AreaDeleteFence,
         auth_generation: Option<u64>,
         expected_rev: Option<i64>,
+        local_move: Option<&crate::relocation::LocalMoveGuard>,
     ) -> CloudResult<()> {
         self.pending.wait_until_delete_quiescent(area_id).await;
         if let Some(expected_rev) = expected_rev {
@@ -3332,7 +4600,15 @@ impl Inner {
         // The expected revision rides the DELETE itself; the backend (or the
         // server behind it) refuses with a RevisionConflict when the area
         // moved past it, atomically with the delete.
-        let result = if let Some(auth_generation) = auth_generation {
+        let result = if let Some(guard) = local_move {
+            self.backend
+                .finish_local_move(
+                    &area_id,
+                    guard,
+                    auth_generation.expect("cloud move is generation-bound"),
+                )
+                .await
+        } else if let Some(auth_generation) = auth_generation {
             self.backend
                 .delete_area_expecting_at_generation(&area_id, expected_rev, auth_generation)
                 .await
@@ -3395,7 +4671,20 @@ impl Inner {
         area_id: AreaId,
         change: MetadataChange<'_>,
     ) -> CloudResult<()> {
+        self.update_metadata_reviewed(area_id, change, None).await
+    }
+
+    async fn update_metadata_reviewed(
+        &self,
+        area_id: AreaId,
+        change: MetadataChange<'_>,
+        review: Option<&crate::access_review::ReviewedFiling>,
+    ) -> CloudResult<()> {
+        self.refuse_source_area(area_id)?;
         let auth_generation = self.metadata_auth_generation(area_id);
+        if review.is_some_and(|review| review.generation != auth_generation) {
+            return Err(CloudError::CredentialChanged);
+        }
         let backend = self.backend_for_area(area_id);
         let tracking = {
             let _mutation_guard = self.mutation_gate.lock();
@@ -3422,9 +4711,20 @@ impl Inner {
             }
             MetadataChange::Move(atlas_id) => {
                 if let Some(generation) = auth_generation {
-                    self.backend
-                        .move_area_to_atlas_at_generation(&area_id, atlas_id, generation)
-                        .await
+                    if let Some(review) = review {
+                        self.backend
+                            .commit_reviewed_filing(
+                                &area_id,
+                                atlas_id,
+                                &review.review.token,
+                                generation,
+                            )
+                            .await
+                    } else {
+                        self.backend
+                            .move_area_to_atlas_at_generation(&area_id, atlas_id, generation)
+                            .await
+                    }
                 } else {
                     backend.move_area_to_atlas(&area_id, atlas_id).await
                 }
@@ -3465,11 +4765,7 @@ impl Inner {
         let description = format!("Set area property {name}");
         self.mutate_area(
             area_id,
-            vec![AreaMutation::UpsertAreaProperty {
-                name,
-                value,
-                is_secret: None,
-            }],
+            vec![AreaMutation::UpsertAreaProperty { name, value }],
             description,
             PairedExitPolicy::Reject,
         )
@@ -3542,6 +4838,7 @@ impl Inner {
         self.mutate_area(
             area_id,
             vec![AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number,
                 body: updates,
             }],
@@ -3577,6 +4874,7 @@ impl Inner {
         self.mutate_area(
             area_id,
             vec![AreaMutation::CreateRoom {
+                room_source: None,
                 room_number,
                 body: updates,
             }],
@@ -3612,7 +4910,11 @@ impl Inner {
         };
         let mut ops: Vec<AreaMutation> = updates
             .into_iter()
-            .map(|(room_number, body)| AreaMutation::UpsertRoom { room_number, body })
+            .map(|(room_number, body)| AreaMutation::UpsertRoom {
+                room_source: None,
+                room_number,
+                body,
+            })
             .collect();
         let mut batches = Vec::new();
         while ops.len() > MAX_MUTATION_OPERATIONS {
@@ -3637,7 +4939,10 @@ impl Inner {
         let description = format!("Delete room {room_number}");
         self.mutate_area(
             area_id,
-            vec![AreaMutation::DeleteRoom { room_number }],
+            vec![AreaMutation::DeleteRoom {
+                room_source: None,
+                room_number,
+            }],
             description,
             PairedExitPolicy::Reject,
         )
@@ -3658,10 +4963,10 @@ impl Inner {
         self.mutate_area(
             area_id,
             vec![AreaMutation::UpsertRoomProperty {
+                room_source: None,
                 room_number,
                 name,
                 value,
-                is_secret: None,
             }],
             description,
             PairedExitPolicy::Reject,
@@ -3681,7 +4986,11 @@ impl Inner {
         let description = format!("Delete property {name} on room {room_number}");
         self.mutate_area(
             area_id,
-            vec![AreaMutation::DeleteRoomProperty { room_number, name }],
+            vec![AreaMutation::DeleteRoomProperty {
+                room_source: None,
+                room_number,
+                name,
+            }],
             description,
             PairedExitPolicy::Reject,
         )
@@ -3700,7 +5009,11 @@ impl Inner {
         let description = format!("Add tag {tag} to room {room_number}");
         self.mutate_area(
             area_id,
-            vec![AreaMutation::AddRoomTag { room_number, tag }],
+            vec![AreaMutation::AddRoomTag {
+                room_source: None,
+                room_number,
+                tag,
+            }],
             description,
             PairedExitPolicy::Reject,
         )
@@ -3723,7 +5036,11 @@ impl Inner {
         let description = format!("Remove tag {tag} from room {room_number}");
         self.mutate_area(
             area_id,
-            vec![AreaMutation::RemoveRoomTag { room_number, tag }],
+            vec![AreaMutation::RemoveRoomTag {
+                room_source: None,
+                room_number,
+                tag,
+            }],
             description,
             PairedExitPolicy::Reject,
         )
@@ -3748,7 +5065,15 @@ impl Inner {
         let room = area
             .get_room(&room_number)
             .ok_or_else(|| CloudError::RoomNotFound(RoomKey::new(area_id, room_number)))?;
-        if !room.get_exits().iter().any(|exit| exit.id == exit_id) {
+        // The room's own exits, or one a Secret or Private keeps on it (the
+        // write routes to that place).
+        let anchored = area.source_layers().iter().any(|layer| {
+            layer
+                .anchored_exits(room_number)
+                .iter()
+                .any(|exit| exit.id == exit_id)
+        });
+        if !anchored && !room.get_exits().iter().any(|exit| exit.id == exit_id) {
             return Err(CloudError::ExitNotFound(exit_id));
         }
         drop(cache);
@@ -3769,24 +5094,23 @@ impl Inner {
         area_id: AreaId,
         keep_room_number: RoomNumber,
         remove_room_number: RoomNumber,
+        sources: Sources,
     ) -> CloudResult<MutationSubmission> {
+        self.refuse_source_area(area_id)?;
         let _mutation_guard = self.mutation_gate.lock();
         let cache = self.atlas_cache.load();
         let area = cache
             .get_area(&area_id)
             .ok_or(CloudError::AreaNotFound(area_id))?;
-        if !area.effective_access().is_cleared_for_secrets() {
-            return Err(CloudError::StructuralConflict(
-                "merge_requires_full_projection".to_string(),
-            ));
-        }
         let remove_room = area
             .get_room(&remove_room_number)
             .ok_or_else(|| CloudError::RoomNotFound(RoomKey::new(area_id, remove_room_number)))?;
-        let outbound_foreign = remove_room
-            .get_exits()
-            .iter()
-            .any(|exit| exit.to_area_id.is_some_and(|target| target != area_id));
+        // An exit into another map's Secret room goes with the room on the
+        // server and never refuses a merge (see `merge_room_operations`).
+        let outbound_foreign = remove_room.get_exits().iter().any(|exit| {
+            exit.foreign_secret().is_none()
+                && exit.to_area_id.is_some_and(|target| target != area_id)
+        });
         let inbound_foreign = cache
             .areas()
             .filter(|candidate| *candidate.get_id() != area_id)
@@ -3803,12 +5127,17 @@ impl Inner {
                 "merge_cross_area_links".to_string(),
             ));
         }
-        let operations =
-            merge_room_operations(&area.to_details(), keep_room_number, remove_room_number)?;
+        let operations = merge_room_operations(
+            &area.to_details(),
+            keep_room_number,
+            remove_room_number,
+            sources,
+        )?;
         drop(cache);
         let mut result = self.mutate_batches_locked(
             vec![AreaMutationBatch {
                 area_id,
+                source: SourceId::Map,
                 operations,
                 description: format!(
                     "Merge room {remove_room_number} into room {keep_room_number}"
@@ -3877,6 +5206,7 @@ impl Inner {
         let submission = self.mutate_area(
             area_id,
             vec![AreaMutation::CreateExit {
+                room_source: None,
                 room_number,
                 body: args,
             }],
@@ -4085,6 +5415,7 @@ impl Inner {
         let mut submissions = self.mutate_batches_locked(
             vec![AreaMutationBatch {
                 area_id,
+                source: SourceId::Map,
                 operations,
                 description,
                 paired_policy,
@@ -4100,14 +5431,18 @@ impl Inner {
         room_remap: Option<&crate::backends::local::LocalRoomRemap>,
     ) -> CloudResult<Vec<MutationSubmission>> {
         let cache = self.atlas_cache.load_full();
+        let batch_count = batches.len();
+        let resolved = resolve_source_batches(&cache, batches)?;
+        let origins: Vec<usize> = resolved.iter().map(|part| part.origin).collect();
         let mut working = HashMap::<AreaId, AreaWithDetails>::new();
         let mut staged = Vec::<(AreaId, PendingEnvelope)>::new();
-        let mut submissions = Vec::with_capacity(batches.len());
+        let mut submissions = Vec::with_capacity(resolved.len());
         let mut server_cleared = Vec::<ServerClearedLinks>::new();
 
-        for batch in batches {
+        for ResolvedBatch { batch, .. } in resolved {
             let AreaMutationBatch {
                 area_id,
+                source,
                 operations,
                 description,
                 paired_policy,
@@ -4136,6 +5471,47 @@ impl Inner {
                     .ok_or(CloudError::AreaNotFound(area_id))?
                     .to_details()
             };
+            if !source.is_map() || !details.sources.is_empty() || !details.room_data.is_empty() {
+                let envelope = self.stage_source_batch(
+                    &mut details,
+                    source,
+                    operations,
+                    description,
+                    paired_policy,
+                )?;
+                if let Some(envelope) = envelope {
+                    if source.is_map() {
+                        let deleted = area_edits::deleted_rooms(&envelope.ops);
+                        if !deleted.is_empty() {
+                            self.stage_link_clears(
+                                area_id,
+                                &deleted,
+                                &cache,
+                                &mut working,
+                                &mut staged,
+                                &mut server_cleared,
+                            );
+                        }
+                    } else if let SourceId::Secret(secret) = source {
+                        self.stage_secret_room_clears(
+                            area_id,
+                            secret,
+                            &envelope.ops,
+                            &cache,
+                            &mut server_cleared,
+                        );
+                    }
+                    submissions.push(MutationSubmission::Queued(envelope.operation_id));
+                    staged.push((area_id, envelope));
+                    working.insert(area_id, details);
+                } else {
+                    if from_working {
+                        working.insert(area_id, details);
+                    }
+                    submissions.push(MutationSubmission::NoChange);
+                }
+                continue;
+            }
             // Structural preconditions and route maintenance both compare
             // against the pre-envelope document; capture before compilation
             // applies anything.
@@ -4193,6 +5569,7 @@ impl Inner {
             let mut envelope = self.pending_envelope(
                 self.lane_of(area_id),
                 operation_id,
+                SourceId::Map,
                 operations,
                 description,
                 structural_preconditions,
@@ -4221,7 +5598,7 @@ impl Inner {
         if !working.is_empty() {
             let updates = working
                 .into_iter()
-                .map(|(area_id, details)| (area_id, Arc::new(AreaCache::new_with_area(details))))
+                .map(|(area_id, details)| (area_id, self.area_cache_of(details, &cache)))
                 .collect::<Vec<_>>();
             // Links between cloud areas are cleared by the server in the
             // deletion's own transaction; the session mirrors that on screen
@@ -4257,7 +5634,111 @@ impl Inner {
         drop(accounted);
         drop(pending_by_area);
         self.pending.publish_staged(publication);
-        Ok(submissions)
+        // One submission per caller's batch: the last envelope queued for
+        // it, when a resolved batch became several.
+        let mut folded = vec![MutationSubmission::NoChange; batch_count];
+        for (origin, submission) in origins.into_iter().zip(submissions) {
+            if let MutationSubmission::Queued(_) = submission {
+                folded[origin] = submission;
+            }
+        }
+        Ok(folded)
+    }
+
+    /// Compiles a batch for one source, including retained Map attachments, over that
+    /// source's document (see [`SourceDocument`]), applies it to `details`, and
+    /// returns its envelope; `None` when the batch changes nothing. Such
+    /// Map envelopes retain their ordinary room-presence preconditions.
+    fn stage_source_batch(
+        &self,
+        details: &mut AreaWithDetails,
+        source: SourceId,
+        operations: Vec<AreaMutation>,
+        description: String,
+        paired_policy: PairedExitPolicy,
+    ) -> CloudResult<Option<PendingEnvelope>> {
+        let area_id = details.area.id;
+        let storage = self.area_storage(area_id);
+        if !source.is_map()
+            && storage != MapStorage::Cloud
+            && !(source == SourceId::Private && storage == MapStorage::Local)
+        {
+            return Err(CloudError::InvalidInput(
+                "Secrets require cloud storage; Private additions require local or cloud storage"
+                    .to_string(),
+            ));
+        }
+        let existing_rooms: HashSet<_> =
+            details.rooms.iter().map(|room| room.room_number).collect();
+        let mut document = SourceDocument::open(details, source)?;
+        let room_moves =
+            area_edits::capture_room_moves_in(&document.content, &operations, &document.context);
+        let operations = compile_source_mutations(
+            &mut document.content,
+            operations,
+            paired_policy,
+            &document.context,
+        )?;
+        if operations.len() > MAX_MUTATION_OPERATIONS {
+            return Err(CloudError::InvalidInput(format!(
+                "the compiled mutation may contain at most {MAX_MUTATION_OPERATIONS} operations"
+            )));
+        }
+        if operations.is_empty() {
+            return Ok(None);
+        }
+        area_edits::maintain_routes_after_room_moves_in(
+            &room_moves,
+            &mut document.content,
+            &document.context,
+        );
+        area_edits::validate_connection_graph_in(&mut document.content, &document.context)?;
+        let structural_preconditions = if source.is_map() {
+            operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    AreaMutation::UpsertRoom { room_number, .. } => {
+                        Some(if existing_rooms.contains(room_number) {
+                            StructuralPrecondition::RoomPresent(*room_number)
+                        } else {
+                            StructuralPrecondition::RoomAbsent(*room_number)
+                        })
+                    }
+                    AreaMutation::CreateRoom { room_number, .. } => {
+                        Some(StructuralPrecondition::RoomAbsent(*room_number))
+                    }
+                    _ => None,
+                })
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        document.close(details);
+        if source.is_map() || storage == MapStorage::Local {
+            details.area.rev += 1;
+        }
+        self.pending_envelope(
+            self.lane_of(area_id),
+            Uuid::new_v4(),
+            source,
+            operations,
+            description,
+            structural_preconditions,
+        )
+        .map(Some)
+    }
+
+    /// Refuses an area-level call (rename, delete, export, copy, move,
+    /// merge) on a Secret's or Private additions' own area: those are
+    /// managed through their map, in the map editor.
+    pub(crate) fn refuse_source_area(&self, area_id: AreaId) -> CloudResult<()> {
+        if self.atlas_cache.load().source_of(&area_id).is_some() {
+            Err(refusal("secret_area_level"))
+        } else {
+            Ok(())
+        }
     }
 
     /// Where `area_id`'s envelopes are delivered.
@@ -4278,6 +5759,7 @@ impl Inner {
         &self,
         lane: Lane,
         operation_id: OperationId,
+        source: SourceId,
         ops: Vec<AreaMutation>,
         description: String,
         structural_preconditions: Vec<StructuralPrecondition>,
@@ -4293,12 +5775,14 @@ impl Inner {
             (None, self.backend.auth_generation())
         };
         Ok(PendingEnvelope {
+            source,
             operation_id,
             ops,
             description,
             structural_preconditions,
             room_remap: None,
             attempts: 0,
+            held: 0,
             viewer_id,
             local_durable: lane.local_durable,
             auth_generation,
@@ -4340,14 +5824,19 @@ impl Inner {
         };
         // Every other area's exits into the deleted rooms, read from the
         // document this gesture already staged for the area when there is
-        // one, else from the session's copy.
+        // one, else from the session's copy. A staged document names an
+        // exit into a room of the map's Secret by the map and the Secret's
+        // own number, which is not the map room of that number.
         let mut linking: Vec<(AreaId, Vec<ExitId>)> = Vec::new();
         for (id, details) in working.iter().filter(|(id, _)| **id != area_id) {
             let exits: Vec<ExitId> = details
                 .rooms
                 .iter()
                 .flat_map(|room| &room.exits)
-                .filter(|exit| leads_into(exit.to_area_id, exit.to_room_number))
+                .filter(|exit| {
+                    exit.foreign_secret().is_none()
+                        && leads_into(exit.to_area_id, exit.to_room_number)
+                })
                 .map(|exit| exit.id)
                 .collect();
             if !exits.is_empty() {
@@ -4422,6 +5911,59 @@ impl Inner {
         }
     }
 
+    /// The exits other cloud maps keep into the rooms `ops` delete from
+    /// Secret `secret` of map `map`. The server dangles them in the
+    /// deletion's own transaction (format-3.md §4.4), so the session only
+    /// clears them on screen, as it does for a deleted map room's
+    /// (`stage_link_clears`), and their maps' refetches bring the server's
+    /// copies. The map itself and its other places never lead into the
+    /// Secret's rooms.
+    fn stage_secret_room_clears(
+        &self,
+        map: AreaId,
+        secret: Uuid,
+        ops: &[AreaMutation],
+        cache: &AtlasCache,
+        server_cleared: &mut Vec<ServerClearedLinks>,
+    ) {
+        let own = SourceId::Secret(secret);
+        let rooms: HashSet<RoomNumber> = ops
+            .iter()
+            .filter_map(|operation| match operation {
+                AreaMutation::DeleteRoom {
+                    room_number,
+                    room_source: Some(source),
+                } if *source == own => Some(*room_number),
+                _ => None,
+            })
+            .collect();
+        if rooms.is_empty() || !self.lane_of(map).to_server {
+            return;
+        }
+        let area = AreaId(secret);
+        let linking: Vec<AreaId> = cache
+            .areas()
+            .filter(|candidate| {
+                *candidate.get_id() != map && self.lane_of(*candidate.get_id()).to_server
+            })
+            .filter(|candidate| {
+                candidate.get_rooms().iter().any(|room| {
+                    room.get_exits()
+                        .iter()
+                        .any(|exit| room_cache::RoomCache::exit_leads_into(exit, area, &rooms))
+                })
+            })
+            .map(|candidate| *candidate.get_id())
+            .collect();
+        if !linking.is_empty() {
+            server_cleared.push(ServerClearedLinks {
+                area_id: area,
+                rooms,
+                linking,
+            });
+        }
+    }
+
     /// The envelopes clearing the destinations of `exits` in area `id`,
     /// [`MAX_MUTATION_OPERATIONS`] exits apiece, each compiled against
     /// `document` as the ones before it leave it, and the document they
@@ -4467,6 +6009,7 @@ impl Inner {
             envelopes.push(self.pending_envelope(
                 lane,
                 Uuid::new_v4(),
+                SourceId::Map,
                 operations,
                 description.to_string(),
                 Vec::new(),
@@ -4499,10 +6042,8 @@ impl Inner {
                         continue;
                     }
                     let (ready, deadline) = inner.pending.take_ready(Instant::now());
-                    if let Some((area_id, envelope, rev, fingerprint)) = ready {
-                        inner
-                            .dispatch_envelope(area_id, envelope, rev, fingerprint)
-                            .await;
+                    if let Some((area_id, envelope, rev)) = ready {
+                        inner.dispatch_envelope(area_id, envelope, rev).await;
                         continue;
                     }
                     match (deadline, retirement_deadline) {
@@ -4533,33 +6074,34 @@ impl Inner {
         area_id: AreaId,
         envelope: PendingEnvelope,
         confirmed_rev: Option<i64>,
-        fingerprint: Option<String>,
     ) {
-        // The precondition rides the last backend-confirmed revision; until
-        // any backend truth lands, the cached revision stands in. The server
-        // requires the access fingerprint on every area precondition, so an
-        // unrecorded fingerprint falls back to the cached area's access
-        // block; local/ephemeral areas have no access block and their
-        // backends ignore the field.
-        let (expected_rev, fingerprint) = {
+        // The precondition names the written source at its last
+        // backend-confirmed revision; until any backend truth lands, the
+        // cached revision stands in (0 for Private additions not yet made).
+        let source = envelope.source;
+        let expected_rev = confirmed_rev.unwrap_or_else(|| {
             let cache = self.atlas_cache.load();
             let area = cache.get_area(&area_id);
-            (
-                confirmed_rev.unwrap_or_else(|| area.as_ref().map_or(0, |a| a.get_rev())),
-                fingerprint.or_else(|| area.map(|a| a.effective_access().fingerprint())),
-            )
-        };
+            if source.is_map() {
+                area.map_or(0, |area| area.get_rev())
+            } else {
+                area.and_then(|area| {
+                    area.meta()
+                        .sources
+                        .iter()
+                        .find(|bundle| bundle.source == source)
+                        .map(|bundle| bundle.rev)
+                })
+                .unwrap_or(0)
+            }
+        });
         let operation_id = envelope.operation_id;
         let viewer_id = envelope.viewer_id;
         let auth_generation = envelope.auth_generation;
         let wire = MutationEnvelope {
+            source,
             operation_id,
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: area_id.0,
-                expected_rev,
-                access_fingerprint: fingerprint,
-            }],
+            preconditions: vec![Precondition::source(area_id.0, source, expected_rev)],
             payload: envelope.ops,
         };
         let result = if envelope.local_durable {
@@ -4594,9 +6136,11 @@ impl Inner {
                     .versions
                     .iter()
                     .find(|version| {
-                        version.resource == ResourceKind::Area && version.id == area_id.0
+                        version.resource == ResourceKind::Source
+                            && version.id == area_id.0
+                            && version.source == source
                     })
-                    .map(|version| version.rev);
+                    .map(|version| (source, version.rev));
                 // Settle the receipt under the same gate used by sync
                 // refetch adoption. A GET that began before this ACK can
                 // therefore observe the new confirmed revision and reject
@@ -4613,12 +6157,22 @@ impl Inner {
                     }
                     let acknowledged = self.pending.acknowledge(area_id, operation_id, own_rev);
                     let mut foreign_versions = false;
+                    // Every other changed source (another source of this
+                    // map, or an exit target's map) confirms its revision
+                    // and asks for a sync.
                     for version in &result.versions {
-                        if version.resource == ResourceKind::Area && version.id != area_id.0 {
-                            self.pending
-                                .note_confirmed_rev(AreaId(version.id), version.rev, None);
-                            foreign_versions = true;
+                        if version.resource != ResourceKind::Source {
+                            continue;
                         }
+                        if version.id == area_id.0 && version.source == source {
+                            continue;
+                        }
+                        self.pending.note_source_rev(
+                            AreaId(version.id),
+                            version.source,
+                            version.rev,
+                        );
+                        foreign_versions = true;
                     }
                     (acknowledged, foreign_versions)
                 };
@@ -4681,16 +6235,19 @@ impl Inner {
                     .credential_changed(area_id, operation_id, auth_generation);
                 self.request_sync();
             }
+            Err(CloudError::ServiceUnavailable(_)) => {
+                // A hold lasts a moment, or up to two minutes after a lost
+                // transfer request: wait it out without spending attempts.
+                self.pending
+                    .service_unavailable(area_id, operation_id, Instant::now());
+            }
             Err(err) if err.is_transport_error() => {
                 self.transport_failure_with_accounting(area_id, operation_id);
             }
             Err(err) => {
                 // Validation/authorization verdicts never spin: park the
                 // envelope for Retry / Discard and close its accounting.
-                if self
-                    .pending
-                    .permanent_failure(area_id, operation_id, err.to_string())
-                {
+                if self.pending.permanent_failure(area_id, operation_id, err) {
                     self.sync_stats
                         .operations_failed
                         .fetch_add(1, Ordering::Relaxed);
@@ -4798,12 +6355,23 @@ impl Inner {
             let mut scratch = working.clone();
             let preconditions_hold =
                 mode == ReplayMode::KeepMine || envelope.structural_preconditions_hold(&working);
-            if preconditions_hold
-                && envelope
+            let applies = if envelope.source.is_map()
+                && scratch.sources.is_empty()
+                && scratch.room_data.is_empty()
+            {
+                envelope
                     .ops
                     .iter()
                     .all(|op| area_edits::apply_mutation(&mut scratch, op).is_ok())
-            {
+            } else {
+                crate::backends::source_document::apply_source_ops(
+                    &mut scratch,
+                    envelope.source,
+                    &envelope.ops,
+                )
+                .is_ok()
+            };
+            if preconditions_hold && applies {
                 working = scratch;
             } else {
                 if first_failed.is_none() {
@@ -4847,8 +6415,8 @@ impl Inner {
     }
 
     /// Rebuilds the displayed area as `fresh confirmed projection + pending
-    /// envelopes` (folded per `mode`), records the fetched revision and
-    /// fingerprint as backend truth, and swaps the rebuilt cache in.
+    /// envelopes` (folded per `mode`), records the fetched revision as
+    /// backend truth, and swaps the rebuilt cache in.
     ///
     /// Returns the operation id of the first envelope that failed to
     /// apply, from the last fold performed (`None` = everything applied).
@@ -4862,11 +6430,8 @@ impl Inner {
         if self.is_local_projection(area_id) {
             return local_projection::replay_locked(self, area_id, mode);
         }
-        self.pending.adopt_confirmed_rev(
-            area_id,
-            fresh.area.rev,
-            fresh.area.access.map(|access| access.fingerprint()),
-        );
+        self.pending.adopt_confirmed_rev(area_id, fresh.area.rev);
+        self.pending.adopt_source_revs(area_id, &fresh.sources);
         let (area, failed) = self.project_confirmed(fresh, mode, None);
         self.publish_areas(&[(area_id, area)], &[]);
         failed
@@ -5026,49 +6591,6 @@ impl Inner {
     // === INDEX MANAGEMENT ===
 }
 
-impl Mapper {
-    /// Optimistically mirrors a `POST /areas/{id}/secret-marks` change onto
-    /// the cached atlas: flips `is_secret` on the referenced entities and
-    /// bumps the area rev by one (like other local edits, so open editors
-    /// notice and resync their inspectors).
-    ///
-    /// No sync operation is enqueued — the server already owns the change;
-    /// its bumped rev arrives through the sync engine (callers typically
-    /// follow a successful POST with [`Self::sync_now`]).
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_local_secret_marks(
-        &self,
-        area_id: AreaId,
-        secret: bool,
-        rooms: &[RoomNumber],
-        exits: &[ExitId],
-        labels: &[LabelId],
-        shapes: &[ShapeId],
-        room_properties: &[(RoomNumber, String)],
-        area_properties: &[String],
-    ) {
-        self.inner.atlas_cache.rcu(|cache| {
-            cache.get_area(&area_id).map_or_else(
-                || cache.clone(),
-                |area| {
-                    Arc::new(cache.insert_area(
-                        *area.get_id(),
-                        Arc::new(area.apply_secret_marks(
-                            secret,
-                            rooms,
-                            exits,
-                            labels,
-                            shapes,
-                            room_properties,
-                            area_properties,
-                        )),
-                    ))
-                },
-            )
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5084,8 +6606,12 @@ mod tests {
     /// real revision semantics, and each received envelope is logged for
     /// receipt/batching assertions.
     struct FixedBackend {
+        generation: std::sync::atomic::AtomicU64,
+        reviewed_moves: Mutex<Vec<crate::mutation::MoveRequest>>,
+        committed_moves: Mutex<Vec<crate::mutation::MoveRequest>>,
         areas: Mutex<HashMap<AreaId, AreaWithDetails>>,
         omit_from_list: Mutex<HashSet<AreaId>>,
+        hold_listing: tokio::sync::watch::Sender<bool>,
         /// One `(operation id, operation count)` entry per received
         /// envelope, in arrival order.
         mutations: Mutex<Vec<(Uuid, usize)>>,
@@ -5124,8 +6650,12 @@ mod tests {
     impl FixedBackend {
         fn new(areas: Vec<AreaWithDetails>) -> Self {
             Self {
+                generation: std::sync::atomic::AtomicU64::new(0),
+                reviewed_moves: Mutex::new(Vec::new()),
+                committed_moves: Mutex::new(Vec::new()),
                 areas: Mutex::new(areas.into_iter().map(|a| (a.area.id, a)).collect()),
                 omit_from_list: Mutex::new(HashSet::new()),
+                hold_listing: tokio::sync::watch::channel(false).0,
                 mutations: Mutex::new(Vec::new()),
                 fail_with: Mutex::new(None),
                 deletes: Mutex::new(Vec::new()),
@@ -5171,6 +6701,44 @@ mod tests {
 
     #[async_trait]
     impl MapperBackend for FixedBackend {
+        fn auth_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+
+        async fn review_move_content(
+            &self,
+            _area_id: &AreaId,
+            request: &crate::mutation::MoveRequest,
+            generation: u64,
+        ) -> CloudResult<crate::access_review::AccessReview> {
+            assert_eq!(generation, self.auth_generation());
+            self.reviewed_moves.lock().push(request.clone());
+            Ok(crate::access_review::AccessReview {
+                token: "test-review-token".into(),
+                requires_confirmation: true,
+                destination_notice: true,
+                changes: Vec::new(),
+                property_conflicts: Vec::new(),
+                preserves_undo: true,
+            })
+        }
+
+        async fn move_content(
+            &self,
+            area_id: &AreaId,
+            request: &crate::mutation::MoveRequest,
+            generation: u64,
+        ) -> CloudResult<crate::mutation::MoveResult> {
+            assert_eq!(generation, self.auth_generation());
+            self.committed_moves.lock().push(request.clone());
+            // These tests exercise stale review handling, not materialization.
+            Err(CloudError::RevisionConflict {
+                id: area_id.0,
+                expected_rev: request.preconditions[0].expected_rev,
+                current_rev: self.areas.lock()[area_id].area.rev,
+            })
+        }
+
         /// Mints an empty owned area the way the server does: the request's
         /// client-only fields never reach it.
         async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
@@ -5197,6 +6765,8 @@ mod tests {
         }
 
         async fn list_areas(&self) -> CloudResult<Vec<Area>> {
+            let mut held = self.hold_listing.subscribe();
+            held.wait_for(|held| !held).await.unwrap();
             let omitted = self.omit_from_list.lock();
             Ok(self
                 .areas
@@ -5263,7 +6833,7 @@ mod tests {
                     .preconditions
                     .iter()
                     .find(|precondition| {
-                        precondition.resource == ResourceKind::Area && precondition.id == area_id.0
+                        precondition.id == area_id.0 && precondition.source.is_map()
                     })
                     .map(|precondition| precondition.expected_rev),
             );
@@ -5277,7 +6847,11 @@ mod tests {
             // All-or-nothing like the server: apply to a working copy and
             // commit only a fully-successful envelope.
             let mut working = details.clone();
-            let result = area_edits::apply_envelope(&mut working, *area_id, envelope)?;
+            let result = if envelope.source.is_map() {
+                area_edits::apply_envelope(&mut working, *area_id, envelope)?
+            } else {
+                apply_source_envelope(&mut working, envelope)?
+            };
             *details = working;
             Ok(result)
         }
@@ -5349,9 +6923,1155 @@ mod tests {
         }
     }
 
+    /// A Secret envelope applied the way the server applies it: its
+    /// source's revision checked, its operations landed in that source, the
+    /// revision moved once.
+    fn apply_source_envelope(
+        details: &mut AreaWithDetails,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<crate::mutation::MutationResult> {
+        let source = envelope.source;
+        let current = details
+            .sources
+            .iter()
+            .find(|bundle| bundle.source == source)
+            .map_or(0, |bundle| bundle.rev);
+        let expected = envelope
+            .preconditions
+            .iter()
+            .find(|precondition| precondition.source == source)
+            .map(|precondition| precondition.expected_rev);
+        if expected != Some(current) {
+            return Err(CloudError::RevisionConflict {
+                id: details.area.id.0,
+                expected_rev: expected.unwrap_or_default(),
+                current_rev: current,
+            });
+        }
+        crate::backends::source_document::apply_source_ops(details, source, &envelope.payload)?;
+        let bundle = details
+            .sources
+            .iter_mut()
+            .find(|bundle| bundle.source == source)
+            .expect("applying created the bundle");
+        bundle.rev = current + 1;
+        Ok(crate::mutation::MutationResult {
+            operation_id: envelope.operation_id,
+            versions: vec![crate::mutation::VersionInfo {
+                resource: ResourceKind::Source,
+                id: details.area.id.0,
+                source,
+                rev: bundle.rev,
+                deleted: false,
+            }],
+            data: Vec::new(),
+        })
+    }
+
+    /// The single-room sample area with an empty Secret at revision 4.
+    fn area_with_secret(area_id: AreaId, secret: SourceId) -> AreaWithDetails {
+        let mut details = sample_area(area_id, "Reading Room");
+        details.sources.push(crate::SourceBundle {
+            source: secret,
+            name: Some("Hidden".to_string()),
+            ownership: Some("owner".to_string()),
+            clan_id: None,
+            color: None,
+            rev: 4,
+            actions: ["read", "add", "edit", "remove"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            properties: vec![],
+            rooms: vec![],
+            room_data: vec![],
+            labels: vec![],
+            shapes: vec![],
+            connections: vec![],
+        });
+        details
+    }
+
+    #[tokio::test]
+    async fn a_secret_batch_writes_its_source_and_confirms_that_revision() {
+        let area_id = AreaId(Uuid::new_v4());
+        let secret = SourceId::Secret(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![area_with_secret(area_id, secret)]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+
+        let note = AreaMutation::UpsertRoomProperty {
+            room_number: RoomNumber(1),
+            room_source: None,
+            name: "notes".to_string(),
+            value: "pull the red book".to_string(),
+        };
+        let submission = mapper
+            .mutate_batches(vec![
+                AreaMutationBatch::strict(area_id, vec![note], "Note").in_source(secret),
+            ])
+            .unwrap()
+            .pop()
+            .unwrap();
+        // Shown at once, in the Secret and not on the map.
+        let shown = mapper.get_current_atlas().get_area(&area_id).unwrap();
+        assert_eq!(
+            shown
+                .get_room(&RoomNumber(1))
+                .unwrap()
+                .get_property("notes"),
+            None
+        );
+        let bundle = shown
+            .meta()
+            .sources
+            .iter()
+            .find(|bundle| bundle.source == secret)
+            .unwrap();
+        assert_eq!(bundle.room_data[0].properties[0].value, "pull the red book");
+
+        mapper
+            .wait_for_mutation(submission.operation_id().unwrap())
+            .await
+            .expect("accepted at the Secret's revision");
+        assert_eq!(
+            mapper.inner.pending.confirmed_source_rev(area_id, secret),
+            Some(5)
+        );
+        assert_eq!(
+            mapper.inner.pending.confirmed_rev(area_id),
+            Some(1),
+            "the map is unmoved"
+        );
+        let stored = backend.areas.lock()[&area_id].clone();
+        assert!(stored.rooms[0].properties.is_empty());
+        assert_eq!(
+            stored.sources[0].room_data[0].properties[0].value,
+            "pull the red book"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_and_session_maps_refuse_source_batches() {
+        let area_id = AreaId(Uuid::new_v4());
+        let secret = SourceId::Secret(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![area_with_secret(area_id, secret)]));
+        backend.session_ids.lock().insert(area_id);
+        let mapper = Mapper::new(backend, temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+        let refused = mapper.mutate_batches(vec![
+            AreaMutationBatch::strict(
+                area_id,
+                vec![AreaMutation::AddRoomTag {
+                    room_number: RoomNumber(1),
+                    room_source: None,
+                    tag: "DOOR".to_string(),
+                }],
+                "Tag",
+            )
+            .in_source(secret),
+        ]);
+        assert!(
+            matches!(refused, Err(CloudError::InvalidInput(_))),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrated_local_private_edits_are_journaled_and_published_without_cloud_auth() {
+        use crate::backends::local_privacy::tests::legacy_private_map;
+        let root = temp_cache_dir();
+        let local = root.join("local");
+        let areas = local.join("areas-v2");
+        std::fs::create_dir_all(&areas).unwrap();
+        let id = AreaId(Uuid::new_v4());
+        std::fs::write(
+            areas.join(format!("{id}.json")),
+            serde_json::to_vec(&legacy_private_map(id)).unwrap(),
+        )
+        .unwrap();
+        let backend = Arc::new(crate::backends::LocalBackend::new(&local));
+        let mapper =
+            Mapper::new_with_journal(backend.clone(), root.join("cache"), root.join("pending"));
+        mapper.load_all_areas().await.unwrap();
+        for value in ["first private edit", "second private edit"] {
+            let submissions = mapper
+                .mutate_batches(vec![
+                    AreaMutationBatch::strict(
+                        id,
+                        vec![AreaMutation::UpsertRoomProperty {
+                            room_number: RoomNumber(1),
+                            room_source: None,
+                            name: "private-note".into(),
+                            value: value.into(),
+                        }],
+                        "Edit private note",
+                    )
+                    .in_source(SourceId::Private),
+                ])
+                .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                mapper.wait_for_mutation(submissions[0].operation_id().unwrap()),
+            )
+            .await
+            .expect("local Private write settles")
+            .unwrap();
+            let shown = mapper
+                .get_current_atlas()
+                .get_area(&id)
+                .unwrap()
+                .to_details();
+            let stored = backend.get_area(&id).await.unwrap();
+            assert_eq!(shown.sources[0].room_data[0].properties[0].value, value);
+            assert_eq!(shown.sources, stored.sources);
+            assert!(
+                shown.rooms[0]
+                    .properties
+                    .iter()
+                    .all(|property| property.name != "private-note")
+            );
+        }
+        for number in [i32::MIN, i32::MAX] {
+            let submitted = mapper
+                .mutate_batches(vec![
+                    AreaMutationBatch::strict(
+                        id,
+                        vec![AreaMutation::CreateRoom {
+                            room_number: RoomNumber(number),
+                            room_source: Some(SourceId::Private),
+                            body: RoomUpdates {
+                                title: Some(format!("Private {number}")),
+                                ..RoomUpdates::default()
+                            },
+                        }],
+                        "Create a Private room at the numeric limit",
+                    )
+                    .in_source(SourceId::Private),
+                ])
+                .unwrap();
+            mapper
+                .wait_for_mutation(submitted[0].operation_id().unwrap())
+                .await
+                .unwrap();
+        }
+        let reopened = Mapper::new(backend, root.join("reopened"));
+        reopened.load_all_areas().await.unwrap();
+        let atlas = reopened.get_current_atlas();
+        let shown = atlas.get_area(&id).unwrap();
+        let private = shown.document_layer(SourceId::Private).unwrap();
+        for number in [i32::MIN, i32::MAX] {
+            assert_eq!(
+                private.own_room(RoomNumber(number)).unwrap().get_title(),
+                format!("Private {number}")
+            );
+        }
+        assert_eq!(
+            private
+                .map_room_data(RoomNumber(1))
+                .unwrap()
+                .get_property("private-note"),
+            Some("second private edit")
+        );
+    }
+
+    /// The single-room sample area with a Secret at revision 4 whose own
+    /// room 2 sits behind a hidden door on map room 1: a note on map room
+    /// 1, an exit from it into room 2 and one back, paired.
+    fn area_with_secret_door(area_id: AreaId, secret: SourceId) -> AreaWithDetails {
+        let mut details = sample_area(area_id, "Reading Room");
+        let exit = |id: u128, from: &str, to_room: i32, to_source: Option<SourceId>| {
+            serde_json::json!({
+                "id": Uuid::from_u128(id), "from_direction": from,
+                "to_area_id": area_id, "to_room_number": to_room, "to_source": to_source,
+                "to_direction": null, "to_unknown": false, "path": "", "command": "",
+                "weight": 1.0, "connection_id": Uuid::from_u128(0xc1),
+                "is_hidden": true, "door": null
+            })
+        };
+        let bundle: crate::SourceBundle = serde_json::from_value(serde_json::json!({
+            "source": secret, "name": "Bookcase", "ownership": "owner", "rev": 4,
+            "actions": ["read", "add", "edit", "remove"],
+            "rooms": [{
+                "room_number": 2, "title": "Vault", "description": "", "color": "",
+                "level": 0, "x": 2.0, "y": 0.0, "properties": [], "tags": [],
+                "exits": [exit(2, "West", 1, None)]
+            }],
+            "room_data": [{
+                "room_number": 1,
+                "properties": [{ "name": "notes", "value": "pull the red book" }],
+                "exits": [exit(1, "East", 2, Some(secret))]
+            }],
+            "connections": [{
+                "id": Uuid::from_u128(0xc1),
+                "endpoint_a": {
+                    "room_number": 1, "side": "East", "port_offset": 0.5, "port_mode": "AutoPinned"
+                },
+                "endpoint_b": {
+                    "room_number": 2, "source": secret, "side": "West",
+                    "port_offset": 0.5, "port_mode": "AutoPinned"
+                },
+                "kind": "Internal", "routing": "Simple", "segment_shape": "Direct",
+                "corner": "Sharp", "route_points": [], "dash": "Solid",
+                "color": "#A4A4A4", "thickness": 1.0
+            }]
+        }))
+        .expect("the Secret parses");
+        details.sources.push(bundle);
+        details
+    }
+
+    #[tokio::test]
+    async fn deleting_a_map_room_drops_the_secret_data_on_it_at_once() {
+        let area_id = AreaId(Uuid::new_v4());
+        let secret = SourceId::Secret(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![area_with_secret_door(
+            area_id, secret,
+        )]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+
+        let submission = mapper
+            .delete_room(RoomKey::new(area_id, RoomNumber(1)))
+            .expect("the map room deletes");
+
+        let shown = mapper.get_current_atlas().get_area(&area_id).unwrap();
+        let layer = &shown.source_layers()[0];
+        assert!(
+            layer
+                .attachment(crate::RoomAddress::map(RoomNumber(1)))
+                .is_none()
+        );
+        let bundle = &shown.meta().sources[0];
+        assert!(bundle.room_data.is_empty(), "the note and the door go");
+        assert_eq!(bundle.rooms[0].exits[0].to_room_number, None);
+
+        mapper
+            .wait_for_mutation(submission.operation_id().unwrap())
+            .await
+            .expect("accepted");
+        let stored = backend.areas.lock()[&area_id].clone();
+        assert!(stored.sources[0].room_data.is_empty());
+    }
+
+    /// A mapper over [`area_with_secret_door`], with the caller holding
+    /// `actions` on the Secret.
+    async fn secret_door_mapper(
+        actions: &[&str],
+    ) -> (Arc<FixedBackend>, Mapper, AreaId, SourceId, AreaId) {
+        let area_id = AreaId(Uuid::new_v4());
+        let secret_uuid = Uuid::new_v4();
+        let secret = SourceId::Secret(secret_uuid);
+        let mut details = area_with_secret_door(area_id, secret);
+        details.sources[0].actions = actions.iter().map(|act| (*act).to_string()).collect();
+        let backend = Arc::new(FixedBackend::new(vec![details]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+        (backend, mapper, area_id, secret, AreaId(secret_uuid))
+    }
+
+    fn exit_into(area_id: AreaId, room: i32, direction: crate::ExitDirection) -> ExitArgs {
+        ExitArgs {
+            from_direction: direction,
+            to_area_id: Some(area_id),
+            to_room_number: Some(RoomNumber(room)),
+            weight: 1.0,
+            ..ExitArgs::default()
+        }
+    }
+
+    fn refusal_code(result: CloudResult<impl std::fmt::Debug>) -> String {
+        match result {
+            Err(CloudError::InvalidInput(code)) => code,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_room_made_while_standing_in_a_secret_goes_into_the_secret() {
+        let all = ["read", "add", "edit", "remove"];
+        let (backend, mapper, area_id, secret, secret_area) = secret_door_mapper(&all).await;
+
+        // Each place numbers its own rooms: the Secret above its own room 2,
+        // the map above its own room 1.
+        let number = mapper.try_next_room_number(&secret_area).unwrap();
+        assert_eq!(number, RoomNumber(3));
+        assert_eq!(
+            mapper.try_next_room_number(&area_id).unwrap(),
+            RoomNumber(2)
+        );
+        let submission = mapper
+            .create_room(
+                RoomKey::new(secret_area, number),
+                RoomUpdates {
+                    title: Some("Crypt".to_string()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .expect("the Secret takes the room");
+        mapper
+            .create_exit(
+                RoomKey::new(secret_area, number),
+                exit_into(secret_area, 2, crate::ExitDirection::North),
+            )
+            .await
+            .expect("an exit between the Secret's own rooms");
+
+        let atlas = mapper.get_current_atlas();
+        let crypt = atlas
+            .get_room(&RoomKey::new(secret_area, number))
+            .expect("shown in the Secret at once");
+        assert_eq!(crypt.get_title(), "Crypt");
+        assert_eq!(
+            (
+                crypt.get_exits()[0].to_area_id,
+                crypt.get_exits()[0].to_room_number
+            ),
+            (Some(secret_area), Some(RoomNumber(2)))
+        );
+        assert!(atlas.get_room(&RoomKey::new(area_id, number)).is_none());
+        assert_eq!(
+            mapper.try_next_room_number(&secret_area).unwrap(),
+            RoomNumber(4)
+        );
+        assert_eq!(
+            mapper.try_next_room_number(&area_id).unwrap(),
+            RoomNumber(2),
+            "the map's numbering never saw the Secret's room"
+        );
+
+        mapper
+            .wait_for_mutation(submission.operation_id().unwrap())
+            .await
+            .expect("accepted");
+        mapper.wait_for_sync_completion(5).await.ok();
+        let stored = backend.areas.lock()[&area_id].clone();
+        assert_eq!(stored.rooms.len(), 1, "the map never gets the room");
+        let bundle = &stored.sources[0];
+        assert_eq!(bundle.source, secret);
+        let stored_crypt = bundle
+            .rooms
+            .iter()
+            .find(|room| room.room_number == number)
+            .expect("the Secret holds the room");
+        let exit = &stored_crypt.exits[0];
+        assert_eq!(
+            (exit.to_area_id, exit.to_room_number, exit.to_source),
+            (Some(area_id), Some(RoomNumber(2)), Some(secret))
+        );
+    }
+
+    /// Each place numbers its own rooms: a new Secret's first room is 1 while
+    /// the map has a room 1, the map's next room takes a number the other
+    /// Secret's own room uses, and a draft reserving in one place holds
+    /// nothing in another.
+    #[tokio::test]
+    async fn every_place_numbers_its_own_rooms_from_one() {
+        let area_id = AreaId(Uuid::new_v4());
+        let (secret_uuid, fresh_uuid) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut details = area_with_secret_door(area_id, SourceId::Secret(secret_uuid));
+        details.sources.push(
+            serde_json::from_value(serde_json::json!({
+                "source": SourceId::Secret(fresh_uuid), "name": "Fresh", "ownership": "owner",
+                "rev": 1, "actions": ["read", "add", "edit", "remove"],
+            }))
+            .expect("the new Secret parses"),
+        );
+        let backend = Arc::new(FixedBackend::new(vec![details]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+        let (secret_area, fresh_area) = (AreaId(secret_uuid), AreaId(fresh_uuid));
+        let titled = |title: &str| RoomUpdates {
+            title: Some(title.to_string()),
+            ..RoomUpdates::default()
+        };
+
+        assert_eq!(
+            mapper.try_next_room_number(&fresh_area).unwrap(),
+            RoomNumber(1)
+        );
+        let crypt = mapper
+            .create_room(RoomKey::new(fresh_area, RoomNumber(1)), titled("Crypt"))
+            .expect("the new Secret takes room 1");
+        assert_eq!(
+            mapper.try_next_room_number(&area_id).unwrap(),
+            RoomNumber(2)
+        );
+        let hall = mapper
+            .create_room(RoomKey::new(area_id, RoomNumber(2)), titled("Hall"))
+            .expect("the map takes room 2 beside the Secret's own room 2");
+
+        let draft = Uuid::new_v4();
+        assert_eq!(
+            mapper.reserve_room_number(&secret_area, draft).unwrap(),
+            RoomNumber(3)
+        );
+        assert_eq!(
+            mapper.try_next_room_number(&area_id).unwrap(),
+            RoomNumber(3),
+            "a draft in the Secret holds nothing in the map"
+        );
+        assert_eq!(
+            mapper.try_next_room_number(&secret_area).unwrap(),
+            RoomNumber(4)
+        );
+        mapper.release_room_reservations(&secret_area, draft);
+        assert_eq!(
+            mapper.try_next_room_number(&secret_area).unwrap(),
+            RoomNumber(3)
+        );
+
+        for submission in [crypt, hall] {
+            mapper
+                .wait_for_mutation(submission.operation_id().unwrap())
+                .await
+                .expect("accepted");
+        }
+        mapper.wait_for_sync_completion(5).await.ok();
+        let stored = backend.areas.lock()[&area_id].clone();
+        let numbers = |rooms: &[crate::RoomWithDetails]| {
+            rooms
+                .iter()
+                .map(|room| room.room_number.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(numbers(&stored.rooms), vec![1, 2]);
+        assert_eq!(numbers(&stored.sources[0].rooms), vec![2]);
+        assert_eq!(numbers(&stored.sources[1].rooms), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_map_exit_into_a_readable_secret_stays_owned_by_the_map() {
+        let (backend, mapper, area_id, secret, secret_area) = secret_door_mapper(&["read"]).await;
+        let exit_id = mapper
+            .create_exit(
+                RoomKey::new(area_id, RoomNumber(1)),
+                exit_into(secret_area, 2, crate::ExitDirection::Down),
+            )
+            .await
+            .expect("Map Add and destination Read suffice");
+        mapper.wait_for_sync_completion(5).await.unwrap();
+        let stored = backend.areas.lock()[&area_id].clone();
+        let door = stored.rooms[0]
+            .exits
+            .iter()
+            .find(|exit| exit.id == exit_id)
+            .unwrap();
+        assert_eq!(
+            (door.to_area_id, door.to_room_number, door.to_source),
+            (Some(area_id), Some(RoomNumber(2)), Some(secret))
+        );
+        assert!(
+            stored.sources[0]
+                .room_data
+                .iter()
+                .all(|data| data.exits.iter().all(|exit| exit.id != exit_id))
+        );
+        assert_eq!(
+            stored.sources[0].rev, 4,
+            "the destination's source is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_of_a_secrets_exit_on_a_map_room_goes_into_the_secret() {
+        let all = ["read", "add", "edit", "remove"];
+        let (backend, mapper, area_id, _, _) = secret_door_mapper(&all).await;
+        // Use the existing Secret-owned door on Map room 1; ownership is
+        // determined by its identity, never inferred from its destination.
+        let exit_id = backend.areas.lock()[&area_id].sources[0].room_data[0].exits[0].id;
+
+        // Scripts see the door among the map room's exits and edit it by id.
+        mapper
+            .update_exit(
+                RoomKey::new(area_id, RoomNumber(1)),
+                exit_id,
+                ExitUpdates {
+                    command: Some("push book".to_string()),
+                    ..ExitUpdates::default()
+                },
+            )
+            .expect("the edit goes to the Secret");
+        mapper.wait_for_sync_completion(5).await.ok();
+        let stored = backend.areas.lock()[&area_id].clone();
+        let door = stored.sources[0].room_data[0]
+            .exits
+            .iter()
+            .find(|exit| exit.id == exit_id)
+            .expect("still kept by the Secret");
+        assert_eq!(door.command, "push book");
+
+        mapper
+            .delete_exit(RoomKey::new(area_id, RoomNumber(1)), exit_id)
+            .expect("the delete goes to the Secret");
+        mapper.wait_for_sync_completion(5).await.ok();
+        let stored = backend.areas.lock()[&area_id].clone();
+        assert!(
+            stored.sources[0]
+                .room_data
+                .iter()
+                .all(|data| data.exits.iter().all(|exit| exit.id != exit_id)),
+            "the Secret no longer keeps the door"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_view_only_secret_refuses_writes_up_front() {
+        let (backend, mapper, area_id, _, secret_area) = secret_door_mapper(&["read"]).await;
+
+        let refused = mapper.create_room(
+            RoomKey::new(secret_area, RoomNumber(7)),
+            RoomUpdates::default(),
+        );
+        assert_eq!(refusal_code(refused), "secret_view_only");
+
+        let atlas = mapper.get_current_atlas();
+        assert!(
+            atlas
+                .get_room(&RoomKey::new(area_id, RoomNumber(7)))
+                .is_none()
+        );
+        assert!(
+            atlas
+                .get_room(&RoomKey::new(secret_area, RoomNumber(7)))
+                .is_none()
+        );
+        assert!(
+            atlas
+                .get_area(&area_id)
+                .unwrap()
+                .get_room(&RoomNumber(1))
+                .unwrap()
+                .get_exits()
+                .is_empty()
+        );
+        assert!(backend.mutations.lock().is_empty(), "nothing was queued");
+    }
+
+    #[tokio::test]
+    async fn a_secret_write_needs_the_action_each_operation_needs() {
+        let (backend, mapper, _, _, secret_area) = secret_door_mapper(&["read", "add"]).await;
+
+        let refused = mapper.set_room_property(
+            RoomKey::new(secret_area, RoomNumber(2)),
+            "notes".to_string(),
+            "behind the shelf".to_string(),
+        );
+        assert_eq!(refusal_code(refused), "secret_cannot_edit");
+        let refused = mapper.delete_room(RoomKey::new(secret_area, RoomNumber(2)));
+        assert_eq!(refusal_code(refused), "secret_cannot_remove");
+        assert!(backend.mutations.lock().is_empty(), "nothing was queued");
+
+        mapper
+            .create_room(
+                RoomKey::new(secret_area, RoomNumber(7)),
+                RoomUpdates::default(),
+            )
+            .expect("an add-only grantee adds rooms");
+    }
+
+    #[tokio::test]
+    async fn a_clan_secret_on_a_linked_map_keeps_only_its_own_rooms() {
+        let all = ["read", "add", "edit", "remove"];
+        for own_map in [false, true] {
+            let area_id = AreaId(Uuid::new_v4());
+            let secret_uuid = Uuid::new_v4();
+            let secret = SourceId::Secret(secret_uuid);
+            let secret_area = AreaId(secret_uuid);
+            let clan = Uuid::new_v4();
+            let mut details = area_with_secret_door(area_id, secret);
+            details.sources[0].actions = all.iter().map(|act| (*act).to_string()).collect();
+            details.sources[0].clan_id = Some(clan);
+            details.area.clan_id = own_map.then_some(clan);
+            let backend = Arc::new(FixedBackend::new(vec![details]));
+            let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+            mapper.load_all_areas().await.unwrap();
+
+            // Its own rooms take data either way.
+            mapper
+                .set_room_property(
+                    RoomKey::new(secret_area, RoomNumber(2)),
+                    "notes".to_string(),
+                    "behind the shelf".to_string(),
+                )
+                .expect("a Secret's own room takes its data");
+
+            let into_secret = mapper
+                .create_exit(
+                    RoomKey::new(area_id, RoomNumber(1)),
+                    exit_into(secret_area, 2, crate::ExitDirection::Down),
+                )
+                .await;
+            let into_map = mapper
+                .create_exit(
+                    RoomKey::new(secret_area, RoomNumber(2)),
+                    exit_into(area_id, 1, crate::ExitDirection::Up),
+                )
+                .await;
+            if own_map {
+                assert!(
+                    into_secret.is_ok() && into_map.is_ok(),
+                    "the clan's own map"
+                );
+            } else {
+                assert!(
+                    into_secret.is_ok(),
+                    "the Map-owned exit only reads its destination"
+                );
+                assert_eq!(refusal_code(into_map), "secret_linked_map_rooms");
+                let moved = mapper
+                    .move_content(
+                        area_id,
+                        SourceId::Map,
+                        secret,
+                        MovedContent {
+                            rooms: vec![RoomNumber(1)],
+                            ..MovedContent::default()
+                        },
+                    )
+                    .await;
+                assert_eq!(refusal_code(moved), "secret_linked_map_rooms");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One fixture contrasts same-map, foreign and retargeted links.
+    async fn links_between_readable_sources_keep_the_origin_owner_and_qualified_destination() {
+        let area_id = AreaId(Uuid::new_v4());
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut details = area_with_secret_door(area_id, SourceId::Secret(first));
+        let mut other = details.sources[0].clone();
+        other.source = SourceId::Secret(second);
+        other.room_data.clear();
+        other.connections.clear();
+        details.sources.push(other);
+        let elsewhere = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![
+            details,
+            sample_area(elsewhere, "Road"),
+        ]));
+        let mapper = Mapper::new(backend, temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+        let (first, second) = (AreaId(first), AreaId(second));
+
+        let between = mapper
+            .create_exit(
+                RoomKey::new(first, RoomNumber(2)),
+                exit_into(second, 2, crate::ExitDirection::East),
+            )
+            .await;
+        let between_id = between.expect("the destination Secret requires Read only");
+        let stored = mapper.get_current_atlas().get_area(&area_id).unwrap();
+        let source = stored
+            .meta()
+            .sources
+            .iter()
+            .find(|bundle| bundle.source == SourceId::Secret(first.0))
+            .unwrap();
+        let exit = source
+            .rooms
+            .iter()
+            .flat_map(|room| &room.exits)
+            .find(|exit| exit.id == between_id)
+            .unwrap();
+        assert_eq!(exit.to_source, Some(SourceId::Secret(second.0)));
+        assert_eq!(exit.to_area_id, Some(area_id));
+        // From another map, an exit leads into the Secret's room: the cache
+        // reads it under the Secret's own area, the wire under its map.
+        let from_elsewhere = mapper
+            .create_exit(
+                RoomKey::new(elsewhere, RoomNumber(1)),
+                exit_into(first, 2, crate::ExitDirection::East),
+            )
+            .await
+            .expect("an exit into another map's Secret room");
+        let shown = mapper
+            .get_current_atlas()
+            .get_room(&RoomKey::new(elsewhere, RoomNumber(1)))
+            .unwrap();
+        let exit = shown
+            .get_exits()
+            .iter()
+            .find(|exit| exit.id == from_elsewhere)
+            .unwrap();
+        assert_eq!(exit.to_area_id, Some(first));
+        assert_eq!(exit.to_secret_map, Some(area_id));
+        assert_eq!(exit.to_room_number, Some(RoomNumber(2)));
+        let written = exit.to_exit();
+        assert_eq!(written.to_area_id, Some(area_id));
+        assert_eq!(written.to_source, Some(SourceId::Secret(first.0)));
+        // An unloaded Private source supplies no target; a Secret destination
+        // must identify a room.
+        let private = crate::mapper::area_cache::source_area_id(area_id, SourceId::Private, None)
+            .expect("a Private area");
+        assert!(mapper.get_current_atlas().get_area(&private).is_none());
+        let roomless = mapper
+            .create_exit(
+                RoomKey::new(elsewhere, RoomNumber(1)),
+                ExitArgs {
+                    from_direction: crate::ExitDirection::West,
+                    to_area_id: Some(first),
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            )
+            .await;
+        assert_eq!(refusal_code(roomless), "secret_link_into_other_map");
+
+        let map_exit = mapper
+            .create_exit(
+                RoomKey::new(area_id, RoomNumber(1)),
+                ExitArgs {
+                    from_direction: crate::ExitDirection::West,
+                    weight: 1.0,
+                    ..ExitArgs::default()
+                },
+            )
+            .await
+            .unwrap();
+        let retarget = mapper.retarget_exit(
+            RoomKey::new(area_id, RoomNumber(1)),
+            map_exit,
+            ExitUpdates {
+                to_area_id: Some(first),
+                to_room_number: Some(RoomNumber(2)),
+                ..ExitUpdates::default()
+            },
+        );
+        retarget.expect("a Map-owned exit may target a readable Secret");
+        let shown = mapper.get_current_atlas().get_area(&area_id).unwrap();
+        let exit = shown
+            .get_rooms()
+            .iter()
+            .flat_map(|room| room.get_exits())
+            .find(|exit| exit.id == map_exit)
+            .unwrap()
+            .to_exit();
+        assert_eq!(exit.to_source, Some(SourceId::Secret(first.0)));
+    }
+
+    #[test]
+    fn source_area_connection_updates_preserve_explicit_anchor_sources() {
+        let map = AreaId(Uuid::new_v4());
+        let area = AreaId(Uuid::new_v4());
+        let source = SourceId::Secret(area.0);
+        for anchor in [
+            None,
+            Some(SourceId::Map),
+            Some(SourceId::Private),
+            Some(source),
+        ] {
+            let operation = AreaMutation::UpdateConnection {
+                connection_id: crate::ConnectionId(Uuid::new_v4()),
+                body: crate::ConnectionUpdates {
+                    endpoint_a: Some(crate::ConnectionEndpoint {
+                        room_number: RoomNumber(2),
+                        source: anchor,
+                        side: crate::RoomSide::West,
+                        port_offset: 0.5,
+                        port_mode: crate::PortMode::AutoPinned,
+                    }),
+                    ..Default::default()
+                },
+            };
+            let AreaMutation::UpdateConnection { body, .. } =
+                into_source_addressing(operation, map, area, source)
+            else {
+                panic!("a connection update stays a connection update");
+            };
+            assert_eq!(body.endpoint_a.unwrap().source, anchor.or(Some(source)));
+        }
+    }
+
+    /// References to unreadable sources fail before anything is queued;
+    /// readable anchors do not grant authority over the anchored room's fields.
+    #[tokio::test]
+    async fn writes_naming_unavailable_source_rooms_or_other_sources_room_fields_are_refused() {
+        let all = ["read", "add", "edit", "remove"];
+        let (backend, mapper, area_id, secret, secret_area) = secret_door_mapper(&all).await;
+        let other = SourceId::Secret(Uuid::new_v4());
+        let into = |to_source: Option<SourceId>| AreaMutation::CreateExit {
+            room_number: RoomNumber(1),
+            room_source: None,
+            body: ExitArgs {
+                to_source,
+                ..exit_into(area_id, 2, crate::ExitDirection::Down)
+            },
+        };
+        let batch =
+            |area: AreaId, op: AreaMutation| AreaMutationBatch::strict(area, vec![op], "Link");
+        let endpoint = |source: Option<SourceId>| crate::ConnectionEndpoint {
+            room_number: RoomNumber(2),
+            source,
+            side: crate::RoomSide::West,
+            port_offset: 0.5,
+            port_mode: crate::PortMode::AutoPinned,
+        };
+        let link_to = |source: Option<SourceId>| AreaMutation::CreateConnection {
+            body: crate::ConnectionArgs {
+                id: crate::ConnectionId(Uuid::new_v4()),
+                endpoint_a: endpoint(None),
+                endpoint_b: Some(endpoint(source)),
+                routing: crate::ConnectionRouting::default(),
+                segment_shape: crate::SegmentShape::default(),
+                corner: crate::CornerStyle::default(),
+                route_points: Vec::new(),
+                dash: crate::ConnectionDash::default(),
+                color: crate::DEFAULT_CONNECTION_COLOR.to_string(),
+                thickness: 1.0,
+            },
+        };
+
+        for (refused, code) in [
+            (
+                batch(
+                    area_id,
+                    AreaMutation::UpsertRoom {
+                        room_number: RoomNumber(2),
+                        room_source: Some(secret),
+                        body: RoomUpdates {
+                            title: Some("not mine to change".into()),
+                            ..RoomUpdates::default()
+                        },
+                    },
+                ),
+                "cannot_edit_other_source_room",
+            ),
+            // The Secret names another Secret's room.
+            (
+                batch(area_id, into(Some(other))).in_source(secret),
+                "referenced_room_unavailable",
+            ),
+            (
+                batch(area_id, link_to(Some(other))).in_source(secret),
+                "referenced_room_unavailable",
+            ),
+            (
+                batch(secret_area, into(Some(other))),
+                "referenced_room_unavailable",
+            ),
+            // A Secret the client does not hold.
+            (
+                batch(area_id, into(None)).in_source(other),
+                "secret_unavailable",
+            ),
+        ] {
+            assert_eq!(refusal_code(mapper.mutate_batches(vec![refused])), code);
+        }
+        assert!(backend.mutations.lock().is_empty(), "nothing was queued");
+        let atlas = mapper.get_current_atlas();
+        let map = atlas.get_area(&area_id).expect("the map");
+        assert_eq!(map.meta().sources.len(), 1, "no Secret appears");
+    }
+
+    #[tokio::test]
+    async fn map_owned_attachments_on_secret_rooms_stay_qualified_through_ack_and_replay() {
+        let all = ["read", "add", "edit", "remove"];
+        let (backend, mapper, area_id, secret, _) = secret_door_mapper(&all).await;
+        let before = backend.areas.lock()[&area_id].clone();
+        backend.hold_mutations(true);
+        let submission = mapper
+            .mutate_batches(vec![AreaMutationBatch::strict(
+                area_id,
+                vec![AreaMutation::UpsertRoomProperty {
+                    room_number: RoomNumber(2),
+                    room_source: Some(secret),
+                    name: "notes".into(),
+                    value: "Kept on the map".into(),
+                }],
+                "Retained map note",
+            )])
+            .unwrap();
+        let staged = mapper
+            .get_current_atlas()
+            .get_area(&area_id)
+            .unwrap()
+            .to_details();
+        assert_eq!(staged.rooms, before.rooms);
+        assert_eq!(staged.sources, before.sources);
+        assert_eq!(staged.room_data[0].room_source, Some(secret));
+        assert_eq!(staged.room_data[0].properties[0].value, "Kept on the map");
+
+        // A new server projection must replay the pending attachment against
+        // its qualified anchor, even though the base has no room_data yet.
+        let (folded, failed) = mapper.inner.fold_pending_with_receipts(
+            area_id,
+            &before,
+            ReplayMode::StopAtFailure,
+            None,
+        );
+        assert!(failed.is_none());
+        assert_eq!(folded.rooms, before.rooms);
+        assert_eq!(folded.sources, before.sources);
+        assert_eq!(folded.room_data, staged.room_data);
+        backend.hold_mutations(false);
+        mapper
+            .wait_for_mutation(submission[0].operation_id().unwrap())
+            .await
+            .unwrap();
+        let saved = backend.areas.lock()[&area_id].clone();
+        assert_eq!(saved.rooms, before.rooms);
+        assert_eq!(saved.sources, before.sources);
+        assert_eq!(saved.room_data, staged.room_data);
+    }
+
+    #[tokio::test]
+    async fn area_level_calls_on_a_secret_are_refused() {
+        let all = ["read", "add", "edit", "remove"];
+        let (_, mapper, _, _, secret_area) = secret_door_mapper(&all).await;
+
+        let code = |result: CloudResult<()>| refusal_code(result);
+        assert_eq!(
+            code(mapper.rename_area(secret_area, "x").await),
+            "secret_area_level"
+        );
+        assert_eq!(
+            code(mapper.delete_area(secret_area).await),
+            "secret_area_level"
+        );
+        assert_eq!(
+            code(mapper.move_area_to_atlas(secret_area, None).await),
+            "secret_area_level"
+        );
+        assert_eq!(
+            refusal_code(mapper.export_area(secret_area).await),
+            "secret_area_level"
+        );
+        assert_eq!(
+            refusal_code(mapper.merge_rooms(secret_area, RoomNumber(2), RoomNumber(3))),
+            "secret_area_level"
+        );
+        assert!(mapper.get_current_atlas().get_area(&secret_area).is_some());
+    }
+
+    #[tokio::test]
+    async fn merging_away_a_room_a_secret_keeps_data_for_is_refused() {
+        let area_id = AreaId(Uuid::new_v4());
+        let mut details = area_with_secret_door(area_id, SourceId::Secret(Uuid::new_v4()));
+        let mut second = details.rooms[0].clone();
+        second.room_number = RoomNumber(2);
+        details.rooms.push(second);
+        let backend = Arc::new(FixedBackend::new(vec![details]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+
+        let refused = mapper.merge_rooms(area_id, RoomNumber(2), RoomNumber(1));
+        assert!(
+            matches!(refused, Err(CloudError::SecretKeepsRoomData(RoomNumber(1)))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "A Secret keeps data for room 1. Move or remove it first. (merge_secret_room_data)"
+        );
+        assert!(backend.mutations.lock().is_empty());
+        mapper
+            .merge_rooms(area_id, RoomNumber(1), RoomNumber(2))
+            .expect("room 2 holds nothing of the Secret's");
+    }
+
+    /// To a caller who does not see the map's Secrets, what a Secret keeps
+    /// on the removed room refuses nothing: the server takes it with the
+    /// room, as it does for anyone who cannot read the Secret.
+    #[tokio::test]
+    async fn a_merge_for_a_caller_who_cannot_see_secrets_leaves_their_data_to_the_server() {
+        let area_id = AreaId(Uuid::new_v4());
+        let mut details = area_with_secret_door(area_id, SourceId::Secret(Uuid::new_v4()));
+        let mut second = details.rooms[0].clone();
+        second.room_number = RoomNumber(2);
+        details.rooms.push(second);
+        let backend = Arc::new(FixedBackend::new(vec![details]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+
+        mapper
+            .merge_rooms_as(area_id, RoomNumber(2), RoomNumber(1), Sources::Hidden)
+            .expect("the Secret's data on room 1 is the server's to take");
+    }
+
+    #[tokio::test]
+    async fn reviewed_move_does_not_refresh_its_preconditions_after_a_new_edit() {
+        let area = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(area, "Original")]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+        let reviewed = mapper
+            .review_move_content(
+                area,
+                SourceId::Map,
+                SourceId::Private,
+                MovedContent {
+                    rooms: vec![RoomNumber(1)],
+                    ..MovedContent::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(backend.committed_moves.lock().is_empty());
+        // A preview releases its fence. A subsequent edit can complete,
+        // but the old approval must not silently adopt its new revision.
+        let edit = mapper
+            .upsert_room(
+                RoomKey::new(area, RoomNumber(1)),
+                RoomUpdates {
+                    title: Some("Edited after review".into()),
+                    ..RoomUpdates::default()
+                },
+            )
+            .unwrap();
+        mapper
+            .wait_for_mutation(edit.operation_id().unwrap())
+            .await
+            .unwrap();
+        let mut original = backend.reviewed_moves.lock()[0].clone();
+        original.access_review = Some(reviewed.review.token.clone());
+        let result = mapper.commit_reviewed_move(reviewed).await;
+        assert!(matches!(result, Err(CloudError::RevisionConflict { .. })));
+        let committed = backend.committed_moves.lock()[0].clone();
+        assert_eq!(
+            serde_json::to_value(committed).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+        assert_eq!(
+            backend.areas.lock()[&area].rooms[0].title,
+            "Edited after review"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewed_move_cannot_cross_an_account_change() {
+        let area = AreaId(Uuid::new_v4());
+        let backend = Arc::new(FixedBackend::new(vec![sample_area(area, "Original")]));
+        let mapper = Mapper::new(backend.clone(), temp_cache_dir());
+        mapper.load_all_areas().await.unwrap();
+        let reviewed = mapper
+            .review_move_content(
+                area,
+                SourceId::Map,
+                SourceId::Private,
+                MovedContent {
+                    rooms: vec![RoomNumber(1)],
+                    ..MovedContent::default()
+                },
+            )
+            .await
+            .unwrap();
+        backend.generation.fetch_add(1, Ordering::AcqRel);
+        assert!(matches!(
+            mapper.commit_reviewed_move(reviewed).await,
+            Err(CloudError::CredentialChanged)
+        ));
+        assert!(backend.committed_moves.lock().is_empty());
+        assert_eq!(backend.areas.lock()[&area].rooms.len(), 1);
+    }
+
     fn sample_area(area_id: AreaId, room_title: &str) -> AreaWithDetails {
         AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: Area {
+                projection_token: None,
                 id: area_id,
                 user_id: None,
                 atlas_id: None,
@@ -5364,10 +8084,13 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
                 atlas_name: None,
             },
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: vec![],
             rooms: vec![RoomWithDetails {
                 room_number: RoomNumber(1),
@@ -5380,7 +8103,6 @@ mod tests {
                 properties: vec![],
                 exits: vec![],
                 tags: Default::default(),
-                is_secret: false,
                 external_id: None,
             }],
             labels: vec![],
@@ -5395,6 +8117,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stalled_initial_load_keeps_local_maps_and_refuses_blind_imports() {
+        let local_id = AreaId(Uuid::new_v4());
+        let cloud_id = AreaId(Uuid::new_v4());
+        let local = Arc::new(LocalBackend::new(temp_cache_dir()));
+        local
+            .import_local_area(sample_area(local_id, "local"))
+            .await
+            .unwrap();
+        let cloud = Arc::new(FixedBackend::new(vec![sample_area(cloud_id, "cloud")]));
+        cloud.hold_listing.send_replace(true);
+        let mapper = Mapper::new(
+            Arc::new(crate::CompositeBackend::new(local, cloud.clone())),
+            temp_cache_dir(),
+        );
+        let importer = tokio::spawn({
+            let mapper = mapper.clone();
+            async move {
+                mapper
+                    .import_areas_if_absent(vec![sample_area(cloud_id, "duplicate")])
+                    .await
+            }
+        });
+        let result = mapper
+            .inner
+            .load_initial_areas(Duration::from_millis(100))
+            .await;
+        assert!(matches!(result, Err(CloudError::NetworkError(_))));
+        assert!(mapper.get_current_atlas().get_area(&local_id).is_some());
+        assert!(mapper.get_current_atlas().get_area(&cloud_id).is_none());
+        assert!(matches!(
+            importer.await.unwrap(),
+            Err(CloudError::NetworkError(_))
+        ));
+
+        cloud.hold_listing.send_replace(false);
+        mapper.load_initial_areas().await.unwrap();
+        assert!(mapper.get_current_atlas().get_area(&cloud_id).is_some());
+        let retried = mapper
+            .import_areas_if_absent(vec![sample_area(cloud_id, "duplicate")])
+            .await
+            .unwrap();
+        assert!(retried.added.is_empty());
+        assert_eq!(retried.skipped.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_deadline_also_bounds_waiting_for_another_loader() {
+        let cloud = Arc::new(FixedBackend::new(vec![]));
+        cloud.hold_listing.send_replace(true);
+        let mapper = Mapper::new(cloud.clone(), temp_cache_dir());
+        let refresh = tokio::spawn({
+            let mapper = mapper.clone();
+            async move { mapper.load_all_areas().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(mapper.inner.load_gate.try_lock().is_err());
+        assert!(
+            mapper
+                .inner
+                .load_initial_areas(Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+        cloud.hold_listing.send_replace(false);
+        refresh.await.unwrap().unwrap();
+        mapper.load_initial_areas().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn full_load_preserves_newer_acknowledged_revision() {
         let id = AreaId(Uuid::new_v4());
         let backend = Arc::new(FixedBackend::new(vec![sample_area(id, "room")]));
@@ -5402,9 +8193,9 @@ mod tests {
         mapper.load_all_areas().await.unwrap();
         // An ACK has advanced backend truth, but a buffered/cached GET still
         // carries the old body. Full loads do not have a per-GET stale check.
-        mapper.inner.pending.note_confirmed_rev(id, 2, None);
+        mapper.inner.pending.note_confirmed_rev(id, 2);
         mapper.load_all_areas().await.unwrap();
-        assert_eq!(mapper.inner.pending.confirmed_rev(id).0, Some(2));
+        assert_eq!(mapper.inner.pending.confirmed_rev(id), Some(2));
     }
 
     #[tokio::test]
@@ -5675,8 +8466,10 @@ mod tests {
         let cache_dir = temp_cache_dir();
         let mapper = Mapper::new(backend.clone(), &cache_dir);
         let envelope = PendingEnvelope {
+            source: SourceId::Map,
             operation_id: Uuid::new_v4(),
             ops: vec![AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: RoomUpdates {
                     title: Some("durable edit".to_string()),
@@ -5687,6 +8480,7 @@ mod tests {
             structural_preconditions: Vec::new(),
             room_remap: None,
             attempts: 0,
+            held: 0,
             viewer_id: None,
             local_durable: true,
             auth_generation: 0,
@@ -5802,6 +8596,7 @@ mod tests {
         let pair = ConnectionId::new();
         let external = ConnectionId::new();
         let endpoint = |room: i32, side: RoomSide| ConnectionEndpoint {
+            source: None,
             room_number: RoomNumber(room),
             side,
             port_offset: 0.5,
@@ -5827,6 +8622,7 @@ mod tests {
                     from: crate::ExitDirection,
                     to: Option<(AreaId, i32)>,
                     connection_id: ConnectionId| Exit {
+            to_source: None,
             id: ExitId(Uuid::from_u128(n)),
             from_direction: from,
             to_area_id: to.map(|(area, _)| area),
@@ -5834,14 +8630,12 @@ mod tests {
             to_direction: None,
             path: String::new(),
             is_hidden: false,
-            is_closed: false,
-            is_locked: false,
+            door: None,
             weight: 1.0,
             command: String::new(),
             connection_id,
             to_unknown: false,
             to_area_token: None,
-            is_secret: false,
         };
         let mut details = sample_area(area_id, "Origin");
         details.rooms[0].exits = vec![
@@ -5864,7 +8658,6 @@ mod tests {
                 pair,
             )],
             tags: std::collections::BTreeSet::default(),
-            is_secret: false,
             external_id: None,
         });
         details.connections = vec![
@@ -5899,11 +8692,9 @@ mod tests {
                     to_room_number: Some(RoomNumber(2)),
                     path: Some(String::new()),
                     is_hidden: Some(false),
-                    is_closed: Some(false),
-                    is_locked: Some(false),
+                    door: Some(None),
                     weight: Some(1.0),
                     command: Some(String::new()),
-                    is_secret: Some(false),
                     clear_to: Some(false),
                     ..ExitUpdates::default()
                 },
@@ -5926,6 +8717,7 @@ mod tests {
         let compiled = compile_area_mutations(
             &mut scratch,
             vec![AreaMutation::CreateExit {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: ExitArgs {
                     from_direction: crate::ExitDirection::Special,
@@ -5951,13 +8743,13 @@ mod tests {
 
         let mut applied = details;
         let envelope = MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: area_id.0,
-                expected_rev: applied.area.rev,
-                access_fingerprint: applied.area.access.map(|access| access.fingerprint()),
-            }],
+            preconditions: vec![Precondition::source(
+                area_id.0,
+                crate::SourceId::map(),
+                applied.area.rev,
+            )],
             payload: compiled,
         };
         area_edits::apply_envelope(&mut applied, area_id, &envelope)
@@ -5978,6 +8770,7 @@ mod tests {
         let compiled = compile_area_mutations(
             &mut scratch,
             vec![AreaMutation::CreateExit {
+                room_source: None,
                 room_number: RoomNumber(2),
                 body: ExitArgs {
                     from_direction: crate::ExitDirection::West,
@@ -6003,13 +8796,13 @@ mod tests {
 
         let mut applied = details;
         let envelope = MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: area_id.0,
-                expected_rev: applied.area.rev,
-                access_fingerprint: applied.area.access.map(|access| access.fingerprint()),
-            }],
+            preconditions: vec![Precondition::source(
+                area_id.0,
+                crate::SourceId::map(),
+                applied.area.rev,
+            )],
             payload: compiled,
         };
         area_edits::apply_envelope(&mut applied, area_id, &envelope)
@@ -6054,13 +8847,13 @@ mod tests {
 
         let mut applied = details.clone();
         let envelope = MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: area_id.0,
-                expected_rev: applied.area.rev,
-                access_fingerprint: applied.area.access.map(|access| access.fingerprint()),
-            }],
+            preconditions: vec![Precondition::source(
+                area_id.0,
+                crate::SourceId::map(),
+                applied.area.rev,
+            )],
             payload: compiled,
         };
         area_edits::apply_envelope(&mut applied, area_id, &envelope)
@@ -6074,7 +8867,7 @@ mod tests {
         let foreign = AreaId(Uuid::new_v4());
         let details = sample_v2_document(area_id, foreign);
 
-        let raw = merge_room_operations(&details, RoomNumber(1), RoomNumber(2))
+        let raw = merge_room_operations(&details, RoomNumber(1), RoomNumber(2), Sources::Shown)
             .expect("same-area merge plan");
         let compiled = compile_area_mutations(&mut details.clone(), raw, PairedExitPolicy::Split)
             .expect("paired topology is split explicitly");
@@ -6082,19 +8875,20 @@ mod tests {
         assert!(matches!(
             compiled.last(),
             Some(AreaMutation::DeleteRoom {
-                room_number: RoomNumber(2)
+                room_number: RoomNumber(2),
+                ..
             })
         ));
 
         let mut applied = details;
         let envelope = MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: area_id.0,
-                expected_rev: applied.area.rev,
-                access_fingerprint: applied.area.access.map(|access| access.fingerprint()),
-            }],
+            preconditions: vec![Precondition::source(
+                area_id.0,
+                crate::SourceId::map(),
+                applied.area.rev,
+            )],
             payload: compiled,
         };
         area_edits::apply_envelope(&mut applied, area_id, &envelope)
@@ -6239,9 +9033,8 @@ mod tests {
                 "exits": [{
                     "id": Uuid::from_u128(0xAB), "from_direction": "North",
                     "to_area_id": null, "to_room_number": null, "to_direction": null,
-                    "path": "", "is_hidden": false, "is_closed": false,
-                    "is_locked": false, "weight": 1.0, "command": "",
-                    "style": "Stub", "color": "#224466"
+                    "path": "", "is_hidden": false, "is_closed": false, "is_locked": false,
+                    "weight": 1.0, "command": "", "style": "Stub", "color": "#224466"
                 }]
             }],
             "labels": [],
@@ -6264,8 +9057,8 @@ mod tests {
         let ids = mapper.import_areas(vec![migrated]).await.expect("import");
         assert_eq!(ids.len(), 1, "the migrated document imports cleanly");
 
-        let v3 = serde_json::json!({ "format_version": 3, "id": Uuid::new_v4(), "name": "Future" });
-        let err = serde_json::from_value::<AreaImportDocument>(v3)
+        let v4 = serde_json::json!({ "format_version": 4, "id": Uuid::new_v4(), "name": "Future" });
+        let err = serde_json::from_value::<AreaImportDocument>(v4)
             .expect_err("a newer format is rejected without partial import");
         assert!(err.to_string().contains("newer than this client"), "{err}");
     }
@@ -6353,6 +9146,7 @@ mod tests {
 
     fn exit_to(id: u128, to_area: AreaId, to_room: i32) -> Exit {
         Exit {
+            to_source: None,
             id: ExitId(Uuid::from_u128(id)),
             from_direction: crate::ExitDirection::North,
             to_area_id: Some(to_area),
@@ -6360,14 +9154,12 @@ mod tests {
             to_direction: Some(crate::ExitDirection::South),
             path: String::new(),
             is_hidden: false,
-            is_closed: false,
-            is_locked: false,
+            door: None,
             weight: 1.0,
             command: String::new(),
             connection_id: crate::ConnectionId::new(),
             to_unknown: false,
             to_area_token: None,
-            is_secret: false,
         }
     }
 
@@ -6383,7 +9175,6 @@ mod tests {
             properties: vec![],
             exits,
             tags: Default::default(),
-            is_secret: false,
             external_id: None,
         }
     }
@@ -6399,7 +9190,10 @@ mod tests {
             })
             .collect();
         let mut details = AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: Area {
+                projection_token: None,
                 id: area_id,
                 user_id: None,
                 atlas_id: None,
@@ -6412,10 +9206,13 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
                 atlas_name: None,
             },
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: vec![],
             rooms,
             labels: vec![],
@@ -6427,8 +9224,10 @@ mod tests {
             area_edits::apply_mutation(
                 &mut details,
                 &AreaMutation::CreateExit {
+                    room_source: None,
                     room_number,
                     body: ExitArgs {
+                        to_source: None,
                         id: Some(exit.id),
                         connection_id: None,
                         new_connection_id: None,
@@ -6438,11 +9237,9 @@ mod tests {
                         to_direction: exit.to_direction,
                         path: Some(exit.path),
                         is_hidden: exit.is_hidden,
-                        is_closed: exit.is_closed,
-                        is_locked: exit.is_locked,
+                        door: exit.door,
                         weight: exit.weight,
                         command: Some(exit.command),
-                        is_secret: Some(exit.is_secret),
                     },
                 },
             )
@@ -6714,6 +9511,7 @@ mod tests {
                 a,
                 vec![
                     AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: RoomNumber(1),
                         body: RoomUpdates {
                             title: Some("Kept".to_string()),
@@ -6721,6 +9519,7 @@ mod tests {
                         },
                     },
                     AreaMutation::DeleteRoom {
+                        room_source: None,
                         room_number: RoomNumber(3),
                     },
                 ],
@@ -6729,7 +9528,7 @@ mod tests {
             .expect("delete in a batch");
         wait_until(|| {
             mapper.inner.pending.total_pending() == 0
-                && mapper.inner.pending.confirmed_rev(b).0 == Some(stored_b().area.rev)
+                && mapper.inner.pending.confirmed_rev(b) == Some(stored_b().area.rev)
         })
         .await;
 
@@ -6790,10 +9589,12 @@ mod tests {
             .await
             .expect("create B");
         let room = |number: i32| AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(number),
             body: RoomUpdates::default(),
         };
         let link = |seed: u128, from_direction, to: i32| AreaMutation::CreateExit {
+            room_source: None,
             room_number: RoomNumber(5),
             body: ExitArgs {
                 id: Some(ExitId(Uuid::from_u128(seed))),
@@ -6825,7 +9626,7 @@ mod tests {
             .expect("delete a room");
         wait_until(|| {
             mapper.inner.pending.total_pending() == 0
-                && mapper.inner.pending.confirmed_rev(b).0 == Some(b_rev + 1)
+                && mapper.inner.pending.confirmed_rev(b) == Some(b_rev + 1)
         })
         .await;
 
@@ -6842,6 +9643,7 @@ mod tests {
 
     fn blank_room(number: i32) -> AreaMutation {
         AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(number),
             body: RoomUpdates::default(),
         }
@@ -6850,6 +9652,7 @@ mod tests {
     /// Exit `seed` from room `from` to room `to.1` of area `to.0`.
     fn link_to(from: i32, seed: u128, to: (AreaId, i32)) -> AreaMutation {
         AreaMutation::CreateExit {
+            room_source: None,
             room_number: RoomNumber(from),
             body: ExitArgs {
                 id: Some(ExitId(Uuid::from_u128(seed))),
@@ -6932,6 +9735,7 @@ mod tests {
                 AreaMutationBatch::strict(
                     b,
                     vec![AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: RoomNumber(5),
                         body: RoomUpdates {
                             title: Some("Edited".to_string()),
@@ -6944,6 +9748,7 @@ mod tests {
                 AreaMutationBatch::strict(
                     a,
                     vec![AreaMutation::DeleteRoom {
+                        room_source: None,
                         room_number: RoomNumber(2),
                     }],
                     "delete A 2",
@@ -7011,13 +9816,14 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// A holds rooms 1 to 3, and B's exits lead to A 4 and A 5, rooms since
-    /// deleted, and to A 9. The next room and a draft's reservation pass
-    /// over 4 and 5 and take the free numbers below 9; rooms created at the
-    /// numbers handed out leave every stale exit leading nowhere. An exit
-    /// to A 20 changes nothing until allocation reaches 20.
+    /// A holds rooms 1 to 3, and B's exits lead to A 4, A 5 and A 9, numbers
+    /// no room of A holds. A room that goes clears every exit into it, so
+    /// such exits are stale and allocation is plain: the next room and a
+    /// draft's reservation take one above A's highest room and the drafts'
+    /// numbers, whatever exits name. Merges and pastes still see the numbers
+    /// as vacant targets.
     #[tokio::test]
-    async fn new_rooms_never_take_a_number_a_stale_exit_leads_to() {
+    async fn new_room_numbers_are_one_above_the_highest_room() {
         use crate::ExitDirection::{East, West};
         let (a, b) = (AreaId(Uuid::new_v4()), AreaId(Uuid::new_v4()));
         let backend = Arc::new(FixedBackend::new(vec![
@@ -7044,45 +9850,26 @@ mod tests {
         let mapper = Mapper::new(backend, temp_cache_dir());
         mapper.load_all_areas().await.expect("load");
 
-        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(6)));
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(4)));
         let draft = Uuid::new_v4();
         assert_eq!(
             mapper.reserve_room_number(&a, draft).expect("reserve"),
-            RoomNumber(6)
+            RoomNumber(4)
         );
-        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(7)));
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(5)));
         mapper.release_room_reservations(&a, draft);
-        for expected in [6, 7, 8, 10] {
+        for expected in [4, 5, 6] {
             let created = mapper.next_room_number(&a).expect("A is loaded");
             assert_eq!(created, RoomNumber(expected));
             mapper
                 .create_room(RoomKey::new(a, created), RoomUpdates::default())
                 .expect("create a room");
         }
-
-        let atlas = mapper.get_current_atlas();
-        for number in [4, 5, 9] {
-            assert!(
-                atlas
-                    .get_room(&RoomKey::new(a, RoomNumber(number)))
-                    .is_none()
-            );
-        }
-        assert_eq!(exit_target(&atlas, b, 5, 1), (Some(a), Some(RoomNumber(4))));
-
-        mapper
-            .create_exit(
-                RoomKey::new(b, RoomNumber(5)),
-                ExitArgs {
-                    from_direction: crate::ExitDirection::South,
-                    to_area_id: Some(a),
-                    to_room_number: Some(RoomNumber(20)),
-                    ..ExitArgs::default()
-                },
-            )
-            .await
-            .expect("link B to A 20");
-        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(11)));
+        assert_eq!(mapper.next_room_number(&a), Some(RoomNumber(7)));
+        assert_eq!(
+            mapper.get_current_atlas().vacant_exit_targets(&a),
+            vec![RoomNumber(9)]
+        );
     }
 
     #[tokio::test]
@@ -7191,7 +9978,7 @@ mod tests {
         let backend = Arc::new(FixedBackend::new(vec![sample_area(a_id, "Plaza")]));
         let mapper = Mapper::new(backend.clone(), temp_cache_dir());
         mapper.load_all_areas().await.expect("load");
-        assert_eq!(mapper.inner.pending.confirmed_rev(a_id).0, Some(1));
+        assert_eq!(mapper.inner.pending.confirmed_rev(a_id), Some(1));
 
         mapper
             .upsert_room(
@@ -7207,7 +9994,7 @@ mod tests {
 
         // The backend applied one envelope and the confirmed revision moved.
         assert_eq!(backend.mutations.lock().len(), 1);
-        assert_eq!(mapper.inner.pending.confirmed_rev(a_id).0, Some(2));
+        assert_eq!(mapper.inner.pending.confirmed_rev(a_id), Some(2));
         let stats = mapper.get_sync_stats();
         assert_eq!(stats.operations_sent(), 1);
         assert_eq!(stats.operations_succeeded(), 1);
@@ -7323,7 +10110,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(mapper.inner.pending.confirmed_rev(id).0, Some(2));
+        assert_eq!(mapper.inner.pending.confirmed_rev(id), Some(2));
         assert_eq!(
             mapper
                 .get_current_atlas()
@@ -7444,7 +10231,7 @@ mod tests {
             mutations[0].0, mutations[1].0,
             "the resend carries the same operation id"
         );
-        assert_eq!(mapper.inner.pending.confirmed_rev(a_id).0, Some(3));
+        assert_eq!(mapper.inner.pending.confirmed_rev(a_id), Some(3));
         let stats = mapper.get_sync_stats();
         assert_eq!(stats.operations_succeeded(), 1);
         assert_eq!(stats.operations_failed(), 0);
@@ -7475,7 +10262,6 @@ mod tests {
                 properties: vec![],
                 exits: vec![],
                 tags: Default::default(),
-                is_secret: false,
                 external_id: None,
             });
         }
@@ -7538,7 +10324,6 @@ mod tests {
                 properties: vec![],
                 exits: vec![],
                 tags: Default::default(),
-                is_secret: false,
                 external_id: None,
             });
         }
@@ -7716,6 +10501,7 @@ mod tests {
             AreaMutationBatch::strict(
                 a_id,
                 vec![AreaMutation::UpsertRoom {
+                    room_source: None,
                     room_number: RoomNumber(1),
                     body: RoomUpdates {
                         title: Some("Must not publish".to_string()),
@@ -8184,7 +10970,6 @@ mod tests {
         b_one.properties.push(crate::Property {
             name: "shard".to_string(),
             value: "jurassic".to_string(),
-            is_secret: false,
         });
         let documents = vec![
             area_with_rooms(
@@ -8270,6 +11055,8 @@ mod tests {
             .create_area(CreateAreaRequest {
                 name: "Original".into(),
                 atlas_id: None,
+                clan_id: None,
+                ownership: None,
                 ephemeral: false,
                 properties: BTreeMap::new(),
             })
@@ -8325,15 +11112,15 @@ mod tests {
             )
             .unwrap();
         let (claimed, _) = mapper.inner.pending.take_ready(Instant::now());
-        let (_, pending, expected_rev, access_fingerprint) = claimed.unwrap();
+        let (_, pending, expected_rev) = claimed.unwrap();
         let envelope = MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: pending.operation_id,
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: fixture.a.0,
-                expected_rev: expected_rev.unwrap(),
-                access_fingerprint,
-            }],
+            preconditions: vec![Precondition::source(
+                fixture.a.0,
+                crate::SourceId::map(),
+                expected_rev.unwrap(),
+            )],
             payload: pending.ops,
         };
         backend
@@ -8481,8 +11268,10 @@ mod tests {
                 "non-cloud".into(),
             );
             let envelope = PendingEnvelope {
+                source: SourceId::Map,
                 operation_id: operation,
                 ops: vec![AreaMutation::UpsertRoom {
+                    room_source: None,
                     room_number: RoomNumber(77),
                     body: RoomUpdates::default(),
                 }],
@@ -8490,6 +11279,7 @@ mod tests {
                 structural_preconditions: Vec::new(),
                 room_remap: None,
                 attempts: 0,
+                held: 0,
                 viewer_id: None,
                 local_durable: true,
                 auth_generation: 0,
@@ -8603,6 +11393,8 @@ mod tests {
             .create_area(CreateAreaRequest {
                 name: "Delete".into(),
                 atlas_id: None,
+                clan_id: None,
+                ownership: None,
                 ephemeral: false,
                 properties: BTreeMap::new(),
             })

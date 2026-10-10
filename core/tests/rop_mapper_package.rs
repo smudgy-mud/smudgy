@@ -9,9 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use smudgy_cloud::{
-    Area, AreaId, AreaUpdates, AreaWithDetails, CloudResult, CompositeBackend, CreateAreaRequest,
-    Credential, CredentialSource, ExitDirection, LocalBackend, MapStorage, Mapper, MapperBackend,
-    PackageApiClient, RoomNumber,
+    Area, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasListItem, CloudResult,
+    CompositeBackend, CreateAreaRequest, Credential, CredentialSource, ExitDirection, LocalBackend,
+    MapStorage, Mapper, MapperBackend, PackageApiClient, RoomNumber,
     mutation::{AreaMutation, MutationEnvelope, MutationResult},
 };
 use smudgy_core::models::local_packages::packages_dir;
@@ -72,6 +72,16 @@ impl MapperBackend for TestTierBackend {
             self.inner.refresh_local().await?;
         }
         Ok(())
+    }
+
+    // Maps live in atlases: the package's new maps go in the server's
+    // default one.
+    async fn list_atlases(&self) -> CloudResult<Vec<AtlasListItem>> {
+        self.inner.list_atlases().await
+    }
+
+    async fn create_atlas(&self, name: &str) -> CloudResult<Atlas> {
+        self.inner.create_atlas(name).await
     }
 
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
@@ -243,6 +253,12 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package(SERVER, "map-layout");
     copy_package(SERVER, "auto-mapper");
     copy_package(SERVER, "rop-mapper");
@@ -582,7 +598,11 @@ async fn rop_mapper_imports_engine_and_provisions_authoritative_neighborhood() {
         .find(|exit| exit.from_direction == ExitDirection::East)
         .unwrap_or_else(|| panic!("structured east exit parsed; transcript:\n{transcript}"));
     assert_eq!(east.to_room_number, Some(key5541.room_number));
-    assert!(east.is_closed, "RoP door state is preserved");
+    assert_eq!(
+        east.door.as_ref().map(|door| door.state),
+        Some(smudgy_cloud::DoorState::Closed),
+        "RoP door state is preserved"
+    );
     assert!(
         !room5539.get_exits().iter().any(|exit| {
             exit.from_direction == ExitDirection::North

@@ -89,6 +89,73 @@ impl AccountHandle {
     }
 }
 
+/// Whose deletion the user asked for: the account (its user id, when known)
+/// and the credential generation it was asked under. A deletion is
+/// outstanding only for that account while that credential is in use:
+/// signing out or in ends it, and an answer to `DELETE /me` that arrives
+/// after either says nothing of the account signed in now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletionKey {
+    pub user_id: Option<smudgy_cloud::Uuid>,
+    pub generation: u64,
+}
+
+impl DeletionKey {
+    /// Whether this deletion is of the account in use: asked under
+    /// credential generation `generation`, for account `user` when both are
+    /// known.
+    #[must_use]
+    pub fn applies(self, generation: u64, user: Option<smudgy_cloud::Uuid>) -> bool {
+        self.generation == generation
+            && match (self.user_id, user) {
+                (Some(asked), Some(user)) => asked == user,
+                _ => true,
+            }
+    }
+}
+
+/// What an answer that the account a deletion names is gone does here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletionAnswer {
+    /// The account and credential in use: sign out and forget the account.
+    SignOut,
+    /// Signed out since: forget what this computer keeps for that account.
+    Forget(smudgy_cloud::Uuid),
+    /// Another credential is in use, or the account is unknown.
+    Ignore,
+}
+
+/// What an account-gone answer for `key` does, under credential
+/// `generation`, with `user` signed in as far as known, and whether a
+/// credential is in use.
+fn deletion_answer(
+    key: DeletionKey,
+    generation: u64,
+    user: Option<smudgy_cloud::Uuid>,
+    credential_in_use: bool,
+) -> DeletionAnswer {
+    if key.applies(generation, user) {
+        return DeletionAnswer::SignOut;
+    }
+    match key.user_id {
+        Some(asked) if !credential_in_use => DeletionAnswer::Forget(asked),
+        _ => DeletionAnswer::Ignore,
+    }
+}
+
+/// Removes, off the UI thread, the map cache and queued writes this
+/// computer keeps for `user_id`.
+fn forget_on_disk(user_id: smudgy_cloud::Uuid) {
+    match smudgy_core::get_smudgy_home() {
+        Ok(home) => {
+            std::thread::spawn(move || {
+                crate::account_deletion::forget_account_on_disk(&home, user_id);
+            });
+        }
+        Err(err) => log::warn!("cannot find the cloud map cache to clear: {err}"),
+    }
+}
+
 /// Everything a window needs to talk to the cloud, cheap to clone.
 #[derive(Clone)]
 pub struct CloudHandles {
@@ -99,6 +166,23 @@ pub struct CloudHandles {
     /// App-lifetime serialization for mutations of one local package. A task keeps its permit
     /// even if the Automations window that launched it is closed or replaced.
     pub(crate) package_operations: PackageOperationGate,
+}
+
+impl CloudHandles {
+    /// The key a deletion asked for now carries: the account signed in and
+    /// the credential generation in use.
+    #[must_use]
+    pub fn deletion_key(&self) -> DeletionKey {
+        DeletionKey {
+            user_id: self
+                .snapshot
+                .get()
+                .profile
+                .as_ref()
+                .map(|profile| profile.id),
+            generation: self.credentials.generation(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +393,29 @@ pub enum Message {
     /// [`CloudApiClient::upgrade_available`]); a `426` arrives as an
     /// [`CloudError`] whose [`CloudError::is_upgrade_required`] is set.
     UpdateCheckCompleted(Result<(), CloudError>),
+    /// Some client sharing the account's credential (map sync, the map
+    /// editor, packages, account calls) met a 401.
+    CredentialRefused,
+}
+
+/// The shared credential source, as the identity of the subscription that
+/// watches it for refusals. There is one account, so every value is the
+/// same subscription.
+struct RefusalWatch(CredentialSource);
+
+impl std::hash::Hash for RefusalWatch {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        "credential-refusals".hash(state);
+    }
+}
+
+/// Whether a refusal ends the session here: only while the user's deletion
+/// of the account in use is outstanding (`deleting`), since an account being
+/// deleted refuses everything but `DELETE /me`, and only of the credential
+/// still in use. Other refusals (an expired or revoked session) keep their
+/// path: the next `/me` probe or session refresh signs out.
+fn refusal_ends_session(deleting: bool, credentials: &CredentialSource) -> bool {
+    deleting && credentials.current_was_refused()
 }
 
 pub struct CloudAccount {
@@ -327,6 +434,10 @@ pub struct CloudAccount {
     /// skipped and the soft "upgrade available" prompt stays suppressed, so a
     /// cloud-averse user sees no update nudges at all.
     auto_check_for_updates: bool,
+    /// Mirrors `account.json`'s `deletion_requested`: the user asked to delete
+    /// the account and nothing since has shown it still works. Keyed to that
+    /// account and credential, so it never carries to another.
+    deletion: Option<DeletionKey>,
 }
 
 impl CloudAccount {
@@ -343,6 +454,15 @@ impl CloudAccount {
         let client = CloudApiClient::new(base_url.as_str(), credentials.clone());
 
         let cached_account = auth::load_account();
+        // A deletion asked for under the stored session; `account.json` is
+        // cleared on sign-out, so without a session there is none.
+        let deletion = cached_account
+            .as_ref()
+            .filter(|account| signed_in && account.deletion_requested)
+            .map(|account| DeletionKey {
+                user_id: account.user_id,
+                generation: credentials.generation(),
+            });
         let snapshot = AccountSnapshot {
             profile: None,
             signed_in,
@@ -363,6 +483,7 @@ impl CloudAccount {
             upgrade_dismissed_session: false,
             dismissed_upgrade_version: settings.dismissed_upgrade_version.clone(),
             auto_check_for_updates: settings.auto_check_for_updates,
+            deletion,
         };
 
         // On launch: slide the session deadline forward (so an install opened
@@ -526,6 +647,9 @@ impl CloudAccount {
                 }
                 match result {
                     Ok(profile) => {
+                        // An account being deleted answers nothing but
+                        // `DELETE /me`: this one works.
+                        self.deletion = None;
                         self.absorb_profile(profile);
                         self.recompute_upgrade_prompt();
                         Task::none()
@@ -533,12 +657,7 @@ impl CloudAccount {
                     Err(err) if err.is_upgrade_required() => self.mark_upgrade_required(),
                     Err(err) if err.is_auth_error() => {
                         log::info!("stored session rejected; signing out locally");
-                        let _ = clear_session_token();
-                        self.credentials.set(None);
-                        self.mutate(|s| {
-                            s.signed_in = false;
-                            s.busy = false;
-                        });
+                        self.drop_rejected_session();
                         Task::none()
                     }
                     Err(err) => {
@@ -561,8 +680,11 @@ impl CloudAccount {
                 match result {
                     Ok(_) => {
                         // Slid forward server-side; the token is unchanged, so
-                        // there's nothing to persist or update locally.
+                        // there's nothing to persist or update locally. An
+                        // account being deleted could not refresh, so a
+                        // requested deletion never started.
                         log::debug!("cloud session refreshed");
+                        self.clear_deletion();
                         self.recompute_upgrade_prompt();
                         Task::none()
                     }
@@ -572,12 +694,7 @@ impl CloudAccount {
                         // revoked elsewhere: drop it locally, mirroring the
                         // failed `/me` probe path.
                         log::info!("session refresh rejected; signing out locally");
-                        let _ = clear_session_token();
-                        self.credentials.set(None);
-                        self.mutate(|s| {
-                            s.signed_in = false;
-                            s.busy = false;
-                        });
+                        self.drop_rejected_session();
                         Task::none()
                     }
                     Err(err) => {
@@ -588,6 +705,15 @@ impl CloudAccount {
                         Task::none()
                     }
                 }
+            }
+            Message::CredentialRefused => {
+                if refusal_ends_session(self.deleting(), &self.credentials) {
+                    // The deletion took: sign out and forget the account, as a
+                    // refused `/me` does.
+                    log::info!("the account being deleted was refused; signing out locally");
+                    self.drop_rejected_session();
+                }
+                Task::none()
             }
             Message::UpdateCheckCompleted(result) => match result {
                 Ok(()) => {
@@ -615,6 +741,8 @@ impl CloudAccount {
         }
         self.credentials
             .set(Some(Credential::Session(session.session_token.clone())));
+        // A new session (perhaps another account's) has no deletion pending.
+        self.deletion = None;
         let needs_nickname = session.needs_nickname;
         self.mutate(|s| {
             s.signed_in = true;
@@ -626,14 +754,24 @@ impl CloudAccount {
         Task::none()
     }
 
-    /// Profile data arrived (login, `/me`, nickname change…): cache it.
+    /// Profile data arrived (login, `/me`, nickname change…): cache it. A
+    /// deletion asked for another account or credential is dropped, never
+    /// written into this account's record.
     pub fn absorb_profile(&mut self, profile: UserProfile) {
+        let generation = self.credentials.generation();
+        if self
+            .deletion
+            .is_some_and(|key| !key.applies(generation, Some(profile.id)))
+        {
+            self.deletion = None;
+        }
         let info = AccountInfo {
             user_id: Some(profile.id),
             email: profile.email.clone(),
             nickname: profile.nickname.clone(),
             email_verified: profile.email_verified_at.is_some(),
             needs_nickname: profile.email_verified_at.is_some() && profile.nickname.is_none(),
+            deletion_requested: self.deletion.is_some(),
         };
         if let Err(err) = auth::save_account(&info) {
             log::warn!("failed to persist account info: {err}");
@@ -675,9 +813,154 @@ impl CloudAccount {
             log::warn!("failed to clear account info: {err}");
         }
         self.credentials.set(None);
+        self.deletion = None;
         self.mutate(|s| *s = AccountSnapshot::default());
 
         server_task
+    }
+
+    /// The stored session was refused (401): drop it locally. When the user
+    /// had asked to delete the account, the refusal means the account is gone
+    /// or being deleted, so what this computer keeps for it goes too.
+    fn drop_rejected_session(&mut self) {
+        let deleting = self.deleting();
+        let _ = clear_session_token();
+        self.credentials.set(None);
+        if deleting {
+            self.forget_deleted_account();
+        } else {
+            self.deletion = None;
+        }
+        self.mutate(|s| {
+            s.signed_in = false;
+            s.busy = false;
+        });
+    }
+
+    /// The account signed in now, as far as known.
+    fn current_user(&self) -> Option<smudgy_cloud::Uuid> {
+        self.snapshot
+            .load()
+            .profile
+            .as_ref()
+            .map(|profile| profile.id)
+    }
+
+    /// Whether `key` names the account and credential in use.
+    fn is_current(&self, key: DeletionKey) -> bool {
+        key.applies(self.credentials.generation(), self.current_user())
+    }
+
+    /// Whether a deletion of the account in use is outstanding.
+    fn deleting(&self) -> bool {
+        self.deletion.is_some_and(|key| self.is_current(key))
+    }
+
+    /// The user asked to delete the account `key` names. Recorded (and
+    /// persisted, so a refusal after a restart is still understood) only
+    /// while that account and credential are in use.
+    pub fn deletion_requested(&mut self, key: DeletionKey) {
+        if !self.is_current(key) {
+            log::info!("a deletion asked for an account no longer in use; ignoring it");
+            return;
+        }
+        self.deletion = Some(key);
+        self.persist_deletion(true);
+    }
+
+    /// The deletion `key` names did not happen: the account still works.
+    pub fn deletion_refused(&mut self, key: DeletionKey) {
+        if self.is_current(key) {
+            self.clear_deletion();
+        }
+    }
+
+    /// No deletion is outstanding.
+    fn clear_deletion(&mut self) {
+        if self.deletion.take().is_some() {
+            self.persist_deletion(false);
+        }
+    }
+
+    fn persist_deletion(&self, requested: bool) {
+        if let Some(mut info) = auth::load_account() {
+            info.deletion_requested = requested;
+            if let Err(err) = auth::save_account(&info) {
+                log::warn!("failed to persist the account deletion request: {err}");
+            }
+        }
+    }
+
+    /// The account `key` names is gone (or being deleted, which the server
+    /// finishes on its own): sign out locally without the server round trip
+    /// a sign-out makes, and remove what this computer keeps for the
+    /// account's cloud maps. Signed out since (the deletion's own refusal
+    /// signs out), what this computer keeps for the account `key` names
+    /// still goes. An answer arriving while another credential is in use
+    /// changes nothing.
+    pub fn account_deleted(&mut self, key: DeletionKey) {
+        match deletion_answer(
+            key,
+            self.credentials.generation(),
+            self.current_user(),
+            self.credentials.get().is_some(),
+        ) {
+            DeletionAnswer::SignOut => {
+                let _ = clear_session_token();
+                self.credentials.set(None);
+                self.forget_deleted_account();
+                self.mutate(|s| *s = AccountSnapshot::default());
+            }
+            DeletionAnswer::Forget(user_id) => {
+                if self
+                    .deletion
+                    .is_some_and(|asked| asked.user_id.is_none_or(|asked| asked == user_id))
+                {
+                    self.deletion = None;
+                }
+                if auth::load_account().and_then(|info| info.user_id) == Some(user_id)
+                    && let Err(err) = auth::clear_account()
+                {
+                    log::warn!("failed to clear account info: {err}");
+                }
+                forget_on_disk(user_id);
+                if self.current_user() == Some(user_id) {
+                    self.mutate(|s| *s = AccountSnapshot::default());
+                }
+            }
+            DeletionAnswer::Ignore => {
+                log::info!("a deletion answer for an account no longer in use; ignoring it");
+            }
+        }
+    }
+
+    /// Clears `account.json` and, off the UI thread, the deleted account's map
+    /// cache and queued writes.
+    fn forget_deleted_account(&mut self) {
+        let user_id = self
+            .snapshot
+            .load()
+            .profile
+            .as_ref()
+            .map(|profile| profile.id)
+            .or_else(|| auth::load_account().and_then(|info| info.user_id));
+        self.deletion = None;
+        if let Err(err) = auth::clear_account() {
+            log::warn!("failed to clear account info: {err}");
+        }
+        if let Some(user_id) = user_id {
+            forget_on_disk(user_id);
+        }
+    }
+
+    /// Each refusal of the account's credential, whichever client met it.
+    pub fn refusals(&self) -> iced::Subscription<Message> {
+        iced::Subscription::run_with(RefusalWatch(self.credentials.clone()), |watch| {
+            futures::stream::unfold(watch.0.refusals(), |mut refusals| async move {
+                refusals.changed().await.ok()?;
+                Some((Message::CredentialRefused, refusals))
+            })
+        })
     }
 
     /// Re-probe `/me` (e.g. after the user says "I verified my email").
@@ -694,6 +977,72 @@ impl CloudAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refusal_during_a_deletion_ends_the_session() {
+        let credentials =
+            CredentialSource::new(Some(Credential::Session("smudgy_sess_mira".to_string())));
+        assert!(
+            !refusal_ends_session(true, &credentials),
+            "nothing refused yet"
+        );
+        credentials.note_refused(&Credential::Session("smudgy_sess_mira".to_string()));
+        assert!(refusal_ends_session(true, &credentials));
+        assert!(
+            !refusal_ends_session(false, &credentials),
+            "an ordinary refusal keeps its path"
+        );
+        credentials.set(Some(Credential::Session("smudgy_sess_new".to_string())));
+        assert!(
+            !refusal_ends_session(true, &credentials),
+            "a refusal of an earlier credential says nothing of this one"
+        );
+    }
+
+    /// An account-gone answer signs out the account and credential in use;
+    /// signed out since, it still forgets the account it names, by that
+    /// account's id; while another credential is in use it does nothing.
+    #[test]
+    fn an_account_gone_answer_forgets_the_account_it_names() {
+        let mira = smudgy_cloud::Uuid::from_u128(1);
+        let iris = smudgy_cloud::Uuid::from_u128(2);
+        let key = DeletionKey {
+            user_id: Some(mira),
+            generation: 3,
+        };
+        assert_eq!(
+            deletion_answer(key, 3, Some(mira), true),
+            DeletionAnswer::SignOut
+        );
+        assert_eq!(
+            deletion_answer(key, 4, Some(mira), false),
+            DeletionAnswer::Forget(mira),
+            "signed out since, with the profile still remembered"
+        );
+        assert_eq!(
+            deletion_answer(key, 4, None, false),
+            DeletionAnswer::Forget(mira),
+            "signed out since"
+        );
+        assert_eq!(
+            deletion_answer(key, 4, Some(iris), true),
+            DeletionAnswer::Ignore,
+            "another account signed in since"
+        );
+        assert_eq!(
+            deletion_answer(key, 4, Some(mira), true),
+            DeletionAnswer::Ignore,
+            "the same account signed in again under a new credential"
+        );
+        let unknown = DeletionKey {
+            user_id: None,
+            generation: 3,
+        };
+        assert_eq!(
+            deletion_answer(unknown, 4, None, false),
+            DeletionAnswer::Ignore
+        );
+    }
 
     #[test]
     fn package_operation_gate_is_shared_case_insensitive_and_raii() {

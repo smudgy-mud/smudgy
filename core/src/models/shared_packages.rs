@@ -306,6 +306,26 @@ fn is_local_owner(owner: &str) -> bool {
     owner.eq_ignore_ascii_case(LOCAL_OWNER)
 }
 
+/// Whether two package addresses name one lockfile identity. Names are global, so
+/// `smudgy:@name` and `smudgy://owner/name` for any owner are one package and share one row;
+/// the reserved `smudgy://local/<name>` row stays apart, because local code never shares a
+/// published row's trust, consent or state. Text that is not an address compares as text,
+/// ignoring ASCII case.
+#[must_use]
+pub fn same_package_address(a: &str, b: &str) -> bool {
+    match (
+        smudgy_script::SmudgySpecifier::parse(a),
+        smudgy_script::SmudgySpecifier::parse(b),
+    ) {
+        (Ok(a), Ok(b)) => {
+            a.subpath == b.subpath
+                && is_local_owner(&a.owner) == is_local_owner(&b.owner)
+                && a.name.eq_ignore_ascii_case(&b.name)
+        }
+        _ => a.eq_ignore_ascii_case(b),
+    }
+}
+
 fn local_state_specifier(name: &str) -> String {
     format!("smudgy://{LOCAL_OWNER}/{name}")
 }
@@ -335,7 +355,7 @@ impl SharedPackageLock {
             .packages
             .iter()
             .enumerate()
-            .filter(|(_, package)| package.specifier.eq_ignore_ascii_case(specifier));
+            .filter(|(_, package)| same_package_address(&package.specifier, specifier));
         let (index, _) = matches.next()?;
         matches.next().is_none().then_some(index)
     }
@@ -345,7 +365,7 @@ impl SharedPackageLock {
     pub fn has_ambiguous_identity(&self, specifier: &str) -> bool {
         self.packages
             .iter()
-            .filter(|package| package.specifier.eq_ignore_ascii_case(specifier))
+            .filter(|package| same_package_address(&package.specifier, specifier))
             .take(2)
             .count()
             > 1
@@ -385,7 +405,7 @@ impl SharedPackageLock {
                 Some(package)
             }
             Some(_) => None,
-            None => remote.filter(|package| package.specifier.eq_ignore_ascii_case(specifier)),
+            None => remote.filter(|package| same_package_address(&package.specifier, specifier)),
         }
     }
 
@@ -464,7 +484,7 @@ impl SharedPackageLock {
     pub fn upsert(&mut self, package: LockedPackage) -> Result<()> {
         if self.has_ambiguous_identity(&package.specifier) {
             anyhow::bail!(
-                "multiple installed rows for {}; uninstall the aliases and review a new install",
+                "multiple installed rows for {}; uninstall the stale one and the other keeps its settings",
                 package.specifier
             );
         }
@@ -481,11 +501,31 @@ impl SharedPackageLock {
     }
 
     /// Remove an installed package by specifier. Returns whether one was removed.
+    ///
+    /// Where an older lockfile holds two rows for one package, naming one row by its exact
+    /// spelling removes that row only ([`Self::stale_alias_row`]): the other keeps its pins,
+    /// trust and consent, and the package loads from it again.
     pub fn remove(&mut self, specifier: &str) -> bool {
         let before = self.packages.len();
-        self.packages
-            .retain(|p| !p.specifier.eq_ignore_ascii_case(specifier));
+        if let Some(index) = self.stale_alias_row(specifier) {
+            self.packages.remove(index);
+        } else {
+            self.packages
+                .retain(|p| !same_package_address(&p.specifier, specifier));
+        }
         self.packages.len() != before
+    }
+
+    /// The row spelled exactly `specifier`, when another row also holds its package: one of
+    /// the duplicate rows an older lockfile can carry, removable on its own.
+    #[must_use]
+    pub fn stale_alias_row(&self, specifier: &str) -> Option<usize> {
+        if !self.has_ambiguous_identity(specifier) {
+            return None;
+        }
+        self.packages
+            .iter()
+            .position(|package| package.specifier == specifier)
     }
 
     /// The auto-installed requirements that would become **orphans** if `removing` were
@@ -533,7 +573,7 @@ impl SharedPackageLock {
         self.packages
             .iter()
             .filter(|p| {
-                !p.specifier.eq_ignore_ascii_case(removing)
+                !same_package_address(&p.specifier, removing)
                     && doomed.contains(&p.specifier.to_ascii_lowercase())
             })
             .map(|p| p.specifier.clone())
@@ -934,7 +974,7 @@ pub fn install_package(
     mutate_lock(server_name, |lock| {
         if lock.has_ambiguous_identity(specifier) {
             anyhow::bail!(
-                "multiple installed rows for {specifier}; uninstall the aliases and review a new install"
+                "multiple installed rows for {specifier}; uninstall the stale one and the other keeps its settings"
             );
         }
         ensure_new_package_rows_have_no_retired_parameter_state(
@@ -996,7 +1036,7 @@ pub fn install_package_with_activation_if_unchanged(
         if lock
             .packages
             .iter()
-            .any(|package| package.specifier.eq_ignore_ascii_case(specifier))
+            .any(|package| same_package_address(&package.specifier, specifier))
         {
             return Ok((Cas::StateChanged, false));
         }
@@ -1318,10 +1358,16 @@ pub fn set_required_closure_if_unchanged(
 pub fn uninstall_package(server_name: &str, specifier: &str) -> Result<()> {
     let _guard = guard(server_name);
     let removed = mutate_lock(server_name, |lock| {
+        // One of two rows for a package: the row goes, and the package's settings and
+        // secrets stay with the row that remains.
+        if let Some(index) = lock.stale_alias_row(specifier) {
+            lock.packages.remove(index);
+            return Ok((None, true));
+        }
         let removed = lock
             .packages
             .iter()
-            .filter(|package| package.specifier.eq_ignore_ascii_case(specifier))
+            .filter(|package| same_package_address(&package.specifier, specifier))
             .map(|package| package.specifier.clone())
             .collect::<Vec<_>>();
         if lock.remove(specifier) {
@@ -1332,8 +1378,11 @@ pub fn uninstall_package(server_name: &str, specifier: &str) -> Result<()> {
             }
         }
         let changed = !removed.is_empty();
-        Ok((removed, changed))
+        Ok((Some(removed), changed))
     })?;
+    let Some(removed) = removed else {
+        return Ok(());
+    };
     let cleanup = if removed.is_empty() {
         vec![specifier.to_string()]
     } else {
@@ -1368,6 +1417,18 @@ pub fn commit_uninstall_if_unchanged(
     let (outcome, removed) = mutate_lock(server_name, |lock| {
         if lock != expected {
             return Ok(((UninstallCommit::Stale, Vec::new()), false));
+        }
+        // One of two rows for a package: the row goes, nothing that requires the package
+        // breaks, and its settings and secrets stay with the row that remains.
+        if let Some(index) = lock.stale_alias_row(specifier) {
+            let row = lock.packages.remove(index);
+            return Ok((
+                (
+                    UninstallCommit::PackagesRemoved(vec![row.specifier]),
+                    Vec::new(),
+                ),
+                true,
+            ));
         }
         let ambiguous = lock.has_ambiguous_identity(specifier);
         let target = lock
@@ -1734,12 +1795,12 @@ pub fn remove_profile_activation(server_name: &str, profile_name: &str) -> Resul
 /// # Errors
 /// Returns an error if the package is absent or the lockfile cannot be saved.
 pub fn record_audio_use(server_name: &str, owner: &str, name: &str) -> Result<bool> {
-    let specifier = format!("smudgy://{owner}/{name}");
+    let specifier = smudgy_script::package_address(owner, name);
     mutate_lock(server_name, |lock| {
         let package = lock
             .packages
             .iter_mut()
-            .find(|package| package.specifier.eq_ignore_ascii_case(&specifier))
+            .find(|package| same_package_address(&package.specifier, &specifier))
             .with_context(|| format!("package {specifier} is not installed"))?;
         if package.audio_used {
             return Ok((false, false));
@@ -2170,7 +2231,7 @@ fn commit_local_manifest_inner(
     let matching_roots = lock
         .packages
         .iter()
-        .filter(|package| package.specifier.eq_ignore_ascii_case(root_specifier))
+        .filter(|package| same_package_address(&package.specifier, root_specifier))
         .count();
     if matching_roots != 1 {
         anyhow::bail!("local package {root_specifier} must have exactly one governing state row");
@@ -2178,7 +2239,7 @@ fn commit_local_manifest_inner(
     let governing_specifier = lock
         .packages
         .iter()
-        .find(|package| package.specifier.eq_ignore_ascii_case(root_specifier))
+        .find(|package| same_package_address(&package.specifier, root_specifier))
         .map(|package| package.specifier.clone())
         .expect("one matching root was counted above");
     if let Some(required) = required {
@@ -3491,7 +3552,7 @@ fn discover_legacy_secret_slots(
                     .join("cache")
                     .join("packages")
                     .join("meta")
-                    .join(&specifier.owner)
+                    .join(smudgy_script::owner_segment(&specifier.owner))
                     .join(&specifier.name)
                     .join(format!("{version}.json"));
                 let value: serde_json::Value =
@@ -3604,9 +3665,10 @@ fn secret_dir_for_slot(server_name: &str, slot: &str) -> Option<PathBuf> {
     let rest = slot.strip_prefix(&prefix)?;
     let (profile, package_and_key) =
         if let Some(profile_and_specifier) = rest.strip_prefix("profile:") {
-            let (profile, package) = profile_and_specifier.split_once(":smudgy://")?;
+            // A profile name never contains `:`, so the specifier starts at the first one.
+            let (profile, package) = profile_and_specifier.split_once(':')?;
             validate_param_profile_name(profile).ok()?;
-            (Some(profile), format!("smudgy://{package}"))
+            (Some(profile), package.to_string())
         } else {
             (None, rest.to_string())
         };
@@ -3839,8 +3901,82 @@ mod tests {
             lock.upsert(LockedPackage::new(alias, UpdateMode::Auto))
                 .is_err()
         );
+        // Removing one row by its spelling leaves the other, pin and all.
+        assert!(lock.remove(alias));
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.find(alias).unwrap().pinned_version(), Some("1.0.0"));
         assert!(lock.remove(alias));
         assert!(lock.packages.is_empty());
+    }
+
+    /// An older lockfile's second row for a package, spelled `stale`, next to the working row
+    /// `working`: pinned, trusted, with a setting and a secret.
+    fn server_with_stale_alias(label: &str, working: &str, stale: &str) -> String {
+        let server = test_server(label);
+        install_package(
+            &server,
+            working,
+            UpdateMode::Pinned {
+                version: "1.2.0".into(),
+            },
+            true,
+        )
+        .unwrap();
+        save_param_value(&server, working, "color", serde_json::json!("blue")).unwrap();
+        mutate_lock(&server, |lock| {
+            lock.find_mut(working).unwrap().trusted = true;
+            lock.packages
+                .push(LockedPackage::new(stale, UpdateMode::Auto));
+            Ok(((), true))
+        })
+        .unwrap();
+        assert!(load_lock(&server).unwrap().has_ambiguous_identity(working));
+        server
+    }
+
+    fn assert_working_row_kept(server: &str, working: &str) {
+        let lock = load_lock(server).unwrap();
+        assert_eq!(lock.packages.len(), 1, "{lock:?}");
+        let row = lock.find(working).unwrap();
+        assert_eq!(row.specifier, working);
+        assert_eq!(row.pinned_version(), Some("1.2.0"));
+        assert!(row.trusted);
+        assert_eq!(
+            get_param_value_for_profile_checked(server, "Main", working, "color").unwrap(),
+            Some(serde_json::json!("blue"))
+        );
+    }
+
+    #[test]
+    fn uninstalling_a_stale_alias_keeps_the_working_row() {
+        for (label, working, stale) in [
+            (
+                "stale-alias-ownerless",
+                "smudgy://wbk/mapper",
+                "smudgy:@mapper",
+            ),
+            (
+                "stale-alias-owner",
+                "smudgy:@mapper",
+                "smudgy://someone/Mapper",
+            ),
+        ] {
+            let server = server_with_stale_alias(label, working, stale);
+            uninstall_package(&server, stale).unwrap();
+            assert_working_row_kept(&server, working);
+        }
+    }
+
+    #[test]
+    fn confirmed_uninstall_of_a_stale_alias_keeps_the_working_row() {
+        let (working, stale) = ("smudgy://wbk/mapper", "smudgy:@mapper");
+        let server = server_with_stale_alias("stale-alias-confirmed", working, stale);
+        let lock = load_lock(&server).unwrap();
+        assert_eq!(
+            commit_uninstall_if_unchanged(&server, &lock, stale, true).unwrap(),
+            UninstallCommit::PackagesRemoved(vec![stale.to_string()])
+        );
+        assert_working_row_kept(&server, working);
     }
 
     #[test]
@@ -3974,13 +4110,15 @@ mod tests {
         };
         save_lock(&server, &lock).unwrap();
         assert!(install_package(&server, second, UpdateMode::Auto, true).is_err());
+        // The named row goes; the other keeps its own (lack of) trust and consent.
         assert_eq!(
             commit_uninstall_if_unchanged(&server, &lock, first, false).unwrap(),
-            UninstallCommit::PackagesRemoved(vec![first.into(), second.into()])
+            UninstallCommit::PackagesRemoved(vec![first.into()])
         );
         install_package(&server, first, UpdateMode::Auto, true).unwrap();
         let repaired = load_lock(&server).unwrap();
         assert_eq!(repaired.packages.len(), 1);
+        assert_eq!(repaired.packages[0].specifier, second);
         assert!(!repaired.packages[0].trusted);
         assert!(repaired.packages[0].consented_permissions.is_none());
     }
@@ -4359,11 +4497,12 @@ mod tests {
         );
         assert_eq!(staged_other().as_deref(), Some("1.1.0"));
 
-        // So does a new row contending for the plan row's leaf.
+        // So does a second row for the plan row's name. Names are global, so an upsert of
+        // another spelling is the same row; a lockfile written before that can still hold both.
         let snapshot = load_lock(&server).unwrap();
         mutate_lock(&server, |lock| {
-            lock.upsert(LockedPackage::new("smudgy://b/other", UpdateMode::Auto))
-                .unwrap();
+            lock.packages
+                .push(LockedPackage::new("smudgy://b/other", UpdateMode::Auto));
             Ok(((), true))
         })
         .unwrap();
@@ -4371,7 +4510,13 @@ mod tests {
             !install_other(&snapshot, "1.2.0"),
             "a same-leaf row refuses the commit"
         );
-        assert_eq!(staged_other().as_deref(), Some("1.1.0"));
+        let lock = load_lock(&server).unwrap();
+        let saved = lock
+            .packages
+            .iter()
+            .find(|package| package.specifier == "smudgy://a/other")
+            .and_then(|package| package.staged_version().map(str::to_string));
+        assert_eq!(saved.as_deref(), Some("1.1.0"));
     }
 
     #[test]
@@ -4654,6 +4799,64 @@ mod tests {
             get_param_value_for_profile(&server, "Main", spec, "k"),
             Some(serde_json::json!(1)),
             "global-scope value survives a stale uninstall attempt"
+        );
+    }
+
+    #[test]
+    fn every_spelling_of_a_published_name_finds_its_one_row() {
+        assert!(same_package_address(
+            "smudgy:@Mapper",
+            "smudgy://wbk/mapper"
+        ));
+        assert!(same_package_address(
+            "smudgy://alice/mapper",
+            "smudgy://wbk/MAPPER"
+        ));
+        assert!(!same_package_address("smudgy:@mapper", "smudgy:@speedwalk"));
+        // The local row stays apart from the published one.
+        assert!(!same_package_address(
+            "smudgy://local/mapper",
+            "smudgy:@mapper"
+        ));
+        assert!(same_package_address(
+            "smudgy://local/mapper",
+            "smudgy://LOCAL/Mapper"
+        ));
+
+        let mut lock = SharedPackageLock::default();
+        lock.packages
+            .push(LockedPackage::new("smudgy://wbk/mapper", UpdateMode::Auto));
+        lock.packages
+            .push(LockedPackage::new("smudgy://local/tools", UpdateMode::Auto));
+        assert_eq!(
+            lock.find("smudgy:@mapper")
+                .map(|row| row.specifier.as_str()),
+            Some("smudgy://wbk/mapper")
+        );
+        assert!(!lock.has_ambiguous_identity("smudgy:@mapper"));
+        assert!(
+            lock.find("smudgy:@tools").is_none(),
+            "a local row is not published"
+        );
+        // Two rows for one name are ambiguous whatever their spellings.
+        lock.packages
+            .push(LockedPackage::new("smudgy:@mapper", UpdateMode::Auto));
+        assert!(lock.has_ambiguous_identity("smudgy://wbk/mapper"));
+        assert!(lock.find("smudgy:@mapper").is_none());
+    }
+
+    #[test]
+    fn profile_secret_slots_of_ownerless_packages_are_recognized() {
+        let server = test_server("ownerless-slots");
+        let slot = format!("pkgparam:{server}:profile:Main:smudgy:@guild-lib:token");
+        assert!(secret_dir_for_slot(&server, &slot).is_some());
+        let spelled = format!("pkgparam:{server}:profile:Main:smudgy://wbk/mapper:token");
+        assert!(secret_dir_for_slot(&server, &spelled).is_some());
+        let global = format!("pkgparam:{server}:smudgy:@guild-lib:token");
+        assert!(secret_dir_for_slot(&server, &global).is_some());
+        assert!(
+            secret_dir_for_slot(&server, &format!("pkgparam:{server}:profile:Main:token"))
+                .is_none()
         );
     }
 

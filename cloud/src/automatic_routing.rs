@@ -16,7 +16,7 @@ use rstar::{AABB, RTree, RTreeObject};
 
 use crate::{
     ConnectionKind, ConnectionRouting, CornerStyle, MAX_COORDINATE, MAX_ROUTE_POINTS, MapPoint,
-    RoomNumber, RoomSide,
+    RoomAddress, RoomSide,
     connection_geometry::{
         ARROW_SIZE, BASE_STROKE_WIDTH, EndpointGeometry, GeometryInput, ROOM_SIZE, StubAxis,
         orthogonal_violation, port_position, resolve, stub_tip,
@@ -108,14 +108,14 @@ impl RouteRect {
 /// One room in the public obstacle projection.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RouteObstacle {
-    pub room_number: RoomNumber,
+    pub room: RoomAddress,
     pub bounds: RouteRect,
 }
 
 /// One endpoint's immutable solve geometry.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RouteEndpoint {
-    pub room_number: RoomNumber,
+    pub room: RoomAddress,
     pub room_center: MapPoint,
     pub side: RoomSide,
     pub port_offset: f32,
@@ -476,7 +476,7 @@ fn valid_request(request: &AutoRouteRequest) -> bool {
 
     let endpoints_valid = valid_endpoint(request.endpoint_a)
         && valid_endpoint(request.endpoint_b)
-        && request.endpoint_a.room_number != request.endpoint_b.room_number;
+        && request.endpoint_a.room != request.endpoint_b.room;
     let stroke_valid = request.thickness.is_finite()
         && request.thickness >= 0.0
         && ROUTE_PADDING >= f64::from(ARROW_SIZE);
@@ -488,14 +488,13 @@ fn valid_request(request: &AutoRouteRequest) -> bool {
         .into_iter()
         .all(|endpoint| {
             request.obstacles.iter().any(|obstacle| {
-                obstacle.room_number == endpoint.room_number
-                    && same_rect(obstacle.bounds, endpoint.room_bounds())
+                obstacle.room == endpoint.room && same_rect(obstacle.bounds, endpoint.room_bounds())
             })
         });
     let mut obstacle_rooms: Vec<_> = request
         .obstacles
         .iter()
-        .map(|obstacle| obstacle.room_number)
+        .map(|obstacle| obstacle.room)
         .collect();
     obstacle_rooms.sort_unstable();
     let rooms_unique = obstacle_rooms.windows(2).all(|pair| pair[0] != pair[1]);
@@ -771,8 +770,8 @@ fn validate_route_with_index(
     let collision = geometry.flattened.iter().any(|polyline| {
         polyline.windows(2).any(|segment| {
             obstacles.iter().any(|entry| {
-                entry.obstacle.room_number != request.endpoint_a.room_number
-                    && entry.obstacle.room_number != request.endpoint_b.room_number
+                entry.obstacle.room != request.endpoint_a.room
+                    && entry.obstacle.room != request.endpoint_b.room
                     && entry.inflated.intersects_segment(segment[0], segment[1])
             })
         })
@@ -837,7 +836,7 @@ mod tests {
 
     fn endpoint(room: i32, center: MapPoint, tip: MapPoint, side: RoomSide) -> RouteEndpoint {
         RouteEndpoint {
-            room_number: RoomNumber(room),
+            room: RoomAddress::map(crate::RoomNumber(room)),
             room_center: center,
             side,
             port_offset: match side {
@@ -849,7 +848,7 @@ mod tests {
 
     fn obstacle(room: i32, center: MapPoint) -> RouteObstacle {
         RouteObstacle {
-            room_number: RoomNumber(room),
+            room: RoomAddress::map(crate::RoomNumber(room)),
             bounds: RouteRect::from_center(center, HALF_ROOM, HALF_ROOM),
         }
     }
@@ -971,7 +970,7 @@ mod tests {
             obstacle(2, MapPoint::new(6.0, 0.0)),
         ]);
         non_finite.obstacles.push(RouteObstacle {
-            room_number: RoomNumber(3),
+            room: RoomAddress::map(crate::RoomNumber(3)),
             bounds: RouteRect {
                 min_x: f64::NAN,
                 min_y: 0.0,

@@ -101,15 +101,19 @@ fn remap_actions(
     current: &CurrentLocation,
 ) -> VecDeque<RuntimeAction> {
     let mut actions = VecDeque::new();
-    let initial_location = *current.borrow();
+    let initial_location = current.get();
     for event in remaps {
         if let MapperEvent::AreasMerged { into, rooms, .. } = event {
             actions.push_back(RuntimeAction::MapperRoomsMerged {
                 into,
                 rooms: rooms.clone().into(),
             });
-            if let Some(location) = current.borrow_mut().as_mut() {
-                remap_location(location, into, &rooms);
+            if let Some(location) = current.get() {
+                let mut moved = location;
+                remap_location(&mut moved, into, &rooms);
+                if moved != location {
+                    current.set(moved);
+                }
             }
             // A frame can already contain a marker created before the
             // commit. Rewrite that pending address too, or its later
@@ -123,8 +127,8 @@ fn remap_actions(
             });
         }
     }
-    if *current.borrow() != initial_location
-        && let Some((area, room)) = *current.borrow()
+    if current.get() != initial_location
+        && let Some((area, room)) = current.get()
     {
         // Consecutive migrations can delete an intermediate destination before
         // this session wakes. Deliver their remaps in order, then only the
@@ -160,6 +164,12 @@ mod tests {
         }
     }
 
+    fn standing_at(area: AreaId, room: i32) -> CurrentLocation {
+        let current = CurrentLocation::default();
+        current.set((area, Some(room)));
+        current
+    }
+
     fn pending_location(action: &RuntimeAction) -> (AreaId, Option<i32>) {
         let RuntimeAction::SetPendingCurrentLocation(location) = action else {
             panic!("expected a pending marker");
@@ -171,7 +181,7 @@ mod tests {
     fn pending_markers_follow_chained_remaps_without_rewriting_new_setters() {
         let area = AreaId(Uuid::new_v4());
         let events = subscribe(None);
-        let current = Rc::new(RefCell::new(Some((area, Some(2)))));
+        let current = standing_at(area, 2);
         let old_marker = marker(&events, area, Some(2));
         let first = remap_actions([migration(area, 2, area, 1)], &events, &current);
         assert_eq!(pending_location(&old_marker), (area, Some(1)));
@@ -180,12 +190,12 @@ mod tests {
         // Room 2 was recreated after the join. This new explicit setter is
         // registered after the first remap and must retain its new identity.
         let reused_marker = marker(&events, area, Some(2));
-        *current.borrow_mut() = Some((area, Some(2)));
+        current.set((area, Some(2)));
         let second = remap_actions([migration(area, 1, area, 3)], &events, &current);
         assert_eq!(pending_location(&old_marker), (area, Some(3)));
         assert_eq!(pending_location(&first[1]), (area, Some(3)));
         assert_eq!(pending_location(&reused_marker), (area, Some(2)));
-        assert_eq!(*current.borrow(), Some((area, Some(2))));
+        assert_eq!(current.get(), Some((area, Some(2))));
         assert_eq!(second.len(), 1, "the explicit current room did not move");
 
         drop(old_marker);
@@ -196,12 +206,56 @@ mod tests {
     }
 
     #[test]
+    fn every_location_write_takes_a_new_number_and_a_settled_marker_none() {
+        let area = AreaId(Uuid::new_v4());
+        let other = AreaId(Uuid::new_v4());
+        let current = standing_at(area, 2);
+        let set = current.write();
+
+        current.settle((area, Some(2)));
+        assert_eq!(
+            current.write(),
+            set,
+            "a marker for the location held writes nothing"
+        );
+
+        current.set((area, Some(2)));
+        let again = current.write();
+        assert_ne!(again, set, "writing the location held is still a write");
+
+        current.set((other, Some(1)));
+        current.settle((area, Some(2)));
+        assert_eq!(current.get(), Some((area, Some(2))));
+        assert_ne!(
+            current.write(),
+            again,
+            "an overtaken marker moves the location back anew"
+        );
+
+        let events = subscribe(None);
+        let settled = current.write();
+        remap_actions([migration(other, 1, other, 5)], &events, &current);
+        assert_eq!(
+            current.write(),
+            settled,
+            "a remap elsewhere leaves the location alone"
+        );
+        remap_actions([migration(area, 2, other, 6)], &events, &current);
+        assert_eq!(current.get(), Some((other, Some(6))));
+        assert_ne!(
+            current.write(),
+            settled,
+            "a remap of the room stood in writes it"
+        );
+    }
+
+    #[test]
     fn new_remaps_follow_queued_delivery_before_pending_markers() {
         let source = AreaId(Uuid::new_v4());
         let first = AreaId(Uuid::new_v4());
         let second = AreaId(Uuid::new_v4());
         let events = subscribe(None);
-        let current = Rc::new(RefCell::new(Some((source, Some(1)))));
+        let current = standing_at(source, 1);
         let mut frame = VecDeque::from([marker(&events, source, Some(1))]);
         insert_remaps(
             &mut frame,
@@ -253,7 +307,7 @@ mod tests {
         let intermediate = AreaId(Uuid::new_v4());
         let destination = AreaId(Uuid::new_v4());
         let mut events = Vec::new();
-        let current = Rc::new(RefCell::new(Some((source, Some(1)))));
+        let current = standing_at(source, 1);
         for (from, old, into, new) in [
             (source, 1, intermediate, 4),
             (intermediate, 4, destination, 9),
@@ -269,7 +323,7 @@ mod tests {
         }
         let subscriber = subscribe(None);
         let actions = remap_actions(events, &subscriber, &current);
-        assert_eq!(*current.borrow(), Some((destination, Some(9))));
+        assert_eq!(current.get(), Some((destination, Some(9))));
         assert_eq!(actions.len(), 3);
         assert!(
             matches!(actions[0], RuntimeAction::MapperRoomsMerged { into, .. } if into == intermediate)

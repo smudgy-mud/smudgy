@@ -483,7 +483,8 @@ catch (e: any) { echo("EVENTASROOT:" + String(e?.message ?? e)); }
 
 let capError = "";
 try {
-    for (let i = 0; i < 20000; i++) store.get("o" + i + "/n", "");
+    // A package is its name, so each identity is another name.
+    for (let i = 0; i < 20000; i++) store.get("o/n" + i, "");
 } catch (e: any) { capError = String(e?.message ?? e); }
 echo("CAP:" + capError.includes("identity table is full"));
 createState('vitals');

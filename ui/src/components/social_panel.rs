@@ -339,12 +339,13 @@ impl SocialPanel {
                 )
             }
             // Uniform 404: the offer may have been responded to / cancelled on the
-            // other end — just resync silently.
+            // other end — just resync silently. Any other failure shows, and the
+            // transfers reload so the offer shows where it stands now.
             Message::TransferActionFinished(result) => match result {
                 Ok(()) | Err(CloudError::NotFoundOrNoAccess) => self.refresh(),
                 Err(err) => {
                     self.absorb_error(&err);
-                    Task::none()
+                    self.refresh_transfers()
                 }
             },
 
@@ -577,12 +578,10 @@ impl SocialPanel {
                 for t in incoming {
                     col = col.push(
                         row![
-                            text(format!(
-                                "{} wants to give you \u{201c}{}\u{201d}",
-                                nickname_or_fallback(t.from_nickname.clone()),
-                                t.subject_name
-                                    .clone()
-                                    .unwrap_or_else(|| t.subject_kind.clone()),
+                            text(crate::i18n::t!(
+                                "social-incoming-transfer",
+                                "from" => nickname_or_fallback(t.from_nickname.clone()),
+                                "subject" => subject_label(t)
                             ))
                             .size(13),
                             space::horizontal(),
@@ -604,14 +603,7 @@ impl SocialPanel {
                 for t in outgoing {
                     col = col.push(
                         row![
-                            text(format!(
-                                "You offered \u{201c}{}\u{201d} to {}",
-                                t.subject_name
-                                    .clone()
-                                    .unwrap_or_else(|| t.subject_kind.clone()),
-                                nickname_or_fallback(t.to_nickname.clone()),
-                            ))
-                            .size(13),
+                            text(outgoing_transfer_label(t)).size(13),
                             text(crate::i18n::t!("social-pending")).size(12),
                             space::horizontal(),
                             button(text(crate::i18n::t!("action-cancel")).size(12))
@@ -790,4 +782,49 @@ impl SocialPanel {
 
 fn nickname_or_fallback(nickname: Option<String>) -> String {
     nickname.unwrap_or_else(|| crate::i18n::t!("social-no-nickname"))
+}
+
+/// An offer's subject: its name, or its kind when the server named none.
+fn subject_label(offer: &TransferView) -> String {
+    offer
+        .subject_name
+        .clone()
+        .unwrap_or_else(|| offer.subject_kind.clone())
+}
+
+/// "You offered “Solace” to ben", or to a clan.
+fn outgoing_transfer_label(offer: &TransferView) -> String {
+    match (&offer.to_clan_id, &offer.to_clan_name) {
+        (Some(_), name) => crate::i18n::t!(
+            "social-outgoing-transfer-clan",
+            "subject" => subject_label(offer),
+            "clan" => name.clone().unwrap_or_default()
+        ),
+        (None, _) => crate::i18n::t!(
+            "social-outgoing-transfer",
+            "subject" => subject_label(offer),
+            "to" => nickname_or_fallback(offer.to_nickname.clone())
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transfer the server no longer shows (404) resyncs the whole panel; any other failure
+    /// shows its error and reloads the transfers, so a stale offer doesn't keep its buttons.
+    #[test]
+    fn a_failed_transfer_answer_reloads_the_transfers() {
+        let mut panel = SocialPanel::new(crate::cloud_account::test_handles_signed_in("mira"));
+        let refused = panel.update(Message::TransferActionFinished(Err(
+            CloudError::NetworkError("offline".to_string()),
+        )));
+        assert!(panel.error.is_some(), "the failure shows");
+        assert_eq!(refused.units(), 1, "the transfers reload");
+        let gone = panel.update(Message::TransferActionFinished(Err(
+            CloudError::NotFoundOrNoAccess,
+        )));
+        assert!(gone.units() > 1, "a 404 reloads everything");
+    }
 }

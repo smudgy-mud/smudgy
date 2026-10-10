@@ -9,7 +9,7 @@
 //! rebuilt from a fresh fetch after conflicts). Cloud work is restart-durable;
 //! local edits have their own durable journal; ephemeral edits stay in session.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(not(windows))]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
@@ -34,7 +34,7 @@ use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileEx
 
 use crate::backends::area_merge::RoomRemap;
 use crate::mutation::{AreaMutation, OperationId};
-use crate::{AreaId, AreaWithDetails, CloudError, CloudResult, RoomNumber};
+use crate::{AreaId, AreaWithDetails, CloudError, CloudResult, RoomNumber, SourceId};
 
 /// Base delay of the transport-failure backoff schedule.
 pub const BACKOFF_BASE: Duration = Duration::from_millis(250);
@@ -49,7 +49,7 @@ const COMMIT_SCHEMA_VERSION: u32 = 1;
 const DELETE_TOMBSTONE_SCHEMA_VERSION: u32 = 1;
 const RECEIPT_RETENTION_DAYS: i64 = 60;
 
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
+pub(super) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let _ = directory;
@@ -63,7 +63,7 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 
 /// Rename whose return is the durable commit point. NTFS needs
 /// `MOVEFILE_WRITE_THROUGH`; Unix needs an fsync of the containing directory.
-fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(super) fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let source = fs::canonicalize(source)?;
@@ -113,6 +113,8 @@ fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
 #[derive(Debug, Clone)]
 pub struct PendingEnvelope {
     pub operation_id: OperationId,
+    /// The source of the map this envelope writes.
+    pub source: SourceId,
     pub ops: Vec<AreaMutation>,
     /// The whole gesture's name, undo-stack style ("Create room 17 and
     /// bidirectional link"), for conflict/failure surfacing.
@@ -125,6 +127,9 @@ pub struct PendingEnvelope {
     pub(crate) room_remap: Option<crate::backends::local::LocalRoomRemap>,
     /// Transport attempts so far.
     pub attempts: u32,
+    /// 503 answers so far: the service held the write for a moment. They
+    /// set the backoff and never spend `attempts`.
+    pub held: u32,
     /// Authenticated cloud viewer this work belongs to. `None` for local and
     /// ephemeral tiers.
     pub(crate) viewer_id: Option<Uuid>,
@@ -199,12 +204,17 @@ pub enum AreaPhase {
     /// Retrying this phase must never resend the mutation.
     AwaitingRetirement {
         operation_id: OperationId,
-        new_rev: Option<i64>,
+        new_rev: Option<(SourceId, i64)>,
         attempts: u32,
         until: Instant,
     },
     /// Transport failure; retry when the deadline passes.
-    Backoff { until: Instant },
+    Backoff {
+        until: Instant,
+        /// The service held the write (a 503) rather than the network
+        /// failing it.
+        held: bool,
+    },
     /// A pending operation failed the structural sanity check after a
     /// conflict refetch; paused for Keep mine / Keep theirs. The phase
     /// names the *failing* operation — not necessarily the head — so
@@ -229,6 +239,9 @@ pub enum AreaSaveStatus {
     Saving(usize),
     /// Retryable transport failure, retrying with backoff.
     Offline(usize),
+    /// The service holds writes for a moment (a 503): retrying with backoff
+    /// without spending attempts.
+    Held(usize),
     /// Queue paused at a failed sanity check.
     ConflictNeedsReview,
     /// Validation/auth/permanent failure awaiting user action.
@@ -337,8 +350,8 @@ struct AreaQueue {
     /// Last backend-acknowledged revision (mutation results, sync
     /// rows, and fresh fetches update it; optimistic cache revs never do).
     confirmed_rev: Option<i64>,
-    /// Access fingerprint accompanying `confirmed_rev`, when known.
-    fingerprint: Option<String>,
+    /// The same for the map's other sources, by source.
+    confirmed_sources: BTreeMap<SourceId, i64>,
     queue: VecDeque<PendingEnvelope>,
     phase: AreaPhase,
     /// Replay can invalidate a follower while the head still owns a request
@@ -351,6 +364,32 @@ struct AreaQueue {
     /// deleted or access was revoked). A later successful fetch reopens this
     /// queue without disturbing unrelated permanent failures.
     recovery_base_failed: bool,
+    /// The server's refusal that parked an operation, so the editor can
+    /// say why in the viewer's language; it answers only while that
+    /// operation is still the one parked, for that refusal.
+    parked_error: Option<(OperationId, CloudError)>,
+}
+
+impl AreaQueue {
+    /// The last backend-acknowledged revision of one source.
+    fn confirmed(&self, source: SourceId) -> Option<i64> {
+        if source.is_map() {
+            self.confirmed_rev
+        } else {
+            self.confirmed_sources.get(&source).copied()
+        }
+    }
+
+    /// Folds in an unordered report of a source's revision, never moving it
+    /// backward.
+    fn confirm(&mut self, source: SourceId, rev: i64) {
+        if source.is_map() {
+            self.confirmed_rev = Some(self.confirmed_rev.map_or(rev, |current| current.max(rev)));
+        } else {
+            let current = self.confirmed_sources.entry(source).or_insert(rev);
+            *current = (*current).max(rev);
+        }
+    }
 }
 
 impl Default for AreaPhase {
@@ -399,6 +438,8 @@ struct State {
 #[derive(Debug, Serialize, Deserialize)]
 struct DurablePendingBody {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    map_format: Option<u32>,
     server_namespace: String,
     viewer_id: Uuid,
     auth_generation_at_enqueue: u64,
@@ -414,6 +455,10 @@ struct DurablePendingBody {
     /// Absent only on schema-v2 records written before batch commit markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     batch_id: Option<Uuid>,
+    /// The written source; absent for the map, so map records keep the
+    /// checksums they were written with.
+    #[serde(default, skip_serializing_if = "SourceId::is_map")]
+    source: SourceId,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -425,6 +470,8 @@ struct DurablePendingRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct DurableCommitMember {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    map_format: Option<u32>,
     server_namespace: String,
     viewer_id: Uuid,
     sequence: u64,
@@ -494,6 +541,19 @@ struct CompletionRegistry {
     terminal_order: VecDeque<OperationId>,
 }
 
+/// Every directory under the journal root `journal_root` holding `viewer`'s
+/// records, one per server namespace (`servers/<namespace>/viewers/<viewer>`).
+pub(crate) fn viewer_journal_directories(journal_root: &Path, viewer: Uuid) -> Vec<PathBuf> {
+    let Ok(namespaces) = fs::read_dir(journal_root.join("servers")) else {
+        return Vec::new();
+    };
+    namespaces
+        .flatten()
+        .map(|namespace| namespace.path().join("viewers").join(viewer.to_string()))
+        .filter(|directory| directory.is_dir())
+        .collect()
+}
+
 /// The store. Cheap to share; all transitions run under one mutex and wake
 /// the worker through `notify`.
 pub struct PendingQueue {
@@ -503,6 +563,8 @@ pub struct PendingQueue {
     server_namespace: String,
     next_sequence: AtomicU64,
     recovery_errors: Mutex<Vec<String>>,
+    recovery_cache: Option<PathBuf>,
+    legacy_recovery: Mutex<Option<super::LegacyCloudRecovery>>,
     pub(crate) notify: Notify,
     projection_notify: Arc<Notify>,
     events: broadcast::Sender<MapperEvent>,
@@ -529,6 +591,14 @@ impl PendingQueue {
 
     #[must_use]
     pub fn with_journal_namespace(journal_root: PathBuf, server_namespace: String) -> Self {
+        Self::with_recovery_cache(journal_root, server_namespace, None)
+    }
+
+    pub(crate) fn with_recovery_cache(
+        journal_root: PathBuf,
+        server_namespace: String,
+        recovery_cache: Option<PathBuf>,
+    ) -> Self {
         let (events, _) = broadcast::channel(256);
         let queue = Self {
             state: Mutex::new(State::default()),
@@ -537,6 +607,8 @@ impl PendingQueue {
             server_namespace,
             next_sequence: AtomicU64::new(1),
             recovery_errors: Mutex::new(Vec::new()),
+            recovery_cache,
+            legacy_recovery: Mutex::new(None),
             notify: Notify::new(),
             projection_notify: Arc::new(Notify::new()),
             events,
@@ -802,12 +874,17 @@ impl PendingQueue {
         encoded
     }
 
-    fn viewer_directory(&self, viewer_id: Uuid) -> PathBuf {
+    fn viewer_root(&self, viewer_id: Uuid) -> PathBuf {
         self.journal_root
             .join("servers")
             .join(self.namespace_key())
             .join("viewers")
             .join(viewer_id.to_string())
+    }
+
+    fn viewer_directory(&self, viewer_id: Uuid) -> PathBuf {
+        // Pre-upgrade queues are recovery input only, even if archiving fails.
+        self.viewer_root(viewer_id).join("format-3")
     }
 
     fn local_directory(&self) -> PathBuf {
@@ -819,7 +896,8 @@ impl PendingQueue {
     }
 
     fn active_member_path(&self, member: &DurableCommitMember) -> PathBuf {
-        let directory = if member.server_namespace == "local" && member.viewer_id == Uuid::nil() {
+        let mut directory = if member.server_namespace == "local" && member.viewer_id == Uuid::nil()
+        {
             self.local_directory()
         } else {
             self.journal_root
@@ -828,6 +906,9 @@ impl PendingQueue {
                 .join("viewers")
                 .join(member.viewer_id.to_string())
         };
+        if let Some(format) = member.map_format {
+            directory = directory.join(format!("format-{format}"));
+        }
         directory.join(format!(
             "{:020}-{}.json",
             member.sequence, member.operation_id
@@ -1133,6 +1214,7 @@ impl PendingQueue {
             };
         let body = DurablePendingBody {
             schema_version: JOURNAL_SCHEMA_VERSION,
+            map_format: envelope.viewer_id.map(|_| 3),
             server_namespace,
             viewer_id,
             auth_generation_at_enqueue,
@@ -1145,6 +1227,7 @@ impl PendingQueue {
             structural_preconditions: envelope.structural_preconditions.clone(),
             room_remap: envelope.room_remap.clone(),
             batch_id: Some(batch_id),
+            source: envelope.source,
         };
         let record = DurablePendingRecord {
             checksum: Self::checksum(&body)?,
@@ -1166,6 +1249,7 @@ impl PendingQueue {
         Ok(Some((
             final_path,
             DurableCommitMember {
+                map_format: record.body.map_format,
                 server_namespace: record.body.server_namespace,
                 viewer_id: record.body.viewer_id,
                 sequence: record.body.sequence,
@@ -1207,6 +1291,7 @@ impl PendingQueue {
                 committed.contains(&CommittedRecordKey {
                     batch_id,
                     member: DurableCommitMember {
+                        map_format: record.body.map_format,
                         server_namespace: record.body.server_namespace.clone(),
                         viewer_id: record.body.viewer_id,
                         sequence: record.body.sequence,
@@ -1447,6 +1532,13 @@ impl PendingQueue {
                     continue;
                 }
             };
+            if record.body.map_format != Some(3) {
+                self.quarantine_record(
+                    &path,
+                    "missing or unsupported cloud map format".to_string(),
+                );
+                continue;
+            }
             if !matches!(
                 record.body.schema_version,
                 LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
@@ -1498,11 +1590,13 @@ impl PendingQueue {
                 area_id: record.body.area_id,
                 envelope: PendingEnvelope {
                     operation_id: record.body.operation_id,
+                    source: record.body.source,
                     ops: record.body.ops,
                     description: record.body.description,
                     structural_preconditions: record.body.structural_preconditions,
                     room_remap: record.body.room_remap,
                     attempts: 0,
+                    held: 0,
                     viewer_id: Some(viewer_id),
                     local_durable: false,
                     auth_generation,
@@ -1614,11 +1708,13 @@ impl PendingQueue {
                 area_id: record.body.area_id,
                 envelope: PendingEnvelope {
                     operation_id: record.body.operation_id,
+                    source: record.body.source,
                     ops: record.body.ops,
                     description: record.body.description,
                     structural_preconditions: record.body.structural_preconditions,
                     room_remap: record.body.room_remap,
                     attempts: 0,
+                    held: 0,
                     viewer_id: None,
                     local_durable: true,
                     auth_generation: 0,
@@ -1687,6 +1783,7 @@ impl PendingQueue {
         if self.state.lock().active_viewer == active {
             return ViewerActivation::default();
         }
+        *self.legacy_recovery.lock() = viewer.and_then(|viewer| self.archive_legacy(viewer));
         let records = viewer.map_or_else(Vec::new, |viewer_id| {
             self.load_viewer_records(viewer_id, auth_generation)
         });
@@ -1786,6 +1883,29 @@ impl PendingQueue {
         }
         self.changed();
         activation
+    }
+
+    fn archive_legacy(&self, viewer: Uuid) -> Option<super::LegacyCloudRecovery> {
+        if self.journal_root.as_os_str().is_empty() {
+            return None;
+        }
+        super::legacy_recovery::archive(
+            &self.viewer_root(viewer),
+            &self.commit_directory(),
+            self.recovery_cache.as_deref(),
+            &self.server_namespace,
+            viewer,
+        )
+    }
+
+    pub(crate) fn legacy_cloud_recovery(&self) -> Option<super::LegacyCloudRecovery> {
+        self.legacy_recovery.lock().clone()
+    }
+
+    pub(crate) fn retry_legacy_cloud_recovery(&self) {
+        if let Some((viewer, _)) = self.active_viewer() {
+            *self.legacy_recovery.lock() = self.archive_legacy(viewer);
+        }
     }
 
     fn park_expired_head(area: &mut AreaQueue) {
@@ -2185,45 +2305,73 @@ impl PendingQueue {
     /// acknowledgement may land after it. Every reader sees the same true
     /// revision, so unordered hints always fold with `max`; only an
     /// authoritative document reconstruction may deliberately rewind it.
-    pub fn note_confirmed_rev(&self, area_id: AreaId, rev: i64, fingerprint: Option<String>) {
+    pub fn note_confirmed_rev(&self, area_id: AreaId, rev: i64) {
         let mut state = self.state.lock();
         let area = state.areas.entry(area_id).or_default();
         area.confirmed_rev = Some(match area.confirmed_rev {
             Some(current) => current.max(rev),
             None => rev,
         });
-        if fingerprint.is_some() {
-            area.fingerprint = fingerprint;
-        }
     }
 
     /// Adopts a revision from an authoritative area document after the
     /// caller has ruled out an in-flight stale response. Unlike unordered
     /// row and acknowledgement hints, a reconstruction may legitimately
     /// move this value downward.
-    pub(crate) fn adopt_confirmed_rev(
-        &self,
-        area_id: AreaId,
-        rev: i64,
-        fingerprint: Option<String>,
-    ) {
+    pub(crate) fn adopt_confirmed_rev(&self, area_id: AreaId, rev: i64) {
         let mut state = self.state.lock();
         let area = state.areas.entry(area_id).or_default();
         area.confirmed_rev = Some(rev);
-        if fingerprint.is_some() {
-            area.fingerprint = fingerprint;
-        }
     }
 
-    /// The confirmed revision + fingerprint for building an envelope's
-    /// precondition; `None` when no backend truth has been recorded yet.
+    /// The confirmed map revision for building an envelope's precondition;
+    /// `None` when no backend truth has been recorded yet.
     #[must_use]
-    pub fn confirmed_rev(&self, area_id: AreaId) -> (Option<i64>, Option<String>) {
+    pub fn confirmed_rev(&self, area_id: AreaId) -> Option<i64> {
+        let state = self.state.lock();
+        state.areas.get(&area_id).and_then(|a| a.confirmed_rev)
+    }
+
+    /// [`Self::confirmed_rev`] for any source of the map.
+    #[must_use]
+    pub fn confirmed_source_rev(&self, area_id: AreaId, source: SourceId) -> Option<i64> {
         let state = self.state.lock();
         state
             .areas
             .get(&area_id)
-            .map_or((None, None), |a| (a.confirmed_rev, a.fingerprint.clone()))
+            .and_then(|area| area.confirmed(source))
+    }
+
+    /// Snapshot all acknowledged source versions for detecting a GET that
+    /// straddled an acknowledgement without advancing the base revision.
+    pub(crate) fn confirmed_source_versions(&self, area_id: AreaId) -> BTreeMap<SourceId, i64> {
+        let state = self.state.lock();
+        let Some(area) = state.areas.get(&area_id) else {
+            return BTreeMap::new();
+        };
+        let mut versions = area.confirmed_sources.clone();
+        if let Some(rev) = area.confirmed_rev {
+            versions.insert(SourceId::map(), rev);
+        }
+        versions
+    }
+
+    /// [`Self::note_confirmed_rev`] for any source of the map.
+    pub fn note_source_rev(&self, area_id: AreaId, source: SourceId, rev: i64) {
+        let mut state = self.state.lock();
+        state.areas.entry(area_id).or_default().confirm(source, rev);
+    }
+
+    /// Adopts the revisions of the map's other sources from an authoritative
+    /// document, as [`Self::adopt_confirmed_rev`] adopts the map's. Sources
+    /// the document does not carry are forgotten.
+    pub(crate) fn adopt_source_revs(&self, area_id: AreaId, sources: &[crate::SourceBundle]) {
+        let mut state = self.state.lock();
+        state.areas.entry(area_id).or_default().confirmed_sources = sources
+            .iter()
+            .filter(|bundle| !bundle.source.is_map())
+            .map(|bundle| (bundle.source, bundle.rev))
+            .collect();
     }
 
     /// The next sendable envelope across all areas, marking it in flight.
@@ -2233,7 +2381,7 @@ impl PendingQueue {
         &self,
         now: Instant,
     ) -> (
-        Option<(AreaId, PendingEnvelope, Option<i64>, Option<String>)>,
+        Option<(AreaId, PendingEnvelope, Option<i64>)>,
         Option<Instant>,
     ) {
         let mut state = self.state.lock();
@@ -2260,7 +2408,7 @@ impl PendingQueue {
             }
             match &area.phase {
                 AreaPhase::Ready => {}
-                AreaPhase::Backoff { until } => {
+                AreaPhase::Backoff { until, .. } => {
                     if *until > now {
                         earliest = Some(earliest.map_or(*until, |e| e.min(*until)));
                         continue;
@@ -2291,9 +2439,8 @@ impl PendingQueue {
                     continue;
                 }
                 area.phase = AreaPhase::InFlight;
-                let rev = area.confirmed_rev;
-                let fingerprint = area.fingerprint.clone();
-                return (Some((area_id, envelope, rev, fingerprint)), earliest);
+                let rev = area.confirmed(envelope.source);
+                return (Some((area_id, envelope, rev)), earliest);
             }
         }
         (None, earliest)
@@ -2346,9 +2493,8 @@ impl PendingQueue {
                 match retirement {
                     Ok(()) => {
                         let _ = area.queue.pop_front();
-                        if let Some(rev) = new_rev {
-                            area.confirmed_rev =
-                                Some(area.confirmed_rev.map_or(rev, |current| current.max(rev)));
+                        if let Some((source, rev)) = new_rev {
+                            area.confirm(source, rev);
                         }
                         conflicted = Self::resume_with_deferred_conflict(area);
                         settled = Some((area_id, operation_id));
@@ -2415,7 +2561,7 @@ impl PendingQueue {
         &self,
         area_id: AreaId,
         operation_id: OperationId,
-        new_rev: Option<i64>,
+        new_rev: Option<(SourceId, i64)>,
     ) -> bool {
         let mut conflicted = None;
         let removed = {
@@ -2450,14 +2596,13 @@ impl PendingQueue {
                     }
                     removed = area.queue.pop_front();
                 }
-                if let Some(rev) = new_rev {
+                if let Some((source, rev)) = new_rev {
                     // An acknowledgement can echo a replayed idempotency
                     // receipt, whose revision is that of the *original*
                     // application and may predate fresher backend truth.
                     // §2.2: remove the operation, but never move the
                     // confirmed aggregate backward.
-                    area.confirmed_rev =
-                        Some(area.confirmed_rev.map_or(rev, |current| current.max(rev)));
+                    area.confirm(source, rev);
                 }
                 if removed.is_some() {
                     conflicted = Self::resume_with_deferred_conflict(area);
@@ -2531,6 +2676,7 @@ impl PendingQueue {
                         let jitter = Duration::from_millis(u64::from(fastrand_ms()) % 100);
                         area.phase = AreaPhase::Backoff {
                             until: now + delay + jitter,
+                            held: false,
                         };
                     }
                 } else {
@@ -2554,6 +2700,40 @@ impl PendingQueue {
         self.emit(MapperEvent::AreaStatusChanged { area_id });
         self.changed();
         verdict
+    }
+
+    /// Reports a 503 on the in-flight head: the service holds writes to the
+    /// subject for a moment (a transfer's seal, or a hold on every write).
+    /// The head backs off and retries without spending its transport
+    /// attempts, so a hold never parks it as `CouldNotSave`.
+    pub(crate) fn service_unavailable(
+        &self,
+        area_id: AreaId,
+        operation_id: OperationId,
+        now: Instant,
+    ) {
+        {
+            let mut state = self.state.lock();
+            let Some(area) = state.areas.get_mut(&area_id) else {
+                return;
+            };
+            match area.queue.front_mut() {
+                Some(head) => {
+                    if head.operation_id != operation_id || area.phase != AreaPhase::InFlight {
+                        return;
+                    }
+                    head.held = head.held.saturating_add(1);
+                    let jitter = Duration::from_millis(u64::from(fastrand_ms()) % 100);
+                    area.phase = AreaPhase::Backoff {
+                        until: now + retry_delay(head.held) + jitter,
+                        held: true,
+                    };
+                }
+                None => area.phase = AreaPhase::Ready,
+            }
+        }
+        self.emit(MapperEvent::AreaStatusChanged { area_id });
+        self.changed();
     }
 
     /// Records an ordinary display replay failure without taking ownership
@@ -2657,13 +2837,15 @@ impl PendingQueue {
         self.changed();
     }
 
-    /// Parks the in-flight head as permanently failed (validation/auth).
+    /// Parks the in-flight head as permanently failed (validation/auth),
+    /// refused with `error`.
     pub(crate) fn permanent_failure(
         &self,
         area_id: AreaId,
         operation_id: OperationId,
-        message: String,
+        error: CloudError,
     ) -> bool {
+        let message = error.to_string();
         let parked = {
             let mut state = self.state.lock();
             state.areas.get_mut(&area_id).and_then(|area| {
@@ -2680,6 +2862,7 @@ impl PendingQueue {
                     message: message.clone(),
                     retryable: true,
                 };
+                area.parked_error = Some((operation_id, error));
                 Some(operation_id)
             })
         };
@@ -3168,6 +3351,26 @@ impl PendingQueue {
         }
     }
 
+    /// The server's refusal that parked the area's queue, while its
+    /// operation is still the one parked; `None` for a park the server did
+    /// not refuse (an exhausted transport budget, a lost recovery base).
+    #[must_use]
+    pub fn parked_error(&self, area_id: AreaId) -> Option<CloudError> {
+        let state = self.state.lock();
+        let area = state.areas.get(&area_id)?;
+        match (&area.phase, &area.parked_error) {
+            (
+                AreaPhase::Failed {
+                    operation_id: Some(parked),
+                    message,
+                    ..
+                },
+                Some((refused, error)),
+            ) if parked == refused && *message == error.to_string() => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     /// The operation currently paused after a permanent delivery failure.
     #[must_use]
     pub fn failed_operation_id(&self, area_id: AreaId) -> Option<OperationId> {
@@ -3221,7 +3424,8 @@ impl PendingQueue {
                 message: message.clone(),
                 retryable: *retryable,
             },
-            AreaPhase::Backoff { .. } => AreaSaveStatus::Offline(pending),
+            AreaPhase::Backoff { held: true, .. } => AreaSaveStatus::Held(pending),
+            AreaPhase::Backoff { held: false, .. } => AreaSaveStatus::Offline(pending),
             AreaPhase::Ready
             | AreaPhase::InFlight
             | AreaPhase::AwaitingPublication
@@ -3245,14 +3449,17 @@ mod tests {
 
     fn envelope(desc: &str) -> PendingEnvelope {
         PendingEnvelope {
+            source: SourceId::Map,
             operation_id: Uuid::new_v4(),
             ops: vec![AreaMutation::DeleteRoom {
+                room_source: None,
                 room_number: RoomNumber(1),
             }],
             description: desc.to_string(),
             structural_preconditions: Vec::new(),
             room_remap: None,
             attempts: 0,
+            held: 0,
             viewer_id: None,
             local_durable: false,
             auth_generation: 0,
@@ -3278,23 +3485,93 @@ mod tests {
 
         let now = Instant::now();
         let (first, _) = q.take_ready(now);
-        let (area1, env1, _, _) = first.expect("head available");
+        let (area1, env1, _) = first.expect("head available");
         // The same area cannot send its second envelope while the first is
         // in flight, but the other area can.
         let (second, _) = q.take_ready(now);
-        let (area2, _, _, _) = second.expect("other area available");
+        let (area2, _, _) = second.expect("other area available");
         assert_ne!(area1, area2);
         let (third, _) = q.take_ready(now);
         assert!(third.is_none(), "both areas in flight");
 
         // Acknowledging one area readies exactly that area's next envelope,
         // at the newly confirmed revision.
-        q.acknowledge(area1, env1.operation_id, Some(5));
+        q.acknowledge(area1, env1.operation_id, Some((SourceId::Map, 5)));
         let (fourth, _) = q.take_ready(now);
-        let (area4, env4, rev4, _) = fourth.expect("second envelope for the acked area");
+        let (area4, env4, rev4) = fourth.expect("second envelope for the acked area");
         assert_eq!(area4, area1);
         assert_eq!(rev4, Some(5));
         assert_ne!(env4.operation_id, env1.operation_id);
+    }
+
+    #[test]
+    fn a_hold_and_a_network_failure_read_apart() {
+        let q = PendingQueue::new();
+        let area = AreaId(Uuid::new_v4());
+        let operation = envelope("op");
+        let operation_id = operation.operation_id;
+        q.enqueue(area, operation).expect("enqueue");
+        let now = Instant::now();
+        assert!(q.take_ready(now).0.is_some());
+        q.service_unavailable(area, operation_id, now);
+        assert_eq!(q.save_status(area), AreaSaveStatus::Held(1));
+        assert!(q.take_ready(now + Duration::from_hours(1)).0.is_some());
+        let _ = q.transport_failure(area, operation_id, now);
+        assert_eq!(q.save_status(area), AreaSaveStatus::Offline(1));
+    }
+
+    /// A refusal that parks the queue answers for the park, so the editor
+    /// can say why in the viewer's language, and no longer once the write
+    /// is retried.
+    #[test]
+    fn a_parked_refusal_answers_while_parked() {
+        let q = PendingQueue::new();
+        let area = AreaId(Uuid::new_v4());
+        let operation = envelope("op");
+        let operation_id = operation.operation_id;
+        q.enqueue(area, operation).expect("enqueue");
+        assert!(q.take_ready(Instant::now()).0.is_some());
+        assert!(q.permanent_failure(area, operation_id, CloudError::ClanDissolving));
+        assert!(matches!(
+            q.parked_error(area),
+            Some(CloudError::ClanDissolving)
+        ));
+        assert!(q.resolve_failure(area, true).expect("retries").unparked);
+        assert!(q.parked_error(area).is_none());
+    }
+
+    #[test]
+    fn a_held_write_backs_off_and_never_parks() {
+        let q = PendingQueue::new();
+        let area = AreaId(Uuid::new_v4());
+        let operation = envelope("op");
+        let operation_id = operation.operation_id;
+        q.enqueue(area, operation).expect("enqueue");
+        let now = Instant::now();
+        for _ in 0..MAX_TRANSPORT_ATTEMPTS * 3 {
+            let (taken, _) = q.take_ready(now + Duration::from_hours(1));
+            assert!(taken.is_some(), "the write retries after its backoff");
+            assert!(
+                q.take_ready(now).0.is_none(),
+                "one request at a time while in flight"
+            );
+            q.service_unavailable(area, operation_id, now);
+            assert!(
+                q.take_ready(now).0.is_none(),
+                "a held write waits out its backoff"
+            );
+            assert!(matches!(q.save_status(area), AreaSaveStatus::Held(1)));
+        }
+        let kept = q.pending_for(area);
+        assert_eq!(kept.len(), 1, "nothing was dropped");
+        assert_eq!(kept[0].attempts, 0, "holds spend no transport attempts");
+        // A transport failure afterwards still has its whole budget.
+        let (taken, _) = q.take_ready(now + Duration::from_hours(1));
+        assert!(taken.is_some());
+        assert_eq!(
+            q.transport_failure(area, operation_id, now),
+            TransportVerdict::BackedOff
+        );
     }
 
     #[test]
@@ -3361,7 +3638,7 @@ mod tests {
         assert!(q.contains_operation(area, operation_id));
         assert_eq!(q.conflicted_operation_id(area), None);
         let (taken, _) = q.take_ready(Instant::now());
-        let (_, env, _, _) = taken.expect("head");
+        let (_, env, _) = taken.expect("head");
         q.finish_conflict_replay(area, env.operation_id, Some(env.operation_id));
         assert_eq!(q.save_status(area), AreaSaveStatus::ConflictNeedsReview);
         assert_eq!(q.conflicted_operation_id(area), Some(env.operation_id));
@@ -3491,7 +3768,7 @@ mod tests {
             q.enqueue(area, envelope("late")).is_err(),
             "new edits must be rejected while delete is pending"
         );
-        q.acknowledge(area, first_id, Some(2));
+        q.acknowledge(area, first_id, Some((SourceId::Map, 2)));
         q.wait_until_delete_quiescent(area).await;
         assert!(
             q.take_ready(Instant::now()).0.is_none(),
@@ -3533,36 +3810,30 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_rev_never_regresses_when_access_changes() {
+    fn confirmed_rev_never_regresses() {
         let q = PendingQueue::new();
         let area = AreaId(Uuid::new_v4());
-        let fp = || Some("fp-a".to_string());
 
         // The load lands, then an acknowledgement advances past it.
-        q.note_confirmed_rev(area, 1, fp());
+        q.note_confirmed_rev(area, 1);
         q.enqueue(area, envelope("op")).expect("enqueue");
         let (taken, _) = q.take_ready(Instant::now());
-        let (_, env, rev, _) = taken.expect("head");
+        let (_, env, rev) = taken.expect("head");
         assert_eq!(rev, Some(1));
-        q.acknowledge(area, env.operation_id, Some(2));
-        assert_eq!(q.confirmed_rev(area).0, Some(2));
+        q.acknowledge(area, env.operation_id, Some((SourceId::Map, 2)));
+        assert_eq!(q.confirmed_rev(area), Some(2));
 
         // A sync row fetched before the acknowledgement lands after it:
         // the stale same-class report must not regress the base.
-        q.note_confirmed_rev(area, 1, fp());
-        assert_eq!(q.confirmed_rev(area).0, Some(2));
+        q.note_confirmed_rev(area, 1);
+        assert_eq!(q.confirmed_rev(area), Some(2));
 
         // A replayed receipt echoing an old revision cannot regress either.
         q.enqueue(area, envelope("op2")).expect("enqueue");
         let (taken, _) = q.take_ready(Instant::now());
-        let (_, env2, _, _) = taken.expect("head");
-        q.acknowledge(area, env2.operation_id, Some(1));
-        assert_eq!(q.confirmed_rev(area).0, Some(2));
-
-        // A changed fingerprint can change redacted content, but all viewers
-        // share the same revision counter, so it cannot regress the base.
-        q.note_confirmed_rev(area, 1, Some("fp-b".to_string()));
-        assert_eq!(q.confirmed_rev(area).0, Some(2));
+        let (_, env2, _) = taken.expect("head");
+        q.acknowledge(area, env2.operation_id, Some((SourceId::Map, 1)));
+        assert_eq!(q.confirmed_rev(area), Some(2));
     }
 
     #[test]
@@ -3596,6 +3867,198 @@ mod tests {
             local_durable: true,
             ..envelope(desc)
         }
+    }
+
+    #[test]
+    fn legacy_committed_batches_and_followers_are_archived_as_a_whole() {
+        let root = journal_test_root();
+        let viewer = Uuid::new_v4();
+        let queue = PendingQueue::with_journal(root.clone());
+        let directory = queue.viewer_root(viewer);
+        fs::create_dir_all(&directory).unwrap();
+        let batch = Uuid::new_v4();
+        let area_a = AreaId(Uuid::new_v4());
+        let area_b = AreaId(Uuid::new_v4());
+        let mut members = Vec::new();
+        let mut originals = Vec::new();
+        for (sequence, area) in [(1, area_a), (2, area_b), (3, area_a)] {
+            let body = DurablePendingBody {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                map_format: None,
+                server_namespace: "test-backend".into(),
+                viewer_id: viewer,
+                auth_generation_at_enqueue: 1,
+                area_id: area,
+                sequence,
+                queued_at: Utc::now(),
+                operation_id: Uuid::new_v4(),
+                ops: envelope("old").ops,
+                description: "legacy ordinary edit".into(),
+                structural_preconditions: Vec::new(),
+                room_remap: None,
+                batch_id: Some(batch),
+                source: SourceId::Map,
+            };
+            let checksum = PendingQueue::checksum(&body).unwrap();
+            members.push(DurableCommitMember {
+                map_format: None,
+                server_namespace: body.server_namespace.clone(),
+                viewer_id: viewer,
+                sequence,
+                operation_id: body.operation_id,
+                record_checksum: checksum.clone(),
+            });
+            let path = queue.active_member_path(members.last().unwrap());
+            let bytes = serde_json::to_vec(&DurablePendingRecord { checksum, body }).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            originals.push((path, bytes));
+        }
+        queue.write_commit_marker(batch, &members).unwrap();
+        let marker = fs::read(queue.commit_directory().join(format!("{batch}.commit"))).unwrap();
+        drop(queue);
+        let restarted = PendingQueue::with_journal(root.clone());
+        restarted.activate_viewer(Some(viewer), 2);
+        assert_eq!(restarted.total_pending(), 0);
+        let notice = restarted.legacy_cloud_recovery().unwrap();
+        assert!(!notice.incomplete);
+        for (path, bytes) in originals {
+            assert!(!path.exists());
+            assert_eq!(
+                fs::read(
+                    notice
+                        .folder
+                        .join("journal")
+                        .join(path.file_name().unwrap())
+                )
+                .unwrap(),
+                bytes
+            );
+        }
+        assert_eq!(
+            fs::read(
+                notice
+                    .folder
+                    .join("commits")
+                    .join(format!("{batch}.commit"))
+            )
+            .unwrap(),
+            marker
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_cloud_recovery_preserves_raw_bytes_and_new_queues_survive_restart() {
+        let root = journal_test_root();
+        let cache = root.join("cache");
+        let viewer = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let area = AreaId(Uuid::new_v4());
+        let queue = PendingQueue::with_recovery_cache(
+            root.clone(),
+            "test-backend".into(),
+            Some(cache.clone()),
+        );
+        let legacy = queue.viewer_root(viewer);
+        fs::create_dir_all(&legacy).unwrap();
+        // Preserve even unknown mutation variants, old secrecy fields, and
+        // invalid JSON. No typed decoder or commit validation may eat them.
+        let originals: &[(&str, &[u8])] = &[
+            (
+                "0001.json",
+                br#"{"ops":[{"old_operation":{"is_secret":true}}]}"#,
+            ),
+            ("0002.json", b"{corrupt-but-recoverable"),
+            ("delete.intent", b"old delete intent"),
+        ];
+        for (name, bytes) in originals {
+            fs::write(legacy.join(name), bytes).unwrap();
+        }
+        let old_cache = cache.join("v2").join(viewer.to_string());
+        fs::create_dir_all(&old_cache).unwrap();
+        fs::write(old_cache.join("map.json"), b"private cached map").unwrap();
+        let other_root = queue.viewer_root(other);
+        fs::create_dir_all(&other_root).unwrap();
+        fs::write(other_root.join("other.json"), b"other viewer").unwrap();
+        let foreign = PendingQueue::with_journal_namespace(root.clone(), "another-origin".into());
+        fs::create_dir_all(foreign.viewer_root(viewer)).unwrap();
+        fs::write(
+            foreign.viewer_root(viewer).join("foreign.json"),
+            b"other origin",
+        )
+        .unwrap();
+        let local = local_durable_envelope("local edit");
+        let local_id = local.operation_id;
+        let local_area = AreaId(Uuid::new_v4());
+        queue.enqueue(local_area, local).unwrap();
+        queue.activate_viewer(Some(viewer), 1);
+        let notice = queue.legacy_cloud_recovery().unwrap();
+        assert!(!notice.incomplete);
+        for (name, bytes) in originals {
+            assert_eq!(
+                fs::read(notice.folder.join("journal").join(name)).unwrap(),
+                *bytes
+            );
+            assert!(!legacy.join(name).exists());
+        }
+        assert_eq!(
+            fs::read(notice.folder.join("cache/v2/map.json")).unwrap(),
+            b"private cached map"
+        );
+        assert!(other_root.join("other.json").exists());
+        assert!(foreign.viewer_root(viewer).join("foreign.json").exists());
+        assert!(queue.pending_for(area).is_empty());
+        let fresh = durable_envelope("new edit", viewer, 1);
+        let fresh_id = fresh.operation_id;
+        queue.enqueue(area, fresh).unwrap();
+        drop(queue);
+        let reopened =
+            PendingQueue::with_recovery_cache(root.clone(), "test-backend".into(), Some(cache));
+        assert_eq!(reopened.pending_for(local_area)[0].operation_id, local_id);
+        reopened.activate_viewer(Some(viewer), 2);
+        assert_eq!(reopened.pending_for(area)[0].operation_id, fresh_id);
+        assert_eq!(reopened.legacy_cloud_recovery(), Some(notice));
+        reopened.activate_viewer(None, 3);
+        assert!(reopened.legacy_cloud_recovery().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_or_interrupted_legacy_archive_never_blocks_new_edits_or_replays_old_ones() {
+        let root = journal_test_root();
+        let viewer = Uuid::new_v4();
+        let queue = PendingQueue::with_journal(root.clone());
+        let legacy = queue.viewer_root(viewer);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("old.json"), b"original bytes").unwrap();
+        fs::write(legacy.join("recovery"), b"blocks directory creation").unwrap();
+        queue.activate_viewer(Some(viewer), 1);
+        assert!(queue.legacy_cloud_recovery().unwrap().incomplete);
+        assert_eq!(queue.total_pending(), 0);
+        assert_eq!(
+            fs::read(legacy.join("old.json")).unwrap(),
+            b"original bytes"
+        );
+        let area = AreaId(Uuid::new_v4());
+        queue
+            .enqueue(area, durable_envelope("new edit", viewer, 1))
+            .unwrap();
+        assert_eq!(queue.total_pending(), 1);
+        fs::remove_file(legacy.join("recovery")).unwrap();
+        // Simulate interruption after copying one record but before its retirement.
+        let archive = legacy.join("recovery/pre-format-3/journal");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("old.json"), b"original bytes").unwrap();
+        fs::write(legacy.join("follower.json"), b"dependent old edit").unwrap();
+        queue.retry_legacy_cloud_recovery();
+        assert!(!queue.legacy_cloud_recovery().unwrap().incomplete);
+        assert_eq!(
+            fs::read(archive.join("follower.json")).unwrap(),
+            b"dependent old edit"
+        );
+        assert!(!legacy.join("old.json").exists());
+        assert_eq!(queue.total_pending(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3812,8 +4275,8 @@ mod tests {
         );
         queue.recovery_base_loaded(area);
         let (ready, _) = queue.take_ready(Instant::now());
-        let (_, ready, _, _) = ready.expect("matching viewer work is sendable");
-        assert!(queue.acknowledge(area, ready.operation_id, Some(2)));
+        let (_, ready, _) = ready.expect("matching viewer work is sendable");
+        assert!(queue.acknowledge(area, ready.operation_id, Some((SourceId::Map, 2))));
         assert!(
             queue
                 .viewer_directory(viewer)
@@ -3869,7 +4332,7 @@ mod tests {
             ready.expect("reactivated edit").1.operation_id,
             operation_id
         );
-        assert!(queue.acknowledge(area, operation_id, Some(2)));
+        assert!(queue.acknowledge(area, operation_id, Some((SourceId::Map, 2))));
         queue
             .wait_for_completion(operation_id)
             .await
@@ -4220,7 +4683,7 @@ mod tests {
             ready.expect("local edit ready").1.operation_id,
             operation_id
         );
-        assert!(recovered.acknowledge(area, operation_id, Some(2)));
+        assert!(recovered.acknowledge(area, operation_id, Some((SourceId::Map, 2))));
 
         let restarted = PendingQueue::with_journal(root.clone());
         assert!(
@@ -4278,7 +4741,7 @@ mod tests {
         assert!(queue.take_ready(Instant::now()).0.is_none());
         assert!(queue.cancel(area, head_id).expect("decided head").is_none());
 
-        assert!(queue.acknowledge(area, head_id, Some(2)));
+        assert!(queue.acknowledge(area, head_id, Some((SourceId::Map, 2))));
         assert_eq!(queue.conflicted_operation_id(area), Some(follower_id));
         assert!(queue.take_ready(Instant::now()).0.is_none());
         let _ = fs::remove_dir_all(root);
@@ -4308,7 +4771,7 @@ mod tests {
                 queue.record_replay_result(area, None);
             }
             assert!(queue.is_in_flight_at_generation(area, head_id, None, 0));
-            assert!(queue.acknowledge(area, head_id, Some(2)));
+            assert!(queue.acknowledge(area, head_id, Some((SourceId::Map, 2))));
             assert_eq!(queue.conflicted_operation_id(area), None);
             if !cancel {
                 queue.pause_conflict(area, follower_id);
@@ -4339,7 +4802,7 @@ mod tests {
             .expect("journal path")
             .with_extension("ack");
         fs::create_dir(&acknowledged).expect("block retirement");
-        assert!(!queue.acknowledge(area, head_id, Some(2)));
+        assert!(!queue.acknowledge(area, head_id, Some((SourceId::Map, 2))));
         queue.record_replay_result(area, Some(follower_id));
         assert_eq!(queue.conflicted_operation_id(area), None);
         assert!(
@@ -4383,7 +4846,7 @@ mod tests {
             .with_extension("ack");
         fs::create_dir(&acknowledged).expect("block acknowledgement rename");
         assert!(
-            !queue.acknowledge(area, operation_id, Some(2)),
+            !queue.acknowledge(area, operation_id, Some((SourceId::Map, 2))),
             "an ACK is not terminal until its WAL record leaves the replay namespace"
         );
         assert_eq!(queue.pending_for(area).len(), 1);
@@ -4557,12 +5020,12 @@ mod tests {
 
         let first = queue.take_ready(Instant::now()).0.expect("first member");
         let second = queue.take_ready(Instant::now()).0.expect("second member");
-        assert!(queue.acknowledge(first.0, first.1.operation_id, Some(2)));
+        assert!(queue.acknowledge(first.0, first.1.operation_id, Some((SourceId::Map, 2))));
         assert!(
             marker.exists(),
             "the marker is needed while any member remains active"
         );
-        assert!(queue.acknowledge(second.0, second.1.operation_id, Some(2)));
+        assert!(queue.acknowledge(second.0, second.1.operation_id, Some((SourceId::Map, 2))));
         assert!(
             !marker.exists(),
             "the marker is garbage-collected after its last active member"
@@ -4661,9 +5124,9 @@ mod tests {
         queue.enqueue(area, expired).expect("expired follower");
 
         let (ready, _) = queue.take_ready(Instant::now());
-        let (_, ready, _, _) = ready.expect("non-expired head should dispatch");
+        let (_, ready, _) = ready.expect("non-expired head should dispatch");
         assert_eq!(ready.operation_id, first_id);
-        assert!(queue.acknowledge(area, first_id, Some(2)));
+        assert!(queue.acknowledge(area, first_id, Some((SourceId::Map, 2))));
         let phase = queue
             .state
             .lock()

@@ -54,7 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 1..=500 {
         let room_updates = RoomUpdates {
-            is_secret: None,
             external_id: None,
             title: Some(format!("Room {i}")),
             description: Some(format!("This is test room number {i}")),
@@ -77,18 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚪 Creating exits...");
     for i in 1..499 {
         let exit_args = ExitArgs {
+            to_source: None,
             id: None,
             connection_id: None,
             new_connection_id: None,
-            is_secret: None,
             from_direction: ExitDirection::East,
             to_area_id: Some(area_id),
             to_room_number: Some(RoomNumber(i + 1)),
             to_direction: Some(ExitDirection::West),
             path: None,
             is_hidden: false,
-            is_closed: false,
-            is_locked: false,
+            door: None,
             weight: 1.0,
             command: None,
         };
@@ -107,7 +105,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a label
     let label_args = LabelArgs {
         id: None,
-        is_secret: None,
         level: 0,
         x: 25.0,
         y: -10.0,
@@ -126,7 +123,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a shape
     let shape_args = ShapeArgs {
         id: None,
-        is_secret: None,
         level: 0,
         x: 0.0,
         y: -20.0,

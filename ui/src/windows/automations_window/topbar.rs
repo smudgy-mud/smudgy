@@ -4,7 +4,7 @@
 
 use iced::alignment::Vertical;
 use iced::widget::{button, column, container, row, rule, text, tooltip};
-use iced::{Border, Color, Length, Padding};
+use iced::{Length, Padding};
 
 use crate::assets::{bootstrap_icons, fonts};
 use crate::theme::Theme;
@@ -150,25 +150,6 @@ impl AutomationsWindow {
     }
 }
 
-/// Active/selected variant of the flat toolbar button: a quiet filled pill so
-/// the currently open browse pane (Discover/Shared) reads as current without
-/// the heavy boxed chrome the rest of the toolbar avoids.
-fn toolbar_active(theme: &Theme, status: button::Status) -> button::Style {
-    let fill = match status {
-        button::Status::Hovered | button::Status::Pressed => 0.16,
-        _ => 0.12,
-    };
-    button::Style {
-        background: Some(Color::from_rgba8(255, 255, 255, fill).into()),
-        border: Border {
-            radius: 4.0.into(),
-            ..Border::default()
-        },
-        text_color: theme.styles.text.normal,
-        ..Default::default()
-    }
-}
-
 fn action_button(
     icon: &'static str,
     label: &'static str,
@@ -176,7 +157,7 @@ fn action_button(
     active: bool,
 ) -> Elem<'static> {
     let style: fn(&Theme, button::Status) -> button::Style = if active {
-        toolbar_active
+        button_style::toolbar_active
     } else {
         button_style::toolbar
     };

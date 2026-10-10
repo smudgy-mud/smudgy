@@ -8,7 +8,7 @@
 //! Storage layout, under a dedicated root (e.g. `~/Documents/smudgy/local/`):
 //!
 //! ```text
-//! <root>/areas-v2/<area_id>.json          one v2 AreaWithDetails per area (authoritative)
+//! <root>/areas-v2/<area_id>.json          one v2+ AreaWithDetails per area (authoritative)
 //! <root>/areas/<area_id>.json             the v1 namespace: read-only migration source
 //! <root>/areas-v1-backup/<id>.<ts>.json   untouched v1 bytes, written before each migration
 //! <root>/atlases/<atlas_id>.json          one Atlas manifest per folder
@@ -26,7 +26,14 @@
 //! v2 copy exists the v1 file is never re-read, so later edits made by an
 //! old binary to the stale v1 namespace are deliberately not merged.
 //! Documents newer than [`crate::AREA_FORMAT_VERSION`] are a hard read-only
-//! error naming the file.
+//! error naming the file. A v2 document (exits with `is_closed`/`is_locked`
+//! rather than doors) is read through the door migration
+//! ([`local_migration::migrate_doorless`]) and written back as the current
+//! format the next time it is saved; old binaries refuse the newer file.
+//! Legacy `is_secret` content becomes Private additions. Stored mutation
+//! receipts retain their operation IDs, with area revisions translated to
+//! map-source revisions. Cross-map destinations follow migrated Private rooms,
+//! including when the destination is saved before its older neighbors.
 //!
 //! Single-document saves use atomic replacement. Changes spanning documents
 //! share one redo journal; its durable installation is the commit decision.
@@ -108,7 +115,32 @@ fn multi_write_sequence_of(path: &Path) -> Option<u64> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalMutationReceipt {
     operation_id: Uuid,
+    #[serde(deserialize_with = "read_local_mutation_result")]
     result: MutationResult,
+}
+
+/// Local receipts predate source revisions. Keep their operation identities
+/// and results so an acknowledged write cannot apply again after an upgrade.
+/// This compatibility is deliberately local; the HTTP contract stays strict.
+fn read_local_mutation_result<'de, D>(deserializer: D) -> Result<MutationResult, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let mut value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(versions) = value
+        .get_mut("versions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for version in versions {
+            if version.get("resource").and_then(serde_json::Value::as_str) == Some("area") {
+                version["resource"] = serde_json::json!("source");
+                version["source"] = serde_json::json!("map");
+            }
+        }
+    }
+    local_migration::doors_from_flags(&mut value);
+    serde_json::from_value(value).map_err(D::Error::custom)
 }
 
 /// Local-only persistence wrapper. Flattening preserves the portable v2 area
@@ -127,6 +159,16 @@ struct LocalAreaDocument {
         skip_serializing_if = "Vec::is_empty"
     )]
     applied_operations: Vec<LocalMutationReceipt>,
+    /// Old cross-map exits address these rooms without a source. Retain the
+    /// aliases after this map is saved so still-v2 neighbors can migrate later.
+    #[serde(
+        default,
+        rename = "_smudgy_legacy_private_rooms",
+        skip_serializing_if = "std::collections::BTreeSet::is_empty"
+    )]
+    legacy_private_rooms: std::collections::BTreeSet<crate::RoomNumber>,
+    #[serde(default, rename = "_smudgy_legacy_references")]
+    needs_legacy_references: bool,
 }
 
 impl LocalAreaDocument {
@@ -135,6 +177,8 @@ impl LocalAreaDocument {
             content_identity: Arc::new(()),
             details,
             applied_operations: Vec::new(),
+            legacy_private_rooms: std::collections::BTreeSet::default(),
+            needs_legacy_references: false,
         }
     }
 
@@ -167,6 +211,7 @@ impl LocalAreaDocument {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalAtlasDeleteTransaction {
     atlas: Atlas,
+    #[serde(deserialize_with = "read_local_documents")]
     members: Vec<LocalAreaDocument>,
     committed: bool,
 }
@@ -179,6 +224,7 @@ struct LocalAtlasDeleteTransaction {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct LocalMultiWriteTransaction {
     /// Full post-images, receipts included.
+    #[serde(deserialize_with = "read_local_documents")]
     writes: Vec<LocalAreaDocument>,
     deletes: Vec<AreaId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1280,13 +1326,67 @@ fn document_version(bytes: &[u8]) -> CloudResult<u32> {
     Ok(serde_json::from_slice::<FormatVersionProbe>(bytes)?.format_version)
 }
 
-/// Parses bytes from the v2 namespace, refusing anything that is not the
-/// current format: a *newer* document is a hard read-only error naming the
-/// file (opening it read-write would corrupt data this build cannot
-/// represent), and an older one does not belong in `areas-v2/` at all.
+/// Parses bytes from the v2 namespace: a *newer* document is a hard
+/// read-only error naming the file (opening it read-write would corrupt data
+/// this build cannot represent), a v1 document does not belong in
+/// `areas-v2/` at all, and a doorless v2 document reads through the door
+/// migration.
 fn parse_v2_document(bytes: &[u8], path: &Path) -> CloudResult<LocalAreaDocument> {
-    validate_v2_version(document_version(bytes)?, path)?;
-    Ok(serde_json::from_slice(bytes)?)
+    let version = document_version(bytes)?;
+    validate_v2_version(version, path)?;
+    if version == crate::AREA_FORMAT_VERSION {
+        // A door an earlier migration stored too long reads clamped.
+        let mut document: LocalAreaDocument = serde_json::from_slice(bytes)?;
+        local_migration::clamp_doors(&mut document.details.rooms);
+        return Ok(document);
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let privacy = super::local_privacy::LegacyPrivacy::read(&value)?;
+    local_migration::doors_from_flags(&mut value);
+    let mut document: LocalAreaDocument = serde_json::from_value(value)?;
+    local_migration::adopt_open_commands(&mut document.details.rooms);
+    privacy.apply(&mut document.details);
+    document.legacy_private_rooms = privacy.private_rooms();
+    document.needs_legacy_references = true;
+    document.details.format_version = crate::AREA_FORMAT_VERSION;
+    Ok(document)
+}
+
+fn read_local_documents<'de, D>(deserializer: D) -> Result<Vec<LocalAreaDocument>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| {
+            let bytes = serde_json::to_vec(&value).map_err(D::Error::custom)?;
+            parse_v2_document(&bytes, Path::new("local transaction")).map_err(D::Error::custom)
+        })
+        .collect()
+}
+
+fn qualify_legacy_destinations(
+    mut documents: HashMap<AreaId, LocalAreaDocument>,
+) -> HashMap<AreaId, LocalAreaDocument> {
+    let aliases: HashSet<_> = documents
+        .values()
+        .flat_map(|document| {
+            document
+                .legacy_private_rooms
+                .iter()
+                .map(|number| (document.details.area.id, *number))
+        })
+        .collect();
+    for document in documents
+        .values_mut()
+        .filter(|document| document.needs_legacy_references)
+    {
+        super::local_privacy::qualify_legacy_exits(&mut document.details, &aliases);
+        document.needs_legacy_references = false;
+    }
+    documents
 }
 
 /// Revision guards need no room graph or receipt allocations. Serde still
@@ -1312,7 +1412,7 @@ fn validate_v2_version(version: u32, path: &Path) -> CloudResult<()> {
             crate::AREA_FORMAT_VERSION
         )));
     }
-    if version < crate::AREA_FORMAT_VERSION {
+    if version < local_migration::DOORLESS_FORMAT_VERSION {
         return Err(CloudError::InvalidInput(format!(
             "local area file {} is format v{version} inside the v2 namespace; \
              v1 documents belong in areas/ and migrate from there",
@@ -1356,6 +1456,15 @@ fn migrate_legacy_file(
                 legacy_path.display()
             ))
         })?
+    } else if version == local_migration::DOORLESS_FORMAT_VERSION {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .and_then(local_migration::migrate_doorless)
+            .map_err(|err| {
+                CloudError::InvalidInput(format!(
+                    "local area file {} claims v{version} but does not parse: {err}",
+                    legacy_path.display()
+                ))
+            })?
     } else {
         let legacy: local_migration::LegacyAreaV1 =
             serde_json::from_slice(bytes).map_err(|err| {
@@ -1382,7 +1491,10 @@ fn migrate_legacy_file(
                 })?;
         }
 
-        local_migration::migrate_v1(legacy)
+        let privacy = super::local_privacy::LegacyPrivacy::read(&serde_json::from_slice(bytes)?)?;
+        let mut details = local_migration::migrate_v1(legacy);
+        privacy.apply(&mut details);
+        details
     };
 
     let Some((v2_path, _)) = persistence else {
@@ -1393,7 +1505,17 @@ fn migrate_legacy_file(
     if let Some(parent) = v2_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    write_atomic(v2_path, &serde_json::to_vec_pretty(&details)?).map_err(|err| {
+    let mut document = LocalAreaDocument::new(details.clone());
+    if version < crate::AREA_FORMAT_VERSION {
+        document.needs_legacy_references = true;
+        document.legacy_private_rooms = details
+            .sources
+            .iter()
+            .filter(|source| source.source == crate::SourceId::Private)
+            .flat_map(|source| source.rooms.iter().map(|room| room.room_number))
+            .collect();
+    }
+    write_atomic(v2_path, &serde_json::to_vec_pretty(&document)?).map_err(|err| {
         CloudError::InternalError(format!(
             "migrating {} failed while writing {} (the v1 file is untouched): {err}",
             legacy_path.display(),
@@ -1437,7 +1559,9 @@ fn scan_areas(
 
     let entries = match fs::read_dir(legacy_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(qualify_legacy_destinations(out));
+        }
         Err(error) => return Err(error.into()),
     };
     for entry in entries {
@@ -1491,12 +1615,23 @@ fn scan_areas(
         ) {
             Ok(details) => {
                 migrated.insert(id);
-                out.insert(details.area.id, LocalAreaDocument::new(details));
+                let mut document = LocalAreaDocument::new(details);
+                if document_version(&bytes)? < crate::AREA_FORMAT_VERSION {
+                    document.needs_legacy_references = true;
+                    document.legacy_private_rooms = document
+                        .details
+                        .sources
+                        .iter()
+                        .filter(|source| source.source == crate::SourceId::Private)
+                        .flat_map(|source| source.rooms.iter().map(|room| room.room_number))
+                        .collect();
+                }
+                out.insert(document.details.area.id, document);
             }
             Err(err) => log::warn!("local map migration failed: {err}"),
         }
     }
-    Ok(out)
+    Ok(qualify_legacy_destinations(out))
 }
 
 /// Serde probe for a document's area id.
@@ -1557,12 +1692,17 @@ impl MapperBackend for LocalBackend {
         true
     }
 
+    fn default_storage(&self) -> MapStorage {
+        MapStorage::Local
+    }
+
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
         self.transact(move |_| {
             // The initial properties ride the document's first write, so the
             // area is never on disk without them.
             let properties = request.document_properties();
             let area = Area {
+                projection_token: None,
                 id: AreaId(Uuid::new_v4()),
                 user_id: None,
                 atlas_id: request.atlas_id,
@@ -1576,11 +1716,16 @@ impl MapperBackend for LocalBackend {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
             };
             let details = AreaWithDetails {
+                room_data: Vec::new(),
+                sources: Vec::new(),
                 area: area.clone(),
                 format_version: crate::AREA_FORMAT_VERSION,
-                content_hash: None,
                 properties,
                 rooms: Vec::new(),
                 labels: Vec::new(),
@@ -1705,7 +1850,7 @@ impl MapperBackend for LocalBackend {
             if let Some(result) = document.receipt(envelope.operation_id) {
                 return Ok((LocalMultiWriteTransaction::default(), result));
             }
-            let result = area_edits::apply_envelope(&mut document.details, id, &envelope)?;
+            let result = area_edits::apply_local_envelope(&mut document.details, id, &envelope)?;
             document.content_identity = Arc::new(());
             document.remember(result.clone());
             Ok((
@@ -1754,6 +1899,8 @@ impl MapperBackend for LocalBackend {
                 into.area.id,
                 LocalAreaDocument {
                     content_identity: Arc::new(()),
+                    legacy_private_rooms: snapshot.document(into.area.id)?.legacy_private_rooms,
+                    needs_legacy_references: false,
                     details: into,
                     applied_operations: into_receipts,
                 },
@@ -1773,6 +1920,10 @@ impl MapperBackend for LocalBackend {
                     details.area.id,
                     LocalAreaDocument {
                         content_identity: Arc::new(()),
+                        legacy_private_rooms: snapshot
+                            .document(details.area.id)?
+                            .legacy_private_rooms,
+                        needs_legacy_references: false,
                         details,
                         applied_operations,
                     },
@@ -1825,6 +1976,9 @@ impl MapperBackend for LocalBackend {
                 is_owner: true,
                 can_admin: true,
                 owner_nickname: None,
+                clan_id: None,
+                clan_name: None,
+                actions: std::collections::BTreeSet::new(),
             })
             .collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1835,6 +1989,7 @@ impl MapperBackend for LocalBackend {
         let atlas = Atlas {
             id: AtlasId(Uuid::new_v4()),
             user_id: None,
+            clan_id: None,
             name: name.to_string(),
             created_at: Utc::now(),
             rev: 1,
@@ -2050,7 +2205,7 @@ mod tests {
         ShapeId,
         backends::{AreaMergeSource, RoomRemap, Translate},
         mapper::RoomKey,
-        mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
+        mutation::{AreaMutation, OpResult, Precondition, VersionInfo},
     };
     use std::{collections::BTreeMap, sync::Arc};
 
@@ -2495,6 +2650,8 @@ mod tests {
         CreateAreaRequest {
             name: name.to_string(),
             atlas_id,
+            clan_id: None,
+            ownership: None,
             ephemeral: false,
             properties: BTreeMap::new(),
         }
@@ -2506,13 +2663,13 @@ mod tests {
         payload: Vec<AreaMutation>,
     ) -> MutationEnvelope {
         MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: area_id.0,
+            preconditions: vec![Precondition::source(
+                area_id.0,
+                crate::SourceId::map(),
                 expected_rev,
-                access_fingerprint: None,
-            }],
+            )],
             payload,
         }
     }
@@ -2586,13 +2743,13 @@ mod tests {
         let properties: Vec<_> = details
             .properties
             .iter()
-            .map(|p| (p.name.as_str(), p.value.as_str(), p.is_secret))
+            .map(|p| (p.name.as_str(), p.value.as_str()))
             .collect();
         assert_eq!(
             properties,
             [
-                ("nukefire.area", "the deathlands", false),
-                ("nukefire.mapper", "NukeFire.Map.Local", false),
+                ("nukefire.area", "the deathlands"),
+                ("nukefire.mapper", "NukeFire.Map.Local"),
             ]
         );
 
@@ -2871,6 +3028,7 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates {
                                 title: Some("Hall".to_string()),
@@ -2878,6 +3036,7 @@ mod tests {
                             },
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 id: Some(exit_id),
@@ -2960,6 +3119,7 @@ mod tests {
                     area.id,
                     41,
                     vec![AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: RoomNumber(1),
                         body: RoomUpdates::default(),
                     }],
@@ -3003,6 +3163,7 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates {
                                 title: Some("Hall".to_string()),
@@ -3010,6 +3171,7 @@ mod tests {
                             },
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 id: Some(exit_id),
@@ -3018,6 +3180,7 @@ mod tests {
                             },
                         },
                         AreaMutation::AddRoomTag {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             tag: "INN".to_string(),
                         },
@@ -3059,6 +3222,7 @@ mod tests {
                     area.id,
                     1,
                     vec![AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: RoomNumber(1),
                         body: RoomUpdates::default(),
                     }],
@@ -3076,10 +3240,12 @@ mod tests {
                     before.area.rev,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::DeleteRoom {
+                            room_source: None,
                             room_number: RoomNumber(999),
                         },
                     ],
@@ -3118,10 +3284,12 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 id: Some(exit_id),
@@ -3172,14 +3340,17 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 from_direction: ExitDirection::North,
@@ -3201,6 +3372,7 @@ mod tests {
                     area.id,
                     2,
                     vec![AreaMutation::DeleteRoom {
+                        room_source: None,
                         room_number: RoomNumber(2),
                     }],
                 ),
@@ -3221,6 +3393,7 @@ mod tests {
 
     fn blank_room(number: i32) -> AreaMutation {
         AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(number),
             body: RoomUpdates::default(),
         }
@@ -3257,6 +3430,7 @@ mod tests {
         let (a, b) = (ids[0], ids[1]);
         apply(&backend, a, vec![blank_room(1), blank_room(2)]).await;
         let link = AreaMutation::CreateExit {
+            room_source: None,
             room_number: RoomNumber(5),
             body: ExitArgs {
                 from_direction: ExitDirection::North,
@@ -3272,6 +3446,7 @@ mod tests {
             &backend,
             a,
             vec![AreaMutation::DeleteRoom {
+                room_source: None,
                 room_number: RoomNumber(2),
             }],
         )
@@ -3309,6 +3484,7 @@ mod tests {
                     area.id,
                     1,
                     vec![AreaMutation::CreateExit {
+                        room_source: None,
                         room_number: RoomNumber(42),
                         body: ExitArgs {
                             from_direction: ExitDirection::North,
@@ -3349,6 +3525,7 @@ mod tests {
                     area.id,
                     2,
                     vec![AreaMutation::CreateExit {
+                        room_source: None,
                         room_number: RoomNumber(42),
                         body: ExitArgs {
                             from_direction: ExitDirection::South,
@@ -3506,6 +3683,349 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// A doorless (v2) document reads through the door migration: flags
+    /// give doors, arctic-mapper's open commands move onto the exits they
+    /// open, and the next save writes the current format.
+    #[tokio::test]
+    async fn a_doorless_document_reads_with_doors_and_saves_in_the_current_format() {
+        let root = temp_root();
+        let backend = LocalBackend::new(&root);
+        let area = backend
+            .create_area(new_area_request("Doors", None))
+            .await
+            .expect("create");
+        let path = root.join("areas-v2").join(format!("{}.json", area.id));
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
+        let exit = |id: u128, direction: &str, closed: bool, locked: bool| {
+            serde_json::json!({
+                "id": Uuid::from_u128(id), "from_direction": direction,
+                "to_area_id": null, "to_room_number": null, "to_direction": null,
+                "path": "", "is_hidden": false, "is_closed": closed, "is_locked": locked,
+                "weight": 1.0, "command": "", "connection_id": Uuid::from_u128(0xC0 + id)
+            })
+        };
+        let connection = |id: u128| {
+            serde_json::json!({
+                "id": Uuid::from_u128(0xC0 + id),
+                "endpoint_a": { "room_number": 1, "side": "North", "port_offset": 0.5, "port_mode": "AutoPinned" },
+                "kind": "Dangling", "routing": "Simple", "segment_shape": "Direct",
+                "corner": "Sharp", "route_points": [], "dash": "Solid",
+                "color": "#A4A4A4", "thickness": 1.0
+            })
+        };
+        doc["format_version"] = serde_json::json!(2);
+        doc["rooms"] = serde_json::json!([{
+            "room_number": 1, "title": "Gate", "description": "", "level": 0,
+            "x": 0.0, "y": 0.0, "color": "",
+            "properties": [
+                { "name": "open_n_command", "value": "pull lever" },
+                { "name": "open_e_command", "value": "" },
+                { "name": "open_w_command", "value": "push wall" },
+                { "name": "Open_s_command", "value": "kept" }
+            ],
+            "exits": [
+                exit(1, "North", false, false),
+                exit(2, "East", true, false),
+                exit(3, "South", true, true)
+            ],
+            "tags": []
+        }]);
+        doc["connections"] = serde_json::json!([connection(1), connection(2), connection(3)]);
+        fs::write(&path, serde_json::to_vec_pretty(&doc).expect("serialize")).expect("write");
+        backend.refresh().await.expect("adopt external edit");
+
+        let details = backend.get_area(&area.id).await.expect("migrated read");
+        assert_eq!(details.format_version, crate::AREA_FORMAT_VERSION);
+        let gate = &details.rooms[0];
+        let door = |id: u128| {
+            gate.exits
+                .iter()
+                .find(|exit| exit.id == ExitId(Uuid::from_u128(id)))
+                .unwrap()
+                .door
+                .clone()
+        };
+        let closed_with = |command: &str| crate::Door {
+            state: crate::DoorState::Closed,
+            name: None,
+            opens_with: Some(command.to_string()),
+        };
+        assert_eq!(door(1), Some(closed_with("pull lever")), "flagless: closed");
+        assert_eq!(door(2), Some(crate::Door::new(crate::DoorState::Closed)));
+        assert_eq!(door(3), Some(crate::Door::new(crate::DoorState::Locked)));
+        let names: Vec<&str> = gate.properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["open_w_command", "Open_s_command"],
+            "an empty value only goes; one with no exit, or another case, stays"
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
+        assert_eq!(on_disk["format_version"], 2, "a read leaves the file alone");
+
+        backend
+            .update_area(
+                &area.id,
+                AreaUpdates {
+                    name: Some("Doors saved".to_string()),
+                    ..AreaUpdates::default()
+                },
+            )
+            .await
+            .expect("save");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
+        assert_eq!(saved["format_version"], crate::AREA_FORMAT_VERSION);
+        let written = saved.to_string();
+        assert!(!written.contains("is_closed") && !written.contains("is_locked"));
+        assert_eq!(saved["rooms"][0]["exits"][2]["door"]["state"], "locked");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn v2_with_receipt(id: AreaId, operation_id: Uuid) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "user_id": null, "atlas_id": null, "name": "Legacy receipts",
+            "created_at": "2026-08-01T00:00:00Z", "rev": 2, "format_version": 2,
+            "properties": [{ "name": "zone", "value": "original", "is_secret": false }],
+            "rooms": [], "labels": [], "shapes": [], "connections": [],
+            "_smudgy_applied_operations": [{
+                "operation_id": operation_id,
+                "result": {
+                    "operation_id": operation_id,
+                    "versions": [{ "resource": "area", "id": id, "rev": 2, "deleted": false }],
+                    "data": [{ "entity": "area_property", "name": "zone" }]
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn migrated_private_content_can_be_edited_and_survives_restart() {
+        use crate::SourceId;
+        let root = temp_root();
+        let id = AreaId(Uuid::new_v4());
+        let path = root.join("areas-v2").join(format!("{id}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original =
+            serde_json::to_vec(&super::super::local_privacy::tests::legacy_private_map(id))
+                .unwrap();
+        fs::write(&path, &original).unwrap();
+        let backend = LocalBackend::new(&root);
+        let before = backend.get_area(&id).await.unwrap();
+        assert_eq!(before.sources[0].source, SourceId::Private);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let private_edit = MutationEnvelope {
+            operation_id: Uuid::new_v4(),
+            source: SourceId::Private,
+            preconditions: vec![Precondition::source(id.0, SourceId::Private, 5)],
+            payload: vec![
+                AreaMutation::UpsertRoom {
+                    room_number: RoomNumber(2),
+                    room_source: Some(SourceId::Private),
+                    body: RoomUpdates {
+                        title: Some("Edited privately".into()),
+                        ..Default::default()
+                    },
+                },
+                AreaMutation::UpsertRoomProperty {
+                    room_number: RoomNumber(1),
+                    room_source: None,
+                    name: "private-note".into(),
+                    value: "edited".into(),
+                },
+            ],
+        };
+        let result = backend.execute_mutation(&id, &private_edit).await.unwrap();
+        assert_eq!(result.versions.len(), 2);
+        let after = backend.get_area(&id).await.unwrap();
+        assert_eq!(after.area.rev, 6);
+        assert_eq!(after.sources[0].rev, 6);
+        assert_eq!(after.sources[0].rooms[0].title, "Edited privately");
+        assert_eq!(after.sources[0].room_data[0].properties[0].value, "edited");
+        assert_eq!(
+            serde_json::to_value(&before.rooms).unwrap(),
+            serde_json::to_value(&after.rooms).unwrap()
+        );
+        let ordinary_edit = envelope(
+            id,
+            6,
+            vec![AreaMutation::UpsertRoom {
+                room_number: RoomNumber(1),
+                room_source: None,
+                body: RoomUpdates {
+                    title: Some("Edited ordinary room".into()),
+                    ..Default::default()
+                },
+            }],
+        );
+        backend.execute_mutation(&id, &ordinary_edit).await.unwrap();
+        assert_eq!(backend.get_area(&id).await.unwrap().sources, after.sources);
+        drop(backend);
+        let reopened = LocalBackend::new(&root);
+        let restored = reopened.get_area(&id).await.unwrap();
+        assert_eq!(restored.sources, after.sources);
+        assert_eq!(restored.area.rev, 7);
+        assert_eq!(
+            reopened
+                .execute_mutation(&id, &private_edit)
+                .await
+                .unwrap()
+                .versions,
+            result.versions
+        );
+        assert_eq!(reopened.get_area(&id).await.unwrap().area.rev, 7);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_cross_map_links_follow_private_rooms_after_partial_upgrade() {
+        use crate::SourceId;
+        let root = temp_root();
+        let origin = AreaId(Uuid::new_v4());
+        let destination = AreaId(Uuid::new_v4());
+        let areas = root.join("areas-v2");
+        fs::create_dir_all(&areas).unwrap();
+        let fixture = super::super::local_privacy::tests::legacy_private_map;
+        let mut from = fixture(origin);
+        from["rooms"][0]["exits"][0]["to_area_id"] = serde_json::json!(destination);
+        fs::write(
+            areas.join(format!("{origin}.json")),
+            serde_json::to_vec(&from).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            areas.join(format!("{destination}.json")),
+            serde_json::to_vec(&fixture(destination)).unwrap(),
+        )
+        .unwrap();
+        let backend = LocalBackend::new(&root);
+        // Saving only the destination must not lose the original address
+        // mapping when an unchanged v2 neighbor is next loaded.
+        backend
+            .update_area(
+                &destination,
+                AreaUpdates {
+                    name: Some("Saved target".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        drop(backend);
+        let reopened = LocalBackend::new(&root);
+        let from = reopened.get_area(&origin).await.unwrap();
+        let exit = &from.sources[0].room_data[0].exits[0];
+        assert_eq!(exit.to_area_id, Some(destination));
+        assert_eq!(exit.to_source, Some(SourceId::Private));
+        assert_eq!(exit.to_room_number, Some(RoomNumber(2)));
+        let disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(areas.join(format!("{origin}.json"))).unwrap())
+                .unwrap();
+        assert_eq!(
+            disk["format_version"], 2,
+            "reading the neighbor did not save it"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_receipts_load_replay_and_survive_a_save() {
+        let root = temp_root();
+        let id = AreaId(Uuid::new_v4());
+        let mut retry = envelope(
+            id,
+            1,
+            vec![AreaMutation::UpsertAreaProperty {
+                name: "zone".into(),
+                value: "must not replay".into(),
+            }],
+        );
+        retry.operation_id = Uuid::new_v4();
+        let original = serde_json::to_vec(&v2_with_receipt(id, retry.operation_id)).unwrap();
+        let path = root.join("areas-v2").join(format!("{id}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &original).unwrap();
+        let backend = LocalBackend::new(&root);
+        assert_eq!(backend.list_areas().await.unwrap().len(), 1);
+        let replay = backend
+            .execute_mutation(&id, &retry)
+            .await
+            .expect("old receipt replays");
+        assert_eq!(replay.versions, vec![VersionInfo::map_source(id.0, 2)]);
+        assert_eq!(
+            backend.get_area(&id).await.unwrap().properties[0].value,
+            "original"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "reading and retrying do not rewrite v2"
+        );
+        backend
+            .update_area(
+                &id,
+                AreaUpdates {
+                    name: Some("Saved".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["format_version"], crate::AREA_FORMAT_VERSION);
+        assert_eq!(
+            saved["_smudgy_applied_operations"][0]["result"]["versions"][0]["resource"],
+            "source"
+        );
+        drop(backend);
+        let reopened = LocalBackend::new(&root);
+        assert_eq!(
+            reopened
+                .execute_mutation(&id, &retry)
+                .await
+                .unwrap()
+                .versions,
+            replay.versions
+        );
+        assert_eq!(reopened.get_area(&id).await.unwrap().area.rev, 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_receipts_in_recovery_journals_survive_upgrade() {
+        let root = temp_root();
+        let id = AreaId(Uuid::new_v4());
+        let operation = Uuid::new_v4();
+        let path = root.join("transactions").join(format!(
+            "{MULTI_WRITE_TRANSACTION_PREFIX}00000000000000000001-test.json"
+        ));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "writes": [v2_with_receipt(id, operation)], "deletes": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let backend = LocalBackend::new(&root);
+        assert_eq!(backend.list_areas().await.unwrap().len(), 1);
+        assert!(!path.exists(), "recovery retires the journal");
+        let mut retry = envelope(id, 1, vec![]);
+        retry.operation_id = operation;
+        assert_eq!(
+            backend
+                .execute_mutation(&id, &retry)
+                .await
+                .unwrap()
+                .versions,
+            vec![VersionInfo::map_source(id.0, 2)]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn unreadable_v1_file_is_reported_and_left_intact() {
         let root = temp_root();
@@ -3542,21 +4062,21 @@ mod tests {
             .await
             .expect("create");
 
-        // Rewrite the stored v2 file as a claimed v3 document.
+        // Rewrite the stored file as a document of the next format.
         let path = root.join("areas-v2").join(format!("{}.json", area.id));
         let mut doc: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
-        doc["format_version"] = serde_json::json!(3);
+        doc["format_version"] = serde_json::json!(4);
         fs::write(&path, serde_json::to_vec_pretty(&doc).expect("serialize")).expect("write");
         backend.refresh().await.expect("adopt external edit");
 
         let err = backend
             .get_area(&area.id)
             .await
-            .expect_err("must refuse v3");
+            .expect_err("must refuse v4");
         let message = err.to_string();
         assert!(
-            message.contains("format v3") && message.contains(&format!("{}", area.id)),
+            message.contains("format v4") && message.contains(&format!("{}", area.id)),
             "the error names the file and version: {message}"
         );
 
@@ -3611,6 +4131,7 @@ mod tests {
                     area.id,
                     1,
                     vec![AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: RoomNumber(1),
                         body: RoomUpdates {
                             title: Some("Original".to_string()),
@@ -3634,9 +4155,9 @@ mod tests {
                         AreaMutation::UpsertAreaProperty {
                             name: "climate".to_string(),
                             value: "arid".to_string(),
-                            is_secret: None,
                         },
                         AreaMutation::CreateRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates {
                                 title: Some("Usurper".to_string()),
@@ -3667,6 +4188,7 @@ mod tests {
                     area.id,
                     2,
                     vec![AreaMutation::CreateRoom {
+                        room_source: None,
                         room_number: RoomNumber(2),
                         body: RoomUpdates {
                             title: Some("Fresh".to_string()),
@@ -3700,6 +4222,7 @@ mod tests {
                 area.id,
                 1,
                 vec![AreaMutation::UpsertRoom {
+                    room_source: None,
                     room_number: RoomNumber(1),
                     body: RoomUpdates {
                         title: Some("Applied once".to_string()),
@@ -4391,6 +4914,7 @@ mod tests {
     /// one receipt.
     async fn seed_room(backend: &LocalBackend, area_id: AreaId, exit_to: Option<(AreaId, i32)>) {
         let mut payload = vec![AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(1),
             body: RoomUpdates {
                 title: Some("Hall".to_string()),
@@ -4399,6 +4923,7 @@ mod tests {
         }];
         if let Some((to_area, to_room)) = exit_to {
             payload.push(AreaMutation::CreateExit {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: ExitArgs {
                     from_direction: ExitDirection::North,
@@ -4878,6 +5403,7 @@ mod tests {
                     2,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: RoomUpdates {
                                 title: Some("Annex".to_string()),
@@ -4885,6 +5411,7 @@ mod tests {
                             },
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: ExitArgs {
                                 from_direction: ExitDirection::South,

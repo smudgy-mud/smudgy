@@ -81,42 +81,6 @@ fn issue_code(st: &mut MockState, user_id: Uuid) {
 }
 
 #[derive(Deserialize)]
-struct SignupRequest {
-    email: String,
-    nickname: String,
-}
-
-/// POST /auth/signup — 202 always (enumeration-flat); 400 only on format.
-/// Insert-only: an existing email is never touched (it gets the
-/// account-exists notice instead of a code).
-pub async fn signup(State(state): State<Shared>, body: String) -> Response {
-    let req: SignupRequest = match parse_body(&body) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    if !valid_email(&req.email) || !valid_nickname(&req.nickname) {
-        return bad_request("Invalid signup input");
-    }
-
-    let email = normalize_email(&req.email);
-    let mut st = state.lock();
-    if st.user_by_email(&email).is_none() {
-        let user_id = Uuid::new_v4();
-        st.users.push(UserRecord {
-            id: user_id,
-            email,
-            nickname: None,
-            requested_nickname: Some(req.nickname),
-            email_verified_at: None,
-            nickname_updated_at: None,
-            created_at: Utc::now(),
-        });
-        issue_code(&mut st, user_id);
-    }
-    accepted()
-}
-
-#[derive(Deserialize)]
 struct EmailOnlyRequest {
     email: String,
 }
@@ -163,7 +127,7 @@ struct VerifyEmailRequest {
     code: String,
 }
 
-/// POST /auth/verify-email — consume the code, mint a session. The first
+/// POST /auth/verify-email — consume the code, mint a     state.lock().sessions.remove(token);. The first
 /// verify allocates the handle + marks the email verified; a returning user
 /// just gets the session. Unknown email and wrong/expired code are the same
 /// uniform 404.
@@ -200,10 +164,10 @@ pub async fn verify_email(State(state): State<Shared>, body: String) -> Response
     if !already_verified {
         let requested = st.user(user_id).and_then(|u| u.requested_nickname.clone());
         needs_nickname = match requested {
-            // The explicit signup path requested a handle: claim it (a collision
+            // An account created with a requested handle claims it (a collision
             // leaves it unallocated and prompts for another).
             Some(nick) => !st.claim_nickname(user_id, &nick),
-            // The unified email-only path requested none: verify the email but
+            // An account created by signing in requested none: verify the email but
             // leave the nickname unallocated, prompting the user post-sign-in.
             None => true,
         };
@@ -237,7 +201,9 @@ pub async fn verify_email(State(state): State<Shared>, body: String) -> Response
     ok(data)
 }
 
-/// POST /auth/logout — session-shaped credential only; idempotent 204.
+/// POST /auth/logout — session-shaped credential only; idempotent 204. The
+/// session row the token names goes without the caller authenticating, so
+/// an account being deleted logs out too (the server's `/auth/logout`).
 pub async fn logout(State(state): State<Shared>, headers: HeaderMap) -> Response {
     let Some(raw) = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -272,6 +238,13 @@ pub async fn refresh_session(State(state): State<Shared>, headers: HeaderMap) ->
 
     let now = Utc::now();
     let mut st = state.lock();
+    let deleting = st
+        .sessions
+        .get(token)
+        .is_some_and(|session| st.deleting_accounts.contains(&session.user_id));
+    if deleting {
+        return err(401, "Missing or invalid credentials");
+    }
     let Some(session) = st.sessions.get_mut(token).filter(|s| s.expires_at > now) else {
         return err(401, "Invalid session");
     };
@@ -300,6 +273,98 @@ pub async fn get_me(State(state): State<Shared>, headers: HeaderMap) -> Response
         Some(user) => ok(profile_json(user)),
         None => not_found(),
     }
+}
+
+/// DELETE /me — deletes the caller's account (docs/architecture.md §9.4).
+/// Session token only; no body; `null` once the account is gone.
+///
+/// While the account is the last owner of an active clan the answer is 409
+/// `last_owner` and nothing changes. Otherwise the account is marked as being
+/// deleted (its credentials then authenticate only this route), and the
+/// steps follow: clan departures and declined invitations, its recorded
+/// ownership in clans with the ownership offers it made or is named in,
+/// friendships and blocks, every grant it holds or issued on maps, folders
+/// and Secrets (on a clan's Secrets, every grant to it), its maps, folders
+/// and owner Secrets, its transfer offers, and finally its credentials and
+/// the account itself, which frees its email and nickname.
+/// Packages are not modelled here; the server keeps them. Every step only
+/// removes access, so a repeat finishes a deletion left partway.
+pub async fn delete_me(State(state): State<Shared>, headers: HeaderMap) -> Response {
+    let mut st = state.lock();
+    let (user_id, kind) = match super::http::resolve_credential(&st, &headers) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if kind != CredKind::Session {
+        return err(401, "Session authentication required");
+    }
+    if super::clans::last_owner_anywhere(&st, user_id) {
+        return conflict("last_owner");
+    }
+    st.deleting_accounts.insert(user_id);
+    if st.interrupt_account_deletions > 0 {
+        st.interrupt_account_deletions -= 1;
+        return err(500, "Internal server error");
+    }
+
+    super::clans::depart_everywhere(&mut st, user_id);
+    super::clan_maps::forget_account(&mut st, user_id);
+    super::clan_secrets::forget_account(&mut st, user_id);
+    st.friendships
+        .retain(|f| f.requester_id != user_id && f.addressee_id != user_id);
+    st.blocks
+        .retain(|b| b.blocker_id != user_id && b.blocked_id != user_id);
+    let grants: Vec<Uuid> = st
+        .grants
+        .iter()
+        .filter(|g| g.grantee_id == user_id || g.grantor_id == user_id)
+        .map(|g| g.id)
+        .collect();
+    st.delete_grants_cascading(&grants);
+    // Grants on owner Secrets go whichever side the account is on; on a
+    // clan's Secrets only those to it do, and those it issued stay.
+    for area in st.areas.values_mut() {
+        let clan_map = area.clan_id.is_some();
+        for secret in &mut area.secrets {
+            secret
+                .grants
+                .retain(|g| g.grantee_id != user_id && (clan_map || g.grantor_id != user_id));
+        }
+    }
+    let maps: Vec<Uuid> = st
+        .areas
+        .values()
+        .filter(|area| area.clan_id.is_none() && area.user_id == user_id)
+        .map(|area| area.id)
+        .collect();
+    for map in maps {
+        super::areas::remove_area(&mut st, map);
+    }
+    let folders: Vec<Uuid> = st
+        .atlases
+        .values()
+        .filter(|atlas| atlas.clan_id.is_none() && atlas.user_id == user_id)
+        .map(|atlas| atlas.id)
+        .collect();
+    for folder in folders {
+        let doomed: Vec<Uuid> = st
+            .grants
+            .iter()
+            .filter(|g| g.atlas_id == Some(folder))
+            .map(|g| g.id)
+            .collect();
+        st.delete_grants_cascading(&doomed);
+        st.atlases.remove(&folder);
+    }
+    st.pending_transfers
+        .retain(|t| t.from_user_id != user_id && t.to_user_id != Some(user_id));
+
+    st.sessions.retain(|_, s| s.user_id != user_id);
+    st.api_keys.retain(|_, k| k.user_id != user_id);
+    st.email_codes.retain(|c| c.user_id != user_id);
+    st.users.retain(|u| u.id != user_id);
+    st.deleting_accounts.remove(&user_id);
+    ok(Value::Null)
 }
 
 #[derive(Deserialize)]

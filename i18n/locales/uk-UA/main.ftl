@@ -110,6 +110,7 @@ nav-preferences = Параметри
 nav-audio = Аудіо
 nav-security = Безпека
 nav-friends = Друзі
+nav-clans = Клани
 nav-licenses = Ліцензії
 
 # Account and authentication
@@ -152,6 +153,24 @@ account-notice-code-resent = Якщо до цієї адреси прив'яза
 account-busy-saving-nickname = Збереження псевдоніма…
 account-notice-nickname-changed = Тепер ви { $handle }.
 account-notice-signed-out = Ви вийшли.
+account-delete = Видалити обліковий запис…
+account-delete-title = Видалити ваш обліковий запис?
+account-delete-goes = Назавжди буде видалено:
+account-delete-goes-maps = • ваші мапи й теки
+account-delete-goes-secrets = • секрети, якими ви володієте, і ваші приватні нотатки на будь-якій мапі
+account-delete-goes-social = • ваші поширення й дружби
+account-delete-goes-clans = • ваше членство в кланах
+account-delete-member-secrets = Секрети в клані, останнім власником яких ви є, залишаться — лише для читання тим, хто може їх читати.
+account-delete-stays = Пакунки, які ви опублікували, залишаться під своїми назвами.
+account-delete-type-nickname = Введіть { $nickname }, щоб підтвердити.
+account-delete-confirm = Видалити мій обліковий запис
+account-busy-deleting = Видалення облікового запису…
+account-delete-done = Ваш обліковий запис видалено, і ви вийшли.
+account-delete-signed-out = Ви вийшли. Ваш обліковий запис видаляється; smudgy завершить це сам.
+account-delete-last-owner = Ви останній власник: { $clans }. Призначте власником іншого учасника або видаліть клан, а тоді спробуйте ще раз.
+account-delete-last-owner-unnamed = Ви останній власник клану. Призначте власником іншого учасника або видаліть клан, а тоді спробуйте ще раз.
+account-delete-not-deleted = Обліковий запис не видалено: { $error }
+account-delete-unfinished = Видалення облікового запису не завершилося: { $error } Спробуйте ще раз — повторна спроба його завершить.
 account-error-nickname-empty = Вкажіть псевдонім.
 account-error-nickname-format = Псевдонім має містити 3–24 символи: літери, цифри, «-» або «_».
 
@@ -505,8 +524,8 @@ notice-package-requirements-review = [package] оновлення { $name } тр
 # Cloud errors
 cloud-error-email-unverified = Підтвердьте свою електронну адресу, щоб користуватися цією функцією.
 cloud-error-not-found = Не знайдено.
-cloud-error-area-not-found = Область не знайдено: { $id }
-cloud-error-room-not-found = Кімнату { $room } не знайдено в області { $area }.
+cloud-error-area-not-found = Мапу не знайдено: { $id }
+cloud-error-room-not-found = Кімнату { $room } не знайдено на мапі { $area }.
 cloud-error-exit-not-found = Вихід не знайдено: { $id }
 cloud-error-label-not-found = Позначку не знайдено: { $id }
 cloud-error-shape-not-found = Фігуру не знайдено: { $id }
@@ -514,6 +533,7 @@ cloud-error-property-not-found = Властивість «{ $property }» не �
 cloud-error-invalid-input = Некоректні вхідні дані: { $detail }
 cloud-error-database = Помилка бази даних: { $detail }
 cloud-error-network = Помилка мережі: { $detail }
+cloud-error-service-unavailable = Служба мап на мить затримує зміни. Спробуйте ще раз трохи згодом.
 cloud-error-serialization = Помилка серіалізації: { $detail }
 cloud-error-authentication = Помилка автентифікації: { $detail }
 cloud-error-permission = Відмовлено в доступі: { $detail }
@@ -527,6 +547,9 @@ cloud-error-upgrade-required = Ця версія Smudgy застаріла; он
 cloud-error-version-unavailable = Цей номер версії вже зайнято; виберіть новий.
 cloud-error-version-unavailable-number = Версію { $version } вже зайнято; виберіть нову.
 cloud-error-version-not-yanked = Відкличте цю версію, перш ніж видаляти її.
+cloud-error-package-name-unavailable = Назва пакунка { $name } уже зайнята. Назви пакунків спільні для всіх і ніколи не використовуються повторно, тож виберіть іншу назву.
+cloud-error-body-being-collected = Під час цього вивантаження сервер упорядковував сховище пакунків. Опублікуйте ще раз за хвилину.
+cloud-error-too-large = Завеликий обсяг для вивантаження: { $detail }
 cloud-error-revision-conflict = Цей елемент змінився на сервері. Оновіть і спробуйте ще раз.
 cloud-error-projection-changed = Ваш доступ до цього елемента змінився. Оновіть і спробуйте ще раз.
 cloud-error-operation-reused = Цю операцію не вдалося безпечно завершити. Оновіть і спробуйте ще раз.
@@ -537,11 +560,25 @@ cloud-error-merge-areas-no-rooms = Виберіть принаймні одну 
 cloud-error-merge-areas-room-not-found = Вибраної кімнати немає у вихідній області. Перевірте номери кімнат перед об’єднанням.
 cloud-error-merge-areas-mixed-tiers = Усі задіяні області, зокрема області з посиланнями на об’єднувані, мають використовувати однакове сховище: локальне або сеансу.
 cloud-error-merge-areas-unsupported-storage = Це сховище не підтримує об’єднання областей. Використовуйте підтримуване локальне сховище або сховище сеансу.
-cloud-error-merge-requires-full-projection = Для об’єднання потрібен повний доступ до всіх задіяних областей, зокрема областей із посиланнями на об’єднувані.
 cloud-error-merge-areas-busy = В одній із задіяних областей є незавершені зміни або триває інша операція. Завершіть або врегулюйте ці операції перед об’єднанням.
 cloud-error-merge-areas-source-changed = Одна із задіяних областей змінилася під час підготовки об’єднання. Перегляньте поточну мапу й спробуйте ще раз.
 cloud-error-merge-areas-room-numbers-exhausted = У цільовій області недостатньо доступних номерів кімнат для цього об’єднання. Виберіть іншу цільову область.
 cloud-error-merge-areas-invalid-translation = Зсув або кінцева позиція виходить за підтримуваний діапазон. Використовуйте скінченні координати й рівні в межах 32-бітного цілого числа.
+cloud-error-merge-secret-room-data = Секрет зберігає дані для кімнати { $room }. Спершу перемістіть або видаліть їх.
+cloud-error-secret-area-level = Секретами керують у редакторі мапи.
+cloud-error-secret-view-only = Цей секрет доступний лише для перегляду.
+cloud-error-secret-unavailable = Цей секрет вам більше не доступний.
+cloud-error-secret-cannot-add = Ви не можете додавати до цього секрету.
+cloud-error-secret-cannot-edit = Ви не можете змінювати вміст цього секрету.
+cloud-error-secret-cannot-remove = Ви не можете нічого видаляти з цього секрету.
+cloud-error-secret-linked-map-rooms = Секрет клану на мапі, підключеній до клану посиланням, зберігає лише власні кімнати. Він не може тримати дані в кімнатах мапи, вести до них чи обмінюватися кімнатами з мапою.
+cloud-error-secret-link-between-secrets = Зв’язок не може з’єднувати два секрети.
+cloud-error-secret-link-into-other-map = Зв’язок із Секретом іншої мапи веде до однієї з його кімнат, і жоден зв’язок не веде до приватних доповнень іншої мапи.
+cloud-error-secret-map-exit-retarget = Вихід мапи не може вести до кімнати секрету. Створіть зв’язок у секреті.
+cloud-error-move-busy = Мапа ще зберігається. Спробуйте ще раз за мить.
+cloud-error-move-drops-places = Мапа сесії не вмістить Секретів чи приватних доповнень цієї мапи, тож перемістити її туди без їх утрати не можна. Натомість скопіюйте її; оригінал їх збереже.
+cloud-error-move-splits-links = З'єднання поєднує ці кімнати з кімнатами, що лишаються. Перемістіть їх разом або спершу видаліть з'єднання.
+cloud-error-room-number-exists = Номер кімнати там уже зайнятий. Нічого не переміщено.
 cloud-error-invalid-connection = Це з'єднання некоректне: { $detail }
 
 # Friends, blocks, and ownership transfers
@@ -563,6 +600,7 @@ social-decline = Відхилити
 social-ownership-transfers = Передача власності
 social-incoming-transfer = { $from } хоче передати вам «{ $subject }»
 social-outgoing-transfer = «{ $subject }» запропоновано користувачу { $to }
+social-outgoing-transfer-clan = «{ $subject }» запропоновано клану { $clan }
 social-no-friends = Немає друзів.
 social-blocks = Блокування
 social-block = Заблокувати
@@ -578,45 +616,348 @@ social-keep-friend = Залишити
 social-unfriend = Видалити з друзів
 social-no-nickname = (без псевдоніма)
 
+# Clans
+cloud-error-last-owner = Спершу призначте власником когось іншого.
+cloud-error-clan-not-empty = У теках цього клану ще є мапи. Перенесіть або видаліть їх, а потім видаліть клан.
+cloud-error-clan-dissolving = Цей клан розпускається: жодна мапа не може до нього потрапити, а його учасники, власники та мапи учасників лишаються незмінними, доки розпуск не завершиться.
+cloud-error-atlas-not-empty = Спершу перенесіть або видаліть мапи з цієї теки.
+cloud-error-already-member = Ця особа вже є учасником.
+cloud-error-name-in-use = Ця назва вже використовується.
+cloud-error-transfer-already-pending = На це вже чекає пропозиція; водночас може бути лише одна.
+clans-title = Клани
+clans-verify-email = Підтвердьте електронну адресу, щоб приєднуватися до кланів.
+clans-name-placeholder = назва клану
+clans-enter-name = Введіть назву.
+clans-invitations = Запрошення
+clans-invited-you = { $inviter } запрошує вас до клану «{ $clan }»
+clans-invited-you-by-a-member = Один з учасників запрошує вас до клану «{ $clan }»
+clans-secret-offers = Пропозиції власності секретів
+clans-secret-offer = { $initiator } пропонує вам власність секрету «{ $secret }» у клані «{ $clan }»
+clans-secret-offer-from-a-member = Один з учасників пропонує вам власність секрету «{ $secret }» у клані «{ $clan }»
+clans-secret-offer-joint = Разом із: { $others }
+clans-secret-offer-accepted = Ви прийняли; очікуємо на: { $others }.
+clans-empty = Кланів ще немає.
+clans-owner-badge = власник
+clans-member-count = { $count ->
+    [one] { $count } учасник
+    [few] { $count } учасники
+    [many] { $count } учасників
+   *[other] { $count } учасника
+}
+clans-members = Учасники
+clans-invite = Запросити
+clans-invitation-sent = Запрошення надіслано.
+clans-invite-failed = Не вдалося запросити { $name }.
+clans-remove-confirm = Вилучити { $name } з клану «{ $clan }»?
+clans-groups = Групи
+clans-group-name-placeholder = назва групи
+clans-no-groups = Груп ще немає.
+clans-filter-placeholder = фільтр
+clans-delete-group = Видалити групу…
+clans-delete-group-confirm = Видалити «{ $name }»? Її учасники втратять те, чим із нею поділилися.
+clans-delete-clan = Видалити клан…
+clans-delete-clan-confirm = Видалити «{ $name }»? Усі вийдуть із клану, і це не можна скасувати. Спершу його теки мають бути порожніми.
+clans-leave-clan = Покинути клан…
+clans-leave-confirm = Покинути «{ $name }»? Ви втратите доступ до його мап.
+clans-leave = Покинути
+
+# Набори дозволів
+presets-kind-map = Мапи
+presets-kind-folder-curation = Порядок у теках
+presets-kind-clan-secrets = Секрети власності клану
+presets-kind-secret = Секрет
+presets-kind-package = Пакунки
+presets-kind-clan-administration = Адміністрування клану
+presets-reader = Читач
+presets-contributor = Дописувач
+presets-editor = Редактор
+presets-curator = Куратор
+presets-access-manager = Керівник доступу
+presets-drafter = Автор чернеток
+presets-maintainer = Супровідник
+presets-recruiter = Вербувальник
+presets-officer = Офіцер
+presets-group-lead = Лідер групи
+presets-folder-manager = Керівник теки
+presets-custom = Власний набір
+presets-scope-clan = Увесь клан
+presets-scope-groups = Групи
+presets-scope-folders = Теки
+presets-scope-maps = Мапи
+presets-scope-packages = Пакунки
+presets-action-clan-edit-profile = Зміна даних клану
+presets-action-clan-read-members = Перегляд учасників
+presets-action-clan-invite = Запрошення
+presets-action-clan-revoke-invitation = Відкликання запрошень
+presets-action-clan-remove-member = Вилучення учасників
+presets-action-group-create = Створення груп
+presets-action-group-rename = Перейменування груп
+presets-action-group-delete = Видалення груп
+presets-action-group-assign = Вибір учасників груп
+presets-action-group-inspect = Перегляд учасників груп
+presets-action-access-inspect = Перегляд того, хто має доступ
+presets-action-access-manage = Надання доступу
+presets-action-folder-create = Створення тек
+presets-action-folder-read = Перегляд теки
+presets-action-folder-rename = Перейменування тек
+presets-action-folder-accept-filing = Переміщення мап у теку
+presets-action-folder-accept-transfer = Переносити мапи до цієї папки
+presets-action-map-create = Створення мап
+presets-action-map-create-member-owned = Створення мап власності учасників
+presets-action-map-read = Читання
+presets-action-map-add = Додавання вмісту
+presets-action-map-edit = Зміна вмісту
+presets-action-map-remove = Вилучення вмісту
+presets-action-map-rename = Перейменування мап
+presets-action-map-refile = Переміщення мап між теками
+presets-action-map-delete = Видалення мап
+presets-action-map-copy = Копіювання мап
+presets-action-map-share-external = Поширення поза кланом
+presets-action-secrets-create-member-owned = Створення секретів власності учасників
+presets-action-secrets-create-clan-owned = Створення секретів власності клану
+presets-action-secrets-read = Читання секретів
+presets-action-secrets-add = Додавання до секретів
+presets-action-secrets-edit = Зміна секретів
+presets-action-secrets-remove = Вилучення із секретів
+presets-action-secrets-manage-access = Керування тим, хто читає секрети
+presets-action-secrets-copy = Копіювання секретів разом із мапою
+presets-action-package-create = Створення пакунків
+presets-action-package-read = Перегляд пакунка
+presets-action-package-edit-draft = Зміна чернетки
+presets-action-package-edit-metadata = Зміна опису
+presets-action-package-publish = Публікація версій
+presets-action-package-retire = Вилучення версій з обігу
+presets-action-package-availability = Зробити публічним чи приватним
+presets-action-package-delete = Видалення пакунка
+presets-action-secret-read = Читання
+presets-action-secret-add = Додавання
+presets-action-secret-edit = Зміна
+presets-action-secret-remove = Вилучення
+presets-action-secret-manage-access = Керування доступом
+presets-action-secret-copy = Копіювання разом із мапою
+
+# Settings › Clans
+clans-all-clans = Усі клани
+clans-tab-members = Учасники
+clans-tab-groups = Групи
+clans-tab-access = Доступ
+clans-tab-settings = Налаштування
+clans-you = Ви
+clans-column-member = Учасник
+clans-column-groups = Групи
+clans-owner-chip = Власник клану
+clans-edit-groups = Змінити групи
+clans-page-range = { $first }–{ $last } з { $total }
+clans-page-previous = Попередня
+clans-page-next = Наступна
+clans-members-hidden = Цей клан показує список учасників лише тим, кого обере.
+clans-invited = Запрошені
+clans-pending-badge = Очікує
+clans-revoke = Відкликати
+clans-invite-title = Запросити до клану { $clan }
+clans-invite-groups = Запропоновані групи
+clans-member-groups-title = Групи · { $name }
+clans-remove-member = Вилучити учасника
+clans-self-assign-reason = Лише власник клану може додати вас до групи, яку створив хтось інший.
+clans-new-group = Нова група
+clans-new-group-note = Ви приєднуєтеся до груп, які створюєте, і вибираєте, хто ще в них буде.
+clans-edit-group = Змінити групу
+clans-group-name-label = Назва
+clans-group-color-label = Колір
+clans-group-permissions = Дозволи
+clans-group-members = Учасники
+clans-group-owners-note = Власники клану.
+clans-group-no-permissions = Ця група не має додаткових дозволів.
+clans-group-permissions-view-only = Доступ групам надають власники клану та ті, кому вони це дозволять.
+clans-group-roster-hidden = Ви не бачите, хто в цій групі.
+clans-shown-count = Показано: { $count }
+clans-add-member = Додати учасника
+clans-add-member-title = Додати учасника · { $group }
+clans-add-member-none = Нікого додати.
+clans-add-permission = Додати дозвіл
+clans-administration-button = Адміністрування клану…
+clans-remove-permission-confirm = Вилучити цей дозвіл? Група одразу втратить те, що він дає.
+clans-note-clan = Лише керування кланом і групами. Доступ до мап, тек, Секретів і пакунків налаштовується на цих ресурсах.
+clans-note-folders = Охоплює мапи, додані туди пізніше.
+clans-note-may-grant = Може надавати: { $preset }
+clans-note-delegated = Надано тим, кому власники клану дозволили надавати доступ.
+clans-scope-more = { $count ->
+    [one] ще { $count }
+    [few] ще { $count }
+    [many] ще { $count }
+   *[other] ще { $count }
+}
+clans-scope-names-and-more = { $names } і ще { $count }
+clans-unknown-group = Певна група
+clans-access-maps = Мапи
+clans-access-packages = Пакунки
+clans-access-secrets = Секрети
+clans-access-no-maps = Немає мап і тек, до яких ви тут маєте доступ.
+clans-access-no-packages = Немає пакунків, до яких ви тут маєте доступ.
+clans-access-no-secrets = Немає секретів, які ви читаєте в цьому клані.
+clans-access-pick = Виберіть щось ліворуч, щоб побачити, хто має до цього доступ.
+clans-kind-folder = Тека
+clans-kind-map = Мапа
+clans-kind-package = Пакунок
+clans-open-map = Відкрити мапу
+clans-open-package = Відкрити пакунок
+clans-open-share = Вікно поширення…
+clans-outside-shares = Поза кланом { $clan }
+clans-outside-shares-note = Друзі, які читають цю мапу, лише для перегляду. Поширення закінчується, коли той, хто поширив, покидає клан або втрачає право поширювати.
+clans-outside-shares-none = Не поширено поза кланом.
+clans-outside-shared-by = Поширив(ла): { $name }
+clans-in-folder = У теці { $folder }
+clans-group-assignments = Призначені групи
+clans-no-assignments = Жодна група ще не має до цього доступу.
+clans-your-access = Що ви тут можете:
+clans-assign-group = Призначити групу
+clans-through-clan = Від усього клану
+clans-through-folder = Від теки { $folder }
+clans-through-a-folder = Від однієї з тек
+clans-member-owned = Власність учасників
+clans-clan-owned = Власність клану
+clans-secret-clan-owned-note = Групи, яким надано секрети власності клану на його мапі чи в теці, теж його читають; див. Мапи.
+clans-details = Дані клану
+clans-name-label = Назва
+clans-description-label = Опис
+clans-description-placeholder = Для чого цей клан
+clans-permission-none = Немає
+clans-editor-title-add = Додати дозвіл · { $group }
+clans-editor-title-assign = Призначити групу · { $resource }
+clans-editor-title-admin = Призначити групу · Адміністрування клану
+clans-editor-title-edit = Змінити дозвіл
+clans-editor-group = Група
+clans-editor-member = Учасник
+clans-editor-member-note = Окремому учаснику можна надати дозволи адміністрування клану й пакунків; мапи й секрети надають групам.
+clans-editor-scope = Стосується
+clans-editor-targets-empty = Тут поки нічого вибрати.
+clans-editor-permissions = Дозволи
+clans-editor-separate = Ніколи не в наборі
+clans-editor-may-grant = Може надавати
+clans-editor-may-grant-help = Може надавати не більше такого доступу до мап, у тих самих місцях.
+clans-editor-all-groups = Усі групи
+clans-editor-group-scope = Межі керування групами
+clans-editor-group-scope-help = Зміна групи й вибір її учасників — окремі дозволи.
+clans-editor-choose-group = Виберіть групу.
+clans-editor-choose-target = Виберіть хоча б одне.
+clans-editor-choose-action = Виберіть хоча б один дозвіл.
+
+# Clans in the map editor
+clan-maps-a-clan = клан
+clan-maps-a-group = група
+clan-maps-incoming-badge = вхідні: { $count }
+clan-maps-new-folder = Нова тека
+clan-maps-incoming = Вхідні мапи…
+clan-maps-new-folder-title = Нова тека в клані { $clan }
+clan-maps-create = Створити
+clan-maps-delete-folder-question = Видалити «{ $name }»?
+clan-maps-delete-folder-detail = Спершу перенесіть її мапи до іншої теки.
+clan-maps-share-clan-title = Поділитися всім кланом { $clan }
+clan-maps-share-clan-help = Кожен, кого ви оберете, отримає доступ до всіх мап у ньому, зокрема нових.
+clan-maps-share-folder-help = Кожен, кого ви оберете, отримає доступ до всіх мап у цій теці, зокрема нових.
+clan-maps-everyone = Усі
+clan-maps-filter-groups-placeholder = фільтр груп
+clan-maps-no-groups = Жодна група не підходить.
+clan-maps-incoming-title = Вхідні мапи · { $clan }
+clan-maps-incoming-empty = Жодна мапа не чекає.
+clan-maps-given-by = передає { $owner }
+clan-maps-given-folder = Тека «{ $name }»
+clan-maps-given-help = Мапа, передана клану, стає власністю клану; мапа, що лишається за тим, хто її передав, стає власністю учасників, і лише він вирішує, хто її бачить. Її Секрети лишаються за учасником, який її передав.
+clan-maps-could-not-accept = Не вдалося прийняти. Можливо, пропозицію відкликано.
+clan-maps-folder-placeholder = Тека
+clan-maps-accept = Прийняти
+clan-maps-decline = Відхилити
+clan-maps-gone = Мапи «{ $name }» більше немає.
+clan-maps-given-stays = від { $owner } · лишається за ним
+clan-maps-offered-help = Учасники пропонують клану мапи, які їм належать. Після прийняття мапа належить клану, і на неї поширюється доступ теки.
+clan-maps-offered-by = пропонує { $owner }
+clan-maps-a-member = учасник
+clan-share-put-in-clan = Помістити в клан…
+clan-share-give-to-clan = Передати клану
+clan-share-give-to-clan-help = Власники клану спільно володіють цією мапою
+clan-share-stays-mine = Лишається моєю
+clan-share-stays-mine-help = Перемістіть цю мапу до клану, зберігши право власності на неї.
+clan-share-give-folder-to-clan-help = Власники клану спільно володіють цими мапами
+clan-share-folder-stays-mine-help = Перемістіть ці мапи до клану, зберігши право власності на них.
+clan-share-title = Поділитися «{ $name }»
+clan-share-owned-by-clan-in = Власність { $clan } · у теці { $folder }
+clan-share-owned-by-clan = Власність { $clan }
+clan-share-owned-by = Власники: { $owners }
+clan-share-member-owned = Власність учасників
+clan-share-member-owned-reach = Доступ теки та власники клану не поширюються на цю мапу. Діє лише те, чим її власники діляться тут із групами та учасниками.
+clan-share-frozen = Ніхто не може змінити, хто бачить цю мапу: обліковий запис її останнього власника видалено. Наявний доступ лишається.
+clan-share-you-can = Ви можете: { $actions }
+clan-share-you-can-read = Ви можете переглядати цю мапу.
+clan-share-you = ви
+clan-share-clan-owners = Власники клану
+clan-share-nobody-yet = Поки що ніхто не має доступу через групу чи учасника.
+clan-share-from-several-maps = разом з іншими мапами
+clan-share-from-folder = з теки { $folder }
+clan-share-from-clan = з усього клану { $clan }
+clan-share-change-for-folder = Змінити для теки…
+clan-share-remove = Вилучити
+clan-share-remove-question = Вилучити цей доступ до мапи?
+clan-share-includes-future-members = Охоплює майбутніх учасників
+clan-share-chosen-automatically = Усі, кого вона охоплює, автоматично
+clan-share-chosen-by-owners = Її учасників обирають лише власники клану
+clan-share-chosen-by-owners-and-leads = Її учасників обирають власники клану та лідери групи
+clan-share-add-recipient = + Група / учасник
+clan-share-pick-recipient = Група чи учасник
+clan-share-groups-only = Показано лише групи: ви не можете бачити список учасників.
+clan-share-outside = Поза кланом { $clan }
+clan-share-outside-help = Друзі поза кланом бачать лише цю мапу: тільки перегляд, ніколи її Секрети.
+clan-share-shared-by = поділився { $name }
+clan-share-shared-by-you = поділилися ви
+clan-share-pick-friend = Друг
+clan-share-share-view-only = Поділитися для перегляду
+clan-share-outside-refused = Не вдалося поділитися. Можливо, ця людина в клані або вже не ваш друг.
+clan-share-secrets = Секрети на цій мапі
+clan-share-share-secret = Поділитися «{ $name }»…
+clan-share-give-up = Відмовитися від власності…
+clan-share-give-up-confirm = Відмовитися від власності на «{ $name }»? Ви збережете лише те, чим поділилися з вами чи вашими групами; без цього ви більше її не бачитимете.
+clan-share-only-owner = Ви її єдиний власник. Спершу запропонуйте власність комусь іншому.
+clan-share-needs-another-owner = Спершу потрібен інший власник.
+clan-share-offer-help = Кожен приймає окремо; власниками вони стають, коли прийме останній. Прийняти можуть лише учасники, які бачать мапу.
+clan-share-offer-replace = Зробити їх єдиними власниками
+clan-share-send-offer = Надіслати пропозицію
+clan-share-offer-sent = Пропозицію надіслано.
+clan-share-no-candidates = Немає кому це запропонувати.
+clan-share-accepted = { $name } (прийнято)
+clan-share-waiting-for = { $name } (очікує)
+clan-share-offer-to-clan = Запропоновано клану { $clan }
+clan-share-cancel-offer = Скасувати пропозицію
+clan-share-make-clan-owned = Передати клану…
+clan-share-make-clan-owned-confirm = Запропонувати «{ $name }» клану { $clan }? Після прийняття мапа належить клану: її власники перестають нею володіти, і на неї поширюється доступ теки. Те, чим ви тут поділилися, лишається.
+clan-share-make-clan-owned-action = Передати клану
+clan-share-someone-accepts = Хтось, хто опрацьовує вхідні мапи клану, прийме її до теки.
+clan-share-into-folder = До теки
+clan-share-offered-to-clan = Запропоновано клану. Вона стане власністю клану, коли її прийме той, хто опрацьовує вхідні мапи клану.
+clan-share-ownership-refused = Не вдалося змінити власника. Можливо, його тим часом змінили; спробуйте ще раз.
+clan-share-make-member-owned = Передати учасникам…
+clan-share-make-member-owned-help = Запропонуйте її учасникам: коли всі приймуть, вона належатиме їм, і на неї поширюватиметься лише те, чим вони поділяться.
+clan-share-lose-folder-access = Ці втратять доступ, який давали їм тека та клан: { $names }.
+clan-share-put-title = Помістити «{ $name }» у клан
+clan-share-friend-shares-end = Її спільний доступ для друзів припиняється: { $names }.
+clan-share-put-secrets = Її Секрети лишаються вашими, як ваші Секрети в клані.
+clan-share-put-action = Помістити в клан
+clan-share-put-done = Тепер вона в клані { $clan }.
+clan-share-new-map-clan-owned = Власність клану
+clan-share-new-map-member-owned-choice = Власність учасників
+clan-share-new-map-member-owned-help = Вона ваша, і ви обираєте, хто її бачить. Доступ теки та власники клану на неї не поширюються.
+clan-share-new-map-member-owned = Вона буде власністю учасників: вона ваша, і ви обираєте, хто її бачить.
+clan-map-offers = Пропозиції власності мап
+clan-map-offer = { $initiator } пропонує вам власність мапи «{ $map }» у клані { $clan }.
+clan-map-offer-replace = { $initiator } пропонує вам власність мапи «{ $map }» у клані { $clan } замість її нинішніх власників.
+clan-map-offer-from-a-member = Один з учасників пропонує вам власність мапи «{ $map }» у клані { $clan }.
+clan-map-offer-replace-from-a-member = Один з учасників пропонує вам власність мапи «{ $map }» у клані { $clan } замість її нинішніх власників.
+clans-leave-copy-maps = Спершу скопіювати мапи, якими я володію в цьому клані, до моїх мап
+
 # Map editor dialogs and sharing
 mapper-transfer-owner-friend-only = Передати можна лише те, що належить вам, і лише наявному другові.
 mapper-transfer-offer-sent = Пропозицію надіслано. «{ $subject }» буде передано, коли отримувач прийме її на своїй панелі «Друзі».
 mapper-transfer-give = Передайте «{ $subject }» другові.
 mapper-transfer-warning = Після прийняття ви станете адміністратором, а не власником.
-mapper-link-target-room = кімната { $room }
-mapper-link-target-new-room = нова кімната { $room }
-mapper-link-target-dangling = порожнє місце (висяче)
-mapper-link-one-way = Односторонній прохід
-mapper-link-from-to = Кімната { $room } до { $target }
-mapper-link-source-direction = Напрямок джерела
-mapper-link-destination-direction = Напрямок призначення
-mapper-link-source-command-placeholder = команда джерела
-mapper-link-return-command-placeholder = команда повернення
-mapper-link-pair-reciprocal = Пов'язати зі зворотним одностороннім з'єднанням (зберегти його маршрут)
-mapper-link-style-invalid = Укажіть підтримуваний колір CSS і ширину від 0,25 до 8.
-mapper-link-create-title = Створити з'єднання
-mapper-link-delete-one = Видаляє його прохід.
-mapper-link-delete-both = Видаляє обидва проходи.
-mapper-link-delete-secret-warning = Це з'єднання містить таємну інформацію про мапу.
-mapper-link-delete-action = Видалити з'єднання
-mapper-link-delete-title = Видалити з'єднання
-mapper-route-preview-link = Попередній перегляд автоматичного маршруту для з'єднання { $id }
-mapper-route-preview-stats = збережених зламів на мапі: { $points } · відвіданих станів скрипта-розв'язувача: { $states }
-mapper-route-preview-accept-help = Прийняття замінює збережені точки однією оборотною зміною типу compare-and-set (порівняти і записати). Скасування залишає поточний маршрут без змін.
-mapper-route-preview-public-help = Автоматичне прокладання маршруту використовує лише публічні кімнати; у режимі з відкритими секретами маршрут може накладатися на непов'язані таємні кімнати.
 mapper-route-preview-accept = Прийняти маршрут
-mapper-route-preview-title = Попередній перегляд автоматичного маршруту
-mapper-layer-secret = таємний
-mapper-layer-public = публічний
-mapper-redistribute-question = Перемістити { $count ->
-        [one] { $count } автоматичний порт
-        [few] { $count } автоматичні порти
-        [many] { $count } автоматичних портів
-       *[other] { $count } автоматичних портів
-    } ({ $layer }) на боці { $side } кімнати { $room }?
-mapper-redistribute-offsets = Попередній перегляд зсувів: { $offsets }
-mapper-redistribute-help = Ручні порти залишаються нерухомими. Перпендикулярні кінцеві відрізки виправляються в тій самій зміні.
-mapper-redistribute-title = Перерозподілити порти
 mapper-copy-boundary-one = { $count } граничне з'єднання залишає виділені кімнати.
 mapper-copy-boundary-many = { $count ->
         [one] { $count } граничне з'єднання залишає виділені кімнати.
@@ -630,15 +971,20 @@ action-cut = Вирізати
 action-copy = Копіювати
 mapper-transfer-leaves-folder = Якщо те, що ви хочете надіслати, міститься в теці, воно буде надіслане з теки після прийняття пропозиції.
 mapper-transfer-to = Кому передати
+mapper-transfer-give-or-clan = Передайте «{ $subject }» другові або одному зі своїх кланів.
+mapper-transfer-warning-clan = Усі наявні спільні доступи до цієї мапи буде видалено після завершення перенесення до клану.
+mapper-transfer-clans = Ваші клани
+mapper-transfer-offer-sent-clan = «{ $subject }» переміщено до { $clan }.
+mapper-transfer-owner-clan-only = Ви маєте володіти цією мапою або папкою й мати дозвіл на перенесення до вибраного місця в клані.
 mapper-loading-friends = Завантаження друзів…
 mapper-no-friends-transfer = Поки що немає друзів.
 mapper-filter-placeholder = фільтрувати…
 mapper-sending = Надсилання…
 mapper-send-offer = Надіслати пропозицію
-mapper-new-area = Нова область
-mapper-name-new-area = Назвіть нову область
-mapper-area-name-placeholder = назва області
-mapper-delete-area = Видалити область
+mapper-new-area = Нова мапа
+mapper-name-new-area = Назвіть нову мапу
+mapper-area-name-placeholder = назва мапи
+mapper-delete-area = Видалити мапу
 mapper-delete-area-question = Видалити «{ $name }» та { $rooms ->
         [one] { $rooms } кімнату в ній
         [few] { $rooms } кімнати в ній
@@ -656,36 +1002,40 @@ mapper-save-local-signed-out = Збережено на цьому пристро
 mapper-delete-folder = Видалити теку
 mapper-delete-folder-question = Видалити теку «{ $name }»?
 mapper-folder-empty = Ця тека порожня.
-mapper-folder-one-map-moves = 1 мапу буде переміщено до Некаталогізованих мап.
-mapper-folder-maps-move =
+mapper-folder-maps-go =
     { $count ->
-        [one] { $count } мапу буде переміщено до Некаталогізованих мап.
-        [few] { $count } мапи буде переміщено до Некаталогізованих мап.
-        [many] { $count } мап буде переміщено до Некаталогізованих мап.
-       *[other] { $count } мап буде переміщено до Некаталогізованих мап.
+        [one] Спершу її { $count } мапу буде переміщено до іншої теки.
+        [few] Спершу її { $count } мапи буде переміщено до іншої теки.
+       *[many] Спершу її { $count } мап буде переміщено до іншої теки.
     }
-mapper-loose-maps = Некаталогізовані мапи
+mapper-folder-maps-move-along =
+    { $count ->
+        [one] Її { $count } мапу буде переміщено разом із нею.
+        [few] Її { $count } мапи буде переміщено разом із нею.
+       *[many] Її { $count } мап буде переміщено разом із нею.
+    }
 mapper-move-area-to = Перемістити «{ $name }» до:
 mapper-move-to-folder = Перемістити до теки
-mapper-relocation-duplicate-notice = { $error } — «{ $name }» повністю скопійовано до призначення, а оригінал залишився. Видаліть одну з двох копій замість повторної спроби переміщення.
+mapper-save-to-folder = Зберегти до теки
+mapper-save-area-in = Зберегти «{ $name }» у:
+mapper-folder-section = Тека
+mapper-folder-new-option = Нова тека…
+mapper-folder-none-yet = Тут ще немає теки. Назвіть теку для цієї мапи.
+mapper-folder-none = У вас ще немає тек. Назвіть теку для цієї мапи.
+mapper-folder-create-and-move = Створити й перемістити
+mapper-folder-create-and-save = Створити й зберегти
+mapper-loose-maps-failed = Деякі мапи поза теками не вдалося покласти в теку. Smudgy спробує ще раз наступного разу.
+mapper-relocation-duplicate-notice = { $error } — Створено копію «{ $name }» у місці призначення, але оригінал не вдалося видалити, і він може містити новіші зміни. Збережіть оригінал і узгодьте вміст обох копій перед повторним переміщенням.
 mapper-share-folder-title = Поділитися текою «{ $name }»
 mapper-loading = Завантаження…
-mapper-no-secrets = У цій області немає секретів.
-mapper-secrets-title = Секрети в цій області
-mapper-unmark = Розсекретити
-mapper-secret-rooms = Кімнати
-mapper-secret-exits = Виходи
-mapper-secret-labels = Позначки
-mapper-secret-shapes = Фігури
-mapper-secret-room-properties = Властивості кімнати
-mapper-secret-area-properties = Властивості області
-mapper-share-title = Поділитися «{ $name }»
+mapper-local-move-title = Перемістити спільні мапи з хмари?
+mapper-local-move-shared-warning = Переміщення цих мап до локального сховища припинить спільний доступ до них у хмарі. Інші користувачі втратять доступ, а їхні Секрети та Приватні доповнення, збережені в хмарних оригіналах, буде видалено. Ваші мапи, Секрети та Приватні доповнення буде збережено локально. Цю дію не можна скасувати.
 mapper-copy-duplicate-intro = Створює другу копію «{ $name }».
 mapper-copy-shared-intro = Створює вашу власну редаговану копію «{ $name }»
 mapper-copy-name-placeholder = назва вашої копії
 mapper-copy-duplicate-inactive = Дублікат початково неактивний. Вам потрібно активувати його, щоб він став видимим для скриптів.
-mapper-copy-atlas-offer = Бажаєте скопіювати весь атлас?
-mapper-copy-whole-atlas = Скопіювати весь атлас…
+mapper-copy-atlas-offer = Бажаєте скопіювати всю теку?
+mapper-copy-whole-atlas = Скопіювати всю теку…
 mapper-copying = Копіювання…
 mapper-copy = Копіювати
 mapper-duplicate-map = Дублювати мапу
@@ -695,9 +1045,6 @@ mapper-show-on-servers = Показувати на серверах
 mapper-show-name-on = Показувати «{ $name }» на:
 mapper-no-server-entries = Немає записів серверів.
 mapper-unchecked-all-servers = Якщо не позначено жодного сервера, мапа видима на всіх серверах.
-mapper-scope = Обсяг
-mapper-scope-area = Лише ця область
-mapper-scope-atlas = Його атлас (охоплює області, додані пізніше)
 mapper-recipients = Отримувачі
 mapper-filter-handle-placeholder = фільтрувати за іменем
 mapper-no-friends-share = Поки що немає друзів.
@@ -708,47 +1055,39 @@ mapper-can-edit-folder = Може редагувати
 mapper-can-reshare = Може повторно надавати доступ (може передати доступ на читання на один рівень углиб)
 mapper-can-copy-area = Може копіювати (копії стають їхніми)
 mapper-can-copy-folder = Може копіювати (копії стають їхніми)
-mapper-include-secrets-area = Додати секрети
-mapper-secrets-no-atlas = Секрети надаються лише під час надання доступу до областей.
-mapper-secrets-owner-only = Лише власник мапи може надавати доступ до її секретів.
 mapper-make-admin-area = Надати права адміністратора
 mapper-disclose-servers = Розкрити сервери
 mapper-disclose-servers-help = Отримувачі бачать ці назви серверів, завдяки чому їхній клієнт може автоматично розмістити мапи у відповідній грі.
-mapper-secret-count-warning = НЕ буде надано в доступ — таємних кімнат: { $rooms }, таємних виходів: { $exits }, таємних нотаток/позначок/фігур: { $other }.
-mapper-review-secrets = Переглянути секрети
-mapper-no-marked-secrets = Ніщо в цій області не позначено як таємне — доступ буде надано до всього.
-mapper-secret-forward-only = Позначення чогось як таємного ПІСЛЯ надання доступу впливає лише на майбутні синхронізації — те, до чого вже надано доступ, залишається видимим для користувачів.
-mapper-preview-recipient = Перегляд як отримувач
-mapper-preview-selected-hint = перегляд вибраного нижче дозволу
-mapper-preview-worst-hint = перегляд найгіршого випадку (виберіть дозвіл нижче, щоб його переглянути)
-mapper-generating-preview = Створення перегляду…
 mapper-shared-with = Доступ надано користувачу { $recipient }.
-mapper-share-no-longer-friends = Не вдалося надати доступ користувачу { $recipient } — ви ще друзі?
 mapper-share-error = Не вдалося надати доступ користувачу { $recipient } — { $error }
+mapper-share-failed = Не вдалося надати доступ користувачу { $recipient }.
+mapper-now-sees-map = { $recipient } тепер бачить мапу «{ $map }».
+mapper-secret-map-hint = Його бачать лише ті, хто бачить мапу «{ $map }».
+mapper-has-access = має доступ
+mapper-clan-members-hidden = Показано лише групи: ви не можете бачити список учасників.
+mapper-secret-can-add = Може додавати
+mapper-secret-can-edit = Може редагувати
+mapper-secret-can-share = Може надавати доступ
+mapper-secret-can-copy = Може копіювати
+mapper-secret-level-copies = { $level }, може копіювати
+mapper-copy-secrets-along = { $count ->
+    [one] До копії потрапляють лише секрети, які ви можете скопіювати: { $count } секрет.
+    [few] До копії потрапляють лише секрети, які ви можете скопіювати: { $count } секрети.
+    [many] До копії потрапляють лише секрети, які ви можете скопіювати: { $count } секретів.
+   *[other] До копії потрапляють лише секрети, які ви можете скопіювати: { $count } секрету.
+}
+mapper-copy-secrets-none = До копії потрапляють лише секрети, які ви можете скопіювати: жоден із тих, що ви тут бачите.
 mapper-sharing = Надання доступу…
 mapper-share = Поділитися
-mapper-previewing-as = Перегляд як { $audience }
-mapper-appears-as = Відображається як: «{ $name }»
-mapper-rooms-visible = Видимі кімнати
-mapper-exits-visible = Видимі виходи
-mapper-labels-visible = Видимі позначки
-mapper-shapes-visible = Видимі фігури
-mapper-properties-visible = Видимі властивості
-mapper-linked-areas-visible = Пов'язані області — так, як їх бачать:
-mapper-unknown-links = → { $count ->
-        [one] { $count } з'єднання веде
-        [few] { $count } з'єднання ведуть
-        [many] { $count } з'єднань веде
-       *[other] { $count } з'єднань веде
-    } до «Невідомої мапи»
 mapper-who-has-access = Хто має доступ
 mapper-not-shared = Ще нікому не надано доступ.
 mapper-badge-edit = редагування
 mapper-badge-reshare = повторне надання
 mapper-badge-copy = копіювання
-mapper-badge-secrets = секрети
 mapper-badge-view = перегляд
-mapper-badge-atlas = атлас
+mapper-badge-add = додавання
+mapper-badge-share = надання доступу
+mapper-badge-atlas = тека
 mapper-shared-by-you = надано вами
 mapper-shared-via = через { $handle }
 mapper-shared-by = надано користувачем { $handle }
@@ -759,30 +1098,15 @@ mapper-flag-admin = адмін
 mapper-remove-reshare-warning = Скасування повторного надання доступу також відкликає все, чим ця особа повторно поділилася.
 mapper-saving = Збереження…
 mapper-revoke-warning = Відкликає доступ і все, чим ця особа повторно поділилася.
-mapper-revoke-atlas-warning = Цей дозвіл охоплює весь атлас.
+mapper-revoke-secret-warning = Відкликає доступ до «{ $name }».
+mapper-revoke-atlas-warning = Цей дозвіл охоплює всю теку.
 mapper-revoking = Відкликання…
 mapper-folder-share-help = Кожен, кого ви виберете, отримає кожну мапу в цій теці, зокрема мапи, які ви додасте до неї пізніше.
-mapper-include-secrets-folder = Додати секрети
 mapper-make-admin-folder = Надати права адміністратора
 mapper-revoke-folder-warning = Відкликає доступ до кожної мапи в цій теці та все, чим ця особа повторно поділилася. Копії, які вона вже зробила, залишаються в її розпорядженні.
-mapper-room-fallback = Кімната { $number }
-mapper-exit-from-room = Вихід { $direction } з кімнати { $room }
-mapper-exit-fallback-id = Вихід { $id }
-mapper-exit-fallback = Вихід
-mapper-label-fallback = Позначка
-mapper-shape-fallback = Фігура
-mapper-shape-at = Фігура в точці ({ $x }, { $y })
 mapper-could-not-revoke = Не вдалося відкликати доступ — можливо, дозвіл уже видалено.
-mapper-preview-no-access = Ця група отримувачів взагалі не бачить цієї області.
 mapper-could-not-update-grant = Не вдалося оновити — можливо, дозвіл видалено або його зміна не дозволена.
 mapper-this-folder = ця тека
-mapper-unnamed-area = (область без назви)
-mapper-selected-grant = вибраний дозвіл
-mapper-worst-case-no-grant = найгірший випадок (немає дозволу)
-mapper-room-title = Кімната { $number } — { $title }
-mapper-label-named = Позначка «{ $text }»
-mapper-room-property = Властивість «{ $name }» у кімнаті { $room }
-mapper-area-property = Властивість області «{ $name }»
 
 # Mapper enum choices
 direction-north = Північ
@@ -813,18 +1137,41 @@ alignment-top = Вгорі
 alignment-bottom = Внизу
 
 # Map inspector
-inspector-nothing-changed = Без змін
-inspector-secrets-not-editable = Тут не можна змінювати секрети.
-inspector-mark-secret = Позначити як таємне
-inspector-unmark-secret = Розсекретити
 inspector-invalid-value = некоректне значення
 inspector-properties = Властивості
 inspector-tags = Теги
 inspector-value-placeholder = значення
 inspector-name-placeholder = назва
 inspector-add-tag-placeholder = додати тег
-inspector-in-this-area = У цій області:
+inspector-tag-to = до
+inspector-tag-on-rooms = { $count ->
+    [one] у { $count } кімнаті
+    [few] у { $count } кімнатах
+    [many] у { $count } кімнатах
+   *[other] у { $count } кімнатах
+}
+inspector-tag-too-long = Тег може мати щонайбільше { $limit } символів.
+inspector-tag-hint-map = { $tag } — тег місця { $place }. Якщо додати його до мапи, його побачить кожен, хто читає мапу.
+inspector-tag-hint-place = { $tag } — тег місця { $place }. Якщо додати його до місця { $destination }, його побачить кожен, хто читає «{ $destination }».
+inspector-tag-adds-to = Додасть до { $count } з { $total } кімнат.
+inspector-tag-cant-carry = { $count ->
+    [one] { $count } кімната в { $place } не може мати тегів місця { $destination }.
+    [few] { $count } кімнати в { $place } не можуть мати тегів місця { $destination }.
+    [many] { $count } кімнат у { $place } не можуть мати тегів місця { $destination }.
+   *[other] { $count } кімнати в { $place } не можуть мати тегів місця { $destination }.
+}
+inspector-tag-used-on-map = Використовується на мапі
+inspector-tag-used-in = Використовується в
+inspector-tag-added = { $count ->
+    [one] Додано { $tag } до { $count } кімнати.
+   *[other] Додано { $tag } до { $count } кімнат.
+}
+inspector-tag-added-some-had = { $count ->
+    [one] Додано { $tag } до { $count } кімнати (вже мали: { $already }).
+   *[other] Додано { $tag } до { $count } кімнат (вже мали: { $already }).
+}
 inspector-room-heading = Кімната #{ $number }
+inspector-place-room-heading = { $place } #{ $number }
 inspector-title = Заголовок
 inspector-room-title-placeholder = заголовок кімнати
 inspector-description = Опис
@@ -833,68 +1180,31 @@ inspector-level = Рівень
 inspector-color = Колір
 inspector-default-placeholder = (стандартний)
 inspector-none-placeholder = (немає)
-inspector-secret-room = Таємна кімната
 inspector-exits = Виходи
 inspector-unknown-map = Невідома мапа
-inspector-unshared-destination = Веде до мапи, до якої вам не надано доступ.
-inspector-area-placeholder = область
-inspector-room-number-placeholder = № кімнати
-inspector-return-direction-placeholder = напр. повернення
-inspector-hidden = приховане
-inspector-closed = зачинене
-inspector-locked = замкнене
-inspector-secret = таємне
-inspector-weight-placeholder = вага
-inspector-command-placeholder = команда
-inspector-path-placeholder = шлях
-inspector-add-exit = Додати вихід
-inspector-unlink-direction = Від'єднати цей напрямок
 inspector-connection-missing = З'єднання більше не існує
-inspector-connection-heading = З'єднання
-inspector-room-label = кімната { $number }
-inspector-room-label-titled = кімната { $number } · { $title }
-inspector-exit-from-room = З кімнати { $number }
-inspector-exit-from-room-titled = З кімнати { $number } · { $title }
-inspector-link = З'єднання
 inspector-endpoint-from = Від
 inspector-endpoint-to = До
 inspector-connection-level-anchored = Трикутник у напрямку виходу (вгору/вниз)
 inspector-connection-port-invalid = зсув порту має бути в межах від 0 до 1
-inspector-add-return = Додати зворотний напрямок
 inspector-appearance = Вигляд
-inspector-style = Стиль
 side-north = Північ
 side-east = Схід
 side-south = Південь
 side-west = Захід
-connection-kind-internal = Внутрішнє
-connection-kind-self-loop = Петля на себе
-connection-kind-cross-level = Міжрівневе
-connection-kind-dangling = Висяче
-connection-kind-external = Зовнішнє
-inspector-connection-span = кімната { $room }
-inspector-connection-span-to = кімната { $room_a } до кімнати { $room_b }
-inspector-connection-bidirectional = двостороннє
-inspector-connection-one-way = одностороннє
-inspector-connection-outward = { $room } назовні
-inspector-connection-between = { $room_a } { $side_a } до { $room_b } { $side_b }
 inspector-connection-port-placeholder = порт 0–1
 inspector-connection-auto = Авто
 inspector-connection-redistribute = Перерозподілити
-inspector-connection-pair-reciprocal = Пов'язати зі зворотним з'єднанням
 inspector-connection-route = Маршрут
 inspector-connection-orthogonal = Ортогональний
 inspector-connection-reroute = Прокласти маршрут заново…
 inspector-connection-route-stale = Маршрут може бути застарілим після змін мапи; скористайтеся опцією «Прокласти маршрут заново».
-inspector-connection-route-collision = Маршрут перетинає публічну кімнату; скористайтеся опцією «Прокласти маршрут заново» або відредагуйте його вручну.
+inspector-connection-route-collision = Маршрут перетинає кімнату; скористайтеся опцією «Прокласти маршрут заново» або відредагуйте його вручну.
 inspector-connection-route-invalid = Збережений автоматичний маршрут некоректний; скористайтеся опцією «Прокласти маршрут заново».
 inspector-connection-route-inactive = У цьому режимі збережений маршрут неактивний.
 inspector-connection-clear-route = Очистити збережений маршрут
 inspector-css-color-placeholder = колір CSS
-inspector-width-placeholder = ширина
 inspector-connection-reset = Скинути маршрут і вигляд
-inspector-connection-delete = Видалити з'єднання
-inspector-connection-delete-both = Видалити з'єднання й обидва напрямки
 inspector-width = Ширина
 inspector-height = Висота
 inspector-label = Позначка
@@ -910,14 +1220,10 @@ inspector-stroke = Обведення
 inspector-stroke-width = Товщина обведення
 inspector-corner-radius = Радіус заокруглення
 inspector-selected = виділено: { $count }
-inspector-selection-counts = кімнати: { $rooms }, позначки: { $labels }, фігури: { $shapes }
+inspector-selection-counts = з'єднання: { $links }, кімнати: { $rooms }, позначки: { $labels }, фігури: { $shapes }
 inspector-mixed-placeholder = (змішано)
 inspector-set-color = Встановити колір (Enter, щоб застосувати)
 inspector-set-level = Встановити рівень (Enter, щоб застосувати)
-inspector-secrecy = Таємність
-inspector-active-tip = Активна — натисніть, щоб деактивувати
-inspector-inactive-tip = Неактивна — натисніть, щоб активувати
-inspector-this-map = Ця мапа:
 inspector-active = Активна
 inspector-inactive = Неактивна
 inspector-active-help = Активні мапи використовуються для визначення вашого розташування під час гри.
@@ -925,8 +1231,7 @@ inspector-copies = Копії цієї мапи
 inspector-this-map-suffix = { $name } (ця мапа)
 inspector-use-only-copy = Використовувати лише цю копію
 inspector-multiple-copies-warning = Одночасно активними можуть бути кілька копій. Коли ви відвідуєте кімнати, копії яких є в кількох активних мапах, мапер може розмістити вас у непередбачуваному місці.
-inspector-no-area-selected = Область не вибрано
-inspector-area-summary = кімнати: { $rooms } · рівень { $level }
+inspector-no-area-selected = Мапу не вибрано
 inspector-shared-map = спільна мапа
 inspector-copied-from = Скопійовано з { $source }
 inspector-copy-revision = у ревізії { $revision }
@@ -934,70 +1239,80 @@ inspector-copy-date = від { $date }
 inspector-source-changed = (джерело відтоді змінилося)
 inspector-view-only = { $attribution } — лише для читання.
 inspector-room-position = Рівень { $level } · ({ $x }, { $y })
-inspector-area-properties = Властивості області
-inspector-another-area = інша область
-inspector-exit-target-area-room = { $area }, кімната { $room }
-inspector-exit-target-room = кімната { $room }
-inspector-exit-target-nowhere = у нікуди
+inspector-area-properties = Властивості мапи
 inspector-shape-summary = { $width }×{ $height } у ({ $x }, { $y })
-inspector-room-count =
-    { $count ->
-        [one] { $count } кімната
-        [few] { $count } кімнати
-        [many] { $count } кімнат
-       *[other] { $count } кімнат
-    }
 inspector-entities-selected = виділено елементів: { $count }
-inspector-marked-secret = позначено як таємне: { $items }
-inspector-unmarked = розсекречено: { $items }
-inspector-count-room-one = 1 кімната
-inspector-count-rooms =
+
+# Map list: several maps and folders chosen at once
+mapper-multi-maps =
     { $count ->
-        [one] { $count } кімната
-        [few] { $count } кімнати
-        [many] { $count } кімнат
-       *[other] { $count } кімнат
+        [one] { $count } мапа
+        [few] { $count } мапи
+        [many] { $count } мап
+       *[other] { $count } мапи
     }
-inspector-count-exit-one = 1 вихід
-inspector-count-exits =
+mapper-multi-folders =
     { $count ->
-        [one] { $count } вихід
-        [few] { $count } виходи
-        [many] { $count } виходів
-       *[other] { $count } виходів
+        [one] { $count } тека
+        [few] { $count } теки
+        [many] { $count } тек
+       *[other] { $count } теки
     }
-inspector-count-label-one = 1 позначка
-inspector-count-labels =
+mapper-multi-maps-object =
     { $count ->
-        [one] { $count } позначка
-        [few] { $count } позначки
-        [many] { $count } позначок
-       *[other] { $count } позначок
+        [one] { $count } мапу
+        [few] { $count } мапи
+        [many] { $count } мап
+       *[other] { $count } мапи
     }
-inspector-count-shape-one = 1 фігура
-inspector-count-shapes =
+mapper-multi-folders-object =
     { $count ->
-        [one] { $count } фігура
-        [few] { $count } фігури
-        [many] { $count } фігур
-       *[other] { $count } фігур
+        [one] { $count } теку
+        [few] { $count } теки
+        [many] { $count } тек
+       *[other] { $count } теки
     }
-inspector-count-room-property-one = 1 властивість кімнати
-inspector-count-room-properties =
+mapper-multi-and = { $first } і { $second }
+mapper-multi-quoted = «{ $name }»
+mapper-multi-list-separator = {", "}
+mapper-multi-skipped = Пропущено: { $names }
+mapper-multi-clear = Зняти виділення
+mapper-multi-move = Перемістити { $items } до теки…
+mapper-multi-share = Надати { $items } у спільний доступ…
+mapper-multi-transfer = Передати { $items }…
+mapper-multi-servers = Показувати { $items } на серверах…
+mapper-multi-delete = Видалити { $items }…
+mapper-multi-delete-none = Видалити…
+mapper-multi-delete-question = Видалити { $items }? Цього не можна скасувати.
+mapper-multi-delete-title = Видалити { $items }
+mapper-multi-delete-holding =
     { $count ->
-        [one] { $count } властивість кімнати
-        [few] { $count } властивості кімнати
-        [many] { $count } властивостей кімнати
-       *[other] { $count } властивостей кімнати
+        [one] У «{ $folder }» є ще { $count } мапа, яку ви не вибрали: { $names }.
+        [few] У «{ $folder }» є ще { $count } мапи, які ви не вибрали: { $names }.
+       *[many] У «{ $folder }» є ще { $count } мап, які ви не вибрали: { $names }.
     }
-inspector-count-area-property-one = 1 властивість області
-inspector-count-area-properties =
-    { $count ->
-        [one] { $count } властивість області
-        [few] { $count } властивості області
-        [many] { $count } властивостей області
-       *[other] { $count } властивостей області
-    }
+mapper-multi-leftovers-move = Перемістити їх до теки
+mapper-multi-leftovers-delete = Видалити їх теж
+mapper-multi-delete-error = Не вдалося видалити { $names } — { $error }
+mapper-multi-kind-map = мапа
+mapper-multi-kind-local-map = локальна мапа
+mapper-multi-kind-session-map = мапа сесії
+mapper-multi-kind-shared-map = спільна мапа
+mapper-multi-kind-folder = тека
+mapper-multi-kind-local-folder = локальна тека
+mapper-multi-kind-shared-folder = спільна тека
+mapper-multi-move-to = Перемістити { $items } до:
+mapper-multi-share-title = Надати { $items } у спільний доступ
+mapper-multi-shared = Доступ до «{ $name }» надано.
+mapper-multi-share-failed = Не вдалося надати доступ до «{ $name }» користувачу { $recipient }.
+mapper-multi-share-error = Не вдалося надати доступ до «{ $name }» користувачу { $recipient } — { $error }
+mapper-multi-transfer-title = Передати { $items }
+mapper-multi-transfer-leaves-folder = Мапа з теки вийде з неї після прийняття пропозиції.
+mapper-multi-send-offers = Надіслати пропозиції
+mapper-multi-offer-sent = Пропозицію щодо «{ $name }» надіслано.
+mapper-multi-offer-error = Не вдалося надіслати пропозицію щодо «{ $name }» — { $error }
+mapper-multi-show-on = Показувати { $items } на:
+mapper-multi-some = частина
 
 # Mapper toolbar, area list, and window
 mapper-tool-select = Виділити
@@ -1009,24 +1324,207 @@ mapper-level = Рівень { $level }
 mapper-level-up = Рівень вище
 mapper-undo = Скасувати
 mapper-redo = Повторити
-mapper-share-area-tip = Поділитися цією областю з друзями
-mapper-copy-shared-tip = Створити власну редаговану копію цієї спільної мапи
 mapper-duplicate = Дублювати
-mapper-duplicate-tip = Створити копію цієї мапи
 mapper-transfer-action = Передати…
-mapper-transfer-tip = Передати цю мапу другові (після прийняття він стає її власником)
-mapper-inactive-location-tip = Не використовується для визначення вашого розташування — активуйте її у списку областей
 mapper-syncing = синхронізація { $count }
 mapper-sync-failed = невдалих: { $count }
 mapper-sync = Синхронізувати
 mapper-sync-tip = Синхронізувати з хмарою
+mapper-status-saved = Збережено
+mapper-status-saving = Збереження змін: { $count }
+mapper-status-offline = Офлайн, змін в очікуванні: { $count }
+mapper-status-held = { $count ->
+    [one] Очікування служби мап (1 зміна в черзі)
+    [few] Очікування служби мап ({ $count } зміни в черзі)
+    [many] Очікування служби мап ({ $count } змін у черзі)
+   *[other] Очікування служби мап ({ $count } зміни в черзі)
+}
+mapper-status-conflict = Конфлікт потребує перегляду
+mapper-status-could-not-save = Не вдалося зберегти
+mapper-pending-tip = Зміни чекають на цьому пристрої, доки не збережуться.
+mapper-tool-link = З'єднати кімнати (Ctrl: в один бік)
+mapper-menu-rename = Перейменувати
+mapper-menu-save = Зберегти…
+mapper-menu-move-to-folder = Перемістити до теки…
+mapper-menu-delete = Видалити мапу…
+mapper-add-to = Додати до
+mapper-place-map = Мапа
+mapper-place-private = Приватне
+mapper-secrets = Секрети
+mapper-rooms = Кімнати
+mapper-tags = Теги
+mapper-tags-none = Тегів поки немає.
+mapper-rooms-filter = Фільтр за назвою, місцем, номером або тегом
+mapper-rooms-none = Жодна кімната не підходить.
+mapper-rooms-more = { $count ->
+    [one] Ще { $count } кімната. Звузьте список фільтром.
+    [few] Ще { $count } кімнати. Звузьте список фільтром.
+   *[other] Ще { $count } кімнат. Звузьте список фільтром.
+}
+mapper-room-untitled = (без назви)
+mapper-new-secret = Новий секрет
+mapper-secret-name-placeholder = Назва секрету
+mapper-secret-color = Колір
+mapper-secret-color-automatic = Автоматичний колір
+mapper-room-count = { $count ->
+    [one] { $count } кімната
+    [few] { $count } кімнати
+    [many] { $count } кімнат
+   *[other] { $count } кімнати
+}
+mapper-view-only = лише перегляд
+mapper-private-help = Їх бачите лише ви.
+mapper-place-gone = «{ $name }» більше немає.
+mapper-now-editing = Зараз редагуєте
+mapper-panel-kind-map = МАПА
+mapper-panel-kind-atlas = АТЛАС
+mapper-panel-data-fields = Поля даних
+mapper-panel-maps = Мапи
+mapper-panel-shares = Спільний доступ
+mapper-panel-servers = Сервери
+mapper-panel-no-maps = У ньому ще немає мап.
+mapper-panel-storage-cloud = У хмарі
+mapper-panel-storage-local = На цьому пристрої
+mapper-panel-storage-session = Лише в цій сесії
+mapper-badge-secret = Секрет
+mapper-badge-private = Приватне
+mapper-delete-secret = Видалити секрет…
+mapper-delete-secret-question = Видалити «{ $name }» разом з усім вмістом?
+mapper-now-viewing = Перегляд
+mapper-secret-owner = Власник
+mapper-secret-owner-me = Я
+mapper-secret-owner-members = Учасники
+mapper-secret-owner-clan = Клан
+mapper-secret-owner-members-of = Учасники клану { $clan }
+mapper-secret-owner-clan-named = Клан { $clan }
+mapper-secret-owner-members-help = Він належить вам; згодом ви можете запропонувати власність іншим учасникам.
+mapper-secret-owner-clan-help = Він належить власникам клану. Ви починаєте як дописувач; хто ще його читає, визначає доступ у клані.
+mapper-secret-owner-none = Ви не можете створити секрет на цій мапі.
+mapper-secret-member-owned = Власність учасників · { $clan }
+mapper-secret-clan-owned = Власність клану · { $clan }
+mapper-secret-read-only = Ви можете читати цей секрет, але не змінювати його.
+mapper-secret-level-reader = Читач
+mapper-secret-level-contributor = Дописувач
+mapper-secret-level-editor = Редактор
+mapper-secret-level-access-manager = Керівник доступу
+mapper-secret-level-manages = { $level }, керує доступом
+mapper-access = Доступ
+mapper-access-owner = Власник
+mapper-access-clan-owner = Власник клану
+mapper-access-grant = { $level }, надано напряму
+mapper-access-group = { $level } через групу «{ $group }»
+mapper-access-group-unnamed = { $level } через групу
+mapper-access-clan-grants = { $level } через доступ клану до мапи
+mapper-access-you = { $name } (ви)
+mapper-access-only-yours = Усіх читачів бачать лише ті, хто керує доступом.
+mapper-ownership = Власність
+mapper-offer-ownership = Запропонувати власність…
+mapper-offer-pick = Запропонувати власність:
+mapper-offer-nobody = Цей секрет поки не читає ніхто інший.
+mapper-offer-replace-toggle = Вони замінять поточних власників
+mapper-offer-add-help = Вони стануть власниками поряд із поточними.
+mapper-offer-replace-help = Вони стануть єдиними власниками.
+mapper-offer-from-clan-help = Вони стануть власниками, а власники клану перестануть ними бути.
+mapper-offer-joint-help = Кожен приймає окремо; власність зміниться, коли прийме останній.
+mapper-offer-recipient-limit = Пропозиція може назвати щонайбільше { $count } осіб.
+mapper-offer-send = Надіслати пропозицію
+mapper-offer-cancel = Відкликати пропозицію
+mapper-offer-accepted = { $name } (прийнято)
+mapper-offer-waiting = { $name } (очікує)
+mapper-offer-add = Пропозиція спільної власності
+mapper-offer-replace = Пропозиція передати власність
+mapper-offer-to-clan = Пропозиція передати клану
+mapper-owners = Власники
+mapper-owner-inactive = { $name } (уже не в клані)
+mapper-owner-remove = Вилучити…
+mapper-owner-remove-confirm = Вилучити { $name } з власників «{ $secret }»? Ця людина збереже лише те, чим із нею поділилися.
+mapper-owner-remove-action = Вилучити
+mapper-owner-give-up = Відмовитися від власності…
+mapper-owner-give-up-confirm = Відмовитися від власності на «{ $secret }»? Ви збережете лише те, чим поділилися з вами чи вашими групами; без цього ви втратите до нього доступ.
+mapper-owner-give-up-action = Відмовитися від власності
+mapper-owner-only-you = Ви його єдиний власник. Спершу запропонуйте власність комусь іншому.
+mapper-owner-last = Спершу потрібен інший власник.
+mapper-make-clan-owned = Передати клану…
+mapper-make-clan-owned-pick = Хто прийме його від імені клану:
+mapper-make-clan-owned-confirm = Запропонувати «{ $secret }» клану? Коли { $name } прийме пропозицію, він стане власністю клану: власники клану зможуть робити з ним усе, а його теперішні власники, зокрема ви, перестануть ними бути.
+mapper-make-clan-owned-confirm-self = Передати «{ $secret }» у власність клану? Власники клану, зокрема ви, зможуть робити з ним усе, а інші його теперішні власники перестануть ними бути. Те, чим поділилися з учасниками й групами, залишається.
+mapper-make-clan-owned-action = Передати клану
+mapper-ownership-refused = Не вдалося змінити власника «{ $secret }». Можливо, його тим часом змінили; спробуйте ще раз.
+mapper-map-rooms = Кімнати мапи
+mapper-menu-paste-here = Вставити тут
+mapper-menu-add-point-here = Додати точку тут
+mapper-menu-remove-point = Видалити точку
+mapper-menu-move-to = Перемістити до
+mapper-place-several = Кілька
+mapper-move-title = Перемістити до «{ $place }»
+mapper-move-action = Перемістити
+mapper-moving = Переміщення…
+mapper-move-loses-data = «{ $place }» втрачає свої дані про ці кімнати.
+mapper-move-strands-exits = Виходи з інших мап до цих кімнат вестимуть у нікуди.
+mapper-move-reveals = Їх побачить кожен, хто бачить цю мапу.
+mapper-move-splits = #{ $room } з'єднана з #{ $other }, яка лишається в «{ $place }».
+mapper-move-include-linked = Додати пов'язані кімнати
+mapper-move-conflict = Нічого не переміщено: «{ $from }» або «{ $to }» щойно змінили деінде. Мапа вже показує цю зміну; перевірте її та перемістіть ще раз.
+mapper-no-room-numbers = На цій мапі закінчилися номери кімнат.
+mapper-route-finding = Пошук маршруту…
+mapper-route-ready = Маршрут готовий.
+mapper-route-none = Вільного маршруту не знайдено.
+mapper-route-limit = Не вдалося знайти маршрут вчасно.
+mapper-route-invalid = Маршрут перетнув кімнату. Спробуйте ще раз.
+mapper-route-link-changed = З'єднання змінилося. Спробуйте ще раз.
+mapper-route-map-changed = Мапа змінилася. Спробуйте ще раз.
+mapper-route-access-changed = Ви більше не можете редагувати цю мапу.
+mapper-route-same-level = Автоматичні маршрути з'єднують дві кімнати на одній мапі й рівні.
+mapper-link-area-gone = Цієї мапи вже немає, тож з'єднання не створено.
+mapper-link-room-taken = Кімнату #{ $old } щойно зайняли. З'єднання тепер використовує #{ $new }.
+mapper-link-not-queued = Не вдалося зберегти з'єднання. Спробуйте ще раз.
+mapper-link-two-secrets = З'єднання не може поєднувати два секрети.
+mapper-map-view-only = Ця мапа доступна лише для перегляду.
+mapper-map-cannot-add = Ви не можете додавати до цієї мапи.
+mapper-map-cannot-edit = Ви не можете змінювати вміст цієї мапи.
+mapper-map-cannot-remove = Ви не можете нічого видаляти з цієї мапи.
+mapper-history-cleared-elsewhere = Історію скасування очищено: кімнати на цій мапі переміщено в іншому вікні.
+mapper-paste-links-skipped = Не вдалося приєднати тут скопійовані з'єднання: { $count }.
+mapper-paste-too-large = Це забагато, щоб вставити за раз.
+mapper-edits-not-recovered = Деякі незбережені зміни не вдалося відновити.
+mapper-legacy-recovery-complete = Попередні зміни хмарних карт, що очікували на синхронізацію, збережено для відновлення; їх не буде надіслано. Хмарні карти завантажуються заново з перенесеного сервісу. Зміни, які не надійшли до старого сервісу, потрібно відновити вручну; нові зміни синхронізуються як завжди.
+mapper-legacy-recovery-incomplete = Попередні зміни хмарних карт, що очікували на синхронізацію, не буде надіслано. Архівування не вдалося завершити; оригінальні файли збережено. Звільніть місце на диску або відновіть доступ до теки, а потім повторіть відновлення. Нові зміни використовують окрему чергу.
+mapper-open-recovery-folder = Відкрити теку відновлення
+mapper-retry-recovery = Повторити відновлення
+mapper-dismiss-recovery = Приховати
+mapper-recovery-open-failed = Не вдалося відкрити теку відновлення. Подробиці наведено в журналі застосунку.
+mapper-selection-removed = Хтось інший видалив виділений елемент.
+inspector-route-too-many-points = Цей маршрут має забагато точок, щоб зробити його прямокутним.
+legend-move-freely = рухати вільно
+legend-cancel = скасувати
+legend-snap-port = прив'язати до середини або кутів
+legend-read-only = Лише перегляд
+legend-move-point = перемістити точку
+legend-remove-point = видалити точку
+legend-stop-editing = завершити редагування
+legend-move-port = перемістити порт
+legend-slide-port = зсунути вздовж стіни
+legend-add-point = додати точку
+legend-key-drag = Перетягнути
+legend-key-delete = Delete
+routing-stub = Коротка
+routing-simple = Пряма
+routing-manual = Ручна
+routing-automatic = Автоматична
+segments-direct = Прямий
+corners-sharp = Гострі кути
+corners-rounded = Заокруглені кути
+dash-solid = Суцільна
+dash-dashed = Штрихова
+dash-dotted = Пунктирна
+inspector-in = У
 mapper-shared-by-friend = Надано другом
 mapper-a-friend = друг
 mapper-shared-by-owner-pair = Надано користувачем { $sharer } · власник: { $owner }
 mapper-shared-by-person = Надано користувачем { $person }
 mapper-window-title = Smudgy — редактор мап
 mapper-window-area-title = Smudgy — редактор мап — { $area }
-mapper-copy-report = Скопійовано області: { $copied }; пропущено: { $skipped } (не можна скопіювати).
+mapper-copy-report = Скопійовано мапи: { $copied }; пропущено: { $skipped } (не можна скопіювати).
 mapper-copy-rooms-denied = Власник цієї мапи не дозволив копіювати кімнати.
 mapper-create-first-room = Створити першу кімнату
 mapper-create-first-room-help = Потім виберіть її розташування на сітці.
@@ -1036,16 +1534,18 @@ action-retry = Повторити спробу
 mapper-local-maps-signin = Локальні мапи зберігаються на цьому пристрої. Увійдіть, щоб користуватися мапами в хмарі, які синхронізуються між пристроями та якими можна ділитися.
 mapper-sign-in-create = Увійдіть або створіть обліковий запис
 mapper-copy-unavailable = Копіювання цієї мапи недоступне.
-area-list-title = Області
+area-list-title = Мапи
 area-list-new-map = Нова мапа
 area-list-new-folder = Нова тека
 area-list-session-maps = Мапи сесії
-area-list-my-maps = Мої мапи
+area-list-my-local-maps = Мої локальні мапи
+area-list-my-shared-maps = Мої спільні мапи
+area-list-not-in-folder = Поза текою
 area-list-on-server = На { $server }
 area-list-unassigned = Непризначені
 area-list-other-servers = Інші сервери
 area-list-this-server = Цей сервер ({ $server })
-area-list-all-atlases = Усі атласи
+area-list-all-atlases = Усі теки
 area-list-empty = порожньо
 area-list-new-map-folder = Нова мапа в теці
 area-list-rename-folder = Перейменувати теку
@@ -1062,6 +1562,10 @@ area-list-edit-badge = редагування
 area-list-move-action = Перемістити…
 area-list-shared-folder = Спільна тека
 area-list-shared-by = Надано користувачем { $person }
+area-list-default-badge = Типова
+area-list-default-tip = Сюди потрапляють нові мапи зі скриптів на { $server }, якщо вони не вказують теку
+area-list-use-for-new-maps = Використовувати для нових мап на { $server }
+area-list-use-for-new-maps-failed = Не вдалося змінити, куди потрапляють нові мапи: { $error }
 
 # Automations shell, dashboard, and command palette
 automations-title = Автоматизації
@@ -1650,7 +2154,7 @@ manifest-tab-system = Система
 manifest-sandbox-deny-note = Встановлення в пісочниці не має доступу ні до чого, що не перелічено тут.
 manifest-dependency-lock-note = Публікація фіксує точну версію кожної залежності на момент публікації. Користувачі отримають новіші версії залежностей лише після того, як ви випустите нову версію цього пакунка, яка їх оновить.
 manifest-readable-path-warning = Шлях для читання поза $DATA спричиняє попередження. Надавайте перевагу $DATA, якщо читання зовнішніх файлів не є необхідним.
-manifest-dependencies-help = Інші пакунки Smudgy, які імпортує цей пакунок: smudgy://owner/name@^1.2. Наразі підтримуються лише пакунки smudgy://. Версіями пакунків jsr і npm керують їхні завантажувачі, і пакунок може їх імпортувати, коли має доступ до реєстру.
+manifest-dependencies-help = Інші пакунки Smudgy, які імпортує цей пакунок: smudgy:@name@^1.2 (також працює smudgy://owner/name@^1.2). Наразі підтримуються лише пакунки Smudgy. Версіями пакунків jsr і npm керують їхні завантажувачі, і пакунок може їх імпортувати, коли має доступ до реєстру.
 manifest-add-dependency-placeholder = Додайте один зі своїх встановлених або локальних пакунків…
 manifest-dependency = залежність
 manifest-any-version-placeholder = будь-яка версія
@@ -1660,7 +2164,7 @@ manifest-min-version-newer = Новіша за цю версію Smudgy ({ $runn
 manifest-hosts-help = Хости, на які націлений цей пакунок у розділі Огляд, застосовуються під час публікації. Залиште порожнім, щоб він був незалежним від хоста.
 manifest-host = хост
 manifest-required-packages = Обов'язкові пакунки
-manifest-required-packages-help = Пакунки, що встановлюються автоматично разом із цим пакунком, кожен працює у власній пісочниці. Використайте smudgy://owner/name[@^1.2].
+manifest-required-packages-help = Пакунки, що встановлюються автоматично разом із цим пакунком, кожен працює у власній пісочниці. Використайте smudgy:@name[@^1.2].
 manifest-required-package = обов'язковий пакунок
 manifest-allow-import = Дозволити іншим імпортувати цей пакунок
 manifest-allow-import-help = Коли вимкнено, модулі цього пакунка можуть імпортувати лише ваші пакунки. Інші пакунки отримують лише типи. Ця поведінка може змінитися в майбутній версії.
@@ -1916,6 +2420,17 @@ package-search-meta = { $count ->
        *[other] { $owner } · v{ $version } · { $count } встановлення ·
     }
 package-you = Ви
+package-owner-clan = Клан
+package-owner-me = Я
+package-owner = Власник: { $owner }
+package-publish-as = Опублікувати як
+package-publish-as-clan-help = { $clan } стане його власником: кожен учасник клану зможе його встановити, а клан вирішує, хто публікує нові версії. Власника пакунка згодом змінити не можна.
+package-clan-private-help = Встановити його можуть лише учасники клану.
+package-clan-cannot-create = { $clan }: ви не можете створювати пакунки в цьому клані. Опублікуйте його як свій або зверніться до власників клану.
+package-clan-cannot-publish = { $clan }: ви не можете публікувати нові версії цього пакунка.
+package-clan-refused = { $clan }: ви не можете зробити це з цим пакунком.
+package-claimed-for-me = Перервана публікація цього пакунка обрала власником вас. Опублікуйте його як свій, щоб завершити.
+package-claimed-for-clan = Перервана публікація цього пакунка обрала власником { $clan }. Опублікуйте його в цьому клані, щоб завершити.
 package-back = ‹ Назад
 package-comments = Коментарі
 package-comment-placeholder = Додати коментар…
@@ -2012,6 +2527,9 @@ permission-can-sessions = Взаємодіяти з іншими відкрит�
 permission-can-display = Приховувати, змінювати стиль, вставляти або замінювати текст гри та бачити поточний рядок
 permission-can-map-read = Читати ваші мапи
 permission-can-map-write = Змінювати ваші мапи
+permission-can-secrets-read = Читати Секрети та приватні доповнення ваших мап
+permission-can-secrets-write = Змінювати Секрети та приватні доповнення ваших мап
+permission-can-secrets-manage = Створювати, перейменовувати та видаляти Секрети ваших мап
 permission-can-widgets = Створювати й змінювати віджети на екрані
 permission-can-panes = Створювати панелі виводу сесії, спрямовувати до них рядки гри та зберігати й застосовувати іменовані розкладки вікон
 permission-can-interop-write = Розсилати події пакунка й публікувати спільний стан, на який можуть реагувати інші пакунки
@@ -2044,7 +2562,8 @@ permission-cannot-read-files = читати ваші файли
 permission-cannot-write-files = змінювати ваші файли
 permission-cannot-read-env = читати змінні середовища
 package-private-shared = Приватні та надані
-package-private-shared-subtitle = Приватні пакунки, якими ви володієте, а також пакунки, надані вам друзями.
+package-private-shared-subtitle = Ваші пакунки, пакунки, надані друзями, та доступні вам пакунки кланів.
+package-clan-packages = Пакунки кланів
 package-your-packages = Ваші пакунки
 package-local = Локальні
 package-no-owned-cloud = Ви ще не володієте жодними пакунками у хмарі.
@@ -2304,3 +2823,218 @@ package-settings-restore-action = Відновити
 package-settings-all-profiles = Усі профілі
 package-settings-required = * Обов’язкове
 package-settings-copied-with-secrets = Збережені налаштування скопійовано. Без секретів.
+
+# Link editor: a room's Exits (compass, one row per link) and a selected link
+compass-north = Пн
+compass-northeast = ПнСх
+compass-east = Сх
+compass-southeast = ПдСх
+compass-south = Пд
+compass-southwest = ПдЗх
+compass-west = Зх
+compass-northwest = ПнЗх
+compass-up = Вг
+compass-down = Вн
+compass-in = всер
+compass-out = наз
+compass-special = спец
+compass-other = інше
+mapper-room-name = #{ $number }
+mapper-room-name-titled = #{ $number } · { $title }
+mapper-place-room-name = { $place } #{ $number }
+mapper-place-room-name-titled = { $place } #{ $number } · { $title }
+mapper-other-map-prefix = { $map } ›
+link-nowhere = (без призначення)
+link-add-exit = + Додати вихід…
+link-new-exit = Новий вихід ({ $direction }) з: { $room }
+link-leaves = виходить
+link-arrives-from = приходить з
+link-weight = вага
+link-command = команда
+link-heading = З'єднання
+link-change = Змінити ▾
+link-change-close = Закрити ▴
+link-two-way = ⇄ двобічне
+link-one-way = → однобічне
+link-swap = ⇅ поміняти кінці
+link-return-elsewhere = Зворотний шлях зберігається в: { $map }.
+link-two-way-would-show = Зворотний шлях бачитиме кожен, хто читає: { $map }.
+link-door-name-too-long = Назва дверей задовга (ліміт символів: { $limit }).
+link-opens-with-too-long = Команда, що відчиняє двері, задовга (ліміт символів: { $limit }).
+link-doors = Двері
+link-same-doors = однакові з обох боків
+link-door-both = Двері з обох боків
+link-door-one = Двері
+link-door-side = Двері з боку: { $room }
+link-door-none = Немає
+link-door-open = Відчинені
+link-door-closed = Зачинені
+link-door-locked = Замкнені
+link-hidden-exit = прихований вихід
+link-named = з назвою
+link-opens-with = відчиняє
+link-door-default-name = door
+link-opens-with-placeholder = open { $name }
+link-hidden = прихований
+link-door = { $state ->
+    [open] відчинені двері
+    [closed] зачинені двері
+   *[locked] замкнені двері
+}
+link-door-named = «{ $name }», { $state ->
+    [open] відчинені
+    [closed] зачинені
+   *[locked] замкнені
+}
+link-segments = Відрізки
+link-corners = Кути
+link-line = Лінія
+link-thickness = Товщина
+link-color-reset = Скинути
+link-ports = Порти
+link-remove = Видалити з'єднання
+link-picker-help = Клацніть кімнату на мапі або знайдіть її
+link-picker-placeholder = Назва кімнати або #номер
+link-picker-map-placeholder = Назва мапи
+link-picker-this-map-group = Ця мапа
+link-picker-places-group = Секрети на цій мапі
+link-picker-other-map = Інша мапа…
+link-picker-other-maps = Інші мапи
+link-picker-this-map = Назад до цієї мапи
+link-picker-nothing = Жодна кімната не підходить.
+link-picker-no-destination = Поки без призначення
+link-picker-more = { $count ->
+    [one] ще { $count } — введіть, щоб звузити
+    [few] ще { $count } — введіть, щоб звузити
+    [many] ще { $count } — введіть, щоб звузити
+   *[other] ще { $count } — введіть, щоб звузити
+}
+mapper-link-not-changed = Не вдалося змінити з'єднання.
+
+# Scoped group permissions.
+
+permissions-tab-clan = Клан
+permissions-title = Дозволи групи { $group }
+permissions-manage = Керувати дозволами
+permissions-select-resource = Виберіть теку, мапу або пакунок, щоб керувати дозволами цієї групи.
+permissions-other-maps = Мапи поза переліченими теками
+permissions-owners-implicit = Власники клану мають повні дозволи в усьому клані, крім мап і секретів, що належать учасникам.
+permissions-folder-inheritance = Дозволи охоплюють цю теку та поточні й майбутні мапи клану в ній. Мапи учасників зберігають власні правила доступу.
+permissions-direct-note = Дозволи від інших надань діють, доки їх не змінять у джерелі. Прямі дозволи можуть додати доступ, але не заборонити успадкований.
+permissions-inherited = Також надано через { $scope }: { $permissions }.
+permissions-edit-origin = Змінити початкове надання
+permissions-delegation-title = Дозволи, які група може надавати іншим
+permissions-delegation-help = Виберіть дозволи, які учасники можуть надавати на цей ресурс. Надання залишаються в цих межах і закінчуються разом із делегуванням. Керування доступом саме по собі не дозволяє читати або редагувати вміст.
+permission-help-clan-edit-profile = Змінювати назву й опис клану.
+permission-help-clan-read-members = Переглядати список учасників клану.
+permission-help-clan-invite = Запрошувати до клану.
+permission-help-clan-revoke-invitation = Скасовувати очікувані запрошення до їх прийняття.
+permission-help-clan-remove-member = Вилучати звичайних учасників і припиняти їхній доступ до клану. Лише власники клану можуть змінювати власність.
+permission-help-group-create = Створювати групи. Автор приєднується до нової групи й може керувати нею, доки є учасником клану.
+permission-help-group-rename = Змінювати назви й кольори груп без зміни дозволів або членства.
+permission-help-group-delete = Видаляти користувацькі групи й доступ, наданий ними. Вбудовані групи видалити не можна.
+permission-help-group-assign = Додавати й вилучати учасників. Вони отримують або втрачають дозволи групи, включно з доступом до її Секретів. Додати себе до чужої групи може лише власник клану.
+permission-help-group-inspect-assignments = Дозволити учасникам цієї групи бачити, хто входить до кожної групи.
+permission-help-atlas-create = Створювати теки клану. Доступ у кожній теці треба надати окремо; це не дає доступу до наявних мап.
+permission-help-package-create = Створювати пакунки клану. Редагування й публікація потребують дозволів на новий пакунок. Інші пакунки мають власні дозволи.
+permission-help-atlas-read = Бачити цю теку. Читання мап усередині потребує окремого дозволу.
+permission-help-atlas-rename = Перейменовувати теку. Її мапи й дозволи залишаються на місці.
+permission-help-atlas-delete = Видаляти теку за правилами клану. Цей дозвіл мають лише власники клану.
+permission-help-atlas-accept-filing = Дозволяти переміщення мап до цієї теки. Переміщення також потребує дозволу перемістити саму мапу з поточної теки.
+permission-help-atlas-accept-transfer = Переміщувати власні мапи до цієї папки клану. Виберіть, чи стане клан їхнім власником, чи ви збережете право власності. Наявні спільні доступи до мап буде припинено.
+permission-help-area-create = Створювати мапи клану в цій теці. Автор може редагувати нову мапу; власники клану зберігають повноваження власника.
+permission-help-area-create-member-owned = Створювати тут мапи учасників. Доступ контролюють їхні записані власники; дозволи теки й власність клану їх не розкривають.
+permission-help-area-read = Читати звичайний вміст мапи. Це не розкриває Секрети або приватні доповнення інших людей. Читання Секрету також потребує доступу до мапи. На мапах учасників читання залишається ввімкненим, доки надано будь-який інший дозвіл на мапу.
+permission-help-area-add = Додавати звичайний вміст мапи. Читання мапи все одно потрібне. Це не дозволяє редагувати наявний вміст або писати в Секретах.
+permission-help-area-edit = Змінювати наявний звичайний вміст мапи. Потрібне читання мапи. Редагування Секретів має окремі дозволи.
+permission-help-area-remove-content = Видаляти звичайний вміст мапи. Видалення кімнати також видаляє прикріплені секретні й приватні доповнення. Це не дозволяє видаляти всю мапу.
+permission-help-area-rename = Перейменовувати мапу без зміни її власності або вмісту.
+permission-help-area-refile = Переміщувати мапу до іншої теки клану, що приймає мапи. Дозволи цільової теки можуть змінити доступ до неї.
+permission-help-area-delete = Видаляти всю мапу разом із Секретами й приватними доповненнями. Це окремо від видалення звичайного вмісту.
+permission-help-area-copy = Створювати незалежну копію. Секрет копіюється лише з власним дозволом копіювання; приватні доповнення інших людей ніколи не копіюються.
+permission-help-area-share-external = Надавати друзям поза кланом перегляд мапи без редагування, копіювання або Секретів. Доступ закінчується, коли автор надання виходить із клану або втрачає цей дозвіл.
+permission-help-secret-create-member-owned = Створювати Секрети учасників на доступній для читання мапі. Їхні власники вибирають одержувачів; власність клану сама по собі не дає доступу.
+permission-help-secret-create-clan-owned = Створювати Секрети клану на доступних мапах клану. Автор може читати, доповнювати й редагувати новий Секрет. Власники клану зберігають усі повноваження.
+permission-help-secret-read = Читати Секрети клану на цих мапах. Читання самої мапи також потрібне. Це ніколи не розкриває Секрети учасників.
+permission-help-secret-add = Додавати вміст до Секретів клану. Мапа й Секрет мають бути доступними для читання. Звичайний вміст мапи має окремі дозволи.
+permission-help-secret-edit = Змінювати вміст Секретів клану. Мапа й Секрет мають бути доступними для читання. Читач мапи може редагувати Секрет без права редагування самої мапи.
+permission-help-secret-remove-content = Видаляти вміст Секретів клану. Мапа й Секрет мають бути доступними для читання. Це не дозволяє видаляти весь Секрет або змінювати Секрети учасників.
+permission-help-secret-manage-access = Переглядати й відкликати надання Секретів клану та надавати наявні у вас дозволи. Це не дає власності або контролю над Секретами учасників.
+permission-help-secret-copy = Додавати Секрети клану до копії мапи. Мапа також потребує дозволу копіювання. Копії незалежні від подальших змін доступу.
+permission-help-grant-inspect = Переглядати надання для цього ресурсу та ресурсів у його межах. Це саме по собі не розкриває Секрети й не дозволяє змінювати доступ.
+permission-help-grant-manage = Надавати доступ у цих межах і за обмеженнями нижче. Лише власники клану можуть надати цей дозвіл. Він не дає власності.
+permission-help-package-read = Показувати пакунок у ресурсах клану. Учасники все одно можуть установлювати опубліковані пакунки клану за назвою без цього дозволу. Він не дає права публікації або редагування.
+permission-help-package-edit-draft = Завантажувати й змінювати чернетку пакунка. Публікація потребує окремого дозволу.
+permission-help-package-edit-metadata = Змінювати метадані пакунка. Публікація та зміна доступності потребують окремих дозволів.
+permission-help-package-manage-availability = Змінювати публічну доступність пакунка. Публічний пакунок можуть знайти й завантажити люди поза кланом.
+permission-help-package-publish = Публікувати нові версії. Люди, які встановили пакунок, можуть отримати новий код під час оновлення.
+permission-help-package-retire = Відкликати версії пакунка за правилами реєстру. Це не видаляє весь пакунок.
+permission-help-package-delete = Видаляти пакунок за правилами реєстру. Завантажені копії можуть залишитися на пристроях інших людей.
+permission-help-read = Читати Секрет, коли його мапа також доступна для читання. Надання Секрету ніколи не дає доступу до самої мапи.
+permission-help-add = Додавати вміст до Секрету. Редагування й видалення наявного вмісту потребують окремих дозволів.
+permission-help-edit = Змінювати наявний вміст Секрету. Звичайний вміст мапи має окремі дозволи.
+permission-help-remove = Видаляти вміст Секрету. Це не дозволяє видаляти весь Секрет.
+permission-help-manage-access = Переглядати й відкликати надання Секрету та надавати наявні у вас дозволи. Лише власники можуть призначати керівників доступу або змінювати власність.
+permission-help-copy = Додавати Секрет до незалежної копії мапи. Мапа також потребує дозволу копіювання. Подальше відкликання не видаляє вже зроблені копії.
+
+permissions-clan-note = Ці дозволи діють для всього клану. Виберіть Мапи або Пакунки, щоб налаштувати доступ до окремих ресурсів.
+permissions-section-clan = Клан і членство
+permissions-section-groups = Керування групами
+permissions-section-creation = Створення ресурсів
+permissions-section-access = Керування доступом
+permissions-section-secret-creation = Створення Секретів
+
+move-review-loading = Перевірка змін доступу…
+move-review-selection = Кімнати: { $rooms } · Зв’язки: { $links } · Мітки: { $labels } · Фігури: { $shapes }
+move-review-destination-notice = Переміщений вміст підпорядковуватиметься дозволам місця призначення, зокрема доступу, який ви не можете перевірити.
+move-review-filing-notice = Переміщення цієї мапи може змінити доступ інших учасників до Секретів, які ви не можете перевірити. Власники Секретів і явні налаштування спільного доступу залишаться незмінними.
+move-review-group = { $name }, включно з майбутніми учасниками
+move-review-members = Учасники клану, включно з майбутніми
+move-review-and = { " ТА " }
+move-review-overlap = Ці аудиторії можуть отримати або втратити перелічені дозволи. Інші надання дозволів можуть зберегти доступ для деяких учасників.
+move-review-gain = Можуть отримати: { $actions }
+move-review-loss = Можуть втратити: { $actions }
+move-review-share-right = Надавати дозвіл: { $action }
+move-review-right-read = Читання
+move-review-right-add = Додавання
+move-review-right-edit = Редагування
+move-review-right-remove = Видалення вмісту
+move-review-right-copy = Копіювання
+move-review-right-manage-access = Керування доступом
+move-review-right-rename = Перейменування
+move-review-right-delete = Видалення
+move-review-right-manage-ownership = Керування власністю
+
+mapper-clipboard-one-source = Вибирайте вміст одного джерела за раз.
+mapper-cut-remove-required = Переміщення потребує дозволу Видалення у вихідному джерелі та Додавання в цільовому.
+mapper-cut-ready = Готово до переміщення. Оригінал залишиться до успішного вставлення.
+mapper-cut-cross-map-unavailable = Переміщення між мапами поки не підтримується. Оригінал не змінено. Скористайтеся копіюванням, щоб створити дублікат.
+mapper-cut-stale = Джерело змінилося після вирізання. Виділіть вміст і виріжте його знову.
+mapper-cut-same-source = Виберіть інше джерело перед вставленням або скористайтеся Вставити тут, щоб змінити розташування.
+move-review-preserve-positions = Переміщення між джерелами зберігає розташування об’єктів та наявні посилання на кімнати.
+
+mapper-copy-source-denied = Для цього вмісту потрібен дозвіл на копіювання його джерела.
+
+cloud-error-access-review-required = Перш ніж підтвердити переміщення, перегляньте, хто отримає або втратить доступ. Нічого не переміщено.
+cloud-error-stale-access-review = Після перегляду доступ змінився. Почніть переміщення знову, щоб переглянути поточний результат. Нічого не переміщено.
+cloud-error-move-property-conflict = Місце призначення містить інші значення деяких властивостей кімнат. Узгодьте ці значення перед переміщенням. Початковий вміст не змінено.
+
+mapper-additional-room-data = Додаткові дані кімнати
+
+move-property-to = Перемістити до…
+move-review-properties = Вибрані властивості: { $count }
+move-review-property-no-undo = Це переміщення об’єднує наявні дані, і його не можна скасувати. Виберіть значення для кожної конфліктної властивості.
+move-review-property-source = Вхідне: { $value }
+move-review-property-destination = У призначенні: { $value }
+move-review-property-keep-source = Залишити вхідне
+move-review-property-keep-destination = Залишити цільове
+
+mapper-attached-rooms = Кімнати з даними в цьому джерелі
+
+area-list-filter-placeholder = Фільтрувати мапи й папки…
+
+area-list-no-matches = Відповідних мап або папок немає.
+
+mapper-multi-transferred = «{ $name }» переміщено до клану.
+
+clan-maps-no-transfer-folder = Немає папок клану, до яких ви можете перемістити цю мапу.

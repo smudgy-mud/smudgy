@@ -1,6 +1,6 @@
 //! Package panes and the client-side dependency model:
 //! installed packages, owned packages, Discover, and Private & Shared (the caller's own
-//! cloud packages plus packages friends have shared).
+//! cloud packages, packages friends have shared, and accessible clan packages).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -12,7 +12,7 @@ use iced::widget::{
 };
 use iced::{Background, Border, Color, Font, Length};
 
-use smudgy_cloud::cloud_api::{CloudApiClient, FriendView};
+use smudgy_cloud::cloud_api::CloudApiClient;
 use smudgy_cloud::package_api::{
     AvailableWithSmudgyUpgrade, CommentView, PackageApiClient, PackageDetail, PackageGrantView,
     PackageSearchResult, ResolvedPackageWire, SearchCategory, VersionListItem,
@@ -50,7 +50,8 @@ use super::common;
 use super::editors::pane_scroll;
 use super::manifest::{ManifestDraft, ManifestTab};
 use super::model::{
-    CreatorAutomations, DepEdge, NodeStatus, package_display_name, parse_specifier, specifier_for,
+    CreatorAutomations, DepEdge, NodeStatus, address_for, package_display_name, parse_specifier,
+    specifier_for,
 };
 use super::param_values::{self, ParamTarget, ParamValueEdit, ParamValueState, ScalarEdit};
 use super::readme;
@@ -885,7 +886,7 @@ async fn resolve_install_closure(
         packages: installed.to_vec(),
     };
     let expected_local_manifests = local_manifests.clone();
-    let root = client.resolve_package(owner, name, pinned).await?;
+    let root = client.resolve_package(Some(owner), name, pinned).await?;
     let available_with_smudgy_upgrade = root.available_with_smudgy_upgrade.clone();
     let ResolvedImportClosure {
         permissions,
@@ -893,13 +894,13 @@ async fn resolve_install_closure(
         closure: import_closure,
     } = closure_permission_union(client, &root).await?;
     let params = resolved_manifest_checked(&root)?.params;
-    let specifier = specifier_for(&root.owner_nickname, &root.name);
+    let specifier = address_for(root.owner_nickname.as_deref(), &root.name);
     // A closure floored above this smudgy blocks the install up front — the engine would
     // refuse it at every load. The requires walk is skipped; nothing co-installs anyway.
     if let Some(reason) = floor.refusal(&shared_packages::running_smudgy_release()) {
         return Ok(InstallResolution {
             specifier,
-            owner: root.owner_nickname,
+            owner: root.owner_nickname.unwrap_or_default(),
             name: root.name,
             version: root.version,
             available_with_smudgy_upgrade,
@@ -920,7 +921,7 @@ async fn resolve_install_closure(
         resolve_required_closure(client, &root, installed, local_manifests).await;
     Ok(InstallResolution {
         specifier,
-        owner: root.owner_nickname,
+        owner: root.owner_nickname.unwrap_or_default(),
         name: root.name,
         version: root.version,
         available_with_smudgy_upgrade,
@@ -988,7 +989,7 @@ async fn resolve_required_closure(
     };
     resolve_required_closure_from_edges(
         client,
-        &root.owner_nickname,
+        root.owner_nickname.as_deref().unwrap_or_default(),
         &root.name,
         &root.version,
         root_edges,
@@ -1061,7 +1062,7 @@ async fn resolve_required_closure_from_edges(
         } else {
             let staged = package.staged_version().map(str::to_string);
             let wire = match client
-                .resolve_package(&owner, &name, staged.as_deref())
+                .resolve_package(Some(&owner), &name, staged.as_deref())
                 .await
             {
                 Ok(wire) => wire,
@@ -1297,8 +1298,32 @@ fn installed_required_closure(
     closure
 }
 
+/// A required root's key: its name, which is global, so every spelling of a published
+/// package's address is one root. A local package keeps its reserved owner, apart from the
+/// published one.
 fn normalized_required_key(owner: &str, name: &str) -> RequiredKey {
-    (owner.to_ascii_lowercase(), name.to_ascii_lowercase())
+    let owner = if owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER) {
+        owner.to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    (owner, name.to_ascii_lowercase())
+}
+
+/// The owner a package card names: its owner's nickname, else the clan label. Only a clan's
+/// package goes without an owner nickname on the registry.
+pub(super) fn owner_label(nickname: Option<&str>) -> String {
+    nickname.map_or_else(|| crate::i18n::t!("package-owner-clan"), str::to_string)
+}
+
+/// The installed row's own address for `owner/name` (names are global, so any spelling
+/// finds it), else the address that spelling would install as.
+fn installed_specifier(installed: &[LockedPackage], owner: &str, name: &str) -> String {
+    let requested = specifier_for(owner, name);
+    installed
+        .iter()
+        .find(|package| shared_packages::same_package_address(&package.specifier, &requested))
+        .map_or(requested, |package| package.specifier.clone())
 }
 
 fn local_required_key(
@@ -1510,7 +1535,7 @@ async fn plan_required_root(
         return Err(required_unavailable(
             name,
             &CloudError::InvalidInput(format!(
-                "multiple installed rows for {specifier}; uninstall the aliases and review a new install"
+                "multiple installed rows for {specifier}; uninstall the stale one and the other keeps its settings"
             )),
         ));
     }
@@ -1523,7 +1548,7 @@ async fn plan_required_root(
         } else {
             Some(
                 client
-                    .resolve_package(owner, name, None)
+                    .resolve_package(Some(owner), name, None)
                     .await
                     .map_err(|error| required_unavailable(name, &error))?
                     .version,
@@ -1541,7 +1566,7 @@ async fn plan_required_root(
             .all(|r| range_admits(r.range.as_deref(), &parsed))
     {
         let wire = client
-            .resolve_package(owner, name, Some(version))
+            .resolve_package(Some(owner), name, Some(version))
             .await
             .map_err(|error| required_unavailable(name, &error))?;
         let root = required_root_from(&wire, client, true, false).await?;
@@ -1550,7 +1575,7 @@ async fn plan_required_root(
 
     // Otherwise seek a single published version satisfying every requirer's range.
     let latest = client
-        .resolve_package(owner, name, None)
+        .resolve_package(Some(owner), name, None)
         .await
         .map_err(|error| required_unavailable(name, &error))?;
     let versions = client
@@ -1561,7 +1586,7 @@ async fn plan_required_root(
         return Err(RequiredRefusal::Conflict(conflict_message(name, ranges)));
     };
     let wire = client
-        .resolve_package(owner, name, Some(&target))
+        .resolve_package(Some(owner), name, Some(&target))
         .await
         .map_err(|error| required_unavailable(name, &error))?;
     // Installed (the lockfile has it) but its version doesn't satisfy every range → an upgrade, even
@@ -1604,7 +1629,7 @@ async fn required_root_from(
         .map_err(|error| required_unavailable(&wire.name, &error))?
         .params;
     Ok(RequiredRoot {
-        specifier: specifier_for(&wire.owner_nickname, &wire.name),
+        specifier: address_for(wire.owner_nickname.as_deref(), &wire.name),
         name: wire.name.clone(),
         version: wire.version.clone(),
         permissions,
@@ -1717,7 +1742,7 @@ async fn closure_permission_union(
     };
 
     seen.insert((
-        root.owner_nickname.clone(),
+        root.owner_nickname.clone().unwrap_or_default(),
         root.name.clone(),
         root.version.clone(),
     ));
@@ -1728,7 +1753,7 @@ async fn closure_permission_union(
         .filter(|dependency| dependency.kind == DependencyKind::Dependency)
     {
         stack.push((
-            dep.owner_nickname.clone(),
+            dep.owner_nickname.clone().unwrap_or_default(),
             dep.name.clone(),
             dep.resolved_version.clone(),
         ));
@@ -1743,7 +1768,7 @@ async fn closure_permission_union(
             version: dep_version.clone(),
         });
         let wire = client
-            .resolve_package(&dep_owner, &dep_name, Some(&dep_version))
+            .resolve_package(Some(&dep_owner), &dep_name, Some(&dep_version))
             .await?;
         fold(&wire, &mut union, &mut floor)?;
         for dep in wire
@@ -1752,7 +1777,7 @@ async fn closure_permission_union(
             .filter(|dependency| dependency.kind == DependencyKind::Dependency)
         {
             stack.push((
-                dep.owner_nickname.clone(),
+                dep.owner_nickname.clone().unwrap_or_default(),
                 dep.name.clone(),
                 dep.resolved_version.clone(),
             ));
@@ -2735,7 +2760,7 @@ impl AutomationsWindow {
             tasks.push(Task::perform(
                 async move {
                     let resolved = client
-                        .resolve_package(&owner, &name, staged.as_deref())
+                        .resolve_package(Some(&owner), &name, staged.as_deref())
                         .await?;
                     // Fold the newest resolvable version's closure union too, so the tree can flag
                     // an update that's blocked because it needs more permissions than were granted.
@@ -2786,7 +2811,7 @@ impl AutomationsWindow {
                     manifest.is_err() || dependency.kind == DependencyKind::Dependency
                 })
                 .map(|d| {
-                    let requested = specifier_for(&d.owner_nickname, &d.name);
+                    let requested = address_for(d.owner_nickname.as_deref(), &d.name);
                     DepEdge {
                         specifier: self.governing_specifier(&requested),
                         range: d.range.clone(),
@@ -2875,7 +2900,7 @@ impl AutomationsWindow {
                 .insert(spec.to_string(), resolved.version.clone());
             self.graph.requires.insert(spec.to_string(), edges);
             for dep in &resolved.dependencies {
-                let requested = specifier_for(&dep.owner_nickname, &dep.name);
+                let requested = address_for(dep.owner_nickname.as_deref(), &dep.name);
                 self.graph.resolved.insert(
                     self.governing_specifier(&requested),
                     dep.resolved_version.clone(),
@@ -3155,7 +3180,7 @@ impl AutomationsWindow {
         let detail_task = Task::perform(
             async move {
                 let resolved = client
-                    .resolve_package(&owner, &name, staged_for_detail.as_deref())
+                    .resolve_package(Some(&owner), &name, staged_for_detail.as_deref())
                     .await?;
                 // Fold the closure union too, so the manage pane can detect an update that adds
                 // permission asks beyond the consented baseline (delta re-prompt), and the
@@ -3198,7 +3223,7 @@ impl AutomationsWindow {
         let latest_task = Task::perform(
             async move {
                 let resolved = latest_client
-                    .resolve_package(&latest_owner, &latest_name, None)
+                    .resolve_package(Some(&latest_owner), &latest_name, None)
                     .await?;
                 let latest_requirements = resolved_requires_signature(&resolved);
                 let requirements_changed =
@@ -3208,7 +3233,7 @@ impl AutomationsWindow {
                         false
                     } else if let Some(staged) = staged_for_latest.as_deref() {
                         latest_client
-                            .resolve_package(&latest_owner, &latest_name, Some(staged))
+                            .resolve_package(Some(&latest_owner), &latest_name, Some(staged))
                             .await
                             .map(|current| {
                                 latest_requirements.is_none()
@@ -3253,11 +3278,10 @@ impl AutomationsWindow {
         let Some(subpath) = self.installed_selected_file.clone() else {
             return Update::none();
         };
-        let Some(module) = self
-            .installed_detail
-            .as_deref()
-            .and_then(|detail| detail.modules.iter().find(|m| m.subpath == subpath))
-        else {
+        let Some(detail) = self.installed_detail.as_deref() else {
+            return Update::none();
+        };
+        let Some(module) = detail.modules.iter().find(|m| m.subpath == subpath) else {
             return Update::none();
         };
         let hash = module.content_hash.clone();
@@ -3285,17 +3309,18 @@ impl AutomationsWindow {
                 .insert(hash, FilePreview::TooLarge { size });
             return Update::none();
         }
-        let url = module.content_url.clone();
+        let bundle_url = detail.bundle_url.clone();
+        let bodies = detail.bodies.clone();
         let fetch_hash = hash.clone();
         let (account_fence, client) = self.frozen_package_client();
         self.installed_source
             .insert(hash.clone(), FilePreview::Loading);
         Update::with_task(Task::perform(
             async move {
-                // `fetch_module_bytes` verifies the body against `content_hash`, so a tampered or
+                // `fetch_body` verifies the body against `content_hash`, so a tampered or
                 // corrupt blob fails here rather than being shown as trusted source.
                 client
-                    .fetch_module_bytes(&url, &fetch_hash)
+                    .fetch_body(&bundle_url, &bodies, &fetch_hash)
                     .await
                     .map(classify_source)
             },
@@ -3343,6 +3368,14 @@ impl AutomationsWindow {
                 let mut scripts_changed = false;
                 // Cloud rating/install metadata for the meta row (best-effort; `None` just hides it).
                 self.installed_rating = rating.map(Box::new);
+                if self
+                    .installed_rating
+                    .as_deref()
+                    .is_some_and(|rated| rated.package.is_clan_owned())
+                    && self.package_clan_names.is_none()
+                {
+                    side_tasks.push(self.load_package_clan_names().task);
+                }
                 // Always track the resolved version's README (the pane defaults to it so the user
                 // reviews before enabling). Refreshing unconditionally — not only when the README is
                 // the current selection — keeps it in sync across a re-resolve: otherwise a pin/update
@@ -4162,18 +4195,35 @@ impl AutomationsWindow {
                     };
                     // The content-addressed cache is truth for bodies it holds (they were
                     // hash-verified when written), so a fork serves cache hits without
-                    // touching the network and fetches only the misses.
+                    // touching the network and fetches only the misses, in one bundle.
+                    // Raw bytes either way, so a fork copies binary modules faithfully too.
                     let cache = PackageCache::new().ok();
+                    let mut bodies: HashMap<String, Vec<u8>> = HashMap::new();
+                    let mut missing: Vec<&str> = Vec::new();
+                    for module in &resolved.modules {
+                        match cached_fork_body(cache.as_ref(), &module.content_hash) {
+                            Some(body) => {
+                                bodies.insert(module.content_hash.clone(), body);
+                            }
+                            None => missing.push(&module.content_hash),
+                        }
+                    }
+                    if !missing.is_empty() {
+                        bodies.extend(
+                            client
+                                .fetch_bodies(&resolved.bundle_url, &resolved.bodies, &missing)
+                                .await
+                                .map_err(|e| display_error(&e))?,
+                        );
+                    }
                     let mut modules = Vec::new();
                     for module in &resolved.modules {
-                        // Raw bytes either way, so a fork copies binary modules faithfully too.
-                        let body = match cached_fork_body(cache.as_ref(), &module.content_hash) {
-                            Some(body) => body,
-                            None => client
-                                .fetch_module_bytes(&module.content_url, &module.content_hash)
-                                .await
-                                .map_err(|e| e.to_string())?,
-                        };
+                        let body = bodies.get(&module.content_hash).cloned().ok_or_else(|| {
+                            display_error(&CloudError::SerializationError(format!(
+                                "the package bundle did not carry {}",
+                                module.subpath
+                            )))
+                        })?;
                         modules.push(LocalModule {
                             subpath: module.subpath.clone(),
                             content: body,
@@ -5014,6 +5064,8 @@ impl AutomationsWindow {
         self.share_package_id = None;
         self.publication_status = PublicationStatus::Unknown;
         self.share_is_public = false;
+        self.share_clan = None;
+        self.publish_owner = local_packages::PublishOwner::Me;
         self.share_friends.clear();
         self.share_grants.clear();
         self.share_versions.clear();
@@ -5108,46 +5160,74 @@ impl AutomationsWindow {
         let pkg_client =
             PackageApiClient::new(self.cloud.base_url.as_str(), frozen_credentials.clone());
         let cloud_client = CloudApiClient::new(self.cloud.base_url.as_str(), frozen_credentials);
+        let bound = match &self.publication_status {
+            PublicationStatus::Bound(id) => Some(*id),
+            _ => None,
+        };
         let result_name = name.clone();
         Task::perform(
             async move {
-                let mine = pkg_client.list_my_packages().await?;
-                let detail = mine
-                    .into_iter()
-                    .find(|p| naming::names_conflict(&p.package.name, &name))
-                    .ok_or(CloudError::NotFoundOrNoAccess)?;
-                let id = detail.package.id;
-                let is_public = detail.package.is_public;
-                let grants = pkg_client.list_grants(id).await?;
-                let friends = cloud_client.friends().await?;
-                let versions = pkg_client.list_versions(id).await?;
-                Ok((id, is_public, friends, grants, versions))
+                // The account's clans name a clan's package and say what it may do there; a
+                // failure leaves them out rather than the package.
+                let clans = cloud_client
+                    .clans()
+                    .await
+                    .map(|overview| overview.clans)
+                    .unwrap_or_default();
+                let share = async {
+                    // A bound folder's package, by ID: a clan's is not among the account's own.
+                    let detail = match bound {
+                        Some(id) => pkg_client.get_package(id).await?,
+                        None => pkg_client
+                            .list_my_packages()
+                            .await?
+                            .into_iter()
+                            .find(|p| naming::names_conflict(&p.package.name, &name))
+                            .ok_or(CloudError::NotFoundOrNoAccess)?,
+                    };
+                    let id = detail.package.id;
+                    let clan = detail.package.is_clan_owned().then(|| {
+                        super::clan_publish::OwnedClan::of(detail.package.owner_id, &clans)
+                    });
+                    // A clan shares its packages by membership: no friend shares.
+                    let (grants, friends) = if clan.is_some() {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        (
+                            pkg_client.list_grants(id).await?,
+                            cloud_client.friends().await?,
+                        )
+                    };
+                    let versions = pkg_client.list_versions(id).await?;
+                    Ok(super::clan_publish::OwnedShare {
+                        id,
+                        is_public: detail.package.is_public,
+                        clan,
+                        friends,
+                        grants,
+                        versions,
+                    })
+                }
+                .await;
+                (share, clans)
             },
-            move |result| Message::OwnedShareLoaded {
+            move |(result, clans)| Message::OwnedShareLoaded {
                 account_epoch,
                 account_fence,
                 seq,
                 name: result_name.clone(),
                 result,
+                clans,
             },
         )
     }
 
-    #[allow(clippy::type_complexity)]
     pub(super) fn owned_share_loaded(
         &mut self,
         seq: ShareSeq,
         name: &str,
-        result: Result<
-            (
-                Uuid,
-                bool,
-                Vec<FriendView>,
-                Vec<PackageGrantView>,
-                Vec<VersionListItem>,
-            ),
-            CloudError,
-        >,
+        result: Result<super::clan_publish::OwnedShare, CloudError>,
+        clans: &[smudgy_cloud::clans::ClanSummary],
     ) -> Update<Message, Event> {
         if seq != self.share_seq
             || !matches!(&self.selection, Selection::OwnedPackage(open) if open == name)
@@ -5155,8 +5235,16 @@ impl AutomationsWindow {
             return Update::none();
         }
         self.share_busy = false;
+        self.learn_publish_clans(name, clans);
         match result {
-            Ok((id, is_public, friends, grants, versions)) => {
+            Ok(super::clan_publish::OwnedShare {
+                id,
+                is_public,
+                clan,
+                friends,
+                grants,
+                versions,
+            }) => {
                 if let PublicationStatus::Bound(bound_id) = &self.publication_status
                     && *bound_id != id
                 {
@@ -5184,6 +5272,7 @@ impl AutomationsWindow {
                 self.share_package_id = Some(id);
                 self.publication_status = PublicationStatus::Bound(id);
                 self.share_is_public = is_public;
+                self.share_clan = clan;
                 self.share_friends = friends;
                 self.share_grants = grants;
                 self.share_versions = versions;
@@ -5198,6 +5287,7 @@ impl AutomationsWindow {
                     self.share_package_id = None;
                     self.publication_status = PublicationStatus::Unpublished;
                     self.share_is_public = false;
+                    self.share_clan = None;
                     self.share_friends.clear();
                     self.share_grants.clear();
                     self.share_versions.clear();
@@ -5565,12 +5655,15 @@ impl AutomationsWindow {
         let result_server = server.clone();
         let result_name = name.clone();
         let result_publisher_id = publisher.id;
+        let owner = self.publish_target();
+        let clan_names = self.clan_names();
         Update::with_task(Task::perform(
             async move {
-                let result =
-                    local_packages::publish_local_package(&client, &server, &name, &publisher)
-                        .await
-                        .map_err(|e| e.to_string());
+                let result = local_packages::publish_local_package(
+                    &client, &server, &name, &publisher, owner,
+                )
+                .await
+                .map_err(|error| super::clan_publish::publish_error(&error, &clan_names));
                 (operation.into_completion(), result)
             },
             move |(completion, result)| Message::PublishFinished {
@@ -5743,7 +5836,7 @@ impl AutomationsWindow {
                 for candidate in candidates {
                     let name = package_display_name(&candidate.specifier).to_string();
                     if matches!(
-                        client.resolve_package(&nick, &name, None).await,
+                        client.resolve_package(Some(&nick), &name, None).await,
                         Err(CloudError::NotFoundOrNoAccess)
                     ) {
                         // Re-check the folder right before the write: the package may have
@@ -5910,7 +6003,7 @@ impl AutomationsWindow {
         match result {
             Ok(is_public) => self.share_is_public = is_public,
             Err(e) => {
-                self.share_feedback = Some(display_error(&e));
+                self.share_feedback = Some(self.share_refusal(&e));
                 return Update::with_task(self.load_owned_share(name.to_string()));
             }
         }
@@ -6028,7 +6121,7 @@ impl AutomationsWindow {
         match result {
             Ok(versions) => self.share_versions = versions,
             Err(e) => {
-                self.share_feedback = Some(display_error(&e));
+                self.share_feedback = Some(self.share_refusal(&e));
                 return Update::with_task(self.load_owned_share(name.to_string()));
             }
         }
@@ -6305,11 +6398,61 @@ impl AutomationsWindow {
         match result {
             Ok(detail) => {
                 self.discover_readme = detail.readme.as_deref().map(markdown::Content::parse);
+                let names_clan =
+                    detail.package.is_clan_owned() && self.package_clan_names.is_none();
                 self.discover_detail = Some(Box::new(detail));
+                if names_clan {
+                    return self.load_package_clan_names();
+                }
             }
             Err(e) => self.discover_error = Some(display_error(&e)),
         }
         Update::none()
+    }
+
+    /// Loads the caller's clans so a clan-owned package names its clan.
+    fn load_package_clan_names(&self) -> Update<Message, Event> {
+        let (account_fence, credentials) = self.frozen_cloud_credentials();
+        let client = smudgy_cloud::CloudApiClient::new(self.cloud.base_url.as_str(), credentials);
+        Update::with_task(Task::perform(
+            async move {
+                client.clans().await.map(|overview| {
+                    overview
+                        .clans
+                        .into_iter()
+                        .map(|clan| (clan.id, clan.name))
+                        .collect()
+                })
+            },
+            move |result| Message::PackageClanNamesLoaded {
+                account_fence,
+                result,
+            },
+        ))
+    }
+
+    pub(super) fn package_clan_names_loaded(
+        &mut self,
+        account_fence: AccountReadFence,
+        result: Result<Vec<(Uuid, String)>, CloudError>,
+    ) -> Update<Message, Event> {
+        if !self.account_read_is_current(account_fence) {
+            return Update::none();
+        }
+        match result {
+            Ok(clans) => self.package_clan_names = Some(clans.into_iter().collect()),
+            Err(error) => log::debug!("clan names for package owners unavailable: {error}"),
+        }
+        Update::none()
+    }
+
+    /// The owner a clan-owned package names: its clan's name when the caller is in it, else
+    /// the clan label.
+    pub(super) fn package_clan_label(&self, clan_id: Uuid) -> String {
+        self.package_clan_names
+            .as_ref()
+            .and_then(|names| names.get(&clan_id).cloned())
+            .unwrap_or_else(|| crate::i18n::t!("package-owner-clan"))
     }
 
     pub(super) fn discover_comments_loaded(
@@ -7893,6 +8036,7 @@ impl AutomationsWindow {
 
     pub(super) fn open_shared(&mut self) -> Update<Message, Event> {
         self.clear_selection();
+        self.clan_packages = None;
         self.shared_with_me = None;
         self.my_cloud_packages = None;
         self.param_prompt = None;
@@ -7905,19 +8049,31 @@ impl AutomationsWindow {
         self.load_shared_cloud_lists()
     }
 
-    fn load_shared_cloud_lists(&self) -> Update<Message, Event> {
-        // Load both halves of the pane in parallel: packages friends shared with the caller, and
+    pub(super) fn load_shared_cloud_lists(&mut self) -> Update<Message, Event> {
+        self.shared_list_request = self.shared_list_request.wrapping_add(1);
+        let request = self.shared_list_request;
+        self.shared_with_me = None;
+        self.my_cloud_packages = None;
+        self.clan_packages = None;
+        self.discover_error = None;
+        if !self.signed_in() {
+            return Update::none();
+        }
+        // Load the inventories in parallel: clan packages, friend shares, and
         // the caller's own cloud packages (so an owner sees private packages that exist in no other
         // surface — e.g. one published from another machine).
         let account_epoch = self.account_epoch;
         let (account_fence, frozen_credentials) = self.frozen_cloud_credentials();
         let shared_client =
             PackageApiClient::new(self.cloud.base_url.as_str(), frozen_credentials.clone());
+        let clan_client =
+            CloudApiClient::new(self.cloud.base_url.as_str(), frozen_credentials.clone());
         let mine_client = PackageApiClient::new(self.cloud.base_url.as_str(), frozen_credentials);
         Update::with_task(Task::batch([
             Task::perform(
                 async move { shared_client.list_shared_packages().await },
                 move |result| Message::SharedLoaded {
+                    request,
                     account_epoch,
                     account_fence,
                     result,
@@ -7926,7 +8082,16 @@ impl AutomationsWindow {
             Task::perform(
                 async move { mine_client.list_my_packages().await },
                 move |result| Message::MyCloudLoaded {
+                    request,
                     account_epoch,
+                    account_fence,
+                    result,
+                },
+            ),
+            Task::perform(
+                async move { super::clan_packages::load(&clan_client).await },
+                move |result| Message::ClanPackagesLoaded {
+                    request,
                     account_fence,
                     result,
                 },
@@ -7936,11 +8101,13 @@ impl AutomationsWindow {
 
     pub(super) fn shared_loaded(
         &mut self,
+        request: u64,
         account_epoch: u64,
         account_fence: AccountReadFence,
         result: Result<Vec<PackageDetail>, CloudError>,
     ) -> Update<Message, Event> {
-        if account_epoch != self.account_epoch
+        if request != self.shared_list_request
+            || account_epoch != self.account_epoch
             || !self.account_read_is_current(account_fence)
             || self.selection != Selection::Shared
         {
@@ -7958,11 +8125,13 @@ impl AutomationsWindow {
 
     pub(super) fn my_cloud_loaded(
         &mut self,
+        request: u64,
         account_epoch: u64,
         account_fence: AccountReadFence,
         result: Result<Vec<PackageDetail>, CloudError>,
     ) -> Update<Message, Event> {
-        if account_epoch != self.account_epoch
+        if request != self.shared_list_request
+            || account_epoch != self.account_epoch
             || !self.account_read_is_current(account_fence)
             || self.selection != Selection::Shared
         {
@@ -7999,10 +8168,14 @@ impl AutomationsWindow {
         self.share_busy = false;
         self.share_package_id = None;
         self.share_is_public = false;
+        self.share_clan = None;
+        self.publish_clans.clear();
+        self.publish_owner = local_packages::PublishOwner::Me;
         self.share_friends.clear();
         self.share_grants.clear();
         self.share_versions.clear();
         self.share_feedback = None;
+        self.clan_packages = None;
         self.shared_with_me = None;
         self.my_cloud_packages = None;
         // These details can include caller-specific ratings/comments. Public search results remain
@@ -8465,14 +8638,15 @@ impl AutomationsWindow {
     pub(super) fn discover_result_card(&self, result: &PackageSearchResult) -> Elem<'_> {
         let installed = super::model::is_installed(
             &self.installed_packages,
-            &result.owner_nickname,
+            result.owner_nickname.as_deref().unwrap_or_default(),
             &result.name,
         );
         let action: Elem = if installed {
             button(text(crate::i18n::t!("package-manage")).size(12.0))
                 .style(button_style::secondary)
-                .on_press(Message::SelectInstalledPackage(specifier_for(
-                    &result.owner_nickname,
+                .on_press(Message::SelectInstalledPackage(installed_specifier(
+                    &self.installed_packages,
+                    result.owner_nickname.as_deref().unwrap_or_default(),
                     &result.name,
                 )))
                 .into()
@@ -8485,12 +8659,12 @@ impl AutomationsWindow {
                     .style(button_style::secondary)
                     .on_press(Message::DiscoverSelect {
                         package_id: result.package_id,
-                        owner: result.owner_nickname.clone(),
+                        owner: result.owner_nickname.clone().unwrap_or_default(),
                     }),
                 button(text(crate::i18n::t!("package-install")).size(12.0))
                     .style(button_style::primary)
                     .on_press(Message::DiscoverInstallResult {
-                        owner: result.owner_nickname.clone(),
+                        owner: result.owner_nickname.clone().unwrap_or_default(),
                         name: result.name.clone(),
                     }),
             ]
@@ -8508,7 +8682,7 @@ impl AutomationsWindow {
                     .style(button_style::secondary)
                     .on_press(Message::DiscoverSelect {
                         package_id: result.package_id,
-                        owner: result.owner_nickname.clone(),
+                        owner: result.owner_nickname.clone().unwrap_or_default(),
                     }),
             ]
             .spacing(8.0)
@@ -8520,7 +8694,7 @@ impl AutomationsWindow {
         let star_color = crate::prefs::current().palette.output;
         let mut meta_spans: Vec<iced::widget::text::Span<'_, ()>> = vec![span(crate::i18n::t!(
             "package-search-meta",
-            "owner" => &result.owner_nickname,
+            "owner" => owner_label(result.owner_nickname.as_deref()),
             "version" => result.latest_version.as_deref().unwrap_or("—"),
             "count" => result.install_count
         ))];
@@ -8569,11 +8743,18 @@ impl AutomationsWindow {
 
     fn view_discover_detail(&self, detail: &PackageDetail) -> Elem<'_> {
         let pkg = &detail.package;
-        let owner = pkg
-            .owner_nickname
-            .clone()
-            .unwrap_or_else(|| crate::i18n::t!("package-you"));
-        let installed = super::model::is_installed(&self.installed_packages, &owner, &pkg.name);
+        let owner = if pkg.is_clan_owned() {
+            self.package_clan_label(pkg.owner_id)
+        } else {
+            pkg.owner_nickname
+                .clone()
+                .unwrap_or_else(|| crate::i18n::t!("package-you"))
+        };
+        let installed = super::model::is_installed(
+            &self.installed_packages,
+            pkg.owner_nickname.as_deref().unwrap_or_default(),
+            &pkg.name,
+        );
         let action: Elem = if installed {
             button(text(crate::i18n::t!("package-installed")).size(12.0))
                 .style(button_style::secondary)
@@ -8780,7 +8961,10 @@ impl AutomationsWindow {
                 .size(16.0),
             )
             .push(
-                text(crate::i18n::t!("package-publisher", "publisher" => &prompt.owner))
+                text(crate::i18n::t!(
+                    "package-publisher",
+                    "publisher" => owner_label(Some(prompt.owner.as_str()).filter(|owner| !owner.is_empty()))
+                ))
                     .size(12.0)
                     .style(common::muted),
             );
@@ -9237,7 +9421,7 @@ impl AutomationsWindow {
                 }
             }
         }
-        pane_scroll(body)
+        pane_scroll(body.push(self.clan_package_sections()))
     }
 }
 
@@ -9247,7 +9431,7 @@ impl AutomationsWindow {
 /// into the space that remains. In iced's flex layout, a shrink-width text column is measured before
 /// later siblings and can consume their room; making the content fluid causes the action rail to be
 /// measured first instead.
-fn card_with_trailing_action<'a, Message, Theme, Renderer>(
+pub(super) fn card_with_trailing_action<'a, Message, Theme, Renderer>(
     content: impl Into<iced::Element<'a, Message, Theme, Renderer>>,
     action: impl Into<iced::Element<'a, Message, Theme, Renderer>>,
 ) -> iced::Element<'a, Message, Theme, Renderer>
@@ -9467,6 +9651,26 @@ fn cached_fork_body(cache: Option<&PackageCache>, content_hash: &str) -> Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_package_without_an_owner_nickname_is_shown_as_a_clans() {
+        use smudgy_core::models::shared_packages::{LockedPackage, UpdateMode};
+        assert_eq!(super::owner_label(Some("wbk")), "wbk");
+        assert_eq!(
+            super::owner_label(None),
+            crate::i18n::translate("package-owner-clan")
+        );
+        // A search result opens the installed row under its own spelling.
+        let installed = [LockedPackage::new("smudgy://wbk/mapper", UpdateMode::Auto)];
+        assert_eq!(
+            super::installed_specifier(&installed, "", "Mapper"),
+            "smudgy://wbk/mapper"
+        );
+        assert_eq!(
+            super::installed_specifier(&installed, "", "guild-lib"),
+            "smudgy:@guild-lib"
+        );
+    }
+
     #[tokio::test]
     async fn mixed_case_required_planner_reuses_satisfying_installed_pin() {
         use std::io::{Read as _, Write as _};
@@ -9601,8 +9805,12 @@ mod tests {
         let closure = installed_required_closure(&lock, root, &manifest, |_| {
             Some(PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap())
         });
-        assert_eq!(closure.required, BTreeSet::from([good.to_string()]));
-        assert_eq!(closure.unavailable.len(), 3);
+        // Names are global: `smudgy://wrong/owner` names the installed `smudgy://a/owner`.
+        assert_eq!(
+            closure.required,
+            BTreeSet::from([good.to_string(), "smudgy://a/owner".to_string()])
+        );
+        assert_eq!(closure.unavailable.len(), 2);
         assert!(!closure.preserve_existing);
 
         let mut lock = lock;
@@ -9658,22 +9866,23 @@ mod tests {
             published_at: "2026-08-10T00:00:00Z".parse().unwrap(),
         };
 
+        let share = |is_public, versions| super::super::clan_publish::OwnedShare {
+            id: Uuid::new_v4(),
+            is_public,
+            clan: None,
+            friends: Vec::new(),
+            grants: Vec::new(),
+            versions,
+        };
         let current = window.share_seq;
-        let _ = window.owned_share_loaded(
-            current,
-            "demo",
-            Ok((Uuid::new_v4(), true, vec![], vec![], vec![version.clone()])),
-        );
+        let _ =
+            window.owned_share_loaded(current, "demo", Ok(share(true, vec![version.clone()])), &[]);
         assert!(!window.share_busy);
         assert_eq!(window.share_versions, vec![version.clone()]);
 
         window.selection = Selection::OwnedPackage("other".to_string());
         window.share_busy = true;
-        let _ = window.owned_share_loaded(
-            current,
-            "demo",
-            Ok((Uuid::new_v4(), false, vec![], vec![], Vec::new())),
-        );
+        let _ = window.owned_share_loaded(current, "demo", Ok(share(false, Vec::new())), &[]);
         assert!(
             window.share_busy,
             "a stale result must not finish the current load"
@@ -9683,11 +9892,7 @@ mod tests {
         window.selection = Selection::OwnedPackage("demo".to_string());
         window.share_seq.bump();
         window.share_busy = true;
-        let _ = window.owned_share_loaded(
-            current,
-            "demo",
-            Ok((Uuid::new_v4(), false, vec![], vec![], Vec::new())),
-        );
+        let _ = window.owned_share_loaded(current, "demo", Ok(share(false, Vec::new())), &[]);
         assert!(window.share_busy, "an older same-package load stays fenced");
         assert_eq!(window.share_versions.len(), 1);
     }

@@ -20,6 +20,7 @@ smudgy_theme = { workspace = true }
 smudgy_ui_shared = { workspace = true }
 smudgy_session_model = { workspace = true }
 smudgy_map_widget = { workspace = true }
+smudgy_palette = { workspace = true }
 smudgy_i18n = { workspace = true, features = ["all-locales"] }
 sys-locale = { workspace = true }
 anyhow = { workspace = true }
@@ -97,7 +98,7 @@ httpdate = "1"
 discord-rich-presence = "1.1.0"
 smudgy_audio = { workspace = true, optional = true }
 smudgy_audio_web = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
+futures = { workspace = true }
 
 # Restart Manager cooperation so the installer can upgrade over a running smudgy:
 # a window-proc subclass catches the session-end message and exits. See win_rm.rs.
@@ -125,7 +126,6 @@ web-audio = ["smudgy_core/web-audio"]
 web-audio-cpal = [
     "smudgy_ui_shared/web-audio-cpal",
     "web-audio",
-    "dep:futures",
     "dep:smudgy_audio",
     "dep:smudgy_audio_web",
     "smudgy_audio/physical-output",

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod aliases;
 pub mod auth;
 pub mod automation_transaction;
+pub mod default_atlases;
 pub mod hotkeys;
 pub mod input_history;
 pub mod local_packages;

@@ -32,6 +32,7 @@ use windows::automations_window::{
 use windows::settings_window::{self, Event as SettingsWindowEvent, SettingsWindow};
 use windows::smudgy_window::SmudgyWindow;
 
+mod account_deletion;
 #[cfg(feature = "web-audio-cpal")]
 mod application_audio;
 mod assets;
@@ -42,6 +43,7 @@ mod images;
 mod package_requirements;
 mod package_update_checker;
 mod pane_drag;
+pub mod presets;
 pub use smudgy_ui_shared::pane_groups;
 pub mod prefs;
 mod session_store;
@@ -189,6 +191,9 @@ struct Smudgy {
     /// the window increments it, so a result from a task started before the rebuild is dropped.
     automations_context_generation: u64,
     map_editor_windows: BTreeMap<window::Id, MapEditorWindow>,
+    /// What the next map editor to open shows first: Settings › Clans asked
+    /// for a map, or its Share dialog, while no editor was open.
+    pending_map_area: Option<windows::map_editor_window::Message>,
     settings_windows: BTreeMap<window::Id, SettingsWindow>,
     /// Areas the user excludes from room identification, mirrored from
     /// settings.json. The authoritative copy for fan-out to live mappers.
@@ -556,6 +561,8 @@ enum Message {
     },
     MapEditorWindowMessage(window::Id, windows::map_editor_window::Message),
     NewMapEditorWindow {
+        /// The room the player is in, where the editor opens.
+        location: Option<(AreaId, i32)>,
         id: window::Id,
         mapper: Mapper,
         server_name: Arc<String>,
@@ -563,6 +570,7 @@ enum Message {
     CreateMapEditorWindow {
         mapper: Mapper,
         server_name: Arc<String>,
+        location: Option<(AreaId, i32)>,
     },
     SettingsWindowMessage(window::Id, windows::settings_window::Message),
     NewSettingsWindow(window::Id),
@@ -897,6 +905,7 @@ fn init(
             automations_window_opening: None,
             automations_context_generation: 0,
             map_editor_windows: BTreeMap::new(),
+            pending_map_area: None,
             settings_windows: BTreeMap::new(),
             disabled_map_areas,
             area_prefs,
@@ -1240,6 +1249,7 @@ fn subscription(smudgy: &Smudgy) -> Subscription<Message> {
     // changes and prefs for newly-shared areas reconcile in (login covers the
     // session-start case; this covers "after a /sync row-set change").
     if smudgy.account.snapshot().signed_in {
+        subs.push(smudgy.account.refusals().map(Message::Account));
         subs.push(
             iced::time::every(Duration::from_secs(90)).map(|_| Message::AreaPrefsReconcileTick),
         );
@@ -1344,6 +1354,52 @@ fn scoped_audio_step(window_id: window::Id, backwards: bool) -> Task<Message> {
         operation,
     ))
     .discard()
+}
+
+/// Settings › Clans hands a map, or its Share dialog, to the map editor: an
+/// open editor shows it; otherwise one opens on the first session with a
+/// mapper and shows it.
+fn open_map_in_editor(
+    smudgy: &mut Smudgy,
+    show: windows::map_editor_window::Message,
+) -> Task<Message> {
+    if let Some(&id) = smudgy.map_editor_windows.keys().next_back() {
+        return Task::batch([
+            Task::done(Message::MapEditorWindowMessage(id, show)),
+            window::gain_focus(id),
+        ]);
+    }
+    let Some((mapper, server_name)) = smudgy.sessions.iter().find_map(|(_, session)| {
+        session
+            .mapper
+            .clone()
+            .map(|mapper| (mapper, Arc::new(session.server_name.clone())))
+    }) else {
+        log::info!("no session with a mapper to open a map in");
+        return Task::none();
+    };
+    smudgy.pending_map_area = Some(show);
+    Task::done(Message::CreateMapEditorWindow {
+        mapper,
+        server_name,
+        location: None,
+    })
+}
+
+/// Settings › Clans hands a package to Automations, on the first session.
+fn open_package_in_automations(smudgy: &Smudgy, name: &str) -> Task<Message> {
+    let Some((session_id, session)) = smudgy.sessions.iter().next() else {
+        log::info!("no session to open package {name} in");
+        return Task::none();
+    };
+    Task::done(Message::CreateAutomationsWindow {
+        server_name: Arc::new(session.server_name.clone()),
+        session_id,
+        profile_name: session.profile_name.clone(),
+        focus: Some(AutomationsFocus::PackageSettings(
+            format!("smudgy:@{name}").into(),
+        )),
+    })
 }
 
 #[cfg(feature = "web-audio-cpal")]
@@ -3713,7 +3769,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                     );
                 }
                 if smudgy.smudgy_windows.is_empty() && !opening_main_survives {
-                    for editor in smudgy.map_editor_windows.values() {
+                    for editor in smudgy.map_editor_windows.values_mut() {
                         editor.prepare_to_close();
                     }
                     // Quit defers `iced::exit()` behind the write-complete
@@ -3757,16 +3813,21 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 smudgy.settings_windows.remove(&id);
                 Task::none()
             } else {
-                if let Some(window) = smudgy.map_editor_windows.get(&id) {
+                if let Some(mut window) = smudgy.map_editor_windows.remove(&id) {
                     window.prepare_to_close();
                 }
-                smudgy.map_editor_windows.remove(&id);
                 Task::none()
             }
         }
         Message::Account(msg) => {
             let before = automations_account_identity(&smudgy.account);
+            let was_signed_in = smudgy.account.snapshot().signed_in;
             let task = smudgy.account.update(msg).map(Message::Account);
+            if was_signed_in && !smudgy.account.snapshot().signed_in {
+                // A refused credential signed the account out: the mappers drop
+                // its cloud maps now rather than at their next sync.
+                poke_all_mappers(smudgy);
+            }
             let after = automations_account_identity(&smudgy.account);
             if before == after {
                 task
@@ -3824,11 +3885,13 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 Some(SmudgyWindowEvent::CreateNewMapEditorWindow {
                     mapper,
                     server_name,
+                    location,
                 }) => Task::batch([
                     task,
                     Task::done(Message::CreateMapEditorWindow {
                         mapper,
                         server_name,
+                        location,
                     }),
                 ]),
                 Some(SmudgyWindowEvent::SetMapperCurrentLocation(area_id, room_number)) => {
@@ -5074,9 +5137,11 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
         Message::CreateMapEditorWindow {
             mapper,
             server_name,
+            location,
         } => {
             let (_, task) = window::open(secondary_window_settings(Size::new(600.0, 400.0)));
             task.map(move |id| Message::NewMapEditorWindow {
+                location,
                 id,
                 mapper: mapper.clone(),
                 server_name: server_name.clone(),
@@ -5086,6 +5151,7 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             id,
             mapper,
             server_name,
+            location,
         } => {
             // CloudHandles are app-global, so they're attached here at
             // construction (like SettingsWindow) rather than threaded through
@@ -5108,9 +5174,13 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                 smudgy.map_editor_clipboard.clone(),
                 (*server_name).clone(),
                 smudgy.map_scopes.clone(),
+                location,
             );
             smudgy.map_editor_windows.insert(id, window);
-            Task::none()
+            match smudgy.pending_map_area.take() {
+                Some(message) => Task::done(Message::MapEditorWindowMessage(id, message)),
+                None => Task::none(),
+            }
         }
         Message::CreateSettingsWindow => {
             // Reuse an existing settings window rather than stacking copies.
@@ -5122,10 +5192,12 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
             }
         }
         Message::NewSettingsWindow(id) => {
-            smudgy
-                .settings_windows
-                .insert(id, SettingsWindow::new(smudgy.account.handles()));
-            Task::none()
+            let mut window = SettingsWindow::new(smudgy.account.handles());
+            let prefetch = window
+                .prefetch()
+                .map(move |msg| Message::SettingsWindowMessage(id, msg));
+            smudgy.settings_windows.insert(id, window);
+            prefetch
         }
         Message::SettingsWindowMessage(id, msg) => {
             if let Some(window) = smudgy.settings_windows.get_mut(&id) {
@@ -5154,6 +5226,19 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                         let task = smudgy.account.sign_out(everywhere).map(Message::Account);
                         poke_all_mappers(smudgy);
                         Task::batch([task, notify_automations_account_changed(smudgy)])
+                    }
+                    Some(SettingsWindowEvent::DeletionRequested(key)) => {
+                        smudgy.account.deletion_requested(key);
+                        Task::none()
+                    }
+                    Some(SettingsWindowEvent::DeletionRefused(key)) => {
+                        smudgy.account.deletion_refused(key);
+                        Task::none()
+                    }
+                    Some(SettingsWindowEvent::AccountDeleted(key)) => {
+                        smudgy.account.account_deleted(key);
+                        poke_all_mappers(smudgy);
+                        notify_automations_account_changed(smudgy)
                     }
                     Some(SettingsWindowEvent::ProfileUpdated(profile)) => {
                         smudgy.account.absorb_profile(*profile);
@@ -5216,6 +5301,17 @@ fn update_body(smudgy: &mut Smudgy, message: Message) -> Task<Message> {
                             })
                             .collect();
                         Task::batch(fan_out)
+                    }
+                    Some(SettingsWindowEvent::OpenMap(area)) => open_map_in_editor(
+                        smudgy,
+                        windows::map_editor_window::Message::AreaSelected(area),
+                    ),
+                    Some(SettingsWindowEvent::OpenMapAccess(area)) => open_map_in_editor(
+                        smudgy,
+                        windows::map_editor_window::Message::MapAccessRequested(area),
+                    ),
+                    Some(SettingsWindowEvent::OpenPackage(name)) => {
+                        open_package_in_automations(smudgy, &name)
                     }
                     None => Task::none(),
                 };

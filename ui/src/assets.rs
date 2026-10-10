@@ -227,14 +227,17 @@ pub mod bootstrap_icons {
     pub const DATABASE: &str = "\u{F8C4}";
     pub const DPAD: &str = "\u{F687}";
     pub const EXCLAMATION_TRIANGLE: &str = "\u{F33B}";
+    pub const EYE_SLASH: &str = "\u{F340}";
     pub const FOLDER_PLUS: &str = "\u{F3D3}";
     pub const FONTS: &str = "\u{F3DA}";
     pub const LIGHTNING: &str = "\u{F46F}";
+    pub const LIST_UL: &str = "\u{F478}";
     pub const PENCIL: &str = "\u{F4CB}";
     pub const PEOPLE: &str = "\u{F4D9}";
     pub const PLUS_LG: &str = "\u{F64D}";
     pub const PLUS_SQUARE: &str = "\u{F4FD}";
     pub const SEARCH: &str = "\u{F52A}";
+    pub const SHARE: &str = "\u{F52E}";
     pub const SLASH_CIRCLE: &str = "\u{F567}";
     pub const TOGGLE_OFF: &str = "\u{F5D5}";
     pub const TOGGLE_ON: &str = "\u{F5D6}";

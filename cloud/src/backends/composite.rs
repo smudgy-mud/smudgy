@@ -22,8 +22,7 @@
 //! cloud's `/sync`, so [`sync_state`](CompositeBackend::sync_state)
 //! **synthesizes a stable row per local and ephemeral area** and folds them
 //! into the cloud rows — otherwise every sync tick would wipe those tiers.
-//! Owner-fingerprinted and carrying the area's real rev, those rows stay quiet
-//! across ticks. The mapper adopts local generations separately and filters
+//! Carrying the area's real rev, those rows stay quiet across ticks. The mapper adopts local generations separately and filters
 //! these compatibility rows out of cloud reconciliation.
 
 use std::{collections::HashSet, sync::Arc};
@@ -33,13 +32,12 @@ use parking_lot::RwLock;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-use super::{
-    AreaMergeCommit, AreaMergePlan, EphemeralBackend, LEGACY_ACCESS_FINGERPRINT, MapperBackend,
-};
+use super::{AreaMergeCommit, AreaMergePlan, EphemeralBackend, MapperBackend};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CloudError, CloudResult, CreateAreaRequest, MapStorage, SyncRow,
-    mutation::{MutationEnvelope, MutationResult},
+    CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
+    cloud_api::{SecretChange, SecretGrant, SecretSummary},
+    mutation::{MoveRequest, MoveResult, MutationEnvelope, MutationResult},
 };
 
 type DynBackend = Arc<dyn MapperBackend + Send + Sync>;
@@ -158,16 +156,9 @@ impl CompositeBackend {
     }
 }
 
-/// A stable owner-fingerprinted sync row for an area no `/sync` covers.
+/// A stable sync row for an area no `/sync` covers.
 fn synthesized_row(area: &Area) -> SyncRow {
-    SyncRow {
-        area_id: area.id,
-        rev: area.rev,
-        access_fingerprint: area.access.map_or_else(
-            || LEGACY_ACCESS_FINGERPRINT.to_string(),
-            |access| access.fingerprint(),
-        ),
-    }
+    SyncRow::synthesized(area)
 }
 
 #[async_trait]
@@ -401,6 +392,29 @@ impl MapperBackend for CompositeBackend {
     // trait default would silently drop the precondition before it could
     // reach a cloud backend that enforces it. A refused delete leaves the
     // tier index untouched.
+    async fn review_local_move(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<crate::relocation::LocalMoveReview> {
+        self.area_backend(*area_id)
+            .await?
+            .review_local_move(area_id, auth_generation)
+            .await
+    }
+
+    async fn finish_local_move(
+        &self,
+        area_id: &AreaId,
+        guard: &crate::relocation::LocalMoveGuard,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.area_backend(*area_id)
+            .await?
+            .finish_local_move(area_id, guard, auth_generation)
+            .await
+    }
+
     async fn delete_area_expecting(
         &self,
         area_id: &AreaId,
@@ -461,7 +475,175 @@ impl MapperBackend for CompositeBackend {
             .await
     }
 
+    // ===== SECRETS AND MOVES =====
+    //
+    // Routed by tier like any area write; only the cloud tier accepts them.
+
+    async fn create_secret_as(
+        &self,
+        area_id: &AreaId,
+        secret: &crate::clan_secrets::NewSecret,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        self.area_backend(*area_id)
+            .await?
+            .create_secret_as(area_id, secret, auth_generation)
+            .await
+    }
+
+    async fn update_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        change: &SecretChange,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        self.area_backend(*area_id)
+            .await?
+            .update_secret(area_id, secret, change, auth_generation)
+            .await
+    }
+
+    async fn rename_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        name: &str,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        self.area_backend(*area_id)
+            .await?
+            .rename_secret(area_id, secret, name, auth_generation)
+            .await
+    }
+
+    async fn recolor_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        color: Option<&str>,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        self.area_backend(*area_id)
+            .await?
+            .recolor_secret(area_id, secret, color, auth_generation)
+            .await
+    }
+
+    async fn delete_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.area_backend(*area_id)
+            .await?
+            .delete_secret(area_id, secret, auth_generation)
+            .await
+    }
+
+    async fn secret_grants(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        auth_generation: u64,
+    ) -> CloudResult<Vec<SecretGrant>> {
+        self.area_backend(*area_id)
+            .await?
+            .secret_grants(area_id, secret, auth_generation)
+            .await
+    }
+
+    async fn grant_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grantee_id: Uuid,
+        actions: &[&str],
+        auth_generation: u64,
+    ) -> CloudResult<SecretGrant> {
+        self.area_backend(*area_id)
+            .await?
+            .grant_secret(area_id, secret, grantee_id, actions, auth_generation)
+            .await
+    }
+
+    async fn update_secret_grant(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grant_id: Uuid,
+        actions: &[&str],
+        auth_generation: u64,
+    ) -> CloudResult<SecretGrant> {
+        self.area_backend(*area_id)
+            .await?
+            .update_secret_grant(area_id, secret, grant_id, actions, auth_generation)
+            .await
+    }
+
+    async fn revoke_secret_grant(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grant_id: Uuid,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.area_backend(*area_id)
+            .await?
+            .revoke_secret_grant(area_id, secret, grant_id, auth_generation)
+            .await
+    }
+
+    async fn move_content(
+        &self,
+        area_id: &AreaId,
+        request: &MoveRequest,
+        auth_generation: u64,
+    ) -> CloudResult<MoveResult> {
+        self.area_backend(*area_id)
+            .await?
+            .move_content(area_id, request, auth_generation)
+            .await
+    }
+
+    async fn review_move_content(
+        &self,
+        area_id: &AreaId,
+        request: &MoveRequest,
+        auth_generation: u64,
+    ) -> CloudResult<crate::access_review::AccessReview> {
+        self.area_backend(*area_id)
+            .await?
+            .review_move_content(area_id, request, auth_generation)
+            .await
+    }
+
     // ===== MULTI-AREA TRANSACTIONS =====
+    async fn review_filing(
+        &self,
+        area_id: &AreaId,
+        atlas_id: Option<AtlasId>,
+        auth_generation: u64,
+    ) -> CloudResult<crate::access_review::AccessReview> {
+        self.area_backend(*area_id)
+            .await?
+            .review_filing(area_id, atlas_id, auth_generation)
+            .await
+    }
+
+    async fn commit_reviewed_filing(
+        &self,
+        area_id: &AreaId,
+        atlas_id: Option<AtlasId>,
+        token: &str,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.area_backend(*area_id)
+            .await?
+            .commit_reviewed_filing(area_id, atlas_id, token, auth_generation)
+            .await
+    }
 
     async fn merge_areas(&self, plan: &AreaMergePlan) -> CloudResult<AreaMergeCommit> {
         self.ensure_routing_seeded().await?;
@@ -568,6 +750,19 @@ impl MapperBackend for CompositeBackend {
         Ok(all)
     }
 
+    /// One tier's atlases, its failure included: a cloud list that fails
+    /// (or a signed-out cloud) is an error here, not an empty tier.
+    async fn list_atlases_in(&self, storage: MapStorage) -> CloudResult<Vec<AtlasListItem>> {
+        match storage {
+            MapStorage::Session => Ok(Vec::new()),
+            MapStorage::Local => self.local.list_atlases().await,
+            MapStorage::Cloud if !self.cloud.has_credential() => Err(CloudError::Unauthorized(
+                "signed out: the cloud folders can't be read".to_string(),
+            )),
+            MapStorage::Cloud => self.cloud.list_atlases().await,
+        }
+    }
+
     async fn create_atlas(&self, name: &str) -> CloudResult<Atlas> {
         // No explicit hint: signed out => local (only option); signed in =>
         // cloud, the default tier.
@@ -619,6 +814,16 @@ impl MapperBackend for CompositeBackend {
 
     // ===== SYNC / IDENTITY =====
 
+    async fn finish_local_atlas_move(
+        &self,
+        atlas_id: &AtlasId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.cloud
+            .finish_local_atlas_move(atlas_id, auth_generation)
+            .await
+    }
+
     fn supports_sync(&self) -> bool {
         // The cloud tier drives /sync; the local rows ride along (see module
         // docs) so the engine never prunes them.
@@ -669,14 +874,7 @@ impl MapperBackend for CompositeBackend {
                 let cloud_areas = self.cloud.list_areas().await?;
                 let mut rows: Vec<SyncRow> = cloud_areas
                     .into_iter()
-                    .map(|area| SyncRow {
-                        area_id: area.id,
-                        rev: area.rev,
-                        access_fingerprint: area.access.map_or_else(
-                            || LEGACY_ACCESS_FINGERPRINT.to_string(),
-                            |access| access.fingerprint(),
-                        ),
-                    })
+                    .map(|area| SyncRow::synthesized(&area))
                     .collect();
                 rows.extend(local_rows);
                 Ok(Some(rows))
@@ -741,6 +939,15 @@ impl MapperBackend for CompositeBackend {
         // engine's re-resolve + full resync (which prunes the prior account's
         // cloud areas while leaving the local tier untouched).
         self.cloud.auth_generation()
+    }
+
+    /// A loose create follows the active tier, as `create_area` routes it.
+    fn default_storage(&self) -> MapStorage {
+        if self.cloud.has_credential() {
+            MapStorage::Cloud
+        } else {
+            MapStorage::Local
+        }
     }
 
     fn has_credential(&self) -> bool {
@@ -844,14 +1051,15 @@ mod tests {
 
     fn room_envelope(area_id: AreaId, expected_rev: i64) -> MutationEnvelope {
         MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![crate::mutation::Precondition {
-                resource: crate::mutation::ResourceKind::Area,
-                id: area_id.0,
+            preconditions: vec![crate::mutation::Precondition::source(
+                area_id.0,
+                crate::SourceId::map(),
                 expected_rev,
-                access_fingerprint: None,
-            }],
+            )],
             payload: vec![crate::mutation::AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: RoomUpdates::default(),
             }],
@@ -880,7 +1088,10 @@ mod tests {
 
     fn owned_area(id: AreaId, name: &str, rev: i64) -> AreaWithDetails {
         AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: Area {
+                projection_token: None,
                 id,
                 user_id: None,
                 atlas_id: None,
@@ -894,9 +1105,12 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
             },
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: Vec::new(),
             rooms: Vec::new(),
             labels: Vec::new(),
@@ -916,6 +1130,8 @@ mod tests {
             .create_area(CreateAreaRequest {
                 name: "Local".to_string(),
                 atlas_id: None,
+                clan_id: None,
+                ownership: None,
                 ephemeral: false,
                 properties: BTreeMap::new(),
             })
@@ -964,8 +1180,8 @@ mod tests {
         let cloud_id = AreaId(Uuid::new_v4());
         cloud.set_sync(Ok(Some(vec![SyncRow {
             area_id: cloud_id,
-            rev: 9,
-            access_fingerprint: "fp".to_string(),
+            projection_token: "p_9".to_string(),
+            revisions: std::collections::BTreeMap::from([(crate::SourceId::map(), 9)]),
         }])));
 
         let composite = CompositeBackend::new(local, cloud);
@@ -1064,6 +1280,8 @@ mod tests {
             .create_area(CreateAreaRequest {
                 name: "Session map".to_string(),
                 atlas_id: None,
+                clan_id: None,
+                ownership: None,
                 ephemeral: true,
                 properties: BTreeMap::new(),
             })
@@ -1081,14 +1299,15 @@ mod tests {
             .execute_mutation(
                 &area.id,
                 &MutationEnvelope {
+                    source: crate::SourceId::map(),
                     operation_id: Uuid::new_v4(),
-                    preconditions: vec![crate::mutation::Precondition {
-                        resource: crate::mutation::ResourceKind::Area,
-                        id: area.id.0,
-                        expected_rev: 1,
-                        access_fingerprint: None,
-                    }],
+                    preconditions: vec![crate::mutation::Precondition::source(
+                        area.id.0,
+                        crate::SourceId::map(),
+                        1,
+                    )],
                     payload: vec![crate::mutation::AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: crate::RoomNumber(1),
                         body: RoomUpdates {
                             title: Some("Gate".to_string()),
@@ -1135,6 +1354,8 @@ mod tests {
             let mut request = CreateAreaRequest {
                 name: label.clone(),
                 atlas_id: None,
+                clan_id: None,
+                ownership: None,
                 ephemeral: false,
                 properties: BTreeMap::new(),
             };
@@ -1167,14 +1388,15 @@ mod tests {
         let composite = CompositeBackend::new(local, cloud);
 
         let envelope = MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![crate::mutation::Precondition {
-                resource: crate::mutation::ResourceKind::Area,
-                id: local_id.0,
-                expected_rev: 1,
-                access_fingerprint: None,
-            }],
+            preconditions: vec![crate::mutation::Precondition::source(
+                local_id.0,
+                crate::SourceId::map(),
+                1,
+            )],
             payload: vec![crate::mutation::AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: crate::RoomNumber(1),
                 body: RoomUpdates {
                     title: Some("Hall".to_string()),
@@ -1242,6 +1464,8 @@ mod tests {
             .create_area(CreateAreaRequest {
                 name: "Session".to_string(),
                 atlas_id: None,
+                clan_id: None,
+                ownership: None,
                 ephemeral: true,
                 properties: BTreeMap::new(),
             })
@@ -1299,6 +1523,8 @@ mod tests {
             .create_area(CreateAreaRequest {
                 name: "Source".to_string(),
                 atlas_id: None,
+                clan_id: None,
+                ownership: None,
                 ephemeral: false,
                 properties: BTreeMap::new(),
             })
@@ -1343,6 +1569,8 @@ mod tests {
                 .create_area(CreateAreaRequest {
                     name: name.to_string(),
                     atlas_id: None,
+                    clan_id: None,
+                    ownership: None,
                     ephemeral: true,
                     properties: BTreeMap::new(),
                 })

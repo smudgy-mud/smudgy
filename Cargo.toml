@@ -5,6 +5,7 @@ members = [
     "cloud",
     "i18n",
     "map_widget",
+    "palette",
     "bench",
     "script",
     "inspector",
@@ -123,6 +124,7 @@ smudgy_theme = { path = "./theme" }
 smudgy_cloud = { path = "./cloud", features = ["cloud"] }
 smudgy_widgets = { path = "./widgets" }
 smudgy_map_widget = { path = "./map_widget" }
+smudgy_palette = { path = "./palette" }
 smudgy_i18n = { path = "./i18n", default-features = false }
 smudgy_audio = { path = "./audio" }
 smudgy_audio_web = { path = "./audio_web" }

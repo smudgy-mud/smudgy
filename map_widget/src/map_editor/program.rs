@@ -16,19 +16,19 @@ use iced::event::Event as IcedEvent;
 
 use smudgy_cloud::{
     CORNER_INSET, ConnectionEndpoint, ConnectionId, ConnectionRouting, ConnectionUpdates, MapPoint,
-    PortMode, RoomNumber, RoomSide, SegmentShape,
+    PortMode, RoomAddress, RoomSide, SegmentShape,
     connection_geometry::{
         EndpointGeometry, GeometryInput, Handle as ConnectionHandle, distance_to_segment,
         port_position, reroute_for_port_move, reroute_for_waypoint_move, resolve, stub_tip,
     },
-    mapper::{RoomKey, room_connection::RoomConnection},
+    mapper::{RoomKey, area_cache::SourceLayer, room_connection::RoomConnection},
 };
 
-use crate::{render, viewport};
+use crate::{render, sources, viewport};
 
 use super::{
-    EntityId, ExitTarget, MapEditor, Message, RectKind, Renderer, SelectedConnectionHandle, Theme,
-    Tool, direction_between,
+    EntityId, ExitTarget, LinkDrop, MapEditor, Message, PlacedRoom, RectKind, Renderer,
+    SelectedConnectionHandle, Theme, Tool, direction_between,
 };
 
 /// Screen-space distance (pixels) a press must travel before it becomes a
@@ -133,6 +133,8 @@ pub enum Interaction {
     Panning {
         translation: Vector,
         start: Point,
+        /// The cursor left the drag threshold: a pan, not a right click.
+        moved: bool,
     },
     /// A left press on an entity that hasn't crossed the drag threshold.
     PendingSelect {
@@ -155,7 +157,7 @@ pub enum Interaction {
     },
     /// Dragging a new exit out of a room's border band.
     DraggingExit {
-        from: RoomNumber,
+        from: PlacedRoom,
         from_center: Point,
         current_map: Point,
     },
@@ -280,6 +282,8 @@ impl MapEditor {
         };
         let atlas = self.mapper.get_current_atlas();
         let area = atlas.get_area(self.area_id.as_ref()?)?;
+        // A Secret's link is edited in its own document.
+        let (area, _) = area.connection_document(connection_id)?;
         let stored = area.get_connection(connection_id)?;
         let radius = HANDLE_SCREEN_SIZE / self.scaling;
         let point = MapPoint::new(point.x, point.y);
@@ -289,10 +293,10 @@ impl MapEditor {
         render.geometry.handles.iter().copied().find_map(|handle| {
             let on_level = match handle {
                 ConnectionHandle::PortA(_) => area
-                    .get_room(&stored.endpoint_a.room_number)
+                    .get_room_at(stored.endpoint_a.address())
                     .is_some_and(|room| room.get_level() == self.level),
                 ConnectionHandle::PortB(_) => stored.endpoint_b.is_some_and(|endpoint| {
-                    area.get_room(&endpoint.room_number)
+                    area.get_room_at(endpoint.address())
                         .is_some_and(|room| room.get_level() == self.level)
                 }),
                 ConnectionHandle::Waypoint(_, _) => true,
@@ -311,6 +315,7 @@ impl MapEditor {
     ) -> Option<ConnectionUpdates> {
         let atlas = self.mapper.get_current_atlas();
         let area = atlas.get_area(self.area_id.as_ref()?)?;
+        let (area, _) = area.connection_document(connection_id)?;
         let connection = area.get_connection(connection_id)?;
         match handle {
             ConnectionHandle::Waypoint(index, _) => {
@@ -342,9 +347,9 @@ impl MapEditor {
                 })
             }
             ConnectionHandle::PortA(_) => {
-                let room = area.get_room(&connection.endpoint_a.room_number)?;
+                let room = area.get_room_at(connection.endpoint_a.address())?;
                 let endpoint = endpoint_at_pointer(
-                    connection.endpoint_a.room_number,
+                    connection.endpoint_a.address(),
                     Point::new(room.get_x(), room.get_y()),
                     current,
                     !modifiers.alt(),
@@ -383,9 +388,9 @@ impl MapEditor {
             }
             ConnectionHandle::PortB(_) => {
                 let endpoint_b = connection.endpoint_b?;
-                let room = area.get_room(&endpoint_b.room_number)?;
+                let room = area.get_room_at(endpoint_b.address())?;
                 let endpoint = endpoint_at_pointer(
-                    endpoint_b.room_number,
+                    endpoint_b.address(),
                     Point::new(room.get_x(), room.get_y()),
                     current,
                     !modifiers.alt(),
@@ -441,13 +446,14 @@ impl MapEditor {
         let updates =
             self.connection_handle_update(*connection_id, *handle, *current_map, state.modifiers)?;
         let atlas = self.mapper.get_current_atlas();
-        let area = atlas.get_area(self.area_id.as_ref()?)?;
+        let map = atlas.get_area(self.area_id.as_ref()?)?;
+        let (area, layer) = map.connection_document(*connection_id)?;
         let stored = area.get_connection(*connection_id)?;
         let updated = updates.apply(stored);
-        let room_a = area.get_room(&updated.endpoint_a.room_number)?;
+        let room_a = area.get_room_at(updated.endpoint_a.address())?;
         let room_b = updated
             .endpoint_b
-            .and_then(|endpoint| area.get_room(&endpoint.room_number));
+            .and_then(|endpoint| area.get_room_at(endpoint.address()));
         let mut preview = area
             .get_room_connections()
             .iter()
@@ -482,10 +488,14 @@ impl MapEditor {
         preview.corner = updated.corner;
         preview.dash = updated.dash;
         preview.thickness = updated.thickness;
+        // A Secret's link keeps its layer's color while it moves.
+        if let Some(color) = layer.and_then(|layer| sources::layer_color(&map, layer.source())) {
+            preview.color = color;
+        }
         Some(preview)
     }
 
-    fn waypoint_insertion(
+    pub(super) fn waypoint_insertion(
         &self,
         connection_id: ConnectionId,
         point: Point,
@@ -493,6 +503,7 @@ impl MapEditor {
     ) -> Option<(usize, Vec<MapPoint>, usize)> {
         let atlas = self.mapper.get_current_atlas();
         let area = atlas.get_area(self.area_id.as_ref()?)?;
+        let (area, _) = area.connection_document(connection_id)?;
         let connection = area.get_connection(connection_id)?;
         if !matches!(
             connection.routing,
@@ -675,24 +686,16 @@ impl MapEditor {
                 from_center,
                 current_map,
             } => {
-                let target = match self.room_at_with_center(current_map) {
-                    Some((number, _)) if number == from => None,
-                    Some((number, center)) => Some((ExitTarget::Room(number), center)),
-                    None => {
-                        let at = if state.modifiers.alt() {
-                            current_map
-                        } else {
-                            viewport::snap(current_map)
-                        };
-                        Some((
-                            if state.modifiers.shift() {
-                                ExitTarget::Dangling(at)
-                            } else {
-                                ExitTarget::Empty(at)
-                            },
-                            at,
-                        ))
-                    }
+                let target = match self.link_drop(
+                    from,
+                    current_map,
+                    state.modifiers.alt(),
+                    state.modifiers.shift(),
+                ) {
+                    LinkDrop::Nothing => None,
+                    LinkDrop::Room(room, center) => Some((ExitTarget::Room(room), center)),
+                    LinkDrop::Empty(at) => Some((ExitTarget::Empty(at), at)),
+                    LinkDrop::Dangling(at) => Some((ExitTarget::Dangling(at), at)),
                 };
 
                 Some(target.map_or_else(
@@ -856,8 +859,30 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     }
                 }
                 mouse::Button::Right => {
-                    if matches!(state.interaction, Interaction::Panning { .. }) {
+                    // Only a pan ends here; a left drag in progress stays.
+                    if let Interaction::Panning {
+                        translation, moved, ..
+                    } = state.interaction.clone()
+                    {
                         state.interaction = Interaction::Idle;
+                        // A right press released where it began is a right
+                        // click: the context menu, with the view the press
+                        // had.
+                        if !moved && let Some(at) = cursor.position_in(bounds) {
+                            let map = viewport::Viewport {
+                                translation,
+                                scaling: self.scaling,
+                            }
+                            .project(at, bounds.size());
+                            return Some(
+                                canvas::Action::publish(Message::ContextMenuRequested {
+                                    at,
+                                    map,
+                                    translation,
+                                })
+                                .and_capture(),
+                            );
+                        }
                         return Some(canvas::Action::request_redraw().and_capture());
                     }
                 }
@@ -881,6 +906,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         state.interaction = Interaction::Panning {
                             translation: self.translation,
                             start: cursor_position,
+                            moved: false,
                         };
 
                         Some(if was_connection_drag {
@@ -893,6 +919,14 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         })
                     }
                     mouse::Button::Left => match self.tool {
+                        Tool::Select if self.picking => {
+                            Some(self.picked_room_at(map_position).map_or_else(
+                                canvas::Action::capture,
+                                |room| {
+                                    canvas::Action::publish(Message::RoomPicked(room)).and_capture()
+                                },
+                            ))
+                        }
                         Tool::Select => {
                             // Connection handles take priority over all other
                             // hit targets, followed by resize handles.
@@ -976,13 +1010,11 @@ impl canvas::Program<Message, Theme> for MapEditor {
                                         .and_capture(),
                                     )
                                 }
-                            } else if let Some((room_number, level)) =
-                                self.ghost_room_at(map_position)
-                            {
+                            } else if let Some((room, level)) = self.ghost_room_at(map_position) {
                                 state.interaction = Interaction::Idle;
                                 Some(
                                     canvas::Action::publish(Message::GhostRoomSelected {
-                                        room_number,
+                                        room,
                                         level,
                                     })
                                     .and_capture(),
@@ -998,8 +1030,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             }
                         }
                         Tool::Link => {
-                            if let Some((from, from_center)) =
-                                self.room_at_with_center(map_position)
+                            if let Some((from, from_center)) = self.link_end_at(map_position)
                                 && chebyshev(map_position, from_center) > EXIT_BAND_INNER
                             {
                                 state.interaction = Interaction::DraggingExit {
@@ -1042,9 +1073,16 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     _ => None,
                 },
                 mouse::Event::CursorMoved { .. } => match &mut state.interaction {
-                    Interaction::Panning { translation, start } => {
-                        let translation =
-                            *translation + (cursor_position - *start) * (1.0 / self.scaling);
+                    Interaction::Panning {
+                        translation,
+                        start,
+                        moved,
+                    } => {
+                        let travel = cursor_position - *start;
+                        if travel.x.abs() > DRAG_THRESHOLD || travel.y.abs() > DRAG_THRESHOLD {
+                            *moved = true;
+                        }
+                        let translation = *translation + travel * (1.0 / self.scaling);
                         Some(
                             canvas::Action::publish(Message::Translated(translation)).and_capture(),
                         )
@@ -1176,6 +1214,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
         let area = self.area_id.as_ref().and_then(|id| atlas.get_area(id));
 
         if let Some(area) = area {
+            let layers = sources::colored_layers(&area);
             let drag_preview = self.connection_drag_preview(state);
             frame.with_save(|frame| {
                 frame.translate(center);
@@ -1205,24 +1244,44 @@ impl canvas::Program<Message, Theme> for MapEditor {
 
                     for shape in area.get_shapes() {
                         if shape.level == ghost_level {
-                            render::draw_shape(frame, shape, opacity, true);
+                            render::draw_shape(frame, shape, opacity);
                         }
                     }
                     for label in area.get_labels() {
                         if label.level == ghost_level {
-                            render::draw_label(frame, label, opacity, true);
+                            render::draw_label(frame, label, opacity);
                         }
                     }
+                    sources::draw_drawings(frame, &layers, ghost_level, 1.0, opacity, &|_| false);
                     area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                         if connection.from_level == ghost_level {
-                            render::draw_connection(frame, &atlas, connection, opacity, true, true);
+                            render::draw_connection(frame, &atlas, connection, opacity, true);
                         }
                     });
+                    sources::draw_connections(
+                        frame,
+                        &atlas,
+                        &layers,
+                        ghost_level,
+                        (min_x, min_y, max_x, max_y),
+                        1.0,
+                        opacity,
+                        &|_| false,
+                    );
                     area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                         if room.get_level() == ghost_level {
-                            render::draw_room(frame, room, opacity, true);
+                            render::draw_room(frame, room, opacity);
                         }
                     });
+                    sources::draw_rooms(
+                        frame,
+                        &layers,
+                        ghost_level,
+                        (min_x, min_y, max_x, max_y),
+                        1.0,
+                        opacity,
+                        &|_, _| false,
+                    );
                 }
 
                 // Current level.
@@ -1231,7 +1290,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         && !(drag_offset.is_some()
                             && self.selection.contains(EntityId::Shape(shape.id)))
                     {
-                        render::draw_shape(frame, shape, 1.0, true);
+                        render::draw_shape(frame, shape, 1.0);
                     }
                 }
                 for label in area.get_labels() {
@@ -1239,20 +1298,27 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         && !(drag_offset.is_some()
                             && self.selection.contains(EntityId::Label(label.id)))
                     {
-                        render::draw_label(frame, label, 1.0, true);
+                        render::draw_label(frame, label, 1.0);
                     }
                 }
+                sources::draw_drawings(frame, &layers, self.level, 1.0, 1.0, &|drawing| {
+                    drag_offset.is_some()
+                        && self.selection.contains(match drawing {
+                            sources::Drawing::Label(id) => EntityId::Label(id),
+                            sources::Drawing::Shape(id) => EntityId::Shape(id),
+                        })
+                });
                 area.with_room_connections_in(min_x, min_y, max_x, max_y, |connection| {
                     if connection.from_level == self.level
                         && drag_preview
                             .as_ref()
                             .is_none_or(|preview| preview.connection_id != connection.connection_id)
                     {
-                        render::draw_connection(frame, &atlas, connection, 1.0, true, false);
+                        render::draw_connection(frame, &atlas, connection, 1.0, false);
                     }
                 });
                 if let Some(preview) = &drag_preview {
-                    render::draw_connection(frame, &atlas, preview, 1.0, true, false);
+                    render::draw_connection(frame, &atlas, preview, 1.0, false);
                 }
                 if let Some((connection_id, geometry)) = &self.automatic_route_preview
                     && let Some(connection) = area.get_room_connections().iter().find(|candidate| {
@@ -1264,10 +1330,24 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     preview.geometry = geometry.clone();
                     preview.routing = ConnectionRouting::Automatic;
                     preview.color = theme.styles.general.accent;
-                    preview.is_secret = false;
                     preview.thickness = preview.thickness.max(2.0);
-                    render::draw_connection(frame, &atlas, &preview, 0.9, false, false);
+                    render::draw_connection(frame, &atlas, &preview, 0.9, false);
                 }
+                // A dragged Secret link draws as its preview above.
+                sources::draw_connections(
+                    frame,
+                    &atlas,
+                    &layers,
+                    self.level,
+                    (min_x, min_y, max_x, max_y),
+                    1.0,
+                    1.0,
+                    &|id| {
+                        drag_preview
+                            .as_ref()
+                            .is_some_and(|preview| preview.connection_id == id)
+                    },
+                );
                 area.with_rooms_in(min_x, min_y, max_x, max_y, |room| {
                     if room.get_level() == self.level
                         && !(drag_offset.is_some()
@@ -1275,9 +1355,24 @@ impl canvas::Program<Message, Theme> for MapEditor {
                                 .selection
                                 .contains(EntityId::Room(room.get_room_number())))
                     {
-                        render::draw_room(frame, room, 1.0, true);
+                        render::draw_room(frame, room, 1.0);
                     }
                 });
+
+                sources::draw_rooms(
+                    frame,
+                    &layers,
+                    self.level,
+                    (min_x, min_y, max_x, max_y),
+                    1.0,
+                    1.0,
+                    &|source, number| {
+                        drag_offset.is_some()
+                            && self
+                                .selection
+                                .contains(EntityId::SourceRoom(source, number))
+                    },
+                );
 
                 // Player marker.
                 if let Some(room_key) = self
@@ -1301,14 +1396,11 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     && self.tool == Tool::Select
                     && matches!(state.interaction, Interaction::Idle)
                     && !self.selection.contains(EntityId::Connection(hovered))
-                    && let Some(connection) = area
-                        .get_room_connections()
-                        .iter()
-                        .find(|item| item.connection_id == hovered && item.from_level == self.level)
+                    && let Some(connection) = self.drawn_connection(&area, hovered)
                 {
                     Self::stroke_resolved_connection_outline(
                         frame,
-                        connection,
+                        &connection,
                         render::apply_opacity(accent, 0.35),
                         false,
                     );
@@ -1353,17 +1445,16 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     current_map,
                 } = &state.interaction
                 {
-                    let target = self.room_at_with_center(*current_map);
-                    let end = match &target {
-                        Some((number, center)) if number != from => *center,
-                        Some(_) => *current_map,
-                        None => {
-                            if state.modifiers.alt() {
-                                *current_map
-                            } else {
-                                viewport::snap(*current_map)
-                            }
-                        }
+                    let target = self.link_drop(
+                        *from,
+                        *current_map,
+                        state.modifiers.alt(),
+                        state.modifiers.shift(),
+                    );
+                    let end = match target {
+                        LinkDrop::Room(_, center) => center,
+                        LinkDrop::Nothing => *current_map,
+                        LinkDrop::Empty(at) | LinkDrop::Dangling(at) => at,
                     };
 
                     let path = canvas::Path::line(*from_center, end);
@@ -1377,7 +1468,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     );
 
                     match target {
-                        Some((number, center)) if number != *from => {
+                        LinkDrop::Room(_, center) => {
                             let half = render::MAP_ROOM_SIZE / 2.0 + 0.06;
                             let path = canvas::Path::rounded_rectangle(
                                 Point::new(center.x - half, center.y - half),
@@ -1386,8 +1477,8 @@ impl canvas::Program<Message, Theme> for MapEditor {
                             );
                             frame.stroke(&path, render::solid_stroke(accent, 2.0));
                         }
-                        Some(_) => {}
-                        None => {
+                        LinkDrop::Nothing | LinkDrop::Dangling(_) => {}
+                        LinkDrop::Empty(_) => {
                             let path = canvas::Path::rounded_rectangle(
                                 Point::new(
                                     end.x - render::MAP_ROOM_SIZE / 2.0,
@@ -1455,14 +1546,9 @@ impl canvas::Program<Message, Theme> for MapEditor {
                 if self.editable
                     && let Some(EntityId::Connection(connection_id)) = self.selection.single()
                     && let Some(connection_render) = drag_preview
-                        .as_ref()
+                        .clone()
                         .filter(|preview| preview.connection_id == connection_id)
-                        .or_else(|| {
-                            area.get_room_connections().iter().find(|connection| {
-                                connection.connection_id == connection_id
-                                    && connection.from_level == self.level
-                            })
-                        })
+                        .or_else(|| self.drawn_connection(&area, connection_id))
                 {
                     let radius = HANDLE_SCREEN_SIZE / self.scaling / 2.0;
                     for handle in &connection_render.geometry.handles {
@@ -1487,16 +1573,28 @@ impl canvas::Program<Message, Theme> for MapEditor {
                     } else {
                         viewport::snap(map_position)
                     };
-                    let path = canvas::Path::rounded_rectangle(
-                        Point::new(
-                            at.x - render::MAP_ROOM_SIZE / 2.0,
-                            at.y - render::MAP_ROOM_SIZE / 2.0,
-                        ),
-                        render::MAP_ROOM_SIZE_AS_SIZE,
-                        render::MAP_ROOM_BORDER_RADIUS.into(),
-                    );
-                    frame.fill(&path, render::apply_opacity(accent, 0.3));
-                    frame.stroke(&path, render::solid_stroke(accent, 1.0));
+                    // A click on an occupied cell selects its room: outline
+                    // that room rather than promise a new one on top of it.
+                    if let Some((_, center)) = self.room_occupying(at) {
+                        let half = render::MAP_ROOM_SIZE / 2.0 + 0.06;
+                        let path = canvas::Path::rounded_rectangle(
+                            Point::new(center.x - half, center.y - half),
+                            Size::new(half * 2.0, half * 2.0),
+                            render::MAP_ROOM_BORDER_RADIUS.into(),
+                        );
+                        frame.stroke(&path, render::solid_stroke(accent, 2.0));
+                    } else {
+                        let path = canvas::Path::rounded_rectangle(
+                            Point::new(
+                                at.x - render::MAP_ROOM_SIZE / 2.0,
+                                at.y - render::MAP_ROOM_SIZE / 2.0,
+                            ),
+                            render::MAP_ROOM_SIZE_AS_SIZE,
+                            render::MAP_ROOM_BORDER_RADIUS.into(),
+                        );
+                        frame.fill(&path, render::apply_opacity(accent, 0.3));
+                        frame.stroke(&path, render::solid_stroke(accent, 1.0));
+                    }
                 }
             });
         }
@@ -1522,6 +1620,13 @@ impl canvas::Program<Message, Theme> for MapEditor {
             _ => {
                 if let Some(cursor_position) = cursor.position_in(bounds) {
                     let map_position = self.viewport().project(cursor_position, bounds.size());
+                    if self.picking {
+                        return if self.picked_room_at(map_position).is_some() {
+                            mouse::Interaction::Crosshair
+                        } else {
+                            mouse::Interaction::default()
+                        };
+                    }
                     if self.connection_handle_at(map_position).is_some() {
                         return mouse::Interaction::Grab;
                     }
@@ -1529,7 +1634,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
                         return resize_cursor(handle);
                     }
                     if self.tool == Tool::Link
-                        && let Some((_, center)) = self.room_at_with_center(map_position)
+                        && let Some((_, center)) = self.link_end_at(map_position)
                     {
                         return if chebyshev(map_position, center) > EXIT_BAND_INNER {
                             mouse::Interaction::Crosshair
@@ -1555,7 +1660,7 @@ impl canvas::Program<Message, Theme> for MapEditor {
 const PORT_SNAP_OFFSETS: [f32; 3] = [CORNER_INSET, 0.5, 1.0 - CORNER_INSET];
 
 fn endpoint_at_pointer(
-    room_number: RoomNumber,
+    room: RoomAddress,
     center: Point,
     pointer: Point,
     snap: bool,
@@ -1587,7 +1692,8 @@ fn endpoint_at_pointer(
             .unwrap_or(port_offset);
     }
     ConnectionEndpoint {
-        room_number,
+        source: room.wire_source(),
+        room_number: room.number,
         side,
         port_offset,
         port_mode: PortMode::Manual,
@@ -1609,32 +1715,56 @@ impl MapEditor {
                 }
                 EntityId::Room(number) => {
                     if let Some(room) = area.get_room(&number) {
-                        render::draw_room(frame, room, 1.0, true);
-                        self.stroke_room_outline(frame, room.get_x(), room.get_y(), accent);
-                    }
-                }
-                EntityId::Label(id) => {
-                    if let Some(label) = area.get_label(&id) {
-                        render::draw_label(frame, label, 1.0, true);
-                        stroke_rect_outline(
+                        render::draw_room(frame, room, 1.0);
+                        self.stroke_room_outline(
                             frame,
-                            label.x,
-                            label.y,
-                            label.width,
-                            label.height,
+                            room.get_x(),
+                            room.get_y(),
+                            ROOM_SELECTION_MARGIN,
                             accent,
                         );
                     }
                 }
-                EntityId::Shape(id) => {
-                    if let Some(shape) = area.get_shape(&id) {
-                        render::draw_shape(frame, shape, 1.0, true);
-                        stroke_rect_outline(
+                EntityId::SourceRoom(source, number) => {
+                    if let Some(room) = sources::source_room(area, source, number) {
+                        render::draw_room(frame, room, 1.0);
+                        if let Some(color) = sources::layer_color(area, source) {
+                            sources::room_ring(frame, room.get_x(), room.get_y(), color, 1.0);
+                        }
+                        self.stroke_room_outline(
                             frame,
-                            shape.x,
-                            shape.y,
-                            shape.width,
-                            shape.height,
+                            room.get_x(),
+                            room.get_y(),
+                            sources::ring_clearance(self.scaling),
+                            accent,
+                        );
+                    }
+                }
+                EntityId::Label(id) => {
+                    if let Some((layer, label)) = area.find_label(&id) {
+                        render::draw_label(frame, label, 1.0);
+                        let rect = Rectangle::new(
+                            Point::new(label.x, label.y),
+                            Size::new(label.width, label.height),
+                        );
+                        let source = SourceLayer::source_of(layer);
+                        self.outline_drawing(frame, area, source, rect, 0.0, true, accent);
+                    }
+                }
+                EntityId::Shape(id) => {
+                    if let Some((layer, shape)) = area.find_shape(&id) {
+                        render::draw_shape(frame, shape, 1.0);
+                        let rect = Rectangle::new(
+                            Point::new(shape.x, shape.y),
+                            Size::new(shape.width, shape.height),
+                        );
+                        self.outline_drawing(
+                            frame,
+                            area,
+                            SourceLayer::source_of(layer),
+                            rect,
+                            shape.border_radius,
+                            true,
                             accent,
                         );
                     }
@@ -1667,29 +1797,49 @@ impl MapEditor {
                 }
                 EntityId::Room(number) => {
                     if let Some(room) = area.get_room(&number) {
-                        self.stroke_room_outline(frame, room.get_x(), room.get_y(), accent);
-                    }
-                }
-                EntityId::Label(id) => {
-                    if let Some(label) = area.get_label(&id) {
-                        stroke_rect_outline(
+                        self.stroke_room_outline(
                             frame,
-                            label.x,
-                            label.y,
-                            label.width,
-                            label.height,
+                            room.get_x(),
+                            room.get_y(),
+                            ROOM_SELECTION_MARGIN,
                             accent,
                         );
                     }
                 }
-                EntityId::Shape(id) => {
-                    if let Some(shape) = area.get_shape(&id) {
-                        stroke_rect_outline(
+                EntityId::SourceRoom(source, number) => {
+                    if let Some(room) = sources::source_room(area, source, number) {
+                        self.stroke_room_outline(
                             frame,
-                            shape.x,
-                            shape.y,
-                            shape.width,
-                            shape.height,
+                            room.get_x(),
+                            room.get_y(),
+                            sources::ring_clearance(self.scaling),
+                            accent,
+                        );
+                    }
+                }
+                EntityId::Label(id) => {
+                    if let Some((layer, label)) = area.find_label(&id) {
+                        let rect = Rectangle::new(
+                            Point::new(label.x, label.y),
+                            Size::new(label.width, label.height),
+                        );
+                        let source = SourceLayer::source_of(layer);
+                        self.outline_drawing(frame, area, source, rect, 0.0, false, accent);
+                    }
+                }
+                EntityId::Shape(id) => {
+                    if let Some((layer, shape)) = area.find_shape(&id) {
+                        let rect = Rectangle::new(
+                            Point::new(shape.x, shape.y),
+                            Size::new(shape.width, shape.height),
+                        );
+                        self.outline_drawing(
+                            frame,
+                            area,
+                            SourceLayer::source_of(layer),
+                            rect,
+                            shape.border_radius,
+                            false,
                             accent,
                         );
                     }
@@ -1698,8 +1848,51 @@ impl MapEditor {
         }
     }
 
-    fn stroke_room_outline(&self, frame: &mut canvas::Frame, x: f32, y: f32, accent: Color) {
-        let margin = render::MAP_ROOM_SIZE * 0.12;
+    /// A label's or shape's selection: its outline, outside the ring a
+    /// source's drawing wears. `ring` draws that ring too (a dragged
+    /// drawing is not drawn by its layer while it moves).
+    #[allow(clippy::too_many_arguments)]
+    fn outline_drawing(
+        &self,
+        frame: &mut canvas::Frame,
+        area: &smudgy_cloud::mapper::area_cache::AreaCache,
+        source: smudgy_cloud::SourceId,
+        rect: Rectangle,
+        radius: f32,
+        ring: bool,
+        accent: Color,
+    ) {
+        if source.is_map() {
+            stroke_rect_outline(frame, rect.x, rect.y, rect.width, rect.height, accent);
+            return;
+        }
+        if ring && let Some(color) = sources::layer_color(area, source) {
+            sources::ring(
+                frame,
+                Point::new(rect.x, rect.y),
+                rect.size(),
+                radius,
+                color,
+                1.0,
+            );
+        }
+        let margin = sources::ring_clearance(self.scaling);
+        let path = canvas::Path::rounded_rectangle(
+            Point::new(rect.x - margin, rect.y - margin),
+            Size::new(rect.width + margin * 2.0, rect.height + margin * 2.0),
+            (radius + margin).into(),
+        );
+        frame.stroke(&path, selection_stroke(accent));
+    }
+
+    fn stroke_room_outline(
+        &self,
+        frame: &mut canvas::Frame,
+        x: f32,
+        y: f32,
+        margin: f32,
+        accent: Color,
+    ) {
         let size = render::MAP_ROOM_SIZE + margin * 2.0;
         let path = canvas::Path::rounded_rectangle(
             Point::new(
@@ -1719,12 +1912,31 @@ impl MapEditor {
         id: ConnectionId,
         accent: Color,
     ) {
-        let Some(connection) = area.get_room_connections().iter().find(|connection| {
-            connection.connection_id == id && connection.from_level == self.level
-        }) else {
+        let Some(connection) = self.drawn_connection(area, id) else {
             return;
         };
-        Self::stroke_resolved_connection_outline(frame, connection, accent, false);
+        Self::stroke_resolved_connection_outline(frame, &connection, accent, false);
+    }
+
+    /// Connection `id`'s half on the current level as the canvas draws it:
+    /// the map's own, or a Secret's in its layer's color.
+    pub(super) fn drawn_connection(
+        &self,
+        area: &smudgy_cloud::mapper::area_cache::AreaCache,
+        id: ConnectionId,
+    ) -> Option<RoomConnection> {
+        let (document, layer) = area.connection_document(id)?;
+        let mut connection = document
+            .get_room_connections()
+            .iter()
+            .find(|connection| {
+                connection.connection_id == id && connection.from_level == self.level
+            })?
+            .clone();
+        if let Some(color) = layer.and_then(|layer| sources::layer_color(area, layer.source())) {
+            connection.color = color;
+        }
+        Some(connection)
     }
 
     /// Accent-halos the *visible* form of one Connection half — the stroked
@@ -1773,12 +1985,7 @@ impl MapEditor {
         frame.stroke(&path, render::solid_stroke(accent, halo));
         frame.stroke(
             &path,
-            render::connection_stroke(
-                connection.color,
-                connection.thickness,
-                connection.dash,
-                connection.is_secret,
-            ),
+            render::connection_stroke(connection.color, connection.thickness, connection.dash),
         );
         for &(center, up) in &connection.geometry.level_markers {
             render::draw_level_triangle_outline(frame, center.x, center.y, up, accent, halo);
@@ -1793,6 +2000,9 @@ impl MapEditor {
         }
     }
 }
+
+/// How far outside a map room its selection outline sits, in map units.
+const ROOM_SELECTION_MARGIN: f32 = render::MAP_ROOM_SIZE * 0.12;
 
 fn stroke_rect_outline(
     frame: &mut canvas::Frame,
@@ -1843,7 +2053,7 @@ mod tests {
     #[test]
     fn port_drags_snap_to_midpoint_and_corner_slots() {
         let center = Point::new(0.0, 0.0);
-        let room = RoomNumber(1);
+        let room = RoomAddress::map(smudgy_cloud::RoomNumber(1));
         // Near the east wall, slightly below the middle: the wall midpoint.
         let snapped = endpoint_at_pointer(room, center, Point::new(0.25, 0.03), true);
         assert_eq!(snapped.side, RoomSide::East);

@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # Core dependencies
 derive_more = { workspace = true, features = ["display", "from", "into", "add"] }
-uuid = { version = "1.7", features = ["v4", "serde"] }
+uuid = { version = "1.7", features = ["v4", "v5", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -32,6 +32,9 @@ sha2 = "0.10"
 # gate floor both parse/compare semver.
 semver = "1"
 imbl = "7.0.0"
+# Package bodies travel as zstd frames (one bundle up per publish, one down per install);
+# the same version smudgy_core already builds.
+zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

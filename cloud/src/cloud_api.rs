@@ -2,9 +2,9 @@
 //!
 //! [`CloudApiClient`] complements [`CloudMapper`](crate::CloudMapper): the
 //! mapper covers area/room content, this client covers accounts, friends,
-//! blocks, share grants, secret marks, previews, and copies. Both are meant
-//! to share one [`CredentialSource`], so logging in upgrades every consumer
-//! at once.
+//! blocks, share grants, the Secrets listing and Secret grants, previews, and
+//! copies. Both are meant to share one [`CredentialSource`], so logging in
+//! upgrades every consumer at once.
 //!
 //! Every JSON response is wrapped in the `{success, data, error}` envelope;
 //! non-2xx statuses map onto the client error taxonomy via
@@ -17,6 +17,7 @@
 //! Types carrying credential material ([`CreatedApiKey`], [`AuthSession`])
 //! redact it from their `Debug` output.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -29,8 +30,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    Area, AreaId, AreaWithDetails, AtlasId, CloudError, CloudResult, ExitId, LabelId, ShapeId,
-    SyncRow, backends::CredentialSource,
+    Area, AreaId, AtlasId, CloudError, CloudResult, SourceId, SyncRow,
+    backends::{Credential, CredentialSource},
 };
 
 // ===========================================================================
@@ -191,7 +192,6 @@ pub struct CreateShareRequest {
     pub can_edit: bool,
     pub can_reshare: bool,
     pub can_copy: bool,
-    pub include_secrets: bool,
     /// Full-deputy. Accepted only from the true owner on an owner-minted root
     /// (server-enforced); implies all lower caps including `can_reshare`.
     pub can_admin: bool,
@@ -221,7 +221,6 @@ pub struct ShareGrant {
     pub can_edit: bool,
     pub can_reshare: bool,
     pub can_copy: bool,
-    pub include_secrets: bool,
     /// Full-deputy flag (owner-minted, root-only). Older servers omit it → false.
     #[serde(default)]
     pub can_admin: bool,
@@ -283,8 +282,6 @@ pub struct SharePatch {
     pub can_reshare: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub can_copy: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_secrets: Option<bool>,
     /// Set/raise/remove the full-deputy flag (owner-only, owner-minted root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub can_admin: Option<bool>,
@@ -293,10 +290,38 @@ pub struct SharePatch {
 /// Direction selector for `GET /transfers?direction=offered|received`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferDirection {
-    /// Offers the caller initiated (`from_user_id`).
+    /// Offers the caller made, to users and to clans (`from_user_id`).
     Offered,
-    /// Offers addressed to the caller (`to_user_id`).
+    /// Offers made to the caller (`to_user_id`); offers to the caller's
+    /// clans are listed per clan (`GET /clans/{c}/transfers`).
     Received,
+}
+
+/// Whom a map or atlas is offered to: a friend, or a clan the owner is an
+/// active member of, with whose each map becomes there: Clan-owned ("give to
+/// the clan") or Member-owned with the offerer its owner ("stays mine").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferRecipient {
+    User(Uuid),
+    Clan(Uuid, crate::clan_maps::MapOwnership),
+}
+
+impl From<Uuid> for TransferRecipient {
+    fn from(user_id: Uuid) -> Self {
+        Self::User(user_id)
+    }
+}
+
+impl TransferRecipient {
+    /// The offer's body: exactly one of `to_user_id` and `to_clan_id`.
+    fn body(self) -> Value {
+        match self {
+            Self::User(id) => serde_json::json!({ "to_user_id": id }),
+            Self::Clan(id, ownership) => {
+                serde_json::json!({ "to_clan_id": id, "ownership": ownership.wire() })
+            }
+        }
+    }
 }
 
 impl TransferDirection {
@@ -309,8 +334,10 @@ impl TransferDirection {
     }
 }
 
-/// A `pending_transfers` row as served by `GET /transfers` and the offer/accept
-/// responses. `expires_at` is null (offers are non-expiring).
+/// A transfer offer as served by `GET /transfers`, `GET /clans/{c}/transfers`
+/// and the offer/accept responses. Offers never expire. An offer names its
+/// recipient as a user (`to_user_id`, `to_nickname`) or as a clan
+/// (`to_clan_id`, `to_clan_name`), never both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferView {
     pub id: Uuid,
@@ -321,7 +348,17 @@ pub struct TransferView {
     #[serde(default)]
     pub atlas_id: Option<AtlasId>,
     pub from_user_id: Uuid,
-    pub to_user_id: Uuid,
+    /// The user it is offered to; absent on an offer to a clan.
+    #[serde(default)]
+    pub to_user_id: Option<Uuid>,
+    /// The clan it is offered to; absent on an offer to a user.
+    #[serde(default)]
+    pub to_clan_id: Option<Uuid>,
+    #[serde(default)]
+    pub to_clan_name: Option<String>,
+    /// On an offer to a clan: whose each map becomes there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<crate::clan_maps::MapOwnership>,
     /// `Offered` | `Accepted` | `Declined` | `Cancelled` | `Expired`.
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -339,61 +376,141 @@ pub struct TransferView {
     pub to_nickname: Option<String>,
 }
 
-/// Identifies one room property in a [`SecretMarksRequest`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RoomPropertyRef {
-    pub room_number: i32,
-    pub name: String,
-}
-
-/// `POST /areas/{id}/secret-marks` body: set or clear `is_secret` in bulk.
-/// Empty lists are serialized as-is (the server defaults them anyway).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SecretMarksRequest {
-    pub secret: bool,
-    pub rooms: Vec<i32>,
-    pub exits: Vec<ExitId>,
-    pub labels: Vec<LabelId>,
-    pub shapes: Vec<ShapeId>,
-    pub room_properties: Vec<RoomPropertyRef>,
-    pub area_properties: Vec<String>,
-}
-
-/// Per-type counts of rows actually changed by a secret-marks call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecretMarksResult {
-    pub rooms: u64,
-    pub exits: u64,
-    pub labels: u64,
-    pub shapes: u64,
-    pub room_properties: u64,
-    pub area_properties: u64,
-}
-
-/// Entity kind in the owner's secret-audit list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SecretEntityKind {
-    Room,
-    Exit,
-    Label,
-    Shape,
-    RoomProperty,
-    AreaProperty,
-}
-
-/// One row of `GET /areas/{id}/secrets`. Fields irrelevant to the kind are
-/// omitted from the wire: `id` for exits/labels/shapes, `room_number` for
-/// rooms/room properties, `name` for properties.
+/// One row of `GET /areas/{id}/secrets`: a Secret on the map the caller can
+/// read. Nothing about Secrets they cannot read is served.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecretEntity {
-    pub kind: SecretEntityKind,
+pub struct SecretSummary {
+    pub source: SourceId,
+    pub name: String,
+    /// `owner`, `members` or `clan`.
+    pub ownership: String,
+    /// The clan a Clan Secret (`members` or `clan`) belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clan_id: Option<Uuid>,
+    /// The chosen color, `#rrggbb`; `None` when the palette picks.
     #[serde(default)]
-    pub id: Option<Uuid>,
-    #[serde(default)]
-    pub room_number: Option<i32>,
-    #[serde(default)]
+    pub color: Option<String>,
+    /// The caller's own actions on it: `read`, and any of `add`, `edit`,
+    /// `remove`, `manage_access` and `copy` (see [`secret_action`]); with
+    /// ownership authority also `rename`, `delete` and, on a Clan Secret,
+    /// `manage_ownership`.
+    pub actions: BTreeSet<String>,
+}
+
+/// A new name, a new color, or both, for a Secret: `PATCH /secrets/{id}`
+/// carries every field that changes in one request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecretChange {
+    /// The new name; `None` keeps the name.
     pub name: Option<String>,
+    pub color: SecretColorChange,
+}
+
+/// What a [`SecretChange`] does to a Secret's color.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SecretColorChange {
+    /// The color stays as it is.
+    #[default]
+    Keep,
+    /// The palette picks the color.
+    Clear,
+    /// The Secret draws in this `#rrggbb` color.
+    Set(String),
+}
+
+impl SecretChange {
+    /// Whether the change names nothing. The server refuses such a request.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.color == SecretColorChange::Keep
+    }
+
+    /// The request body: only the fields that change, with `color: null`
+    /// handing the color back to the palette.
+    #[must_use]
+    pub fn body(&self) -> serde_json::Value {
+        let mut body = serde_json::Map::new();
+        if let Some(name) = &self.name {
+            body.insert("name".to_string(), name.clone().into());
+        }
+        match &self.color {
+            SecretColorChange::Keep => {}
+            SecretColorChange::Clear => {
+                body.insert("color".to_string(), serde_json::Value::Null);
+            }
+            SecretColorChange::Set(color) => {
+                body.insert("color".to_string(), color.clone().into());
+            }
+        }
+        serde_json::Value::Object(body)
+    }
+}
+
+/// The actions on a Secret, as the wire names them. Every reader holds
+/// [`READ`](secret_action::READ); a grant adds any of the others. The map's
+/// owner holds them all, [`COPY`](secret_action::COPY) included.
+pub mod secret_action {
+    /// Reading the Secret. Every grant carries it.
+    pub const READ: &str = "read";
+    /// Adding rooms, exits, properties, tags, labels, shapes and connections.
+    pub const ADD: &str = "add";
+    /// Changing them.
+    pub const EDIT: &str = "edit";
+    /// Deleting them, and moving content out of the Secret.
+    pub const REMOVE: &str = "remove";
+    /// Listing the Secret's grants, and granting, changing and revoking them
+    /// within the holder's own actions. Only the map's owner grants it.
+    pub const MANAGE_ACCESS: &str = "manage_access";
+    /// Taking the Secret along when copying the map. No preset holds it: a
+    /// grant carries it only when it names it.
+    pub const COPY: &str = "copy";
+}
+
+/// One grant on a Secret (`/secrets/{id}/grants`). Its grantee reads the
+/// Secret and may do whatever else `actions` lists, but only while they can
+/// read the map; until then the grant stays in place and confers nothing.
+/// Grants are keyed by (Secret, grantor, grantee), and a grantee's actions
+/// are the union of their grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretGrant {
+    pub id: Uuid,
+    pub secret_id: SourceId,
+    /// The map the Secret belongs to.
+    pub area_id: AreaId,
+    /// The map's owner.
+    pub owner_id: Uuid,
+    pub grantor_id: Uuid,
+    pub grantee_id: Uuid,
+    /// Listings carry the grantee's nickname when they have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grantee_nickname: Option<String>,
+    /// The grantor's nickname, when the server serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grantor_nickname: Option<String>,
+    /// Always `read`, plus any of `add`, `edit`, `remove`, `manage_access`
+    /// and `copy` (see [`secret_action`]).
+    pub actions: BTreeSet<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SecretGrant {
+    /// Whether the grant carries `action`.
+    #[must_use]
+    pub fn can(&self, action: &str) -> bool {
+        self.actions.contains(action)
+    }
+}
+
+/// The path of a Secret's grants. Only Secrets have grants; the map and
+/// Private are refused before anything is sent.
+pub(crate) fn secret_grants_path(secret: &SourceId) -> CloudResult<String> {
+    match secret {
+        SourceId::Secret(id) => Ok(format!("/secrets/{id}/grants")),
+        SourceId::Map | SourceId::Private => Err(CloudError::InvalidInput(
+            "only Secrets have grants".to_string(),
+        )),
+    }
 }
 
 /// `POST /areas/{id}/copy` body; `None` fields are omitted (server defaults:
@@ -452,25 +569,13 @@ impl ShareDirection {
     }
 }
 
-/// Audience simulated by `GET /areas/{id}/preview`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreviewAudience {
-    /// Anonymous worst case: a random viewer with all-false capabilities.
-    WorstCase,
-    /// Simulate the grantee of the given share, when that grant reaches the
-    /// area (a bogus id silently degrades to the worst case server-side).
-    Share(Uuid),
-    /// Simulate a specific user verbatim.
-    AsUser(Uuid),
-}
-
 // ===========================================================================
 // Client
 // ===========================================================================
 
 /// Whether a request attaches the current credential.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Auth {
+pub(crate) enum Auth {
     /// Public auth endpoint: no `Authorization` header, even when logged in.
     Public,
     /// Credential required; fails fast with [`CloudError::Unauthorized`] when
@@ -547,10 +652,9 @@ impl CloudApiClient {
 
     // ===== internal plumbing ==============================================
 
-    fn auth_header(&self) -> CloudResult<String> {
+    fn credential(&self) -> CloudResult<Credential> {
         self.credentials
             .get()
-            .map(|credential| credential.header_value())
             .ok_or_else(|| CloudError::Unauthorized("no credential configured".to_string()))
     }
 
@@ -572,8 +676,12 @@ impl CloudApiClient {
         if !query.is_empty() {
             request = request.query(query);
         }
-        if auth == Auth::Required {
-            request = request.header("authorization", self.auth_header()?);
+        let credential = match auth {
+            Auth::Required => Some(self.credential()?),
+            Auth::Public => None,
+        };
+        if let Some(credential) = &credential {
+            request = request.header("authorization", credential.header_value());
         }
         if let Some(body) = body {
             request = request.json(body);
@@ -581,6 +689,11 @@ impl CloudApiClient {
 
         let response = request.send().await?;
         debug!("{method} {url} - {}", response.status());
+        if let Some(credential) = &credential
+            && response.status() == reqwest::StatusCode::UNAUTHORIZED
+        {
+            self.credentials.note_refused(credential);
+        }
 
         // Soft upgrade nudge: the server tags responses for an in-range (allowed
         // but behind) client with the newest version. Stash it for the UI. Only
@@ -644,14 +757,18 @@ impl CloudApiClient {
         CloudError::from_status(status, &message)
     }
 
-    async fn get<T>(&self, path: &str) -> CloudResult<T>
+    pub(crate) async fn get<T>(&self, path: &str) -> CloudResult<T>
     where
         T: serde::de::DeserializeOwned,
     {
         self.get_with_query(path, &[]).await
     }
 
-    async fn get_with_query<T>(&self, path: &str, query: &[(&str, String)]) -> CloudResult<T>
+    pub(crate) async fn get_with_query<T>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> CloudResult<T>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -661,7 +778,12 @@ impl CloudApiClient {
         Self::parse_data(response).await
     }
 
-    async fn post<T>(&self, path: &str, body: Option<&Value>, auth: Auth) -> CloudResult<T>
+    pub(crate) async fn post<T>(
+        &self,
+        path: &str,
+        body: Option<&Value>,
+        auth: Auth,
+    ) -> CloudResult<T>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -669,12 +791,17 @@ impl CloudApiClient {
         Self::parse_data(response).await
     }
 
-    async fn post_unit(&self, path: &str, body: Option<&Value>, auth: Auth) -> CloudResult<()> {
+    pub(crate) async fn post_unit(
+        &self,
+        path: &str,
+        body: Option<&Value>,
+        auth: Auth,
+    ) -> CloudResult<()> {
         let response = self.send(Method::POST, path, &[], body, auth).await?;
         Self::parse_unit(response).await
     }
 
-    async fn patch<T>(&self, path: &str, body: &Value) -> CloudResult<T>
+    pub(crate) async fn patch<T>(&self, path: &str, body: &Value) -> CloudResult<T>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -684,14 +811,14 @@ impl CloudApiClient {
         Self::parse_data(response).await
     }
 
-    async fn delete(&self, path: &str) -> CloudResult<()> {
+    pub(crate) async fn delete(&self, path: &str) -> CloudResult<()> {
         let response = self
             .send(Method::DELETE, path, &[], None, Auth::Required)
             .await?;
         Self::parse_unit(response).await
     }
 
-    async fn put_unit(&self, path: &str) -> CloudResult<()> {
+    pub(crate) async fn put_unit(&self, path: &str) -> CloudResult<()> {
         let response = self
             .send(Method::PUT, path, &[], None, Auth::Required)
             .await?;
@@ -709,20 +836,6 @@ impl CloudApiClient {
     }
 
     // ===== auth (public endpoints — no credential attached) ===============
-
-    /// `POST /auth/signup` — requests account creation and mails a
-    /// verification code. The server replies `202` regardless of outcome
-    /// (enumeration resistance); an existing email is mailed an "account
-    /// exists" notice instead of a code.
-    ///
-    /// # Errors
-    /// Non-2xx statuses via [`CloudError::from_status`]; transport failures as
-    /// [`CloudError::NetworkError`].
-    pub async fn signup(&self, email: &str, nickname: &str) -> CloudResult<()> {
-        let body = json!({ "email": email, "nickname": nickname });
-        self.post_unit("/auth/signup", Some(&body), Auth::Public)
-            .await
-    }
 
     /// `POST /auth/login` — the unified passwordless entry. Mails a sign-in
     /// code, **creating the account on first sight** when the email is unknown
@@ -807,6 +920,37 @@ impl CloudApiClient {
     pub async fn set_nickname(&self, nickname: &str) -> CloudResult<UserProfile> {
         let body = json!({ "nickname": nickname });
         self.patch("/me", &body).await
+    }
+
+    /// `DELETE /me` — deletes the caller's account. No body; `null` once the
+    /// account is gone.
+    ///
+    /// The server first asks each of the account's clans whether it may
+    /// leave: the last owner of an active clan is refused and nothing
+    /// changes. It then marks the account as being deleted and cancels the
+    /// transfer offers from and to it: from that moment its credentials work
+    /// only for this call, every other route that authenticates them
+    /// (`/auth/refresh` included) answers 401 as for an unknown credential,
+    /// and `/auth/logout` still ends the session (204). Then it leaves every
+    /// clan, ending the account's part in their Secrets, and removes its
+    /// friendships and the grants it holds or issued, its maps, folders and
+    /// owner Secrets, its Private additions, and last the account itself.
+    /// Packages it published stay, under their names. Every step only
+    /// removes access, so repeating the call finishes a deletion left
+    /// partway. The answer is `null` once the account is gone, or once all
+    /// that is left waits for a transfer acceptance under way, which the
+    /// server finishes on its own; once the account is gone, the credential
+    /// is unknown and a repeat answers 401.
+    ///
+    /// Session-only server-side: an API key answers 401.
+    ///
+    /// # Errors
+    /// [`CloudError::LastOwner`] while the account is the last owner of an
+    /// active clan (nothing changes); [`CloudError::Unauthorized`] without a
+    /// session credential, with an API key, or once the account is gone;
+    /// other failures via [`CloudError::from_status`].
+    pub async fn delete_account(&self) -> CloudResult<()> {
+        self.delete("/me").await
     }
 
     /// `GET /me/api-keys` — key metadata only, never key material.
@@ -1026,45 +1170,96 @@ impl CloudApiClient {
 
     // ===== ownership transfer (authenticated) =============================
 
-    /// `POST /areas/{id}/transfer` — offer to transfer area ownership. Raw
-    /// `is_owner`-only server-side (a `can_admin` deputy cannot transfer).
+    /// `POST /areas/{id}/transfer` — offers the caller's own map to a friend
+    /// (use [`Self::transfer_area_to_clan`] for a clan). Raw owner only: a
+    /// `can_admin` deputy cannot transfer, and a clan's maps are never
+    /// transferred.
     ///
     /// # Errors
-    /// [`CloudError::NotFoundOrNoAccess`] for a non-owner / nonexistent subject /
-    /// gate failure; a `409` (an offer is already live) via [`CloudError::from_status`].
+    /// [`CloudError::NotFoundOrNoAccess`] for a non-owner, a clan's map, a
+    /// recipient who is not a friend or a clan the caller is not in; a `409`
+    /// (an offer is already live) via [`CloudError::from_status`].
     pub async fn offer_area_transfer(
         &self,
         area_id: AreaId,
-        to_user_id: Uuid,
+        to: impl Into<TransferRecipient>,
     ) -> CloudResult<TransferView> {
-        let body = serde_json::json!({ "to_user_id": to_user_id });
         self.post(
             &format!("/areas/{area_id}/transfer"),
-            Some(&body),
+            Some(&to.into().body()),
             Auth::Required,
         )
         .await
     }
 
-    /// `POST /atlases/{id}/transfer` — offer to transfer atlas ownership (is_owner-only).
+    /// `POST /atlases/{id}/transfer` — offers the caller's own atlas to a
+    /// friend (use [`Self::transfer_atlas_to_clan`] for a clan).
     ///
     /// # Errors
     /// As [`Self::offer_area_transfer`].
     pub async fn offer_atlas_transfer(
         &self,
         atlas_id: AtlasId,
-        to_user_id: Uuid,
+        to: impl Into<TransferRecipient>,
     ) -> CloudResult<TransferView> {
-        let body = serde_json::json!({ "to_user_id": to_user_id });
         self.post(
             &format!("/atlases/{atlas_id}/transfer"),
-            Some(&body),
+            Some(&to.into().body()),
             Auth::Required,
         )
         .await
     }
 
-    /// `GET /transfers?direction=offered|received` — the caller's live offers.
+    /// Moves an owned map into an authorized clan folder in one request.
+    /// Retain `operation_id` when retrying after a transport failure.
+    ///
+    /// # Errors
+    /// Returns [`CloudError::NotFoundOrNoAccess`] without destination permission;
+    /// other failures use [`CloudError::from_status`].
+    pub async fn transfer_area_to_clan(
+        &self,
+        area: AreaId,
+        clan: Uuid,
+        ownership: crate::clan_maps::MapOwnership,
+        atlas: AtlasId,
+        operation_id: Uuid,
+    ) -> CloudResult<TransferView> {
+        self.post(
+            &format!("/areas/{area}/transfer"),
+            Some(&serde_json::json!({
+                "to_clan_id": clan, "ownership": ownership,
+                "atlas_id": atlas, "operation_id": operation_id,
+            })),
+            Auth::Required,
+        )
+        .await
+    }
+
+    /// Moves an owned atlas into a clan. The caller must be a clan owner.
+    /// Retain `operation_id` when retrying after a transport failure.
+    ///
+    /// # Errors
+    /// As [`Self::transfer_area_to_clan`].
+    pub async fn transfer_atlas_to_clan(
+        &self,
+        atlas: AtlasId,
+        clan: Uuid,
+        ownership: crate::clan_maps::MapOwnership,
+        operation_id: Uuid,
+    ) -> CloudResult<TransferView> {
+        self.post(
+            &format!("/atlases/{atlas}/transfer"),
+            Some(&serde_json::json!({
+                "to_clan_id": clan, "ownership": ownership,
+                "operation_id": operation_id,
+            })),
+            Auth::Required,
+        )
+        .await
+    }
+
+    /// `GET /transfers?direction=offered|received` — the caller's live offers,
+    /// newest first.
     ///
     /// # Errors
     /// Non-2xx statuses via [`CloudError::from_status`]; transport as [`CloudError::NetworkError`].
@@ -1076,12 +1271,28 @@ impl CloudApiClient {
         .await
     }
 
-    /// `POST /transfers/{id}/accept` — recipient accepts; optional atomic rename
-    /// and/or refile into a **caller-owned** atlas.
+    /// `GET /clans/{c}/transfers` — the live offers made to a clan, newest
+    /// first, for holders of `atlas.accept_transfer` on the clan or on any of
+    /// its folders.
     ///
     /// # Errors
-    /// [`CloudError::NotFoundOrNoAccess`] when the offer is not live / not addressed
-    /// to the caller; other failures via [`CloudError::from_status`].
+    /// [`CloudError::NotFoundOrNoAccess`] for anyone else; other failures via
+    /// [`CloudError::from_status`].
+    pub async fn clan_transfers(&self, clan_id: Uuid) -> CloudResult<Vec<TransferView>> {
+        self.get(&format!("/clans/{clan_id}/transfers")).await
+    }
+
+    /// `POST /transfers/{id}/accept` — the recipient accepts, with an
+    /// optional rename. On an offer to the caller, `atlas_id` files a map in
+    /// one of the caller's own atlases (otherwise it is loose). On an offer
+    /// to a clan, a holder of `atlas.accept_transfer` accepts: a map into
+    /// `atlas_id`, one of the clan's folders where they hold it (required),
+    /// an atlas into the clan (`atlas_id` ignored).
+    ///
+    /// # Errors
+    /// [`CloudError::NotFoundOrNoAccess`] when the offer is not live or not
+    /// the caller's to accept; [`CloudError::InvalidInput`] for a clan's map
+    /// offer without `atlas_id`; other failures via [`CloudError::from_status`].
     pub async fn accept_transfer(
         &self,
         id: Uuid,
@@ -1103,7 +1314,8 @@ impl CloudApiClient {
         .await
     }
 
-    /// `POST /transfers/{id}/decline` — recipient declines.
+    /// `POST /transfers/{id}/decline` — the recipient declines; on an offer to
+    /// a clan, any holder of `atlas.accept_transfer` there.
     ///
     /// # Errors
     /// Non-2xx statuses via [`CloudError::from_status`].
@@ -1162,61 +1374,84 @@ impl CloudApiClient {
 
     // ===== secrets, preview, copies =======================================
 
-    /// `POST /areas/{id}/secret-marks` — bulk set/clear `is_secret`.
-    /// Requires clearance (`can_edit` and owner-or-`include_secrets`);
-    /// foreign ids are silently ignored by the server.
-    ///
-    /// # Errors
-    /// [`CloudError::NotFoundOrNoAccess`] when not cleared; other failures via
-    /// [`CloudError::from_status`].
-    pub async fn secret_marks(
-        &self,
-        area_id: AreaId,
-        request: &SecretMarksRequest,
-    ) -> CloudResult<SecretMarksResult> {
-        let body = serde_json::to_value(request)?;
-        self.post(
-            &format!("/areas/{area_id}/secret-marks"),
-            Some(&body),
-            Auth::Required,
-        )
-        .await
-    }
-
-    /// `GET /areas/{id}/secrets` — owner-only flat audit list of every
-    /// secret-marked entity in the area.
+    /// `GET /areas/{id}/secrets` — the Secrets on a map that the caller can
+    /// read, with their own actions on each.
     ///
     /// # Errors
     /// Non-2xx statuses via [`CloudError::from_status`]; transport failures as
     /// [`CloudError::NetworkError`].
-    pub async fn area_secrets(&self, area_id: AreaId) -> CloudResult<Vec<SecretEntity>> {
+    pub async fn area_secrets(&self, area_id: AreaId) -> CloudResult<Vec<SecretSummary>> {
         self.get(&format!("/areas/{area_id}/secrets")).await
     }
 
-    /// `GET /areas/{id}/preview` — owner-only "what does this audience see"
-    /// simulation. `Ok(None)` means the audience sees nothing (the server
-    /// replies `200` with `data: null`).
+    // ===== Secret grants (authenticated, verified email) ==================
+    //
+    // Every refusal past the request's shape is the uniform
+    // [`CloudError::NotFoundOrNoAccess`]: an unknown or unreadable Secret or
+    // grant, a caller who may not manage it, a grantee who is not a friend
+    // or is blocked, and an action beyond the caller's own. An unverified
+    // caller is a `403`; an unknown action is [`CloudError::InvalidInput`].
+
+    /// `GET /secrets/{id}/grants` — the Secret's grants, oldest first. The
+    /// owner and holders of `manage_access` see every grant; another reader
+    /// sees only the grants naming them.
     ///
     /// # Errors
-    /// [`CloudError::NotFoundOrNoAccess`] for non-owners; other failures via
-    /// [`CloudError::from_status`].
-    pub async fn preview(
+    /// See the section comment; [`CloudError::InvalidInput`] for a source
+    /// that is not a Secret.
+    pub async fn secret_grants(&self, secret: &SourceId) -> CloudResult<Vec<SecretGrant>> {
+        self.get(&secret_grants_path(secret)?).await
+    }
+
+    /// `POST /secrets/{id}/grants` — shares the Secret with a friend. `read`
+    /// is implied. A second grant from the caller to the same grantee
+    /// replaces the first one's actions.
+    ///
+    /// # Errors
+    /// See the section comment.
+    pub async fn grant_secret(
         &self,
-        area_id: AreaId,
-        audience: PreviewAudience,
-    ) -> CloudResult<Option<AreaWithDetails>> {
-        let query: Vec<(&str, String)> = match audience {
-            PreviewAudience::WorstCase => Vec::new(),
-            PreviewAudience::Share(id) => vec![("share_id", id.to_string())],
-            PreviewAudience::AsUser(id) => vec![("as_user", id.to_string())],
-        };
-        self.get_with_query(&format!("/areas/{area_id}/preview"), &query)
+        secret: &SourceId,
+        grantee_id: Uuid,
+        actions: &[&str],
+    ) -> CloudResult<SecretGrant> {
+        let body = json!({ "grantee_id": grantee_id, "actions": actions });
+        self.post(&secret_grants_path(secret)?, Some(&body), Auth::Required)
             .await
     }
 
-    /// `POST /areas/{id}/copy` — clones the caller's redacted projection
-    /// into a new owned area. The response carries `copied_from_*`
-    /// provenance, which [`Area`] already models.
+    /// `PATCH /secrets/{id}/grants/{grant}` — replaces a grant's actions.
+    ///
+    /// # Errors
+    /// See the section comment.
+    pub async fn update_secret_grant(
+        &self,
+        secret: &SourceId,
+        grant_id: Uuid,
+        actions: &[&str],
+    ) -> CloudResult<SecretGrant> {
+        let body = json!({ "actions": actions });
+        self.patch(
+            &format!("{}/{grant_id}", secret_grants_path(secret)?),
+            &body,
+        )
+        .await
+    }
+
+    /// `DELETE /secrets/{id}/grants/{grant}` — revokes a grant.
+    ///
+    /// # Errors
+    /// See the section comment.
+    pub async fn revoke_secret_grant(&self, secret: &SourceId, grant_id: Uuid) -> CloudResult<()> {
+        self.delete(&format!("{}/{grant_id}", secret_grants_path(secret)?))
+            .await
+    }
+
+    /// `POST /areas/{id}/copy` — clones the map into a new owned area. Of
+    /// its Secrets, only those the caller holds
+    /// [`COPY`](secret_action::COPY) on come along, each as an owner Secret
+    /// of the copy; the rest leave no trace. The response carries
+    /// `copied_from_*` provenance, which [`Area`] already models.
     ///
     /// # Errors
     /// [`CloudError::NotFoundOrNoAccess`] uniformly when the source is not
@@ -1273,6 +1508,63 @@ mod tests {
 
     fn uuid(text: &str) -> Uuid {
         Uuid::parse_str(text).unwrap()
+    }
+
+    #[test]
+    fn an_offer_names_a_user_or_a_clan() {
+        let to_clan: TransferView = serde_json::from_value(serde_json::json!({
+            "id": "123e4567-e89b-12d3-a456-426614174000",
+            "subject_kind": "area",
+            "area_id": "123e4567-e89b-12d3-a456-426614174001",
+            "from_user_id": "123e4567-e89b-12d3-a456-426614174002",
+            "to_clan_id": "123e4567-e89b-12d3-a456-426614174003",
+            "to_clan_name": "Lantern Company",
+            "status": "Offered",
+            "created_at": "2026-10-06T09:00:00.000000Z",
+            "subject_name": "Solace",
+            "from_nickname": "tomas"
+        }))
+        .expect("an offer to a clan parses");
+        assert_eq!(to_clan.to_user_id, None);
+        assert_eq!(
+            to_clan.to_clan_id,
+            Some(uuid("123e4567-e89b-12d3-a456-426614174003"))
+        );
+        assert_eq!(to_clan.to_clan_name.as_deref(), Some("Lantern Company"));
+
+        let to_user: TransferView = serde_json::from_value(serde_json::json!({
+            "id": "123e4567-e89b-12d3-a456-426614174000",
+            "subject_kind": "atlas",
+            "atlas_id": "123e4567-e89b-12d3-a456-426614174001",
+            "from_user_id": "123e4567-e89b-12d3-a456-426614174002",
+            "to_user_id": "123e4567-e89b-12d3-a456-426614174004",
+            "status": "Accepted",
+            "created_at": "2026-10-06T09:00:00.000000Z",
+            "responded_at": "2026-10-06T09:05:00.000000Z",
+            "to_nickname": "ben"
+        }))
+        .expect("an offer to a user parses");
+        assert_eq!(
+            to_user.to_user_id,
+            Some(uuid("123e4567-e89b-12d3-a456-426614174004"))
+        );
+        assert_eq!(to_user.to_clan_id, None);
+
+        assert_eq!(
+            TransferRecipient::Clan(
+                uuid("123e4567-e89b-12d3-a456-426614174003"),
+                crate::clan_maps::MapOwnership::Members
+            )
+            .body(),
+            serde_json::json!({
+                "to_clan_id": "123e4567-e89b-12d3-a456-426614174003",
+                "ownership": "members"
+            })
+        );
+        assert_eq!(
+            TransferRecipient::from(uuid("123e4567-e89b-12d3-a456-426614174004")).body(),
+            serde_json::json!({ "to_user_id": "123e4567-e89b-12d3-a456-426614174004" })
+        );
     }
 
     #[test]
@@ -1474,40 +1766,43 @@ mod tests {
     }
 
     #[test]
-    fn secret_entity_parses_each_kind_with_omitted_fields() {
-        let rows: Vec<SecretEntity> = serde_json::from_value(json!([
-            { "kind": "room", "room_number": 7 },
-            { "kind": "exit", "id": "123e4567-e89b-12d3-a456-426614174000" },
-            { "kind": "label", "id": "123e4567-e89b-12d3-a456-426614174001" },
-            { "kind": "shape", "id": "123e4567-e89b-12d3-a456-426614174002" },
-            { "kind": "room_property", "room_number": 7, "name": "loot" },
-            { "kind": "area_property", "name": "owner_notes" }
-        ]))
+    fn secret_summary_parses_the_format_3_listing() {
+        let rows: Vec<SecretSummary> = serde_json::from_value(json!([{
+            "source": "123e4567-e89b-12d3-a456-426614174000",
+            "name": "Midgaard Secrets",
+            "ownership": "owner",
+            "actions": ["read", "add", "edit", "remove"]
+        }]))
         .unwrap();
 
-        assert_eq!(rows[0].kind, SecretEntityKind::Room);
-        assert_eq!(rows[0].room_number, Some(7));
-        assert_eq!(rows[0].id, None);
-        assert_eq!(rows[0].name, None);
-
-        assert_eq!(rows[1].kind, SecretEntityKind::Exit);
         assert_eq!(
-            rows[1].id,
-            Some(uuid("123e4567-e89b-12d3-a456-426614174000"))
+            rows[0].source.to_string(),
+            "123e4567-e89b-12d3-a456-426614174000"
         );
-        assert_eq!(rows[1].room_number, None);
+        assert_eq!(rows[0].name, "Midgaard Secrets");
+        assert_eq!(rows[0].ownership, "owner");
+        assert!(rows[0].actions.contains("edit"));
+    }
 
-        assert_eq!(rows[2].kind, SecretEntityKind::Label);
-        assert_eq!(rows[3].kind, SecretEntityKind::Shape);
-
-        assert_eq!(rows[4].kind, SecretEntityKind::RoomProperty);
-        assert_eq!(rows[4].room_number, Some(7));
-        assert_eq!(rows[4].name.as_deref(), Some("loot"));
-
-        assert_eq!(rows[5].kind, SecretEntityKind::AreaProperty);
-        assert_eq!(rows[5].name.as_deref(), Some("owner_notes"));
-        assert_eq!(rows[5].id, None);
-        assert_eq!(rows[5].room_number, None);
+    #[test]
+    fn a_secret_change_sends_only_what_changes() {
+        let both = SecretChange {
+            name: Some("Vault".to_string()),
+            color: SecretColorChange::Set("#3a7bd5".to_string()),
+        };
+        assert_eq!(both.body(), json!({ "name": "Vault", "color": "#3a7bd5" }));
+        let cleared = SecretChange {
+            color: SecretColorChange::Clear,
+            ..SecretChange::default()
+        };
+        assert_eq!(cleared.body(), json!({ "color": null }));
+        let renamed = SecretChange {
+            name: Some("Vault".to_string()),
+            ..SecretChange::default()
+        };
+        assert_eq!(renamed.body(), json!({ "name": "Vault" }));
+        assert!(SecretChange::default().is_empty());
+        assert!(!cleared.is_empty());
     }
 
     #[test]
@@ -1553,7 +1848,6 @@ mod tests {
         assert!(node.grant.can_edit);
         assert!(!node.grant.can_reshare);
         assert!(node.grant.can_copy);
-        assert!(!node.grant.include_secrets);
         assert_eq!(
             node.grant.area_id,
             Some(AreaId(uuid("00000000-0000-0000-0000-00000000000d")))
@@ -1621,11 +1915,11 @@ mod tests {
             can_edit: false,
             can_reshare: false,
             can_copy: false,
-            include_secrets: false,
             can_admin: false,
             host_hints: None,
         };
-        // All five flags explicit; host_hints omitted when None (old-server compat).
+        // All four flags explicit; host_hints omitted when None (old-server
+        // compat). `include_secrets` is no longer a share flag.
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             json!({
@@ -1634,7 +1928,6 @@ mod tests {
                 "can_edit": false,
                 "can_reshare": false,
                 "can_copy": false,
-                "include_secrets": false,
                 "can_admin": false
             })
         );
@@ -1648,7 +1941,6 @@ mod tests {
             can_edit: false,
             can_reshare: false,
             can_copy: false,
-            include_secrets: false,
             can_admin: false,
             host_hints: Some(vec!["arctic.org".to_string()]),
         };
@@ -1656,5 +1948,62 @@ mod tests {
             serde_json::to_value(with_hints).unwrap()["host_hints"],
             json!(["arctic.org"])
         );
+    }
+
+    #[test]
+    fn secret_grant_parses_with_and_without_nicknames() {
+        let grant: SecretGrant = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "secret_id": "00000000-0000-0000-0000-000000000002",
+            "area_id": "00000000-0000-0000-0000-000000000003",
+            "owner_id": "00000000-0000-0000-0000-000000000004",
+            "grantor_id": "00000000-0000-0000-0000-000000000004",
+            "grantee_id": "00000000-0000-0000-0000-000000000005",
+            "grantee_nickname": "tomas",
+            "actions": ["read", "edit", "remove"],
+            "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-02T00:00:00Z",
+        }))
+        .expect("a listed grant parses");
+        assert_eq!(
+            grant.secret_id,
+            SourceId::Secret(uuid("00000000-0000-0000-0000-000000000002"))
+        );
+        assert_eq!(grant.grantee_nickname.as_deref(), Some("tomas"));
+        assert!(grant.grantor_nickname.is_none());
+        assert!(grant.can(secret_action::EDIT) && !grant.can(secret_action::ADD));
+
+        // The create response carries no nicknames.
+        let created: SecretGrant = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "secret_id": "00000000-0000-0000-0000-000000000002",
+            "area_id": "00000000-0000-0000-0000-000000000003",
+            "owner_id": "00000000-0000-0000-0000-000000000004",
+            "grantor_id": "00000000-0000-0000-0000-000000000006",
+            "grantee_id": "00000000-0000-0000-0000-000000000005",
+            "grantor_nickname": "mira",
+            "actions": ["read"],
+            "created_at": "2026-10-01T00:00:00Z",
+            "updated_at": "2026-10-01T00:00:00Z",
+        }))
+        .expect("a created grant parses");
+        assert!(created.grantee_nickname.is_none());
+        assert_eq!(created.grantor_nickname.as_deref(), Some("mira"));
+        assert_eq!(created.actions.len(), 1);
+    }
+
+    #[test]
+    fn only_secrets_have_grant_paths() {
+        let secret = SourceId::Secret(uuid("00000000-0000-0000-0000-000000000002"));
+        assert_eq!(
+            secret_grants_path(&secret).unwrap(),
+            "/secrets/00000000-0000-0000-0000-000000000002/grants"
+        );
+        for other in [SourceId::Map, SourceId::Private] {
+            assert!(matches!(
+                secret_grants_path(&other),
+                Err(CloudError::InvalidInput(_))
+            ));
+        }
     }
 }

@@ -225,6 +225,9 @@ fn reconcile_locked(
         if replay.is_none()
             && !refreshed
             && cached.is_some()
+            // Source edits also change source revisions. The optimistic
+            // content shortcut only accounts for the ordinary map revision.
+            && details.sources.is_empty()
             && projection.contains_optimistic_commit(inner, &snapshot, details)
         {
             confirm_revision(inner, details);
@@ -296,7 +299,7 @@ impl LocalProjection {
         }) {
             return false;
         }
-        let Some(confirmed) = inner.pending.confirmed_rev(id).0 else {
+        let Some(confirmed) = inner.pending.confirmed_rev(id) else {
             return false;
         };
         let committed_here = inner
@@ -350,9 +353,10 @@ fn replay_deferred(
 }
 
 fn confirm_revision(inner: &Inner, details: &AreaWithDetails) {
-    inner.pending.adopt_confirmed_rev(
-        details.area.id,
-        details.area.rev,
-        details.area.access.map(|access| access.fingerprint()),
-    );
+    inner
+        .pending
+        .adopt_confirmed_rev(details.area.id, details.area.rev);
+    inner
+        .pending
+        .adopt_source_revs(details.area.id, &details.sources);
 }

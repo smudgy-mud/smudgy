@@ -13,13 +13,19 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::{Stream, StreamExt};
+use smudgy_cloud::backends::local::{LocalRoomRemap, LocalRoomRemapQueue, LocalSnapshot};
 use smudgy_cloud::{
-    CloudMapper, CompositeBackend, Credential, CredentialSource, LocalBackend, MapDestination,
-    MapStorage, Mapper, MapperBackend, PackageApiClient, RoomNumber, RoomUpdates, mapper::RoomKey,
+    Area, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasListItem, CloudError, CloudMapper,
+    CloudResult, CompositeBackend, CreateAreaRequest, Credential, CredentialSource, ExitDirection,
+    LocalBackend, MapDestination, MapStorage, Mapper, MapperBackend, PackageApiClient, RoomNumber,
+    RoomUpdates,
+    mapper::RoomKey,
+    mutation::{AreaMutation, MutationEnvelope, MutationResult},
 };
 use smudgy_core::models::local_packages::packages_dir;
 use smudgy_core::models::shared_packages::{self, UpdateMode};
@@ -220,6 +226,12 @@ async fn auto_mapper_maps_follows_and_persists() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package_source(SERVER);
     shared_packages::install_package(SERVER, "smudgy://local/auto-mapper", UpdateMode::Auto, true)
         .unwrap();
@@ -681,6 +693,12 @@ async fn auto_mapper_crosses_zones_and_returns_without_duplicates() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(ZONE_SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(ZONE_SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(ZONE_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package_source(ZONE_SERVER);
     shared_packages::install_package(
         ZONE_SERVER,
@@ -915,6 +933,12 @@ async fn auto_mapper_maps_ire_dialect_with_server_coords() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(IRE_SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(IRE_SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(IRE_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package_source(IRE_SERVER);
     shared_packages::install_package(
         IRE_SERVER,
@@ -1087,6 +1111,12 @@ async fn auto_mapper_maps_msdp_composite_room() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(MSDP_SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(MSDP_SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(MSDP_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package_source(MSDP_SERVER);
     shared_packages::install_package(
         MSDP_SERVER,
@@ -1242,6 +1272,12 @@ async fn auto_mapper_maps_idless_exits_by_movement() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(MOVE_SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(MOVE_SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(MOVE_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package_source(MOVE_SERVER);
     shared_packages::install_package(
         MOVE_SERVER,
@@ -1502,6 +1538,12 @@ async fn auto_mapper_follows_continent_rooms_without_drawing() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(CONT_SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(CONT_SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(CONT_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package_source(CONT_SERVER);
     shared_packages::install_package(
         CONT_SERVER,
@@ -1650,6 +1692,12 @@ async fn auto_mapper_defers_to_cross_entry_rescue() {
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(RESCUE_SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(RESCUE_SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(RESCUE_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package_source(RESCUE_SERVER);
     shared_packages::install_package(
         RESCUE_SERVER,
@@ -1789,6 +1837,12 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
     let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
     std::fs::create_dir_all(smudgy_home.join(RETRY_SERVER).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(RETRY_SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(RETRY_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     copy_package_source(RETRY_SERVER);
     shared_packages::install_package(
         RETRY_SERVER,
@@ -1958,6 +2012,294 @@ async fn auto_mapper_retries_into_a_local_area_when_the_bound_map_refuses_writes
         .expect("the retried room exists");
     assert_eq!(fallback_room.get_external_id(), Some("701"));
     assert_eq!(fallback_room.get_title(), "Overgrown Path");
+
+    tx.send(RuntimeAction::Shutdown).ok();
+}
+
+/// The local tier, recording every envelope with its verdict. Once armed with a
+/// room, it refuses any write that gives that room a linked north exit.
+struct RefusingLocalBackend {
+    inner: LocalBackend,
+    refuse_linked_north_from: Mutex<Option<(AreaId, RoomNumber)>>,
+    envelopes: Mutex<Vec<(MutationEnvelope, bool)>>,
+}
+
+impl RefusingLocalBackend {
+    fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            inner: LocalBackend::new(path),
+            refuse_linked_north_from: Mutex::new(None),
+            envelopes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn admit(&self, area_id: &AreaId, envelope: &MutationEnvelope) -> CloudResult<()> {
+        let armed = *self.refuse_linked_north_from.lock().unwrap();
+        let refused = armed.is_some_and(|(area, room)| {
+            area == *area_id
+                && envelope.payload.iter().any(|operation| {
+                    matches!(operation, AreaMutation::CreateExit { room_number, body, .. }
+                        if *room_number == room
+                            && body.from_direction == ExitDirection::North
+                            && body.to_room_number.is_some())
+                })
+        });
+        self.envelopes
+            .lock()
+            .unwrap()
+            .push((envelope.clone(), refused));
+        if refused {
+            Err(CloudError::InvalidInput(
+                "this room's north exit cannot be linked".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl MapperBackend for RefusingLocalBackend {
+    fn local_snapshot(&self) -> Option<Arc<LocalSnapshot>> {
+        self.inner.local_snapshot()
+    }
+
+    async fn subscribe_local(&self) -> CloudResult<Option<tokio::sync::watch::Receiver<u64>>> {
+        self.inner.subscribe_local().await
+    }
+
+    async fn subscribe_local_room_remaps(&self) -> CloudResult<Option<Arc<LocalRoomRemapQueue>>> {
+        self.inner.subscribe_local_room_remaps().await
+    }
+
+    async fn execute_local_mutation_with_room_remap(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+        remap: Option<LocalRoomRemap>,
+    ) -> CloudResult<MutationResult> {
+        self.admit(area_id, envelope)?;
+        self.inner
+            .execute_local_mutation_with_room_remap(area_id, envelope, remap)
+            .await
+    }
+
+    async fn refresh_local(&self) -> CloudResult<()> {
+        self.inner.refresh_local().await
+    }
+
+    fn default_storage(&self) -> MapStorage {
+        self.inner.default_storage()
+    }
+
+    async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
+        self.inner.create_area(request).await
+    }
+
+    async fn create_area_at(
+        &self,
+        request: CreateAreaRequest,
+        storage: MapStorage,
+    ) -> CloudResult<Area> {
+        self.inner.create_area_at(request, storage).await
+    }
+
+    async fn list_areas(&self) -> CloudResult<Vec<Area>> {
+        self.inner.list_areas().await
+    }
+
+    async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
+        self.inner.get_area(area_id).await
+    }
+
+    async fn update_area(&self, area_id: &AreaId, updates: AreaUpdates) -> CloudResult<()> {
+        self.inner.update_area(area_id, updates).await
+    }
+
+    async fn delete_area(&self, area_id: &AreaId) -> CloudResult<()> {
+        self.inner.delete_area(area_id).await
+    }
+
+    async fn execute_mutation(
+        &self,
+        area_id: &AreaId,
+        envelope: &MutationEnvelope,
+    ) -> CloudResult<MutationResult> {
+        self.admit(area_id, envelope)?;
+        self.inner.execute_mutation(area_id, envelope).await
+    }
+
+    async fn list_atlases(&self) -> CloudResult<Vec<AtlasListItem>> {
+        self.inner.list_atlases().await
+    }
+
+    async fn create_atlas(&self, name: &str) -> CloudResult<Atlas> {
+        self.inner.create_atlas(name).await
+    }
+
+    async fn create_atlas_at(&self, name: &str, storage: MapStorage) -> CloudResult<Atlas> {
+        self.inner.create_atlas_at(name, storage).await
+    }
+}
+
+/// Re-pointing an exit deletes it and creates it again, and the two land as one
+/// write: when the backend refuses the new link, discarding the failed edit leaves
+/// the room its exit. Here the waiting exit points at a placeholder whose room turns
+/// out to lie in another zone, so the rebuilt room's discovery relinks it.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end walk, read top to bottom
+async fn auto_mapper_refused_relink_keeps_the_exit() {
+    const RELINK_SERVER: &str = "AutoMapperRefusedRelink";
+    let home = tempfile::tempdir().expect("create temp home");
+    let home_path = home.path().to_path_buf();
+    std::mem::forget(home);
+    smudgy_core::set_smudgy_home(&home_path);
+    let smudgy_home = smudgy_core::get_smudgy_home().expect("smudgy home");
+    std::fs::create_dir_all(smudgy_home.join(RELINK_SERVER).join("modules")).unwrap();
+    std::fs::create_dir_all(smudgy_home.join(RELINK_SERVER).join("logs")).unwrap();
+    // The session's server, whose settings say where the package's new maps go.
+    std::fs::write(
+        smudgy_home.join(RELINK_SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
+    copy_package_source(RELINK_SERVER);
+    shared_packages::install_package(
+        RELINK_SERVER,
+        "smudgy://local/auto-mapper",
+        UpdateMode::Auto,
+        true,
+    )
+    .unwrap();
+
+    let map_root = smudgy_home.join("map-test-refused-relink");
+    let local = Arc::new(RefusingLocalBackend::new(map_root.join("local")));
+    let cloud = Arc::new(CloudMapper::new(
+        "http://127.0.0.1:0".to_string(),
+        "test-key".to_string(),
+    ));
+    let backend: Arc<dyn MapperBackend + Send + Sync> =
+        Arc::new(CompositeBackend::new(local.clone(), cloud));
+    let mapper = Mapper::new(backend, map_root.join("cache"));
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9342_u32),
+        server_name: Arc::new(RELINK_SERVER.to_string()),
+        profile_name: Arc::new("Test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: Some(mapper.clone()),
+        package_client: Some(PackageApiClient::new(
+            "http://127.0.0.1:0",
+            CredentialSource::new(Some(Credential::ApiKey("test".into()))),
+        )),
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+
+    let mut events = Box::pin(spawn(params));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+
+    // Room 600 names its north neighbor 601, which waits as a placeholder in 600's zone.
+    tx.send(RuntimeAction::GmcpEnabled).unwrap();
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 600, "name": "Border Post", "zone": "lowlands", "exits": { "n": 601 } }"#,
+    ))
+    .unwrap();
+    wait_until(
+        &mut events,
+        &mut lines,
+        "room 600 and its north placeholder",
+        |_| rooms_linked(&mapper, "600", "601"),
+    )
+    .await;
+    drain_mutation_queue(&mapper).await;
+    let atlas = mapper.get_current_atlas();
+    let (key600, room600) = atlas.find_room_by_external_id("600").expect("room 600");
+    let north = room600
+        .get_exits()
+        .iter()
+        .find(|exit| exit.from_direction == ExitDirection::North)
+        .expect("600 has a north exit")
+        .id;
+
+    // 601 is in another zone: its room is rebuilt there, and relinking 600's north exit
+    // to the rebuilt room is refused.
+    *local.refuse_linked_north_from.lock().unwrap() = Some((key600.area_id, key600.room_number));
+    tx.send(gmcp(
+        "Room.Info",
+        r#"{ "num": 601, "name": "Hill Path", "zone": "highlands", "exits": { "s": 600 } }"#,
+    ))
+    .unwrap();
+    wait_until(
+        &mut events,
+        &mut lines,
+        "the refused relink to park 600's map",
+        |_| mapper.failed_operation_id(key600.area_id).is_some(),
+    )
+    .await;
+    mapper
+        .resolve_failed(key600.area_id, false)
+        .await
+        .expect("discard the refused edit");
+    wait_until(
+        &mut events,
+        &mut lines,
+        "room 601 to be rebuilt in its own zone and link back to 600",
+        |_| {
+            room_is_materialized(&mapper, "601")
+                && rooms_linked(&mapper, "601", "600")
+                && mapper.failed_operation_id(key600.area_id).is_none()
+        },
+    )
+    .await;
+    // The discarded edit stays counted as failed, so only an unfinished queue is an error.
+    assert_ne!(
+        mapper.wait_for_sync_completion(60).await,
+        Ok(false),
+        "mutation queue still pending after 60 seconds"
+    );
+    let transcript = lines.join("\n");
+
+    let envelopes = local.envelopes.lock().unwrap().clone();
+    assert!(
+        envelopes.iter().any(|(_, refused)| *refused),
+        "the relink reached the backend and was refused.\n{transcript}"
+    );
+    let atlas = mapper.get_current_atlas();
+    let (_, room600) = atlas.find_room_by_external_id("600").expect("room 600");
+    assert!(
+        room600
+            .get_exits()
+            .iter()
+            .any(|exit| exit.from_direction == ExitDirection::North),
+        "600 keeps its north exit after the refused relink.\n{transcript}"
+    );
+    for (envelope, _) in &envelopes {
+        let deletes_north = envelope.payload.iter().any(|operation| {
+            matches!(operation, AreaMutation::DeleteExit { exit_id } if *exit_id == north)
+        });
+        let recreates_north = envelope.payload.iter().any(|operation| {
+            matches!(operation, AreaMutation::CreateExit { room_number, body, .. }
+                if *room_number == key600.room_number
+                    && body.from_direction == ExitDirection::North)
+        });
+        assert!(
+            !deletes_north || recreates_north,
+            "600's north exit is deleted only in the write that recreates it.\n{transcript}"
+        );
+    }
 
     tx.send(RuntimeAction::Shutdown).ok();
 }

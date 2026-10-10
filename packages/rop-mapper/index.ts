@@ -52,14 +52,13 @@ function exitDestination(value: unknown): string | null {
     return asId(value);
 }
 
+/** An exit's `door`, numbered as Mudlet numbers door states: 0 none, 1 open, 2 closed,
+ *  3 locked. No door reports nothing, leaving a door the map already has as it is. */
 function exitDoor(value: unknown): DoorFix | undefined {
     if (!value || typeof value !== "object") return undefined;
     const state = asNumber((value as Record<string, unknown>).door);
-    if (state === null) return undefined;
-    return {
-        closed: state >= 2,
-        locked: state >= 3,
-    };
+    if (state === null || state < 1) return undefined;
+    return { state: state >= 3 ? "locked" : state >= 2 ? "closed" : "open" };
 }
 
 function adaptRoomInfo(info: unknown): RoomFix | null {

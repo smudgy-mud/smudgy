@@ -1,4 +1,4 @@
-//! The settings window: account lifecycle (passwordless signup and login
+//! The settings window: account lifecycle (passwordless sign-in
 //! via emailed one-time codes), handle management, client preferences
 //! (appearance, input, logging), and the security tab (API keys + sessions).
 //!
@@ -23,7 +23,9 @@ use smudgy_ui_shared::settings_appearance::{self, Appearance, Change as Appearan
 use smudgy_ui_shared::settings_input::{self, Change as InputChange, InputPreferences};
 use smudgy_ui_shared::settings_theme;
 
-use crate::cloud_account::CloudHandles;
+use crate::account_deletion::{self, AfterFailure, Answer};
+use crate::cloud_account::{CloudHandles, DeletionKey};
+use crate::components::clan_panel::{self, ClanPanel};
 use crate::components::cloud_errors::display_error;
 use crate::components::color_picker::{self, ColorPicker};
 use crate::components::social_panel::{self, SocialPanel};
@@ -38,6 +40,17 @@ use crate::update::Update;
 /// THIRD-PARTY-NOTICES.md` (see `about.toml` / `about.hbs` at the repo root).
 const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD-PARTY-NOTICES.md");
 
+/// The open account-deletion confirmation.
+#[derive(Debug, Clone, Default)]
+struct DeletionDialog {
+    /// What the user typed to confirm.
+    typed: String,
+    /// `DELETE /me` (or the probe after it) is in flight.
+    busy: bool,
+    /// Why the last attempt did not delete the account.
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Account,
@@ -50,6 +63,7 @@ pub enum Tab {
     Audio,
     Security,
     Friends,
+    Clans,
     Licenses,
 }
 
@@ -112,6 +126,20 @@ pub enum Message {
     SignOutPressed,
     SignOutEverywhereChanged(bool),
 
+    /// Open (`true`) or close the account-deletion confirmation.
+    DeleteAccountShown(bool),
+    DeleteAccountTyped(String),
+    DeleteAccountConfirmed,
+    /// The answer to `DELETE /me`, for the account and credential it was
+    /// asked under.
+    DeleteAccountResult(DeletionKey, Result<(), CloudError>),
+    /// Where a failed deletion left the account (from a `/me` probe), with
+    /// the failure's text.
+    DeleteAccountProbed(DeletionKey, String, AfterFailure),
+    /// The caller's clans (and members of those it owns), for naming the
+    /// clans a `last_owner` refusal is about.
+    DeleteAccountClansLoaded(Result<account_deletion::OwnedClans, CloudError>),
+
     SecurityRefresh,
     ApiKeysLoaded(Result<Vec<ApiKeyInfo>, CloudError>),
     SessionsLoaded(Result<Vec<SessionInfo>, CloudError>),
@@ -152,6 +180,7 @@ pub enum Message {
     OpenNoticesLink(markdown::Uri),
 
     Social(social_panel::Message),
+    Clans(clan_panel::Message),
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +189,15 @@ pub enum Event {
     SessionEstablished(Box<AuthSession>),
     /// User signed out (optionally revoking every session server-side).
     SignOut { everywhere: bool },
+    /// `DELETE /me` is on its way for the account and credential the key
+    /// names: until an answer shows the account still works, a refused
+    /// credential means the account is gone.
+    DeletionRequested(DeletionKey),
+    /// The account was not deleted (409 `last_owner`, or it still answers).
+    DeletionRefused(DeletionKey),
+    /// The account is gone or being deleted: sign out here and forget what
+    /// this computer keeps for it.
+    AccountDeleted(DeletionKey),
     /// Fresh profile data (nickname change etc.).
     ProfileUpdated(Box<UserProfile>),
     /// Ask the account controller to re-probe `/me`.
@@ -167,6 +205,12 @@ pub enum Event {
     /// A preference committed in the Preferences tab. The daemon persists
     /// `settings.json` and propagates the change; this window only emits.
     SettingsChanged(Box<Settings>),
+    /// Settings › Clans › Access asks the map editor to show a map.
+    OpenMap(smudgy_cloud::AreaId),
+    /// Settings › Clans › Access asks the map editor for a map's Share dialog.
+    OpenMapAccess(smudgy_cloud::AreaId),
+    /// Settings › Clans › Access asks Automations to show a package, by name.
+    OpenPackage(String),
 }
 
 pub struct SettingsWindow {
@@ -186,6 +230,8 @@ pub struct SettingsWindow {
     /// button by default so it isn't mistaken for a required step).
     editing_nickname: bool,
     sign_out_everywhere: bool,
+    /// The open account-deletion confirmation.
+    deletion: Option<DeletionDialog>,
 
     busy: Option<String>,
     error: Option<String>,
@@ -216,6 +262,7 @@ pub struct SettingsWindow {
     tweak_picker: Option<(&'static str, ColorPicker)>,
 
     social: SocialPanel,
+    clans: ClanPanel,
 
     /// The parsed license notices, built on first Licenses-tab open. Parsing
     /// the ~600 KB Markdown document once (rather than on every `view`) keeps
@@ -232,6 +279,7 @@ impl SettingsWindow {
             .and_then(|p| p.nickname.clone())
             .unwrap_or_default();
         let social = SocialPanel::new(cloud.clone());
+        let clans = ClanPanel::new(cloud.clone());
         let settings = load_settings();
         let appearance = settings_appearance::State::new(Appearance {
             font_size: settings.terminal_font_size,
@@ -264,6 +312,7 @@ impl SettingsWindow {
             nickname_input,
             editing_nickname: false,
             sign_out_everywhere: false,
+            deletion: None,
             busy: None,
             error: None,
             notice: None,
@@ -280,6 +329,7 @@ impl SettingsWindow {
             tweak_tab: TweakTab::Adjust,
             tweak_picker: None,
             social,
+            clans,
             notices: None,
         }
     }
@@ -300,11 +350,55 @@ impl SettingsWindow {
         self.email.clear();
         self.nickname_input.clear();
         self.editing_nickname = false;
+        self.deletion = None;
         self.api_keys = None;
         self.sessions = None;
         self.created_key = None;
         self.security_error = None;
         self.social = SocialPanel::new(self.cloud.clone());
+        self.clans = ClanPanel::new(self.cloud.clone());
+    }
+
+    /// What the user types to confirm deleting the account: its nickname, or
+    /// its email while it has none.
+    fn deletion_confirmation_text(&self) -> String {
+        let snapshot = self.cloud.snapshot.get();
+        snapshot
+            .profile
+            .as_ref()
+            .map(|profile| {
+                profile
+                    .nickname
+                    .clone()
+                    .unwrap_or_else(|| profile.email.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The account is gone or being deleted: close the confirmation, drop
+    /// this window's account caches, and have the daemon sign out here.
+    fn account_gone(&mut self, key: DeletionKey, notice: String) -> Update<Message, Event> {
+        self.reset_account_caches();
+        self.clear_feedback();
+        self.notice = Some(notice);
+        Update::with_event(Event::AccountDeleted(key))
+    }
+
+    /// Whether an answer about the deletion `key` names still concerns the
+    /// account here: asked under the credential in use, or with no one
+    /// signed in since but that account (the deletion's own refusal signs
+    /// it out, and the answer still says what became of it). An answer
+    /// arriving while another credential or account is in use is dropped,
+    /// and only closes a confirmation left open.
+    fn deletion_answer_current(&mut self, key: DeletionKey) -> bool {
+        let now = self.cloud.deletion_key();
+        let signed_out_since = self.cloud.credentials.get().is_none()
+            && now.user_id.is_none_or(|user| key.user_id == Some(user));
+        if key == now || signed_out_since {
+            return true;
+        }
+        self.deletion = None;
+        false
     }
 
     /// Extracts the emailed one-time code from pasted input. Codes are
@@ -314,9 +408,22 @@ impl SettingsWindow {
         input.chars().filter(char::is_ascii_digit).collect()
     }
 
+    /// What the window loads as it opens: the clans and what waits there,
+    /// so the Clans item can show its count before the tab is opened.
+    pub fn prefetch(&mut self) -> Task<Message> {
+        if self.cloud.snapshot.get().email_verified {
+            self.clans.refresh().map(Message::Clans)
+        } else {
+            Task::none()
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> Update<Message, Event> {
         match message {
             Message::TabSelected(tab) => {
+                if self.tab == Tab::Clans && tab != Tab::Clans {
+                    self.clans.close_clan();
+                }
                 self.tab = tab;
                 if tab == Tab::Preferences && self.system_fonts.is_none() {
                     return Update::with_task(enumerate_system_fonts());
@@ -329,6 +436,12 @@ impl SettingsWindow {
                     && !self.social.is_loaded()
                 {
                     return Update::with_task(self.social.refresh().map(Message::Social));
+                }
+                if tab == Tab::Clans
+                    && self.cloud.snapshot.get().email_verified
+                    && !self.clans.is_loaded()
+                {
+                    return Update::with_task(self.clans.refresh().map(Message::Clans));
                 }
                 if tab == Tab::Licenses && self.notices.is_none() {
                     self.notices = Some(markdown::Content::parse(THIRD_PARTY_NOTICES));
@@ -538,6 +651,106 @@ impl SettingsWindow {
             }
             Message::SignOutEverywhereChanged(v) => {
                 self.sign_out_everywhere = v;
+                Update::none()
+            }
+
+            // ===== account deletion =====
+            Message::DeleteAccountShown(shown) => {
+                self.clear_feedback();
+                self.deletion = shown.then(DeletionDialog::default);
+                Update::none()
+            }
+            Message::DeleteAccountTyped(typed) => {
+                if let Some(dialog) = &mut self.deletion {
+                    dialog.typed = typed;
+                }
+                Update::none()
+            }
+            Message::DeleteAccountConfirmed => {
+                let expected = self.deletion_confirmation_text();
+                let Some(dialog) = &mut self.deletion else {
+                    return Update::none();
+                };
+                if dialog.busy || !account_deletion::confirms(&dialog.typed, &expected) {
+                    return Update::none();
+                }
+                dialog.busy = true;
+                dialog.error = None;
+                let client = self.cloud.client.clone();
+                let key = self.cloud.deletion_key();
+                Update::new(
+                    Task::perform(
+                        async move { client.delete_account().await },
+                        move |result| Message::DeleteAccountResult(key, result),
+                    ),
+                    Some(Event::DeletionRequested(key)),
+                )
+            }
+            Message::DeleteAccountResult(key, _) if !self.deletion_answer_current(key) => {
+                Update::none()
+            }
+            Message::DeleteAccountResult(key, result) => {
+                match account_deletion::read_answer(result) {
+                    Answer::Deleted => self.account_gone(key, t!("account-delete-done")),
+                    Answer::NoLongerAccepted => {
+                        self.account_gone(key, t!("account-delete-signed-out"))
+                    }
+                    Answer::LastOwner => {
+                        if let Some(dialog) = &mut self.deletion {
+                            dialog.busy = false;
+                            dialog.error = Some(t!("account-delete-last-owner-unnamed"));
+                        }
+                        let client = self.cloud.client.clone();
+                        Update::new(
+                            Task::perform(
+                                account_deletion::owned_clans(client),
+                                Message::DeleteAccountClansLoaded,
+                            ),
+                            Some(Event::DeletionRefused(key)),
+                        )
+                    }
+                    Answer::Failed(error) => {
+                        let message = display_error(&error);
+                        let client = self.cloud.client.clone();
+                        Update::with_task(Task::perform(
+                            async move { account_deletion::after_failure(&client.me().await) },
+                            move |after| Message::DeleteAccountProbed(key, message.clone(), after),
+                        ))
+                    }
+                }
+            }
+            Message::DeleteAccountProbed(key, ..) if !self.deletion_answer_current(key) => {
+                Update::none()
+            }
+            Message::DeleteAccountProbed(key, message, after) => match after {
+                AfterFailure::Deleting => self.account_gone(key, t!("account-delete-signed-out")),
+                AfterFailure::Intact => {
+                    if let Some(dialog) = &mut self.deletion {
+                        dialog.busy = false;
+                        dialog.error = Some(t!("account-delete-not-deleted", "error" => message));
+                    }
+                    Update::with_event(Event::DeletionRefused(key))
+                }
+                AfterFailure::Unknown => {
+                    if let Some(dialog) = &mut self.deletion {
+                        dialog.busy = false;
+                        dialog.error = Some(t!("account-delete-unfinished", "error" => message));
+                    }
+                    Update::none()
+                }
+            },
+            Message::DeleteAccountClansLoaded(result) => {
+                let me = self.cloud.snapshot.get().profile.as_ref().map(|p| p.id);
+                let names = match (result, me) {
+                    (Ok(clans), Some(me)) => account_deletion::last_owner_clans(&clans, me),
+                    _ => Vec::new(),
+                };
+                if let Some(dialog) = &mut self.deletion
+                    && !names.is_empty()
+                {
+                    let clans = names.join(&t!("mapper-multi-list-separator"));
+                    dialog.error = Some(t!("account-delete-last-owner", "clans" => clans));
+                }
                 Update::none()
             }
 
@@ -823,6 +1036,17 @@ impl SettingsWindow {
             Message::Social(message) => {
                 Update::with_task(self.social.update(message).map(Message::Social))
             }
+
+            // ===== clans tab =====
+            Message::Clans(message) => {
+                let task = self.clans.update(message).map(Message::Clans);
+                let event = self.clans.take_handoff().map(|handoff| match handoff {
+                    clan_panel::Handoff::Map(area) => Event::OpenMap(area),
+                    clan_panel::Handoff::MapAccess(area) => Event::OpenMapAccess(area),
+                    clan_panel::Handoff::Package(name) => Event::OpenPackage(name),
+                });
+                Update { task, event }
+            }
         }
     }
 
@@ -950,6 +1174,12 @@ impl SettingsWindow {
             self.tab == Tab::Friends,
             Tab::Friends,
         ));
+        nav = nav.push(nav_button_with_count(
+            t!("nav-clans"),
+            self.tab == Tab::Clans,
+            Tab::Clans,
+            self.clans.pending(),
+        ));
         nav = nav.push(nav_button(
             t!("nav-licenses"),
             self.tab == Tab::Licenses,
@@ -969,17 +1199,31 @@ impl SettingsWindow {
             Tab::Audio => column![].into(),
             Tab::Security => self.security_view(),
             Tab::Friends => self.friends_view(),
+            Tab::Clans => self.clans_view(),
             Tab::Licenses => self.licenses_view(),
         };
 
-        row![
-            container(self.nav()).padding(12),
-            rule::vertical(1),
-            container(iced::widget::scrollable(container(content).padding(16)))
-                .width(Length::Fill)
-                .height(Length::Fill),
-        ]
-        .into()
+        let page = container(iced::widget::scrollable(container(content).padding(16)))
+            .width(Length::Fill)
+            .height(Length::Fill);
+        // A clan dialog lies over the whole page, whatever is scrolled.
+        let dialog = (self.tab == Tab::Clans)
+            .then(|| self.clans.modal_view())
+            .flatten();
+        let page: ThemedElement<'_, Message> = match dialog {
+            Some(dialog) => iced::widget::stack![
+                page,
+                iced::widget::opaque(
+                    container(iced::widget::center(dialog.map(Message::Clans)).padding(24))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(theme::builtins::container::overlay)
+                ),
+            ]
+            .into(),
+            None => page.into(),
+        };
+        row![container(self.nav()).padding(12), rule::vertical(1), page].into()
     }
 
     fn feedback(&self) -> ThemedElement<'_, Message> {
@@ -1099,7 +1343,77 @@ impl SettingsWindow {
             .align_y(Alignment::Center),
         );
 
+        col = col.push(rule::horizontal(1));
+        col = col.push(match &self.deletion {
+            None => button(text(t!("account-delete")).size(13))
+                .style(theme::builtins::button::danger)
+                .padding([4, 10])
+                .on_press(Message::DeleteAccountShown(true))
+                .into(),
+            Some(dialog) => self.deletion_dialog(dialog),
+        });
+
         col.into()
+    }
+
+    /// The account-deletion confirmation: what goes, what stays, and the
+    /// nickname to type before the delete button works.
+    fn deletion_dialog<'a>(&self, dialog: &'a DeletionDialog) -> ThemedElement<'a, Message> {
+        let expected = self.deletion_confirmation_text();
+        let confirmed = account_deletion::confirms(&dialog.typed, &expected);
+        let mut col = column![
+            text(t!("account-delete-title"))
+                .size(15)
+                .style(theme::builtins::text::danger),
+            text(t!("account-delete-goes")).size(13),
+            column![
+                text(t!("account-delete-goes-maps")).size(13),
+                text(t!("account-delete-goes-secrets")).size(13),
+                text(t!("account-delete-goes-social")).size(13),
+                text(t!("account-delete-goes-clans")).size(13),
+            ]
+            .spacing(2)
+            .padding([0, 8]),
+            text(t!("account-delete-member-secrets")).size(12),
+            text(t!("account-delete-stays")).size(13),
+            text(t!("account-delete-type-nickname", "nickname" => expected)).size(13),
+            text_input("", &dialog.typed)
+                .on_input(Message::DeleteAccountTyped)
+                .on_submit(Message::DeleteAccountConfirmed)
+                .width(280),
+        ]
+        .spacing(8);
+        if dialog.busy {
+            col = col.push(text(t!("account-busy-deleting")).size(13));
+        }
+        if let Some(error) = &dialog.error {
+            col = col.push(text(error).size(13).style(theme::builtins::text::danger));
+        }
+        let delete = button(text(t!("account-delete-confirm")).size(13))
+            .style(theme::builtins::button::danger)
+            .padding([4, 10]);
+        let cancel = button(text(t!("action-cancel")).size(13))
+            .style(theme::builtins::button::secondary)
+            .padding([4, 10]);
+        col = col.push(
+            row![
+                if dialog.busy {
+                    cancel
+                } else {
+                    cancel.on_press(Message::DeleteAccountShown(false))
+                },
+                if confirmed && !dialog.busy {
+                    delete.on_press(Message::DeleteAccountConfirmed)
+                } else {
+                    delete
+                },
+            ]
+            .spacing(8),
+        );
+        container(col)
+            .padding(10)
+            .style(theme::builtins::container::modal_body)
+            .into()
     }
 
     /// The nickname affordance in the signed-in view, in one of three states:
@@ -1664,6 +1978,24 @@ impl SettingsWindow {
         self.social.view().map(Message::Social)
     }
 
+    /// The Clans tab: Friends' verified-email gate, or the clans panel.
+    fn clans_view(&self) -> ThemedElement<'_, Message> {
+        let snapshot = self.cloud.snapshot.get();
+        if !snapshot.email_verified || self.clans.needs_email_verification() {
+            return column![
+                text(t!("clans-title")).size(20),
+                text(t!("clans-verify-email")).size(14),
+                button(text(t!("friends-go-account")).size(13))
+                    .style(theme::builtins::button::primary)
+                    .padding([6, 16])
+                    .on_press(Message::TabSelected(Tab::Account)),
+            ]
+            .spacing(12)
+            .into();
+        }
+        self.clans.view().map(Message::Clans)
+    }
+
     /// The Licenses tab: the bundled third-party notices (font / icon / runtime
     /// attributions plus every linked Rust library) rendered as Markdown. The
     /// document is parsed once into `self.notices`; the surrounding page
@@ -1861,6 +2193,36 @@ fn preview_strip(palette: &prefs::TerminalPalette) -> ThemedElement<'static, Mes
     .into()
 }
 
+/// A nav item with a small count of what waits there; plain at zero.
+fn nav_button_with_count(
+    label: String,
+    selected: bool,
+    tab: Tab,
+    count: usize,
+) -> ThemedElement<'static, Message> {
+    if count == 0 {
+        return nav_button(label, selected, tab);
+    }
+    let pill = container(text(count.to_string()).size(11))
+        .padding([0, 6])
+        .style(|theme: &crate::Theme| container::Style {
+            background: Some(theme.styles.general.accent.into()),
+            text_color: Some(iced::Color::WHITE),
+            border: iced::border::rounded(8.0),
+            ..Default::default()
+        });
+    button(row![text(label).size(14), space::horizontal(), pill].align_y(iced::Alignment::Center))
+        .style(if selected {
+            theme::builtins::button::list_item_selected
+        } else {
+            theme::builtins::button::list_item
+        })
+        .width(Length::Fill)
+        .padding([6, 10])
+        .on_press(Message::TabSelected(tab))
+        .into()
+}
+
 fn nav_button(label: String, selected: bool, tab: Tab) -> ThemedElement<'static, Message> {
     button(text(label).size(14))
         .style(if selected {
@@ -1890,4 +2252,192 @@ fn nickname_problem(nickname: &str) -> Option<String> {
         return Some(t!("account-error-nickname-format"));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smudgy_cloud::clans::{ClanMember, ClanSummary};
+
+    fn window() -> SettingsWindow {
+        let mut window = SettingsWindow::new(crate::cloud_account::test_handles_signed_in("mira"));
+        let _ = window.update(Message::DeleteAccountShown(true));
+        window
+    }
+
+    fn typed(window: &mut SettingsWindow, text: &str) -> Update<Message, Event> {
+        let _ = window.update(Message::DeleteAccountTyped(text.to_string()));
+        window.update(Message::DeleteAccountConfirmed)
+    }
+
+    fn dialog(window: &SettingsWindow) -> &DeletionDialog {
+        window.deletion.as_ref().expect("the confirmation is open")
+    }
+
+    #[test]
+    fn deleting_waits_for_the_nickname() {
+        let mut window = window();
+        let update = typed(&mut window, "Mira");
+        assert!(update.event.is_none());
+        assert!(!dialog(&window).busy);
+
+        let update = typed(&mut window, "mira");
+        assert!(matches!(
+            update.event,
+            Some(Event::DeletionRequested(key)) if key == window.cloud.deletion_key()
+        ));
+        assert!(dialog(&window).busy);
+
+        let again = window.update(Message::DeleteAccountConfirmed);
+        assert!(again.event.is_none(), "one request at a time");
+    }
+
+    #[test]
+    fn a_deleted_or_refused_credential_signs_out_here() {
+        for result in [Ok(()), Err(CloudError::Unauthorized("gone".to_string()))] {
+            let mut window = window();
+            let _ = typed(&mut window, "mira");
+            let key = window.cloud.deletion_key();
+            let update = window.update(Message::DeleteAccountResult(key, result));
+            assert!(matches!(update.event, Some(Event::AccountDeleted(k)) if k == key));
+            assert!(window.deletion.is_none());
+            assert!(window.notice.is_some());
+        }
+    }
+
+    #[test]
+    fn the_last_owner_hears_which_clans_hold_the_deletion_back() {
+        let mut window = window();
+        let _ = typed(&mut window, "mira");
+        let key = window.cloud.deletion_key();
+        let update = window.update(Message::DeleteAccountResult(
+            key,
+            Err(CloudError::LastOwner),
+        ));
+        assert!(matches!(update.event, Some(Event::DeletionRefused(_))));
+        let generic = dialog(&window).error.clone().expect("a message at once");
+
+        let me = Uuid::nil();
+        let clan = ClanSummary {
+            id: Uuid::new_v4(),
+            name: "Lantern Company".to_string(),
+            description: None,
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            member_count: 1,
+            is_owner: true,
+            group_ids: Vec::new(),
+            actions: std::collections::BTreeSet::new(),
+        };
+        let alone = ClanMember {
+            user_id: me,
+            nickname: Some("mira".to_string()),
+            joined_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            is_owner: true,
+            group_ids: Vec::new(),
+        };
+        let _ = window.update(Message::DeleteAccountClansLoaded(Ok(vec![(
+            clan,
+            Some(vec![alone]),
+        )])));
+        let named = dialog(&window).error.clone().expect("the clans named");
+        assert_ne!(named, generic);
+        assert!(named.contains("Lantern Company"), "{named}");
+        assert!(!dialog(&window).busy, "the user can try again");
+    }
+
+    #[test]
+    fn a_failure_reads_where_the_account_is() {
+        let mut window = window();
+        let _ = typed(&mut window, "mira");
+        let key = window.cloud.deletion_key();
+        let update = window.update(Message::DeleteAccountResult(
+            key,
+            Err(CloudError::NetworkError("offline".to_string())),
+        ));
+        assert!(update.event.is_none(), "the probe decides");
+
+        let update = window.update(Message::DeleteAccountProbed(
+            key,
+            "offline".to_string(),
+            AfterFailure::Unknown,
+        ));
+        assert!(update.event.is_none());
+        assert!(dialog(&window).error.is_some());
+        assert!(!dialog(&window).busy, "repeating finishes it");
+
+        let update = window.update(Message::DeleteAccountProbed(
+            key,
+            "offline".to_string(),
+            AfterFailure::Intact,
+        ));
+        assert!(matches!(update.event, Some(Event::DeletionRefused(_))));
+
+        let update = window.update(Message::DeleteAccountProbed(
+            key,
+            "offline".to_string(),
+            AfterFailure::Deleting,
+        ));
+        assert!(matches!(update.event, Some(Event::AccountDeleted(_))));
+        assert!(window.deletion.is_none());
+    }
+
+    /// An answer to `DELETE /me` that arrives while another credential is in
+    /// use (another account signed in since) says nothing of it: it signs
+    /// nothing out and forgets nothing. Signed out since (the deletion's own
+    /// refusal signs out), the answer still says what became of the account.
+    #[test]
+    fn a_late_deletion_answer_never_reaches_the_next_account() {
+        for result in [
+            Ok(()),
+            Err(CloudError::Unauthorized("gone".to_string())),
+            Err(CloudError::NetworkError("offline".to_string())),
+        ] {
+            let mut window = window();
+            let _ = typed(&mut window, "mira");
+            let key = window.cloud.deletion_key();
+            window
+                .cloud
+                .credentials
+                .set(Some(smudgy_cloud::Credential::Session(
+                    "smudgy_sess_next".to_string(),
+                )));
+            assert_ne!(window.cloud.deletion_key(), key);
+            let update = window.update(Message::DeleteAccountResult(key, result));
+            assert!(update.event.is_none(), "{:?}", update.event);
+            assert!(window.notice.is_none());
+            assert!(window.deletion.is_none(), "the confirmation closes");
+        }
+        let mut window = window();
+        let _ = typed(&mut window, "mira");
+        let key = window.cloud.deletion_key();
+        window.cloud.credentials.set(None);
+        let update = window.update(Message::DeleteAccountProbed(
+            key,
+            "offline".to_string(),
+            AfterFailure::Deleting,
+        ));
+        assert!(matches!(update.event, Some(Event::AccountDeleted(k)) if k == key));
+        assert!(window.notice.is_some());
+    }
+
+    /// A deletion applies to the account and credential it was asked
+    /// under, never to the next.
+    #[test]
+    fn a_deletion_applies_only_to_its_own_account_and_credential() {
+        let mira = Uuid::new_v4();
+        let key = DeletionKey {
+            user_id: Some(mira),
+            generation: 3,
+        };
+        assert!(key.applies(3, Some(mira)));
+        assert!(key.applies(3, None), "before the profile loads");
+        assert!(!key.applies(4, Some(mira)), "another credential");
+        assert!(!key.applies(3, Some(Uuid::new_v4())), "another account");
+        let unknown = DeletionKey {
+            user_id: None,
+            generation: 3,
+        };
+        assert!(unknown.applies(3, Some(mira)));
+        assert!(!unknown.applies(4, Some(mira)));
+    }
 }

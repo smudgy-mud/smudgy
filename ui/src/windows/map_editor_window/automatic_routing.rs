@@ -1,7 +1,6 @@
 //! Immutable editor snapshots for the off-thread Automatic route solver.
-//! The solver deliberately sees the public room projection even when the
-//! author can see secrets, preventing generated public geometry from encoding
-//! unrelated secret-room positions.
+//! Obstacles are the map's own rooms plus the link's readable endpoints.
+//! Unrelated Secret rooms never influence a map link's route.
 
 use smudgy_cloud::{
     AreaId, ConnectionId, ConnectionKind, CornerStyle, MapPoint,
@@ -27,53 +26,43 @@ pub(super) fn capture(
     area: &AreaCache,
     connection_id: ConnectionId,
 ) -> Result<(Snapshot, AutoRouteRequest), &'static str> {
+    // Errors are translation keys.
     let connection = area
         .get_connection(connection_id)
-        .ok_or("Connection no longer exists")?;
+        .ok_or("mapper-route-link-changed")?;
     if connection.kind != ConnectionKind::Internal {
-        return Err("Automatic routing is available only for internal same-level links");
+        return Err("mapper-route-same-level");
     }
-    let endpoint_b = connection
-        .endpoint_b
-        .ok_or("Automatic routing requires two endpoints")?;
+    let endpoint_b = connection.endpoint_b.ok_or("mapper-route-same-level")?;
     let room_a = area
-        .get_room(&connection.endpoint_a.room_number)
-        .ok_or("Connection endpoint room is missing")?;
+        .get_room_at(connection.endpoint_a.address())
+        .ok_or("mapper-route-link-changed")?;
     let room_b = area
-        .get_room(&endpoint_b.room_number)
-        .ok_or("Connection endpoint room is missing")?;
+        .get_room_at(endpoint_b.address())
+        .ok_or("mapper-route-link-changed")?;
     if room_a.get_level() != room_b.get_level() {
-        return Err("Automatic routing requires endpoints on the same level");
+        return Err("mapper-route-same-level");
     }
 
     let endpoint_a = RouteEndpoint {
-        room_number: connection.endpoint_a.room_number,
+        room: connection.endpoint_a.address(),
         room_center: MapPoint::new(room_a.get_x(), room_a.get_y()),
         side: connection.endpoint_a.side,
         port_offset: connection.endpoint_a.port_offset,
     };
     let endpoint_b = RouteEndpoint {
-        room_number: endpoint_b.room_number,
+        room: endpoint_b.address(),
         room_center: MapPoint::new(room_b.get_x(), room_b.get_y()),
         side: endpoint_b.side,
         port_offset: endpoint_b.port_offset,
     };
-    let endpoint_rooms = [endpoint_a.room_number, endpoint_b.room_number];
     let half_room = f64::from(ROOM_SIZE) / 2.0;
     let mut obstacles: Vec<_> = area
         .get_rooms()
         .iter()
-        .filter(|room| {
-            include_public_obstacle(
-                room.get_level(),
-                room.is_secret(),
-                room.get_room_number(),
-                room_a.get_level(),
-                endpoint_rooms,
-            )
-        })
+        .filter(|room| room.get_level() == room_a.get_level())
         .map(|room| RouteObstacle {
-            room_number: room.get_room_number(),
+            room: room.address(),
             bounds: RouteRect::from_center(
                 MapPoint::new(room.get_x(), room.get_y()),
                 half_room,
@@ -81,7 +70,17 @@ pub(super) fn capture(
             ),
         })
         .collect();
-    obstacles.sort_by_key(|obstacle| obstacle.room_number);
+    // A retained link may end in another source. Its readable endpoint is
+    // necessary geometry; other rooms in that source remain excluded.
+    for endpoint in [endpoint_a, endpoint_b] {
+        if !endpoint.room.source.is_map() {
+            obstacles.push(RouteObstacle {
+                room: endpoint.room,
+                bounds: RouteRect::from_center(endpoint.room_center, half_room, half_room),
+            });
+        }
+    }
+    obstacles.sort_by_key(|obstacle| obstacle.room);
 
     let request = AutoRouteRequest {
         endpoint_a,
@@ -103,41 +102,24 @@ pub(super) fn capture(
     Ok((snapshot, request))
 }
 
-fn include_public_obstacle(
-    room_level: i32,
-    room_is_secret: bool,
-    room_number: smudgy_cloud::RoomNumber,
-    route_level: i32,
-    endpoint_rooms: [smudgy_cloud::RoomNumber; 2],
-) -> bool {
-    room_level == route_level && (!room_is_secret || endpoint_rooms.contains(&room_number))
-}
-
-/// Stable FNV-1a over the public obstacle projection. Sorting occurs in
-/// [`capture`], and this function also sorts defensively for focused tests.
+/// Hash every qualified obstacle and its geometry, independent of input order.
 fn obstacle_hash(obstacles: &[RouteObstacle]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-
+    use std::hash::{Hash, Hasher};
     let mut ordered = obstacles.to_vec();
-    ordered.sort_by_key(|obstacle| obstacle.room_number);
-    let mut hash = OFFSET;
+    ordered.sort_by_key(|obstacle| obstacle.room);
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
     for obstacle in ordered {
-        for byte in obstacle.room_number.0.to_le_bytes().into_iter().chain(
-            [
-                obstacle.bounds.min_x.to_bits(),
-                obstacle.bounds.min_y.to_bits(),
-                obstacle.bounds.max_x.to_bits(),
-                obstacle.bounds.max_y.to_bits(),
-            ]
-            .into_iter()
-            .flat_map(u64::to_le_bytes),
-        ) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
+        obstacle.room.hash(&mut hash);
+        [
+            obstacle.bounds.min_x,
+            obstacle.bounds.min_y,
+            obstacle.bounds.max_x,
+            obstacle.bounds.max_y,
+        ]
+        .map(f64::to_bits)
+        .hash(&mut hash);
     }
-    hash
+    hash.finish()
 }
 
 #[cfg(test)]
@@ -148,7 +130,7 @@ mod tests {
 
     fn obstacle(room: i32, x: f64, y: f64) -> RouteObstacle {
         RouteObstacle {
-            room_number: RoomNumber(room),
+            room: smudgy_cloud::RoomAddress::map(RoomNumber(room)),
             bounds: RouteRect {
                 min_x: x,
                 min_y: y,
@@ -169,36 +151,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn public_policy_omits_only_unrelated_secret_rooms_on_the_route_level() {
-        let endpoints = [RoomNumber(1), RoomNumber(2)];
-        assert!(include_public_obstacle(
-            0,
-            false,
-            RoomNumber(3),
-            0,
-            endpoints
-        ));
-        assert!(!include_public_obstacle(
-            0,
-            true,
-            RoomNumber(3),
-            0,
-            endpoints
-        ));
-        assert!(include_public_obstacle(
-            0,
-            true,
-            RoomNumber(1),
-            0,
-            endpoints
-        ));
-        assert!(!include_public_obstacle(
-            1,
-            false,
-            RoomNumber(3),
-            0,
-            endpoints
+    #[tokio::test]
+    async fn namesake_endpoints_route_without_revealing_other_secret_rooms() {
+        use super::super::links::fixture::{C_GARDEN, link, secret, serving, the_maps};
+        use smudgy_cloud::{
+            RoomAddress,
+            automatic_routing::{self, AutoRouteResult},
+        };
+
+        let mut map = the_maps(&["read"]).remove(0);
+        map.rooms.retain(|room| room.room_number == RoomNumber(1));
+        map.connections
+            .retain(|connection| connection.id == link(C_GARDEN));
+        let endpoint = map.connections[0].endpoint_b.as_mut().unwrap();
+        endpoint.source = Some(secret());
+        endpoint.room_number = RoomNumber(1);
+        map.rooms[0]
+            .exits
+            .retain(|exit| exit.connection_id == link(C_GARDEN));
+        map.rooms[0].exits[0].to_source = Some(secret());
+        map.rooms[0].exits[0].to_room_number = Some(RoomNumber(1));
+        let source = &mut map.sources[0];
+        source.connections.clear();
+        source.room_data.clear();
+        source.rooms[0].exits.clear();
+        source.rooms[0].x = 4.0;
+        let mut unrelated = source.rooms[0].clone();
+        unrelated.room_number = RoomNumber(2);
+        unrelated.x = 2.0;
+        source.rooms.push(unrelated);
+
+        let map_id = map.area.id;
+        let mapper = serving(vec![map]).await;
+        let atlas = mapper.get_current_atlas();
+        let cache = atlas.get_area(&map_id).unwrap();
+        let (_, request) = capture(&cache, link(C_GARDEN)).unwrap();
+        assert_eq!(request.endpoint_a.room, RoomAddress::map(RoomNumber(1)));
+        assert_eq!(
+            request.endpoint_b.room,
+            RoomAddress::new(secret(), RoomNumber(1))
+        );
+        assert_eq!(
+            request.obstacles.len(),
+            2,
+            "only the two endpoints are obstacles"
+        );
+        assert!(matches!(
+            automatic_routing::solve(&request, &std::sync::atomic::AtomicBool::new(false)),
+            AutoRouteResult::Solved { .. }
         ));
     }
 }

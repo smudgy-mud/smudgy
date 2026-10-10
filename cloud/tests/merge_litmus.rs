@@ -69,8 +69,8 @@ use smudgy_cloud::{
     CreateAreaRequest, Exit, ExitArgs, ExitDirection, ExitId, Label, LabelArgs, LocalBackend,
     Mapper, MapperBackend, Property, RoomNumber, RoomRemap, RoomUpdates, RoomWithDetails, Shape,
     ShapeArgs, Translate,
-    mapper::{RoomKey, area_cache::AreaCache, room_cache::PropertyEntry, room_cache::RoomCache},
-    mutation::{AreaMutation, MutationEnvelope, Precondition, ResourceKind},
+    mapper::{RoomKey, area_cache::AreaCache, room_cache::RoomCache},
+    mutation::{AreaMutation, MutationEnvelope, Precondition},
 };
 use uuid::Uuid;
 
@@ -229,7 +229,7 @@ impl Content {
         Self {
             name: area.get_name().to_owned(),
             atlas_id: area.meta().atlas_id,
-            properties: area.properties_with_secrecy().map(property).collect(),
+            properties: area.properties().map(property).collect(),
             rooms: area
                 .get_rooms()
                 .iter()
@@ -270,16 +270,16 @@ impl Content {
     }
 }
 
-fn property((name, entry): (&str, &PropertyEntry)) -> Property {
+fn property((name, value): (&str, &str)) -> Property {
     Property {
         name: name.to_owned(),
-        value: entry.value.clone(),
-        is_secret: entry.is_secret,
+        value: value.to_owned(),
     }
 }
 
 fn cached_room(room: &RoomCache) -> RoomWithDetails {
     let exits = room.get_exits().iter().map(|exit| Exit {
+        to_source: None,
         id: exit.id,
         from_direction: exit.from_direction,
         to_area_id: exit.to_area_id,
@@ -287,14 +287,12 @@ fn cached_room(room: &RoomCache) -> RoomWithDetails {
         to_direction: exit.to_direction,
         path: exit.path.clone().unwrap_or_default(),
         is_hidden: exit.is_hidden,
-        is_closed: exit.is_closed,
-        is_locked: exit.is_locked,
+        door: exit.door.clone(),
         weight: exit.weight,
         command: exit.command.clone().unwrap_or_default(),
         connection_id: exit.connection_id,
         to_unknown: exit.to_unknown,
         to_area_token: exit.to_area_token.clone(),
-        is_secret: exit.is_secret,
     });
     RoomWithDetails {
         room_number: room.get_room_number(),
@@ -304,10 +302,9 @@ fn cached_room(room: &RoomCache) -> RoomWithDetails {
         x: room.get_x(),
         y: room.get_y(),
         color: room.get_color().to_owned(),
-        properties: room.properties_with_secrecy().map(property).collect(),
+        properties: room.properties().map(property).collect(),
         exits: exits.collect(),
         tags: room.get_tags().clone(),
-        is_secret: room.is_secret(),
         external_id: room.get_external_id().map(str::to_owned),
     }
 }
@@ -967,6 +964,8 @@ async fn synthetic_store(root: &Path) -> [AreaId; 3] {
         let request = CreateAreaRequest {
             name: name.to_owned(),
             atlas_id: Some(atlas.id),
+            clan_id: None,
+            ownership: None,
             ephemeral: false,
             properties: BTreeMap::new(),
         };
@@ -983,7 +982,6 @@ async fn synthetic_store(root: &Path) -> [AreaId; 3] {
         AreaMutation::UpsertAreaProperty {
             name: "kind".to_owned(),
             value: "synthetic".to_owned(),
-            is_secret: None,
         },
     ];
     let beta_edits = vec![
@@ -993,12 +991,13 @@ async fn synthetic_store(root: &Path) -> [AreaId; 3] {
         exit(2, West, (beta, 1), East),
         exit(1, West, (alpha, 2), East),
         AreaMutation::UpsertRoomProperty {
+            room_source: None,
             room_number: RoomNumber(2),
             name: "shop".to_owned(),
             value: "yes".to_owned(),
-            is_secret: None,
         },
         AreaMutation::AddRoomTag {
+            room_source: None,
             room_number: RoomNumber(2),
             tag: "market".to_owned(),
         },
@@ -1020,13 +1019,13 @@ async fn synthetic_store(root: &Path) -> [AreaId; 3] {
     ] {
         let current = backend.get_area(&area).await.expect("read the area");
         let envelope = MutationEnvelope {
+            source: smudgy_cloud::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: area.0,
-                expected_rev: current.area.rev,
-                access_fingerprint: None,
-            }],
+            preconditions: vec![Precondition::source(
+                area.0,
+                smudgy_cloud::SourceId::map(),
+                current.area.rev,
+            )],
             payload: edits,
         };
         let result = backend.execute_mutation(&area, &envelope).await;
@@ -1037,6 +1036,7 @@ async fn synthetic_store(root: &Path) -> [AreaId; 3] {
 
 fn room(number: i32, x: f32, y: f32, external_id: &str) -> AreaMutation {
     AreaMutation::CreateRoom {
+        room_source: None,
         room_number: RoomNumber(number),
         body: RoomUpdates {
             title: Some(external_id.to_uppercase()),
@@ -1056,6 +1056,7 @@ fn exit(
     back: ExitDirection,
 ) -> AreaMutation {
     AreaMutation::CreateExit {
+        room_source: None,
         room_number: RoomNumber(from),
         body: ExitArgs {
             from_direction: direction,

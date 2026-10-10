@@ -116,13 +116,6 @@ fn room_xy(working: &Working, area_id: Uuid, room: i32) -> Option<(f32, f32)> {
         .map(|room| (room.x, room.y))
 }
 
-fn room_secret(working: &Working, area_id: Uuid, room: i32) -> bool {
-    working
-        .get(&area_id)
-        .and_then(|area| area.rooms.get(&room))
-        .is_some_and(|room| room.is_secret)
-}
-
 fn member_count(area: &AreaRecord, connection_id: Uuid) -> usize {
     area.exits
         .iter()
@@ -133,15 +126,12 @@ fn member_count(area: &AreaRecord, connection_id: Uuid) -> usize {
 /// The §4.3 auto-pinned slot for a NEW endpoint on `(room, side)`: existing
 /// endpoints keep their offsets; the new one lands between its
 /// bearing-neighboring occupied offsets (the wall edges count as 0 and 1).
-/// Only endpoints of the same secrecy layout class participate, so a secret
-/// endpoint can never influence a public coordinate.
 pub fn insert_port_slot(
     working: &Working,
     area_id: Uuid,
     room_number: i32,
     side: &str,
     new_bearing: f32,
-    secret_class: bool,
     default_offset: f32,
 ) -> f32 {
     let Some(area) = working.get(&area_id) else {
@@ -149,26 +139,14 @@ pub fn insert_port_slot(
     };
     let axis_x = wall_axis_is_x(side);
 
-    // (bearing, offset) of every same-class endpoint already on this wall.
+    // (bearing, offset) of every endpoint already on this wall.
     let mut occupied: Vec<(f32, f32)> = Vec::new();
     for connection in &area.connections {
-        // Member facts: any member secret, any destination room secret
-        // (ANY area — the mock, like the server, holds them all), and the
-        // members' outbound direction for one-enders.
-        let members: Vec<_> = area
+        // A one-ender's bearing follows its members' outbound direction.
+        let any_outbound = area
             .exits
             .iter()
             .filter(|exit| exit.connection_id == connection.id)
-            .collect();
-        let any_member_secret = members.iter().any(|exit| exit.is_secret);
-        let any_dest_secret = members.iter().any(|exit| {
-            matches!(
-                (exit.to_area_id, exit.to_room_number),
-                (Some(to_area), Some(to_room)) if room_secret(working, to_area, to_room)
-            )
-        });
-        let any_outbound = members
-            .iter()
             .map(|exit| exit.from_direction.as_str())
             .min();
 
@@ -184,14 +162,6 @@ pub fn insert_port_slot(
                 continue;
             }
             if endpoint.room_number != room_number || endpoint.side != side {
-                continue;
-            }
-            let own_secret = room_secret(working, area_id, endpoint.room_number);
-            let partner_secret =
-                partner.is_some_and(|p| room_secret(working, area_id, p.room_number));
-            let endpoint_secret =
-                any_member_secret || any_dest_secret || own_secret || partner_secret;
-            if endpoint_secret != secret_class {
                 continue;
             }
             let bearing = match partner {
@@ -243,7 +213,6 @@ pub struct NewExitLink {
     pub to_area_id: Option<Uuid>,
     pub to_room_number: Option<i32>,
     pub to_direction: Option<String>,
-    pub is_secret: bool,
     pub new_connection_id: Option<Uuid>,
 }
 
@@ -260,15 +229,7 @@ fn endpoint(room_number: i32, side: &str, port_offset: f32) -> EndpointRecord {
 /// reciprocal one-member candidate exists whose explicit directions do not
 /// contradict; otherwise create a one-member Connection with §1.5 anchors
 /// and §4.3 port slots. Returns the connection id the new exit must carry.
-///
-/// `cleared` gates pairing per §6.2: an uncleared editor is never paired
-/// onto a secret member's Connection.
-pub fn attach_for_new_exit(
-    working: &mut Working,
-    area_id: Uuid,
-    link: &NewExitLink,
-    cleared: bool,
-) -> Uuid {
+pub fn attach_for_new_exit(working: &mut Working, area_id: Uuid, link: &NewExitLink) -> Uuid {
     let same_area_dest = link.to_area_id == Some(area_id)
         && link.to_room_number.is_some()
         && link.to_room_number != Some(link.from_room);
@@ -282,7 +243,6 @@ pub fn attach_for_new_exit(
                 exit.from_room_number == link.to_room_number.expect("same-area dest")
                     && exit.to_area_id == Some(area_id)
                     && exit.to_room_number == Some(link.from_room)
-                    && (cleared || !exit.is_secret)
                     && member_count(area, exit.connection_id) == 1
                     && exit
                         .to_direction
@@ -316,13 +276,6 @@ pub fn attach_for_new_exit(
         to_xy.unwrap_or(from_xy).1 - from_xy.1,
     );
 
-    let secret_class = link.is_secret
-        || matches!(
-            (link.to_area_id, link.to_room_number),
-            (Some(to_area), Some(to_room)) if room_secret(working, to_area, to_room)
-        )
-        || room_secret(working, area_id, link.from_room);
-
     let o_bearing = if wall_axis_is_x(o_side) {
         to_xy.map_or_else(
             || direction_component(&link.from_direction, true),
@@ -343,7 +296,6 @@ pub fn attach_for_new_exit(
             link.from_room,
             o_side,
             o_bearing,
-            secret_class,
             o_offset_default,
         );
         let record = ConnectionRecord::blank(cid, endpoint(link.from_room, o_side, o_port), None);
@@ -383,7 +335,6 @@ pub fn attach_for_new_exit(
         link.from_room,
         o_side,
         o_bearing,
-        secret_class,
         o_offset_default,
     );
     let d_port = insert_port_slot(
@@ -392,7 +343,6 @@ pub fn attach_for_new_exit(
         to_room,
         d_side,
         d_bearing,
-        secret_class,
         d_offset_default,
     );
 
@@ -448,7 +398,12 @@ pub fn repair_after_room_delete(working: &mut Working, area_id: Uuid, room_numbe
     }
     for host in working.values_mut() {
         for exit in &mut host.exits {
-            if exit.to_area_id == Some(area_id) && exit.to_room_number == Some(room_number) {
+            // An exit into another map's Secret room names that Secret's
+            // room, never this map's.
+            if exit.to_secret.is_none()
+                && exit.to_area_id == Some(area_id)
+                && exit.to_room_number == Some(room_number)
+            {
                 exit.to_area_id = None;
                 exit.to_room_number = None;
                 exit.to_direction = None;
@@ -584,15 +539,7 @@ pub fn maintain_after_retarget(working: &mut Working, area_id: Uuid, connection_
         } else {
             from_xy.1 - to_xy.unwrap_or(from_xy).1
         };
-        let port = insert_port_slot(
-            working,
-            area_id,
-            to_room,
-            side,
-            bearing,
-            exit.is_secret,
-            default_offset,
-        );
+        let port = insert_port_slot(working, area_id, to_room, side, bearing, default_offset);
         endpoint(to_room, side, port)
     };
 

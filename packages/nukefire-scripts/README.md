@@ -74,7 +74,7 @@ rechecks the source and final room geometry, commits room moves with compatible
 connection routing, and retains the engine's detours for fixed-room defects.
 The command announces completion after the owner acknowledges the commit. A
 missing acknowledgement reports an unknown result; inspect the map before
-retrying. NukeFire Scripts 0.5.7 requires mapper 0.18.4 and Smudgy 0.5.8.
+retrying. NukeFire Scripts 0.5.8 requires mapper 0.18.5 and Smudgy 0.5.8.
 
 When **Show live layout planner state** is enabled, the panel also attributes
 automatic work to its area, shows the terminal reason, and exposes map-free

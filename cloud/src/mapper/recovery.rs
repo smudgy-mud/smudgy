@@ -102,7 +102,10 @@ impl SessionRecovery {
             // A healthy newer generation proves the store finished every
             // earlier decided transaction. Keep the head non-discardable until
             // this publication; it cannot be retried or discarded meanwhile.
-            let rev = snapshot.area(mutation.area).ok().map(|area| area.area.rev);
+            let rev = snapshot
+                .area(mutation.area)
+                .ok()
+                .map(|area| (crate::SourceId::Map, area.area.rev));
             if inner
                 .pending
                 .acknowledge(mutation.area, mutation.operation, rev)

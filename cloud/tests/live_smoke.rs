@@ -7,7 +7,7 @@
 //! ```text
 //! SMUDGY_LIVE_SMOKE=1 \
 //! SMUDGY_LIVE_TOKEN=smudgy_sess_…              # session token or API key
-//! SMUDGY_LIVE_BASE_URL=https://api.dev.smudgy.org   # optional; this is the default
+//! SMUDGY_LIVE_BASE_URL=https://api.staging.smudgy.org   # optional; this is the default
 //!     cargo test -p smudgy_cloud --test live_smoke -- --ignored --nocapture
 //! ```
 //!
@@ -49,7 +49,7 @@ use smudgy_cloud::{
 };
 use uuid::Uuid;
 
-const DEFAULT_BASE_URL: &str = "https://api.dev.smudgy.org";
+const DEFAULT_BASE_URL: &str = "https://api.staging.smudgy.org";
 const PROD_BASE_URL: &str = "https://api.smudgy.org";
 const SMOKE_PREFIX: &str = "smoke-copy-gate-";
 
@@ -161,11 +161,11 @@ enum Target {
 type ExitFingerprint = (
     String, // from_direction
     Target,
-    Option<String>,           // to_direction
-    String,                   // path
-    String,                   // command
-    u32,                      // weight bits
-    (bool, bool, bool, bool), // hidden/closed/locked/secret
+    Option<String>, // to_direction
+    String,         // path
+    String,         // command
+    u32,            // weight bits
+    (bool, String), // hidden, door
 );
 
 /// Fingerprints one document's per-room content with area-id-relative exit
@@ -186,19 +186,13 @@ fn room_fingerprints(
                 room.x.to_bits().to_string(),
                 room.y.to_bits().to_string(),
                 room.color.clone(),
-                room.is_secret.to_string(),
                 format!("{:?}", room.external_id),
                 format!("{:?}", room.tags),
             ];
             let mut properties: Vec<String> = room
                 .properties
                 .iter()
-                .map(|property| {
-                    format!(
-                        "{}={} secret={}",
-                        property.name, property.value, property.is_secret
-                    )
-                })
+                .map(|property| format!("{}={}", property.name, property.value))
                 .collect();
             properties.sort();
             meta.extend(properties);
@@ -230,12 +224,7 @@ fn room_fingerprints(
                         exit.path.clone(),
                         exit.command.clone(),
                         exit.weight.to_bits(),
-                        (
-                            exit.is_hidden,
-                            exit.is_closed,
-                            exit.is_locked,
-                            exit.is_secret,
-                        ),
+                        (exit.is_hidden, format!("{:?}", exit.door)),
                     )
                 })
                 .collect();
@@ -278,7 +267,7 @@ fn label_fingerprints(doc: &AreaWithDetails) -> BTreeSet<String> {
         .iter()
         .map(|label| {
             format!(
-                "{:?} {} {} {} {} {} {:?} {:?} {} {} {} {} {}",
+                "{:?} {} {} {} {} {} {:?} {:?} {} {} {} {}",
                 label.text,
                 label.level,
                 label.x.to_bits(),
@@ -291,7 +280,6 @@ fn label_fingerprints(doc: &AreaWithDetails) -> BTreeSet<String> {
                 label.background_color,
                 label.font_size,
                 label.font_weight,
-                label.is_secret,
             )
         })
         .collect()
@@ -302,7 +290,7 @@ fn shape_fingerprints(doc: &AreaWithDetails) -> BTreeSet<String> {
         .iter()
         .map(|shape| {
             format!(
-                "{:?} {} {} {} {} {} {:?} {:?} {} {} {}",
+                "{:?} {} {} {} {} {} {:?} {:?} {} {}",
                 shape.shape_type,
                 shape.level,
                 shape.x.to_bits(),
@@ -313,7 +301,6 @@ fn shape_fingerprints(doc: &AreaWithDetails) -> BTreeSet<String> {
                 shape.stroke_color,
                 shape.border_radius.to_bits(),
                 shape.stroke_width.to_bits(),
-                shape.is_secret,
             )
         })
         .collect()
@@ -322,12 +309,7 @@ fn shape_fingerprints(doc: &AreaWithDetails) -> BTreeSet<String> {
 fn area_properties(doc: &AreaWithDetails) -> BTreeSet<String> {
     doc.properties
         .iter()
-        .map(|property| {
-            format!(
-                "{}={} secret={}",
-                property.name, property.value, property.is_secret
-            )
-        })
+        .map(|property| format!("{}={}", property.name, property.value))
         .collect()
 }
 
@@ -471,7 +453,6 @@ fn room(title: &str, x: f32, y: f32) -> RoomUpdates {
         x: Some(x),
         y: Some(y),
         color: Some("#a0b0c0".to_string()),
-        is_secret: None,
         external_id: None,
     }
 }
@@ -483,18 +464,17 @@ fn exit_to(
     to: Option<ExitDirection>,
 ) -> ExitArgs {
     ExitArgs {
+        to_source: None,
         id: None,
         connection_id: None,
         new_connection_id: None,
-        is_secret: None,
         from_direction: from,
         to_area_id,
         to_room_number: to_room_number.map(RoomNumber),
         to_direction: to,
         path: None,
         is_hidden: false,
-        is_closed: false,
-        is_locked: false,
+        door: None,
         weight: 1.0,
         command: None,
     }
@@ -581,7 +561,6 @@ async fn run(
             src,
             LabelArgs {
                 id: None,
-                is_secret: None,
                 level: 0,
                 x: 4.0,
                 y: -10.0,
@@ -603,7 +582,6 @@ async fn run(
             src,
             ShapeArgs {
                 id: None,
-                is_secret: None,
                 level: 0,
                 x: -8.0,
                 y: -16.0,

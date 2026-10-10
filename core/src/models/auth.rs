@@ -101,6 +101,10 @@ pub struct AccountInfo {
     pub email_verified: bool,
     /// Whether the server requires the user to pick a nickname.
     pub needs_nickname: bool,
+    /// The user asked to delete this account and no answer has said it still
+    /// works: when its credential is later refused, the account is gone or
+    /// being deleted, and what this computer keeps for it goes too.
+    pub deletion_requested: bool,
 }
 
 /// Loads the persisted account state from `<smudgy_home>/account.json`.
@@ -415,6 +419,7 @@ mod tests {
             nickname: Some("Walter".to_string()),
             email_verified: true,
             needs_nickname: false,
+            deletion_requested: true,
         };
 
         save_account_in(&dir, &account).expect("save should succeed");

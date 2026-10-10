@@ -2,6 +2,7 @@ pub mod map_editor;
 pub mod map_view;
 pub mod presentation;
 pub mod render;
+pub mod sources;
 mod update;
 pub mod viewport;
 

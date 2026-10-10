@@ -29,9 +29,13 @@ import {
 // The normalized room fix every dialect reduces to.
 // ---------------------------------------------------------------------------------------
 
+/** A door the server reports on an exit. `state` names it outright. An adapter may report
+ *  the `closed` and `locked` booleans instead; with neither set they say only that the
+ *  exit is not closed, which opens a door the exit has and adds none. */
 export interface DoorFix {
-    closed: boolean;
-    locked: boolean;
+    state?: DoorState;
+    closed?: boolean;
+    locked?: boolean;
 }
 
 export interface RoomFix {
@@ -184,6 +188,31 @@ export function boundedCoords(x: number, y: number, z: number): RoomFix["coords"
         return null;
     }
     return { x, y, z };
+}
+
+/** The door state `fix` reports for an exit whose door is `current`, or undefined when it
+ *  leaves the exit's door as it is. */
+function reportedDoorState(fix: DoorFix | undefined, current: Door | null): DoorState | undefined {
+    if (!fix) return undefined;
+    if (fix.state === "open" || fix.state === "closed" || fix.state === "locked") return fix.state;
+    if (fix.locked) return "locked";
+    if (fix.closed) return "closed";
+    return current ? "open" : undefined;
+}
+
+/** The door a new exit gets from `fix`, or null for none. */
+function newExitDoor(fix: DoorFix | undefined): DoorArgs | null {
+    const state = reportedDoorState(fix, null);
+    return state ? { state } : null;
+}
+
+/** The door update `fix` asks of `exit`, or undefined when its door already agrees. An
+ *  update replaces a door whole, so the door's name and opening command carry over. */
+function doorUpdate(fix: DoorFix | undefined, exit: Exit): DoorArgs | undefined {
+    const current = exit.door ?? null;
+    const state = reportedDoorState(fix, current);
+    if (state === undefined || state === current?.state) return undefined;
+    return { state, name: current?.name ?? null, opensWith: current?.opensWith ?? null };
 }
 
 /** Exit table -> canonical map. Compass keys normalize to the long direction; any other
@@ -371,6 +400,33 @@ function zoneKey(zone: string | null): string {
 /** Ids are canonical UUID strings, so `===` is the whole comparison. */
 function sameArea(a: AreaId, b: AreaId): boolean {
     return a === b;
+}
+
+/** Whether `areaId` is the zone's map `zoneMap` or one of its Secrets (or your Private
+ *  additions to it): rooms there belong to the zone. */
+function inZone(areaId: AreaId, zoneMap: AreaId): boolean {
+    if (sameArea(areaId, zoneMap)) return true;
+    const mapId = secretsMap(areaId);
+    return mapId !== undefined && sameArea(mapId, zoneMap);
+}
+
+/** The map a Secret's (or your Private additions') area belongs to; `undefined` for a
+ *  map, or an area that is gone. */
+function secretsMap(areaId: AreaId): AreaId | undefined {
+    try {
+        return mapper.getAreaById(areaId).mapId;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Where a new room of the zone whose map is `zoneMap` goes when you walk on from `from`:
+ *  into the Secret you are standing in when it belongs to the zone's map, so a room
+ *  beyond a Secret room never lands on the map everyone sees; otherwise the map. */
+function zoneTarget(zoneMap: AreaId, from: { areaId: AreaId } | null): AreaId {
+    return from && !sameArea(from.areaId, zoneMap) && inZone(from.areaId, zoneMap)
+        ? from.areaId
+        : zoneMap;
 }
 
 function sameExit(a: ExitId, b: ExitId): boolean {
@@ -633,10 +689,13 @@ function dropPendingExit(exitId: ExitId) {
 }
 
 /** Point an existing exit at a destination by DELETE + RECREATE, preserving its fields.
+ *  The delete and the create are one write — the caller's `mutation` batch, or a batch
+ *  of their own — so a refused create never leaves the room without its exit.
  *  Only a freshly CREATED exit runs the host's reciprocal auto-pair, which folds it onto
  *  the one-member Connection of an opposing exit between the same two rooms — that is
- *  what collapses a back-and-forth walk into one two-way link. An in-place
- *  `setRoomExit` update never re-pairs and leaves two parallel one-way Connections. */
+ *  what collapses a back-and-forth walk into one two-way link. A create inside a batch
+ *  pairs the same way. An in-place `setRoomExit` update never re-pairs and leaves two
+ *  parallel one-way Connections. */
 async function relinkExit(
     areaId: AreaId,
     room: RoomNumber,
@@ -645,21 +704,24 @@ async function relinkExit(
     toRoomNumber: RoomNumber,
     mutation?: AreaMutator,
 ): Promise<ExitId> {
-    if (mutation) await mutation.deleteRoomExit(room, exit.id);
-    else await mapper.deleteRoomExit(areaId, room, exit.id);
+    if (!mutation) {
+        let exitId!: ExitId;
+        await mapper.mutateArea(areaId, async (batch) => {
+            exitId = await relinkExit(areaId, room, exit, toAreaId, toRoomNumber, batch);
+        }, { description: "Relink map exit" });
+        return exitId;
+    }
+    await mutation.deleteRoomExit(room, exit.id);
     const fields: ExitArgs = {
         from_direction: exit.from_direction,
         to_area_id: toAreaId,
         to_room_number: toRoomNumber,
         is_hidden: exit.is_hidden,
-        is_closed: exit.is_closed,
-        is_locked: exit.is_locked,
+        door: exit.door ?? null,
         weight: exit.weight,
         command: exit.command ?? undefined,
     };
-    return mutation
-        ? await mutation.createRoomExit(room, fields)
-        : await mapper.createRoomExit(areaId, room, fields);
+    return await mutation.createRoomExit(room, fields);
 }
 
 function trackPending(destId: string, areaId: AreaId, room: RoomNumber, exitId: ExitId, dir: string) {
@@ -794,8 +856,7 @@ async function linkOrStub(
                 from_direction,
                 to_area_id: dest.area_id,
                 to_room_number: dest.room_number,
-                is_closed: door?.closed,
-                is_locked: door?.locked,
+                door: newExitDoor(door),
                 command,
                 weight: 1,
             };
@@ -814,8 +875,7 @@ async function linkOrStub(
     // far room is discovered.
     const fields: ExitArgs = {
         from_direction,
-        is_closed: door?.closed,
-        is_locked: door?.locked,
+        door: newExitDoor(door),
         command,
         weight: 1,
     };
@@ -934,12 +994,10 @@ async function reconcileReportedExit(
         return;
     }
 
+    const updatedDoor = doorUpdate(door, existing);
     if (destId === null) {
-        if (door && (existing.is_closed !== door.closed || existing.is_locked !== door.locked)) {
-            const fields: ExitUpdates = {
-                is_closed: door.closed,
-                is_locked: door.locked,
-            };
+        if (updatedDoor) {
+            const fields: ExitUpdates = { door: updatedDoor };
             if (mutation) await mutation.setRoomExit(roomNumber, existing.id, fields);
             else await mapper.setRoomExit(areaId, roomNumber, existing.id, fields);
         }
@@ -984,11 +1042,8 @@ async function reconcileReportedExit(
             mutation,
         );
     }
-    if (door && (existing.is_closed !== door.closed || existing.is_locked !== door.locked)) {
-        const fields: ExitUpdates = {
-            is_closed: door.closed,
-            is_locked: door.locked,
-        };
+    if (updatedDoor) {
+        const fields: ExitUpdates = { door: updatedDoor };
         if (mutation) await mutation.setRoomExit(roomNumber, exitId, fields);
         else await mapper.setRoomExit(areaId, roomNumber, exitId, fields);
     }
@@ -1056,7 +1111,7 @@ async function reconcileKnownRoom(room: Room, fix: RoomFix) {
 async function materialize(room: Room, fix: RoomFix, dir: string | null): Promise<Room> {
     const id = fix.id!;
     const target = await zoneArea(fix.zone);
-    if (sameArea(target, room.area_id)) {
+    if (inZone(room.area_id, target)) {
         await mapper.mutateArea(room.area_id, async (mutation) => {
             if (fix.coords) {
                 const at = placement(room.area_id, fix, null);
@@ -1105,7 +1160,7 @@ function warnUnwritable(areaId: AreaId, err: unknown) {
 
 async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir: string | null): Promise<void> {
     if (fix.id === null) return;
-    let areaId = await zoneArea(fix.zone);
+    let areaId = zoneTarget(await zoneArea(fix.zone), lastRoom);
 
     let room: RoomNumber | null = null;
     let topologyPlanned = false;
@@ -1143,7 +1198,9 @@ async function autoCreate(fix: RoomFix, placementDir: string | null, movementDir
             // leaves `room` pointing at a room that never existed; clear it or
             // the retry is skipped and links/current-location bind the phantom.
             room = null;
-            if (attempt === 1) throw err;
+            // A Secret you can only read refuses before anything is written. Its rooms
+            // never fall back into a map: follow only.
+            if (attempt === 1 || secretsMap(areaId) !== undefined) throw err;
             // The bound map refused the write: an adopted map we cannot write (a
             // read-only share), or an area deleted mid-session. Detach it for good and
             // fall back to a fresh local area so mapping continues durably.

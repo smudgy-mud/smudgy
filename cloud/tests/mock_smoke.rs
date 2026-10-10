@@ -8,12 +8,8 @@ mod support;
 
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use smudgy_cloud::mutation::{
-    AreaMutation, MutationEnvelope, OpResult, Precondition, ResourceKind,
-};
-use smudgy_cloud::{
-    AreaId, CloudMapper, CreateAreaRequest, MapperBackend, RoomNumber, RoomUpdates, Uuid,
-};
+use smudgy_cloud::mutation::{AreaMutation, MutationEnvelope, OpResult, Precondition};
+use smudgy_cloud::{CloudMapper, CreateAreaRequest, MapperBackend, RoomNumber, RoomUpdates, Uuid};
 use std::collections::BTreeMap;
 use support::{GrantFlags, GrantScope, MockServer};
 
@@ -45,6 +41,8 @@ async fn cloud_mapper_crud_roundtrip() {
         .create_area(CreateAreaRequest {
             name: "Test Area".to_string(),
             atlas_id: None,
+            clan_id: None,
+            ownership: None,
             ephemeral: false,
             properties: BTreeMap::new(),
         })
@@ -73,8 +71,8 @@ async fn cloud_mapper_crud_roundtrip() {
     assert_eq!(rev_before, 1);
     assert!(details.rooms.is_empty());
     assert!(
-        details.content_hash.is_some(),
-        "projection carries a content hash"
+        details.area.projection_token.is_some(),
+        "projection carries a token"
     );
 
     // A room upsert rides a mutation envelope and bumps the served rev. The
@@ -84,14 +82,15 @@ async fn cloud_mapper_crud_roundtrip() {
         .execute_mutation(
             &area.id,
             &MutationEnvelope {
+                source: smudgy_cloud::SourceId::map(),
                 operation_id: Uuid::new_v4(),
-                preconditions: vec![Precondition {
-                    resource: ResourceKind::Area,
-                    id: area.id.0,
-                    expected_rev: rev_before,
-                    access_fingerprint: details.area.access.map(|access| access.fingerprint()),
-                }],
+                preconditions: vec![Precondition::source(
+                    area.id.0,
+                    smudgy_cloud::SourceId::map(),
+                    rev_before,
+                )],
                 payload: vec![AreaMutation::UpsertRoom {
+                    room_source: None,
                     room_number: RoomNumber(1),
                     body: RoomUpdates {
                         title: Some("Entry Hall".to_string()),
@@ -118,11 +117,11 @@ async fn cloud_mapper_crud_roundtrip() {
     assert_eq!(details_after.rooms.len(), 1);
     assert_eq!(details_after.rooms[0].title, "Entry Hall");
     assert_ne!(
-        details.content_hash, details_after.content_hash,
-        "content hash changes when visible content changes"
+        details.area.projection_token, details_after.area.projection_token,
+        "the token changes when visible content changes"
     );
 
-    // /sync sees the area with the owner fingerprint.
+    // /sync carries the same token and the map's revision.
     let sync = mapper
         .sync_state()
         .await
@@ -132,123 +131,19 @@ async fn cloud_mapper_crud_roundtrip() {
         .iter()
         .find(|r| r.area_id == area.id)
         .expect("sync row for the area");
-    assert_eq!(row.rev, details_after.area.rev);
-    assert_eq!(row.access_fingerprint.len(), 16);
+    assert_eq!(row.map_rev(), Some(details_after.area.rev));
+    assert_eq!(
+        Some(&row.projection_token),
+        details_after.area.projection_token.as_ref()
+    );
 }
 
 // ---------------------------------------------------------------------------
-// 2. Identity flow via raw reqwest
+// 2. Format 3: the map bundle, and targets the viewer cannot read
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auth_flow_signup_verify_me() {
-    let server = MockServer::spawn().await;
-    let client = reqwest::Client::new();
-    let base = &server.base_url;
-
-    // Signup is enumeration-flat 202.
-    let response = client
-        .post(format!("{base}/auth/signup"))
-        .json(&json!({
-            "email": "new@example.com",
-            "nickname": "newbie",
-        }))
-        .send()
-        .await
-        .expect("signup sends");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let body: Value = response.json().await.expect("json");
-    assert_eq!(body["data"]["status"], "accepted");
-
-    // The emailed code is exposed through state for tests.
-    let code = server
-        .verify_code_for("new@example.com")
-        .expect("code minted");
-
-    // Verify-email consumes the code and returns a session + the profile.
-    let response = client
-        .post(format!("{base}/auth/verify-email"))
-        .json(&json!({ "email": "new@example.com", "code": code }))
-        .send()
-        .await
-        .expect("verify sends");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("json");
-    let session = body["data"]["session_token"]
-        .as_str()
-        .expect("session token");
-    assert!(session.starts_with("smudgy_sess_"));
-    assert_eq!(body["data"]["user"]["nickname"], "newbie");
-    assert!(
-        body["data"].get("needs_nickname").is_none(),
-        "needs_nickname omitted when false"
-    );
-
-    // The code is single-use, and the failure is the uniform 404.
-    let response = client
-        .post(format!("{base}/auth/verify-email"))
-        .json(&json!({ "email": "new@example.com", "code": code }))
-        .send()
-        .await
-        .expect("re-verify sends");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let body: Value = response.json().await.expect("json");
-    assert_eq!(body["error"], "Not found");
-
-    // /me over the fresh session: verified, full profile (email included).
-    let (status, body) = get_json(&client, &format!("{base}/me"), session).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"]["email"], "new@example.com");
-    assert!(
-        !body["data"]["email_verified_at"].is_null(),
-        "email_verified_at set after verification"
-    );
-
-    // A returning login is the same enumeration-flat 202 — known email...
-    let response = client
-        .post(format!("{base}/auth/login"))
-        .json(&json!({ "email": "new@example.com" }))
-        .send()
-        .await
-        .expect("login sends");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let fresh = server
-        .verify_code_for("new@example.com")
-        .expect("sign-in code minted");
-
-    // ...or new — a first-time email is provisioned on first sight behind the
-    // same enumeration-flat 202, minting a code for the new (nickname-less)
-    // account (the unified email-only entry).
-    let response = client
-        .post(format!("{base}/auth/login"))
-        .json(&json!({ "email": "stranger@example.com" }))
-        .send()
-        .await
-        .expect("first-time login sends");
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert!(
-        server.verify_code_for("stranger@example.com").is_some(),
-        "create-on-absent mints a code for the new account",
-    );
-
-    // The fresh code signs the returning user in; the handle is kept.
-    let response = client
-        .post(format!("{base}/auth/verify-email"))
-        .json(&json!({ "email": "new@example.com", "code": fresh }))
-        .send()
-        .await
-        .expect("returning verify sends");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("json");
-    assert_eq!(body["data"]["user"]["nickname"], "newbie");
-}
-
-// ---------------------------------------------------------------------------
-// 3. Redaction: secret rooms/exits filtered; hidden targets tokenized
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
+async fn projection_bundles_the_map_and_tokenizes_hidden_targets() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("owner@example.com", "owner", true);
     let grantee = server.create_user("friend@example.com", "friend", true);
@@ -256,19 +151,11 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
 
     let area = server.create_area(&owner, "Shared Area");
     let hidden = server.create_area(&owner, "Hidden Area");
-    server.add_room(hidden, 1, "Far Side", false);
-
-    server.add_room(area, 1, "Plaza", false);
-    server.add_room(area, 2, "Vault", true); // secret room
-    server.add_room(area, 3, "Market", false);
-    let e_public = server.add_exit(area, 1, "North", Some((area, 3)), false);
-    let e_to_secret = server.add_exit(area, 1, "East", Some((area, 2)), false);
-    // Deliberately NOT the reciprocal of e_public: under the §6 closure a
-    // secret member would scrub its whole pair (e_public included); a
-    // dangling secret exit keeps this fixture about per-exit secrecy.
-    let e_secret = server.add_exit(area, 3, "South", None, true);
-    let e_cross = server.add_exit(area, 1, "West", Some((hidden, 1)), false);
-
+    server.add_room(hidden, 1, "Far Side");
+    server.add_room(area, 1, "Plaza");
+    server.add_room(area, 3, "Market");
+    let e_public = server.add_exit(area, 1, "North", Some((area, 3)));
+    let e_cross = server.add_exit(area, 1, "West", Some((hidden, 1)));
     server.grant(
         &owner,
         &grantee,
@@ -279,38 +166,31 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
     let client = reqwest::Client::new();
     let base = server.base_url.clone();
     let url = format!("{base}/areas/{area}");
-
-    // --- Grantee view: redacted ---
     let (status, body) = get_json(&client, &url, &grantee.api_key).await;
     assert_eq!(status, StatusCode::OK);
     let data = &body["data"];
-    assert_eq!(data["access"]["is_owner"], false);
-    let rooms = data["rooms"].as_array().expect("rooms array");
-    let room_numbers: Vec<i64> = rooms
-        .iter()
-        .map(|r| r["room_number"].as_i64().expect("number"))
-        .collect();
-    assert_eq!(room_numbers, vec![1, 3], "secret room 2 is filtered out");
+    assert_eq!(data["format_version"], 3);
+    assert!(
+        data["projection_token"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("p_"))
+    );
+    assert!(data.get("rev").is_none() && data.get("rooms").is_none());
+    let sources = data["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 1, "the mock serves the map source only");
+    let map = &sources[0];
+    assert_eq!(map["source"], "map");
+    assert_eq!(map["actions"], json!(["read"]), "a view-only grantee reads");
 
-    let room1 = rooms
+    let room1 = map["rooms"]
+        .as_array()
+        .expect("rooms")
         .iter()
         .find(|r| r["room_number"] == 1)
         .expect("room 1");
-    let exit_ids: Vec<&str> = room1["exits"]
-        .as_array()
-        .expect("exits")
-        .iter()
-        .map(|e| e["id"].as_str().expect("exit id"))
-        .collect();
-    assert!(exit_ids.contains(&e_public.to_string().as_str()));
-    assert!(
-        !exit_ids.contains(&e_to_secret.to_string().as_str()),
-        "exit into the secret room is dropped for the grantee"
-    );
-
-    let cross = room1["exits"]
-        .as_array()
-        .unwrap()
+    let exits = room1["exits"].as_array().expect("exits");
+    assert!(exits.iter().any(|e| e["id"] == e_public.to_string()));
+    let cross = exits
         .iter()
         .find(|e| e["id"] == e_cross.to_string())
         .expect("cross-area exit survives");
@@ -319,81 +199,6 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
     assert!(cross["to_room_number"].is_null());
     let token = cross["to_area_token"].as_str().expect("token present");
     assert!(token.starts_with("u_") && token.len() == 18);
-    assert_eq!(cross["is_secret"], false);
-
-    let room3 = rooms
-        .iter()
-        .find(|r| r["room_number"] == 3)
-        .expect("room 3");
-    assert!(
-        room3["exits"].as_array().expect("exits").is_empty(),
-        "secret exit is dropped for the grantee"
-    );
-
-    // linked_areas carries only the hidden token entry (same-area links are
-    // not foreign).
-    let linked = data["linked_areas"].as_array().expect("linked");
-    assert_eq!(linked.len(), 1);
-    assert_eq!(linked[0]["visible"], false);
-    assert_eq!(linked[0]["to_area_token"], token);
-
-    // Token is stable across fetches.
-    let (_, body_again) = get_json(&client, &url, &grantee.api_key).await;
-    let cross_again = body_again["data"]["rooms"][0]["exits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["id"] == e_cross.to_string())
-        .expect("cross exit again");
-    assert_eq!(
-        cross_again["to_area_token"], token,
-        "to_area_token is stable per (viewer, target)"
-    );
-
-    // --- Owner view: everything, real ids ---
-    let (status, body) = get_json(&client, &url, &owner.api_key).await;
-    assert_eq!(status, StatusCode::OK);
-    let data = &body["data"];
-    assert_eq!(data["access"]["is_owner"], true);
-    let rooms = data["rooms"].as_array().expect("rooms");
-    let room_numbers: Vec<i64> = rooms
-        .iter()
-        .map(|r| r["room_number"].as_i64().expect("number"))
-        .collect();
-    assert_eq!(room_numbers, vec![1, 2, 3], "owner sees the secret room");
-
-    let room1 = rooms
-        .iter()
-        .find(|r| r["room_number"] == 1)
-        .expect("room 1");
-    let exits1 = room1["exits"].as_array().expect("exits");
-    assert!(
-        exits1.iter().any(|e| e["id"] == e_to_secret.to_string()),
-        "owner sees the exit into the secret room"
-    );
-    let cross = exits1
-        .iter()
-        .find(|e| e["id"] == e_cross.to_string())
-        .expect("cross exit");
-    assert_eq!(cross["to_unknown"], false);
-    assert_eq!(
-        cross["to_area_id"].as_str().expect("real target id"),
-        hidden.to_string(),
-        "owner sees the real cross-area target"
-    );
-
-    let room3 = rooms
-        .iter()
-        .find(|r| r["room_number"] == 3)
-        .expect("room 3");
-    let secret_exit = room3["exits"]
-        .as_array()
-        .expect("exits")
-        .iter()
-        .find(|e| e["id"] == e_secret.to_string())
-        .expect("owner sees the secret exit")
-        .clone();
-    assert_eq!(secret_exit["is_secret"], true);
 
     // Unshared area is a uniform 404 for the grantee.
     let hidden_url = format!("{base}/areas/{hidden}");
@@ -403,107 +208,100 @@ async fn redaction_hides_secrets_and_tokenizes_hidden_targets() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Shared revs + fingerprints: secret-only edits and include_secrets flips
+// 3. Format 3: write bodies carrying `is_secret` are refused
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_rev_and_fingerprint_semantics() {
+async fn write_bodies_carrying_is_secret_are_refused() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("owner@example.com", "owner", true);
-    let grantee = server.create_user("friend@example.com", "friend", true);
-    server.befriend(&owner, &grantee);
+    let area = server.create_area(&owner, "Flagless");
+    server.add_room(area, 1, "Hall");
+    let label = server.add_label(area, "Sign");
+    let shape = server.add_shape(area);
+    let rev = server.area_rev(area);
 
-    let area = server.create_area(&owner, "Revved Area");
-    let grant_id = server.grant(
-        &owner,
-        &grantee,
-        GrantScope::Area(area),
-        GrantFlags::VIEW_ONLY,
-    );
+    let base = server.base_url.clone();
+    let envelope = json!({
+        "operation_id": Uuid::new_v4(),
+        "preconditions": [{"resource": "source", "id": area, "expected_rev": rev}],
+        "payload": [{
+            "op": "upsert_room",
+            "room_number": 1,
+            "body": {"title": "Vault", "is_secret": true},
+        }],
+    });
+    let writes = [
+        (
+            reqwest::Method::POST,
+            format!("{base}/areas/{area}/mutations"),
+            envelope,
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{base}/areas/{area}/1"),
+            json!({"title": "Vault", "is_secret": true}),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{base}/areas/{area}/properties/theme"),
+            json!({"value": "dark", "is_secret": false}),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{base}/areas/{area}/rooms/1/properties/note"),
+            json!({"value": "hidden", "is_secret": true}),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{base}/areas/{area}/labels"),
+            json!({
+                "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0,
+                "horizontal_alignment": "Center", "vertical_alignment": "Center",
+                "text": "Psst", "is_secret": true,
+            }),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{base}/areas/{area}/labels/{label}"),
+            json!({"text": "Psst", "is_secret": true}),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("{base}/areas/{area}/shapes"),
+            json!({
+                "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0,
+                "shape_type": "Rectangle", "is_secret": true,
+            }),
+        ),
+        (
+            reqwest::Method::PUT,
+            format!("{base}/areas/{area}/shapes/{shape}"),
+            json!({"radius": 2.0, "is_secret": true}),
+        ),
+    ];
 
     let client = reqwest::Client::new();
-    let base = server.base_url.clone();
-    let sync_url = format!("{base}/sync");
-
-    let sync_row = |body: &Value, id: AreaId| -> (i64, String) {
-        let row = body["data"]
-            .as_array()
-            .expect("sync rows")
-            .iter()
-            .find(|r| r["area_id"] == id.to_string())
-            .expect("row for area")
-            .clone();
-        (
-            row["rev"].as_i64().expect("rev"),
-            row["access_fingerprint"].as_str().expect("fp").to_string(),
-        )
-    };
-
-    let (_, body) = get_json(&client, &sync_url, &grantee.api_key).await;
-    let (grantee_rev0, grantee_fp0) = sync_row(&body, area);
-    let (_, body) = get_json(&client, &sync_url, &owner.api_key).await;
-    let (owner_rev0, owner_fp0) = sync_row(&body, area);
-    assert_eq!(grantee_rev0, owner_rev0, "no secrets yet: revs agree");
-    assert_ne!(grantee_fp0, owner_fp0, "caps differ, fingerprints differ");
-
-    // Owner makes a SECRET-only edit through the API (insert a secret room).
-    let response = client
-        .put(format!("{base}/areas/{area}/10"))
-        .header("authorization", format!("Bearer {}", owner.api_key))
-        .json(&json!({"title": "Hidden Cellar", "is_secret": true}))
-        .send()
-        .await
-        .expect("secret room upsert");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let (_, body) = get_json(&client, &sync_url, &owner.api_key).await;
-    let (owner_rev1, _) = sync_row(&body, area);
-    assert!(owner_rev1 > owner_rev0, "owner rev bumps on a secret write");
-
-    let (_, body) = get_json(&client, &sync_url, &grantee.api_key).await;
-    let (grantee_rev1, grantee_fp1) = sync_row(&body, area);
-    assert_eq!(
-        grantee_rev1, owner_rev1,
-        "all viewers receive the shared rev after a secret-only edit"
-    );
-    assert!(
-        grantee_rev1 > grantee_rev0,
-        "the shared rev reports secret-only activity without exposing content"
-    );
-    assert_eq!(
-        grantee_fp1, grantee_fp0,
-        "share writes change no fingerprint"
-    );
-
-    // Owner raises include_secrets on the grant (root Area-scope: allowed).
-    let response = client
-        .patch(format!("{base}/shares/{grant_id}"))
-        .header("authorization", format!("Bearer {}", owner.api_key))
-        .json(&json!({"include_secrets": true}))
-        .send()
-        .await
-        .expect("patch share");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("json");
-    assert_eq!(body["data"]["include_secrets"], true);
-
-    let (_, body) = get_json(&client, &sync_url, &grantee.api_key).await;
-    let (grantee_rev2, grantee_fp2) = sync_row(&body, area);
-    assert_ne!(
-        grantee_fp2, grantee_fp1,
-        "include_secrets flip changes the fingerprint"
-    );
-    assert_eq!(
-        grantee_rev2, grantee_rev1,
-        "a capability change alters the projection without bumping the shared rev"
-    );
-
-    // The cleared grantee now sees the secret room too.
-    let (status, body) = get_json(&client, &format!("{base}/areas/{area}"), &grantee.api_key).await;
-    assert_eq!(status, StatusCode::OK);
-    let rooms = body["data"]["rooms"].as_array().expect("rooms");
-    assert!(
-        rooms.iter().any(|r| r["room_number"] == 10),
-        "include_secrets grantee sees the secret room"
-    );
+    for (method, url, body) in writes {
+        let response = client
+            .request(method, &url)
+            .header("authorization", format!("Bearer {}", owner.api_key))
+            .json(&body)
+            .send()
+            .await
+            .expect("request sends");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{url} refuses `is_secret`"
+        );
+        let body: Value = response.json().await.expect("json body");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("`is_secret` is not part of format 3")),
+            "{url} names the refused key: {body}"
+        );
+    }
+    assert_eq!(server.area_rev(area), rev, "no refused write applied");
 }

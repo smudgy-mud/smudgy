@@ -2,6 +2,10 @@
 //! GET /areas/{id}/shares. Mirrors `ShareQueries` in the real db.rs: the
 //! friendship/block validator, covering-parent inference, depth-1 children,
 //! clamp/delete cascades, the reaching-grant tree. Every denial -> 404.
+//!
+//! On a clan's Clan-owned map the same routes make outside shares
+//! (docs/clans.md §5.5): view only, of one map, never of its Secrets, by a
+//! member holding `area.share_external`, lasting while the sharer holds it.
 
 use std::sync::Arc;
 
@@ -39,7 +43,8 @@ pub fn grant_json(g: &GrantRecord) -> Value {
         "can_edit": g.can_edit,
         "can_reshare": g.can_reshare,
         "can_copy": g.can_copy,
-        "include_secrets": g.include_secrets,
+        // No longer a flag; rows always carry `false`.
+        "include_secrets": false,
         "can_admin": g.can_admin,
         "parent_grant_id": g.parent_grant_id,
         "created_at": g.created_at,
@@ -65,7 +70,6 @@ fn validate_grant_write(
     can_edit: bool,
     can_reshare: bool,
     can_copy: bool,
-    include_secrets: bool,
     can_admin: bool,
 ) -> Result<(), Response> {
     if grantee_id == owner_id {
@@ -87,7 +91,6 @@ fn validate_grant_write(
             || (can_edit && !parent.can_edit)
             || (can_copy && !parent.can_copy)
             || can_reshare
-            || include_secrets
             || can_admin
         {
             return Err(not_found());
@@ -177,6 +180,7 @@ struct CreateShareRequest {
     can_reshare: bool,
     #[serde(default)]
     can_copy: bool,
+    /// No longer a share flag: `true` is a 400, `false` is accepted.
     #[serde(default)]
     include_secrets: bool,
     #[serde(default)]
@@ -185,6 +189,12 @@ struct CreateShareRequest {
     #[serde(default)]
     host_hints: Option<Vec<String>>,
 }
+
+/// The 400 for an `include_secrets: true` share or patch: Secrets are shared
+/// one at a time, and silently dropping the flag would quietly withhold what
+/// the sharer meant to share.
+const INCLUDE_SECRETS: &str =
+    "include_secrets is no longer a share flag; share each Secret through /secrets/{id}/grants";
 
 /// Maximum number of host hints a single share may carry (mirrors the server's
 /// `MAX_HOST_HINTS`).
@@ -234,12 +244,32 @@ pub async fn create_share(
         Ok(r) => r,
         Err(e) => return e,
     };
+    if req.include_secrets {
+        return bad_request(INCLUDE_SECRETS);
+    }
     // Untagged scope: the Area variant is tried first, so area_id wins.
     let (area_id, atlas_id) = match (req.scope.area_id, req.scope.atlas_id) {
         (Some(a), _) => (Some(a), None),
         (None, Some(t)) => (None, Some(t)),
         (None, None) => return bad_request("Invalid JSON: unknown share scope"),
     };
+
+    if let Some(aid) = area_id
+        && st
+            .areas
+            .get(&aid)
+            .is_some_and(|area| area.clan_id.is_some())
+    {
+        return create_outside_share(&mut st, caller, aid, &req);
+    }
+    if let Some(aid) = atlas_id
+        && st
+            .atlases
+            .get(&aid)
+            .is_some_and(|atlas| atlas.clan_id.is_some())
+    {
+        return not_found();
+    }
 
     // 1. Resolve the subject's TRUE owner; nonexistent -> 404.
     let owner_id = if let Some(aid) = area_id {
@@ -292,18 +322,15 @@ pub async fn create_share(
         }
     };
 
-    // 3. Depth-1: children never carry reshare / secrets / admin. include_secrets
-    //    is allowed at atlas OR area scope but stays root-only via the child-zeroing;
-    //    can_admin rides only an owner root.
-    let (can_edit, can_reshare, can_copy, include_secrets, can_admin) = if parent_grant_id.is_some()
-    {
-        (req.can_edit, false, req.can_copy, false, false)
+    // 3. Depth-1: children never carry reshare / admin; can_admin rides only
+    //    an owner root.
+    let (can_edit, can_reshare, can_copy, can_admin) = if parent_grant_id.is_some() {
+        (req.can_edit, false, req.can_copy, false)
     } else {
         (
             req.can_edit,
             req.can_reshare,
             req.can_copy,
-            req.include_secrets,
             req.can_admin && caller_is_owner,
         )
     };
@@ -322,7 +349,6 @@ pub async fn create_share(
         can_edit,
         can_reshare,
         can_copy,
-        include_secrets,
         can_admin,
     ) {
         return e;
@@ -347,7 +373,6 @@ pub async fn create_share(
         g.can_edit = can_edit;
         g.can_reshare = can_reshare;
         g.can_copy = can_copy;
-        g.include_secrets = include_secrets;
         g.can_admin = can_admin;
         g.parent_grant_id = parent_grant_id;
         g.host_hints = host_hints;
@@ -364,7 +389,6 @@ pub async fn create_share(
             can_edit,
             can_reshare,
             can_copy,
-            include_secrets,
             can_admin,
             host_hints,
             parent_grant_id,
@@ -425,6 +449,7 @@ struct PatchShareRequest {
     can_edit: Option<bool>,
     can_reshare: Option<bool>,
     can_copy: Option<bool>,
+    /// No longer a share flag: `true` is a 400, `false` is accepted.
     include_secrets: Option<bool>,
     #[serde(default)]
     can_admin: Option<bool>,
@@ -450,10 +475,25 @@ pub async fn patch_share(
         Ok(r) => r,
         Err(e) => return e,
     };
+    if req.include_secrets == Some(true) {
+        return bad_request(INCLUDE_SECRETS);
+    }
 
     let Some(cur) = st.grant(grant_id).cloned() else {
         return not_found();
     };
+    if let Some(area) = outside_share_area(&st, &cur) {
+        if !may_revoke_outside(&st, caller, &cur, area) {
+            return not_found();
+        }
+        let raised = [req.can_edit, req.can_reshare, req.can_copy, req.can_admin]
+            .into_iter()
+            .any(|flag| flag == Some(true));
+        if raised {
+            return bad_request("An outside share is view only");
+        }
+        return ok(grant_json(&cur));
+    }
     if !caller_may_manage(&st, caller, &cur) {
         return not_found();
     }
@@ -461,13 +501,8 @@ pub async fn patch_share(
     let new_can_edit = req.can_edit.unwrap_or(cur.can_edit);
     let new_can_reshare = req.can_reshare.unwrap_or(cur.can_reshare);
     let new_can_copy = req.can_copy.unwrap_or(cur.can_copy);
-    let new_include_secrets = req.include_secrets.unwrap_or(cur.include_secrets);
     let new_can_admin = req.can_admin.unwrap_or(cur.can_admin);
 
-    // include_secrets raisable ONLY on a root grant (Area OR Atlas scope).
-    if new_include_secrets && !cur.include_secrets && cur.parent_grant_id.is_some() {
-        return not_found();
-    }
     // can_admin: owner-only to set/raise/remove, and only on an owner-minted root.
     if new_can_admin != cur.can_admin {
         let owner_minted_root = cur.parent_grant_id.is_none() && cur.grantor_id == cur.owner_id;
@@ -479,23 +514,15 @@ pub async fn patch_share(
     let raised = (new_can_edit && !cur.can_edit)
         || (new_can_reshare && !cur.can_reshare)
         || (new_can_copy && !cur.can_copy)
-        || (new_include_secrets && !cur.include_secrets)
         || (new_can_admin && !cur.can_admin);
     if raised {
-        if cur.parent_grant_id.is_some()
-            && (new_can_reshare || new_include_secrets || new_can_admin)
-        {
+        if cur.parent_grant_id.is_some() && (new_can_reshare || new_can_admin) {
             return not_found();
         }
-        let (v_reshare, v_secrets) = if cur.parent_grant_id.is_some() {
+        let (v_reshare, v_admin) = if cur.parent_grant_id.is_some() {
             (false, false)
         } else {
-            (new_can_reshare, new_include_secrets)
-        };
-        let v_admin = if cur.parent_grant_id.is_some() {
-            false
-        } else {
-            new_can_admin
+            (new_can_reshare, new_can_admin)
         };
         if let Err(e) = validate_grant_write(
             &st,
@@ -506,7 +533,6 @@ pub async fn patch_share(
             new_can_edit,
             v_reshare,
             new_can_copy,
-            v_secrets,
             v_admin,
         ) {
             return e;
@@ -518,7 +544,6 @@ pub async fn patch_share(
         g.can_edit = new_can_edit;
         g.can_reshare = new_can_reshare;
         g.can_copy = new_can_copy;
-        g.include_secrets = new_include_secrets;
         g.can_admin = new_can_admin;
         g.updated_at = Utc::now();
         g.clone()
@@ -558,7 +583,11 @@ pub async fn delete_share(
     let Some(cur) = st.grant(grant_id).cloned() else {
         return not_found();
     };
-    if !caller_may_manage(&st, caller, &cur) {
+    let allowed = match outside_share_area(&st, &cur) {
+        Some(area) => may_revoke_outside(&st, caller, &cur, area),
+        None => caller_may_manage(&st, caller, &cur),
+    };
+    if !allowed {
         return not_found();
     }
     st.delete_grants_cascading(&[grant_id]);
@@ -588,6 +617,9 @@ pub async fn area_shares(
     let Some(area) = st.areas.get(&area_id) else {
         return not_found();
     };
+    if area.clan_id.is_some() {
+        return list_outside_shares(&st, caller, area);
+    }
     let is_owner = area.user_id == caller;
 
     // Grants REACHING this area: Area-scope on it, or Atlas-scope on its
@@ -641,5 +673,193 @@ pub async fn area_shares(
     }
     nodes.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     let rows: Vec<Value> = nodes.into_iter().map(|(_, _, v)| v).collect();
+    ok(json!(rows))
+}
+
+// ---------------------------------------------------------------------------
+// Outside shares of a clan's Clan-owned maps (docs/clans.md §5.5)
+// ---------------------------------------------------------------------------
+
+/// The clan map an outside share names; `None` for every other share.
+fn outside_share_area<'a>(
+    st: &'a MockState,
+    grant: &GrantRecord,
+) -> Option<&'a super::state::AreaRecord> {
+    grant
+        .area_id
+        .and_then(|area| st.areas.get(&area))
+        .filter(|area| area.clan_id.is_some())
+}
+
+fn shares_externally(st: &MockState, user: Uuid, area: &super::state::AreaRecord) -> bool {
+    area.member_owned.is_none()
+        && super::clan_maps::area_actions(st, user, area).is_some_and(|actions| {
+            actions.contains("area.read") && actions.contains("area.share_external")
+        })
+}
+
+fn is_clan_owner(st: &MockState, user: Uuid, area: &super::state::AreaRecord) -> bool {
+    area.clan_id
+        .and_then(|clan| st.clans.clans.get(&clan))
+        .is_some_and(|clan| !clan.dissolved && clan.has_owner(user))
+}
+
+/// The outside shares of a Clan-owned map that are live, oldest first:
+/// those whose sharer still holds `area.share_external` on it.
+pub fn live_outside_shares<'a>(
+    st: &'a MockState,
+    area: &super::state::AreaRecord,
+) -> Vec<&'a GrantRecord> {
+    let mut shares: Vec<&GrantRecord> = st
+        .grants
+        .iter()
+        .filter(|grant| {
+            grant.area_id == Some(area.id) && shares_externally(st, grant.grantor_id, area)
+        })
+        .collect();
+    shares.sort_by_key(|grant| (grant.created_at, grant.id));
+    shares
+}
+
+/// Whether `user` sees a Clan-owned map's outside shares: one who reads it
+/// and holds `area.share_external` on it, clan owners among them.
+pub fn sees_outside_shares(st: &MockState, user: Uuid, area: &super::state::AreaRecord) -> bool {
+    area.member_owned.is_none()
+        && (is_clan_owner(st, user, area) || shares_externally(st, user, area))
+}
+
+/// Its sharer, or a clan owner.
+fn may_revoke_outside(
+    st: &MockState,
+    caller: Uuid,
+    grant: &GrantRecord,
+    area: &super::state::AreaRecord,
+) -> bool {
+    grant.grantor_id == caller || is_clan_owner(st, caller, area)
+}
+
+/// Whether an outside share lets `viewer` read the clan's map: one made to
+/// them by a member who still holds `area.share_external` on it.
+pub fn outside_reader(st: &MockState, viewer: Uuid, area: &super::state::AreaRecord) -> bool {
+    area.clan_id.is_some()
+        && st.grants.iter().any(|grant| {
+            grant.area_id == Some(area.id)
+                && grant.grantee_id == viewer
+                && shares_externally(st, grant.grantor_id, area)
+        })
+}
+
+/// Deletes the outside shares whose sharer no longer may share their map,
+/// as every change to clan access runs it: a share ends when its sharer
+/// leaves or loses `area.read` or `area.share_external` there, and does not
+/// return when they regain it.
+pub fn sweep_outside_shares(st: &mut MockState) {
+    let ended: Vec<Uuid> = st
+        .grants
+        .iter()
+        .filter(|grant| {
+            outside_share_area(st, grant)
+                .is_some_and(|area| !shares_externally(st, grant.grantor_id, area))
+        })
+        .map(|grant| grant.id)
+        .collect();
+    if !ended.is_empty() {
+        st.delete_grants_cascading(&ended);
+    }
+}
+
+/// The sharer's departure deletes the outside shares they made.
+pub fn forget_outside_shares_by(st: &mut MockState, clan: Uuid, user: Uuid) {
+    let maps: Vec<Uuid> = st
+        .areas
+        .values()
+        .filter(|area| area.clan_id == Some(clan))
+        .map(|area| area.id)
+        .collect();
+    st.grants.retain(|grant| {
+        !(grant.grantor_id == user && grant.area_id.is_some_and(|area| maps.contains(&area)))
+    });
+}
+
+fn create_outside_share(
+    st: &mut MockState,
+    caller: Uuid,
+    area_id: Uuid,
+    req: &CreateShareRequest,
+) -> Response {
+    let area = &st.areas[&area_id];
+    let clan_id = area.clan_id.expect("a clan map");
+    if !shares_externally(st, caller, area) {
+        return not_found();
+    }
+    if req.can_edit || req.can_reshare || req.can_copy || req.can_admin {
+        return bad_request("An outside share is view only");
+    }
+    let outsider = st
+        .clans
+        .clans
+        .get(&clan_id)
+        .is_none_or(|clan| !clan.has_member(req.grantee_id));
+    if caller == req.grantee_id
+        || !outsider
+        || !st.are_friends(caller, req.grantee_id)
+        || st.blocked_pair(caller, req.grantee_id)
+    {
+        return not_found();
+    }
+    let existing = st.grants.iter().find(|grant| {
+        grant.grantor_id == caller
+            && grant.grantee_id == req.grantee_id
+            && grant.area_id == Some(area_id)
+    });
+    if let Some(grant) = existing {
+        return created(grant_json(grant));
+    }
+    let now = Utc::now();
+    let grant = GrantRecord {
+        id: Uuid::new_v4(),
+        owner_id: clan_id,
+        grantor_id: caller,
+        grantee_id: req.grantee_id,
+        area_id: Some(area_id),
+        atlas_id: None,
+        can_edit: false,
+        can_reshare: false,
+        can_copy: false,
+        can_admin: false,
+        host_hints: None,
+        parent_grant_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+    st.grants.push(grant.clone());
+    created(grant_json(&grant))
+}
+
+/// A clan map's outside shares, oldest first, to those who read it and hold
+/// `area.share_external` on it, clan owners among them, each with who made
+/// it.
+fn list_outside_shares(st: &MockState, caller: Uuid, area: &super::state::AreaRecord) -> Response {
+    let owner_sees = is_clan_owner(st, caller, area) && area.member_owned.is_none();
+    if !owner_sees && !shares_externally(st, caller, area) {
+        return not_found();
+    }
+    let nickname = |user: Uuid| st.user(user).and_then(|record| record.nickname.clone());
+    let mut shares: Vec<&GrantRecord> = st
+        .grants
+        .iter()
+        .filter(|grant| grant.area_id == Some(area.id))
+        .collect();
+    shares.sort_by_key(|grant| (grant.created_at, grant.id));
+    let rows: Vec<Value> = shares
+        .into_iter()
+        .map(|grant| {
+            let mut row = grant_json(grant);
+            row["depth"] = json!(0);
+            row["grantor_nickname"] = json!(nickname(grant.grantor_id));
+            row["grantee_nickname"] = json!(nickname(grant.grantee_id));
+            row
+        })
+        .collect();
     ok(json!(rows))
 }

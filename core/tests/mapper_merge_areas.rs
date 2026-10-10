@@ -161,6 +161,12 @@ async fn merge_areas_folds_sources_into_the_destination() {
     let modules = smudgy_home.join(SERVER).join("modules");
     std::fs::create_dir_all(&modules).expect("create modules directory");
     std::fs::create_dir_all(smudgy_home.join(SERVER).join("logs")).expect("create logs directory");
+    // The session's server, whose settings say where its new maps go.
+    std::fs::write(
+        smudgy_home.join(SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .expect("write server settings");
     std::fs::write(modules.join("merge.ts"), MERGE_TS).expect("write merge module");
 
     // A tiered mapper: the session tier exists only behind the composite, and

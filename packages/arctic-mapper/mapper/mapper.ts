@@ -1,6 +1,7 @@
 import { mapper, sendRaw, echo } from 'smudgy:core';
 import { get } from 'smudgy:params';
 import { idsMatch } from './ids.ts';
+import { openCommandFor } from './doors.ts';
 
 export { idsMatch } from './ids.ts';
 
@@ -223,19 +224,14 @@ export const DirectionLetter: Record<Direction, string> = {
     [Direction.Down]: "d",
 };
 
-/** Room property holding the command that opens/clears this room's exit (e.g. `open n`, `part brush`). */
-export function openCommandProperty(direction: Direction): string {
-    return `open_${DirectionLetter[direction]}_command`;
-}
-
 /**
  * Speedwalk from `from` (default: the mapper's current room) to `to` along the
  * mapped shortest path, one hop at a time. ArcticMUD movement lives here rather
  * than in the host so each MUD owns its own conventions: per hop we first send
- * the exit's open command (an explicit `open_<d>_command` property, or `open <d>`
- * when the exit is mapped closed), then the exit's `command` if set, else the
- * direction letter. Commands go out with `sendRaw` so the emitted directions do
- * NOT re-fire the movement-capture alias. Returns the number of hops walked.
+ * the exit's open command (its door's `opensWith`, or `open <d>` when the door
+ * is mapped closed), then the exit's `command` if set, else the direction
+ * letter. Commands go out with `sendRaw` so the emitted directions do NOT
+ * re-fire the movement-capture alias. Returns the number of hops walked.
  */
 export function speedwalk(to: Room, from: Room | null = state.room): number {
     if (!from) {
@@ -282,9 +278,8 @@ export function speedwalk(to: Room, from: Room | null = state.room): number {
         const direction = exit.from_direction as Direction;
         const letter = DirectionLetter[direction] ?? exit.from_direction.toLowerCase();
 
-        // Open a mapped-closed door before stepping through it.
-        const openCommand = room.data(openCommandProperty(direction))
-            || (exit.is_closed ? `open ${letter}` : null);
+        // Open the exit's door before stepping through it.
+        const openCommand = openCommandFor(exit, `open ${letter}`);
         if (openCommand) {
             sendCommands(openCommand);
         }
