@@ -155,3 +155,7 @@ workspace = true
 name = "Smudgy"
 identifier = "org.smudgy"
 icon = ["../assets/icon256.png", "../assets/icon256@2x.png"]
+
+[[test]]
+name = "text_effects_catalogue"
+path = "../tests/text-effects/native.rs"

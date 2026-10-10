@@ -159,6 +159,10 @@ mod tests;
 #[cfg(test)]
 mod alignment_tests;
 
+#[cfg(test)]
+#[path = "../../../tests/text-effects/gpu.rs"]
+mod catalogue_tests;
+
 #[cfg(any(test, feature = "profiling"))]
 pub(crate) fn admitted_inputs() -> usize {
     INPUTS.load(Ordering::Relaxed)
