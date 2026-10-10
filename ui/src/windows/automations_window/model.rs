@@ -1644,32 +1644,42 @@ pub fn upsert_script_folder<'a>(
     Ok(current)
 }
 
-/// Parses a `smudgy://owner/name` specifier into `(owner, name)`.
+/// Parses a package address into `(owner, name)`: `smudgy:@name` has an empty owner,
+/// `smudgy://owner/name` the owner segment.
 pub fn parse_specifier(specifier: &str) -> Option<(String, String)> {
-    let rest = specifier.strip_prefix("smudgy://")?;
-    let (owner, name) = rest.rsplit_once('/')?;
-    if owner.is_empty() || name.is_empty() {
+    let parsed = smudgy_script::SmudgySpecifier::parse(specifier).ok()?;
+    if parsed.subpath.is_some() {
         return None;
     }
-    Some((owner.to_string(), name.to_string()))
+    Some((parsed.owner, parsed.name))
 }
 
 /// A short display label for an installed-package specifier (the trailing name).
 pub fn package_display_name(specifier: &str) -> &str {
-    specifier.rsplit('/').next().unwrap_or(specifier)
+    let name = specifier.rsplit('/').next().unwrap_or(specifier);
+    name.strip_prefix(smudgy_script::ADDRESS_PREFIX)
+        .unwrap_or(name)
 }
 
-/// The specifier a `LockedPackage` would carry for a given owner/name.
+/// The address a `LockedPackage` carries for a given owner/name: `smudgy:@name` when the
+/// owner is empty (a clan's package, or any package addressed by name), else
+/// `smudgy://owner/name`.
 pub fn specifier_for(owner: &str, name: &str) -> String {
-    format!("smudgy://{owner}/{name}")
+    smudgy_script::package_address(owner, name)
 }
 
-/// Whether `owner/name` is present in the lockfile list.
+/// The address for a wire owner nickname (absent for an owner without one) and name.
+pub fn address_for(owner: Option<&str>, name: &str) -> String {
+    specifier_for(owner.unwrap_or_default(), name)
+}
+
+/// Whether `owner/name` is present in the lockfile list. Names are global, so any spelling
+/// of the package's address counts.
 pub fn is_installed(installed: &[LockedPackage], owner: &str, name: &str) -> bool {
     let specifier = specifier_for(owner, name);
-    installed
-        .iter()
-        .any(|p| p.specifier.eq_ignore_ascii_case(&specifier))
+    installed.iter().any(|p| {
+        smudgy_core::models::shared_packages::same_package_address(&p.specifier, &specifier)
+    })
 }
 
 /// Required-parameter completeness per profile for the open profile-scoped package. Computing
@@ -1781,6 +1791,36 @@ impl AutomationsWindow {
 #[cfg(test)]
 mod tests {
     use super::{DepEdge, PackageGraph, Script, upsert_script_folder};
+
+    #[test]
+    fn both_address_spellings_parse_and_name_one_installed_package() {
+        use smudgy_core::models::shared_packages::{LockedPackage, UpdateMode};
+        assert_eq!(
+            super::parse_specifier("smudgy:@guild-lib"),
+            Some((String::new(), "guild-lib".to_string()))
+        );
+        assert_eq!(
+            super::parse_specifier("smudgy://wbk/mapper"),
+            Some(("wbk".to_string(), "mapper".to_string()))
+        );
+        assert_eq!(super::parse_specifier("smudgy:@guild-lib/sub"), None);
+        assert_eq!(super::specifier_for("", "guild-lib"), "smudgy:@guild-lib");
+        assert_eq!(super::address_for(None, "guild-lib"), "smudgy:@guild-lib");
+        assert_eq!(
+            super::address_for(Some("wbk"), "mapper"),
+            "smudgy://wbk/mapper"
+        );
+        assert_eq!(
+            super::package_display_name("smudgy:@guild-lib"),
+            "guild-lib"
+        );
+        assert_eq!(super::package_display_name("smudgy://wbk/mapper"), "mapper");
+
+        let installed = [LockedPackage::new("smudgy://wbk/mapper", UpdateMode::Auto)];
+        assert!(super::is_installed(&installed, "", "Mapper"));
+        assert!(super::is_installed(&installed, "someone", "mapper"));
+        assert!(!super::is_installed(&installed, "", "speedwalk"));
+    }
 
     #[test]
     fn script_folder_tree_preserves_legacy_case_variants() {

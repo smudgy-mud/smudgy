@@ -150,7 +150,7 @@ echo("MANUAL-COMMANDS-READY");
 
 fn dependency(name: &str, version: &str, range: &str, kind: DependencyKind) -> ResolvedDependency {
     ResolvedDependency {
-        owner_nickname: OWNER.to_string(),
+        owner_nickname: Some(OWNER.to_string()),
         name: name.to_string(),
         range: range.to_string(),
         resolved_version: version.to_string(),
@@ -222,6 +222,7 @@ fn cache_package(
                 manifest,
                 modules,
                 dependencies,
+                owner: None,
             },
         )
         .expect("cache authored package metadata");
@@ -399,10 +400,10 @@ async fn seed_area(mapper: &Mapper, name: &str, cells: &[(i16, i16, i32)]) -> Ar
     let mut edits = vec![AreaMutation::UpsertAreaProperty {
         name: "nukefire.mapper".to_string(),
         value: "NukeFire.Map.Local".to_string(),
-        is_secret: None,
     }];
     for (index, &(x, y, level)) in cells.iter().enumerate() {
         edits.push(AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(i32::try_from(index + 1).unwrap()),
             body: RoomUpdates {
                 title: Some(format!("Room {}", index + 1)),
@@ -423,6 +424,7 @@ async fn connect(mapper: &Mapper, area: AreaId, from: i32, to: i32, direction: E
         mapper,
         area,
         vec![AreaMutation::CreateExit {
+            room_source: None,
             room_number: RoomNumber(from),
             body: ExitArgs {
                 from_direction: direction,
@@ -445,6 +447,7 @@ async fn seed_authored_orthogonal(mapper: &Mapper, name: &str) -> (AreaId, Conne
         area,
         vec![
             AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: RoomUpdates {
                     x: Some(0.25),
@@ -453,6 +456,7 @@ async fn seed_authored_orthogonal(mapper: &Mapper, name: &str) -> (AreaId, Conne
                 },
             },
             AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(2),
                 body: RoomUpdates {
                     x: Some(4.125),
@@ -618,6 +622,7 @@ async fn installed_manual_reflows_commit_routes_acknowledge_and_reject_stale_res
         control,
         vec![
             AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: RoomUpdates {
                     x: Some(1.0),
@@ -627,6 +632,7 @@ async fn installed_manual_reflows_commit_routes_acknowledge_and_reject_stale_res
                 },
             },
             AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(2),
                 body: RoomUpdates {
                     x: Some(3.0),

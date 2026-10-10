@@ -1,159 +1,41 @@
-//! P4 — secrets tooling + clone: POST /areas/{id}/secret-marks,
-//! GET /areas/{id}/secrets, GET /areas/{id}/preview, POST /areas/{id}/copy,
-//! POST /atlases/{id}/copy. Mirrors `MapQueries` chunk D + the clone
-//! materializer (redacted projection as owned rows, pairwise exit remap).
+//! Secrets listing and copies: GET /areas/{id}/secrets, POST
+//! /areas/{id}/copy, POST /atlases/{id}/copy.
+//! Fidelity reference: the smudgy-cloudflare service (`src/maps/copies.ts`,
+//! `src/library/maps/copies.ts`; docs/format-3.md §5.2). A copy carries the
+//! map whole, with pairwise exit remap, and every Secret the copier holds
+//! `copy` on as an owner Secret of the copy with no grants. A Secret they
+//! read without `copy`, like one they do not read, leaves no trace.
 
 use std::collections::HashMap;
 use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use uuid::Uuid;
 
 use super::http::{
     authenticate, bad_request, created, gate_verified, not_found, ok, parse_area_id, parse_body,
 };
-use super::projection::project_area;
-use super::state::{AreaRecord, AtlasRecord, Caps, MockState, RoomRecord};
+use super::secret_grants::COPY;
+use super::state::{
+    AreaRecord, AtlasRecord, Caps, ExitRecord, LabelRecord, MockState, RoomRecord, SecretRecord,
+    ShapeRecord,
+};
 
 pub type Shared = Arc<Mutex<MockState>>;
-
-// ---------------------------------------------------------------------------
-// POST /areas/{id}/secret-marks
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct RoomPropKey {
-    room_number: i32,
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct SecretMarksRequest {
-    secret: bool,
-    #[serde(default)]
-    rooms: Vec<i32>,
-    #[serde(default)]
-    exits: Vec<Uuid>,
-    #[serde(default)]
-    labels: Vec<Uuid>,
-    #[serde(default)]
-    shapes: Vec<Uuid>,
-    #[serde(default)]
-    room_properties: Vec<RoomPropKey>,
-    #[serde(default)]
-    area_properties: Vec<String>,
-}
-
-/// POST /areas/{id}/secret-marks — CLEARED callers only; area-scoped updates;
-/// foreign ids silently ignored; per-type matched-row counts.
-pub async fn secret_marks(
-    State(state): State<Shared>,
-    Path(raw_id): Path<String>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
-    let area_id = match parse_area_id(&raw_id) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let mut st = state.lock();
-    let (viewer, _) = match authenticate(&st, &headers) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let req: SecretMarksRequest = match parse_body(&body) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    let Some(caps) = st.caps(viewer, area_id) else {
-        return not_found();
-    };
-    if !caps.cleared() {
-        return not_found();
-    }
-
-    let secret = req.secret;
-    let mut bumps: Vec<bool> = Vec::new(); // per touched row: bump_public?
-
-    let area = st.areas.get_mut(&area_id).expect("area exists");
-    let mut rooms = 0u64;
-    for n in &req.rooms {
-        if let Some(room) = area.rooms.get_mut(n) {
-            bumps.push(!(room.is_secret && secret));
-            room.is_secret = secret;
-            rooms += 1;
-        }
-    }
-    let mut exits = 0u64;
-    for id in &req.exits {
-        if let Some(exit) = area.exits.iter_mut().find(|e| e.id == *id) {
-            bumps.push(!(exit.is_secret && secret));
-            exit.is_secret = secret;
-            exits += 1;
-        }
-    }
-    let mut labels = 0u64;
-    for id in &req.labels {
-        if let Some(label) = area.labels.iter_mut().find(|l| l.id == *id) {
-            bumps.push(!(label.is_secret && secret));
-            label.is_secret = secret;
-            labels += 1;
-        }
-    }
-    let mut shapes = 0u64;
-    for id in &req.shapes {
-        if let Some(shape) = area.shapes.iter_mut().find(|s| s.id == *id) {
-            bumps.push(!(shape.is_secret && secret));
-            shape.is_secret = secret;
-            shapes += 1;
-        }
-    }
-    let mut room_properties = 0u64;
-    for key in &req.room_properties {
-        if let Some(prop) = area
-            .rooms
-            .get_mut(&key.room_number)
-            .and_then(|r| r.properties.get_mut(&key.name))
-        {
-            bumps.push(!(prop.is_secret && secret));
-            prop.is_secret = secret;
-            room_properties += 1;
-        }
-    }
-    let mut area_properties = 0u64;
-    for name in &req.area_properties {
-        if let Some(prop) = area.properties.get_mut(name) {
-            bumps.push(!(prop.is_secret && secret));
-            prop.is_secret = secret;
-            area_properties += 1;
-        }
-    }
-    for bump_public in bumps {
-        st.bump(Some(area_id), bump_public, false);
-    }
-
-    ok(json!({
-        "rooms": rooms,
-        "exits": exits,
-        "labels": labels,
-        "shapes": shapes,
-        "room_properties": room_properties,
-        "area_properties": area_properties,
-    }))
-}
 
 // ---------------------------------------------------------------------------
 // GET /areas/{id}/secrets
 // ---------------------------------------------------------------------------
 
-/// GET /areas/{id}/secrets — OWNER-only flat audit list.
+/// GET /areas/{id}/secrets — the Secrets on the map the caller can read, as
+/// `{source, name, ownership, actions}`, in creation order.
 pub async fn list_secrets(
     State(state): State<Shared>,
     Path(raw_id): Path<String>,
@@ -168,129 +50,32 @@ pub async fn list_secrets(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let Some(area) = st.areas.get(&area_id) else {
-        return not_found();
-    };
-    if area.user_id != viewer {
+    if !st.caps(viewer, area_id).is_some_and(|caps| caps.can_view) {
         return not_found();
     }
-
-    let mut entries: Vec<Value> = Vec::new();
-    for room in area.rooms.values().filter(|r| r.is_secret) {
-        entries.push(json!({"kind": "room", "room_number": room.room_number}));
-    }
-    for exit in area.exits.iter().filter(|e| e.is_secret) {
-        entries.push(json!({"kind": "exit", "id": exit.id}));
-    }
-    for label in area.labels.iter().filter(|l| l.is_secret) {
-        entries.push(json!({"kind": "label", "id": label.id}));
-    }
-    for shape in area.shapes.iter().filter(|s| s.is_secret) {
-        entries.push(json!({"kind": "shape", "id": shape.id}));
-    }
-    for room in area.rooms.values() {
-        for (name, prop) in &room.properties {
-            if prop.is_secret {
-                entries.push(json!({
-                    "kind": "room_property",
-                    "room_number": room.room_number,
-                    "name": name,
-                }));
-            }
-        }
-    }
-    for (name, prop) in &area.properties {
-        if prop.is_secret {
-            entries.push(json!({"kind": "area_property", "name": name}));
-        }
-    }
-    ok(json!(entries))
-}
-
-// ---------------------------------------------------------------------------
-// GET /areas/{id}/preview[?share_id|as_user]
-// ---------------------------------------------------------------------------
-
-/// GET /areas/{id}/preview — OWNER-only; share_id wins over as_user; a bogus
-/// share_id degrades to the anonymous worst case; audience-sees-nothing is a
-/// 200 with data:null.
-pub async fn preview_area(
-    State(state): State<Shared>,
-    Path(raw_id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-) -> Response {
-    let area_id = match parse_area_id(&raw_id) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let st = state.lock();
-    let (viewer, _) = match authenticate(&st, &headers) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let Some(area) = st.areas.get(&area_id) else {
-        return not_found();
-    };
-    if area.user_id != viewer {
-        return not_found();
-    }
-
-    let share_id = match params.get("share_id") {
-        Some(raw) => match Uuid::parse_str(raw) {
-            Ok(id) => Some(id),
-            Err(_) => return bad_request("Invalid share_id"),
-        },
-        None => None,
-    };
-    let as_user = match params.get("as_user") {
-        Some(raw) => match Uuid::parse_str(raw) {
-            Ok(id) => Some(id),
-            Err(_) => return bad_request("Invalid as_user"),
-        },
-        None => None,
-    };
-
-    // share_id wins; a grant that does not REACH this area degrades to the
-    // anonymous worst case (a random uuid with no grants).
-    let simulated: Uuid = if let Some(sid) = share_id {
-        st.grants
+    let area = st.areas.get(&area_id).expect("caps proved the area exists");
+    ok(json!(
+        st.readable_secrets(viewer, area)
             .iter()
-            .find(|g| {
-                g.id == sid
-                    && (g.area_id == Some(area_id)
-                        || (g.atlas_id.is_some() && g.atlas_id == area.atlas_id))
-            })
-            .map_or_else(Uuid::new_v4, |g| g.grantee_id)
-    } else if let Some(uid) = as_user {
-        uid
-    } else {
-        Uuid::new_v4()
-    };
-
-    match project_area(&st, simulated, area_id) {
-        Some(projection) => ok(projection),
-        None => ok(Value::Null),
-    }
+            .map(|(secret, actions)| super::secrets::summary(secret, actions))
+            .collect::<Vec<_>>()
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Clone materializer (shared by area copy and atlas copy)
 // ---------------------------------------------------------------------------
 
-/// Materialize the CALLER's redacted projection of every `(src, new)` pair as
-/// owned rows in the clones; remap exits pairwise; dangle hidden targets.
-/// Mirrors `materialize_clone`: per-source `see_secrets`, `is_secret`
-/// preserved, FK placeholders synthesized, rev triggers fired per row.
+/// Materialize the map content of every `(src, new)` pair as owned rows in
+/// the clones; remap exits pairwise; dangle targets the caller cannot read.
+/// Mirrors `materialize_clone`: FK placeholders synthesized, rev triggers
+/// fired per row.
 fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]) {
+    st.bind_room_references();
+    let mut room_ids = HashMap::new();
     let remap: HashMap<Uuid, Uuid> = area_map.iter().copied().collect();
 
-    // Per-source clearance + per-target visibility, resolved BEFORE mutation.
-    let mut see_secrets_by_src: HashMap<Uuid, bool> = HashMap::new();
-    for (src, _) in area_map {
-        let ss = st.caps(viewer, *src).is_some_and(|c| c.see_secrets());
-        see_secrets_by_src.insert(*src, ss);
-    }
+    // Per-target visibility, resolved BEFORE mutation.
     let mut target_visible: HashMap<Uuid, bool> = HashMap::new();
     for (src, _) in area_map {
         let Some(area) = st.areas.get(src) else {
@@ -307,97 +92,57 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
 
     // PASS 1 — rooms + child content for every clone (exits land in pass 2).
     for (src, new_area) in area_map {
-        let see = see_secrets_by_src[src];
         let Some(source) = st.areas.get(src).cloned() else {
             continue;
         };
-        let mut bump_count_public = 0u32;
-        let mut bump_count_secret = 0u32;
+        let mut row_count = 0usize;
         {
             let clone = st.areas.get_mut(new_area).expect("clone header exists");
-            for room in source.rooms.values().filter(|r| see || !r.is_secret) {
+            for room in source.rooms.values() {
+                // The room, each property, and each tag are one row apiece.
+                row_count += 1 + room.properties.len() + room.tags.len();
                 let mut copied = room.clone();
-                copied.properties.retain(|_, p| see || !p.is_secret);
-                for prop in copied.properties.values() {
-                    if prop.is_secret {
-                        bump_count_secret += 1;
-                    } else {
-                        bump_count_public += 1;
-                    }
-                }
-                // Tags are non-secret: each copied tag is a public insert.
-                bump_count_public += u32::try_from(copied.tags.len()).unwrap_or(u32::MAX);
-                if copied.is_secret {
-                    bump_count_secret += 1;
-                } else {
-                    bump_count_public += 1;
-                }
-                clone.rooms.insert(copied.room_number, copied);
+                copied.identity = Uuid::new_v4();
+                room_ids.insert(room.identity, copied.identity);
+                clone.rooms.insert(room.room_number, copied);
             }
-            for label in source.labels.iter().filter(|l| see || !l.is_secret) {
+            for label in &source.labels {
                 let mut copied = label.clone();
                 copied.id = Uuid::new_v4();
-                if copied.is_secret {
-                    bump_count_secret += 1;
-                } else {
-                    bump_count_public += 1;
-                }
+                row_count += 1;
                 clone.labels.push(copied);
             }
-            for shape in source.shapes.iter().filter(|s| see || !s.is_secret) {
+            for shape in &source.shapes {
                 let mut copied = shape.clone();
                 copied.id = Uuid::new_v4();
-                if copied.is_secret {
-                    bump_count_secret += 1;
-                } else {
-                    bump_count_public += 1;
-                }
+                row_count += 1;
                 clone.shapes.push(copied);
             }
-            for (name, prop) in source
-                .properties
-                .iter()
-                .filter(|(_, p)| see || !p.is_secret)
-            {
-                if prop.is_secret {
-                    bump_count_secret += 1;
-                } else {
-                    bump_count_public += 1;
-                }
+            for (name, prop) in &source.properties {
+                row_count += 1;
                 clone.properties.insert(name.clone(), prop.clone());
             }
         }
-        for _ in 0..bump_count_public {
-            st.bump(Some(*new_area), true, false);
-        }
-        for _ in 0..bump_count_secret {
-            st.bump(Some(*new_area), false, false);
+        for _ in 0..row_count {
+            st.bump(Some(*new_area));
         }
     }
 
-    // PASS 2 — Connections first (fresh UUIDs, §6-closure-filtered), then
-    // exits with rewired `connection_id`s, mirroring the server: a group is
-    // copied IFF the cloner's projection of the source would include it,
-    // and an exit is copied exactly when its Connection was — an uncleared
-    // clone can never resurrect a group scrubbed from its source
-    // projection.
+    // PASS 2 — Connections first (fresh UUIDs), then exits with rewired
+    // `connection_id`s, mirroring the server: an exit is copied exactly
+    // when its Connection was.
     for (src, new_area) in area_map {
-        let see = see_secrets_by_src[src];
         let Some(source) = st.areas.get(src).cloned() else {
             continue;
         };
 
-        // (f)+(g) surviving Connections, copied under fresh ids. Endpoint B
-        // (and the stored route with it) clears when the clone lacks its
-        // room — a copied route may never keep a coordinate frame the clone
-        // does not contain.
+        // Connections, copied under fresh ids. Endpoint B (and the stored
+        // route with it) clears when the clone lacks its room — a copied
+        // route may never keep a coordinate frame the clone does not
+        // contain.
         let mut connection_map: HashMap<Uuid, Uuid> = HashMap::new();
         let mut copied_connections = Vec::new();
         for connection in &source.connections {
-            let verdict = super::projection::connection_verdict(st, viewer, &source, connection);
-            if verdict.omitted(see) {
-                continue;
-            }
             let mut copied = connection.clone();
             copied.id = Uuid::new_v4();
             connection_map.insert(connection.id, copied.id);
@@ -414,13 +159,21 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
         }
 
         // (h) Exits — copied iff their Connection was, destination
-        // re-resolved (remapped clone / kept visible target / dangled).
+        // re-resolved (remapped clone / kept visible target / dangled). An
+        // exit into another map's Secret room comes along only for a
+        // copier who reads that Secret, keeping its destination, and is
+        // otherwise left out with its connection, never dangled.
         let mut staged = Vec::new();
         for exit in &source.exits {
             let Some(new_connection) = connection_map.get(&exit.connection_id) else {
                 continue;
             };
             let (new_to_area, new_to_room, new_to_dir) = match exit.to_area_id {
+                _ if exit.to_room_identity.is_some() || exit.to_secret.is_some() => (
+                    exit.to_area_id,
+                    exit.to_room_number,
+                    exit.to_direction.clone(),
+                ),
                 None => (None, None, None),
                 Some(target) => {
                     if let Some(mapped) = remap.get(&target) {
@@ -444,15 +197,19 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
             copied.to_area_id = new_to_area;
             copied.to_room_number = new_to_room;
             copied.to_direction = new_to_dir;
-            copied.is_secret = see && exit.is_secret;
             staged.push(copied);
         }
 
-        // Defensive FK placeholders (the closure normally guarantees every
-        // surviving from-room/same-area to-room was copied in pass 1).
+        // Defensive FK placeholders (every from-room/same-area to-room was
+        // normally copied in pass 1).
         let mut placeholder_rooms: Vec<i32> = Vec::new();
         {
             let clone = st.areas.get_mut(new_area).expect("clone exists");
+            copied_connections.retain(|connection| {
+                staged
+                    .iter()
+                    .any(|exit: &ExitRecord| exit.connection_id == connection.id)
+            });
             clone.connections.extend(copied_connections);
             for exit in &staged {
                 if let Entry::Vacant(slot) = clone.rooms.entry(exit.from_room_number) {
@@ -469,22 +226,154 @@ fn materialize_clone(st: &mut MockState, viewer: Uuid, area_map: &[(Uuid, Uuid)]
             }
         }
         for _ in placeholder_rooms {
-            st.bump(Some(*new_area), true, false);
+            st.bump(Some(*new_area));
         }
         // Land the exits, firing the two-sided insert trigger.
-        let mut bumps: Vec<(Option<Uuid>, bool)> = Vec::new();
+        let mut bumps: Vec<Option<Uuid>> = Vec::new();
         {
             let clone = st.areas.get_mut(new_area).expect("clone exists");
             for exit in staged {
-                bumps.push((Some(*new_area), !exit.is_secret));
-                bumps.push((exit.to_area_id, !exit.is_secret));
+                bumps.push(Some(*new_area));
+                if exit.to_secret.is_none() {
+                    bumps.push(exit.to_area_id);
+                }
                 clone.exits.push(exit);
             }
         }
-        for (target, public) in bumps {
-            st.bump(target, public, false);
+        for target in bumps {
+            st.bump(target);
         }
     }
+
+    // PASS 3 — every Secret the copier holds `copy` on, of any ownership,
+    // becomes an owner Secret of the copy: same name, color and content, a
+    // new id, revision 1 and no grants. A Secret they read without `copy`,
+    // like one they cannot read, leaves no trace.
+    for (src, new_area) in area_map {
+        let Some(source) = st.areas.get(src) else {
+            continue;
+        };
+        let copies: Vec<SecretRecord> = st
+            .readable_secrets(viewer, source)
+            .into_iter()
+            .filter(|(_, actions)| actions.contains(&COPY))
+            .map(|(secret, _)| copy_secret(st, viewer, secret, *src, *new_area, &remap))
+            .collect();
+        st.areas
+            .get_mut(new_area)
+            .expect("clone exists")
+            .secrets
+            .extend(copies);
+    }
+    for (src, new_area) in area_map {
+        let source = &st.areas[src];
+        let clone = &st.areas[new_area];
+        let copied_sources: Vec<_> = st
+            .readable_secrets(viewer, source)
+            .into_iter()
+            .filter(|(_, actions)| actions.contains(&COPY))
+            .map(|(secret, _)| secret)
+            .collect();
+        for (original, copied) in copied_sources.iter().zip(&clone.secrets) {
+            for (number, room) in &original.rooms {
+                if let Some(copied_room) = copied.rooms.get(number) {
+                    room_ids.insert(room.identity, copied_room.identity);
+                }
+            }
+        }
+    }
+    for (_, new_area) in area_map {
+        let clone = st.areas.get_mut(new_area).unwrap();
+        for room in clone
+            .rooms
+            .values_mut()
+            .chain(clone.secrets.iter_mut().flat_map(|s| s.rooms.values_mut()))
+        {
+            if let Some(anchor) = room.anchor {
+                room.anchor = Some(room_ids.get(&anchor).copied().unwrap_or_else(Uuid::new_v4));
+            }
+        }
+        for exit in clone.exits.iter_mut().chain(
+            clone
+                .secrets
+                .iter_mut()
+                .flat_map(|secret| &mut secret.exits),
+        ) {
+            if let Some(identity) = exit.to_room_identity.and_then(|id| room_ids.get(&id)) {
+                exit.to_room_identity = Some(*identity);
+                if let Some(target) = exit.to_area_id.and_then(|area| remap.get(&area)) {
+                    exit.to_area_id = Some(*target);
+                }
+            }
+        }
+    }
+}
+
+/// A Secret of map `src` as an owner Secret of its copy `new_area`. Its
+/// rooms keep their numbers, so its data stays keyed to the same map rooms;
+/// exits, connections, labels and shapes get new ids. An exit into the
+/// copied maps leads into the copies, one into a map the copier reads stays,
+/// and any other dangles.
+fn copy_secret(
+    st: &MockState,
+    viewer: Uuid,
+    secret: &SecretRecord,
+    src: Uuid,
+    new_area: Uuid,
+    remap: &HashMap<Uuid, Uuid>,
+) -> SecretRecord {
+    let mut copy = SecretRecord::new(Uuid::new_v4(), secret.name.clone());
+    copy.color.clone_from(&secret.color);
+    copy.properties.clone_from(&secret.properties);
+    copy.rooms.clone_from(&secret.rooms);
+    for room in copy.rooms.values_mut() {
+        room.identity = Uuid::new_v4();
+    }
+    let mut connections: HashMap<Uuid, Uuid> = HashMap::new();
+    for connection in &secret.connections {
+        let mut copied = connection.clone();
+        copied.id = Uuid::new_v4();
+        connections.insert(connection.id, copied.id);
+        copy.connections.push(copied);
+    }
+    for exit in &secret.exits {
+        let mut copied = exit.clone();
+        copied.id = Uuid::new_v4();
+        if let Some(connection) = connections.get(&exit.connection_id) {
+            copied.connection_id = *connection;
+        }
+        if let Some(target) = exit.to_area_id {
+            if target == src {
+                copied.to_area_id = Some(new_area);
+            } else if let Some(mapped) = remap.get(&target) {
+                copied.to_area_id = Some(*mapped);
+            } else if exit.to_room_identity.is_none()
+                && !st.caps(viewer, target).is_some_and(|caps| caps.can_view)
+            {
+                copied.to_area_id = None;
+                copied.to_room_number = None;
+                copied.to_direction = None;
+            }
+        }
+        copy.exits.push(copied);
+    }
+    copy.labels = secret
+        .labels
+        .iter()
+        .map(|label| LabelRecord {
+            id: Uuid::new_v4(),
+            ..label.clone()
+        })
+        .collect();
+    copy.shapes = secret
+        .shapes
+        .iter()
+        .map(|shape| ShapeRecord {
+            id: Uuid::new_v4(),
+            ..shape.clone()
+        })
+        .collect();
+    copy
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +387,7 @@ struct CopyAreaRequest {
 }
 
 /// POST /areas/{id}/copy — VERIFIED + effective can_copy; materializes the
-/// caller's redacted projection with provenance; response rev is the header's
+/// map's content with provenance; response rev is the header's
 /// initial 1 (matching the real RETURNING-before-triggers behavior).
 pub async fn copy_area(
     State(state): State<Shared>,
@@ -526,6 +415,9 @@ pub async fn copy_area(
             Err(e) => return e,
         }
     };
+    if let Some(refusal) = req.name.as_deref().and_then(super::http::name_refusal) {
+        return refusal;
+    }
 
     let caps = st.caps(viewer, area_id).unwrap_or(Caps::NONE);
     if !(caps.can_view && caps.can_copy) {
@@ -581,7 +473,9 @@ struct CopyAtlasRequest {
 
 /// POST /atlases/{id}/copy — per-member effective can_copy decides copied vs
 /// skipped (skipped = viewable-but-not-copyable; invisible members dropped
-/// silently); intra-atlas links remap pairwise.
+/// silently); intra-atlas links remap pairwise. An atlas the caller reads
+/// no map of and does not administer, or a clan's atlas to a non-member,
+/// is the uniform 404 (the server's `exportAtlasCopy`).
 pub async fn copy_atlas(
     State(state): State<Shared>,
     Path(raw_id): Path<String>,
@@ -607,10 +501,14 @@ pub async fn copy_atlas(
             Err(e) => return e,
         }
     };
+    if let Some(refusal) = req.name.as_deref().and_then(super::http::name_refusal) {
+        return refusal;
+    }
 
-    let Some(atlas_name) = st.atlases.get(&atlas_id).map(|a| a.name.clone()) else {
+    let Some(atlas) = st.atlases.get(&atlas_id) else {
         return not_found();
     };
+    let atlas_name = atlas.name.clone();
 
     // Member areas in stable (created, id) order.
     let mut members: Vec<(u64, Uuid)> = st
@@ -620,6 +518,27 @@ pub async fn copy_atlas(
         .map(|a| (a.created_seq, a.id))
         .collect();
     members.sort_unstable();
+
+    // The atlas is reachable when the caller reads one of its maps or
+    // administers it; a clan's atlas, by the clan's members alone. Anything
+    // else is the uniform 404, revealing nothing of it.
+    let reads_a_map = members
+        .iter()
+        .any(|(_, member)| st.caps(viewer, *member).is_some_and(|caps| caps.can_view));
+    let administers = atlas.clan_id.is_none()
+        && (atlas.user_id == viewer
+            || st.grants.iter().any(|grant| {
+                grant.atlas_id == Some(atlas_id) && grant.grantee_id == viewer && grant.can_admin
+            }));
+    let outsider = atlas.clan_id.is_some_and(|clan| {
+        !st.clans
+            .clans
+            .get(&clan)
+            .is_some_and(|record| record.has_member(viewer))
+    });
+    if (!reads_a_map && !administers) || outsider {
+        return not_found();
+    }
 
     let mut copyable: Vec<Uuid> = Vec::new();
     let mut skipped: Vec<Uuid> = Vec::new();
@@ -640,8 +559,10 @@ pub async fn copy_atlas(
         AtlasRecord {
             id: new_atlas_id,
             user_id: viewer,
+            clan_id: None,
             name: new_name.clone(),
             created_at: Utc::now(),
+            rev: 1,
         },
     );
 

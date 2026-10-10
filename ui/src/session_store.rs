@@ -456,6 +456,9 @@ pub struct ManagedSession {
 
     widget_root: WidgetRoot<'static, crate::Theme, crate::Renderer>,
     map_store: MapStore,
+    /// Where the mapper last placed the player, so a map editor opened from
+    /// this session starts there.
+    pub current_location: Option<(AreaId, i32)>,
     text_store: TextEditorStore,
 
     runtime_tx: Option<mpsc::UnboundedSender<RuntimeAction>>,
@@ -566,11 +569,12 @@ fn load_audio_package_rows(server: &str, profile: &str) -> Result<Vec<AudioPacka
         .iter()
         .filter(|package| lock.is_effectively_enabled_for(&package.specifier, profile))
         .filter_map(|package| {
-            let rest = package.specifier.strip_prefix("smudgy://")?;
-            let (owner, name) = rest.rsplit_once('/')?;
+            // Either address spelling: `smudgy:@name` has an empty owner.
+            let parsed = smudgy_script::SmudgySpecifier::parse(&package.specifier).ok()?;
+            let (owner, name) = (parsed.owner, parsed.name);
             let ui_key = next_audio_row_key()?;
             let action_key = next_audio_row_key()?;
-            (!owner.is_empty() && !name.is_empty()).then(|| AudioPackageRow {
+            parsed.subpath.is_none().then(|| AudioPackageRow {
                 ui_key,
                 action_key,
                 owner: Arc::from(owner.to_ascii_lowercase()),
@@ -1723,6 +1727,7 @@ impl ManagedSession {
             mapper,
             widget_root,
             map_store,
+            current_location: None,
             text_store,
         };
         #[cfg(feature = "web-audio-cpal")]
@@ -2549,11 +2554,20 @@ impl ManagedSession {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SetMapperCurrentLocation(area_id, room_number) => {
+                self.current_location = room_number.map(|room_number| (area_id, room_number));
                 self.map_store.set_current_location(area_id, room_number);
                 Task::none()
             }
             Message::WidgetMapMessage { id, message } => {
                 if let Some(update) = self.map_store.update_map(id, message) {
+                    // A room clicked goes to the session's scripts as `map:click`; the
+                    // runtime decides which of them may hear of it.
+                    if let Some(map_view::Event::RoomClicked(room)) = update.event {
+                        self.send_runtime_action(RuntimeAction::MapRoomClicked {
+                            area_id: room.area_id,
+                            room_number: room.room_number.0,
+                        });
+                    }
                     update
                         .task
                         .map(move |inner_message| Message::WidgetMapMessage {

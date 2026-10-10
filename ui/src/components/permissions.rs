@@ -347,6 +347,15 @@ fn smudgy_can_lines(caps: &SmudgyCapabilities) -> Vec<PermissionLine> {
     if caps.mapper_write {
         out.push(cap_line(crate::i18n::ts!("permission-can-map-write")));
     }
+    if caps.secrets_read {
+        out.push(cap_line(crate::i18n::ts!("permission-can-secrets-read")));
+    }
+    if caps.secrets_write {
+        out.push(cap_line(crate::i18n::ts!("permission-can-secrets-write")));
+    }
+    if caps.secrets_manage {
+        out.push(cap_line(crate::i18n::ts!("permission-can-secrets-manage")));
+    }
     if caps.widgets {
         out.push(cap_line(crate::i18n::ts!("permission-can-widgets")));
     }

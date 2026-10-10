@@ -17,8 +17,8 @@ import {
     DirectionLetter,
     MoveCommands,
     OppositeDirection,
-    openCommandProperty,
 } from "./mapper.ts";
+import { describeDoor, doorUpdate, nextDoorState, openCommandFor } from "./doors.ts";
 
 createAlias(/^map\b(\s+(?<args>.*))?$/, mapperCommand, { name: "mapper" });
 
@@ -482,11 +482,10 @@ async function roomCommand([subcommand, ...args]: string[]) {
             echo(`Coordinates: ${state.room.x}, ${state.room.y} Level:${state.room.level}`);
             echo(`Exits: ${state.room.exits.map(e => {
                 const markers = [
-                    e.is_closed && "closed",
+                    e.door && `door ${describeDoor(e.door)}`,
                     e.is_hidden && "hidden",
-                    e.is_locked && "locked",
                     e.command && `cmd: ${e.command}`,
-                    state.room.data(openCommandProperty(e.from_direction as Direction)) && `open: ${state.room.data(openCommandProperty(e.from_direction as Direction))}`,
+                    e.door?.opensWith && `open: ${e.door.opensWith}`,
                 ].filter(Boolean);
                 return `${e.from_direction} -> ${e.to_room_number ?? "?"}${markers.length ? ` [${markers.join(", ")}]` : ""}`;
             }).join(", ")}`);
@@ -581,11 +580,12 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
     const usage = () => {
         echo("Usage: map exit <direction> [action]");
         echo("Actions:");
-        echo("  (none)                  - Show the exit's commands and flags");
-        echo("  open <cmd>              - Command sent before moving (e.g. `open n`, `part brush`)");
+        echo("  (none)                  - Show the exit's door, commands and flags");
+        echo("  open <cmd>              - Command that opens the door (e.g. `unlock n;open n`, `part brush`)");
         echo("  command <cmd>           - Command sent instead of the direction (e.g. `enter hole`)");
-        echo("  clear open|command      - Remove the open/movement command");
-        echo("  closed|hidden|locked [true|false] - Set exit flags");
+        echo("  clear open|command|door - Remove the open command, the movement command, or the door");
+        echo("  closed|locked [true|false] - Set the door's state");
+        echo("  hidden [true|false]     - Set the hidden flag");
     };
 
     if (!state.room) {
@@ -599,22 +599,26 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
         return;
     }
     const direction = intent;
-    const openProp = openCommandProperty(direction);
 
     const exit = state.room.exits.find((e) => e.from_direction === direction);
     if (!exit) {
         echo(`No exit ${direction} from ${state.room.title}`);
         return;
     }
+    const door = exit.door ?? null;
+    const setDoor = async (next: DoorArgs | null) => {
+        await mapper.setRoomExit(state.area.id, state.room.room_number, exit.id, { door: next });
+        state.refreshRoomAndArea();
+    };
 
     switch (action) {
         case undefined:
         case 'show': {
-            const flags = [exit.is_closed && "closed", exit.is_hidden && "hidden", exit.is_locked && "locked"].filter(Boolean).join(", ");
             echo(`Exit ${direction} from ${state.room.title}:`);
             echo(`  to: ${exit.to_room_number ?? "(unlinked)"}${exit.to_direction ? ` (arrives from ${exit.to_direction})` : ""}`);
-            echo(`  flags: ${flags || "(none)"}`);
-            echo(`  open command: ${state.room.data(openProp) || (exit.is_closed ? `open door ${DirectionLetter[direction]} (default)` : "(none)")}`);
+            echo(`  door: ${door ? describeDoor(door) : "(none)"}`);
+            echo(`  flags: ${exit.is_hidden ? "hidden" : "(none)"}`);
+            echo(`  open command: ${openCommandFor(exit, `open door ${DirectionLetter[direction]} (default)`) ?? "(none)"}`);
             echo(`  movement command: ${exit.command || "(none)"}`);
             break;
         }
@@ -624,8 +628,7 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
                 usage();
                 return;
             }
-            await mapper.setRoomProperty(state.area.id, state.room.room_number, openProp, cmd);
-            state.refreshRoomAndArea();
+            await setDoor(doorUpdate(door, { opensWith: cmd }));
             echo(`Exit ${direction}: open command set to \`${cmd}\``);
             break;
         }
@@ -643,25 +646,49 @@ async function exitCommand([dirArg, action, ...rest]: string[]) {
         case 'clear': {
             const what = rest[0]?.toLowerCase();
             if (what === 'open') {
-                await mapper.setRoomProperty(state.area.id, state.room.room_number, openProp, "");
+                if (!door?.opensWith) {
+                    echo(`Exit ${direction} has no open command`);
+                    return;
+                }
+                await setDoor(doorUpdate(door, { opensWith: null }));
                 echo(`Exit ${direction}: open command cleared`);
             } else if (what === 'command') {
                 await mapper.setRoomExit(state.area.id, state.room.room_number, exit.id, { command: "" });
+                state.refreshRoomAndArea();
                 echo(`Exit ${direction}: movement command cleared`);
+            } else if (what === 'door') {
+                if (!door) {
+                    echo(`Exit ${direction} has no door`);
+                    return;
+                }
+                await setDoor(null);
+                echo(`Exit ${direction}: door removed`);
             } else {
                 usage();
-                return;
             }
-            state.refreshRoomAndArea();
             break;
         }
         case 'closed':
-        case 'hidden':
         case 'locked': {
             const value = (rest[0] ?? "true").toLowerCase() !== "false";
-            await mapper.setRoomExit(state.area.id, state.room.room_number, exit.id, { [`is_${action}`]: value });
+            const current = door?.state ?? null;
+            const next = nextDoorState(current, action, value);
+            if (next === null) {
+                echo(`Exit ${direction} has no door`);
+                return;
+            }
+            const updated = doorUpdate(door, { state: next });
+            if (next !== current) {
+                await setDoor(updated);
+            }
+            echo(`Exit ${direction}: door ${describeDoor(updated)}`);
+            break;
+        }
+        case 'hidden': {
+            const value = (rest[0] ?? "true").toLowerCase() !== "false";
+            await mapper.setRoomExit(state.area.id, state.room.room_number, exit.id, { isHidden: value });
             state.refreshRoomAndArea();
-            echo(`Exit ${direction}: ${action} = ${value}`);
+            echo(`Exit ${direction}: hidden = ${value}`);
             break;
         }
         default:
@@ -940,7 +967,7 @@ const commands = {
                         if (!currentExits.has(exit.direction) && roomNumber !== undefined) {
                             const id = await mutation.createRoomExit(roomNumber, {
                                 from_direction: exit.direction,
-                                is_closed: exit.closed,
+                                door: exit.closed ? { state: "closed" } : null,
                             });
                             createdExits.push([exit.direction, id]);
                         }
@@ -1049,11 +1076,10 @@ function advanceInDark(visibleExits: string | undefined) {
 
 /**
  * Active-mode movement: consult the map about the exit we're about to use.
- * Sends the exit's open command first when one applies (explicit
- * open_<d>_command property, the exit flagged closed on the map, or the
- * prompt currently showing the exit parenthesized), then sends the exit's
- * movement command if it has one. Returns true when the movement command
- * was sent in place of the direction.
+ * Sends the exit's open command first when one applies (its door's
+ * `opensWith`, a door mapped closed, or the prompt currently showing the exit
+ * parenthesized), then sends the exit's movement command if it has one.
+ * Returns true when the movement command was sent in place of the direction.
  */
 function activeMove(direction: Direction): boolean {
     if (!state.room) {
@@ -1069,8 +1095,7 @@ function activeMove(direction: Direction): boolean {
     // undefined = unknown (no prompt data, or a hidden exit).
     const liveClosed = state.seenExits?.get(direction);
 
-    const openCommand = state.room.data(openCommandProperty(direction))
-        || ((exit.is_closed || liveClosed) ? `open door ${DirectionLetter[direction]}` : null);
+    const openCommand = openCommandFor(exit, `open door ${DirectionLetter[direction]}`, liveClosed === true);
 
     // Skip opening only when the prompt affirmatively shows the exit open.
     if (openCommand && liveClosed !== false) {
@@ -1249,7 +1274,7 @@ async function createNewRoomInDirection(roomEvent: RoomEvent, direction: Directi
             if (exit.direction !== OppositeDirection[direction]) {
                 exitIds.push(await mutation.createRoomExit(newRoomNumber, {
                     from_direction: exit.direction,
-                    is_closed: exit.closed,
+                    door: exit.closed ? { state: "closed" } : null,
                 }));
             }
         }

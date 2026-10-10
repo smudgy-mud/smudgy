@@ -8,8 +8,10 @@ iced = { workspace = true }
 iced_anim = { workspace = true }
 log = { workspace = true }
 smudgy_cloud = { workspace = true }
+smudgy_palette = { workspace = true }
 smudgy_theme = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+async-trait = "0.1"
 

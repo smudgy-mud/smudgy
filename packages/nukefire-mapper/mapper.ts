@@ -51,6 +51,7 @@ import {
   type DecisionLogRecord,
 } from "./decision-log.ts";
 import { AreaNames } from "./area-names.ts";
+import { copyDoor, doorIsClosed, reportedDoor, sameDoor } from "./doors.ts";
 import { NUKEFIRE_MARKS } from "./nukefire-maps.ts";
 import { glimpsedZoneMap, readZoneFacts, type Settlement, settleZone, type ZoneContext } from "./zone-settle.ts";
 import { counted, elapsedClock, polishProgressLine, qualitySummary, zoneNameFromMaps } from "./tidy.ts";
@@ -203,8 +204,7 @@ interface ExitMirror {
   toAreaId: AreaId | null;
   toRoomNumber: RoomNumber | null;
   hidden: boolean;
-  closed: boolean;
-  locked: boolean;
+  door: Door | null;
   weight: number;
   command: string | null;
 }
@@ -483,8 +483,7 @@ function copyExit(exit: Exit): ExitMirror {
     toAreaId: exit.to_area_id,
     toRoomNumber: exit.to_room_number,
     hidden: exit.is_hidden,
-    closed: exit.is_closed,
-    locked: exit.is_locked,
+    door: copyDoor(exit.door),
     weight: exit.weight,
     command: exit.command,
   };
@@ -503,8 +502,7 @@ function exitFromFields(
     toAreaId: fields.to_area_id ?? null,
     toRoomNumber: fields.to_room_number ?? null,
     hidden: fields.is_hidden ?? false,
-    closed: fields.is_closed ?? false,
-    locked: fields.is_locked ?? false,
+    door: copyDoor(fields.door),
     weight: fields.weight ?? 1,
     command: fields.command ?? null,
   };
@@ -520,8 +518,7 @@ function exitMatchesFields(exit: ExitMirror, fields: ExitArgs): boolean {
     sameOptionalArea(exit.toAreaId, fields.to_area_id) &&
     exit.toRoomNumber === (fields.to_room_number ?? null) &&
     exit.hidden === (fields.is_hidden ?? false) &&
-    exit.closed === (fields.is_closed ?? false) &&
-    exit.locked === (fields.is_locked ?? false) &&
+    sameDoor(exit.door, copyDoor(fields.door)) &&
     exit.weight === (fields.weight ?? 1) &&
     commandKey(exit.command) === commandKey(fields.command ?? null);
 }
@@ -532,8 +529,7 @@ function applyExitFields(exit: ExitMirror, fields: ExitArgs): void {
   exit.toAreaId = fields.to_area_id ?? null;
   exit.toRoomNumber = fields.to_room_number ?? null;
   exit.hidden = fields.is_hidden ?? false;
-  exit.closed = fields.is_closed ?? false;
-  exit.locked = fields.is_locked ?? false;
+  exit.door = copyDoor(fields.door);
   exit.weight = fields.weight ?? 1;
   exit.command = fields.command ?? null;
 }
@@ -3938,7 +3934,7 @@ export class NukeFireMapper {
     for (const observation of observations) {
       if (!observation.closed || observation.destination !== undefined) continue;
       const existing = matchingExit(room, observation.mapped);
-      if (existing?.closed) continue;
+      if (existing && doorIsClosed(existing.door)) continue;
       if (existing && !existing.id) {
         const source = mapper.getAreaById(room.areaId).room(room.roomNumber);
         const hostExit = source?.exits.find((exit) =>
@@ -3959,8 +3955,7 @@ export class NukeFireMapper {
           if (!existing) {
             const fields: ExitArgs = {
               from_direction: observation.mapped.direction,
-              is_closed: true,
-              is_locked: false,
+              door: reportedDoor(true, false, null),
               weight: 1,
               command: observation.mapped.command,
             };
@@ -3971,15 +3966,16 @@ export class NukeFireMapper {
             room.exits.push(exitFromFields(fields, id));
             continue;
           }
+          const door = reportedDoor(true, false, existing.door);
           await this.#whileCurrentRun(
             runGeneration,
             () => mutation.setRoomExit(
               room.roomNumber,
               existing.id as ExitId,
-              { is_closed: true },
+              { door },
             ),
           );
-          existing.closed = true;
+          existing.door = copyDoor(door);
         }
       }, `Apply NukeFire vertical exits for room ${room.roomNumber}`),
     );
@@ -4087,8 +4083,7 @@ export class NukeFireMapper {
         ...(mapped.opposite ? { to_direction: mapped.opposite } : {}),
         to_area_id: to.areaId,
         to_room_number: to.roomNumber,
-        is_closed: link.closed,
-        is_locked: link.locked,
+        door: reportedDoor(link.closed, link.locked, null),
         weight: 1,
         command: mapped.command,
       },
@@ -4100,8 +4095,7 @@ export class NukeFireMapper {
         to_direction: mapped.direction,
         to_area_id: from.areaId,
         to_room_number: from.roomNumber,
-        is_closed: link.closed,
-        is_locked: link.locked,
+        door: reportedDoor(link.closed, link.locked, null),
         weight: 1,
         command: reverse.command,
       });
@@ -4166,8 +4160,7 @@ export class NukeFireMapper {
     const fields: ExitArgs = {
       from_direction: mapped.direction,
       ...destination,
-      is_closed: closed,
-      is_locked: locked,
+      door: reportedDoor(closed, locked, existing?.door ?? null),
       weight: 1,
       command: mapped.command,
     };

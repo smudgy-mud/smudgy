@@ -44,6 +44,8 @@ impl AutomationsWindow {
                         .size(13.0),
                         text(if self.share_is_public {
                             crate::i18n::ts!("package-public-help")
+                        } else if self.share_clan.is_some() {
+                            crate::i18n::ts!("package-clan-private-help")
                         } else {
                             crate::i18n::ts!("package-private-help")
                         })
@@ -62,8 +64,10 @@ impl AutomationsWindow {
                     )
                     .style(button_style::secondary)
                     .on_press_maybe(
-                        (!self.authoring_busy && !self.share_busy)
-                            .then_some(Message::SetVisibility(!self.share_is_public)),
+                        (!self.authoring_busy
+                            && !self.share_busy
+                            && self.may_change_availability_here())
+                        .then_some(Message::SetVisibility(!self.share_is_public)),
                     ),
                 ]
                 .spacing(8.0)
@@ -73,6 +77,11 @@ impl AutomationsWindow {
             .width(Length::Fill)
             .style(common::banner_style),
         );
+
+        // A clan shares its packages by membership, not with friends.
+        if self.share_clan.is_some() {
+            return col.into();
+        }
 
         // Friends list (private only).
         if !self.share_is_public {

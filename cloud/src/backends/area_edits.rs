@@ -14,6 +14,10 @@
 
 use std::collections::HashSet;
 
+use super::source_document::{
+    EditContext, SourceDocument, exits, exits_mut, room_content_mut, room_data_address,
+};
+use crate::{RoomAddress, SourceId};
 use uuid::Uuid;
 
 use crate::{
@@ -49,9 +53,6 @@ pub(super) fn apply_room_updates(room: &mut RoomWithDetails, updates: &RoomUpdat
     if let Some(color) = &updates.color {
         room.color.clone_from(color);
     }
-    if let Some(is_secret) = updates.is_secret {
-        room.is_secret = is_secret;
-    }
     if let Some(external_id) = &updates.external_id {
         room.external_id.clone_from(external_id);
     }
@@ -67,6 +68,7 @@ pub(super) fn apply_exit_updates(exit: &mut Exit, updates: ExitUpdates) {
         exit.to_area_id = None;
         exit.to_room_number = None;
         exit.to_direction = None;
+        exit.to_source = None;
     } else {
         if let Some(to_area_id) = updates.to_area_id {
             exit.to_area_id = Some(to_area_id);
@@ -77,6 +79,11 @@ pub(super) fn apply_exit_updates(exit: &mut Exit, updates: ExitUpdates) {
         if let Some(to_direction) = updates.to_direction {
             exit.to_direction = Some(to_direction);
         }
+        // Absent keeps the destination's source. A document names a source
+        // only for a room of another map's Secret.
+        if let Some(to_source) = updates.to_source {
+            exit.to_source = to_source;
+        }
     }
     if let Some(path) = updates.path {
         exit.path = path;
@@ -84,11 +91,9 @@ pub(super) fn apply_exit_updates(exit: &mut Exit, updates: ExitUpdates) {
     if let Some(is_hidden) = updates.is_hidden {
         exit.is_hidden = is_hidden;
     }
-    if let Some(is_closed) = updates.is_closed {
-        exit.is_closed = is_closed;
-    }
-    if let Some(is_locked) = updates.is_locked {
-        exit.is_locked = is_locked;
+    // A door is replaced whole; no door keeps no name or command.
+    if let Some(door) = updates.door {
+        exit.door = door;
     }
     if let Some(weight) = updates.weight {
         exit.weight = weight;
@@ -96,30 +101,16 @@ pub(super) fn apply_exit_updates(exit: &mut Exit, updates: ExitUpdates) {
     if let Some(command) = updates.command {
         exit.command = command;
     }
-    if let Some(is_secret) = updates.is_secret {
-        exit.is_secret = is_secret;
-    }
 }
 
-/// Sets (or inserts) a property on a `Vec<Property>`. Secrecy follows the
-/// server's COALESCE: an absent `is_secret` preserves the existing flag
-/// (defaulting to public on insert); a present one sets it.
-pub(super) fn upsert_property(
-    properties: &mut Vec<Property>,
-    name: &str,
-    value: &str,
-    is_secret: Option<bool>,
-) {
+/// Sets (or inserts) a property on a `Vec<Property>`.
+pub(super) fn upsert_property(properties: &mut Vec<Property>, name: &str, value: &str) {
     if let Some(existing) = properties.iter_mut().find(|p| p.name == name) {
         existing.value = value.to_string();
-        if let Some(is_secret) = is_secret {
-            existing.is_secret = is_secret;
-        }
     } else {
         properties.push(Property {
             name: name.to_string(),
             value: value.to_string(),
-            is_secret: is_secret.unwrap_or(false),
         });
     }
 }
@@ -138,7 +129,6 @@ fn blank_room(number: RoomNumber) -> RoomWithDetails {
         properties: Vec::new(),
         exits: Vec::new(),
         tags: std::collections::BTreeSet::default(),
-        is_secret: false,
         external_id: None,
     }
 }
@@ -168,19 +158,31 @@ fn upsert_room_details<'a>(
 /// Connections kept alive by a surviving member converted to dangling.
 /// Exits in other areas that led to the room are cleared by edits of those
 /// areas, which the mapper queues behind the deletion.
-pub(super) fn delete_room(area: &mut AreaWithDetails, area_id: AreaId, number: RoomNumber) {
-    area.rooms.retain(|r| r.room_number != number);
-    for room in &mut area.rooms {
-        for exit in &mut room.exits {
-            if exit.to_area_id == Some(area_id) && exit.to_room_number == Some(number) {
-                exit.to_area_id = None;
-                exit.to_room_number = None;
-                exit.to_direction = None;
-            }
+pub(crate) fn delete_room_in(
+    area: &mut AreaWithDetails,
+    address: RoomAddress,
+    context: &EditContext,
+) {
+    if address.source == context.source {
+        area.rooms.retain(|room| room.room_number != address.number);
+    }
+    area.room_data
+        .retain(|data| room_data_address(data) != address);
+    let area_id = area.area.id;
+    for exit in exits_mut(area) {
+        if exit.to_area_id == Some(area_id)
+            && exit
+                .to_room_number
+                .is_some_and(|number| RoomAddress::from_wire(exit.to_source, number) == address)
+        {
+            exit.to_area_id = None;
+            exit.to_room_number = None;
+            exit.to_direction = None;
+            exit.to_source = None;
         }
     }
-    let survivors = exit_topologies(area, None);
-    connection_lifecycle::repair_after_room_delete(number, &survivors, &mut area.connections);
+    let survivors = exit_topologies_in(area, None, context);
+    connection_lifecycle::repair_after_room_delete(address, &survivors, &mut area.connections);
 }
 
 /// The rooms an envelope deletes: the room of every `DeleteRoom` among its
@@ -189,7 +191,7 @@ pub(crate) fn deleted_rooms(operations: &[AreaMutation]) -> HashSet<RoomNumber> 
     operations
         .iter()
         .filter_map(|operation| match operation {
-            AreaMutation::DeleteRoom { room_number } => Some(*room_number),
+            AreaMutation::DeleteRoom { room_number, .. } => Some(*room_number),
             _ => None,
         })
         .collect()
@@ -200,6 +202,7 @@ pub(crate) fn deleted_rooms(operations: &[AreaMutation]) -> HashSet<RoomNumber> 
 /// minting one when absent (the server's v2 contract).
 pub(crate) fn exit_from_args(exit_data: ExitArgs, connection_id: ConnectionId) -> Exit {
     Exit {
+        to_source: exit_data.to_source,
         id: exit_data.id.unwrap_or_else(|| ExitId(Uuid::new_v4())),
         from_direction: exit_data.from_direction,
         to_area_id: exit_data.to_area_id,
@@ -207,26 +210,29 @@ pub(crate) fn exit_from_args(exit_data: ExitArgs, connection_id: ConnectionId) -
         to_direction: exit_data.to_direction,
         path: exit_data.path.unwrap_or_default(),
         is_hidden: exit_data.is_hidden,
-        is_closed: exit_data.is_closed,
-        is_locked: exit_data.is_locked,
+        door: exit_data.door,
         weight: exit_data.weight,
         command: exit_data.command.unwrap_or_default(),
         connection_id,
         to_unknown: false,
         to_area_token: None,
-        is_secret: exit_data.is_secret.unwrap_or(false),
     }
 }
 
 /// Projects one stored exit into its connection-relevant topology.
-pub(super) fn exit_topology(area_id: AreaId, from_room: RoomNumber, exit: &Exit) -> ExitTopology {
+pub(super) fn exit_topology(area_id: AreaId, from_room: RoomAddress, exit: &Exit) -> ExitTopology {
     let same_area = exit.to_area_id == Some(area_id);
     ExitTopology {
         id: exit.id,
         connection_id: exit.connection_id,
         from_room,
         from_direction: exit.from_direction,
-        to_room_in_area: if same_area { exit.to_room_number } else { None },
+        to_room_in_area: if same_area {
+            exit.to_room_number
+                .map(|number| RoomAddress::from_wire(exit.to_source, number))
+        } else {
+            None
+        },
         to_direction: exit.to_direction,
         leaves_area: exit.to_unknown || (!same_area && exit.to_area_id.is_some()),
     }
@@ -234,29 +240,29 @@ pub(super) fn exit_topology(area_id: AreaId, from_room: RoomNumber, exit: &Exit)
 
 /// Every exit's topology in the document, optionally excluding one (the
 /// exit being edited or deleted).
+pub(super) fn exit_topologies_in(
+    area: &AreaWithDetails,
+    exclude: Option<ExitId>,
+    context: &EditContext,
+) -> Vec<ExitTopology> {
+    exits(area, context.source)
+        .filter(|(_, exit)| Some(exit.id) != exclude)
+        .map(|(address, exit)| exit_topology(area.area.id, address, exit))
+        .collect()
+}
+
 pub(super) fn exit_topologies(
     area: &AreaWithDetails,
     exclude: Option<ExitId>,
 ) -> Vec<ExitTopology> {
-    let area_id = area.area.id;
-    area.rooms
-        .iter()
-        .flat_map(|room| {
-            room.exits
-                .iter()
-                .filter(|exit| Some(exit.id) != exclude)
-                .map(move |exit| exit_topology(area_id, room.room_number, exit))
-        })
-        .collect()
+    exit_topologies_in(area, exclude, &EditContext::default())
 }
 
-/// A room-placement lookup over the document, for anchor bearings and
-/// level classification.
-pub(super) fn room_site(area: &AreaWithDetails) -> impl Fn(RoomNumber) -> Option<RoomSite> + '_ {
-    |number| {
+pub(super) fn room_site(area: &AreaWithDetails) -> impl Fn(RoomAddress) -> Option<RoomSite> + '_ {
+    |address| {
         area.rooms
             .iter()
-            .find(|room| room.room_number == number)
+            .find(|room| address.source.is_map() && room.room_number == address.number)
             .map(|room| RoomSite {
                 x: room.x,
                 y: room.y,
@@ -284,14 +290,25 @@ fn ensure_room(area: &mut AreaWithDetails, number: RoomNumber) {
 /// destination matrix does. A cross-area destination stays a stored
 /// reference — a single-area applier cannot create rooms in a foreign
 /// document; the live cache and the sync engine own cross-area healing.
-pub(super) fn create_room_exit(
+pub(super) fn create_room_exit_in(
     area: &mut AreaWithDetails,
-    room_key: &RoomKey,
+    address: RoomAddress,
     mut exit_data: ExitArgs,
+    context: &EditContext,
 ) -> CloudResult<Exit> {
-    ensure_room(area, room_key.room_number);
+    context.require_anchor(address)?;
+    context.validate_destination(
+        area.area.id,
+        exit_data.to_area_id,
+        exit_data.to_source,
+        exit_data.to_room_number,
+    )?;
+    if address.source == context.source {
+        ensure_room(area, address.number);
+    }
     if exit_data.to_area_id == Some(area.area.id)
         && let Some(to_room) = exit_data.to_room_number
+        && exit_data.to_source.unwrap_or_default() == context.source
     {
         ensure_room(area, to_room);
     }
@@ -301,10 +318,12 @@ pub(super) fn create_room_exit(
     let topology = ExitTopology {
         id: exit_id,
         connection_id: ConnectionId::default(),
-        from_room: room_key.room_number,
+        from_room: address,
         from_direction: exit_data.from_direction,
         to_room_in_area: if same_area {
-            exit_data.to_room_number
+            exit_data
+                .to_room_number
+                .map(|number| RoomAddress::from_wire(exit_data.to_source, number))
         } else {
             None
         },
@@ -328,10 +347,8 @@ pub(super) fn create_room_exit(
         // Counted directly off the stored exits (capped at the pair limit)
         // rather than materializing every exit topology per created exit —
         // bulk copies create exits by the hundred thousand.
-        let member_count = area
-            .rooms
-            .iter()
-            .flat_map(|room| &room.exits)
+        let member_count = exits(area, context.source)
+            .map(|(_, exit)| exit)
             .filter(|exit| exit.connection_id == connection_id)
             .take(2)
             .count();
@@ -344,13 +361,13 @@ pub(super) fn create_room_exit(
         }
         connection_id
     } else {
-        let peers = exit_topologies(area, None);
+        let peers = exit_topologies_in(area, None, context);
         let mut connections = std::mem::take(&mut area.connections);
         let connection_id = connection_lifecycle::attach_exit(
             &topology,
             &peers,
             &mut connections,
-            room_site(area),
+            |address| context.site(area, address),
             exit_data.new_connection_id,
         );
         area.connections = connections;
@@ -358,12 +375,9 @@ pub(super) fn create_room_exit(
     };
 
     let exit = exit_from_args(exit_data, connection_id);
-    let room = area
-        .rooms
-        .iter_mut()
-        .find(|r| r.room_number == room_key.room_number)
-        .expect("the from-room was just materialized");
-    room.exits.push(exit.clone());
+    room_content_mut(area, context, address)?
+        .exits
+        .push(exit.clone());
     Ok(exit)
 }
 
@@ -371,12 +385,14 @@ fn invalid_connection(reason: &str) -> CloudError {
     CloudError::InvalidConnection(reason.to_string())
 }
 
-fn room_level(details: &AreaWithDetails, number: RoomNumber) -> CloudResult<i32> {
-    details
-        .rooms
-        .iter()
-        .find(|room| room.room_number == number)
-        .map(|room| room.level)
+fn room_level(
+    details: &AreaWithDetails,
+    address: RoomAddress,
+    context: &EditContext,
+) -> CloudResult<i32> {
+    context
+        .site(details, address)
+        .map(|site| site.level)
         .ok_or_else(|| invalid_connection("invalid_endpoint"))
 }
 
@@ -384,13 +400,14 @@ fn provisional_kind(
     details: &AreaWithDetails,
     a: crate::ConnectionEndpoint,
     b: Option<crate::ConnectionEndpoint>,
+    context: &EditContext,
 ) -> CloudResult<ConnectionKind> {
-    let a_level = room_level(details, a.room_number)?;
+    let a_level = room_level(details, a.address(), context)?;
     let Some(b) = b else {
         return Ok(ConnectionKind::Dangling);
     };
-    let b_level = room_level(details, b.room_number)?;
-    if a.room_number == b.room_number {
+    let b_level = room_level(details, b.address(), context)?;
+    if a.address() == b.address() {
         Ok(ConnectionKind::SelfLoop)
     } else if a_level == b_level {
         Ok(ConnectionKind::Internal)
@@ -403,13 +420,16 @@ fn canonicalize_connection(connection: &mut Connection) {
     let Some(endpoint_b) = connection.endpoint_b else {
         return;
     };
-    let flip = if connection.endpoint_a.room_number == endpoint_b.room_number {
+    let flip = if connection.endpoint_a.address().connection_order_key()
+        == endpoint_b.address().connection_order_key()
+    {
         (
             connection.endpoint_a.side as u8,
             connection.endpoint_a.port_offset,
         ) > (endpoint_b.side as u8, endpoint_b.port_offset)
     } else {
-        connection.endpoint_a.room_number > endpoint_b.room_number
+        connection.endpoint_a.address().connection_order_key()
+            > endpoint_b.address().connection_order_key()
     };
     if flip {
         connection.endpoint_b = Some(connection.endpoint_a);
@@ -463,12 +483,13 @@ fn normalize_connection(connection: &mut Connection) -> CloudResult<()> {
 fn connection_from_args(
     details: &AreaWithDetails,
     args: &ConnectionArgs,
+    context: &EditContext,
 ) -> CloudResult<Connection> {
     let mut connection = Connection {
         id: args.id,
         endpoint_a: args.endpoint_a,
         endpoint_b: args.endpoint_b,
-        kind: provisional_kind(details, args.endpoint_a, args.endpoint_b)?,
+        kind: provisional_kind(details, args.endpoint_a, args.endpoint_b, context)?,
         routing: args.routing,
         segment_shape: args.segment_shape,
         corner: args.corner,
@@ -484,8 +505,12 @@ fn connection_from_args(
     Ok(connection)
 }
 
-fn connection_members(details: &AreaWithDetails, id: ConnectionId) -> Vec<ExitTopology> {
-    exit_topologies(details, None)
+fn connection_members(
+    details: &AreaWithDetails,
+    id: ConnectionId,
+    context: &EditContext,
+) -> Vec<ExitTopology> {
+    exit_topologies_in(details, None, context)
         .into_iter()
         .filter(|exit| exit.connection_id == id)
         .collect()
@@ -516,17 +541,17 @@ fn member_matches_endpoints(
     member: &ExitTopology,
     destinations: &std::collections::HashMap<ExitId, ExitDestination>,
 ) -> bool {
-    let endpoint_a = connection.endpoint_a.room_number;
+    let endpoint_a = connection.endpoint_a.address();
     match connection.endpoint_b {
-        Some(endpoint_b) if endpoint_b.room_number == endpoint_a => {
+        Some(endpoint_b) if endpoint_b.address() == endpoint_a => {
             !member.leaves_area
                 && member.from_room == endpoint_a
                 && member.to_room_in_area == Some(endpoint_a)
         }
         Some(endpoint_b) => {
             let expected_destination = if member.from_room == endpoint_a {
-                Some(endpoint_b.room_number)
-            } else if member.from_room == endpoint_b.room_number {
+                Some(endpoint_b.address())
+            } else if member.from_room == endpoint_b.address() {
                 Some(endpoint_a)
             } else {
                 None
@@ -554,9 +579,9 @@ fn member_matches_endpoints(
 fn refresh_kind(
     connection: &Connection,
     members: &[ExitTopology],
-    sites: &std::collections::HashMap<RoomNumber, RoomSite>,
+    sites: &std::collections::HashMap<RoomAddress, RoomSite>,
 ) -> CloudResult<ConnectionKind> {
-    let level = |number: RoomNumber| -> CloudResult<i32> {
+    let level = |number: RoomAddress| -> CloudResult<i32> {
         sites
             .get(&number)
             .map(|site| site.level)
@@ -570,11 +595,11 @@ fn refresh_kind(
                 ConnectionKind::Dangling
             }
         }
-        Some(endpoint_b) if endpoint_b.room_number == connection.endpoint_a.room_number => {
+        Some(endpoint_b) if endpoint_b.address() == connection.endpoint_a.address() => {
             ConnectionKind::SelfLoop
         }
         Some(endpoint_b) => {
-            if level(endpoint_b.room_number)? == level(connection.endpoint_a.room_number)? {
+            if level(endpoint_b.address())? == level(connection.endpoint_a.address())? {
                 ConnectionKind::Internal
             } else {
                 ConnectionKind::CrossLevel
@@ -584,7 +609,10 @@ fn refresh_kind(
     Ok(kind)
 }
 
-pub(crate) fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
+pub(crate) fn validate_connection_graph_in(
+    details: &mut AreaWithDetails,
+    context: &EditContext,
+) -> CloudResult<()> {
     let area_id = details.area.id;
     let ids: std::collections::HashSet<_> = details.connections.iter().map(|c| c.id).collect();
     if ids.len() != details.connections.len() {
@@ -599,39 +627,34 @@ pub(crate) fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudR
         std::collections::HashMap::with_capacity(details.connections.len());
     let mut destinations: std::collections::HashMap<ExitId, ExitDestination> =
         std::collections::HashMap::new();
-    for room in &details.rooms {
-        for exit in &room.exits {
-            if !ids.contains(&exit.connection_id) {
-                return Err(invalid_connection("connection_not_found"));
-            }
-            members_by_connection
-                .entry(exit.connection_id)
-                .or_default()
-                .push(exit_topology(area_id, room.room_number, exit));
-            destinations.insert(
-                exit.id,
-                ExitDestination {
-                    to_unknown: exit.to_unknown,
-                    to_area_id: exit.to_area_id,
-                    to_room_number: exit.to_room_number,
-                },
-            );
+    for (address, exit) in exits(details, context.source) {
+        if !ids.contains(&exit.connection_id) {
+            return Err(invalid_connection("connection_not_found"));
         }
+        members_by_connection
+            .entry(exit.connection_id)
+            .or_default()
+            .push(exit_topology(area_id, address, exit));
+        destinations.insert(
+            exit.id,
+            ExitDestination {
+                to_unknown: exit.to_unknown,
+                to_area_id: exit.to_area_id,
+                to_room_number: exit.to_room_number,
+            },
+        );
     }
-    let sites: std::collections::HashMap<RoomNumber, RoomSite> = details
-        .rooms
-        .iter()
-        .map(|room| {
-            (
-                room.room_number,
-                RoomSite {
-                    x: room.x,
-                    y: room.y,
-                    level: room.level,
-                },
-            )
-        })
-        .collect();
+    let mut sites = context.anchors.clone();
+    sites.extend(details.rooms.iter().map(|room| {
+        (
+            RoomAddress::new(context.source, room.room_number),
+            RoomSite {
+                x: room.x,
+                y: room.y,
+                level: room.level,
+            },
+        )
+    }));
 
     for index in 0..details.connections.len() {
         let mut connection = details.connections[index].clone();
@@ -645,6 +668,16 @@ pub(crate) fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudR
             } else {
                 "too_many_members"
             }));
+        }
+        let unreadable = !sites.contains_key(&connection.endpoint_a.address())
+            || connection
+                .endpoint_b
+                .is_some_and(|end| !sites.contains_key(&end.address()));
+        if unreadable {
+            if context.unreadable_connections.get(&connection.id) == Some(&connection) {
+                continue;
+            }
+            return Err(invalid_connection("invalid_endpoint"));
         }
         connection.kind = refresh_kind(&connection, members, &sites)?;
         normalize_connection(&mut connection)?;
@@ -664,54 +697,60 @@ pub(crate) fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudR
                 return Err(invalid_connection("invalid_endpoint"));
             }
         }
-        if connection.segment_shape == SegmentShape::Orthogonal
-            && matches!(
-                connection.routing,
-                ConnectionRouting::Manual | ConnectionRouting::Automatic
-            )
-        {
-            let room_a = sites
-                .get(&connection.endpoint_a.room_number)
-                .expect("endpoint validated");
-            let endpoint_b = connection.endpoint_b.zip(
-                connection
-                    .endpoint_b
-                    .and_then(|endpoint| sites.get(&endpoint.room_number)),
-            );
-            let geometry = connection_geometry::resolve(&connection_geometry::GeometryInput {
-                kind: connection.kind,
-                routing: connection.routing,
-                corner: connection.corner,
-                endpoint_a: connection_geometry::EndpointGeometry {
-                    room_center: MapPoint::new(room_a.x, room_a.y),
-                    side: connection.endpoint_a.side,
-                    port_offset: connection.endpoint_a.port_offset,
-                    // Orthogonality validation runs on the wall-normal
-                    // contract tips; stub axes never enter into it.
-                    stub: connection_geometry::StubAxis::Normal,
-                },
-                endpoint_b: endpoint_b.map(|(endpoint, room)| {
-                    connection_geometry::EndpointGeometry {
-                        room_center: MapPoint::new(room.x, room.y),
-                        side: endpoint.side,
-                        port_offset: endpoint.port_offset,
-                        stub: connection_geometry::StubAxis::Normal,
-                    }
-                }),
-                route_points: &connection.route_points,
-                thickness: connection.thickness,
-            });
-            if geometry.centerline.windows(2).any(|segment| {
-                let dx = (segment[0].x - segment[1].x).abs();
-                let dy = (segment[0].y - segment[1].y).abs();
-                dx > f32::EPSILON && dy > f32::EPSILON
-            }) {
-                return Err(invalid_connection("non_orthogonal"));
-            }
-        }
+        validate_connection_route(&connection, &sites)?;
         details.connections[index] = connection;
     }
     details.connections.sort_by_key(|connection| connection.id);
+    Ok(())
+}
+
+fn validate_connection_route(
+    connection: &Connection,
+    sites: &std::collections::HashMap<RoomAddress, RoomSite>,
+) -> CloudResult<()> {
+    if connection.segment_shape == SegmentShape::Orthogonal
+        && matches!(
+            connection.routing,
+            ConnectionRouting::Manual | ConnectionRouting::Automatic
+        )
+    {
+        let room_a = sites
+            .get(&connection.endpoint_a.address())
+            .expect("endpoint validated");
+        let endpoint_b = connection.endpoint_b.zip(
+            connection
+                .endpoint_b
+                .and_then(|endpoint| sites.get(&endpoint.address())),
+        );
+        let geometry = connection_geometry::resolve(&connection_geometry::GeometryInput {
+            kind: connection.kind,
+            routing: connection.routing,
+            corner: connection.corner,
+            endpoint_a: connection_geometry::EndpointGeometry {
+                room_center: MapPoint::new(room_a.x, room_a.y),
+                side: connection.endpoint_a.side,
+                port_offset: connection.endpoint_a.port_offset,
+                // Orthogonality validation runs on the wall-normal
+                // contract tips; stub axes never enter into it.
+                stub: connection_geometry::StubAxis::Normal,
+            },
+            endpoint_b: endpoint_b.map(|(endpoint, room)| connection_geometry::EndpointGeometry {
+                room_center: MapPoint::new(room.x, room.y),
+                side: endpoint.side,
+                port_offset: endpoint.port_offset,
+                stub: connection_geometry::StubAxis::Normal,
+            }),
+            route_points: &connection.route_points,
+            thickness: connection.thickness,
+        });
+        if geometry.centerline.windows(2).any(|segment| {
+            let dx = (segment[0].x - segment[1].x).abs();
+            let dy = (segment[0].y - segment[1].y).abs();
+            dx > f32::EPSILON && dy > f32::EPSILON
+        }) {
+            return Err(invalid_connection("non_orthogonal"));
+        }
+    }
     Ok(())
 }
 
@@ -727,10 +766,10 @@ fn endpoint_tip_at(room_center: MapPoint, endpoint: crate::ConnectionEndpoint) -
 /// payload carries no explicit room coordinate.
 pub(crate) struct RoomMoveCapture {
     /// Pre-envelope positions of exactly the rooms the payload may move.
-    moved: std::collections::HashMap<RoomNumber, MapPoint>,
+    moved: std::collections::HashMap<RoomAddress, MapPoint>,
     /// Every room number present before the envelope. A connection whose
     /// endpoint room the envelope itself created keeps its authored route.
-    preexisting: std::collections::HashSet<RoomNumber>,
+    preexisting: std::collections::HashSet<RoomAddress>,
 }
 
 impl RoomMoveCapture {
@@ -744,17 +783,20 @@ impl RoomMoveCapture {
 /// coordinate, plus the pre-envelope room-number set. Rooms the envelope
 /// creates are naturally absent from both — they had no position to
 /// preserve.
-pub(crate) fn capture_room_moves(
+pub(crate) fn capture_room_moves_in(
     details: &AreaWithDetails,
     payload: &[AreaMutation],
+    context: &EditContext,
 ) -> RoomMoveCapture {
-    let targets: std::collections::HashSet<RoomNumber> = payload
+    let targets: std::collections::HashSet<RoomAddress> = payload
         .iter()
         .filter_map(|op| match op {
-            AreaMutation::UpsertRoom { room_number, body }
-                if body.x.is_some() || body.y.is_some() =>
-            {
-                Some(*room_number)
+            AreaMutation::UpsertRoom {
+                room_number,
+                room_source,
+                body,
+            } if body.x.is_some() || body.y.is_some() => {
+                Some(RoomAddress::from_wire(*room_source, *room_number))
             }
             _ => None,
         })
@@ -766,12 +808,12 @@ pub(crate) fn capture_room_moves(
     if targets.is_empty() {
         return capture;
     }
+    capture.preexisting.extend(context.anchors.keys().copied());
     for room in &details.rooms {
-        capture.preexisting.insert(room.room_number);
-        if targets.contains(&room.room_number) {
-            capture
-                .moved
-                .insert(room.room_number, MapPoint::new(room.x, room.y));
+        let address = RoomAddress::new(context.source, room.room_number);
+        capture.preexisting.insert(address);
+        if targets.contains(&address) {
+            capture.moved.insert(address, MapPoint::new(room.x, room.y));
         }
     }
     capture
@@ -785,24 +827,36 @@ pub(crate) fn capture_room_moves(
 /// legs and insert the minimum endpoint elbow when a fixed interior vertex
 /// can no longer meet the moved stub tip.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn maintain_routes_after_room_moves(
+pub(crate) fn maintain_routes_after_room_moves_in(
     capture: &RoomMoveCapture,
     after: &mut AreaWithDetails,
+    context: &EditContext,
 ) {
     if capture.is_empty() {
         return;
     }
     let moved_before = &capture.moved;
-    let positions: std::collections::HashMap<RoomNumber, MapPoint> = after
+    let positions: std::collections::HashMap<RoomAddress, MapPoint> = after
         .rooms
         .iter()
-        .map(|room| (room.room_number, MapPoint::new(room.x, room.y)))
+        .map(|room| {
+            (
+                RoomAddress::new(context.source, room.room_number),
+                MapPoint::new(room.x, room.y),
+            )
+        })
+        .chain(
+            context
+                .anchors
+                .iter()
+                .map(|(address, site)| (*address, MapPoint::new(site.x, site.y))),
+        )
         .collect();
     // A preexisting room absent from `moved_before` kept its position: its
     // delta is zero and its old center is its current one. A moved room
     // that no longer exists yields `None`, matching the old skip of
     // connections whose endpoint room vanished.
-    let delta_for = |number: RoomNumber| -> Option<MapPoint> {
+    let delta_for = |number: RoomAddress| -> Option<MapPoint> {
         match moved_before.get(&number) {
             None => Some(MapPoint::default()),
             Some(old) => positions
@@ -810,7 +864,7 @@ pub(crate) fn maintain_routes_after_room_moves(
                 .map(|new| MapPoint::new(new.x - old.x, new.y - old.y)),
         }
     };
-    let old_position = |number: RoomNumber| -> Option<MapPoint> {
+    let old_position = |number: RoomAddress| -> Option<MapPoint> {
         moved_before
             .get(&number)
             .copied()
@@ -823,14 +877,14 @@ pub(crate) fn maintain_routes_after_room_moves(
         };
         if !capture
             .preexisting
-            .contains(&connection.endpoint_a.room_number)
-            || !capture.preexisting.contains(&endpoint_b.room_number)
+            .contains(&connection.endpoint_a.address())
+            || !capture.preexisting.contains(&endpoint_b.address())
         {
             continue;
         }
         let (Some(delta_a), Some(delta_b)) = (
-            delta_for(connection.endpoint_a.room_number),
-            delta_for(endpoint_b.room_number),
+            delta_for(connection.endpoint_a.address()),
+            delta_for(endpoint_b.address()),
         ) else {
             continue;
         };
@@ -852,16 +906,16 @@ pub(crate) fn maintain_routes_after_room_moves(
         {
             continue;
         }
-        let Some(old_center_a) = old_position(connection.endpoint_a.room_number) else {
+        let Some(old_center_a) = old_position(connection.endpoint_a.address()) else {
             continue;
         };
-        let Some(old_center_b) = old_position(endpoint_b.room_number) else {
+        let Some(old_center_b) = old_position(endpoint_b.address()) else {
             continue;
         };
-        let Some(new_center_a) = positions.get(&connection.endpoint_a.room_number).copied() else {
+        let Some(new_center_a) = positions.get(&connection.endpoint_a.address()).copied() else {
             continue;
         };
-        let Some(new_center_b) = positions.get(&endpoint_b.room_number).copied() else {
+        let Some(new_center_b) = positions.get(&endpoint_b.address()).copied() else {
             continue;
         };
         let old_tip_a = endpoint_tip_at(old_center_a, connection.endpoint_a);
@@ -929,7 +983,6 @@ pub(crate) fn label_from_args(args: LabelArgs) -> Label {
         background_color: args.background_color.unwrap_or_default(),
         font_size: args.font_size,
         font_weight: args.font_weight,
-        is_secret: args.is_secret.unwrap_or(false),
     }
 }
 
@@ -948,20 +1001,7 @@ pub(crate) fn shape_from_args(args: ShapeArgs) -> Shape {
         shape_type: args.shape_type,
         border_radius: args.border_radius,
         stroke_width: args.stroke_width.unwrap_or(1.0),
-        is_secret: args.is_secret.unwrap_or(false),
     }
-}
-
-/// The room an operation addresses, or [`CloudError::RoomNotFound`].
-fn room_mut(
-    area: &mut AreaWithDetails,
-    area_id: AreaId,
-    number: RoomNumber,
-) -> CloudResult<&mut RoomWithDetails> {
-    area.rooms
-        .iter_mut()
-        .find(|r| r.room_number == number)
-        .ok_or_else(|| CloudError::RoomNotFound(RoomKey::new(area_id, number)))
 }
 
 /// Applies one operation of a mutation envelope to the area document,
@@ -970,24 +1010,41 @@ fn room_mut(
 /// entity-specific not-found error, and each echo carries the entity as
 /// stored after the change.
 #[allow(clippy::too_many_lines)] // one exhaustive dispatch over the op alphabet
-pub(crate) fn apply_mutation(
+pub(crate) fn apply_mutation_in(
     details: &mut AreaWithDetails,
     op: &AreaMutation,
+    context: &EditContext,
 ) -> CloudResult<OpResult> {
     let area_id = details.area.id;
+    let owned = |number, source| context.owned(RoomAddress::from_wire(source, number));
     match op {
         AreaMutation::AssertMergeSafe {
             keep_room_number,
             remove_room_number,
-        } => Ok(OpResult::MergeSafetyChecked {
-            keep_room_number: *keep_room_number,
-            remove_room_number: *remove_room_number,
-        }),
-        AreaMutation::UpsertRoom { room_number, body } => {
+            room_source,
+        } => {
+            owned(*keep_room_number, *room_source)?;
+            owned(*remove_room_number, *room_source)?;
+            Ok(OpResult::MergeSafetyChecked {
+                keep_room_number: *keep_room_number,
+                remove_room_number: *remove_room_number,
+            })
+        }
+        AreaMutation::UpsertRoom {
+            room_number,
+            room_source,
+            body,
+        } => {
+            owned(*room_number, *room_source)?;
             let room = upsert_room_details(details, *room_number, body);
             Ok(OpResult::Room { room: room.clone() })
         }
-        AreaMutation::CreateRoom { room_number, body } => {
+        AreaMutation::CreateRoom {
+            room_number,
+            room_source,
+            body,
+        } => {
+            owned(*room_number, *room_source)?;
             // Must-not-exist creation, mirroring the server's refusal so
             // tier behavior cannot drift: an occupied number is a
             // structural conflict, never a silent merge.
@@ -999,14 +1056,29 @@ pub(crate) fn apply_mutation(
             let room = upsert_room_details(details, *room_number, body);
             Ok(OpResult::Room { room: room.clone() })
         }
-        AreaMutation::DeleteRoom { room_number } => {
+        AreaMutation::DeleteRoom {
+            room_number,
+            room_source,
+        } => {
+            owned(*room_number, *room_source)?;
             if !details.rooms.iter().any(|r| r.room_number == *room_number) {
                 return Err(CloudError::RoomNotFound(RoomKey::new(
                     area_id,
                     *room_number,
                 )));
             }
-            delete_room(details, area_id, *room_number);
+            // A map's other sources lose their hold on the room with it.
+            if !details.sources.is_empty() {
+                super::source_document::forget_room(
+                    details,
+                    RoomAddress::new(context.source, *room_number),
+                );
+            }
+            delete_room_in(
+                details,
+                RoomAddress::new(context.source, *room_number),
+                context,
+            );
             Ok(OpResult::RoomDeleted {
                 room_number: *room_number,
             })
@@ -1015,17 +1087,29 @@ pub(crate) fn apply_mutation(
             room_number,
             name,
             value,
-            is_secret,
+            room_source,
         } => {
-            let room = room_mut(details, area_id, *room_number)?;
-            upsert_property(&mut room.properties, name, value, *is_secret);
+            let room = room_content_mut(
+                details,
+                context,
+                RoomAddress::from_wire(*room_source, *room_number),
+            )?;
+            upsert_property(room.properties, name, value);
             Ok(OpResult::RoomProperty {
                 room_number: *room_number,
                 name: name.clone(),
             })
         }
-        AreaMutation::DeleteRoomProperty { room_number, name } => {
-            let room = room_mut(details, area_id, *room_number)?;
+        AreaMutation::DeleteRoomProperty {
+            room_number,
+            room_source,
+            name,
+        } => {
+            let room = room_content_mut(
+                details,
+                context,
+                RoomAddress::from_wire(*room_source, *room_number),
+            )?;
             let idx = room
                 .properties
                 .iter()
@@ -1041,29 +1125,41 @@ pub(crate) fn apply_mutation(
                 name: name.clone(),
             })
         }
-        AreaMutation::AddRoomTag { room_number, tag } => {
-            let room = room_mut(details, area_id, *room_number)?;
+        AreaMutation::AddRoomTag {
+            room_number,
+            room_source,
+            tag,
+        } => {
+            let room = room_content_mut(
+                details,
+                context,
+                RoomAddress::from_wire(*room_source, *room_number),
+            )?;
             room.tags.insert(tag.clone());
             Ok(OpResult::RoomTag {
                 room_number: *room_number,
                 tag: tag.clone(),
             })
         }
-        AreaMutation::RemoveRoomTag { room_number, tag } => {
+        AreaMutation::RemoveRoomTag {
+            room_number,
+            room_source,
+            tag,
+        } => {
             // Removing an absent tag succeeds, like the server's DELETE.
-            let room = room_mut(details, area_id, *room_number)?;
+            let room = room_content_mut(
+                details,
+                context,
+                RoomAddress::from_wire(*room_source, *room_number),
+            )?;
             room.tags.remove(tag);
             Ok(OpResult::RoomTagRemoved {
                 room_number: *room_number,
                 tag: tag.clone(),
             })
         }
-        AreaMutation::UpsertAreaProperty {
-            name,
-            value,
-            is_secret,
-        } => {
-            upsert_property(&mut details.properties, name, value, *is_secret);
+        AreaMutation::UpsertAreaProperty { name, value } => {
+            upsert_property(&mut details.properties, name, value);
             Ok(OpResult::AreaProperty { name: name.clone() })
         }
         AreaMutation::DeleteAreaProperty { name } => {
@@ -1079,32 +1175,42 @@ pub(crate) fn apply_mutation(
             details.properties.remove(idx);
             Ok(OpResult::AreaPropertyDeleted { name: name.clone() })
         }
-        AreaMutation::CreateExit { room_number, body } => {
-            let key = RoomKey::new(area_id, *room_number);
-            let exit = create_room_exit(details, &key, body.clone())?;
+        AreaMutation::CreateExit {
+            room_number,
+            room_source,
+            body,
+        } => {
+            if let Some(door) = &body.door {
+                door.check()?;
+            }
+            let exit = create_room_exit_in(
+                details,
+                RoomAddress::from_wire(*room_source, *room_number),
+                body.clone(),
+                context,
+            )?;
             Ok(OpResult::Exit { exit })
         }
         AreaMutation::UpdateExit { exit_id, body } => {
-            let (from_room, before) = details
-                .rooms
-                .iter()
-                .find_map(|room| {
-                    room.exits
-                        .iter()
-                        .find(|exit| exit.id == *exit_id)
-                        .map(|exit| {
-                            (
-                                room.room_number,
-                                exit_topology(area_id, room.room_number, exit),
-                            )
-                        })
+            if let Some(Some(door)) = &body.door {
+                door.check()?;
+            }
+            let (from_room, before, current) = exits(details, context.source)
+                .find(|(_, exit)| exit.id == *exit_id)
+                .map(|(address, exit)| {
+                    (address, exit_topology(area_id, address, exit), exit.clone())
                 })
                 .ok_or(CloudError::ExitNotFound(*exit_id))?;
+            if body.clear_to != Some(true) {
+                context.validate_destination(
+                    area_id,
+                    body.to_area_id.or(current.to_area_id),
+                    body.to_source.unwrap_or(current.to_source),
+                    body.to_room_number.or(current.to_room_number),
+                )?;
+            }
             let updated = {
-                let exit = details
-                    .rooms
-                    .iter_mut()
-                    .flat_map(|room| room.exits.iter_mut())
+                let exit = exits_mut(details)
                     .find(|exit| exit.id == *exit_id)
                     .expect("located above");
                 apply_exit_updates(exit, body.clone());
@@ -1115,7 +1221,7 @@ pub(crate) fn apply_mutation(
             let after = exit_topology(area_id, from_room, &updated);
             let mut echo = updated;
             if connection_lifecycle::topology_differs(&before, &after) {
-                let peers = exit_topologies(details, Some(*exit_id));
+                let peers = exit_topologies_in(details, Some(*exit_id), context);
                 if peers
                     .iter()
                     .any(|peer| peer.connection_id == before.connection_id)
@@ -1130,15 +1236,12 @@ pub(crate) fn apply_mutation(
                     &after,
                     &peers,
                     &mut connections,
-                    room_site(details),
+                    |address| context.site(details, address),
                 );
                 details.connections = connections;
                 if connection_id != echo.connection_id {
                     echo.connection_id = connection_id;
-                    let exit = details
-                        .rooms
-                        .iter_mut()
-                        .flat_map(|room| room.exits.iter_mut())
+                    let exit = exits_mut(details)
                         .find(|exit| exit.id == *exit_id)
                         .expect("located above");
                     exit.connection_id = connection_id;
@@ -1147,23 +1250,20 @@ pub(crate) fn apply_mutation(
             Ok(OpResult::Exit { exit: echo })
         }
         AreaMutation::DeleteExit { exit_id } => {
-            let removed_connection = {
-                let room = details
-                    .rooms
-                    .iter_mut()
-                    .find(|room| room.exits.iter().any(|exit| exit.id == *exit_id))
-                    .ok_or(CloudError::ExitNotFound(*exit_id))?;
-                let connection_id = room
-                    .exits
-                    .iter()
-                    .find(|exit| exit.id == *exit_id)
-                    .map(|exit| exit.connection_id);
+            let removed_connection = exits(details, context.source)
+                .find(|(_, exit)| exit.id == *exit_id)
+                .map(|(_, exit)| exit.connection_id)
+                .ok_or(CloudError::ExitNotFound(*exit_id))?;
+            for room in &mut details.rooms {
                 room.exits.retain(|exit| exit.id != *exit_id);
-                connection_id
-            };
+            }
+            for data in &mut details.room_data {
+                data.exits.retain(|exit| exit.id != *exit_id);
+            }
             // Deleting the last member exit deletes the Connection.
-            if let Some(connection_id) = removed_connection {
-                let survivors = exit_topologies(details, None);
+            {
+                let connection_id = removed_connection;
+                let survivors = exit_topologies_in(details, None, context);
                 connection_lifecycle::remove_orphan_connection(
                     connection_id,
                     &survivors,
@@ -1180,7 +1280,7 @@ pub(crate) fn apply_mutation(
             {
                 return Err(invalid_connection("duplicate_connection"));
             }
-            let connection = connection_from_args(details, body)?;
+            let connection = connection_from_args(details, body, context)?;
             details.connections.push(connection.clone());
             Ok(OpResult::Connection { connection })
         }
@@ -1195,9 +1295,9 @@ pub(crate) fn apply_mutation(
                 .cloned()
                 .ok_or_else(|| invalid_connection("connection_not_found"))?;
             let mut updated = body.clone().apply(&current);
-            if updated.endpoint_a.room_number != current.endpoint_a.room_number
-                || updated.endpoint_b.map(|endpoint| endpoint.room_number)
-                    != current.endpoint_b.map(|endpoint| endpoint.room_number)
+            if updated.endpoint_a.address() != current.endpoint_a.address()
+                || updated.endpoint_b.map(crate::ConnectionEndpoint::address)
+                    != current.endpoint_b.map(crate::ConnectionEndpoint::address)
             {
                 return Err(invalid_connection("endpoint_room_immutable"));
             }
@@ -1222,8 +1322,8 @@ pub(crate) fn apply_mutation(
             if keep_connection_id == merge_connection_id {
                 return Err(invalid_connection("same_connection"));
             }
-            let keep_members = connection_members(details, *keep_connection_id);
-            let merge_members = connection_members(details, *merge_connection_id);
+            let keep_members = connection_members(details, *keep_connection_id, context);
+            let merge_members = connection_members(details, *merge_connection_id, context);
             let ([keep], [merge]) = (keep_members.as_slice(), merge_members.as_slice()) else {
                 return Err(invalid_connection("pair_requires_one_member"));
             };
@@ -1241,11 +1341,9 @@ pub(crate) fn apply_mutation(
             {
                 return Err(invalid_connection("connection_not_found"));
             }
-            for room in &mut details.rooms {
-                for exit in &mut room.exits {
-                    if exit.connection_id == *merge_connection_id {
-                        exit.connection_id = *keep_connection_id;
-                    }
+            for exit in exits_mut(details) {
+                if exit.connection_id == *merge_connection_id {
+                    exit.connection_id = *keep_connection_id;
                 }
             }
             details
@@ -1263,13 +1361,11 @@ pub(crate) fn apply_mutation(
             exit_id,
             new_connection_id,
         } => {
-            let old_id = details
-                .rooms
-                .iter()
-                .flat_map(|room| &room.exits)
+            let old_id = exits(details, context.source)
+                .map(|(_, exit)| exit)
                 .find(|exit| exit.id == *exit_id)
                 .map(|exit| exit.connection_id);
-            unlink_exits(details, &[(*exit_id, *new_connection_id)])?;
+            unlink_exits_in(details, &[(*exit_id, *new_connection_id)], context)?;
             let old_id = old_id.expect("unlink validated the exit");
             let connections = [old_id, *new_connection_id]
                 .into_iter()
@@ -1294,6 +1390,10 @@ pub(crate) fn apply_mutation(
             }
             for room in &mut details.rooms {
                 room.exits
+                    .retain(|exit| exit.connection_id != *connection_id);
+            }
+            for data in &mut details.room_data {
+                data.exits
                     .retain(|exit| exit.connection_id != *connection_id);
             }
             details
@@ -1363,20 +1463,35 @@ pub(crate) fn apply_mutation(
 /// Splits selected exits with the same rules as `Unlink`, indexing the document
 /// once for a batch. Order and fresh ids come from the caller. As with the
 /// mutation applier, the caller discards the document on failure.
-pub(super) fn unlink_exits(
+pub(super) fn unlink_exits_in(
     details: &mut AreaWithDetails,
     splits: &[(ExitId, ConnectionId)],
+    context: &EditContext,
 ) -> CloudResult<()> {
     use std::collections::HashMap;
     if splits.is_empty() {
         return Ok(());
     }
     let mut members: HashMap<ConnectionId, usize> = HashMap::new();
-    let mut exits = HashMap::new();
-    for (room_index, room) in details.rooms.iter().enumerate() {
+    let mut locations = HashMap::new();
+    for (index, room) in details.rooms.iter().enumerate() {
         for (exit_index, exit) in room.exits.iter().enumerate() {
             *members.entry(exit.connection_id).or_default() += 1;
-            exits.insert(exit.id, (room_index, exit_index));
+            locations.insert(
+                exit.id,
+                (
+                    false,
+                    index,
+                    exit_index,
+                    RoomAddress::new(context.source, room.room_number),
+                ),
+            );
+        }
+    }
+    for (index, data) in details.room_data.iter().enumerate() {
+        for (exit_index, exit) in data.exits.iter().enumerate() {
+            *members.entry(exit.connection_id).or_default() += 1;
+            locations.insert(exit.id, (true, index, exit_index, room_data_address(data)));
         }
     }
     let mut connections: HashMap<_, _> = details
@@ -1389,12 +1504,14 @@ pub(super) fn unlink_exits(
         if connections.contains_key(&new_connection_id) {
             return Err(invalid_connection("duplicate_connection"));
         }
-        let &(room_index, exit_index) = exits
+        let &(attachment, index, exit_index, from_room) = locations
             .get(&exit_id)
             .ok_or(CloudError::ExitNotFound(exit_id))?;
-        let room = &mut details.rooms[room_index];
-        let from_room = room.room_number;
-        let exit = &mut room.exits[exit_index];
+        let exit = if attachment {
+            &mut details.room_data[index].exits[exit_index]
+        } else {
+            &mut details.rooms[index].exits[exit_index]
+        };
         let old_connection_id = exit.connection_id;
         if members.get(&old_connection_id) != Some(&2) {
             return Err(invalid_connection("unlink_requires_pair"));
@@ -1414,11 +1531,11 @@ pub(super) fn unlink_exits(
                 value - 0.05
             }
         };
-        if cloned.endpoint_a.room_number == from_room {
+        if cloned.endpoint_a.address() == from_room {
             cloned.endpoint_a.port_offset = offset(cloned.endpoint_a.port_offset);
             cloned.endpoint_a.port_mode = crate::PortMode::AutoPinned;
         } else if let Some(endpoint) = cloned.endpoint_b.as_mut()
-            && endpoint.room_number == from_room
+            && endpoint.address() == from_room
         {
             endpoint.port_offset = offset(endpoint.port_offset);
             endpoint.port_mode = crate::PortMode::AutoPinned;
@@ -1445,9 +1562,12 @@ fn validate_preconditions(
             "a mutation envelope must carry exactly one precondition".to_string(),
         ));
     };
-    if precondition.resource != ResourceKind::Area || precondition.id != area_id.0 {
+    if precondition.resource != ResourceKind::Source
+        || precondition.id != area_id.0
+        || !precondition.source.is_map()
+    {
         return Err(CloudError::InvalidInput(
-            "a mutation envelope's precondition must name the addressed area".to_string(),
+            "a mutation envelope's precondition must name the addressed map".to_string(),
         ));
     }
     if precondition.expected_rev != details.area.rev {
@@ -1470,7 +1590,34 @@ pub(crate) fn apply_envelope(
     area_id: AreaId,
     envelope: &MutationEnvelope,
 ) -> CloudResult<MutationResult> {
+    if !envelope.source.is_map() {
+        return Err(CloudError::InvalidInput(
+            "only cloud maps have Secrets and Private additions".to_string(),
+        ));
+    }
     validate_preconditions(details, area_id, &envelope.preconditions)?;
+    if !details.sources.is_empty() || !details.room_data.is_empty() {
+        let mut document = SourceDocument::open(details, SourceId::Map)?;
+        let operations = &envelope.payload;
+        let room_moves = capture_room_moves_in(&document.content, operations, &document.context);
+        let mut data = Vec::with_capacity(operations.len());
+        for op in operations {
+            data.push(apply_mutation_in(
+                &mut document.content,
+                op,
+                &document.context,
+            )?);
+        }
+        maintain_routes_after_room_moves_in(&room_moves, &mut document.content, &document.context);
+        validate_connection_graph_in(&mut document.content, &document.context)?;
+        document.close(details);
+        details.area.rev += 1;
+        return Ok(MutationResult {
+            operation_id: envelope.operation_id,
+            versions: vec![VersionInfo::map_source(area_id.0, details.area.rev)],
+            data,
+        });
+    }
     let room_moves = capture_room_moves(details, &envelope.payload);
     let mut data = Vec::with_capacity(envelope.payload.len());
     for op in &envelope.payload {
@@ -1481,12 +1628,125 @@ pub(crate) fn apply_envelope(
     details.area.rev += 1;
     Ok(MutationResult {
         operation_id: envelope.operation_id,
-        versions: vec![VersionInfo {
-            resource: ResourceKind::Area,
-            id: area_id.0,
-            rev: details.area.rev,
-            deleted: false,
-        }],
+        versions: vec![VersionInfo::map_source(area_id.0, details.area.rev)],
         data,
     })
+}
+
+/// Durable local maps also own the user's Private additions. A Private edit
+/// advances both its source revision and the file revision used to detect
+/// concurrent writers; it never changes the ordinary map's content.
+pub(crate) fn apply_local_envelope(
+    details: &mut AreaWithDetails,
+    area_id: AreaId,
+    envelope: &MutationEnvelope,
+) -> CloudResult<MutationResult> {
+    if envelope.source != crate::SourceId::Private {
+        return apply_envelope(details, area_id, envelope);
+    }
+    let current = details
+        .sources
+        .iter()
+        .find(|bundle| bundle.source == envelope.source)
+        .map_or(0, |bundle| bundle.rev);
+    let [condition] = envelope.preconditions.as_slice() else {
+        return Err(CloudError::InvalidInput(
+            "a mutation envelope must carry exactly one precondition".into(),
+        ));
+    };
+    if condition.resource != ResourceKind::Source
+        || condition.id != area_id.0
+        || condition.source != envelope.source
+    {
+        return Err(CloudError::InvalidInput(
+            "a Private mutation must name the addressed map's Private source".into(),
+        ));
+    }
+    if condition.expected_rev != current {
+        return Err(CloudError::RevisionConflict {
+            id: area_id.0,
+            expected_rev: condition.expected_rev,
+            current_rev: current,
+        });
+    }
+    let mut document = SourceDocument::open(details, envelope.source)?;
+    let moves = capture_room_moves_in(&document.content, &envelope.payload, &document.context);
+    let mut data = Vec::with_capacity(envelope.payload.len());
+    for operation in &envelope.payload {
+        data.push(apply_mutation_in(
+            &mut document.content,
+            operation,
+            &document.context,
+        )?);
+    }
+    maintain_routes_after_room_moves_in(&moves, &mut document.content, &document.context);
+    validate_connection_graph_in(&mut document.content, &document.context)?;
+    document.close(details);
+    details
+        .sources
+        .iter_mut()
+        .find(|bundle| bundle.source == envelope.source)
+        .expect("closing a source creates its bundle")
+        .rev = current + 1;
+    details.area.rev += 1;
+    Ok(MutationResult {
+        operation_id: envelope.operation_id,
+        versions: vec![
+            VersionInfo::map_source(area_id.0, details.area.rev),
+            VersionInfo {
+                resource: ResourceKind::Source,
+                id: area_id.0,
+                source: envelope.source,
+                rev: current + 1,
+                deleted: false,
+            },
+        ],
+        data,
+    })
+}
+
+pub(crate) fn apply_mutation(
+    details: &mut AreaWithDetails,
+    op: &AreaMutation,
+) -> CloudResult<OpResult> {
+    apply_mutation_in(details, op, &EditContext::default())
+}
+
+pub(crate) fn validate_connection_graph(details: &mut AreaWithDetails) -> CloudResult<()> {
+    validate_connection_graph_in(details, &EditContext::default())
+}
+
+#[cfg(test)]
+pub(super) fn create_room_exit(
+    area: &mut AreaWithDetails,
+    room_key: &RoomKey,
+    body: ExitArgs,
+) -> CloudResult<Exit> {
+    create_room_exit_in(
+        area,
+        RoomAddress::map(room_key.room_number),
+        body,
+        &EditContext::default(),
+    )
+}
+
+pub(crate) fn capture_room_moves(
+    details: &AreaWithDetails,
+    payload: &[AreaMutation],
+) -> RoomMoveCapture {
+    capture_room_moves_in(details, payload, &EditContext::default())
+}
+
+pub(crate) fn maintain_routes_after_room_moves(
+    capture: &RoomMoveCapture,
+    details: &mut AreaWithDetails,
+) {
+    maintain_routes_after_room_moves_in(capture, details, &EditContext::default());
+}
+
+pub(super) fn unlink_exits(
+    details: &mut AreaWithDetails,
+    splits: &[(ExitId, ConnectionId)],
+) -> CloudResult<()> {
+    unlink_exits_in(details, splits, &EditContext::default())
 }

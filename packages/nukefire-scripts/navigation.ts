@@ -4,13 +4,20 @@
 /** An area id as the mapper spells it: a canonical UUID string. */
 export type NavigationAreaId = string;
 
+/** An exit's door as the mapper reads it back. Locked implies closed. */
+export interface NavigationDoor {
+  readonly state: "open" | "closed" | "locked";
+  readonly name: string | null;
+  readonly opensWith: string | null;
+}
+
 export interface NavigationExit {
   from_direction: string;
   to_area_id: NavigationAreaId | null;
   to_room_number: number | null;
   command: string | null;
-  is_closed?: boolean;
-  is_locked?: boolean;
+  /** The exit's door, or null for none. */
+  door?: NavigationDoor | null;
 }
 
 export interface NavigationRoom {
@@ -90,13 +97,14 @@ export function buildNavigationRoute(
       };
     }
 
+    const door = exit.door?.state;
     steps.push({
       from,
       to,
       direction: exit.from_direction,
       command,
-      closed: exit.is_closed === true,
-      locked: exit.is_locked === true,
+      closed: door === "closed" || door === "locked",
+      locked: door === "locked",
     });
   }
 

@@ -69,11 +69,16 @@ impl EphemeralBackend {
 
 #[async_trait]
 impl MapperBackend for EphemeralBackend {
+    fn default_storage(&self) -> MapStorage {
+        MapStorage::Session
+    }
+
     // ===== AREA OPERATIONS =====
 
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
         let properties = request.document_properties();
         let area = Area {
+            projection_token: None,
             id: AreaId(Uuid::new_v4()),
             user_id: None,
             // Always loose: the ephemeral tier has no folders.
@@ -88,11 +93,16 @@ impl MapperBackend for EphemeralBackend {
             copied_from_rev: None,
             copied_at: None,
             family_token: None,
+            clan_id: None,
+            clan_name: None,
+            actions: None,
+            clan_ownership: crate::clan_maps::ClanOwnership::default(),
         };
         let details = AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: area.clone(),
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties,
             rooms: Vec::new(),
             labels: Vec::new(),
@@ -240,7 +250,7 @@ mod tests {
         MapPoint, PortMode, RoomNumber, RoomSide, RoomUpdates, SegmentShape, ShapeArgs, ShapeId,
         backends::{AreaMergeSource, RoomRemap, Translate},
         mapper::RoomKey,
-        mutation::{AreaMutation, OpResult, Precondition, ResourceKind},
+        mutation::{AreaMutation, OpResult, Precondition},
     };
     use std::collections::BTreeMap;
 
@@ -248,6 +258,8 @@ mod tests {
         CreateAreaRequest {
             name: name.to_string(),
             atlas_id: None,
+            clan_id: None,
+            ownership: None,
             ephemeral: true,
             properties: BTreeMap::new(),
         }
@@ -259,13 +271,13 @@ mod tests {
         payload: Vec<AreaMutation>,
     ) -> MutationEnvelope {
         MutationEnvelope {
+            source: crate::SourceId::map(),
             operation_id: Uuid::new_v4(),
-            preconditions: vec![Precondition {
-                resource: ResourceKind::Area,
-                id: area_id.0,
+            preconditions: vec![Precondition::source(
+                area_id.0,
+                crate::SourceId::map(),
                 expected_rev,
-                access_fingerprint: None,
-            }],
+            )],
             payload,
         }
     }
@@ -296,7 +308,6 @@ mod tests {
         assert_eq!(details.properties.len(), 1);
         assert_eq!(details.properties[0].name, "nukefire.zone");
         assert_eq!(details.properties[0].value, "315");
-        assert!(!details.properties[0].is_secret);
     }
 
     #[tokio::test]
@@ -316,6 +327,7 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates {
                                 title: Some("Gate".to_string()),
@@ -323,6 +335,7 @@ mod tests {
                             },
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 from_direction: ExitDirection::North,
@@ -357,14 +370,17 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 from_direction: ExitDirection::North,
@@ -386,6 +402,7 @@ mod tests {
                     area.id,
                     2,
                     vec![AreaMutation::DeleteRoom {
+                        room_source: None,
                         room_number: RoomNumber(2),
                     }],
                 ),
@@ -409,6 +426,7 @@ mod tests {
         let a = backend.create_area(request("A")).await.expect("create").id;
         let b = backend.create_area(request("B")).await.expect("create").id;
         let room = |number: i32| AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(number),
             body: RoomUpdates::default(),
         };
@@ -417,6 +435,7 @@ mod tests {
             .await
             .expect("seed A");
         let link = AreaMutation::CreateExit {
+            room_source: None,
             room_number: RoomNumber(5),
             body: ExitArgs {
                 from_direction: ExitDirection::North,
@@ -439,6 +458,7 @@ mod tests {
                     a,
                     2,
                     vec![AreaMutation::DeleteRoom {
+                        room_source: None,
                         room_number: RoomNumber(2),
                     }],
                 ),
@@ -474,6 +494,7 @@ mod tests {
                     area.id,
                     41,
                     vec![AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: RoomNumber(1),
                         body: RoomUpdates::default(),
                     }],
@@ -514,6 +535,7 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates {
                                 title: Some("Gate".to_string()),
@@ -521,6 +543,7 @@ mod tests {
                             },
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 id: Some(exit_id),
@@ -529,6 +552,7 @@ mod tests {
                             },
                         },
                         AreaMutation::AddRoomTag {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             tag: "INN".to_string(),
                         },
@@ -567,6 +591,7 @@ mod tests {
                     area.id,
                     1,
                     vec![AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: RoomNumber(1),
                         body: RoomUpdates::default(),
                     }],
@@ -584,10 +609,12 @@ mod tests {
                     before.area.rev,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::DeleteRoom {
+                            room_source: None,
                             room_number: RoomNumber(999),
                         },
                     ],
@@ -623,10 +650,12 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 id: Some(exit_id),
@@ -660,6 +689,7 @@ mod tests {
 
     fn endpoint(room_number: i32, side: RoomSide) -> ConnectionEndpoint {
         ConnectionEndpoint {
+            source: None,
             room_number: RoomNumber(room_number),
             side,
             port_offset: 0.5,
@@ -685,10 +715,12 @@ mod tests {
                     1,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates::default(),
                         },
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: RoomUpdates {
                                 x: Some(2.0),
@@ -710,6 +742,7 @@ mod tests {
                             },
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: ExitArgs {
                                 id: Some(east),
@@ -723,6 +756,7 @@ mod tests {
                             },
                         },
                         AreaMutation::CreateExit {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: ExitArgs {
                                 id: Some(west),
@@ -880,10 +914,12 @@ mod tests {
                         1,
                         vec![
                             AreaMutation::UpsertRoom {
+                                room_source: None,
                                 room_number: RoomNumber(1),
                                 body: RoomUpdates::default(),
                             },
                             AreaMutation::UpsertRoom {
+                                room_source: None,
                                 room_number: RoomNumber(2),
                                 body: RoomUpdates::default(),
                             },
@@ -902,6 +938,7 @@ mod tests {
                                 },
                             },
                             AreaMutation::CreateExit {
+                                room_source: None,
                                 room_number: RoomNumber(1),
                                 body: ExitArgs {
                                     id: Some(ExitId::new()),
@@ -941,10 +978,12 @@ mod tests {
         let west = ExitId::new();
         vec![
             AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: RoomUpdates::default(),
             },
             AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(2),
                 body: RoomUpdates {
                     x: Some(2.0),
@@ -966,6 +1005,7 @@ mod tests {
                 },
             },
             AreaMutation::CreateExit {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: ExitArgs {
                     id: Some(east),
@@ -979,6 +1019,7 @@ mod tests {
                 },
             },
             AreaMutation::CreateExit {
+                room_source: None,
                 room_number: RoomNumber(2),
                 body: ExitArgs {
                     id: Some(west),
@@ -1018,6 +1059,7 @@ mod tests {
                     2,
                     vec![
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(1),
                             body: RoomUpdates {
                                 x: Some(3.0),
@@ -1026,6 +1068,7 @@ mod tests {
                             },
                         },
                         AreaMutation::UpsertRoom {
+                            room_source: None,
                             room_number: RoomNumber(2),
                             body: RoomUpdates {
                                 x: Some(5.0),
@@ -1069,6 +1112,7 @@ mod tests {
                     area.id,
                     2,
                     vec![AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: RoomNumber(1),
                         body: RoomUpdates {
                             x: Some(1.0),
@@ -1124,11 +1168,13 @@ mod tests {
         exit_to: Option<(AreaId, i32)>,
     ) {
         let mut payload = vec![AreaMutation::UpsertRoom {
+            room_source: None,
             room_number: RoomNumber(1),
             body: RoomUpdates::default(),
         }];
         if let Some((to_area, to_room)) = exit_to {
             payload.push(AreaMutation::CreateExit {
+                room_source: None,
                 room_number: RoomNumber(1),
                 body: ExitArgs {
                     from_direction: ExitDirection::North,

@@ -15,7 +15,7 @@
 //! Area create/rename/delete intentionally bypass this stack (not
 //! undoable), and the stack is cleared when the edited area changes.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use iced::{Task, Vector};
@@ -23,13 +23,14 @@ use smudgy_cloud::{
     AreaId, ConnectionArgs, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionRouting,
     ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS,
     ExitArgs, ExitDirection, ExitId, ExitUpdates, LabelArgs, LabelId, LabelUpdates, Mapper,
-    PortMode, RoomNumber, RoomUpdates, SegmentShape, ShapeArgs, ShapeId, ShapeUpdates, Uuid,
-    default_anchor_for_direction,
+    PortMode, RoomAddress, RoomNumber, RoomUpdates, SegmentShape, ShapeArgs, ShapeId, ShapeUpdates,
+    Uuid, default_anchor_for_direction,
     mapper::{AreaMutationBatch, AtlasCache, MutationSubmission, RoomKey},
     mutation::{AreaMutation, MAX_MUTATION_OPERATIONS, OperationId},
 };
-use smudgy_map_widget::map_editor::{EntityId, Selection};
+use smudgy_map_widget::map_editor::{EntityId, PlacedRoom, Selection};
 
+use super::document::Document;
 use crate::components::cloud_errors::display_error;
 
 pub type CommandId = u64;
@@ -49,7 +50,6 @@ pub enum IdRef<T> {
 /// A backend-assigned id stored in a command's slot table.
 #[derive(Debug, Clone, Copy)]
 pub enum ResolvedId {
-    Exit(ExitId),
     Label(LabelId),
     Shape(ShapeId),
 }
@@ -63,31 +63,29 @@ pub enum Mutation {
         operations: Vec<AreaMutation>,
         description: String,
     },
+    /// The same, written to one of the map's other sources (a Secret or
+    /// Private additions). Longer than one envelope, it continues in order.
+    SourceBatch {
+        area_id: AreaId,
+        source: smudgy_cloud::SourceId,
+        operations: Vec<AreaMutation>,
+        description: String,
+        /// An exit edit that changes one end of a two-way link splits the
+        /// link first, as [`Mutation::UpdateExit`] does on the map.
+        split_paired_exit: bool,
+    },
     UpsertRooms(AreaId, Vec<(RoomNumber, RoomUpdates)>),
     DeleteRoom(RoomKey),
     SetRoomProperty(RoomKey, String, String),
     DeleteRoomProperty(RoomKey, String),
-    AddRoomTag(RoomKey, String),
-    RemoveRoomTag(RoomKey, String),
     SetAreaProperty(AreaId, String, String),
     DeleteAreaProperty(AreaId, String),
-    CreateExit {
-        room_key: RoomKey,
-        args: ExitArgs,
-        /// Applied once the create resolves; restores state `ExitArgs`
-        /// cannot express (e.g. an explicitly cleared destination on an
-        /// undo recreation).
-        follow_up: Option<ExitUpdates>,
-        slot: SlotId,
-    },
+    /// One of the map's exits; a direction edit on one end of a two-way
+    /// link splits the link. Exits are created and deleted in batches.
     UpdateExit {
         room_key: RoomKey,
-        id: IdRef<ExitId>,
+        id: ExitId,
         updates: ExitUpdates,
-    },
-    DeleteExit {
-        room_key: RoomKey,
-        id: IdRef<ExitId>,
     },
     CreateLabel {
         area_id: AreaId,
@@ -123,18 +121,8 @@ impl Mutation {
     /// The number of slots this mutation requires (max referenced + 1).
     fn slot_requirement(&self) -> usize {
         match self {
-            Mutation::CreateExit { slot, .. }
-            | Mutation::CreateLabel { slot, .. }
-            | Mutation::CreateShape { slot, .. } => slot + 1,
-            Mutation::UpdateExit {
-                id: IdRef::Slot(slot),
-                ..
-            }
-            | Mutation::DeleteExit {
-                id: IdRef::Slot(slot),
-                ..
-            }
-            | Mutation::UpdateLabel {
+            Mutation::CreateLabel { slot, .. } | Mutation::CreateShape { slot, .. } => slot + 1,
+            Mutation::UpdateLabel {
                 id: IdRef::Slot(slot),
                 ..
             }
@@ -155,11 +143,112 @@ impl Mutation {
     }
 }
 
+/// Where an operation writes, as [`needed_actions`] reports it: a place,
+/// or the place holding a label or shape (read from the map when judged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writes {
+    Place(smudgy_cloud::SourceId),
+    Label(LabelId),
+    Shape(ShapeId),
+}
+
+/// The map `mutation` writes, and each action its operations need there
+/// (`add`, `edit` or `remove`, as the server judges each operation), with
+/// where it needs it.
+#[must_use]
+pub fn needed_actions(mutation: &Mutation) -> (AreaId, Vec<(Writes, &'static str)>) {
+    use smudgy_cloud::SourceId;
+    let map = |action| vec![(Writes::Place(SourceId::Map), action)];
+    match mutation {
+        Mutation::AreaBatch {
+            area_id,
+            operations,
+            ..
+        } => (
+            *area_id,
+            operations
+                .iter()
+                .map(|operation| (Writes::Place(SourceId::Map), operation.required_action()))
+                .collect(),
+        ),
+        Mutation::SourceBatch {
+            area_id,
+            source,
+            operations,
+            ..
+        } => (
+            *area_id,
+            operations
+                .iter()
+                .map(|operation| (Writes::Place(*source), operation.required_action()))
+                .collect(),
+        ),
+        Mutation::UpsertRooms(area_id, _)
+        | Mutation::SetAreaProperty(area_id, ..)
+        | Mutation::UpdateLabel {
+            area_id,
+            id: IdRef::Slot(_),
+            ..
+        }
+        | Mutation::UpdateShape {
+            area_id,
+            id: IdRef::Slot(_),
+            ..
+        } => (*area_id, map("edit")),
+        Mutation::SetRoomProperty(room_key, ..) | Mutation::UpdateExit { room_key, .. } => {
+            (room_key.area_id, map("edit"))
+        }
+        Mutation::DeleteRoom(room_key) | Mutation::DeleteRoomProperty(room_key, _) => {
+            (room_key.area_id, map("remove"))
+        }
+        Mutation::DeleteAreaProperty(area_id, _)
+        | Mutation::DeleteLabel {
+            area_id,
+            id: IdRef::Slot(_),
+        }
+        | Mutation::DeleteShape {
+            area_id,
+            id: IdRef::Slot(_),
+        } => (*area_id, map("remove")),
+        Mutation::CreateLabel { area_id, .. } | Mutation::CreateShape { area_id, .. } => {
+            (*area_id, map("add"))
+        }
+        Mutation::UpdateLabel {
+            area_id,
+            id: IdRef::Known(id),
+            ..
+        } => (*area_id, vec![(Writes::Label(*id), "edit")]),
+        Mutation::DeleteLabel {
+            area_id,
+            id: IdRef::Known(id),
+        } => (*area_id, vec![(Writes::Label(*id), "remove")]),
+        Mutation::UpdateShape {
+            area_id,
+            id: IdRef::Known(id),
+            ..
+        } => (*area_id, vec![(Writes::Shape(*id), "edit")]),
+        Mutation::DeleteShape {
+            area_id,
+            id: IdRef::Known(id),
+        } => (*area_id, vec![(Writes::Shape(*id), "remove")]),
+    }
+}
+
 /// The entity a coalescable field edit targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityRef {
     Area(AreaId),
     Room(RoomKey),
+    SourceRoom(AreaId, smudgy_cloud::SourceId, RoomNumber),
+    /// A source's data on a qualified room owned by another source.
+    RoomData(
+        AreaId,
+        smudgy_cloud::SourceId,
+        smudgy_cloud::SourceId,
+        RoomNumber,
+    ),
+    /// A Secret's or Private's own fields, on its map.
+    Place(AreaId, smudgy_cloud::SourceId),
     Exit(AreaId, ExitId),
     Connection(AreaId, ConnectionId),
     Label(AreaId, LabelId),
@@ -187,10 +276,13 @@ pub enum FieldId {
     StrokeWidth,
     FromDirection,
     Destination,
-    Path,
     Weight,
     Command,
     Flags,
+    /// A door's name.
+    DoorName,
+    /// The command that opens a door.
+    DoorOpensWith,
     Routing,
     SegmentShape,
     CornerStyle,
@@ -241,9 +333,42 @@ pub struct Command {
     pending: usize,
     operation_ids: Vec<OperationId>,
     application_error: Option<String>,
+    /// How many of the last writes of each direction are follow-ups
+    /// ([`Command::then`]): writes to other maps made only once the writes
+    /// before them are acknowledged.
+    follow_ups: usize,
+    /// Whether the other maps hold the redo follow-ups (rather than their
+    /// undo, or neither yet).
+    followed: bool,
+    /// The application whose follow-ups wait for its own writes.
+    awaiting: Option<Awaiting>,
+    /// Counts applications, so an acknowledgement answers only its own.
+    applications: u64,
+}
+
+/// An application of a command waiting for its own writes to be
+/// acknowledged before its follow-ups go.
+#[derive(Debug, Clone)]
+struct Awaiting {
+    application: u64,
+    direction: Direction,
+    areas: Vec<AreaId>,
+    operations: Vec<OperationId>,
 }
 
 impl Command {
+    /// The mutations applying the command writes.
+    #[must_use]
+    pub fn redo_mutations(&self) -> &[Mutation] {
+        &self.redo
+    }
+
+    /// The mutations undoing the command writes.
+    #[must_use]
+    pub fn undo_mutations(&self) -> &[Mutation] {
+        &self.undo
+    }
+
     #[must_use]
     pub fn new(redo: Vec<Mutation>, undo: Vec<Mutation>) -> Self {
         let slots = redo
@@ -262,7 +387,34 @@ impl Command {
             pending: 0,
             operation_ids: Vec::new(),
             application_error: None,
+            follow_ups: 0,
+            followed: false,
+            awaiting: None,
+            applications: 0,
         }
+    }
+
+    /// The command with one more write after its own (`redo`), undone
+    /// after its own undo (`undo`); it coalesces as before.
+    #[must_use]
+    pub fn also(mut self, redo: Mutation, undo: Mutation) -> Self {
+        self.redo.insert(self.redo.len() - self.follow_ups, redo);
+        self.undo.insert(self.undo.len() - self.follow_ups, undo);
+        self
+    }
+
+    /// The command with a follow-up: a write to another map (`redo`) made
+    /// only once the command's own writes are acknowledged, and its undo
+    /// (`undo`) made likewise once the command's own undo is. A write of
+    /// the command's own that is refused and discarded never leaves the
+    /// other map's write to go alone; an undo or redo before the
+    /// acknowledgement leaves the other map as it is.
+    #[must_use]
+    pub fn then(mut self, redo: Mutation, undo: Mutation) -> Self {
+        self.redo.push(redo);
+        self.undo.push(undo);
+        self.follow_ups += 1;
+        self
     }
 
     /// Marks this command as a coalescable field edit.
@@ -278,16 +430,6 @@ impl Command {
     pub fn seed_slot(mut self, slot: SlotId, id: ResolvedId) -> Self {
         self.resolved_ids[slot] = Some(id);
         self
-    }
-
-    fn exit_id(&self, id: IdRef<ExitId>) -> Option<ExitId> {
-        match id {
-            IdRef::Known(id) => Some(id),
-            IdRef::Slot(slot) => match self.resolved_ids.get(slot)? {
-                Some(ResolvedId::Exit(id)) => Some(*id),
-                _ => None,
-            },
-        }
     }
 
     fn label_id(&self, id: IdRef<LabelId>) -> Option<LabelId> {
@@ -314,13 +456,6 @@ impl Command {
 /// The completion of an asynchronous create issued by a command.
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    Exit {
-        command: CommandId,
-        slot: SlotId,
-        room_key: RoomKey,
-        follow_up: Option<ExitUpdates>,
-        result: Result<ExitId, String>,
-    },
     Label {
         command: CommandId,
         slot: SlotId,
@@ -331,9 +466,16 @@ pub enum Outcome {
         slot: SlotId,
         result: Result<ShapeId, String>,
     },
+    /// Whether one application's own writes were all acknowledged, for
+    /// [`CommandStack::follow_up`].
+    Acknowledged {
+        command: CommandId,
+        application: u64,
+        acknowledged: bool,
+    },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Direction {
     Redo,
     Undo,
@@ -356,6 +498,18 @@ impl CommandStack {
     #[must_use]
     pub fn can_redo(&self) -> bool {
         self.redo.last().is_some_and(|command| command.pending == 0)
+    }
+
+    /// The command undo would revert next.
+    #[must_use]
+    pub fn next_undo(&self) -> Option<&Command> {
+        self.undo.back()
+    }
+
+    /// The command redo would apply next.
+    #[must_use]
+    pub fn next_redo(&self) -> Option<&Command> {
+        self.redo.last()
     }
 
     /// Drops all history (used when the edited area changes or is deleted,
@@ -416,6 +570,7 @@ impl CommandStack {
 
         let coalesced = command.coalesce.is_some()
             && command.pending == 0
+            && command.follow_ups == 0
             && self
                 .undo
                 .back()
@@ -437,6 +592,24 @@ impl CommandStack {
 
         self.last_error = application_error;
         (task, operation_ids)
+    }
+
+    /// The operations the command that submitted `operation_id` submitted
+    /// after it: the rest of that gesture, which goes too when that
+    /// operation is discarded.
+    #[must_use]
+    pub fn operations_after(&self, operation_id: OperationId) -> Vec<OperationId> {
+        self.undo
+            .iter()
+            .chain(self.redo.iter())
+            .find_map(|command| {
+                let position = command
+                    .operation_ids
+                    .iter()
+                    .position(|id| *id == operation_id)?;
+                Some(command.operation_ids[position + 1..].to_vec())
+            })
+            .unwrap_or_default()
     }
 
     /// Removes the undo/redo entry that submitted a discarded CAS operation.
@@ -501,30 +674,8 @@ impl CommandStack {
     ///
     /// The id slot and operation id are recorded before the command enters
     /// history; this completion only unblocks undo and drives selection.
-    pub fn resolve(&mut self, mapper: &Mapper, outcome: Outcome) {
+    pub fn resolve(&mut self, outcome: Outcome) {
         match outcome {
-            Outcome::Exit {
-                command,
-                slot,
-                room_key,
-                follow_up,
-                result,
-            } => {
-                let Some(command) = self.find_mut(command) else {
-                    return;
-                };
-                command.pending = command.pending.saturating_sub(1);
-                match result {
-                    Ok(id) => {
-                        command.resolved_ids[slot] = Some(ResolvedId::Exit(id));
-                        if let Some(follow_up) = follow_up {
-                            let result = mapper.update_exit(room_key, id, follow_up);
-                            Self::record_submission(command, result, "exit follow-up update");
-                        }
-                    }
-                    Err(error) => log::warn!("exit create failed: {error}"),
-                }
-            }
             Outcome::Label {
                 command,
                 slot,
@@ -553,6 +704,106 @@ impl CommandStack {
                     Err(error) => log::warn!("shape create failed: {error}"),
                 }
             }
+            // Settled by [`Self::follow_up`], which writes.
+            Outcome::Acknowledged { .. } => {}
+        }
+    }
+
+    /// Makes the follow-ups ([`Command::then`]) of application
+    /// `application` of command `command` once its own writes are
+    /// `acknowledged`. Without the acknowledgement (a write refused and
+    /// discarded, or cancelled), or once the command was undone, redone or
+    /// dropped from history since, the other maps stay as they are.
+    pub fn follow_up(
+        &mut self,
+        mapper: &Mapper,
+        command: CommandId,
+        application: u64,
+        acknowledged: bool,
+    ) -> Task<Outcome> {
+        self.last_error = None;
+        let Some(entry) = self.find_mut(command) else {
+            return Task::none();
+        };
+        let Some(awaiting) = entry
+            .awaiting
+            .take_if(|awaiting| awaiting.application == application)
+        else {
+            return Task::none();
+        };
+        if !acknowledged {
+            return Task::none();
+        }
+        let mutations = match awaiting.direction {
+            Direction::Redo => &entry.redo,
+            Direction::Undo => &entry.undo,
+        };
+        let mut writes = Command::new(
+            mutations[mutations.len() - entry.follow_ups..].to_vec(),
+            Vec::new(),
+        );
+        let (task, applied) = Self::apply(mapper, &mut writes, Direction::Redo);
+        if applied {
+            entry.operation_ids.extend(writes.operation_ids);
+            entry.followed = matches!(awaiting.direction, Direction::Redo);
+        }
+        self.last_error = writes.application_error.take();
+        task
+    }
+
+    /// Queues every follow-up still waiting for an acknowledgement at once,
+    /// beside the writes it follows, as the window closes: no window is left
+    /// to wait, and a follow-up never made would leave the other map as it
+    /// was for good. Its map's durable queue then holds it like any write.
+    pub fn queue_waiting_follow_ups(&mut self, mapper: &Mapper) {
+        let waiting: Vec<(CommandId, u64)> = self
+            .undo
+            .iter()
+            .chain(&self.redo)
+            .filter_map(|command| {
+                let awaiting = command.awaiting.as_ref()?;
+                Some((command.id, awaiting.application))
+            })
+            .collect();
+        for (command, application) in waiting {
+            // The window closes: what the writes would report is answered
+            // by no one.
+            let _ = self.follow_up(mapper, command, application, true);
+            if let Some(error) = self.last_error.take() {
+                log::warn!("a follow-up was not queued as the window closed: {error}");
+            }
+        }
+    }
+
+    /// The acknowledgements the follow-ups of commands in history wait
+    /// for, as the window's runtime runs them.
+    #[cfg(test)]
+    pub fn acknowledgements(&self, mapper: &Mapper) -> Vec<Acknowledgement> {
+        self.undo
+            .iter()
+            .chain(&self.redo)
+            .filter_map(|command| {
+                let awaiting = command.awaiting.clone()?;
+                let future: Acknowledgement =
+                    Box::pin(acknowledgement(mapper.clone(), command.id, awaiting));
+                Some(future)
+            })
+            .collect()
+    }
+
+    /// Waits for every acknowledgement follow-ups wait for, and makes the
+    /// follow-ups, as the window does.
+    #[cfg(test)]
+    pub async fn settle(&mut self, mapper: &Mapper) {
+        for waiting in self.acknowledgements(mapper) {
+            if let Outcome::Acknowledged {
+                command,
+                application,
+                acknowledged,
+            } = waiting.await
+            {
+                let _ = self.follow_up(mapper, command, application, acknowledged);
+            }
         }
     }
 
@@ -561,30 +812,6 @@ impl CommandStack {
             .iter_mut()
             .chain(self.redo.iter_mut())
             .find(|command| command.id == id)
-    }
-
-    fn record_submission(
-        command: &mut Command,
-        result: smudgy_cloud::CloudResult<MutationSubmission>,
-        context: &str,
-    ) -> bool {
-        match result {
-            Ok(submission) => {
-                if let Some(operation_id) = submission.operation_id() {
-                    command.operation_ids.push(operation_id);
-                }
-                true
-            }
-            Err(error) => {
-                let message = format!(
-                    "{context} failed validation or durable enqueue: {}",
-                    display_error(&error)
-                );
-                log::warn!("{message}");
-                command.application_error = Some(message);
-                false
-            }
-        }
     }
 
     /// Compiles one direction into a private batch, then durably stages every
@@ -598,10 +825,17 @@ impl CommandStack {
     ) -> (Task<Outcome>, bool) {
         command.operation_ids.clear();
         command.application_error = None;
-        let mutations = match direction {
+        let mut mutations = match direction {
             Direction::Redo => command.redo.clone(),
             Direction::Undo => command.undo.clone(),
         };
+        let follow_ups = mutations.split_off(mutations.len() - command.follow_ups);
+        let mut areas: Vec<AreaId> = mutations
+            .iter()
+            .map(|mutation| needed_actions(mutation).0)
+            .collect();
+        areas.sort_unstable_by_key(|area| area.0);
+        areas.dedup();
 
         let resolved_before = command.resolved_ids.clone();
         let pending_before = command.pending;
@@ -615,6 +849,32 @@ impl CommandStack {
                     operations,
                     description,
                 } => batches.push(AreaMutationBatch::strict(area_id, operations, description)),
+                Mutation::SourceBatch {
+                    area_id,
+                    source,
+                    mut operations,
+                    description,
+                    split_paired_exit,
+                } => {
+                    let batch = |operations, description| {
+                        if split_paired_exit {
+                            AreaMutationBatch::splitting_paired_exit(
+                                area_id,
+                                operations,
+                                description,
+                            )
+                        } else {
+                            AreaMutationBatch::strict(area_id, operations, description)
+                        }
+                        .in_source(source)
+                    };
+                    while operations.len() > MAX_MUTATION_OPERATIONS {
+                        let rest = operations.split_off(MAX_MUTATION_OPERATIONS);
+                        batches.push(batch(operations, description.clone()));
+                        operations = rest;
+                    }
+                    batches.push(batch(operations, description));
+                }
                 Mutation::UpsertRooms(area_id, updates) => {
                     let description = if updates.len() == 1 {
                         format!("Update room {}", updates[0].0)
@@ -623,7 +883,11 @@ impl CommandStack {
                     };
                     let mut operations: Vec<_> = updates
                         .into_iter()
-                        .map(|(room_number, body)| AreaMutation::UpsertRoom { room_number, body })
+                        .map(|(room_number, body)| AreaMutation::UpsertRoom {
+                            room_source: None,
+                            room_number,
+                            body,
+                        })
                         .collect();
                     while operations.len() > MAX_MUTATION_OPERATIONS {
                         let rest = operations.split_off(MAX_MUTATION_OPERATIONS);
@@ -640,6 +904,7 @@ impl CommandStack {
                     batches.push(AreaMutationBatch::strict(
                         room_key.area_id,
                         vec![AreaMutation::DeleteRoom {
+                            room_source: None,
                             room_number: room_key.room_number,
                         }],
                         format!("Delete room {}", room_key.room_number),
@@ -651,10 +916,10 @@ impl CommandStack {
                     batches.push(AreaMutationBatch::strict(
                         room_key.area_id,
                         vec![AreaMutation::UpsertRoomProperty {
+                            room_source: None,
                             room_number: room_key.room_number,
                             name,
                             value,
-                            is_secret: None,
                         }],
                         description,
                     ));
@@ -665,41 +930,18 @@ impl CommandStack {
                     batches.push(AreaMutationBatch::strict(
                         room_key.area_id,
                         vec![AreaMutation::DeleteRoomProperty {
+                            room_source: None,
                             room_number: room_key.room_number,
                             name,
                         }],
                         description,
                     ));
                 }
-                Mutation::AddRoomTag(room_key, tag) => {
-                    batches.push(AreaMutationBatch::strict(
-                        room_key.area_id,
-                        vec![AreaMutation::AddRoomTag {
-                            room_number: room_key.room_number,
-                            tag,
-                        }],
-                        format!("Add tag to room {}", room_key.room_number),
-                    ));
-                }
-                Mutation::RemoveRoomTag(room_key, tag) => {
-                    batches.push(AreaMutationBatch::strict(
-                        room_key.area_id,
-                        vec![AreaMutation::RemoveRoomTag {
-                            room_number: room_key.room_number,
-                            tag,
-                        }],
-                        format!("Remove tag from room {}", room_key.room_number),
-                    ));
-                }
                 Mutation::SetAreaProperty(area_id, name, value) => {
                     let description = format!("Set area property {name}");
                     batches.push(AreaMutationBatch::strict(
                         area_id,
-                        vec![AreaMutation::UpsertAreaProperty {
-                            name,
-                            value,
-                            is_secret: None,
-                        }],
+                        vec![AreaMutation::UpsertAreaProperty { name, value }],
                         description,
                     ));
                 }
@@ -711,67 +953,19 @@ impl CommandStack {
                         description,
                     ));
                 }
-                Mutation::CreateExit {
-                    room_key,
-                    mut args,
-                    follow_up,
-                    slot,
-                } => {
-                    let command_id = command.id;
-                    let id = args.id.unwrap_or_else(ExitId::new);
-                    args.id = Some(id);
-                    batches.push(AreaMutationBatch::strict(
-                        room_key.area_id,
-                        vec![AreaMutation::CreateExit {
-                            room_number: room_key.room_number,
-                            body: args,
-                        }],
-                        format!("Create exit from room {}", room_key.room_number),
-                    ));
-                    if let Some(follow_up) = follow_up {
-                        batches.push(AreaMutationBatch::splitting_paired_exit(
-                            room_key.area_id,
-                            vec![AreaMutation::UpdateExit {
-                                exit_id: id,
-                                body: follow_up,
-                            }],
-                            "Restore exit details",
-                        ));
-                    }
-                    command.resolved_ids[slot] = Some(ResolvedId::Exit(id));
-                    command.pending += 1;
-                    tasks.push(Task::done(Outcome::Exit {
-                        command: command_id,
-                        slot,
-                        room_key,
-                        follow_up: None,
-                        result: Ok(id),
-                    }));
-                }
                 Mutation::UpdateExit {
                     room_key,
                     id,
                     updates,
                 } => {
-                    if let Some(exit_id) = command.exit_id(id) {
-                        batches.push(AreaMutationBatch::splitting_paired_exit(
-                            room_key.area_id,
-                            vec![AreaMutation::UpdateExit {
-                                exit_id,
-                                body: updates,
-                            }],
-                            "Update exit",
-                        ));
-                    }
-                }
-                Mutation::DeleteExit { room_key, id } => {
-                    if let Some(exit_id) = command.exit_id(id) {
-                        batches.push(AreaMutationBatch::strict(
-                            room_key.area_id,
-                            vec![AreaMutation::DeleteExit { exit_id }],
-                            "Delete exit",
-                        ));
-                    }
+                    batches.push(AreaMutationBatch::splitting_paired_exit(
+                        room_key.area_id,
+                        vec![AreaMutation::UpdateExit {
+                            exit_id: id,
+                            body: updates,
+                        }],
+                        "Update exit",
+                    ));
                 }
                 Mutation::CreateLabel {
                     area_id,
@@ -800,22 +994,28 @@ impl CommandStack {
                     updates,
                 } => {
                     if let Some(label_id) = command.label_id(id) {
-                        batches.push(AreaMutationBatch::strict(
-                            area_id,
-                            vec![AreaMutation::UpdateLabel {
-                                label_id,
-                                body: updates,
-                            }],
-                            "Update label",
+                        batches.push(in_owner(
+                            AreaMutationBatch::strict(
+                                area_id,
+                                vec![AreaMutation::UpdateLabel {
+                                    label_id,
+                                    body: updates,
+                                }],
+                                "Update label",
+                            ),
+                            label_source(mapper, area_id, label_id),
                         ));
                     }
                 }
                 Mutation::DeleteLabel { area_id, id } => {
                     if let Some(label_id) = command.label_id(id) {
-                        batches.push(AreaMutationBatch::strict(
-                            area_id,
-                            vec![AreaMutation::DeleteLabel { label_id }],
-                            "Delete label",
+                        batches.push(in_owner(
+                            AreaMutationBatch::strict(
+                                area_id,
+                                vec![AreaMutation::DeleteLabel { label_id }],
+                                "Delete label",
+                            ),
+                            label_source(mapper, area_id, label_id),
                         ));
                     }
                 }
@@ -846,22 +1046,28 @@ impl CommandStack {
                     updates,
                 } => {
                     if let Some(shape_id) = command.shape_id(id) {
-                        batches.push(AreaMutationBatch::strict(
-                            area_id,
-                            vec![AreaMutation::UpdateShape {
-                                shape_id,
-                                body: updates,
-                            }],
-                            "Update shape",
+                        batches.push(in_owner(
+                            AreaMutationBatch::strict(
+                                area_id,
+                                vec![AreaMutation::UpdateShape {
+                                    shape_id,
+                                    body: updates,
+                                }],
+                                "Update shape",
+                            ),
+                            shape_source(mapper, area_id, shape_id),
                         ));
                     }
                 }
                 Mutation::DeleteShape { area_id, id } => {
                     if let Some(shape_id) = command.shape_id(id) {
-                        batches.push(AreaMutationBatch::strict(
-                            area_id,
-                            vec![AreaMutation::DeleteShape { shape_id }],
-                            "Delete shape",
+                        batches.push(in_owner(
+                            AreaMutationBatch::strict(
+                                area_id,
+                                vec![AreaMutation::DeleteShape { shape_id }],
+                                "Delete shape",
+                            ),
+                            shape_source(mapper, area_id, shape_id),
                         ));
                     }
                 }
@@ -875,6 +1081,25 @@ impl CommandStack {
                         .into_iter()
                         .filter_map(MutationSubmission::operation_id),
                 );
+                // The other maps follow where they still hold the other
+                // direction's state; an earlier wait is answered no more.
+                command.applications += 1;
+                let wanted = match direction {
+                    Direction::Redo => !command.followed,
+                    Direction::Undo => command.followed,
+                };
+                command.awaiting = (!follow_ups.is_empty() && wanted).then(|| Awaiting {
+                    application: command.applications,
+                    direction,
+                    areas,
+                    operations: command.operation_ids.clone(),
+                });
+                if let Some(awaiting) = command.awaiting.clone() {
+                    tasks.push(Task::perform(
+                        acknowledgement(mapper.clone(), command.id, awaiting),
+                        std::convert::identity,
+                    ));
+                }
                 (Task::batch(tasks), true)
             }
             Err(error) => {
@@ -889,6 +1114,52 @@ impl CommandStack {
                 (Task::none(), false)
             }
         }
+    }
+}
+
+/// A wait for one application's acknowledgement, run by hand in tests.
+#[cfg(test)]
+pub type Acknowledgement = std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send>>;
+
+/// How often a wait for an acknowledgement looks again at a write parked
+/// for the viewer's Retry or Discard.
+const PARKED_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether every write of `awaiting` is acknowledged, as an
+/// [`Outcome::Acknowledged`] for `command`. A write parked for the
+/// viewer's Retry or Discard is waited out: retried, it may yet go
+/// through; discarded or cancelled, it never will.
+async fn acknowledgement(mapper: Mapper, command: CommandId, awaiting: Awaiting) -> Outcome {
+    let parked = |operation| {
+        awaiting
+            .areas
+            .iter()
+            .any(|area| mapper.is_operation_pending(*area, operation))
+    };
+    let mut acknowledged = true;
+    'operations: for &operation in &awaiting.operations {
+        loop {
+            if mapper.wait_for_mutation(operation).await.is_ok() {
+                break;
+            }
+            if parked(operation) {
+                tokio::time::sleep(PARKED_POLL).await;
+                continue;
+            }
+            // An acknowledgement leaves the queue just before it is
+            // recorded; one more look tells it from a discard.
+            tokio::task::yield_now().await;
+            if mapper.wait_for_mutation(operation).await.is_err() {
+                acknowledged = false;
+                break 'operations;
+            }
+            break;
+        }
+    }
+    Outcome::Acknowledged {
+        command,
+        application: awaiting.application,
+        acknowledged,
     }
 }
 
@@ -940,7 +1211,7 @@ pub fn move_selection(
     }
 
     for label_id in selection.labels() {
-        let Some(label) = area.get_label(&label_id) else {
+        let Some((_, label)) = area.find_label(&label_id) else {
             continue;
         };
         redo.push(Mutation::UpdateLabel {
@@ -964,7 +1235,7 @@ pub fn move_selection(
     }
 
     for shape_id in selection.shapes() {
-        let Some(shape) = area.get_shape(&shape_id) else {
+        let Some((_, shape)) = area.find_shape(&shape_id) else {
             continue;
         };
         redo.push(Mutation::UpdateShape {
@@ -987,6 +1258,10 @@ pub fn move_selection(
         });
     }
 
+    let (source_redo, source_undo) = super::source_rooms::move_rooms(&area, selection, offset);
+    redo.extend(source_redo);
+    undo.extend(source_undo);
+
     if redo.is_empty() {
         None
     } else {
@@ -994,184 +1269,312 @@ pub fn move_selection(
     }
 }
 
-/// Deletes every selected entity. Undo restores rooms with their
-/// properties and outgoing exits, and recreates labels/shapes (with fresh
-/// backend ids, re-tracked through slots).
+/// One place's part of a delete, with qualified room addresses.
+#[derive(Default)]
+struct DeletePart {
+    /// The selected links held here, then the place's selected rooms.
+    redo: Vec<AreaMutation>,
+    /// Self-contained steps, in order: each room with its data, each link.
+    undo: Vec<Vec<AreaMutation>>,
+    /// Exits on rooms that stay, led into a deleted room, and ride no
+    /// restored link: each one's full prior state, by its room.
+    inbound: Vec<(RoomAddress, ExitId, ExitUpdates)>,
+}
+
+/// What deleting rooms and links does to one document, and how undo brings
+/// it back. `own` are rooms the delete names; `cascade` are rooms that go
+/// with them (attachments on deleted map rooms: the server drops
+/// every place's data on a deleted map room). `selected` are the selected
+/// links; those held here are deleted whole.
+fn delete_in(
+    document: &Document<'_>,
+    own: &BTreeSet<RoomAddress>,
+    cascade: &BTreeSet<RoomAddress>,
+    selected: &HashSet<ConnectionId>,
+) -> DeletePart {
+    let content = document.content();
+    let area_id = document.area_id();
+    let doomed = |room: RoomAddress| own.contains(&room) || cascade.contains(&room);
+    let mut part = DeletePart::default();
+
+    let mut picked: Vec<ConnectionId> = content
+        .get_connections()
+        .iter()
+        .map(|connection| connection.id)
+        .filter(|id| selected.contains(id))
+        .collect();
+    picked.sort();
+    part.redo.extend(
+        picked
+            .iter()
+            .map(|&connection_id| AreaMutation::DeleteLink { connection_id }),
+    );
+    part.redo
+        .extend(own.iter().map(|&room_number| AreaMutation::DeleteRoom {
+            room_number: room_number.number,
+            room_source: room_number.wire_source(),
+        }));
+
+    // Rooms come back first, with the place's data on them.
+    for &number in own.iter().chain(cascade) {
+        let Some(room) = content.get_room_at(number) else {
+            continue;
+        };
+        let mut step = Vec::new();
+        if own.contains(&number) {
+            step.push(document.recreate_room(number.number, full_fields(room)));
+        }
+        let mut properties: Vec<(&str, &str)> = room.properties().collect();
+        properties.sort_unstable();
+        step.extend(
+            properties
+                .into_iter()
+                .map(|(name, value)| AreaMutation::UpsertRoomProperty {
+                    room_number: number.number,
+                    room_source: number.wire_source(),
+                    name: name.to_string(),
+                    value: value.to_string(),
+                }),
+        );
+        step.extend(room.tags().map(|tag| AreaMutation::AddRoomTag {
+            room_number: number.number,
+            room_source: number.wire_source(),
+            tag: tag.to_string(),
+        }));
+        // An exit whose link row is missing returns under its id and
+        // finds its link again.
+        step.extend(
+            room.get_exits()
+                .iter()
+                .filter(|exit| content.get_connection(exit.connection_id).is_none())
+                .map(|exit| AreaMutation::CreateExit {
+                    room_number: number.number,
+                    room_source: number.wire_source(),
+                    body: ExitArgs {
+                        id: Some(exit.id),
+                        ..exit_args_from_cache(exit)
+                    },
+                }),
+        );
+        if !step.is_empty() {
+            part.undo.push(step);
+        }
+    }
+
+    // Every selected link, and every link touching a deleted room, comes
+    // back by its id with its route and style.
+    let mut restored = HashSet::new();
+    for connection in content.get_connections() {
+        let members = link_members(content, connection.id);
+        let picked = selected.contains(&connection.id);
+        let touches = doomed(connection.endpoint_a.address())
+            || connection
+                .endpoint_b
+                .is_some_and(|endpoint| doomed(endpoint.address()))
+            || members.iter().any(|(room, exit)| {
+                doomed(*room)
+                    || exit.destination_address().is_some_and(|destination| {
+                        destination.map == area_id && doomed(destination.room)
+                    })
+            });
+        if !picked && !touches {
+            continue;
+        }
+        if members.iter().any(|(_, exit)| exit.to_unknown) {
+            // The destination was redacted ("Unknown map") and is
+            // unknowable client-side: undo brings the exit back without it.
+            log::warn!(
+                "map editor: a deleted link leads to an unshared map; undo will \
+                 recreate it without its destination"
+            );
+        }
+        // A member on a room that stays keeps an unselected link alive,
+        // one-ended and with its route cleared: undo takes that down first.
+        let remnant = !picked && members.iter().any(|(room, _)| !doomed(*room));
+        restored.insert(connection.id);
+        part.undo.push(restore_link(content, connection, remnant));
+    }
+
+    for room in content.document_rooms() {
+        let number = room.address();
+        if doomed(number) {
+            continue;
+        }
+        for exit in room.get_exits() {
+            if !restored.contains(&exit.connection_id)
+                && exit.destination_address().is_some_and(|destination| {
+                    destination.map == area_id && doomed(destination.room)
+                })
+            {
+                part.inbound
+                    .push((number, exit.id, exit_updates_from_cache(exit)));
+            }
+        }
+    }
+    part
+}
+
+/// `steps` as few envelopes as fit, never splitting a step.
+fn pack(steps: Vec<Vec<AreaMutation>>) -> Vec<Vec<AreaMutation>> {
+    let mut envelopes: Vec<Vec<AreaMutation>> = Vec::new();
+    for step in steps {
+        match envelopes.last_mut() {
+            Some(last) if last.len() + step.len() <= MAX_MUTATION_OPERATIONS => last.extend(step),
+            _ => envelopes.push(step),
+        }
+    }
+    envelopes
+}
+
+/// Every field of a room, for recreating it.
+fn full_fields(room: &smudgy_cloud::mapper::room_cache::RoomCache) -> RoomUpdates {
+    RoomUpdates {
+        title: Some(room.get_title().to_string()),
+        description: Some(room.get_description().to_string()),
+        level: Some(room.get_level()),
+        x: Some(room.get_x()),
+        y: Some(room.get_y()),
+        color: Some(room.get_color().to_string()),
+        external_id: room.get_external_id().map(|id| Some(id.to_string())),
+    }
+}
+
+/// One place's writes for a delete or its undo: `steps` packed into
+/// envelopes, then the exit relinks.
+fn part_writes(
+    document: &Document<'_>,
+    steps: Vec<Vec<AreaMutation>>,
+    inbound: Vec<(RoomAddress, ExitId, ExitUpdates)>,
+    description: &str,
+) -> Vec<Mutation> {
+    let mut writes: Vec<Mutation> = pack(steps)
+        .into_iter()
+        .map(|operations| document.batch(operations, description))
+        .collect();
+    writes.extend(
+        inbound
+            .into_iter()
+            .map(|(room, exit_id, updates)| document.update_exit(room, exit_id, updates)),
+    );
+    writes
+}
+
+/// Deletes every selected entity, each in the place that holds it.
+///
+/// Undo brings back every place's part, the map's first so a Secret's data
+/// on a map room has its room to return to: rooms with their fields,
+/// properties and tags; every selected link and every link touching a
+/// deleted room, by its id with its route, style and member exits; exits
+/// elsewhere that led into a deleted room; labels and shapes. Deleting a
+/// map room takes each Secret's (and Private's) data and exits on it too,
+/// and undo returns those to every place the viewer may write.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn delete_selection(
     atlas: &Arc<AtlasCache>,
     area_id: AreaId,
     selection: &Selection,
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
-    // Secrecy flags are restorable only when the viewer may send them; a
-    // non-cleared viewer's projection has no secret entities anyway.
-    let cleared = area.effective_access().is_cleared_for_secrets();
+    let map_rooms: BTreeSet<RoomNumber> = selection
+        .rooms()
+        .filter(|number| area.get_room(number).is_some())
+        .collect();
+    let selected: HashSet<ConnectionId> = selection.connections().collect();
 
     let mut redo = Vec::new();
-    let mut undo_rooms = Vec::new();
-    let mut undo_late = Vec::new();
-    let mut seeds = Vec::new();
-    let mut next_slot: SlotId = 0;
+    let mut source_undo = Vec::new();
 
-    // Explicitly selected Connections delete as links in their own right —
-    // except those whose every member exit rides a selected room's cascade
-    // delete, which stay on the room path exactly as before (their exits
-    // are restored by the room undo and a fresh link derives). The link
-    // deletes run before the room deletes (a cascaded-away link can't be
-    // deleted twice) and their restores run after every room is back.
-    let selected_room_set: HashSet<RoomNumber> = selection.rooms().collect();
-    let mut restored_connections: HashSet<ConnectionId> = HashSet::new();
-    let mut link_deletes = Vec::new();
-    let mut link_restores = Vec::new();
-    let mut selected_connections: Vec<ConnectionId> = selection.connections().collect();
-    selected_connections.sort();
-    for connection_id in selected_connections {
-        let Some(connection) = area.get_connection(connection_id) else {
+    // Each Secret's and Private's part goes first, so its selected links
+    // are still whole when a map room's delete reaches its data.
+    let mut drawings = super::source_rooms::drawings_by_source(&area, selection);
+    for layer in area.source_layers() {
+        let source = layer.source();
+        let Some(document) = Document::of(&area, source) else {
             continue;
         };
-        let mut members = Vec::new();
-        for room in area.get_rooms() {
-            for exit in room.get_exits() {
-                if exit.connection_id == connection_id {
-                    members.push((room.get_room_number(), exit));
-                }
-            }
-        }
-        if !members.is_empty()
-            && members
-                .iter()
-                .all(|(room_number, _)| selected_room_set.contains(room_number))
-        {
-            continue;
-        }
-        members.sort_by_key(|(_, exit)| exit.id.0);
-        restored_connections.insert(connection_id);
-        link_deletes.push(AreaMutation::DeleteLink { connection_id });
-        let mut restore = vec![AreaMutation::CreateConnection {
-            body: ConnectionArgs::from(connection),
-        }];
-        for (room_number, exit) in &members {
-            restore.push(AreaMutation::CreateExit {
-                room_number: *room_number,
-                body: restore_exit_args(exit, connection_id, cleared),
-            });
-        }
-        link_restores.push(Mutation::AreaBatch {
-            area_id,
-            operations: restore,
-            description: "Restore deleted link".to_string(),
-        });
-    }
-    if !link_deletes.is_empty() {
-        redo.push(Mutation::AreaBatch {
-            area_id,
-            operations: link_deletes,
-            description: "Delete links".to_string(),
-        });
-    }
-
-    for room_number in selection.rooms() {
-        let Some(room) = area.get_room(&room_number) else {
-            continue;
-        };
-        let room_key = RoomKey::new(area_id, room_number);
-
-        redo.push(Mutation::DeleteRoom(room_key.clone()));
-
-        undo_rooms.push((
-            room_number,
-            RoomUpdates {
-                is_secret: cleared.then_some(room.is_secret()),
-                title: Some(room.get_title().to_string()),
-                description: Some(room.get_description().to_string()),
-                level: Some(room.get_level()),
-                x: Some(room.get_x()),
-                y: Some(room.get_y()),
-                color: Some(room.get_color().to_string()),
-                external_id: room.get_external_id().map(|id| Some(id.to_string())),
-            },
-        ));
-
-        // KNOWN GAP: the property PUT body has no secrecy channel, so a
-        // property that was secret-marked is restored as *public* — re-marking
-        // it needs a separate POST /secret-marks the undo stack can't express
-        // today. The room/exit/label/shape is_secret flags ARE restored.
-        let mut properties: Vec<(String, String)> = room
-            .properties()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
+        let own: BTreeSet<RoomAddress> = selection
+            .source_rooms()
+            .filter(|(of, number)| *of == source && layer.own_room(*number).is_some())
+            .map(|(_, number)| RoomAddress::new(source, number))
             .collect();
-        properties.sort();
-        for (name, value) in properties {
-            undo_late.push(Mutation::SetRoomProperty(room_key.clone(), name, value));
+        let cascade: BTreeSet<RoomAddress> = map_rooms
+            .iter()
+            .map(|number| RoomAddress::map(*number))
+            .filter(|address| layer.attachment(*address).is_some())
+            .collect();
+        let mut part = delete_in(&document, &own, &cascade, &selected);
+        let (drawing_deletes, drawing_restores) = drawings.remove(&source).unwrap_or_default();
+        part.redo.extend(drawing_deletes);
+        part.undo.extend(
+            drawing_restores
+                .into_iter()
+                .map(|operation| vec![operation]),
+        );
+        if !part.redo.is_empty() {
+            redo.extend(part_writes(
+                &document,
+                part.redo
+                    .into_iter()
+                    .map(|operation| vec![operation])
+                    .collect(),
+                Vec::new(),
+                "Delete selection",
+            ));
         }
-
-        for exit in room.get_exits() {
-            // This exit's whole link is being deleted and restored (with
-            // its identities) by the explicit-connection path above; a
-            // second recreation here would duplicate it.
-            if restored_connections.contains(&exit.connection_id) {
-                continue;
-            }
-            if exit.to_unknown {
-                // The destination was redacted ("Unknown map") and is
-                // unknowable client-side, but the room delete cascades the
-                // exit anyway. Undo recreates it DANGLING (args carry
-                // to_* = None): the cross-area link is lost at delete time
-                // and cannot be restored from here.
-                log::warn!(
-                    "map editor: deleting room {room_number} discards an exit to an \
-                     unshared map; undo will recreate it without its destination"
-                );
-            }
-            let slot = next_slot;
-            next_slot += 1;
-            seeds.push((slot, ResolvedId::Exit(exit.id)));
-
-            undo_late.push(Mutation::CreateExit {
-                room_key: room_key.clone(),
-                args: exit_args_from_cache(exit, cleared),
-                follow_up: Some(exit_updates_from_cache(exit)),
-                slot,
-            });
+        // A place the viewer can't write keeps what the delete took.
+        if super::secrets::can_write(&area, source) {
+            source_undo.extend(part_writes(
+                &document,
+                part.undo,
+                part.inbound,
+                "Restore deleted selection",
+            ));
         }
     }
 
-    // Deleting a room nulls the destination of every exit that pointed at it
-    // (the server cascades this, and `Mapper::delete_room` clears the same
-    // exits in their own maps). Capture an `UpdateExit` restore for each
-    // such inbound exit so undo re-links it. Exits hosted by a room that is
-    // *also* being deleted are restored by that room's own exit recreation
-    // above, so they are skipped here.
-    let deleted_rooms: HashSet<RoomKey> = selection
-        .rooms()
-        .map(|room_number| RoomKey::new(area_id, room_number))
-        .collect();
+    let document = Document::map(&area);
+    let part = delete_in(
+        &document,
+        &map_rooms.iter().copied().map(RoomAddress::map).collect(),
+        &BTreeSet::new(),
+        &selected,
+    );
+    redo.extend(part_writes(
+        &document,
+        part.redo
+            .into_iter()
+            .map(|operation| vec![operation])
+            .collect(),
+        Vec::new(),
+        "Delete selection",
+    ));
+    let mut undo = part_writes(
+        &document,
+        part.undo,
+        part.inbound,
+        "Restore deleted selection",
+    );
+
+    // Another map's exits into a deleted room lose their destination with
+    // it (the server cascades this, and `Mapper::delete_room` clears the
+    // same exits in their own maps); undo re-links each.
     for host_area in atlas.areas() {
         let host_area_id = *host_area.get_id();
+        if host_area_id == area_id {
+            continue;
+        }
         for host_room in host_area.get_rooms() {
             let host_key = RoomKey::new(host_area_id, host_room.get_room_number());
-            if deleted_rooms.contains(&host_key) {
-                continue;
-            }
             for exit in host_room.get_exits() {
-                // Members of an explicitly deleted link don't survive the
-                // delete at all — their restore (with destination) rides the
-                // link's own CreateExit batch. A relink here would enqueue
-                // an UpdateExit for an exit that no longer exists, wedging
-                // the sync queue on ExitNotFound.
-                if restored_connections.contains(&exit.connection_id) {
-                    continue;
-                }
-                let (Some(to_area_id), Some(to_room_number)) =
-                    (exit.to_area_id, exit.to_room_number)
-                else {
-                    continue;
-                };
-                if deleted_rooms.contains(&RoomKey::new(to_area_id, to_room_number)) {
-                    undo_late.push(Mutation::UpdateExit {
+                if exit.to_area_id == Some(area_id)
+                    && exit
+                        .to_room_number
+                        .is_some_and(|number| map_rooms.contains(&number))
+                {
+                    undo.push(Mutation::UpdateExit {
                         room_key: host_key.clone(),
-                        id: IdRef::Known(exit.id),
+                        id: exit.id,
                         updates: exit_updates_from_cache(exit),
                     });
                 }
@@ -1179,6 +1582,8 @@ pub fn delete_selection(
         }
     }
 
+    let mut seeds = Vec::new();
+    let mut next_slot: SlotId = 0;
     for label_id in selection.labels() {
         let Some(label) = area.get_label(&label_id) else {
             continue;
@@ -1191,12 +1596,11 @@ pub fn delete_selection(
             area_id,
             id: IdRef::Slot(slot),
         });
-        undo_late.push(Mutation::CreateLabel {
+        undo.push(Mutation::CreateLabel {
             area_id,
             args: LabelArgs {
                 // Recreation mints a fresh identity at apply time.
                 id: None,
-                is_secret: cleared.then_some(label.is_secret),
                 level: label.level,
                 x: label.x,
                 y: label.y,
@@ -1228,12 +1632,11 @@ pub fn delete_selection(
             area_id,
             id: IdRef::Slot(slot),
         });
-        undo_late.push(Mutation::CreateShape {
+        undo.push(Mutation::CreateShape {
             area_id,
             args: ShapeArgs {
                 // Recreation mints a fresh identity at apply time.
                 id: None,
-                is_secret: cleared.then_some(shape.is_secret),
                 level: shape.level,
                 x: shape.x,
                 y: shape.y,
@@ -1254,15 +1657,7 @@ pub fn delete_selection(
     if redo.is_empty() {
         return None;
     }
-
-    // Rooms must exist again before their properties and exits restore,
-    // and both before explicitly-deleted links reattach to them.
-    let mut undo = Vec::new();
-    if !undo_rooms.is_empty() {
-        undo.push(Mutation::UpsertRooms(area_id, undo_rooms));
-    }
-    undo.extend(undo_late);
-    undo.extend(link_restores);
+    undo.extend(source_undo);
 
     let mut command = Command::new(redo, undo);
     for (slot, id) in seeds {
@@ -1271,29 +1666,54 @@ pub fn delete_selection(
     Some(command)
 }
 
+/// A label's or shape's update and delete go to whichever source holds it,
+/// so every edit to an existing drawing works the same for a Secret's.
+fn in_owner(batch: AreaMutationBatch, owner: Option<smudgy_cloud::SourceId>) -> AreaMutationBatch {
+    match owner {
+        Some(source) => batch.in_source(source),
+        None => batch,
+    }
+}
+
+/// The source holding a label, when it is not the map itself.
+fn label_source(
+    mapper: &Mapper,
+    area_id: AreaId,
+    label_id: LabelId,
+) -> Option<smudgy_cloud::SourceId> {
+    let atlas = mapper.get_current_atlas();
+    let area = atlas.get_area(&area_id)?;
+    let (layer, _) = area.find_label(&label_id)?;
+    layer.map(smudgy_cloud::mapper::area_cache::SourceLayer::source)
+}
+
+/// The source holding a shape, when it is not the map itself.
+fn shape_source(
+    mapper: &Mapper,
+    area_id: AreaId,
+    shape_id: ShapeId,
+) -> Option<smudgy_cloud::SourceId> {
+    let atlas = mapper.get_current_atlas();
+    let area = atlas.get_area(&area_id)?;
+    let (layer, _) = area.find_shape(&shape_id)?;
+    layer.map(smudgy_cloud::mapper::area_cache::SourceLayer::source)
+}
+
 /// `ExitArgs` recreating a cached exit (everything `ExitArgs` can express).
-/// `restore_secrecy` carries the cached `is_secret` flag into the create
-/// body — pass it only when the viewer is cleared for secrets (the server
-/// uniform-404s the field otherwise); recreation then defaults to public,
-/// which is the most the viewer's projection can know.
-fn exit_args_from_cache(
-    exit: &smudgy_cloud::mapper::exit_cache::ExitCache,
-    restore_secrecy: bool,
-) -> ExitArgs {
+fn exit_args_from_cache(exit: &smudgy_cloud::mapper::exit_cache::ExitCache) -> ExitArgs {
     ExitArgs {
+        to_source: exit.to_exit().to_source,
         // Recreation mints a fresh identity at apply time.
         id: None,
         connection_id: None,
         new_connection_id: None,
-        is_secret: restore_secrecy.then_some(exit.is_secret),
         from_direction: exit.from_direction,
-        to_area_id: exit.to_area_id,
+        to_area_id: exit.to_exit().to_area_id,
         to_room_number: exit.to_room_number,
         to_direction: exit.to_direction,
         path: exit.path.clone(),
         is_hidden: exit.is_hidden,
-        is_closed: exit.is_closed,
-        is_locked: exit.is_locked,
+        door: exit.door.clone(),
         weight: exit.weight,
         command: exit.command.clone(),
     }
@@ -1307,25 +1727,28 @@ fn exit_args_from_cache(
 /// therefore carry `clear_to: Some(true)`, or replaying it would silently
 /// keep whatever destination is current. Redacted destinations
 /// (`to_unknown`) are left untouched: the server still holds the real
-/// link, and `clear_to` would destroy it.
-fn exit_updates_from_cache(exit: &smudgy_cloud::mapper::exit_cache::ExitCache) -> ExitUpdates {
+/// link, and `clear_to` would destroy it. The same holds for `command` and
+/// `path`: an exit without one is written `""` (none), never omitted, so
+/// replaying the snapshot takes away one written since.
+pub(super) fn exit_updates_from_cache(
+    exit: &smudgy_cloud::mapper::exit_cache::ExitCache,
+) -> ExitUpdates {
     let destination_empty = exit.to_area_id.is_none()
         && exit.to_room_number.is_none()
         && exit.to_direction.is_none()
         && !exit.to_unknown;
     ExitUpdates {
-        is_secret: None,
+        to_source: Some(exit.to_exit().to_source),
         clear_to: destination_empty.then_some(true),
         from_direction: Some(exit.from_direction),
-        to_area_id: exit.to_area_id,
+        to_area_id: exit.to_exit().to_area_id,
         to_room_number: exit.to_room_number,
         to_direction: exit.to_direction,
-        path: exit.path.clone(),
+        path: Some(exit.path.clone().unwrap_or_default()),
         is_hidden: Some(exit.is_hidden),
-        is_closed: Some(exit.is_closed),
-        is_locked: Some(exit.is_locked),
+        door: Some(exit.door.clone()),
         weight: Some(exit.weight),
-        command: exit.command.clone(),
+        command: Some(exit.command.clone().unwrap_or_default()),
     }
 }
 
@@ -1333,8 +1756,9 @@ fn exit_updates_from_cache(exit: &smudgy_cloud::mapper::exit_cache::ExitCache) -
 #[derive(Debug, Clone, Copy)]
 pub enum NewExitTarget {
     /// An existing room.
-    Room(RoomNumber),
-    /// A new room created at this position/level as part of the command.
+    Room(PlacedRoom),
+    /// A new room created at this position/level as part of the command,
+    /// in the place the link goes.
     NewRoom {
         room_number: RoomNumber,
         at: iced::Point,
@@ -1374,9 +1798,21 @@ impl Default for NewLinkOptions {
     }
 }
 
-/// Creates a Link-tool draft as one compound mutation. IDs are allocated
-/// before enqueue so room + Connection + traversal creation is atomic and
-/// retry-safe.
+/// A Link-tool link: the place it is written to, and its ends.
+#[derive(Debug, Clone, Copy)]
+pub struct NewLink {
+    pub area_id: AreaId,
+    /// The map, or the Secret (or Private) the link goes into. Each end is
+    /// a map room or one of this place's own rooms.
+    pub place: smudgy_cloud::SourceId,
+    pub from: PlacedRoom,
+    pub from_direction: smudgy_cloud::ExitDirection,
+    pub to: NewExitTarget,
+    pub to_direction: smudgy_cloud::ExitDirection,
+}
+
+/// [`create_link`] between map rooms, into the map.
+#[cfg(test)]
 #[must_use]
 pub fn create_exit_with_options(
     area_id: AreaId,
@@ -1386,54 +1822,103 @@ pub fn create_exit_with_options(
     to_direction: smudgy_cloud::ExitDirection,
     options: NewLinkOptions,
 ) -> Command {
+    let link = NewLink {
+        area_id,
+        place: smudgy_cloud::SourceId::Map,
+        from: PlacedRoom::map(from),
+        from_direction,
+        to: *to,
+        to_direction,
+    };
+    create_link(&link, options)
+        .map(|(command, _)| command)
+        .expect("a link between map rooms goes into the map")
+}
+
+/// Creates a Link-tool link where it goes, as one compound mutation, with
+/// the id of the link it makes (or pairs with). IDs are allocated before
+/// enqueue so room + Connection + traversal creation is atomic and
+/// retry-safe. Built in wire form, so an end may be a map room the place
+/// keeps nothing for yet. `None` when an end is a room of another place.
+#[must_use]
+pub fn create_link(link: &NewLink, options: NewLinkOptions) -> Option<(Command, ConnectionId)> {
+    let place = link.place;
+    // A room on the wire: a map room, or one of `place`'s own rooms.
+    let wire = |room: PlacedRoom| {
+        if room.source.is_map() {
+            Some((room.number, None))
+        } else if room.source == place {
+            Some((room.number, Some(place)))
+        } else {
+            None
+        }
+    };
+    let own = (!place.is_map()).then_some(place);
+    let from = wire(link.from)?;
+    let to = match link.to {
+        NewExitTarget::Room(room) => Some(wire(room)?),
+        NewExitTarget::NewRoom { room_number, .. } => Some((room_number, own)),
+        NewExitTarget::Dangling => None,
+    };
+    let (area_id, from_direction, to_direction) =
+        (link.area_id, link.from_direction, link.to_direction);
     let connection_id = ConnectionId::new();
     let forward_id = ExitId::new();
-    let dangling = matches!(to, NewExitTarget::Dangling);
+    let dangling = matches!(link.to, NewExitTarget::Dangling);
     let one_way = options.one_way || dangling || options.pair_with.is_some();
     let reverse_id = (!one_way).then(ExitId::new);
     let mut operations = Vec::new();
-    let to_room = match *to {
-        NewExitTarget::Room(room_number) => Some(room_number),
-        NewExitTarget::NewRoom {
-            room_number,
-            at,
-            level,
-        } => {
-            operations.push(AreaMutation::UpsertRoom {
+    if let NewExitTarget::NewRoom {
+        room_number,
+        at,
+        level,
+    } = link.to
+    {
+        let body = RoomUpdates {
+            title: Some(String::new()),
+            description: Some(String::new()),
+            level: Some(level),
+            x: Some(at.x),
+            y: Some(at.y),
+            color: Some(String::new()),
+            external_id: None,
+        };
+        operations.push(if own.is_some() {
+            AreaMutation::CreateRoom {
+                room_source: own,
                 room_number,
-                body: RoomUpdates {
-                    is_secret: None,
-                    title: Some(String::new()),
-                    description: Some(String::new()),
-                    level: Some(level),
-                    x: Some(at.x),
-                    y: Some(at.y),
-                    color: Some(String::new()),
-                    external_id: None,
-                },
-            });
-            Some(room_number)
-        }
-        NewExitTarget::Dangling => None,
-    };
+                body,
+            }
+        } else {
+            AreaMutation::UpsertRoom {
+                room_source: None,
+                room_number,
+                body,
+            }
+        });
+    }
     if options.pair_with.is_none() {
         let (from_side, from_offset) = default_anchor_for_direction(from_direction, None);
         let mut endpoint_a = ConnectionEndpoint {
-            room_number: from,
+            source: from.1,
+            room_number: from.0,
             side: from_side,
             port_offset: from_offset,
             port_mode: PortMode::AutoPinned,
         };
-        let mut endpoint_b = to_room.map(|to_room| {
+        let mut endpoint_b = to.map(|(room_number, source)| {
             let (to_side, to_offset) = default_anchor_for_direction(to_direction, None);
             ConnectionEndpoint {
-                room_number: to_room,
+                source,
+                room_number,
                 side: to_side,
                 port_offset: to_offset,
                 port_mode: PortMode::AutoPinned,
             }
         });
-        if endpoint_b.is_some_and(|endpoint| endpoint_a.room_number > endpoint.room_number) {
+        if endpoint_b.is_some_and(|endpoint| {
+            endpoint_a.address().connection_order_key() > endpoint.address().connection_order_key()
+        }) {
             std::mem::swap(
                 &mut endpoint_a,
                 endpoint_b.as_mut().expect("checked endpoint B"),
@@ -1456,28 +1941,33 @@ pub fn create_exit_with_options(
     }
     let attached_connection_id = options.pair_with.unwrap_or(connection_id);
     operations.push(AreaMutation::CreateExit {
-        room_number: from,
+        room_source: from.1,
+        room_number: from.0,
         body: ExitArgs {
             id: Some(forward_id),
             connection_id: Some(attached_connection_id),
             from_direction,
-            to_area_id: to_room.map(|_| area_id),
-            to_room_number: to_room,
-            to_direction: to_room.map(|_| to_direction),
+            to_area_id: to.map(|_| area_id),
+            to_room_number: to.map(|(number, _)| number),
+            to_source: to.and_then(|(_, source)| source),
+            to_direction: to.map(|_| to_direction),
             command: options.from_command.clone(),
             weight: 1.0,
             ..Default::default()
         },
     });
     if let Some(reverse_id) = reverse_id {
+        let (to_room, to_source) = to.expect("a bidirectional link has a destination room");
         operations.push(AreaMutation::CreateExit {
-            room_number: to_room.expect("a bidirectional link has a destination room"),
+            room_source: to_source,
+            room_number: to_room,
             body: ExitArgs {
                 id: Some(reverse_id),
                 connection_id: Some(connection_id),
                 from_direction: to_direction,
                 to_area_id: Some(area_id),
-                to_room_number: Some(from),
+                to_room_number: Some(from.0),
+                to_source: from.1,
                 to_direction: Some(from_direction),
                 command: options.to_command.clone(),
                 weight: 1.0,
@@ -1489,7 +1979,7 @@ pub fn create_exit_with_options(
     let intent = if options.pair_with.is_some() {
         "Pair reciprocal traversal".to_string()
     } else {
-        match (to, one_way) {
+        match (link.to, one_way) {
             (NewExitTarget::NewRoom { room_number, .. }, false) => {
                 format!("Create room {room_number} and bidirectional link")
             }
@@ -1500,11 +1990,6 @@ pub fn create_exit_with_options(
             (_, true) => "Create one-way link".to_string(),
         }
     };
-    let redo = Mutation::AreaBatch {
-        area_id,
-        operations,
-        description: intent,
-    };
     let mut inverse = if options.pair_with.is_some() {
         vec![AreaMutation::DeleteExit {
             exit_id: forward_id,
@@ -1512,40 +1997,39 @@ pub fn create_exit_with_options(
     } else {
         vec![AreaMutation::DeleteLink { connection_id }]
     };
-    if let NewExitTarget::NewRoom { room_number, .. } = to {
+    if let NewExitTarget::NewRoom { room_number, .. } = link.to {
         inverse.push(AreaMutation::DeleteRoom {
-            room_number: *room_number,
+            room_source: own,
+            room_number,
         });
     }
-    let undo = Mutation::AreaBatch {
-        area_id,
-        operations: inverse,
-        description: "Undo link creation".to_string(),
+    let batch = |operations, description: String| match own {
+        Some(source) => Mutation::SourceBatch {
+            area_id,
+            source,
+            operations,
+            description,
+            split_paired_exit: false,
+        },
+        None => Mutation::AreaBatch {
+            area_id,
+            operations,
+            description,
+        },
     };
-    Command::new(vec![redo], vec![undo])
+    let command = Command::new(
+        vec![batch(operations, intent)],
+        vec![batch(inverse, "Undo link creation".to_string())],
+    );
+    Some((command, attached_connection_id))
 }
 
-/// Edits shared Connection geometry/appearance through one semantic
-/// envelope and captures exactly the touched fields for undo.
-#[must_use]
-pub fn edit_connection(
-    atlas: &Arc<AtlasCache>,
-    area_id: AreaId,
-    connection_id: ConnectionId,
-    field: FieldId,
-    updates: ConnectionUpdates,
-    description: impl Into<String>,
-) -> Option<Command> {
-    let area = atlas.get_area(&area_id)?;
-    let current = area.get_connection(connection_id)?;
-    // `ConnectionUpdates` deliberately cannot clear endpoint B (topology
-    // changes travel through the semantic link operations), so an edit that
-    // would *set* it on a connection without one has no expressible inverse.
-    // Refuse it rather than record an undo that silently keeps the endpoint.
-    if updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
-        return None;
-    }
-    let inverse = ConnectionUpdates {
+/// The inverse of `updates` against `current`: exactly the touched fields.
+fn connection_inverse(
+    current: &smudgy_cloud::Connection,
+    updates: &ConnectionUpdates,
+) -> ConnectionUpdates {
+    ConnectionUpdates {
         endpoint_a: updates.endpoint_a.map(|_| current.endpoint_a),
         endpoint_b: updates.endpoint_b.and(current.endpoint_b),
         routing: updates.routing.map(|_| current.routing),
@@ -1558,7 +2042,33 @@ pub fn edit_connection(
         dash: updates.dash.map(|_| current.dash),
         color: updates.color.as_ref().map(|_| current.color.clone()),
         thickness: updates.thickness.map(|_| current.thickness),
-    };
+    }
+}
+
+/// Edits shared Connection geometry/appearance through one semantic
+/// envelope and captures exactly the touched fields for undo. A Secret's
+/// link is edited in its Secret; `updates` name its rooms in that
+/// qualified room addresses.
+#[must_use]
+pub fn edit_connection(
+    atlas: &Arc<AtlasCache>,
+    area_id: AreaId,
+    connection_id: ConnectionId,
+    field: FieldId,
+    updates: ConnectionUpdates,
+    description: impl Into<String>,
+) -> Option<Command> {
+    let area = atlas.get_area(&area_id)?;
+    let document = Document::of_connection(&area, connection_id)?;
+    let current = document.content().get_connection(connection_id)?;
+    // `ConnectionUpdates` deliberately cannot clear endpoint B (topology
+    // changes travel through the semantic link operations), so an edit that
+    // would *set* it on a connection without one has no expressible inverse.
+    // Refuse it rather than record an undo that silently keeps the endpoint.
+    if updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
+        return None;
+    }
+    let inverse = connection_inverse(current, &updates);
     let description = description.into();
     // Coalescing keeps the first command's undo and the last redo, which
     // only inverts correctly when every merged command touches the same
@@ -1579,22 +2089,20 @@ pub fn edit_connection(
     };
     Some(
         Command::new(
-            vec![Mutation::AreaBatch {
-                area_id,
-                operations: vec![AreaMutation::UpdateConnection {
+            vec![document.batch(
+                vec![AreaMutation::UpdateConnection {
                     connection_id,
                     body: updates,
                 }],
-                description: description.clone(),
-            }],
-            vec![Mutation::AreaBatch {
-                area_id,
-                operations: vec![AreaMutation::UpdateConnection {
+                description.clone(),
+            )],
+            vec![document.batch(
+                vec![AreaMutation::UpdateConnection {
                     connection_id,
                     body: inverse,
                 }],
-                description: format!("Undo {description}"),
-            }],
+                format!("Undo {description}"),
+            )],
         )
         .coalescing(key),
     )
@@ -1627,7 +2135,8 @@ pub fn accept_automatic_route(
 
 /// Applies a previewed group of Connection edits as one undoable area
 /// mutation. Wall-port redistribution uses this so every affected endpoint
-/// and orthogonal elbow moves in one CAS envelope.
+/// and orthogonal elbow moves in one CAS envelope. Every edited link lives
+/// in one document: the map's, or one Secret's.
 #[must_use]
 pub fn edit_connections(
     atlas: &Arc<AtlasCache>,
@@ -1636,31 +2145,16 @@ pub fn edit_connections(
     description: impl Into<String>,
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
-    if edits.is_empty() {
-        return None;
-    }
+    let document = Document::of_connection(&area, edits.first()?.0)?;
     let mut redo = Vec::with_capacity(edits.len());
     let mut undo = Vec::with_capacity(edits.len());
     for (connection_id, updates) in edits {
-        let current = area.get_connection(connection_id)?;
+        let current = document.content().get_connection(connection_id)?;
         // Same endpoint-B inverse rule as `edit_connection` above.
         if updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
             return None;
         }
-        let inverse = ConnectionUpdates {
-            endpoint_a: updates.endpoint_a.map(|_| current.endpoint_a),
-            endpoint_b: updates.endpoint_b.and(current.endpoint_b),
-            routing: updates.routing.map(|_| current.routing),
-            segment_shape: updates.segment_shape.map(|_| current.segment_shape),
-            corner: updates.corner.map(|_| current.corner),
-            route_points: updates
-                .route_points
-                .as_ref()
-                .map(|_| current.route_points.clone()),
-            dash: updates.dash.map(|_| current.dash),
-            color: updates.color.as_ref().map(|_| current.color.clone()),
-            thickness: updates.thickness.map(|_| current.thickness),
-        };
+        let inverse = connection_inverse(current, &updates);
         redo.push(AreaMutation::UpdateConnection {
             connection_id,
             body: updates,
@@ -1672,16 +2166,8 @@ pub fn edit_connections(
     }
     let description = description.into();
     Some(Command::new(
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: redo,
-            description: description.clone(),
-        }],
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: undo,
-            description: format!("Undo {description}"),
-        }],
+        vec![document.batch(redo, description.clone())],
+        vec![document.batch(undo, format!("Undo {description}"))],
     ))
 }
 
@@ -1693,7 +2179,9 @@ pub fn delete_waypoint(
     index: usize,
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
-    let connection = area.get_connection(connection_id)?;
+    let document = Document::of_connection(&area, connection_id)?;
+    let content = document.content();
+    let connection = content.get_connection(connection_id)?;
     if index >= connection.route_points.len() {
         return None;
     }
@@ -1705,7 +2193,7 @@ pub fn delete_waypoint(
             ConnectionRouting::Manual | ConnectionRouting::Automatic
         )
     {
-        let render = area.get_room_connections().iter().find(|render| {
+        let render = content.get_room_connections().iter().find(|render| {
             render.connection_id == connection_id && render.geometry.stub_tip_b.is_some()
         })?;
         points = smudgy_cloud::connection_geometry::orthogonalize_route(
@@ -1728,31 +2216,77 @@ pub fn delete_waypoint(
     )
 }
 
-fn restore_exit_args(
+pub(super) fn restore_exit_args(
     exit: &smudgy_cloud::mapper::exit_cache::ExitCache,
     connection_id: ConnectionId,
-    restore_secrecy: bool,
 ) -> ExitArgs {
     ExitArgs {
+        to_source: exit.to_exit().to_source,
         id: Some(exit.id),
         connection_id: Some(connection_id),
         new_connection_id: None,
-        is_secret: restore_secrecy.then_some(exit.is_secret),
         from_direction: exit.from_direction,
-        to_area_id: exit.to_area_id,
+        to_area_id: exit.to_exit().to_area_id,
         to_room_number: exit.to_room_number,
         to_direction: exit.to_direction,
         path: exit.path.clone(),
         is_hidden: exit.is_hidden,
-        is_closed: exit.is_closed,
-        is_locked: exit.is_locked,
+        door: exit.door.clone(),
         weight: exit.weight,
         command: exit.command.clone(),
     }
 }
 
+/// Every member exit of `connection_id` in `content`, with its room, in a
+/// stable (id) order.
+pub(super) fn link_members(
+    content: &smudgy_cloud::mapper::area_cache::AreaCache,
+    connection_id: ConnectionId,
+) -> Vec<(RoomAddress, &smudgy_cloud::mapper::exit_cache::ExitCache)> {
+    let mut members: Vec<_> = content
+        .document_rooms()
+        .flat_map(|room| {
+            room.get_exits()
+                .iter()
+                .filter(|exit| exit.connection_id == connection_id)
+                .map(move |exit| (room.address(), exit))
+        })
+        .collect();
+    members.sort_by_key(|(_, exit)| exit.id.0);
+    members
+}
+
+/// The "Restore deleted link" recipe, with qualified room addresses: the
+/// link's row by its id, with its route and style, then each member exit
+/// under its own id. `remnant` first deletes what a delete left of it (a
+/// surviving member keeps a one-ended link alive, its route cleared).
+pub(super) fn restore_link(
+    content: &smudgy_cloud::mapper::area_cache::AreaCache,
+    connection: &smudgy_cloud::Connection,
+    remnant: bool,
+) -> Vec<AreaMutation> {
+    let mut operations = Vec::new();
+    if remnant {
+        operations.push(AreaMutation::DeleteLink {
+            connection_id: connection.id,
+        });
+    }
+    operations.push(AreaMutation::CreateConnection {
+        body: ConnectionArgs::from(connection),
+    });
+    for (room_number, exit) in link_members(content, connection.id) {
+        operations.push(AreaMutation::CreateExit {
+            room_source: room_number.wire_source(),
+            room_number: room_number.number,
+            body: restore_exit_args(exit, connection.id),
+        });
+    }
+    operations
+}
+
 /// Delete a selected visual link and every traversal it owns. Undo restores
-/// the same stable Connection and Exit identities in one envelope.
+/// the same stable Connection and Exit identities in one envelope. A
+/// Secret's link is deleted in its Secret.
 #[must_use]
 pub fn delete_connection(
     atlas: &Arc<AtlasCache>,
@@ -1760,151 +2294,23 @@ pub fn delete_connection(
     connection_id: ConnectionId,
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
-    let connection = area.get_connection(connection_id)?;
-    let cleared = area.effective_access().is_cleared_for_secrets();
-    let mut restore = vec![AreaMutation::CreateConnection {
-        body: ConnectionArgs::from(connection),
-    }];
-    let mut members = Vec::new();
-    for room in area.get_rooms() {
-        for exit in room.get_exits() {
-            if exit.connection_id == connection_id {
-                members.push((room.get_room_number(), exit));
-            }
-        }
-    }
-    members.sort_by_key(|(_, exit)| exit.id.0);
-    for (room_number, exit) in &members {
-        restore.push(AreaMutation::CreateExit {
-            room_number: *room_number,
-            body: restore_exit_args(exit, connection_id, cleared),
-        });
-    }
+    let document = Document::of_connection(&area, connection_id)?;
+    let content = document.content();
+    let connection = content.get_connection(connection_id)?;
+    let members = link_members(content, connection_id).len();
     Some(Command::new(
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![AreaMutation::DeleteLink { connection_id }],
-            description: if members.len() == 2 {
-                "Delete bidirectional link".to_string()
+        vec![document.batch(
+            vec![AreaMutation::DeleteLink { connection_id }],
+            if members == 2 {
+                "Delete bidirectional link"
             } else {
-                "Delete link".to_string()
+                "Delete link"
             },
-        }],
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: restore,
-            description: "Restore deleted link".to_string(),
-        }],
-    ))
-}
-
-#[must_use]
-pub fn unlink_exit(area_id: AreaId, exit_id: ExitId, old_connection_id: ConnectionId) -> Command {
-    let new_connection_id = ConnectionId::new();
-    Command::new(
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![AreaMutation::Unlink {
-                exit_id,
-                new_connection_id,
-            }],
-            description: "Unlink selected direction".to_string(),
-        }],
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![AreaMutation::Pair {
-                keep_connection_id: old_connection_id,
-                merge_connection_id: new_connection_id,
-            }],
-            description: "Restore linked directions".to_string(),
-        }],
-    )
-}
-
-/// Makes a one-way link two-way: creates the reciprocal exit on the
-/// destination room, attached to the same Connection (whose kind the
-/// backend re-derives from the final member topology). The new exit's
-/// direction is the stored return direction, or the opposite of the
-/// forward direction. Undo deletes exactly that exit.
-///
-/// Refuses links that are not exactly one member, have no same-area
-/// destination (dangling/external), or whose destination was redacted.
-#[must_use]
-pub fn add_return_exit(
-    atlas: &Arc<AtlasCache>,
-    area_id: AreaId,
-    connection_id: ConnectionId,
-) -> Option<Command> {
-    let area = atlas.get_area(&area_id)?;
-    let connection = area.get_connection(connection_id)?;
-    // A two-member self-loop is invalid membership; the loop arc already
-    // covers both senses visually.
-    if connection.kind == smudgy_cloud::ConnectionKind::SelfLoop {
-        return None;
-    }
-    let mut members = area.get_rooms().iter().flat_map(|room| {
-        room.get_exits()
-            .iter()
-            .filter(|exit| exit.connection_id == connection_id)
-            .map(move |exit| (room.get_room_number(), exit))
-    });
-    let (from_room, exit) = members.next()?;
-    if members.next().is_some() || exit.to_unknown {
-        return None;
-    }
-    let to_room = exit.to_room_number?;
-    if exit.to_area_id != Some(area_id) {
-        return None;
-    }
-    let destination = area.get_room(&to_room)?;
-    let return_direction = exit
-        .to_direction
-        .unwrap_or_else(|| exit.from_direction.opposite());
-    // Refuse when the destination already answers: an exit in the return
-    // direction would collide, and an existing exit back toward the origin
-    // is a reciprocal that should be Paired instead of duplicated.
-    if destination.get_exits().iter().any(|other| {
-        other.from_direction == return_direction
-            || (other.to_area_id == Some(area_id) && other.to_room_number == Some(from_room))
-    }) {
-        return None;
-    }
-
-    let cleared = area.effective_access().is_cleared_for_secrets();
-    let new_id = ExitId::new();
-    let body = ExitArgs {
-        id: Some(new_id),
-        connection_id: Some(connection_id),
-        new_connection_id: None,
-        // The return of a secret/closed/locked passage is the same
-        // passage: mirror those, but not the direction-specific
-        // path/command.
-        is_secret: (cleared && exit.is_secret).then_some(true),
-        from_direction: return_direction,
-        to_area_id: Some(area_id),
-        to_room_number: Some(from_room),
-        to_direction: Some(exit.from_direction),
-        path: None,
-        is_hidden: exit.is_hidden,
-        is_closed: exit.is_closed,
-        is_locked: exit.is_locked,
-        weight: exit.weight,
-        command: None,
-    };
-    Some(Command::new(
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![AreaMutation::CreateExit {
-                room_number: to_room,
-                body,
-            }],
-            description: "Add return direction".to_string(),
-        }],
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![AreaMutation::DeleteExit { exit_id: new_id }],
-            description: "Remove return direction".to_string(),
-        }],
+        )],
+        vec![document.batch(
+            restore_link(content, connection, false),
+            "Restore deleted link",
+        )],
     ))
 }
 
@@ -1918,25 +2324,20 @@ pub fn pair_connections(
     merge_connection_id: ConnectionId,
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
-    let merge = area.get_connection(merge_connection_id)?.clone();
-    let moved_exit = area
-        .get_rooms()
-        .iter()
-        .flat_map(|room| room.get_exits())
-        .find(|exit| exit.connection_id == merge_connection_id)?
-        .id;
+    let document = Document::of_connection(&area, keep_connection_id)?;
+    let content = document.content();
+    let merge = content.get_connection(merge_connection_id)?.clone();
+    let moved_exit = link_members(content, merge_connection_id).first()?.1.id;
     Some(Command::new(
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![AreaMutation::Pair {
+        vec![document.batch(
+            vec![AreaMutation::Pair {
                 keep_connection_id,
                 merge_connection_id,
             }],
-            description: "Pair reciprocal connections".to_string(),
-        }],
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![
+            "Pair reciprocal connections",
+        )],
+        vec![document.batch(
+            vec![
                 AreaMutation::Unlink {
                     exit_id: moved_exit,
                     new_connection_id: merge_connection_id,
@@ -1956,31 +2357,37 @@ pub fn pair_connections(
                     },
                 },
             ],
-            description: "Unpair reciprocal connections".to_string(),
-        }],
+            "Unpair reciprocal connections",
+        )],
     ))
 }
 
-/// Adds a default unconnected exit to a room (edited in the inspector).
-#[must_use]
-pub fn add_default_exit(area_id: AreaId, room_number: RoomNumber) -> Command {
-    let room_key = RoomKey::new(area_id, room_number);
-    Command::new(
-        vec![Mutation::CreateExit {
-            room_key: room_key.clone(),
-            args: ExitArgs {
-                from_direction: smudgy_cloud::ExitDirection::Special,
-                weight: 1.0,
-                ..Default::default()
-            },
-            follow_up: None,
-            slot: 0,
-        }],
-        vec![Mutation::DeleteExit {
-            room_key,
-            id: IdRef::Slot(0),
-        }],
-    )
+/// An exit as the editor addresses it: the place whose document holds it,
+/// its qualified anchor room, and its id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitRef {
+    pub area_id: AreaId,
+    pub place: smudgy_cloud::SourceId,
+    pub room: RoomAddress,
+    pub id: ExitId,
+}
+
+/// The document holding `exit`, with the cached exit.
+fn exit_in<'a>(
+    area: &'a smudgy_cloud::mapper::area_cache::AreaCache,
+    exit: ExitRef,
+) -> Option<(
+    Document<'a>,
+    &'a smudgy_cloud::mapper::exit_cache::ExitCache,
+)> {
+    let document = Document::of(area, exit.place)?;
+    let cached = document
+        .content()
+        .get_room_at(exit.room)?
+        .get_exits()
+        .iter()
+        .find(|cached| cached.id == exit.id)?;
+    Some((document, cached))
 }
 
 /// Edits an exit by mutating a full-field snapshot of its current state;
@@ -1990,17 +2397,18 @@ pub fn add_default_exit(area_id: AreaId, room_number: RoomNumber) -> Command {
 /// `clear_to` is recomputed after the edit: set when the resulting
 /// destination is empty (and the prior one wasn't merely redacted), dropped
 /// when the edit establishes one (`clear_to` overrides `to_*` on the wire).
+///
+/// `change` sees the snapshot as the editor shows it: a destination in this
+/// map names its room by its number on the map.
 #[must_use]
 pub fn edit_exit_field(
     atlas: &Arc<AtlasCache>,
-    room_key: RoomKey,
-    exit_id: ExitId,
+    exit_ref: ExitRef,
     field: FieldId,
     change: impl FnOnce(&mut ExitUpdates),
 ) -> Option<Command> {
-    let area = atlas.get_area(&room_key.area_id)?;
-    let room = area.get_room(&room_key.room_number)?;
-    let exit = room.get_exits().iter().find(|exit| exit.id == exit_id)?;
+    let area = atlas.get_area(&exit_ref.area_id)?;
+    let (document, exit) = exit_in(&area, exit_ref)?;
 
     let prior = exit_updates_from_cache(exit);
     let mut updates = prior.clone();
@@ -2009,23 +2417,14 @@ pub fn edit_exit_field(
         || updates.to_room_number.is_some()
         || updates.to_direction.is_some();
     updates.clear_to = (!destination_expressed && !exit.to_unknown).then_some(true);
-    let area_id = room_key.area_id;
 
     Some(
         Command::new(
-            vec![Mutation::UpdateExit {
-                room_key: room_key.clone(),
-                id: IdRef::Known(exit_id),
-                updates,
-            }],
-            vec![Mutation::UpdateExit {
-                room_key,
-                id: IdRef::Known(exit_id),
-                updates: prior,
-            }],
+            vec![document.update_exit(exit_ref.room, exit_ref.id, updates)],
+            vec![document.update_exit(exit_ref.room, exit_ref.id, prior)],
         )
         .coalescing(CoalesceKey {
-            entity: EntityRef::Exit(area_id, exit_id),
+            entity: EntityRef::Exit(exit_ref.area_id, exit_ref.id),
             field,
             detail: None,
         }),
@@ -2041,15 +2440,13 @@ pub fn edit_exit_field(
 #[must_use]
 pub fn edit_exit_with_endpoint(
     atlas: &Arc<AtlasCache>,
-    room_key: RoomKey,
-    exit_id: ExitId,
+    exit_ref: ExitRef,
     change: impl FnOnce(&mut ExitUpdates),
     connection_id: ConnectionId,
     connection_updates: ConnectionUpdates,
 ) -> Option<Command> {
-    let area = atlas.get_area(&room_key.area_id)?;
-    let room = area.get_room(&room_key.room_number)?;
-    let exit = room.get_exits().iter().find(|exit| exit.id == exit_id)?;
+    let area = atlas.get_area(&exit_ref.area_id)?;
+    let (document, exit) = exit_in(&area, exit_ref)?;
 
     let prior = exit_updates_from_cache(exit);
     let mut updates = prior.clone();
@@ -2058,106 +2455,36 @@ pub fn edit_exit_with_endpoint(
         || updates.to_room_number.is_some()
         || updates.to_direction.is_some();
     updates.clear_to = (!destination_expressed && !exit.to_unknown).then_some(true);
-    let area_id = room_key.area_id;
 
-    let current = area.get_connection(connection_id)?;
+    let current = document.content().get_connection(connection_id)?;
     // Same endpoint-B inverse rule as `edit_connection`.
     if connection_updates.endpoint_b.is_some() && current.endpoint_b.is_none() {
         return None;
     }
-    let inverse = ConnectionUpdates {
-        endpoint_a: connection_updates.endpoint_a.map(|_| current.endpoint_a),
-        endpoint_b: connection_updates.endpoint_b.and(current.endpoint_b),
-        routing: connection_updates.routing.map(|_| current.routing),
-        segment_shape: connection_updates
-            .segment_shape
-            .map(|_| current.segment_shape),
-        corner: connection_updates.corner.map(|_| current.corner),
-        route_points: connection_updates
-            .route_points
-            .as_ref()
-            .map(|_| current.route_points.clone()),
-        dash: connection_updates.dash.map(|_| current.dash),
-        color: connection_updates
-            .color
-            .as_ref()
-            .map(|_| current.color.clone()),
-        thickness: connection_updates.thickness.map(|_| current.thickness),
-    };
+    let inverse = connection_inverse(current, &connection_updates);
 
+    // Both edits retain their wire-qualified room addresses.
+    let operations = |exit_body: ExitUpdates, link_body: ConnectionUpdates| {
+        let mut operations = vec![AreaMutation::UpdateExit {
+            exit_id: exit_ref.id,
+            body: exit_body,
+        }];
+        operations.push(AreaMutation::UpdateConnection {
+            connection_id,
+            body: link_body,
+        });
+        operations
+    };
     Some(Command::new(
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![
-                AreaMutation::UpdateExit {
-                    exit_id,
-                    body: updates,
-                },
-                AreaMutation::UpdateConnection {
-                    connection_id,
-                    body: connection_updates,
-                },
-            ],
-            description: "Change exit direction".to_string(),
-        }],
-        vec![Mutation::AreaBatch {
-            area_id,
-            operations: vec![
-                AreaMutation::UpdateExit {
-                    exit_id,
-                    body: prior,
-                },
-                AreaMutation::UpdateConnection {
-                    connection_id,
-                    body: inverse,
-                },
-            ],
-            description: "Undo change exit direction".to_string(),
-        }],
+        vec![document.batch(
+            operations(updates, connection_updates),
+            "Change exit direction",
+        )],
+        vec![document.batch(operations(prior, inverse), "Undo change exit direction")],
     ))
 }
 
-/// Deletes one exit; undo recreates it (with a fresh backend id tracked
-/// through a slot).
-///
-/// Refuses exits whose destination was redacted (`to_unknown`): the real
-/// destination never reached this client, so an undo could only recreate
-/// the exit dangling — silently destroying the owner's cross-area link
-/// while claiming to have restored it. The inspector hides the delete
-/// affordance on those rows; this guards any other path.
-#[must_use]
-pub fn delete_exit(atlas: &Arc<AtlasCache>, room_key: RoomKey, exit_id: ExitId) -> Option<Command> {
-    let area = atlas.get_area(&room_key.area_id)?;
-    let room = area.get_room(&room_key.room_number)?;
-    let exit = room.get_exits().iter().find(|exit| exit.id == exit_id)?;
-
-    if exit.to_unknown {
-        log::warn!(
-            "map editor: refusing to delete exit {exit_id} — its destination is an \
-             unshared map and could not be restored on undo"
-        );
-        return None;
-    }
-
-    let cleared = area.effective_access().is_cleared_for_secrets();
-    Some(
-        Command::new(
-            vec![Mutation::DeleteExit {
-                room_key: room_key.clone(),
-                id: IdRef::Slot(0),
-            }],
-            vec![Mutation::CreateExit {
-                room_key,
-                args: exit_args_from_cache(exit, cleared),
-                follow_up: Some(exit_updates_from_cache(exit)),
-                slot: 0,
-            }],
-        )
-        .seed_slot(0, ResolvedId::Exit(exit_id)),
-    )
-}
-
-/// Creates a room at a map-space point on the given level.
+// Creates a room at a map-space point on the given level.
 #[must_use]
 pub fn create_room(
     area_id: AreaId,
@@ -2171,7 +2498,6 @@ pub fn create_room(
             vec![(
                 room_number,
                 RoomUpdates {
-                    is_secret: None,
                     title: Some(String::new()),
                     description: Some(String::new()),
                     level: Some(level),
@@ -2208,7 +2534,6 @@ pub fn bulk_edit_rooms(
         undo.push((
             room_number,
             RoomUpdates {
-                is_secret: None,
                 title: updates.title.as_ref().map(|_| room.get_title().to_string()),
                 description: updates
                     .description
@@ -2226,14 +2551,16 @@ pub fn bulk_edit_rooms(
         ));
     }
 
-    if redo.is_empty() {
-        None
-    } else {
-        Some(Command::new(
-            vec![Mutation::UpsertRooms(area_id, redo)],
-            vec![Mutation::UpsertRooms(area_id, undo)],
-        ))
+    let (mut redo_all, mut undo_all) = (Vec::new(), Vec::new());
+    if !redo.is_empty() {
+        redo_all.push(Mutation::UpsertRooms(area_id, redo));
+        undo_all.push(Mutation::UpsertRooms(area_id, undo));
     }
+    // A Secret's or Private's selected rooms change in their own place.
+    let (source_redo, source_undo) = super::source_rooms::edit_rooms(&area, selection, updates);
+    redo_all.extend(source_redo);
+    undo_all.extend(source_undo);
+    (!redo_all.is_empty()).then(|| Command::new(redo_all, undo_all))
 }
 
 /// Moves every selected room (and label/shape) up or down by whole levels
@@ -2277,8 +2604,13 @@ pub fn shift_selection_level(
         undo.push(Mutation::UpsertRooms(area_id, room_undo));
     }
 
+    let (source_redo, source_undo) =
+        super::source_rooms::shift_rooms_level(&area, selection, delta);
+    redo.extend(source_redo);
+    undo.extend(source_undo);
+
     for label_id in selection.labels() {
-        let Some(label) = area.get_label(&label_id) else {
+        let Some((_, label)) = area.find_label(&label_id) else {
             continue;
         };
         redo.push(Mutation::UpdateLabel {
@@ -2300,7 +2632,7 @@ pub fn shift_selection_level(
     }
 
     for shape_id in selection.shapes() {
-        let Some(shape) = area.get_shape(&shape_id) else {
+        let Some((_, shape)) = area.find_shape(&shape_id) else {
             continue;
         };
         redo.push(Mutation::UpdateShape {
@@ -2379,42 +2711,6 @@ pub fn delete_room_property(
     ))
 }
 
-/// Adds one tag to a room. Returns `None` (no undo entry) when the normalized tag
-/// is empty or the room already carries it, so an idempotent add is not recorded.
-#[must_use]
-pub fn add_room_tag(atlas: &Arc<AtlasCache>, room_key: RoomKey, tag: String) -> Option<Command> {
-    let tag = smudgy_cloud::mapper::normalize_tag(&tag);
-    if tag.is_empty() {
-        return None;
-    }
-    let area = atlas.get_area(&room_key.area_id)?;
-    let room = area.get_room(&room_key.room_number)?;
-    if room.has_tag(&tag) {
-        return None;
-    }
-
-    Some(Command::new(
-        vec![Mutation::AddRoomTag(room_key.clone(), tag.clone())],
-        vec![Mutation::RemoveRoomTag(room_key, tag)],
-    ))
-}
-
-/// Removes one tag from a room. Returns `None` when the room does not carry it.
-#[must_use]
-pub fn remove_room_tag(atlas: &Arc<AtlasCache>, room_key: RoomKey, tag: String) -> Option<Command> {
-    let tag = smudgy_cloud::mapper::normalize_tag(&tag);
-    let area = atlas.get_area(&room_key.area_id)?;
-    let room = area.get_room(&room_key.room_number)?;
-    if !room.has_tag(&tag) {
-        return None;
-    }
-
-    Some(Command::new(
-        vec![Mutation::RemoveRoomTag(room_key.clone(), tag.clone())],
-        vec![Mutation::AddRoomTag(room_key, tag)],
-    ))
-}
-
 /// Sets one area property; coalesces with consecutive edits to the same key.
 #[must_use]
 pub fn set_area_property(
@@ -2466,21 +2762,7 @@ pub fn create_label(area_id: AreaId, rect: iced::Rectangle, level: i32) -> Comma
     Command::new(
         vec![Mutation::CreateLabel {
             area_id,
-            args: LabelArgs {
-                level,
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: rect.height,
-                text: crate::i18n::t!("inspector-label"),
-                color: "#c8c8c8".to_string(),
-                // Explicitly transparent: an absent background invites
-                // server-side creation defaults (historically white).
-                background_color: Some(String::new()),
-                font_size: 16,
-                font_weight: 400,
-                ..Default::default()
-            },
+            args: new_label_args(rect, level),
             slot: 0,
         }],
         vec![Mutation::DeleteLabel {
@@ -2490,22 +2772,48 @@ pub fn create_label(area_id: AreaId, rect: iced::Rectangle, level: i32) -> Comma
     )
 }
 
+/// A new label's fields: a placeholder text covering `rect` on `level`.
+#[must_use]
+pub fn new_label_args(rect: iced::Rectangle, level: i32) -> LabelArgs {
+    LabelArgs {
+        level,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        text: crate::i18n::t!("inspector-label"),
+        color: "#c8c8c8".to_string(),
+        // Explicitly transparent: an absent background invites
+        // server-side creation defaults (historically white).
+        background_color: Some(String::new()),
+        font_size: 16,
+        font_weight: 400,
+        ..Default::default()
+    }
+}
+
+/// A new shape's fields: a filled rectangle covering `rect` on `level`.
+#[must_use]
+pub fn new_shape_args(rect: iced::Rectangle, level: i32) -> ShapeArgs {
+    ShapeArgs {
+        level,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        background_color: Some("#32323c".to_string()),
+        stroke_color: Some(String::new()),
+        ..Default::default()
+    }
+}
+
 /// Creates a shape covering a map-space rect on the given level.
 #[must_use]
 pub fn create_shape(area_id: AreaId, rect: iced::Rectangle, level: i32) -> Command {
     Command::new(
         vec![Mutation::CreateShape {
             area_id,
-            args: ShapeArgs {
-                level,
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: rect.height,
-                background_color: Some("#32323c".to_string()),
-                stroke_color: Some(String::new()),
-                ..Default::default()
-            },
+            args: new_shape_args(rect, level),
             slot: 0,
         }],
         vec![Mutation::DeleteShape {
@@ -2527,7 +2835,7 @@ pub fn resize_entity(
 
     match entity {
         EntityId::Label(label_id) => {
-            let label = area.get_label(&label_id)?;
+            let (_, label) = area.find_label(&label_id)?;
             Some(Command::new(
                 vec![Mutation::UpdateLabel {
                     area_id,
@@ -2554,7 +2862,7 @@ pub fn resize_entity(
             ))
         }
         EntityId::Shape(shape_id) => {
-            let shape = area.get_shape(&shape_id)?;
+            let (_, shape) = area.find_shape(&shape_id)?;
             Some(Command::new(
                 vec![Mutation::UpdateShape {
                     area_id,
@@ -2580,7 +2888,7 @@ pub fn resize_entity(
                 }],
             ))
         }
-        EntityId::Room(_) | EntityId::Connection(_) => None,
+        EntityId::Room(_) | EntityId::SourceRoom(..) | EntityId::Connection(_) => None,
     }
 }
 
@@ -2596,14 +2904,12 @@ pub struct RoomClip {
     pub x: f32,
     pub y: f32,
     pub color: String,
-    pub is_secret: bool,
     /// Server-global room id (GMCP/MSDP identity); rides copy/paste so the
     /// merge workflow's cut+paste keeps bindings.
     pub external_id: Option<String>,
-    /// Sorted by name for deterministic paste mutation order. Secrecy
-    /// marks don't survive the trip: the property PUT body has no secrecy
-    /// channel (same gap as `delete_selection`'s undo).
+    /// Sorted by name for deterministic paste mutation order.
     pub properties: Vec<(String, String)>,
+    pub tags: Vec<String>,
     pub exits: Vec<ExitClip>,
 }
 
@@ -2612,17 +2918,17 @@ pub struct RoomClip {
 /// projection artifact and must never be written back.
 #[derive(Debug, Clone)]
 pub struct ExitClip {
+    /// An attachment on another source's room; None means the copied source.
+    pub from_source: Option<smudgy_cloud::SourceId>,
     pub from_direction: ExitDirection,
     pub to_area_id: Option<AreaId>,
     pub to_room_number: Option<RoomNumber>,
     pub to_direction: Option<ExitDirection>,
     pub path: Option<String>,
     pub is_hidden: bool,
-    pub is_closed: bool,
-    pub is_locked: bool,
+    pub door: Option<smudgy_cloud::Door>,
     pub weight: f32,
     pub command: Option<String>,
-    pub is_secret: bool,
     /// Destination redacted ("Unknown map"); always pastes dangling.
     pub to_unknown: bool,
 }
@@ -2641,10 +2947,15 @@ pub struct ConnectionClip {
 /// apply a cascading offset, cross-area pastes preserve them exactly.
 #[derive(Debug, Clone, Default)]
 pub struct EntityClipboard {
+    /// A Cut is a deferred move; staging it never removes the original.
+    pub cut: Option<CutSelection>,
+    /// Authority that authorized this copy, rechecked before each paste.
+    pub copy_from: Option<(AreaId, smudgy_cloud::SourceId, u64)>,
     /// The area the snapshot came from; decides same-area (fresh room
     /// numbers, cascading offset) vs cross-area (numbers preserved where
     /// vacant, exact positions) paste semantics.
     pub source_area_id: Option<AreaId>,
+    pub source_map_id: Option<AreaId>,
     pub rooms: Vec<RoomClip>,
     pub connections: Vec<ConnectionClip>,
     pub connection_origin: Option<smudgy_cloud::MapPoint>,
@@ -2652,10 +2963,60 @@ pub struct EntityClipboard {
     pub shapes: Vec<ShapeArgs>,
 }
 
+/// Selected identities waiting for an atomic move, rather than copied content.
+#[derive(Debug, Clone)]
+pub struct CutSelection {
+    pub id: Uuid,
+    pub map: AreaId,
+    pub source: smudgy_cloud::SourceId,
+    pub revision: i64,
+    pub auth_revision: u64,
+    pub selection: Vec<EntityId>,
+    pub content: smudgy_cloud::MovedContent,
+    pub center: Option<iced::Point>,
+}
+
+/// The middle of everything on the clipboard, for placing a paste.
+#[must_use]
+pub fn clipboard_center(clipboard: &EntityClipboard) -> Option<iced::Point> {
+    let points = clipboard
+        .rooms
+        .iter()
+        .map(|room| (room.x, room.y))
+        .chain(
+            clipboard
+                .labels
+                .iter()
+                .map(|label| (label.x + label.width / 2.0, label.y + label.height / 2.0)),
+        )
+        .chain(
+            clipboard
+                .shapes
+                .iter()
+                .map(|shape| (shape.x + shape.width / 2.0, shape.y + shape.height / 2.0)),
+        );
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
+    for (x, y) in points {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    min_x
+        .is_finite()
+        .then(|| iced::Point::new((min_x + max_x) / 2.0, (min_y + max_y) / 2.0))
+}
+
 impl EntityClipboard {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rooms.is_empty()
+        self.cut.is_none()
+            && self.rooms.is_empty()
             && self.connections.is_empty()
             && self.labels.is_empty()
             && self.shapes.is_empty()
@@ -2677,6 +3038,16 @@ pub fn snapshot_selection(
         return EntityClipboard::default();
     };
 
+    snapshot_document(&area, selection, allow_rooms, include_boundary_links)
+}
+
+pub(super) fn snapshot_document(
+    area: &smudgy_cloud::mapper::area_cache::AreaCache,
+    selection: &Selection,
+    allow_rooms: bool,
+    include_boundary_links: bool,
+) -> EntityClipboard {
+    let area_id = *area.get_id();
     let mut rooms = Vec::new();
     let selected_rooms: HashSet<_> = selection.rooms().collect();
     let connection_origin = selected_rooms
@@ -2707,7 +3078,9 @@ pub fn snapshot_selection(
             // the selection.
             explicitly_selected.contains(&connection.id)
                 || connection.endpoint_b.is_some_and(|endpoint_b| {
-                    selected_rooms.contains(&connection.endpoint_a.room_number)
+                    connection.endpoint_a.address().source == area.document_source()
+                        && selected_rooms.contains(&connection.endpoint_a.room_number)
+                        && endpoint_b.address().source == area.document_source()
                         && selected_rooms.contains(&endpoint_b.room_number)
                 })
         })
@@ -2737,9 +3110,9 @@ pub fn snapshot_selection(
                 x: room.get_x(),
                 y: room.get_y(),
                 color: room.get_color().to_string(),
-                is_secret: room.is_secret(),
                 external_id: room.get_external_id().map(str::to_string),
                 properties,
+                tags: room.tags().map(str::to_string).collect(),
                 exits,
             });
         }
@@ -2753,6 +3126,10 @@ pub fn snapshot_selection(
             .filter(|connection| eligible_connections.contains(&connection.id))
         {
             let mut body = ConnectionArgs::from(connection);
+            for endpoint in std::iter::once(&mut body.endpoint_a).chain(body.endpoint_b.as_mut()) {
+                endpoint.source = (endpoint.address().source != area.document_source())
+                    .then_some(endpoint.address().source);
+            }
             if let Some(origin) = connection_origin {
                 for point in &mut body.route_points {
                     point.x -= origin.x;
@@ -2760,23 +3137,23 @@ pub fn snapshot_selection(
                 }
             }
             let mut members = Vec::new();
-            for room in area.get_rooms() {
+            for room in area.document_rooms() {
                 for exit in room.get_exits() {
                     if exit.connection_id == connection.id {
                         members.push((
                             room.get_room_number(),
                             ExitClip {
+                                from_source: (room.address().source != area.document_source())
+                                    .then_some(room.address().source),
                                 from_direction: exit.from_direction,
                                 to_area_id: exit.to_area_id,
                                 to_room_number: exit.to_room_number,
                                 to_direction: exit.to_direction,
                                 path: exit.path.clone(),
                                 is_hidden: exit.is_hidden,
-                                is_closed: exit.is_closed,
-                                is_locked: exit.is_locked,
+                                door: exit.door.clone(),
                                 weight: exit.weight,
                                 command: exit.command.clone(),
-                                is_secret: exit.is_secret,
                                 to_unknown: exit.to_unknown,
                             },
                         ));
@@ -2810,12 +3187,17 @@ pub fn snapshot_selection(
                 let Some(endpoint) = [connection.endpoint_a]
                     .into_iter()
                     .chain(connection.endpoint_b)
-                    .find(|endpoint| endpoint.room_number == from_room)
+                    .find(|endpoint| {
+                        endpoint.address() == RoomAddress::new(area.document_source(), from_room)
+                    })
                 else {
                     continue;
                 };
                 let mut body = ConnectionArgs::from(connection);
-                body.endpoint_a = endpoint;
+                body.endpoint_a = ConnectionEndpoint {
+                    source: None,
+                    ..endpoint
+                };
                 body.endpoint_b = None;
                 body.route_points.clear();
                 if matches!(
@@ -2830,17 +3212,16 @@ pub fn snapshot_selection(
                     members: vec![(
                         from_room,
                         ExitClip {
+                            from_source: None,
                             from_direction: exit.from_direction,
                             to_area_id: None,
                             to_room_number: None,
                             to_direction: None,
                             path: exit.path.clone(),
                             is_hidden: exit.is_hidden,
-                            is_closed: exit.is_closed,
-                            is_locked: exit.is_locked,
+                            door: exit.door.clone(),
                             weight: exit.weight,
                             command: exit.command.clone(),
-                            is_secret: exit.is_secret,
                             to_unknown: false,
                         },
                     )],
@@ -2855,7 +3236,6 @@ pub fn snapshot_selection(
         .map(|label| LabelArgs {
             // Clipboard entries carry no identity; each paste mints its own.
             id: None,
-            is_secret: None,
             level: label.level,
             x: label.x,
             y: label.y,
@@ -2879,7 +3259,6 @@ pub fn snapshot_selection(
         .map(|shape| ShapeArgs {
             // Clipboard entries carry no identity; each paste mints its own.
             id: None,
-            is_secret: None,
             level: shape.level,
             x: shape.x,
             y: shape.y,
@@ -2896,7 +3275,10 @@ pub fn snapshot_selection(
         .collect();
 
     EntityClipboard {
+        cut: None,
+        copy_from: None,
         source_area_id: Some(area_id),
+        source_map_id: Some(area_id),
         rooms,
         connections,
         connection_origin,
@@ -2909,6 +3291,7 @@ pub fn snapshot_selection(
 /// explicit dangling one-way links. Used by the clipboard confirmation so
 /// omission is visible rather than silent.
 #[must_use]
+#[cfg(test)]
 pub fn boundary_link_count(
     atlas: &Arc<AtlasCache>,
     area_id: AreaId,
@@ -2917,12 +3300,21 @@ pub fn boundary_link_count(
     let Some(area) = atlas.get_area(&area_id) else {
         return 0;
     };
+    boundary_links_in_document(&area, selection)
+}
+
+pub(super) fn boundary_links_in_document(
+    area: &smudgy_cloud::mapper::area_cache::AreaCache,
+    selection: &Selection,
+) -> usize {
     let selected_rooms: HashSet<_> = selection.rooms().collect();
     area.get_connections()
         .iter()
         .filter(|connection| {
             let fully_contained = connection.endpoint_b.is_some_and(|endpoint_b| {
-                selected_rooms.contains(&connection.endpoint_a.room_number)
+                connection.endpoint_a.address().source == area.document_source()
+                    && selected_rooms.contains(&connection.endpoint_a.room_number)
+                    && endpoint_b.address().source == area.document_source()
                     && selected_rooms.contains(&endpoint_b.room_number)
             });
             !fully_contained
@@ -3023,9 +3415,7 @@ fn classify_pasted_exit(
     }
 }
 
-/// Pastes the clipboard into `target_area_id` as one undo step: rooms in a
-/// single [`Mutation::UpsertRooms`] batch (one cache rebuild), then their
-/// properties and exits, then labels/shapes.
+/// Pastes the clipboard into the ordinary map as one atomic undo step.
 ///
 /// Same-area pastes (`source_area_id == target`) allocate fresh room
 /// numbers and apply `offset`/`level` like label/shape paste always has;
@@ -3041,6 +3431,7 @@ fn classify_pasted_exit(
 /// Panics if the room-number remap targets an occupied number (an
 /// invariant of [`remap_room_numbers`]; pasting must never overwrite an
 /// existing room).
+#[cfg(test)]
 #[must_use]
 pub fn paste_clipboard(
     atlas: &Arc<AtlasCache>,
@@ -3049,27 +3440,67 @@ pub fn paste_clipboard(
     level: i32,
     offset: Vector,
     // The first number a pasted room may take when it cannot keep its own:
-    // the Mapper's reservation-aware allocation, which also passes over
-    // numbers links lead to. `None` when the target has no room numbers
+    // the Mapper's reservation-aware allocation, one above the target's
+    // highest room. `None` when the target has no room numbers
     // left; a clipboard holding rooms then pastes nothing.
+    next_room_number: Option<RoomNumber>,
+) -> (Option<Command>, Vec<RoomNumber>, usize) {
+    paste_into_source(
+        atlas,
+        target_area_id,
+        smudgy_cloud::SourceId::Map,
+        clipboard,
+        level,
+        offset,
+        next_room_number,
+    )
+}
+
+/// Pastes into a named source, including an as-yet empty Private source.
+/// All content is one envelope; no label or room can be left as a partial paste.
+#[must_use]
+pub fn paste_into_source(
+    atlas: &Arc<AtlasCache>,
+    map_id: AreaId,
+    source: smudgy_cloud::SourceId,
+    clipboard: &EntityClipboard,
+    level: i32,
+    offset: Vector,
     next_room_number: Option<RoomNumber>,
 ) -> (Option<Command>, Vec<RoomNumber>, usize) {
     if clipboard.is_empty() {
         return (None, Vec::new(), 0);
     }
-    let Some(area) = atlas.get_area(&target_area_id) else {
+    let Some(map) = atlas.get_area(&map_id) else {
         return (None, Vec::new(), 0);
     };
+    let layer = map
+        .source_layers()
+        .iter()
+        .find(|layer| layer.source() == source);
+    let area = if source.is_map() {
+        Some(map.as_ref())
+    } else {
+        layer.map(|layer| layer.area().as_ref())
+    };
+    if area.is_none() && source != smudgy_cloud::SourceId::Private {
+        return (None, Vec::new(), 0);
+    }
+    // This id is used only to classify clipboard references. Wire addresses
+    // always use the parent map and an explicit source.
+    let target_area_id = area.map_or_else(|| AreaId(Uuid::new_v4()), |area| *area.get_id());
     let same_area = clipboard.source_area_id == Some(target_area_id);
-    // Secrecy flags may only be sent when the viewer is cleared on the
-    // *target* (the server uniform-404s otherwise); an uncleared viewer's
-    // clipboard holds no secret entities anyway.
-    let cleared = area.effective_access().is_cleared_for_secrets();
     let source_area_id = clipboard.source_area_id.unwrap_or(target_area_id);
-
-    let mut redo = Vec::new();
+    let room_source = (!source.is_map()).then_some(source);
+    let wire_destination = |id: AreaId| {
+        atlas.get_area(&id).map_or((id, None), |area| {
+            (
+                area.map_id().unwrap_or(id),
+                (!area.place().is_map()).then_some(area.place()),
+            )
+        })
+    };
     let mut undo = Vec::new();
-    let mut next_slot: SlotId = 0;
     let mut pasted_rooms = Vec::new();
     let mut skipped_connections = 0usize;
 
@@ -3084,8 +3515,8 @@ pub fn paste_clipboard(
             return (None, Vec::new(), 0);
         };
         let occupied: HashSet<RoomNumber> = area
-            .get_rooms()
-            .iter()
+            .into_iter()
+            .flat_map(|area| area.get_rooms())
             .map(|room| room.get_room_number())
             .collect();
         // A pasted room that kept a number an exit already leads to would
@@ -3110,10 +3541,10 @@ pub fn paste_clipboard(
                 "paste remap produced an occupied room number"
             );
             pasted_rooms.push(number);
-            compound.push(AreaMutation::UpsertRoom {
+            compound.push(AreaMutation::CreateRoom {
+                room_source,
                 room_number: number,
                 body: RoomUpdates {
-                    is_secret: cleared.then_some(room.is_secret),
                     title: Some(room.title.clone()),
                     description: Some(room.description.clone()),
                     // Rooms keep their source level in both modes: a
@@ -3123,18 +3554,25 @@ pub fn paste_clipboard(
                     x: Some(room.x + offset.x),
                     y: Some(room.y + offset.y),
                     color: Some(room.color.clone()),
-                    // Bindings ride the paste (cut+paste is the merge-workflow
-                    // move); duplicates resolve best-effort, own-map-first.
+                    // Copies retain the game-server binding. Cut uses a
+                    // separate identity-preserving move.
                     external_id: room.external_id.clone().map(Some),
                 },
             });
 
             for (name, value) in &room.properties {
                 compound.push(AreaMutation::UpsertRoomProperty {
+                    room_source,
                     room_number: number,
                     name: name.clone(),
                     value: value.clone(),
-                    is_secret: None,
+                });
+            }
+            for tag in &room.tags {
+                compound.push(AreaMutation::AddRoomTag {
+                    room_source,
+                    room_number: number,
+                    tag: tag.clone(),
                 });
             }
             for exit in &room.exits {
@@ -3145,30 +3583,31 @@ pub fn paste_clipboard(
             let destination = classify_pasted_exit(exit, source_area_id, &mapping, |id| {
                 atlas.get_area(&id).is_some()
             });
-            let (to_area_id, to_room_number, to_direction) = match destination {
+            let (to_area_id, to_source, to_room_number, to_direction) = match destination {
                 PastedExitDestination::Remapped(number) => {
-                    (Some(target_area_id), Some(number), exit.to_direction)
+                    (Some(map_id), room_source, Some(number), exit.to_direction)
                 }
                 PastedExitDestination::Live(area_id, number) => {
-                    (Some(area_id), Some(number), exit.to_direction)
+                    let (map, source) = wire_destination(area_id);
+                    (Some(map), source, Some(number), exit.to_direction)
                 }
-                PastedExitDestination::Dangling => (None, None, None),
+                PastedExitDestination::Dangling => (None, None, None, None),
             };
             compound.push(AreaMutation::CreateExit {
+                room_source,
                 room_number,
                 body: ExitArgs {
+                    to_source,
                     id: Some(ExitId::new()),
                     connection_id: None,
                     new_connection_id: None,
-                    is_secret: cleared.then_some(exit.is_secret),
                     from_direction: exit.from_direction,
                     to_area_id,
                     to_room_number,
                     to_direction,
                     path: exit.path.clone(),
                     is_hidden: exit.is_hidden,
-                    is_closed: exit.is_closed,
-                    is_locked: exit.is_locked,
+                    door: exit.door.clone(),
                     weight: exit.weight,
                     command: exit.command.clone(),
                 },
@@ -3184,20 +3623,41 @@ pub fn paste_clipboard(
     // deliberate no-op, not an ambiguous second exit.
     let origin = clipboard.connection_origin.unwrap_or_default();
     for connection in &clipboard.connections {
-        let resolve = |number: RoomNumber| {
-            mapping
-                .get(&number)
-                .copied()
-                .or_else(|| area.get_room(&number).is_some().then_some(number))
+        let resolve = |number: RoomNumber, anchor: Option<smudgy_cloud::SourceId>| {
+            if let Some(anchor) = anchor {
+                if clipboard.source_map_id != Some(map_id) {
+                    return None;
+                }
+                let exists = if anchor.is_map() {
+                    map.get_room(&number).is_some()
+                } else {
+                    map.source_layers()
+                        .iter()
+                        .find(|layer| layer.source() == anchor)
+                        .and_then(|layer| layer.own_room(number))
+                        .is_some()
+                };
+                exists.then_some((number, (!anchor.is_map()).then_some(anchor), false))
+            } else {
+                mapping
+                    .get(&number)
+                    .copied()
+                    .map(|number| (number, room_source, true))
+                    .or_else(|| {
+                        area.and_then(|area| area.get_room(&number))
+                            .map(|_| (number, room_source, false))
+                    })
+            }
         };
-        let source_a = connection.body.endpoint_a.room_number;
-        let Some(endpoint_a_room) = resolve(source_a) else {
+        let a = connection.body.endpoint_a;
+        let Some((endpoint_a_room, endpoint_a_source, a_copied)) = resolve(a.room_number, a.source)
+        else {
             skipped_connections += 1;
             continue;
         };
         let endpoint_b_room = match connection.body.endpoint_b {
-            Some(endpoint) => match resolve(endpoint.room_number) {
-                Some(number) => Some((endpoint.room_number, number)),
+            Some(endpoint) => match resolve(endpoint.room_number, endpoint.source) {
+                Some(target) => Some(target),
                 None => {
                     skipped_connections += 1;
                     continue;
@@ -3209,23 +3669,44 @@ pub fn paste_clipboard(
         // route belongs to the source layout and must be dropped, and (b)
         // the room-delete cascade won't clean the link up on undo, so it
         // needs its own DeleteLink.
-        let any_existing = !mapping.contains_key(&source_a)
-            || endpoint_b_room.is_some_and(|(source, _)| !mapping.contains_key(&source));
+        let any_existing = !a_copied || endpoint_b_room.is_some_and(|(_, _, copied)| !copied);
 
         let mut members = Vec::new();
         let mut viable = true;
         for (from_room, exit) in &connection.members {
-            let Some(room_number) = resolve(*from_room) else {
+            let Some((room_number, from_source, copied)) = resolve(*from_room, exit.from_source)
+            else {
                 viable = false;
                 break;
             };
-            if !mapping.contains_key(from_room)
-                && area.get_room(&room_number).is_some_and(|room| {
-                    room.get_exits()
-                        .iter()
-                        .any(|other| other.from_direction == exit.from_direction)
-                })
-            {
+            let anchor = from_source.unwrap_or(smudgy_cloud::SourceId::Map);
+            let occupied = if anchor == source {
+                area.and_then(|area| area.get_room(&room_number))
+                    .is_some_and(|room| {
+                        room.get_exits()
+                            .iter()
+                            .any(|other| other.from_direction == exit.from_direction)
+                    })
+            } else if source.is_map() {
+                map.meta()
+                    .room_data
+                    .iter()
+                    .filter(|data| {
+                        data.room_source.unwrap_or(smudgy_cloud::SourceId::Map) == anchor
+                            && data.room_number == room_number
+                    })
+                    .flat_map(|data| &data.exits)
+                    .any(|other| other.from_direction == exit.from_direction)
+            } else {
+                layer
+                    .and_then(|layer| layer.attachment(RoomAddress::new(anchor, room_number)))
+                    .is_some_and(|room| {
+                        room.get_exits()
+                            .iter()
+                            .any(|other| other.from_direction == exit.from_direction)
+                    })
+            };
+            if !copied && occupied {
                 viable = false;
                 break;
             }
@@ -3234,24 +3715,33 @@ pub fn paste_clipboard(
             // cross-area destination (an explicit External clip) keeps its
             // area when it's live in the atlas, and dangles otherwise —
             // never silently rewritten into the target area.
-            let (to_area_id, to_room_number, to_direction) = match exit.to_area_id {
-                Some(destination_area) if destination_area != source_area_id => {
-                    if atlas.get_area(&destination_area).is_some() {
-                        (
-                            Some(destination_area),
-                            exit.to_room_number,
-                            exit.to_direction,
-                        )
-                    } else {
-                        (None, None, None)
+            let (to_area_id, to_source, to_room_number, to_direction) =
+                match exit.to_area_id.filter(|_| !exit.to_unknown) {
+                    Some(destination_area) if destination_area != source_area_id => {
+                        if atlas.get_area(&destination_area).is_some() {
+                            let (map, source) = wire_destination(destination_area);
+                            (Some(map), source, exit.to_room_number, exit.to_direction)
+                        } else {
+                            (None, None, None, None)
+                        }
                     }
-                }
-                _ => match exit.to_room_number.and_then(resolve) {
-                    Some(number) => (Some(target_area_id), Some(number), exit.to_direction),
-                    None => (None, None, None),
-                },
-            };
-            members.push((room_number, exit, to_area_id, to_room_number, to_direction));
+                    Some(_) => match exit.to_room_number.and_then(|number| resolve(number, None)) {
+                        Some((number, source, _)) => {
+                            (Some(map_id), source, Some(number), exit.to_direction)
+                        }
+                        None => (None, None, None, None),
+                    },
+                    None => (None, None, None, None),
+                };
+            members.push((
+                room_number,
+                from_source,
+                exit,
+                to_area_id,
+                to_source,
+                to_room_number,
+                to_direction,
+            ));
         }
         if !viable {
             skipped_connections += 1;
@@ -3262,8 +3752,12 @@ pub fn paste_clipboard(
         let mut body = connection.body.clone();
         body.id = new_connection_id;
         body.endpoint_a.room_number = endpoint_a_room;
-        if let (Some(endpoint), Some((_, number))) = (body.endpoint_b.as_mut(), endpoint_b_room) {
+        body.endpoint_a.source = endpoint_a_source;
+        if let (Some(endpoint), Some((number, source, _))) =
+            (body.endpoint_b.as_mut(), endpoint_b_room)
+        {
             endpoint.room_number = number;
+            endpoint.source = source;
         }
         if any_existing {
             body.route_points.clear();
@@ -3284,22 +3778,24 @@ pub fn paste_clipboard(
             }
         }
         compound.push(AreaMutation::CreateConnection { body });
-        for (room_number, exit, to_area_id, to_room_number, to_direction) in members {
+        for (room_number, from_source, exit, to_area_id, to_source, to_room_number, to_direction) in
+            members
+        {
             compound.push(AreaMutation::CreateExit {
+                room_source: from_source,
                 room_number,
                 body: ExitArgs {
+                    to_source,
                     id: Some(ExitId::new()),
                     connection_id: Some(new_connection_id),
                     new_connection_id: None,
-                    is_secret: cleared.then_some(exit.is_secret),
                     from_direction: exit.from_direction,
                     to_area_id,
                     to_room_number,
                     to_direction,
                     path: exit.path.clone(),
                     is_hidden: exit.is_hidden,
-                    is_closed: exit.is_closed,
-                    is_locked: exit.is_locked,
+                    door: exit.door.clone(),
                     weight: exit.weight,
                     command: exit.command.clone(),
                 },
@@ -3307,74 +3803,69 @@ pub fn paste_clipboard(
         }
     }
 
-    if !compound.is_empty() {
-        if compound.len() > smudgy_cloud::MAX_MUTATION_OPERATIONS {
-            return (None, Vec::new(), 0);
-        }
-        redo.push(Mutation::AreaBatch {
-            area_id: target_area_id,
-            operations: compound,
-            description: if pasted_rooms.is_empty() {
-                "Paste links".to_string()
-            } else {
-                format!("Paste {} rooms and contained links", pasted_rooms.len())
-            },
-        });
-        let mut undo_ops = undo_links;
-        undo_ops.extend(
-            pasted_rooms
-                .iter()
-                .map(|room_number| AreaMutation::DeleteRoom {
-                    room_number: *room_number,
-                }),
-        );
-        undo.push(Mutation::AreaBatch {
-            area_id: target_area_id,
-            operations: undo_ops,
-            description: "Undo paste".to_string(),
-        });
-    }
-
+    undo.extend(undo_links);
+    undo.extend(
+        pasted_rooms
+            .iter()
+            .map(|room_number| AreaMutation::DeleteRoom {
+                room_source,
+                room_number: *room_number,
+            }),
+    );
     for label in &clipboard.labels {
-        let slot = next_slot;
-        next_slot += 1;
-        redo.push(Mutation::CreateLabel {
-            area_id: target_area_id,
-            args: LabelArgs {
+        let id = LabelId(Uuid::new_v4());
+        compound.push(AreaMutation::CreateLabel {
+            body: LabelArgs {
+                id: Some(id),
                 level: if same_area { level } else { label.level },
                 x: label.x + offset.x,
                 y: label.y + offset.y,
                 ..label.clone()
             },
-            slot,
         });
-        undo.push(Mutation::DeleteLabel {
-            area_id: target_area_id,
-            id: IdRef::Slot(slot),
-        });
+        undo.push(AreaMutation::DeleteLabel { label_id: id });
     }
-
     for shape in &clipboard.shapes {
-        let slot = next_slot;
-        next_slot += 1;
-        redo.push(Mutation::CreateShape {
-            area_id: target_area_id,
-            args: ShapeArgs {
+        let id = ShapeId(Uuid::new_v4());
+        compound.push(AreaMutation::CreateShape {
+            body: ShapeArgs {
+                id: Some(id),
                 level: if same_area { level } else { shape.level },
                 x: shape.x + offset.x,
                 y: shape.y + offset.y,
                 ..shape.clone()
             },
-            slot,
         });
-        undo.push(Mutation::DeleteShape {
-            area_id: target_area_id,
-            id: IdRef::Slot(slot),
-        });
+        undo.push(AreaMutation::DeleteShape { shape_id: id });
     }
-
-    let command = (!redo.is_empty()).then(|| Command::new(redo, undo));
-    (command, pasted_rooms, skipped_connections)
+    if compound.is_empty() || compound.len() > MAX_MUTATION_OPERATIONS {
+        return (None, Vec::new(), skipped_connections);
+    }
+    let batch = |operations, description: &str| {
+        if source.is_map() {
+            Mutation::AreaBatch {
+                area_id: map_id,
+                operations,
+                description: description.into(),
+            }
+        } else {
+            Mutation::SourceBatch {
+                area_id: map_id,
+                source,
+                operations,
+                description: description.into(),
+                split_paired_exit: false,
+            }
+        }
+    };
+    (
+        Some(Command::new(
+            vec![batch(compound, "Paste content")],
+            vec![batch(undo, "Undo paste")],
+        )),
+        pasted_rooms,
+        skipped_connections,
+    )
 }
 
 /// Edits one label field; coalesces with consecutive edits to the same
@@ -3388,10 +3879,9 @@ pub fn edit_label_field(
     updates: LabelUpdates,
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
-    let label = area.get_label(&label_id)?;
+    let (_, label) = area.find_label(&label_id)?;
 
     let prior = LabelUpdates {
-        is_secret: None,
         level: updates.level.map(|_| label.level),
         x: updates.x.map(|_| label.x),
         y: updates.y.map(|_| label.y),
@@ -3443,10 +3933,9 @@ pub fn edit_shape_field(
     updates: ShapeUpdates,
 ) -> Option<Command> {
     let area = atlas.get_area(&area_id)?;
-    let shape = area.get_shape(&shape_id)?;
+    let (_, shape) = area.find_shape(&shape_id)?;
 
     let prior = ShapeUpdates {
-        is_secret: None,
         level: updates.level.map(|_| shape.level),
         x: updates.x.map(|_| shape.x),
         y: updates.y.map(|_| shape.y),
@@ -3498,7 +3987,6 @@ pub fn edit_room_field(
     let room = area.get_room(&room_key.room_number)?;
 
     let prior = RoomUpdates {
-        is_secret: None,
         title: updates.title.as_ref().map(|_| room.get_title().to_string()),
         description: updates
             .description
@@ -3559,7 +4047,12 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: smudgy_cloud::clan_maps::ClanOwnership::default(),
                 atlas_name: None,
+                projection_token: None,
             })
         }
 
@@ -3605,12 +4098,9 @@ mod tests {
                 + 1;
             Ok(smudgy_cloud::mutation::MutationResult {
                 operation_id: envelope.operation_id,
-                versions: vec![smudgy_cloud::mutation::VersionInfo {
-                    resource: smudgy_cloud::mutation::ResourceKind::Area,
-                    id: area_id.0,
-                    rev,
-                    deleted: false,
-                }],
+                versions: vec![smudgy_cloud::mutation::VersionInfo::map_source(
+                    area_id.0, rev,
+                )],
                 data: Vec::new(),
             })
         }
@@ -3635,53 +4125,31 @@ mod tests {
     /// Settles the ready create-completion tasks that an iced runtime would
     /// normally feed back to the command stack.
     fn drive_create_completions(
-        mapper: &Mapper,
         stack: &mut CommandStack,
         command_id: CommandId,
         mutations: Vec<Mutation>,
     ) {
         for mutation in mutations {
             match mutation {
-                Mutation::CreateExit { room_key, slot, .. } => {
-                    let ResolvedId::Exit(id) = resolved_id(stack, command_id, slot) else {
-                        panic!("exit slot held the wrong entity kind");
-                    };
-                    stack.resolve(
-                        mapper,
-                        Outcome::Exit {
-                            command: command_id,
-                            slot,
-                            room_key,
-                            follow_up: None,
-                            result: Ok(id),
-                        },
-                    );
-                }
                 Mutation::CreateLabel { slot, .. } => {
                     let ResolvedId::Label(id) = resolved_id(stack, command_id, slot) else {
                         panic!("label slot held the wrong entity kind");
                     };
-                    stack.resolve(
-                        mapper,
-                        Outcome::Label {
-                            command: command_id,
-                            slot,
-                            result: Ok(id),
-                        },
-                    );
+                    stack.resolve(Outcome::Label {
+                        command: command_id,
+                        slot,
+                        result: Ok(id),
+                    });
                 }
                 Mutation::CreateShape { slot, .. } => {
                     let ResolvedId::Shape(id) = resolved_id(stack, command_id, slot) else {
                         panic!("shape slot held the wrong entity kind");
                     };
-                    stack.resolve(
-                        mapper,
-                        Outcome::Shape {
-                            command: command_id,
-                            slot,
-                            result: Ok(id),
-                        },
-                    );
+                    stack.resolve(Outcome::Shape {
+                        command: command_id,
+                        slot,
+                        result: Ok(id),
+                    });
                 }
                 _ => {}
             }
@@ -3861,6 +4329,14 @@ mod tests {
             )
             .await
             .expect("exit");
+        mapper
+            .add_room_tag(key.clone(), "dock".into())
+            .expect("stage tag");
+        let link = {
+            let atlas = mapper.get_current_atlas();
+            let area = atlas.get_area(&area_id).expect("area");
+            area.get_room(&RoomNumber(1)).expect("room").get_exits()[0].connection_id
+        };
 
         let mut stack = CommandStack::default();
         let selection = select_rooms(&[1]);
@@ -3880,40 +4356,25 @@ mod tests {
             );
         }
 
-        // Undo stages the recreation synchronously; settle the ready UI
-        // completion by hand because this test has no iced runtime.
+        // Undo is synchronous: every id is known up front.
         let _ = stack.undo(&mapper);
-
-        let new_exit_id = {
-            let undone = stack.redo.last().expect("undone command");
-            let command_id = undone.id;
-            let mutations = undone.undo.clone();
-            let slot = mutations
-                .iter()
-                .find_map(|mutation| match mutation {
-                    Mutation::CreateExit { slot, .. } => Some(*slot),
-                    _ => None,
-                })
-                .expect("exit recreation");
-            let ResolvedId::Exit(id) = resolved_id(&stack, command_id, slot) else {
-                panic!("exit slot held the wrong entity kind");
-            };
-            drive_create_completions(&mapper, &mut stack, command_id, mutations);
-            id
-        };
-        assert_ne!(new_exit_id, exit_id, "recreated exit gets a fresh id");
 
         let atlas = mapper.get_current_atlas();
         let area = atlas.get_area(&area_id).expect("area");
         let room = area.get_room(&RoomNumber(1)).expect("room restored");
         assert_eq!(room.get_title(), "Room 1");
         assert_eq!(room.get_property("zone"), Some("docks"));
+        assert!(room.has_tag("DOCK"), "tags come back too");
         assert_eq!(room.get_exits().len(), 1);
+        let exit = &room.get_exits()[0];
+        assert_eq!(exit.id, exit_id, "the exit returns under its own id");
+        assert_eq!(exit.connection_id, link, "on its own link");
         assert_eq!(
-            room.get_exits()[0].to_room_number,
+            exit.to_room_number,
             Some(RoomNumber(2)),
             "exit destination restored"
         );
+        assert!(area.get_connection(link).is_some(), "the link row is back");
     }
 
     fn exit_destination(
@@ -3954,8 +4415,12 @@ mod tests {
 
         let command = edit_exit_field(
             &mapper.get_current_atlas(),
-            key.clone(),
-            exit_id,
+            ExitRef {
+                area_id,
+                place: smudgy_cloud::SourceId::Map,
+                room: key.room_number.into(),
+                id: exit_id,
+            },
             FieldId::Destination,
             |updates| {
                 updates.to_area_id = None;
@@ -4051,8 +4516,12 @@ mod tests {
 
         let command = edit_exit_field(
             &mapper.get_current_atlas(),
-            key.clone(),
-            exit_id,
+            ExitRef {
+                area_id,
+                place: smudgy_cloud::SourceId::Map,
+                room: key.room_number.into(),
+                id: exit_id,
+            },
             FieldId::Destination,
             |updates| {
                 updates.to_area_id = Some(area_id);
@@ -4090,95 +4559,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn delete_and_undo_restores_secrecy_flags() {
-        let mapper = test_mapper();
-        let area_id = area_with_rooms(&mapper, &[(1, 0.0, 0.0), (2, 1.0, 0.0)]).await;
-        let key = RoomKey::new(area_id, RoomNumber(1));
-
-        let exit_id = mapper
-            .create_exit(
-                key.clone(),
-                ExitArgs {
-                    from_direction: ExitDirection::East,
-                    to_area_id: Some(area_id),
-                    to_room_number: Some(RoomNumber(2)),
-                    to_direction: Some(ExitDirection::West),
-                    weight: 1.0,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("exit");
-        let label_id = mapper
-            .create_label(
-                area_id,
-                LabelArgs {
-                    text: "hideout".into(),
-                    color: "#fff".into(),
-                    width: 2.0,
-                    height: 1.0,
-                    font_size: 16,
-                    font_weight: 400,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("label");
-
-        // Mark everything secret (an owned area is always cleared).
-        mapper.apply_local_secret_marks(
-            area_id,
-            true,
-            &[RoomNumber(1)],
-            &[exit_id],
-            &[label_id],
-            &[],
-            &[],
-            &[],
-        );
-
-        let selection: Selection = [EntityId::Room(RoomNumber(1)), EntityId::Label(label_id)]
-            .into_iter()
-            .collect();
-        let command =
-            delete_selection(&mapper.get_current_atlas(), area_id, &selection).expect("command");
-
-        // The recreate bodies must carry the cached secrecy flags: omitted
-        // is_secret defaults to false on insert, which would silently
-        // republish the entities to non-secret grantees.
-        for mutation in &command.undo {
-            match mutation {
-                Mutation::UpsertRooms(_, rooms) => {
-                    assert_eq!(rooms[0].1.is_secret, Some(true), "room keeps secrecy");
-                }
-                Mutation::CreateExit { args, .. } => {
-                    assert_eq!(args.is_secret, Some(true), "exit keeps secrecy");
-                }
-                Mutation::CreateLabel { args, .. } => {
-                    assert_eq!(args.is_secret, Some(true), "label keeps secrecy");
-                }
-                other => panic!("unexpected undo mutation: {other:?}"),
-            }
-        }
-
-        let mut stack = CommandStack::default();
-        let _ = stack.push_and_apply(&mapper, command);
-        let _ = stack.undo(&mapper);
-
-        // Settle the ready create-completion tasks dropped by this test.
-        let command_id = stack.redo.last().expect("undone").id;
-        let mutations = stack.redo.last().expect("undone").undo.clone();
-        drive_create_completions(&mapper, &mut stack, command_id, mutations);
-
-        let atlas = mapper.get_current_atlas();
-        let area = atlas.get_area(&area_id).expect("area");
-        let room = area.get_room(&RoomNumber(1)).expect("room restored");
-        assert!(room.is_secret(), "room secrecy restored");
-        assert!(room.get_exits()[0].is_secret, "exit secrecy restored");
-        assert!(area.get_labels()[0].is_secret, "label secrecy restored");
-    }
-
     /// Links room 1 → room 2 (two-way) and returns the connection id.
     async fn link_rooms(
         mapper: &Mapper,
@@ -4191,7 +4571,7 @@ mod tests {
             area_id,
             RoomNumber(from),
             ExitDirection::East,
-            &NewExitTarget::Room(RoomNumber(to)),
+            &NewExitTarget::Room(PlacedRoom::map(RoomNumber(to))),
             ExitDirection::West,
             NewLinkOptions::default(),
         );
@@ -4386,7 +4766,10 @@ mod tests {
             .expect("area");
 
         let clipboard = EntityClipboard {
+            cut: None,
+            copy_from: None,
             source_area_id: Some(area_id),
+            source_map_id: Some(area_id),
             rooms: vec![],
             connections: vec![],
             connection_origin: None,
@@ -4427,16 +4810,19 @@ mod tests {
         let (_task, operation_ids) = stack.push_and_apply_tracked(&mapper, command);
         assert_eq!(
             operation_ids.len(),
-            2,
-            "both creates are represented in durable undo history"
+            1,
+            "all copied entities share one atomic durable operation"
         );
 
-        assert!(!stack.can_undo(), "pending creates block undo");
+        assert!(
+            stack.can_undo(),
+            "paste identities are known before enqueue"
+        );
 
         // Settle the ready completion tasks dropped by this test.
         let command_id = stack.undo.back().expect("pushed").id;
         let mutations = stack.undo.back().expect("pushed").redo.clone();
-        drive_create_completions(&mapper, &mut stack, command_id, mutations);
+        drive_create_completions(&mut stack, command_id, mutations);
 
         {
             let atlas = mapper.get_current_atlas();
@@ -4517,10 +4903,15 @@ mod tests {
             None,
         );
         let command = command.expect("paste command");
-        let Mutation::CreateLabel { args, .. } = command.redo[0].clone() else {
+        let Mutation::AreaBatch { operations, .. } = &command.redo[0] else {
+            panic!("expected an atomic paste");
+        };
+        let AreaMutation::CreateLabel { body } = &operations[0] else {
             panic!("expected a label create");
         };
-        let pasted_id = mapper.create_label(area_id, args).await.expect("pasted");
+        let pasted_id = body.id.expect("paste mints the label identity");
+        let mut stack = CommandStack::default();
+        let _ = stack.push_and_apply(&mapper, command);
 
         let atlas = mapper.get_current_atlas();
         let area = atlas.get_area(&area_id).expect("area");
@@ -4591,17 +4982,16 @@ mod tests {
         to_unknown: bool,
     ) -> ExitClip {
         ExitClip {
+            from_source: None,
             from_direction: ExitDirection::North,
             to_area_id,
             to_room_number,
             to_direction: Some(ExitDirection::South),
             path: None,
             is_hidden: false,
-            is_closed: false,
-            is_locked: false,
+            door: None,
             weight: 1.0,
             command: None,
-            is_secret: false,
             to_unknown,
         }
     }
@@ -4684,10 +5074,10 @@ mod tests {
     }
 
     /// Settles the ready exit-create completions from a just-pushed paste.
-    fn drive_paste_exit_creates(mapper: &Mapper, stack: &mut CommandStack) {
+    fn drive_paste_exit_creates(stack: &mut CommandStack) {
         let command_id = stack.undo.back().expect("pushed").id;
         let mutations = stack.undo.back().expect("pushed").redo.clone();
-        drive_create_completions(mapper, stack, command_id, mutations);
+        drive_create_completions(stack, command_id, mutations);
     }
 
     #[tokio::test]
@@ -4800,7 +5190,7 @@ mod tests {
 
         let mut stack = CommandStack::default();
         let _ = stack.push_and_apply(&mapper, command);
-        drive_paste_exit_creates(&mapper, &mut stack);
+        drive_paste_exit_creates(&mut stack);
 
         {
             let atlas = mapper.get_current_atlas();
@@ -4950,7 +5340,7 @@ mod tests {
 
         let mut stack = CommandStack::default();
         let _ = stack.push_and_apply(&mapper, command);
-        drive_paste_exit_creates(&mapper, &mut stack);
+        drive_paste_exit_creates(&mut stack);
 
         let atlas = mapper.get_current_atlas();
         let area = atlas.get_area(&area_id).expect("area");
@@ -5000,14 +5390,11 @@ mod tests {
         let ResolvedId::Label(id) = resolved_id(&stack, 7, 0) else {
             panic!("label slot held the wrong entity kind");
         };
-        stack.resolve(
-            &mapper,
-            Outcome::Label {
-                command: 7,
-                slot: 0,
-                result: Ok(id),
-            },
-        );
+        stack.resolve(Outcome::Label {
+            command: 7,
+            slot: 0,
+            result: Ok(id),
+        });
         assert!(stack.can_undo(), "resolution unblocks undo");
     }
 
@@ -5035,9 +5422,8 @@ mod tests {
         let area = atlas.get_area(&area_id).expect("area");
         let edits = super::super::inspector::redistribute_port_updates(
             &area,
-            RoomNumber(1),
+            RoomNumber(1).into(),
             RoomSide::North,
-            false,
         );
         assert_eq!(edits.len(), 2);
         let mut offsets = edits

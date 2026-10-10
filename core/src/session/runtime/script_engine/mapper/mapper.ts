@@ -31,11 +31,13 @@ const {
     op_smudgy_mapper_relocate_atlas,
     op_smudgy_mapper_delete_area,
     op_smudgy_mapper_get_area_is_ephemeral,
+    op_smudgy_mapper_get_area_map_id,
     op_smudgy_mapper_rename_area,
     op_smudgy_mapper_get_area_by_id,
     op_smudgy_mapper_get_area_name,
     op_smudgy_mapper_get_area_id,
     op_smudgy_mapper_warn_area_uuid_once,
+    op_smudgy_mapper_warn_snake_case_once,
     op_smudgy_mapper_get_area_room_by_number,
     op_smudgy_mapper_get_area_property,
     op_smudgy_mapper_get_area_next_room_number,
@@ -98,6 +100,25 @@ const {
     op_smudgy_mapper_import_areas_if_absent,
     op_smudgy_mapper_export_area,
     op_smudgy_mapper_get_path_between_rooms,
+    op_smudgy_mapper_room_place,
+    op_smudgy_mapper_area_place,
+    op_smudgy_mapper_resolve_place,
+    op_smudgy_mapper_list_area_places,
+    op_smudgy_mapper_check_place,
+    op_smudgy_mapper_room_place_data,
+    op_smudgy_mapper_room_place_tags,
+    op_smudgy_mapper_room_place_has_tag,
+    op_smudgy_mapper_room_place_exits,
+    op_smudgy_mapper_area_place_data,
+    op_smudgy_mapper_room_combined_data,
+    op_smudgy_mapper_room_combined_tags,
+    op_smudgy_mapper_list_area_secrets,
+    op_smudgy_mapper_get_area_secret,
+    op_smudgy_mapper_area_secret_exists,
+    op_smudgy_mapper_get_secret,
+    op_smudgy_mapper_create_secret,
+    op_smudgy_mapper_update_secret,
+    op_smudgy_mapper_delete_secret,
     // (untyped: Deno.core is deno's private bootstrap namespace, no type decls)
 } = (globalThis as any).Deno.core.ops;
 
@@ -127,6 +148,73 @@ type ExitIdLike = ExitId | (string & { readonly __id?: undefined });
 type ConnectionIdLike = ConnectionId | (string & { readonly __id?: undefined });
 type LabelIdLike = LabelId | (string & { readonly __id?: undefined });
 type ShapeIdLike = ShapeId | (string & { readonly __id?: undefined });
+type SecretId = string & { readonly __id: "SecretId" };
+type SecretIdLike = SecretId | (string & { readonly __id?: undefined });
+
+/** Who holds ownership authority over a Secret: the map's owner, its recorded clan members,
+ * or its clan. */
+type SecretOwnership = "owner" | "members" | "clan";
+
+/** What the caller may do with a Secret. */
+type SecretAction =
+    | "read"
+    | "add"
+    | "edit"
+    | "remove"
+    | "manageAccess"
+    | "copy"
+    | "rename"
+    | "delete"
+    | "manageOwnership";
+
+/** A Secret as the host serves it. */
+interface SecretSnapshot {
+    readonly id: SecretId;
+    readonly mapId: AreaId;
+    readonly name: string;
+    readonly color: string | null;
+    readonly ownership: SecretOwnership;
+    readonly clanId?: string;
+    readonly actions: readonly SecretAction[];
+}
+
+interface SecretUpdates {
+    name?: string;
+    color?: string | null;
+}
+
+interface CreateSecretOptions {
+    name: string;
+    color?: string | null;
+    ownership?: "owner" | "members" | "clan";
+    clanId?: string;
+}
+
+/** One of a map's places: its own content, Private additions, or a Secret. */
+type MapPlace = "map" | "private" | Secret;
+/** A place as calls take it: a place, or a Secret's id. */
+type MapPlaceLike = MapPlace | SecretIdLike;
+
+interface PlaceOptions {
+    in?: MapPlaceLike;
+}
+
+/** One place's value for a property of a room (`room.combinedData(key)`). */
+interface RoomPlaceData {
+    readonly source: MapPlace;
+    readonly data: string;
+}
+
+/** One place's value for one of a room's properties (`room.combinedData()`). */
+interface RoomPlaceEntry extends RoomPlaceData {
+    readonly key: string;
+}
+
+/** One place's tag on a room (`room.combinedTags()`). */
+interface RoomPlaceTag {
+    readonly source: MapPlace;
+    readonly tag: string;
+}
 
 /** A compass/special exit direction (the canonical PascalCase names). */
 type ExitDirection =
@@ -186,6 +274,7 @@ interface CreateAtlasOptions {
 
 interface MutateAreaOptions {
     description?: string;
+    in?: MapPlaceLike;
 }
 
 class MutateAreaError extends Error {
@@ -204,6 +293,180 @@ class MutateAreaError extends Error {
 function normalizeId<T extends string>(value: unknown, what: string): T {
     if (typeof value === "string") return value as T;
     throw new TypeError(`expected ${what} as a canonical UUID string, got ${typeof value}`);
+}
+
+// Every name in this API is camelCase. Through Smudgy 0.5.x the snake_case names earlier
+// versions used keep working: what the API returns answers to them through hidden getters,
+// what it takes accepts them, and the first one a script uses draws one notice per isolate.
+// They go at 0.6 with the other 0.5 shims (the gate in mapper_api.rs).
+
+type Renames = readonly (readonly [string, string])[];
+
+const EXIT_ARGS_RENAMES: Renames = [
+    ["from_direction", "fromDirection"],
+    ["to_direction", "toDirection"],
+    ["to_area_id", "toAreaId"],
+    ["to_room_number", "toRoomNumber"],
+    ["is_hidden", "isHidden"],
+];
+
+/**
+ * @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+ * Each snake_case name, by the kind of object that carries it, with the camelCase name that
+ * replaced it.
+ */
+const SNAKE_CASE_NAMES = {
+    room: [["room_number", "roomNumber"], ["area_id", "areaId"]],
+    area: [["room_numbers", "roomNumbers"], ["next_room_number", "nextRoomNumber"]],
+    exit: [
+        ["connection_id", "connectionId"],
+        ["from_area_id", "fromAreaId"],
+        ["from_room_number", "fromRoomNumber"],
+        ...EXIT_ARGS_RENAMES,
+    ],
+    exitArgs: EXIT_ARGS_RENAMES,
+    traversal: [["room_number", "roomNumber"], ...EXIT_ARGS_RENAMES],
+    endpoint: [["room_number", "roomNumber"], ["port_offset", "portOffset"], ["port_mode", "portMode"]],
+    connection: [
+        ["endpoint_a", "endpointA"],
+        ["endpoint_b", "endpointB"],
+        ["segment_shape", "segmentShape"],
+        ["route_points", "routePoints"],
+    ],
+    label: [
+        ["horizontal_alignment", "horizontalAlignment"],
+        ["vertical_alignment", "verticalAlignment"],
+        ["background_color", "backgroundColor"],
+        ["font_size", "fontSize"],
+        ["font_weight", "fontWeight"],
+    ],
+    shape: [
+        ["background_color", "backgroundColor"],
+        ["stroke_color", "strokeColor"],
+        ["shape_type", "shapeType"],
+        ["border_radius", "borderRadius"],
+        ["stroke_width", "strokeWidth"],
+    ],
+} satisfies Record<string, Renames>;
+
+let snakeCaseWarned = false;
+
+/** Report the first snake_case name a script uses; the host latches it per isolate too. */
+function warnSnakeCase(old: string, now: string): void {
+    if (snakeCaseWarned) return;
+    snakeCaseWarned = true;
+    op_smudgy_mapper_warn_snake_case_once(old, now);
+}
+
+/** Give `target` a hidden getter for each snake_case name, reading its camelCase name. */
+function defineSnakeCaseAliases(target: object, renames: Renames): void {
+    for (const [old, now] of renames) {
+        Object.defineProperty(target, old, {
+            get(this: Record<string, unknown>) {
+                warnSnakeCase(old, now);
+                return this[now];
+            },
+            enumerable: false,
+            configurable: true,
+        });
+    }
+}
+
+function aliasPrototype(renames: Renames): object {
+    const prototype = {};
+    defineSnakeCaseAliases(prototype, renames);
+    return prototype;
+}
+
+const LABEL_PROTOTYPE = aliasPrototype(SNAKE_CASE_NAMES.label);
+const SHAPE_PROTOTYPE = aliasPrototype(SNAKE_CASE_NAMES.shape);
+const ENDPOINT_PROTOTYPE = aliasPrototype(SNAKE_CASE_NAMES.endpoint);
+const CONNECTION_PROTOTYPE = aliasPrototype(SNAKE_CASE_NAMES.connection);
+
+/** `value`'s own fields on an object that also answers to their snake_case names. Only the
+ * camelCase fields are enumerable, so `JSON.stringify` and spreads carry those alone. */
+function withSnakeCaseAliases<T extends object>(value: T, prototype: object): T {
+    return Object.assign(Object.create(prototype), value);
+}
+
+/** `input` with each snake_case field moved to its camelCase name; a field given under both
+ * names keeps the camelCase one. An input without snake_case fields comes back as it is. */
+function fromSnakeCase<T>(input: T, renames: Renames): T {
+    if (input === null || typeof input !== "object") return input;
+    let out: Record<string, unknown> | undefined;
+    for (const [old, now] of renames) {
+        if (!Object.prototype.hasOwnProperty.call(input, old)) continue;
+        warnSnakeCase(old, now);
+        out ??= { ...(input as Record<string, unknown>) };
+        if (out[now] === undefined) out[now] = out[old];
+        delete out[old];
+    }
+    return (out ?? input) as T;
+}
+
+/** The door flags exits no longer take, in both spellings. An exit's door says whether it is
+ * open, closed or locked. */
+const DOOR_FLAGS = ["isClosed", "isLocked", "is_closed", "is_locked"] as const;
+
+/** Refuses exit fields naming a door flag (any value but `undefined`), naming `door` as the
+ * field that replaces it, so a script written for the flags fails where it passes them
+ * instead of writing an exit without its door. */
+function refuseDoorFlags(exit: unknown) {
+    if (exit === null || typeof exit !== "object") return;
+    const fields = exit as Record<string, unknown>;
+    const flag = DOOR_FLAGS.find((name) => fields[name] !== undefined);
+    if (flag === undefined) return;
+    throw new TypeError(
+        `Exits take no \`${flag}\`: give the exit a \`door\` instead, ` +
+            `e.g. door: { state: "closed" } or door: { state: "locked" }; ` +
+            `door: null for no door.`,
+    );
+}
+
+function exitArgsIn<T extends ExitUpdates>(exit: T): T {
+    refuseDoorFlags(exit);
+    return fromSnakeCase(exit, SNAKE_CASE_NAMES.exitArgs);
+}
+
+/** Connection fields, with their endpoints and a link's traversals, in camelCase. */
+function connectionIn<T extends ConnectionUpdates & { traversals?: LinkTraversalArgs[] }>(updates: T): T {
+    const out = fromSnakeCase(updates, SNAKE_CASE_NAMES.connection);
+    if (out === null || typeof out !== "object") return out;
+    return {
+        ...out,
+        endpointA: fromSnakeCase(out.endpointA, SNAKE_CASE_NAMES.endpoint),
+        endpointB: fromSnakeCase(out.endpointB, SNAKE_CASE_NAMES.endpoint),
+        traversals: Array.isArray(out.traversals)
+            ? out.traversals.map((traversal) => {
+                refuseDoorFlags(traversal);
+                return fromSnakeCase(traversal, SNAKE_CASE_NAMES.traversal);
+            })
+            : out.traversals,
+    } as T;
+}
+
+/** A refusal's message as the host words one: the reason, then its code, with the code's
+ * snake_case spelling beside it through 0.5.x. */
+function refusal(message: string, code: string, formerly: string): string {
+    return `${message} (${code}; formerly ${formerly})`;
+}
+
+function connectionOut(connection: Connection): Connection {
+    return withSnakeCaseAliases(
+        {
+            ...connection,
+            endpointA: withSnakeCaseAliases(connection.endpointA, ENDPOINT_PROTOTYPE),
+            endpointB: connection.endpointB === null
+                ? null
+                : withSnakeCaseAliases(connection.endpointB, ENDPOINT_PROTOTYPE),
+        },
+        CONNECTION_PROTOTYPE,
+    );
+}
+
+/** A room argument's number. */
+function roomNumberOf(room: Room | RoomNumber): RoomNumber {
+    return room instanceof Room ? room.roomNumber : room;
 }
 
 /** Unwrap an atlas argument structurally. The contract `Atlas` type is an
@@ -228,6 +491,352 @@ function areaIdOf(area: Area | AreaId): AreaId {
     return typeof area === "string"
         ? normalizeId<AreaId>(area, what)
         : normalizeId<AreaId>((area as Area)?.id, what);
+}
+
+/** The key the host names a place by: "map", "private", or a Secret's id. A Secret's id is a
+ * UUID, so it can never be mistaken for a keyword; the host checks that it names a Secret. */
+function placeKey(place: MapPlaceLike): string {
+    if (typeof place === "string") return place;
+    if (place instanceof Secret) return place.id;
+    if (typeof place === "object" && place !== null && typeof (place as Secret).id === "string") {
+        return (place as Secret).id;
+    }
+    throw new TypeError(
+        `expected a place ("map", "private", a Secret or a Secret's id), got ${typeof place}`,
+    );
+}
+
+/** The key of an options object's `in`, or "" (every place, or the handle's own) without one. */
+function optionalPlaceKey(options: PlaceOptions | undefined): string {
+    return options?.in === undefined ? "" : placeKey(options.in);
+}
+
+/** A place the host served: a keyword, or a Secret. */
+function placeFrom(served: string | SecretSnapshot): MapPlace {
+    return typeof served === "string" ? (served as "map" | "private") : Secret.from(served);
+}
+
+/** The place a host key names. Anything but the map needs the `secrets` capability. */
+function placeOf(key: string): MapPlace {
+    return key === "map" ? "map" : placeFrom(op_smudgy_mapper_resolve_place(key));
+}
+
+/** Resolves place keys, each once per call. */
+function placeCache(): (key: string) => MapPlace {
+    const places = new Map<string, MapPlace>();
+    return (key) => {
+        let place = places.get(key);
+        if (place === undefined) {
+            place = placeOf(key);
+            places.set(key, place);
+        }
+        return place;
+    };
+}
+
+/** Write one operation into a place of a map (`place` "" is the area's own), through the same
+ * path as `mutateArea`. */
+async function writeInPlace(
+    area: Area | AreaId,
+    place: string,
+    operation: AreaBatchOperation,
+    description: string,
+): Promise<OperationId | null> {
+    const outcome: { committed: OperationId[]; error: string | null } =
+        await op_smudgy_mapper_mutate_area(areaIdOf(area), place, [operation], description);
+    if (outcome.error !== null && outcome.error !== undefined) throw new Error(outcome.error);
+    return outcome.committed[0] ?? null;
+}
+
+/** One of a cloud map's Secrets. A handle shows what the caller's projection serves about it
+ * (never its owners, grants or audience) as of the last time it was read; every read of the
+ * same Secret refreshes the same handle, so handles compare with `===`. */
+class Secret {
+    static readonly #handles = new Map<string, Secret>();
+
+    readonly id: SecretId;
+    #snapshot: SecretSnapshot;
+
+    private constructor(snapshot: SecretSnapshot) {
+        this.id = snapshot.id;
+        this.#snapshot = snapshot;
+    }
+
+    /** The handle for a Secret the host served, refreshed to what it served. */
+    static from(snapshot: SecretSnapshot): Secret {
+        const served = Object.freeze({ ...snapshot, actions: Object.freeze([...snapshot.actions]) });
+        const known = Secret.#handles.get(served.id);
+        if (known !== undefined) {
+            known.#snapshot = served;
+            return known;
+        }
+        const handle = new Secret(served);
+        Secret.#handles.set(served.id, handle);
+        return handle;
+    }
+
+    static #forget(id: string): void {
+        Secret.#handles.delete(id);
+    }
+
+    get name(): string {
+        return this.#snapshot.name;
+    }
+
+    /** Its chosen color, `#rrggbb`, or `null` when the palette picks one. */
+    get color(): string | null {
+        return this.#snapshot.color;
+    }
+
+    get ownership(): SecretOwnership {
+        return this.#snapshot.ownership;
+    }
+
+    /** The clan a Clan Secret belongs to. */
+    get clanId(): string | undefined {
+        return this.#snapshot.clanId;
+    }
+
+    /** What the caller may do with it. */
+    get actions(): readonly SecretAction[] {
+        return this.#snapshot.actions;
+    }
+
+    /** The map the Secret belongs to. */
+    get mapId(): AreaId {
+        return this.#snapshot.mapId;
+    }
+
+    /** The Secret's own area: its own rooms, labels and shapes. */
+    get area(): Area {
+        return mapper.getAreaById(this.id);
+    }
+
+    /** Rename and recolor in one request; the handle shows the result. */
+    async update(changes: SecretUpdates): Promise<void> {
+        if (changes === null || typeof changes !== "object") {
+            throw new TypeError("expected the Secret's changes as { name?, color? }");
+        }
+        const name = changes.name;
+        if (name !== undefined && typeof name !== "string") {
+            throw new TypeError(`expected the Secret's name as a string, got ${typeof name}`);
+        }
+        const setColor = changes.color !== undefined;
+        if (setColor && changes.color !== null && typeof changes.color !== "string") {
+            throw new TypeError(`expected the Secret's color as "#rrggbb" or null, got ${typeof changes.color}`);
+        }
+        if (name === undefined && !setColor) {
+            throw new TypeError("expected a new name, a new color or both");
+        }
+        Secret.from(await op_smudgy_mapper_update_secret(this.id, name, setColor, changes.color ?? null));
+    }
+
+    /** Delete the Secret and everything in it. */
+    async delete(): Promise<void> {
+        await op_smudgy_mapper_delete_secret(this.id);
+        Secret.#forget(this.id);
+    }
+
+    toString(): string {
+        return this.#snapshot.name;
+    }
+}
+
+/** A map's Secrets (`area.secrets`). */
+class SecretRegistry {
+    readonly #area: Area;
+    readonly #obj: unknown;
+
+    constructor(area: Area, obj: unknown) {
+        this.#area = area;
+        this.#obj = obj;
+    }
+
+    /** The map's Secrets the caller reads, in place order. */
+    list(): Secret[] {
+        return op_smudgy_mapper_list_area_secrets(this.#obj).map((secret: SecretSnapshot) =>
+            Secret.from(secret)
+        );
+    }
+
+    /** The Secret with this id on this map; "Secret not found" alike for one that does not
+     * exist, one the caller cannot read and one on another map. */
+    get(id: SecretIdLike): Secret {
+        return Secret.from(op_smudgy_mapper_get_area_secret(this.#obj, normalizeId<SecretId>(id, "a SecretId")));
+    }
+
+    /** Whether `get(id)` would find it. */
+    exists(id: SecretIdLike): boolean {
+        return op_smudgy_mapper_area_secret_exists(this.#obj, normalizeId<SecretId>(id, "a SecretId"));
+    }
+
+    /** Create a Secret on this map in one request, and resolve once the server has it: an owner
+     * Secret, or with `ownership` a Clan Secret. */
+    async create(options: CreateSecretOptions): Promise<Secret> {
+        if (options === null || typeof options !== "object" || typeof options.name !== "string") {
+            throw new TypeError("expected the new Secret as { name, color?, ownership?, clanId? }");
+        }
+        const color = options.color ?? null;
+        if (color !== null && typeof color !== "string") {
+            throw new TypeError(`expected the Secret's color as "#rrggbb" or null, got ${typeof color}`);
+        }
+        const ownership = options.ownership ?? null;
+        if (ownership !== null && ownership !== "owner" && ownership !== "members" && ownership !== "clan") {
+            throw new TypeError(`expected the Secret's ownership as "owner", "members" or "clan", got ${String(ownership)}`);
+        }
+        const clanId = options.clanId ?? null;
+        if (clanId !== null && typeof clanId !== "string") {
+            throw new TypeError(`expected clanId as a string, got ${typeof clanId}`);
+        }
+        if ((ownership === null || ownership === "owner") && clanId !== null) {
+            throw new TypeError("an owner Secret takes no clanId");
+        }
+        return Secret.from(
+            await op_smudgy_mapper_create_secret(this.#area.id, options.name, color, ownership, clanId),
+        );
+    }
+}
+
+/** One place's data on one room (`room.in(place)`). */
+class RoomView {
+    readonly #room: Room;
+    readonly #obj: unknown;
+    readonly #key: string;
+    readonly #own: boolean;
+
+    constructor(room: Room, obj: unknown, key: string) {
+        this.#room = room;
+        this.#obj = obj;
+        this.#key = key;
+        this.#own = key === op_smudgy_mapper_room_place(obj);
+    }
+
+    get place(): MapPlace {
+        return placeOf(this.#key);
+    }
+
+    data(key: string): string | undefined {
+        return op_smudgy_mapper_room_place_data(this.#obj, this.#key, key) ?? undefined;
+    }
+
+    get tags(): string[] {
+        return op_smudgy_mapper_room_place_tags(this.#obj, this.#key);
+    }
+
+    hasTag(tag: string): boolean {
+        return op_smudgy_mapper_room_place_has_tag(this.#obj, this.#key, String(tag));
+    }
+
+    get exits(): Exit[] {
+        return op_smudgy_mapper_room_place_exits(this.#obj, this.#key).map((exit: ExitWire) => new MapExit(exit));
+    }
+
+    #attachmentAddress(): { mapId: AreaId; room_number: RoomNumber; room_source: string } {
+        const area = mapper.getAreaById(this.#room.areaId);
+        if (!area) throw new Error("The room's map is no longer available");
+        return {
+            mapId: area.mapId ?? area.id,
+            room_number: this.#room.roomNumber,
+            room_source: op_smudgy_mapper_room_place(this.#obj),
+        };
+    }
+
+    setData(key: string, value: string): Promise<OperationId | null> {
+        const room = this.#room;
+        if (this.#own) return mapper.setRoomProperty(room.areaId, room, key, value);
+        const { mapId, ...anchor } = this.#attachmentAddress();
+        return writeInPlace(mapId, this.#key, {
+            upsert_room_property: { ...anchor, name: key, value },
+        }, "Scripted room property");
+    }
+
+    deleteData(key: string): Promise<OperationId | null> {
+        const room = this.#room;
+        if (this.#own) return mapper.deleteRoomProperty(room.areaId, room, key);
+        const { mapId, ...anchor } = this.#attachmentAddress();
+        return writeInPlace(mapId, this.#key, {
+            delete_room_property: { ...anchor, name: key },
+        }, "Scripted room property");
+    }
+
+    async addTag(tag: string): Promise<OperationId | null> {
+        if (this.hasTag(tag)) return null;
+        const room = this.#room;
+        if (this.#own) return mapper.addRoomTag(room.areaId, room, tag);
+        const { mapId, ...anchor } = this.#attachmentAddress();
+        return writeInPlace(mapId, this.#key, {
+            add_room_tag: { ...anchor, tag },
+        }, "Scripted room tag");
+    }
+
+    async removeTag(tag: string): Promise<OperationId | null> {
+        if (!this.hasTag(tag)) return null;
+        const room = this.#room;
+        if (this.#own) return mapper.removeRoomTag(room.areaId, room, tag);
+        const { mapId, ...anchor } = this.#attachmentAddress();
+        return writeInPlace(mapId, this.#key, {
+            remove_room_tag: { ...anchor, tag },
+        }, "Scripted room tag");
+    }
+
+    async createExit(exit: ExitArgs): Promise<ExitId> {
+        const room = this.#room;
+        if (this.#own) return mapper.createRoomExit(room.areaId, room, exit);
+        const id: ExitId = op_smudgy_mapper_generate_id();
+        const { mapId, ...anchor } = this.#attachmentAddress();
+        await writeInPlace(mapId, this.#key, {
+            create_exit: { ...anchor, id, body: { ...exitArgsIn(exit) } },
+        }, "Scripted room exit");
+        return id;
+    }
+}
+
+/** One place's data on one map (`area.in(place)`), and the searches narrowed to it. */
+class AreaView {
+    readonly #area: Area;
+    readonly #obj: unknown;
+    readonly #key: string;
+    readonly #own: boolean;
+
+    constructor(area: Area, obj: unknown, key: string) {
+        this.#area = area;
+        this.#obj = obj;
+        this.#key = key;
+        this.#own = key === op_smudgy_mapper_area_place(obj);
+    }
+
+    get place(): MapPlace {
+        return placeOf(this.#key);
+    }
+
+    data(key: string): string | undefined {
+        return op_smudgy_mapper_area_place_data(this.#obj, this.#key, key) ?? undefined;
+    }
+
+    setData(key: string, value: string): Promise<OperationId | null> {
+        if (this.#own) return mapper.setAreaProperty(this.#area, key, value);
+        return writeInPlace(this.#area.id, this.#key, {
+            upsert_area_property: { name: key, value },
+        }, "Scripted area property");
+    }
+
+    deleteData(key: string): Promise<OperationId | null> {
+        return writeInPlace(this.#area.id, this.#own ? "" : this.#key, {
+            delete_area_property: { name: key },
+        }, "Scripted area property");
+    }
+
+    findRoomsByProperty(name: string, value: string): Room[] {
+        return this.#area.findRoomsByProperty(name, value, { in: this.#key });
+    }
+
+    findRoomsWithProperty(name: string): Room[] {
+        return this.#area.findRoomsWithProperty(name, { in: this.#key });
+    }
+
+    findRoomsWithTag(tag: string): Room[] {
+        return this.#area.findRoomsWithTag(tag, { in: this.#key });
+    }
 }
 
 /** Resolves room references returned by the indexed lookups. A reference
@@ -374,9 +983,15 @@ const mapper = {
         return op_smudgy_mapper_list_area_ids().map((id: AreaId) => new Area(op_smudgy_mapper_get_area_by_id(id)));
     },
 
-    getAreaById(id: AreaId) {
+    getAreaById(id: AreaId | SecretId) {
         let area = op_smudgy_mapper_get_area_by_id(normalizeId<AreaId>(id, "an AreaId"));
         return new Area(area);
+    },
+
+    /** One of a cloud map's Secrets, by an id you stored, or "Secret not found" alike for one
+     * that does not exist and one you cannot read. */
+    getSecretById(id: SecretIdLike): Secret {
+        return Secret.from(op_smudgy_mapper_get_secret(normalizeId<SecretId>(id, "a SecretId")));
     },
 
     /** Collect related writes to one area. Callback and validation failures submit
@@ -391,14 +1006,19 @@ const mapper = {
         options?: MutateAreaOptions,
     ): Promise<OperationId[]> {
         // Always start from the current host snapshot. A script may retain an Area
-        // wrapper across prior writes, including a now-stale next_room_number.
+        // wrapper across prior writes, including a now-stale nextRoomNumber.
         const target = this.getAreaById(areaIdOf(area));
-        const mutation = new AreaMutator(target);
+        const place = optionalPlaceKey(options);
+        // A place other than the map, written through the map, keeps data on the map's
+        // rooms; its own rooms are edited through its own area.
+        const onMapRooms = place !== "" && place !== "map" && target.mapId === undefined;
+        const mutation = new AreaMutator(target, onMapRooms);
         try {
             await callback(mutation);
             const outcome: { committed: OperationId[]; error: string | null } =
                 await op_smudgy_mapper_mutate_area(
                     target.id,
+                    place,
                     mutation.finish(),
                     options?.description ?? "Scripted area mutation",
                 );
@@ -430,29 +1050,27 @@ const mapper = {
         );
     },
 
-    /** Every room on the map whose `name` property is exactly `value`, as
-     * `room.data(name)` reads it. Name and value both match exactly. The map
-     * keeps an index for this, so it costs one lookup however large the map is;
-     * there is no reason to walk the areas yourself. Rooms of maps you have
-     * turned off are left out. Requires `mapper:read`. */
-    findRoomsByProperty(name: string, value: string): Room[] {
-        return hydrateRooms(op_smudgy_mapper_find_rooms_by_property(name, value));
+    /** Every room whose `name` property is exactly `value` in any place you read (the map's
+     * own data, a Secret's, your Private additions'), or in the one `options.in` names. Name
+     * and value both match exactly. One indexed lookup per place, however large the map is.
+     * Rooms of maps you have turned off are left out. Requires `mapper:read`. */
+    findRoomsByProperty(name: string, value: string, options?: PlaceOptions): Room[] {
+        return hydrateRooms(op_smudgy_mapper_find_rooms_by_property(name, value, optionalPlaceKey(options)));
     },
 
-    /** Every room on the map carrying a property called `name`, whatever its
-     * value -- "which rooms did I write this on at all". Indexed like
-     * `findRoomsByProperty`. Rooms of maps you have turned off are left out.
-     * Requires `mapper:read`. */
-    findRoomsWithProperty(name: string): Room[] {
-        return hydrateRooms(op_smudgy_mapper_find_rooms_with_property(name));
+    /** Every room carrying a property called `name`, whatever its value, in any place you
+     * read or the one `options.in` names. Indexed like `findRoomsByProperty`. Rooms of maps
+     * you have turned off are left out. Requires `mapper:read`. */
+    findRoomsWithProperty(name: string, options?: PlaceOptions): Room[] {
+        return hydrateRooms(op_smudgy_mapper_find_rooms_with_property(name, optionalPlaceKey(options)));
     },
 
-    /** Every room on the map carrying `tag` (case-insensitive), in no
-     * particular order. Reach for `findNearestRoomWithTag` when you want the
-     * closest one instead: that walks the map, this reads an index. Rooms of
-     * maps you have turned off are left out. Requires `mapper:read`. */
-    findRoomsWithTag(tag: string): Room[] {
-        return hydrateRooms(op_smudgy_mapper_find_rooms_with_tag(tag));
+    /** Every room carrying `tag` (case-insensitive) in any place you read or the one
+     * `options.in` names, in no particular order. Reach for `findNearestRoomWithTag` when you
+     * want the closest one instead. Rooms of maps you have turned off are left out. Requires
+     * `mapper:read`. */
+    findRoomsWithTag(tag: string, options?: PlaceOptions): Room[] {
+        return hydrateRooms(op_smudgy_mapper_find_rooms_with_tag(tag, optionalPlaceKey(options)));
     },
 
     /** Every area whose `name` property is exactly `value`, as `area.data(name)`
@@ -484,43 +1102,49 @@ const mapper = {
 
     setRoomTitle(area: Area | AreaId, room: Room | RoomNumber, title: string): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_set_room_title(areaId, roomNumber, title);
     },
 
     setRoomDescription(area: Area | AreaId, room: Room | RoomNumber, description: string): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_set_room_description(areaId, roomNumber, description);
     },
 
     setRoomColor(area: Area | AreaId, room: Room | RoomNumber, color: string): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_set_room_color(areaId, roomNumber, color);
     },
 
     setRoomLevel(area: Area | AreaId, room: Room | RoomNumber, level: number): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_set_room_level(areaId, roomNumber, level);
     },
 
     setRoomX(area: Area | AreaId, room: Room | RoomNumber, x: number): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_set_room_x(areaId, roomNumber, x);
     },
 
     setRoomY(area: Area | AreaId, room: Room | RoomNumber, y: number): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_set_room_y(areaId, roomNumber, y);
     },
 
-    setRoomProperty(area: Area | AreaId, room: Room | RoomNumber, name: string, value: string): Promise<OperationId | null> {
+    /** Set a custom property on a room, in the room's own place. Requires `mapper:write`. */
+    setRoomProperty(
+        area: Area | AreaId,
+        room: Room | RoomNumber,
+        name: string,
+        value: string,
+    ): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_set_room_property(areaId, roomNumber, name, value);
     },
 
@@ -531,43 +1155,63 @@ const mapper = {
         return op_smudgy_mapper_set_area_property(areaId, name, value);
     },
 
-    /** Add a case-insensitive tag to a room. The tag is normalized to UPPERCASE;
-     * re-adding an existing tag is a no-op. Requires the `mapper:write` capability. */
+    /** Delete a room property from the room's own place. */
+    deleteRoomProperty(area: Area | AreaId, room: Room | RoomNumber, name: string): Promise<OperationId | null> {
+        const roomNumber = roomNumberOf(room);
+        return writeInPlace(area, "", {
+            delete_room_property: { room_number: roomNumber, name },
+        }, "Scripted room property");
+    },
+
+    /** Delete an area property from the area's own place. */
+    deleteAreaProperty(area: Area | AreaId, name: string): Promise<OperationId | null> {
+        return writeInPlace(area, "", {
+            delete_area_property: { name },
+        }, "Scripted area property");
+    },
+
+    /** Add a case-insensitive tag to a room, in the room's own place (on a map room, the map's
+     * tags, which everyone who reads the map sees; `room.in(place).addTag` tags it in another
+     * place). The tag is normalized to UPPERCASE; re-adding an existing tag is a no-op. Requires
+     * the `mapper:write` capability. */
     addRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_add_room_tag(areaId, roomNumber, tag);
     },
 
-    /** Remove a tag from a room (case-insensitive). Requires `mapper:write`. */
+    /** Remove a tag from a room's own place (case-insensitive). Requires `mapper:write`. */
     removeRoomTag(area: Area | AreaId, room: Room | RoomNumber, tag: string): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_remove_room_tag(areaId, roomNumber, tag);
     },
 
-    /** The nearest reachable room carrying `tag` (case-insensitive) from `from`,
-     * by the same weighted graph search as `getPathBetweenRooms` (the start room
-     * counts if it carries the tag), or `undefined` if none is reachable. Path to
-     * it with `getPathBetweenRooms`. Requires `mapper:read`. */
-    findNearestRoomWithTag(from: Room, tag: string): Room | undefined {
-        return this.findNearestRoomWithTags(from, { all: [tag] });
+    /** The nearest reachable room carrying `tag` (case-insensitive) in any place you read, or
+     * in the one `options.in` names, from `from`, by the same weighted graph search as
+     * `getPathBetweenRooms`, which takes the hidden doors you read (the start room counts if
+     * it carries the tag), or `undefined` if none is reachable. Path to it with
+     * `getPathBetweenRooms`. Requires `mapper:read`. */
+    findNearestRoomWithTag(from: Room, tag: string, options?: PlaceOptions): Room | undefined {
+        return this.findNearestRoomWithTags(from, { all: [tag] }, options);
     },
 
-    /** The nearest reachable room whose tags satisfy a conjunctive filter: has
-     * every tag in `all` and none in `none` (all case-insensitive), or
-     * `undefined` if none is reachable. The filter is evaluated in Rust during the
-     * search, so it is cheap even over large maps. An empty filter returns
-     * `undefined`. Requires `mapper:read`. */
+    /** The nearest reachable room whose tags satisfy a conjunctive filter: has every tag in
+     * `all` and none in `none` (all case-insensitive), where a room's tags are every place's
+     * you read (or the one place `options.in` names), or `undefined` if none is reachable.
+     * The candidates come from indexed lookups, so the search is cheap even over large maps.
+     * An empty filter returns `undefined`. Requires `mapper:read`. */
     findNearestRoomWithTags(
         from: Room,
         filter: { all?: string[]; none?: string[] },
+        options?: PlaceOptions,
     ): Room | undefined {
         const ref = op_smudgy_mapper_find_nearest_room_with_tags(
-            from.area_id,
-            from.room_number,
+            from.areaId,
+            from.roomNumber,
             filter.all ?? [],
             filter.none ?? [],
+            optionalPlaceKey(options),
         );
         if (!ref) return undefined;
         const [areaId, roomNumber] = ref;
@@ -582,8 +1226,8 @@ const mapper = {
     findNearestRoomInArea(from: Room, area: Area | AreaId): Room | undefined {
         const areaId = areaIdOf(area);
         const ref = op_smudgy_mapper_find_nearest_room_in_area(
-            from.area_id,
-            from.room_number,
+            from.areaId,
+            from.roomNumber,
             areaId,
         );
         if (!ref) return undefined;
@@ -615,7 +1259,7 @@ const mapper = {
      * Requires `mapper:write`. */
     setRoomExternalId(area: Area | AreaId, room: Room | RoomNumber, externalId: string): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_set_room_external_id(areaId, roomNumber, externalId);
     },
 
@@ -628,7 +1272,7 @@ const mapper = {
      * instead of one per field. Only the fields present in `fields` change. */
     updateRoom(area: Area | AreaId, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_update_room(areaId, roomNumber, fields);
     },
 
@@ -639,26 +1283,27 @@ const mapper = {
         return op_smudgy_mapper_update_rooms(areaId, updates);
     },
 
+    /** Create an exit on a room, in the room's own place. */
     createRoomExit(area: Area | AreaId, room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
-        return op_smudgy_mapper_create_room_exit(areaId, roomNumber, exit);
+        const roomNumber = roomNumberOf(room);
+        return op_smudgy_mapper_create_room_exit(areaId, roomNumber, exitArgsIn(exit));
     },
     /** Update an existing exit and resolve only after the map backend
      * acknowledges the exact mutation. Equal updates resolve to `null`
      * without sending a revision-bumping no-op. */
     setRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId, exit: ExitUpdates): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
-        return op_smudgy_mapper_set_room_exit(areaId, roomNumber, exitId, exit);
+        const roomNumber = roomNumberOf(room);
+        return op_smudgy_mapper_set_room_exit(areaId, roomNumber, exitId, exitArgsIn(exit));
     },
     /** Merge `remove` into `keep` as one durable area mutation. The kept
      * room's metadata wins; traversal is deduplicated and rewired. Resolves
      * only after the backend acknowledges the exact operation. */
     mergeRooms(area: Area | AreaId, keep: Room | RoomNumber, remove: Room | RoomNumber): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const keepRoomNumber = keep instanceof Room ? keep.room_number : keep;
-        const removeRoomNumber = remove instanceof Room ? remove.room_number : remove;
+        const keepRoomNumber = roomNumberOf(keep);
+        const removeRoomNumber = roomNumberOf(remove);
         return op_smudgy_mapper_merge_rooms(areaId, keepRoomNumber, removeRoomNumber);
     },
     /** Fold areas into `into` as one durable transaction. Whole sources move their content
@@ -687,7 +1332,7 @@ const mapper = {
             if (entry.rooms !== undefined) {
                 if (!Array.isArray(entry.rooms) ||
                     Array.from(entry.rooms).some((room) => !integer(room))) {
-                    throw new TypeError("merge_areas_invalid_rooms: rooms must be an array of 32-bit integers");
+                    throw new TypeError(refusal("Rooms must be an array of 32-bit integers.", "mergeAreasInvalidRooms", "merge_areas_invalid_rooms"));
                 }
                 wire.rooms = entry.rooms;
             }
@@ -697,7 +1342,7 @@ const mapper = {
                     [offset.x, offset.y].some((value) => value !== undefined &&
                         (typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > 3.4028234663852886e38)) ||
                     (offset.level !== undefined && !integer(offset.level))) {
-                    throw new TypeError("merge_areas_invalid_translation: translation requires finite coordinates and a 32-bit integer level");
+                    throw new TypeError(refusal("A translation needs finite coordinates and a 32-bit integer level.", "mergeAreasInvalidTranslation", "merge_areas_invalid_translation"));
                 }
                 wire.translate = offset;
             }
@@ -707,23 +1352,23 @@ const mapper = {
     },
     deleteRoom(area: Area | AreaId, room: Room | RoomNumber): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_delete_room(areaId, roomNumber);
     },
     deleteRoomExit(area: Area | AreaId, room: Room | RoomNumber, exitId: ExitId): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        const roomNumber = room instanceof Room ? room.room_number : room;
+        const roomNumber = roomNumberOf(room);
         return op_smudgy_mapper_delete_room_exit(areaId, roomNumber, exitId);
     },
     /** Atomically create one Connection and its one or two member traversals. */
     createLink(area: Area | AreaId, link: LinkCreateArgs): Promise<ConnectionId> {
         const areaId = areaIdOf(area);
-        return op_smudgy_mapper_create_link(areaId, link);
+        return op_smudgy_mapper_create_link(areaId, connectionIn(link));
     },
     /** Update shared Connection geometry or appearance. */
     setConnection(area: Area | AreaId, connectionId: ConnectionId, updates: ConnectionUpdates): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        return op_smudgy_mapper_set_connection(areaId, connectionId, updates);
+        return op_smudgy_mapper_set_connection(areaId, connectionId, connectionIn(updates));
     },
     /** Split one traversal out of a bidirectional Connection. */
     unlinkRoomExit(area: Area | AreaId, exitId: ExitId): Promise<ConnectionId> {
@@ -743,12 +1388,12 @@ const mapper = {
     /** Add a text label to an area; returns its new id. Requires `mapper:write`. */
     createLabel(area: Area | AreaId, label: LabelArgs): Promise<LabelId> {
         const areaId = areaIdOf(area);
-        return op_smudgy_mapper_create_label(areaId, label);
+        return op_smudgy_mapper_create_label(areaId, fromSnakeCase(label, SNAKE_CASE_NAMES.label));
     },
     /** Add a graphical shape to an area; returns its new id. Requires `mapper:write`. */
     createShape(area: Area | AreaId, shape: ShapeArgs): Promise<ShapeId> {
         const areaId = areaIdOf(area);
-        return op_smudgy_mapper_create_shape(areaId, shape);
+        return op_smudgy_mapper_create_shape(areaId, fromSnakeCase(shape, SNAKE_CASE_NAMES.shape));
     },
     /** Delete a label from an area. Requires `mapper:write`. */
     deleteLabel(area: Area | AreaId, labelId: LabelId): Promise<OperationId | null> {
@@ -763,12 +1408,12 @@ const mapper = {
     /** Update an existing label; only present fields change. Requires `mapper:write`. */
     setLabel(area: Area | AreaId, labelId: LabelId, updates: LabelUpdates): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        return op_smudgy_mapper_set_label(areaId, labelId, updates);
+        return op_smudgy_mapper_set_label(areaId, labelId, fromSnakeCase(updates, SNAKE_CASE_NAMES.label));
     },
     /** Update an existing shape; only present fields change. Requires `mapper:write`. */
     setShape(area: Area | AreaId, shapeId: ShapeId, updates: ShapeUpdates): Promise<OperationId | null> {
         const areaId = areaIdOf(area);
-        return op_smudgy_mapper_set_shape(areaId, shapeId, updates);
+        return op_smudgy_mapper_set_shape(areaId, shapeId, fromSnakeCase(updates, SNAKE_CASE_NAMES.shape));
     },
     /** Serialize an area to a portable JSON blob. Requires `mapper:read` and copy rights
      * (`can_copy`) on the area. */
@@ -800,44 +1445,120 @@ const mapper = {
 interface Exit {
     readonly id: ExitId;
     /** The shared Connection this traversal belongs to. */
-    readonly connection_id: ConnectionId;
-    readonly from_direction: ExitDirection;
-    readonly from_area_id: AreaId;
-    readonly from_room_number: RoomNumber;
-    readonly to_direction: ExitDirection | null;
-    readonly to_area_id: AreaId | null;
-    readonly to_room_number: RoomNumber | null;
-    readonly is_hidden: boolean;
-    readonly is_closed: boolean;
-    readonly is_locked: boolean;
+    readonly connectionId: ConnectionId;
+    readonly fromDirection: ExitDirection;
+    readonly fromAreaId: AreaId;
+    readonly fromRoomNumber: RoomNumber;
+    readonly toDirection: ExitDirection | null;
+    readonly toAreaId: AreaId | null;
+    readonly toRoomNumber: RoomNumber | null;
+    readonly isHidden: boolean;
+    readonly door: Door | null;
     readonly weight: number;
     readonly command: string | null;
+    readonly toRoom: Room | undefined;
+    readonly place: MapPlace;
 }
 
-// Fields accepted when creating an exit (`createRoomExit`); `from_direction` is required.
+// A door's state. Locked implies closed; an exit without a door has `door: null`.
+type DoorState = "open" | "closed" | "locked";
+
+// An exit's door: its state, its name, and the command that opens it (distinct from the
+// exit's `command`, the one that goes through it).
+interface Door {
+    readonly state: DoorState;
+    readonly name: string | null;
+    readonly opensWith: string | null;
+}
+
+// A door as `createRoomExit` and `setRoomExit` take it; omitted or `null` name and
+// `opensWith` are none.
+interface DoorArgs {
+    state: DoorState;
+    name?: string | null;
+    opensWith?: string | null;
+}
+
+/** An exit as the host serves it, with the key of the place that keeps it. */
+type ExitWire = Omit<Exit, "toRoom" | "place"> & { readonly place: string };
+
+/** An exit as `room.exits` returns it. */
+class MapExit implements Exit {
+    readonly id: ExitId;
+    readonly connectionId: ConnectionId;
+    readonly fromDirection: ExitDirection;
+    readonly fromAreaId: AreaId;
+    readonly fromRoomNumber: RoomNumber;
+    readonly toDirection: ExitDirection | null;
+    readonly toAreaId: AreaId | null;
+    readonly toRoomNumber: RoomNumber | null;
+    readonly isHidden: boolean;
+    readonly door: Door | null;
+    readonly weight: number;
+    readonly command: string | null;
+    readonly #place: string;
+
+    constructor(exit: ExitWire) {
+        this.id = exit.id;
+        this.connectionId = exit.connectionId;
+        this.fromDirection = exit.fromDirection;
+        this.fromAreaId = exit.fromAreaId;
+        this.fromRoomNumber = exit.fromRoomNumber;
+        this.toDirection = exit.toDirection;
+        this.toAreaId = exit.toAreaId;
+        this.toRoomNumber = exit.toRoomNumber;
+        this.isHidden = exit.isHidden;
+        this.door = exit.door === null ? null : Object.freeze({ ...exit.door });
+        this.weight = exit.weight;
+        this.command = exit.command;
+        this.#place = exit.place;
+    }
+
+    /** The room the exit leads to, wherever it lives: a map's room, or a Secret's own room. */
+    get toRoom(): Room | undefined {
+        if (this.toAreaId === null || this.toRoomNumber === null) return undefined;
+        let area: Area;
+        try {
+            area = mapper.getAreaById(this.toAreaId);
+        } catch {
+            return undefined;
+        }
+        return area.room(this.toRoomNumber);
+    }
+
+    /** The place that keeps the exit. */
+    get place(): MapPlace {
+        return placeOf(this.#place);
+    }
+}
+defineSnakeCaseAliases(MapExit.prototype, SNAKE_CASE_NAMES.exit);
+
+// Fields accepted when creating an exit (`createRoomExit`); `fromDirection` is required.
 // Visual appearance (routing, dash, color, thickness) lives on the shared
 // Connection, not the exit.
 interface ExitArgs {
-    from_direction: ExitDirection;
-    to_direction?: ExitDirection;
-    to_area_id?: AreaIdLike;
-    to_room_number?: RoomNumber;
-    is_hidden?: boolean;
-    is_closed?: boolean;
-    is_locked?: boolean;
+    fromDirection: ExitDirection;
+    toDirection?: ExitDirection;
+    toAreaId?: AreaIdLike;
+    toRoomNumber?: RoomNumber;
+    isHidden?: boolean;
+    // The new exit's door; omitted or `null` for none. Exits take no `isClosed` or
+    // `isLocked` (nor `is_closed`, `is_locked`): passing one throws a TypeError naming `door`.
+    door?: DoorArgs | null;
     weight?: number;
     command?: string;
 }
 
 // Fields accepted when updating an exit (`setRoomExit`). Any omitted field is left unchanged.
 interface ExitUpdates {
-    from_direction?: ExitDirection;
-    to_direction?: ExitDirection;
-    to_area_id?: AreaIdLike;
-    to_room_number?: RoomNumber;
-    is_hidden?: boolean;
-    is_closed?: boolean;
-    is_locked?: boolean;
+    fromDirection?: ExitDirection;
+    toDirection?: ExitDirection;
+    toAreaId?: AreaIdLike;
+    toRoomNumber?: RoomNumber;
+    isHidden?: boolean;
+    // `null` removes the door with its name and command; a door replaces it whole. As in
+    // `ExitArgs`, a door flag (`isClosed`, `isLocked`) throws a TypeError naming `door`.
+    door?: DoorArgs | null;
     weight?: number;
     command?: string;
 }
@@ -856,57 +1577,62 @@ interface MapPoint {
 }
 
 interface ConnectionEndpoint {
-    room_number: RoomNumber;
+    place?: "map" | "private" | SecretId;
+    roomNumber: RoomNumber;
     side: RoomSide;
-    port_offset: number;
-    port_mode: PortMode;
+    portOffset: number;
+    portMode: PortMode;
 }
 
 interface Connection {
     readonly id: ConnectionId;
-    readonly endpoint_a: ConnectionEndpoint;
-    readonly endpoint_b: ConnectionEndpoint | null;
+    readonly endpointA: ConnectionEndpoint;
+    readonly endpointB: ConnectionEndpoint | null;
     readonly kind: ConnectionKind;
     readonly routing: ConnectionRouting;
-    readonly segment_shape: ConnectionSegmentShape;
+    readonly segmentShape: ConnectionSegmentShape;
     readonly corner: ConnectionCorner;
-    readonly route_points: MapPoint[];
+    readonly routePoints: MapPoint[];
     readonly dash: ConnectionDash;
     readonly color: string;
     readonly thickness: number;
 }
 
 interface ConnectionUpdates {
-    endpoint_a?: ConnectionEndpoint;
-    endpoint_b?: ConnectionEndpoint;
+    endpointA?: ConnectionEndpoint;
+    endpointB?: ConnectionEndpoint;
     routing?: ConnectionRouting;
-    segment_shape?: ConnectionSegmentShape;
+    segmentShape?: ConnectionSegmentShape;
     corner?: ConnectionCorner;
-    route_points?: MapPoint[];
+    routePoints?: MapPoint[];
     dash?: ConnectionDash;
     color?: string;
     thickness?: number;
 }
 
 interface LinkTraversalArgs extends ExitArgs {
-    room_number: RoomNumber;
+    roomNumber: RoomNumber;
 }
 
 interface LinkCreateArgs extends ConnectionUpdates {
-    endpoint_a: ConnectionEndpoint;
-    endpoint_b?: ConnectionEndpoint;
+    endpointA: ConnectionEndpoint;
+    endpointB?: ConnectionEndpoint;
     traversals: LinkTraversalArgs[];
 }
 
+// The host's batch wire: operation tags and their own fields keep the wire spelling, and
+// each `body` carries the script-facing camelCase fields.
 type AreaBatchOperation =
     | { upsert_room: { room_number: RoomNumber; body: CreateRoomParams } }
     | { create_room: { room_number: RoomNumber; body: CreateRoomParams } }
     | { delete_room: { room_number: RoomNumber } }
-    | { upsert_room_property: { room_number: RoomNumber; name: string; value: string } }
+    | { upsert_room_property: { room_number: RoomNumber; room_source?: string; name: string; value: string } }
     | { upsert_area_property: { name: string; value: string } }
-    | { add_room_tag: { room_number: RoomNumber; tag: string } }
-    | { remove_room_tag: { room_number: RoomNumber; tag: string } }
-    | { create_exit: { room_number: RoomNumber; id: ExitId; body: ExitArgs } }
+    | { delete_room_property: { room_number: RoomNumber; room_source?: string; name: string } }
+    | { delete_area_property: { name: string } }
+    | { add_room_tag: { room_number: RoomNumber; room_source?: string; tag: string } }
+    | { remove_room_tag: { room_number: RoomNumber; room_source?: string; tag: string } }
+    | { create_exit: { room_number: RoomNumber; room_source?: string; id: ExitId; body: ExitArgs } }
     | { update_exit: { exit_id: ExitId; body: ExitUpdates } }
     | { delete_exit: { exit_id: ExitId } }
     | { create_link: { connection_id: ConnectionId; body: LinkCreateArgs } }
@@ -914,10 +1640,10 @@ type AreaBatchOperation =
 
 function roomNumberInArea(areaId: AreaId, room: Room | RoomNumber): RoomNumber {
     if (!(room instanceof Room)) return room;
-    if (room.area_id !== areaId) {
+    if (room.areaId !== areaId) {
         throw new TypeError("mutateArea cannot edit a room from another area");
     }
-    return room.room_number;
+    return room.roomNumber;
 }
 
 /** A callback-scoped write collector. Its methods preserve the familiar async
@@ -928,12 +1654,14 @@ function roomNumberInArea(areaId: AreaId, room: Room | RoomNumber): RoomNumber {
 class AreaMutator {
     readonly #areaId: AreaId;
     readonly #token: OperationId;
+    readonly #onMapRooms: boolean;
     #operations: AreaBatchOperation[] = [];
     #open = true;
 
-    constructor(area: Area) {
+    constructor(area: Area, onMapRooms = false) {
         this.#areaId = area.id;
         this.#token = op_smudgy_mapper_generate_id();
+        this.#onMapRooms = onMapRooms;
     }
 
     #record(operation: AreaBatchOperation): void {
@@ -941,15 +1669,26 @@ class AreaMutator {
         this.#operations.push(operation);
     }
 
+    /** A place written through its map keeps properties, tags and exits on the map's rooms
+     * and cannot change the rooms themselves. */
+    #roomFields(): void {
+        if (this.#onMapRooms) {
+            throw new TypeError(
+                "a mutateArea place keeps data on the map's rooms and cannot create, change or delete them; edit a Secret's own rooms through secret.area",
+            );
+        }
+    }
+
     async createRoom(params: CreateRoomParams): Promise<RoomNumber> {
         if (!this.#open) throw new TypeError("this mutateArea callback has finished");
+        this.#roomFields();
         const roomNumber: RoomNumber = op_smudgy_mapper_reserve_room_number(
             this.#areaId,
             this.#token,
         );
         // Create-only submission: if this number exists by submission time
         // (another client won the race), the envelope is refused with
-        // `room_number_exists` and surfaces through mutateArea's thrown
+        // `roomNumberExists` and surfaces through mutateArea's thrown
         // error (committedOperations carries any acknowledged prefix),
         // never a silent merge into the other client's room.
         this.#record({
@@ -959,6 +1698,7 @@ class AreaMutator {
     }
 
     async updateRoom(room: Room | RoomNumber, fields: UpdateRoomParams): Promise<void> {
+        this.#roomFields();
         this.#record({
             upsert_room: {
                 room_number: roomNumberInArea(this.#areaId, room),
@@ -968,6 +1708,7 @@ class AreaMutator {
     }
 
     async updateRooms(updates: [RoomNumber, UpdateRoomParams][]): Promise<void> {
+        this.#roomFields();
         for (const [roomNumber, fields] of updates) {
             this.#record({
                 upsert_room: { room_number: roomNumber, body: { ...fields } },
@@ -1017,6 +1758,19 @@ class AreaMutator {
         this.#record({ upsert_area_property: { name, value } });
     }
 
+    async deleteRoomProperty(room: Room | RoomNumber, name: string): Promise<void> {
+        this.#record({
+            delete_room_property: {
+                room_number: roomNumberInArea(this.#areaId, room),
+                name,
+            },
+        });
+    }
+
+    async deleteAreaProperty(name: string): Promise<void> {
+        this.#record({ delete_area_property: { name } });
+    }
+
     async addRoomTag(room: Room | RoomNumber, tag: string): Promise<void> {
         this.#record({
             add_room_tag: {
@@ -1041,7 +1795,7 @@ class AreaMutator {
             create_exit: {
                 room_number: roomNumberInArea(this.#areaId, room),
                 id,
-                body: { ...exit },
+                body: { ...exitArgsIn(exit) },
             },
         });
         return id;
@@ -1053,10 +1807,11 @@ class AreaMutator {
         exit: ExitUpdates,
     ): Promise<void> {
         roomNumberInArea(this.#areaId, room);
-        this.#record({ update_exit: { exit_id: exitId, body: { ...exit } } });
+        this.#record({ update_exit: { exit_id: exitId, body: { ...exitArgsIn(exit) } } });
     }
 
     async deleteRoom(room: Room | RoomNumber): Promise<void> {
+        this.#roomFields();
         this.#record({
             delete_room: { room_number: roomNumberInArea(this.#areaId, room) },
         });
@@ -1069,10 +1824,11 @@ class AreaMutator {
 
     async createLink(link: LinkCreateArgs): Promise<ConnectionId> {
         const connectionId: ConnectionId = op_smudgy_mapper_generate_id();
+        const body = connectionIn(link);
         this.#record({
             create_link: {
                 connection_id: connectionId,
-                body: { ...link, traversals: link.traversals.map((value) => ({ ...value })) },
+                body: { ...body, traversals: body.traversals.map((value) => ({ ...value })) },
             },
         });
         return connectionId;
@@ -1080,7 +1836,7 @@ class AreaMutator {
 
     async setConnection(connectionId: ConnectionId, updates: ConnectionUpdates): Promise<void> {
         this.#record({
-            update_connection: { connection_id: connectionId, body: { ...updates } },
+            update_connection: { connection_id: connectionId, body: { ...connectionIn(updates) } },
         });
     }
 
@@ -1120,13 +1876,13 @@ interface Label {
     readonly y: number;
     readonly width: number;
     readonly height: number;
-    readonly horizontal_alignment: LabelHorizontalAlign;
-    readonly vertical_alignment: LabelVerticalAlign;
+    readonly horizontalAlignment: LabelHorizontalAlign;
+    readonly verticalAlignment: LabelVerticalAlign;
     readonly text: string;
     readonly color: string;
-    readonly background_color: string;
-    readonly font_size: number;
-    readonly font_weight: number;
+    readonly backgroundColor: string;
+    readonly fontSize: number;
+    readonly fontWeight: number;
 }
 
 // Fields accepted when creating a label (`createLabel`); position, size, and `text` are
@@ -1138,12 +1894,12 @@ interface LabelArgs {
     height: number;
     text: string;
     level?: number;
-    horizontal_alignment?: LabelHorizontalAlign;
-    vertical_alignment?: LabelVerticalAlign;
+    horizontalAlignment?: LabelHorizontalAlign;
+    verticalAlignment?: LabelVerticalAlign;
     color?: string;
-    background_color?: string;
-    font_size?: number;
-    font_weight?: number;
+    backgroundColor?: string;
+    fontSize?: number;
+    fontWeight?: number;
 }
 
 // Fields accepted when updating a label (`setLabel`). Any omitted field is left unchanged.
@@ -1154,12 +1910,12 @@ interface LabelUpdates {
     height?: number;
     text?: string;
     level?: number;
-    horizontal_alignment?: LabelHorizontalAlign;
-    vertical_alignment?: LabelVerticalAlign;
+    horizontalAlignment?: LabelHorizontalAlign;
+    verticalAlignment?: LabelVerticalAlign;
     color?: string;
-    background_color?: string;
-    font_size?: number;
-    font_weight?: number;
+    backgroundColor?: string;
+    fontSize?: number;
+    fontWeight?: number;
 }
 
 // A graphical shape read back from an area (`area.shapes`). Mirrors the `Shape` contract interface.
@@ -1170,11 +1926,11 @@ interface Shape {
     readonly y: number;
     readonly width: number;
     readonly height: number;
-    readonly background_color: string | null;
-    readonly stroke_color: string | null;
-    readonly shape_type: ShapeKind;
-    readonly border_radius: number;
-    readonly stroke_width: number;
+    readonly backgroundColor: string | null;
+    readonly strokeColor: string | null;
+    readonly shapeType: ShapeKind;
+    readonly borderRadius: number;
+    readonly strokeWidth: number;
 }
 
 // Fields accepted when creating a shape (`createShape`); position and size are required,
@@ -1185,11 +1941,11 @@ interface ShapeArgs {
     width: number;
     height: number;
     level?: number;
-    background_color?: string;
-    stroke_color?: string;
-    shape_type?: ShapeKind;
-    border_radius?: number;
-    stroke_width?: number;
+    backgroundColor?: string;
+    strokeColor?: string;
+    shapeType?: ShapeKind;
+    borderRadius?: number;
+    strokeWidth?: number;
 }
 
 // Fields accepted when updating a shape (`setShape`). Any omitted field is left unchanged.
@@ -1199,11 +1955,11 @@ interface ShapeUpdates {
     width?: number;
     height?: number;
     level?: number;
-    background_color?: string;
-    stroke_color?: string;
-    shape_type?: ShapeKind;
-    border_radius?: number;
-    stroke_width?: number;
+    backgroundColor?: string;
+    strokeColor?: string;
+    shapeType?: ShapeKind;
+    borderRadius?: number;
+    strokeWidth?: number;
 }
 
 // A portable area JSON blob produced by `exportArea` and consumed by `importArea`/`importAreas`.
@@ -1267,7 +2023,13 @@ class Area {
         return op_smudgy_mapper_get_area_name(this.#obj);
     }
 
-    get room_numbers(): RoomNumber[] {
+    /** For a Secret's area (or your Private additions'), the map it belongs to;
+     * `undefined` for a map. */
+    get mapId(): AreaId | undefined {
+        return op_smudgy_mapper_get_area_map_id(this.#obj) ?? undefined;
+    }
+
+    get roomNumbers(): RoomNumber[] {
         return op_smudgy_mapper_list_area_room_numbers(this.#obj) || [];
     }
 
@@ -1283,7 +2045,7 @@ class Area {
         return op_smudgy_mapper_get_area_storage(this.#obj);
     }
 
-    get next_room_number(): RoomNumber {
+    get nextRoomNumber(): RoomNumber {
         return op_smudgy_mapper_get_area_next_room_number(this.#obj);
     }
 
@@ -1292,53 +2054,78 @@ class Area {
         return room && new Room(room);
     }
 
+    /** Read a custom property of the area's own place (or `undefined` if unset). */
     data(key: string): string | undefined {
         return op_smudgy_mapper_get_area_property(this.#obj, key);
     }
 
-    /** This area's rooms whose `name` property is exactly `value`, as
-     * `room.data(name)` reads it. One indexed lookup, however many rooms the
-     * area has. An area answers for itself even when you have turned its map
-     * off -- naming it is asking for it. */
-    findRoomsByProperty(name: string, value: string): Room[] {
-        return this.#rooms(op_smudgy_mapper_find_area_rooms_by_property(this.#obj, name, value));
+    /** Where this area lives: `"map"` for a map, the Secret or `"private"` for one of
+     * their own areas. */
+    get place(): MapPlace {
+        return placeOf(op_smudgy_mapper_area_place(this.#obj));
     }
 
-    /** This area's rooms carrying a property called `name`, whatever its
-     * value. */
-    findRoomsWithProperty(name: string): Room[] {
-        return this.#rooms(op_smudgy_mapper_find_area_rooms_with_property(this.#obj, name));
+    /** The map's places: `"map"`, each Secret you read in layer order, then `"private"` on a
+     * cloud map. A Secret's or Private additions' own area has its own place alone. */
+    get places(): MapPlace[] {
+        return op_smudgy_mapper_list_area_places(this.#obj).map(placeFrom);
     }
 
-    /** This area's rooms carrying `tag` (case-insensitive), in no particular
-     * order. */
-    findRoomsWithTag(tag: string): Room[] {
-        return this.#rooms(op_smudgy_mapper_find_area_rooms_with_tag(this.#obj, tag));
+    /** One place's data on this map, and the searches narrowed to that place. */
+    in(place: MapPlaceLike): AreaView {
+        const key = placeKey(place);
+        op_smudgy_mapper_check_place(this.id, key, false);
+        return new AreaView(this, this.#obj, key);
     }
 
-    /** Resolves this area's own room numbers to rooms. */
-    #rooms(roomNumbers: RoomNumber[]): Room[] {
-        const rooms: Room[] = [];
-        for (const roomNumber of roomNumbers) {
-            const room = this.room(roomNumber);
-            if (room) rooms.push(room);
-        }
-        return rooms;
+    /** The map's Secrets. */
+    get secrets(): SecretRegistry {
+        return new SecretRegistry(this, this.#obj);
+    }
+
+    /** This area's rooms whose `name` property is exactly `value`, in any place you read or
+     * the one `options.in` names. One indexed lookup per place, however many rooms the area
+     * has. An area answers for itself even when you have turned its map off -- naming it is
+     * asking for it. */
+    findRoomsByProperty(name: string, value: string, options?: PlaceOptions): Room[] {
+        return hydrateRooms(
+            op_smudgy_mapper_find_area_rooms_by_property(this.#obj, name, value, optionalPlaceKey(options)),
+        );
+    }
+
+    /** This area's rooms carrying a property called `name`, whatever its value, in any
+     * place you read or the one `options.in` names. */
+    findRoomsWithProperty(name: string, options?: PlaceOptions): Room[] {
+        return hydrateRooms(
+            op_smudgy_mapper_find_area_rooms_with_property(this.#obj, name, optionalPlaceKey(options)),
+        );
+    }
+
+    /** This area's rooms carrying `tag` (case-insensitive) in any place you read or the one
+     * `options.in` names, in no particular order. */
+    findRoomsWithTag(tag: string, options?: PlaceOptions): Room[] {
+        return hydrateRooms(
+            op_smudgy_mapper_find_area_rooms_with_tag(this.#obj, tag, optionalPlaceKey(options)),
+        );
     }
 
     /** This area's text labels. */
     get labels(): Label[] {
-        return op_smudgy_mapper_get_area_labels(this.#obj);
+        return op_smudgy_mapper_get_area_labels(this.#obj).map((label: Label) =>
+            withSnakeCaseAliases(label, LABEL_PROTOTYPE)
+        );
     }
 
     /** This area's graphical shapes. */
     get shapes(): Shape[] {
-        return op_smudgy_mapper_get_area_shapes(this.#obj);
+        return op_smudgy_mapper_get_area_shapes(this.#obj).map((shape: Shape) =>
+            withSnakeCaseAliases(shape, SHAPE_PROTOTYPE)
+        );
     }
 
     /** This area's shared link geometry and appearance records. */
     get connections(): Connection[] {
-        return op_smudgy_mapper_get_area_connections(this.#obj);
+        return op_smudgy_mapper_get_area_connections(this.#obj).map(connectionOut);
     }
 
     toString() {
@@ -1353,11 +2140,11 @@ class Room {
         this.#obj = obj;
     }
 
-    get room_number(): RoomNumber {
+    get roomNumber(): RoomNumber {
         return op_smudgy_mapper_get_room_number(this.#obj);
     }
 
-    get area_id(): AreaId {
+    get areaId(): AreaId {
         return op_smudgy_mapper_get_room_area_id(this.#obj);
     }
 
@@ -1390,34 +2177,77 @@ class Room {
     }
 
     get exits(): Exit[] {
-        return op_smudgy_mapper_get_room_exits(this.#obj);
+        return op_smudgy_mapper_get_room_exits(this.#obj).map((exit: ExitWire) => new MapExit(exit));
     }
 
+    /** Read a custom property of the room's own place (or `undefined` if unset). */
     data(key: string): string | undefined {
         return op_smudgy_mapper_get_room_property(this.#obj, key);
     }
 
-    /** This room's tags, normalized to UPPERCASE and sorted. */
+    /** Where this room lives: `"map"` for a map's room, the Secret or `"private"` for one of
+     * their own rooms. */
+    get place(): MapPlace {
+        return placeOf(op_smudgy_mapper_room_place(this.#obj));
+    }
+
+    /** One place's data on this room. */
+    in(place: MapPlaceLike): RoomView {
+        const key = placeKey(place);
+        op_smudgy_mapper_check_place(this.areaId, key, true);
+        return new RoomView(this, this.#obj, key);
+    }
+
+    /** Every readable place's value for `key` on this room (every property, with its key, when
+     * `key` is omitted): the room's own place first, then the map's places in order. */
+    combinedData(key: string): RoomPlaceData[];
+    combinedData(): RoomPlaceEntry[];
+    combinedData(key?: string): RoomPlaceData[] | RoomPlaceEntry[] {
+        const served: { place: string; key: string; data: string }[] =
+            op_smudgy_mapper_room_combined_data(this.#obj, key ?? null);
+        const place = placeCache();
+        if (key === undefined) {
+            return served.map((entry) =>
+                Object.freeze({ source: place(entry.place), key: entry.key, data: entry.data })
+            );
+        }
+        return served.map((entry) => Object.freeze({ source: place(entry.place), data: entry.data }));
+    }
+
+    /** Each readable place's tags for this room, the room's own place first. */
+    combinedTags(): RoomPlaceTag[] {
+        const served: [string, string][] = op_smudgy_mapper_room_combined_tags(this.#obj);
+        const place = placeCache();
+        return served.map(([key, tag]) => Object.freeze({ source: place(key), tag }));
+    }
+
+    /** Every readable place's tags for this room together, normalized to UPPERCASE and
+     * sorted. Each tag still lives in one place (`combinedTags()` says which): writing this
+     * list back with `mapper.addRoomTag` copies every other place's tags into the room's own
+     * place. To tag the room in one place, use `room.in(place).addTag(tag)`. */
     get tags(): string[] {
         return op_smudgy_mapper_get_room_tags(this.#obj);
     }
 
-    /** Whether this room carries `tag` (case-insensitive). */
+    /** Whether any readable place tags this room with `tag` (case-insensitive). */
     hasTag(tag: string): boolean {
-        return op_smudgy_mapper_has_tag(this.#obj, tag);
+        return op_smudgy_mapper_has_tag(this.#obj, String(tag));
     }
 
     /** Update multiple fields of this room in one cache update. Convenience over
-     * `mapper.updateRoom(this.area_id, this.room_number, fields)`; only the present fields
+     * `mapper.updateRoom(this.areaId, this.roomNumber, fields)`; only the present fields
      * change. */
     update(fields: UpdateRoomParams): Promise<OperationId | null> {
-        return op_smudgy_mapper_update_room(this.area_id, this.room_number, fields);
+        return op_smudgy_mapper_update_room(this.areaId, this.roomNumber, fields);
     }
 
     toString() {
         return this.#obj.toString();
     }
 }
+
+defineSnakeCaseAliases(Area.prototype, SNAKE_CASE_NAMES.area);
+defineSnakeCaseAliases(Room.prototype, SNAKE_CASE_NAMES.room);
 
 // smudgy.ts loads before this extension and exposes a one-shot private registrar. Hand the
 // public values to its lexical facade without publishing them on globalThis.
@@ -1438,3 +2268,7 @@ export type AreaImpl = Area;
 export type RoomImpl = Room;
 export type ExitImpl = Exit;
 export type ConnectionImpl = Connection;
+export type SecretImpl = Secret;
+export type SecretRegistryImpl = SecretRegistry;
+export type RoomViewImpl = RoomView;
+export type AreaViewImpl = AreaView;

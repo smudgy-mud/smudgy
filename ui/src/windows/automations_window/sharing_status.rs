@@ -101,7 +101,11 @@ impl AutomationsWindow {
             async move {
                 let result = async {
                     let remote = client
-                        .resolve_package(&owner, &snapshot.name, Some(&snapshot.manifest.version))
+                        .resolve_package(
+                            Some(&owner),
+                            &snapshot.name,
+                            Some(&snapshot.manifest.version),
+                        )
                         .await?;
                     anyhow::ensure!(
                         remote.package_id == package_id,

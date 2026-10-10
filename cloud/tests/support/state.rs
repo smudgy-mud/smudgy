@@ -1,6 +1,6 @@
 //! In-memory state for the mock server: users, credentials, areas, grants,
 //! friendships, blocks. Mirrors the real schema closely enough to honor the
-//! wire contract (dual revs, secrecy flags, grant trees).
+//! wire contract (source revisions, grant trees).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -15,9 +15,8 @@ pub const API_KEY_PREFIX: &str = "smudgy_";
 /// Same fixed dev fallback the real server uses when `REDACTION_KEY` is unset.
 pub const REDACTION_KEY: &[u8] = b"smudgy-dev-redaction-key-do-not-use-in-prod";
 
-/// The area wire/file format this mock produces — the v2 Connection
-/// contract, mirroring the server's `AREA_FORMAT_VERSION`.
-pub const AREA_FORMAT_VERSION: u32 = 2;
+/// The map wire format this mock serves (format 3: per-source bundles).
+pub const WIRE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct UserRecord {
@@ -61,18 +60,20 @@ pub struct EmailCodeRecord {
 #[derive(Debug, Clone)]
 pub struct AreaPropRecord {
     pub value: String,
-    pub is_secret: bool,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RoomPropRecord {
     pub value: String,
-    pub is_secret: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct RoomRecord {
+    pub identity: Uuid,
+    /// A data/link stand-in for this stable room identity in another source.
+    /// It never constitutes a room owned by this source.
+    pub anchor: Option<Uuid>,
     pub room_number: i32,
     pub title: String,
     pub description: String,
@@ -80,19 +81,20 @@ pub struct RoomRecord {
     pub x: f32,
     pub y: f32,
     pub color: String,
-    pub is_secret: bool,
     pub created_at: DateTime<Utc>,
     pub properties: BTreeMap<String, RoomPropRecord>,
-    /// Case-insensitive room tags, normalized to UPPERCASE. Non-secret.
+    /// Case-insensitive room tags, normalized to UPPERCASE.
     pub tags: BTreeSet<String>,
-    /// Server-global room identity (GMCP/MSDP room id). Nullable, non-secret,
-    /// not unique-enforced.
+    /// Server-global room identity (GMCP/MSDP room id). Nullable, not
+    /// unique-enforced.
     pub external_id: Option<String>,
 }
 
 impl RoomRecord {
     pub fn placeholder(room_number: i32) -> Self {
         Self {
+            identity: Uuid::new_v4(),
+            anchor: None,
             room_number,
             title: String::new(),
             description: String::new(),
@@ -100,7 +102,6 @@ impl RoomRecord {
             x: 0.0,
             y: 0.0,
             color: String::new(),
-            is_secret: false,
             created_at: Utc::now(),
             properties: BTreeMap::new(),
             tags: BTreeSet::new(),
@@ -111,6 +112,7 @@ impl RoomRecord {
 
 #[derive(Debug, Clone)]
 pub struct ExitRecord {
+    pub to_room_identity: Option<Uuid>,
     pub id: Uuid,
     pub from_room_number: i32,
     pub from_direction: String,
@@ -119,15 +121,42 @@ pub struct ExitRecord {
     pub to_direction: Option<String>,
     pub path: String,
     pub is_hidden: bool,
-    pub is_closed: bool,
-    pub is_locked: bool,
+    /// The exit's door; `None` for none.
+    pub door: Option<DoorRecord>,
     pub weight: f32,
     pub command: String,
     /// The v2 contract: every exit is a member of exactly one Connection
     /// (`map_exits.connection_id NOT NULL`); the per-exit style/color of v1
     /// live on the Connection now.
     pub connection_id: Uuid,
-    pub is_secret: bool,
+    /// For an exit into a room of another map's Secret (the server's
+    /// `to_secret_id`): that Secret, on map `to_area_id`, whose own room
+    /// `to_room_number` names. Shown only to the Secret's readers.
+    pub to_secret: Option<Uuid>,
+}
+
+/// An exit's door (format-3 §2.1): its state, `open`, `closed` or `locked`,
+/// its name and the command that opens it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoorRecord {
+    pub state: String,
+    pub name: Option<String>,
+    pub opens_with: Option<String>,
+}
+
+impl DoorRecord {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.state,
+            "name": self.name,
+            "opens_with": self.opens_with,
+        })
+    }
+}
+
+/// An exit's `door` as the wire carries it: null for none.
+pub fn door_json(door: Option<&DoorRecord>) -> serde_json::Value {
+    door.map_or(serde_json::Value::Null, DoorRecord::json)
 }
 
 /// One stored Connection endpoint (`map_connections.endpoint_*`). Enum-ish
@@ -192,7 +221,6 @@ pub struct LabelRecord {
     pub background_color: String,
     pub font_size: i32,
     pub font_weight: i32,
-    pub is_secret: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -208,20 +236,102 @@ pub struct ShapeRecord {
     pub shape_type: String,
     pub border_radius: f32,
     pub stroke_width: f32,
-    pub is_secret: bool,
+}
+
+/// Where a Secret keeps what it holds for map room `n`: under `STAND_IN + n`
+/// among its rooms. The Secret's own rooms keep their own numbers, which
+/// must stay below `STAND_IN`, and map rooms a Secret refers to must lie in
+/// `0..STAND_IN`; the server numbers each source on its own, and this
+/// offset keeps the two numberings apart inside one record.
+pub const STAND_IN: i32 = 1_000_000_000;
+
+/// The key a Secret holds map room `map_room` under, when it is in range.
+pub fn stand_in(map_room: i32) -> Option<i32> {
+    (0..STAND_IN)
+        .contains(&map_room)
+        .then(|| map_room + STAND_IN)
+}
+
+/// The map room a Secret's room key stands in for; `None` for its own rooms.
+pub fn map_room_of(key: i32) -> Option<i32> {
+    (key >= STAND_IN).then(|| key - STAND_IN)
+}
+
+/// An owner Secret: a named source of one map.
+///
+/// Its rooms are its own rooms under their own numbers and, under
+/// [`STAND_IN`] + n, the map rooms it keeps something for: their properties
+/// and tags are the Secret's data for map room n, never the map's, and the
+/// exits leaving them are the exits the Secret keeps on map room n (its
+/// hidden doors). An exit or connection endpoint naming this map names a
+/// room by the same key. A stand-in exists only while it holds something or
+/// something refers to it.
+#[derive(Debug, Clone)]
+pub struct SecretRecord {
+    pub id: Uuid,
+    pub name: String,
+    /// The chosen color, `#rrggbb`.
+    pub color: Option<String>,
+    pub rev: i64,
+    /// The Secret's own properties, keyed by nothing.
+    pub properties: BTreeMap<String, AreaPropRecord>,
+    pub rooms: BTreeMap<i32, RoomRecord>,
+    pub exits: Vec<ExitRecord>,
+    pub connections: Vec<ConnectionRecord>,
+    pub labels: Vec<LabelRecord>,
+    pub shapes: Vec<ShapeRecord>,
+    /// The Secret's grants, oldest first. They go with the Secret, and with
+    /// its map.
+    pub grants: Vec<SecretGrantRecord>,
+    /// What makes it a Clan Secret; `None` for an owner Secret.
+    pub clan: Option<super::clan_secrets::ClanSecretRecord>,
+}
+
+impl SecretRecord {
+    pub fn new(id: Uuid, name: String) -> Self {
+        Self {
+            id,
+            name,
+            color: None,
+            rev: 1,
+            properties: BTreeMap::new(),
+            rooms: BTreeMap::new(),
+            exits: Vec::new(),
+            connections: Vec::new(),
+            labels: Vec::new(),
+            shapes: Vec::new(),
+            grants: Vec::new(),
+            clan: None,
+        }
+    }
+}
+
+/// A `secret_grants` row: one grantor's grant of a Secret to one grantee,
+/// keyed by (Secret, grantor, grantee). Every grant gives `read`; `actions`
+/// holds the ones beyond it (`add`, `edit`, `remove`, `manage_access`).
+#[derive(Debug, Clone)]
+pub struct SecretGrantRecord {
+    pub id: Uuid,
+    pub grantor_id: Uuid,
+    pub grantee_id: Uuid,
+    pub actions: BTreeSet<&'static str>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
 pub struct AreaRecord {
     pub id: Uuid,
+    /// The owning user; nil on a clan's map.
     pub user_id: Uuid,
+    /// The owning clan, on a clan's map (`user_id` is then nil).
+    pub clan_id: Option<Uuid>,
     pub atlas_id: Option<Uuid>,
     pub name: String,
     pub created_at: DateTime<Utc>,
     /// Insertion order tiebreaker for `ORDER BY created_at` listings.
     pub created_seq: u64,
     pub rev: i64,
-    pub public_rev: i64,
     pub copied_from_area_id: Option<Uuid>,
     pub copied_from_rev: Option<i64>,
     pub copied_at: Option<DateTime<Utc>>,
@@ -231,6 +341,14 @@ pub struct AreaRecord {
     pub connections: Vec<ConnectionRecord>,
     pub labels: Vec<LabelRecord>,
     pub shapes: Vec<ShapeRecord>,
+    /// The map's Secrets in creation order, the order the server serves
+    /// their bundles in.
+    pub secrets: Vec<SecretRecord>,
+    /// Each author's Private source. It never appears in the Secret directory.
+    pub private_sources: BTreeMap<Uuid, SecretRecord>,
+    /// On a clan's Member-owned map: its recorded owners. `None` on a
+    /// Clan-owned map and on every user's map.
+    pub member_owned: Option<super::clan_maps::MemberOwnedRecord>,
 }
 
 impl AreaRecord {
@@ -238,12 +356,12 @@ impl AreaRecord {
         Self {
             id,
             user_id,
+            clan_id: None,
             atlas_id,
             name,
             created_at: Utc::now(),
             created_seq: seq,
             rev: 1,
-            public_rev: 1,
             copied_from_area_id: None,
             copied_from_rev: None,
             copied_at: None,
@@ -253,6 +371,9 @@ impl AreaRecord {
             connections: Vec::new(),
             labels: Vec::new(),
             shapes: Vec::new(),
+            secrets: Vec::new(),
+            private_sources: BTreeMap::new(),
+            member_owned: None,
         }
     }
 }
@@ -260,9 +381,14 @@ impl AreaRecord {
 #[derive(Debug, Clone)]
 pub struct AtlasRecord {
     pub id: Uuid,
+    /// The owning user; nil on a clan's folder.
     pub user_id: Uuid,
+    /// The owning clan, on a clan's folder (`user_id` is then nil).
+    pub clan_id: Option<Uuid>,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    /// Moves when the name does.
+    pub rev: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,7 +424,6 @@ pub struct GrantRecord {
     pub can_edit: bool,
     pub can_reshare: bool,
     pub can_copy: bool,
-    pub include_secrets: bool,
     pub can_admin: bool,
     /// Grantor-authored advisory host hints snapshotted at share creation
     /// (mirrors `share_grants.host_hints`). `None` = the share carried none.
@@ -318,6 +443,7 @@ impl GrantRecord {
 
 /// `effective_area_caps(viewer, area)`: every cap is `is_owner OR
 /// bool_or(covering grants)`, `can_view` is `is_owner OR any covering grant`.
+/// `include_secrets` is the owner's alone: Secrets are shared one at a time.
 #[derive(Debug, Clone, Copy)]
 pub struct Caps {
     pub is_owner: bool,
@@ -339,16 +465,6 @@ impl Caps {
         include_secrets: false,
         can_admin: false,
     };
-
-    /// `see_secrets` — note `include_secrets` already ORs in ownership.
-    pub fn see_secrets(&self) -> bool {
-        self.is_owner || self.include_secrets
-    }
-
-    /// `cleared` — may set/clear `is_secret`.
-    pub fn cleared(&self) -> bool {
-        self.can_edit && self.see_secrets()
-    }
 }
 
 /// A `mutation_receipts` row: one accepted envelope per `(actor,
@@ -357,17 +473,12 @@ impl Caps {
 #[derive(Debug, Clone)]
 pub struct MutationReceipt {
     pub request_hash: String,
-    /// The caller's access fingerprint when the mutation was accepted. The
-    /// stored result embeds that projection (secret properties, secret
-    /// exits), so a replay is served only to a caller whose projection
-    /// still matches; anyone else gets `projection_changed` and refetches.
-    pub access_fingerprint: String,
     /// The stored `MutationResult` JSON (the `data` member of the success
     /// envelope), exactly as first served.
     pub result: Value,
 }
 
-/// A `pending_transfers` row. `expires_at` is always null.
+/// A `transfer_offers` row: an offer to a user, or to a clan.
 #[derive(Debug, Clone)]
 pub struct PendingTransferRecord {
     pub id: Uuid,
@@ -375,10 +486,16 @@ pub struct PendingTransferRecord {
     pub area_id: Option<Uuid>,
     pub atlas_id: Option<Uuid>,
     pub from_user_id: Uuid,
-    pub to_user_id: Uuid,
+    /// Exactly one of the two recipients.
+    pub to_user_id: Option<Uuid>,
+    pub to_clan_id: Option<Uuid>,
+    /// On an offer to a clan: `"clan"` (the default) or `"members"`.
+    pub ownership: Option<&'static str>,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub responded_at: Option<DateTime<Utc>>,
+    pub direct: bool,
+    pub destination_atlas_id: Option<Uuid>,
 }
 
 #[derive(Debug, Default)]
@@ -396,6 +513,12 @@ pub struct MockState {
     pub friendships: Vec<FriendshipRecord>,
     pub blocks: Vec<BlockRecord>,
     pub pending_transfers: Vec<PendingTransferRecord>,
+    /// Accounts marked as being deleted (`users.deleting_at`): their
+    /// credentials authenticate only `DELETE /me`.
+    pub deleting_accounts: BTreeSet<Uuid>,
+    pub clans: super::clans::ClanStore,
+    /// Pending ownership offers on clan maps.
+    pub area_offers: Vec<super::clan_maps::AreaOfferRecord>,
     /// Idempotency receipts of the compound mutation endpoint, keyed
     /// `(actor, operation_id)` (mirrors the `mutation_receipts` table).
     pub mutation_receipts: HashMap<(Uuid, Uuid), MutationReceipt>,
@@ -415,6 +538,28 @@ pub struct MockState {
     /// Test hook: fail the next N area deletes with a 500 before anything is
     /// deleted — an outage the client cannot tell from a lost response.
     pub fail_area_deletes: u32,
+    /// Test hook: stop the next N account deletions right after the account
+    /// is marked as being deleted, with a 500 — a deletion left partway,
+    /// which a repeat of `DELETE /me` finishes.
+    pub interrupt_account_deletions: u32,
+    /// Test hook: stop the next N clan dissolutions right after the clan is
+    /// marked dissolving, with a 500 — a dissolution left partway, which its
+    /// owner repeating the request finishes.
+    pub interrupt_dissolutions: u32,
+    /// Test hook: lose the answer of the next N clan dissolutions after their
+    /// Library commits, before the directory marks the clan dissolved.
+    pub lose_dissolution_answers: u32,
+    /// Test hook: maps whose writes answer 503 `write_freeze` to those who
+    /// read them, as a transfer's sealed export does from its seal until
+    /// its drop.
+    pub sealed_maps: BTreeSet<Uuid>,
+    /// Test hook: runs inside the next transfer acceptance, after its claim
+    /// and before its flip, as a request racing it would; `true` stops the
+    /// acceptance there, as a failure would.
+    pub interrupt_acceptance: Option<fn(&mut MockState, &PendingTransferRecord) -> bool>,
+    /// Test hook: fail the next N area reads (`GET /areas/{id}`) with a 500 —
+    /// an outage between a sync row and the refetch it calls for.
+    pub fail_area_reads: u32,
     /// Client-version gate floor, mirroring the server's `MIN_CLIENT_VERSION`.
     /// `None` (the default) leaves the gate disabled for every test.
     pub min_client_version: Option<String>,
@@ -468,6 +613,18 @@ impl MockState {
     /// `effective_area_caps(viewer, area_id)`; `None` when the area is absent.
     pub fn caps(&self, viewer: Uuid, area_id: Uuid) -> Option<Caps> {
         let area = self.areas.get(&area_id)?;
+        // A clan's map: its members' actions, folded into the share flags;
+        // an outside share reads it and nothing more.
+        if area.clan_id.is_some() {
+            let mut caps = Caps::NONE;
+            if let Some(actions) = super::clan_maps::area_actions(self, viewer, area) {
+                super::clan_maps::fold_actions(&mut caps, &actions);
+            }
+            if !caps.can_view && super::shares::outside_reader(self, viewer, area) {
+                caps.can_view = true;
+            }
+            return Some(caps);
+        }
         let is_owner = area.user_id == viewer;
         let mut caps = Caps {
             is_owner,
@@ -488,21 +645,17 @@ impl MockState {
             caps.can_edit |= g.can_edit || g.can_admin;
             caps.can_reshare |= g.can_reshare || g.can_admin;
             caps.can_copy |= g.can_copy || g.can_admin;
-            caps.include_secrets |= g.include_secrets || g.can_admin;
             caps.can_admin |= g.can_admin;
         }
         Some(caps)
     }
 
-    /// `increment_area_revision(area, bump_public)` — the per-row rev trigger.
-    /// `suppress` models the txn-local `smudgy.suppress_public_rev` GUC.
-    pub fn bump(&mut self, area_id: Option<Uuid>, bump_public: bool, suppress: bool) {
+    /// Moves the map source's revision of `area_id` by one; `None` (a
+    /// dangling exit's target) and absent areas are no-ops.
+    pub fn bump(&mut self, area_id: Option<Uuid>) {
         let Some(area_id) = area_id else { return };
         if let Some(area) = self.areas.get_mut(&area_id) {
             area.rev += 1;
-            if bump_public && !suppress {
-                area.public_rev += 1;
-            }
         }
     }
 
@@ -583,22 +736,107 @@ pub fn gen_code() -> String {
     format!("{n:06}")
 }
 
-/// First 16 hex of `SHA-256("v2|o|e|r|c|a|s")`, bools rendered '1'/'0' (the v2
-/// layout includes `can_admin`; must match the client `AreaAccess::fingerprint` exactly).
-pub fn access_fingerprint(caps: &Caps) -> String {
-    fn bit(b: bool) -> &'static str {
-        if b { "1" } else { "0" }
+/// The format-3 `projection_token`: opaque, and equal exactly when what the
+/// viewer's projection shows is equal — the map's revision, their access,
+/// the atlas it is filed in (whose name the header carries), each Secret
+/// they read with its revision and their actions on it, and every exit into
+/// another map's Secret room they are shown, with its connection (such
+/// exits change no revision).
+pub fn projection_token(
+    state: &MockState,
+    viewer: Uuid,
+    area: &AreaRecord,
+    caps: &Caps,
+    atlas_name: Option<&str>,
+) -> String {
+    let bundles = super::source_refs::bundles(state, viewer, area);
+    let view = serde_json::json!([
+        [
+            caps.is_owner,
+            caps.can_edit,
+            caps.can_reshare,
+            caps.can_copy,
+            caps.can_admin,
+            caps.include_secrets
+        ],
+        area.atlas_id,
+        atlas_name,
+        bundles,
+        super::source_refs::linked(state, area.id, &bundles),
+    ]);
+    let mut hasher = Sha256::new();
+    hasher.update(viewer.as_bytes());
+    hasher.update(area.id.as_bytes());
+    hasher.update(view.to_string().as_bytes());
+    format!("p_{}", &hex::encode(hasher.finalize())[..32])
+}
+
+/// The projection's `linked_areas` as the token covers them: each map the
+/// shown exits lead into that `viewer` reads, by ID and name, and each other
+/// one by its `to_area_token`, which nothing done to that map moves.
+fn linked_view(state: &MockState, viewer: Uuid, area: &AreaRecord) -> Vec<String> {
+    let mut linked: Vec<String> = Vec::new();
+    let mut note = |exit: &ExitRecord| {
+        let (exit, reads) = state.resolved_exit(viewer, area.id, exit);
+        let Some(target) = exit.to_area_id.filter(|target| *target != area.id) else {
+            return;
+        };
+        let entry = if reads {
+            let name = state.areas.get(&target).map(|map| map.name.clone());
+            format!("{target}:{name:?}")
+        } else {
+            to_area_token(
+                viewer,
+                if exit.to_room_number.is_some() {
+                    exit.id
+                } else {
+                    target
+                },
+            )
+        };
+        if !linked.contains(&entry) {
+            linked.push(entry);
+        }
+    };
+    for exit in &area.exits {
+        note(exit);
     }
-    let input = format!(
-        "v2|{}|{}|{}|{}|{}|{}",
-        bit(caps.is_owner),
-        bit(caps.can_edit),
-        bit(caps.can_reshare),
-        bit(caps.can_copy),
-        bit(caps.can_admin),
-        bit(caps.include_secrets),
-    );
-    hex::encode(Sha256::digest(input.as_bytes()))[..16].to_string()
+    for (secret, _) in state.readable_secrets(viewer, area) {
+        for exit in &secret.exits {
+            note(exit);
+        }
+    }
+    linked.sort();
+    linked
+}
+
+/// Every exit into another map's Secret room that `viewer` is shown on
+/// `area`, the map's and its readable Secrets', with its connection, as
+/// the token covers them.
+fn shown_foreign_exits(state: &MockState, viewer: Uuid, area: &AreaRecord) -> Vec<String> {
+    let mut shown = Vec::new();
+    let mut collect = |exits: &[ExitRecord]| {
+        for exit in exits
+            .iter()
+            .filter(|exit| exit.to_area_id.is_some_and(|target| target != area.id))
+        {
+            let (resolved, readable) = state.resolved_exit(viewer, area.id, exit);
+            shown.push(if readable {
+                format!(
+                    "{}:{:?}:{:?}:{:?}",
+                    exit.id, resolved.to_area_id, resolved.to_secret, resolved.to_room_number
+                )
+            } else {
+                format!("{}:unknown", exit.id)
+            });
+        }
+    };
+    collect(&area.exits);
+    for (secret, _) in state.readable_secrets(viewer, area) {
+        collect(&secret.exits);
+    }
+    shown.sort();
+    shown
 }
 
 /// `"u_" + first 16 hex of HMAC-SHA256(key, viewer || target)`.
@@ -610,12 +848,4 @@ pub fn to_area_token(viewer: Uuid, target: Uuid) -> String {
     mac.update(target.as_bytes());
     let bytes = mac.finalize().into_bytes();
     format!("u_{}", &hex::encode(bytes)[..16])
-}
-
-/// First 32 hex of `SHA-256(viewer_bytes || canonical_projection_bytes)`.
-pub fn content_hash(viewer: Uuid, canonical: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(viewer.as_bytes());
-    hasher.update(canonical);
-    hex::encode(hasher.finalize())[..32].to_string()
 }

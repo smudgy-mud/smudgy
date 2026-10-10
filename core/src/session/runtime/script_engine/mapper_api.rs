@@ -6,15 +6,35 @@ use deno_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::ops::SmudgyGrants;
+use super::mapper_names::{op_smudgy_mapper_warn_snake_case_once, script_reasons};
+use super::mapper_places::{
+    connection_anchors_visible, connection_as_seen, ensure_area_write,
+    ensure_connection_anchors_read, ensure_exit_shown, ensure_exit_target, ensure_exit_write,
+    hides_area, op_smudgy_mapper_area_place, op_smudgy_mapper_area_place_data,
+    op_smudgy_mapper_area_secret_exists, op_smudgy_mapper_check_place,
+    op_smudgy_mapper_create_secret, op_smudgy_mapper_delete_secret,
+    op_smudgy_mapper_find_area_rooms_by_property, op_smudgy_mapper_find_area_rooms_with_property,
+    op_smudgy_mapper_find_area_rooms_with_tag, op_smudgy_mapper_find_nearest_room_with_tags,
+    op_smudgy_mapper_find_rooms_by_property, op_smudgy_mapper_find_rooms_with_property,
+    op_smudgy_mapper_find_rooms_with_tag, op_smudgy_mapper_get_area_secret,
+    op_smudgy_mapper_get_room_tags, op_smudgy_mapper_get_secret, op_smudgy_mapper_has_tag,
+    op_smudgy_mapper_list_area_places, op_smudgy_mapper_list_area_secrets,
+    op_smudgy_mapper_resolve_place, op_smudgy_mapper_room_combined_data,
+    op_smudgy_mapper_room_combined_tags, op_smudgy_mapper_room_place,
+    op_smudgy_mapper_room_place_data, op_smudgy_mapper_room_place_exits,
+    op_smudgy_mapper_room_place_has_tag, op_smudgy_mapper_room_place_tags,
+    op_smudgy_mapper_update_secret, reach, reach_for_write, room_exits, sources_for, write_place,
+};
+use super::ops::{ServerName, SmudgyGrants};
 use super::script_uuid::ScriptUuid;
+use crate::models::default_atlases::resolve_default_atlas;
 use crate::session::runtime::action::{ActionQueue, RuntimeAction};
 use smudgy_cloud::{
     AreaId, AreaMergeSource, AreaWithDetails, AtlasId, CloudError, Connection, ConnectionArgs,
     ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind, ConnectionRouting,
-    ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS,
-    ExitArgs, ExitDirection, ExitId, ExitUpdates, HorizontalAlignment, Label, LabelArgs, LabelId,
-    LabelUpdates, MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode,
+    ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, Door,
+    DoorState, ExitArgs, ExitDirection, ExitId, ExitUpdates, HorizontalAlignment, Label, LabelArgs,
+    LabelId, LabelUpdates, MapDestination, MapPoint, MapStorage, Mapper, PortMode, RelocationMode,
     RoomNumber, RoomSide, RoomUpdates, SegmentShape, Shape, ShapeArgs, ShapeId, ShapeType,
     ShapeUpdates, Translate, Uuid, VerticalAlignment,
     mapper::{
@@ -39,6 +59,7 @@ deno_core::extension!(
       op_smudgy_mapper_relocate_atlas,
       op_smudgy_mapper_delete_area,
       op_smudgy_mapper_get_area_is_ephemeral,
+      op_smudgy_mapper_get_area_map_id,
       op_smudgy_mapper_get_room_external_id,
       op_smudgy_mapper_set_room_external_id,
       op_smudgy_mapper_find_room_by_external_id,
@@ -47,6 +68,7 @@ deno_core::extension!(
       op_smudgy_mapper_get_area_name,
       op_smudgy_mapper_get_area_id,
       op_smudgy_mapper_warn_area_uuid_once,
+      op_smudgy_mapper_warn_snake_case_once,
       op_smudgy_mapper_rename_area,
       op_smudgy_mapper_list_area_room_numbers,
       op_smudgy_mapper_list_rooms_by_title_and_description,
@@ -117,6 +139,25 @@ deno_core::extension!(
       op_smudgy_mapper_import_areas_if_absent,
       op_smudgy_mapper_export_area,
       op_smudgy_mapper_get_path_between_rooms,
+      op_smudgy_mapper_room_place,
+      op_smudgy_mapper_area_place,
+      op_smudgy_mapper_resolve_place,
+      op_smudgy_mapper_list_area_places,
+      op_smudgy_mapper_check_place,
+      op_smudgy_mapper_room_place_data,
+      op_smudgy_mapper_room_place_tags,
+      op_smudgy_mapper_room_place_has_tag,
+      op_smudgy_mapper_room_place_exits,
+      op_smudgy_mapper_area_place_data,
+      op_smudgy_mapper_room_combined_data,
+      op_smudgy_mapper_room_combined_tags,
+      op_smudgy_mapper_list_area_secrets,
+      op_smudgy_mapper_get_area_secret,
+      op_smudgy_mapper_area_secret_exists,
+      op_smudgy_mapper_get_secret,
+      op_smudgy_mapper_create_secret,
+      op_smudgy_mapper_update_secret,
+      op_smudgy_mapper_delete_secret,
       ],
   esm_entry_point = "ext:smudgy_mapper/mapper.ts",
   esm = [ dir "src/session/runtime/script_engine/mapper", "mapper.ts" ],
@@ -159,14 +200,14 @@ pub enum MapperError {
     #[error("Atlas not found")]
     AtlasNotFound,
     #[class(generic)]
-    #[error("Failed to create map: {0}")]
+    #[error("Failed to create map: {}", script_reasons(.0))]
     FailedToCreate(String),
     /// A non-creation mapper operation failed. `operation` is the
     /// author-facing verb phrase ("delete area", "mutate area", ...), so the
     /// script-visible message names what actually failed; creation paths keep
     /// [`Self::FailedToCreate`]'s established text.
     #[class(generic)]
-    #[error("Failed to {operation}: {message}")]
+    #[error("Failed to {operation}: {}", script_reasons(.message))]
     OperationFailed {
         operation: &'static str,
         message: String,
@@ -187,6 +228,27 @@ pub enum MapperError {
     #[class(generic)]
     #[error("smudgy: {0:?} is not a map id (expected a canonical UUID string)")]
     InvalidId(String),
+    /// A script named something that is not one of a map's places.
+    #[class(generic)]
+    #[error(
+        "smudgy: {0:?} is not a place (expected \"map\", \"private\", a Secret or a Secret's id)"
+    )]
+    InvalidPlace(String),
+    /// A Secret's (or Private additions') own area or room was asked about another place.
+    /// Those areas hold only their own place's content.
+    #[class(generic)]
+    #[error(
+        "smudgy: a Secret's area holds only that Secret's content; reach a map's other places through the map"
+    )]
+    PlaceMismatch,
+    /// `"private"` named on a local or session map.
+    #[class(generic)]
+    #[error("smudgy: only cloud maps keep Private additions")]
+    PrivateNeedsCloud,
+    /// The same answer for a Secret that does not exist and one the caller cannot read.
+    #[class(generic)]
+    #[error("Secret not found")]
+    SecretNotFound,
 }
 
 /// Gate a mapper op on the isolate's [`SmudgyGrants`] (seeded into `OpState` by the `smudgy_ops`
@@ -194,7 +256,7 @@ pub enum MapperError {
 /// needs `mapper_write` (see `PACKAGE-ISOLATES-OP-CAPABILITIES.md`). Only the ops that reach `Mapper`
 /// through `OpState` are gated — the `&JSArea`/`&JSRoom` wrapper accessors operate on a handle the
 /// script must first obtain via one of these gated entry ops, so they need no separate check.
-fn ensure_mapper(state: &OpState, write: bool) -> Result<(), MapperError> {
+pub(super) fn ensure_mapper(state: &OpState, write: bool) -> Result<(), MapperError> {
     let grants = *state.borrow::<SmudgyGrants>();
     let (allowed, cap) = if write {
         (grants.mapper_write, "mapper-write")
@@ -213,21 +275,13 @@ fn ensure_mapper(state: &OpState, write: bool) -> Result<(), MapperError> {
 /// the op off V8's fast-call path, costing several times a `#[string]` param's
 /// ~18 ns per id (`bench/examples/id_wire.rs`). The macro enforces the payoff --
 /// an op whose every argument is fast-compatible must be marked `fast`.
-/// Renders an atlas-wide room lookup's hits as script room refs.
-fn room_refs(rooms: impl Iterator<Item = (AreaId, Arc<RoomCache>)>) -> Vec<JsRoomRef> {
-    rooms
-        .map(|(area_id, room)| (ScriptUuid(area_id.0), room.get_room_number().0))
-        .collect()
-}
-
-/// Renders a per-area room lookup's hits as room numbers. The area is already
-/// named by the handle the call came through, so the id would be redundant.
-fn area_room_numbers(rooms: &[Arc<RoomCache>]) -> Vec<i32> {
-    rooms.iter().map(|room| room.get_room_number().0).collect()
-}
-
-fn parse_id(value: &str) -> Result<Uuid, MapperError> {
+pub(super) fn parse_id(value: &str) -> Result<Uuid, MapperError> {
     Uuid::try_parse(value).map_err(|_| MapperError::InvalidId(value.to_owned()))
+}
+
+/// [`reach`] for an async op, which holds its state shared.
+fn reach_shared(state: &Rc<RefCell<OpState>>, area_id: AreaId) -> Result<AreaId, CloudError> {
+    reach(&state.borrow(), area_id)
 }
 
 /// Hand an id straight to V8 as a one-byte string, formatted into a stack
@@ -265,7 +319,7 @@ async fn await_mapper_submission(
 
 /// A room reference as serialized to JS: the area id as a `u64` pair plus the
 /// room number.
-type JsRoomRef = (ScriptUuid, i32);
+pub(super) type JsRoomRef = (ScriptUuid, i32);
 
 /// Queue a bind-on-use navigation hint for the UI daemon. A demonstrated
 /// speedwalk / find-nearest resolution into `area_id` is evidence the player is
@@ -273,7 +327,12 @@ type JsRoomRef = (ScriptUuid, i32);
 /// store) decides whether the area's atlas is unassigned and worth binding, so
 /// the op stays policy-free. Cheap by construction: one `VecDeque` push, dwarfed
 /// by the pathfinding that just ran.
-fn note_navigation(state: &OpState, area_id: AreaId) {
+pub(super) fn note_navigation(state: &OpState, area_id: AreaId) {
+    // A Secret's rooms are navigation in its map.
+    let area_id = state
+        .try_borrow::<Mapper>()
+        .and_then(|mapper| mapper.get_current_atlas().map_of(&area_id))
+        .unwrap_or(area_id);
     state
         .borrow::<ActionQueue>()
         .borrow_mut()
@@ -373,23 +432,42 @@ async fn op_smudgy_mapper_create_area(
                 return Err(MapperError::AtlasNotFound);
             }
         }
+        // No tier requested: durable in the default tier, the cloud when
+        // signed in and this device otherwise.
         let storage = resolve_create_storage(options.storage, options.ephemeral)
-            .or_else(|| atlas_id.and_then(|id| mapper.atlas_storage(&id)));
-        let created = if let Some(storage) = storage {
-            mapper
-                .create_area_at_with_properties(
-                    name,
-                    MapDestination { storage, atlas_id },
-                    options.properties,
-                )
-                .await
-        } else {
-            // No tier was requested: create durable in the default tier —
-            // cloud when signed in, local otherwise.
-            mapper
-                .create_area_with_properties(name, options.properties)
-                .await
+            .or_else(|| atlas_id.and_then(|id| mapper.atlas_storage(&id)))
+            .unwrap_or_else(|| mapper.default_storage());
+        // Maps live in atlases: a durable map named into none goes in this
+        // server's default atlas for its storage. One made just now is shown
+        // on this server.
+        let atlas_id = match atlas_id {
+            Some(atlas_id) => Some(atlas_id),
+            None if storage == MapStorage::Session => None,
+            None => {
+                let server = state.borrow().borrow::<ServerName>().0.clone();
+                let default = resolve_default_atlas(&mapper, &server, storage)
+                    .await
+                    .map_err(|error| MapperError::OperationFailed {
+                        operation: "find this server's default atlas",
+                        message: format!("{error:#}"),
+                    })?;
+                if default.created {
+                    state
+                        .borrow()
+                        .borrow::<ActionQueue>()
+                        .borrow_mut()
+                        .push_back(RuntimeAction::AssociateCreatedAtlas(default.id));
+                }
+                Some(default.id)
+            }
         };
+        let created = mapper
+            .create_area_at_with_properties(
+                name,
+                MapDestination { storage, atlas_id },
+                options.properties,
+            )
+            .await;
         // A non-ephemeral (cloud-tier) area created from a session is associated
         // with that session's server entry — nothing user-created starts
         // unassigned. Ephemeral areas are session-scoped by nature and get no
@@ -460,12 +538,14 @@ const COMPAT_MINOR: u32 = version_component(env!("CARGO_PKG_VERSION_MINOR").as_b
 
 /// The 0.5 compatibility shims expire at 0.6, and this refuses to BUILD past
 /// that line rather than waiting for a test run: `createArea`'s `ephemeral`
-/// option, `area.isEphemeral`, and the `area.uuid` alias (with its warn-once
-/// op) all come out together, along with this gate and the catalog test in
-/// `models/script_typings.rs`.
+/// option, `area.isEphemeral`, the `area.uuid` alias (with its warn-once
+/// op), and the `snake_case` names (`SNAKE_CASE_NAMES` in `mapper.ts`, its
+/// warn-once op, and the old spelling `mapper_names::script_reasons` keeps
+/// beside each refusal code) all come out together, along with this gate and
+/// the catalog test in `models/script_typings.rs`.
 const _: () = assert!(
     COMPAT_MAJOR == 0 && COMPAT_MINOR < 6,
-    "0.6 reached: remove the mapper's 0.5 compatibility shims (createArea's `ephemeral` option, `area.isEphemeral`, the `area.uuid` alias and its warn-once op), this gate, and the catalog test in models/script_typings.rs"
+    "0.6 reached: remove the mapper's 0.5 compatibility shims (createArea's `ephemeral` option, `area.isEphemeral`, the `area.uuid` alias and its warn-once op, the snake_case names in mapper.ts with their warn-once op, and the snake_case refusal codes in mapper_names.rs), this gate, and the catalog test in models/script_typings.rs"
 );
 
 /// Per-isolate latch for the `ephemeral`-option deprecation notice.
@@ -690,25 +770,35 @@ async fn op_smudgy_mapper_relocate_areas(
             .cloned()
             .ok_or(MapperError::MapperNotEnabled)?
     };
-    let result = mapper
-        .relocate_areas(
-            source_ids
-                .into_iter()
-                .map(|id| AreaId(id.into_uuid()))
-                .collect(),
-            destination.into_destination(),
-            if move_source {
-                RelocationMode::Move
-            } else {
-                RelocationMode::Copy
-            },
-        )
-        .await
-        .map_err(operation_failed(if move_source {
-            "move areas"
-        } else {
-            "copy areas"
-        }))?;
+    let source_ids: Vec<AreaId> = source_ids
+        .into_iter()
+        .map(|id| AreaId(id.into_uuid()))
+        .collect();
+    for area_id in &source_ids {
+        ensure_area_write(&state.borrow(), *area_id)?;
+    }
+    let reached: Result<Vec<AreaId>, CloudError> = source_ids
+        .into_iter()
+        .map(|id| reach_shared(&state, id))
+        .collect();
+    let mode = if move_source {
+        RelocationMode::Move
+    } else {
+        RelocationMode::Copy
+    };
+    let result = match reached {
+        Ok(ids) => {
+            mapper
+                .relocate_areas(ids, destination.into_destination(), mode)
+                .await
+        }
+        Err(error) => Err(error.into()),
+    }
+    .map_err(operation_failed(if move_source {
+        "move areas"
+    } else {
+        "copy areas"
+    }))?;
     if result.destination.storage == MapStorage::Cloud {
         let state = state.borrow();
         let mut queue = state.borrow::<ActionQueue>().borrow_mut();
@@ -806,7 +896,10 @@ fn op_smudgy_mapper_get_area_by_id(
 
     if let Some(atlas) = atlas {
         let id = AreaId(parse_id(&id)?);
-        if let Some(area) = atlas.get_area(&id) {
+        // A Secret's or Private additions' own area this isolate cannot see is not found, as
+        // an id naming nothing is not.
+        let sources = sources_for(&state.borrow());
+        if let Some(area) = atlas.get_area(&id).filter(|_| atlas.sees(sources, &id)) {
             return Ok(JSArea(area.clone()));
         }
         return Err(MapperError::AreaNotFound);
@@ -829,6 +922,13 @@ async fn op_smudgy_mapper_delete_area(
             .ok_or(MapperError::MapperNotEnabled)?
     };
     let id = AreaId(parse_id(&area_id)?);
+    // The server holds no area under an id this isolate cannot see, and says so.
+    if reach_shared(&state, id).is_err() {
+        return Err(operation_failed("delete area")(
+            CloudError::NotFoundOrNoAccess,
+        ));
+    }
+    ensure_area_write(&state.borrow(), id)?;
     mapper
         .delete_area_and_wait(id)
         .await
@@ -850,6 +950,13 @@ async fn op_smudgy_mapper_rename_area(
             .ok_or(MapperError::MapperNotEnabled)?
     };
     let id = AreaId(parse_id(&area_id)?);
+    // The server holds no area under an id this isolate cannot see, and says so.
+    if reach_shared(&state, id).is_err() {
+        return Err(operation_failed("rename area")(
+            CloudError::NotFoundOrNoAccess,
+        ));
+    }
+    ensure_area_write(&state.borrow(), id)?;
     mapper
         .rename_area_and_wait(id, name.as_str())
         .await
@@ -873,6 +980,15 @@ fn op_smudgy_mapper_get_area_id<'a>(
     #[cppgc] area_wrapper: &JSArea,
 ) -> v8::Local<'a, v8::String> {
     id_to_v8(scope, area_wrapper.0.get_id().0)
+}
+
+/// `area.mapId`: for a Secret's area (or the caller's Private additions'),
+/// the map it belongs to; `None` (`undefined` in JS) for a map. Wrapper
+/// accessor on a `JSArea` handle -- not gated.
+#[op2]
+#[serde]
+fn op_smudgy_mapper_get_area_map_id(#[cppgc] area_wrapper: &JSArea) -> Option<ScriptUuid> {
+    area_wrapper.0.map_id().map(|map_id| ScriptUuid(map_id.0))
 }
 
 /// `area.isEphemeral`: whether the area lives in the session-lifetime
@@ -906,8 +1022,10 @@ fn op_smudgy_mapper_list_rooms_by_title_and_description(
 
     if let Some(mapper) = mapper {
         let atlas = mapper.get_current_atlas();
+        let sources = sources_for(state);
         let rooms = atlas.get_rooms_by_title_and_description(title, description);
         Ok(rooms
+            .filter(|(area_id, _)| atlas.sees(sources, area_id))
             .map(|(area_id, room)| (ScriptUuid(area_id.0), room.get_room_number().0))
             .collect())
     } else {
@@ -928,73 +1046,21 @@ fn op_smudgy_mapper_list_rooms_by_title_description_and_visible_exits(
 
     if let Some(mapper) = mapper {
         let atlas = mapper.get_current_atlas();
-        let rooms = atlas.get_rooms_by_title_description_and_visible_exits(
+        let sources = sources_for(state);
+        let rooms = atlas.rooms_by_title_description_and_visible_exits_for(
             title,
             description,
-            visible_exit_directions.iter(),
+            &visible_exit_directions,
+            sources,
         );
         Ok(rooms
+            .into_iter()
+            .filter(|(area_id, _)| atlas.sees(sources, area_id))
             .map(|(area_id, room)| (ScriptUuid(area_id.0), room.get_room_number().0))
             .collect())
     } else {
         Ok(vec![])
     }
-}
-
-/// `mapper.findRoomsByProperty`: every room in the current atlas whose
-/// `name` property holds exactly `value`. One probe of the atlas cache's
-/// name-and-value table.
-#[op2]
-#[serde]
-fn op_smudgy_mapper_find_rooms_by_property(
-    state: &OpState,
-    #[string] name: &str,
-    #[string] value: &str,
-) -> Result<Vec<JsRoomRef>, MapperError> {
-    ensure_mapper(state, false)?;
-    let Some(mapper) = state.try_borrow::<Mapper>() else {
-        return Ok(vec![]);
-    };
-    Ok(room_refs(
-        mapper
-            .get_current_atlas()
-            .get_rooms_by_property(name, value),
-    ))
-}
-
-/// `mapper.findRoomsWithProperty`: every room in the current atlas carrying a
-/// property named `name`, whatever its value. One probe.
-#[op2]
-#[serde]
-fn op_smudgy_mapper_find_rooms_with_property(
-    state: &OpState,
-    #[string] name: &str,
-) -> Result<Vec<JsRoomRef>, MapperError> {
-    ensure_mapper(state, false)?;
-    let Some(mapper) = state.try_borrow::<Mapper>() else {
-        return Ok(vec![]);
-    };
-    Ok(room_refs(
-        mapper.get_current_atlas().get_rooms_with_property(name),
-    ))
-}
-
-/// `mapper.findRoomsWithTag`: every room in the current atlas carrying `tag`,
-/// matched case-insensitively. One probe -- unlike `findNearestRoomWithTag`,
-/// which walks the graph because it wants the closest one rather than all.
-#[op2]
-#[serde]
-fn op_smudgy_mapper_find_rooms_with_tag(
-    state: &OpState,
-    #[string] tag: &str,
-) -> Result<Vec<JsRoomRef>, MapperError> {
-    ensure_mapper(state, false)?;
-    let Some(mapper) = state.try_borrow::<Mapper>() else {
-        return Ok(vec![]);
-    };
-    Ok(room_refs(
-        mapper.get_current_atlas().get_rooms_with_tag(tag),
-    ))
 }
 
 /// `mapper.findAreasByProperty`: every area in the current atlas whose `name`
@@ -1034,41 +1100,6 @@ fn op_smudgy_mapper_find_areas_with_property(
         .get_areas_with_property(name)
         .map(|area_id| ScriptUuid(area_id.0))
         .collect())
-}
-
-/// `area.findRoomsByProperty`: the area's own rooms whose `name` property
-/// holds exactly `value`. Reads the handle's per-area table, so it answers for
-/// an excluded area too -- naming the area is explicit addressing.
-#[op2]
-#[serde]
-fn op_smudgy_mapper_find_area_rooms_by_property(
-    #[cppgc] area_wrapper: &JSArea,
-    #[string] name: &str,
-    #[string] value: &str,
-) -> Vec<i32> {
-    area_room_numbers(area_wrapper.0.get_rooms_by_property(name, value))
-}
-
-/// `area.findRoomsWithProperty`: the area's own rooms carrying a property
-/// named `name`, whatever its value.
-#[op2]
-#[serde]
-fn op_smudgy_mapper_find_area_rooms_with_property(
-    #[cppgc] area_wrapper: &JSArea,
-    #[string] name: &str,
-) -> Vec<i32> {
-    area_room_numbers(area_wrapper.0.get_rooms_with_property(name))
-}
-
-/// `area.findRoomsWithTag`: the area's own rooms carrying `tag`, matched
-/// case-insensitively.
-#[op2]
-#[serde]
-fn op_smudgy_mapper_find_area_rooms_with_tag(
-    #[cppgc] area_wrapper: &JSArea,
-    #[string] tag: &str,
-) -> Vec<i32> {
-    area_room_numbers(area_wrapper.0.get_rooms_with_tag(tag))
 }
 
 #[op2]
@@ -1131,8 +1162,9 @@ fn op_smudgy_mapper_reserve_room_number(
         .ok_or(MapperError::MapperNotEnabled)?;
     let area_id = AreaId(parse_id(&area_id)?);
     let token = parse_id(&token)?;
-    mapper
-        .reserve_room_number(&area_id, token)
+    ensure_area_write(state, area_id)?;
+    reach(state, area_id)
+        .and_then(|area_id| mapper.reserve_room_number(&area_id, token))
         .map(|number| number.0)
         .map_err(|error| match error {
             CloudError::AreaNotFound(_) => MapperError::AreaNotFound,
@@ -1150,7 +1182,11 @@ fn op_smudgy_mapper_release_room_reservations(
 ) -> Result<(), MapperError> {
     ensure_mapper(state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>() {
-        mapper.release_room_reservations(&AreaId(parse_id(&area_id)?), parse_id(&token)?);
+        let area_id = AreaId(parse_id(area_id)?);
+        let token = parse_id(token)?;
+        if !hides_area(state, area_id) {
+            mapper.release_room_reservations(&area_id, token);
+        }
     }
     Ok(())
 }
@@ -1234,23 +1270,11 @@ fn op_smudgy_mapper_get_room_property<'a>(
     }
 }
 
-/// The room's tags, normalized to UPPERCASE and sorted. A wrapper accessor on a
-/// handle the script already obtained through a gated entry op, so it is not
-/// separately capability-gated (see [`ensure_mapper`]).
-#[op2]
-#[serde]
-fn op_smudgy_mapper_get_room_tags(#[cppgc] room_wrapper: &JSRoom) -> Vec<String> {
-    room_wrapper.0.tags().map(String::from).collect()
-}
-
-/// Case-insensitive tag-membership test. Wrapper accessor — not gated.
-#[op2(fast)]
-fn op_smudgy_mapper_has_tag(#[cppgc] room_wrapper: &JSRoom, #[string] tag: String) -> bool {
-    room_wrapper.0.has_tag(&tag)
-}
-
+/// An exit as scripts read it, with the place that keeps it (`"map"`, `"private"` or a
+/// Secret's id), which the script resolves on demand.
 #[derive(Debug, Serialize)]
-struct JSExit {
+#[serde(rename_all = "camelCase")]
+pub(super) struct JSExit {
     id: ScriptUuid,
     connection_id: ScriptUuid,
     from_direction: String,
@@ -1260,36 +1284,136 @@ struct JSExit {
     to_area_id: Option<ScriptUuid>,
     to_room_number: Option<i32>,
     is_hidden: bool,
-    is_closed: bool,
-    is_locked: bool,
+    door: Option<JSDoor>,
     weight: f32,
     command: Option<String>,
+    place: String,
+}
+
+/// An exit's door as scripts read it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct JSDoor {
+    state: DoorState,
+    name: Option<String>,
+    opens_with: Option<String>,
+}
+
+impl From<&Door> for JSDoor {
+    fn from(door: &Door) -> Self {
+        Self {
+            state: door.state,
+            name: door.name.clone(),
+            opens_with: door.opens_with.clone(),
+        }
+    }
+}
+
+/// A door as scripts give it: a state, and optionally a name and the command that opens it
+/// (absent or `null` for none).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JSDoorArgs {
+    state: DoorState,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    opens_with: Option<String>,
+}
+
+impl From<JSDoorArgs> for Door {
+    fn from(door: JSDoorArgs) -> Self {
+        Self {
+            state: door.state,
+            name: door.name,
+            opens_with: door.opens_with,
+        }
+    }
+}
+
+/// A field present in a script's object, `null` included, as `Some`; an absent one stays
+/// `None` (the field's default).
+#[allow(clippy::option_option)] // absent, null and a value are the three cases a script means
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl JSExit {
+    /// `exit`, leaving room `from_room` of area `from_area`, kept by `place`.
+    pub(super) fn of(
+        exit: &smudgy_cloud::mapper::exit_cache::ExitCache,
+        from_area: AreaId,
+        from_room: RoomNumber,
+        place: smudgy_cloud::SourceId,
+        destination_readable: bool,
+    ) -> Self {
+        Self {
+            id: ScriptUuid(exit.id.0),
+            connection_id: ScriptUuid(exit.connection_id.0),
+            from_direction: exit.from_direction.to_string(),
+            from_area_id: ScriptUuid(from_area.0),
+            from_room_number: from_room.0,
+            to_direction: destination_readable
+                .then_some(exit.to_direction)
+                .flatten()
+                .map(|direction| direction.to_string()),
+            to_area_id: destination_readable
+                .then_some(exit.to_area_id)
+                .flatten()
+                .map(|area_id| ScriptUuid(area_id.0)),
+            to_room_number: destination_readable
+                .then_some(exit.to_room_number)
+                .flatten()
+                .map(|room_number| room_number.0),
+            is_hidden: exit.is_hidden,
+            door: exit.door.as_ref().map(JSDoor::from),
+            weight: exit.weight,
+            command: exit.command.clone(),
+            place: place.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSExitCreateParams {
     from_direction: ExitDirection,
     to_direction: Option<ExitDirection>,
     to_area_id: Option<ScriptUuid>,
     to_room_number: Option<i32>,
     is_hidden: Option<bool>,
-    is_closed: Option<bool>,
-    is_locked: Option<bool>,
+    /// Absent or `null`: no door.
+    #[serde(default)]
+    door: Option<JSDoorArgs>,
     weight: Option<f32>,
     command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSExitUpdateParams {
     from_direction: Option<ExitDirection>,
     to_direction: Option<ExitDirection>,
     to_area_id: Option<ScriptUuid>,
     to_room_number: Option<i32>,
     is_hidden: Option<bool>,
-    is_closed: Option<bool>,
-    is_locked: Option<bool>,
+    /// Absent: unchanged; `null`: no door; a door: replaced whole.
+    #[serde(default, deserialize_with = "present")]
+    #[allow(clippy::option_option)] // absent, null and a door are three different updates
+    door: Option<Option<JSDoorArgs>>,
     weight: Option<f32>,
     command: Option<String>,
+}
+
+impl JSExitUpdateParams {
+    #[allow(clippy::option_option)] // `ExitUpdates::door`'s shape: absent, removed, replaced
+    fn door(&mut self) -> Option<Option<Door>> {
+        self.door.take().map(|door| door.map(Door::from))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1306,9 +1430,8 @@ struct JSRoomParams {
 
 impl From<JSRoomParams> for RoomUpdates {
     /// Project the script-supplied room fields onto a cloud `RoomUpdates` (all-`Option`, so an
-    /// absent field is left unchanged). `is_secret` is never settable from a script. The script
-    /// spelling of "clear the external id" is the empty string (a JS-friendly stand-in for the
-    /// wire's present-but-null).
+    /// absent field is left unchanged). The script spelling of "clear the external id" is the
+    /// empty string (a JS-friendly stand-in for the wire's present-but-null).
     fn from(params: JSRoomParams) -> Self {
         Self {
             title: params.title,
@@ -1317,7 +1440,6 @@ impl From<JSRoomParams> for RoomUpdates {
             x: params.x,
             y: params.y,
             color: params.color,
-            is_secret: None,
             external_id: params
                 .external_id
                 .map(|id| if id.is_empty() { None } else { Some(id) }),
@@ -1337,41 +1459,29 @@ fn submit_room_update(
         .try_borrow::<Mapper>()
         .cloned()
         .ok_or(MapperError::MapperNotEnabled)?;
-    let submission = mapper
-        .upsert_room(
-            RoomKey {
-                area_id: AreaId(parse_id(area_id)?),
-                room_number: RoomNumber(room_number),
-            },
-            updates,
-        )
+    let area_id = AreaId(parse_id(area_id)?);
+    ensure_area_write(&state, area_id)?;
+    let submission = reach(&state, area_id)
+        .and_then(|area_id| {
+            mapper.upsert_room(
+                RoomKey {
+                    area_id,
+                    room_number: RoomNumber(room_number),
+                },
+                updates,
+            )
+        })
         .map_err(operation_failed("update room"))?;
     Ok((mapper, submission))
 }
 
+/// A room's exits. A map room's include the exits its map's Secrets and
+/// Private additions keep on it, so a walk through a hidden door finds the
+/// door; editing one by id writes the place that keeps it.
 #[op2]
 #[serde]
-fn op_smudgy_mapper_get_room_exits(#[cppgc] room_wrapper: &JSRoom) -> Vec<JSExit> {
-    room_wrapper
-        .0
-        .get_exits()
-        .iter()
-        .map(|exit| JSExit {
-            id: ScriptUuid(exit.id.0),
-            connection_id: ScriptUuid(exit.connection_id.0),
-            from_direction: exit.from_direction.to_string(),
-            from_area_id: ScriptUuid(room_wrapper.1.0),
-            from_room_number: room_wrapper.0.get_room_number().0,
-            to_direction: exit.to_direction.map(|direction| direction.to_string()),
-            to_area_id: exit.to_area_id.map(|area_id| ScriptUuid(area_id.0)),
-            to_room_number: exit.to_room_number.map(|room_number| room_number.0),
-            is_hidden: exit.is_hidden,
-            is_closed: exit.is_closed,
-            is_locked: exit.is_locked,
-            weight: exit.weight,
-            command: exit.command.clone(),
-        })
-        .collect()
+fn op_smudgy_mapper_get_room_exits(state: &OpState, #[cppgc] room_wrapper: &JSRoom) -> Vec<JSExit> {
+    room_exits(state, room_wrapper)
 }
 
 /// ROOM SETTER METHODS
@@ -1435,7 +1545,7 @@ fn op_smudgy_mapper_find_room_by_external_id(
     if let Some(mapper) = state.try_borrow::<Mapper>() {
         Ok(mapper
             .get_current_atlas()
-            .find_room_by_external_id(&external_id)
+            .find_room_by_external_id_with(&external_id, sources_for(&state))
             .map(|(room_key, _)| (ScriptUuid(room_key.area_id.0), room_key.room_number.0)))
     } else {
         Err(MapperError::MapperNotEnabled)
@@ -1463,7 +1573,10 @@ fn op_smudgy_mapper_rescue_room_by_external_id(
     let Some(mapper) = state.try_borrow::<Mapper>() else {
         return Err(MapperError::MapperNotEnabled);
     };
-    let Some(hit) = mapper.find_room_elsewhere_by_external_id(&external_id) else {
+    let Some(hit) = mapper
+        .get_current_atlas()
+        .find_room_elsewhere_by_external_id_with(&external_id, sources_for(&state))
+    else {
         return Ok(false);
     };
     state
@@ -1590,6 +1703,8 @@ async fn op_smudgy_mapper_set_room_property(
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state, area_id)?;
+        reach(&state, area_id).map_err(operation_failed("update room"))?;
         let submission = mapper
             .set_room_property(
                 RoomKey {
@@ -1619,6 +1734,8 @@ async fn op_smudgy_mapper_set_area_property(
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state, area_id)?;
+        reach(&state, area_id).map_err(operation_failed("update area"))?;
         let submission = mapper
             .set_area_property(area_id, name, value)
             .map_err(operation_failed("update area"))?;
@@ -1641,6 +1758,8 @@ async fn op_smudgy_mapper_add_room_tag(
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state, area_id)?;
+        reach(&state, area_id).map_err(operation_failed("add room tag"))?;
         let submission = mapper
             .add_room_tag(
                 RoomKey {
@@ -1669,6 +1788,8 @@ async fn op_smudgy_mapper_remove_room_tag(
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state, area_id)?;
+        reach(&state, area_id).map_err(operation_failed("remove room tag"))?;
         let submission = mapper
             .remove_room_tag(
                 RoomKey {
@@ -1696,6 +1817,10 @@ async fn op_smudgy_mapper_create_room(
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(parse_id(&area_id)?);
+        if hides_area(&state, area_id) {
+            return Err(MapperError::AreaNotFound);
+        }
+        ensure_area_write(&state, area_id)?;
         // Reservation-aware allocation: numbers drafted by an open
         // `mutateArea` callback are skipped, so an ambient create landing
         // mid-callback cannot silently merge with a draft.
@@ -1742,6 +1867,8 @@ async fn op_smudgy_mapper_update_room(
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state, area_id)?;
+        reach(&state, area_id).map_err(operation_failed("update room"))?;
         let submission = mapper
             .upsert_room(
                 RoomKey {
@@ -1772,6 +1899,8 @@ async fn op_smudgy_mapper_update_rooms(
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
         let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state, area_id)?;
+        reach(&state, area_id).map_err(operation_failed("update rooms"))?;
         let updates = updates
             .into_iter()
             .map(|(room_number, params)| (RoomNumber(room_number), params.into()))
@@ -1803,16 +1932,25 @@ async fn op_smudgy_mapper_create_room_exit(
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
-        drop(state);
-
         let area_id = AreaId(parse_id(&area_id)?);
+        reach_for_write(&state, area_id, |error| {
+            MapperError::FailedToCreate(error.to_string())
+        })?;
+        if let Some(target) = params.to_area_id {
+            ensure_exit_target(&state, AreaId(target.into_uuid()), |error| {
+                MapperError::FailedToCreate(error.to_string())
+            })?;
+        }
+        drop(state);
         let id = ExitId::new();
         let submission = mapper
             .mutate_area(
                 area_id,
                 vec![AreaMutation::CreateExit {
+                    room_source: None,
                     room_number: RoomNumber(room_number),
                     body: ExitArgs {
+                        to_source: None,
                         id: Some(id),
                         connection_id: None,
                         new_connection_id: None,
@@ -1821,12 +1959,10 @@ async fn op_smudgy_mapper_create_room_exit(
                         to_area_id: params.to_area_id.map(|area_id| AreaId(area_id.into_uuid())),
                         to_room_number: params.to_room_number.map(RoomNumber),
                         is_hidden: params.is_hidden.unwrap_or(false),
-                        is_closed: params.is_closed.unwrap_or(false),
-                        is_locked: params.is_locked.unwrap_or(false),
+                        door: params.door.map(Door::from),
                         weight: params.weight.unwrap_or(1.0),
                         command: params.command,
                         path: None,
-                        is_secret: None,
                     },
                 }],
                 "Create scripted exit",
@@ -1846,31 +1982,49 @@ async fn op_smudgy_mapper_set_room_exit(
     #[string] area_id: String,
     room_number: i32,
     #[string] exit_id: String,
-    #[serde] params: JSExitUpdateParams,
+    #[serde] mut params: JSExitUpdateParams,
 ) -> Result<Option<ScriptUuid>, MapperError> {
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        let area_id = AreaId(parse_id(&area_id)?);
+        let exit_id = ExitId(parse_id(&exit_id)?);
+        ensure_area_write(&state, area_id)?;
+        reach(&state, area_id).map_err(operation_failed("update exit"))?;
+        ensure_exit_write(
+            &state,
+            area_id,
+            Some(RoomNumber(room_number)),
+            exit_id,
+            operation_failed("update exit"),
+        )?;
+        if let Some(target) = params.to_area_id {
+            ensure_exit_target(
+                &state,
+                AreaId(target.into_uuid()),
+                operation_failed("update exit"),
+            )?;
+        }
         drop(state);
+        let door = params.door();
         let submission = mapper
             .update_exit(
                 RoomKey {
-                    area_id: AreaId(parse_id(&area_id)?),
+                    area_id,
                     room_number: RoomNumber(room_number),
                 },
-                ExitId(parse_id(&exit_id)?),
+                exit_id,
                 ExitUpdates {
+                    to_source: None,
                     from_direction: params.from_direction,
                     to_direction: params.to_direction,
                     to_area_id: params.to_area_id.map(|area_id| AreaId(area_id.into_uuid())),
                     to_room_number: params.to_room_number.map(RoomNumber),
                     is_hidden: params.is_hidden,
-                    is_closed: params.is_closed,
-                    is_locked: params.is_locked,
+                    door,
                     weight: params.weight,
                     command: params.command,
                     path: None,
-                    is_secret: None,
                     clear_to: None,
                 },
             )
@@ -1900,12 +2054,17 @@ async fn op_smudgy_mapper_merge_rooms(
             .ready()
             .await
             .map_err(operation_failed("load maps before joining rooms"))?;
-        let submission = mapper
-            .merge_rooms(
-                area_id,
-                RoomNumber(keep_room_number),
-                RoomNumber(remove_room_number),
-            )
+        ensure_area_write(&state.borrow(), area_id)?;
+        let sources = sources_for(&state.borrow());
+        let submission = reach_shared(&state, area_id)
+            .and_then(|area_id| {
+                mapper.merge_rooms_as(
+                    area_id,
+                    RoomNumber(keep_room_number),
+                    RoomNumber(remove_room_number),
+                    sources,
+                )
+            })
             .map_err(operation_failed("merge rooms"))?;
         let result = await_mapper_submission(&mapper, submission).await?;
         mapper
@@ -1993,16 +2152,21 @@ async fn op_smudgy_mapper_merge_areas(
             .ok_or(MapperError::MapperNotEnabled)?
     };
     let into = AreaId(parse_id(&into)?);
-    let commit = mapper
-        .merge_areas(
-            into,
-            sources
-                .into_iter()
-                .map(JsMergeAreaSource::into_source)
-                .collect(),
-        )
-        .await
-        .map_err(operation_failed("merge areas"))?;
+    let sources: Vec<AreaMergeSource> = sources
+        .into_iter()
+        .map(JsMergeAreaSource::into_source)
+        .collect();
+    for area_id in std::iter::once(into).chain(sources.iter().map(|source| source.id)) {
+        ensure_area_write(&state.borrow(), area_id)?;
+    }
+    let reached = std::iter::once(into)
+        .chain(sources.iter().map(|source| source.id))
+        .try_for_each(|area_id| reach_shared(&state, area_id).map(drop));
+    let commit = match reached {
+        Ok(()) => mapper.merge_areas(into, sources).await,
+        Err(error) => Err(error),
+    }
+    .map_err(operation_failed("merge areas"))?;
     let rooms = commit.outcome.rooms;
     drain_mapper_events(&state.borrow());
     Ok(rooms
@@ -2036,10 +2200,14 @@ async fn op_smudgy_mapper_delete_room(
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
-        let submission = mapper
-            .delete_room(RoomKey {
-                area_id: AreaId(parse_id(&area_id)?),
-                room_number: RoomNumber(room_number),
+        let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state, area_id)?;
+        let submission = reach(&state, area_id)
+            .and_then(|area_id| {
+                mapper.delete_room(RoomKey {
+                    area_id,
+                    room_number: RoomNumber(room_number),
+                })
             })
             .map_err(operation_failed("delete room"))?;
         drop(state);
@@ -2060,14 +2228,27 @@ async fn op_smudgy_mapper_delete_room_exit(
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
-        let submission = mapper
-            .delete_exit(
-                RoomKey {
-                    area_id: AreaId(parse_id(&area_id)?),
-                    room_number: RoomNumber(room_number),
-                },
-                ExitId(parse_id(&exit_id)?),
-            )
+        let area_id = AreaId(parse_id(&area_id)?);
+        let exit_id = ExitId(parse_id(&exit_id)?);
+        ensure_area_write(&state, area_id)?;
+        reach(&state, area_id).map_err(operation_failed("delete exit"))?;
+        ensure_exit_write(
+            &state,
+            area_id,
+            None,
+            exit_id,
+            operation_failed("delete exit"),
+        )?;
+        let submission = reach(&state, area_id)
+            .and_then(|area_id| {
+                mapper.delete_exit(
+                    RoomKey {
+                        area_id,
+                        room_number: RoomNumber(room_number),
+                    },
+                    exit_id,
+                )
+            })
             .map_err(operation_failed("delete exit"))?;
         drop(state);
         await_mapper_submission(&mapper, submission).await
@@ -2082,7 +2263,11 @@ async fn op_smudgy_mapper_delete_room_exit(
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSConnectionEndpoint {
+    /// The room's source; absent means the containing area's own place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    place: Option<smudgy_cloud::SourceId>,
     room_number: i32,
     side: RoomSide,
     port_offset: f32,
@@ -2092,6 +2277,7 @@ struct JSConnectionEndpoint {
 impl From<ConnectionEndpoint> for JSConnectionEndpoint {
     fn from(endpoint: ConnectionEndpoint) -> Self {
         Self {
+            place: endpoint.source,
             room_number: endpoint.room_number.0,
             side: endpoint.side,
             port_offset: endpoint.port_offset,
@@ -2103,6 +2289,7 @@ impl From<ConnectionEndpoint> for JSConnectionEndpoint {
 impl From<JSConnectionEndpoint> for ConnectionEndpoint {
     fn from(endpoint: JSConnectionEndpoint) -> Self {
         Self {
+            source: endpoint.place,
             room_number: RoomNumber(endpoint.room_number),
             side: endpoint.side,
             port_offset: endpoint.port_offset,
@@ -2112,6 +2299,7 @@ impl From<JSConnectionEndpoint> for ConnectionEndpoint {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JSConnection {
     id: ScriptUuid,
     endpoint_a: JSConnectionEndpoint,
@@ -2145,6 +2333,7 @@ impl From<&Connection> for JSConnection {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSConnectionUpdateParams {
     endpoint_a: Option<JSConnectionEndpoint>,
     endpoint_b: Option<JSConnectionEndpoint>,
@@ -2174,6 +2363,7 @@ impl From<JSConnectionUpdateParams> for ConnectionUpdates {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSLinkCreateParams {
     endpoint_a: JSConnectionEndpoint,
     endpoint_b: Option<JSConnectionEndpoint>,
@@ -2188,6 +2378,7 @@ struct JSLinkCreateParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSLinkTraversalParams {
     room_number: i32,
     /// Kept outside the flattened exit so `serde_v8` can decode `BigInt`-carried
@@ -2227,6 +2418,8 @@ enum JSAreaBatchOperation {
     },
     UpsertRoomProperty {
         room_number: i32,
+        #[serde(default)]
+        room_source: Option<smudgy_cloud::SourceId>,
         name: String,
         value: String,
     },
@@ -2234,16 +2427,31 @@ enum JSAreaBatchOperation {
         name: String,
         value: String,
     },
+    DeleteRoomProperty {
+        room_number: i32,
+        #[serde(default)]
+        room_source: Option<smudgy_cloud::SourceId>,
+        name: String,
+    },
+    DeleteAreaProperty {
+        name: String,
+    },
     AddRoomTag {
         room_number: i32,
+        #[serde(default)]
+        room_source: Option<smudgy_cloud::SourceId>,
         tag: String,
     },
     RemoveRoomTag {
         room_number: i32,
+        #[serde(default)]
+        room_source: Option<smudgy_cloud::SourceId>,
         tag: String,
     },
     CreateExit {
         room_number: i32,
+        #[serde(default)]
+        room_source: Option<smudgy_cloud::SourceId>,
         id: ScriptUuid,
         body: JSExitCreateParams,
     },
@@ -2270,6 +2478,7 @@ fn script_exit_args(
     connection_id: Option<ConnectionId>,
 ) -> ExitArgs {
     ExitArgs {
+        to_source: None,
         id: Some(id),
         connection_id,
         new_connection_id: None,
@@ -2278,12 +2487,10 @@ fn script_exit_args(
         to_area_id: params.to_area_id.map(|area_id| AreaId(area_id.into_uuid())),
         to_room_number: params.to_room_number.map(RoomNumber),
         is_hidden: params.is_hidden.unwrap_or(false),
-        is_closed: params.is_closed.unwrap_or(false),
-        is_locked: params.is_locked.unwrap_or(false),
+        door: params.door.map(Door::from),
         weight: params.weight.unwrap_or(1.0),
         command: params.command,
         path: None,
-        is_secret: None,
     }
 }
 
@@ -2309,66 +2516,90 @@ fn script_connection_args(
 }
 
 impl JSAreaBatchOperation {
+    #[allow(clippy::too_many_lines)] // one arm per operation
     fn into_group(self) -> Vec<AreaMutation> {
         match self {
             Self::UpsertRoom { room_number, body } => vec![AreaMutation::UpsertRoom {
+                room_source: None,
                 room_number: RoomNumber(room_number),
                 body: body.into(),
             }],
             Self::CreateRoom { room_number, body } => vec![AreaMutation::CreateRoom {
+                room_source: None,
                 room_number: RoomNumber(room_number),
                 body: body.into(),
             }],
             Self::DeleteRoom { room_number } => vec![AreaMutation::DeleteRoom {
+                room_source: None,
                 room_number: RoomNumber(room_number),
             }],
             Self::UpsertRoomProperty {
                 room_number,
+                room_source,
                 name,
                 value,
             } => vec![AreaMutation::UpsertRoomProperty {
+                room_source,
                 room_number: RoomNumber(room_number),
                 name,
                 value,
-                is_secret: None,
             }],
             Self::UpsertAreaProperty { name, value } => {
-                vec![AreaMutation::UpsertAreaProperty {
+                vec![AreaMutation::UpsertAreaProperty { name, value }]
+            }
+            Self::DeleteRoomProperty {
+                room_number,
+                room_source,
+                name,
+            } => {
+                vec![AreaMutation::DeleteRoomProperty {
+                    room_source,
+                    room_number: RoomNumber(room_number),
                     name,
-                    value,
-                    is_secret: None,
                 }]
             }
-            Self::AddRoomTag { room_number, tag } => vec![AreaMutation::AddRoomTag {
+            Self::DeleteAreaProperty { name } => vec![AreaMutation::DeleteAreaProperty { name }],
+            Self::AddRoomTag {
+                room_number,
+                room_source,
+                tag,
+            } => vec![AreaMutation::AddRoomTag {
+                room_source,
                 room_number: RoomNumber(room_number),
                 tag,
             }],
-            Self::RemoveRoomTag { room_number, tag } => vec![AreaMutation::RemoveRoomTag {
+            Self::RemoveRoomTag {
+                room_number,
+                room_source,
+                tag,
+            } => vec![AreaMutation::RemoveRoomTag {
+                room_source,
                 room_number: RoomNumber(room_number),
                 tag,
             }],
             Self::CreateExit {
                 room_number,
+                room_source,
                 id,
                 body,
             } => vec![AreaMutation::CreateExit {
+                room_source,
                 room_number: RoomNumber(room_number),
                 body: script_exit_args(body, ExitId(id.into_uuid()), None),
             }],
-            Self::UpdateExit { exit_id, body } => vec![AreaMutation::UpdateExit {
+            Self::UpdateExit { exit_id, mut body } => vec![AreaMutation::UpdateExit {
                 exit_id: ExitId(exit_id.into_uuid()),
                 body: ExitUpdates {
+                    to_source: None,
+                    door: body.door(),
                     from_direction: body.from_direction,
                     to_direction: body.to_direction,
                     to_area_id: body.to_area_id.map(|area_id| AreaId(area_id.into_uuid())),
                     to_room_number: body.to_room_number.map(RoomNumber),
                     is_hidden: body.is_hidden,
-                    is_closed: body.is_closed,
-                    is_locked: body.is_locked,
                     weight: body.weight,
                     command: body.command,
                     path: None,
-                    is_secret: None,
                     clear_to: None,
                 },
             }],
@@ -2387,6 +2618,7 @@ impl JSAreaBatchOperation {
                 operations.extend(body.traversals.into_iter().map(|traversal| {
                     let (room_number, exit) = traversal.into_parts();
                     AreaMutation::CreateExit {
+                        room_source: None,
                         room_number: RoomNumber(room_number),
                         body: script_exit_args(exit, ExitId::new(), Some(connection_id)),
                     }
@@ -2402,6 +2634,47 @@ impl JSAreaBatchOperation {
             }],
         }
     }
+}
+
+/// Refuses the exit destinations and attachment anchors of `mutations` that this
+/// isolate may not name ([`ensure_exit_target`]), each refusal through `failed`.
+fn ensure_exit_targets_write<'m>(
+    state: &OpState,
+    mutations: impl IntoIterator<Item = &'m AreaMutation>,
+    failed: impl Fn(smudgy_cloud::CloudError) -> MapperError,
+) -> Result<(), MapperError> {
+    for mutation in mutations {
+        match mutation {
+            AreaMutation::UpsertRoomProperty { room_source, .. }
+            | AreaMutation::DeleteRoomProperty { room_source, .. }
+            | AreaMutation::AddRoomTag { room_source, .. }
+            | AreaMutation::RemoveRoomTag { room_source, .. }
+            | AreaMutation::CreateExit { room_source, .. } => {
+                if let Some(source) = room_source {
+                    super::mapper_places::ensure_place_read(state, *source)?;
+                }
+            }
+            AreaMutation::CreateConnection { body } => {
+                ensure_connection_anchors_read(state, [Some(body.endpoint_a), body.endpoint_b])?;
+            }
+            AreaMutation::UpdateConnection { body, .. } => {
+                ensure_connection_anchors_read(state, [body.endpoint_a, body.endpoint_b])?;
+            }
+            _ => {}
+        }
+        let (target, source) = match mutation {
+            AreaMutation::CreateExit { body, .. } => (body.to_area_id, body.to_source),
+            AreaMutation::UpdateExit { body, .. } => (body.to_area_id, body.to_source.flatten()),
+            _ => (None, None),
+        };
+        if let Some(source) = source {
+            super::mapper_places::ensure_place_read(state, source)?;
+        }
+        if let Some(target) = target {
+            ensure_exit_target(state, target, &failed)?;
+        }
+    }
+    Ok(())
 }
 
 fn pack_area_batch_operations(
@@ -2462,20 +2735,61 @@ struct JsMutateAreaOutcome {
 async fn op_smudgy_mapper_mutate_area(
     state: Rc<RefCell<OpState>>,
     #[string] area_id: String,
+    #[string] source: String,
     #[serde] operations: Vec<JSAreaBatchOperation>,
     #[string] description: String,
 ) -> Result<JsMutateAreaOutcome, MapperError> {
+    let area_id = AreaId(parse_id(&area_id)?);
     let state = state.borrow();
     ensure_mapper(&state, true)?;
+    // Empty is the area's own place; anything else names one place of the map.
+    let source = write_place(&state, area_id, &source)?;
+    ensure_area_write(&state, area_id)?;
+    reach(&state, area_id).map_err(operation_failed("mutate area"))?;
     let mapper = state
         .try_borrow::<Mapper>()
         .cloned()
         .ok_or(MapperError::MapperNotEnabled)?;
+    let mut chunks = pack_area_batch_operations(operations)?;
+    ensure_exit_targets_write(
+        &state,
+        chunks.iter().flatten(),
+        operation_failed("mutate area"),
+    )?;
+    if source.is_map() {
+        for mutation in chunks.iter_mut().flatten() {
+            match mutation {
+                AreaMutation::UpdateExit { exit_id, .. } | AreaMutation::DeleteExit { exit_id } => {
+                    ensure_exit_write(
+                        &state,
+                        area_id,
+                        None,
+                        *exit_id,
+                        operation_failed("mutate area"),
+                    )?;
+                }
+                AreaMutation::Unlink { exit_id, .. } => {
+                    ensure_exit_shown(&state, area_id, *exit_id, operation_failed("mutate area"))?;
+                }
+                AreaMutation::UpdateConnection { connection_id, .. }
+                | AreaMutation::DeleteLink { connection_id } => {
+                    *connection_id = connection_as_seen(&state, area_id, *connection_id);
+                }
+                AreaMutation::Pair {
+                    keep_connection_id,
+                    merge_connection_id,
+                } => {
+                    for connection_id in [keep_connection_id, merge_connection_id] {
+                        *connection_id = connection_as_seen(&state, area_id, *connection_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     drop(state);
 
-    let chunks = pack_area_batch_operations(operations)?;
     let chunk_count = chunks.len();
-    let area_id = AreaId(parse_id(&area_id)?);
     let batches = chunks
         .into_iter()
         .enumerate()
@@ -2485,7 +2799,7 @@ async fn op_smudgy_mapper_mutate_area(
             } else {
                 description.clone()
             };
-            AreaMutationBatch::strict(area_id, chunk, chunk_description)
+            AreaMutationBatch::strict(area_id, chunk, chunk_description).in_source(source)
         })
         .collect();
     let submissions = mapper
@@ -2511,13 +2825,18 @@ async fn op_smudgy_mapper_mutate_area(
     })
 }
 
+/// Connections stored in this readable area, independent of remote destinations.
 #[op2]
 #[serde]
-fn op_smudgy_mapper_get_area_connections(#[cppgc] area_wrapper: &JSArea) -> Vec<JSConnection> {
+fn op_smudgy_mapper_get_area_connections(
+    state: &OpState,
+    #[cppgc] area_wrapper: &JSArea,
+) -> Vec<JSConnection> {
     area_wrapper
         .0
         .get_connections()
         .iter()
+        .filter(|connection| connection_anchors_visible(state, connection))
         .map(JSConnection::from)
         .collect()
 }
@@ -2536,6 +2855,9 @@ async fn op_smudgy_mapper_create_link(
         .cloned()
         .ok_or(MapperError::MapperNotEnabled)?;
     let area_id = AreaId(parse_id(&area_id)?);
+    reach_for_write(&state, area_id, |error| {
+        MapperError::FailedToCreate(error.to_string())
+    })?;
     let connection_id = ConnectionId::new();
     let mut operations = Vec::with_capacity(params.traversals.len() + 1);
     operations.push(AreaMutation::CreateConnection {
@@ -2557,8 +2879,10 @@ async fn op_smudgy_mapper_create_link(
     for traversal in params.traversals {
         let (room_number, exit) = traversal.into_parts();
         operations.push(AreaMutation::CreateExit {
+            room_source: None,
             room_number: RoomNumber(room_number),
             body: ExitArgs {
+                to_source: None,
                 id: Some(ExitId::new()),
                 connection_id: Some(connection_id),
                 new_connection_id: None,
@@ -2567,15 +2891,16 @@ async fn op_smudgy_mapper_create_link(
                 to_area_id: exit.to_area_id.map(|id| AreaId(id.into_uuid())),
                 to_room_number: exit.to_room_number.map(RoomNumber),
                 is_hidden: exit.is_hidden.unwrap_or(false),
-                is_closed: exit.is_closed.unwrap_or(false),
-                is_locked: exit.is_locked.unwrap_or(false),
+                door: exit.door.map(Door::from),
                 weight: exit.weight.unwrap_or(1.0),
                 command: exit.command,
                 path: None,
-                is_secret: None,
             },
         });
     }
+    ensure_exit_targets_write(&state, &operations, |error| {
+        MapperError::FailedToCreate(error.to_string())
+    })?;
     let submission = mapper
         .mutate_area(area_id, operations, "Create scripted link")
         .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
@@ -2598,12 +2923,21 @@ async fn op_smudgy_mapper_set_connection(
         .try_borrow::<Mapper>()
         .cloned()
         .ok_or(MapperError::MapperNotEnabled)?;
+    ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
+    reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("update connection"))?;
+    let updates: ConnectionUpdates = params.into();
+    ensure_connection_anchors_read(&state, [updates.endpoint_a, updates.endpoint_b])?;
+    let connection_id = connection_as_seen(
+        &state,
+        AreaId(parse_id(&area_id)?),
+        ConnectionId(parse_id(&connection_id)?),
+    );
     let submission = mapper
         .mutate_area(
             AreaId(parse_id(&area_id)?),
             vec![AreaMutation::UpdateConnection {
-                connection_id: ConnectionId(parse_id(&connection_id)?),
-                body: params.into(),
+                connection_id,
+                body: updates,
             }],
             "Update scripted connection",
         )
@@ -2626,6 +2960,14 @@ async fn op_smudgy_mapper_unlink_exit(
         .cloned()
         .ok_or(MapperError::MapperNotEnabled)?;
     let connection_id = ConnectionId::new();
+    ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
+    reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("unlink exit"))?;
+    ensure_exit_shown(
+        &state,
+        AreaId(parse_id(&area_id)?),
+        ExitId(parse_id(&exit_id)?),
+        operation_failed("unlink exit"),
+    )?;
     let submission = mapper
         .mutate_area(
             AreaId(parse_id(&area_id)?),
@@ -2655,12 +2997,24 @@ async fn op_smudgy_mapper_pair_connections(
         .try_borrow::<Mapper>()
         .cloned()
         .ok_or(MapperError::MapperNotEnabled)?;
+    ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
+    reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("pair connections"))?;
+    let keep_connection_id = connection_as_seen(
+        &state,
+        AreaId(parse_id(&area_id)?),
+        ConnectionId(parse_id(&keep_connection_id)?),
+    );
+    let merge_connection_id = connection_as_seen(
+        &state,
+        AreaId(parse_id(&area_id)?),
+        ConnectionId(parse_id(&merge_connection_id)?),
+    );
     let submission = mapper
         .mutate_area(
             AreaId(parse_id(&area_id)?),
             vec![AreaMutation::Pair {
-                keep_connection_id: ConnectionId(parse_id(&keep_connection_id)?),
-                merge_connection_id: ConnectionId(parse_id(&merge_connection_id)?),
+                keep_connection_id,
+                merge_connection_id,
             }],
             "Pair scripted connections",
         )
@@ -2682,12 +3036,17 @@ async fn op_smudgy_mapper_delete_link(
         .try_borrow::<Mapper>()
         .cloned()
         .ok_or(MapperError::MapperNotEnabled)?;
+    ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
+    reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("delete link"))?;
+    let connection_id = connection_as_seen(
+        &state,
+        AreaId(parse_id(&area_id)?),
+        ConnectionId(parse_id(&connection_id)?),
+    );
     let submission = mapper
         .mutate_area(
             AreaId(parse_id(&area_id)?),
-            vec![AreaMutation::DeleteLink {
-                connection_id: ConnectionId(parse_id(&connection_id)?),
-            }],
+            vec![AreaMutation::DeleteLink { connection_id }],
             "Delete scripted link",
         )
         .map_err(operation_failed("delete link"))?;
@@ -2702,6 +3061,7 @@ async fn op_smudgy_mapper_delete_link(
 // ============================================================================
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JSLabel {
     id: ScriptUuid,
     level: i32,
@@ -2739,6 +3099,7 @@ impl From<&Label> for JSLabel {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JSShape {
     id: ScriptUuid,
     level: i32,
@@ -2774,6 +3135,7 @@ impl From<&Shape> for JSShape {
 /// `createLabel` fields: position, size, and `text` are required; the rest default host-side
 /// (mirroring `CreateRoomParams`, where only the essentials are required).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSLabelParams {
     x: f32,
     y: f32,
@@ -2791,8 +3153,7 @@ struct JSLabelParams {
 
 impl From<JSLabelParams> for LabelArgs {
     /// Project the script-supplied label fields onto a cloud `LabelArgs`, filling defaults
-    /// (level 0, Center/Center, `#ffffff`, 16px, weight 400). `is_secret` is never settable
-    /// from a script (matching the room/exit ops).
+    /// (level 0, Center/Center, `#ffffff`, 16px, weight 400).
     fn from(params: JSLabelParams) -> Self {
         Self {
             // Script-created labels carry no pre-minted identity; the mapper
@@ -2810,13 +3171,13 @@ impl From<JSLabelParams> for LabelArgs {
             background_color: params.background_color,
             font_size: params.font_size.unwrap_or(16),
             font_weight: params.font_weight.unwrap_or(400),
-            is_secret: None,
         }
     }
 }
 
 /// `setLabel` fields: all optional; only present fields change (mirrors `JSExitUpdateParams`).
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSLabelUpdateParams {
     x: Option<f32>,
     y: Option<f32>,
@@ -2833,7 +3194,6 @@ struct JSLabelUpdateParams {
 }
 
 impl From<JSLabelUpdateParams> for LabelUpdates {
-    /// `is_secret` is never settable from a script.
     fn from(params: JSLabelUpdateParams) -> Self {
         Self {
             level: params.level,
@@ -2848,13 +3208,13 @@ impl From<JSLabelUpdateParams> for LabelUpdates {
             background_color: params.background_color,
             font_size: params.font_size,
             font_weight: params.font_weight,
-            is_secret: None,
         }
     }
 }
 
 /// `createShape` fields: position and size are required; the rest default host-side.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSShapeParams {
     x: f32,
     y: f32,
@@ -2870,7 +3230,7 @@ struct JSShapeParams {
 
 impl From<JSShapeParams> for ShapeArgs {
     /// Project the script-supplied shape fields onto a cloud `ShapeArgs`, filling defaults
-    /// (level 0, `Rectangle`, radius 0). `is_secret` is never settable from a script.
+    /// (level 0, `Rectangle`, radius 0).
     fn from(params: JSShapeParams) -> Self {
         Self {
             // Script-created shapes carry no pre-minted identity; the mapper
@@ -2886,13 +3246,13 @@ impl From<JSShapeParams> for ShapeArgs {
             shape_type: params.shape_type.unwrap_or_default(),
             border_radius: params.border_radius.unwrap_or(0.0),
             stroke_width: params.stroke_width,
-            is_secret: None,
         }
     }
 }
 
 /// `setShape` fields: all optional; only present fields change.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JSShapeUpdateParams {
     x: Option<f32>,
     y: Option<f32>,
@@ -2907,7 +3267,6 @@ struct JSShapeUpdateParams {
 }
 
 impl From<JSShapeUpdateParams> for ShapeUpdates {
-    /// `is_secret` is never settable from a script.
     fn from(params: JSShapeUpdateParams) -> Self {
         Self {
             level: params.level,
@@ -2920,7 +3279,6 @@ impl From<JSShapeUpdateParams> for ShapeUpdates {
             shape_type: params.shape_type,
             border_radius: params.border_radius,
             stroke_width: params.stroke_width,
-            is_secret: None,
         }
     }
 }
@@ -2954,6 +3312,9 @@ async fn op_smudgy_mapper_create_label(
     };
     if let Some(mapper) = mapper {
         let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state.borrow(), area_id)?;
+        reach_shared(&state, area_id)
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
         let id = LabelId(Uuid::new_v4());
         let mut body: LabelArgs = params.into();
         body.id = Some(id);
@@ -2986,6 +3347,9 @@ async fn op_smudgy_mapper_create_shape(
     };
     if let Some(mapper) = mapper {
         let area_id = AreaId(parse_id(&area_id)?);
+        ensure_area_write(&state.borrow(), area_id)?;
+        reach_shared(&state, area_id)
+            .map_err(|error| MapperError::FailedToCreate(error.to_string()))?;
         let id = ShapeId(Uuid::new_v4());
         let mut body: ShapeArgs = params.into();
         body.id = Some(id);
@@ -3014,6 +3378,8 @@ async fn op_smudgy_mapper_delete_label(
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
+        reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("delete label"))?;
         let submission = mapper
             .delete_label(AreaId(parse_id(&area_id)?), LabelId(parse_id(&label_id)?))
             .map_err(operation_failed("delete label"))?;
@@ -3035,6 +3401,8 @@ async fn op_smudgy_mapper_delete_shape(
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
+        reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("delete shape"))?;
         let submission = mapper
             .delete_shape(AreaId(parse_id(&area_id)?), ShapeId(parse_id(&shape_id)?))
             .map_err(operation_failed("delete shape"))?;
@@ -3058,6 +3426,8 @@ async fn op_smudgy_mapper_set_label(
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
+        reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("update label"))?;
         let submission = mapper
             .update_label(
                 AreaId(parse_id(&area_id)?),
@@ -3085,6 +3455,8 @@ async fn op_smudgy_mapper_set_shape(
     let state = state.borrow();
     ensure_mapper(&state, true)?;
     if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
+        ensure_area_write(&state, AreaId(parse_id(&area_id)?))?;
+        reach(&state, AreaId(parse_id(&area_id)?)).map_err(operation_failed("update shape"))?;
         let submission = mapper
             .update_shape(
                 AreaId(parse_id(&area_id)?),
@@ -3120,12 +3492,7 @@ async fn op_smudgy_mapper_import_areas(
     };
     if let Some(mapper) = mapper {
         let ids = mapper
-            .import_areas(
-                areas
-                    .into_iter()
-                    .map(smudgy_cloud::AreaImportDocument::into_inner)
-                    .collect(),
-            )
+            .import_areas(smudgy_cloud::AreaImportDocument::into_documents(areas))
             .await
             .map_err(operation_failed("import areas"))?;
         Ok(ids.into_iter().map(|id| ScriptUuid(id.0)).collect())
@@ -3159,12 +3526,7 @@ async fn op_smudgy_mapper_import_areas_if_absent(
     };
     if let Some(mapper) = mapper {
         let outcome = mapper
-            .import_areas_if_absent(
-                areas
-                    .into_iter()
-                    .map(smudgy_cloud::AreaImportDocument::into_inner)
-                    .collect(),
-            )
+            .import_areas_if_absent(smudgy_cloud::AreaImportDocument::into_documents(areas))
             .await
             .map_err(operation_failed("import areas"))?;
         Ok(JsAreasImportedIfAbsent {
@@ -3183,6 +3545,9 @@ async fn op_smudgy_mapper_import_areas_if_absent(
 /// `exportArea(area)`: serialize an area to its full JSON. Read-gated, plus a per-area `can_copy`
 /// gate -- dumping an area to JSON is making a copy, so a read-only share without copy rights is
 /// refused. The cache is already viewer-redacted, so this can only emit what the viewer can see.
+/// An isolate without `secrets` gets the map alone: no sources, and no projection token, which
+/// covers every source the projection shows and so would move when a Secret changes. Nothing
+/// reads the token back (an import starts its areas without one).
 #[op2(async(lazy), fast)]
 #[serde]
 async fn op_smudgy_mapper_export_area(
@@ -3198,15 +3563,28 @@ async fn op_smudgy_mapper_export_area(
     let Some(mapper) = mapper else {
         return Err(MapperError::MapperNotEnabled);
     };
-    match mapper.area_effective_access(area_id) {
+    let access = reach_shared(&state, area_id)
+        .ok()
+        .and_then(|area_id| mapper.area_effective_access(area_id));
+    match access {
         Some(access) if access.can_copy => {}
         Some(_) => return Err(MapperError::NotCopyable),
         None => return Err(MapperError::AreaNotFound),
     }
-    mapper
+    let mut exported = mapper
         .export_area(area_id)
         .await
-        .map_err(operation_failed("export area"))
+        .map_err(operation_failed("export area"))?;
+    // A map's Secrets and Private additions travel with it only to an isolate that sees them,
+    // and so do its exits into other maps' Secret rooms, with every trace they leave: the maps
+    // `linked_areas` names are then those the map's own exits lead into.
+    if sources_for(&state.borrow()) == smudgy_cloud::mapper::places::Sources::Hidden {
+        exported.sources.clear();
+        exported.area.projection_token = None;
+        exported.redact_source_destinations();
+        exported.retain_linked_areas_of_exits();
+    }
+    Ok(exported)
 }
 
 #[op2]
@@ -3231,7 +3609,7 @@ fn op_smudgy_mapper_get_path_between_rooms(
         };
         let resolved = mapper
             .get_current_atlas()
-            .get_path_between_rooms(&from_room_key, &to_room_key)
+            .get_path_between_rooms_with(&from_room_key, &to_room_key, sources_for(&state))
             .unwrap_or_default();
         // A resolved route into the destination area is demonstrated navigation
         // intent — hint the daemon (bind-on-use). Only on a real path.
@@ -3243,42 +3621,6 @@ fn op_smudgy_mapper_get_path_between_rooms(
             .map(|room_key| (ScriptUuid(room_key.area_id.0), room_key.room_number.0))
             .collect();
         Ok(path)
-    } else {
-        Err(MapperError::MapperNotEnabled)
-    }
-}
-
-/// The nearest reachable room whose tags satisfy a conjunctive filter — carries
-/// every tag in `required`, none in `excluded` (both case-insensitive) — as a
-/// serialized room ref (or `null`). Backs `findNearestRoomWithTag(s)`. The script
-/// resolves the ref to a `Room` via `getAreaById(...).room(...)`, then paths to it
-/// with the existing methods. The predicate runs entirely in Rust over the local
-/// cache (one normalization, per-room set lookups).
-#[op2]
-#[serde]
-fn op_smudgy_mapper_find_nearest_room_with_tags(
-    state: Rc<RefCell<OpState>>,
-    #[string] from_area_id: &str,
-    from_room_number: i32,
-    #[serde] required: Vec<String>,
-    #[serde] excluded: Vec<String>,
-) -> Result<Option<JsRoomRef>, MapperError> {
-    let state = state.borrow();
-    ensure_mapper(&state, false)?;
-    if let Some(mapper) = state.try_borrow::<Mapper>().cloned() {
-        let from_room_key = RoomKey {
-            area_id: AreaId(parse_id(&from_area_id)?),
-            room_number: RoomNumber(from_room_number),
-        };
-        let nearest = mapper.get_current_atlas().find_nearest_room_matching_tags(
-            &from_room_key,
-            &required,
-            &excluded,
-        );
-        if let Some(room_key) = &nearest {
-            note_navigation(&state, room_key.area_id);
-        }
-        Ok(nearest.map(|room_key| (ScriptUuid(room_key.area_id.0), room_key.room_number.0)))
     } else {
         Err(MapperError::MapperNotEnabled)
     }
@@ -3305,9 +3647,15 @@ fn op_smudgy_mapper_find_nearest_room_in_area(
             room_number: RoomNumber(from_room_number),
         };
         let target_area_id = AreaId(parse_id(&target_area_id)?);
-        let nearest = mapper
-            .get_current_atlas()
-            .find_nearest_room_in_area(&from_room_key, &target_area_id);
+        // A start or target this isolate cannot see answers as an unknown one: no room.
+        if hides_area(&state, from_room_key.area_id) || hides_area(&state, target_area_id) {
+            return Ok(None);
+        }
+        let nearest = mapper.get_current_atlas().find_nearest_room_in_area_with(
+            &from_room_key,
+            &target_area_id,
+            sources_for(&state),
+        );
         if let Some(room_key) = &nearest {
             note_navigation(&state, room_key.area_id);
         }
@@ -3327,6 +3675,24 @@ mod compatibility_tests {
     use serde_json::json;
     use smudgy_script::{ModulePolicy, ScriptRuntime, ScriptRuntimeOptions, WorkerMode};
     use std::rc::Rc;
+
+    #[test]
+    fn connection_endpoint_round_trip_keeps_its_qualified_room() {
+        for place in ["map", "private", "00000000-0000-4000-8000-000000000001"] {
+            let value = json!({
+                "place": place, "roomNumber": 2, "side": "East",
+                "portOffset": 0.5, "portMode": "AutoPinned",
+            });
+            let endpoint: super::JSConnectionEndpoint =
+                serde_json::from_value(value.clone()).unwrap();
+            let wire: smudgy_cloud::ConnectionEndpoint = endpoint.into();
+            assert_eq!(wire.source.unwrap().to_string(), place);
+            assert_eq!(
+                serde_json::to_value(super::JSConnectionEndpoint::from(wire)).unwrap(),
+                value
+            );
+        }
+    }
 
     /// A throwaway isolate for decoding a script value, booted from the smudgy_script startup
     /// snapshot like every other isolate in this test process. V8 shares one read-only heap
@@ -3431,32 +3797,32 @@ mod compatibility_tests {
                 "create_link": {
                     "connection_id": "11111111-1111-4111-8111-111111111111",
                     "body": {
-                        "endpoint_a": {
-                            "room_number": 1,
+                        "endpointA": {
+                            "roomNumber": 1,
                             "side": "East",
-                            "port_offset": 0.5,
-                            "port_mode": "AutoPinned"
+                            "portOffset": 0.5,
+                            "portMode": "AutoPinned"
                         },
-                        "endpoint_b": {
-                            "room_number": 2,
+                        "endpointB": {
+                            "roomNumber": 2,
                             "side": "West",
-                            "port_offset": 0.5,
-                            "port_mode": "AutoPinned"
+                            "portOffset": 0.5,
+                            "portMode": "AutoPinned"
                         },
                         "traversals": [
                             {
-                                "room_number": 1,
-                                "from_direction": "East",
-                                "to_direction": "West",
-                                "to_area_id": "33333333-3333-4333-8333-333333333333",
-                                "to_room_number": 2
+                                "roomNumber": 1,
+                                "fromDirection": "East",
+                                "toDirection": "West",
+                                "toAreaId": "33333333-3333-4333-8333-333333333333",
+                                "toRoomNumber": 2
                             },
                             {
-                                "room_number": 2,
-                                "from_direction": "West",
-                                "to_direction": "East",
-                                "to_area_id": "33333333-3333-4333-8333-333333333333",
-                                "to_room_number": 1
+                                "roomNumber": 2,
+                                "fromDirection": "West",
+                                "toDirection": "East",
+                                "toAreaId": "33333333-3333-4333-8333-333333333333",
+                                "toRoomNumber": 1
                             }
                         ]
                     }
@@ -3498,10 +3864,10 @@ mod compatibility_tests {
                         room_number: 1,
                         id: "67e55044-10b1-426f-9247-bb680e5fe0c8",
                         body: {
-                            from_direction: "East",
-                            to_direction: "West",
-                            to_area_id: "3f1a0c9e-2b47-4d18-9a55-7c2e6b901d34",
-                            to_room_number: 2
+                            fromDirection: "East",
+                            toDirection: "West",
+                            toAreaId: "3f1a0c9e-2b47-4d18-9a55-7c2e6b901d34",
+                            toRoomNumber: 2
                         }
                     } }]"#,
                 ),
@@ -3541,7 +3907,7 @@ mod compatibility_tests {
                     r#"[{ create_exit: {
                         room_number: 1,
                         id: [18446744073709551615n, 9223372036854775808n],
-                        body: { from_direction: "East", to_room_number: 2 }
+                        body: { fromDirection: "East", toRoomNumber: 2 }
                     } }]"#,
                 ),
             )
@@ -3567,17 +3933,17 @@ mod compatibility_tests {
                     r#"[{ create_link: {
                         connection_id: "67e55044-10b1-426f-9247-bb680e5fe0c8",
                         body: {
-                            endpoint_a: {
-                                room_number: 1,
+                            endpointA: {
+                                roomNumber: 1,
                                 side: "East",
-                                port_offset: 0.5,
-                                port_mode: "AutoPinned"
+                                portOffset: 0.5,
+                                portMode: "AutoPinned"
                             },
                             traversals: [{
-                                room_number: 1,
-                                from_direction: "East",
-                                to_area_id: "3f1a0c9e-2b47-4d18-9a55-7c2e6b901d34",
-                                to_room_number: 2
+                                roomNumber: 1,
+                                fromDirection: "East",
+                                toAreaId: "3f1a0c9e-2b47-4d18-9a55-7c2e6b901d34",
+                                toRoomNumber: 2
                             }]
                         }
                     } }]"#,

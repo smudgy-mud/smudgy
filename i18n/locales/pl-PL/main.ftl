@@ -53,6 +53,7 @@ nav-preferences = Ustawienia
 nav-audio = Dźwięk
 nav-security = Bezpieczeństwo
 nav-friends = Znajomi
+nav-clans = Klany
 nav-licenses = Licencje
 
 # Account and authentication
@@ -95,6 +96,24 @@ account-notice-code-resent = Jeśli do tego adresu przypisane jest konto, nowy k
 account-busy-saving-nickname = Zapisywanie pseudonimu…
 account-notice-nickname-changed = Jesteś { $handle }.
 account-notice-signed-out = Wylogowano.
+account-delete = Usuń konto…
+account-delete-title = Usunąć Twoje konto?
+account-delete-goes = Na zawsze usunięte zostaną:
+account-delete-goes-maps = • Twoje mapy i foldery
+account-delete-goes-secrets = • Sekrety, których jesteś właścicielem, i Twoje Prywatne notatki na każdej mapie
+account-delete-goes-social = • Twoje udostępnienia i znajomości
+account-delete-goes-clans = • Twoje członkostwa w klanach
+account-delete-member-secrets = Sekrety w klanie, których jesteś ostatnim właścicielem, zostają — tylko do odczytu dla osób, które mogą je czytać.
+account-delete-stays = Opublikowane przez Ciebie pakiety zostają, pod swoimi nazwami.
+account-delete-type-nickname = Wpisz { $nickname }, aby potwierdzić.
+account-delete-confirm = Usuń moje konto
+account-busy-deleting = Usuwanie konta…
+account-delete-done = Twoje konto zostało usunięte, a Ty wylogowany(-a).
+account-delete-signed-out = Wylogowano. Twoje konto jest usuwane; smudgy dokończy to samo.
+account-delete-last-owner = Jesteś ostatnim właścicielem: { $clans }. Ustaw innego członka jako właściciela albo usuń klan, a potem spróbuj ponownie.
+account-delete-last-owner-unnamed = Jesteś ostatnim właścicielem klanu. Ustaw innego członka jako właściciela albo usuń klan, a potem spróbuj ponownie.
+account-delete-not-deleted = Konto nie zostało usunięte: { $error }
+account-delete-unfinished = Usuwanie konta nie zostało dokończone: { $error } Spróbuj ponownie; kolejna próba je dokończy.
 account-error-nickname-empty = Podaj pseudonim.
 account-error-nickname-format = Pseudonim musi składać się z 3-24 znaków: liter, cyfr, „-" lub „_".
 
@@ -443,8 +462,8 @@ notice-package-requirements-review = [package] aktualizacja { $name } wymaga spr
 # Cloud errors
 cloud-error-email-unverified = Zweryfikuj swój adres e-mail, aby korzystać z tej funkcji.
 cloud-error-not-found = Nie znaleziono.
-cloud-error-area-not-found = Nie znaleziono obszaru: { $id }
-cloud-error-room-not-found = Nie znaleziono pokoju { $room } w obszarze { $area }.
+cloud-error-area-not-found = Nie znaleziono mapy: { $id }
+cloud-error-room-not-found = Nie znaleziono pokoju { $room } na mapie { $area }.
 cloud-error-exit-not-found = Nie znaleziono wyjścia: { $id }
 cloud-error-label-not-found = Nie znaleziono etykiety: { $id }
 cloud-error-shape-not-found = Nie znaleziono kształtu: { $id }
@@ -452,6 +471,7 @@ cloud-error-property-not-found = Nie znaleziono właściwości „{ $property }"
 cloud-error-invalid-input = Nieprawidłowe dane wejściowe: { $detail }
 cloud-error-database = Błąd bazy danych: { $detail }
 cloud-error-network = Błąd sieci: { $detail }
+cloud-error-service-unavailable = Usługa map na chwilę wstrzymuje zmiany. Spróbuj ponownie za moment.
 cloud-error-serialization = Błąd serializacji: { $detail }
 cloud-error-authentication = Błąd uwierzytelniania: { $detail }
 cloud-error-permission = Odmowa dostępu: { $detail }
@@ -465,6 +485,9 @@ cloud-error-upgrade-required = Ta wersja Smudgy jest nieaktualna; zaktualizuj j�
 cloud-error-version-unavailable = Ten numer wersji jest już zajęty; wybierz nowy.
 cloud-error-version-unavailable-number = Wersja { $version } jest już zajęta; wybierz nową.
 cloud-error-version-not-yanked = Wycofaj tę wersję, zanim ją usuniesz.
+cloud-error-package-name-unavailable = Nazwa pakietu { $name } jest zajęta. Nazwy pakietów są wspólne dla wszystkich i nigdy nie są używane ponownie, więc wybierz inną nazwę.
+cloud-error-body-being-collected = Serwer porządkował magazyn pakietów podczas tego przesyłania. Opublikuj ponownie za minutę.
+cloud-error-too-large = Za duże, aby przesłać: { $detail }
 cloud-error-revision-conflict = Ten element zmienił się na serwerze. Odśwież i spróbuj ponownie.
 cloud-error-projection-changed = Twój dostęp do tego elementu uległ zmianie. Odśwież i spróbuj ponownie.
 cloud-error-operation-reused = Tej operacji nie udało się bezpiecznie ukończyć. Odśwież i spróbuj ponownie.
@@ -475,11 +498,25 @@ cloud-error-merge-areas-no-rooms = Wybierz co najmniej jedno pomieszczenie z ka�
 cloud-error-merge-areas-room-not-found = Wybranego pomieszczenia nie ma w obszarze źródłowym. Sprawdź numery pomieszczeń przed scaleniem.
 cloud-error-merge-areas-mixed-tiers = Wszystkie obszary objęte scaleniem, w tym obszary z prowadzącymi do nich połączeniami, muszą używać tego samego miejsca przechowywania: lokalnego lub sesji.
 cloud-error-merge-areas-unsupported-storage = To miejsce przechowywania nie obsługuje scalania obszarów. Użyj obsługiwanego przechowywania lokalnego lub w sesji.
-cloud-error-merge-requires-full-projection = Scalanie wymaga pełnego dostępu do wszystkich objętych nim obszarów, w tym obszarów z prowadzącymi do nich połączeniami.
 cloud-error-merge-areas-busy = W jednym z obszarów są oczekujące zmiany lub trwa inna operacja. Zakończ lub rozwiąż te operacje przed scaleniem.
 cloud-error-merge-areas-source-changed = Jeden z obszarów zmienił się podczas przygotowywania scalenia. Sprawdź aktualną mapę i spróbuj ponownie.
 cloud-error-merge-areas-room-numbers-exhausted = W obszarze docelowym nie ma wystarczającej liczby dostępnych numerów pomieszczeń do tego scalenia. Wybierz inny obszar docelowy.
 cloud-error-merge-areas-invalid-translation = Przesunięcie lub wynikowa pozycja wykracza poza obsługiwany zakres. Użyj skończonych współrzędnych i poziomów w zakresie 32-bitowej liczby całkowitej.
+cloud-error-merge-secret-room-data = Sekret przechowuje dane pokoju { $room }. Najpierw je przenieś lub usuń.
+cloud-error-secret-area-level = Sekretami zarządza się w edytorze mapy.
+cloud-error-secret-view-only = Ten sekret jest tylko do odczytu.
+cloud-error-secret-unavailable = Ten sekret nie jest już dla Ciebie dostępny.
+cloud-error-secret-cannot-add = Nie możesz dodawać do tego sekretu.
+cloud-error-secret-cannot-edit = Nie możesz zmieniać zawartości tego sekretu.
+cloud-error-secret-cannot-remove = Nie możesz niczego usuwać z tego sekretu.
+cloud-error-secret-linked-map-rooms = Sekret klanu na mapie dołączonej do klanu przez link przechowuje tylko własne pokoje. Nie może mieć danych w pokojach mapy, prowadzić do nich ani wymieniać z mapą pokoi.
+cloud-error-secret-link-between-secrets = Połączenie nie może łączyć dwóch sekretów.
+cloud-error-secret-link-into-other-map = Połączenie z Sekretem innej mapy prowadzi do jednego z jego pomieszczeń, a żadne połączenie nie prowadzi do prywatnych dodatków innej mapy.
+cloud-error-secret-map-exit-retarget = Wyjście mapy nie może prowadzić do pokoju sekretu. Utwórz połączenie w sekrecie.
+cloud-error-move-busy = Mapa wciąż się zapisuje. Spróbuj ponownie za chwilę.
+cloud-error-move-drops-places = Mapa sesji nie pomieści Sekretów ani prywatnych dodatków tej mapy, więc nie można jej tam przenieść bez ich utraty. Zamiast tego ją skopiuj; oryginał je zachowa.
+cloud-error-move-splits-links = Połączenie łączy te pokoje z pokojami, które zostają. Przenieś je razem albo najpierw usuń połączenie.
+cloud-error-room-number-exists = Numer pokoju jest tam już zajęty. Nic nie przeniesiono.
 cloud-error-invalid-connection = To połączenie jest nieprawidłowe: { $detail }
 
 # Friends, blocks, and ownership transfers
@@ -501,6 +538,7 @@ social-decline = Odrzuć
 social-ownership-transfers = Przeniesienie własności
 social-incoming-transfer = { $from } chce Ci przekazać „{ $subject }"
 social-outgoing-transfer = Zaoferowano „{ $subject }" użytkownikowi { $to }
+social-outgoing-transfer-clan = Zaoferowano „{ $subject }" klanowi { $clan }
 social-no-friends = Brak znajomych.
 social-blocks = Blokady
 social-block = Zablokuj
@@ -516,45 +554,348 @@ social-keep-friend = Zachowaj
 social-unfriend = Usuń ze znajomych
 social-no-nickname = (brak pseudonimu)
 
+# Clans
+cloud-error-last-owner = Najpierw ustaw kogoś innego jako właściciela.
+cloud-error-clan-not-empty = Ten klan nadal ma mapy w swoich folderach. Przenieś je lub usuń, a potem usuń klan.
+cloud-error-clan-dissolving = Ten klan jest rozwiązywany: żadna mapa nie może do niego trafić, a jego członkowie, właściciele i mapy członków pozostają bez zmian do końca rozwiązywania.
+cloud-error-atlas-not-empty = Najpierw przenieś lub usuń mapy z tego folderu.
+cloud-error-already-member = Ta osoba już jest członkiem.
+cloud-error-name-in-use = Ta nazwa jest już zajęta.
+cloud-error-transfer-already-pending = Na to czeka już jedna oferta; naraz może być tylko jedna.
+clans-title = Klany
+clans-verify-email = Zweryfikuj adres e-mail, aby dołączać do klanów.
+clans-name-placeholder = nazwa klanu
+clans-enter-name = Wpisz nazwę.
+clans-invitations = Zaproszenia
+clans-invited-you = { $inviter } zaprasza Cię do klanu „{ $clan }”
+clans-invited-you-by-a-member = Jeden z członków zaprasza Cię do klanu „{ $clan }”
+clans-secret-offers = Propozycje własności sekretów
+clans-secret-offer = { $initiator } proponuje Ci własność sekretu „{ $secret }” w klanie „{ $clan }”
+clans-secret-offer-from-a-member = Jeden z członków proponuje Ci własność sekretu „{ $secret }” w klanie „{ $clan }”
+clans-secret-offer-joint = Razem z: { $others }
+clans-secret-offer-accepted = Zaakceptowano; czekamy na: { $others }.
+clans-empty = Nie masz jeszcze klanów.
+clans-owner-badge = właściciel
+clans-member-count = { $count ->
+    [one] 1 członek
+    [few] { $count } członków
+    [many] { $count } członków
+   *[other] { $count } członka
+}
+clans-members = Członkowie
+clans-invite = Zaproś
+clans-invitation-sent = Zaproszenie wysłane.
+clans-invite-failed = Nie udało się zaprosić użytkownika { $name }.
+clans-remove-confirm = Usunąć { $name } z klanu „{ $clan }”?
+clans-groups = Grupy
+clans-group-name-placeholder = nazwa grupy
+clans-no-groups = Nie ma jeszcze grup.
+clans-filter-placeholder = filtruj
+clans-delete-group = Usuń grupę…
+clans-delete-group-confirm = Usunąć „{ $name }”? Jej członkowie stracą to, co jej udostępniono.
+clans-delete-clan = Usuń klan…
+clans-delete-clan-confirm = Usunąć „{ $name }”? Wszyscy opuszczą klan i nie da się tego cofnąć. Najpierw jego foldery muszą być puste.
+clans-leave-clan = Opuść klan…
+clans-leave-confirm = Opuścić „{ $name }”? Stracisz dostęp do jego map.
+clans-leave = Opuść
+
+# Zestawy uprawnień
+presets-kind-map = Mapy
+presets-kind-folder-curation = Porządek w folderach
+presets-kind-clan-secrets = Sekrety własności klanu
+presets-kind-secret = Sekret
+presets-kind-package = Pakiety
+presets-kind-clan-administration = Administracja klanu
+presets-reader = Czytelnik
+presets-contributor = Współtwórca
+presets-editor = Redaktor
+presets-curator = Kustosz
+presets-access-manager = Zarządca dostępu
+presets-drafter = Autor szkiców
+presets-maintainer = Opiekun
+presets-recruiter = Werbownik
+presets-officer = Oficer
+presets-group-lead = Lider grupy
+presets-folder-manager = Zarządca folderu
+presets-custom = Własne
+presets-scope-clan = Cały klan
+presets-scope-groups = Grupy
+presets-scope-folders = Foldery
+presets-scope-maps = Mapy
+presets-scope-packages = Pakiety
+presets-action-clan-edit-profile = Edycja danych klanu
+presets-action-clan-read-members = Odczyt listy członków
+presets-action-clan-invite = Zapraszanie
+presets-action-clan-revoke-invitation = Cofanie zaproszeń
+presets-action-clan-remove-member = Usuwanie członków
+presets-action-group-create = Tworzenie grup
+presets-action-group-rename = Zmiana nazw grup
+presets-action-group-delete = Usuwanie grup
+presets-action-group-assign = Wybór członków grup
+presets-action-group-inspect = Podgląd członków grup
+presets-action-access-inspect = Podgląd, kto ma dostęp
+presets-action-access-manage = Nadawanie dostępu
+presets-action-folder-create = Tworzenie folderów
+presets-action-folder-read = Widok folderu
+presets-action-folder-rename = Zmiana nazw folderów
+presets-action-folder-accept-filing = Przenoszenie map do folderu
+presets-action-folder-accept-transfer = Przenoś mapy do tego folderu
+presets-action-map-create = Tworzenie map
+presets-action-map-create-member-owned = Tworzenie map własności członków
+presets-action-map-read = Odczyt
+presets-action-map-add = Dodawanie treści
+presets-action-map-edit = Edycja treści
+presets-action-map-remove = Usuwanie treści
+presets-action-map-rename = Zmiana nazw map
+presets-action-map-refile = Przenoszenie map między folderami
+presets-action-map-delete = Usuwanie map
+presets-action-map-copy = Kopiowanie map
+presets-action-map-share-external = Udostępnianie poza klanem
+presets-action-secrets-create-member-owned = Tworzenie sekretów własności członków
+presets-action-secrets-create-clan-owned = Tworzenie sekretów własności klanu
+presets-action-secrets-read = Odczyt sekretów
+presets-action-secrets-add = Dodawanie do sekretów
+presets-action-secrets-edit = Edycja sekretów
+presets-action-secrets-remove = Usuwanie z sekretów
+presets-action-secrets-manage-access = Zarządzanie tym, kto czyta sekrety
+presets-action-secrets-copy = Kopiowanie sekretów razem z mapą
+presets-action-package-create = Tworzenie pakietów
+presets-action-package-read = Widok pakietu
+presets-action-package-edit-draft = Edycja wersji roboczej
+presets-action-package-edit-metadata = Edycja opisu
+presets-action-package-publish = Publikowanie wersji
+presets-action-package-retire = Wycofywanie wersji
+presets-action-package-availability = Ustawianie jako publiczny lub prywatny
+presets-action-package-delete = Usuwanie pakietu
+presets-action-secret-read = Odczyt
+presets-action-secret-add = Dodawanie
+presets-action-secret-edit = Edycja
+presets-action-secret-remove = Usuwanie
+presets-action-secret-manage-access = Zarządzanie dostępem
+presets-action-secret-copy = Kopiowanie razem z mapą
+
+# Settings › Clans
+clans-all-clans = Wszystkie klany
+clans-tab-members = Członkowie
+clans-tab-groups = Grupy
+clans-tab-access = Dostęp
+clans-tab-settings = Ustawienia
+clans-you = Ty
+clans-column-member = Członek
+clans-column-groups = Grupy
+clans-owner-chip = Właściciel klanu
+clans-edit-groups = Edytuj grupy
+clans-page-range = { $first }–{ $last } z { $total }
+clans-page-previous = Poprzednia
+clans-page-next = Następna
+clans-members-hidden = Ten klan pokazuje listę członków tylko wybranym osobom.
+clans-invited = Zaproszeni
+clans-pending-badge = Oczekuje
+clans-revoke = Cofnij
+clans-invite-title = Zaproś do klanu { $clan }
+clans-invite-groups = Proponowane grupy
+clans-member-groups-title = Grupy · { $name }
+clans-remove-member = Usuń członka
+clans-self-assign-reason = Tylko właściciel klanu może dodać cię do grupy utworzonej przez kogoś innego.
+clans-new-group = Nowa grupa
+clans-new-group-note = Dołączasz do grup, które tworzysz, i wybierasz, kto jeszcze w nich jest.
+clans-edit-group = Edytuj grupę
+clans-group-name-label = Nazwa
+clans-group-color-label = Kolor
+clans-group-permissions = Uprawnienia
+clans-group-members = Członkowie
+clans-group-owners-note = Właściciele klanu.
+clans-group-no-permissions = Ta grupa nie ma dodatkowych uprawnień.
+clans-group-permissions-view-only = Dostęp grupom dają właściciele klanu i osoby, którym na to pozwolą.
+clans-group-roster-hidden = Nie widzisz, kto jest w tej grupie.
+clans-shown-count = Widocznych: { $count }
+clans-add-member = Dodaj członka
+clans-add-member-title = Dodaj członka · { $group }
+clans-add-member-none = Nie ma kogo dodać.
+clans-add-permission = Dodaj uprawnienie
+clans-administration-button = Administracja klanu…
+clans-remove-permission-confirm = Usunąć to uprawnienie? Grupa od razu straci to, co ono daje.
+clans-note-clan = Tylko zarządzanie klanem i grupami. Dostęp do map, folderów, Sekretów i pakietów ustawia się na tych zasobach.
+clans-note-folders = Obejmuje mapy dodane tam później.
+clans-note-may-grant = Może nadawać: { $preset }
+clans-note-delegated = Nadane przez osobę, której właściciele klanu pozwolili dawać dostęp.
+clans-scope-more = { $count ->
+    [one] jeszcze { $count }
+    [few] jeszcze { $count }
+    [many] jeszcze { $count }
+   *[other] jeszcze { $count }
+}
+clans-scope-names-and-more = { $names } i jeszcze { $count }
+clans-unknown-group = Pewna grupa
+clans-access-maps = Mapy
+clans-access-packages = Pakiety
+clans-access-secrets = Sekrety
+clans-access-no-maps = Brak map i folderów, do których masz tu dostęp.
+clans-access-no-packages = Brak pakietów, do których masz tu dostęp.
+clans-access-no-secrets = Brak sekretów, które czytasz w tym klanie.
+clans-access-pick = Wybierz coś po lewej, aby zobaczyć, kto ma do tego dostęp.
+clans-kind-folder = Folder
+clans-kind-map = Mapa
+clans-kind-package = Pakiet
+clans-open-map = Otwórz mapę
+clans-open-package = Otwórz pakiet
+clans-open-share = Okno udostępniania…
+clans-outside-shares = Poza klanem { $clan }
+clans-outside-shares-note = Znajomi, którzy czytają tę mapę, tylko do podglądu. Udostępnienie kończy się, gdy udostępniający opuści klan lub straci prawo do udostępniania.
+clans-outside-shares-none = Nieudostępniona poza klanem.
+clans-outside-shared-by = Udostępnił(a): { $name }
+clans-in-folder = W folderze { $folder }
+clans-group-assignments = Przypisane grupy
+clans-no-assignments = Żadna grupa nie ma jeszcze do tego dostępu.
+clans-your-access = Co możesz tu robić:
+clans-assign-group = Przypisz grupę
+clans-through-clan = Z całego klanu
+clans-through-folder = Z folderu { $folder }
+clans-through-a-folder = Z jednego z folderów
+clans-member-owned = Własność członków
+clans-clan-owned = Własność klanu
+clans-secret-clan-owned-note = Grupy, którym dano sekrety własności klanu na jego mapie lub w folderze, też go czytają; zobacz Mapy.
+clans-details = Dane klanu
+clans-name-label = Nazwa
+clans-description-label = Opis
+clans-description-placeholder = Czemu służy klan
+clans-permission-none = Brak
+clans-editor-title-add = Dodaj uprawnienie · { $group }
+clans-editor-title-assign = Przypisz grupę · { $resource }
+clans-editor-title-admin = Przypisz grupę · Administracja klanu
+clans-editor-title-edit = Edytuj uprawnienie
+clans-editor-group = Grupa
+clans-editor-member = Członek
+clans-editor-member-note = Pojedynczemu członkowi można dać uprawnienia administracji klanu i pakietów; mapy i sekrety przypisuje się grupom.
+clans-editor-scope = Dotyczy
+clans-editor-targets-empty = Nie ma tu jeszcze nic do wyboru.
+clans-editor-permissions = Uprawnienia
+clans-editor-separate = Nigdy w zestawie
+clans-editor-may-grant = Może nadawać
+clans-editor-may-grant-help = Może dawać najwyżej taki dostęp do map, w tych samych miejscach.
+clans-editor-all-groups = Wszystkie grupy
+clans-editor-group-scope = Zakres zarządzania grupami
+clans-editor-group-scope-help = Zmiana grupy i wybór jej członków to osobne uprawnienia.
+clans-editor-choose-group = Wybierz grupę.
+clans-editor-choose-target = Wybierz co najmniej jedno.
+clans-editor-choose-action = Wybierz co najmniej jedno uprawnienie.
+
+# Clans in the map editor
+clan-maps-a-clan = klan
+clan-maps-a-group = grupa
+clan-maps-incoming-badge = oczekujące: { $count }
+clan-maps-new-folder = Nowy folder
+clan-maps-incoming = Oczekujące mapy…
+clan-maps-new-folder-title = Nowy folder w klanie { $clan }
+clan-maps-create = Utwórz
+clan-maps-delete-folder-question = Usunąć „{ $name }”?
+clan-maps-delete-folder-detail = Najpierw przenieś jego mapy do innego folderu.
+clan-maps-share-clan-title = Udostępnij cały klan { $clan }
+clan-maps-share-clan-help = Każdy, kogo wybierzesz, dostanie dostęp do wszystkich map w nim, także nowych.
+clan-maps-share-folder-help = Każdy, kogo wybierzesz, dostanie dostęp do wszystkich map w tym folderze, także nowych.
+clan-maps-everyone = Wszyscy
+clan-maps-filter-groups-placeholder = filtruj grupy
+clan-maps-no-groups = Żadna grupa nie pasuje.
+clan-maps-incoming-title = Oczekujące mapy · { $clan }
+clan-maps-incoming-empty = Żadna mapa nie czeka.
+clan-maps-given-by = przekazuje { $owner }
+clan-maps-given-folder = Folder „{ $name }”
+clan-maps-given-help = Mapa przekazana klanowi staje się własnością klanu; mapa, która zostaje u przekazującego, staje się własnością członków i tylko on decyduje, kto ją widzi. Jej Sekrety pozostają przy członku, który ją przekazał.
+clan-maps-could-not-accept = Nie udało się przyjąć. Oferta mogła zostać wycofana.
+clan-maps-folder-placeholder = Folder
+clan-maps-accept = Przyjmij
+clan-maps-decline = Odrzuć
+clan-maps-gone = Mapy „{ $name }” już nie ma.
+clan-maps-given-stays = od { $owner } · zostaje jego
+clan-maps-offered-help = Członkowie proponują klanowi mapy, które do nich należą. Po przyjęciu mapa należy do klanu i obejmuje ją dostęp z folderu.
+clan-maps-offered-by = proponuje { $owner }
+clan-maps-a-member = członek
+clan-share-put-in-clan = Umieść w klanie…
+clan-share-give-to-clan = Przekaż klanowi
+clan-share-give-to-clan-help = Właściciele klanu są współwłaścicielami tej mapy
+clan-share-stays-mine = Zostaje moja
+clan-share-stays-mine-help = Przenieś tę mapę do klanu, zachowując jej własność.
+clan-share-give-folder-to-clan-help = Właściciele klanu są współwłaścicielami tych map
+clan-share-folder-stays-mine-help = Przenieś te mapy do klanu, zachowując ich własność.
+clan-share-title = Udostępnij „{ $name }”
+clan-share-owned-by-clan-in = Własność { $clan } · w folderze { $folder }
+clan-share-owned-by-clan = Własność { $clan }
+clan-share-owned-by = Właściciele: { $owners }
+clan-share-member-owned = Własność członków
+clan-share-member-owned-reach = Dostęp z folderu i właściciele klanu nie obejmują tej mapy. Obejmuje ją tylko to, co jej właściciele udostępnią tu grupom i członkom.
+clan-share-frozen = Nikt nie może zmienić, kto widzi tę mapę: konto jej ostatniego właściciela zostało usunięte. Dotychczasowe udostępnienia zostają.
+clan-share-you-can = Możesz: { $actions }
+clan-share-you-can-read = Możesz oglądać tę mapę.
+clan-share-you = Ty
+clan-share-clan-owners = Właściciele klanu
+clan-share-nobody-yet = Nikt nie ma jeszcze dostępu przez grupę ani członka.
+clan-share-from-several-maps = razem z innymi mapami
+clan-share-from-folder = z folderu { $folder }
+clan-share-from-clan = z całego klanu { $clan }
+clan-share-change-for-folder = Zmień dla folderu…
+clan-share-remove = Usuń
+clan-share-remove-question = Usunąć ten dostęp do mapy?
+clan-share-includes-future-members = Obejmuje przyszłych członków
+clan-share-chosen-automatically = Wszyscy, których obejmuje, automatycznie
+clan-share-chosen-by-owners = Jej członków wybierają tylko właściciele klanu
+clan-share-chosen-by-owners-and-leads = Jej członków wybierają właściciele klanu i liderzy grupy
+clan-share-add-recipient = + Grupa / członek
+clan-share-pick-recipient = Grupa lub członek
+clan-share-groups-only = Widać tylko grupy: nie możesz zobaczyć listy członków.
+clan-share-outside = Poza klanem { $clan }
+clan-share-outside-help = Znajomi spoza klanu widzą tylko tę mapę: tylko podgląd, nigdy jej Sekretów.
+clan-share-shared-by = udostępnia { $name }
+clan-share-shared-by-you = udostępniasz Ty
+clan-share-pick-friend = Znajomy
+clan-share-share-view-only = Udostępnij do podglądu
+clan-share-outside-refused = Nie udało się udostępnić. Ta osoba może być w klanie albo nie jest już Twoim znajomym.
+clan-share-secrets = Sekrety na tej mapie
+clan-share-share-secret = Udostępnij „{ $name }”…
+clan-share-give-up = Zrezygnuj z własności…
+clan-share-give-up-confirm = Zrezygnować z własności „{ $name }”? Zachowasz tylko to, co jest udostępnione Tobie lub Twoim grupom; bez tego przestaniesz ją widzieć.
+clan-share-only-owner = Jesteś jej jedynym właścicielem. Najpierw zaproponuj własność komuś innemu.
+clan-share-needs-another-owner = Najpierw potrzebny jest inny właściciel.
+clan-share-offer-help = Każdy akceptuje osobno; właścicielami stają się, gdy zaakceptuje ostatni. Zaakceptować mogą tylko członkowie, którzy widzą mapę.
+clan-share-offer-replace = Niech to będą jej jedyni właściciele
+clan-share-send-offer = Wyślij propozycję
+clan-share-offer-sent = Propozycja wysłana.
+clan-share-no-candidates = Nie ma komu tego zaproponować.
+clan-share-accepted = { $name } (zaakceptowano)
+clan-share-waiting-for = { $name } (oczekuje)
+clan-share-offer-to-clan = Zaproponowano klanowi { $clan }
+clan-share-cancel-offer = Anuluj propozycję
+clan-share-make-clan-owned = Przekaż klanowi…
+clan-share-make-clan-owned-confirm = Zaproponować „{ $name }” klanowi { $clan }? Po przyjęciu mapa należy do klanu: jej właściciele przestają nią władać, a obejmuje ją dostęp z folderu. To, co tu udostępniono, zostaje.
+clan-share-make-clan-owned-action = Przekaż klanowi
+clan-share-someone-accepts = Ktoś, kto obsługuje oczekujące mapy klanu, przyjmie ją do folderu.
+clan-share-into-folder = Do folderu
+clan-share-offered-to-clan = Zaproponowano klanowi. Stanie się własnością klanu, gdy przyjmie ją ktoś, kto obsługuje oczekujące mapy klanu.
+clan-share-ownership-refused = Nie udało się zmienić właściciela. Mógł się w międzyczasie zmienić; spróbuj ponownie.
+clan-share-make-member-owned = Przekaż członkom…
+clan-share-make-member-owned-help = Zaproponuj ją członkom: gdy wszyscy zaakceptują, będzie należeć do nich i obejmie ją tylko to, co oni udostępnią.
+clan-share-lose-folder-access = Ci stracą dostęp, który dawał im folder i klan: { $names }.
+clan-share-put-title = Umieść „{ $name }” w klanie
+clan-share-friend-shares-end = Jej udostępnienia znajomym wygasają: { $names }.
+clan-share-put-secrets = Jej Sekrety pozostają Twoje, jako Twoje Sekrety w klanie.
+clan-share-put-action = Umieść w klanie
+clan-share-put-done = Jest teraz w klanie { $clan }.
+clan-share-new-map-clan-owned = Własność klanu
+clan-share-new-map-member-owned-choice = Własność członków
+clan-share-new-map-member-owned-help = Należy do Ciebie i Ty wybierasz, kto ją widzi. Dostęp z folderu i właściciele klanu jej nie obejmują.
+clan-share-new-map-member-owned = Będzie własnością członków: należy do Ciebie i Ty wybierasz, kto ją widzi.
+clan-map-offers = Propozycje własności map
+clan-map-offer = { $initiator } proponuje Ci własność mapy „{ $map }” w klanie { $clan }.
+clan-map-offer-replace = { $initiator } proponuje Ci własność mapy „{ $map }” w klanie { $clan } w miejsce obecnych właścicieli.
+clan-map-offer-from-a-member = Jeden z członków proponuje Ci własność mapy „{ $map }” w klanie { $clan }.
+clan-map-offer-replace-from-a-member = Jeden z członków proponuje Ci własność mapy „{ $map }” w klanie { $clan } w miejsce obecnych właścicieli.
+clans-leave-copy-maps = Najpierw skopiuj mapy, które mam w tym klanie, do moich map
+
 # Map editor dialogs and sharing
 mapper-transfer-owner-friend-only = Przekazać można tylko coś, co należy do Ciebie, i tylko obecnemu znajomemu.
 mapper-transfer-offer-sent = Oferta wysłana. „{ $subject }" zostanie przekazany, gdy odbiorca zaakceptuje je w swoim panelu Znajomi.
 mapper-transfer-give = Przekaż „{ $subject }" znajomemu.
 mapper-transfer-warning = Po zaakceptowaniu odbiorca staje się właścicielem. Zachowasz prawa administratora, ale własność mapy zostanie przeniesiona.
-mapper-link-target-room = pokój { $room }
-mapper-link-target-new-room = nowy pokój { $room }
-mapper-link-target-dangling = puste miejsce (wiszące)
-mapper-link-one-way = Przejście jednokierunkowe
-mapper-link-from-to = Pokój { $room } do { $target }
-mapper-link-source-direction = Kierunek źródłowy
-mapper-link-destination-direction = Kierunek docelowy
-mapper-link-source-command-placeholder = polecenie źródłowe
-mapper-link-return-command-placeholder = polecenie powrotne
-mapper-link-pair-reciprocal = Powiąż z odwrotnym połączeniem jednokierunkowym (zachowaj jego trasę)
-mapper-link-style-invalid = Podaj obsługiwany kolor CSS i szerokość od 0,25 do 8.
-mapper-link-create-title = Utwórz połączenie
-mapper-link-delete-one = Usuwa jego przejście.
-mapper-link-delete-both = Usuwa oba przejścia.
-mapper-link-delete-secret-warning = To połączenie zawiera tajne informacje o mapie.
-mapper-link-delete-action = Usuń połączenie
-mapper-link-delete-title = Usuń połączenie
-mapper-route-preview-link = Podgląd automatycznej trasy dla połączenia { $id }
-mapper-route-preview-stats = { $points } zapisanych załamań na mapie · { $states } odwiedzonych stanów skryptu solver
-mapper-route-preview-accept-help = Akceptacja zastępuje zapisane punkty jedną odwracalną zmianą typu compare-and-set (porównaj i zapisz). Anulowanie pozostawia bieżącą trasę bez zmian.
-mapper-route-preview-public-help = Automatyczne wyznaczanie trasy korzysta tylko z pokoi publicznych; w widoku z odsłoniętymi sekretami trasa może nakładać się na niepowiązane tajne pokoje.
 mapper-route-preview-accept = Zaakceptuj trasę
-mapper-route-preview-title = Podgląd automatycznej trasy
-mapper-layer-secret = tajny
-mapper-layer-public = publiczny
-mapper-redistribute-question = Przenieść { $count ->
-        [one] { $count } automatyczny port
-        [few] { $count } automatyczne porty
-        [many] { $count } automatycznych portów
-       *[other] { $count } automatycznych portów
-    } ({ $layer }) po stronie { $side } pokoju { $room }?
-mapper-redistribute-offsets = Podgląd przesunięć: { $offsets }
-mapper-redistribute-help = Porty ręczne pozostają nieruchome. Prostopadłe odcinki końcowe są naprawiane w tej samej zmianie.
-mapper-redistribute-title = Rozmieść porty ponownie
 mapper-copy-boundary-one = { $count } połączenie graniczne opuszcza zaznaczone pokoje.
 mapper-copy-boundary-many = { $count } połączeń granicznych opuszcza zaznaczone pokoje.
 mapper-copy-boundary-help = Domyślnie są pomijane. Po uwzględnieniu każde z nich staje się wiszącym połączeniem jednokierunkowym bez zapisanych punktów trasy.
@@ -564,15 +905,20 @@ action-cut = Wytnij
 action-copy = Kopiuj
 mapper-transfer-leaves-folder = Jeśli to, co chcesz wysłać znajduje się w folderze, zostanie wysłane z folderu po zaakceptowaniu oferty.
 mapper-transfer-to = Przekaż do
+mapper-transfer-give-or-clan = Przekaż „{ $subject }" znajomemu lub jednemu ze swoich klanów.
+mapper-transfer-warning-clan = Wszystkie istniejące udostępnienia tej mapy zostaną usunięte po zakończeniu przenoszenia do klanu.
+mapper-transfer-clans = Twoje klany
+mapper-transfer-offer-sent-clan = Przeniesiono „{ $subject }” do { $clan }.
+mapper-transfer-owner-clan-only = Musisz być właścicielem tej mapy lub folderu i mieć uprawnienie do przeniesienia ich do wybranego miejsca w klanie.
 mapper-loading-friends = Ładowanie znajomych…
 mapper-no-friends-transfer = Póki co, nie masz tu jeszcze znajomych.
 mapper-filter-placeholder = filtruj…
 mapper-sending = Wysyłanie…
 mapper-send-offer = Wyślij ofertę
-mapper-new-area = Nowy obszar
-mapper-name-new-area = Nazwij nowy obszar
-mapper-area-name-placeholder = nazwa obszaru
-mapper-delete-area = Usuń obszar
+mapper-new-area = Nowa mapa
+mapper-name-new-area = Nazwij nową mapę
+mapper-area-name-placeholder = nazwa mapy
+mapper-delete-area = Usuń mapę
 mapper-delete-area-question = Usunąć „{ $name }" i jego { $rooms } pokoi?
 mapper-cannot-undo = Tej operacji nie można cofnąć.
 mapper-new-folder = Nowy folder
@@ -585,36 +931,40 @@ mapper-save-local-signed-out = Zapisano na tym urządzeniu. Zaloguj się, aby tw
 mapper-delete-folder = Usuń folder
 mapper-delete-folder-question = Usunąć folder „{ $name }"?
 mapper-folder-empty = Ten folder jest pusty.
-mapper-folder-one-map-moves = 1 mapa zostanie przeniesiona do Nieskatalogowanych map.
-mapper-folder-maps-move =
+mapper-folder-maps-go =
     { $count ->
-        [one] { $count } mapa zostanie przeniesiona do Nieskatalogowanych map.
-        [few] { $count } mapy zostaną przeniesione do Nieskatalogowanych map.
-        [many] { $count } map zostanie przeniesionych do Nieskatalogowanych map.
-       *[other] { $count } map zostanie przeniesionych do Nieskatalogowanych map.
+        [one] Najpierw jego mapa trafi do innego folderu.
+        [few] Najpierw jego { $count } mapy trafią do innego folderu.
+       *[many] Najpierw jego { $count } map trafi do innego folderu.
     }
-mapper-loose-maps = Nieskatalogowane mapy
+mapper-folder-maps-move-along =
+    { $count ->
+        [one] Jego mapa zostanie przeniesiona razem z nim.
+        [few] Jego { $count } mapy zostaną przeniesione razem z nim.
+       *[many] Jego { $count } map zostanie przeniesionych razem z nim.
+    }
 mapper-move-area-to = Przenieś „{ $name }" do:
 mapper-move-to-folder = Przenieś do folderu
-mapper-relocation-duplicate-notice = { $error } — mapa „{ $name }" została w całości skopiowana do miejsca docelowego, a oryginał pozostał w folderze. Usuń jedną z dwóch kopii zamiast ponawiać przenoszenie.
+mapper-save-to-folder = Zapisz w folderze
+mapper-save-area-in = Zapisz „{ $name }" w:
+mapper-folder-section = Folder
+mapper-folder-new-option = Nowy folder…
+mapper-folder-none-yet = Nie ma tu jeszcze folderu. Nazwij folder dla tej mapy.
+mapper-folder-none = Nie masz jeszcze folderów. Nazwij folder dla tej mapy.
+mapper-folder-create-and-move = Utwórz i przenieś
+mapper-folder-create-and-save = Utwórz i zapisz
+mapper-loose-maps-failed = Niektórych map spoza folderów nie udało się umieścić w folderze. Smudgy spróbuje ponownie następnym razem.
+mapper-relocation-duplicate-notice = { $error } — Utworzono kopię „{ $name }” w miejscu docelowym, ale nie udało się usunąć oryginału, który może zawierać nowsze zmiany. Zachowaj oryginał i uzgodnij zawartość obu kopii przed ponownym przeniesieniem.
 mapper-share-folder-title = Udostępnij folder „{ $name }"
 mapper-loading = Ładowanie…
-mapper-no-secrets = Brak sekretów w tym obszarze.
-mapper-secrets-title = Sekrety w tym obszarze
-mapper-unmark = Odtajnij
-mapper-secret-rooms = Pokoje
-mapper-secret-exits = Wyjścia
-mapper-secret-labels = Etykiety
-mapper-secret-shapes = Kształty
-mapper-secret-room-properties = Właściwości pokoju
-mapper-secret-area-properties = Właściwości obszaru
-mapper-share-title = Udostępnij „{ $name }"
+mapper-local-move-title = Przenieść udostępnione mapy z chmury?
+mapper-local-move-shared-warning = Przeniesienie tych map do pamięci lokalnej zakończy ich udostępnianie w chmurze. Osoby, którym je udostępniono, utracą dostęp, a ich Sekrety i Prywatne dodatki zapisane przy oryginałach w chmurze zostaną usunięte. Twoje mapy, Sekrety i Prywatne dodatki zostaną zachowane lokalnie. Tej operacji nie można cofnąć.
 mapper-copy-duplicate-intro = Tworzy drugą kopię „{ $name }".
 mapper-copy-shared-intro = Tworzy Twoją własną edytowalną kopię „{ $name }".
 mapper-copy-name-placeholder = nazwa Twojej kopii
 mapper-copy-duplicate-inactive = Duplikat jest teraz nieaktywny. Musisz go aktywować, aby był widoczny dla skryptów.
-mapper-copy-atlas-offer = Czy chcesz skopiować cały atlas?
-mapper-copy-whole-atlas = Skopiuj cały atlas…
+mapper-copy-atlas-offer = Czy chcesz skopiować cały folder?
+mapper-copy-whole-atlas = Skopiuj cały folder…
 mapper-copying = Kopiowanie…
 mapper-copy = Kopiuj
 mapper-duplicate-map = Duplikuj mapę
@@ -624,9 +974,6 @@ mapper-show-on-servers = Pokaż na serwerach
 mapper-show-name-on = Pokaż „{ $name }" na:
 mapper-no-server-entries = Brak wpisów serwerów.
 mapper-unchecked-all-servers = Odznaczenie wszędzie oznacza "widoczne na każdym serwerze".
-mapper-scope = Zakres
-mapper-scope-area = Tylko ten obszar
-mapper-scope-atlas = Jego atlas (obejmuje obszary dodane później)
 mapper-recipients = Odbiorcy
 mapper-filter-handle-placeholder = filtruj według nazwy
 mapper-no-friends-share = Póki co, nie masz tu jeszcze znajomych.
@@ -637,47 +984,39 @@ mapper-can-edit-folder = Może edytować
 mapper-can-reshare = Może ponownie udostępniać (jeden poziom w głąb, tylko do odczytu)
 mapper-can-copy-area = Może kopiować (kopie stają się ich własnością)
 mapper-can-copy-folder = Może kopiować (kopie stają się ich własnością)
-mapper-include-secrets-area = Uwzględnij sekrety
-mapper-secrets-no-atlas = Sekrety są udostępniane tylko podczas udostępniania obszarów.
-mapper-secrets-owner-only = Tylko właściciel mapy może udostępniać jej sekrety.
 mapper-make-admin-area = Nadaj uprawnienia administratora
 mapper-disclose-servers = Ujawnij serwery
 mapper-disclose-servers-help = Odbiorcy widzą te nazwy serwerów, dzięki czemu ich klient może dopasować mapy do właściwego profilu serwera.
-mapper-secret-count-warning = { $rooms } tajnych pokoi, { $exits } tajnych wyjść oraz { $other } tajnych notatek/etykiet/kształtów NIE zostanie udostępnionych.
-mapper-review-secrets = Przejrzyj sekrety
-mapper-no-marked-secrets = Nic w tym obszarze nie jest oznaczone jako tajne — wszystko zostanie udostępnione.
-mapper-secret-forward-only = Oznaczenie czegoś jako tajne PO udostępnieniu wpływa tylko na przyszłe synchronizacje — to, co już udostępniono, pozostaje widoczne dla użytkowników.
-mapper-preview-recipient = Podgląd jako odbiorca
-mapper-preview-selected-hint = podgląd wybranego poniżej uprawnienia
-mapper-preview-worst-hint = podgląd najgorszego przypadku (wybierz poniżej uprawnienie, aby je podejrzeć)
-mapper-generating-preview = Generowanie podglądu…
 mapper-shared-with = Udostępniono użytkownikowi { $recipient }.
-mapper-share-no-longer-friends = Nie udało się udostępnić użytkownikowi { $recipient } — czy nadal jesteście znajomymi?
 mapper-share-error = Nie udało się udostępnić użytkownikowi { $recipient } — { $error }
+mapper-share-failed = Nie udało się udostępnić użytkownikowi { $recipient }.
+mapper-now-sees-map = { $recipient } widzi teraz mapę „{ $map }".
+mapper-secret-map-hint = Widzą go tylko osoby, które widzą mapę „{ $map }".
+mapper-has-access = ma dostęp
+mapper-clan-members-hidden = Widoczne są tylko grupy: nie możesz zobaczyć listy członków.
+mapper-secret-can-add = Może dodawać
+mapper-secret-can-edit = Może edytować
+mapper-secret-can-share = Może udostępniać
+mapper-secret-can-copy = Może kopiować
+mapper-secret-level-copies = { $level }, może kopiować
+mapper-copy-secrets-along = { $count ->
+    [one] Do kopii trafiają tylko sekrety, które możesz skopiować: { $count } sekret.
+    [few] Do kopii trafiają tylko sekrety, które możesz skopiować: { $count } sekrety.
+    [many] Do kopii trafiają tylko sekrety, które możesz skopiować: { $count } sekretów.
+   *[other] Do kopii trafiają tylko sekrety, które możesz skopiować: { $count } sekretu.
+}
+mapper-copy-secrets-none = Do kopii trafiają tylko sekrety, które możesz skopiować: żaden z tych, które tu widzisz.
 mapper-sharing = Udostępnianie…
 mapper-share = Udostępnij
-mapper-previewing-as = Podgląd jako { $audience }
-mapper-appears-as = Wyświetla się jako: „{ $name }"
-mapper-rooms-visible = Widoczne pokoje
-mapper-exits-visible = Widoczne wyjścia
-mapper-labels-visible = Widoczne etykiety
-mapper-shapes-visible = Widoczne kształty
-mapper-properties-visible = Widoczne właściwości
-mapper-linked-areas-visible = Połączone obszary, tak jak je widzą:
-mapper-unknown-links = → { $count ->
-        [one] { $count } połączenie prowadzi
-        [few] { $count } połączenia prowadzą
-        [many] { $count } połączeń prowadzi
-       *[other] { $count } połączeń prowadzi
-    } do „Nieznanej mapy"
 mapper-who-has-access = Kto ma dostęp
 mapper-not-shared = Jeszcze nikomu nie udostępniono.
 mapper-badge-edit = edycja
 mapper-badge-reshare = ponowne udostępnianie
 mapper-badge-copy = kopiowanie
-mapper-badge-secrets = sekrety
 mapper-badge-view = podgląd
-mapper-badge-atlas = atlas
+mapper-badge-add = dodawanie
+mapper-badge-share = udostępnianie
+mapper-badge-atlas = folder
 mapper-shared-by-you = udostępnione przez Ciebie
 mapper-shared-via = przez { $handle }
 mapper-shared-by = udostępnione przez { $handle }
@@ -688,30 +1027,15 @@ mapper-flag-admin = admin
 mapper-remove-reshare-warning = Usunięcie ponownego udostępniania odbiera też wszystko, co ta osoba ponownie udostępniła.
 mapper-saving = Zapisywanie…
 mapper-revoke-warning = Odbiera dostęp oraz wszystko, co ta osoba ponownie udostępniła.
-mapper-revoke-atlas-warning = To uprawnienie obejmuje cały atlas.
+mapper-revoke-secret-warning = Odbiera dostęp do „{ $name }".
+mapper-revoke-atlas-warning = To uprawnienie obejmuje cały folder.
 mapper-revoking = Odbieranie…
 mapper-folder-share-help = Każdy, kogo wybierzesz, otrzyma dostęp do całego folderu.
-mapper-include-secrets-folder = Uwzględnij sekrety
 mapper-make-admin-folder = Nadaj uprawnienia administratora
 mapper-revoke-folder-warning = Odbiera dostęp do każdej mapy w tym folderze oraz wszystko, co ta osoba ponownie udostępniła. Kopie, które już wykonała, pozostają w jej posiadaniu.
-mapper-room-fallback = Pokój { $number }
-mapper-exit-from-room = Wyjście { $direction } z pokoju { $room }
-mapper-exit-fallback-id = Wyjście { $id }
-mapper-exit-fallback = Wyjście
-mapper-label-fallback = Etykieta
-mapper-shape-fallback = Kształt
-mapper-shape-at = Kształt w ({ $x }, { $y })
 mapper-could-not-revoke = Nie udało się odebrać dostępu — uprawnienie mogło już zostać usunięte.
-mapper-preview-no-access = Ta grupa odbiorców w ogóle nie widzi tego obszaru.
 mapper-could-not-update-grant = Nie udało się zaktualizować — uprawnienie mogło zostać usunięte lub jego zmiana jest niedozwolona.
 mapper-this-folder = ten folder
-mapper-unnamed-area = (obszar bez nazwy)
-mapper-selected-grant = wybrane uprawnienie
-mapper-worst-case-no-grant = najgorszy przypadek (brak uprawnienia)
-mapper-room-title = Pokój { $number } — { $title }
-mapper-label-named = Etykieta „{ $text }"
-mapper-room-property = Właściwość „{ $name }" w pokoju { $room }
-mapper-area-property = Właściwość obszaru „{ $name }"
 
 # Mapper enum choices
 direction-north = Północ
@@ -742,18 +1066,41 @@ alignment-top = Do góry
 alignment-bottom = Do dołu
 
 # Map inspector
-inspector-nothing-changed = Brak zmian
-inspector-secrets-not-editable = Nie możesz tutaj zmieniać sekretów.
-inspector-mark-secret = Oznacz jako tajne
-inspector-unmark-secret = Odtajnij
 inspector-invalid-value = nieprawidłowa wartość
 inspector-properties = Właściwości
 inspector-tags = Tagi
 inspector-value-placeholder = wartość
 inspector-name-placeholder = nazwa
 inspector-add-tag-placeholder = dodaj tag
-inspector-in-this-area = W tym obszarze:
+inspector-tag-to = do
+inspector-tag-on-rooms = { $count ->
+    [one] w 1 pokoju
+    [few] w { $count } pokojach
+    [many] w { $count } pokojach
+   *[other] w { $count } pokojach
+}
+inspector-tag-too-long = Tag może mieć najwyżej { $limit } znaków.
+inspector-tag-hint-map = { $tag } to tag miejsca { $place }. Dodanie go do mapy pokaże go każdemu, kto czyta mapę.
+inspector-tag-hint-place = { $tag } to tag miejsca { $place }. Dodanie go do miejsca { $destination } pokaże go każdemu, kto czyta „{ $destination }”.
+inspector-tag-adds-to = Doda do { $count } z { $total } pokoi.
+inspector-tag-cant-carry = { $count ->
+    [one] 1 pokój w { $place } nie może mieć tagów miejsca { $destination }.
+    [few] { $count } pokoje w { $place } nie mogą mieć tagów miejsca { $destination }.
+    [many] { $count } pokoi w { $place } nie może mieć tagów miejsca { $destination }.
+   *[other] { $count } pokoju w { $place } nie może mieć tagów miejsca { $destination }.
+}
+inspector-tag-used-on-map = Używany na mapie
+inspector-tag-used-in = Używany w
+inspector-tag-added = { $count ->
+    [one] Dodano { $tag } do 1 pokoju.
+   *[other] Dodano { $tag } do { $count } pokoi.
+}
+inspector-tag-added-some-had = { $count ->
+    [one] Dodano { $tag } do 1 pokoju (już miało go: { $already }).
+   *[other] Dodano { $tag } do { $count } pokoi (już miało go: { $already }).
+}
 inspector-room-heading = Pokój #{ $number }
+inspector-place-room-heading = { $place } #{ $number }
 inspector-title = Tytuł
 inspector-room-title-placeholder = tytuł pokoju
 inspector-description = Opis
@@ -762,68 +1109,31 @@ inspector-level = Poziom
 inspector-color = Kolor
 inspector-default-placeholder = (domyślny)
 inspector-none-placeholder = (brak)
-inspector-secret-room = Tajny pokój
 inspector-exits = Wyjścia
 inspector-unknown-map = Nieznana mapa
-inspector-unshared-destination = Prowadzi do mapy, która nie została Ci udostępniona.
-inspector-area-placeholder = obszar
-inspector-room-number-placeholder = nr pokoju
-inspector-return-direction-placeholder = kier. powrotu
-inspector-hidden = ukryte
-inspector-closed = zamknięte
-inspector-locked = zablokowane
-inspector-secret = tajne
-inspector-weight-placeholder = waga
-inspector-command-placeholder = polecenie
-inspector-path-placeholder = ścieżka
-inspector-add-exit = Dodaj wyjście
-inspector-unlink-direction = Odłącz ten kierunek
 inspector-connection-missing = Połączenie już nie istnieje
-inspector-connection-heading = Połączenie
-inspector-room-label = pokój { $number }
-inspector-room-label-titled = pokój { $number } · { $title }
-inspector-exit-from-room = Z pokoju { $number }
-inspector-exit-from-room-titled = Z pokoju { $number } · { $title }
-inspector-link = Połączenie
 inspector-endpoint-from = Od
 inspector-endpoint-to = Do
 inspector-connection-level-anchored = Trójkąt w kierunku wyjścia (góra/dół)
 inspector-connection-port-invalid = przesunięcie portu musi mieścić się między 0 a 1
-inspector-add-return = Dodaj kierunek powrotny
 inspector-appearance = Wygląd
-inspector-style = Styl
 side-north = Północ
 side-east = Wschód
 side-south = Południe
 side-west = Zachód
-connection-kind-internal = Wewnętrzne
-connection-kind-self-loop = Pętla własna
-connection-kind-cross-level = Międzypoziomowe
-connection-kind-dangling = Wiszące
-connection-kind-external = Zewnętrzne
-inspector-connection-span = pokój { $room }
-inspector-connection-span-to = pokój { $room_a } do pokoju { $room_b }
-inspector-connection-bidirectional = dwukierunkowe
-inspector-connection-one-way = jednokierunkowe
-inspector-connection-outward = { $room } na zewnątrz
-inspector-connection-between = { $room_a } { $side_a } do { $room_b } { $side_b }
 inspector-connection-port-placeholder = port 0–1
 inspector-connection-auto = Auto
 inspector-connection-redistribute = Rozmieść ponownie
-inspector-connection-pair-reciprocal = Powiąż z odwrotnym połączeniem
 inspector-connection-route = Trasa
 inspector-connection-orthogonal = Ortogonalna
 inspector-connection-reroute = Ponownie wyznacz trasę…
 inspector-connection-route-stale = Trasa może być nieaktualna po zmianach mapy; użyj opcji Ponownie wyznacz trasę.
-inspector-connection-route-collision = Trasa przecina pokój publiczny; użyj opcji Ponownie wyznacz trasę lub edytuj ją ręcznie.
+inspector-connection-route-collision = Trasa przecina pokój; użyj opcji Ponownie wyznacz trasę lub edytuj ją ręcznie.
 inspector-connection-route-invalid = Zapisana automatyczna trasa jest nieprawidłowa; użyj opcji Ponownie wyznacz trasę.
 inspector-connection-route-inactive = W tym trybie zapisana trasa jest nieaktywna.
 inspector-connection-clear-route = Wyczyść zapisaną trasę
 inspector-css-color-placeholder = kolor CSS
-inspector-width-placeholder = szerokość
 inspector-connection-reset = Zresetuj trasę i wygląd
-inspector-connection-delete = Usuń połączenie
-inspector-connection-delete-both = Usuń połączenie i oba kierunki
 inspector-width = Szerokość
 inspector-height = Wysokość
 inspector-label = Etykieta
@@ -839,14 +1149,10 @@ inspector-stroke = Obrys
 inspector-stroke-width = Szerokość obrysu
 inspector-corner-radius = Promień zaokrąglenia
 inspector-selected = zaznaczono: { $count }
-inspector-selection-counts = pokoje: { $rooms }, etykiety: { $labels }, kształty: { $shapes }
+inspector-selection-counts = połączenia: { $links }, pokoje: { $rooms }, etykiety: { $labels }, kształty: { $shapes }
 inspector-mixed-placeholder = (mieszane)
 inspector-set-color = Ustaw kolor (Enter, aby zastosować)
 inspector-set-level = Ustaw poziom (Enter, aby zastosować)
-inspector-secrecy = Tajność
-inspector-active-tip = Aktywna — kliknij, aby dezaktywować
-inspector-inactive-tip = Nieaktywna — kliknij, aby aktywować
-inspector-this-map = Ta mapa:
 inspector-active = Aktywna
 inspector-inactive = Nieaktywna
 inspector-active-help = Aktywne mapy służą do ustalania Twojego położenia podczas gry.
@@ -854,8 +1160,7 @@ inspector-copies = Kopie tej mapy
 inspector-this-map-suffix = { $name } (ta mapa)
 inspector-use-only-copy = Używaj tylko tej kopii
 inspector-multiple-copies-warning = Możesz mieć jednocześnie aktywnych wiele kopii. Podczas odwiedzania pokoi, których kopie znajdują się w wielu aktywnych mapach, maper może umieścić Cię w nieprzewidywalnym miejscu.
-inspector-no-area-selected = Nie wybrano obszaru
-inspector-area-summary = pokoje: { $rooms } · poziom { $level }
+inspector-no-area-selected = Nie wybrano mapy
 inspector-shared-map = udostępniona mapa
 inspector-copied-from = Skopiowano z { $source }
 inspector-copy-revision = w rewizji { $revision }
@@ -863,70 +1168,80 @@ inspector-copy-date = dnia { $date }
 inspector-source-changed = (źródło od tego czasu się zmieniło)
 inspector-view-only = { $attribution } — tylko do odczytu.
 inspector-room-position = Poziom { $level } · ({ $x }, { $y })
-inspector-area-properties = Właściwości obszaru
-inspector-another-area = inny obszar
-inspector-exit-target-area-room = { $area }, pokój { $room }
-inspector-exit-target-room = pokój { $room }
-inspector-exit-target-nowhere = donikąd
+inspector-area-properties = Właściwości mapy
 inspector-shape-summary = { $width }×{ $height } w ({ $x }, { $y })
-inspector-room-count =
-    { $count ->
-        [one] { $count } pokój
-        [few] { $count } pokoje
-        [many] { $count } pokoi
-       *[other] { $count } pokoje
-       }
 inspector-entities-selected = zaznaczono elementy: { $count }
-inspector-marked-secret = oznaczono jako tajne: { $items }
-inspector-unmarked = odtajniono: { $items }
-inspector-count-room-one = 1 pokój
-inspector-count-rooms =
+
+# Map list: several maps and folders chosen at once
+mapper-multi-maps =
     { $count ->
-        [one] { $count } pokój
-        [few] { $count } pokoje
-        [many] { $count } pokoi
-       *[other] { $count } pokoje
-       }
-inspector-count-exit-one = 1 wyjście
-inspector-count-exits =
+        [one] { $count } mapa
+        [few] { $count } mapy
+        [many] { $count } map
+       *[other] { $count } map
+    }
+mapper-multi-folders =
     { $count ->
-        [one] { $count } wyjście
-        [few] { $count } wyjścia
-        [many] { $count } wyjść
-       *[other] { $count } wyjść
-       }
-inspector-count-label-one = 1 etykieta
-inspector-count-labels =
+        [one] { $count } folder
+        [few] { $count } foldery
+        [many] { $count } folderów
+       *[other] { $count } folderów
+    }
+mapper-multi-maps-object =
     { $count ->
-        [one] { $count } etykieta
-        [few] { $count } etykiety
-        [many] { $count } etykiet
-       *[other] { $count } etykiet
-       }
-inspector-count-shape-one = 1 kształt
-inspector-count-shapes =
+        [one] { $count } mapę
+        [few] { $count } mapy
+        [many] { $count } map
+       *[other] { $count } map
+    }
+mapper-multi-folders-object =
     { $count ->
-        [one] { $count } kształt
-        [few] { $count } kształty
-        [many] { $count } kształtów
-       *[other] { $count } kształtów
-       }
-inspector-count-room-property-one = 1 właściwość pokoju
-inspector-count-room-properties =
+        [one] { $count } folder
+        [few] { $count } foldery
+        [many] { $count } folderów
+       *[other] { $count } folderów
+    }
+mapper-multi-and = { $first } i { $second }
+mapper-multi-quoted = „{ $name }”
+mapper-multi-list-separator = {", "}
+mapper-multi-skipped = Pominięto: { $names }
+mapper-multi-clear = Wyczyść zaznaczenie
+mapper-multi-move = Przenieś { $items } do folderu…
+mapper-multi-share = Udostępnij { $items }…
+mapper-multi-transfer = Przekaż { $items }…
+mapper-multi-servers = Pokaż { $items } na serwerach…
+mapper-multi-delete = Usuń { $items }…
+mapper-multi-delete-none = Usuń…
+mapper-multi-delete-question = Usunąć { $items }? Nie da się tego cofnąć.
+mapper-multi-delete-title = Usuń { $items }
+mapper-multi-delete-holding =
     { $count ->
-        [one] { $count } właściwość pokoju
-        [few] { $count } właściwości pokoju
-        [many] { $count } właściwości pokoju
-       *[other] { $count } właściwości pokoju
-       }
-inspector-count-area-property-one = 1 właściwość obszaru
-inspector-count-area-properties =
-    { $count ->
-        [one] { $count } właściwość obszaru
-        [few] { $count } właściwości obszaru
-        [many] { $count } właściwości obszaru
-       *[other] { $count } właściwości obszaru
-       }
+        [one] W „{ $folder }” jest też mapa, której nie wybrano: { $names }.
+        [few] W „{ $folder }” są też { $count } mapy, których nie wybrano: { $names }.
+       *[many] W „{ $folder }” jest też { $count } map, których nie wybrano: { $names }.
+    }
+mapper-multi-leftovers-move = Przenieś je do folderu
+mapper-multi-leftovers-delete = Usuń je również
+mapper-multi-delete-error = Nie udało się usunąć { $names } — { $error }
+mapper-multi-kind-map = mapa
+mapper-multi-kind-local-map = mapa lokalna
+mapper-multi-kind-session-map = mapa sesji
+mapper-multi-kind-shared-map = mapa udostępniona
+mapper-multi-kind-folder = folder
+mapper-multi-kind-local-folder = folder lokalny
+mapper-multi-kind-shared-folder = folder udostępniony
+mapper-multi-move-to = Przenieś { $items } do:
+mapper-multi-share-title = Udostępnij { $items }
+mapper-multi-shared = Udostępniono „{ $name }”.
+mapper-multi-share-failed = Nie udało się udostępnić „{ $name }” użytkownikowi { $recipient }.
+mapper-multi-share-error = Nie udało się udostępnić „{ $name }” użytkownikowi { $recipient } — { $error }
+mapper-multi-transfer-title = Przekaż { $items }
+mapper-multi-transfer-leaves-folder = Mapa z folderu opuści go po zaakceptowaniu oferty.
+mapper-multi-send-offers = Wyślij oferty
+mapper-multi-offer-sent = Wysłano ofertę dla „{ $name }”.
+mapper-multi-offer-error = Nie udało się wysłać oferty dla „{ $name }” — { $error }
+mapper-multi-show-on = Pokaż { $items } na:
+mapper-multi-some = część
 
 # Mapper toolbar, area list, and window
 mapper-tool-select = Zaznacz
@@ -938,24 +1253,201 @@ mapper-level = Poziom { $level }
 mapper-level-up = Poziom wyżej
 mapper-undo = Cofnij
 mapper-redo = Ponów
-mapper-share-area-tip = Udostępnij ten obszar znajomym
-mapper-copy-shared-tip = Utwórz własną edytowalną kopię tej udostępnionej mapy
 mapper-duplicate = Duplikuj
-mapper-duplicate-tip = Utwórz kopię tej mapy
 mapper-transfer-action = Przekaż…
-mapper-transfer-tip = Przekaż tę mapę znajomemu (po zaakceptowaniu staje się jej właścicielem)
-mapper-inactive-location-tip = Nieużywana do ustalania Twojego położenia — aktywuj ją na liście obszarów
 mapper-syncing = synchronizowanie { $count }
 mapper-sync-failed = { $count } nieudanych
 mapper-sync = Synchronizuj
 mapper-sync-tip = Synchronizuj z chmurą
+mapper-status-saved = Zapisano
+mapper-status-saving = Zapisywanie zmian: { $count }
+mapper-status-offline = Offline, oczekujące zmiany: { $count }
+mapper-status-held = { $count ->
+    [one] Oczekiwanie na usługę map (1 zmiana w kolejce)
+    [few] Oczekiwanie na usługę map ({ $count } zmiany w kolejce)
+    [many] Oczekiwanie na usługę map ({ $count } zmian w kolejce)
+   *[other] Oczekiwanie na usługę map ({ $count } zmiany w kolejce)
+}
+mapper-status-conflict = Konflikt do przejrzenia
+mapper-status-could-not-save = Nie udało się zapisać
+mapper-pending-tip = Zmiany czekają na tym urządzeniu, aż zostaną zapisane.
+mapper-tool-link = Połącz pokoje (Ctrl: jednokierunkowo)
+mapper-menu-rename = Zmień nazwę
+mapper-menu-save = Zapisz…
+mapper-menu-move-to-folder = Przenieś do folderu…
+mapper-menu-delete = Usuń mapę…
+mapper-add-to = Dodaj do
+mapper-place-map = Mapa
+mapper-place-private = Prywatne
+mapper-secrets = Sekrety
+mapper-rooms = Pokoje
+mapper-tags = Tagi
+mapper-tags-none = Brak tagów.
+mapper-rooms-filter = Filtruj po tytule, miejscu, numerze lub tagu
+mapper-rooms-none = Brak pasujących pokoi.
+mapper-rooms-more = { $count ->
+    [one] Jeszcze 1 pokój. Zawęź listę filtrem.
+    [few] Jeszcze { $count } pokoje. Zawęź listę filtrem.
+   *[other] Jeszcze { $count } pokoi. Zawęź listę filtrem.
+}
+mapper-room-untitled = (bez tytułu)
+mapper-new-secret = Nowy sekret
+mapper-secret-name-placeholder = Nazwa sekretu
+mapper-secret-color = Kolor
+mapper-secret-color-automatic = Użyj koloru automatycznego
+mapper-room-count = { $count ->
+    [one] 1 pokój
+    [few] { $count } pokoje
+    [many] { $count } pokoi
+   *[other] { $count } pokoju
+}
+mapper-view-only = tylko podgląd
+mapper-private-help = Widzisz je tylko Ty.
+mapper-place-gone = „{ $name }” już nie istnieje.
+mapper-now-editing = Teraz edytujesz
+mapper-panel-kind-map = MAPA
+mapper-panel-kind-atlas = ATLAS
+mapper-panel-data-fields = Pola danych
+mapper-panel-maps = Mapy
+mapper-panel-shares = Udostępnienia
+mapper-panel-servers = Serwery
+mapper-panel-no-maps = Nie ma w nim jeszcze map.
+mapper-panel-storage-cloud = W chmurze
+mapper-panel-storage-local = Na tym urządzeniu
+mapper-panel-storage-session = Tylko w tej sesji
+mapper-badge-secret = Sekret
+mapper-badge-private = Prywatne
+mapper-delete-secret = Usuń sekret…
+mapper-delete-secret-question = Usunąć „{ $name }” wraz z całą zawartością?
+mapper-now-viewing = Podgląd
+mapper-secret-owner = Właściciel
+mapper-secret-owner-me = Ja
+mapper-secret-owner-members = Członkowie
+mapper-secret-owner-clan = Klan
+mapper-secret-owner-members-of = Członkowie klanu { $clan }
+mapper-secret-owner-clan-named = Klan { $clan }
+mapper-secret-owner-members-help = Należy do Ciebie; później możesz zaproponować jego własność innym członkom.
+mapper-secret-owner-clan-help = Należy do właścicieli klanu. Zaczynasz jako współtwórca; kto jeszcze go czyta, wynika z dostępu w klanie.
+mapper-secret-owner-none = Nie możesz utworzyć sekretu na tej mapie.
+mapper-secret-member-owned = Własność członków · { $clan }
+mapper-secret-clan-owned = Własność klanu · { $clan }
+mapper-secret-read-only = Możesz czytać ten sekret, ale nie możesz go zmieniać.
+mapper-secret-level-reader = Czytelnik
+mapper-secret-level-contributor = Współtwórca
+mapper-secret-level-editor = Redaktor
+mapper-secret-level-access-manager = Zarządca dostępu
+mapper-secret-level-manages = { $level }, zarządza dostępem
+mapper-access = Dostęp
+mapper-access-owner = Właściciel
+mapper-access-clan-owner = Właściciel klanu
+mapper-access-grant = { $level }, nadane bezpośrednio
+mapper-access-group = { $level } przez grupę „{ $group }”
+mapper-access-group-unnamed = { $level } przez grupę
+mapper-access-clan-grants = { $level } przez dostęp klanu do mapy
+mapper-access-you = { $name } (Ty)
+mapper-access-only-yours = Wszystkich czytających widzą tylko osoby zarządzające dostępem.
+mapper-ownership = Własność
+mapper-offer-ownership = Zaproponuj własność…
+mapper-offer-pick = Zaproponuj własność:
+mapper-offer-nobody = Nikt inny jeszcze nie czyta tego sekretu.
+mapper-offer-replace-toggle = Zastępują obecnych właścicieli
+mapper-offer-add-help = Staną się właścicielami obok obecnych.
+mapper-offer-replace-help = Staną się jedynymi właścicielami.
+mapper-offer-from-clan-help = Staną się właścicielami, a właściciele klanu przestaną nimi być.
+mapper-offer-joint-help = Każdy akceptuje osobno; własność zmienia się, gdy zaakceptuje ostatnia osoba.
+mapper-offer-recipient-limit = Oferta może wskazać najwyżej { $count } osób.
+mapper-offer-send = Wyślij propozycję
+mapper-offer-cancel = Wycofaj propozycję
+mapper-offer-accepted = { $name } (zaakceptowano)
+mapper-offer-waiting = { $name } (oczekuje)
+mapper-offer-add = Propozycja współwłasności
+mapper-offer-replace = Propozycja przejęcia własności
+mapper-offer-to-clan = Propozycja przekazania klanowi
+mapper-owners = Właściciele
+mapper-owner-inactive = { $name } (już nie w klanie)
+mapper-owner-remove = Usuń…
+mapper-owner-remove-confirm = Usunąć { $name } z właścicieli „{ $secret }”? Tej osobie zostanie tylko to, co jej udostępniono.
+mapper-owner-remove-action = Usuń
+mapper-owner-give-up = Zrzeknij się własności…
+mapper-owner-give-up-confirm = Zrzec się własności „{ $secret }”? Zostanie Ci tylko to, co udostępniono Tobie lub Twoim grupom; bez tego stracisz do niego dostęp.
+mapper-owner-give-up-action = Zrzeknij się własności
+mapper-owner-only-you = Jesteś jedynym właścicielem. Najpierw zaproponuj własność komuś innemu.
+mapper-owner-last = Najpierw potrzebny jest inny właściciel.
+mapper-make-clan-owned = Przekaż klanowi…
+mapper-make-clan-owned-pick = Kto przyjmie go w imieniu klanu:
+mapper-make-clan-owned-confirm = Zaproponować „{ $secret }” klanowi? Gdy { $name } przyjmie propozycję, stanie się on własnością klanu: właściciele klanu będą mogli zrobić z nim wszystko, a jego obecni właściciele, łącznie z Tobą, przestaną nimi być.
+mapper-make-clan-owned-confirm-self = Przekazać „{ $secret }” na własność klanu? Właściciele klanu, w tym Ty, będą mogli zrobić z nim wszystko, a pozostali obecni właściciele przestaną nimi być. To, co udostępniono członkom i grupom, pozostaje.
+mapper-make-clan-owned-action = Przekaż klanowi
+mapper-ownership-refused = Nie udało się zmienić właściciela „{ $secret }”. Mógł się w międzyczasie zmienić; spróbuj ponownie.
+mapper-map-rooms = Pokoje mapy
+mapper-menu-paste-here = Wklej tutaj
+mapper-menu-add-point-here = Dodaj punkt tutaj
+mapper-menu-remove-point = Usuń punkt
+mapper-menu-move-to = Przenieś do
+mapper-place-several = Kilka
+mapper-move-title = Przenieś do „{ $place }”
+mapper-move-action = Przenieś
+mapper-moving = Przenoszenie…
+mapper-move-loses-data = „{ $place }” traci swoje dane o tych pokojach.
+mapper-move-strands-exits = Wyjścia z innych map do tych pokoi będą prowadzić donikąd.
+mapper-move-reveals = Zobaczy je każdy, kto widzi tę mapę.
+mapper-move-splits = #{ $room } łączy się z #{ $other }, który zostaje w „{ $place }”.
+mapper-move-include-linked = Dołącz połączone pokoje
+mapper-move-conflict = Nic nie przeniesiono: „{ $from }” lub „{ $to }” zmieniono wcześniej gdzie indziej. Mapa pokazuje już tę zmianę; sprawdź ją i przenieś ponownie.
+mapper-no-room-numbers = Na tej mapie skończyły się numery pokoi.
+mapper-route-finding = Wyznaczanie trasy…
+mapper-route-ready = Trasa gotowa.
+mapper-route-none = Nie znaleziono wolnej trasy.
+mapper-route-limit = Nie znaleziono trasy w wyznaczonym czasie.
+mapper-route-invalid = Trasa przecięła pokój. Spróbuj ponownie.
+mapper-route-link-changed = Połączenie się zmieniło. Spróbuj ponownie.
+mapper-route-map-changed = Mapa się zmieniła. Spróbuj ponownie.
+mapper-route-access-changed = Nie możesz już edytować tej mapy.
+mapper-route-same-level = Trasy automatyczne łączą dwa pokoje na tej samej mapie i poziomie.
+mapper-link-area-gone = Tej mapy już nie ma, więc połączenia nie utworzono.
+mapper-link-room-taken = Pokój #{ $old } został właśnie zajęty. Połączenie używa teraz #{ $new }.
+mapper-link-not-queued = Nie udało się zapisać połączenia. Spróbuj ponownie.
+mapper-link-two-secrets = Połączenie nie może łączyć dwóch sekretów.
+mapper-map-view-only = Ta mapa jest tylko do odczytu.
+mapper-map-cannot-add = Nie możesz dodawać do tej mapy.
+mapper-map-cannot-edit = Nie możesz zmieniać zawartości tej mapy.
+mapper-map-cannot-remove = Nie możesz niczego usuwać z tej mapy.
+mapper-history-cleared-elsewhere = Historia cofania została wyczyszczona: pokoje na tej mapie zostały przeniesione w innym oknie.
+mapper-paste-links-skipped = Nie udało się tu dołączyć skopiowanych połączeń: { $count }.
+mapper-paste-too-large = To za dużo, by wkleić naraz.
+mapper-edits-not-recovered = Nie udało się odzyskać części niezapisanych zmian.
+mapper-selection-removed = Ktoś inny usunął coś, co było zaznaczone.
+inspector-route-too-many-points = Ta trasa ma za dużo punktów, by uczynić ją prostokątną.
+legend-move-freely = przesuń swobodnie
+legend-cancel = anuluj
+legend-snap-port = przyciągnij do środka lub narożników
+legend-read-only = Tylko podgląd
+legend-move-point = przesuń punkt
+legend-remove-point = usuń punkt
+legend-stop-editing = zakończ edycję
+legend-move-port = przesuń port
+legend-slide-port = przesuń wzdłuż ściany
+legend-add-point = dodaj punkt
+legend-key-drag = Przeciągnij
+legend-key-delete = Delete
+routing-stub = Krótka
+routing-simple = Prosta
+routing-manual = Ręczna
+routing-automatic = Automatyczna
+segments-direct = Bezpośrednia
+corners-sharp = Ostre narożniki
+corners-rounded = Zaokrąglone narożniki
+dash-solid = Ciągła
+dash-dashed = Kreskowana
+dash-dotted = Kropkowana
+inspector-in = W
 mapper-shared-by-friend = Udostępnione przez znajomego
 mapper-a-friend = znajomy
 mapper-shared-by-owner-pair = Udostępnione przez { $sharer } · właściciel: { $owner }
 mapper-shared-by-person = Udostępnione przez { $person }
 mapper-window-title = Smudgy edytor map
 mapper-window-area-title = Smudgy edytor map — { $area }
-mapper-copy-report = Skopiowano obszary: { $copied }; pominięto: { $skipped } (nie można skopiować).
+mapper-copy-report = Skopiowano mapy: { $copied }; pominięto: { $skipped } (nie można skopiować).
 mapper-copy-rooms-denied = Właściciel tej mapy nie zezwolił na kopiowanie pokoi.
 mapper-create-first-room = Utwórz pierwszy pokój
 mapper-create-first-room-help = Następnie wybierz jego położenie na siatce.
@@ -965,16 +1457,18 @@ action-retry = Ponów próbę
 mapper-local-maps-signin = Mapy lokalne są zapisywane na tym urządzeniu. Zaloguj się, aby korzystać z map w chmurze, które synchronizują się między urządzeniami i które można udostępniać.
 mapper-sign-in-create = Zaloguj się lub utwórz konto
 mapper-copy-unavailable = Kopiowanie tej mapy nie jest dostępne.
-area-list-title = Obszary
+area-list-title = Mapy
 area-list-new-map = Nowa mapa
 area-list-new-folder = Nowy folder
 area-list-session-maps = Mapy sesji
-area-list-my-maps = Moje mapy
+area-list-my-local-maps = Moje mapy lokalne
+area-list-my-shared-maps = Moje udostępniane mapy
+area-list-not-in-folder = Poza folderem
 area-list-on-server = Na { $server }
 area-list-unassigned = Nieprzypisane
 area-list-other-servers = Inne serwery
 area-list-this-server = Ten serwer ({ $server })
-area-list-all-atlases = Wszystkie atlasy
+area-list-all-atlases = Wszystkie foldery
 area-list-empty = pusty
 area-list-new-map-folder = Nowa mapa w folderze
 area-list-rename-folder = Zmień nazwę folderu
@@ -991,6 +1485,10 @@ area-list-edit-badge = edycja
 area-list-move-action = Przenieś…
 area-list-shared-folder = Udostępniony folder
 area-list-shared-by = Udostępnione przez { $person }
+area-list-default-badge = Domyślny
+area-list-default-tip = Tu trafiają nowe mapy ze skryptów na { $server }, gdy nie wskazują folderu
+area-list-use-for-new-maps = Używaj dla nowych map na { $server }
+area-list-use-for-new-maps-failed = Nie udało się zmienić, dokąd trafiają nowe mapy: { $error }
 
 # Automations shell, dashboard, and command palette
 automations-title = Automatyzacje
@@ -1566,7 +2064,7 @@ manifest-tab-system = System
 manifest-sandbox-deny-note = Instalacja w sandboxie nie ma dostępu do niczego, co nie zostało tu wymienione.
 manifest-dependency-lock-note = Publikacja blokuje dokładną wersję każdej zależności w chwili publikacji. Użytkownicy otrzymają nowsze wersje zależności dopiero po wydaniu przez Ciebie nowej wersji tego pakietu, która je zaktualizuje.
 manifest-readable-path-warning = Ścieżka do odczytu spoza $DATA powoduje ostrzeżenie. Preferuj $DATA, chyba że odczyt zewnętrznych plików jest niezbędny.
-manifest-dependencies-help = Inne pakiety Smudgy, które ten pakiet importuje: smudgy://owner/name@^1.2. Obecnie obsługiwane są tylko pakiety smudgy://. Zarządzanie wersjami pakietów jsr i npm jest realizowane przez ich moduły ładujące, a pakiet może je importować, gdy ma dostęp do rejestru.
+manifest-dependencies-help = Inne pakiety Smudgy, które ten pakiet importuje: smudgy:@name@^1.2 (działa też smudgy://owner/name@^1.2). Obecnie obsługiwane są tylko pakiety Smudgy. Zarządzanie wersjami pakietów jsr i npm jest realizowane przez ich moduły ładujące, a pakiet może je importować, gdy ma dostęp do rejestru.
 manifest-add-dependency-placeholder = Dodaj jeden ze swoich zainstalowanych lub lokalnych pakietów…
 manifest-dependency = zależność
 manifest-any-version-placeholder = dowolna wersja
@@ -1576,7 +2074,7 @@ manifest-min-version-newer = Nowsza niż to Smudgy ({ $running }) — instalacja
 manifest-hosts-help = Hosty, na które ten pakiet jest kierowany w sekcji Odkrywaj, stosowane przy publikacji. Pozostaw puste, aby był niezależny od hosta.
 manifest-host = host
 manifest-required-packages = Wymagane pakiety
-manifest-required-packages-help = Pakiety instalowane automatycznie razem z tym pakietem, każdy działający we własnym sandboxie. Użyj smudgy://owner/name[@^1.2].
+manifest-required-packages-help = Pakiety instalowane automatycznie razem z tym pakietem, każdy działający we własnym sandboxie. Użyj smudgy:@name[@^1.2].
 manifest-required-package = wymagany pakiet
 manifest-allow-import = Zezwól innym na importowanie tego pakietu
 manifest-allow-import-help = Gdy wyłączone, moduły tego pakietu mogą importować tylko Twoje pakiety. Inne pakiety otrzymują wyłącznie typy. To zachowanie może się zmienić w przyszłej wersji.
@@ -1831,6 +2329,17 @@ package-search-meta =
        *[other] { $count } instalacji
     } ·
 package-you = Ty
+package-owner-clan = Klan
+package-owner-me = Ja
+package-owner = Właściciel: { $owner }
+package-publish-as = Opublikuj jako
+package-publish-as-clan-help = { $clan } będzie jego właścicielem: każdy członek klanu może go zainstalować, a klan decyduje, kto publikuje nowe wersje. Właściciela pakietu nie da się później zmienić.
+package-clan-private-help = Mogą go zainstalować tylko członkowie klanu.
+package-clan-cannot-create = { $clan }: nie możesz tworzyć pakietów w tym klanie. Opublikuj go jako własny albo poproś właścicieli klanu.
+package-clan-cannot-publish = { $clan }: nie możesz publikować nowych wersji tego pakietu.
+package-clan-refused = { $clan }: nie możesz tego zrobić z tym pakietem.
+package-claimed-for-me = Przerwana publikacja tego pakietu wybrała Ciebie jako właściciela. Opublikuj go jako własny, aby ją dokończyć.
+package-claimed-for-clan = Przerwana publikacja tego pakietu wybrała { $clan } jako właściciela. Opublikuj go w tym klanie, aby ją dokończyć.
 package-back = ‹ Wstecz
 package-comments = Komentarze
 package-comment-placeholder = Dodaj komentarz…
@@ -1927,6 +2436,9 @@ permission-can-sessions = Wchodzić w interakcję z innymi otwartymi sesjami, w 
 permission-can-display = Ukrywać, zmieniać styl, wstawiać lub zamieniać tekst gry oraz widzieć bieżący wiersz
 permission-can-map-read = Odczytywać Twoje mapy
 permission-can-map-write = Zmieniać Twoje mapy
+permission-can-secrets-read = Odczytywać Sekrety i prywatne dodatki Twoich map
+permission-can-secrets-write = Zmieniać Sekrety i prywatne dodatki Twoich map
+permission-can-secrets-manage = Tworzyć, zmieniać nazwy i usuwać Sekrety Twoich map
 permission-can-widgets = Tworzyć i zmieniać widgety na ekranie
 permission-can-panes = Tworzyć panele wyjścia sesji, kierować do nich wiersze gry oraz zapisywać i stosować nazwane układy okien
 permission-can-interop-write = Rozgłaszać zdarzenia pakietu i publikować współdzielony stan, na który inne pakiety mogą reagować 
@@ -1959,7 +2471,8 @@ permission-cannot-read-files = odczytywać Twoich plików
 permission-cannot-write-files = modyfikować Twoich plików
 permission-cannot-read-env = odczytywać zmiennych środowiskowych
 package-private-shared = Prywatne i udostępnione
-package-private-shared-subtitle = Prywatne pakiety, które posiadasz, oraz pakiety udostępnione Ci przez znajomych.
+package-private-shared-subtitle = Twoje pakiety, pakiety udostępnione przez znajomych i dostępne dla Ciebie pakiety klanów.
+package-clan-packages = Pakiety klanów
 package-your-packages = Twoje pakiety
 package-local = Lokalne
 package-no-owned-cloud = Nie posiadasz jeszcze żadnych pakietów w chmurze.
@@ -2195,3 +2708,218 @@ package-settings-restore-action = Przywróć
 package-settings-all-profiles = Wszystkie profile
 package-settings-required = * Wymagane
 package-settings-copied-with-secrets = Skopiowano zapisane ustawienia. Bez sekretów.
+
+# Link editor: a room's Exits (compass, one row per link) and a selected link
+compass-north = Pn
+compass-northeast = PnW
+compass-east = W
+compass-southeast = PdW
+compass-south = Pd
+compass-southwest = PdZ
+compass-west = Z
+compass-northwest = PnZ
+compass-up = G
+compass-down = D
+compass-in = wew
+compass-out = zew
+compass-special = spec
+compass-other = inne
+mapper-room-name = #{ $number }
+mapper-room-name-titled = #{ $number } · { $title }
+mapper-place-room-name = { $place } #{ $number }
+mapper-place-room-name-titled = { $place } #{ $number } · { $title }
+mapper-other-map-prefix = { $map } ›
+link-nowhere = (bez celu)
+link-add-exit = + Dodaj wyjście…
+link-new-exit = Nowe wyjście ({ $direction }) z: { $room }
+link-leaves = wychodzi
+link-arrives-from = przychodzi z
+link-weight = waga
+link-command = polecenie
+link-heading = Połączenie
+link-change = Zmień ▾
+link-change-close = Zamknij ▴
+link-two-way = ⇄ dwukierunkowe
+link-one-way = → jednokierunkowe
+link-swap = ⇅ zamień końce
+link-return-elsewhere = Droga powrotna jest zapisana w: { $map }.
+link-two-way-would-show = Droga powrotna byłaby widoczna dla każdego, kto czyta: { $map }.
+link-door-name-too-long = Nazwa drzwi jest za długa (limit znaków: { $limit }).
+link-opens-with-too-long = Polecenie otwierające drzwi jest za długie (limit znaków: { $limit }).
+link-doors = Drzwi
+link-same-doors = takie same po obu stronach
+link-door-both = Drzwi po obu stronach
+link-door-one = Drzwi
+link-door-side = Drzwi po stronie: { $room }
+link-door-none = Brak
+link-door-open = Otwarte
+link-door-closed = Zamknięte
+link-door-locked = Zablokowane
+link-hidden-exit = ukryte wyjście
+link-named = nazwane
+link-opens-with = otwiera
+link-door-default-name = door
+link-opens-with-placeholder = open { $name }
+link-hidden = ukryte
+link-door = { $state ->
+    [open] otwarte drzwi
+    [closed] zamknięte drzwi
+   *[locked] zablokowane drzwi
+}
+link-door-named = „{ $name }”, { $state ->
+    [open] otwarte
+    [closed] zamknięte
+   *[locked] zablokowane
+}
+link-segments = Odcinki
+link-corners = Narożniki
+link-line = Linia
+link-thickness = Grubość
+link-color-reset = Przywróć
+link-ports = Porty
+link-remove = Usuń połączenie
+link-picker-help = Kliknij pokój na mapie lub wyszukaj
+link-picker-placeholder = Tytuł pokoju lub #numer
+link-picker-map-placeholder = Nazwa mapy
+link-picker-this-map-group = Ta mapa
+link-picker-places-group = Sekrety na tej mapie
+link-picker-other-map = Inna mapa…
+link-picker-other-maps = Inne mapy
+link-picker-this-map = Wróć do tej mapy
+link-picker-nothing = Żaden pokój nie pasuje.
+link-picker-no-destination = Na razie bez celu
+link-picker-more = { $count ->
+    [one] jeszcze 1 — wpisz, aby zawęzić
+    [few] jeszcze { $count } — wpisz, aby zawęzić
+    [many] jeszcze { $count } — wpisz, aby zawęzić
+   *[other] jeszcze { $count } — wpisz, aby zawęzić
+}
+mapper-link-not-changed = Nie udało się zmienić połączenia.
+
+# Scoped group permissions.
+
+permissions-tab-clan = Klan
+permissions-title = Uprawnienia grupy { $group }
+permissions-manage = Zarządzaj uprawnieniami
+permissions-select-resource = Wybierz folder, mapę lub pakiet, aby zarządzać uprawnieniami tej grupy.
+permissions-other-maps = Mapy poza wymienionymi folderami
+permissions-owners-implicit = Właściciele klanu mają pełne uprawnienia w całym klanie, z wyjątkiem map i sekretów należących do członków.
+permissions-folder-inheritance = Uprawnienia obejmują ten folder oraz obecne i przyszłe mapy klanu w nim umieszczone. Mapy należące do członków zachowują własne zasady dostępu.
+permissions-direct-note = Uprawnienia z innych nadań obowiązują do czasu zmiany u źródła. Bezpośrednie uprawnienia mogą dodać dostęp, ale nie mogą odmówić dostępu odziedziczonego.
+permissions-inherited = Dostęp także przez { $scope }: { $permissions }.
+permissions-edit-origin = Edytuj pierwotne nadanie
+permissions-delegation-title = Uprawnienia, które grupa może nadawać innym
+permissions-delegation-help = Wybierz uprawnienia, które członkowie mogą nadawać do tego zasobu. Nadania pozostają w tych granicach i wygasają wraz z delegacją. Zarządzanie dostępem samo w sobie nie pozwala czytać ani edytować treści.
+permission-help-clan-edit-profile = Zmieniaj nazwę i opis klanu.
+permission-help-clan-read-members = Przeglądaj listę członków klanu.
+permission-help-clan-invite = Zapraszaj do klanu.
+permission-help-clan-revoke-invitation = Anuluj oczekujące zaproszenia przed ich przyjęciem.
+permission-help-clan-remove-member = Usuwaj zwykłych członków i odbieraj im dostęp do klanu. Tylko właściciele klanu mogą zmieniać własność.
+permission-help-group-create = Twórz grupy. Twórca dołącza do nowej grupy i może nią zarządzać, dopóki należy do klanu.
+permission-help-group-rename = Zmieniaj nazwy i kolory grup bez zmiany uprawnień ani członkostwa.
+permission-help-group-delete = Usuwaj grupy niestandardowe i dostęp wynikający z ich nadań. Grup wbudowanych nie można usunąć.
+permission-help-group-assign = Dodawaj i usuwaj członków. Zyskują lub tracą uprawnienia grupy, w tym dostęp do udostępnionych jej Sekretów. Dodanie siebie do cudzej grupy wymaga własności klanu.
+permission-help-group-inspect-assignments = Pozwól członkom tej grupy sprawdzać, kto należy do każdej grupy.
+permission-help-atlas-create = Twórz foldery klanu. Dostęp wewnątrz każdego folderu trzeba nadać osobno; to uprawnienie nie daje dostępu do istniejących map.
+permission-help-package-create = Twórz pakiety klanu. Edycja i publikowanie wymagają uprawnień do nowego pakietu. Inne pakiety mają własne uprawnienia.
+permission-help-atlas-read = Wyświetlaj ten folder. Czytanie map wewnątrz wymaga osobnego uprawnienia.
+permission-help-atlas-rename = Zmieniaj nazwę folderu. Jego mapy i uprawnienia pozostają na miejscu.
+permission-help-atlas-delete = Usuwaj folder zgodnie z zasadami klanu. To uprawnienie mają tylko właściciele klanu.
+permission-help-atlas-accept-filing = Zezwalaj na przenoszenie map do tego folderu. Przeniesienie wymaga też uprawnienia do przenoszenia danej mapy z jej obecnego folderu.
+permission-help-atlas-accept-transfer = Przenoś własne mapy do tego folderu klanu. Wybierz, czy klan ma zostać ich właścicielem, czy zachowasz własność. Istniejące udostępnienia map zostaną zakończone.
+permission-help-area-create = Twórz mapy klanu w tym folderze. Twórca może edytować nową mapę; właściciele klanu zachowują pełną władzę właścicielską.
+permission-help-area-create-member-owned = Twórz tu mapy należące do członków. Dostęp kontrolują ich zapisani właściciele; uprawnienia folderu ani własność klanu ich nie ujawniają.
+permission-help-area-read = Czytaj zwykłą treść mapy. Nie ujawnia to Sekretów ani prywatnych dodatków innych osób. Czytanie Sekretu wymaga też dostępu do mapy. Na mapach należących do członków odczyt pozostaje włączony, dopóki nadane jest jakiekolwiek inne uprawnienie do mapy.
+permission-help-area-add = Dodawaj zwykłą treść mapy. Nadal wymagane jest prawo odczytu mapy. Nie pozwala to edytować istniejącej treści ani pisać w Sekretach.
+permission-help-area-edit = Zmieniaj istniejącą zwykłą treść mapy. Wymagany jest odczyt mapy. Edycja treści Sekretów ma osobne uprawnienia.
+permission-help-area-remove-content = Usuwaj zwykłą treść mapy. Usunięcie pokoju usuwa też dołączone dodatki Sekretów i prywatne. Nie pozwala to usuwać całej mapy.
+permission-help-area-rename = Zmieniaj nazwę mapy bez zmiany jej własności ani treści.
+permission-help-area-refile = Przenoś mapę do innego folderu klanu, który zezwala na przyjmowanie map. Uprawnienia docelowego folderu mogą zmienić dostęp do mapy.
+permission-help-area-delete = Usuwaj całą mapę wraz z Sekretami i prywatnymi dodatkami. To odrębne uprawnienie od usuwania zwykłej treści.
+permission-help-area-copy = Twórz niezależną kopię. Sekret jest kopiowany tylko z własnym uprawnieniem kopiowania; prywatne dodatki innych osób nigdy nie są kopiowane.
+permission-help-area-share-external = Udostępniaj znajomym spoza klanu mapę tylko do odczytu, bez edycji, kopiowania i Sekretów. Udostępnienie kończy się po odejściu osoby udostępniającej lub utracie tego uprawnienia.
+permission-help-secret-create-member-owned = Twórz Sekrety członków na czytelnej mapie. Ich właściciele wybierają odbiorców; sama własność klanu nie daje dostępu.
+permission-help-secret-create-clan-owned = Twórz Sekrety klanu na czytelnych mapach klanu. Twórca może czytać, dodawać i edytować nowy Sekret. Właściciele klanu zachowują pełną władzę.
+permission-help-secret-read = Czytaj Sekrety klanu na tych mapach. Wymagany jest też odczyt mapy. Nigdy nie ujawnia to Sekretów należących do członków.
+permission-help-secret-add = Dodawaj treść do Sekretów klanu. Mapa i Sekret muszą być czytelne. Zwykła treść mapy ma osobne uprawnienia.
+permission-help-secret-edit = Zmieniaj treść Sekretów klanu. Mapa i Sekret muszą być czytelne. Czytelnik mapy może edytować Sekret bez prawa edycji samej mapy.
+permission-help-secret-remove-content = Usuwaj treść Sekretów klanu. Mapa i Sekret muszą być czytelne. Nie pozwala to usuwać całego Sekretu ani zmieniać Sekretów członków.
+permission-help-secret-manage-access = Przeglądaj i odwołuj nadania Sekretów klanu oraz nadawaj posiadane uprawnienia. Nie daje to własności ani kontroli nad Sekretami członków.
+permission-help-secret-copy = Dołączaj Sekrety klanu przy kopiowaniu mapy. Mapa także wymaga uprawnienia kopiowania. Kopie są niezależne od późniejszych zmian dostępu.
+permission-help-grant-inspect = Przeglądaj nadania obejmujące ten zasób i zasoby w jego zakresie. Samo uprawnienie nie ujawnia Sekretów ani nie pozwala zmieniać dostępu.
+permission-help-grant-manage = Nadawaj dostęp w tym zakresie i granicach poniżej. Tylko właściciele klanu mogą nadać to uprawnienie. Nie daje ono własności.
+permission-help-package-read = Wyświetlaj pakiet w zasobach klanu. Członkowie klanu nadal mogą instalować opublikowane pakiety klanu po nazwie bez tego uprawnienia. Nie daje ono prawa publikacji ani edycji.
+permission-help-package-edit-draft = Przesyłaj i zmieniaj wersję roboczą pakietu. Publikowanie wymaga osobnego uprawnienia.
+permission-help-package-edit-metadata = Zmieniaj metadane pakietu. Publikowanie i zmiana dostępności wymagają osobnych uprawnień.
+permission-help-package-manage-availability = Zmieniaj publiczną dostępność pakietu. Pakiet publiczny mogą znaleźć i pobrać osoby spoza klanu.
+permission-help-package-publish = Publikuj nowe wersje. Osoby mające pakiet mogą otrzymać nowy kod podczas aktualizacji.
+permission-help-package-retire = Wycofuj wersje zgodnie z zasadami rejestru. Nie usuwa to całego pakietu.
+permission-help-package-delete = Usuwaj pakiet zgodnie z zasadami rejestru. Pobrane kopie mogą pozostać na urządzeniach innych osób.
+permission-help-read = Czytaj Sekret, gdy jego mapa jest czytelna. Nadanie Sekretu nigdy nie daje dostępu do samej mapy.
+permission-help-add = Dodawaj treść do Sekretu. Edycja i usuwanie istniejącej treści wymagają osobnych uprawnień.
+permission-help-edit = Zmieniaj istniejącą treść Sekretu. Zwykła treść mapy ma osobne uprawnienia.
+permission-help-remove = Usuwaj treść Sekretu. Nie pozwala to usuwać całego Sekretu.
+permission-help-manage-access = Przeglądaj i odwołuj nadania Sekretu oraz nadawaj posiadane uprawnienia. Tylko właściciele mogą wyznaczać zarządców dostępu lub zmieniać własność.
+permission-help-copy = Dołączaj Sekret do niezależnej kopii mapy. Mapa także wymaga uprawnienia kopiowania. Późniejsze odebranie dostępu nie usuwa już wykonanych kopii.
+
+permissions-clan-note = Te uprawnienia dotyczą całego klanu. Wybierz Mapy lub Pakiety, aby ustawić dostęp do poszczególnych zasobów.
+permissions-section-clan = Klan i członkostwo
+permissions-section-groups = Zarządzanie grupami
+permissions-section-creation = Tworzenie zasobów
+permissions-section-access = Zarządzanie dostępem
+permissions-section-secret-creation = Tworzenie Sekretów
+
+move-review-loading = Sprawdzanie zmian dostępu…
+move-review-selection = Pokoje: { $rooms } · Połączenia: { $links } · Etykiety: { $labels } · Kształty: { $shapes }
+move-review-destination-notice = Przeniesiona zawartość będzie podlegać uprawnieniom miejsca docelowego, w tym dostępowi, którego nie możesz sprawdzić.
+move-review-filing-notice = Przeniesienie tej mapy może zmienić dostęp innych członków do Sekretów, których nie możesz sprawdzić. Własność Sekretów i jawne ustawienia udostępniania pozostaną bez zmian.
+move-review-group = { $name }, w tym przyszli członkowie
+move-review-members = Członkowie klanu, w tym przyszli członkowie
+move-review-and = { " ORAZ " }
+move-review-overlap = Te grupy odbiorców mogą uzyskać lub utracić wymienione uprawnienia. Nakładające się nadania mogą zachować dostęp niektórych członków.
+move-review-gain = Możliwe uzyskanie: { $actions }
+move-review-loss = Możliwa utrata: { $actions }
+move-review-share-right = Przekazywanie uprawnienia: { $action }
+move-review-right-read = Odczyt
+move-review-right-add = Dodawanie
+move-review-right-edit = Edycja
+move-review-right-remove = Usuwanie zawartości
+move-review-right-copy = Kopiowanie
+move-review-right-manage-access = Zarządzanie dostępem
+move-review-right-rename = Zmiana nazwy
+move-review-right-delete = Usuwanie
+move-review-right-manage-ownership = Zarządzanie własnością
+
+mapper-clipboard-one-source = Wybierz zawartość z jednego źródła naraz.
+mapper-cut-remove-required = Przenoszenie wymaga uprawnienia Usuwanie w źródle i Dodawanie w miejscu docelowym.
+mapper-cut-ready = Gotowe do przeniesienia. Oryginał pozostanie do pomyślnego wklejenia.
+mapper-cut-cross-map-unavailable = Przenoszenie między mapami nie jest jeszcze obsługiwane. Oryginał pozostaje bez zmian. Użyj Kopiuj, aby go powielić.
+mapper-cut-stale = Źródło zmieniło się od wycięcia. Zaznacz zawartość i wytnij ją ponownie.
+mapper-cut-same-source = Wybierz inne źródło przed wklejeniem lub użyj Wklej tutaj, aby zmienić położenie zaznaczenia.
+move-review-preserve-positions = Przenoszenie między źródłami zachowuje położenie obiektów i istniejące odwołania do pomieszczeń.
+
+mapper-copy-source-denied = Wymagane jest uprawnienie Kopiowanie dla źródła tej zawartości.
+
+cloud-error-access-review-required = Przed potwierdzeniem przeniesienia sprawdź, kto zyska lub utraci dostęp. Nic nie zostało przeniesione.
+cloud-error-stale-access-review = Dostęp zmienił się po sprawdzeniu. Rozpocznij przenoszenie ponownie, aby sprawdzić aktualny wynik. Nic nie zostało przeniesione.
+cloud-error-move-property-conflict = Miejsce docelowe przechowuje inne wartości niektórych właściwości pokoi. Rozwiąż te różnice przed przeniesieniem. Oryginalna zawartość pozostaje bez zmian.
+
+mapper-additional-room-data = Dodatkowe dane pokoju
+
+move-property-to = Przenieś do…
+move-review-properties = Wybrane właściwości: { $count }
+move-review-property-no-undo = Ten ruch scala istniejące dane i nie można go cofnąć. Wybierz wartość do zachowania dla każdej sprzecznej właściwości.
+move-review-property-source = Przenoszona: { $value }
+move-review-property-destination = Docelowa: { $value }
+move-review-property-keep-source = Zachowaj przenoszoną
+move-review-property-keep-destination = Zachowaj docelową
+
+mapper-attached-rooms = Pokoje z danymi w tym źródle
+
+area-list-filter-placeholder = Filtruj mapy i foldery…
+
+area-list-no-matches = Brak pasujących map lub folderów.
+
+mapper-multi-transferred = Przeniesiono „{ $name }” do klanu.
+
+clan-maps-no-transfer-folder = Brak folderów klanu, do których możesz przenieść tę mapę.

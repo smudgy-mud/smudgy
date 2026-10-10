@@ -19,7 +19,7 @@ use super::state::{
     FriendStatus, FriendshipRecord, GrantRecord, LabelRecord, MockState, RoomPropRecord,
     RoomRecord, SESSION_PREFIX, SessionRecord, ShapeRecord, UserRecord, gen_token,
 };
-use super::{areas, clone, identity, mutations, shares, social, transfers};
+use super::{areas, clone, identity, mutations, secret_grants, secrets, shares, social, transfers};
 
 pub type Shared = Arc<Mutex<MockState>>;
 
@@ -39,13 +39,33 @@ pub enum GrantScope {
     Atlas(Uuid),
 }
 
+/// A room a Secret's content names, for the Secret pokes on [`MockHandle`]:
+/// a room of the Secret's map, one of the Secret's own rooms, or a room of
+/// another map.
+#[derive(Debug, Clone, Copy)]
+pub enum SecretPlace {
+    Map(i32),
+    Own(i32),
+    Elsewhere(AreaId, i32),
+}
+
+/// Secret `secret` of map `area`, for a state poke.
+fn secret_mut(st: &mut MockState, area: AreaId, secret: Uuid) -> &mut super::state::SecretRecord {
+    st.areas
+        .get_mut(&area.0)
+        .expect("area exists")
+        .secrets
+        .iter_mut()
+        .find(|candidate| candidate.id == secret)
+        .expect("Secret exists")
+}
+
 /// Capability flags for [`MockHandle::grant`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GrantFlags {
     pub can_edit: bool,
     pub can_reshare: bool,
     pub can_copy: bool,
-    pub include_secrets: bool,
     pub can_admin: bool,
 }
 
@@ -54,7 +74,6 @@ impl GrantFlags {
         can_edit: false,
         can_reshare: false,
         can_copy: false,
-        include_secrets: false,
         can_admin: false,
     };
 
@@ -64,7 +83,6 @@ impl GrantFlags {
             can_edit: true,
             can_reshare: false,
             can_copy: false,
-            include_secrets: false,
             can_admin: false,
         }
     }
@@ -76,7 +94,6 @@ impl GrantFlags {
             can_edit: false,
             can_reshare: false,
             can_copy: false,
-            include_secrets: false,
             can_admin: true,
         }
     }
@@ -113,13 +130,27 @@ impl MockServer {
 
 fn router(state: Shared) -> Router {
     Router::new()
+        .merge(
+            super::clans::routes()
+                .merge(super::clan_resources::routes())
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    credentials_first,
+                )),
+        )
+        .merge(super::clan_maps::routes())
+        .merge(super::clan_secrets::routes())
         // identity
-        .route("/auth/signup", post(identity::signup))
         .route("/auth/login", post(identity::login))
         .route("/auth/verify-email", post(identity::verify_email))
         .route("/auth/logout", post(identity::logout))
         .route("/auth/refresh", post(identity::refresh_session))
-        .route("/me", get(identity::get_me).patch(identity::patch_me))
+        .route(
+            "/me",
+            get(identity::get_me)
+                .patch(identity::patch_me)
+                .delete(identity::delete_me),
+        )
         .route(
             "/me/api-keys",
             get(identity::list_api_keys).post(identity::create_api_key),
@@ -164,10 +195,36 @@ fn router(state: Shared) -> Router {
                 .delete(areas::delete_area),
         )
         .route("/areas/:area_id/mutations", post(mutations::area_mutations))
+        .route(
+            "/areas/:area_id/local-move",
+            get(areas::review_local_move).post(areas::finish_local_move),
+        )
         .route("/areas/:area_id/shares", get(shares::area_shares))
-        .route("/areas/:area_id/secret-marks", post(clone::secret_marks))
-        .route("/areas/:area_id/secrets", get(clone::list_secrets))
-        .route("/areas/:area_id/preview", get(clone::preview_area))
+        .route(
+            "/areas/:area_id/secrets",
+            get(clone::list_secrets).post(secrets::create_secret),
+        )
+        .route("/areas/:area_id/moves", post(super::reviewed_moves::commit))
+        .route(
+            "/areas/:area_id/filing-review",
+            post(super::filing::preview),
+        )
+        .route(
+            "/areas/:area_id/moves/preview",
+            post(super::reviewed_moves::preview),
+        )
+        .route(
+            "/secrets/:secret_id",
+            axum::routing::patch(secrets::rename_secret).delete(secrets::delete_secret),
+        )
+        .route(
+            "/secrets/:secret_id/grants",
+            get(secret_grants::list_grants).post(secret_grants::create_grant),
+        )
+        .route(
+            "/secrets/:secret_id/grants/:grant_id",
+            axum::routing::patch(secret_grants::update_grant).delete(secret_grants::revoke_grant),
+        )
         .route("/areas/:area_id/copy", post(clone::copy_area))
         .route(
             "/areas/:area_id/properties/:name",
@@ -210,6 +267,10 @@ fn router(state: Shared) -> Router {
         )
         .route("/transfers", get(transfers::list_transfers))
         .route(
+            "/clans/:clan_id/transfers",
+            get(transfers::list_clan_transfers),
+        )
+        .route(
             "/transfers/:transfer_id/accept",
             post(transfers::accept_transfer),
         )
@@ -225,6 +286,22 @@ fn router(state: Shared) -> Router {
         // every request passes through it before any handler runs.
         .layer(middleware::from_fn_with_state(state.clone(), version_gate))
         .with_state(state)
+}
+
+/// A clan route answers a request without valid credentials 401, whatever
+/// the shape of its path or body, mirroring the server's `credentialsFirst`
+/// (src/clans/routes.ts): a shape refusal (a 400, or the 404 of a malformed
+/// path ID), which a route may judge before it authenticates, is answered
+/// only once the credentials are.
+async fn credentials_first(State(state): State<Shared>, request: Request, next: Next) -> Response {
+    let headers = request.headers().clone();
+    let response = next.run(request).await;
+    if matches!(response.status().as_u16(), 400 | 404)
+        && let Err(denied) = super::http::authenticate(&state.lock(), &headers)
+    {
+        return denied;
+    }
+    response
 }
 
 /// Reject a too-old client with 426 before routing, mirroring the real
@@ -338,8 +415,10 @@ impl MockHandle {
             AtlasRecord {
                 id,
                 user_id: owner.id,
+                clan_id: None,
                 name: name.to_string(),
                 created_at: Utc::now(),
+                rev: 1,
             },
         );
         id
@@ -357,14 +436,14 @@ impl MockHandle {
     }
 
     /// Direct state poke: add a room (no rev bump — test setup).
-    pub fn add_room(&self, area: AreaId, room_number: i32, title: &str, is_secret: bool) {
+    pub fn add_room(&self, area: AreaId, room_number: i32, title: &str) {
         let mut st = self.state.lock();
         let area = st.areas.get_mut(&area.0).expect("area exists");
         area.rooms.insert(
             room_number,
             RoomRecord {
+                identity: Uuid::new_v4(),
                 title: title.to_string(),
-                is_secret,
                 ..RoomRecord::placeholder(room_number)
             },
         );
@@ -374,17 +453,13 @@ impl MockHandle {
     /// exit attaches to a Connection through the same server-style rules as
     /// the mutation endpoint (auto-pair the unique reciprocal one-member
     /// candidate, else a fresh one-member Connection), so seeded state
-    /// always satisfies the v2 membership invariants. NOTE the §6 closure
-    /// consequence: a reciprocal seed pair forms ONE Connection, so one
-    /// secret member hides BOTH exits from an uncleared viewer — seed
-    /// non-reciprocal shapes when a fixture needs them redacted separately.
+    /// always satisfies the v2 membership invariants.
     pub fn add_exit(
         &self,
         area: AreaId,
         from_room: i32,
         direction: &str,
         to: Option<(AreaId, i32)>,
-        is_secret: bool,
     ) -> Uuid {
         let mut st = self.state.lock();
         let id = Uuid::new_v4();
@@ -397,13 +472,12 @@ impl MockHandle {
                 to_area_id: to.map(|(a, _)| a.0),
                 to_room_number: to.map(|(_, n)| n),
                 to_direction: None,
-                is_secret,
                 new_connection_id: None,
             },
-            true, // direct pokes are owner-level setup
         );
         let area = st.areas.get_mut(&area.0).expect("area exists");
         area.exits.push(ExitRecord {
+            to_room_identity: None,
             id,
             from_room_number: from_room,
             from_direction: direction.to_string(),
@@ -412,17 +486,16 @@ impl MockHandle {
             to_direction: None,
             path: String::new(),
             is_hidden: false,
-            is_closed: false,
-            is_locked: false,
+            door: None,
             weight: 1.0,
             command: String::new(),
             connection_id,
-            is_secret,
+            to_secret: None,
         });
         id
     }
 
-    pub fn add_label(&self, area: AreaId, text: &str, is_secret: bool) -> Uuid {
+    pub fn add_label(&self, area: AreaId, text: &str) -> Uuid {
         let mut st = self.state.lock();
         let id = Uuid::new_v4();
         let area = st.areas.get_mut(&area.0).expect("area exists");
@@ -440,12 +513,11 @@ impl MockHandle {
             background_color: "white".to_string(),
             font_size: 12,
             font_weight: 400,
-            is_secret,
         });
         id
     }
 
-    pub fn add_shape(&self, area: AreaId, is_secret: bool) -> Uuid {
+    pub fn add_shape(&self, area: AreaId) -> Uuid {
         let mut st = self.state.lock();
         let id = Uuid::new_v4();
         let area = st.areas.get_mut(&area.0).expect("area exists");
@@ -461,32 +533,201 @@ impl MockHandle {
             shape_type: "Rectangle".to_string(),
             border_radius: 0.0,
             stroke_width: 1.0,
-            is_secret,
         });
         id
     }
 
-    pub fn set_area_property(&self, area: AreaId, name: &str, value: &str, is_secret: bool) {
+    /// Direct state poke: add an owner Secret to the map. Returns its id.
+    pub fn add_secret(&self, area: AreaId, name: &str) -> Uuid {
+        let mut st = self.state.lock();
+        let id = Uuid::new_v4();
+        st.areas
+            .get_mut(&area.0)
+            .expect("area exists")
+            .secrets
+            .push(super::state::SecretRecord::new(id, name.to_string()));
+        id
+    }
+
+    /// Direct state poke: one of Secret `secret`'s own rooms.
+    pub fn add_secret_room(&self, area: AreaId, secret: Uuid, room_number: i32, title: &str) {
+        assert!(
+            room_number < super::state::STAND_IN,
+            "a Secret room number in range"
+        );
+        let mut st = self.state.lock();
+        let secret = secret_mut(&mut st, area, secret);
+        secret.rooms.insert(
+            room_number,
+            RoomRecord {
+                identity: Uuid::new_v4(),
+                title: title.to_string(),
+                ..RoomRecord::placeholder(room_number)
+            },
+        );
+    }
+
+    /// Direct state poke: an exit Secret `secret` keeps, from `from` to
+    /// `to`, attached to a Connection by the same rules as a write (a
+    /// unique reciprocal one-member exit pairs). A map room it names must
+    /// exist; the Secret's stand-in for it is made as needed.
+    pub fn add_secret_exit(
+        &self,
+        area: AreaId,
+        secret: Uuid,
+        from: SecretPlace,
+        direction: &str,
+        to: Option<SecretPlace>,
+    ) -> Uuid {
+        let mut st = self.state.lock();
+        let map = st.areas.get(&area.0).expect("area exists").clone();
+        let index = map
+            .secrets
+            .iter()
+            .position(|candidate| candidate.id == secret)
+            .expect("Secret exists");
+        let key = |place: SecretPlace| -> (Uuid, i32) {
+            match place {
+                SecretPlace::Map(room) => {
+                    assert!(map.rooms.contains_key(&room), "map room {room} exists");
+                    (area.0, super::state::stand_in(room).expect("in range"))
+                }
+                SecretPlace::Own(room) => (area.0, room),
+                SecretPlace::Elsewhere(other, room) => (other.0, room),
+            }
+        };
+        let (_, from_key) = key(from);
+        let to = to.map(key);
+        let mut working = super::connections::Working::new();
+        let mut doc = super::secrets::secret_doc(&map, &map.secrets[index]);
+        doc.rooms
+            .entry(from_key)
+            .or_insert_with(|| RoomRecord::placeholder(from_key));
+        if let Some((to_area, to_key)) = to
+            && to_area == area.0
+        {
+            doc.rooms
+                .entry(to_key)
+                .or_insert_with(|| RoomRecord::placeholder(to_key));
+        }
+        working.insert(area.0, doc);
+        let connection_id = super::connections::attach_for_new_exit(
+            &mut working,
+            area.0,
+            &super::connections::NewExitLink {
+                from_room: from_key,
+                from_direction: direction.to_string(),
+                to_area_id: to.map(|(to_area, _)| to_area),
+                to_room_number: to.map(|(_, to_key)| to_key),
+                to_direction: None,
+                new_connection_id: None,
+            },
+        );
+        let id = Uuid::new_v4();
+        let mut doc = working.remove(&area.0).expect("just inserted");
+        doc.exits.push(ExitRecord {
+            to_room_identity: None,
+            id,
+            from_room_number: from_key,
+            from_direction: direction.to_string(),
+            to_area_id: to.map(|(to_area, _)| to_area),
+            to_room_number: to.map(|(_, to_key)| to_key),
+            to_direction: None,
+            path: String::new(),
+            is_hidden: true,
+            door: None,
+            weight: 1.0,
+            command: String::new(),
+            connection_id,
+            to_secret: None,
+        });
+        let secret = secret_mut(&mut st, area, secret);
+        super::secrets::store_doc(secret, doc);
+        id
+    }
+
+    /// Direct state poke: Secret `secret`'s own property `name` on `place`
+    /// (one of its rooms, or its data for a map room).
+    pub fn set_secret_room_property(
+        &self,
+        area: AreaId,
+        secret: Uuid,
+        place: SecretPlace,
+        name: &str,
+        value: &str,
+    ) {
+        let mut st = self.state.lock();
+        let key = match place {
+            SecretPlace::Map(room) => super::state::stand_in(room).expect("in range"),
+            SecretPlace::Own(room) => room,
+            SecretPlace::Elsewhere(..) => panic!("a Secret keeps data on its own map's rooms"),
+        };
+        let secret = secret_mut(&mut st, area, secret);
+        secret
+            .rooms
+            .entry(key)
+            .or_insert_with(|| RoomRecord::placeholder(key))
+            .properties
+            .insert(
+                name.to_string(),
+                RoomPropRecord {
+                    value: value.to_string(),
+                },
+            );
+    }
+
+    /// Direct state poke: `grantor` shares Secret `secret` with `grantee`,
+    /// with `read` and `actions`. Returns the grant id.
+    pub fn grant_secret(
+        &self,
+        area: AreaId,
+        secret: Uuid,
+        grantor: &TestUser,
+        grantee: &TestUser,
+        actions: &[&'static str],
+    ) -> Uuid {
+        let mut st = self.state.lock();
+        let id = Uuid::new_v4();
+        secret_mut(&mut st, area, secret)
+            .grants
+            .push(super::state::SecretGrantRecord {
+                id,
+                grantor_id: grantor.id,
+                grantee_id: grantee.id,
+                actions: actions.iter().copied().collect(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        id
+    }
+
+    /// Direct state poke: every grant of Secret `secret` to `grantee` goes.
+    pub fn revoke_secret(&self, area: AreaId, secret: Uuid, grantee: &TestUser) {
+        let mut st = self.state.lock();
+        secret_mut(&mut st, area, secret)
+            .grants
+            .retain(|grant| grant.grantee_id != grantee.id);
+    }
+
+    /// A Secret's revision, as its readers see it.
+    pub fn secret_rev(&self, area: AreaId, secret: Uuid) -> i64 {
+        let mut st = self.state.lock();
+        secret_mut(&mut st, area, secret).rev
+    }
+
+    pub fn set_area_property(&self, area: AreaId, name: &str, value: &str) {
         let mut st = self.state.lock();
         let area = st.areas.get_mut(&area.0).expect("area exists");
         area.properties.insert(
             name.to_string(),
             AreaPropRecord {
                 value: value.to_string(),
-                is_secret,
                 created_at: Utc::now(),
             },
         );
     }
 
-    pub fn set_room_property(
-        &self,
-        area: AreaId,
-        room_number: i32,
-        name: &str,
-        value: &str,
-        is_secret: bool,
-    ) {
+    pub fn set_room_property(&self, area: AreaId, room_number: i32, name: &str, value: &str) {
         let mut st = self.state.lock();
         let area = st.areas.get_mut(&area.0).expect("area exists");
         let room = area.rooms.get_mut(&room_number).expect("room exists");
@@ -494,7 +735,6 @@ impl MockHandle {
             name.to_string(),
             RoomPropRecord {
                 value: value.to_string(),
-                is_secret,
             },
         );
     }
@@ -557,7 +797,6 @@ impl MockHandle {
             can_edit: flags.can_edit,
             can_reshare: flags.can_reshare,
             can_copy: flags.can_copy,
-            include_secrets: flags.include_secrets,
             can_admin: flags.can_admin,
             host_hints,
             parent_grant_id: None,
@@ -567,10 +806,10 @@ impl MockHandle {
         id
     }
 
-    /// Bump both revs (a generic "something changed" poke).
+    /// Bump the map's revision (a generic "something changed" poke).
     pub fn bump_rev(&self, area: AreaId) {
         let mut st = self.state.lock();
-        st.bump(Some(area.0), true, false);
+        st.bump(Some(area.0));
     }
 
     /// Queue N compound-mutation responses to be dropped: each affected
@@ -588,10 +827,62 @@ impl MockHandle {
         self.state.lock().refuse_mutations = n;
     }
 
+    /// Runs `during` inside the next transfer acceptance, between its claim
+    /// and its flip; `during` returning `true` stops the acceptance there.
+    pub fn interrupt_next_acceptance(
+        &self,
+        during: fn(&mut super::state::MockState, &super::state::PendingTransferRecord) -> bool,
+    ) {
+        self.state.lock().interrupt_acceptance = Some(during);
+    }
+
     /// Queue N area-delete failures: each affected `DELETE /areas/{id}`
     /// answers 500 and deletes nothing.
     pub fn fail_next_area_deletes(&self, n: u32) {
         self.state.lock().fail_area_deletes = n;
+    }
+
+    /// Queue N area-read failures: each `GET /areas/{id}` answers 500.
+    /// Stop the next `n` account deletions right after the mark, with a 500.
+    pub fn interrupt_next_account_deletions(&self, n: u32) {
+        self.state.lock().interrupt_account_deletions = n;
+    }
+
+    /// Stop the next `n` clan dissolutions right after the clan is marked
+    /// dissolving, with a 500; the clan stays dissolving until a repeat
+    /// finishes it.
+    pub fn interrupt_next_dissolutions(&self, n: u32) {
+        self.state.lock().interrupt_dissolutions = n;
+    }
+
+    /// Lose the answer of the next `n` clan dissolutions after they commit,
+    /// before the directory marks the clan dissolved.
+    pub fn lose_next_dissolution_answers(&self, n: u32) {
+        self.state.lock().lose_dissolution_answers = n;
+    }
+
+    /// Seals a map as a transfer's export does: its compound writes answer
+    /// 503 `write_freeze` to its readers until [`Self::unseal`].
+    pub fn seal(&self, area: AreaId) {
+        self.state.lock().sealed_maps.insert(area.0);
+    }
+
+    pub fn unseal(&self, area: AreaId) {
+        self.state.lock().sealed_maps.remove(&area.0);
+    }
+
+    /// How many requests reached `method path` so far.
+    pub fn requests_to(&self, method: &str, path: &str) -> usize {
+        self.state
+            .lock()
+            .http_requests
+            .iter()
+            .filter(|(m, p)| m == method && p == path)
+            .count()
+    }
+
+    pub fn fail_next_area_reads(&self, n: u32) {
+        self.state.lock().fail_area_reads = n;
     }
 
     /// Every mutation envelope the compound endpoint accepted, in arrival
@@ -600,11 +891,10 @@ impl MockHandle {
         self.state.lock().mutation_log.clone()
     }
 
-    /// The current dual revision counters of an area: `(rev, public_rev)`.
-    pub fn area_revs(&self, area: AreaId) -> (i64, i64) {
+    /// The current revision of an area's map source.
+    pub fn area_rev(&self, area: AreaId) -> i64 {
         let st = self.state.lock();
-        let area = st.areas.get(&area.0).expect("area exists");
-        (area.rev, area.public_rev)
+        st.areas.get(&area.0).expect("area exists").rev
     }
 
     /// Fish the latest UNCONSUMED one-time code for `email` out of state —

@@ -490,6 +490,13 @@ pub enum RuntimeAction {
     /// A script or migration marker that has not reached dispatch yet. Its
     /// address follows later committed remaps while the action remains queued.
     SetPendingCurrentLocation(Arc<Mutex<(AreaId, Option<i32>)>>),
+    /// The user clicked a room in a session map view: room `room_number` of
+    /// area `area_id` (a place's own room by its own area). Fires `map:click`,
+    /// which reaches an isolate only when it may see the room.
+    MapRoomClicked {
+        area_id: AreaId,
+        room_number: i32,
+    },
     /// Durable address changes, delivered before the relocated marker event.
     MapperRoomsMerged {
         into: AreaId,

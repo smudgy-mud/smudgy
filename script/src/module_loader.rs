@@ -519,12 +519,12 @@ impl ModuleLoader for ScriptModuleLoader {
             )));
         }
 
-        // A user `smudgy://owner/name[/sub]` import: parse with our own parser (path-based,
+        // A package import (`smudgy:@name[/sub]` or `smudgy://owner/name[/sub]`): parse with our own parser (path-based,
         // not url::Url, so the marker/canonical URL spaces round-trip) and return the
         // version-less marker URL. `load()` resolves the version and redirects to the
         // canonical pinned URL. Relative imports from inside a package use the
         // canonical `smudgy-pkg:` scheme and fall through to the normal path below.
-        if specifier.starts_with("smudgy://") {
+        if crate::package_resolver::is_package_address(specifier) {
             let spec =
                 crate::package_resolver::SmudgySpecifier::parse(specifier).map_err(|err| {
                     generic_loader_error(format!("invalid smudgy specifier {specifier}: {err}"))
@@ -1191,9 +1191,18 @@ mod dep_gating_tests {
                 )
                 .is_ok()
         );
+        // Names are global, so any spelling of the package's own name is a self-reference.
+        for own in ["smudgy://other/app", "smudgy:@App"] {
+            assert!(
+                loader
+                    .resolve(own, APP_REFERRER, ResolutionKind::Import)
+                    .is_ok(),
+                "{own}"
+            );
+        }
         assert!(
             loader
-                .resolve("smudgy://other/app", APP_REFERRER, ResolutionKind::Import)
+                .resolve("smudgy:@other", APP_REFERRER, ResolutionKind::Import)
                 .is_err()
         );
     }
@@ -1221,7 +1230,10 @@ mod dep_gating_tests {
     fn mixed_case_same_owner_may_import_private_package() {
         assert!(load_lib(false, Some(("gandalf", "other", "1.0.0"))).is_ok());
         assert!(load_lib(false, Some(("Gandalf", "other", "1.0.0"))).is_ok());
-        assert!(load_lib(false, Some(("other", "other", "1.0.0"))).is_err());
+        // The importer's spelling is not its owner: `other` is Gandalf's package however its
+        // address is spelled, and `app` is Frodo's.
+        assert!(load_lib(false, Some(("other", "other", "1.0.0"))).is_ok());
+        assert!(load_lib(false, Some(("gandalf", "app", "1.0.0"))).is_err());
     }
     use super::*;
     use crate::package_resolver::{
@@ -1302,12 +1314,24 @@ mod dep_gating_tests {
         let loader =
             loader_with_app(r#"{ "name": "app", "version": "1.0.0", "dependencies": [] }"#);
         // A non-canonical (user-module) referrer is unrestricted.
-        let resolved = loader.resolve(
-            "smudgy://anyone#1/anything",
-            "file:///home/user/script.ts",
-            ResolutionKind::Import,
+        for target in ["smudgy://anyone/anything", "smudgy:@anything"] {
+            let resolved = loader.resolve(
+                target,
+                "file:///home/user/script.ts",
+                ResolutionKind::Import,
+            );
+            assert!(resolved.is_ok(), "user modules are not gated: {resolved:?}");
+        }
+        // An owner segment without a nickname's form is not an address.
+        assert!(
+            loader
+                .resolve(
+                    "smudgy://anyone#1/anything",
+                    "file:///home/user/script.ts",
+                    ResolutionKind::Import,
+                )
+                .is_err()
         );
-        assert!(resolved.is_ok(), "user modules are not gated: {resolved:?}");
     }
 
     #[test]
@@ -1377,14 +1401,15 @@ mod dep_gating_tests {
         );
     }
 
-    /// A provider holding one library `gandalf/lib@1.0.0` with the given `importable` flag.
-    fn provider_with_lib(importable: bool) -> Rc<InMemoryPackageProvider> {
-        let mut provider = InMemoryPackageProvider::new();
+    /// The clan that owns `guildlib` and `guildapp` in [`provider_with_lib`].
+    const CLAN_ID: &str = "00000000-0000-4000-8000-00000000c1a0";
+
+    fn package(owner: &str, name: &str, importable: bool) -> ResolvedPackage {
         let manifest_json = format!(r#"{{ "version": "1.0.0", "importable": {importable} }}"#);
-        provider.insert(ResolvedPackage {
+        ResolvedPackage {
             key: PackageKey {
-                owner: "gandalf".into(),
-                name: "lib".into(),
+                owner: owner.into(),
+                name: name.into(),
             },
             resolved_version: "1.0.0".into(),
             manifest: PackageManifest::parse(&manifest_json).unwrap(),
@@ -1393,19 +1418,39 @@ mod dep_gating_tests {
                 subpath: "index.ts".into(),
                 text: "export const x = 1;".into(),
             }],
-        });
+        }
+    }
+
+    /// A registry holding Gandalf's library `lib@1.0.0` (with the given `importable` flag) and
+    /// his `other`, Frodo's `app`, and a clan's non-importable `guildlib` and its `guildapp`.
+    /// `mystery` is a package whose owner the provider does not know.
+    fn provider_with_lib(importable: bool) -> Rc<InMemoryPackageProvider> {
+        let mut provider = InMemoryPackageProvider::new();
+        provider.insert(package("gandalf", "lib", importable));
+        provider.insert(package("gandalf", "other", true));
+        provider.insert(package("frodo", "app", true));
+        provider.insert(package("", "mystery", true));
+        provider.insert_owned(
+            package("", "guildlib", false),
+            crate::package_resolver::PackageOwner::clan(CLAN_ID),
+        );
+        provider.insert_owned(
+            package("", "guildapp", true),
+            crate::package_resolver::PackageOwner::clan(CLAN_ID),
+        );
         Rc::new(provider)
     }
 
-    /// Run `load_marker_module` for an import of `gandalf/lib` from `referrer` (None = a
-    /// user/top-level import, Some = another package's instance), on a current-thread runtime.
-    fn load_lib(
+    /// Run `load_marker_module` for an import of `address` from `referrer` (None = a
+    /// user/top-level import, Some = another package's instance, spelled `(owner, name,
+    /// version)`), on a current-thread runtime.
+    fn load_address(
         importable: bool,
+        address: &str,
         referrer: Option<(&str, &str, &str)>,
     ) -> Result<ModuleSource, ModuleLoaderError> {
         let provider = provider_with_lib(importable);
-        let mut spec =
-            crate::package_resolver::SmudgySpecifier::parse("smudgy://gandalf/lib").unwrap();
+        let mut spec = crate::package_resolver::SmudgySpecifier::parse(address).unwrap();
         if let Some((owner, name, version)) = referrer {
             spec = spec.with_referrer(
                 PackageKey {
@@ -1423,6 +1468,14 @@ mod dep_gating_tests {
         rt.block_on(crate::package_resolver::load_marker_module(
             provider, &marker,
         ))
+    }
+
+    /// [`load_address`] of `smudgy://gandalf/lib`.
+    fn load_lib(
+        importable: bool,
+        referrer: Option<(&str, &str, &str)>,
+    ) -> Result<ModuleSource, ModuleLoaderError> {
+        load_address(importable, "smudgy://gandalf/lib", referrer)
     }
 
     #[test]
@@ -1451,6 +1504,57 @@ mod dep_gating_tests {
             result.is_ok(),
             "a user/top-level import is exempt: {result:?}"
         );
+    }
+
+    #[test]
+    fn non_importable_owner_judged_by_registry_not_spelling() {
+        // Gandalf's own package imports his library by its canonical address.
+        for referrer in [("gandalf", "other", "1.0.0"), ("", "other", "1.0.0")] {
+            for address in ["smudgy:@lib", "smudgy://gandalf/lib", "smudgy://frodo/lib"] {
+                assert!(
+                    load_address(false, address, Some(referrer)).is_ok(),
+                    "{address} from {referrer:?}"
+                );
+            }
+        }
+        // Frodo's package spelling the library, or itself, with Gandalf's name gains nothing.
+        for referrer in [("frodo", "app", "1.0.0"), ("gandalf", "app", "1.0.0")] {
+            for address in ["smudgy:@lib", "smudgy://gandalf/lib", "smudgy://frodo/lib"] {
+                let result = load_address(false, address, Some(referrer));
+                let error = result.expect_err(&format!("{address} from {referrer:?}"));
+                assert!(
+                    error.to_string().contains("smudgy:@lib is not importable")
+                        && error.to_string().contains("smudgy:@app may not"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_importable_unknown_owner_is_another_owner() {
+        assert!(load_lib(false, Some(("gandalf", "mystery", "1.0.0"))).is_err());
+        assert!(load_lib(false, Some(("gandalf", "unregistered", "1.0.0"))).is_err());
+        assert!(load_lib(true, Some(("gandalf", "mystery", "1.0.0"))).is_ok());
+    }
+
+    #[test]
+    fn non_importable_clan_package_follows_its_clan() {
+        // The clan's own package imports the clan's library, by either spelling.
+        for address in ["smudgy:@guildlib", "smudgy://gandalf/guildlib"] {
+            for referrer in [("", "guildapp", "1.0.0"), ("gandalf", "guildapp", "1.0.0")] {
+                assert!(
+                    load_address(false, address, Some(referrer)).is_ok(),
+                    "{address} from {referrer:?}"
+                );
+            }
+            // A member's own package is not the clan's.
+            assert!(load_address(false, address, Some(("gandalf", "other", "1.0.0"))).is_err());
+        }
+        // The clan's package importing a user's non-importable library is another owner too.
+        for referrer in [("", "guildapp", "1.0.0"), ("gandalf", "guildapp", "1.0.0")] {
+            assert!(load_lib(false, Some(referrer)).is_err(), "{referrer:?}");
+        }
     }
 
     #[test]

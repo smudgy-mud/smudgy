@@ -115,45 +115,49 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
                 AreaMutation::UpsertAreaProperty {
                     name: "nukefire.zone".to_string(),
                     value: "33".to_string(),
-                    is_secret: None,
                 },
                 AreaMutation::UpsertAreaProperty {
                     name: "nukefire.mapper".to_string(),
                     value: "NukeFire.Map.Local".to_string(),
-                    is_secret: None,
                 },
                 // Simulate an earlier quiet reflow which was interrupted. The
                 // package must retry it passively on this area's first entry.
                 AreaMutation::UpsertAreaProperty {
                     name: "nukefire.layout.polish-pending".to_string(),
                     value: "true".to_string(),
-                    is_secret: None,
                 },
                 AreaMutation::UpsertRoom {
+                    room_source: None,
                     room_number: RoomNumber(1),
                     body: room("Existing Port Target", "500", 0.0, 0.0),
                 },
                 AreaMutation::UpsertRoom {
+                    room_source: None,
                     room_number: RoomNumber(2),
                     body: room("Existing Reciprocal Source", "501", -3.0, 0.0),
                 },
                 AreaMutation::UpsertRoom {
+                    room_source: None,
                     room_number: RoomNumber(3),
                     body: room("Existing Northwest Source", "502", -3.0, -1.0),
                 },
                 AreaMutation::UpsertRoom {
+                    room_source: None,
                     room_number: RoomNumber(4),
                     body: room("Existing Southwest Source", "503", -3.0, 1.0),
                 },
                 AreaMutation::CreateExit {
+                    room_source: None,
                     room_number: RoomNumber(2),
                     body: exit(ExitDirection::East, 1, Some(ExitDirection::West), None),
                 },
                 AreaMutation::CreateExit {
+                    room_source: None,
                     room_number: RoomNumber(1),
                     body: exit(ExitDirection::West, 2, Some(ExitDirection::East), None),
                 },
                 AreaMutation::CreateExit {
+                    room_source: None,
                     room_number: RoomNumber(3),
                     body: exit(
                         ExitDirection::Special,
@@ -163,6 +167,7 @@ async fn nukefire_snapshot_creates_one_local_area_inside_the_nukefire_atlas() {
                     ),
                 },
                 AreaMutation::CreateExit {
+                    room_source: None,
                     room_number: RoomNumber(4),
                     body: exit(
                         ExitDirection::Special,

@@ -10,8 +10,8 @@
 //!    persisted at load time, then [`read_blob_bytes`](PackageAssetCache::read_blob_bytes)
 //!    serves the body if it was ever downloaded.
 //! 3. On a blob miss the fetcher re-resolves the version over the network for a fresh
-//!    presigned URL (they are ephemeral and deliberately never cached), byte-fetches
-//!    SHA-verified, and hands the body back through
+//!    signed bundle URL (they are ephemeral and deliberately never cached), fetches that
+//!    one body (decoded and SHA-verified), and hands it back through
 //!    [`write_blob_bytes`](PackageAssetCache::write_blob_bytes) — content-addressed and
 //!    immutable, so it is cached forever after.
 

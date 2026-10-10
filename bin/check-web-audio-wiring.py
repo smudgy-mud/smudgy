@@ -207,7 +207,8 @@ def main() -> None:
         require_optional_workspace_edge(
             core["dependencies"][dependency], crate="smudgy_core", name=dependency
         )
-    for dependency in ("futures", "smudgy_audio", "smudgy_audio_web"):
+    # General UI subscriptions also use futures, independently of audio.
+    for dependency in ("smudgy_audio", "smudgy_audio_web"):
         require_optional_workspace_edge(
             ui["dependencies"][dependency], crate="smudgy_ui", name=dependency
         )
@@ -267,7 +268,6 @@ def main() -> None:
         "web-audio-cpal",
         {
             "web-audio",
-            "dep:futures",
             "dep:smudgy_audio",
             "dep:smudgy_audio_web",
             "smudgy_audio/physical-output",

@@ -10,8 +10,18 @@
 
 #[path = "integration_sync/create_area_properties.rs"]
 mod create_area_properties;
+#[path = "integration_sync/link_clears.rs"]
+mod link_clears;
+#[path = "integration_sync/links.rs"]
+mod links;
 #[path = "integration_sync/local_queue_regressions.rs"]
 mod local_queue_regressions;
+#[path = "integration_sync/relocation_places.rs"]
+mod relocation_places;
+#[path = "integration_sync/secret_connections.rs"]
+mod secret_connections;
+#[path = "integration_sync/secrets.rs"]
+mod secrets;
 mod support;
 
 use std::collections::BTreeMap;
@@ -19,11 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use smudgy_cloud::cloud_api::{CreateShareRequest, SharePatch, ShareScope};
+use smudgy_cloud::cloud_api::{CreateShareRequest, ShareScope};
 use smudgy_cloud::mapper::{RoomKey, SyncState};
-use smudgy_cloud::mutation::{
-    AreaMutation, MutationEnvelope, MutationResult, Precondition, ResourceKind,
-};
+use smudgy_cloud::mutation::{AreaMutation, MutationEnvelope, MutationResult, Precondition};
 use smudgy_cloud::{
     AreaId, AtlasId, CachedCloudMapper, CloudApiClient, CloudError, CloudMapper, ConnectionDash,
     ConnectionKind, ConnectionRouting, Credential, CredentialSource, ExitArgs, ExitDirection,
@@ -98,36 +106,6 @@ fn api_client(base_url: &str, api_key: &str) -> CloudApiClient {
     )
 }
 
-/// Executes one compound envelope as `backend`'s viewer, preconditioned on
-/// the viewer's freshly-fetched shared revision — the direct-wire way to
-/// drive `POST /areas/{id}/mutations` outside a `Mapper`.
-async fn execute_ops(
-    backend: &CloudMapper,
-    area: AreaId,
-    payload: Vec<AreaMutation>,
-) -> MutationResult {
-    let current = backend
-        .get_area(&area)
-        .await
-        .expect("fetch for the precondition");
-    backend
-        .execute_mutation(
-            &area,
-            &MutationEnvelope {
-                operation_id: Uuid::new_v4(),
-                preconditions: vec![Precondition {
-                    resource: ResourceKind::Area,
-                    id: area.0,
-                    expected_rev: current.area.rev,
-                    access_fingerprint: current.area.access.map(|access| access.fingerprint()),
-                }],
-                payload,
-            },
-        )
-        .await
-        .expect("envelope accepted")
-}
-
 /// The served `/sync` rev for one area, as seen by `client`'s viewer.
 async fn sync_row_rev(client: &CloudApiClient, area_id: AreaId) -> i64 {
     client
@@ -137,7 +115,8 @@ async fn sync_row_rev(client: &CloudApiClient, area_id: AreaId) -> i64 {
         .into_iter()
         .find(|row| row.area_id == area_id)
         .expect("sync row for the area")
-        .rev
+        .map_rev()
+        .expect("the row carries the map revision")
 }
 
 /// Recursively collects every `.json` file under `dir`.
@@ -158,18 +137,8 @@ fn collect_json_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Whether ANY `.json` file under `dir` (recursively) contains `needle`.
-fn any_json_contains(dir: &Path, needle: &[u8]) -> bool {
-    let mut files = Vec::new();
-    collect_json_files(dir, &mut files);
-    files.iter().any(|path| {
-        std::fs::read(path)
-            .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
-    })
-}
-
 /// Every cached `.json` file under `dir` belonging to `area_id`
-/// (`{area_id}-{rev}-{fingerprint}.json`, possibly nested per viewer).
+/// (`{area_id}-{token}.json`, possibly nested per viewer).
 fn cache_files_for_area(dir: &Path, area_id: AreaId) -> Vec<PathBuf> {
     let prefix = format!("{area_id}-");
     let mut files = Vec::new();
@@ -185,7 +154,7 @@ fn cache_files_for_area(dir: &Path, area_id: AreaId) -> Vec<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// 1. A grant appears in the grantee's atlas cache via /sync, redacted.
+// 1. A grant appears in the grantee's atlas cache via /sync.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -194,7 +163,7 @@ async fn acknowledged_cloud_edits_wake_only_sessions_for_the_same_viewer() {
     let owner = server.create_user("hint-owner@example.com", "hint-owner", true);
     let stranger = server.create_user("hint-other@example.com", "hint-other", true);
     let area = server.create_area(&owner, "Shared between my sessions");
-    server.add_room(area, 1, "Before", false);
+    server.add_room(area, 1, "Before");
     let writer_dir = TempCacheDir::new("hint-writer");
     let observer_dir = TempCacheDir::new("hint-observer");
     let stranger_dir = TempCacheDir::new("hint-stranger");
@@ -255,6 +224,8 @@ async fn local_generation_adoption_does_not_request_cloud_sync() {
         .create_area(smudgy_cloud::CreateAreaRequest {
             name: "Local only".into(),
             atlas_id: None,
+            clan_id: None,
+            ownership: None,
             ephemeral: false,
             properties: BTreeMap::new(),
         })
@@ -272,14 +243,9 @@ async fn share_appears_in_grantee_atlas_via_sync() {
     server.befriend(&owner, &grantee);
 
     let area = server.create_area(&owner, "Shared Lands");
-    server.add_room(area, 1, "Plaza", false);
-    server.add_room(area, 2, "Hidden Vault", true); // secret room
-    server.add_room(area, 3, "Market", false);
-    server.add_exit(area, 1, "North", Some((area, 3)), false);
-    // A secret SELF-LOOP: reciprocal with the public exit it would form one
-    // Connection, and the §6 closure would then scrub both members. This
-    // fixture is about per-exit secrecy, so it stays its own group.
-    server.add_exit(area, 3, "South", Some((area, 3)), true); // secret exit
+    server.add_room(area, 1, "Plaza");
+    server.add_room(area, 3, "Market");
+    server.add_exit(area, 1, "North", Some((area, 3)));
 
     let cache_dir = TempCacheDir::new("share-appears");
     let mapper = new_synced_mapper(&server.base_url, &grantee.api_key, cache_dir.path()).await;
@@ -297,7 +263,6 @@ async fn share_appears_in_grantee_atlas_via_sync() {
             can_edit: false,
             can_reshare: false,
             can_copy: false,
-            include_secrets: false,
             can_admin: false,
             host_hints: None,
         })
@@ -311,15 +276,13 @@ async fn share_appears_in_grantee_atlas_via_sync() {
         .get_area(&area)
         .expect("area lands in the grantee's atlas cache");
     assert_eq!(cached.get_name(), "Shared Lands");
-    assert_eq!(cached.room_count(), 2, "the secret room is filtered out");
-    assert!(cached.get_room(&RoomNumber(2)).is_none());
+    assert_eq!(cached.room_count(), 2, "both rooms reach the grantee");
 
-    let room1 = cached.get_room(&RoomNumber(1)).expect("public room 1");
-    assert_eq!(room1.get_exits().len(), 1, "the public exit survives");
-    let room3 = cached.get_room(&RoomNumber(3)).expect("public room 3");
+    let room1 = cached.get_room(&RoomNumber(1)).expect("room 1");
+    assert_eq!(room1.get_exits().len(), 1, "the exit reaches the grantee");
     assert!(
-        room3.get_exits().is_empty(),
-        "the secret exit is dropped for the grantee"
+        cached.get_room(&RoomNumber(3)).is_some(),
+        "room 3 reaches the grantee"
     );
 
     let access = cached.meta().access.expect("access block present");
@@ -409,7 +372,7 @@ async fn room_tags_roundtrip_through_sync() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("tagowner@example.com", "tagowner", true);
     let area = server.create_area(&owner, "Tagged Area");
-    server.add_room(area, 1, "Inn of the Last Home", false);
+    server.add_room(area, 1, "Inn of the Last Home");
 
     // Write tags through the mapper (lowercase input must normalize to
     // UPPERCASE); the writes ride envelopes on the compound endpoint.
@@ -481,7 +444,7 @@ async fn fresh_exit_connection_identity_roundtrips_without_remint() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("stableid@example.com", "stableid", true);
     let area = server.create_area(&owner, "Stable Identity Area");
-    server.add_room(area, 1, "Landing", false);
+    server.add_room(area, 1, "Landing");
 
     let cache_dir = TempCacheDir::new("stable-connection-id");
     let mapper = new_synced_mapper(&server.base_url, &owner.api_key, cache_dir.path()).await;
@@ -520,8 +483,8 @@ async fn bidirectional_pair_roundtrips_as_one_connection() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("pairowner@example.com", "pairowner", true);
     let area = server.create_area(&owner, "Paired Area");
-    server.add_room(area, 1, "Landing", false);
-    server.add_room(area, 2, "Loft", false);
+    server.add_room(area, 1, "Landing");
+    server.add_room(area, 2, "Loft");
 
     // Create both directions through the mapper (client-minted ids; the
     // wire lands on the compound endpoint). The server auto-pairs the
@@ -626,11 +589,11 @@ async fn pair_member_retarget_is_refused_with_unlink_before_edit() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("unlinkowner@example.com", "unlinkowner", true);
     let area = server.create_area(&owner, "Linked Lands");
-    server.add_room(area, 1, "Here", false);
-    server.add_room(area, 2, "There", false);
-    server.add_room(area, 3, "Elsewhere", false);
-    let out_id = server.add_exit(area, 1, "East", Some((area, 2)), false);
-    server.add_exit(area, 2, "West", Some((area, 1)), false); // auto-pairs
+    server.add_room(area, 1, "Here");
+    server.add_room(area, 2, "There");
+    server.add_room(area, 3, "Elsewhere");
+    let out_id = server.add_exit(area, 1, "East", Some((area, 2)));
+    server.add_exit(area, 2, "West", Some((area, 1))); // auto-pairs
 
     let backend = CloudMapper::new(server.base_url.clone(), owner.api_key.clone());
     let current = backend.get_area(&area).await.expect("fetch");
@@ -652,13 +615,13 @@ async fn pair_member_retarget_is_refused_with_unlink_before_edit() {
         .execute_mutation(
             &area,
             &MutationEnvelope {
+                source: smudgy_cloud::SourceId::map(),
                 operation_id: Uuid::new_v4(),
-                preconditions: vec![Precondition {
-                    resource: ResourceKind::Area,
-                    id: area.0,
-                    expected_rev: current.area.rev,
-                    access_fingerprint: current.area.access.map(|access| access.fingerprint()),
-                }],
+                preconditions: vec![Precondition::source(
+                    area.0,
+                    smudgy_cloud::SourceId::map(),
+                    current.area.rev,
+                )],
                 payload: vec![AreaMutation::UpdateExit {
                     exit_id: smudgy_cloud::ExitId(out_id),
                     body: ExitUpdates {
@@ -680,13 +643,13 @@ async fn pair_member_retarget_is_refused_with_unlink_before_edit() {
         .expect("refetch after snapshot");
 
     let envelope = |payload| MutationEnvelope {
+        source: smudgy_cloud::SourceId::map(),
         operation_id: Uuid::new_v4(),
-        preconditions: vec![Precondition {
-            resource: ResourceKind::Area,
-            id: area.0,
-            expected_rev: current.area.rev,
-            access_fingerprint: current.area.access.map(|access| access.fingerprint()),
-        }],
+        preconditions: vec![Precondition::source(
+            area.0,
+            smudgy_cloud::SourceId::map(),
+            current.area.rev,
+        )],
         payload,
     };
 
@@ -745,323 +708,7 @@ async fn pair_member_retarget_is_refused_with_unlink_before_edit() {
 }
 
 // ---------------------------------------------------------------------------
-// 1d. §6.4 closure through the real stack: one secret member in a pair
-//     hides BOTH exits and the Connection from an uncleared editor's
-//     projection (no to_unknown trace), and clearing the secret reveals the
-//     group and moves the editor's shared rev.
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn secret_pair_member_hides_the_whole_group_from_an_uncleared_editor() {
-    let server = MockServer::spawn().await;
-    let owner = server.create_user("closureowner@example.com", "closureowner", true);
-    let editor = server.create_user("closureeditor@example.com", "closureeditor", true);
-    server.befriend(&owner, &editor);
-
-    let area = server.create_area(&owner, "Closure Realm");
-    server.add_room(area, 1, "Gate", false);
-    server.add_room(area, 2, "Yard", false);
-
-    // Owner builds the bidirectional pair through a real Mapper.
-    let owner_dir = TempCacheDir::new("closure-owner");
-    let owner_mapper = new_synced_mapper(&server.base_url, &owner.api_key, owner_dir.path()).await;
-    let out_id = owner_mapper
-        .create_exit(
-            RoomKey::new(area, RoomNumber(1)),
-            ExitArgs {
-                from_direction: ExitDirection::East,
-                to_area_id: Some(area),
-                to_room_number: Some(RoomNumber(2)),
-                to_direction: Some(ExitDirection::West),
-                ..ExitArgs::default()
-            },
-        )
-        .await
-        .expect("outbound create");
-    let back_id = owner_mapper
-        .create_exit(
-            RoomKey::new(area, RoomNumber(2)),
-            ExitArgs {
-                from_direction: ExitDirection::West,
-                to_area_id: Some(area),
-                to_room_number: Some(RoomNumber(1)),
-                to_direction: Some(ExitDirection::East),
-                ..ExitArgs::default()
-            },
-        )
-        .await
-        .expect("reverse create");
-    // Mark ONE member secret (a traversal-only edit — legal on a pair).
-    owner_mapper
-        .update_exit(
-            RoomKey::new(area, RoomNumber(1)),
-            out_id,
-            ExitUpdates {
-                is_secret: Some(true),
-                ..ExitUpdates::default()
-            },
-        )
-        .expect("queue secret edit");
-    assert!(
-        owner_mapper
-            .wait_for_sync_completion(10)
-            .await
-            .expect("owner writes acknowledged"),
-        "owner queue drains"
-    );
-
-    // An editor grant WITHOUT include_secrets: can_edit, not cleared.
-    server.grant(&owner, &editor, GrantScope::Area(area), GrantFlags::edit());
-
-    // The editor's projection: the whole group is gone — both exits AND the
-    // Connection — with no to_unknown/token trace of either member.
-    let editor_dir = TempCacheDir::new("closure-editor");
-    let editor_mapper =
-        new_synced_mapper(&server.base_url, &editor.api_key, editor_dir.path()).await;
-    let editor_backend = CloudMapper::new(server.base_url.clone(), editor.api_key.clone());
-    let projected = editor_backend.get_area(&area).await.expect("editor fetch");
-    assert!(
-        projected.connections.is_empty(),
-        "the effectively-secret Connection is omitted"
-    );
-    let projected_exits: Vec<_> = projected
-        .rooms
-        .iter()
-        .flat_map(|room| room.exits.iter())
-        .collect();
-    assert!(
-        projected_exits.is_empty(),
-        "BOTH members vanish — the public one included"
-    );
-    let raw = serde_json::to_string(&projected).expect("serialize");
-    assert!(
-        !raw.contains(&out_id.to_string()) && !raw.contains(&back_id.to_string()),
-        "no exit id survives anywhere in the projection"
-    );
-    assert!(
-        !raw.contains("to_area_token") && !raw.contains("\"to_unknown\":true"),
-        "an omitted group leaves no unknown-target trace"
-    );
-    let editor_cached = editor_mapper
-        .get_current_atlas()
-        .get_area(&area)
-        .expect("editor caches the area");
-    assert!(
-        editor_cached.get_room_connections().is_empty(),
-        "nothing renders for the uncleared editor"
-    );
-
-    // Clearing the secret reveals the whole group and moves the editor's
-    // shared rev (§6.3: a reveal changes visible content).
-    let editor_client = api_client(&server.base_url, &editor.api_key);
-    let rev_hidden = sync_row_rev(&editor_client, area).await;
-    owner_mapper
-        .update_exit(
-            RoomKey::new(area, RoomNumber(1)),
-            out_id,
-            ExitUpdates {
-                is_secret: Some(false),
-                ..ExitUpdates::default()
-            },
-        )
-        .expect("queue secret clear");
-    assert!(
-        owner_mapper
-            .wait_for_sync_completion(10)
-            .await
-            .expect("owner unset acknowledged"),
-        "owner queue drains"
-    );
-    let rev_revealed = sync_row_rev(&editor_client, area).await;
-    assert_ne!(
-        rev_revealed, rev_hidden,
-        "revealing the group moves the editor's shared rev"
-    );
-
-    tick(&editor_mapper).await;
-    let projected = editor_backend
-        .get_area(&area)
-        .await
-        .expect("editor refetch");
-    assert_eq!(projected.connections.len(), 1, "the group reappears whole");
-    let visible_exits: Vec<_> = projected
-        .rooms
-        .iter()
-        .flat_map(|room| room.exits.iter())
-        .collect();
-    assert_eq!(visible_exits.len(), 2, "both members are back");
-    assert!(
-        visible_exits
-            .iter()
-            .all(|exit| exit.connection_id == projected.connections[0].id),
-        "linkage is intact after the reveal"
-    );
-    let editor_cached = editor_mapper
-        .get_current_atlas()
-        .get_area(&area)
-        .expect("editor cache refreshed");
-    assert_eq!(editor_cached.get_room_connections().len(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// 2. include_secrets toggling moves the served rev and forces purge+refetch.
-// ---------------------------------------------------------------------------
-
-const SECRET_TITLE: &str = "ZZ-SECRET-VAULT-XYZZY";
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_rev_reports_secret_activity_and_fingerprint_refetches_capability_changes() {
-    let server = MockServer::spawn().await;
-    let owner = server.create_user("owner@example.com", "owner", true);
-    let grantee = server.create_user("friend@example.com", "friend", true);
-    server.befriend(&owner, &grantee);
-
-    let area = server.create_area(&owner, "Revved Area");
-    server.add_room(area, 1, "Plaza", false);
-
-    // The secret room is inserted through the compound endpoint so the full
-    // rev diverges from the public rev (secret-only writes bump only the
-    // full rev).
-    let owner_mapper = CloudMapper::new(server.base_url.clone(), owner.api_key.clone());
-    execute_ops(
-        &owner_mapper,
-        area,
-        vec![AreaMutation::UpsertRoom {
-            room_number: RoomNumber(7),
-            body: RoomUpdates {
-                title: Some(SECRET_TITLE.to_string()),
-                is_secret: Some(true),
-                ..RoomUpdates::default()
-            },
-        }],
-    )
-    .await;
-
-    let grant_id = server.grant(
-        &owner,
-        &grantee,
-        GrantScope::Area(area),
-        GrantFlags::VIEW_ONLY,
-    );
-
-    let cache_dir = TempCacheDir::new("secrets-toggle");
-    let mapper = new_synced_mapper(&server.base_url, &grantee.api_key, cache_dir.path()).await;
-
-    let cached = mapper
-        .get_current_atlas()
-        .get_area(&area)
-        .expect("startup tick caches the shared area");
-    assert_eq!(cached.room_count(), 1, "view-only: secret room hidden");
-    assert!(cached.get_room(&RoomNumber(7)).is_none());
-
-    let grantee_client = api_client(&server.base_url, &grantee.api_key);
-    let rev_view_only = sync_row_rev(&grantee_client, area).await;
-
-    // Secret-only owner activity still advances the revision visible to this
-    // uncleared reader. The redacted document remains secret-free.
-    execute_ops(
-        &owner_mapper,
-        area,
-        vec![AreaMutation::UpsertRoom {
-            room_number: RoomNumber(7),
-            body: RoomUpdates {
-                description: Some("owner-only activity".to_string()),
-                ..RoomUpdates::default()
-            },
-        }],
-    )
-    .await;
-    let rev_after_secret_edit = sync_row_rev(&grantee_client, area).await;
-    assert!(
-        rev_after_secret_edit > rev_view_only,
-        "all readers are notified that a secret-only edit occurred"
-    );
-    tick(&mapper).await;
-    assert!(
-        mapper
-            .get_current_atlas()
-            .get_area(&area)
-            .expect("area remains cached")
-            .get_room(&RoomNumber(7))
-            .is_none(),
-        "activity notification does not reveal secret content"
-    );
-
-    // Owner raises include_secrets (root, Area-scope grant: allowed).
-    let owner_client = api_client(&server.base_url, &owner.api_key);
-    let patched = owner_client
-        .update_share(
-            grant_id,
-            SharePatch {
-                include_secrets: Some(true),
-                ..SharePatch::default()
-            },
-        )
-        .await
-        .expect("include_secrets raisable on a root area-scope grant");
-    assert!(patched.include_secrets);
-
-    tick(&mapper).await;
-
-    let cached = mapper
-        .get_current_atlas()
-        .get_area(&area)
-        .expect("area still cached");
-    let room7 = cached
-        .get_room(&RoomNumber(7))
-        .expect("fingerprint change forced a purge+refetch; secret room now visible");
-    assert_eq!(room7.get_title(), SECRET_TITLE);
-
-    let rev_with_secrets = sync_row_rev(&grantee_client, area).await;
-    assert_eq!(
-        rev_with_secrets, rev_after_secret_edit,
-        "share flags change the fingerprint, not the shared area revision"
-    );
-
-    // Sanity-check the disk scanner actually sees the secret bytes while the
-    // grantee is cleared — otherwise the final assertion would be vacuous.
-    assert!(
-        any_json_contains(cache_dir.path(), SECRET_TITLE.as_bytes()),
-        "cleared grantee's disk cache holds the secret room"
-    );
-
-    // Owner lowers include_secrets again.
-    owner_client
-        .update_share(
-            grant_id,
-            SharePatch {
-                include_secrets: Some(false),
-                ..SharePatch::default()
-            },
-        )
-        .await
-        .expect("lowering include_secrets");
-
-    tick(&mapper).await;
-
-    let cached = mapper
-        .get_current_atlas()
-        .get_area(&area)
-        .expect("area still cached");
-    assert!(
-        cached.get_room(&RoomNumber(7)).is_none(),
-        "secret room gone from the atlas cache after the flag drops"
-    );
-
-    let rev_back = sync_row_rev(&grantee_client, area).await;
-    assert_eq!(
-        rev_back, rev_with_secrets,
-        "dropping secret access also leaves the shared area revision alone"
-    );
-
-    assert!(
-        !any_json_contains(cache_dir.path(), SECRET_TITLE.as_bytes()),
-        "no on-disk cache file may retain the secret room's bytes"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 3. Revoking the grant purges the atlas cache AND the on-disk cache.
+// 2. Revoking the grant purges the atlas cache AND the on-disk cache.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1072,7 +719,7 @@ async fn revoke_purges_cache_and_disk() {
     server.befriend(&owner, &grantee);
 
     let area = server.create_area(&owner, "Borrowed Realm");
-    server.add_room(area, 1, "Atrium", false);
+    server.add_room(area, 1, "Atrium");
     let grant_id = server.grant(
         &owner,
         &grantee,
@@ -1111,7 +758,7 @@ async fn revoke_purges_cache_and_disk() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. An unknown cross-area link resolves when the neighbour gets shared,
+// 3. An unknown cross-area link resolves when the neighbour gets shared,
 //    without the host area's own rev moving.
 // ---------------------------------------------------------------------------
 
@@ -1124,9 +771,9 @@ async fn unknown_link_resolves_when_neighbour_shared() {
 
     let area_a = server.create_area(&owner, "Alpha");
     let area_b = server.create_area(&owner, "Beta");
-    server.add_room(area_a, 1, "Gatehouse", false);
-    server.add_room(area_b, 1, "Far Side", false);
-    server.add_exit(area_a, 1, "West", Some((area_b, 1)), false);
+    server.add_room(area_a, 1, "Gatehouse");
+    server.add_room(area_b, 1, "Far Side");
+    server.add_exit(area_a, 1, "West", Some((area_b, 1)));
     server.grant(
         &owner,
         &grantee,
@@ -1180,7 +827,7 @@ async fn unknown_link_resolves_when_neighbour_shared() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. The legacy solo API-key path is unchanged.
+// 4. The legacy solo API-key path is unchanged.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1232,7 +879,7 @@ async fn legacy_api_key_path_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Two clients on one account edit the same area: the second client's
+// 5. Two clients on one account edit the same area: the second client's
 //    stale-rev envelope conflicts, refetches, replays, and both converge.
 // ---------------------------------------------------------------------------
 
@@ -1241,7 +888,7 @@ async fn concurrent_edits_conflict_refetch_replay_and_converge() {
     let server = MockServer::spawn().await;
     let user = server.create_user("pair@example.com", "pair", true);
     let area = server.create_area(&user, "Contested Lands");
-    server.add_room(area, 1, "Origin", false);
+    server.add_room(area, 1, "Origin");
 
     let cache_a = TempCacheDir::new("converge-a");
     let cache_b = TempCacheDir::new("converge-b");
@@ -1342,7 +989,7 @@ async fn concurrent_edits_conflict_refetch_replay_and_converge() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Receipt dedupe over the wire: the mock commits a mutation but drops the
+// 6. Receipt dedupe over the wire: the mock commits a mutation but drops the
 //    response; the client's transport retry carries the same operation id and
 //    replays the stored receipt, so the mutation applies exactly once.
 // ---------------------------------------------------------------------------
@@ -1352,11 +999,11 @@ async fn receipt_dedupes_a_retry_after_a_lost_response() {
     let server = MockServer::spawn().await;
     let user = server.create_user("retry@example.com", "retry", true);
     let area = server.create_area(&user, "Flaky Wire");
-    server.add_room(area, 1, "Origin", false);
+    server.add_room(area, 1, "Origin");
 
     let cache_dir = TempCacheDir::new("receipt-dedupe");
     let mapper = new_synced_mapper(&server.base_url, &user.api_key, cache_dir.path()).await;
-    let (rev_before, _) = server.area_revs(area);
+    let rev_before = server.area_rev(area);
 
     // The first response is lost AFTER the mock commits and stores the
     // receipt; the client sees a transport failure and retries.
@@ -1389,7 +1036,7 @@ async fn receipt_dedupes_a_retry_after_a_lost_response() {
     assert!(!requests[0].1, "the first request applied fresh");
     assert!(requests[1].1, "the retry replayed the stored receipt");
 
-    let (rev_after, _) = server.area_revs(area);
+    let rev_after = server.area_rev(area);
     assert_eq!(
         rev_after,
         rev_before + 1,
@@ -1411,104 +1058,92 @@ async fn receipt_dedupes_a_retry_after_a_lost_response() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Receipt replay across a fingerprint change: a stored result embeds the
-//    accept-time projection, so once the caller's capabilities move, the
-//    identical retry is refused with `projection_changed` (carrying the
-//    CURRENT fingerprint) instead of leaking the stale projection.
+// A sealed transfer export answers 503 `write_freeze` to the map's readers:
+// the queue keeps the edit and retries it with backoff, reports no failure,
+// keeps the session, and the edit lands once the seal goes.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_after_fingerprint_change_yields_projection_changed() {
+async fn a_sealed_map_holds_an_edit_until_the_seal_goes() {
+    use smudgy_cloud::mapper::{AreaSaveStatus, MapperEvent};
+
     let server = MockServer::spawn().await;
-    let owner = server.create_user("owner@example.com", "owner", true);
-    let grantee = server.create_user("editor@example.com", "editor", true);
-    server.befriend(&owner, &grantee);
+    let user = server.create_user("sealed@example.com", "sealed", true);
+    let area = server.create_area(&user, "Moving House");
+    server.add_room(area, 1, "Origin");
 
-    let area = server.create_area(&owner, "Receipt Realm");
-    server.add_room(area, 1, "Foyer", false);
-    let grant_id = server.grant(&owner, &grantee, GrantScope::Area(area), GrantFlags::edit());
+    let cache_dir = TempCacheDir::new("write-freeze");
+    let mapper = new_synced_mapper(&server.base_url, &user.api_key, cache_dir.path()).await;
+    let mut events = mapper.subscribe_mapper_events();
+    let path = format!("/areas/{area}/mutations");
 
-    // The grantee applies an envelope through the real client stack.
-    let grantee_backend = CloudMapper::new(server.base_url.clone(), grantee.api_key.clone());
-    let before = grantee_backend
-        .get_area(&area)
-        .await
-        .expect("fetch for the precondition");
-    let envelope = MutationEnvelope {
-        operation_id: Uuid::new_v4(),
-        preconditions: vec![Precondition {
-            resource: ResourceKind::Area,
-            id: area.0,
-            expected_rev: before.area.rev,
-            access_fingerprint: before.area.access.map(|access| access.fingerprint()),
-        }],
-        payload: vec![AreaMutation::UpsertRoom {
-            room_number: RoomNumber(2),
-            body: RoomUpdates {
-                title: Some("Annex".to_string()),
+    server.seal(area);
+    mapper
+        .upsert_room(
+            RoomKey::new(area, RoomNumber(2)),
+            RoomUpdates {
+                title: Some("Kept".to_string()),
                 ..RoomUpdates::default()
             },
-        }],
-    };
-    grantee_backend
-        .execute_mutation(&area, &envelope)
-        .await
-        .expect("envelope accepted");
-
-    // While the projection stands still, the identical retry replays the
-    // stored receipt verbatim (nothing re-applies).
-    grantee_backend
-        .execute_mutation(&area, &envelope)
-        .await
-        .expect("identical retry replays under an unchanged fingerprint");
-    let requests = server.mutation_requests();
-    assert_eq!(requests.len(), 2, "fresh application plus one replay");
-    assert!(requests[1].1, "the retry was served from the receipt");
-
-    // The owner raises include_secrets: the grantee's projection class flips.
-    let owner_client = api_client(&server.base_url, &owner.api_key);
-    owner_client
-        .update_share(
-            grant_id,
-            SharePatch {
-                include_secrets: Some(true),
-                ..SharePatch::default()
-            },
         )
-        .await
-        .expect("owner raises include_secrets");
+        .expect("enqueue room");
 
-    // The same retry now crosses the projection boundary: the receipt's
-    // stored result was built for the old capabilities, so the server
-    // refuses with projection_changed carrying the CURRENT fingerprint.
-    let err = grantee_backend
-        .execute_mutation(&area, &envelope)
-        .await
-        .expect_err("replay must be refused after the fingerprint change");
-    let current_fingerprint = grantee_backend
-        .get_area(&area)
-        .await
-        .expect("refetch under the new capabilities")
-        .area
-        .access
-        .expect("access block present")
-        .fingerprint();
-    match err {
-        CloudError::ProjectionChanged { access_fingerprint } => assert_eq!(
-            access_fingerprint, current_fingerprint,
-            "the refusal carries the caller's current fingerprint"
-        ),
-        other => panic!("expected ProjectionChanged, got {other:?}"),
+    // The write is refused and retried, with a growing wait between tries.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while server.requests_to("POST", &path) < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held write is retried"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        server.mutation_requests().is_empty(),
+        "nothing applied while sealed"
+    );
+    assert!(
+        matches!(
+            mapper.area_save_status(area),
+            AreaSaveStatus::Held(1) | AreaSaveStatus::Saving(1)
+        ),
+        "kept and waiting: {:?}",
+        mapper.area_save_status(area)
+    );
+    assert!(
+        !matches!(mapper.sync_status().state, SyncState::LoggedOut),
+        "a held write never signs anyone out"
+    );
+
+    server.unseal(area);
+    assert!(
+        mapper
+            .wait_for_sync_completion(30)
+            .await
+            .expect("the retry lands"),
+        "the queue drains once the seal goes"
+    );
+    assert_eq!(server.mutation_requests().len(), 1, "applied once");
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, MapperEvent::MutationFailed { .. }),
+            "no failure is reported for a held write: {event:?}"
+        );
+    }
+    let cached = mapper
+        .get_current_atlas()
+        .get_area(&area)
+        .expect("area cached");
     assert_eq!(
-        server.mutation_requests().len(),
-        2,
-        "the refused retry neither re-applied nor replayed"
+        cached
+            .get_room(&RoomNumber(2))
+            .expect("room landed")
+            .get_title(),
+        "Kept"
     );
 }
 
 // ---------------------------------------------------------------------------
-// 9. An idempotent tag re-add through the Mapper is accepted but moves no
+// 7. An idempotent tag re-add through the Mapper is accepted but moves no
 //    revision counter: the envelope's every op no-ops, so the /sync row rev
 //    stands still and the response reports the standing revision.
 // ---------------------------------------------------------------------------
@@ -1518,7 +1153,7 @@ async fn idempotent_tag_readd_moves_no_rev() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("tagger@example.com", "tagger", true);
     let area = server.create_area(&owner, "Tag Stability");
-    server.add_room(area, 1, "Shrine", false);
+    server.add_room(area, 1, "Shrine");
 
     let cache_dir = TempCacheDir::new("tag-noop");
     let mapper = new_synced_mapper(&server.base_url, &owner.api_key, cache_dir.path()).await;
@@ -1543,9 +1178,9 @@ async fn idempotent_tag_readd_moves_no_rev() {
     );
 
     // Re-add, differently cased (normalizes to the same tag): the envelope
-    // is accepted and acknowledged, but every op no-ops, so neither rev nor
-    // public_rev moves.
-    let revs_before_readd = server.area_revs(area);
+    // is accepted and acknowledged, but every op no-ops, so the rev does
+    // not move.
+    let rev_before_readd = server.area_rev(area);
     mapper
         .add_room_tag(RoomKey::new(area, RoomNumber(1)), "Inn".to_string())
         .expect("enqueue duplicate tag");
@@ -1562,9 +1197,9 @@ async fn idempotent_tag_readd_moves_no_rev() {
         "an idempotent tag re-add moves no served revision"
     );
     assert_eq!(
-        server.area_revs(area),
-        revs_before_readd,
-        "neither rev nor public_rev moved on the all-no-op envelope"
+        server.area_rev(area),
+        rev_before_readd,
+        "the stored rev did not move on the all-no-op envelope"
     );
 
     // Both envelopes were accepted fresh — the no-op acceptance is a normal
@@ -1591,7 +1226,7 @@ async fn two_composite_mappers_keep_local_edits_local_and_ignore_their_own_cloud
     let server = MockServer::spawn().await;
     let owner = server.create_user("composite@example.com", "composite", true);
     let cloud_area = server.create_area(&owner, "Cloud");
-    server.add_room(cloud_area, 1, "Before", false);
+    server.add_room(cloud_area, 1, "Before");
     let directory = TempCacheDir::new("two-composites");
     let make = || {
         Mapper::new(

@@ -151,9 +151,46 @@ const PENDING_UPDATE_FLUSH_THRESHOLD: usize = 4096;
 /// is otherwise write-only (it fans out a UI marker), so the runtime mirrors the most recent
 /// value here on the session thread; the same `Rc` is bound into every isolate's ops, which
 /// read it back. It is a CURRENT-session read: the value lives on this thread, not
-/// in the `Mapper` cache, and is not addressable cross-session. `None` until a location is set;
-/// the inner `Option<i32>` is the room number (a location can name an area with no specific room).
-pub(crate) type CurrentLocation = Rc<RefCell<Option<(smudgy_cloud::AreaId, Option<i32>)>>>;
+/// in the `Mapper` cache, and is not addressable cross-session.
+pub(crate) type CurrentLocation = Rc<LocationCell>;
+
+/// The cell behind [`CurrentLocation`]: the location, `None` until one is set (the inner
+/// `Option<i32>` is the room number; a location can name an area with no specific room), and
+/// the number of the write that put it there. Every write takes a new number, a write of the
+/// location already held included, so a reader that kept a number knows whether anything has
+/// written the location since without having seen the write itself.
+#[derive(Default)]
+pub(crate) struct LocationCell {
+    location: Cell<Option<(smudgy_cloud::AreaId, Option<i32>)>>,
+    write: Cell<u64>,
+}
+
+impl LocationCell {
+    /// The location, `None` until one is set.
+    pub(crate) fn get(&self) -> Option<(smudgy_cloud::AreaId, Option<i32>)> {
+        self.location.get()
+    }
+
+    /// The number of the write that put the current location here.
+    pub(crate) fn write(&self) -> u64 {
+        self.write.get()
+    }
+
+    /// Writes `location` under a new write number.
+    pub(crate) fn set(&self, location: (smudgy_cloud::AreaId, Option<i32>)) {
+        self.location.set(Some(location));
+        self.write.set(self.write.get() + 1);
+    }
+
+    /// Settles a queued marker for `location`, a write its setter already made here. The cell
+    /// keeps its write number while it still holds `location`; a marker overtaken by another
+    /// write moves it back, as a new write.
+    pub(crate) fn settle(&self, location: (smudgy_cloud::AreaId, Option<i32>)) {
+        if self.location.get() != Some(location) {
+            self.set(location);
+        }
+    }
+}
 
 /// The script-visible settings snapshot backing `getSettings()`. Seeded from disk at
 /// construction and refreshed by [`RuntimeAction::ApplySettings`]; the same `Rc` is bound
@@ -1501,7 +1538,7 @@ impl Runtime {
 
             // The session's current mapper location, mirrored here from `SetCurrentLocation`
             // and read back by `getCurrentLocation`. Preserved across reload (cloned below).
-            let current_location: CurrentLocation = Rc::new(RefCell::new(None));
+            let current_location = CurrentLocation::default();
             let mapper_events = mapper_events::subscribe(mapper.as_ref());
 
             let pane_registry = local_pane_registry;
@@ -3601,6 +3638,11 @@ impl Inner<'_> {
                     maps.shared
                 ));
             }
+        } else if progress == Progress::Pending {
+            if !first {
+                text = text.text("; ");
+            }
+            text = text.text("Loading maps\u{2026}");
         }
         // Nothing at all loaded leaves the row blank: the pane draws a blank
         // system row as an empty line, so a profile with nothing to load
@@ -3996,6 +4038,18 @@ impl Inner<'_> {
         })
         .await;
 
+        // Publish the completed package phase before waiting for maps. A slow
+        // cloud response must not leave the UI claiming packages are loading.
+        match self.flush_buffer_updates() {
+            Ok(Some(flush)) => {
+                if let Err(error) = flush.await {
+                    warn!("Failed to flush map-loading progress: {error:?}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => warn!("Failed to flush map-loading progress: {error:?}"),
+        }
+
         // Always load: the mapper's local tier serves maps with no credential
         // (and `list_areas` swallows cloud auth errors), so a signed-out
         // session still loads its local maps. Cloud maps join via the sync
@@ -4077,6 +4131,11 @@ impl Inner<'_> {
 
         info!("Starting session event loop");
 
+        // An error the idle readiness branch's pump returned: Phase 1 reports it next. deno
+        // returns each uncaught error once, so the branch keeps it rather than drop it (a
+        // promise continuation that throws after an op completed while the session idled).
+        let mut idle_pump_error: Option<deno_core::error::CoreError> = None;
+
         loop {
             // Arm before checking the subscriber, so publication between the
             // drain and idle select cannot lose a wakeup.
@@ -4127,6 +4186,10 @@ impl Inner<'_> {
             // Scheduling of the other tasks on this runtime is unaffected either way: a pump
             // that returns `Ready` is not a yield point, so it was never what gave the
             // connection reader its turn — that is the readiness arm's `yield_now` below.
+            if let Some(err) = idle_pump_error.take() {
+                warn!("Error in script engine event loop: {err:?}");
+                self.echo_warn_str_sync(&script_engine::format_script_error(&err));
+            }
             let frame_pending = action_stack.last().is_some_and(|frame| !frame.is_empty());
             if !frame_pending {
                 let mut deno_iters = 0;
@@ -4268,12 +4331,13 @@ impl Inner<'_> {
                         trace!("Handling external action: {external_action:?}");
                         Some(external_action)
                     }
-                    // Resolves the moment any isolate makes progress; Phase 1 then drains/handles it.
-                    () = std::future::poll_fn(|cx| match engine.poll_event_loop(cx) {
-                        Poll::Ready(_) => Poll::Ready(()),
-                        Poll::Pending => Poll::Pending,
-                    }) => {
+                    // Resolves the moment any isolate makes progress; Phase 1 then drains/handles
+                    // it, and reports an error this pump returned.
+                    pumped = std::future::poll_fn(|cx| engine.poll_event_loop(cx)) => {
                         trace!("Readiness branch: isolate made progress, re-entering Phase 1");
+                        if let Err(err) = pumped {
+                            idle_pump_error = Some(err);
+                        }
                         // Yield once before re-entering Phase 1 so a perpetually-`Ready` isolate
                         // (a hot microtask/timer loop, or a script erroring on every poll) cannot
                         // busy-spin this current-thread runtime and starve tasks spawned onto it

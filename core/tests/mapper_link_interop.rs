@@ -87,6 +87,12 @@ async fn link_creation_accepts_area_ids_returned_by_mapper() {
     let modules = smudgy_home.join(SERVER).join("modules");
     std::fs::create_dir_all(&modules).expect("create modules directory");
     std::fs::create_dir_all(smudgy_home.join(SERVER).join("logs")).expect("create logs directory");
+    // The session's server, whose settings say where its new maps go.
+    std::fs::write(
+        smudgy_home.join(SERVER).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .expect("write server settings");
     std::fs::write(modules.join("link-interop.ts"), LINK_INTEROP_TS)
         .expect("write link interop module");
 

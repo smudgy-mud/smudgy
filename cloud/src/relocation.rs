@@ -16,9 +16,9 @@ use std::collections::{HashMap, HashSet};
 use log::warn;
 
 use crate::{
-    AreaId, AreaWithDetails, AtlasId, CloudError, CloudResult, ConnectionArgs, ConnectionId,
-    ConnectionKind, Exit, ExitArgs, ExitId, LabelArgs, LabelId, MapDestination, MapStorage, Mapper,
-    RoomNumber, RoomUpdates, ShapeArgs, ShapeId,
+    AreaId, AreaWithDetails, AtlasId, CloudError, CloudResult, Connection, ConnectionArgs,
+    ConnectionId, ConnectionKind, Exit, ExitArgs, ExitId, LabelArgs, LabelId, MapDestination,
+    MapStorage, Mapper, RoomNumber, RoomUpdates, ShapeArgs, ShapeId, SourceBundle, SourceId,
     mapper::{AreaMutationBatch, MutationSubmission, validate_import_document},
     mutation::{AreaMutation, MAX_MUTATION_OPERATIONS},
 };
@@ -28,6 +28,25 @@ use crate::{
 pub enum RelocationMode {
     Copy,
     Move,
+}
+
+/// The owner's sharing review for moving a personal cloud map to local storage.
+/// Supplying this review to a relocation acknowledges the displayed loss of
+/// shared users' cloud-only content when `has_shares` is true.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalMoveReview {
+    pub area_id: AreaId,
+    pub sharing_token: String,
+    pub has_shares: bool,
+    #[serde(skip)]
+    pub auth_generation: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalMoveGuard {
+    pub expected_projection_token: String,
+    pub sharing_token: String,
+    pub shared_loss_confirmed: bool,
 }
 
 /// Name marker a replay-populated relocation destination carries while its
@@ -105,7 +124,7 @@ impl<T> std::fmt::Display for RelocationError<T> {
         if self.completed.is_some() {
             write!(
                 f,
-                "{}. The copy at the destination is complete; the source was left in place — remove it there instead of retrying the move",
+                "{}. A destination copy was created, but the original could not be removed. Keep the original and reconcile both copies before retrying; the original may contain newer work",
                 self.error
             )
         } else if self.partial.is_some() {
@@ -123,17 +142,111 @@ impl<T> std::fmt::Display for RelocationError<T> {
 impl<T: std::fmt::Debug> std::error::Error for RelocationError<T> {}
 
 impl Mapper {
+    /// Review cloud sources before offering a destructive move to local storage.
+    /// Clan sources are refused even when the caller owns the clan or map.
+    ///
+    /// # Errors
+    /// Returns an error if ownership cannot be verified or the service cannot
+    /// review a guarded move under the current credential.
+    pub async fn review_local_moves(
+        &self,
+        area_ids: &[AreaId],
+    ) -> CloudResult<Vec<LocalMoveReview>> {
+        self.local_move_reviews(area_ids).await
+    }
+
     /// Copy or move a set of areas to one explicit storage/folder destination.
     /// Cross-area exits whose targets are also in `source_ids` are remapped to
     /// the corresponding destination areas. For copied members, links leaving
-    /// the set become dangling, matching portable import semantics; a moved
-    /// member already in the destination tier keeps its id (and therefore
-    /// its outside links) and is merely re-filed.
+    /// the set become dangling, matching portable import semantics, except in
+    /// a cloud→cloud copy the service makes (see `server_copy_applies`),
+    /// whose links follow its copy rule; a moved member already in the
+    /// destination tier keeps its id (and therefore its outside links) and is
+    /// merely re-filed.
+    ///
+    /// A copied member carries its places as smudgy-cloudflare format-3.md
+    /// §5.2 says (`keep_what_a_copy_carries`) into local and cloud storage:
+    /// each Secret as an owner Secret of the copy, and the caller's Private
+    /// additions as theirs there. Session storage keeps no places: a copy
+    /// there arrives without them, and a move there of a map holding any is
+    /// refused with [`MOVE_DROPS_PLACES`] before anything is created, so a
+    /// move never deletes a place with its original.
+    ///
+    /// # Errors
+    /// Returns authorization, storage, or synchronization errors. A failed
+    /// source deletion reports any destination copies already completed.
+    /// Shared cloud sources require [`Self::relocate_areas_reviewed`].
     pub async fn relocate_areas(
         &self,
         source_ids: Vec<AreaId>,
         destination: MapDestination,
         mode: RelocationMode,
+    ) -> Result<MapRelocation, RelocationError<MapRelocation>> {
+        self.relocate_areas_reviewed(source_ids, destination, mode, &[])
+            .await
+    }
+
+    /// Relocate with the exact sharing reviews acknowledged by the caller.
+    ///
+    /// # Errors
+    /// Has the same failures as [`Self::relocate_areas`], and refuses stale
+    /// sharing reviews or source snapshots without deleting the original.
+    pub async fn relocate_areas_reviewed(
+        &self,
+        source_ids: Vec<AreaId>,
+        destination: MapDestination,
+        mode: RelocationMode,
+        reviews: &[LocalMoveReview],
+    ) -> Result<MapRelocation, RelocationError<MapRelocation>> {
+        self.relocate_areas_with_reviews(source_ids, destination, mode, reviews, &[])
+            .await
+    }
+
+    /// Relocates a set after acknowledging the cloud filing previews for its cloud members.
+    ///
+    /// # Errors
+    /// Has the relocation failures above, including stale or unauthorized filing reviews.
+    pub async fn relocate_areas_with_filing_reviews(
+        &self,
+        source_ids: Vec<AreaId>,
+        destination: MapDestination,
+        reviews: &[crate::access_review::ReviewedFiling],
+    ) -> Result<MapRelocation, RelocationError<MapRelocation>> {
+        self.relocate_areas_with_reviews(
+            source_ids,
+            destination,
+            RelocationMode::Move,
+            &[],
+            reviews,
+        )
+        .await
+    }
+
+    async fn refile_reviewed_relocation(
+        &self,
+        id: AreaId,
+        atlas: Option<AtlasId>,
+        reviews: &[crate::access_review::ReviewedFiling],
+    ) -> CloudResult<()> {
+        if let Some(review) = reviews.iter().find(|review| review.area_id == id) {
+            if review.atlas_id != atlas {
+                return Err(CloudError::InvalidInput(
+                    "filing review names another destination".to_string(),
+                ));
+            }
+            self.commit_reviewed_filing(review.clone()).await
+        } else {
+            self.move_area_to_atlas(id, atlas).await
+        }
+    }
+
+    async fn relocate_areas_with_reviews(
+        &self,
+        source_ids: Vec<AreaId>,
+        destination: MapDestination,
+        mode: RelocationMode,
+        reviews: &[LocalMoveReview],
+        filing_reviews: &[crate::access_review::ReviewedFiling],
     ) -> Result<MapRelocation, RelocationError<MapRelocation>> {
         if destination.storage == MapStorage::Session && destination.atlas_id.is_some() {
             return Err(CloudError::InvalidInput(
@@ -183,6 +296,15 @@ impl Mapper {
                 .get_area(source_id)
                 .ok_or(CloudError::AreaNotFound(*source_id))?;
             let access = area.effective_access();
+            if mode == RelocationMode::Move
+                && destination.storage != MapStorage::Cloud
+                && area.meta().clan_id.is_some()
+            {
+                return Err(CloudError::InvalidInput(
+                    "clan-library maps cannot be moved to local storage; use Copy".to_string(),
+                )
+                .into());
+            }
             if !access.can_copy {
                 return Err(CloudError::InvalidInput(format!(
                     "map '{}' cannot be copied with the current access",
@@ -230,7 +352,7 @@ impl Mapper {
             let mut refiled = Vec::with_capacity(source_ids.len());
             for (index, source_id) in source_ids.iter().enumerate() {
                 if let Err(error) = self
-                    .move_area_to_atlas(*source_id, destination.atlas_id)
+                    .refile_reviewed_relocation(*source_id, destination.atlas_id, filing_reviews)
                     .await
                 {
                     return Err(RelocationError {
@@ -253,6 +375,26 @@ impl Mapper {
             });
         }
 
+        let local_reviews = if mode == RelocationMode::Move
+            && destination.storage != MapStorage::Cloud
+        {
+            let current = self.review_local_moves(&copied_ids).await?;
+            for review in &current {
+                match reviews.iter().find(|approved| approved.area_id == review.area_id) {
+                    Some(approved) if approved != review => return Err(CloudError::InvalidInput(
+                        "map sharing changed; review the move again".to_string(),
+                    ).into()),
+                    None if review.has_shares => return Err(CloudError::InvalidInput(
+                        "confirm that moving this shared map ends sharing and deletes shared users' cloud-only content".to_string(),
+                    ).into()),
+                    _ => {}
+                }
+            }
+            current
+        } else {
+            Vec::new()
+        };
+
         // Only members whose sources get deleted need the move fence; kept
         // members stay editable throughout and are merely re-filed and
         // relinked at the end.
@@ -264,10 +406,47 @@ impl Mapper {
             None
         };
 
-        let (snapshots, confirmed_revs) = self.snapshot_relocation_sources(&copied_ids)?;
-        for snapshot in &snapshots {
+        let (mut snapshots, confirmed_revs) = self.snapshot_relocation_sources(&copied_ids)?;
+        let local_guards: HashMap<_, _> = local_reviews
+            .iter()
+            .map(|review| {
+                let snapshot = snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.area.id == review.area_id)
+                    .ok_or(CloudError::AreaNotFound(review.area_id))?;
+                let token = snapshot.area.projection_token.clone().ok_or_else(|| {
+                    CloudError::InvalidInput(
+                        "refresh the cloud map before moving it to local storage".to_string(),
+                    )
+                })?;
+                Ok((
+                    review.area_id,
+                    (
+                        LocalMoveGuard {
+                            expected_projection_token: token,
+                            sharing_token: review.sharing_token.clone(),
+                            shared_loss_confirmed: review.has_shares,
+                        },
+                        review.auth_generation,
+                    ),
+                ))
+            })
+            .collect::<CloudResult<_>>()?;
+        for snapshot in &mut snapshots {
+            let cloud = self.area_storage(&snapshot.area.id) == MapStorage::Cloud;
+            keep_what_a_copy_carries(snapshot, cloud);
             validate_import_document(snapshot)?;
         }
+        // Session storage keeps no places, so a move there would delete the
+        // original's Secrets and Private additions with it. A copy leaves
+        // the original whole and arrives without them.
+        if mode == RelocationMode::Move
+            && destination.storage == MapStorage::Session
+            && snapshots.iter().any(holds_places)
+        {
+            return Err(CloudError::StructuralConflict(MOVE_DROPS_PLACES.to_string()).into());
+        }
+        let members: HashSet<AreaId> = source_ids.iter().copied().collect();
         // The backend revision each move snapshot stands on: the last
         // acknowledged revision when one is known, else the cached document
         // revision (queued-but-unsent optimistic bumps ride the copy and are
@@ -281,12 +460,17 @@ impl Mapper {
         let mut server_copied = vec![false; snapshots.len()];
         for (index, snapshot) in snapshots.iter().enumerate() {
             let source_id = snapshot.area.id;
+            let acknowledged = confirmed_revs[index] == Some(snapshot.area.rev)
+                && snapshot.sources.iter().all(|bundle| {
+                    self.confirmed_source_rev(source_id, bundle.source) == Some(bundle.rev)
+                });
             let copied = if server_copy_applies(
                 snapshot,
+                &members,
                 self.area_storage(&source_id),
                 destination.storage,
                 mode,
-                confirmed_revs[index],
+                acknowledged,
             ) {
                 match self
                     .copy_cloud_area(source_id, &snapshot.area.name, destination.atlas_id)
@@ -343,9 +527,9 @@ impl Mapper {
         // Server-copied members are already complete; everything else is
         // freshened and replayed. In-set links from replayed members into a
         // server-copied sibling still remap correctly through `id_map`,
-        // because the server clone preserves room numbers. Secrecy markings
-        // ride the copy untouched — the snapshot already is the viewer's
-        // projection.
+        // because the server clone preserves room numbers. The places the
+        // snapshot keeps (`keep_what_a_copy_carries`) ride the copy as the
+        // copier's own.
         let mut documents: Vec<_> = snapshots
             .into_iter()
             .zip(server_copied.iter().copied())
@@ -356,7 +540,7 @@ impl Mapper {
             &mut documents,
             &id_map,
             &FreshenOptions {
-                scrub_secrets: false,
+                stamp_local_owner: false,
             },
         );
 
@@ -411,7 +595,7 @@ impl Mapper {
         let mut refiled = Vec::with_capacity(kept_ids.len());
         for (index, kept_id) in kept_ids.iter().enumerate() {
             if let Err(error) = self
-                .move_area_to_atlas(*kept_id, destination.atlas_id)
+                .refile_reviewed_relocation(*kept_id, destination.atlas_id, filing_reviews)
                 .await
             {
                 return Err(RelocationError {
@@ -434,7 +618,7 @@ impl Mapper {
             destination,
         };
 
-        if mode == RelocationMode::Move {
+        if let Some(fences) = move_fences.take() {
             // Destination content is fully acknowledged before the first
             // source delete. A delete failure (including the rev-drift
             // refusal) leaves complete copies on both sides — recoverable and
@@ -442,9 +626,13 @@ impl Mapper {
             // the remedy is pointing at the existing copy, not a retry that
             // would mint another one. Fences not yet committed are dropped
             // here, which reopens their sources for editing.
-            let fences = move_fences.take().expect("move mode creates source fences");
             for (fence, expected_rev) in fences.into_iter().zip(expected_revs) {
-                if let Err(error) = self.commit_area_move(fence, Some(expected_rev)).await {
+                let result = if let Some((guard, generation)) = local_guards.get(&fence.area_id()) {
+                    self.commit_local_area_move(fence, guard, *generation).await
+                } else {
+                    self.commit_area_move(fence, Some(expected_rev)).await
+                };
+                if let Err(error) = result {
                     return Err(RelocationError {
                         error,
                         completed: Some(completed()),
@@ -464,12 +652,34 @@ impl Mapper {
     /// Copy or move one whole atlas. Refuses to start unless the cache holds
     /// every member reported by the authoritative inventory, so a failed area
     /// load cannot silently turn into a partial atlas move.
+    ///
+    /// # Errors
+    /// Returns inventory, permission, or storage errors. Completed destination
+    /// copies are reported if source deletion fails. Shared cloud maps require
+    /// [`Self::relocate_atlas_reviewed`].
     pub async fn relocate_atlas(
         &self,
         source_atlas_id: AtlasId,
         destination_storage: MapStorage,
         mode: RelocationMode,
     ) -> Result<AtlasRelocation, RelocationError<AtlasRelocation>> {
+        self.relocate_atlas_reviewed(source_atlas_id, destination_storage, mode, &[])
+            .await
+    }
+
+    /// Relocate an atlas with the acknowledged sharing reviews of its maps.
+    ///
+    /// # Errors
+    /// Has the same failures as [`Self::relocate_atlas`], and refuses stale
+    /// sharing reviews or source snapshots without deleting those originals.
+    pub async fn relocate_atlas_reviewed(
+        &self,
+        source_atlas_id: AtlasId,
+        destination_storage: MapStorage,
+        mode: RelocationMode,
+        reviews: &[LocalMoveReview],
+    ) -> Result<AtlasRelocation, RelocationError<AtlasRelocation>> {
+        let auth_generation = self.local_move_generation();
         if destination_storage == MapStorage::Session {
             return Err(CloudError::InvalidInput(
                 "session storage does not support atlases".to_string(),
@@ -493,6 +703,12 @@ impl Mapper {
         if !source.is_owner {
             return Err(CloudError::InvalidInput(
                 "a shared atlas cannot be copied or moved".to_string(),
+            )
+            .into());
+        }
+        if mode == RelocationMode::Move && source.clan_id.is_some() {
+            return Err(CloudError::InvalidInput(
+                "clan-library atlases cannot be moved to local storage; use Copy".to_string(),
             )
             .into());
         }
@@ -521,6 +737,26 @@ impl Mapper {
             .into());
         }
 
+        let local_reviews = if mode == RelocationMode::Move
+            && destination_storage == MapStorage::Local
+        {
+            let current = self.review_local_moves(&member_ids).await?;
+            for review in &current {
+                match reviews.iter().find(|approved| approved.area_id == review.area_id) {
+                    Some(approved) if approved != review => return Err(CloudError::InvalidInput(
+                        "map sharing changed; review the move again".into(),
+                    ).into()),
+                    None if review.has_shares => return Err(CloudError::InvalidInput(
+                        "confirm the loss of shared users' cloud-only content before moving this atlas".into(),
+                    ).into()),
+                    _ => {}
+                }
+            }
+            current
+        } else {
+            Vec::new()
+        };
+
         let mut move_fences = if mode == RelocationMode::Move {
             let fences = self.begin_relocation(&member_ids)?;
             self.wait_area_move_quiescent(&fences).await;
@@ -532,6 +768,30 @@ impl Mapper {
         // The backend revision each member's copy stands on, captured after
         // quiescence and before the copy (see `relocate_areas`).
         let member_cache = self.get_current_atlas();
+        let local_guards: HashMap<_, _> = local_reviews
+            .iter()
+            .map(|review| {
+                let token = member_cache
+                    .get_area(&review.area_id)
+                    .and_then(|area| area.meta().projection_token.clone())
+                    .ok_or_else(|| {
+                        CloudError::InvalidInput(
+                            "refresh the cloud maps before moving this atlas".into(),
+                        )
+                    })?;
+                Ok((
+                    review.area_id,
+                    (
+                        LocalMoveGuard {
+                            expected_projection_token: token,
+                            sharing_token: review.sharing_token.clone(),
+                            shared_loss_confirmed: review.has_shares,
+                        },
+                        review.auth_generation,
+                    ),
+                ))
+            })
+            .collect::<CloudResult<_>>()?;
         let expected_revs: Vec<i64> = member_ids
             .iter()
             .map(|id| {
@@ -593,18 +853,20 @@ impl Mapper {
             }
         };
 
-        if mode == RelocationMode::Move {
+        if let Some(fences) = move_fences.take() {
             let completed = || AtlasRelocation {
                 source_atlas_id,
                 destination_atlas_id: destination_atlas.id,
                 destination_atlas_name: destination_atlas_name.clone(),
                 areas: areas.clone(),
             };
-            let fences = move_fences
-                .take()
-                .expect("atlas move mode creates source fences");
             for (fence, expected_rev) in fences.into_iter().zip(expected_revs) {
-                if let Err(error) = self.commit_area_move(fence, Some(expected_rev)).await {
+                let result = if let Some((guard, generation)) = local_guards.get(&fence.area_id()) {
+                    self.commit_local_area_move(fence, guard, *generation).await
+                } else {
+                    self.commit_area_move(fence, Some(expected_rev)).await
+                };
+                if let Err(error) = result {
                     return Err(RelocationError {
                         error,
                         completed: Some(completed()),
@@ -612,7 +874,13 @@ impl Mapper {
                     });
                 }
             }
-            if let Err(error) = self.delete_atlas(source_atlas_id).await {
+            let removal = if destination_storage == MapStorage::Local {
+                self.finish_local_atlas_move(source_atlas_id, auth_generation)
+                    .await
+            } else {
+                self.delete_atlas(source_atlas_id).await
+            };
+            if let Err(error) = removal {
                 return Err(RelocationError {
                     error,
                     completed: Some(completed()),
@@ -659,6 +927,7 @@ impl Mapper {
                 chunk_ops(
                     document.area.id,
                     document.rooms.iter().map(|room| AreaMutation::UpsertRoom {
+                        room_source: None,
                         room_number: room.room_number,
                         body: RoomUpdates {
                             title: Some(room.title.clone()),
@@ -667,7 +936,6 @@ impl Mapper {
                             x: Some(room.x),
                             y: Some(room.y),
                             color: Some(room.color.clone()),
-                            is_secret: Some(room.is_secret),
                             external_id: Some(room.external_id.clone()),
                         },
                     }),
@@ -685,19 +953,19 @@ impl Mapper {
                         AreaMutation::UpsertAreaProperty {
                             name: property.name.clone(),
                             value: property.value.clone(),
-                            is_secret: Some(property.is_secret),
                         }
                     });
                     let room_props = document.rooms.iter().flat_map(|room| {
                         let properties = room.properties.iter().map(|property| {
                             AreaMutation::UpsertRoomProperty {
+                                room_source: None,
                                 room_number: room.room_number,
                                 name: property.name.clone(),
                                 value: property.value.clone(),
-                                is_secret: Some(property.is_secret),
                             }
                         });
                         let tags = room.tags.iter().map(|tag| AreaMutation::AddRoomTag {
+                            room_source: None,
                             room_number: room.room_number,
                             tag: tag.clone(),
                         });
@@ -725,41 +993,13 @@ impl Mapper {
                     .labels
                     .iter()
                     .map(|label| AreaMutation::CreateLabel {
-                        body: LabelArgs {
-                            id: Some(label.id),
-                            level: label.level,
-                            x: label.x,
-                            y: label.y,
-                            width: label.width,
-                            height: label.height,
-                            horizontal_alignment: label.horizontal_alignment.clone(),
-                            vertical_alignment: label.vertical_alignment.clone(),
-                            text: label.text.clone(),
-                            color: label.color.clone(),
-                            background_color: Some(label.background_color.clone()),
-                            font_size: label.font_size,
-                            font_weight: label.font_weight,
-                            is_secret: Some(label.is_secret),
-                        },
+                        body: label_args(label),
                     });
                 let shapes = document
                     .shapes
                     .iter()
                     .map(|shape| AreaMutation::CreateShape {
-                        body: ShapeArgs {
-                            id: Some(shape.id),
-                            level: shape.level,
-                            x: shape.x,
-                            y: shape.y,
-                            width: shape.width,
-                            height: shape.height,
-                            background_color: shape.background_color.clone(),
-                            stroke_color: shape.stroke_color.clone(),
-                            shape_type: shape.shape_type.clone(),
-                            border_radius: shape.border_radius,
-                            stroke_width: Some(shape.stroke_width),
-                            is_secret: Some(shape.is_secret),
-                        },
+                        body: shape_args(shape),
                     });
                 chunk_ops(
                     document.area.id,
@@ -768,7 +1008,44 @@ impl Mapper {
                 )
             })
             .collect();
-        self.stage_and_wait(decoration_batches).await
+        self.stage_and_wait(decoration_batches).await?;
+
+        for document in documents {
+            if self.area_storage(&document.area.id) == MapStorage::Cloud {
+                self.populate_places(document).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replays a populated cloud destination's places: each Secret becomes
+    /// an owner Secret of the destination under the id the service gives
+    /// it, with the same name, color and content, and the Private additions
+    /// become the caller's own there. Every map room is already in place,
+    /// so a place's data for map rooms and its links into them land whole.
+    async fn populate_places(&self, document: &AreaWithDetails) -> CloudResult<()> {
+        let area_id = document.area.id;
+        for bundle in document.sources.iter().filter(|bundle| holds_place(bundle)) {
+            let source = match bundle.source {
+                SourceId::Secret(_) => {
+                    let name = bundle.name.as_deref().unwrap_or_default();
+                    self.create_secret(area_id, name, bundle.color.as_deref())
+                        .await?
+                        .source
+                }
+                other => other,
+            };
+            let bundle = renamed_place(bundle, source);
+            self.stage_and_wait(place_batches(area_id, &bundle, PlaceStage::Rooms))
+                .await?;
+            self.stage_and_wait(place_batches(area_id, &bundle, PlaceStage::Properties))
+                .await?;
+            self.stage_and_wait(place_batches(area_id, &bundle, PlaceStage::Connections))
+                .await?;
+            self.stage_and_wait(place_batches(area_id, &bundle, PlaceStage::Decorations))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Retargets, in the kept members of a mixed-tier move, every exit
@@ -820,18 +1097,22 @@ impl Mapper {
 }
 
 /// Whether one source can take the server-side cloud clone
-/// (`POST /areas/{id}/copy`) instead of freshen-and-replay. The gate is
-/// deliberately narrow because the server clone's semantics diverge from
-/// the freshen contract outside it:
+/// (`POST /areas/{id}/copy`) instead of freshen-and-replay. A cloud→cloud
+/// copy takes it whenever it can, because the service copies what the
+/// copier may copy (smudgy-cloudflare format-3.md §5.2) with every place
+/// in it, where the replay rebuilds them one write at a time:
 ///
-/// - the server preserves live outbound cross-area links to visible areas,
-///   where relocation demotes every link leaving the set to dangling — so
-///   only an area with **no cross-area exits at all** (in-set links from
-///   siblings are inbound and unaffected) is eligible;
-/// - the server copies its own state, where relocation copies the local
-///   optimistic snapshot — so eligibility requires the backend-acknowledged
-///   revision to match the snapshot (no queued edits the server has not
-///   seen);
+/// - the service copies its own state, where relocation copies the local
+///   optimistic snapshot — so every source the snapshot carries must stand
+///   at its backend-acknowledged revision (`acknowledged`: no queued edits
+///   the service has not seen);
+/// - a clone links into the original of another member of the set, which
+///   only the replay's set-wide remap leads into that member's copy — so a
+///   member with an exit into another member, from the map or from a
+///   place, takes the replay;
+/// - links into maps outside the set follow the service's copy rule: they
+///   stay where the copier reads the map they lead into, and dangle
+///   elsewhere;
 /// - both paths mint fresh area/connection/exit identities and preserve
 ///   room numbers, so in-set inbound remaps hold either way.
 ///
@@ -840,24 +1121,32 @@ impl Mapper {
 /// and truthful for a copy.
 fn server_copy_applies(
     snapshot: &AreaWithDetails,
+    members: &HashSet<AreaId>,
     source_storage: MapStorage,
     destination_storage: MapStorage,
     mode: RelocationMode,
-    confirmed_rev: Option<i64>,
+    acknowledged: bool,
 ) -> bool {
+    let own = snapshot.area.id;
+    let place_exits = snapshot.sources.iter().flat_map(|bundle| {
+        bundle
+            .rooms
+            .iter()
+            .flat_map(|room| &room.exits)
+            .chain(bundle.room_data.iter().flat_map(|data| &data.exits))
+    });
     mode == RelocationMode::Copy
         && source_storage == MapStorage::Cloud
         && destination_storage == MapStorage::Cloud
-        && confirmed_rev == Some(snapshot.area.rev)
+        && acknowledged
         && snapshot
             .rooms
             .iter()
             .flat_map(|room| &room.exits)
+            .chain(place_exits)
             .all(|exit| {
-                !exit.to_unknown
-                    && exit
-                        .to_area_id
-                        .is_none_or(|target| target == snapshot.area.id)
+                exit.to_area_id
+                    .is_none_or(|target| target == own || !members.contains(&target))
             })
 }
 
@@ -888,22 +1177,46 @@ fn chunk_ops(
 /// envelope; a connection without members is structurally invalid at an
 /// envelope boundary.
 fn connection_batches(document: &AreaWithDetails) -> Vec<AreaMutationBatch> {
+    let exits = document
+        .rooms
+        .iter()
+        .flat_map(|room| room.exits.iter().map(|exit| (None, room.room_number, exit)));
+    grouped_connection_batches(
+        document.area.id,
+        SourceId::Map,
+        &document.connections,
+        exits,
+    )
+}
+
+/// An exit and the room it leaves: `room_source` for one of a source's own
+/// rooms, none for a map room.
+type LeavingExit<'a> = (Option<SourceId>, RoomNumber, &'a Exit);
+
+/// [`connection_batches`] for any source of a map.
+fn grouped_connection_batches<'a>(
+    area_id: AreaId,
+    source: SourceId,
+    connections: &[Connection],
+    exits: impl IntoIterator<Item = LeavingExit<'a>>,
+) -> Vec<AreaMutationBatch> {
     // One pass over every exit builds the member index; scanning every
     // room's exits per connection would be quadratic in area size.
-    let mut members: HashMap<ConnectionId, Vec<(RoomNumber, &Exit)>> =
-        HashMap::with_capacity(document.connections.len());
-    for room in &document.rooms {
-        for exit in &room.exits {
-            members
-                .entry(exit.connection_id)
-                .or_default()
-                .push((room.room_number, exit));
-        }
+    let mut members: HashMap<ConnectionId, Vec<LeavingExit<'a>>> =
+        HashMap::with_capacity(connections.len());
+    for (room_source, room_number, exit) in exits {
+        members
+            .entry(exit.connection_id)
+            .or_default()
+            .push((room_source, room_number, exit));
     }
 
+    let batch = |operations| {
+        AreaMutationBatch::strict(area_id, operations, "Copy map connections").in_source(source)
+    };
     let mut batches = Vec::new();
     let mut current = Vec::with_capacity(MAX_MUTATION_OPERATIONS);
-    for connection in &document.connections {
+    for connection in connections {
         let mut group = vec![AreaMutation::CreateConnection {
             body: ConnectionArgs::from(connection),
         }];
@@ -913,52 +1226,448 @@ fn connection_batches(document: &AreaWithDetails) -> Vec<AreaMutationBatch> {
                 .map(Vec::as_slice)
                 .unwrap_or_default()
                 .iter()
-                .map(|&(room_number, exit)| AreaMutation::CreateExit {
-                    room_number,
-                    body: ExitArgs {
-                        id: Some(exit.id),
-                        connection_id: Some(exit.connection_id),
-                        new_connection_id: None,
-                        from_direction: exit.from_direction,
-                        to_area_id: exit.to_area_id,
-                        to_room_number: exit.to_room_number,
-                        to_direction: exit.to_direction,
-                        path: Some(exit.path.clone()),
-                        is_hidden: exit.is_hidden,
-                        is_closed: exit.is_closed,
-                        is_locked: exit.is_locked,
-                        weight: exit.weight,
-                        command: Some(exit.command.clone()),
-                        is_secret: Some(exit.is_secret),
+                .map(
+                    |&(room_source, room_number, exit)| AreaMutation::CreateExit {
+                        room_source,
+                        room_number,
+                        body: ExitArgs {
+                            to_source: exit.to_source,
+                            id: Some(exit.id),
+                            connection_id: Some(exit.connection_id),
+                            new_connection_id: None,
+                            from_direction: exit.from_direction,
+                            to_area_id: exit.to_area_id,
+                            to_room_number: exit.to_room_number,
+                            to_direction: exit.to_direction,
+                            path: Some(exit.path.clone()),
+                            is_hidden: exit.is_hidden,
+                            door: exit.door.clone(),
+                            weight: exit.weight,
+                            command: Some(exit.command.clone()),
+                        },
                     },
-                }),
+                ),
         );
         if current.len() + group.len() > MAX_MUTATION_OPERATIONS && !current.is_empty() {
-            batches.push(AreaMutationBatch::strict(
-                document.area.id,
-                std::mem::take(&mut current),
-                "Copy map connections",
-            ));
+            batches.push(batch(std::mem::take(&mut current)));
         }
         current.extend(group);
     }
     if !current.is_empty() {
-        batches.push(AreaMutationBatch::strict(
-            document.area.id,
-            current,
-            "Copy map connections",
-        ));
+        batches.push(batch(current));
     }
     batches
 }
 
-/// How [`freshen_documents`] treats viewer-only markings.
+/// A label's creation under its own id.
+fn label_args(label: &crate::Label) -> LabelArgs {
+    LabelArgs {
+        id: Some(label.id),
+        level: label.level,
+        x: label.x,
+        y: label.y,
+        width: label.width,
+        height: label.height,
+        horizontal_alignment: label.horizontal_alignment.clone(),
+        vertical_alignment: label.vertical_alignment.clone(),
+        text: label.text.clone(),
+        color: label.color.clone(),
+        background_color: Some(label.background_color.clone()),
+        font_size: label.font_size,
+        font_weight: label.font_weight,
+    }
+}
+
+/// A shape's creation under its own id.
+fn shape_args(shape: &crate::Shape) -> ShapeArgs {
+    ShapeArgs {
+        id: Some(shape.id),
+        level: shape.level,
+        x: shape.x,
+        y: shape.y,
+        width: shape.width,
+        height: shape.height,
+        background_color: shape.background_color.clone(),
+        stroke_color: shape.stroke_color.clone(),
+        shape_type: shape.shape_type.clone(),
+        border_radius: shape.border_radius,
+        stroke_width: Some(shape.stroke_width),
+    }
+}
+
+/// The refusal of a move into storage that keeps no places (session maps)
+/// of a map holding Secrets or Private additions.
+pub const MOVE_DROPS_PLACES: &str = "move_drops_places";
+
+/// Whether a source of a snapshot is a place: a Secret, or the caller's
+/// Private additions.
+fn holds_place(bundle: &SourceBundle) -> bool {
+    !bundle.source.is_map()
+}
+
+fn holds_places(document: &AreaWithDetails) -> bool {
+    document.sources.iter().any(holds_place)
+}
+
+/// A freshened place under the id its destination gave it: the source and
+/// every reference to its own rooms.
+fn renamed_place(bundle: &SourceBundle, source: SourceId) -> SourceBundle {
+    let old = bundle.source;
+    let mut bundle = bundle.clone();
+    bundle.source = source;
+    let rename = |named: &mut Option<SourceId>| {
+        if *named == Some(old) {
+            *named = Some(source);
+        }
+    };
+    for connection in &mut bundle.connections {
+        rename(&mut connection.endpoint_a.source);
+        if let Some(endpoint) = connection.endpoint_b.as_mut() {
+            rename(&mut endpoint.source);
+        }
+    }
+    for exit in bundle
+        .rooms
+        .iter_mut()
+        .flat_map(|room| room.exits.iter_mut())
+        .chain(
+            bundle
+                .room_data
+                .iter_mut()
+                .flat_map(|data| data.exits.iter_mut()),
+        )
+    {
+        rename(&mut exit.to_source);
+    }
+    bundle
+}
+
+/// The order a place is replayed in: its rooms, then what it keeps on
+/// rooms, then the links among them, then its labels and shapes.
+#[derive(Clone, Copy)]
+enum PlaceStage {
+    Rooms,
+    Properties,
+    Connections,
+    Decorations,
+}
+
+/// One stage of replaying `bundle` into map `area_id`, written to the
+/// bundle's own source. Its own rooms are named with `room_source`, map
+/// rooms without it.
+fn place_batches(
+    area_id: AreaId,
+    bundle: &SourceBundle,
+    stage: PlaceStage,
+) -> Vec<AreaMutationBatch> {
+    let source = bundle.source;
+    let own = Some(source);
+    let in_source = |batches: Vec<AreaMutationBatch>| {
+        batches
+            .into_iter()
+            .map(|batch| batch.in_source(source))
+            .collect()
+    };
+    match stage {
+        PlaceStage::Rooms => in_source(chunk_ops(
+            area_id,
+            bundle.rooms.iter().map(|room| AreaMutation::UpsertRoom {
+                room_source: own,
+                room_number: room.room_number,
+                body: RoomUpdates {
+                    title: Some(room.title.clone()),
+                    description: Some(room.description.clone()),
+                    level: Some(room.level),
+                    x: Some(room.x),
+                    y: Some(room.y),
+                    color: Some(room.color.clone()),
+                    external_id: Some(room.external_id.clone()),
+                },
+            }),
+            "Copy map rooms",
+        )),
+        PlaceStage::Properties => {
+            let properties =
+                bundle
+                    .properties
+                    .iter()
+                    .map(|property| AreaMutation::UpsertAreaProperty {
+                        name: property.name.clone(),
+                        value: property.value.clone(),
+                    });
+            let own_rooms = bundle
+                .rooms
+                .iter()
+                .map(|room| (own, room.room_number, &room.properties, &room.tags));
+            let map_rooms = bundle
+                .room_data
+                .iter()
+                .map(|data| (None, data.room_number, &data.properties, &data.tags));
+            let rooms = own_rooms.chain(map_rooms).flat_map(
+                |(room_source, room_number, properties, tags)| {
+                    properties
+                        .iter()
+                        .map(move |property| AreaMutation::UpsertRoomProperty {
+                            room_source,
+                            room_number,
+                            name: property.name.clone(),
+                            value: property.value.clone(),
+                        })
+                        .chain(tags.iter().map(move |tag| AreaMutation::AddRoomTag {
+                            room_source,
+                            room_number,
+                            tag: tag.clone(),
+                        }))
+                },
+            );
+            in_source(chunk_ops(
+                area_id,
+                properties.chain(rooms),
+                "Copy map properties",
+            ))
+        }
+        PlaceStage::Connections => {
+            let exits = bundle
+                .rooms
+                .iter()
+                .flat_map(|room| {
+                    room.exits
+                        .iter()
+                        .map(move |exit| (own, room.room_number, exit))
+                })
+                .chain(bundle.room_data.iter().flat_map(|data| {
+                    data.exits
+                        .iter()
+                        .map(move |exit| (None, data.room_number, exit))
+                }));
+            grouped_connection_batches(area_id, source, &bundle.connections, exits)
+        }
+        PlaceStage::Decorations => {
+            let labels = bundle.labels.iter().map(|label| AreaMutation::CreateLabel {
+                body: label_args(label),
+            });
+            let shapes = bundle.shapes.iter().map(|shape| AreaMutation::CreateShape {
+                body: shape_args(shape),
+            });
+            in_source(chunk_ops(
+                area_id,
+                labels.chain(shapes),
+                "Copy map decorations",
+            ))
+        }
+    }
+}
+
+/// Keep sources the caller may copy. Exits belong to their owning source,
+/// including exits with unreadable destinations. The freshener preserves
+/// those exits and makes destinations outside the copied set dangling.
+pub(crate) fn keep_what_a_copy_carries(document: &mut AreaWithDetails, cloud: bool) {
+    if cloud {
+        document.keep_copyable_sources();
+    }
+}
+
+const OWNER_SECRET_ACTIONS: [&str; 8] = [
+    "read",
+    "add",
+    "edit",
+    "remove",
+    "manage_access",
+    "copy",
+    "rename",
+    "delete",
+];
+
+/// Freshens one of a copied map's sources as [`freshen_documents`] does the
+/// map: a Secret becomes an owner Secret of the copy under a fresh id, with
+/// the same name, color and content and nothing of its owners, clan or
+/// grants; every exit, connection, label and shape takes a fresh id; and its
+/// exits follow the map's rules: into the copied map, or a set member, they
+/// lead into the copy, and into any other map they dangle.
+fn freshen_source_bundle(
+    bundle: &mut SourceBundle,
+    id_map: &HashMap<AreaId, AreaId>,
+    leaves_area: impl Fn(AreaId) -> bool,
+) {
+    let old = bundle.source;
+    let own = match old {
+        SourceId::Secret(_) => {
+            bundle.ownership = Some(crate::clan_secrets::ownership::OWNER.to_string());
+            bundle.clan_id = None;
+            bundle.actions = OWNER_SECRET_ACTIONS
+                .iter()
+                .map(|action| (*action).to_string())
+                .collect();
+            old
+        }
+        other => other,
+    };
+    bundle.source = own;
+    bundle.rev = 1;
+    let renamed =
+        |source: Option<SourceId>| source.map(|source| if source == old { own } else { source });
+    for label in &mut bundle.labels {
+        label.id = LabelId(uuid::Uuid::new_v4());
+    }
+    for shape in &mut bundle.shapes {
+        shape.id = ShapeId(uuid::Uuid::new_v4());
+    }
+    let connection_map: HashMap<ConnectionId, ConnectionId> = bundle
+        .connections
+        .iter()
+        .map(|connection| (connection.id, ConnectionId::new()))
+        .collect();
+    for connection in &mut bundle.connections {
+        connection.id = connection_map[&connection.id];
+        connection.endpoint_a.source = renamed(connection.endpoint_a.source);
+        if let Some(endpoint) = connection.endpoint_b.as_mut() {
+            endpoint.source = renamed(endpoint.source);
+        }
+    }
+    let exits = bundle
+        .rooms
+        .iter_mut()
+        .flat_map(|room| room.exits.iter_mut())
+        .chain(
+            bundle
+                .room_data
+                .iter_mut()
+                .flat_map(|data| data.exits.iter_mut()),
+        );
+    let mut leaving: HashSet<ConnectionId> = HashSet::new();
+    for exit in exits {
+        exit.id = ExitId::new();
+        exit.connection_id = connection_map
+            .get(&exit.connection_id)
+            .copied()
+            .unwrap_or_else(ConnectionId::new);
+        exit.to_unknown = false;
+        exit.to_area_token = None;
+        exit.to_source = renamed(exit.to_source);
+        exit.to_area_id = match exit.to_area_id {
+            Some(target) if id_map.contains_key(&target) => Some(id_map[&target]),
+            Some(_) => {
+                exit.to_room_number = None;
+                exit.to_direction = None;
+                exit.to_source = None;
+                None
+            }
+            None => None,
+        };
+        if exit.to_area_id.is_some_and(&leaves_area) {
+            leaving.insert(exit.connection_id);
+        }
+    }
+    for connection in &mut bundle.connections {
+        if connection.kind == ConnectionKind::External && !leaving.contains(&connection.id) {
+            connection.kind = ConnectionKind::Dangling;
+            connection.endpoint_b = None;
+        }
+    }
+}
+
+/// Allocate Secret identities for the whole copied set before rewriting any
+/// reference. A reference into a source omitted from the copy must not point
+/// at the original source, or fall back to an ordinary room of the same number.
+fn freshen_source_references(documents: &mut [AreaWithDetails], id_map: &HashMap<AreaId, AreaId>) {
+    let mut sources: HashMap<_, _> = id_map
+        .keys()
+        .map(|map| ((*map, SourceId::Map), SourceId::Map))
+        .collect();
+    for document in documents.iter() {
+        sources.insert((document.area.id, SourceId::Map), SourceId::Map);
+        for bundle in &document.sources {
+            sources.insert(
+                (document.area.id, bundle.source),
+                match bundle.source {
+                    SourceId::Secret(_) => SourceId::Secret(uuid::Uuid::new_v4()),
+                    other => other,
+                },
+            );
+        }
+    }
+    for document in documents {
+        let map = document.area.id;
+        let rewrite = |rooms: &mut Vec<crate::RoomWithDetails>,
+                       data: &mut Vec<crate::RoomData>,
+                       connections: &mut Vec<Connection>| {
+            data.retain(|data| {
+                sources.contains_key(&(map, data.room_source.unwrap_or(SourceId::Map)))
+            });
+            for data in data.iter_mut() {
+                data.room_source = data.room_source.map(|source| sources[&(map, source)]);
+            }
+            connections.retain(|connection| {
+                sources.contains_key(&(map, connection.endpoint_a.source.unwrap_or(SourceId::Map)))
+            });
+            for connection in connections.iter_mut() {
+                connection.endpoint_a.source = connection
+                    .endpoint_a
+                    .source
+                    .map(|source| sources[&(map, source)]);
+                if let Some(endpoint) = connection.endpoint_b.as_mut() {
+                    if let Some(source) =
+                        sources.get(&(map, endpoint.source.unwrap_or(SourceId::Map)))
+                    {
+                        endpoint.source = endpoint.source.map(|_| *source);
+                    } else {
+                        connection.endpoint_b = None;
+                    }
+                }
+            }
+            let kept: HashSet<ConnectionId> =
+                connections.iter().map(|connection| connection.id).collect();
+            for exits in rooms
+                .iter_mut()
+                .map(|room| &mut room.exits)
+                .chain(data.iter_mut().map(|data| &mut data.exits))
+            {
+                exits.retain(|exit| kept.contains(&exit.connection_id));
+                for exit in exits {
+                    if let Some(target) =
+                        exit.to_area_id.filter(|target| id_map.contains_key(target))
+                    {
+                        if id_map[&target] == target {
+                            continue;
+                        }
+                        if let Some(source) =
+                            sources.get(&(target, exit.to_source.unwrap_or(SourceId::Map)))
+                        {
+                            exit.to_source = exit.to_source.map(|_| *source);
+                        } else {
+                            exit.to_area_id = None;
+                            exit.to_room_number = None;
+                            exit.to_direction = None;
+                            exit.to_source = None;
+                        }
+                    }
+                }
+            }
+        };
+        rewrite(
+            &mut document.rooms,
+            &mut document.room_data,
+            &mut document.connections,
+        );
+        for bundle in &mut document.sources {
+            let source = sources[&(map, bundle.source)];
+            rewrite(
+                &mut bundle.rooms,
+                &mut bundle.room_data,
+                &mut bundle.connections,
+            );
+            bundle.source = source;
+        }
+    }
+}
+
+/// How [`freshen_documents`] treats viewer-only metadata.
 pub(crate) struct FreshenOptions {
-    /// Strip every `is_secret` marking and stamp locally-owned access — the
+    /// Stamp locally-owned access and drop the owner's nickname — the
     /// JSON-import contract, which resets foreign metadata to a
-    /// locally-owned area. Relocation keeps markings: a copy of one's own
-    /// map preserves the viewer's projection verbatim.
-    pub scrub_secrets: bool,
+    /// locally-owned area. Relocation keeps them: a copy of one's own map
+    /// preserves the viewer's projection verbatim.
+    pub stamp_local_owner: bool,
 }
 
 /// The shared identity freshener behind relocation and the §8.4 JSON
@@ -974,34 +1683,35 @@ pub(crate) fn freshen_documents(
     id_map: &HashMap<AreaId, AreaId>,
     options: &FreshenOptions,
 ) {
+    freshen_source_references(documents, id_map);
     for document in documents {
         document.area.id = id_map[&document.area.id];
         document.area.atlas_id = None;
         document.area.atlas_name = None;
         document.area.user_id = None;
+        // The source map's clan, the caller's actions there, and its
+        // ownership there: a fresh area is in no clan.
+        document.area.clan_id = None;
+        document.area.clan_name = None;
+        document.area.actions = None;
+        document.area.clan_ownership = crate::clan_maps::ClanOwnership::default();
         document.area.rev = 1;
         document.area.copied_from_area_id = None;
         document.area.copied_from_rev = None;
         document.area.copied_at = None;
         document.area.family_token = None;
-        document.content_hash = None;
+        document.area.projection_token = None;
         document.linked_areas.clear();
-        if options.scrub_secrets {
+        if options.stamp_local_owner {
             document.area.access = Some(crate::AreaAccess::OWNER);
             document.area.owner_nickname = None;
         }
 
         for label in &mut document.labels {
             label.id = LabelId(uuid::Uuid::new_v4());
-            if options.scrub_secrets {
-                label.is_secret = false;
-            }
         }
         for shape in &mut document.shapes {
             shape.id = ShapeId(uuid::Uuid::new_v4());
-            if options.scrub_secrets {
-                shape.is_secret = false;
-            }
         }
         let connection_map: HashMap<ConnectionId, ConnectionId> = document
             .connections
@@ -1012,33 +1722,37 @@ pub(crate) fn freshen_documents(
             connection.id = connection_map[&connection.id];
         }
         let area_id = document.area.id;
-        for room in &mut document.rooms {
-            if options.scrub_secrets {
-                room.is_secret = false;
-            }
-            for exit in &mut room.exits {
-                exit.id = ExitId::new();
-                exit.connection_id = connection_map[&exit.connection_id];
-                if options.scrub_secrets {
-                    exit.is_secret = false;
+        for exit in document
+            .rooms
+            .iter_mut()
+            .flat_map(|room| &mut room.exits)
+            .chain(
+                document
+                    .room_data
+                    .iter_mut()
+                    .flat_map(|data| &mut data.exits),
+            )
+        {
+            exit.id = ExitId::new();
+            exit.connection_id = connection_map[&exit.connection_id];
+            exit.to_unknown = false;
+            exit.to_area_token = None;
+            exit.to_area_id = match exit.to_area_id {
+                Some(old) if id_map.contains_key(&old) => Some(id_map[&old]),
+                Some(_) => {
+                    exit.to_room_number = None;
+                    exit.to_direction = None;
+                    exit.to_source = None;
+                    None
                 }
-                exit.to_unknown = false;
-                exit.to_area_token = None;
-                exit.to_area_id = match exit.to_area_id {
-                    Some(old) if id_map.contains_key(&old) => Some(id_map[&old]),
-                    Some(_) => {
-                        exit.to_room_number = None;
-                        exit.to_direction = None;
-                        None
-                    }
-                    None => None,
-                };
-            }
+                None => None,
+            };
         }
         let leaves_area: HashSet<ConnectionId> = document
             .rooms
             .iter()
             .flat_map(|room| room.exits.iter())
+            .chain(document.room_data.iter().flat_map(|data| data.exits.iter()))
             .filter(|exit| exit.to_area_id.is_some_and(|target| target != area_id))
             .map(|exit| exit.connection_id)
             .collect();
@@ -1048,6 +1762,9 @@ pub(crate) fn freshen_documents(
                 connection.kind = ConnectionKind::Dangling;
                 connection.endpoint_b = None;
             }
+        }
+        for bundle in &mut document.sources {
+            freshen_source_bundle(bundle, id_map, |target| target != area_id);
         }
     }
 }
@@ -1117,6 +1834,105 @@ mod tests {
         }
     }
 
+    /// A local map holding a Secret, as a local copy of a cloud map does.
+    async fn local_map_with_a_secret(mapper: &Mapper) -> AreaId {
+        let source = mapper
+            .create_area_at(
+                "Copied Keep".to_string(),
+                MapDestination::loose(MapStorage::Local),
+            )
+            .await
+            .expect("create local source");
+        let mut document = blank_document(source, "Copied Keep");
+        document.rooms = vec![plain_room(1)];
+        document.sources = vec![secret_bundle(source, Uuid::new_v4(), &["read", "copy"])];
+        assert!(
+            mapper
+                .bulk_populate_local_area(document)
+                .await
+                .expect("writes")
+        );
+        mapper.load_all_areas().await.expect("reload");
+        source
+    }
+
+    fn place_count(mapper: &Mapper, area: AreaId) -> usize {
+        mapper
+            .get_current_atlas()
+            .get_area(&area)
+            .map(|area| area.source_layers().len())
+            .unwrap_or_default()
+    }
+
+    /// A move into storage that can't take a map's Secret fails before it
+    /// deletes anything: the original keeps the Secret, and no copy is left.
+    #[tokio::test]
+    async fn a_local_maps_secret_survives_a_move_to_a_cloud_that_refuses_it() {
+        let (mapper, root) = mapper("move-secret").await;
+        let source = local_map_with_a_secret(&mapper).await;
+        let before = place_count(&mapper, source);
+        assert!(before > 0, "the source holds its Secret");
+        let areas_before = mapper.get_current_atlas().areas().count();
+
+        let refused = mapper
+            .relocate_areas(
+                vec![source],
+                MapDestination::loose(MapStorage::Cloud),
+                RelocationMode::Move,
+            )
+            .await
+            .expect_err("this cloud tier keeps no Secrets");
+        assert!(refused.completed.is_none() && refused.partial.is_none());
+        assert_eq!(place_count(&mapper, source), before, "the Secret stays");
+        assert_eq!(
+            mapper.get_current_atlas().areas().count(),
+            areas_before,
+            "the failed copy is cleaned up"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Session storage keeps no places: a move there of a map holding one
+    /// is refused before anything is created, and a copy arrives without
+    /// them while the original keeps them.
+    #[tokio::test]
+    async fn a_map_holding_places_moves_into_no_session_but_copies_there() {
+        let (mapper, root) = mapper("session-places").await;
+        let source = local_map_with_a_secret(&mapper).await;
+        let before = place_count(&mapper, source);
+        let areas_before = mapper.get_current_atlas().areas().count();
+
+        let refused = mapper
+            .relocate_areas(
+                vec![source],
+                MapDestination::loose(MapStorage::Session),
+                RelocationMode::Move,
+            )
+            .await
+            .expect_err("a session map keeps no places");
+        assert!(
+            matches!(&refused.error, CloudError::StructuralConflict(code) if code == MOVE_DROPS_PLACES),
+            "{refused}"
+        );
+        assert!(refused.completed.is_none() && refused.partial.is_none());
+        assert_eq!(mapper.get_current_atlas().areas().count(), areas_before);
+        assert_eq!(place_count(&mapper, source), before);
+
+        let copied = mapper
+            .relocate_areas(
+                vec![source],
+                MapDestination::loose(MapStorage::Session),
+                RelocationMode::Copy,
+            )
+            .await
+            .expect("a copy leaves the original whole");
+        let copy = copied.destination_ids[0];
+        assert_eq!(mapper.area_storage(&copy), MapStorage::Session);
+        assert_eq!(place_count(&mapper, copy), 0);
+        assert_eq!(place_count(&mapper, source), before);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn cross_tier_move_copies_content_before_removing_source() {
         let (mapper, root) = mapper("area-move").await;
@@ -1168,22 +1984,40 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// C3: a local-tier destination is populated by the wholesale write
-    /// path (one atomic file write), not envelope replay. The copy must
-    /// carry the full document — rooms, linked exits and their connection,
-    /// decorations, properties, tags — persist it durably (read back
-    /// through the backend, not the cache), and the destination must accept
-    /// ordinary envelope edits afterward.
+    #[tokio::test]
+    async fn unsupported_cloud_cannot_fall_back_to_an_unguarded_delete() {
+        let (mapper, root) = mapper("unsupported-local-move").await;
+        let source = mapper
+            .create_area_at("Original".into(), MapDestination::loose(MapStorage::Cloud))
+            .await
+            .unwrap();
+        let failure = mapper
+            .relocate_areas(
+                vec![source],
+                MapDestination::loose(MapStorage::Local),
+                RelocationMode::Move,
+            )
+            .await
+            .expect_err("a backend without guarded moves must refuse");
+        assert!(failure.completed.is_none() && failure.partial.is_none());
+        assert!(mapper.get_current_atlas().get_area(&source).is_some());
+        assert_eq!(mapper.get_current_atlas().areas().count(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A local destination receives the full document in one atomic write,
+    /// including linked exits, decorations, properties and tags, and remains
+    /// editable after the move.
     #[tokio::test]
     async fn move_to_local_bulk_writes_the_full_document() {
         let (mapper, root) = mapper("bulk-local").await;
         let source = mapper
             .create_area_at(
                 "Deep Halls".to_string(),
-                MapDestination::loose(MapStorage::Cloud),
+                MapDestination::loose(MapStorage::Session),
             )
             .await
-            .expect("create cloud source");
+            .expect("create session source");
         for (number, title, x) in [(1, "Gate", 0.0), (2, "Vault", 4.0)] {
             wait(
                 &mapper,
@@ -1542,7 +2376,10 @@ mod tests {
 
     fn blank_document(area_id: AreaId, name: &str) -> AreaWithDetails {
         AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: crate::Area {
+                projection_token: None,
                 id: area_id,
                 user_id: None,
                 atlas_id: None,
@@ -1556,9 +2393,12 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
             },
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: Vec::new(),
             rooms: Vec::new(),
             labels: Vec::new(),
@@ -1580,7 +2420,6 @@ mod tests {
             properties: Vec::new(),
             exits: Vec::new(),
             tags: std::collections::BTreeSet::default(),
-            is_secret: false,
             external_id: None,
         }
     }
@@ -1591,6 +2430,7 @@ mod tests {
         to: Option<(AreaId, i32)>,
     ) -> Exit {
         Exit {
+            to_source: None,
             id: ExitId::new(),
             from_direction,
             to_area_id: to.map(|(area, _)| area),
@@ -1598,14 +2438,12 @@ mod tests {
             to_direction: None,
             path: String::new(),
             is_hidden: false,
-            is_closed: false,
-            is_locked: false,
+            door: None,
             weight: 1.0,
             command: String::new(),
             connection_id,
             to_unknown: false,
             to_area_token: None,
-            is_secret: false,
         }
     }
 
@@ -1616,6 +2454,7 @@ mod tests {
         kind: ConnectionKind,
     ) -> crate::Connection {
         let endpoint = |room: i32, side: crate::RoomSide| crate::ConnectionEndpoint {
+            source: None,
             room_number: RoomNumber(room),
             side,
             port_offset: 0.5,
@@ -1636,11 +2475,177 @@ mod tests {
         }
     }
 
+    /// A Secret as a copy of `map` sees it: its door on map room 1 into its
+    /// own room 2, the connection between them, and `actions`.
+    fn secret_bundle(map: AreaId, secret: Uuid, actions: &[&str]) -> SourceBundle {
+        let own = SourceId::Secret(secret);
+        let connection = ConnectionId::new();
+        let mut door = member_exit(connection, crate::ExitDirection::East, Some((map, 2)));
+        door.to_source = Some(own);
+        let mut back = member_exit(connection, crate::ExitDirection::West, Some((map, 1)));
+        back.is_hidden = true;
+        let mut link = plain_connection(connection, 1, Some(2), ConnectionKind::Internal);
+        if let Some(end) = link.endpoint_b.as_mut() {
+            end.source = Some(own);
+        }
+        let mut vault = plain_room(2);
+        vault.exits.push(back);
+        serde_json::from_value(serde_json::json!({
+            "source": own, "name": "Bookcase", "ownership": "members",
+            "clan_id": Uuid::new_v4(), "rev": 7, "actions": actions,
+        }))
+        .map(|mut bundle: SourceBundle| {
+            bundle.rooms.push(vault);
+            bundle.room_data.push(crate::RoomData {
+                room_source: None,
+                room_number: RoomNumber(1),
+                properties: Vec::new(),
+                tags: std::collections::BTreeSet::default(),
+                exits: vec![door],
+            });
+            bundle.connections.push(link);
+            bundle
+        })
+        .expect("the Secret parses")
+    }
+
+    /// A copy carries of a map's Secrets only those the copier holds `copy`
+    /// on, each as an owner Secret of the copy under a fresh id whose
+    /// references to its own rooms follow it. Remote exits retain their own
+    /// content and connection while destinations outside the copy dangle.
+    #[test]
+    fn a_copy_carries_only_copyable_secrets_as_owner_secrets_under_fresh_ids() {
+        let map = AreaId(Uuid::new_v4());
+        let elsewhere = (AreaId(Uuid::new_v4()), Uuid::new_v4());
+        let (copyable, readable) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut document = blank_document(map, "Library");
+        document.area.access = Some(crate::AreaAccess {
+            is_owner: false,
+            can_edit: true,
+            can_reshare: false,
+            can_copy: true,
+            can_admin: false,
+            include_secrets: false,
+        });
+        let foreign_link = ConnectionId::new();
+        let mut foreign = member_exit(
+            foreign_link,
+            crate::ExitDirection::North,
+            Some((elsewhere.0, 4)),
+        );
+        foreign.to_source = Some(SourceId::Secret(elsewhere.1));
+        let mut room = plain_room(1);
+        room.exits.push(foreign);
+        document.rooms = vec![room, plain_room(2)];
+        document.connections.push(plain_connection(
+            foreign_link,
+            1,
+            None,
+            ConnectionKind::External,
+        ));
+        document.sources = vec![
+            secret_bundle(map, copyable, &["read", "copy"]),
+            secret_bundle(map, readable, &["read", "add", "edit", "remove"]),
+        ];
+
+        keep_what_a_copy_carries(&mut document, true);
+        let copy = AreaId(Uuid::new_v4());
+        freshen_documents(
+            std::slice::from_mut(&mut document),
+            &HashMap::from([(map, copy)]),
+            &FreshenOptions {
+                stamp_local_owner: false,
+            },
+        );
+
+        let exit = &document.rooms[0].exits[0];
+        assert_eq!(exit.to_area_id, None);
+        assert_eq!(exit.to_room_number, None);
+        assert_eq!(exit.to_source, None);
+        assert_eq!(document.connections.len(), 1);
+        assert_eq!(document.connections[0].id, exit.connection_id);
+        assert_eq!(document.connections[0].kind, ConnectionKind::Dangling);
+        assert_eq!(
+            document.sources.len(),
+            1,
+            "only the copyable Secret comes along"
+        );
+        let bundle = &document.sources[0];
+        let SourceId::Secret(id) = bundle.source else {
+            panic!("a Secret: {:?}", bundle.source);
+        };
+        assert!(id != copyable && id != readable, "a fresh id");
+        assert_eq!(bundle.ownership.as_deref(), Some("owner"));
+        assert_eq!(bundle.clan_id, None);
+        assert_eq!(bundle.rev, 1);
+        assert!(bundle.can("copy") && bundle.can("delete") && bundle.can("manage_access"));
+        assert!(!bundle.can("manage_ownership"));
+        let door = &bundle.room_data[0].exits[0];
+        assert_eq!(door.to_area_id, Some(copy));
+        assert_eq!(door.to_source, Some(bundle.source));
+        let back = &bundle.rooms[0].exits[0];
+        assert_eq!(back.to_area_id, Some(copy));
+        assert_eq!(back.to_source, None);
+        let link = &bundle.connections[0];
+        assert_eq!(door.connection_id, link.id);
+        assert_eq!(back.connection_id, link.id);
+        assert_eq!(
+            link.endpoint_b.as_ref().and_then(|end| end.source),
+            Some(bundle.source)
+        );
+    }
+
+    #[test]
+    fn copying_maps_remaps_secret_references_and_dangles_targets_omitted_from_the_copy() {
+        let map = AreaId(Uuid::new_v4());
+        let target = AreaId(Uuid::new_v4());
+        let (kept, omitted) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut document = blank_document(map, "Origin");
+        let mut origin = plain_room(1);
+        for source in [kept, omitted] {
+            let id = ConnectionId::new();
+            let mut exit = member_exit(id, crate::ExitDirection::East, Some((target, 2)));
+            exit.to_source = Some(SourceId::Secret(source));
+            exit.command = "enter".into();
+            origin.exits.push(exit);
+            document
+                .connections
+                .push(plain_connection(id, 1, None, ConnectionKind::External));
+        }
+        document.rooms.push(origin);
+        let mut destination = blank_document(target, "Destination");
+        destination.rooms.push(plain_room(2));
+        destination
+            .sources
+            .push(secret_bundle(target, kept, &["read", "copy"]));
+        let mut documents = vec![document, destination];
+        let copied_origin = AreaId(Uuid::new_v4());
+        let copied_target = AreaId(Uuid::new_v4());
+        freshen_documents(
+            &mut documents,
+            &HashMap::from([(map, copied_origin), (target, copied_target)]),
+            &FreshenOptions {
+                stamp_local_owner: true,
+            },
+        );
+        let copied_source = documents[1].sources[0].source;
+        assert_ne!(copied_source, SourceId::Secret(kept));
+        let exits = &documents[0].rooms[0].exits;
+        assert_eq!(exits[0].to_area_id, Some(copied_target));
+        assert_eq!(exits[0].to_source, Some(copied_source));
+        assert_eq!(exits[0].to_room_number, Some(RoomNumber(2)));
+        assert_eq!(exits[1].to_area_id, None);
+        assert_eq!(exits[1].to_source, None);
+        assert_eq!(exits[1].to_room_number, None);
+        assert_eq!(exits[1].command, "enter");
+        assert_eq!(documents[0].connections.len(), 2);
+    }
+
     /// C6: the shared freshener remaps in-set cross-area targets across the
     /// whole document set, drops out-of-set targets, demotes their External
     /// Connections to Dangling exactly as a live edit would, and treats
-    /// secrecy per caller contract — preserved for relocation, scrubbed to
-    /// a locally-owned area for import.
+    /// access per caller contract — preserved for relocation, stamped
+    /// locally owned for import.
     #[test]
     fn freshener_remaps_in_set_links_and_demotes_the_rest() {
         let a = AreaId(Uuid::new_v4());
@@ -1651,10 +2656,8 @@ mod tests {
             let to_outside = ConnectionId::new();
             let mut doc_a = blank_document(a, "A");
             let mut room = plain_room(1);
-            room.is_secret = true;
-            let mut in_set = member_exit(to_b, crate::ExitDirection::East, Some((b, 5)));
-            in_set.is_secret = true;
-            room.exits.push(in_set);
+            room.exits
+                .push(member_exit(to_b, crate::ExitDirection::East, Some((b, 5))));
             room.exits.push(member_exit(
                 to_outside,
                 crate::ExitDirection::West,
@@ -1684,7 +2687,7 @@ mod tests {
             &mut preserved,
             &id_map,
             &FreshenOptions {
-                scrub_secrets: false,
+                stamp_local_owner: false,
             },
         );
         assert_eq!(preserved[0].area.id, id_map[&a]);
@@ -1717,10 +2720,6 @@ mod tests {
             .expect("demoted connection survives");
         assert_eq!(demoted.kind, ConnectionKind::Dangling);
         assert_eq!(demoted.endpoint_b, None);
-        assert!(
-            room.is_secret && room.exits[0].is_secret,
-            "relocation preserves the viewer's secrecy markings"
-        );
         assert!(preserved[0].area.access.is_none(), "access left untouched");
 
         let mut scrubbed = build();
@@ -1728,19 +2727,48 @@ mod tests {
             &mut scrubbed,
             &id_map,
             &FreshenOptions {
-                scrub_secrets: true,
+                stamp_local_owner: true,
             },
-        );
-        let room = &scrubbed[0].rooms[0];
-        assert!(
-            !room.is_secret && room.exits.iter().all(|exit| !exit.is_secret),
-            "import scrubs secrecy markings"
         );
         assert_eq!(
             scrubbed[0].area.access,
             Some(crate::AreaAccess::OWNER),
             "import stamps locally-owned access"
         );
+    }
+
+    /// A copy of a clan's map, imported or relocated, is in no clan: it
+    /// keeps neither the clan, the caller's actions there, nor its ownership.
+    #[test]
+    fn freshened_copies_of_a_clans_map_are_in_no_clan() {
+        let source = AreaId(Uuid::new_v4());
+        let copy = AreaId(Uuid::new_v4());
+        let clan = Uuid::new_v4();
+        for stamp_local_owner in [false, true] {
+            let mut document = blank_document(source, "Solace");
+            document.area.clan_id = Some(clan);
+            document.area.clan_name = Some("Lantern Company".to_string());
+            document.area.actions = Some(["area.read".to_string(), "area.copy".to_string()].into());
+            document.area.clan_ownership = crate::clan_maps::ClanOwnership {
+                ownership: Some(crate::clan_maps::MapOwnership::Members),
+                owned_by_me: true,
+                frozen: false,
+            };
+            let mut documents = vec![document];
+            freshen_documents(
+                &mut documents,
+                &HashMap::from([(source, copy)]),
+                &FreshenOptions { stamp_local_owner },
+            );
+            let area = &documents[0].area;
+            assert_eq!(area.clan_id, None);
+            assert_eq!(area.clan_name, None);
+            assert_eq!(area.actions, None);
+            assert_eq!(
+                area.clan_ownership,
+                crate::clan_maps::ClanOwnership::default()
+            );
+        }
     }
 
     /// C6: connection groups (one CreateConnection plus its member exits)
@@ -2109,38 +3137,35 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// C3: the server-side cloud clone applies only to a self-contained,
-    /// fully acknowledged cloud→cloud copy — every other combination must
-    /// take the freshen-and-replay path whose semantics the relocation
-    /// contract documents.
+    /// The server-side cloud clone applies to every fully acknowledged
+    /// cloud→cloud copy whose links lead into no other member of the set;
+    /// every other combination takes the freshen-and-replay path.
     #[test]
-    fn server_copy_gate_is_narrow() {
+    fn server_copy_gate_takes_every_acknowledged_cloud_copy_without_in_set_links() {
         let area_id = AreaId(Uuid::new_v4());
-        let snapshot = |cross_area: bool, to_unknown: bool| {
+        let snapshot = |target: AreaId, to_unknown: bool| {
             let connection_id = ConnectionId::new();
             let exit = Exit {
+                to_source: None,
                 id: ExitId::new(),
                 from_direction: crate::ExitDirection::North,
-                to_area_id: if cross_area {
-                    Some(AreaId(Uuid::new_v4()))
-                } else {
-                    Some(area_id)
-                },
+                to_area_id: Some(target),
                 to_room_number: Some(RoomNumber(2)),
                 to_direction: None,
                 path: String::new(),
                 is_hidden: false,
-                is_closed: false,
-                is_locked: false,
+                door: None,
                 weight: 1.0,
                 command: String::new(),
                 connection_id,
                 to_unknown,
                 to_area_token: None,
-                is_secret: false,
             };
             AreaWithDetails {
+                room_data: Vec::new(),
+                sources: Vec::new(),
                 area: crate::Area {
+                    projection_token: None,
                     id: area_id,
                     user_id: None,
                     atlas_id: None,
@@ -2154,9 +3179,12 @@ mod tests {
                     copied_from_rev: None,
                     copied_at: None,
                     family_token: None,
+                    clan_id: None,
+                    clan_name: None,
+                    actions: None,
+                    clan_ownership: crate::clan_maps::ClanOwnership::default(),
                 },
                 format_version: crate::AREA_FORMAT_VERSION,
-                content_hash: None,
                 properties: Vec::new(),
                 rooms: vec![crate::RoomWithDetails {
                     room_number: RoomNumber(1),
@@ -2169,7 +3197,6 @@ mod tests {
                     properties: Vec::new(),
                     exits: vec![exit],
                     tags: std::collections::BTreeSet::default(),
-                    is_secret: false,
                     external_id: None,
                 }],
                 labels: Vec::new(),
@@ -2179,85 +3206,59 @@ mod tests {
             }
         };
 
-        let eligible = snapshot(false, false);
-        assert!(server_copy_applies(
-            &eligible,
-            MapStorage::Cloud,
-            MapStorage::Cloud,
-            RelocationMode::Copy,
-            Some(4),
-        ));
+        let sibling = AreaId(Uuid::new_v4());
+        let outside = AreaId(Uuid::new_v4());
+        let members: HashSet<AreaId> = [area_id, sibling].into_iter().collect();
+        let gate = |snapshot: &AreaWithDetails,
+                    from: MapStorage,
+                    to: MapStorage,
+                    mode: RelocationMode,
+                    acknowledged: bool| {
+            server_copy_applies(snapshot, &members, from, to, mode, acknowledged)
+        };
+        let (cloud, local) = (MapStorage::Cloud, MapStorage::Local);
+        let copy = RelocationMode::Copy;
 
-        // Any single condition failing must force the replay path.
+        let eligible = snapshot(area_id, false);
+        assert!(gate(&eligible, cloud, cloud, copy, true));
         assert!(
-            !server_copy_applies(
-                &eligible,
-                MapStorage::Cloud,
-                MapStorage::Cloud,
-                RelocationMode::Move,
-                Some(4),
-            ),
+            gate(&snapshot(outside, false), cloud, cloud, copy, true),
+            "a link out of the set follows the service's copy rule"
+        );
+        assert!(
+            gate(&snapshot(outside, true), cloud, cloud, copy, true),
+            "a link into a map the copier can't read dangles in the service's copy"
+        );
+
+        // Any single condition failing forces the replay path.
+        assert!(
+            !gate(&eligible, cloud, cloud, RelocationMode::Move, true),
             "moves never take the server clone"
         );
         assert!(
-            !server_copy_applies(
-                &eligible,
-                MapStorage::Local,
-                MapStorage::Cloud,
-                RelocationMode::Copy,
-                Some(4),
-            ),
+            !gate(&eligible, local, cloud, copy, true),
             "only a cloud source has a server-side copy"
         );
         assert!(
-            !server_copy_applies(
-                &eligible,
-                MapStorage::Cloud,
-                MapStorage::Local,
-                RelocationMode::Copy,
-                Some(4),
-            ),
+            !gate(&eligible, cloud, local, copy, true),
             "a cross-tier destination needs the freshen contract"
         );
         assert!(
-            !server_copy_applies(
-                &eligible,
-                MapStorage::Cloud,
-                MapStorage::Cloud,
-                RelocationMode::Copy,
-                Some(3),
-            ),
+            !gate(&eligible, cloud, cloud, copy, false),
             "queued unacknowledged edits would be missing from a server clone"
         );
         assert!(
-            !server_copy_applies(
-                &eligible,
-                MapStorage::Cloud,
-                MapStorage::Cloud,
-                RelocationMode::Copy,
-                None,
-            ),
-            "an unknown acknowledged revision is not proof of quiescence"
+            !gate(&snapshot(sibling, false), cloud, cloud, copy, true),
+            "a link into another member leads into its copy only through the replay"
         );
+        let mut place_into_sibling = eligible.clone();
+        place_into_sibling.sources =
+            vec![secret_bundle(area_id, Uuid::new_v4(), &["read", "copy"])];
+        place_into_sibling.sources[0].room_data[0].exits[0].to_area_id = Some(sibling);
+        place_into_sibling.sources[0].room_data[0].exits[0].to_source = None;
         assert!(
-            !server_copy_applies(
-                &snapshot(true, false),
-                MapStorage::Cloud,
-                MapStorage::Cloud,
-                RelocationMode::Copy,
-                Some(4),
-            ),
-            "outbound cross-area links would survive a server clone but must dangle"
-        );
-        assert!(
-            !server_copy_applies(
-                &snapshot(false, true),
-                MapStorage::Cloud,
-                MapStorage::Cloud,
-                RelocationMode::Copy,
-                Some(4),
-            ),
-            "redacted destinations mark links that leave the area"
+            !gate(&place_into_sibling, cloud, cloud, copy, true),
+            "a place's link into another member counts as the map's own"
         );
     }
 

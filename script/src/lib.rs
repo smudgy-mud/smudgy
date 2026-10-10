@@ -48,14 +48,16 @@ use sys_traits::impls::RealSys;
 
 pub use module_loader::{ImportProvider, ScriptModuleLoader};
 pub use package_resolver::{
-    CANONICAL_SCHEME, CanonicalCoords, EVENTS_SCHEME, ImportPolicy, InMemoryPackageProvider,
-    IpcEntry, IpcEntryIssue, IpcGrants, MARKER_SCHEME, PARAMS_SCHEME, PackageDependency,
-    PackageError, PackageKey, PackageManifest, PackageModuleSource, PackageParameter,
-    PackagePermissions, PackageProvider, ParamKind, ParamOption, ReferrerRef, ResolvedPackage,
-    STATE_SCHEME, SmudgyCapabilities, SmudgySpecifier, SmudgySpecifierError, canonical_url,
-    is_any_host_net_entry, is_local_transport_net_entry, is_windows_pipe_namespace_entry,
-    native_ipc_grants, native_ipc_path, params_module_url, parse_canonical, parse_params_url,
-    platform_event_catalog, platform_state_producer,
+    ADDRESS_PREFIX, CANONICAL_SCHEME, CanonicalCoords, EVENTS_SCHEME, ImportPolicy,
+    InMemoryPackageProvider, IpcEntry, IpcEntryIssue, IpcGrants, MARKER_SCHEME,
+    OWNER_ADDRESS_PREFIX, PARAMS_SCHEME, PackageDependency, PackageError, PackageKey,
+    PackageManifest, PackageModuleSource, PackageOwner, PackageParameter, PackagePermissions,
+    PackageProvider, ParamKind, ParamOption, ReferrerRef, ResolvedPackage, STATE_SCHEME,
+    SmudgyCapabilities, SmudgySpecifier, SmudgySpecifierError, canonical_url, is_address_owner,
+    is_any_host_net_entry, is_local_transport_net_entry, is_package_address,
+    is_windows_pipe_namespace_entry, native_ipc_grants, native_ipc_path, owner_segment,
+    package_address, params_module_url, parse_canonical, parse_params_url, platform_event_catalog,
+    platform_state_producer, same_package_owner,
 };
 pub use web_workers::{WorkerMode, worker_host_denied_extension};
 

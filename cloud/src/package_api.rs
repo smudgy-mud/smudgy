@@ -2,20 +2,28 @@
 //!
 //! [`PackageApiClient`] is the sibling of [`CloudApiClient`](crate::CloudApiClient):
 //! the mapper covers area content, `CloudApiClient` covers identity/social/sharing,
-//! and this covers shared **packages** — publish, resolve (`smudgy://owner/name`
-//! → manifest + module sources), discovery search, ratings, comments, host alignment,
+//! and this covers shared **packages** — publish, resolve (a package address →
+//! manifest + module sources), discovery search, ratings, comments, host alignment,
 //! and package grants. All three share one [`CredentialSource`] and the
 //! `{success, data, error}` envelope.
 //!
-//! The `smudgy://` URI is a *client-side* construct: this client decomposes it into
-//! `owner` (the globally-unique nickname), `name`, and `subpath`, and never
-//! sends the URI on the wire. Module bodies are fetched from a content-addressed URL
-//! the resolve response carries (a presigned object URL in production), and integrity
-//! is verified against the per-module content hash.
+//! A package's name is global, so its address is the name: `smudgy:@name`.
+//! `smudgy://owner/name` is a compatibility spelling of the same package; the server
+//! checks the owner's form and otherwise ignores it. Addresses are a *client-side*
+//! construct: on the wire an address is an optional `owner` and a `name`, never the URI.
+//! Every owner field on this wire is optional: a clan's package, and a package whose owner
+//! has no nickname, has none.
 //!
-//! The contract here is **mirrored, not shared** with the server
-//! (`smudgy-web/smudgy-api`) and the in-memory test mock (`map/tests/support/`): a
-//! change to a wire shape must move all three together.
+//! Module bodies travel and rest as zstd. A version's **bodies** are its distinct content
+//! hashes in canonical order (first appearance in its module list); each travels as one
+//! zstd **frame**, and a **bundle** is frames concatenated with nothing between or after
+//! them. Publish uploads one bundle of every body; install and update download one bundle
+//! of the bodies they lack from the signed URL a resolve carries, split it by the declared
+//! frame sizes, and verify each decoded body against its uncompressed length and SHA-256.
+//!
+//! The contract here is **mirrored, not shared** with the server and the in-memory test
+//! mock (`cloud/tests/integration_packages.rs`): a change to a wire shape must move all
+//! three together.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -28,15 +36,38 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zstd::zstd_safe::{self, DCtx, DParameter, InBuffer, OutBuffer};
 
-use crate::{CloudError, CloudResult, backends::CredentialSource};
+use crate::{
+    CloudError, CloudResult,
+    backends::{Credential, CredentialSource},
+};
 
 /// Advertises support for [`AvailableWithSmudgyUpgrade`] and advisory-only discovery
 /// results. Client-relative compatibility projection itself is keyed by the existing
 /// client-version header, including for older clients. Keeping this package-specific
-/// avoids sending registry protocol details to presigned or package-chosen content URLs.
+/// avoids sending registry protocol details to signed bundle URLs.
 const PACKAGE_COMPATIBILITY_HEADER: &str = "x-smudgy-package-compatibility";
 const PACKAGE_COMPATIBILITY_VERSION: &str = "1";
+
+/// The zstd level publish compresses each body at.
+const BODY_COMPRESSION_LEVEL: i32 = 19;
+
+/// How long a publish whose upload met a body under garbage collection waits before it begins
+/// again. A collection deletes the body's frame in the same sweep that marks it.
+const COLLECTION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The standard zstd frame magic number (`0xFD2FB528`) as it opens every body frame.
+/// Skippable and legacy frames start with anything else.
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Body frames declare a window of at most 16 MiB (`Window_Size` ≤ 2^24), which also
+/// bounds the decoder's memory.
+const MAX_FRAME_WINDOW_LOG: u32 = 24;
+
+/// Decoded output is reserved up to this much ahead of time; anything larger grows as the
+/// frame actually produces it, so a size the server merely claims never allocates.
+const INITIAL_BODY_CAPACITY: usize = 1024 * 1024;
 
 // ===========================================================================
 // Wire types (mirror smudgy-api `src/models.rs` package DTOs)
@@ -51,11 +82,30 @@ pub struct AvailableWithSmudgyUpgrade {
     pub minimum_smudgy_version: String,
 }
 
-/// A package namespace owned by a user (`POST /packages`, `GET /packages/{id}`).
+/// Who owns a package: a user (the default, `owner_kind` omitted) or a clan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageOwnerKind {
+    #[default]
+    User,
+    Clan,
+}
+
+impl PackageOwnerKind {
+    #[must_use]
+    pub const fn is_user(&self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
+/// A package (`POST /packages`, `GET /packages/{id}`). Its owner is a user or, with
+/// [`PackageOwnerKind::Clan`], the clan whose ID is `owner_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageView {
     pub id: Uuid,
     pub owner_id: Uuid,
+    #[serde(default, skip_serializing_if = "PackageOwnerKind::is_user")]
+    pub owner_kind: PackageOwnerKind,
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -63,9 +113,31 @@ pub struct PackageView {
     pub is_public: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// The owner's nickname (omitted to the owner themselves).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The owner's nickname (omitted to the owner themselves, and for an owner without one,
+    /// such as a clan).
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub owner_nickname: Option<String>,
+}
+
+impl PackageView {
+    /// Whether a clan owns this package.
+    #[must_use]
+    pub const fn is_clan_owned(&self) -> bool {
+        matches!(self.owner_kind, PackageOwnerKind::Clan)
+    }
+}
+
+/// An optional owner nickname: absent, `null` and `""` all mean the package has none.
+fn optional_owner<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let owner: Option<String> = Option::deserialize(deserializer)?;
+    Ok(owner.filter(|owner| !owner.is_empty()))
 }
 
 /// Full detail for one package (`GET /packages/{id}`).
@@ -103,7 +175,13 @@ pub struct PackageDetail {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PackageSearchResult {
     pub package_id: Uuid,
-    pub owner_nickname: String,
+    /// The owner's nickname; `None` for an owner without one (a clan's package).
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_nickname: Option<String>,
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -143,11 +221,17 @@ pub struct VersionListItem {
 }
 
 /// A package resolved to a concrete version (`GET /packages/resolve`). This is the
-/// install/auto-load path: the manifest plus every module's content-addressed URL.
+/// install/auto-load path: the manifest, every module, and where to fetch their bodies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedPackageWire {
     pub package_id: Uuid,
-    pub owner_nickname: String,
+    /// The owner's nickname; `None` for an owner without one (a clan's package).
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_nickname: Option<String>,
     pub name: String,
     pub version: String,
     /// A newer release that becomes selectable after upgrading Smudgy.
@@ -165,10 +249,30 @@ pub struct ResolvedPackageWire {
     #[serde(default)]
     pub readme: Option<String>,
     pub modules: Vec<ResolvedModuleWire>,
-    /// The resolved version's locked `smudgy://` dependencies (referrer-aware
+    /// The version's distinct bodies in canonical order: the order of the version's bundle
+    /// and the index space of a bundle request's `want` bitmap.
+    #[serde(default)]
+    pub bodies: Vec<BundleBody>,
+    /// A signed, expiring (15 minute) `GET` URL for the version's bodies as one bundle;
+    /// [`PackageApiClient::fetch_bodies`] reads it.
+    #[serde(default)]
+    pub bundle_url: String,
+    /// The resolved version's locked package dependencies (referrer-aware
     /// resolution). Servers predating the field omit it → empty (referrer-blind fallback).
     #[serde(default)]
     pub dependencies: Vec<ResolvedDependency>,
+}
+
+/// One distinct body of a resolved version. Its frame is `compressed_size` bytes of the
+/// version's bundle and decodes to `byte_size` bytes hashing to `content_hash`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleBody {
+    /// Lowercase-hex SHA-256 of the uncompressed body.
+    pub content_hash: String,
+    /// The uncompressed length.
+    pub byte_size: u64,
+    /// The length of the body's zstd frame.
+    pub compressed_size: u64,
 }
 
 /// The relationship represented by a [`ResolvedDependency`].
@@ -187,14 +291,20 @@ pub enum DependencyKind {
     Requires,
 }
 
-/// One locked `smudgy://` relationship carried on a [`ResolvedPackageWire`]: the target's
-/// owner nickname, name, declared `range`, concrete locked version, and relation kind.
+/// One locked package relationship carried on a [`ResolvedPackageWire`]: the target's
+/// owner nickname (`None` when its owner has none), name, declared `range`, concrete locked
+/// version, and relation kind.
 /// Only [`DependencyKind::Dependency`] participates in the importing package's module,
 /// permission, and version-solver closure. A [`DependencyKind::Requires`] edge instead names
 /// a separately installed and executed root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedDependency {
-    pub owner_nickname: String,
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_nickname: Option<String>,
     pub name: String,
     #[serde(default)]
     pub range: String,
@@ -210,7 +320,8 @@ pub struct ResolvedDependency {
 pub struct ResolvedModuleWire {
     /// File path within the package, e.g. `index.ts`, `lib/util.ts`.
     pub subpath: String,
-    /// Lowercase-hex SHA-256 of the body; verified after fetch.
+    /// Lowercase-hex SHA-256 of the uncompressed body; the key into the version's
+    /// [`bodies`](ResolvedPackageWire::bodies).
     pub content_hash: String,
     #[serde(default = "default_media_type")]
     pub media_type: String,
@@ -218,13 +329,12 @@ pub struct ResolvedModuleWire {
     pub byte_size: i64,
     #[serde(default)]
     pub is_entry: bool,
-    /// Where to fetch the body (a presigned object URL in production).
-    pub content_url: String,
 }
 
-/// One module to publish. The body is uploaded directly to S3 via a presigned PUT
-/// ([`PackageApiClient::publish_version`] runs the begin → upload → finalize flow); the
-/// server only ever sees the hash + size. `content` is raw bytes, so binaries publish too.
+/// One module to publish. [`PackageApiClient::publish_version`] runs the begin → upload →
+/// finalize flow: the bodies travel as one zstd bundle to a signed URL, and the registry
+/// API only ever sees each module's hash and sizes. `content` is raw bytes, so binaries
+/// publish too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishModule {
     pub subpath: String,
@@ -233,32 +343,41 @@ pub struct PublishModule {
     pub is_entry: bool,
 }
 
-/// One module's metadata in a publish request (`begin` + `finalize`) — mirrors the server's
-/// `PublishModuleMeta`. The body rides to S3 separately; only this metadata crosses our wire.
+/// One module's metadata in a publish request (`begin` + `finalize`). The body rides in
+/// the bundle; only this metadata crosses the registry API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PublishModuleMeta {
     subpath: String,
     content_hash: String,
     byte_size: i64,
+    /// The length of the body's frame in the bundle; equal for every module sharing a
+    /// `content_hash`.
+    compressed_size: u64,
     media_type: String,
     is_entry: bool,
 }
 
-/// `…/versions/begin` response — a presigned PUT per module body not already in S3.
+/// `…/versions/begin` response: where to upload the publish's bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct BeginVersionResponse {
-    #[serde(default)]
-    uploads: Vec<PresignedUpload>,
+    bundle: BundleUpload,
 }
 
-/// One presigned upload from `begin`: PUT the body to `url` with exactly `headers` (which
-/// include `x-amz-checksum-sha256`, binding the body to its declared hash).
+/// The bundle upload `begin` grants: PUT exactly `size` bytes to `url` with exactly
+/// `headers`. The signed URL covers the publish, the declared size and an expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct PresignedUpload {
-    content_hash: String,
+struct BundleUpload {
     url: String,
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    size: u64,
+}
+
+/// One publish's bodies, compressed: the bundle and each body's frame length, both in
+/// canonical order.
+struct CompressedBodies {
+    bundle: Vec<u8>,
+    frame_sizes: Vec<u64>,
 }
 
 /// A published version, metadata only (no module bodies).
@@ -309,11 +428,17 @@ pub struct PackageGrantView {
     pub created_at: DateTime<Utc>,
 }
 
-/// One `smudgy://` dependency declared at publish — the client locks the declared range
-/// to a concrete version and sends both (`POST /packages/{id}/versions`).
+/// One package dependency declared at publish — the client locks the declared range to a
+/// concrete version and sends both (`…/versions/begin` and `…/versions/finalize`). The
+/// owner is sent only when the manifest spelled the address `smudgy://owner/name`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishDependency {
-    pub owner_nickname: String,
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_nickname: Option<String>,
     pub name: String,
     pub range: String,
     pub resolved_version: String,
@@ -324,7 +449,12 @@ pub struct PublishDependency {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareClosureItem {
     pub package_id: Uuid,
-    pub owner_nickname: String,
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_nickname: Option<String>,
     pub name: String,
     #[serde(default)]
     pub is_public: bool,
@@ -352,7 +482,13 @@ pub struct StaleDependencyView {
 /// The server caps a request at 64 entries (400 beyond).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckUpdatesEntry {
-    pub owner: String,
+    /// The owner segment of a `smudgy://owner/name` address; `None` for `smudgy:@name`.
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner: Option<String>,
     pub name: String,
     /// The installed (staged) version, when known — the server reports its
     /// yanked/deleted status in [`CheckUpdatesResult::installed`].
@@ -365,7 +501,13 @@ pub struct CheckUpdatesEntry {
 /// is immutable truth, so re-sending the manifest would be pure waste.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckUpdatesHave {
-    pub owner: String,
+    /// Ignored by the server (a `have` row matches by name and version); sent when known.
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner: Option<String>,
     pub name: String,
     pub version: String,
 }
@@ -381,7 +523,13 @@ pub struct CheckUpdatesResponse {
 /// One entry's update-check verdict.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckUpdatesResult {
-    pub owner: String,
+    /// The entry's owner, echoed; `None` when the entry had none.
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner: Option<String>,
     pub name: String,
     /// `"ok"`, or the uniform `"not_found"` — absent OR not visible to this viewer,
     /// indistinguishable by design (existence privacy), so it must never trigger
@@ -424,8 +572,8 @@ pub struct UpdateCheckInstalled {
 
 /// The newest live version selected for this caller in a check-updates result — or the absolute
 /// newest live fallback when none is runnable — with everything a cached resolution needs
-/// *except* content URLs (no presigns anywhere in this endpoint), so every part is immutably
-/// cacheable.
+/// *except* a bundle URL (no signed URLs anywhere in this endpoint), so every part is
+/// immutably cacheable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateCheckLatest {
     pub version: String,
@@ -446,7 +594,13 @@ pub struct UpdateCheckLatest {
 /// `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateCheckDependency {
-    pub owner: String,
+    /// The target's owner nickname; `None` when its owner has none.
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner: Option<String>,
     pub name: String,
     #[serde(default)]
     pub range: String,
@@ -468,7 +622,13 @@ fn default_dependency_kind() -> String {
 /// lists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateCheckClosureNode {
-    pub owner: String,
+    /// The node's owner nickname; `None` when its owner has none.
+    #[serde(
+        default,
+        deserialize_with = "optional_owner",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner: Option<String>,
     pub name: String,
     pub version: String,
     /// The node's manifest as stored, verbatim.
@@ -601,24 +761,26 @@ impl PackageApiClient {
 
     // ===== package operations =============================================
 
-    /// Resolves `owner/name` at `version` (`None`/`"latest"` = newest) to a
-    /// concrete version, manifest, and module list (`GET /packages/resolve`).
-    /// `owner_nickname` is the owner's globally-unique nickname.
+    /// Resolves the package `name` at `version` (`None`/`"latest"` = newest) to a
+    /// concrete version, manifest, and module list (`GET /packages/resolve`). `owner` is
+    /// the owner segment of a `smudgy://owner/name` address and `None` for
+    /// `smudgy:@name`; the server checks its form and resolves by name either way.
     ///
     /// # Errors
     /// Returns a [`CloudError`] on auth failure, a missing/unauthorized package (404), or
     /// transport/parse failure.
     pub async fn resolve_package(
         &self,
-        owner_nickname: &str,
+        owner: Option<&str>,
         name: &str,
         version: Option<&str>,
     ) -> CloudResult<ResolvedPackageWire> {
-        let query = [
-            ("owner", owner_nickname.to_string()),
-            ("name", name.to_string()),
-            ("version", version.unwrap_or("latest").to_string()),
-        ];
+        let mut query = Vec::with_capacity(3);
+        if let Some(owner) = owner.filter(|owner| !owner.is_empty()) {
+            query.push(("owner", owner.to_string()));
+        }
+        query.push(("name", name.to_string()));
+        query.push(("version", version.unwrap_or("latest").to_string()));
         self.get_with_query_public("/packages/resolve", &query)
             .await
     }
@@ -679,13 +841,31 @@ impl PackageApiClient {
         self.get("/packages/shared-with-me").await
     }
 
-    /// Creates (or returns) the caller's package namespace `name` (`POST /packages`).
+    /// Creates (or returns) the caller's package `name` (`POST /packages`). Names are
+    /// global and reserved forever: a name any other package holds or held is refused.
     ///
     /// # Errors
-    /// Returns a [`CloudError`] on auth failure, a verification gate (403), a name
-    /// conflict (409), or transport/parse failure.
+    /// Returns a [`CloudError`] on auth failure, a verification gate (403),
+    /// [`CloudError::PackageNameUnavailable`] for a name another package holds, or
+    /// transport/parse failure.
     pub async fn create_package(&self, name: &str, description: &str) -> CloudResult<PackageView> {
         let body = json!({ "name": name, "description": description });
+        self.post("/packages", Some(&body)).await
+    }
+
+    /// Creates (or returns) a package `name` the clan `clan_id` owns (`POST /packages`
+    /// with `clan_id`), for a member holding `package.create` in it.
+    ///
+    /// # Errors
+    /// The errors of [`Self::create_package`]; a clan the caller is not in, or holds no
+    /// `package.create` in, is [`CloudError::NotFoundOrNoAccess`].
+    pub async fn create_clan_package(
+        &self,
+        clan_id: Uuid,
+        name: &str,
+        description: &str,
+    ) -> CloudResult<PackageView> {
+        let body = json!({ "name": name, "description": description, "clan_id": clan_id });
         self.post("/packages", Some(&body)).await
     }
 
@@ -710,14 +890,16 @@ impl PackageApiClient {
             .await
     }
 
-    /// Publishes an immutable version via the presigned begin → upload → finalize flow:
-    /// `begin` validates + returns a presigned PUT per body not already in S3, the client PUTs
-    /// each missing body directly to S3, then `finalize` commits. Module bodies are arbitrary
-    /// bytes (binaries publish too); the server only ever sees the hash + size.
+    /// Publishes an immutable version via the begin → upload → finalize flow: each distinct
+    /// body is compressed once, `begin` validates the metadata and grants one signed bundle
+    /// upload, the client PUTs every body as one bundle, then `finalize` commits. Module
+    /// bodies are arbitrary bytes (binaries publish too).
     ///
     /// # Errors
-    /// Returns a [`CloudError`] on auth failure, non-ownership, a cap (413), a duplicate
-    /// version (409), an upload/integrity failure, or transport/parse failure.
+    /// Returns a [`CloudError`] on auth failure, non-ownership, a cap including the bundle
+    /// size cap ([`CloudError::TooLarge`]), a duplicate version (409), an upload/integrity
+    /// failure, [`CloudError::BodyBeingCollected`] when garbage collection refused the upload
+    /// twice, or transport/parse failure.
     pub async fn publish_version(
         &self,
         package_id: Uuid,
@@ -739,13 +921,13 @@ impl PackageApiClient {
         .await
     }
 
-    /// Publishes an immutable version and runs `pre_finalize` after every requested blob upload,
+    /// Publishes an immutable version and runs `pre_finalize` after the bundle upload,
     /// immediately before the irreversible finalize request. A caller that builds the payload from
     /// mutable local state can use this hook to prove that state still matches its snapshot.
     ///
     /// # Errors
     /// Returns the same errors as [`Self::publish_version`], or the error returned by
-    /// `pre_finalize`. Uploaded content-addressed blobs can remain unreferenced when that check
+    /// `pre_finalize`. Uploaded content-addressed bodies can remain unreferenced when that check
     /// fails; no package version has been committed at that point.
     // This mirrors `publish_version`'s wire fields and adds exactly one lifecycle hook. Bundling
     // the established public arguments into a second request type would make the two APIs drift.
@@ -763,20 +945,35 @@ impl PackageApiClient {
     where
         F: FnOnce() -> CloudResult<()>,
     {
-        // Hash each body once; build the metadata wire list + a content_hash -> bytes lookup.
-        let mut by_hash: HashMap<String, &[u8]> = HashMap::new();
+        // Hash every module, then gather the distinct bodies in canonical order (first
+        // appearance in the module list): the bundle's frame order.
+        let hashes: Vec<String> = modules.iter().map(|m| sha256_hex(&m.content)).collect();
+        let mut body_index: HashMap<&str, usize> = HashMap::new();
+        let mut sources: Vec<Vec<u8>> = Vec::new();
+        for (module, hash) in modules.iter().zip(&hashes) {
+            if !body_index.contains_key(hash.as_str()) {
+                body_index.insert(hash, sources.len());
+                sources.push(module.content.clone());
+            }
+        }
+        // Level-19 compression of a large package takes seconds; it runs on the blocking
+        // pool, never on the caller's executor thread.
+        let compressed = tokio::task::spawn_blocking(move || compress_bodies(&sources))
+            .await
+            .map_err(|error| {
+                CloudError::InternalError(format!("package body compression stopped: {error}"))
+            })??;
+
         let metas: Vec<PublishModuleMeta> = modules
             .iter()
-            .map(|m| {
-                let content_hash = sha256_hex(&m.content);
-                by_hash.insert(content_hash.clone(), m.content.as_slice());
-                PublishModuleMeta {
-                    subpath: m.subpath.clone(),
-                    content_hash,
-                    byte_size: i64::try_from(m.content.len()).unwrap_or(i64::MAX),
-                    media_type: m.media_type.clone(),
-                    is_entry: m.is_entry,
-                }
+            .zip(&hashes)
+            .map(|(m, content_hash)| PublishModuleMeta {
+                subpath: m.subpath.clone(),
+                content_hash: content_hash.clone(),
+                byte_size: i64::try_from(m.content.len()).unwrap_or(i64::MAX),
+                compressed_size: compressed.frame_sizes[body_index[content_hash.as_str()]],
+                media_type: m.media_type.clone(),
+                is_entry: m.is_entry,
             })
             .collect();
         let body = json!({
@@ -787,27 +984,43 @@ impl PackageApiClient {
             "readme": readme,
         });
 
-        // 1. begin — validate + get a presigned PUT per body not already in S3.
-        let begin: BeginVersionResponse = self
-            .post(
-                &format!("/packages/{package_id}/versions/begin"),
-                Some(&body),
-            )
-            .await?;
-
-        // 2. upload each missing body directly to S3 (presigned, no auth header).
-        for upload in &begin.uploads {
-            let bytes = by_hash.get(upload.content_hash.as_str()).ok_or_else(|| {
-                CloudError::SerializationError(format!(
-                    "server requested upload of an unknown blob {}",
-                    upload.content_hash
-                ))
-            })?;
-            self.upload_blob(&upload.url, &upload.headers, bytes.to_vec())
+        // 1. begin — validate and get the signed bundle upload; 2. upload every body as one
+        // bundle. An upload that meets a body garbage collection is deleting stores nothing,
+        // and once the collection finishes a fresh begin stores that body anew, so the first
+        // such refusal begins the publish again.
+        let bundle_len = u64::try_from(compressed.bundle.len()).unwrap_or(u64::MAX);
+        let mut bundle = compressed.bundle;
+        let mut retried = false;
+        loop {
+            let begin: BeginVersionResponse = self
+                .post(
+                    &format!("/packages/{package_id}/versions/begin"),
+                    Some(&body),
+                )
                 .await?;
+            if begin.bundle.size != bundle_len {
+                return Err(CloudError::SerializationError(format!(
+                    "the server expects a {}-byte package bundle, but this publish's bundle is {bundle_len} bytes",
+                    begin.bundle.size
+                )));
+            }
+            // The first attempt keeps the bundle for the retry; the retry sends it.
+            let attempt = if retried {
+                std::mem::take(&mut bundle)
+            } else {
+                bundle.clone()
+            };
+            match self.upload_bundle(&begin.bundle, attempt).await {
+                Ok(()) => break,
+                Err(CloudError::BodyBeingCollected) if !retried => {
+                    retried = true;
+                    tokio::time::sleep(COLLECTION_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        // 3. finalize — confirm the uploads + commit.
+        // 3. finalize — commit the bodies the bundle recorded.
         pre_finalize()?;
         self.post(
             &format!("/packages/{package_id}/versions/finalize"),
@@ -816,27 +1029,30 @@ impl PackageApiClient {
         .await
     }
 
-    /// PUT a module body directly to its presigned URL. No `Authorization` (the URL is
-    /// presigned); `headers` come verbatim from `begin` (they include the checksum binding).
-    async fn upload_blob(
-        &self,
-        url: &str,
-        headers: &BTreeMap<String, String>,
-        bytes: Vec<u8>,
-    ) -> CloudResult<()> {
-        debug!("PUT <module body>");
-        let mut request = self.client.put(url).body(bytes);
-        for (name, value) in headers {
+    /// PUTs a publish's bundle to its signed URL with exactly the headers `begin` named. No
+    /// `Authorization` and no registry headers: the URL itself carries the grant.
+    async fn upload_bundle(&self, upload: &BundleUpload, bundle: Vec<u8>) -> CloudResult<()> {
+        debug!("PUT <package bundle>");
+        let mut request = self.client.put(&upload.url).body(bundle);
+        for (name, value) in &upload.headers {
             request = request.header(name, value);
         }
         let response = request.send().await?;
-        if !response.status().is_success() {
-            return Err(CloudError::from_status(
-                response.status().as_u16(),
-                "failed to upload package module body",
-            ));
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
         }
-        Ok(())
+        // A refused frame is a 400 naming the module's subpath; keep that message. A body
+        // under garbage collection is a 409 `body_being_collected`; servers that predate the
+        // code answer a 500 `body … is being collected; retry the upload`.
+        match Self::error_for(status.as_u16(), response).await {
+            CloudError::NetworkError(message)
+                if status.as_u16() == 500 && message.contains("is being collected") =>
+            {
+                Err(CloudError::BodyBeingCollected)
+            }
+            error => Err(error),
+        }
     }
 
     /// Yanks or un-yanks a published version (`PATCH /packages/{id}/versions/{version}`);
@@ -1062,67 +1278,155 @@ impl PackageApiClient {
             .await
     }
 
-    /// Fetches a module body as raw bytes from its content-addressed URL and verifies its
-    /// SHA-256 against `expected_hash` (lowercase hex). The URL is presigned in production, so
-    /// no `Authorization` header is sent. Use this for binary modules; text callers can use
-    /// [`Self::fetch_module_body`].
+    /// Fetches the bodies named by `content_hashes` from a resolved version's bundle
+    /// (`bundle_url` and `bodies` from [`ResolvedPackageWire`]) in one request, and returns
+    /// each uncompressed body keyed by its content hash as `content_hashes` spells it: every
+    /// requested hash has an entry.
+    ///
+    /// The request selects exactly the named bodies (a `want` bitmap unless that is all of
+    /// them), and is not sent when one declares a frame larger than zstd ever makes for its
+    /// size. The response is split by the declared frame sizes; each frame must be one
+    /// standard zstd frame recording its content size, is decoded without ever producing
+    /// more than the body's declared `byte_size`, and must match that length and its
+    /// SHA-256. Duplicate hashes are fetched once; no hashes means no request. The URL is
+    /// signed, so no `Authorization` header is sent.
     ///
     /// # Errors
-    /// Returns [`CloudError::SerializationError`] on an integrity mismatch, or a transport error.
-    pub async fn fetch_module_bytes(
+    /// [`CloudError::NotFoundOrNoAccess`] for a bad or expired bundle URL;
+    /// [`CloudError::SerializationError`] for a hash the version lists no body for, an
+    /// impossible frame size, a response of the wrong length, a malformed or oversized
+    /// frame, or an integrity mismatch (`"... integrity mismatch ..."`); otherwise
+    /// transport errors.
+    pub async fn fetch_bodies(
         &self,
-        content_url: &str,
-        expected_hash: &str,
-    ) -> CloudResult<Vec<u8>> {
-        debug!("GET <module body>");
-        let response = self.client.get(content_url).send().await?;
+        bundle_url: &str,
+        bodies: &[BundleBody],
+        content_hashes: &[&str],
+    ) -> CloudResult<HashMap<String, Vec<u8>>> {
+        // Each selected body remembers the spelling it was asked for by, which keys its result.
+        let mut requested: Vec<Option<&str>> = vec![None; bodies.len()];
+        for &hash in content_hashes {
+            let index = bodies
+                .iter()
+                .position(|body| body.content_hash.eq_ignore_ascii_case(hash))
+                .ok_or_else(|| {
+                    CloudError::SerializationError(format!(
+                        "the resolved version lists no body for content hash {hash}"
+                    ))
+                })?;
+            requested[index].get_or_insert(hash);
+        }
+        let selected: Vec<bool> = requested.iter().map(Option::is_some).collect();
+        if !selected.contains(&true) {
+            return Ok(HashMap::new());
+        }
+        let wanted: Vec<(&str, &BundleBody)> = requested
+            .iter()
+            .zip(bodies)
+            .filter_map(|(key, body)| key.map(|key| (key, body)))
+            .collect();
+        // No zstd frame of a body is larger than this bound, so a larger declared size is
+        // refused before a byte of it is read.
+        if let Some((_, body)) = wanted
+            .iter()
+            .find(|(_, body)| body.compressed_size > compress_bound(body.byte_size))
+        {
+            return Err(CloudError::SerializationError(format!(
+                "package body {} declares a {}-byte frame, more than any frame of {} bytes",
+                body.content_hash, body.compressed_size, body.byte_size
+            )));
+        }
+        let expected = wanted
+            .iter()
+            .try_fold(0u64, |total, (_, body)| {
+                total.checked_add(body.compressed_size)
+            })
+            .ok_or_else(|| {
+                CloudError::SerializationError(
+                    "the resolved version's frame sizes overflow".to_string(),
+                )
+            })?;
+
+        debug!("GET <package bundle>");
+        let url = match want_bitmap(&selected) {
+            Some(want) => bundle_request_url(bundle_url, &want),
+            None => bundle_url.to_string(),
+        };
+        let mut response = self.client.get(&url).send().await?;
         if !response.status().is_success() {
             return Err(CloudError::from_status(
                 response.status().as_u16(),
-                "failed to fetch package module body",
+                "failed to fetch package bundle",
             ));
         }
-        let bytes = response.bytes().await?;
-        let actual = sha256_hex(&bytes);
-        if !actual.eq_ignore_ascii_case(expected_hash.trim_start_matches("sha256-")) {
-            return Err(CloudError::SerializationError(format!(
-                "package module integrity mismatch: expected {expected_hash}, got {actual}"
-            )));
+        if let Some(length) = response.content_length()
+            && length != expected
+        {
+            return Err(bundle_length_error(expected, length));
         }
-        Ok(bytes.to_vec())
+        let mut bundle = Vec::with_capacity(
+            usize::try_from(expected)
+                .unwrap_or(usize::MAX)
+                .min(INITIAL_BODY_CAPACITY),
+        );
+        while let Some(chunk) = response.chunk().await? {
+            let received = u64::try_from(bundle.len() + chunk.len()).unwrap_or(u64::MAX);
+            if received > expected {
+                return Err(bundle_length_error(expected, received));
+            }
+            bundle.extend_from_slice(&chunk);
+        }
+        let received = u64::try_from(bundle.len()).unwrap_or(u64::MAX);
+        if received != expected {
+            return Err(bundle_length_error(expected, received));
+        }
+
+        let mut fetched = HashMap::with_capacity(wanted.len());
+        let mut rest = bundle.as_slice();
+        for (key, body) in wanted {
+            // The total matched, so every declared frame fits in what remains.
+            let (frame, tail) = rest.split_at(usize::try_from(body.compressed_size).unwrap_or(0));
+            rest = tail;
+            fetched.insert(key.to_string(), decode_body_frame(frame, body)?);
+        }
+        Ok(fetched)
     }
 
-    /// Fetches a module body as UTF-8 text (verifying its hash). Errors on a non-UTF-8 body —
-    /// use [`Self::fetch_module_bytes`] for binaries.
+    /// Fetches one body from a resolved version's bundle: [`Self::fetch_bodies`] for a
+    /// single content hash.
     ///
     /// # Errors
-    /// Returns [`CloudError::SerializationError`] on an integrity mismatch or non-UTF-8 body,
-    /// or a transport error.
-    pub async fn fetch_module_body(
+    /// The same errors as [`Self::fetch_bodies`].
+    pub async fn fetch_body(
         &self,
-        content_url: &str,
-        expected_hash: &str,
-    ) -> CloudResult<String> {
-        let bytes = self.fetch_module_bytes(content_url, expected_hash).await?;
-        String::from_utf8(bytes).map_err(|err| {
-            CloudError::SerializationError(format!("package module body is not valid UTF-8: {err}"))
-        })
+        bundle_url: &str,
+        bodies: &[BundleBody],
+        content_hash: &str,
+    ) -> CloudResult<Vec<u8>> {
+        self.fetch_bodies(bundle_url, bodies, &[content_hash])
+            .await?
+            .into_values()
+            .next()
+            .ok_or_else(|| {
+                CloudError::SerializationError(format!(
+                    "the package bundle did not carry body {content_hash}"
+                ))
+            })
     }
 
     // ===== internal plumbing ==============================================
 
-    fn auth_header(&self) -> CloudResult<String> {
+    fn credential(&self) -> CloudResult<Credential> {
         self.credentials
             .get()
-            .map(|credential| credential.header_value())
             .ok_or_else(|| CloudError::Unauthorized("no credential configured".to_string()))
     }
 
     /// Sends a request. Bodies are never logged (they may carry option/secret
     /// values); only the URL (sans query) and the response status, at debug
     /// level. Most package endpoints require a credential; the public read
-    /// surface ([`Auth::Optional`]) sends one only when present. Presigned
-    /// object URLs are fetched separately in [`Self::fetch_module_body`].
+    /// surface ([`Auth::Optional`]) sends one only when present. Signed bundle
+    /// URLs are fetched separately in [`Self::fetch_bodies`].
     async fn send(
         &self,
         method: Method,
@@ -1136,15 +1440,12 @@ impl PackageApiClient {
 
         let mut request = self.client.request(method.clone(), &url);
         request = request.header(PACKAGE_COMPATIBILITY_HEADER, PACKAGE_COMPATIBILITY_VERSION);
-        match auth {
-            Auth::Required => {
-                request = request.header("authorization", self.auth_header()?);
-            }
-            Auth::Optional => {
-                if let Some(credential) = self.credentials.get() {
-                    request = request.header("authorization", credential.header_value());
-                }
-            }
+        let credential = match auth {
+            Auth::Required => Some(self.credential()?),
+            Auth::Optional => self.credentials.get(),
+        };
+        if let Some(credential) = &credential {
+            request = request.header("authorization", credential.header_value());
         }
         if !query.is_empty() {
             request = request.query(query);
@@ -1155,6 +1456,11 @@ impl PackageApiClient {
 
         let response = request.send().await?;
         debug!("{method} {url} - {}", response.status());
+        if let Some(credential) = &credential
+            && response.status() == reqwest::StatusCode::UNAUTHORIZED
+        {
+            self.credentials.note_refused(credential);
+        }
 
         if let Some(newest) = response
             .headers()
@@ -1298,6 +1604,183 @@ fn sha256_hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Compresses each body into one zstd frame at [`BODY_COMPRESSION_LEVEL`], with a content
+/// checksum and no dictionary, and lays the frames end to end. Single-shot compression
+/// pledges the whole source, so every frame records its content size.
+fn compress_bodies(sources: &[Vec<u8>]) -> CloudResult<CompressedBodies> {
+    let compression_error = |error: std::io::Error| {
+        CloudError::InternalError(format!("package body compression: {error}"))
+    };
+    let mut compressor =
+        zstd::bulk::Compressor::new(BODY_COMPRESSION_LEVEL).map_err(compression_error)?;
+    compressor
+        .set_parameter(zstd_safe::CParameter::ChecksumFlag(true))
+        .map_err(compression_error)?;
+    compressor
+        .set_parameter(zstd_safe::CParameter::ContentSizeFlag(true))
+        .map_err(compression_error)?;
+    let mut bundle = Vec::new();
+    let mut frame_sizes = Vec::with_capacity(sources.len());
+    for source in sources {
+        let frame = compressor.compress(source).map_err(compression_error)?;
+        frame_sizes.push(u64::try_from(frame.len()).unwrap_or(u64::MAX));
+        bundle.extend_from_slice(&frame);
+    }
+    Ok(CompressedBodies {
+        bundle,
+        frame_sizes,
+    })
+}
+
+/// The largest frame zstd produces for `byte_size` bytes of content (libzstd's
+/// `ZSTD_COMPRESSBOUND`): `n + (n >> 8)`, plus `(131072 - n) >> 11` below 128 KiB. The
+/// registry refuses any body declaring a larger frame, and so does the client.
+fn compress_bound(byte_size: u64) -> u64 {
+    const SMALL_SOURCE_LIMIT: u64 = 128 * 1024;
+    let margin = if byte_size < SMALL_SOURCE_LIMIT {
+        (SMALL_SOURCE_LIMIT - byte_size) >> 11
+    } else {
+        0
+    };
+    byte_size
+        .saturating_add(byte_size >> 8)
+        .saturating_add(margin)
+}
+
+/// The `want` value selecting the `selected` bodies: lowercase hex of a bitset in which bit
+/// `i` selects `bodies[i]`, byte 0 holding bits 0–7 least significant bit first, trailing
+/// zero bytes omitted. `None` when every body is selected, which is what no `want` means.
+fn want_bitmap(selected: &[bool]) -> Option<String> {
+    use std::fmt::Write as _;
+    if selected.iter().all(|&chosen| chosen) {
+        return None;
+    }
+    let mut bits = vec![0u8; selected.len().div_ceil(8)];
+    for (index, _) in selected.iter().enumerate().filter(|(_, chosen)| **chosen) {
+        bits[index / 8] |= 1 << (index % 8);
+    }
+    while bits.last() == Some(&0) {
+        bits.pop();
+    }
+    Some(
+        bits.iter()
+            .fold(String::with_capacity(bits.len() * 2), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            }),
+    )
+}
+
+/// `bundle_url` with `want` appended as one more query parameter.
+fn bundle_request_url(bundle_url: &str, want: &str) -> String {
+    let separator = if bundle_url.contains('?') { '&' } else { '?' };
+    format!("{bundle_url}{separator}want={want}")
+}
+
+fn bundle_length_error(expected: u64, received: u64) -> CloudError {
+    CloudError::SerializationError(format!(
+        "the package bundle is {received} bytes where its frames total {expected}"
+    ))
+}
+
+/// The window a frame header declares (RFC 8878 §3.1.1.1.2): its content size when the
+/// frame is a single segment, otherwise what its `Window_Descriptor` encodes. `None` for a
+/// header too short to say.
+fn frame_window_size(frame: &[u8], content_size: u64) -> Option<u64> {
+    let frame_header_descriptor = *frame.get(4)?;
+    if frame_header_descriptor & 0x20 != 0 {
+        return Some(content_size);
+    }
+    let window_descriptor = *frame.get(5)?;
+    let base = 1u64 << (10 + u32::from(window_descriptor >> 3));
+    Some(base + base / 8 * u64::from(window_descriptor & 0x07))
+}
+
+/// Decodes one body's frame and verifies it: exactly one standard zstd frame filling the
+/// segment, recording a content size equal to the body's `byte_size`, needing no dictionary,
+/// with a window of at most 16 MiB. Decoding stops the moment output would pass `byte_size`,
+/// whatever the frame claims, and the result must match `byte_size` and `content_hash`.
+fn decode_body_frame(frame: &[u8], body: &BundleBody) -> CloudResult<Vec<u8>> {
+    let malformed = |reason: &str| {
+        CloudError::SerializationError(format!(
+            "package body {} is not a valid frame: {reason}",
+            body.content_hash
+        ))
+    };
+    if !frame.starts_with(&ZSTD_FRAME_MAGIC) {
+        return Err(malformed("it does not start a standard zstd frame"));
+    }
+    match zstd_safe::get_frame_content_size(frame) {
+        Ok(Some(size)) if size == body.byte_size => {}
+        Ok(Some(size)) => {
+            return Err(malformed(&format!(
+                "it records {size} bytes of content, not {}",
+                body.byte_size
+            )));
+        }
+        Ok(None) => return Err(malformed("it does not record its content size")),
+        Err(_) => return Err(malformed("its header is corrupt")),
+    }
+    if zstd_safe::get_dict_id_from_frame(frame).is_some() {
+        return Err(malformed("it needs a dictionary"));
+    }
+    if frame_window_size(frame, body.byte_size)
+        .is_none_or(|window| window > 1 << MAX_FRAME_WINDOW_LOG)
+    {
+        return Err(malformed("its window is larger than 16 MiB"));
+    }
+    let limit = usize::try_from(body.byte_size).map_err(|_| malformed("it is too large"))?;
+
+    let decoder_error = |code: usize| malformed(zstd_safe::get_error_name(code));
+    let mut decoder = DCtx::try_create().ok_or_else(|| malformed("no decoder is available"))?;
+    decoder
+        .set_parameter(DParameter::WindowLogMax(MAX_FRAME_WINDOW_LOG))
+        .map_err(decoder_error)?;
+    let mut output = Vec::with_capacity(limit.min(INITIAL_BODY_CAPACITY));
+    let mut chunk = vec![0u8; DCtx::out_size()];
+    let mut input = InBuffer::around(frame);
+    loop {
+        // Room for one byte past the limit, so an overrun shows without decoding further.
+        let room = (limit - output.len()).saturating_add(1).min(chunk.len());
+        let mut out = OutBuffer::around(&mut chunk[..room]);
+        let remaining = decoder
+            .decompress_stream(&mut out, &mut input)
+            .map_err(decoder_error)?;
+        let produced = out.pos();
+        if produced > limit - output.len() {
+            return Err(CloudError::SerializationError(format!(
+                "package body {} decodes to more than its {} bytes",
+                body.content_hash, body.byte_size
+            )));
+        }
+        output.extend_from_slice(&chunk[..produced]);
+        if remaining == 0 {
+            break;
+        }
+        if produced == 0 && input.pos() == frame.len() {
+            return Err(malformed("it is truncated"));
+        }
+    }
+    if input.pos() != frame.len() {
+        return Err(malformed("bytes follow the frame"));
+    }
+    if output.len() != limit {
+        return Err(malformed(&format!(
+            "it decodes to {} bytes, not {}",
+            output.len(),
+            body.byte_size
+        )));
+    }
+    let actual = sha256_hex(&output);
+    if !actual.eq_ignore_ascii_case(&body.content_hash) {
+        return Err(CloudError::SerializationError(format!(
+            "package module integrity mismatch: expected {}, got {actual}",
+            body.content_hash
+        )));
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1318,15 +1801,30 @@ mod tests {
                     "content_hash": "abc123",
                     "media_type": "application/typescript",
                     "byte_size": 12,
-                    "is_entry": true,
-                    "content_url": "https://example.com/obj/abc123"
+                    "is_entry": true
                 }
-            ]
+            ],
+            "bodies": [
+                { "content_hash": "abc123", "byte_size": 12, "compressed_size": 21 }
+            ],
+            "bundle_url": "https://example.com/bundles/v1?expires=1&sig=abc"
         });
         let resolved: ResolvedPackageWire = serde_json::from_value(json).unwrap();
         assert_eq!(resolved.version, "1.4.0");
         assert_eq!(resolved.modules.len(), 1);
         assert!(resolved.modules[0].is_entry);
+        assert_eq!(
+            resolved.bodies,
+            vec![BundleBody {
+                content_hash: "abc123".to_string(),
+                byte_size: 12,
+                compressed_size: 21,
+            }]
+        );
+        assert_eq!(
+            resolved.bundle_url,
+            "https://example.com/bundles/v1?expires=1&sig=abc"
+        );
         assert_eq!(resolved.aligned_hosts, vec!["mud.arctic.org"]);
         // A response without `dependencies` (an older server) parses to an empty set.
         assert!(resolved.dependencies.is_empty());
@@ -1432,7 +1930,7 @@ mod tests {
         let latest = result.latest.expect("latest");
         assert_eq!(latest.version, "1.3.0");
         assert!(latest.modules[0].is_entry);
-        assert_eq!(latest.dependencies[0].owner, "wbk");
+        assert_eq!(latest.dependencies[0].owner.as_deref(), Some("wbk"));
         assert_eq!(latest.dependencies[0].kind, "dependency");
         assert_eq!(latest.dependencies[1].kind, "requires");
         assert_eq!(
@@ -1466,12 +1964,117 @@ mod tests {
         // `installed` is optional on the request wire — an entry without one
         // serializes without the key at all (mirroring the server's contract).
         let bare = serde_json::to_value(CheckUpdatesEntry {
-            owner: "wbk".into(),
+            owner: Some("wbk".into()),
             name: "duo".into(),
             installed: None,
         })
         .unwrap();
         assert_eq!(bare, serde_json::json!({ "owner": "wbk", "name": "duo" }));
+    }
+
+    #[test]
+    fn ownerless_addresses_omit_the_owner_on_the_wire() {
+        // `smudgy:@name` sends the name alone: no owner key at all.
+        let entry = serde_json::to_value(CheckUpdatesEntry {
+            owner: None,
+            name: "duo".into(),
+            installed: Some("1.0.0".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            entry,
+            serde_json::json!({ "name": "duo", "installed": "1.0.0" })
+        );
+        let have = serde_json::to_value(CheckUpdatesHave {
+            owner: None,
+            name: "duo-core".into(),
+            version: "1.1.0".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            have,
+            serde_json::json!({ "name": "duo-core", "version": "1.1.0" })
+        );
+        let edge = serde_json::to_value(PublishDependency {
+            owner_nickname: None,
+            name: "lib".into(),
+            range: "^1".into(),
+            resolved_version: "1.4.0".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            edge,
+            serde_json::json!({ "name": "lib", "range": "^1", "resolved_version": "1.4.0" })
+        );
+    }
+
+    #[test]
+    fn a_clan_package_parses_without_an_owner_nickname() {
+        // A clan's package: `owner_kind: "clan"`, the clan's ID as `owner_id`, and no
+        // nickname — `null` on resolve, omitted on edges and closure nodes, `""` in search.
+        let view: PackageView = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000002",
+            "owner_id": "00000000-0000-0000-0000-00000000c1a0",
+            "owner_kind": "clan",
+            "name": "guild-tools",
+            "created_at": "2026-06-20T00:00:00Z",
+            "updated_at": "2026-06-20T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(view.is_clan_owned());
+        assert_eq!(view.owner_nickname, None);
+        let user: PackageView = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000002",
+            "owner_id": "00000000-0000-0000-0000-000000000003",
+            "name": "speedwalk",
+            "created_at": "2026-06-20T00:00:00Z",
+            "updated_at": "2026-06-20T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(user.owner_kind, PackageOwnerKind::User);
+        assert!(
+            serde_json::to_value(&user)
+                .unwrap()
+                .get("owner_kind")
+                .is_none(),
+            "a user's package omits owner_kind"
+        );
+
+        let resolved: ResolvedPackageWire = serde_json::from_value(serde_json::json!({
+            "package_id": "00000000-0000-0000-0000-000000000001",
+            "owner_nickname": null,
+            "name": "guild-tools",
+            "version": "1.0.0",
+            "modules": [],
+            "dependencies": [
+                { "name": "guild-lib", "range": "^1", "resolved_version": "1.2.0" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resolved.owner_nickname, None);
+        assert_eq!(resolved.dependencies[0].owner_nickname, None);
+
+        let search: PackageSearchResult = serde_json::from_value(serde_json::json!({
+            "package_id": "00000000-0000-0000-0000-000000000002",
+            "owner_nickname": "",
+            "name": "guild-tools"
+        }))
+        .unwrap();
+        assert_eq!(search.owner_nickname, None, "an empty nickname is none");
+
+        let result: CheckUpdatesResult = serde_json::from_value(serde_json::json!({
+            "name": "guild-tools", "status": "ok", "installed": null,
+            "latest": {
+                "version": "1.0.0", "published_at": "2026-06-20T00:00:00Z",
+                "dependencies": [ { "name": "guild-lib", "range": "^1",
+                                    "resolved_version": "1.2.0", "kind": "dependency" } ]
+            },
+            "closure": [ { "name": "guild-lib", "version": "1.2.0", "dependencies": [] } ]
+        }))
+        .unwrap();
+        assert_eq!(result.owner, None);
+        assert_eq!(result.latest.unwrap().dependencies[0].owner, None);
+        assert_eq!(result.closure[0].owner, None);
     }
 
     #[test]
@@ -1645,5 +2248,254 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn want_bitmap_is_lowercase_hex_least_significant_bit_first() {
+        assert_eq!(
+            want_bitmap(&[true, true, true]),
+            None,
+            "all bodies is no want"
+        );
+        assert_eq!(want_bitmap(&[true, false]).as_deref(), Some("01"));
+        assert_eq!(want_bitmap(&[false, true, false]).as_deref(), Some("02"));
+        let mut ten = [false; 10];
+        ten[0] = true;
+        ten[9] = true;
+        assert_eq!(
+            want_bitmap(&ten).as_deref(),
+            Some("0102"),
+            "byte 0 holds bits 0-7"
+        );
+        let mut twelve = [false; 12];
+        twelve[3] = true;
+        twelve[7] = true;
+        assert_eq!(
+            want_bitmap(&twelve).as_deref(),
+            Some("88"),
+            "trailing zero bytes are omitted"
+        );
+        let mut seventeen = [false; 17];
+        seventeen[12] = true;
+        assert_eq!(want_bitmap(&seventeen).as_deref(), Some("0010"));
+    }
+
+    #[test]
+    fn want_joins_the_signed_query() {
+        assert_eq!(
+            bundle_request_url("https://r.example/b/v?expires=9&sig=ab", "02"),
+            "https://r.example/b/v?expires=9&sig=ab&want=02"
+        );
+        assert_eq!(
+            bundle_request_url("https://r.example/b/v", "02"),
+            "https://r.example/b/v?want=02"
+        );
+    }
+
+    #[test]
+    fn compress_bound_is_libzstds() {
+        for size in [
+            0usize,
+            1,
+            255,
+            256,
+            2047,
+            2048,
+            131_071,
+            131_072,
+            131_073,
+            10 << 20,
+        ] {
+            assert_eq!(
+                compress_bound(size as u64),
+                zstd_safe::compress_bound(size) as u64,
+                "{size}"
+            );
+        }
+        assert_eq!(compress_bound(0), 64);
+        assert_eq!(compress_bound(10 << 20), (10 << 20) + (10 << 12));
+    }
+
+    fn body_for(content: &[u8], frame: &[u8]) -> BundleBody {
+        BundleBody {
+            content_hash: sha256_hex(content),
+            byte_size: content.len() as u64,
+            compressed_size: frame.len() as u64,
+        }
+    }
+
+    /// One frame of `content` from a level-1 compressor the test configures.
+    fn frame_with(content: &[u8], configure: impl FnOnce(&mut zstd::bulk::Compressor)) -> Vec<u8> {
+        let mut compressor = zstd::bulk::Compressor::new(1).unwrap();
+        configure(&mut compressor);
+        compressor.compress(content).unwrap()
+    }
+
+    /// Where a frame's `Frame_Content_Size` field sits and how wide it is.
+    fn content_size_field(frame: &[u8]) -> (usize, usize) {
+        let descriptor = frame[4];
+        let single_segment = descriptor & 0x20 != 0;
+        let dictionary_id_len = [0, 1, 2, 4][usize::from(descriptor & 0x03)];
+        let field_len = match descriptor >> 6 {
+            0 => usize::from(single_segment),
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+        (
+            5 + usize::from(!single_segment) + dictionary_id_len,
+            field_len,
+        )
+    }
+
+    #[test]
+    fn published_frames_record_size_and_checksum_and_round_trip() {
+        let sources = vec![
+            b"export const x = 1;".to_vec(),
+            Vec::new(),
+            vec![0, 159, 146, 150, 255],
+            b"lorem ipsum ".repeat(40_000),
+        ];
+        let compressed = compress_bodies(&sources).unwrap();
+        assert_eq!(compressed.frame_sizes.len(), sources.len());
+        assert_eq!(
+            compressed.frame_sizes.iter().sum::<u64>(),
+            compressed.bundle.len() as u64,
+            "the bundle is the frames and nothing else"
+        );
+        let mut rest = compressed.bundle.as_slice();
+        for (source, &size) in sources.iter().zip(&compressed.frame_sizes) {
+            let (frame, tail) = rest.split_at(usize::try_from(size).unwrap());
+            rest = tail;
+            assert!(frame.starts_with(&ZSTD_FRAME_MAGIC));
+            assert_eq!(
+                zstd_safe::get_frame_content_size(frame).unwrap(),
+                Some(source.len() as u64),
+                "the pledged source size is recorded, even for an empty body"
+            );
+            assert_ne!(frame[4] & 0x04, 0, "the content checksum flag is set");
+            assert_eq!(zstd_safe::get_dict_id_from_frame(frame), None);
+            assert_eq!(
+                &decode_body_frame(frame, &body_for(source, frame)).unwrap(),
+                source
+            );
+        }
+    }
+
+    fn decode_error(frame: &[u8], body: &BundleBody) -> String {
+        match decode_body_frame(frame, body) {
+            Err(CloudError::SerializationError(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_frame_that_decodes_past_its_byte_size_is_refused() {
+        // Frames whose headers claim half the content their blocks hold. A 1 KiB window
+        // makes libzstd decode through a ring buffer far smaller than the claim, so nothing
+        // inside the decoder stops at the claimed size.
+        let bomb = |claimed: u32| {
+            let content = vec![0u8; claimed as usize * 2];
+            let mut frame = frame_with(&content, |c| {
+                c.set_parameter(zstd_safe::CParameter::WindowLog(10))
+                    .unwrap();
+            });
+            let (offset, len) = content_size_field(&frame);
+            assert_eq!(len, 4);
+            frame[offset..offset + 4].copy_from_slice(&claimed.to_le_bytes());
+            let body = BundleBody {
+                content_hash: sha256_hex(&content[..claimed as usize]),
+                byte_size: u64::from(claimed),
+                compressed_size: frame.len() as u64,
+            };
+            (frame, body)
+        };
+
+        // Larger than one output chunk: the frame streams, and the output limit stops it
+        // one byte past the claimed size.
+        let (frame, body) = bomb(300_000);
+        let message = decode_error(&frame, &body);
+        assert!(
+            message.contains("decodes to more than its 300000 bytes"),
+            "{message}"
+        );
+
+        // Within one output chunk: libzstd decodes it in one pass into a buffer one byte
+        // larger than the claim, and refuses to overrun that buffer.
+        let (frame, body) = bomb(100_000);
+        let message = decode_error(&frame, &body);
+        assert!(message.contains(&body.content_hash), "{message}");
+        assert!(
+            message.contains("Destination buffer is too small"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn malformed_frames_are_refused() {
+        let content = b"export const answer = 42;\n".repeat(400);
+        let frame = frame_with(&content, |_| {});
+        let body = body_for(&content, &frame);
+
+        let mut truncated = frame.clone();
+        truncated.truncate(frame.len() - 3);
+        assert!(decode_error(&truncated, &body).contains("not a valid frame"));
+
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(decode_error(&trailing, &body).contains("bytes follow the frame"));
+
+        let mut two_frames = frame.clone();
+        two_frames.extend_from_slice(&frame);
+        assert!(decode_error(&two_frames, &body).contains("bytes follow the frame"));
+
+        let mut skippable = vec![0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
+        skippable.extend_from_slice(&frame);
+        assert!(decode_error(&skippable, &body).contains("does not start a standard zstd frame"));
+
+        assert!(decode_error(b"not zstd at all", &body).contains("does not start"));
+
+        let without_size = frame_with(&content, |c| {
+            c.set_parameter(zstd_safe::CParameter::ContentSizeFlag(false))
+                .unwrap();
+        });
+        assert!(decode_error(&without_size, &body).contains("does not record its content size"));
+
+        let shorter = frame_with(&content[1..], |_| {});
+        assert!(decode_error(&shorter, &body).contains(&format!(
+            "records {} bytes of content, not {}",
+            content.len() - 1,
+            content.len()
+        )));
+
+        // The same frame, re-headered to name dictionary 7.
+        let mut with_dictionary = frame.clone();
+        assert_ne!(with_dictionary[4] & 0x20, 0, "a small body is one segment");
+        with_dictionary[4] |= 0x01;
+        with_dictionary.insert(5, 7);
+        assert!(decode_error(&with_dictionary, &body).contains("needs a dictionary"));
+
+        // A multi-segment frame re-headered to declare a 32 MiB window.
+        let mut wide = frame_with(&content, |c| {
+            c.set_parameter(zstd_safe::CParameter::WindowLog(10))
+                .unwrap();
+        });
+        assert_eq!(
+            wide[4] & 0x20,
+            0,
+            "a 1 KiB window splits this body into segments"
+        );
+        wide[5] = 15 << 3;
+        assert!(decode_error(&wide, &body).contains("window is larger than 16 MiB"));
+    }
+
+    #[test]
+    fn a_frame_of_other_content_is_an_integrity_mismatch() {
+        let content = b"export const x = 1;";
+        let impostor = b"export const y = 2;";
+        let frame = frame_with(impostor, |_| {});
+        let message = decode_error(&frame, &body_for(content, &frame));
+        assert!(message.contains("integrity mismatch"), "{message}");
+        assert!(message.contains(&sha256_hex(content)), "{message}");
     }
 }

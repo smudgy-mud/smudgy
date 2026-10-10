@@ -7,7 +7,9 @@
 //! override). Its persistent settings live on a reserved `smudgy://local/<name>` lock row so
 //! mutable local code never inherits trust, consent, or secrets from a same-name published
 //! install. Publishing reads the folder and uploads it (create-or-get namespace, then an
-//! immutable version). See `smudgy/script/PACKAGES.md`.
+//! immutable version). The first publish chooses the package's owner, the account or one of
+//! its clans; later publishes go to the package the folder is bound to, whoever owns it. See
+//! `smudgy/script/PACKAGES.md`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -45,7 +47,73 @@ struct PublicationClaimIntent {
     account_id: Uuid,
     account_nickname: String,
     leaf: String,
+    /// The clan the first publish makes the package's owner; absent for the account's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clan_id: Option<Uuid>,
 }
+
+/// Who a local package's first publish makes the package's owner. A package's owner never
+/// changes, so later publishes go to the package the folder is bound to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PublishOwner {
+    /// The signed-in account.
+    #[default]
+    Me,
+    /// A clan the account belongs to, which must let it create packages (`package.create`).
+    Clan(Uuid),
+}
+
+impl PublishOwner {
+    /// The owning clan, if a clan owns it.
+    #[must_use]
+    pub const fn clan_id(self) -> Option<Uuid> {
+        match self {
+            Self::Me => None,
+            Self::Clan(clan) => Some(clan),
+        }
+    }
+
+    const fn of_claim(clan_id: Option<Uuid>) -> Self {
+        match clan_id {
+            Some(clan) => Self::Clan(clan),
+            None => Self::Me,
+        }
+    }
+}
+
+/// A publish the server or the folder's own record refused, for a precise message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishRefusal {
+    /// The clan doesn't let this account create packages: the uniform 404 on create.
+    ClanCreate(Uuid),
+    /// The package's clan doesn't let this account publish new versions: the uniform 404 on
+    /// a version's publish.
+    ClanPublish(Uuid),
+    /// An interrupted first publish chose another owner, which a retry must keep.
+    ClaimedForAnotherOwner(PublishOwner),
+}
+
+impl std::fmt::Display for PublishRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClanCreate(clan) => {
+                write!(f, "clan {clan} does not let this account create packages")
+            }
+            Self::ClanPublish(clan) => {
+                write!(
+                    f,
+                    "clan {clan} does not let this account publish new versions of its package"
+                )
+            }
+            Self::ClaimedForAnotherOwner(owner) => write!(
+                f,
+                "an interrupted first publish of this package chose another owner ({owner:?}); publish it with that owner again"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PublishRefusal {}
 
 /// The owner segment a local package's persistent state lives under: `smudgy://local/<name>`.
 /// Reserved on the server so no real account can publish under it and collide.
@@ -111,6 +179,8 @@ fn package_snapshot_digest(package: &LocalPackage) -> Result<String> {
 pub struct PublishSummary {
     /// The package namespace that owns the newly published version.
     pub package_id: Uuid,
+    /// The clan that owns the package, if a clan owns it.
+    pub clan_id: Option<Uuid>,
     /// The namespace's current visibility, returned by create-or-get before publishing.
     pub is_public: bool,
     /// The published version (the manifest's `version`).
@@ -381,6 +451,7 @@ fn ensure_publication_claim_in(
     name: &str,
     account_id: Uuid,
     account_nickname: &str,
+    owner: PublishOwner,
 ) -> Result<PublicationClaimIntent> {
     let name = checked_package_name(name)?;
     let account_nickname = checked_package_name(account_nickname)?;
@@ -391,6 +462,12 @@ fn ensure_publication_claim_in(
         if intent.account_id != account_id {
             bail!(
                 "local package {name} has an unfinished publication claim for a different account"
+            );
+        }
+        if intent.clan_id != owner.clan_id() {
+            return Err(
+                PublishRefusal::ClaimedForAnotherOwner(PublishOwner::of_claim(intent.clan_id))
+                    .into(),
             );
         }
         if crate::models::naming::names_conflict(&intent.account_nickname, account_nickname) {
@@ -416,6 +493,7 @@ fn ensure_publication_claim_in(
         account_id,
         account_nickname: account_nickname.to_string(),
         leaf: name.to_string(),
+        clan_id: owner.clan_id(),
     };
     let json = serde_json::to_vec_pretty(&intent).context("serialize publication claim")?;
     let path = publication_claim_path_in(home, server_name, name);
@@ -455,6 +533,7 @@ fn prepare_publication_namespace_state(
     expected_snapshot: &str,
     account_id: Uuid,
     account_nickname: &str,
+    owner: PublishOwner,
 ) -> Result<(Option<PublicationBinding>, Option<PublicationClaimIntent>)> {
     with_local_package_transaction(server_name, |home, _| {
         ensure_local_snapshot_matches_in(home, server_name, name, expected_snapshot)?;
@@ -466,6 +545,7 @@ fn prepare_publication_namespace_state(
                 name,
                 account_id,
                 account_nickname,
+                owner,
             )?)
         } else {
             load_publication_claim_in(home, server_name, name)?
@@ -502,9 +582,13 @@ fn validate_claimed_namespace(
     intent: &PublicationClaimIntent,
     view: &smudgy_cloud::PackageView,
 ) -> Result<()> {
-    if view.owner_id != intent.account_id {
+    let owned = match intent.clan_id {
+        Some(clan) => view.is_clan_owned() && view.owner_id == clan,
+        None => !view.is_clan_owned() && view.owner_id == intent.account_id,
+    };
+    if !owned {
         bail!(
-            "the claimed cloud namespace for local package {} belongs to a different account",
+            "the claimed cloud namespace for local package {} belongs to a different owner",
             intent.leaf
         );
     }
@@ -516,6 +600,19 @@ fn validate_claimed_namespace(
         );
     }
     Ok(())
+}
+
+/// The owner an interrupted first publish of a local package chose, which a retry keeps;
+/// `None` when no first publish is pending.
+///
+/// # Errors
+/// Returns an error when the package name is invalid or the claim sidecar is unreadable or
+/// malformed.
+pub fn publication_claim_owner(server_name: &str, name: &str) -> Result<Option<PublishOwner>> {
+    with_local_package_transaction(server_name, |home, _| {
+        Ok(load_publication_claim_in(home, server_name, name)?
+            .map(|intent| PublishOwner::of_claim(intent.clan_id)))
+    })
 }
 
 /// Reads the cloud-namespace binding for a local package. Older, never-published folders
@@ -1501,7 +1598,8 @@ pub async fn matches_published_content(
 
 struct PublishRequestSnapshot<'a> {
     package_id: Uuid,
-    owner_nickname: &'a str,
+    /// The owner nickname a resolve names: the publisher's, or none for a clan's package.
+    owner_nickname: Option<&'a str>,
     package_name: &'a str,
     version: &'a str,
     manifest: &'a serde_json::Value,
@@ -1516,8 +1614,13 @@ fn resolved_matches_publish_request(
     resolved: &ResolvedPackageWire,
     request: &PublishRequestSnapshot<'_>,
 ) -> bool {
+    let owner_matches = match (resolved.owner_nickname.as_deref(), request.owner_nickname) {
+        (None, None) => true,
+        (Some(owner), Some(expected)) => crate::models::naming::names_conflict(owner, expected),
+        _ => false,
+    };
     if resolved.package_id != request.package_id
-        || !crate::models::naming::names_conflict(&resolved.owner_nickname, request.owner_nickname)
+        || !owner_matches
         || !crate::models::naming::names_conflict(&resolved.name, request.package_name)
         || semver::Version::parse(&resolved.version).ok()
             != semver::Version::parse(request.version).ok()
@@ -1561,12 +1664,13 @@ fn resolved_matches_publish_request(
     {
         return false;
     }
+    // Names are global, so an edge is its target's name: the owner segment a publish spelled
+    // it with is not stored, and the server names the target's current owner instead.
     let mut expected_dependencies = request
         .dependencies
         .iter()
         .map(|dependency| {
             (
-                dependency.owner_nickname.to_lowercase(),
                 dependency.name.to_lowercase(),
                 dependency.range.clone(),
                 dependency.resolved_version.clone(),
@@ -1579,7 +1683,6 @@ fn resolved_matches_publish_request(
         .iter()
         .map(|dependency| {
             (
-                dependency.owner_nickname.to_lowercase(),
                 dependency.name.to_lowercase(),
                 dependency.range.clone(),
                 dependency.resolved_version.clone(),
@@ -1593,7 +1696,7 @@ fn resolved_matches_publish_request(
 async fn confirm_ambiguous_publish(
     client: &PackageApiClient,
     package_id: Uuid,
-    publisher_nickname: &str,
+    address_owner: Option<&str>,
     package_name: &str,
     target_version: &str,
     request: &PublishRequestSnapshot<'_>,
@@ -1612,7 +1715,7 @@ async fn confirm_ambiguous_publish(
         return Err(anyhow!(ambiguity.to_string()));
     };
     let resolved = client
-        .resolve_package(publisher_nickname, package_name, Some(target_version))
+        .resolve_package(address_owner, package_name, Some(target_version))
         .await
         .map_err(|confirm_error| {
             anyhow!(
@@ -1627,8 +1730,10 @@ async fn confirm_ambiguous_publish(
     Ok((confirmed.version, confirmed.published_at))
 }
 
-/// Publish a local package: create-or-get the caller's namespace, then publish an
-/// immutable version from the folder. Bump the manifest `version` to ship an update.
+/// Publish a local package: create-or-get its namespace, owned by `owner` on a first publish,
+/// then publish an immutable version from the folder. Bump the manifest `version` to ship an
+/// update. A folder already bound publishes to its package, whoever owns it; a clan's package
+/// needs the clan's `package.publish`, which the server judges.
 ///
 /// The service enforces one published namespace for each package leaf name. A copied package must
 /// therefore be renamed before publish when that leaf is already owned by another account; the
@@ -1642,6 +1747,7 @@ pub async fn publish_local_package(
     server_name: &str,
     name: &str,
     publisher: &UserProfile,
+    owner: PublishOwner,
 ) -> Result<PublishSummary> {
     if publisher.id.is_nil() {
         bail!("the signed-in account has no stable identity; sign in again");
@@ -1703,7 +1809,7 @@ pub async fn publish_local_package(
         .iter()
         .map(|d| {
             (
-                format!("smudgy://{}/{}", d.owner_nickname, d.name),
+                smudgy_script::package_address(d.owner_nickname.as_deref().unwrap_or(""), &d.name),
                 d.resolved_version.clone(),
             )
         })
@@ -1723,6 +1829,7 @@ pub async fn publish_local_package(
         &snapshot_digest,
         publisher.id,
         &publisher_nickname,
+        owner,
     )?;
 
     // The published namespace name is the folder name (`package.name`); the manifest carries no
@@ -1734,13 +1841,16 @@ pub async fn publish_local_package(
             .get_package(binding.package_id)
             .await
             .map_err(|e| anyhow!("load bound package namespace: {e}"))?;
-        if !detail.viewer_can_admin {
+        // Nobody has the owner's view of a clan's package: the clan decides who publishes
+        // there, and the server answers for it.
+        let clan_owned = detail.package.is_clan_owned();
+        if !clan_owned && !detail.viewer_can_admin {
             bail!(
                 "local package {} is bound to a namespace that this account cannot publish",
                 package.name
             );
         }
-        if detail.package.owner_id != publisher.id
+        if (!clan_owned && detail.package.owner_id != publisher.id)
             || detail.package.id != binding.package_id
             || !crate::models::naming::names_conflict(&detail.package.name, &binding.leaf)
             || !crate::models::naming::names_conflict(&package.name, &binding.leaf)
@@ -1764,19 +1874,40 @@ pub async fn publish_local_package(
         let intent = publication_claim
             .as_ref()
             .context("first publish has no namespace-claim intent")?;
-        let view = match client
-            .create_package(&package.name, &package.manifest.description)
-            .await
-        {
+        let created = match intent.clan_id {
+            Some(clan) => {
+                client
+                    .create_clan_package(clan, &package.name, &package.manifest.description)
+                    .await
+            }
+            None => {
+                client
+                    .create_package(&package.name, &package.manifest.description)
+                    .await
+            }
+        };
+        let view = match created {
             Ok(view) => view,
             Err(error) => {
-                // A name-unavailable response proves this account did not claim the leaf. Other
-                // failures can be ambiguous (including a committed response that could not be
-                // decoded), so retain the intent and require an idempotent retry.
-                if matches!(&error, smudgy_cloud::CloudError::NameUnavailable(_)) {
+                // A name-unavailable response proves this account did not claim the leaf, and
+                // so does the clan's refusal to let it create packages: the create is atomic.
+                // Other failures can be ambiguous (including a committed response that could
+                // not be decoded), so retain the intent and require an idempotent retry.
+                let clan_refused = intent.clan_id.is_some()
+                    && matches!(&error, smudgy_cloud::CloudError::NotFoundOrNoAccess);
+                if clan_refused
+                    || matches!(
+                        &error,
+                        smudgy_cloud::CloudError::NameUnavailable(_)
+                            | smudgy_cloud::CloudError::PackageNameUnavailable(_)
+                    )
+                {
                     clear_publication_claim_if_unchanged(server_name, name, intent).context(
-                        "the package name is unavailable, and its local claim could not be cleared",
+                        "the package namespace was refused, and its local claim could not be cleared",
                     )?;
+                }
+                if let (true, Some(clan)) = (clan_refused, intent.clan_id) {
+                    return Err(PublishRefusal::ClanCreate(clan).into());
                 }
                 return Err(anyhow!("create package namespace: {error}"));
             }
@@ -1787,12 +1918,15 @@ pub async fn publish_local_package(
         view
     };
 
+    let clan_id = view.is_clan_owned().then_some(view.owner_id);
+    // A clan's package has no owner nickname: it is addressed, and resolves, by name alone.
+    let address_owner = clan_id.is_none().then_some(publisher_nickname.as_str());
     let target_version = semver::Version::parse(&package.manifest.version)?.to_string();
     // The README is part of the same initial snapshot as the manifest and modules.
     let readme = package.readme.as_deref();
     let request = PublishRequestSnapshot {
         package_id: view.id,
-        owner_nickname: &publisher_nickname,
+        owner_nickname: address_owner,
         package_name: &package.name,
         version: &target_version,
         manifest: &manifest_value,
@@ -1815,11 +1949,7 @@ pub async fn publish_local_package(
             bail!("package version {target_version} was already published and deleted");
         }
         let resolved = client
-            .resolve_package(
-                &publisher_nickname,
-                &package.name,
-                Some(&target_version),
-            )
+            .resolve_package(address_owner, &package.name, Some(&target_version))
             .await
             .map_err(|error| {
                 anyhow!(
@@ -1874,7 +2004,7 @@ pub async fn publish_local_package(
                 let confirmed = confirm_ambiguous_publish(
                     client,
                     view.id,
-                    &publisher_nickname,
+                    address_owner,
                     &package.name,
                     &target_version,
                     &request,
@@ -1887,6 +2017,11 @@ pub async fn publish_local_package(
                 });
                 confirmed
             }
+            // A clan's refusal is the uniform 404, which commits nothing: it is no lost
+            // response to recover from.
+            Err(smudgy_cloud::CloudError::NotFoundOrNoAccess) if clan_id.is_some() => {
+                return Err(PublishRefusal::ClanPublish(view.owner_id).into());
+            }
             Err(error) => {
                 // Finalize is an irreversible remote commit. A dropped response is ambiguous. A
                 // used number alone is not proof: another authorized request can win the race.
@@ -1896,7 +2031,7 @@ pub async fn publish_local_package(
                 let confirmed = confirm_ambiguous_publish(
                     client,
                     view.id,
-                    &publisher_nickname,
+                    address_owner,
                     &package.name,
                     &target_version,
                     &request,
@@ -1918,19 +2053,25 @@ pub async fn publish_local_package(
     // report a failed metadata update as recovery work and never return an error that invites the
     // author to retry the immutable version number.
     if view.description != package.manifest.description {
-        if let Err(error) = client
+        match client
             .patch_package(view.id, Some(&package.manifest.description), None)
             .await
         {
-            warn!(
-                "published {}@{}, but its package description could not be updated: {error}",
-                package.name, published_version
-            );
-            publication_warnings.push(PublicationWarning::DescriptionUpdateFailed {
-                name: package.name.clone(),
-                version: published_version.clone(),
-                error: error.to_string(),
-            });
+            Ok(_) => {}
+            // A clan keeps its package's description for members holding
+            // `package.edit_metadata`; publishing alone leaves it as it is.
+            Err(smudgy_cloud::CloudError::NotFoundOrNoAccess) if clan_id.is_some() => {}
+            Err(error) => {
+                warn!(
+                    "published {}@{}, but its package description could not be updated: {error}",
+                    package.name, published_version
+                );
+                publication_warnings.push(PublicationWarning::DescriptionUpdateFailed {
+                    name: package.name.clone(),
+                    version: published_version.clone(),
+                    error: error.to_string(),
+                });
+            }
         }
     }
 
@@ -1997,6 +2138,7 @@ pub async fn publish_local_package(
 
     Ok(PublishSummary {
         package_id: view.id,
+        clan_id,
         is_public: view.is_public,
         version: published_version,
         published_at,
@@ -2050,7 +2192,7 @@ async fn interop_publish_warnings(
     // Rename diff vs the published latest. Use the immutable profile captured beside this
     // operation's detached credential; a sign-in change must not switch authors between awaits.
     let Ok(previous) = client
-        .resolve_package(publisher_nickname, &package.name, None)
+        .resolve_package(Some(publisher_nickname), &package.name, None)
         .await
     else {
         return warnings;
@@ -2064,10 +2206,17 @@ async fn interop_publish_warnings(
     let Some(prev_module) = previous.modules.iter().find(|m| m.subpath == prev_entry) else {
         return warnings;
     };
-    let Ok(prev_text) = client
-        .fetch_module_body(&prev_module.content_url, &prev_module.content_hash)
+    let Ok(prev_bytes) = client
+        .fetch_body(
+            &previous.bundle_url,
+            &previous.bodies,
+            &prev_module.content_hash,
+        )
         .await
     else {
+        return warnings;
+    };
+    let Ok(prev_text) = String::from_utf8(prev_bytes) else {
         return warnings;
     };
     let Ok(prev_url) = deno_core::ModuleSpecifier::parse(&format!("file:///{prev_entry}")) else {
@@ -2228,7 +2377,7 @@ async fn generate_publish_typings(modules: &[LocalModule]) -> (Vec<PublishModule
     }
 }
 
-/// Resolve each declared `smudgy://` dependency range to the concrete highest published
+/// Resolve each declared package dependency range to the concrete highest published
 /// version that satisfies it, recording `{specifier, range, resolved_version}`. Installers
 /// reproduce this exact dependency set, and the resolution engine dedupes/coexists
 /// packages by what each dependent locked. A range with no published match is a publish
@@ -2245,26 +2394,24 @@ async fn lock_dependencies(
     let mut dependencies = Vec::new();
     let mut warnings = Vec::new();
     for dep in manifest.smudgy_dependencies() {
-        let owner_nickname = dep.key.owner.clone();
+        // The owner segment travels only when the manifest spelled one (`smudgy://owner/name`).
+        let owner_nickname = Some(dep.key.owner.clone()).filter(|owner| !owner.is_empty());
+        let address = dep.key.to_user_specifier();
         let name = dep.key.name;
         // A range-less dependency means "any version" (`*`); that's also what we record.
         let range = dep.range.unwrap_or_else(|| "*".to_string());
 
         let resolved = client
-            .resolve_package(&owner_nickname, &name, None)
+            .resolve_package(owner_nickname.as_deref(), &name, None)
             .await
-            .map_err(|e| anyhow!("lock dependency {owner_nickname}/{name}: {e}"))?;
+            .map_err(|e| anyhow!("lock dependency {address}: {e}"))?;
         let versions = client
             .list_versions(resolved.package_id)
             .await
-            .map_err(|e| anyhow!("lock dependency {owner_nickname}/{name}: {e}"))?;
+            .map_err(|e| anyhow!("lock dependency {address}: {e}"))?;
         let resolved_version = highest_satisfying_version(&versions, Some(&range))
-            .map_err(|e| {
-                anyhow!("dependency {owner_nickname}/{name} has an invalid range {range}: {e}")
-            })?
-            .ok_or_else(|| {
-                anyhow!("no published version of {owner_nickname}/{name} satisfies {range}")
-            })?;
+            .map_err(|e| anyhow!("dependency {address} has an invalid range {range}: {e}"))?
+            .ok_or_else(|| anyhow!("no published version of {address} satisfies {range}"))?;
 
         // The highest published version overall is always >= the highest *within* the range (the
         // range is a subset), so if they differ the range is excluding a strictly-newer release.
@@ -2279,7 +2426,7 @@ async fn lock_dependencies(
                 " — widen the range or re-publish to pick it up"
             };
             warnings.push(format!(
-                "dependency {owner_nickname}/{name}: locked v{resolved_version}, but v{latest} is \
+                "dependency {address}: locked v{resolved_version}, but v{latest} is \
                  published and your range \"{range}\" excludes it{hint}"
             ));
         }
@@ -2315,7 +2462,7 @@ mod tests {
     fn published_fixture(package: &LocalPackage) -> ResolvedPackageWire {
         ResolvedPackageWire {
             package_id: Uuid::new_v4(),
-            owner_nickname: "author".into(),
+            owner_nickname: Some("author".into()),
             name: package.name.clone(),
             version: package.manifest.version.clone(),
             available_with_smudgy_upgrade: None,
@@ -2333,9 +2480,10 @@ mod tests {
                     byte_size: i64::try_from(module.content.len()).unwrap(),
                     is_entry: module.subpath
                         == package.manifest.entry.as_deref().unwrap_or("index.ts"),
-                    content_url: "https://example.invalid/content".into(),
                 })
                 .collect(),
+            bodies: Vec::new(),
+            bundle_url: "https://example.invalid/bundle".into(),
             dependencies: Vec::new(),
         }
     }
@@ -2465,6 +2613,137 @@ mod tests {
         );
         fs::create_dir_all(get_smudgy_home().unwrap().join(&name)).unwrap();
         name
+    }
+
+    fn package_view(owner_id: Uuid, clan: bool) -> smudgy_cloud::PackageView {
+        smudgy_cloud::PackageView {
+            id: Uuid::new_v4(),
+            owner_id,
+            owner_kind: if clan {
+                smudgy_cloud::PackageOwnerKind::Clan
+            } else {
+                smudgy_cloud::PackageOwnerKind::User
+            },
+            name: "guild-tools".into(),
+            description: String::new(),
+            is_public: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            owner_nickname: None,
+        }
+    }
+
+    #[test]
+    fn a_first_publish_claims_its_owner_and_a_retry_keeps_it() {
+        let server = test_server("claim-owner");
+        write_bare_local_folder(&server, "guild-tools");
+        let home = get_smudgy_home().unwrap();
+        let account = Uuid::new_v4();
+        let clan = Uuid::new_v4();
+        let claim = |owner| {
+            ensure_publication_claim_in(&home, &server, "guild-tools", account, "wbk", owner)
+        };
+        assert_eq!(claim(PublishOwner::Clan(clan)).unwrap().clan_id, Some(clan));
+        assert_eq!(
+            publication_claim_owner(&server, "guild-tools").unwrap(),
+            Some(PublishOwner::Clan(clan))
+        );
+        // A retry keeps the owner the interrupted publish chose.
+        assert_eq!(claim(PublishOwner::Clan(clan)).unwrap().clan_id, Some(clan));
+        for other in [PublishOwner::Me, PublishOwner::Clan(Uuid::new_v4())] {
+            let refused = claim(other).unwrap_err();
+            assert_eq!(
+                refused.downcast_ref::<PublishRefusal>(),
+                Some(&PublishRefusal::ClaimedForAnotherOwner(PublishOwner::Clan(
+                    clan
+                )))
+            );
+        }
+        // A claim written before owners were recorded is the account's own.
+        write_bare_local_folder(&server, "my-tools");
+        let path = publication_claim_path_in(&home, &server, "my-tools");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"account_id":"{account}","account_nickname":"wbk","leaf":"my-tools"}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            publication_claim_owner(&server, "my-tools").unwrap(),
+            Some(PublishOwner::Me)
+        );
+        assert_eq!(
+            publication_claim_owner(&server, "nothing-here").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_claimed_namespace_belongs_to_the_owner_it_was_claimed_for() {
+        let account = Uuid::new_v4();
+        let clan = Uuid::new_v4();
+        let intent = |clan_id| PublicationClaimIntent {
+            version: 1,
+            account_id: account,
+            account_nickname: "wbk".into(),
+            leaf: "guild-tools".into(),
+            clan_id,
+        };
+        let for_clan = intent(Some(clan));
+        assert!(validate_claimed_namespace(&for_clan, &package_view(clan, true)).is_ok());
+        assert!(validate_claimed_namespace(&for_clan, &package_view(account, false)).is_err());
+        assert!(
+            validate_claimed_namespace(&for_clan, &package_view(Uuid::new_v4(), true)).is_err()
+        );
+        let mine = intent(None);
+        assert!(validate_claimed_namespace(&mine, &package_view(account, false)).is_ok());
+        // A clan whose ID happened to equal the account's would still be a clan.
+        assert!(validate_claimed_namespace(&mine, &package_view(account, true)).is_err());
+    }
+
+    #[test]
+    fn a_clan_packages_version_resolves_without_an_owner() {
+        let package = LocalPackage {
+            name: "guild-tools".into(),
+            manifest: PackageManifest::parse(r#"{"version":"1.0.0","entry":"index.ts"}"#).unwrap(),
+            readme: None,
+            modules: vec![LocalModule {
+                subpath: "index.ts".into(),
+                content: b"export {};".to_vec(),
+            }],
+        };
+        let mut resolved = published_fixture(&package);
+        resolved.owner_nickname = None;
+        let modules = vec![PublishModule {
+            subpath: "index.ts".into(),
+            content: b"export {};".to_vec(),
+            media_type: media_type_for("index.ts").into(),
+            is_entry: true,
+        }];
+        let manifest = serde_json::to_value(&package.manifest).unwrap();
+        let request = |owner_nickname| PublishRequestSnapshot {
+            package_id: resolved.package_id,
+            owner_nickname,
+            package_name: "guild-tools",
+            version: "1.0.0",
+            manifest: &manifest,
+            modules: &modules,
+            dependencies: &[],
+            readme: None,
+        };
+        assert!(resolved_matches_publish_request(&resolved, &request(None)));
+        assert!(!resolved_matches_publish_request(
+            &resolved,
+            &request(Some("wbk"))
+        ));
+        let mut named = resolved.clone();
+        named.owner_nickname = Some("WBK".into());
+        assert!(resolved_matches_publish_request(
+            &named,
+            &request(Some("wbk"))
+        ));
+        assert!(!resolved_matches_publish_request(&named, &request(None)));
     }
 
     fn write_bare_local_folder(server: &str, name: &str) {

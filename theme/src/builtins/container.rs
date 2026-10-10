@@ -205,6 +205,20 @@ pub fn icon_chip(_theme: &Theme) -> container::Style {
     }
 }
 
+/// A raised surface card: stat cards, panels and dropdown menus.
+#[must_use]
+pub fn card(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(theme.styles.general.container_background.into()),
+        border: Border {
+            color: theme.styles.general.border,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
 /// Opaque, fully-rounded card for standalone pop-ups (e.g. the upgrade prompt)
 /// that place content directly in the container rather than filling it with the
 /// opaque title-bar + body panels the Connect modal uses. Without an explicit

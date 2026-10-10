@@ -1,5 +1,10 @@
-//! The area list pane: the viewer's own areas first, then one labeled group
-//! per sharer who shared maps with them, with the active area highlighted.
+//! The area list pane, a three-level tree. The top level is where maps come
+//! from: the viewer's own maps on this device ("My local maps") and in the
+//! cloud ("My shared maps"), each of their clans, one "Shared by" group per
+//! sharer, and session maps. Folders sit one step in under their group, and
+//! maps one step further in under their folder. The active area is
+//! highlighted. A map shows in every folder holding it; "Shared by" leaves
+//! out maps in a clan folder.
 //!
 //! Shared rows are grouped by the *sharer's* identity (the friend who handed
 //! the map to the viewer), resolved from the received-grants list, falling
@@ -9,22 +14,27 @@
 //! display fallback. A re-shared map (sharer differs from owner) gets a
 //! subtle "owned by …" badge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iced::widget::{
     Column, button, column, container, row, scrollable, space, text, text_input, tooltip,
 };
-use iced::{Length, alignment::Vertical};
+use iced::{Length, Padding, alignment::Vertical};
 use smudgy_cloud::cloud_api::ShareGrantRow;
 use smudgy_cloud::mapper::AtlasCache;
-use smudgy_cloud::{AreaId, AtlasId, AtlasListItem, Uuid};
+use smudgy_cloud::mapper::area_cache::AreaCache;
+use smudgy_cloud::{AreaId, AtlasId, AtlasListItem, MapStorage, Uuid};
 
 use crate::assets::{bootstrap_icons, fonts};
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
+use crate::widgets::dropdown::Dropdown;
 
 use smudgy_core::models::map_scopes::ScopeState;
 
+use super::clan_maps::{self, ClanGroup};
+use super::default_atlases;
+use super::multi_select::{ListItem, MultiMessage};
 use super::{FolderKey, MapEditorWindow, Message, ScopeTarget};
 
 fn icon_button(
@@ -34,6 +44,55 @@ fn icon_button(
     button(text(codepoint).font(fonts::BOOTSTRAP_ICONS).size(12.0))
         .style(builtins::button::toolbar)
         .on_press(message)
+}
+
+/// How deep a row sits in the tree: a group heads its folders, a folder its
+/// maps. Maps listed straight under a group (session maps, a sharer's maps in
+/// no folder) sit at folder depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Depth {
+    Group,
+    Folder,
+    Map,
+}
+
+/// The left inset every row's content starts at: a list row's own padding.
+const ROW_INSET: f32 = button::DEFAULT_PADDING.left;
+
+/// How far each level of the tree steps in.
+const INDENT_STEP: f32 = 14.0;
+
+/// Around a folder's chevron, pressable or not, so every folder's name
+/// starts at the same place.
+const CHEVRON_PADDING: Padding = Padding {
+    top: 0.0,
+    right: 2.0,
+    bottom: 0.0,
+    left: 2.0,
+};
+
+impl Depth {
+    /// Where the row's content starts.
+    fn inset(self) -> f32 {
+        let steps = match self {
+            Self::Group => 0.0,
+            Self::Folder => 1.0,
+            Self::Map => 2.0,
+        };
+        ROW_INSET + INDENT_STEP * steps
+    }
+
+    /// A list row's padding at this depth. The indent is inside the row, so
+    /// a chosen row's highlight still spans the pane.
+    fn row_padding(self) -> Padding {
+        button::DEFAULT_PADDING.left(self.inset())
+    }
+
+    /// The padding around an inline rename input, whose text starts after
+    /// the input's own padding.
+    fn input_padding(self) -> Padding {
+        Padding::ZERO.left(self.inset() - text_input::DEFAULT_PADDING.left)
+    }
 }
 
 /// The friend who shared a map with the viewer, as resolved from the
@@ -133,9 +192,6 @@ impl SharerIndex {
 pub struct AreaSummary {
     pub id: AreaId,
     pub name: String,
-    /// Cached on the [`smudgy_cloud::mapper::area_cache::AreaCache`] at
-    /// construction — no per-redraw room scan.
-    pub has_secrets: bool,
     /// The viewer owns this area (rename/delete are owner-only).
     pub owned: bool,
     /// The viewer may edit this area (drives the subtle "edit" badge on
@@ -155,10 +211,6 @@ pub struct AreaSummary {
     /// This area is one of ≥2 copies in a copy-family (linked by `copied_from`
     /// provenance or a shared `family_token`); drives the "copy" family badge.
     pub in_family: bool,
-    /// For a genuinely atlas-less **cloud** area, the scope target its row's
-    /// "Servers…" affordance writes. `None` for atlas-filed areas (scoped by
-    /// their atlas's folder header), local areas, and session maps.
-    pub scope_target: Option<ScopeTarget>,
 }
 
 fn sort_by_name(areas: &mut [AreaSummary]) {
@@ -170,12 +222,13 @@ fn sort_by_name(areas: &mut [AreaSummary]) {
     });
 }
 
-/// One folder in the "My maps" tree: a named atlas, or the catch-all "Loose"
-/// bucket for owned areas filed under no atlas. Empty atlas folders are kept
-/// (rendered as empty), so a freshly created folder is visible before any
-/// map is filed into it. `owned` distinguishes the viewer's own folders (full
-/// affordances) from a shared atlas folder surfaced under a sharer group (only
-/// the per-user "Servers…" override).
+/// One folder in the tree: a named atlas, or the "Not in a folder" bucket
+/// holding the viewer's own maps whose folder the inventory doesn't list
+/// (yet). Empty atlas folders are kept (rendered as empty), so a freshly
+/// created folder is visible before any map is filed into it. `owned`
+/// distinguishes the viewer's own folders (full affordances) from a shared
+/// atlas folder surfaced under a sharer group (only the per-user "Servers…"
+/// override).
 pub struct Folder {
     pub key: FolderKey,
     pub label: String,
@@ -195,9 +248,32 @@ pub struct SharedGroup {
     pub loose: Vec<AreaSummary>,
 }
 
+/// Match map and atlas names, keeping a matching map's parent and all the
+/// maps in a matching atlas. Synthetic buckets are not atlas names.
+fn filter_folders(folders: &mut Vec<Folder>, query: &str) {
+    if query.is_empty() {
+        return;
+    }
+    folders.retain_mut(|folder| {
+        if matches!(folder.key, FolderKey::Atlas(_)) && folder.label.to_lowercase().contains(query)
+        {
+            return true;
+        }
+        filter_areas(&mut folder.areas, query);
+        !folder.areas.is_empty()
+    });
+}
+
+fn filter_areas(areas: &mut Vec<AreaSummary>, query: &str) {
+    if !query.is_empty() {
+        areas.retain(|area| area.name.to_lowercase().contains(query));
+    }
+}
+
 /// Some area to fall back to when no specific selection is wanted (initial
-/// open, after a delete). Owned areas first, then shared, each name-sorted.
-/// Ephemeral (session) areas are excluded — the editor doesn't manage them.
+/// open, after a delete). The viewer's own areas first, then the rest
+/// (shared and clans' maps), each name-sorted. Ephemeral (session) areas are
+/// excluded — the editor doesn't manage them.
 #[must_use]
 pub fn first_area_id(
     atlas: &AtlasCache,
@@ -210,7 +286,7 @@ pub fn first_area_id(
             continue;
         }
         let entry = (area.get_name().to_lowercase(), *area.get_id());
-        if area.effective_access().is_owner {
+        if is_own_map(&area) {
             owned.push(entry);
         } else {
             shared.push(entry);
@@ -221,90 +297,152 @@ pub fn first_area_id(
     owned.into_iter().chain(shared).map(|(_, id)| id).next()
 }
 
-/// Groups the viewer's OWN areas into folders: one per atlas in `atlases`
-/// (kept even when empty), plus a trailing "Loose" folder when any owned area
-/// is filed under no atlas. Areas whose `atlas_id` is absent from the
-/// inventory (a just-deleted folder, or before the inventory has loaded) fall
-/// back to Loose until the inventory catches up. Shared rows are excluded —
-/// they group by sharer (see [`shared_groups`]). Ephemeral (session) areas
-/// are excluded too: the editor's tree only shows maps that outlive the
-/// session, so a session map can't be toggled into the per-area preference
-/// lists or picked as a folder member.
+/// Whether `area` is one of the viewer's own maps: owned, and not a clan's,
+/// which lists under its clan.
+fn is_own_map(area: &AreaCache) -> bool {
+    area.is_owned() && area.meta().clan_id.is_none()
+}
+
+/// One of the viewer's own maps, as the owned grouping reads it.
+pub struct OwnedMap {
+    pub summary: AreaSummary,
+    pub atlas_id: Option<AtlasId>,
+    /// The folder's name as the map carries it (cloud maps do).
+    pub atlas_name: Option<String>,
+    /// Stored on this device rather than in the cloud.
+    pub local: bool,
+}
+
+/// The viewer's own folders, split by where they are stored: on this device
+/// ("My local maps") or in the cloud, where they can be shared ("My shared
+/// maps").
+#[derive(Default)]
+pub struct OwnedGroups {
+    pub local: Vec<Folder>,
+    pub shared: Vec<Folder>,
+}
+
+/// Groups the viewer's OWN areas into their folders, split into local and
+/// shared. Shared rows are excluded — they group by sharer (see
+/// [`shared_groups`]). Ephemeral (session) areas are excluded too: the
+/// editor's tree only shows maps that outlive the session, so a session map
+/// can't be toggled into the per-area preference lists or picked as a folder
+/// member.
 #[must_use]
-pub fn owned_folders(
+pub fn owned_groups(
     atlas: &AtlasCache,
     atlases: &[AtlasListItem],
-    family_members: &std::collections::HashSet<AreaId>,
-    ephemeral: &std::collections::HashSet<AreaId>,
-    local_areas: &std::collections::HashSet<AreaId>,
-) -> Vec<Folder> {
-    let known: std::collections::HashSet<AtlasId> = atlases.iter().map(|item| item.id).collect();
-    let mut by_atlas: HashMap<AtlasId, Vec<AreaSummary>> = HashMap::new();
-    let mut loose: Vec<AreaSummary> = Vec::new();
-
-    for area in atlas.areas() {
-        let access = area.effective_access();
-        if !access.is_owner || ephemeral.contains(area.get_id()) {
-            continue;
-        }
-        let area_id = *area.get_id();
-        let atlas_id = area.meta().atlas_id;
-        let filed = matches!(atlas_id, Some(id) if known.contains(&id));
-        // A genuinely atlas-less *cloud* area carries its own scope target; a
-        // filed area is scoped by its atlas, and local areas aren't scoped.
-        let scope_target =
-            (!filed && !local_areas.contains(&area_id)).then_some(ScopeTarget::Area(area_id));
-        let summary = AreaSummary {
-            id: area_id,
-            name: area.get_name().to_string(),
-            has_secrets: area.has_secrets(),
-            owned: true,
-            can_edit: access.can_edit,
-            can_admin: access.can_admin,
-            enabled: atlas.is_area_enabled(&area_id),
-            reshare_owner: None,
-            sharer_label: None,
-            in_family: family_members.contains(&area_id),
-            scope_target,
-        };
-        if filed {
-            if let Some(id) = atlas_id {
-                by_atlas.entry(id).or_default().push(summary);
+    local_atlases: &HashSet<AtlasId>,
+    local_areas: &HashSet<AreaId>,
+    family_members: &HashSet<AreaId>,
+    ephemeral: &HashSet<AreaId>,
+) -> OwnedGroups {
+    let maps = atlas
+        .areas()
+        .filter(|area| is_own_map(area) && !ephemeral.contains(area.get_id()))
+        .map(|area| {
+            let access = area.effective_access();
+            let area_id = *area.get_id();
+            OwnedMap {
+                summary: AreaSummary {
+                    id: area_id,
+                    name: area.get_name().to_string(),
+                    owned: true,
+                    can_edit: access.can_edit,
+                    can_admin: access.can_admin,
+                    enabled: atlas.is_area_enabled(&area_id),
+                    reshare_owner: None,
+                    sharer_label: None,
+                    in_family: family_members.contains(&area_id),
+                },
+                atlas_id: area.meta().atlas_id,
+                atlas_name: area.meta().atlas_name.clone(),
+                local: local_areas.contains(&area_id),
             }
-        } else {
-            loose.push(summary);
+        })
+        .collect();
+    group_owned(maps, atlases, local_atlases)
+}
+
+/// [`owned_groups`] over plain rows: one folder per non-clan atlas in
+/// `atlases` (kept even when empty), in the group its storage puts it in.
+/// A map filed in a folder the inventory doesn't list yet (it hasn't loaded)
+/// shows in that folder under the name the map carries. A map in no folder,
+/// or one whose folder neither names, waits in a trailing "Not in a folder"
+/// bucket of its own storage's group.
+#[must_use]
+pub fn group_owned(
+    maps: Vec<OwnedMap>,
+    atlases: &[AtlasListItem],
+    local_atlases: &HashSet<AtlasId>,
+) -> OwnedGroups {
+    // Each folder: its id, name, and whether it is on this device. Clan
+    // folders list under their clan, never under the viewer's own maps.
+    let mut folders: Vec<(AtlasId, String, bool)> = atlases
+        .iter()
+        .filter(|item| item.clan_id.is_none())
+        .map(|item| (item.id, item.name.clone(), local_atlases.contains(&item.id)))
+        .collect();
+    let known: HashSet<AtlasId> = folders.iter().map(|(id, _, _)| *id).collect();
+    let mut by_atlas: HashMap<AtlasId, Vec<AreaSummary>> = HashMap::new();
+    let mut unfiled_local: Vec<AreaSummary> = Vec::new();
+    let mut unfiled_shared: Vec<AreaSummary> = Vec::new();
+
+    for map in maps {
+        match map.atlas_id {
+            Some(atlas_id) if known.contains(&atlas_id) => {
+                by_atlas.entry(atlas_id).or_default().push(map.summary);
+            }
+            Some(atlas_id) if map.atlas_name.is_some() => {
+                if !by_atlas.contains_key(&atlas_id) {
+                    folders.push((atlas_id, map.atlas_name.unwrap_or_default(), map.local));
+                }
+                by_atlas.entry(atlas_id).or_default().push(map.summary);
+            }
+            _ if map.local => unfiled_local.push(map.summary),
+            _ => unfiled_shared.push(map.summary),
         }
     }
 
-    let mut inventory: Vec<&AtlasListItem> = atlases.iter().collect();
-    inventory.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name))
+    folders.sort_by(|(a_id, a, _), (b_id, b, _)| {
+        a.to_lowercase()
+            .cmp(&b.to_lowercase())
+            .then_with(|| a.cmp(b))
+            .then_with(|| a_id.0.cmp(&b_id.0))
     });
 
-    let mut folders = Vec::with_capacity(inventory.len() + 1);
-    for item in inventory {
-        let mut areas = by_atlas.remove(&item.id).unwrap_or_default();
+    let mut groups = OwnedGroups::default();
+    for (id, label, local) in folders {
+        let mut areas = by_atlas.remove(&id).unwrap_or_default();
         sort_by_name(&mut areas);
-        folders.push(Folder {
-            key: FolderKey::Atlas(item.id),
-            label: item.name.clone(),
+        let folder = Folder {
+            key: FolderKey::Atlas(id),
+            label,
+            areas,
+            owned: true,
+        };
+        if local {
+            groups.local.push(folder);
+        } else {
+            groups.shared.push(folder);
+        }
+    }
+    for (storage, mut areas, group) in [
+        (MapStorage::Local, unfiled_local, &mut groups.local),
+        (MapStorage::Cloud, unfiled_shared, &mut groups.shared),
+    ] {
+        if areas.is_empty() {
+            continue;
+        }
+        sort_by_name(&mut areas);
+        group.push(Folder {
+            key: FolderKey::Unfiled(storage),
+            label: crate::i18n::t!("area-list-not-in-folder"),
             areas,
             owned: true,
         });
     }
-    if !loose.is_empty() {
-        sort_by_name(&mut loose);
-        folders.push(Folder {
-            key: FolderKey::Loose,
-            label: crate::i18n::t!("mapper-loose-maps"),
-            areas: loose,
-            owned: true,
-        });
-    }
-    folders
+    groups
 }
 
 /// The viewer's ephemeral (session) areas, name-sorted. These live only for
@@ -324,7 +462,6 @@ pub fn session_maps(
             AreaSummary {
                 id: area_id,
                 name: area.get_name().to_string(),
-                has_secrets: false,
                 owned: true,
                 can_edit: true,
                 can_admin: true,
@@ -332,7 +469,6 @@ pub fn session_maps(
                 reshare_owner: None,
                 sharer_label: None,
                 in_family: false,
-                scope_target: None,
             }
         })
         .collect();
@@ -346,12 +482,14 @@ pub fn session_maps(
 /// are further grouped by their atlas into named folders (§4.1 un-redaction now
 /// delivers `atlas_id` + `atlas_name` to any viewer who can see the area), with
 /// genuinely atlas-less areas left in a flat pile. Name-sorted within each
-/// folder/pile and across groups.
+/// folder/pile and across groups. Maps in the viewer's clan folders
+/// are left out: they list under their clan.
 #[must_use]
 pub fn shared_groups(
     atlas: &AtlasCache,
     sharers: Option<&SharerIndex>,
     family_members: &std::collections::HashSet<AreaId>,
+    in_clan_folders: &std::collections::HashSet<AreaId>,
 ) -> Vec<SharedGroup> {
     // The accumulating shape of one sharer group before folders are ordered:
     // atlas-id -> (name, areas), plus the atlas-less pile.
@@ -369,7 +507,8 @@ pub fn shared_groups(
         let meta = area.meta();
         let area_id = *area.get_id();
 
-        if access.is_owner {
+        // A map in one of the viewer's clan folders lists under its clan.
+        if access.is_owner || in_clan_folders.contains(&area_id) {
             continue;
         }
 
@@ -401,18 +540,9 @@ pub fn shared_groups(
             _ => None,
         };
 
-        // A genuinely atlas-less shared area carries its own area-level scope
-        // target (the §5 override surface); an atlas-filed area is scoped by
-        // its folder header instead.
-        let scope_target = meta
-            .atlas_id
-            .is_none()
-            .then_some(ScopeTarget::Area(area_id));
-
         let summary = AreaSummary {
             id: area_id,
             name: area.get_name().to_string(),
-            has_secrets: area.has_secrets(),
             owned: false,
             can_edit: access.can_edit,
             can_admin: access.can_admin,
@@ -420,7 +550,6 @@ pub fn shared_groups(
             reshare_owner,
             sharer_label: Some(sharer_label.clone()),
             in_family: family_members.contains(&area_id),
-            scope_target,
         };
 
         let accum = shared.entry(group_key).or_insert_with(|| Accum {
@@ -494,31 +623,83 @@ fn badge<'a>(content: String) -> iced::widget::Text<'a, crate::Theme> {
         })
 }
 
-/// A dimmed group/section header ("My maps", "Shared by …").
-fn group_label<'a>(label: String) -> ThemedElement<'a, Message> {
-    text(label)
-        .size(12)
-        .style(|theme: &crate::Theme| iced::widget::text::Style {
-            color: Some(theme.styles.text.normal.scale_alpha(0.6)),
+/// A top-level group's header row, its content lined up with the rows below
+/// and its ⋯ menu with theirs.
+fn group_header<'a>(content: impl Into<ThemedElement<'a, Message>>) -> ThemedElement<'a, Message> {
+    container(content)
+        .padding(Padding {
+            top: 0.0,
+            right: ROW_INSET,
+            bottom: 0.0,
+            left: Depth::Group.inset(),
         })
         .into()
 }
 
-/// A small text button for inline row actions ("Move…", "Share…").
-fn text_button(
-    label: &'static str,
-    message: Message,
-) -> iced::widget::Button<'static, Message, crate::Theme> {
-    button(text(label).size(11))
-        .style(builtins::button::toolbar)
-        .on_press(message)
+/// A dimmed group header ("My local maps", "Shared by …"), spaced like a
+/// clan's.
+fn group_label<'a>(label: String) -> ThemedElement<'a, Message> {
+    group_header(
+        container(
+            text(label)
+                .size(12)
+                .style(|theme: &crate::Theme| iced::widget::text::Style {
+                    color: Some(theme.styles.text.normal.scale_alpha(0.6)),
+                }),
+        )
+        .padding(Padding::ZERO.top(4)),
+    )
+}
+
+/// One of the viewer's own groups: its header, then its folders. Nothing
+/// when it holds no folder.
+fn push_owned<'a>(
+    mut list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    label: String,
+    folders: Vec<Folder>,
+    selected: Option<AreaId>,
+) -> Column<'a, Message, crate::Theme> {
+    if folders.is_empty() {
+        return list;
+    }
+    list = list.push(group_label(label));
+    for folder in folders {
+        list = push_folder(list, window, folder, selected);
+    }
+    list
+}
+
+/// The viewer's local, then shared, group.
+fn push_owned_groups<'a>(
+    list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    owned: OwnedGroups,
+    selected: Option<AreaId>,
+) -> Column<'a, Message, crate::Theme> {
+    let list = push_owned(
+        list,
+        window,
+        crate::i18n::t!("area-list-my-local-maps"),
+        owned.local,
+        selected,
+    );
+    push_owned(
+        list,
+        window,
+        crate::i18n::t!("area-list-my-shared-maps"),
+        owned.shared,
+        selected,
+    )
 }
 
 pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     let atlas = window.mapper.get_current_atlas();
     let selected = window.editor.area_id();
+    // Rows note themselves as they're drawn, for Shift+click ranges.
+    window.multi.begin_order();
 
-    let header = row![
+    let mut header = row![
         text(crate::i18n::t!("area-list-title")).size(14),
         space::horizontal(),
         tooltip(
@@ -535,20 +716,42 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     .spacing(4)
     .align_y(Vertical::Center)
     .padding(8);
+    if let Some(menu) = scope_menu(window) {
+        header = header.push(menu);
+    }
 
     // Copy-family membership (over copied_from edges + family_token) for the
     // "copy" badge; computed once for the whole list.
     let family_members = window.family_members();
     let ephemeral = window.mapper.session_area_ids();
-    let local_areas = window.mapper.local_area_ids();
-    let folders = owned_folders(
+    // Read from the mapper rather than the tick-refreshed snapshot, so a
+    // folder made a moment ago lands in the right group straight away.
+    let mut owned = owned_groups(
         &atlas,
         &window.atlases,
+        &window.mapper.local_atlas_ids(),
+        &window.mapper.local_area_ids(),
         &family_members,
         &ephemeral,
-        &local_areas,
     );
-    let shared = shared_groups(&atlas, window.sharers.as_ref(), &family_members);
+    // Each clan's folders list between the viewer's own maps and "Shared
+    // by"; a map in a clan folder lists there, and in every other folder
+    // holding it.
+    let mut clans = clan_maps::clan_groups(window, &atlas, &family_members, &ephemeral);
+    let in_clans = clan_maps::in_clan_folders(&atlas);
+    let mut shared = shared_groups(&atlas, window.sharers.as_ref(), &family_members, &in_clans);
+    let query = window.map_list_filter.trim().to_lowercase();
+    filter_folders(&mut owned.local, &query);
+    filter_folders(&mut owned.shared, &query);
+    for group in &mut clans {
+        filter_folders(&mut group.folders, &query);
+        filter_areas(&mut group.unfiled, &query);
+    }
+    for group in &mut shared {
+        filter_folders(&mut group.folders, &query);
+        filter_areas(&mut group.loose, &query);
+    }
+    shared.retain(|group| !group.folders.is_empty() || !group.loose.is_empty());
 
     let mut list = Column::new().spacing(2).padding(4);
 
@@ -560,28 +763,35 @@ pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
     //   No context   — flat: every folder and shared group, unfiltered.
     list = match (window.server_name.as_deref(), window.scope_all) {
         (Some(server), false) => {
-            render_this_server(list, window, folders, shared, selected, server)
+            render_this_server(list, window, owned, clans, shared, selected, server)
         }
-        (Some(server), true) => render_all_buckets(list, window, folders, shared, selected, server),
-        (None, _) => render_flat(list, window, folders, shared, selected),
+        (Some(server), true) => {
+            render_all_buckets(list, window, owned, clans, shared, selected, server)
+        }
+        (None, _) => render_flat(list, window, owned, clans, shared, selected),
     };
 
-    // Session (ephemeral) maps render as their own flat group, so a live
-    // auto-map is inspectable while it builds. Excluded from the folder tree
-    // above (they never persist); shown here for diagnosis + promotion.
-    let session = session_maps(&atlas, &ephemeral);
+    // Session (ephemeral) maps render as their own group, so a live auto-map
+    // is inspectable while it builds. Excluded from the folder tree above
+    // (they never persist); shown here for diagnosis + promotion.
+    let mut session = session_maps(&atlas, &ephemeral);
+    filter_areas(&mut session, &query);
     if !session.is_empty() {
         list = list.push(group_label(crate::i18n::t!("area-list-session-maps")));
         for area in session {
-            list = list.push(area_row(window, area, selected, false));
+            list = list.push(area_row(window, area, selected, Depth::Folder));
         }
     }
 
-    let mut chrome = column![header];
-    if let Some(control) = scope_control(window) {
-        chrome = chrome.push(control);
+    if !query.is_empty() && window.multi.order.borrow().is_empty() {
+        list =
+            list.push(container(text(crate::i18n::t!("area-list-no-matches")).size(12)).padding(8));
     }
-    chrome = chrome.push(scrollable(list).height(Length::Fill));
+    let chrome = column![
+        header,
+        filter_control(window),
+        scrollable(list).height(Length::Fill)
+    ];
 
     container(chrome)
         .style(builtins::container::opaque)
@@ -610,8 +820,8 @@ impl SharedFrag {
 }
 
 /// The scope state of an owned/shared atlas folder against `server`. Local
-/// atlases and the Loose bucket aren't scope-keyed, so they always read as
-/// `Here` (shown on every entry, including this one).
+/// atlases and the "Not in a folder" bucket aren't scope-keyed, so they
+/// always read as `Here` (shown on every entry, including this one).
 fn folder_scope(window: &MapEditorWindow, folder: &Folder, server: &str) -> ScopeState {
     match folder.key {
         FolderKey::Atlas(atlas_id) if !window.local_atlas_ids.contains(&atlas_id) => {
@@ -656,8 +866,92 @@ fn partition_shared_group(
     frags
 }
 
-/// Renders a run of shared fragments: each sharer label, then its atlas folders
-/// and atlas-less area rows.
+/// Split one clan's folders into the three scope buckets for `server`. The
+/// clan's name labels each bucket its folders land in.
+fn partition_clan(window: &MapEditorWindow, group: ClanGroup, server: &str) -> [ClanGroup; 3] {
+    let mut parts = std::array::from_fn(|_| ClanGroup {
+        clan_id: group.clan_id,
+        label: group.label.clone(),
+        incoming: group.incoming,
+        folders: Vec::new(),
+        unfiled: Vec::new(),
+    });
+    for folder in group.folders {
+        let idx = scope_index(folder_scope(window, &folder, server));
+        parts[idx].folders.push(folder);
+    }
+    // A map in no folder is scoped by its own area record.
+    for area in group.unfiled {
+        let idx = scope_index(window.map_scopes.area_scope(&area.id, server));
+        parts[idx].unfiled.push(area);
+    }
+    parts
+}
+
+/// Splits the viewer's own folders into the three scope buckets
+/// (`[Here, Unassigned, Elsewhere]`) for `server`, keeping local and shared
+/// apart.
+fn partition_owned(window: &MapEditorWindow, owned: OwnedGroups, server: &str) -> [OwnedGroups; 3] {
+    let mut parts: [OwnedGroups; 3] = std::array::from_fn(|_| OwnedGroups::default());
+    for folder in owned.local {
+        let idx = scope_index(folder_scope(window, &folder, server));
+        parts[idx].local.push(folder);
+    }
+    for folder in owned.shared {
+        let idx = scope_index(folder_scope(window, &folder, server));
+        parts[idx].shared.push(folder);
+    }
+    parts
+}
+
+/// Renders one clan: its header (with its ⋯ menu where `with_menu`), then
+/// its folders.
+fn push_clan<'a>(
+    mut list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    group: ClanGroup,
+    with_menu: bool,
+    selected: Option<AreaId>,
+) -> Column<'a, Message, crate::Theme> {
+    if !window.map_list_filter.trim().is_empty()
+        && group.folders.is_empty()
+        && group.unfiled.is_empty()
+    {
+        return list;
+    }
+    list = list.push(group_header(clan_maps::clan_header(
+        window, &group, with_menu,
+    )));
+    for folder in group.folders {
+        list = push_folder(list, window, folder, selected);
+    }
+    for area in group.unfiled {
+        list = list.push(area_row(window, area, selected, Depth::Folder));
+    }
+    list
+}
+
+/// Renders one sharer's group: its label, then its atlas folders and the
+/// shared maps in no folder.
+fn push_shared<'a>(
+    mut list: Column<'a, Message, crate::Theme>,
+    window: &'a MapEditorWindow,
+    label: String,
+    folders: Vec<Folder>,
+    loose: Vec<AreaSummary>,
+    selected: Option<AreaId>,
+) -> Column<'a, Message, crate::Theme> {
+    list = list.push(group_label(label));
+    for folder in folders {
+        list = push_folder(list, window, folder, selected);
+    }
+    for area in loose {
+        list = list.push(area_row(window, area, selected, Depth::Folder));
+    }
+    list
+}
+
+/// Renders a run of shared fragments, one sharer group each.
 fn render_shared_frags<'a>(
     mut list: Column<'a, Message, crate::Theme>,
     window: &'a MapEditorWindow,
@@ -665,37 +959,33 @@ fn render_shared_frags<'a>(
     selected: Option<AreaId>,
 ) -> Column<'a, Message, crate::Theme> {
     for frag in frags {
-        list = list.push(group_label(frag.label));
-        for folder in frag.folders {
-            list = push_folder(list, window, folder, selected);
-        }
-        for area in frag.loose {
-            list = list.push(area_row(window, area, selected, false));
-        }
+        list = push_shared(list, window, frag.label, frag.folders, frag.loose, selected);
     }
     list
 }
 
 /// This-server scope: only content associated with (or unassigned relative to)
 /// the current entry appears — atlases bound only to other entries are omitted,
-/// and unassigned atlases/areas collapse into one "Unassigned" group.
+/// and unassigned atlases/areas collapse into one "Unassigned" section.
 fn render_this_server<'a>(
     mut list: Column<'a, Message, crate::Theme>,
     window: &'a MapEditorWindow,
-    folders: Vec<Folder>,
+    owned: OwnedGroups,
+    clans: Vec<ClanGroup>,
     shared: Vec<SharedGroup>,
     selected: Option<AreaId>,
     server: &str,
 ) -> Column<'a, Message, crate::Theme> {
-    let has_shared = !shared.is_empty();
+    let [owned_here, owned_unassigned, _elsewhere] = partition_owned(window, owned, server);
 
-    let mut owned_here = Vec::new();
-    let mut owned_unassigned = Vec::new();
-    for folder in folders {
-        match folder_scope(window, &folder, server) {
-            ScopeState::Here => owned_here.push(folder),
-            ScopeState::Unassigned => owned_unassigned.push(folder),
-            ScopeState::Elsewhere => {}
+    // Every clan heads its folders here, so its menu is always at hand.
+    let mut clans_here: Vec<ClanGroup> = Vec::new();
+    let mut clans_unassigned: Vec<ClanGroup> = Vec::new();
+    for group in clans {
+        let [here, unassigned, _elsewhere] = partition_clan(window, group, server);
+        clans_here.push(here);
+        if !unassigned.folders.is_empty() || !unassigned.unfiled.is_empty() {
+            clans_unassigned.push(unassigned);
         }
     }
 
@@ -711,26 +1001,30 @@ fn render_this_server<'a>(
         }
     }
 
-    // "My maps" labels the owned tree only when shared groups also appear.
-    if has_shared && !owned_here.is_empty() {
-        list = list.push(group_label(crate::i18n::t!("area-list-my-maps")));
-    }
-    for folder in owned_here {
-        list = push_folder(list, window, folder, selected);
+    list = push_owned_groups(list, window, owned_here, selected);
+    for group in clans_here {
+        list = push_clan(list, window, group, true, selected);
     }
     list = render_shared_frags(list, window, shared_here, selected);
 
-    let unassigned_count = owned_unassigned.len()
+    let unassigned_count = owned_unassigned.local.len()
+        + owned_unassigned.shared.len()
+        + clans_unassigned
+            .iter()
+            .map(|group| group.folders.len() + group.unfiled.len())
+            .sum::<usize>()
         + shared_unassigned
             .iter()
             .map(SharedFrag::count)
             .sum::<usize>();
     if unassigned_count > 0 {
-        let collapsed = window.collapsed_folders.contains(&FolderKey::Unassigned);
-        list = list.push(unassigned_header(unassigned_count, collapsed));
+        let filtering = !window.map_list_filter.trim().is_empty();
+        let collapsed = !filtering && window.collapsed_folders.contains(&FolderKey::Unassigned);
+        list = list.push(unassigned_header(unassigned_count, collapsed, filtering));
         if !collapsed {
-            for folder in owned_unassigned {
-                list = push_folder(list, window, folder, selected);
+            list = push_owned_groups(list, window, owned_unassigned, selected);
+            for group in clans_unassigned {
+                list = push_clan(list, window, group, false, selected);
             }
             list = render_shared_frags(list, window, shared_unassigned, selected);
         }
@@ -744,15 +1038,28 @@ fn render_this_server<'a>(
 fn render_all_buckets<'a>(
     mut list: Column<'a, Message, crate::Theme>,
     window: &'a MapEditorWindow,
-    folders: Vec<Folder>,
+    owned: OwnedGroups,
+    clans: Vec<ClanGroup>,
     shared: Vec<SharedGroup>,
     selected: Option<AreaId>,
     server: &str,
 ) -> Column<'a, Message, crate::Theme> {
-    let mut owned: [Vec<Folder>; 3] = std::array::from_fn(|_| Vec::new());
-    for folder in folders {
-        let idx = scope_index(folder_scope(window, &folder, server));
-        owned[idx].push(folder);
+    let mut owned = partition_owned(window, owned, server);
+    // Every clan heads its folders on this server, with its menu; elsewhere
+    // its name labels the folders that land there.
+    let mut clan_buckets: [Vec<ClanGroup>; 3] = std::array::from_fn(|_| Vec::new());
+    for group in clans {
+        for (idx, part) in partition_clan(window, group, server)
+            .into_iter()
+            .enumerate()
+        {
+            if (idx == 0 && window.map_list_filter.trim().is_empty())
+                || !part.folders.is_empty()
+                || !part.unfiled.is_empty()
+            {
+                clan_buckets[idx].push(part);
+            }
+        }
     }
     let mut shared_buckets: [Vec<SharedFrag>; 3] = std::array::from_fn(|_| Vec::new());
     for group in shared {
@@ -773,108 +1080,157 @@ fn render_all_buckets<'a>(
     ];
     for (idx, header) in headers.into_iter().enumerate() {
         let owned_bucket = std::mem::take(&mut owned[idx]);
+        let clan_bucket = std::mem::take(&mut clan_buckets[idx]);
         let shared_bucket = std::mem::take(&mut shared_buckets[idx]);
-        if owned_bucket.is_empty() && shared_bucket.is_empty() {
+        if owned_bucket.local.is_empty()
+            && owned_bucket.shared.is_empty()
+            && clan_bucket.is_empty()
+            && shared_bucket.is_empty()
+        {
             continue;
         }
         list = list.push(bucket_header(header));
-        for folder in owned_bucket {
-            list = push_folder(list, window, folder, selected);
+        list = push_owned_groups(list, window, owned_bucket, selected);
+        for group in clan_bucket {
+            list = push_clan(list, window, group, idx == 0, selected);
         }
         list = render_shared_frags(list, window, shared_bucket, selected);
     }
     list
 }
 
-/// No server context: flat rendering — every owned folder, then every shared
-/// group, unfiltered (the pre-scoping single-context behavior).
+/// No server context: flat rendering — the viewer's own groups, every clan,
+/// then every sharer's group, unfiltered (the pre-scoping single-context
+/// behavior).
 fn render_flat<'a>(
     mut list: Column<'a, Message, crate::Theme>,
     window: &'a MapEditorWindow,
-    folders: Vec<Folder>,
+    owned: OwnedGroups,
+    clans: Vec<ClanGroup>,
     shared: Vec<SharedGroup>,
     selected: Option<AreaId>,
 ) -> Column<'a, Message, crate::Theme> {
-    let has_shared = !shared.is_empty();
-    if window.atlases.is_empty() {
-        // No owned atlases: keep today's flat owned list (clean single-user
-        // view) rather than a lone "Loose maps" header.
-        let owned: Vec<AreaSummary> = folders
-            .into_iter()
-            .flat_map(|folder| folder.areas)
-            .collect();
-        if !owned.is_empty() {
-            if has_shared {
-                list = list.push(group_label(crate::i18n::t!("area-list-my-maps")));
-            }
-            for area in owned {
-                list = list.push(area_row(window, area, selected, false));
-            }
-        }
-    } else {
-        if has_shared {
-            list = list.push(group_label(crate::i18n::t!("area-list-my-maps")));
-        }
-        for folder in folders {
-            list = push_folder(list, window, folder, selected);
-        }
+    list = push_owned_groups(list, window, owned, selected);
+    for group in clans {
+        list = push_clan(list, window, group, true, selected);
     }
     for group in shared {
-        list = list.push(group_label(group.label));
-        for folder in group.folders {
-            list = push_folder(list, window, folder, selected);
-        }
-        for area in group.loose {
-            list = list.push(area_row(window, area, selected, false));
-        }
+        list = push_shared(
+            list,
+            window,
+            group.label,
+            group.folders,
+            group.loose,
+            selected,
+        );
     }
     list
 }
 
-/// A top-level scope-bucket header for the All-atlases three-bucket view.
+/// A scope-bucket section header for the All-atlases three-bucket view. It
+/// divides the list rather than heading a level of the tree, so the groups
+/// under it stay at the top level.
 fn bucket_header<'a>(label: String) -> ThemedElement<'a, Message> {
-    text(label).size(13).into()
+    container(text(label).size(13))
+        .padding(Padding::ZERO.left(Depth::Group.inset()))
+        .into()
 }
 
 /// The "This server / All atlases" scope control, shown only when the editor
 /// has a server context (otherwise everything is shown and there is nothing to
 /// switch).
-fn scope_control(window: &MapEditorWindow) -> Option<ThemedElement<'_, Message>> {
+fn scope_menu(window: &MapEditorWindow) -> Option<ThemedElement<'_, Message>> {
     let server = window.server_name.as_deref()?;
-    let tab = |label: String, active: bool, all: bool| {
+    let choice = |label: String, active: bool, all: bool| {
         let style = if active {
             builtins::button::list_item_selected
         } else {
             builtins::button::toolbar
         };
-        button(text(label).size(11))
-            .style(style)
-            .on_press(Message::ScopeAllToggled(all))
-            .width(Length::FillPortion(1))
+        button(
+            row![
+                text(if active { "✓" } else { "" }).width(16),
+                text(label).size(12)
+            ]
+            .spacing(6),
+        )
+        .style(style)
+        .on_press(Message::ScopeAllToggled(all))
+        .padding([6, 10])
+        .width(Length::Fill)
     };
-    Some(
-        row![
-            tab(
-                crate::i18n::t!("area-list-this-server", "server" => server),
-                !window.scope_all,
-                false
-            ),
-            tab(
-                crate::i18n::t!("area-list-all-atlases"),
-                window.scope_all,
-                true
-            ),
-        ]
-        .spacing(4)
-        .align_y(Vertical::Center)
-        .padding([0, 8])
-        .into(),
-    )
+    let open = window.scope_menu_open;
+    let trigger = tooltip(
+        button(text("⋯").size(14))
+            .style(if open {
+                builtins::button::toolbar_active
+            } else {
+                builtins::button::toolbar
+            })
+            .padding([0, 6])
+            .on_press(Message::ScopeMenuToggled(!open)),
+        text(if window.scope_all {
+            crate::i18n::t!("area-list-all-atlases")
+        } else {
+            crate::i18n::t!("area-list-this-server", "server" => server)
+        }),
+        tooltip::Position::Bottom,
+    );
+    let menu = open.then(|| {
+        container(
+            column![
+                choice(
+                    crate::i18n::t!("area-list-this-server", "server" => server),
+                    !window.scope_all,
+                    false
+                ),
+                choice(
+                    crate::i18n::t!("area-list-all-atlases"),
+                    window.scope_all,
+                    true
+                ),
+            ]
+            .spacing(2),
+        )
+        .width(240)
+        .padding(6)
+        .style(builtins::container::card)
+        .into()
+    });
+    Some(Dropdown::new(trigger, menu, Message::ScopeMenuToggled(false)).into())
+}
+
+fn filter_control(window: &MapEditorWindow) -> ThemedElement<'_, Message> {
+    let mut filter = row![
+        text_input(
+            crate::i18n::ts!("area-list-filter-placeholder"),
+            &window.map_list_filter
+        )
+        .on_input(Message::MapListFilterChanged)
+        .size(12)
+        .width(Length::Fill),
+    ]
+    .spacing(4)
+    .align_y(Vertical::Center);
+    if !window.map_list_filter.is_empty() {
+        filter = filter.push(tooltip(
+            button(text("×").size(14))
+                .style(builtins::button::toolbar)
+                .on_press(Message::MapListFilterChanged(String::new())),
+            crate::i18n::ts!("action-clear"),
+            tooltip::Position::Bottom,
+        ));
+    }
+    container(filter).padding([0, 8]).into()
 }
 
 /// The collapsed-by-default "Unassigned" group header (This-server scope): the
 /// atlases with no server-entry association yet.
-fn unassigned_header<'a>(count: usize, collapsed: bool) -> ThemedElement<'a, Message> {
+fn unassigned_header<'a>(
+    count: usize,
+    collapsed: bool,
+    filtering: bool,
+) -> ThemedElement<'a, Message> {
     let disclosure = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
     let header = row![
         text(disclosure)
@@ -891,23 +1247,27 @@ fn unassigned_header<'a>(count: usize, collapsed: bool) -> ThemedElement<'a, Mes
     .width(Length::Fill);
     button(header)
         .style(builtins::button::list_item)
-        .on_press(Message::ToggleFolderCollapsed(FolderKey::Unassigned))
+        .on_press_maybe(
+            (!filtering).then_some(Message::ToggleFolderCollapsed(FolderKey::Unassigned)),
+        )
         .width(Length::Fill)
         .into()
 }
 
-/// Appends a folder's disclosure header and (unless collapsed) its rows.
+/// Appends a folder's disclosure header and (unless collapsed) its rows, a
+/// step in from it.
 fn push_folder<'a>(
     mut list: Column<'a, Message, crate::Theme>,
     window: &'a MapEditorWindow,
     folder: Folder,
     selected: Option<AreaId>,
 ) -> Column<'a, Message, crate::Theme> {
-    let collapsed = window.collapsed_folders.contains(&folder.key);
+    let collapsed =
+        window.map_list_filter.trim().is_empty() && window.collapsed_folders.contains(&folder.key);
     list = list.push(folder_header(window, &folder, collapsed));
     if !collapsed {
         for area in folder.areas {
-            list = list.push(area_row(window, area, selected, true));
+            list = list.push(area_row(window, area, selected, Depth::Map));
         }
     }
     list
@@ -915,39 +1275,78 @@ fn push_folder<'a>(
 
 /// One folder's disclosure header: a chevron, the folder name, a count badge,
 /// and (for named atlases) new-map / rename / delete / share affordances.
-/// Pressing the row toggles collapse; the nested affordance buttons capture
-/// their own clicks. While the folder is being renamed it becomes a text
-/// input instead.
+/// Pressing a named folder's row chooses it, and the inspector shows its
+/// panel (Ctrl/Shift+click chooses several); its chevron opens and closes
+/// it. The "Not in a folder" row opens and closes on any press. The nested
+/// buttons capture their own clicks. While the folder is being renamed it
+/// becomes a text input instead.
 fn folder_header<'a>(
     window: &'a MapEditorWindow,
     folder: &Folder,
     collapsed: bool,
 ) -> ThemedElement<'a, Message> {
+    let item = match folder.key {
+        FolderKey::Atlas(atlas_id) => Some(ListItem::Folder(atlas_id)),
+        FolderKey::Unfiled(_) | FolderKey::Unassigned => None,
+    };
+    if let Some(item) = item {
+        window.multi.record(item);
+    }
     if let Some((renaming_id, name)) = &window.renaming_atlas
         && FolderKey::Atlas(*renaming_id) == folder.key
     {
-        return text_input(crate::i18n::ts!("mapper-folder-name-placeholder"), name)
-            .size(13)
-            .on_input(Message::RenameAtlasChanged)
-            .on_submit(Message::RenameAtlasCommitted)
-            .into();
+        return container(
+            text_input(crate::i18n::ts!("mapper-folder-name-placeholder"), name)
+                .size(13)
+                .on_input(Message::RenameAtlasChanged)
+                .on_submit(Message::RenameAtlasCommitted),
+        )
+        .padding(Depth::Folder.input_padding())
+        .into();
     }
 
     // Triangles render in the regular font, sidestepping the icon-font set.
     let disclosure = if collapsed { "\u{25B8}" } else { "\u{25BE}" };
     let count = folder.areas.len();
-
-    let mut header = row![
+    let chevron =
         text(disclosure)
             .size(10)
             .style(|theme: &crate::Theme| iced::widget::text::Style {
                 color: Some(theme.styles.text.normal.scale_alpha(0.6)),
-            }),
-        text(folder.label.clone()).size(13),
-    ]
-    .spacing(6)
-    .align_y(Vertical::Center)
-    .width(Length::Fill);
+            });
+    // A row that chooses its folder opens and closes by its chevron.
+    let chevron: ThemedElement<'static, Message> = if item.is_some() {
+        button(chevron)
+            .style(builtins::button::link)
+            .padding(CHEVRON_PADDING)
+            .on_press_maybe(
+                window
+                    .map_list_filter
+                    .trim()
+                    .is_empty()
+                    .then_some(Message::ToggleFolderCollapsed(folder.key)),
+            )
+            .into()
+    } else {
+        container(chevron).padding(CHEVRON_PADDING).into()
+    };
+
+    let mut header = row![chevron, text(folder.label.clone()).size(13)]
+        .spacing(6)
+        .align_y(Vertical::Center)
+        .width(Length::Fill);
+
+    // Where this server's scripts put new maps that name no folder.
+    if let FolderKey::Atlas(atlas_id) = folder.key
+        && window.default_atlases.contains(atlas_id)
+        && let Some(server) = window.server_name.as_deref()
+    {
+        header = header.push(tooltip(
+            badge(crate::i18n::t!("area-list-default-badge")),
+            text(crate::i18n::t!("area-list-default-tip", "server" => server)),
+            tooltip::Position::Bottom,
+        ));
+    }
 
     header = header.push(badge(if count == 0 {
         crate::i18n::t!("area-list-empty")
@@ -956,7 +1355,8 @@ fn folder_header<'a>(
     }));
     header = header.push(space::horizontal());
 
-    // The Loose bucket isn't a real atlas — no rename/delete/share/new-map.
+    // The "Not in a folder" bucket isn't a real atlas — no rename/delete/
+    // share/new-map.
     if let FolderKey::Atlas(atlas_id) = folder.key {
         // Owner-only structural affordances (new-map/rename/delete/share/
         // transfer). A shared atlas folder (surfaced under a sharer group) shows
@@ -968,88 +1368,63 @@ fn folder_header<'a>(
                 crate::i18n::ts!("area-list-new-map-folder"),
                 tooltip::Position::Bottom,
             ));
-            header = header.push(tooltip(
-                icon_button(
-                    bootstrap_icons::PENCIL,
-                    Message::RenameAtlasStarted(atlas_id),
-                ),
-                "Rename folder",
-                tooltip::Position::Bottom,
-            ));
-            header = header.push(tooltip(
-                icon_button(
-                    bootstrap_icons::TRASH_3,
-                    Message::DeleteAtlasRequested(atlas_id),
-                ),
-                "Delete folder",
-                tooltip::Position::Bottom,
-            ));
-            let atlas_is_local = window.local_atlas_ids.contains(&atlas_id);
-            // An atlas move always crosses the local/cloud boundary, so both
-            // directions need the cloud side: signed out, a local source has
-            // no destination and a cloud source's delete would fail after the
-            // copy (a recoverable duplicate, but an error all the same).
-            if window.cloud.snapshot.get().signed_in {
-                header = header.push(text_button(
-                    crate::i18n::ts!("area-list-move-action"),
-                    Message::MoveAtlasStorageRequested(atlas_id),
-                ));
-            }
-            // Sharing is cloud-only — a local folder has no server identity, so
-            // the affordance would always 404. New-map/rename/delete work on
-            // both tiers.
-            if !atlas_is_local {
-                header = header.push(text_button(
-                    "Share\u{2026}",
-                    Message::ShareAtlasRequested(atlas_id),
-                ));
-                // Hand the whole folder to a friend (owner-only).
-                header = header.push(text_button(
-                    crate::i18n::ts!("mapper-transfer-action"),
-                    Message::TransferAtlasOwnershipRequested(atlas_id),
-                ));
-            }
         }
-        // Choose which server entries this atlas is shown on (the §5 override
-        // surface). Atlas-level scoping is the norm, and the associations are
-        // per-user local — so it works on a shared atlas folder too. A local
-        // atlas is entry-isolated and never scoped.
-        if !window.local_atlas_ids.contains(&atlas_id) {
-            header = header.push(text_button(
-                crate::i18n::ts!("area-list-servers-action"),
-                Message::ServersChecklistRequested(ScopeTarget::Atlas(atlas_id)),
-            ));
+        if let Some(menu) = folder_menu(window, atlas_id, folder.owned) {
+            header = header.push(menu);
         }
     }
 
+    let chosen = item.is_some_and(|item| {
+        window
+            .multi
+            .selection
+            .contains(item, window.editor.area_id())
+    });
     button(header)
-        .style(builtins::button::list_item)
-        .on_press(Message::ToggleFolderCollapsed(folder.key))
+        .style(if chosen {
+            builtins::button::list_item_selected
+        } else {
+            builtins::button::list_item
+        })
+        .padding(Depth::Folder.row_padding())
+        .on_press_maybe(match item {
+            Some(item) => Some(Message::Multi(MultiMessage::Pressed(item))),
+            None => window
+                .map_list_filter
+                .trim()
+                .is_empty()
+                .then_some(Message::ToggleFolderCollapsed(folder.key)),
+        })
         .width(Length::Fill)
         .into()
 }
 
-/// One area row, shared by the folder tree and the by-sharer groups. Selected
-/// owned rows gain the active/inactive switch plus move/rename/delete; the
-/// move affordance only appears when there are folders to move into.
+/// One map row at `depth`, shared by the folder tree and the by-sharer
+/// groups. Rows only choose a map: its actions live in the toolbar.
+/// Ctrl/Shift+click chooses several.
 fn area_row<'a>(
     window: &'a MapEditorWindow,
     area: AreaSummary,
     selected: Option<AreaId>,
-    has_folders: bool,
+    depth: Depth,
 ) -> ThemedElement<'a, Message> {
-    let is_selected = Some(area.id) == selected;
+    let list_item = ListItem::Map(area.id);
+    window.multi.record(list_item);
+    let is_selected = window.multi.selection.contains(list_item, selected);
 
     // A row being renamed swaps to a text input; Enter commits, Escape
     // (window-level) cancels.
     if let Some((renaming_id, name)) = &window.renaming_area
         && *renaming_id == area.id
     {
-        return text_input(crate::i18n::ts!("mapper-area-name-placeholder"), name)
-            .size(14)
-            .on_input(Message::RenameAreaChanged)
-            .on_submit(Message::RenameAreaCommitted)
-            .into();
+        return container(
+            text_input(crate::i18n::ts!("mapper-area-name-placeholder"), name)
+                .size(14)
+                .on_input(Message::RenameAreaChanged)
+                .on_submit(Message::RenameAreaCommitted),
+        )
+        .padding(depth.input_padding())
+        .into();
     }
 
     // Inactive maps grey their name hard so the active/inactive split reads at
@@ -1077,17 +1452,6 @@ fn area_row<'a>(
             crate::i18n::ts!("area-list-inactive-tip"),
             tooltip::Position::Bottom,
         ));
-    }
-
-    if area.has_secrets {
-        item = item.push(
-            text(super::ICON_LOCK_FILL)
-                .font(fonts::BOOTSTRAP_ICONS)
-                .size(10.0)
-                .style(|theme: &crate::Theme| iced::widget::text::Style {
-                    color: Some(theme.styles.text.normal.scale_alpha(0.45)),
-                }),
-        );
     }
 
     // Family badge: this map is one of several copies sharing an origin.
@@ -1125,69 +1489,113 @@ fn area_row<'a>(
 
     item = item.push(space::horizontal());
 
-    // The selected row gets an active/inactive switch: the icon shows the
-    // current state (switch on = active), the tooltip the action.
-    if is_selected {
-        let (codepoint, tip) = if area.enabled {
-            (
-                bootstrap_icons::TOGGLE_ON,
-                crate::i18n::ts!("inspector-active-tip"),
-            )
-        } else {
-            (
-                bootstrap_icons::TOGGLE_OFF,
-                crate::i18n::ts!("inspector-inactive-tip"),
-            )
-        };
-        item = item.push(tooltip(
-            icon_button(codepoint, Message::ToggleAreaEnabled(area.id)),
-            tip,
-            tooltip::Position::Bottom,
-        ));
-    }
-
-    // rename/delete are gated on "owner OR admin" (server: is_owner OR can_admin).
-    // Move (same-owner) and Transfer (raw is_owner) stay owner-only.
-    if is_selected && area.owned && has_folders {
-        item = item.push(text_button(
-            "Move\u{2026}",
-            Message::MoveAreaRequested(area.id),
-        ));
-    }
-    if is_selected && (area.owned || area.can_admin) {
-        item = item.push(icon_button(
-            bootstrap_icons::PENCIL,
-            Message::RenameAreaStarted(area.id),
-        ));
-        item = item.push(icon_button(
-            bootstrap_icons::TRASH_3,
-            Message::DeleteAreaRequested(area.id),
-        ));
-    }
-    if is_selected && area.owned {
-        item = item.push(text_button(
-            crate::i18n::ts!("mapper-transfer-action"),
-            Message::TransferAreaOwnershipRequested(area.id),
-        ));
-    }
-    // A loose cloud area carries its own "show on servers" checklist (an
-    // atlas-filed area is scoped by its folder header instead).
-    if is_selected && let Some(target) = area.scope_target {
-        item = item.push(text_button(
-            crate::i18n::ts!("area-list-servers-action"),
-            Message::ServersChecklistRequested(target),
-        ));
-    }
-
     button(item)
         .style(if is_selected {
             builtins::button::list_item_selected
         } else {
             builtins::button::list_item
         })
-        .on_press(Message::AreaSelected(area.id))
+        .padding(depth.row_padding())
+        .on_press(Message::Multi(MultiMessage::Pressed(list_item)))
         .width(Length::Fill)
         .into()
+}
+
+/// A folder's ⋯ menu: rename, delete, move, share, transfer (owner only) and
+/// the per-user server checklist; a clan folder's as its actions allow.
+/// `None` when nothing applies.
+fn folder_menu(
+    window: &MapEditorWindow,
+    atlas_id: AtlasId,
+    owned: bool,
+) -> Option<ThemedElement<'static, Message>> {
+    let atlas_is_local = window.local_atlas_ids.contains(&atlas_id);
+    // A clan folder's menu follows the folder's actions.
+    let clan_folder = clan_maps::is_clan_folder(window, atlas_id);
+    let mut entries: Vec<(String, Message)> = if clan_folder {
+        clan_maps::folder_entries(window, atlas_id)
+    } else {
+        Vec::new()
+    };
+    if owned {
+        entries.push((
+            crate::i18n::t!("mapper-menu-rename"),
+            Message::RenameAtlasStarted(atlas_id),
+        ));
+        // An atlas move always crosses the local/cloud boundary, so both
+        // directions need the cloud side: signed out, a local source has
+        // no destination and a cloud source's delete would fail after the
+        // copy (a recoverable duplicate, but an error all the same).
+        if window.cloud.snapshot.get().signed_in && !clan_folder {
+            entries.push((
+                crate::i18n::t!("area-list-move-action"),
+                Message::MoveAtlasStorageRequested(atlas_id),
+            ));
+        }
+        // Sharing is cloud-only: a local folder has no server identity. A
+        // clan's folder is never transferred.
+        if !atlas_is_local {
+            entries.push((
+                crate::i18n::t!("area-list-share-action"),
+                Message::ShareAtlasRequested(atlas_id),
+            ));
+            if !clan_folder {
+                entries.push((
+                    crate::i18n::t!("mapper-transfer-action"),
+                    Message::TransferAtlasOwnershipRequested(atlas_id),
+                ));
+            }
+        }
+        if !clan_folder {
+            entries.extend(default_atlases::menu_entry(window, atlas_id));
+        }
+    }
+    // Which server entries the folder shows on. The associations are
+    // per-user, so this works on a shared folder too; a local folder is never
+    // scoped.
+    if !atlas_is_local && !clan_folder {
+        entries.push((
+            crate::i18n::t!("area-list-servers-action"),
+            Message::ServersChecklistRequested(ScopeTarget::Atlas(atlas_id)),
+        ));
+    }
+    if owned {
+        entries.push((
+            crate::i18n::t!("area-list-delete-folder"),
+            Message::DeleteAtlasRequested(atlas_id),
+        ));
+    }
+    if entries.is_empty() {
+        return None;
+    }
+
+    let open = window.folder_menu == Some(atlas_id);
+    let trigger = button(text("⋯").size(14.0))
+        .style(if open {
+            builtins::button::toolbar_active
+        } else {
+            builtins::button::toolbar
+        })
+        .padding([0, 6])
+        .on_press(Message::FolderMenuToggled((!open).then_some(atlas_id)));
+    let menu = open.then(|| {
+        let mut list = column![].spacing(2);
+        for (label, message) in entries {
+            list = list.push(
+                button(text(label).size(12))
+                    .width(Length::Fill)
+                    .padding([6, 10])
+                    .style(builtins::button::link)
+                    .on_press(Message::MenuPicked(Box::new(message))),
+            );
+        }
+        container(list)
+            .width(200)
+            .padding(6)
+            .style(builtins::container::card)
+            .into()
+    });
+    Some(Dropdown::new(trigger, menu, Message::FolderMenuToggled(None)).into())
 }
 
 #[cfg(test)]
@@ -1217,7 +1625,6 @@ mod tests {
                 can_edit: false,
                 can_reshare: false,
                 can_copy: false,
-                include_secrets: false,
                 can_admin: false,
                 parent_grant_id: None,
                 created_at: Utc::now() + Duration::seconds(created_offset_secs),
@@ -1284,5 +1691,326 @@ mod tests {
         let index = SharerIndex::build(&[area_grant, atlas_grant]);
         let sharer = index.sharer_for(area, Some(atlas)).expect("sharer");
         assert_eq!(sharer.user_id, area_grantor);
+    }
+
+    fn owned_map(n: u128, name: &str, atlas: Option<u128>, local: bool) -> OwnedMap {
+        OwnedMap {
+            summary: AreaSummary {
+                id: AreaId(uuid(n)),
+                name: name.to_string(),
+                owned: true,
+                can_edit: true,
+                can_admin: true,
+                enabled: true,
+                reshare_owner: None,
+                sharer_label: None,
+                in_family: false,
+            },
+            atlas_id: atlas.map(|atlas| AtlasId(uuid(atlas))),
+            atlas_name: None,
+            local,
+        }
+    }
+
+    fn folder_item(n: u128, name: &str, clan: Option<u128>) -> AtlasListItem {
+        AtlasListItem {
+            id: AtlasId(uuid(n)),
+            name: name.to_string(),
+            created_at: Utc::now(),
+            area_count: 0,
+            rev: 1,
+            is_owner: clan.is_none(),
+            can_admin: clan.is_none(),
+            owner_nickname: None,
+            clan_id: clan.map(uuid),
+            clan_name: None,
+            actions: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Each group's folders as (key, label, map names).
+    fn shape(folders: &[Folder]) -> Vec<(FolderKey, String, Vec<&str>)> {
+        folders
+            .iter()
+            .map(|folder| {
+                (
+                    folder.key,
+                    folder.label.clone(),
+                    folder.areas.iter().map(|area| area.name.as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn own_maps_split_into_local_and_shared_groups() {
+        let atlases = [
+            folder_item(1, "Roads", None),
+            folder_item(2, "Cities", None),
+            folder_item(3, "Empty", None),
+            // A clan's folder lists under its clan, never here.
+            folder_item(4, "Clan towns", Some(40)),
+        ];
+        let local_atlases: HashSet<AtlasId> = [AtlasId(uuid(1))].into();
+        let maps = vec![
+            owned_map(10, "Trail", Some(1), true),
+            owned_map(11, "Midgaard", Some(2), false),
+            owned_map(12, "Scratch", None, true),
+            owned_map(13, "Sketch", None, false),
+            // Its folder isn't in the inventory (yet).
+            owned_map(14, "Arriving", Some(99), false),
+        ];
+        let groups = group_owned(maps, &atlases, &local_atlases);
+        let not_in_folder = crate::i18n::t!("area-list-not-in-folder");
+        assert_eq!(
+            shape(&groups.local),
+            [
+                (
+                    FolderKey::Atlas(AtlasId(uuid(1))),
+                    "Roads".to_string(),
+                    vec!["Trail"]
+                ),
+                (
+                    FolderKey::Unfiled(MapStorage::Local),
+                    not_in_folder.clone(),
+                    vec!["Scratch"]
+                ),
+            ]
+        );
+        assert_eq!(
+            shape(&groups.shared),
+            [
+                (
+                    FolderKey::Atlas(AtlasId(uuid(2))),
+                    "Cities".to_string(),
+                    vec!["Midgaard"]
+                ),
+                // An empty folder still shows, so a new one is visible.
+                (
+                    FolderKey::Atlas(AtlasId(uuid(3))),
+                    "Empty".to_string(),
+                    vec![]
+                ),
+                (
+                    FolderKey::Unfiled(MapStorage::Cloud),
+                    not_in_folder,
+                    vec!["Arriving", "Sketch"]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_map_shows_in_its_folder_before_the_folder_list_arrives() {
+        let arriving = OwnedMap {
+            atlas_name: Some("Harbor".to_string()),
+            ..owned_map(14, "Docks", Some(99), false)
+        };
+        let groups = group_owned(
+            vec![arriving, owned_map(15, "Sketch", None, false)],
+            &[],
+            &HashSet::new(),
+        );
+        assert_eq!(
+            shape(&groups.shared),
+            [
+                (
+                    FolderKey::Atlas(AtlasId(uuid(99))),
+                    "Harbor".to_string(),
+                    vec!["Docks"]
+                ),
+                (
+                    FolderKey::Unfiled(MapStorage::Cloud),
+                    crate::i18n::t!("area-list-not-in-folder"),
+                    vec!["Sketch"]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_group_with_every_map_filed_has_no_unfiled_bucket() {
+        let atlases = [folder_item(1, "Roads", None)];
+        let local_atlases: HashSet<AtlasId> = [AtlasId(uuid(1))].into();
+        let groups = group_owned(
+            vec![owned_map(10, "Trail", Some(1), true)],
+            &atlases,
+            &local_atlases,
+        );
+        assert_eq!(groups.local.len(), 1);
+        assert!(groups.shared.is_empty());
+    }
+
+    #[test]
+    fn filtering_keeps_matching_maps_with_their_folder_and_matching_atlases_with_all_maps() {
+        let mut groups = group_owned(
+            vec![
+                owned_map(10, "North Gate", Some(1), false),
+                owned_map(11, "Market", Some(1), false),
+                owned_map(12, "South Gate", Some(2), false),
+                owned_map(13, "Trail", None, false),
+            ],
+            &[
+                folder_item(1, "City", None),
+                folder_item(2, "North Country", None),
+                folder_item(3, "North Sea", None),
+                folder_item(4, "Empty", None),
+            ],
+            &HashSet::new(),
+        );
+        filter_folders(&mut groups.shared, "north");
+        assert_eq!(
+            shape(&groups.shared),
+            [
+                (
+                    FolderKey::Atlas(AtlasId(uuid(1))),
+                    "City".to_string(),
+                    vec!["North Gate"]
+                ),
+                (
+                    FolderKey::Atlas(AtlasId(uuid(2))),
+                    "North Country".to_string(),
+                    vec!["South Gate"]
+                ),
+                (
+                    FolderKey::Atlas(AtlasId(uuid(3))),
+                    "North Sea".to_string(),
+                    vec![]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn filtering_unfiled_maps_does_not_match_the_synthetic_bucket_name() {
+        let mut groups = group_owned(
+            vec![owned_map(10, "Trail", None, true)],
+            &[],
+            &HashSet::new(),
+        );
+        filter_folders(&mut groups.local, "");
+        assert_eq!(groups.local.len(), 1);
+        let bucket_name = groups.local[0].label.to_lowercase();
+        filter_folders(&mut groups.local, &bucket_name);
+        assert!(groups.local.is_empty());
+    }
+
+    /// Exercise the rendered row order used for Shift+click, including
+    /// unassigned folders, clan maps, scope changes, and clearing the query.
+    #[tokio::test]
+    async fn filtering_reveals_collapsed_matches_without_changing_scope_or_collapse_state() {
+        let mapper = super::super::links::fixture::serving(vec![
+            created_map(10, "North Gate", 1, None),
+            created_map(11, "Market", 1, None),
+            created_map(12, "North Road", 2, Some(7)),
+        ])
+        .await;
+        let mut window = super::super::test_window(mapper, AreaId(uuid(10)));
+        // Opening the map associates its atlas with this server. Put it
+        // back in Unassigned to exercise that section's disclosure too.
+        window.map_scopes = smudgy_core::models::map_scopes::MapScopes::default();
+        window.atlases = vec![
+            folder_item(1, "City", None),
+            folder_item(2, "Roads", Some(7)),
+        ];
+        window
+            .map_scopes
+            .set_atlas_entry(AtlasId(uuid(2)), "another server", true);
+        window
+            .collapsed_folders
+            .insert(FolderKey::Atlas(AtlasId(uuid(1))));
+        window.collapsed_folders.insert(FolderKey::Unassigned);
+        let collapsed = window.collapsed_folders.clone();
+        drop(view(&window));
+        assert!(window.multi.order.borrow().is_empty());
+        let _ = window.update(Message::MapListFilterChanged("  NORTH  ".to_string()));
+        drop(view(&window));
+        assert_eq!(
+            *window.multi.order.borrow(),
+            [
+                ListItem::Folder(AtlasId(uuid(1))),
+                ListItem::Map(AreaId(uuid(10)))
+            ]
+        );
+        assert_eq!(window.collapsed_folders, collapsed);
+
+        let _ = window.update(Message::ScopeAllToggled(true));
+        drop(view(&window));
+        assert_eq!(
+            *window.multi.order.borrow(),
+            [
+                ListItem::Folder(AtlasId(uuid(1))),
+                ListItem::Map(AreaId(uuid(10))),
+                ListItem::Folder(AtlasId(uuid(2))),
+                ListItem::Map(AreaId(uuid(12))),
+            ]
+        );
+        let _ = window.update(Message::MapListFilterChanged("no such map".to_string()));
+        drop(view(&window));
+        assert!(window.multi.order.borrow().is_empty());
+
+        let _ = window.update(Message::MapListFilterChanged(" ".to_string()));
+        let _ = window.update(Message::ScopeAllToggled(false));
+        drop(view(&window));
+        assert!(window.multi.order.borrow().is_empty());
+        assert_eq!(window.collapsed_folders, collapsed);
+        assert_eq!(window.editor.area_id(), Some(AreaId(uuid(10))));
+    }
+
+    /// A map as a create reply describes it: no word of what the viewer may
+    /// do with it.
+    fn created_map(
+        n: u128,
+        name: &str,
+        atlas: u128,
+        clan: Option<u128>,
+    ) -> smudgy_cloud::AreaWithDetails {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid(n), "user_id": null, "atlas_id": uuid(atlas), "name": name,
+            "created_at": "2026-10-06T00:00:00Z", "rev": 1, "clan_id": clan.map(uuid),
+            "format_version": smudgy_cloud::AREA_FORMAT_VERSION,
+            "properties": [], "rooms": [], "labels": [], "shapes": []
+        }))
+        .expect("a map")
+    }
+
+    /// A clan's map the viewer just made lists under its clan alone, even
+    /// before the server says what the viewer may do with it.
+    #[tokio::test]
+    async fn a_new_clan_map_is_not_among_the_viewers_own() {
+        let mapper = super::super::links::fixture::serving(vec![
+            created_map(10, "Solace", 2, Some(7)),
+            created_map(11, "Wayside", 1, None),
+        ])
+        .await;
+        let atlas = mapper.get_current_atlas();
+        let atlases = [
+            folder_item(1, "Mine", None),
+            folder_item(2, "Roads", Some(7)),
+        ];
+        let none = HashSet::new();
+        let groups = owned_groups(&atlas, &atlases, &HashSet::new(), &none, &none, &none);
+        assert!(groups.local.is_empty());
+        assert_eq!(
+            shape(&groups.shared),
+            [(
+                FolderKey::Atlas(AtlasId(uuid(1))),
+                "Mine".to_string(),
+                vec!["Wayside"]
+            )]
+        );
+        assert_eq!(first_area_id(&atlas, &none), Some(AreaId(uuid(11))));
+    }
+
+    #[test]
+    fn rows_step_in_one_level_per_depth() {
+        assert!(Depth::Group.inset() < Depth::Folder.inset());
+        assert!(Depth::Folder.inset() < Depth::Map.inset());
+        assert_eq!(Depth::Group.inset(), ROW_INSET);
+        // A rename input's text lines up with the row it replaces.
+        assert_eq!(
+            Depth::Map.input_padding().left + text_input::DEFAULT_PADDING.left,
+            Depth::Map.inset()
+        );
     }
 }

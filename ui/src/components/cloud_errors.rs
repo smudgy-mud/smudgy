@@ -47,6 +47,7 @@ pub fn display_error(err: &CloudError) -> String {
         CloudError::NetworkError(detail) => {
             crate::i18n::t!("cloud-error-network", "detail" => detail)
         }
+        CloudError::ServiceUnavailable(_) => crate::i18n::t!("cloud-error-service-unavailable"),
         CloudError::SerializationError(detail) => {
             crate::i18n::t!("cloud-error-serialization", "detail" => detail)
         }
@@ -84,6 +85,13 @@ pub fn display_error(err: &CloudError) -> String {
             "version" => version
         ),
         CloudError::VersionNotYanked => crate::i18n::t!("cloud-error-version-not-yanked"),
+        CloudError::PackageNameUnavailable(name) => {
+            crate::i18n::t!("cloud-error-package-name-unavailable", "name" => name)
+        }
+        CloudError::BodyBeingCollected => crate::i18n::t!("cloud-error-body-being-collected"),
+        CloudError::TooLarge(detail) => {
+            crate::i18n::t!("cloud-error-too-large", "detail" => detail)
+        }
         CloudError::RevisionConflict { .. } => {
             crate::i18n::t!("cloud-error-revision-conflict")
         }
@@ -97,6 +105,18 @@ pub fn display_error(err: &CloudError) -> String {
         CloudError::InvalidConnection(detail) => {
             crate::i18n::t!("cloud-error-invalid-connection", "detail" => detail)
         }
+        CloudError::SecretKeepsRoomData(room) => {
+            crate::i18n::t!("cloud-error-merge-secret-room-data", "room" => room.to_string())
+        }
+        CloudError::LastOwner => crate::i18n::t!("cloud-error-last-owner"),
+        CloudError::ClanNotEmpty => crate::i18n::t!("cloud-error-clan-not-empty"),
+        CloudError::ClanDissolving => crate::i18n::t!("cloud-error-clan-dissolving"),
+        CloudError::AtlasNotEmpty => crate::i18n::t!("cloud-error-atlas-not-empty"),
+        CloudError::AlreadyMember => crate::i18n::t!("cloud-error-already-member"),
+        CloudError::NameInUse => crate::i18n::t!("cloud-error-name-in-use"),
+        CloudError::TransferAlreadyPending => {
+            crate::i18n::t!("cloud-error-transfer-already-pending")
+        }
     }
 }
 
@@ -108,11 +128,27 @@ fn merge_refusal_key(reason: &str) -> Option<&'static str> {
         "merge_areas_room_not_found" => "cloud-error-merge-areas-room-not-found",
         "merge_areas_mixed_tiers" => "cloud-error-merge-areas-mixed-tiers",
         "merge_areas_unsupported_storage" => "cloud-error-merge-areas-unsupported-storage",
-        "merge_requires_full_projection" => "cloud-error-merge-requires-full-projection",
         "merge_areas_busy" => "cloud-error-merge-areas-busy",
         "merge_areas_source_changed" => "cloud-error-merge-areas-source-changed",
         "merge_areas_room_numbers_exhausted" => "cloud-error-merge-areas-room-numbers-exhausted",
         "merge_areas_invalid_translation" => "cloud-error-merge-areas-invalid-translation",
+        "secret_area_level" => "cloud-error-secret-area-level",
+        "secret_view_only" => "cloud-error-secret-view-only",
+        "secret_unavailable" => "cloud-error-secret-unavailable",
+        "secret_cannot_add" => "cloud-error-secret-cannot-add",
+        "secret_cannot_edit" => "cloud-error-secret-cannot-edit",
+        "secret_cannot_remove" => "cloud-error-secret-cannot-remove",
+        "secret_linked_map_rooms" => "cloud-error-secret-linked-map-rooms",
+        "secret_link_between_secrets" => "cloud-error-secret-link-between-secrets",
+        "secret_link_into_other_map" => "cloud-error-secret-link-into-other-map",
+        "secret_map_exit_retarget" => "cloud-error-secret-map-exit-retarget",
+        "move_busy" => "cloud-error-move-busy",
+        "move_drops_places" => "cloud-error-move-drops-places",
+        "move_splits_links" => "cloud-error-move-splits-links",
+        "access_review_required" => "cloud-error-access-review-required",
+        "stale_access_review" => "cloud-error-stale-access-review",
+        "move_property_conflict" => "cloud-error-move-property-conflict",
+        "room_number_exists" => "cloud-error-room-number-exists",
         _ => return None,
     })
 }
@@ -120,6 +156,29 @@ fn merge_refusal_key(reason: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_review_refusals_give_localized_recovery_instructions() {
+        for reason in [
+            "access_review_required",
+            "stale_access_review",
+            "move_property_conflict",
+        ] {
+            let key = merge_refusal_key(reason).expect("a specific recovery message");
+            assert!(
+                !display_error(&CloudError::StructuralConflict(reason.into())).contains(reason)
+            );
+            for catalog in smudgy_i18n::available_catalogs() {
+                let translator = smudgy_i18n::Translator::for_tag(catalog.tag).unwrap();
+                let text = translator.translate(key);
+                assert!(
+                    !text.contains('⟦') && text != key,
+                    "{}: {text}",
+                    catalog.tag
+                );
+            }
+        }
+    }
 
     #[test]
     fn merge_refusals_use_specific_localized_messages() {
@@ -142,10 +201,6 @@ mod tests {
                 "merge_areas_unsupported_storage",
                 "cloud-error-merge-areas-unsupported-storage",
             ),
-            (
-                "merge_requires_full_projection",
-                "cloud-error-merge-requires-full-projection",
-            ),
             ("merge_areas_busy", "cloud-error-merge-areas-busy"),
             (
                 "merge_areas_source_changed",
@@ -158,6 +213,28 @@ mod tests {
             (
                 "merge_areas_invalid_translation",
                 "cloud-error-merge-areas-invalid-translation",
+            ),
+            ("secret_area_level", "cloud-error-secret-area-level"),
+            ("secret_view_only", "cloud-error-secret-view-only"),
+            ("secret_unavailable", "cloud-error-secret-unavailable"),
+            ("secret_cannot_add", "cloud-error-secret-cannot-add"),
+            ("secret_cannot_edit", "cloud-error-secret-cannot-edit"),
+            ("secret_cannot_remove", "cloud-error-secret-cannot-remove"),
+            (
+                "secret_linked_map_rooms",
+                "cloud-error-secret-linked-map-rooms",
+            ),
+            (
+                "secret_link_between_secrets",
+                "cloud-error-secret-link-between-secrets",
+            ),
+            (
+                "secret_link_into_other_map",
+                "cloud-error-secret-link-into-other-map",
+            ),
+            (
+                "secret_map_exit_retarget",
+                "cloud-error-secret-map-exit-retarget",
             ),
         ] {
             let error = if code == "merge_areas_invalid_translation" {
@@ -180,6 +257,153 @@ mod tests {
                         catalog.tag
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn clan_conflicts_use_their_own_localized_messages() {
+        for (error, key) in [
+            (CloudError::LastOwner, "cloud-error-last-owner"),
+            (CloudError::ClanNotEmpty, "cloud-error-clan-not-empty"),
+            (CloudError::AtlasNotEmpty, "cloud-error-atlas-not-empty"),
+            (CloudError::AlreadyMember, "cloud-error-already-member"),
+            (CloudError::NameInUse, "cloud-error-name-in-use"),
+            (
+                CloudError::TransferAlreadyPending,
+                "cloud-error-transfer-already-pending",
+            ),
+        ] {
+            let rendered = display_error(&error);
+            assert_eq!(rendered, crate::i18n::translate(key), "{key}");
+            assert!(!rendered.contains('_'), "{rendered}");
+            for catalog in smudgy_i18n::available_catalogs() {
+                let translator = smudgy_i18n::Translator::for_tag(catalog.tag).unwrap();
+                let translated = translator.translate(key);
+                assert!(!translated.is_empty() && !translated.contains('⟦'), "{key}");
+                if catalog.tag != "en-US" {
+                    assert_ne!(
+                        translated,
+                        smudgy_i18n::Translator::default().translate(key),
+                        "{} must translate {key}",
+                        catalog.tag
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn package_refusals_use_their_own_localized_messages() {
+        let taken = display_error(&CloudError::PackageNameUnavailable("My-Lib".to_string()));
+        assert!(taken.contains("My-Lib"), "{taken}");
+        assert!(!taken.contains('_'), "{taken}");
+        let collected = display_error(&CloudError::BodyBeingCollected);
+        assert_eq!(
+            collected,
+            crate::i18n::translate("cloud-error-body-being-collected")
+        );
+        for catalog in smudgy_i18n::available_catalogs() {
+            let translator = smudgy_i18n::Translator::for_tag(catalog.tag).unwrap();
+            for key in [
+                "cloud-error-body-being-collected",
+                "cloud-error-clan-not-empty",
+                "package-owner-clan",
+            ] {
+                let translated = translator.translate(key);
+                assert!(!translated.is_empty() && !translated.contains('⟦'), "{key}");
+                if catalog.tag != "en-US" {
+                    assert_ne!(
+                        translated,
+                        smudgy_i18n::Translator::default().translate(key),
+                        "{} must translate {key}",
+                        catalog.tag
+                    );
+                }
+            }
+            let render = |translator: smudgy_i18n::Translator| smudgy_i18n::t!(translator, "cloud-error-package-name-unavailable", "name" => "My-Lib");
+            let translated = render(translator);
+            assert!(
+                translated.contains("My-Lib") && !translated.contains('⟦'),
+                "{}: {translated}",
+                catalog.tag
+            );
+            let confirm = |translator: smudgy_i18n::Translator| smudgy_i18n::t!(translator, "clans-delete-clan-confirm", "name" => "Guild");
+            let translated = confirm(smudgy_i18n::Translator::for_tag(catalog.tag).unwrap());
+            assert!(
+                translated.contains("Guild") && !translated.contains('⟦'),
+                "{}: {translated}",
+                catalog.tag
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_write_reads_as_a_moment_to_wait_in_every_language() {
+        let error = CloudError::from_status(503, "Service temporarily unavailable");
+        let shown = display_error(&error);
+        assert_eq!(
+            shown,
+            crate::i18n::translate("cloud-error-service-unavailable")
+        );
+        assert!(!shown.contains("503"), "{shown}");
+        let english =
+            smudgy_i18n::Translator::default().translate("cloud-error-service-unavailable");
+        for catalog in smudgy_i18n::available_catalogs() {
+            let translated = smudgy_i18n::Translator::for_tag(catalog.tag)
+                .unwrap()
+                .translate("cloud-error-service-unavailable");
+            assert!(
+                !translated.is_empty() && !translated.contains('⟦'),
+                "{}",
+                catalog.tag
+            );
+            if catalog.tag != "en-US" {
+                assert_ne!(translated, english, "{} must translate it", catalog.tag);
+            }
+        }
+    }
+
+    #[test]
+    fn a_dissolving_clan_has_its_own_localized_message() {
+        let error = CloudError::from_status(409, "clan_dissolving");
+        assert_eq!(
+            display_error(&error),
+            crate::i18n::translate("cloud-error-clan-dissolving")
+        );
+        let english = smudgy_i18n::Translator::default().translate("cloud-error-clan-dissolving");
+        assert!(english.contains("being dissolved"), "{english}");
+        for catalog in smudgy_i18n::available_catalogs() {
+            let translated = smudgy_i18n::Translator::for_tag(catalog.tag)
+                .unwrap()
+                .translate("cloud-error-clan-dissolving");
+            assert!(
+                !translated.is_empty() && !translated.contains('⟦'),
+                "{}",
+                catalog.tag
+            );
+            if catalog.tag != "en-US" {
+                assert_ne!(translated, english, "{} must translate it", catalog.tag);
+            }
+        }
+    }
+
+    #[test]
+    fn a_size_cap_is_localized_and_keeps_the_servers_detail() {
+        let detail = "bundle too large: 95000001 bytes (max 95000000)";
+        let rendered = display_error(&CloudError::TooLarge(detail.to_string()));
+        assert!(rendered.contains(detail), "{rendered}");
+        let render = |translator: smudgy_i18n::Translator| smudgy_i18n::t!(translator, "cloud-error-too-large", "detail" => detail);
+        let english = render(smudgy_i18n::Translator::default());
+        for catalog in smudgy_i18n::available_catalogs() {
+            let translated = render(smudgy_i18n::Translator::for_tag(catalog.tag).unwrap());
+            assert!(
+                translated.contains(detail) && !translated.contains('⟦'),
+                "{}: {translated}",
+                catalog.tag
+            );
+            if catalog.tag != "en-US" {
+                assert_ne!(translated, english, "{} must translate it", catalog.tag);
             }
         }
     }

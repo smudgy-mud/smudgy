@@ -30,8 +30,8 @@ use super::persistence::write_atomic;
 ///   the same prod-like behavior and notification suppression as an RC, while
 ///   their title marker includes the build timestamp and Git commit.
 /// - [`Dev`](BuildChannel::Dev) — any other suffixed version (`0.4.0-beta`,
-///   `0.3.2+ci`): an isolated dev/pre-release build (dev API, `smudgy-dev/`
-///   data + keyring, script inspector on).
+///   `0.3.2+ci`): an isolated dev/pre-release build (staging API,
+///   `smudgy-dev/` data + keyring, script inspector on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildChannel {
     Release,
@@ -153,11 +153,11 @@ const fn version_has_prerelease_marker(bytes: &[u8], marker: &[u8]) -> bool {
 }
 
 /// The API base URL used when [`Settings::api_base_url`] is not set. Derived from
-/// the [`build_channel`]: a [`Dev`](BuildChannel::Dev) build defaults to the dev
-/// API; a release or prod-like prerelease defaults to prod. Override via
-/// `api_base_url` in settings.json.
+/// the [`build_channel`]: a [`Dev`](BuildChannel::Dev) build defaults to the
+/// staging service; a release or prod-like prerelease defaults to prod.
+/// Override via `api_base_url` in settings.json.
 pub const DEFAULT_API_BASE_URL: &str = if is_dev_build() {
-    "https://api.dev.smudgy.org"
+    "https://api.staging.smudgy.org"
 } else {
     "https://api.smudgy.org"
 };

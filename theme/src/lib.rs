@@ -21,6 +21,7 @@ pub mod builtins {
     pub mod svg;
     pub mod text;
     pub mod text_input;
+    pub mod toggler;
 }
 
 pub type Element<'a, Message> = iced::Element<'a, Message, Theme>;

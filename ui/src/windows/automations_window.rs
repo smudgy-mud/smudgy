@@ -44,10 +44,12 @@ use crate::keymap::MaybePhysicalKey;
 use crate::theme::Element as ThemedElement;
 use crate::update::Update;
 
+mod clan_packages;
 pub(crate) mod common;
 // Host-owned writable-code controller and `iced-code-editor` adapter. The current
 // read-only previews intentionally keep their existing text widgets.
 #[allow(dead_code)]
+mod clan_publish;
 mod code_editor;
 mod dashboard;
 mod editors;
@@ -777,23 +779,17 @@ pub enum Message {
         server_name: String,
         name: String,
     },
-    #[allow(clippy::type_complexity)]
     OwnedShareLoaded {
         account_epoch: u64,
         account_fence: AccountReadFence,
         seq: ShareSeq,
         name: String,
-        result: Result<
-            (
-                Uuid,
-                bool,
-                Vec<FriendView>,
-                Vec<PackageGrantView>,
-                Vec<VersionListItem>,
-            ),
-            CloudError,
-        >,
+        result: Result<clan_publish::OwnedShare, CloudError>,
+        /// The account's clans, for the first publish's owner choices and clan names.
+        clans: Vec<smudgy_cloud::clans::ClanSummary>,
     },
+    /// The owner the first publish of the open package makes it.
+    PublishOwnerPicked(clan_publish::OwnerChoice),
 
     // ---- installed package -------------------------------------------------
     /// The [`DetailSeq`] is the manage-pane detail generation captured when the load started; a
@@ -924,6 +920,11 @@ pub enum Message {
         account_fence: AccountReadFence,
         result: Result<PackageDetail, CloudError>,
     },
+    /// The caller's clans, by ID and name, for naming a clan-owned package's owner.
+    PackageClanNamesLoaded {
+        account_fence: AccountReadFence,
+        result: Result<Vec<(Uuid, String)>, CloudError>,
+    },
     DiscoverCommentsLoaded {
         seq: DiscoverSeq,
         package_id: Uuid,
@@ -988,6 +989,7 @@ pub enum Message {
     // ---- private & shared --------------------------------------------------
     OpenShared,
     SharedLoaded {
+        request: u64,
         account_epoch: u64,
         account_fence: AccountReadFence,
         result: Result<Vec<PackageDetail>, CloudError>,
@@ -996,9 +998,15 @@ pub enum Message {
     /// shared-with-me list in the "Private & Shared" pane — including private ones with
     /// no local copy on this machine, which appear in no other surface.
     MyCloudLoaded {
+        request: u64,
         account_epoch: u64,
         account_fence: AccountReadFence,
         result: Result<Vec<PackageDetail>, CloudError>,
+    },
+    ClanPackagesLoaded {
+        request: u64,
+        account_fence: AccountReadFence,
+        result: Result<Vec<clan_packages::ClanPackages>, CloudError>,
     },
     InstallShared {
         owner: String,
@@ -1271,6 +1279,13 @@ pub struct AutomationsWindow {
     /// Sharing details are loaded or the user is signed in.
     publication_status: PublicationStatus,
     pub(super) share_is_public: bool,
+    /// The clan that owns the open package, with the account's actions there; `None` for the
+    /// account's own package or one not yet published.
+    pub(super) share_clan: Option<clan_publish::OwnedClan>,
+    /// The clans that let the account create packages, by ID and name, for the first publish.
+    pub(super) publish_clans: Vec<(Uuid, String)>,
+    /// The owner the open package's first publish makes it.
+    pub(super) publish_owner: smudgy_core::models::local_packages::PublishOwner,
     pub(super) share_friends: Vec<FriendView>,
     pub(super) share_grants: Vec<PackageGrantView>,
     pub(super) share_versions: Vec<VersionListItem>,
@@ -1342,6 +1357,9 @@ pub struct AutomationsWindow {
     pub(super) discover_owner: Option<String>,
     pub(super) discover_requested_package: Option<Uuid>,
     pub(super) discover_detail: Option<Box<PackageDetail>>,
+    /// The names of the caller's clans by ID, loaded when a clan-owned package is shown. A
+    /// clan the caller is not in stays unnamed.
+    pub(super) package_clan_names: Option<std::collections::HashMap<Uuid, String>>,
     pub(super) discover_readme: Option<markdown::Content>,
     pub(super) discover_comments: Vec<CommentView>,
     pub(super) discover_comment_input: String,
@@ -1383,6 +1401,8 @@ pub struct AutomationsWindow {
     pub(super) profile_param_status: Option<model::ProfileParamStatus>,
 
     // ---- private & shared --------------------------------------------------
+    pub(super) shared_list_request: u64,
+    pub(super) clan_packages: Option<Result<Vec<clan_packages::ClanPackages>, CloudError>>,
     pub(super) shared_with_me: Option<Vec<PackageDetail>>,
     /// The caller's own cloud packages (`GET /packages/mine`), public and private. `None`
     /// until the "Private & Shared" pane loads them. Surfaces packages the owner has no
@@ -1606,6 +1626,9 @@ impl AutomationsWindow {
             share_package_id: None,
             publication_status: PublicationStatus::Unknown,
             share_is_public: false,
+            share_clan: None,
+            publish_clans: Vec::new(),
+            publish_owner: smudgy_core::models::local_packages::PublishOwner::Me,
             share_friends: Vec::new(),
             share_grants: Vec::new(),
             share_versions: Vec::new(),
@@ -1643,6 +1666,7 @@ impl AutomationsWindow {
             discover_owner: None,
             discover_requested_package: None,
             discover_detail: None,
+            package_clan_names: None,
             discover_readme: None,
             discover_comments: Vec::new(),
             discover_comment_input: String::new(),
@@ -1663,6 +1687,8 @@ impl AutomationsWindow {
             settings_menu_request: 0,
             settings_paste_ready: None,
             profile_param_status: None,
+            shared_list_request: 0,
+            clan_packages: None,
             shared_with_me: None,
             my_cloud_packages: None,
             palette_open: false,
@@ -3189,6 +3215,25 @@ impl AutomationsWindow {
                             if same_account {
                                 self.share_package_id = Some(summary.package_id);
                                 self.share_is_public = summary.is_public;
+                                // A clan's package: the publish shows the account may create and
+                                // publish there; the reload below brings the rest.
+                                if let Some(clan) = summary.clan_id
+                                    && self
+                                        .share_clan
+                                        .as_ref()
+                                        .is_none_or(|owned| owned.id != clan)
+                                {
+                                    self.share_clan = Some(clan_publish::OwnedClan {
+                                        id: clan,
+                                        actions: [
+                                            smudgy_cloud::clans::action::CREATE_PACKAGE,
+                                            smudgy_cloud::clans::action::PUBLISH_PACKAGE,
+                                        ]
+                                        .into_iter()
+                                        .map(str::to_string)
+                                        .collect(),
+                                    });
+                                }
                                 if !self
                                     .share_versions
                                     .iter()
@@ -3246,7 +3291,10 @@ impl AutomationsWindow {
                                 .locked_dependencies
                                 .iter()
                                 .map(|(spec, ver)| {
-                                    format!("{}@{ver}", spec.trim_start_matches("smudgy://"))
+                                    let shown = spec
+                                        .trim_start_matches("smudgy://")
+                                        .trim_start_matches("smudgy:");
+                                    format!("{shown}@{ver}")
                                 })
                                 .collect();
                             feedback.push('\n');
@@ -3513,14 +3561,19 @@ impl AutomationsWindow {
                 seq,
                 name,
                 result,
+                clans,
             } => {
                 if account_epoch == self.account_epoch
                     && self.account_read_is_current(account_fence)
                 {
-                    self.owned_share_loaded(seq, &name, result)
+                    self.owned_share_loaded(seq, &name, result, &clans)
                 } else {
                     Update::none()
                 }
+            }
+            Message::PublishOwnerPicked(choice) => {
+                self.publish_owner = choice.owner;
+                Update::none()
             }
 
             // -------- installed package ------------------------------------
@@ -3710,6 +3763,10 @@ impl AutomationsWindow {
                 account_fence,
                 result,
             } => self.discover_detail_loaded(seq, package_id, account_fence, result),
+            Message::PackageClanNamesLoaded {
+                account_fence,
+                result,
+            } => self.package_clan_names_loaded(account_fence, result),
             Message::DiscoverCommentsLoaded {
                 seq,
                 package_id,
@@ -3761,15 +3818,22 @@ impl AutomationsWindow {
             // -------- private & shared -------------------------------------
             Message::OpenShared => self.open_shared(),
             Message::SharedLoaded {
+                request,
                 account_epoch,
                 account_fence,
                 result,
-            } => self.shared_loaded(account_epoch, account_fence, result),
+            } => self.shared_loaded(request, account_epoch, account_fence, result),
             Message::MyCloudLoaded {
+                request,
                 account_epoch,
                 account_fence,
                 result,
-            } => self.my_cloud_loaded(account_epoch, account_fence, result),
+            } => self.my_cloud_loaded(request, account_epoch, account_fence, result),
+            Message::ClanPackagesLoaded {
+                request,
+                account_fence,
+                result,
+            } => self.clan_packages_loaded(request, account_fence, result),
             Message::InstallShared { owner, name } => self.begin_install(owner, name),
             Message::PromoteInstalledDependency => self.promote_installed_dependency(),
 
@@ -3790,6 +3854,11 @@ impl AutomationsWindow {
                         Task::done(Message::LoadLocalPackages),
                         Task::done(Message::LoadInstalledPackages),
                         Task::done(Message::LoadFeaturedDiscover),
+                        if self.selection == Selection::Shared {
+                            self.load_shared_cloud_lists().task
+                        } else {
+                            Task::none()
+                        },
                         toast,
                     ]),
                     Some(Event::ScriptsChanged {
@@ -4570,6 +4639,7 @@ mod tab_traversal_tests {
             publisher_id,
             result: Ok(PublishSummary {
                 package_id,
+                clan_id: None,
                 is_public: true,
                 version: "1.2.3".to_string(),
                 published_at,
@@ -4623,6 +4693,7 @@ mod tab_traversal_tests {
             publisher_id: Uuid::new_v4(),
             result: Ok(PublishSummary {
                 package_id,
+                clan_id: None,
                 is_public: true,
                 version: "1.0.0".to_string(),
                 published_at: "2026-08-10T00:00:00Z".parse().unwrap(),
@@ -7001,7 +7072,7 @@ mod tab_traversal_tests {
         let before = shared_packages::load_lock(&window.server_name).unwrap();
         wire.manifest = serde_json::json!({"version":"1.0.0", "requires":false});
         wire.dependencies = vec![smudgy_cloud::ResolvedDependency {
-            owner_nickname: "publisher".into(),
+            owner_nickname: Some("publisher".into()),
             name: "prompt-malformed".into(),
             range: "*".into(),
             resolved_version: "1.0.0".into(),

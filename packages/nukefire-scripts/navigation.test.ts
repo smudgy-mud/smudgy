@@ -6,6 +6,7 @@ import {
   splitArrivalCommands,
   takeCommandArgument,
   type NavigationAreaId,
+  type NavigationDoor,
   type NavigationRoom,
 } from "./navigation.ts";
 
@@ -33,7 +34,7 @@ test("turns weighted mapper paths into explicit and directional commands", () =>
       to_area_id: OTHER,
       to_room_number: 20,
       command: "enter portal",
-      is_closed: true,
+      door: { state: "closed", name: null, opensWith: null },
     }])],
     [`${OTHER}:20`, room(20, [], OTHER)],
   ]);
@@ -48,6 +49,33 @@ test("turns weighted mapper paths into explicit and directional commands", () =>
     { command: "enter portal", closed: true },
   ]);
   assert.equal(formatRoute(route.steps), "north ; enter portal");
+});
+
+test("reads each hop's door: locked is closed too, and an open door is neither", () => {
+  const exit = (to: number, door: NavigationDoor | null) => ({
+    from_direction: "East",
+    to_area_id: AREA,
+    to_room_number: to,
+    command: null,
+    door,
+  });
+  const rooms = new Map<number, NavigationRoom>([
+    [1, room(1, [exit(2, { state: "locked", name: "gate", opensWith: "unlock gate;open gate" })])],
+    [2, room(2, [exit(3, { state: "open", name: null, opensWith: null })])],
+    [3, room(3, [exit(4, null)])],
+    [4, room(4)],
+  ]);
+  const route = buildNavigationRoute(
+    [[AREA, 1], [AREA, 2], [AREA, 3], [AREA, 4]],
+    (_area, number) => rooms.get(number),
+  );
+
+  assert.equal(route.error, undefined);
+  assert.deepEqual(route.steps.map(({ closed, locked }) => ({ closed, locked })), [
+    { closed: true, locked: true },
+    { closed: false, locked: false },
+    { closed: false, locked: false },
+  ]);
 });
 
 test("falls back to the canonical short command when an exit has none", () => {

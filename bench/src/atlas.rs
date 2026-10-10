@@ -125,14 +125,13 @@ fn exit(
         to_direction: Some(from.opposite()),
         path: String::new(),
         is_hidden: false,
-        is_closed: false,
-        is_locked: false,
+        door: None,
         weight: 1.0,
         command: String::new(),
         connection_id: connection,
         to_unknown: false,
         to_area_token: None,
-        is_secret: false,
+        to_source: None,
     }
 }
 
@@ -148,6 +147,7 @@ fn pair_connection(
     let endpoint = |room: RoomNumber, direction: ExitDirection| {
         let (side, port_offset) = default_anchor_for_direction(direction, None);
         ConnectionEndpoint {
+            source: None,
             room_number: room,
             side,
             port_offset,
@@ -326,7 +326,6 @@ pub fn synthetic_area(area_index: u32, rooms: usize) -> AreaWithDetails {
             properties: Vec::new(),
             exits: std::mem::take(room_exits),
             tags,
-            is_secret: false,
             external_id: None,
         });
     }
@@ -337,6 +336,7 @@ pub fn synthetic_area(area_index: u32, rooms: usize) -> AreaWithDetails {
     let created_at = Default::default();
 
     AreaWithDetails {
+        room_data: Vec::new(),
         area: Area {
             id: area_id,
             user_id: None,
@@ -350,16 +350,21 @@ pub fn synthetic_area(area_index: u32, rooms: usize) -> AreaWithDetails {
             copied_from_rev: None,
             copied_at: None,
             family_token: None,
+            clan_id: None,
+            clan_name: None,
+            actions: None,
+            clan_ownership: smudgy_cloud::clan_maps::ClanOwnership::default(),
             atlas_name: None,
+            projection_token: None,
         },
         format_version: smudgy_cloud::AREA_FORMAT_VERSION,
-        content_hash: None,
         properties: Vec::new(),
         rooms: room_list,
         labels: Vec::new(),
         shapes: Vec::new(),
         connections,
         linked_areas: Vec::new(),
+        sources: Vec::new(),
     }
 }
 

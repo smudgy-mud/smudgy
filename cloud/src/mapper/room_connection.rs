@@ -48,13 +48,10 @@ pub struct RoomConnection {
     /// single member traverses A→B (arrow at B), `Some(false)` = B→A (arrow
     /// at A), `None` = bidirectional (no arrow).
     pub arrow_toward_b: Option<bool>,
-    /// True when any member exit or either endpoint room is secret-marked
-    /// (cleared views only ever see this); renderers draw these distinctly.
-    pub is_secret: bool,
-    /// Persisted member state, aggregated so a closed/locked traversal is
-    /// visible even when its reciprocal member is open.
-    pub is_closed: bool,
-    pub is_locked: bool,
+    /// The most shut door among the members, so a closed or locked
+    /// traversal shows even when its reciprocal member's door is open or
+    /// absent; `None` when no member has a door.
+    pub door: Option<crate::DoorState>,
     pub to: RoomConnectionEnd,
     /// Endpoint A's room (grouping/level anchor). For the far half of a
     /// cross-level Connection this is endpoint B's room instead — each half

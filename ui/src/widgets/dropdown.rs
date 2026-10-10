@@ -8,6 +8,12 @@
 //! keyboard navigation (up/down/enter) to application messages while open —
 //! the part a stock `pick_list` gives for free that a custom list must not
 //! lose.
+//!
+//! With [`Dropdown::at`] the content floats at a point inside the anchor
+//! instead of beneath it: a context menu over a canvas. Then a press outside
+//! the menu dismisses it before the anchor sees it, except a right press,
+//! which also reaches the anchor so a right click elsewhere can reopen the
+//! menu there; scrolling dismisses too.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Tree, Widget, tree};
@@ -25,6 +31,9 @@ pub struct Dropdown<'a, Message, Renderer = iced::Renderer> {
     on_dismiss: Message,
     #[allow(clippy::type_complexity)]
     on_key: Option<Box<dyn Fn(&keyboard::Key) -> Option<Message> + 'a>>,
+    /// Where the content floats, relative to the anchor's top-left; `None`
+    /// floats it beneath the anchor.
+    at: Option<Point>,
 }
 
 impl<'a, Message, Renderer> Dropdown<'a, Message, Renderer> {
@@ -40,7 +49,16 @@ impl<'a, Message, Renderer> Dropdown<'a, Message, Renderer> {
             children,
             on_dismiss,
             on_key: None,
+            at: None,
         }
+    }
+
+    /// Floats the content at `point` inside the anchor (a context menu)
+    /// rather than beneath it.
+    #[must_use]
+    pub fn at(mut self, point: Point) -> Self {
+        self.at = Some(point);
+        self
     }
 
     /// Maps a key press to a message while the dropdown is open (arrow
@@ -103,6 +121,24 @@ impl<Message: Clone, Renderer: renderer::Renderer> Widget<Message, Theme, Render
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // A context menu dismisses on presses outside it before its anchor
+        // sees them; presses inside never get here (the overlay captures
+        // them first).
+        if self.at.is_some() && self.is_open() {
+            match event {
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
+                | Event::Mouse(mouse::Event::WheelScrolled { .. }) => {
+                    shell.publish(self.on_dismiss.clone());
+                }
+                Event::Mouse(mouse::Event::ButtonPressed(_))
+                | Event::Touch(touch::Event::FingerPressed { .. }) => {
+                    shell.publish(self.on_dismiss.clone());
+                    shell.capture_event();
+                    return;
+                }
+                _ => {}
+            }
+        }
         self.children[0].as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -204,14 +240,23 @@ impl<Message: Clone, Renderer: renderer::Renderer> Widget<Message, Theme, Render
             let (anchor_trees, content_trees) = tree.children.split_at_mut(1);
             let _ = anchor_trees;
             let bounds = layout.bounds();
-            Some(overlay::Element::new(Box::new(DropdownOverlay {
-                content: &mut self.children[1],
-                tree: &mut content_trees[0],
-                anchor: Rectangle {
+            let anchor = match self.at {
+                Some(point) => Rectangle {
+                    x: bounds.x + translation.x + point.x,
+                    y: bounds.y + translation.y + point.y - GAP,
+                    width: 0.0,
+                    height: 0.0,
+                },
+                None => Rectangle {
                     x: bounds.x + translation.x,
                     y: bounds.y + translation.y,
                     ..bounds
                 },
+            };
+            Some(overlay::Element::new(Box::new(DropdownOverlay {
+                content: &mut self.children[1],
+                tree: &mut content_trees[0],
+                anchor,
             })))
         } else {
             self.children[0].as_widget_mut().overlay(
@@ -368,6 +413,30 @@ mod tests {
                 height: 160.0
             }
         );
+    }
+
+    #[test]
+    fn a_context_menu_floats_at_its_point() {
+        let mut dropdown: Element<'_, u8, Theme, ()> = Dropdown::new(
+            Space::new().width(800).height(600),
+            Some(Space::new().width(200).height(160).into()),
+            0,
+        )
+        .at(Point::new(300.0, 120.0))
+        .into();
+        let mut tree = Tree::new(dropdown.as_widget());
+        let bounds = Size::new(1500.0, 800.0);
+        let viewport = Rectangle::with_size(bounds);
+        let node = dropdown
+            .as_widget_mut()
+            .layout(&mut tree, &(), &layout::Limits::new(Size::ZERO, bounds))
+            .move_to(Point::new(250.0, 40.0));
+        let mut overlay = dropdown
+            .as_widget_mut()
+            .overlay(&mut tree, Layout::new(&node), &(), &viewport, Vector::ZERO)
+            .unwrap();
+        let node = overlay.as_overlay_mut().layout(&(), bounds);
+        assert_eq!(node.bounds().position(), Point::new(550.0, 160.0));
     }
 
     #[test]

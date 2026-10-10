@@ -33,7 +33,8 @@ use smudgy_cloud::package_api::{
 const FACTS_TTL: Duration = Duration::from_mins(5);
 
 /// A `(owner, name, version)` triple naming one concrete published package version —
-/// enough to re-resolve a closure node when an offer is later accepted.
+/// enough to re-resolve a closure node when an offer is later accepted. `owner` is empty
+/// when the package's owner has no nickname: names are global, so the name resolves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageVersionRef {
     pub owner: String,
@@ -41,9 +42,10 @@ pub struct PackageVersionRef {
     pub version: String,
 }
 
-/// The case-folded cache key for one package. Owner nicknames and package names are
-/// case-insensitive identities on the registry, and the same package may be installed
-/// by several servers, so the key must not depend on any one lockfile's spelling.
+/// The case-folded cache key for one package address (`owner` empty for `smudgy:@name`).
+/// Owner nicknames and package names are case-insensitive on the registry, and the same
+/// package may be installed by several servers, so the key must not depend on any one
+/// lockfile's casing.
 #[must_use]
 pub fn facts_key(owner: &str, name: &str) -> String {
     format!(
@@ -58,7 +60,7 @@ pub fn facts_key(owner: &str, name: &str) -> String {
 /// checks (two servers staging different versions each ask about their own).
 struct StoredFacts {
     fetched_at: Instant,
-    owner: String,
+    owner: Option<String>,
     name: String,
     status: String,
     latest: Option<UpdateCheckLatest>,
@@ -198,7 +200,7 @@ mod tests {
 
     fn result(latest_version: Option<&str>) -> CheckUpdatesResult {
         CheckUpdatesResult {
-            owner: "wbk".into(),
+            owner: Some("wbk".into()),
             name: "mapper".into(),
             status: "ok".into(),
             installed: Some(UpdateCheckInstalled {

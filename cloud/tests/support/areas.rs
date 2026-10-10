@@ -1,6 +1,7 @@
-//! P2 — /areas CRUD, room/property/exit/label/shape writes, /sync.
-//! Mirrors `handlers.rs` + `db.rs` (MapQueries) semantics: can_edit gating,
-//! secret clearance, the exit destination matrix, dual-rev bumps.
+//! P2 — /areas CRUD, room/property/label/shape writes, /sync.
+//! Mirrors `handlers.rs` + `db.rs` (MapQueries) semantics: can_edit gating
+//! and rev bumps. Write bodies carrying `is_secret` are refused, as on the
+//! mutation envelope.
 
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use chrono::Utc;
 use parking_lot::Mutex;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -17,10 +19,11 @@ use super::http::{
     authenticate, bad_request, created, err, gate_verified, not_found, ok, parse_area_id,
     parse_body,
 };
+use super::mutations::mentions_is_secret;
 use super::projection::{project_area, project_list_item, viewer_covers};
 use super::state::{
     AreaPropRecord, AreaRecord, Caps, ExitRecord, LabelRecord, MockState, RoomPropRecord,
-    RoomRecord, ShapeRecord, access_fingerprint,
+    RoomRecord, ShapeRecord, projection_token,
 };
 
 pub type Shared = Arc<Mutex<MockState>>;
@@ -63,6 +66,17 @@ where
     Deserialize::deserialize(de).map(Some)
 }
 
+/// Parses a per-entity write body. Format 3 replaces `is_secret` with
+/// sources, so a body carrying the key anywhere is a 400.
+fn parse_write_body<T: DeserializeOwned>(body: &str) -> Result<T, Response> {
+    if serde_json::from_str::<Value>(body).is_ok_and(|value| mentions_is_secret(&value)) {
+        return Err(bad_request(
+            "`is_secret` is not part of format 3; write to a source instead",
+        ));
+    }
+    parse_body(body)
+}
+
 /// Caps for a write/read on an existing area; uniform 404 when absent.
 pub fn require_caps(st: &MockState, viewer: Uuid, area_id: Uuid) -> Result<Caps, Response> {
     st.caps(viewer, area_id).ok_or_else(not_found)
@@ -79,12 +93,27 @@ pub fn embedded_exit_json(e: &ExitRecord) -> Value {
         "to_direction": e.to_direction,
         "path": e.path,
         "is_hidden": e.is_hidden,
-        "is_closed": e.is_closed,
-        "is_locked": e.is_locked,
+        "door": super::state::door_json(e.door.as_ref()),
         "weight": e.weight,
         "command": e.command,
         "connection_id": e.connection_id,
     })
+    .tap_source(e)
+}
+
+/// Adds `to_source` to an exit's JSON when it leads into a room of another
+/// map's Secret.
+trait TapSource {
+    fn tap_source(self, exit: &ExitRecord) -> Value;
+}
+
+impl TapSource for Value {
+    fn tap_source(mut self, exit: &ExitRecord) -> Value {
+        if let Some(secret) = exit.to_secret {
+            self["to_source"] = json!(secret);
+        }
+        self
+    }
 }
 
 pub fn embedded_label_json(l: &LabelRecord) -> Value {
@@ -122,14 +151,20 @@ pub fn embedded_shape_json(s: &ShapeRecord) -> Value {
 }
 
 fn legacy_area_json(area: &AreaRecord) -> Value {
-    json!({
+    let mut out = json!({
         "id": area.id,
         "user_id": area.user_id,
         "atlas_id": area.atlas_id,
         "name": area.name,
         "created_at": area.created_at,
         "rev": area.rev,
-    })
+    });
+    // A clan's map names its clan in place of a user.
+    if let Some(clan) = area.clan_id {
+        out["user_id"] = Value::Null;
+        out["clan_id"] = json!(clan);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +175,10 @@ fn legacy_area_json(area: &AreaRecord) -> Value {
 struct CreateAreaRequest {
     name: String,
     atlas_id: Option<Uuid>,
+    #[serde(default)]
+    clan_id: Option<Uuid>,
+    #[serde(default)]
+    ownership: Option<String>,
 }
 
 /// POST /areas — no verified gate; atlas (when given) must be caller-owned.
@@ -149,6 +188,7 @@ pub async fn create_area(
     body: String,
 ) -> Response {
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
@@ -157,6 +197,20 @@ pub async fn create_area(
         Ok(r) => r,
         Err(e) => return e,
     };
+    // With `clan_id`, the map goes in the clan (docs/clans.md §6).
+    if let Some(clan) = req.clan_id {
+        return match super::clan_maps::create_clan_area(
+            &mut st,
+            viewer,
+            clan,
+            req.atlas_id,
+            req.name,
+            req.ownership.as_deref(),
+        ) {
+            Ok(id) => created(legacy_area_json(&st.areas[&id])),
+            Err(response) => response,
+        };
+    }
     if let Some(atlas_id) = req.atlas_id {
         let owned = st
             .atlases
@@ -203,11 +257,16 @@ pub async fn get_area(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let st = state.lock();
+    let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if st.fail_area_reads > 0 {
+        st.fail_area_reads -= 1;
+        return super::http::err(500, "injected read failure");
+    }
     match project_area(&st, viewer, area_id) {
         Some(projection) => ok(projection),
         None => not_found(),
@@ -219,9 +278,10 @@ struct UpdateAreaRequest {
     name: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     atlas_id: Option<Option<Uuid>>,
+    access_review: Option<String>,
 }
 
-/// PUT /areas/{id} — OWNER-only rename/atlas-move; bumps both revs; the
+/// PUT /areas/{id} — OWNER-only rename/atlas-move; bumps the rev; the
 /// atlas-move drift cleanup deletes Area-scope re-shares parented on the old
 /// atlas grant.
 pub async fn update_area(
@@ -235,6 +295,7 @@ pub async fn update_area(
         Err(e) => return e,
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
@@ -243,17 +304,29 @@ pub async fn update_area(
         Ok(r) => r,
         Err(e) => return e,
     };
+    if let Some(refusal) = req.name.as_deref().and_then(super::http::name_refusal) {
+        return refusal;
+    }
 
     let Some(area) = st.areas.get(&area_id) else {
         return not_found();
     };
-    if area.user_id != viewer {
+    if area.clan_id.is_some() {
+        let renames = req.name.as_ref().is_some_and(|name| *name != area.name);
+        if let Err(response) =
+            super::clan_maps::may_update_clan_area(&st, viewer, area, renames, req.atlas_id)
+        {
+            return response;
+        }
+    } else if area.user_id != viewer {
         return not_found();
     }
     let old_atlas = area.atlas_id;
     let old_name = area.name.clone();
 
-    if let Some(Some(target_atlas)) = req.atlas_id {
+    if area.clan_id.is_none()
+        && let Some(Some(target_atlas)) = req.atlas_id
+    {
         let owned = st
             .atlases
             .get(&target_atlas)
@@ -264,18 +337,42 @@ pub async fn update_area(
     }
 
     let new_atlas = req.atlas_id.unwrap_or(old_atlas);
+    if new_atlas != old_atlas {
+        let review = match super::filing::review(
+            &st,
+            viewer,
+            area_id,
+            new_atlas,
+            req.access_review.as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        if let Err(response) =
+            super::reviewed_moves::check_review(&review, req.access_review.as_deref())
+        {
+            return response;
+        }
+    }
     let new_name = req.name.unwrap_or(old_name.clone());
     let changed = new_atlas != old_atlas || new_name != old_name;
+    if changed && let Some(refusal) = super::clan_maps::refused_while_disposing(&st, area_id) {
+        return refusal;
+    }
 
     {
         let area = st.areas.get_mut(&area_id).expect("area exists");
         area.atlas_id = new_atlas;
         area.name = new_name;
         if changed {
-            // BEFORE-UPDATE self trigger: name/atlas changes bump BOTH revs.
+            // BEFORE-UPDATE self trigger: name/atlas changes bump the rev.
             area.rev += 1;
-            area.public_rev += 1;
         }
+    }
+    // A clan map leaving a folder leaves the reach of the folder's grants,
+    // so its sharers may lose `area.share_external` on it.
+    if new_atlas != old_atlas {
+        super::shares::sweep_outside_shares(&mut st);
     }
 
     // Drift cleanup (AFTER UPDATE OF atlas_id): delete Area-scope grants on
@@ -311,6 +408,7 @@ pub async fn update_area(
 pub async fn delete_area(
     State(state): State<Shared>,
     Path(raw_id): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     headers: HeaderMap,
 ) -> Response {
     let area_id = match parse_area_id(&raw_id) {
@@ -318,36 +416,173 @@ pub async fn delete_area(
         Err(e) => return e,
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    // The query's shape is judged before the map is looked up.
+    if let Err(refusal) = super::http::expected_rev(query.as_deref()) {
+        return refusal;
+    }
     let Some(area) = st.areas.get(&area_id) else {
         return not_found();
     };
-    if area.user_id != viewer {
+    // A clan's map goes with `area.delete`; anyone else's only by its owner.
+    let may_delete = if area.clan_id.is_some() {
+        super::clan_maps::area_actions(&st, viewer, area)
+            .is_some_and(|actions| actions.contains("area.delete"))
+    } else {
+        area.user_id == viewer
+    };
+    if !may_delete {
         return not_found();
+    }
+    if let Some(refusal) = super::clan_maps::refused_while_disposing(&st, area_id) {
+        return refusal;
     }
     if st.fail_area_deletes > 0 {
         st.fail_area_deletes -= 1;
         return err(500, "injected delete failure");
     }
 
-    st.areas.remove(&area_id);
+    remove_area(&mut st, area_id);
+    ok(Value::Null)
+}
+
+fn local_move_review(st: &MockState, viewer: Uuid, area: &AreaRecord) -> Option<Value> {
+    use sha2::{Digest, Sha256};
+    if area.clan_id.is_some() || area.user_id != viewer {
+        return None;
+    }
+    let mut grants: Vec<_> = st
+        .grants
+        .iter()
+        .filter(|grant| grant.covers_area(area))
+        .collect();
+    grants.sort_by_key(|grant| grant.id);
+    let mut secret_grants: Vec<_> = area
+        .secrets
+        .iter()
+        .flat_map(|secret| &secret.grants)
+        .collect();
+    secret_grants.sort_by_key(|grant| grant.id);
+    let token = Sha256::digest(format!(
+        "local-move-sharing/v1:{viewer}:{}:{:?}:{grants:?}:{secret_grants:?}",
+        area.id, area.atlas_id
+    ));
+    Some(json!({
+        "area_id": area.id,
+        "sharing_token": format!("p_{}", &hex::encode(token)[..32]),
+        "has_shares": !grants.is_empty() || !secret_grants.is_empty(),
+    }))
+}
+
+pub async fn review_local_move(
+    State(state): State<Shared>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let id = match parse_area_id(&raw_id) {
+        Ok(id) => id,
+        Err(error) => return error,
+    };
+    let st = state.lock();
+    let (viewer, _) = match authenticate(&st, &headers) {
+        Ok(who) => who,
+        Err(error) => return error,
+    };
+    st.areas
+        .get(&id)
+        .and_then(|area| local_move_review(&st, viewer, area))
+        .map_or_else(not_found, ok)
+}
+
+pub async fn finish_local_move(
+    State(state): State<Shared>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let id = match parse_area_id(&raw_id) {
+        Ok(id) => id,
+        Err(error) => return error,
+    };
+    let guard: smudgy_cloud::relocation::LocalMoveGuard = match parse_body(&body) {
+        Ok(guard) => guard,
+        Err(error) => return error,
+    };
+    let valid = |token: &str| {
+        token.len() == 34
+            && token.starts_with("p_")
+            && token[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    };
+    if !valid(&guard.sharing_token) || !valid(&guard.expected_projection_token) {
+        return bad_request("Invalid local-move token");
+    }
+    let mut st = state.lock();
+    st.bind_room_references();
+    let (viewer, _) = match authenticate(&st, &headers) {
+        Ok(who) => who,
+        Err(error) => return error,
+    };
+    let Some(review) = st
+        .areas
+        .get(&id)
+        .and_then(|area| local_move_review(&st, viewer, area))
+    else {
+        return not_found();
+    };
+    let Some(projection) = project_area(&st, viewer, id) else {
+        return not_found();
+    };
+    if review["sharing_token"] != guard.sharing_token
+        || (review["has_shares"] == true && !guard.shared_loss_confirmed)
+        || projection["projection_token"] != guard.expected_projection_token
+    {
+        return err(409, "revision_conflict");
+    }
+    if st.fail_area_deletes > 0 {
+        st.fail_area_deletes -= 1;
+        return err(500, "injected delete failure");
+    }
+    remove_area(&mut st, id);
+    ok(Value::Null)
+}
+
+/// Removes a map with everything kept beside it, as `DELETE /areas/{id}`
+/// does: its clan links, the destinations of exits other maps keep into it,
+/// and the grants on it with their subtrees.
+pub fn remove_area(st: &mut MockState, area_id: Uuid) {
+    st.bind_room_references();
+    let removed = st.areas.remove(&area_id);
+    // Exits into its Secrets' rooms go, everywhere, moving nothing.
+    for secret in removed.iter().flat_map(|area| &area.secrets) {
+        super::secrets::drop_exits_into_secret(&mut st.areas, area_id, secret.id, None);
+    }
+    // Deleting a map takes it out of grant scopes and ends its ownership
+    // and transfer offers.
+    super::clan_maps::forget_area(st, area_id);
+    super::transfers::cancel_offers_of(st, area_id);
     // FK SET NULL on (to_area_id, to_room_number): null the destination of
     // exits in OTHER areas that pointed at a room in the deleted area.
-    let mut touched: Vec<(Uuid, bool)> = Vec::new();
+    let mut touched: Vec<Uuid> = Vec::new();
     for other in st.areas.values_mut() {
         for exit in &mut other.exits {
-            if exit.to_area_id == Some(area_id) && exit.to_room_number.is_some() {
+            if exit.to_room_identity.is_none()
+                && exit.to_area_id == Some(area_id)
+                && exit.to_room_number.is_some()
+            {
                 exit.to_area_id = None;
                 exit.to_room_number = None;
-                touched.push((other.id, exit.is_secret));
+                touched.push(other.id);
             }
         }
     }
-    for (host, secret) in touched {
-        st.bump(Some(host), !secret, false);
+    for host in touched {
+        st.bump(Some(host));
     }
     // Grants on the area cascade (subtrees via parent FK).
     let doomed: Vec<Uuid> = st
@@ -357,7 +592,6 @@ pub async fn delete_area(
         .map(|g| g.id)
         .collect();
     st.delete_grants_cascading(&doomed);
-    ok(Value::Null)
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +601,6 @@ pub async fn delete_area(
 #[derive(Deserialize)]
 struct PropertyRequest {
     value: String,
-    is_secret: Option<bool>,
 }
 
 /// PUT /areas/{id}/properties/{name}
@@ -382,11 +615,12 @@ pub async fn upsert_area_property(
         Err(e) => return e,
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let req: PropertyRequest = match parse_body(&body) {
+    let req: PropertyRequest = match parse_write_body(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -397,37 +631,17 @@ pub async fn upsert_area_property(
     if !caps.can_edit {
         return not_found();
     }
-    if req.is_secret.is_some() && !caps.cleared() {
-        return not_found();
-    }
 
     let area = st.areas.get_mut(&area_id).expect("area exists");
-    let (old_secret, new_secret) = match area.properties.get_mut(&name) {
-        Some(existing) => {
-            if existing.is_secret && !caps.cleared() {
-                return err(409, "property name unavailable");
-            }
-            let old = existing.is_secret;
-            existing.value.clone_from(&req.value);
-            existing.created_at = Utc::now();
-            existing.is_secret = req.is_secret.unwrap_or(existing.is_secret);
-            (old, existing.is_secret)
-        }
-        None => {
-            let secret = req.is_secret.unwrap_or(false);
-            area.properties.insert(
-                name.clone(),
-                AreaPropRecord {
-                    value: req.value.clone(),
-                    is_secret: secret,
-                    created_at: Utc::now(),
-                },
-            );
-            (secret, secret)
-        }
-    };
+    area.properties.insert(
+        name.clone(),
+        AreaPropRecord {
+            value: req.value.clone(),
+            created_at: Utc::now(),
+        },
+    );
     let prop_created_at = area.properties[&name].created_at;
-    st.bump(Some(area_id), !(old_secret && new_secret), false);
+    st.bump(Some(area_id));
     ok(json!({
         "area_id": area_id,
         "name": name,
@@ -436,7 +650,7 @@ pub async fn upsert_area_property(
     }))
 }
 
-/// DELETE /areas/{id}/properties/{name} — no clearance gate on deletes.
+/// DELETE /areas/{id}/properties/{name}
 pub async fn delete_area_property(
     State(state): State<Shared>,
     Path((raw_id, name)): Path<(String, String)>,
@@ -447,6 +661,7 @@ pub async fn delete_area_property(
         Err(e) => return e,
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
@@ -459,12 +674,11 @@ pub async fn delete_area_property(
         return not_found();
     }
     let area = st.areas.get_mut(&area_id).expect("area exists");
-    match area.properties.remove(&name) {
-        Some(prop) => {
-            st.bump(Some(area_id), !prop.is_secret, false);
-            ok(Value::Null)
-        }
-        None => err(404, "Property not found"),
+    if area.properties.remove(&name).is_some() {
+        st.bump(Some(area_id));
+        ok(Value::Null)
+    } else {
+        err(404, "Property not found")
     }
 }
 
@@ -480,7 +694,6 @@ struct UpsertRoomRequest {
     x: Option<f32>,
     y: Option<f32>,
     color: Option<String>,
-    is_secret: Option<bool>,
     /// Absent = unchanged, null = clear, string = set (`Option<Option<_>>`
     /// needs the double-option helper — a bare nested option folds null into
     /// absent).
@@ -503,11 +716,12 @@ pub async fn upsert_room(
         return bad_request(&format!("Invalid room number: {raw_room}"));
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let req: UpsertRoomRequest = match parse_body(&body) {
+    let req: UpsertRoomRequest = match parse_write_body(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -518,17 +732,10 @@ pub async fn upsert_room(
     if !caps.can_edit {
         return not_found();
     }
-    if req.is_secret.is_some() && !caps.cleared() {
-        return not_found();
-    }
 
     let area = st.areas.get_mut(&area_id).expect("area exists");
-    let (old_secret, new_secret) = match area.rooms.get_mut(&room_number) {
+    match area.rooms.get_mut(&room_number) {
         Some(room) => {
-            if room.is_secret && !caps.cleared() {
-                return err(409, "room number unavailable");
-            }
-            let old = room.is_secret;
             if let Some(title) = req.title {
                 room.title = title;
             }
@@ -550,12 +757,11 @@ pub async fn upsert_room(
             if let Some(binding) = req.external_id {
                 room.external_id = binding;
             }
-            room.is_secret = req.is_secret.unwrap_or(room.is_secret);
-            (old, room.is_secret)
         }
         None => {
-            let secret = req.is_secret.unwrap_or(false);
             let room = RoomRecord {
+                identity: Uuid::new_v4(),
+                anchor: None,
                 room_number,
                 title: req.title.unwrap_or_default(),
                 description: req.description.unwrap_or_default(),
@@ -563,17 +769,15 @@ pub async fn upsert_room(
                 x: req.x.unwrap_or(0.0),
                 y: req.y.unwrap_or(0.0),
                 color: req.color.unwrap_or_default(),
-                is_secret: secret,
                 created_at: Utc::now(),
                 properties: std::collections::BTreeMap::new(),
                 tags: std::collections::BTreeSet::new(),
                 external_id: req.external_id.flatten(),
             };
             area.rooms.insert(room_number, room);
-            (secret, secret)
         }
-    };
-    st.bump(Some(area_id), !(old_secret && new_secret), false);
+    }
+    st.bump(Some(area_id));
 
     // Mutation responses are NOT projected: full properties + exits.
     let area = st.areas.get(&area_id).expect("area exists");
@@ -624,11 +828,12 @@ pub async fn upsert_room_property(
         return bad_request(&format!("Invalid room number: {raw_room}"));
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let req: PropertyRequest = match parse_body(&body) {
+    let req: PropertyRequest = match parse_write_body(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -639,37 +844,18 @@ pub async fn upsert_room_property(
     if !caps.can_edit {
         return not_found();
     }
-    if req.is_secret.is_some() && !caps.cleared() {
-        return not_found();
-    }
 
     let area = st.areas.get_mut(&area_id).expect("area exists");
     let Some(room) = area.rooms.get_mut(&room_number) else {
         return err(404, "Room not found");
     };
-    let (old_secret, new_secret) = match room.properties.get_mut(&name) {
-        Some(existing) => {
-            if existing.is_secret && !caps.cleared() {
-                return err(409, "property name unavailable");
-            }
-            let old = existing.is_secret;
-            existing.value.clone_from(&req.value);
-            existing.is_secret = req.is_secret.unwrap_or(existing.is_secret);
-            (old, existing.is_secret)
-        }
-        None => {
-            let secret = req.is_secret.unwrap_or(false);
-            room.properties.insert(
-                name.clone(),
-                RoomPropRecord {
-                    value: req.value.clone(),
-                    is_secret: secret,
-                },
-            );
-            (secret, secret)
-        }
-    };
-    st.bump(Some(area_id), !(old_secret && new_secret), false);
+    room.properties.insert(
+        name.clone(),
+        RoomPropRecord {
+            value: req.value.clone(),
+        },
+    );
+    st.bump(Some(area_id));
     ok(json!({"name": name, "value": req.value}))
 }
 
@@ -687,6 +873,7 @@ pub async fn delete_room_property(
         return bad_request(&format!("Invalid room number: {raw_room}"));
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
@@ -703,17 +890,16 @@ pub async fn delete_room_property(
         .rooms
         .get_mut(&room_number)
         .and_then(|room| room.properties.remove(&name));
-    match removed {
-        Some(prop) => {
-            st.bump(Some(area_id), !prop.is_secret, false);
-            ok(Value::Null)
-        }
-        None => err(404, "Room property not found"),
+    if removed.is_some() {
+        st.bump(Some(area_id));
+        ok(Value::Null)
+    } else {
+        err(404, "Room property not found")
     }
 }
 
 // ---------------------------------------------------------------------------
-// Room tags — non-secret, normalized to UPPERCASE
+// Room tags — normalized to UPPERCASE
 // ---------------------------------------------------------------------------
 
 /// PUT /areas/{id}/rooms/{room_number}/tags/{tag}
@@ -735,6 +921,7 @@ pub async fn add_room_tag(
         return bad_request("Tag must not be empty");
     }
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
@@ -750,11 +937,10 @@ pub async fn add_room_tag(
     let Some(room) = area.rooms.get_mut(&room_number) else {
         return err(404, "Room not found");
     };
-    // Tags are non-secret: any real change bumps the public rev. An idempotent
-    // re-add changes nothing.
+    // Any real change bumps the rev. An idempotent re-add changes nothing.
     let inserted = room.tags.insert(normalized);
     if inserted {
-        st.bump(Some(area_id), true, false);
+        st.bump(Some(area_id));
     }
     ok(Value::Null)
 }
@@ -774,6 +960,7 @@ pub async fn remove_room_tag(
     };
     let normalized = tag.trim().to_uppercase();
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
@@ -791,7 +978,7 @@ pub async fn remove_room_tag(
         .get_mut(&room_number)
         .is_some_and(|room| room.tags.remove(&normalized));
     if removed {
-        st.bump(Some(area_id), true, false);
+        st.bump(Some(area_id));
         ok(Value::Null)
     } else {
         err(404, "Room tag not found")
@@ -825,7 +1012,6 @@ struct CreateLabelRequest {
     background_color: Option<String>,
     font_size: Option<i32>,
     font_weight: Option<i32>,
-    is_secret: Option<bool>,
 }
 
 /// POST /areas/{id}/labels
@@ -840,11 +1026,12 @@ pub async fn create_label(
         Err(e) => return e,
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let req: CreateLabelRequest = match parse_body(&body) {
+    let req: CreateLabelRequest = match parse_write_body(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -859,9 +1046,6 @@ pub async fn create_label(
         Err(e) => return e,
     };
     if !caps.can_edit {
-        return not_found();
-    }
-    if req.is_secret.is_some() && !caps.cleared() {
         return not_found();
     }
 
@@ -879,16 +1063,14 @@ pub async fn create_label(
         background_color: req.background_color.unwrap_or_else(|| "white".to_string()),
         font_size: req.font_size.unwrap_or(12),
         font_weight: req.font_weight.unwrap_or(400),
-        is_secret: req.is_secret.unwrap_or(false),
     };
     let response = embedded_label_json(&label);
-    let secret = label.is_secret;
     st.areas
         .get_mut(&area_id)
         .expect("area exists")
         .labels
         .push(label);
-    st.bump(Some(area_id), !secret, false);
+    st.bump(Some(area_id));
     created(response)
 }
 
@@ -906,7 +1088,6 @@ struct UpdateLabelRequest {
     background_color: Option<String>,
     font_size: Option<i32>,
     font_weight: Option<i32>,
-    is_secret: Option<bool>,
 }
 
 /// PUT /areas/{id}/labels/{label_id}
@@ -924,11 +1105,12 @@ pub async fn update_label(
         return bad_request(&format!("Invalid label ID: {raw_label}"));
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let req: UpdateLabelRequest = match parse_body(&body) {
+    let req: UpdateLabelRequest = match parse_write_body(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -949,20 +1131,11 @@ pub async fn update_label(
     if !caps.can_edit {
         return not_found();
     }
-    if req.is_secret.is_some() && !caps.cleared() {
-        return not_found();
-    }
 
-    let cleared = caps.cleared();
     let area = st.areas.get_mut(&area_id).expect("area exists");
     let Some(label) = area.labels.iter_mut().find(|l| l.id == label_id) else {
         return err(404, "Label not found");
     };
-    // Touching an already-secret label requires clearance (atomic WHERE).
-    if label.is_secret && !cleared {
-        return not_found();
-    }
-    let old_secret = label.is_secret;
     if let Some(v) = req.level {
         label.level = v;
     }
@@ -999,12 +1172,8 @@ pub async fn update_label(
     if let Some(v) = req.font_weight {
         label.font_weight = v;
     }
-    if let Some(v) = req.is_secret {
-        label.is_secret = v;
-    }
     let response = embedded_label_json(label);
-    let new_secret = label.is_secret;
-    st.bump(Some(area_id), !(old_secret && new_secret), false);
+    st.bump(Some(area_id));
     ok(response)
 }
 
@@ -1022,6 +1191,7 @@ pub async fn delete_label(
         return bad_request(&format!("Invalid label ID: {raw_label}"));
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
@@ -1037,8 +1207,8 @@ pub async fn delete_label(
     let Some(idx) = area.labels.iter().position(|l| l.id == label_id) else {
         return err(404, "Label not found");
     };
-    let label = area.labels.remove(idx);
-    st.bump(Some(area_id), !label.is_secret, false);
+    area.labels.remove(idx);
+    st.bump(Some(area_id));
     ok(Value::Null)
 }
 
@@ -1058,7 +1228,6 @@ struct CreateShapeRequest {
     shape_type: String,
     border_radius: Option<f32>,
     stroke_width: Option<f32>,
-    is_secret: Option<bool>,
 }
 
 /// POST /areas/{id}/shapes
@@ -1073,11 +1242,12 @@ pub async fn create_shape(
         Err(e) => return e,
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let req: CreateShapeRequest = match parse_body(&body) {
+    let req: CreateShapeRequest = match parse_write_body(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -1089,9 +1259,6 @@ pub async fn create_shape(
         Err(e) => return e,
     };
     if !caps.can_edit {
-        return not_found();
-    }
-    if req.is_secret.is_some() && !caps.cleared() {
         return not_found();
     }
 
@@ -1110,16 +1277,14 @@ pub async fn create_shape(
         shape_type: req.shape_type,
         border_radius: req.border_radius.unwrap_or(0.0),
         stroke_width: req.stroke_width.unwrap_or(1.0),
-        is_secret: req.is_secret.unwrap_or(false),
     };
     let response = embedded_shape_json(&shape);
-    let secret = shape.is_secret;
     st.areas
         .get_mut(&area_id)
         .expect("area exists")
         .shapes
         .push(shape);
-    st.bump(Some(area_id), !secret, false);
+    st.bump(Some(area_id));
     created(response)
 }
 
@@ -1136,7 +1301,6 @@ struct UpdateShapeRequest {
     /// Asymmetric with create: the UPDATE field is named `radius`.
     radius: Option<f32>,
     stroke_width: Option<f32>,
-    is_secret: Option<bool>,
 }
 
 /// PUT /areas/{id}/shapes/{shape_id}
@@ -1154,11 +1318,12 @@ pub async fn update_shape(
         return bad_request(&format!("Invalid shape ID: {raw_shape}"));
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let req: UpdateShapeRequest = match parse_body(&body) {
+    let req: UpdateShapeRequest = match parse_write_body(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -1174,19 +1339,11 @@ pub async fn update_shape(
     if !caps.can_edit {
         return not_found();
     }
-    if req.is_secret.is_some() && !caps.cleared() {
-        return not_found();
-    }
 
-    let cleared = caps.cleared();
     let area = st.areas.get_mut(&area_id).expect("area exists");
     let Some(shape) = area.shapes.iter_mut().find(|s| s.id == shape_id) else {
         return err(404, "Shape not found");
     };
-    if shape.is_secret && !cleared {
-        return not_found();
-    }
-    let old_secret = shape.is_secret;
     if let Some(v) = req.level {
         shape.level = v;
     }
@@ -1217,12 +1374,8 @@ pub async fn update_shape(
     if let Some(v) = req.stroke_width {
         shape.stroke_width = v;
     }
-    if let Some(v) = req.is_secret {
-        shape.is_secret = v;
-    }
     let response = embedded_shape_json(shape);
-    let new_secret = shape.is_secret;
-    st.bump(Some(area_id), !(old_secret && new_secret), false);
+    st.bump(Some(area_id));
     ok(response)
 }
 
@@ -1240,6 +1393,7 @@ pub async fn delete_shape(
         return bad_request(&format!("Invalid shape ID: {raw_shape}"));
     };
     let mut st = state.lock();
+    st.bind_room_references();
     let (viewer, _) = match authenticate(&st, &headers) {
         Ok(v) => v,
         Err(e) => return e,
@@ -1255,8 +1409,8 @@ pub async fn delete_shape(
     let Some(idx) = area.shapes.iter().position(|s| s.id == shape_id) else {
         return err(404, "Shape not found");
     };
-    let shape = area.shapes.remove(idx);
-    st.bump(Some(area_id), !shape.is_secret, false);
+    area.shapes.remove(idx);
+    st.bump(Some(area_id));
     ok(Value::Null)
 }
 
@@ -1282,10 +1436,21 @@ pub async fn sync(State(state): State<Shared>, headers: HeaderMap) -> Response {
         .filter(|a| viewer_covers(&st, viewer, a))
         .map(|a| {
             let caps = st.caps(viewer, a.id).expect("area exists");
+            let mut revisions = serde_json::Map::new();
+            revisions.insert("map".to_string(), json!(a.rev));
+            for (secret, _) in st.readable_secrets(viewer, a) {
+                revisions.insert(secret.id.to_string(), json!(secret.rev));
+            }
             json!({
                 "area_id": a.id,
-                "rev": a.rev,
-                "access_fingerprint": access_fingerprint(&caps),
+                "projection_token": projection_token(
+                    &st,
+                    viewer,
+                    a,
+                    &caps,
+                    super::projection::atlas_name(&st, a).as_deref(),
+                ),
+                "revisions": revisions,
             })
         })
         .collect();

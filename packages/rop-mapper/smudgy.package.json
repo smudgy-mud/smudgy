@@ -1,10 +1,10 @@
 {
     "name": "rop-mapper",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "description": "Rites of Passage mapper using authoritative Room.Info exits and Room.Map neighborhoods, with explicit cloud upgrade.",
-    "min_smudgy_version": "0.5.5",
+    "min_smudgy_version": "0.5.8",
     "dependencies": [
-        "smudgy://official/auto-mapper@^0.3.6"
+        "smudgy://official/auto-mapper@^0.3.8"
     ],
     "hosts": [
         "play.ropmud.com"

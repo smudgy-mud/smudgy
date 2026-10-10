@@ -1,17 +1,14 @@
 //! `CloudApiClient` end-to-end over real HTTP against the contract-shaped mock
-//! in `tests/support/` — identity, social, share-validator, secrets/preview,
+//! in `tests/support/` — identity, social, share-validator, secrets,
 //! and clone flows.
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
 mod support;
 
-use smudgy_cloud::cloud_api::{
-    CopyAreaRequest, CreateShareRequest, PreviewAudience, RoomPropertyRef, SecretEntityKind,
-    SecretMarksRequest, ShareDirection, ShareScope,
-};
+use smudgy_cloud::cloud_api::{CopyAreaRequest, CreateShareRequest, ShareDirection, ShareScope};
 use smudgy_cloud::{
     AreaId, AtlasId, CloudApiClient, CloudError, CloudMapper, CreateAreaRequest, Credential,
-    CredentialSource, ExitId, LabelId, MapperBackend, RoomNumber, ShapeId,
+    CredentialSource, MapperBackend, RoomNumber,
 };
 use std::collections::BTreeMap;
 use support::{GrantFlags, GrantScope, MockHandle, MockServer, TestUser};
@@ -41,7 +38,6 @@ fn view_only_share(grantee_id: Uuid, area_id: AreaId) -> CreateShareRequest {
         can_edit: false,
         can_reshare: false,
         can_copy: false,
-        include_secrets: false,
         can_admin: false,
         host_hints: None,
     }
@@ -59,11 +55,8 @@ async fn full_account_lifecycle() {
     let credentials = CredentialSource::empty();
     let client = CloudApiClient::new(server.base_url.clone(), credentials.clone());
 
-    // Signup is enumeration-flat; the emailed code is fished out of state.
-    client
-        .signup(EMAIL, "lifer")
-        .await
-        .expect("signup accepted");
+    // Signing in creates the account; the emailed code is fished out of state.
+    client.login(EMAIL).await.expect("login accepted");
     let code = server.verify_code_for(EMAIL).expect("code minted");
 
     // Wrong code and unknown email are the same uniform 404.
@@ -85,7 +78,10 @@ async fn full_account_lifecycle() {
         .expect("verify-email");
     assert!(session.session_token.starts_with("smudgy_sess_"));
     assert!(session.user.is_verified());
-    assert!(!session.needs_nickname, "handle allocated at verification");
+    assert!(
+        session.needs_nickname,
+        "an account created by signing in has no handle yet"
+    );
     let first_session_token = session.session_token.clone();
 
     // The code is single-use.
@@ -97,6 +93,7 @@ async fn full_account_lifecycle() {
 
     // Hot-swap the shared credential source onto the fresh session.
     credentials.set(Some(Credential::Session(first_session_token.clone())));
+    client.set_nickname("lifer").await.expect("claim a handle");
     let me = client.me().await.expect("/me over the session");
     assert_eq!(me.email, EMAIL);
     assert!(me.is_verified());
@@ -151,7 +148,7 @@ async fn full_account_lifecycle() {
         .expect("returning login");
     assert_ne!(second.session_token, first_session_token);
     assert!(!second.needs_nickname, "returning user keeps their handle");
-    assert_eq!(second.user.nickname.clone(), session.user.nickname.clone());
+    assert_eq!(second.user.nickname, me.nickname);
     let sessions = client.sessions().await.expect("list sessions");
     assert!(sessions.len() >= 2, "both sessions listed");
 
@@ -176,8 +173,8 @@ async fn full_account_lifecycle() {
 // 1a. The unified email-only entry: login creates the account on first sight
 // ---------------------------------------------------------------------------
 
-/// `login` on a brand-new email provisions a nickname-less account (no signup,
-/// no nickname up front); verifying it signs in but signals `needs_nickname` so
+/// `login` on a brand-new email provisions a nickname-less account (no
+/// nickname up front); verifying it signs in but signals `needs_nickname` so
 /// the client prompts for a handle post-sign-in, which `set_nickname` then
 /// claims. This is the cross-wire contract for the login flow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -188,7 +185,7 @@ async fn login_creates_account_on_first_sight() {
     let credentials = CredentialSource::empty();
     let client = CloudApiClient::new(server.base_url.clone(), credentials.clone());
 
-    // No signup: the email-only entry creates the account and mails a code.
+    // The email-only entry creates the account and mails a code.
     client
         .login(EMAIL)
         .await
@@ -481,28 +478,35 @@ async fn shares_validator_uniform_404() {
         .expect_err("view-only grantee cannot re-share");
     assert!(matches!(err, CloudError::NotFoundOrNoAccess));
 
-    // include_secrets MAY ride an atlas-scope root grant (not just an area-scope grant).
+    // include_secrets is no longer a share flag: `true` is a 400 on POST and
+    // PATCH, so a sharer never believes Secrets went along; `false` and
+    // absence are accepted, and grant rows always carry `false`.
     let atlas = server.create_atlas(&owner, "Bundle");
-    let grant = owner_client
-        .create_share(CreateShareRequest {
-            grantee_id: friend.id,
-            scope: ShareScope::Atlas {
-                atlas_id: AtlasId(atlas),
-            },
-            can_edit: false,
-            can_reshare: false,
-            can_copy: false,
-            include_secrets: true,
-            can_admin: false,
-            host_hints: None,
-        })
+    let http = reqwest::Client::new();
+    let post = |include_secrets: bool| {
+        http.post(format!("{}/shares", server.base_url))
+            .bearer_auth(&owner.api_key)
+            .json(&serde_json::json!({
+                "grantee_id": friend.id,
+                "scope": { "atlas_id": atlas },
+                "include_secrets": include_secrets,
+            }))
+            .send()
+    };
+    assert_eq!(post(true).await.expect("sent").status().as_u16(), 400);
+    let accepted = post(false).await.expect("sent");
+    assert_eq!(accepted.status().as_u16(), 201);
+    let body: serde_json::Value = accepted.json().await.expect("enveloped grant");
+    assert_eq!(body["data"]["include_secrets"], serde_json::json!(false));
+    let id = body["data"]["id"].as_str().expect("grant id");
+    let patched = http
+        .patch(format!("{}/shares/{id}", server.base_url))
+        .bearer_auth(&owner.api_key)
+        .json(&serde_json::json!({ "include_secrets": true }))
+        .send()
         .await
-        .expect("include_secrets may ride an atlas-scope root grant (M6)");
-    assert!(grant.area_id.is_none(), "atlas-scope grant");
-    assert!(
-        grant.include_secrets,
-        "the atlas grant carries include_secrets"
-    );
+        .expect("sent");
+    assert_eq!(patched.status().as_u16(), 400);
 }
 
 /// §4.2: `host_hints` ride the `create_share` body, echo on the created grant,
@@ -575,133 +579,7 @@ async fn share_host_hints_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Secret marks, the audit list, and previews
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn secret_marks_and_audit() {
-    let server = MockServer::spawn().await;
-    let owner = server.create_user("owner@example.com", "owner", true);
-    let grantee = server.create_user("friend@example.com", "friend", true);
-    server.befriend(&owner, &grantee);
-
-    let area = server.create_area(&owner, "Audited Area");
-    server.add_room(area, 1, "Lobby", false);
-    server.add_room(area, 2, "Vault", false);
-    let exit = server.add_exit(area, 1, "East", Some((area, 2)), false);
-    let label = server.add_label(area, "Watch out", false);
-    let shape = server.add_shape(area, false);
-    server.set_area_property(area, "notes", "owner notes", false);
-    server.set_room_property(area, 1, "loot", "diamonds", false);
-
-    let grant_id = server.grant(
-        &owner,
-        &grantee,
-        GrantScope::Area(area),
-        GrantFlags::VIEW_ONLY,
-    );
-
-    // Bulk-mark everything; bogus ids are silently ignored by the server.
-    let owner_client = api_client(&server.base_url, &owner.api_key);
-    let result = owner_client
-        .secret_marks(
-            area,
-            &SecretMarksRequest {
-                secret: true,
-                rooms: vec![2, 99], // 99 does not exist
-                exits: vec![ExitId(exit), ExitId(Uuid::new_v4())],
-                labels: vec![LabelId(label)],
-                shapes: vec![ShapeId(shape)],
-                room_properties: vec![RoomPropertyRef {
-                    room_number: 1,
-                    name: "loot".to_string(),
-                }],
-                area_properties: vec!["notes".to_string()],
-            },
-        )
-        .await
-        .expect("owner is cleared for secret marks");
-    assert_eq!(result.rooms, 1, "the bogus room number was ignored");
-    assert_eq!(result.exits, 1, "the bogus exit id was ignored");
-    assert_eq!(result.labels, 1);
-    assert_eq!(result.shapes, 1);
-    assert_eq!(result.room_properties, 1);
-    assert_eq!(result.area_properties, 1);
-
-    // The owner audit list carries one row per marked entity.
-    let secrets = owner_client.area_secrets(area).await.expect("audit list");
-    assert_eq!(secrets.len(), 6);
-    assert!(
-        secrets
-            .iter()
-            .any(|s| s.kind == SecretEntityKind::Room && s.room_number == Some(2))
-    );
-    assert!(
-        secrets
-            .iter()
-            .any(|s| s.kind == SecretEntityKind::Exit && s.id == Some(exit))
-    );
-    assert!(
-        secrets
-            .iter()
-            .any(|s| s.kind == SecretEntityKind::Label && s.id == Some(label))
-    );
-    assert!(
-        secrets
-            .iter()
-            .any(|s| s.kind == SecretEntityKind::Shape && s.id == Some(shape))
-    );
-    assert!(secrets.iter().any(|s| {
-        s.kind == SecretEntityKind::RoomProperty
-            && s.room_number == Some(1)
-            && s.name.as_deref() == Some("loot")
-    }));
-    assert!(
-        secrets
-            .iter()
-            .any(|s| s.kind == SecretEntityKind::AreaProperty && s.name.as_deref() == Some("notes"))
-    );
-
-    // Worst case: the anonymous audience sees nothing at all (data: null).
-    let worst = owner_client
-        .preview(area, PreviewAudience::WorstCase)
-        .await
-        .expect("worst-case preview");
-    assert!(worst.is_none(), "no grant reaches an anonymous viewer");
-
-    // Share-grant preview hides the secrets...
-    let preview = owner_client
-        .preview(area, PreviewAudience::Share(grant_id))
-        .await
-        .expect("share preview")
-        .expect("the grantee audience sees the area");
-    let room_numbers: Vec<i32> = preview.rooms.iter().map(|r| r.room_number.0).collect();
-    assert_eq!(room_numbers, vec![1], "secret room hidden in the preview");
-    assert!(
-        preview.rooms[0].exits.is_empty(),
-        "the secret exit (into the secret room) is hidden"
-    );
-    assert!(preview.properties.is_empty(), "secret area property hidden");
-    assert!(
-        preview.rooms[0].properties.is_empty(),
-        "secret room property hidden"
-    );
-    assert!(preview.labels.is_empty(), "secret label hidden");
-    assert!(preview.shapes.is_empty(), "secret shape hidden");
-
-    // ...and matches the grantee's actual projection byte-for-byte.
-    let grantee_mapper = CloudMapper::new(server.base_url.clone(), grantee.api_key.clone());
-    let grantee_view = grantee_mapper.get_area(&area).await.expect("grantee view");
-    assert!(preview.content_hash.is_some());
-    assert_eq!(
-        preview.content_hash, grantee_view.content_hash,
-        "preview(Share) is the grantee's projection (same viewer salt)"
-    );
-    assert_eq!(grantee_view.rooms.len(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// 5. Clone flows: area copy with provenance, atlas copy with a copy split
+// 4. Clone flows: area copy with provenance, atlas copy with a copy split
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -715,11 +593,11 @@ async fn clone_flow() {
     let source = server.create_area(&owner, "Original");
     let shared_target = server.create_area(&owner, "Neighbour");
     let hidden_target = server.create_area(&owner, "Private");
-    server.add_room(source, 1, "Hall", false);
-    server.add_room(shared_target, 1, "Annex", false);
-    server.add_room(hidden_target, 1, "Sanctum", false);
-    server.add_exit(source, 1, "North", Some((shared_target, 1)), false);
-    server.add_exit(source, 1, "South", Some((hidden_target, 1)), false);
+    server.add_room(source, 1, "Hall");
+    server.add_room(shared_target, 1, "Annex");
+    server.add_room(hidden_target, 1, "Sanctum");
+    server.add_exit(source, 1, "North", Some((shared_target, 1)));
+    server.add_exit(source, 1, "South", Some((hidden_target, 1)));
 
     server.grant(
         &owner,
@@ -799,8 +677,8 @@ async fn clone_flow() {
         .find(|e| e.to_area_id.is_none())
         .expect("link into the unshared area dangles");
     assert!(
-        !dangling.to_unknown,
-        "dangling, not tokenized — the hidden id never entered the clone"
+        dangling.to_unknown,
+        "the retained target is currently unreadable"
     );
     assert!(dangling.to_room_number.is_none());
 
@@ -810,6 +688,8 @@ async fn clone_flow() {
         .create_area(CreateAreaRequest {
             name: "Member One".to_string(),
             atlas_id: Some(AtlasId(atlas)),
+            clan_id: None,
+            ownership: None,
             ephemeral: false,
             properties: BTreeMap::new(),
         })
@@ -819,6 +699,8 @@ async fn clone_flow() {
         .create_area(CreateAreaRequest {
             name: "Member Two".to_string(),
             atlas_id: Some(AtlasId(atlas)),
+            clan_id: None,
+            ownership: None,
             ephemeral: false,
             properties: BTreeMap::new(),
         })

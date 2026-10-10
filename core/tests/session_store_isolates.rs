@@ -1093,3 +1093,136 @@ async fn importable_false_blocks_code_import_but_not_interop_consumption() {
         "consuming events must not be mistaken for a code import; transcript:\n{lines:#?}"
     );
 }
+
+/// A package is its name. Installed as `smudgy://wbk/beacon`, its events reach
+/// `events.lookup` under every spelling of its address, a post through any spelling reaches
+/// its procedure, and the catalogue keeps all of it under one producer.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_package_is_its_name_to_events_procedures_and_the_catalogue() {
+    use smudgy_core::session::runtime::catalogue::{CatalogueEvent, CatalogueKind};
+
+    let server = "ss_one_identity";
+    prepare_server(server);
+    shared_packages::install_package(server, "smudgy://wbk/beacon", UpdateMode::Auto, true)
+        .unwrap();
+    shared_packages::record_consent(
+        server,
+        "smudgy://wbk/beacon",
+        &consent_with(|s| s.interop_write = true),
+    )
+    .unwrap();
+    let beacon = make_package(
+        "wbk",
+        "beacon",
+        "1.0.0",
+        r#"
+        import { createEvent, createProcedure, echo } from "smudgy:core";
+        const ping = createEvent("ping");
+        export const ask = createProcedure((payload) => { echo("ASKED:" + payload.via); });
+        setTimeout(() => { ping.emit({ n: 1 }); }, 200);
+        echo("BEACON_READY");
+        "#,
+    );
+    write_main_module(
+        server,
+        "consumer.ts",
+        r#"
+        import { echo, events } from "smudgy:core";
+        const spellings = ["smudgy:@beacon", "smudgy://wbk/beacon", "smudgy://Someone/BEACON", "smudgy:@Beacon"];
+        for (const spelling of spellings) {
+            events.lookup(spelling, "ping").on((p: any) => echo("PING:" + spelling + ":" + p.n));
+        }
+        for (const spelling of ["smudgy:@beacon", "smudgy://someone/beacon"]) {
+            (globalThis as any).__smudgy_interop_consumer(spelling).procedure("ask").post({ via: spelling });
+        }
+        "#,
+    );
+
+    let params = Arc::new(SessionParams {
+        session_id: SessionId::from(9712),
+        server_name: Arc::new(server.to_string()),
+        profile_name: Arc::new("test".to_string()),
+        profile_subtext: Arc::new(String::new()),
+        mapper: None,
+        package_client: None,
+        extra_script_extensions: Arc::new(Vec::new),
+        on_engine_rebuild: None,
+    });
+    let mut events = Box::pin(spawn_with_package_provider(
+        params,
+        factory_for(vec![beacon]),
+    ));
+    let mut lines: Vec<String> = Vec::new();
+    let tx = loop {
+        let event = tokio::time::timeout(Duration::from_mins(1), events.next())
+            .await
+            .expect("timed out waiting for RuntimeReady")
+            .expect("event stream ended before RuntimeReady");
+        match event.event {
+            SessionEvent::RuntimeReady(tx) => break tx,
+            SessionEvent::UpdateBuffer(updates) => collect(&updates, &mut lines),
+            _ => {}
+        }
+    };
+    let mut catalogue = smudgy_core::session::registry::get_runtime(SessionId::from(9712))
+        .expect("the session is registered")
+        .subscribe_catalogue();
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET_PERIOD, events.next()).await {
+        if let SessionEvent::UpdateBuffer(updates) = event.event {
+            collect(&updates, &mut lines);
+        }
+    }
+    // One more drain, so the last snapshot holds everything the session did.
+    tx.send(RuntimeAction::Echo(Arc::new("SETTLED".to_string())))
+        .unwrap();
+    let mut snapshot = None;
+    while let Ok(Ok(CatalogueEvent::Snapshot(next))) =
+        tokio::time::timeout(QUIET_PERIOD, catalogue.recv()).await
+    {
+        snapshot = Some(next);
+    }
+    tx.send(RuntimeAction::Shutdown).ok();
+
+    assert!(has_line(&lines, "BEACON_READY"), "transcript:\n{lines:#?}");
+    for spelling in [
+        "smudgy:@beacon",
+        "smudgy://wbk/beacon",
+        "smudgy://Someone/BEACON",
+        "smudgy:@Beacon",
+    ] {
+        assert!(
+            has_line(&lines, &format!("PING:{spelling}:1")),
+            "events.lookup({spelling:?}) must hear the package's event; transcript:\n{lines:#?}"
+        );
+    }
+    for spelling in ["smudgy:@beacon", "smudgy://someone/beacon"] {
+        assert!(
+            has_line(&lines, &format!("ASKED:{spelling}")),
+            "a post through {spelling:?} must reach the package's procedure; transcript:\n{lines:#?}"
+        );
+    }
+    let snapshot = snapshot.expect("a catalogue snapshot arrived");
+    let beacon_producers: std::collections::BTreeSet<&str> = snapshot
+        .entries
+        .iter()
+        .map(|entry| &*entry.producer)
+        .filter(|producer| producer.to_ascii_lowercase().ends_with("beacon"))
+        .collect();
+    assert_eq!(
+        beacon_producers.len(),
+        1,
+        "the catalogue keeps one producer for the package: {beacon_producers:?}"
+    );
+    let ask = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.kind == CatalogueKind::Procedure && &*entry.name == "ask")
+        .expect("the procedure is catalogued");
+    assert!(
+        ask.runtime_confirmed && ask.occurrences == 2,
+        "both posts land on the procedure the package created: confirmed {}, occurrences {}",
+        ask.runtime_confirmed,
+        ask.occurrences
+    );
+}

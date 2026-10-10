@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::StreamExt;
 use smudgy_cloud::{
-    AREA_FORMAT_VERSION, Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, CloudError,
-    CloudResult, CreateAreaRequest, MapStorage, Mapper, MapperBackend, Uuid,
-    mutation::{AreaMutation, MutationEnvelope, MutationResult, ResourceKind, VersionInfo},
+    AREA_FORMAT_VERSION, Area, AreaAccess, AreaId, AreaUpdates, AreaWithDetails, Atlas, AtlasId,
+    CloudError, CloudResult, CreateAreaRequest, MapStorage, Mapper, MapperBackend, Uuid,
+    mutation::{AreaMutation, MutationEnvelope, MutationResult, VersionInfo},
 };
 use smudgy_core::session::runtime::RuntimeAction;
 use smudgy_core::session::{BufferUpdate, SessionEvent, SessionId, SessionParams, spawn};
@@ -56,20 +56,33 @@ impl BudgetedBackend {
 
 fn empty_details(area: Area) -> AreaWithDetails {
     AreaWithDetails {
+        room_data: Vec::new(),
         area,
         format_version: AREA_FORMAT_VERSION,
-        content_hash: None,
         properties: vec![],
         rooms: vec![],
         labels: vec![],
         shapes: vec![],
         connections: vec![],
         linked_areas: vec![],
+        sources: vec![],
     }
 }
 
 #[async_trait]
 impl MapperBackend for BudgetedBackend {
+    // Maps live in atlases: a new map goes in the server's default one.
+    async fn create_atlas_at(&self, name: &str, _storage: MapStorage) -> CloudResult<Atlas> {
+        Ok(Atlas {
+            id: AtlasId(Uuid::new_v4()),
+            user_id: None,
+            clan_id: None,
+            name: name.to_string(),
+            created_at: Utc::now(),
+            rev: 1,
+        })
+    }
+
     async fn create_area(&self, request: CreateAreaRequest) -> CloudResult<Area> {
         self.create_area_at(request, MapStorage::Local).await
     }
@@ -82,7 +95,7 @@ impl MapperBackend for BudgetedBackend {
         let area = Area {
             id: AreaId(Uuid::new_v4()),
             user_id: None,
-            atlas_id: None,
+            atlas_id: request.atlas_id,
             name: request.name,
             created_at: Utc::now(),
             rev: 1,
@@ -92,7 +105,12 @@ impl MapperBackend for BudgetedBackend {
             copied_from_rev: None,
             copied_at: None,
             family_token: None,
+            clan_id: None,
+            clan_name: None,
+            actions: None,
+            clan_ownership: smudgy_cloud::clan_maps::ClanOwnership::default(),
             atlas_name: None,
+            projection_token: None,
         };
         self.areas.lock().unwrap().push(area.clone());
         Ok(area)
@@ -168,12 +186,7 @@ impl MapperBackend for BudgetedBackend {
         };
         Ok(MutationResult {
             operation_id: envelope.operation_id,
-            versions: vec![VersionInfo {
-                resource: ResourceKind::Area,
-                id: area_id.0,
-                rev,
-                deleted: false,
-            }],
+            versions: vec![VersionInfo::map_source(area_id.0, rev)],
             data: vec![],
         })
     }
@@ -223,6 +236,12 @@ async fn run_module_on(
     });
     std::fs::create_dir_all(smudgy_home.join(server).join("modules")).unwrap();
     std::fs::create_dir_all(smudgy_home.join(server).join("logs")).unwrap();
+    // The session's server, whose settings say where its new maps go.
+    std::fs::write(
+        smudgy_home.join(server).join("server.json"),
+        r#"{"host":"localhost","port":4000}"#,
+    )
+    .unwrap();
     std::fs::write(
         smudgy_home.join(server).join("modules").join("batch.ts"),
         module,

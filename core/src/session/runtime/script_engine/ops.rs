@@ -577,6 +577,17 @@ pub struct SmudgyGrants {
     /// `workers: ["spawn"]` — construct Web Workers: off-thread reduced-op compute
     /// realms with a message-only bridge (no network, file, or smudgy ops inside them).
     pub workers: bool,
+    /// `secrets: ["read"]` (implied by `write` and `manage`) — read a cloud map's Secrets
+    /// and the user's Private additions: the places, views, combined reads and searches
+    /// that reach beyond the map's own data (`area.places`, `room.in(place)`, ...), on top
+    /// of `mapper_read`.
+    pub secrets_read: bool,
+    /// `secrets: ["write"]` — write Secret and Private content through a place's view, on
+    /// top of `mapper_write`.
+    pub secrets_write: bool,
+    /// `secrets: ["manage"]` — create, update (rename and recolor) and delete Secrets, on top of
+    /// `mapper_read`.
+    pub secrets_manage: bool,
 }
 
 impl SmudgyGrants {
@@ -601,6 +612,9 @@ impl SmudgyGrants {
             gmcp_send: true,
             input: true,
             workers: true,
+            secrets_read: true,
+            secrets_write: true,
+            secrets_manage: true,
         }
     }
 
@@ -626,6 +640,9 @@ impl SmudgyGrants {
             gmcp_send: caps.gmcp_send,
             input: caps.input,
             workers: caps.workers,
+            secrets_read: caps.secrets_read,
+            secrets_write: caps.secrets_write,
+            secrets_manage: caps.secrets_manage,
         }
     }
 }
@@ -924,7 +941,7 @@ fn param_read_allowed(isolate: &IsolateId, specifier: &str) -> bool {
     match isolate {
         IsolateId::Main => true,
         IsolateId::Package(pkg) => {
-            specifier.eq_ignore_ascii_case(&format!("smudgy://{}/{}", pkg.owner, pkg.name))
+            specifier.eq_ignore_ascii_case(&smudgy_script::package_address(&pkg.owner, &pkg.name))
         }
     }
 }
@@ -1601,9 +1618,9 @@ struct CreatorSeat {
 /// (`docs/interop.md` §14).
 struct InteropRoot {
     producer: store::ProducerKey,
-    /// The producer's display spec (`"user"` / `"smudgy://owner/name"`), interned as the
-    /// catalogue's shared key form (`Arc<str>`) so the catalogue and diagnostic paths key
-    /// off it with refcount bumps instead of re-allocating `to_string()` per call.
+    /// The producer's identity (`"user"` / `"smudgy:@name"`, [`store::ProducerKey::identity`]),
+    /// interned as the catalogue's shared key form (`Arc<str>`) so the catalogue and diagnostic
+    /// paths key off it with refcount bumps instead of re-allocating per call.
     producer_spec: Arc<str>,
     /// The constant path prefix under the producer subtree (empty = the subtree root); the
     /// per-call subpath — the genuinely dynamic part — joins onto it.
@@ -1852,7 +1869,7 @@ fn op_smudgy_interop_resolve_creator(
     let is_home = store::is_home(state.borrow::<store::HomeRegistry>(), &producer, &isolate);
     let identity = RootIdentity::Creator(origin.clone());
     let root = InteropRoot {
-        producer_spec: Arc::from(producer.to_string()),
+        producer_spec: Arc::from(producer.identity()),
         producer,
         root_path: store::StorePath::root(),
         seat: Some(CreatorSeat { origin, is_home }),
@@ -1906,7 +1923,7 @@ fn op_smudgy_interop_resolve_consumer_root(
         path: path.clone(),
     };
     let root = InteropRoot {
-        producer_spec: Arc::from(producer.to_string()),
+        producer_spec: Arc::from(producer.identity()),
         producer,
         root_path: path,
         seat: None,
@@ -1956,10 +1973,11 @@ fn op_smudgy_interop_resolve_event(
     let Some(seat) = creator.seat.clone() else {
         return Err(not_a_creator(creator_id));
     };
-    // The canonical event name is `<producer>#<local>` (`user#…` or `smudgy://owner/name#…`).
-    // Routing uses the fold (case-insensitive matching), but handlers receive the ORIGINAL
-    // spelling — a script that branches on the event name must see the name as emitted.
-    let stamped = format!("{}#{name}", creator.producer);
+    // The canonical event name is `<producer identity>#<local>` (`user#…` or
+    // `smudgy:@name#…`, whichever owner the package's address spells). Routing uses the fold
+    // (case-insensitive matching), but handlers receive the local name's ORIGINAL spelling —
+    // a script that branches on the event name must see the name as emitted.
+    let stamped = format!("{}#{name}", creator.producer_spec);
     let name_arc: Arc<str> = Arc::from(name);
     // The catalogue's per-sample key form, shared with the display spelling when the fold
     // is the identity (the common case).
@@ -2536,11 +2554,12 @@ fn op_smudgy_store_remote_bind(
 // ============================================================================
 
 /// The canonical routing key for `(producer, procedure name)` — the folded
-/// `<producer>#<name>` form, same shape as stamped event names (a separate registry keeps
-/// the namespaces apart). The stamped form is a fresh temporary, so it is folded in place —
-/// a borrowing fold saves nothing here.
+/// `<producer identity>#<name>` form, same shape as stamped event names (a separate registry
+/// keeps the namespaces apart), so a post through any spelling of a package's address reaches
+/// it. The stamped form is a fresh temporary, so it is folded in place — a borrowing fold
+/// saves nothing here.
 fn canonical_procedure(producer: &store::ProducerKey, name: &str) -> String {
-    let mut canonical = format!("{producer}#{name}");
+    let mut canonical = format!("{}#{name}", producer.identity());
     canonical.make_ascii_lowercase();
     canonical
 }
@@ -2644,13 +2663,10 @@ fn op_smudgy_procedure_post(
     let isolate = current_isolate(state);
     let caller_origin = match &isolate {
         IsolateId::Main => "user".to_string(),
-        IsolateId::Package(pkg) => {
-            format!(
-                "smudgy://{}/{}",
-                pkg.owner.to_ascii_lowercase(),
-                pkg.name.to_ascii_lowercase()
-            )
-        }
+        IsolateId::Package(pkg) => smudgy_script::package_address(
+            &pkg.owner.to_ascii_lowercase(),
+            &pkg.name.to_ascii_lowercase(),
+        ),
     };
     let caller_id = *state.borrow::<SessionId>();
     let caller = registry::snapshot(caller_id).ok_or_else(|| {
@@ -2861,10 +2877,9 @@ fn op_smudgy_procedure_call(
     ))?;
     let origin: Arc<str> = match current_isolate(state) {
         IsolateId::Main => Arc::from("user"),
-        IsolateId::Package(pkg) => Arc::from(format!(
-            "smudgy://{}/{}",
-            pkg.owner.to_ascii_lowercase(),
-            pkg.name.to_ascii_lowercase()
+        IsolateId::Package(pkg) => Arc::from(smudgy_script::package_address(
+            &pkg.owner.to_ascii_lowercase(),
+            &pkg.name.to_ascii_lowercase(),
         )),
     };
     let id = bus.borrow_mut().calls.allocate_id()?;
@@ -8551,6 +8566,7 @@ fn op_smudgy_mapper_set_current_location(
             .map_err(|_| SetCurrentLocationError::InvalidId(area_id.to_owned()))?,
     );
     set_current_location(state, area_id, room_number);
+    super::mapper_places::note_named_area(state, area_id, room_number);
     Ok(())
 }
 
@@ -8568,9 +8584,9 @@ pub(super) fn set_current_location(state: &mut OpState, area_id: AreaId, room_nu
         state.borrow::<crate::session::runtime::CurrentLocation>(),
     );
     let action = crate::session::runtime::mapper_events::marker(events, area_id, room_number);
-    *state
+    state
         .borrow::<crate::session::runtime::CurrentLocation>()
-        .borrow_mut() = Some((area_id, room_number));
+        .set((area_id, room_number));
     queue_own_action(state, action);
 }
 
@@ -8592,8 +8608,11 @@ fn op_smudgy_mapper_get_current_location(
     ensure(grants(state).mapper_read, "mapper-read")?;
     Ok(state
         .borrow::<crate::session::runtime::CurrentLocation>()
-        .borrow()
-        .map(|(area_id, room)| (ScriptUuid(area_id.0), room)))
+        .get()
+        .map(|(area_id, room)| {
+            let (area_id, room) = super::mapper_places::visible_location(state, area_id, room);
+            (ScriptUuid(area_id.0), room)
+        }))
 }
 
 #[op2(fast)]
@@ -9314,10 +9333,20 @@ mod tests {
 
     #[test]
     fn canonical_procedure_is_the_folded_stamp() {
-        let producer = ProducerKey::parse("smudgy://wbk/tracker").unwrap();
+        for spelling in [
+            "smudgy://wbk/tracker",
+            "smudgy:@Tracker",
+            "smudgy://other/tracker",
+        ] {
+            let producer = ProducerKey::parse(spelling).unwrap();
+            assert_eq!(
+                canonical_procedure(&producer, "Refresh"),
+                "smudgy:@tracker#refresh"
+            );
+        }
         assert_eq!(
-            canonical_procedure(&producer, "Refresh"),
-            "smudgy://wbk/tracker#refresh"
+            canonical_procedure(&ProducerKey::User, "Refresh"),
+            "user#refresh"
         );
     }
 

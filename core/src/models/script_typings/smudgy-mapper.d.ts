@@ -15,6 +15,21 @@
 //  Edits here are lost on the next launch.
 // =============================================================================
 
+// ---- Names ------------------------------------------------------------------
+//
+// Every name in this API is camelCase.
+//
+// @deprecated Supported through Smudgy 0.5.x; removed in 0.6.0.
+// The snake_case names earlier versions used keep working until then, untyped: what the API
+// returns answers to them (`room.room_number`, `room.area_id`, `area.room_numbers`,
+// `area.next_room_number`, every `Exit` field such as `to_room_number` and `is_hidden`, and the
+// `Label`, `Shape`, `Connection` and `ConnectionEndpoint` fields such as `background_color`,
+// `shape_type`, `endpoint_a` and `port_offset`), and what it takes accepts them in the same
+// objects (`ExitArgs`, `LabelArgs`, `ShapeArgs`, `LinkCreateArgs`, the updates). The first one
+// a script uses draws a notice, once. A refusal's message carries its code's old spelling
+// beside the new one (`roomNumberExists; formerly room_number_exists`), so a script matching
+// the old code keeps matching.
+
 // ---- Identifiers ------------------------------------------------------------
 
 /**
@@ -69,6 +84,219 @@ type LabelIdLike = LabelId | (string & { readonly __id?: undefined });
 /** What a call accepts wherever it takes a ShapeId; see {@link AreaIdLike}. */
 type ShapeIdLike = ShapeId | (string & { readonly __id?: undefined });
 
+/**
+ * A Secret's identifier, spelled like {@link AreaId}. A Secret's own rooms read as
+ * an area of their own under the same id ({@link Secret.area}).
+ */
+type SecretId = string & { readonly __id: "SecretId" };
+/** What a call accepts wherever it takes a SecretId; see {@link AreaIdLike}. */
+type SecretIdLike = SecretId | (string & { readonly __id?: undefined });
+
+// ---- Places -----------------------------------------------------------------
+//
+// A cloud map's content lives in several **places**: the map's own content
+// (`"map"`), each of its Secrets you can read (shared with their own readers), and
+// your Private additions (`"private"`, only you see them). Each place keeps its own
+// properties, tags and exits for the map's rooms, so map room 12 can carry the map's
+// `notes` and a Secret's `notes` side by side; nothing merges two places' values. A
+// Secret or your Private additions also keep rooms of their own, which live in that
+// place.
+//
+// Each place numbers its own rooms, starting at 1: map room 3 and a Secret's own room
+// 3 are different rooms, told apart by the area they belong to (a Secret's own rooms
+// read as an area of their own). `area.nextRoomNumber` and `createRoom` number within
+// the area's place alone. A room moved between places keeps its number unless the
+// place it moves to already uses it; then it takes that place's next number. Room
+// handles are snapshots and keep naming where the room was: the current location
+// (and a location still being set) moves with the room, and `map:merged` says where
+// each moved room went, so look the room up again from there.
+//
+// Every call that names no place works where the handle lives, as it always has: a
+// map room's data is the map's, a Secret's own room's data is that Secret's. Reach
+// another place through a view, `room.in(place)` or `area.in(place)`. A few reads
+// cover every place at once: `room.tags` and `room.hasTag`, `room.combinedData` and
+// `room.combinedTags`, and the searches (`findRoomsWithTag` and the rest, and
+// `findNearestRoomWithTag(s)`), which take `{ in: place }` to narrow to one place.
+// A place can be named by its keyword, a Secret handle, or a Secret's id, which can
+// never be mistaken for a keyword. A Secret that does not exist and one you cannot
+// read both throw the same "Secret not found".
+//
+// An installed package reaches places other than the map only with the `secrets`
+// capability in its manifest's `permissions.smudgy`: `"read"`, `"write"` (implies
+// read; writes also need `mapper: ["write"]`) and `"manage"` (implies read; creating,
+// updating and deleting Secrets). The capability covers Secrets and Private additions
+// alike.
+//
+// Without `secrets`, Secrets and Private additions are invisible: nothing a package
+// sees differs from a map without them. Places, views, combined reads and searches
+// cover the map alone; `room.exits` leaves out Secret/Private-owned doors and
+// `area.connections` leaves out links anchored on Secret/Private rooms. Map-owned
+// exits into an unreadable destination retain their content with an unknown target.
+// A write naming a hidden attachment by id
+// (`setRoomExit`, `deleteRoomExit`, `unlinkRoomExit`, `setConnection`,
+// `pairConnections`, `deleteLink`, `mutateArea`) answers as an id naming nothing does; routes and the
+// nearest-room searches never pass through them; a Secret's or Private additions' own
+// area, and every room in it, answers every lookup and every write exactly as an id
+// naming nothing does; and while the player stands in one of their rooms, the current
+// location reads, and `map:room` announces, the map with no room, as an unmapped room
+// of the map would; a click on one of their rooms in a map view never fires
+// `map:click`. Naming a Secret or `"private"` in a view or a search throws the
+// same capability error for every name, existing or not, before anything is looked up.
+
+/** Who holds ownership authority over a Secret: the map's owner (`"owner"`), its
+ *  recorded clan members (`"members"`), or its clan (`"clan"`). */
+type SecretOwnership = "owner" | "members" | "clan";
+
+/**
+ * What you may do with a Secret: `"read"` it; `"add"`, `"edit"` and `"remove"` its
+ * content; `"manageAccess"` (share it); `"copy"` (take it along when copying the
+ * map); `"rename"` it (its name and color); `"delete"` it; `"manageOwnership"`.
+ */
+type SecretAction =
+    | "read"
+    | "add"
+    | "edit"
+    | "remove"
+    | "manageAccess"
+    | "copy"
+    | "rename"
+    | "delete"
+    | "manageOwnership";
+
+/** A new name, a new color, or both, for {@link Secret.update}. */
+interface SecretUpdates {
+    name?: string;
+    /** `#rrggbb`, or `null` to let the palette pick. */
+    color?: string | null;
+}
+
+/** A new Secret, for {@link SecretRegistry.create}. */
+interface CreateSecretOptions {
+    name: string;
+    /** `#rrggbb`; omitted or `null`, the palette picks. */
+    color?: string | null;
+    /** Who owns it. Omitted or `"owner"`: an owner Secret, on a map you own.
+     *  `"members"`: a Member-owned Clan Secret with you as its first owner (needs
+     *  the clan's `secret.create_member_owned` on the map). `"clan"`: a Clan-owned
+     *  Clan Secret, which you start as a Contributor of (needs `secret.create_clan_owned`). */
+    ownership?: "owner" | "members" | "clan";
+    /** The clan a Clan Secret belongs to: required on a user's map filed in a clan,
+     *  and on a clan's own map that clan (the default). */
+    clanId?: string;
+}
+
+/**
+ * One of a cloud map's Secrets, as you can see it: never its owners, grants or
+ * audience. A handle shows what was served the last time the Secret was read, and
+ * every read of the same Secret refreshes the same handle, so two handles for one
+ * Secret are `===`.
+ */
+interface Secret {
+    readonly id: SecretId;
+    readonly name: string;
+    /** Its chosen color, `#rrggbb`, or `null` when the palette picks one. */
+    readonly color: string | null;
+    readonly ownership: SecretOwnership;
+    /** The clan a Clan Secret (`"members"` or `"clan"` ownership) belongs to. */
+    readonly clanId?: string;
+    readonly actions: readonly SecretAction[];
+    /** The Secret's own area: its own rooms, labels and shapes, under its id. */
+    readonly area: Area;
+    /** The map the Secret belongs to. */
+    readonly mapId: AreaId;
+    /** Rename and recolor it in one request (needs its `"rename"` action). Resolves
+     *  once the server has it; the handle shows the result. */
+    update(changes: SecretUpdates): Promise<void>;
+    /** Delete it and everything in it (needs its `"delete"` action). */
+    delete(): Promise<void>;
+    toString(): string;
+}
+
+/** A map's Secrets ({@link Area.secrets}). Empty on a Secret's own area and on local
+ *  and session maps. */
+interface SecretRegistry {
+    /** The map's Secrets you can read, in place order. */
+    list(): Secret[];
+    /** The Secret with this id on this map. One that does not exist, one you cannot
+     *  read and one on another map all throw the same "Secret not found". */
+    get(id: SecretIdLike): Secret;
+    /** Whether {@link SecretRegistry.get} would find it; always `false` without the
+     *  `secrets` capability. */
+    exists(id: SecretIdLike): boolean;
+    /** Create a Secret on this cloud map in one request, and resolve once the server
+     *  has it: an owner Secret on a map you own, or with `ownership` a Clan Secret
+     *  where a clan lets you make one. An installed package needs
+     *  `secrets: ["manage"]`. */
+    create(options: CreateSecretOptions): Promise<Secret>;
+}
+
+/** One of a map's places: its own content, your Private additions, or a Secret. */
+type MapPlace = "map" | "private" | Secret;
+
+/** A place as calls take it: a {@link MapPlace}, or a Secret's id. */
+type MapPlaceLike = MapPlace | SecretIdLike;
+
+/** Narrows a search to one place. Omitted, a search covers every place you read. */
+interface PlaceOptions {
+    in?: MapPlaceLike;
+}
+
+/** One place's value for a room's property ({@link Room.combinedData}). */
+interface RoomPlaceData {
+    readonly source: MapPlace;
+    readonly data: string;
+}
+
+/** One place's value for one of a room's properties ({@link Room.combinedData}). */
+interface RoomPlaceEntry extends RoomPlaceData {
+    readonly key: string;
+}
+
+/** One place's tag on a room ({@link Room.combinedTags}). */
+interface RoomPlaceTag {
+    readonly source: MapPlace;
+    readonly tag: string;
+}
+
+/**
+ * One place's data on one room ({@link Room.in}). Writes go to that place alone:
+ * on a map room, a Secret's or your Private additions' data for the room never
+ * touches the map's, and the reverse.
+ */
+interface RoomView {
+    readonly place: MapPlace;
+    /** The value this place keeps for `key` on the room, or `undefined`. */
+    data(key: string): string | undefined;
+    /** This place's tags for the room, UPPERCASE and sorted. */
+    readonly tags: string[];
+    /** Whether this place tags the room with `tag` (case-insensitive). */
+    hasTag(tag: string): boolean;
+    /** The exits this place keeps on the room. */
+    readonly exits: Exit[];
+    setData(key: string, value: string): Promise<OperationId | null>;
+    deleteData(key: string): Promise<OperationId | null>;
+    /** Add a tag (normalized to UPPERCASE); adding one the place already keeps is a
+     *  no-op that resolves to `null`. */
+    addTag(tag: string): Promise<OperationId | null>;
+    /** Remove a tag; removing one the place does not keep resolves to `null`. */
+    removeTag(tag: string): Promise<OperationId | null>;
+    /** Create an exit owned by this place on the readable room. Reading the
+     *  destination is required; writing to its source is not. */
+    createExit(exit: ExitArgs): Promise<ExitId>;
+}
+
+/** One place's data on one map ({@link Area.in}), and the searches narrowed to it. */
+interface AreaView {
+    readonly place: MapPlace;
+    /** This place's own property `key` on the map (keyed by no room), or `undefined`. */
+    data(key: string): string | undefined;
+    setData(key: string, value: string): Promise<OperationId | null>;
+    deleteData(key: string): Promise<OperationId | null>;
+    findRoomsByProperty(name: string, value: string): Room[];
+    findRoomsWithProperty(name: string): Room[];
+    findRoomsWithTag(tag: string): Room[];
+}
+
 /** Where a map is stored. Session maps disappear when the session closes. */
 type MapStorage = "session" | "local" | "cloud";
 
@@ -122,15 +350,15 @@ interface Label {
     readonly y: number;
     readonly width: number;
     readonly height: number;
-    readonly horizontal_alignment: LabelHorizontalAlign;
-    readonly vertical_alignment: LabelVerticalAlign;
+    readonly horizontalAlignment: LabelHorizontalAlign;
+    readonly verticalAlignment: LabelVerticalAlign;
     readonly text: string;
     /** A CSS color string. */
     readonly color: string;
     /** A CSS color string for the background (`""` for none). */
-    readonly background_color: string;
-    readonly font_size: number;
-    readonly font_weight: number;
+    readonly backgroundColor: string;
+    readonly fontSize: number;
+    readonly fontWeight: number;
 }
 
 /** Fields accepted when creating a label (`mapper.createLabel`). Position, size, and `text` are
@@ -144,16 +372,16 @@ interface LabelArgs {
     /** Map level / z-layer (default 0). */
     level?: number;
     /** Text alignment (defaults: Center / Center). */
-    horizontal_alignment?: LabelHorizontalAlign;
-    vertical_alignment?: LabelVerticalAlign;
+    horizontalAlignment?: LabelHorizontalAlign;
+    verticalAlignment?: LabelVerticalAlign;
     /** A CSS color string for the text (default `"#ffffff"`). */
     color?: string;
     /** A CSS color string for the background; omit for none. */
-    background_color?: string;
+    backgroundColor?: string;
     /** Text size in px (default 16). */
-    font_size?: number;
+    fontSize?: number;
     /** Text weight (default 400). */
-    font_weight?: number;
+    fontWeight?: number;
 }
 
 /** Fields accepted when updating a label (`mapper.setLabel`). Any omitted field is left
@@ -166,14 +394,14 @@ interface LabelUpdates {
     text?: string;
     /** Map level / z-layer. */
     level?: number;
-    horizontal_alignment?: LabelHorizontalAlign;
-    vertical_alignment?: LabelVerticalAlign;
+    horizontalAlignment?: LabelHorizontalAlign;
+    verticalAlignment?: LabelVerticalAlign;
     /** A CSS color string for the text. */
     color?: string;
     /** A CSS color string for the background. */
-    background_color?: string;
-    font_size?: number;
-    font_weight?: number;
+    backgroundColor?: string;
+    fontSize?: number;
+    fontWeight?: number;
 }
 
 /** A graphical shape read back from an area (`area.shapes`). */
@@ -186,12 +414,12 @@ interface Shape {
     readonly width: number;
     readonly height: number;
     /** A CSS color string, or `null` for none. */
-    readonly background_color: string | null;
+    readonly backgroundColor: string | null;
     /** A CSS color string, or `null` for none. */
-    readonly stroke_color: string | null;
-    readonly shape_type: ShapeKind;
-    readonly border_radius: number;
-    readonly stroke_width: number;
+    readonly strokeColor: string | null;
+    readonly shapeType: ShapeKind;
+    readonly borderRadius: number;
+    readonly strokeWidth: number;
 }
 
 /** Fields accepted when creating a shape (`mapper.createShape`). Position and size are required;
@@ -204,15 +432,15 @@ interface ShapeArgs {
     /** Map level / z-layer (default 0). */
     level?: number;
     /** A CSS fill color; omit for none. */
-    background_color?: string;
+    backgroundColor?: string;
     /** A CSS stroke color; omit for none. */
-    stroke_color?: string;
+    strokeColor?: string;
     /** Shape kind (default `"Rectangle"`). */
-    shape_type?: ShapeKind;
+    shapeType?: ShapeKind;
     /** Corner radius (default 0). */
-    border_radius?: number;
+    borderRadius?: number;
     /** Stroke width in px. */
-    stroke_width?: number;
+    strokeWidth?: number;
 }
 
 /** Fields accepted when updating a shape (`mapper.setShape`). Any omitted field is left
@@ -225,12 +453,12 @@ interface ShapeUpdates {
     /** Map level / z-layer. */
     level?: number;
     /** A CSS fill color. */
-    background_color?: string;
+    backgroundColor?: string;
     /** A CSS stroke color. */
-    stroke_color?: string;
-    shape_type?: ShapeKind;
-    border_radius?: number;
-    stroke_width?: number;
+    strokeColor?: string;
+    shapeType?: ShapeKind;
+    borderRadius?: number;
+    strokeWidth?: number;
 }
 
 /** A portable area export, produced by {@link Mapper.exportArea} and consumed by
@@ -265,6 +493,14 @@ type UpdateRoomParams = CreateRoomParams;
 interface MutateAreaOptions {
     /** Description shown by save/conflict diagnostics. */
     description?: string;
+    /**
+     * The one place the whole callback writes. Omitted, it writes the area's own
+     * place. Named on a map, the callback writes that place's properties, tags and
+     * exits on the map's rooms and its own area properties; creating, changing or
+     * deleting rooms throws, because another place cannot change the map's rooms —
+     * edit a Secret's own rooms through {@link Secret.area}.
+     */
+    in?: MapPlaceLike;
 }
 
 /**
@@ -274,47 +510,101 @@ interface MutateAreaOptions {
 interface Exit {
     readonly id: ExitId;
     /** The shared Connection this traversal belongs to. */
-    readonly connection_id: ConnectionId;
-    readonly from_direction: ExitDirection;
-    readonly from_area_id: AreaId;
-    readonly from_room_number: RoomNumber;
-    readonly to_direction: ExitDirection | null;
-    readonly to_area_id: AreaId | null;
-    readonly to_room_number: RoomNumber | null;
-    readonly is_hidden: boolean;
-    readonly is_closed: boolean;
-    readonly is_locked: boolean;
+    readonly connectionId: ConnectionId;
+    readonly fromDirection: ExitDirection;
+    readonly fromAreaId: AreaId;
+    readonly fromRoomNumber: RoomNumber;
+    readonly toDirection: ExitDirection | null;
+    /**
+     * Where the room it leads to lives: a map, or a Secret's own area. An exit
+     * into a room of another map's Secret names that Secret's own area (its id),
+     * as {@link Secret.area} does, and `toRoomNumber` the room in the Secret's
+     * own numbering. Only scripts that can read Secrets (`smudgy.secrets` read)
+     * ever see such an exit.
+     */
+    readonly toAreaId: AreaId | null;
+    readonly toRoomNumber: RoomNumber | null;
+    readonly isHidden: boolean;
+    /** The exit's door, or `null` for an exit without one. */
+    readonly door: Door | null;
     /** Pathfinding cost. */
     readonly weight: number;
-    /** The command sent to traverse this exit, or `null` to use `from_direction`. */
+    /** The command sent to traverse this exit, or `null` to use `fromDirection`. */
     readonly command: string | null;
+    /** The room it leads to, wherever it lives (a map's room or a Secret's own room),
+     *  or `undefined` when it leads nowhere loaded. */
+    readonly toRoom: Room | undefined;
+    /** The place that keeps the exit: the room's own place, or, for a hidden door on a
+     *  map room, the Secret or Private additions that keep it. */
+    readonly place: MapPlace;
+}
+
+/** Whether a door is open, closed or locked. Locked implies closed. */
+type DoorState = "open" | "closed" | "locked";
+
+/** An exit's door. Each side of a link has its own. */
+interface Door {
+    readonly state: DoorState;
+    /** The door's name ("gate", "bookshelf"), or `null`. */
+    readonly name: string | null;
+    /**
+     * The command that opens the door ("pull lever"), or `null`. It differs
+     * from the exit's `command`, which goes through the exit.
+     */
+    readonly opensWith: string | null;
+}
+
+/**
+ * A door as exits take it. `name` (1 to 64 characters) and `opensWith` (1 to
+ * 255) are omitted or `null` for none; an empty string is refused.
+ */
+interface DoorArgs {
+    state: DoorState;
+    name?: string | null;
+    opensWith?: string | null;
 }
 
 /** Fields accepted when creating an exit (`mapper.createRoomExit`). Only
- *  `from_direction` is required. Visual appearance (routing, dash, color,
- *  thickness) lives on the shared Connection, not the exit. */
+ *  `fromDirection` is required. Visual appearance (routing, dash, color,
+ *  thickness) lives on the shared Connection, not the exit.
+ *
+ *  An exit's door says whether it is open, closed or locked: exits take no
+ *  `isClosed` or `isLocked` (nor `is_closed`, `is_locked`). Passing one to
+ *  `createRoomExit`, `setRoomExit`, `createLink` or a `mutateArea` callback
+ *  throws a `TypeError` naming `door`, and nothing is written. */
 interface ExitArgs {
-    from_direction: ExitDirection;
-    to_direction?: ExitDirection;
-    to_area_id?: AreaIdLike;
-    to_room_number?: RoomNumber;
-    is_hidden?: boolean;
-    is_closed?: boolean;
-    is_locked?: boolean;
+    fromDirection: ExitDirection;
+    toDirection?: ExitDirection;
+    /**
+     * The area the destination room lives in: a map, or a Secret's own area. A
+     * Secret of another map is named by its own area (`secret.area.id`), with
+     * `toRoomNumber` in its numbering; the exit stays in the room's place and
+     * shows only to that Secret's readers. Naming one needs `smudgy.secrets`
+     * read, and an exit into a Secret's room on the room's own map, which goes
+     * into that Secret, `smudgy.secrets` write.
+     */
+    toAreaId?: AreaIdLike;
+    toRoomNumber?: RoomNumber;
+    isHidden?: boolean;
+    /** The new exit's door; omitted or `null` for none. Use it in place of
+     *  `isClosed` and `isLocked`, which throw: `door: { state: "locked" }`. */
+    door?: DoorArgs | null;
     weight?: number;
     command?: string;
 }
 
 /** Fields accepted when updating an exit (`mapper.setRoomExit`). Any omitted field is
- *  left unchanged. */
+ *  left unchanged. As with {@link ExitArgs}, `isClosed` and `isLocked` throw a
+ *  `TypeError` naming `door`. */
 interface ExitUpdates {
-    from_direction?: ExitDirection;
-    to_direction?: ExitDirection;
-    to_area_id?: AreaIdLike;
-    to_room_number?: RoomNumber;
-    is_hidden?: boolean;
-    is_closed?: boolean;
-    is_locked?: boolean;
+    fromDirection?: ExitDirection;
+    toDirection?: ExitDirection;
+    /** As in {@link ExitArgs.toAreaId}. */
+    toAreaId?: AreaIdLike;
+    toRoomNumber?: RoomNumber;
+    isHidden?: boolean;
+    /** `null` removes the door, with its name and command; a door replaces it whole. */
+    door?: DoorArgs | null;
     weight?: number;
     command?: string;
 }
@@ -344,23 +634,27 @@ interface MapPoint {
 
 /** A Connection's wall attachment on one room. */
 interface ConnectionEndpoint {
-    room_number: RoomNumber;
+    /** The room's place: "map", "private", or a Secret id. When omitted, the
+     * containing area's own place. Reading or naming a Secret/Private anchor
+     * requires the secrets Read capability; it does not change link ownership. */
+    place?: "map" | "private" | SecretId;
+    roomNumber: RoomNumber;
     side: RoomSide;
     /** Normalized position along the room wall, from 0 through 1. */
-    port_offset: number;
-    port_mode: PortMode;
+    portOffset: number;
+    portMode: PortMode;
 }
 
 /** Shared topology, route, and appearance for one or two member Exits. */
 interface Connection {
     readonly id: ConnectionId;
-    readonly endpoint_a: ConnectionEndpoint;
-    readonly endpoint_b: ConnectionEndpoint | null;
+    readonly endpointA: ConnectionEndpoint;
+    readonly endpointB: ConnectionEndpoint | null;
     readonly kind: ConnectionKind;
     readonly routing: ConnectionRouting;
-    readonly segment_shape: ConnectionSegmentShape;
+    readonly segmentShape: ConnectionSegmentShape;
     readonly corner: ConnectionCorner;
-    readonly route_points: MapPoint[];
+    readonly routePoints: MapPoint[];
     readonly dash: ConnectionDash;
     readonly color: string;
     readonly thickness: number;
@@ -368,12 +662,12 @@ interface Connection {
 
 /** Geometry/appearance fields accepted by {@link Mapper.setConnection}. */
 interface ConnectionUpdates {
-    endpoint_a?: ConnectionEndpoint;
-    endpoint_b?: ConnectionEndpoint;
+    endpointA?: ConnectionEndpoint;
+    endpointB?: ConnectionEndpoint;
     routing?: ConnectionRouting;
-    segment_shape?: ConnectionSegmentShape;
+    segmentShape?: ConnectionSegmentShape;
     corner?: ConnectionCorner;
-    route_points?: MapPoint[];
+    routePoints?: MapPoint[];
     dash?: ConnectionDash;
     color?: string;
     thickness?: number;
@@ -382,13 +676,13 @@ interface ConnectionUpdates {
 /** One directed Exit to create as a member of a new Connection. */
 interface LinkTraversalArgs extends ExitArgs {
     /** Room that owns this traversal. */
-    room_number: RoomNumber;
+    roomNumber: RoomNumber;
 }
 
 /** One atomic link creation: Connection first, followed by one or two traversals. */
 interface LinkCreateArgs extends ConnectionUpdates {
-    endpoint_a: ConnectionEndpoint;
-    endpoint_b?: ConnectionEndpoint;
+    endpointA: ConnectionEndpoint;
+    endpointB?: ConnectionEndpoint;
     traversals: LinkTraversalArgs[];
 }
 
@@ -406,7 +700,7 @@ interface AreaMutator {
      *
      * The draft submits as a must-not-exist create: if the number is taken
      * by submission time (another client raced it in), the mutation is
-     * rejected (`mutateArea` throws with `room_number_exists` in the
+     * rejected (`mutateArea` throws with `roomNumberExists` in the
      * message) rather than silently merging two logical rooms.
      */
     createRoom(params: CreateRoomParams): Promise<RoomNumber>;
@@ -421,6 +715,9 @@ interface AreaMutator {
     setRoomExternalId(room: Room | RoomNumber, externalId: string): Promise<void>;
     setRoomProperty(room: Room | RoomNumber, name: string, value: string): Promise<void>;
     setAreaProperty(name: string, value: string): Promise<void>;
+    deleteRoomProperty(room: Room | RoomNumber, name: string): Promise<void>;
+    deleteAreaProperty(name: string): Promise<void>;
+    /** Add a tag to the room's own place, as {@link Mapper.addRoomTag} does. */
     addRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
     removeRoomTag(room: Room | RoomNumber, tag: string): Promise<void>;
     createRoomExit(room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
@@ -433,8 +730,9 @@ interface AreaMutator {
 
 /** A room read from the map. Obtain one via `area.room(n)` or the `listRooms*` helpers. */
 interface Room {
-    readonly room_number: RoomNumber;
-    readonly area_id: AreaId;
+    readonly roomNumber: RoomNumber;
+    /** Where the room lives: its map, or for a Secret's own room the Secret's area. */
+    readonly areaId: AreaId;
     readonly title: string;
     /**
      * The server's own id for this room (the room number games send over
@@ -448,12 +746,51 @@ interface Room {
     readonly y: number;
     /** A CSS color string. */
     readonly color: string;
+    /** The room's exits, with the hidden doors the map's other places you read keep on it. */
     readonly exits: Exit[];
-    /** Read a custom room property by key (or `undefined` if unset). */
+    /** Where the room lives: `"map"` for a map's room, or the Secret (or
+     *  `"private"`) whose own room it is. */
+    readonly place: MapPlace;
+    /**
+     * Read a custom property of the room's own place by key (or `undefined` if
+     * unset). Other places' values never stand in: reach them with `in(place)` or
+     * list them all with `combinedData`.
+     *
+     * @example
+     * ```ts
+     * const ordinary = room.data("notes");
+     * const mine = room.in("private").data("notes");
+     * const quest = room.in(questSecretId).data("notes");
+     * ```
+     */
     data(key: string): string | undefined;
-    /** This room's tags, normalized to UPPERCASE and sorted. */
+    /**
+     * One place's data on this room: `"map"`, `"private"` or any readable Secret
+     * of the same map (a handle or its id). The data stays in that place even
+     * when the room belongs to another source; reading it requires both sources.
+     * A Secret that does not exist and one you cannot read both throw the same
+     * "Secret not found".
+     */
+    in(place: MapPlaceLike): RoomView;
+    /**
+     * Every readable place's value for `key` on this room, side by side: the
+     * room's own place first, then the map's places in {@link Area.places} order.
+     * A place that keeps nothing for `key` is left out. Nothing is merged or ranked.
+     */
+    combinedData(key: string): RoomPlaceData[];
+    /** Every readable place's properties on this room, each with its key, in the
+     *  same order. */
+    combinedData(): RoomPlaceEntry[];
+    /** Each readable place's tags for this room, the room's own place first. */
+    combinedTags(): RoomPlaceTag[];
+    /** Every readable place's tags for this room together, normalized to UPPERCASE,
+     *  without repeats, and sorted. Each tag still lives in one place
+     *  ({@link Room.combinedTags} says which): writing this list back with
+     *  `mapper.addRoomTag` copies every other place's tags into the room's own place,
+     *  where everyone who reads that place sees them. To tag the room in one place,
+     *  use `room.in(place).addTag(tag)`. */
     readonly tags: string[];
-    /** Whether this room carries `tag` (case-insensitive). */
+    /** Whether any readable place tags this room with `tag` (case-insensitive). */
     hasTag(tag: string): boolean;
     /** Update multiple fields of this room in one cache update; only present fields change. */
     update(fields: UpdateRoomParams): Promise<OperationId | null>;
@@ -475,7 +812,21 @@ interface Area {
      */
     readonly uuid: string;
     readonly name: string;
-    readonly room_numbers: RoomNumber[];
+    /**
+     * For a Secret's own area, or your Private additions', the map it belongs to;
+     * absent on a map. A Secret's rooms are rooms like any other: routes, the
+     * current location and `getAreaById` all take its area id.
+     */
+    readonly mapId?: AreaId;
+    /** Where the area lives: `"map"` for a map, or the Secret (or `"private"`)
+     *  whose own area it is. */
+    readonly place: MapPlace;
+    /**
+     * The map's places: `"map"`, each Secret you read in layer (color) order, then
+     * `"private"` on a cloud map. A Secret's own area has its own place alone.
+     */
+    readonly places: MapPlace[];
+    readonly roomNumbers: RoomNumber[];
     /**
      * Whether this is a session map: it lives only for this session and is
      * discarded when the session closes.
@@ -485,29 +836,37 @@ interface Area {
     readonly isEphemeral: boolean;
     /** The area's actual storage tier. */
     readonly storage: MapStorage;
-    /** The next unused room number in this area. */
-    readonly next_room_number: RoomNumber;
+    /** The next unused room number in this area. Each place numbers its own rooms, so
+     *  a Secret's own area starts at 1 whatever numbers the map uses. */
+    readonly nextRoomNumber: RoomNumber;
     /** The room with this number, or `undefined`. */
     room(roomNumber: number): Room | undefined;
-    /** Read a custom area property by key (or `undefined` if unset). */
+    /** Read a custom property of the area's own place by key (or `undefined` if unset). */
     data(key: string): string | undefined;
+    /** One place's data on this map, and the searches narrowed to that place; see
+     *  {@link Room.in}. */
+    in(place: MapPlaceLike): AreaView;
+    /** The map's Secrets. */
+    readonly secrets: SecretRegistry;
     /**
-     * This area's rooms whose `name` property is exactly `value`, as
-     * `room.data(name)` reads it. One indexed lookup, however many rooms the
-     * area has. An area answers for itself even when you have turned its map
-     * off — naming it is asking for it.
+     * This area's rooms whose `name` property is exactly `value` in any place
+     * you read (or the one `options.in` names): a map room matched by a
+     * Secret's data is the map's room, and a Secret's own room is the Secret's.
+     * One indexed lookup per place, however many rooms the area has. An area
+     * answers for itself even when you have turned its map off — naming it is
+     * asking for it.
      */
-    findRoomsByProperty(name: string, value: string): Room[];
+    findRoomsByProperty(name: string, value: string, options?: PlaceOptions): Room[];
     /**
      * This area's rooms carrying a property called `name`, whatever its value —
-     * "which rooms did I write this on at all".
+     * "which rooms did I write this on at all" — like `findRoomsByProperty`.
      */
-    findRoomsWithProperty(name: string): Room[];
+    findRoomsWithProperty(name: string, options?: PlaceOptions): Room[];
     /**
-     * This area's rooms carrying `tag` (case-insensitive), in no particular
-     * order.
+     * This area's rooms carrying `tag` (case-insensitive), like
+     * `findRoomsByProperty`, in no particular order.
      */
-    findRoomsWithTag(tag: string): Room[];
+    findRoomsWithTag(tag: string, options?: PlaceOptions): Room[];
     /** This area's text labels. */
     readonly labels: Label[];
     /** This area's graphical shapes. */
@@ -528,9 +887,14 @@ interface CreateAreaOptions {
      */
     storage?: MapStorage;
     /**
-     * Optionally create the area inside this atlas. The atlas determines the
-     * storage tier when `storage` is omitted; when both are given they must
-     * match.
+     * The atlas to create the area in. The atlas determines the storage tier
+     * when `storage` is omitted; when both are given they must match. When
+     * omitted, a saved map goes in this server's default atlas for its
+     * storage tier, which the player can change in the map editor. Until one
+     * is set, the player's atlas named for the server in the cloud ("Loose
+     * maps (Arctic)" on a server named Arctic), or "Loose maps" on this
+     * device, becomes it, made the first time it is needed. A session map is
+     * in no atlas. If no atlas can be had, the call rejects.
      */
     atlas?: Atlas | AtlasIdLike;
     /**
@@ -605,7 +969,10 @@ interface Mapper {
     listAtlases(): Promise<Atlas[]>;
     /** Create a durable atlas in an explicit storage tier. */
     createAtlas(name: string, options: CreateAtlasOptions): Promise<Atlas>;
-    /** Copy areas together, preserving links between members of the set. */
+    /** Copy areas together, preserving links between members of the set. A copy
+     *  carries the Secrets you may copy (`"copy"` in their actions), as Secrets of
+     *  your own under new ids, and your Private additions; nothing of other
+     *  Secrets, and no exit into another map's Secret. */
     copyAreas(areas: (Area | AreaIdLike)[], destination: MapDestination): Promise<Area[]>;
     /** Move areas together. Cross-tier moves copy completely before deleting sources. */
     moveAreas(areas: (Area | AreaIdLike)[], destination: MapDestination): Promise<Area[]>;
@@ -618,11 +985,23 @@ interface Mapper {
     /** Set the current map location (the per-session "you are here" marker). */
     setCurrentLocation(areaId: AreaIdLike, roomNumber?: RoomNumber): void;
     /** The current map location, or `undefined` if none is set. `room` is absent when the
-     *  location names an area without a specific room. */
+     *  location names an area without a specific room: somewhere unmapped. Without the
+     *  `secrets` capability, a room of a Secret or of Private additions reads that way too. */
     getCurrentLocation(): { area: AreaId; room?: RoomNumber } | undefined;
     /** All active areas (areas marked inactive are excluded). */
     readonly areas: Area[];
-    getAreaById(id: AreaIdLike): Area;
+    /**
+     * The area with this id. A Secret's id names the Secret's own area: its own
+     * rooms, labels and shapes, with `mapId` naming its map. Without the `secrets`
+     * capability, a Secret's or Private additions' area is not found, as an unknown id is not.
+     */
+    getAreaById(id: AreaIdLike | SecretIdLike): Area;
+    /**
+     * One of a cloud map's Secrets, by an id you stored (`area.secrets` lists a
+     * map's). A Secret that does not exist and one you cannot read both throw the
+     * same "Secret not found".
+     */
+    getSecretById(id: SecretIdLike): Secret;
     /**
      * Collect related writes to one area. Callback and validation failures submit
      * nothing and pass through unchanged. Large batches may save in several ordered
@@ -664,26 +1043,28 @@ interface Mapper {
         visibleExitDirections: string[],
     ): (Room | undefined)[];
     /**
-     * Every room on the map whose `name` property is exactly `value`, as
-     * `room.data(name)` reads it. Name and value both match exactly. The map
-     * keeps an index for this, so it costs one lookup however large the map is;
-     * there is no reason to walk the areas yourself. Rooms of maps you have
-     * turned off are left out.
+     * Every room whose `name` property is exactly `value` in any place you read
+     * (the map's own data, each Secret's, your Private additions'), or in the
+     * one `options.in` names: a map room matched by a Secret's data is the map's
+     * room, and a Secret's own room is the Secret's. Name and value both match
+     * exactly. Each place keeps an index, so this costs one lookup per place
+     * however large the map is; there is no reason to walk the areas yourself.
+     * Rooms of maps you have turned off are left out.
      */
-    findRoomsByProperty(name: string, value: string): Room[];
+    findRoomsByProperty(name: string, value: string, options?: PlaceOptions): Room[];
     /**
-     * Every room on the map carrying a property called `name`, whatever its
-     * value — "which rooms did I write this on at all". Indexed like
-     * `findRoomsByProperty`. Rooms of maps you have turned off are left out.
+     * Every room carrying a property called `name`, whatever its value — "which
+     * rooms did I write this on at all" — in any place you read or the one
+     * `options.in` names. Indexed like `findRoomsByProperty`.
      */
-    findRoomsWithProperty(name: string): Room[];
+    findRoomsWithProperty(name: string, options?: PlaceOptions): Room[];
     /**
-     * Every room on the map carrying `tag` (case-insensitive), in no particular
-     * order. Reach for `findNearestRoomWithTag` when you want the closest one
-     * instead: that walks the map, this reads an index. Rooms of maps you have
-     * turned off are left out.
+     * Every room carrying `tag` (case-insensitive) in any place you read or the
+     * one `options.in` names, in no particular order. Reach for
+     * `findNearestRoomWithTag` when you want the closest one instead. Indexed
+     * like `findRoomsByProperty`.
      */
-    findRoomsWithTag(tag: string): Room[];
+    findRoomsWithTag(tag: string, options?: PlaceOptions): Room[];
     /**
      * Every area whose `name` property is exactly `value`, as `area.data(name)`
      * reads it. Indexed like the room lookups. Maps you have turned off are
@@ -706,30 +1087,48 @@ interface Mapper {
     setRoomLevel(area: Area | AreaIdLike, room: Room | RoomNumber, level: number): Promise<OperationId | null>;
     setRoomX(area: Area | AreaIdLike, room: Room | RoomNumber, x: number): Promise<OperationId | null>;
     setRoomY(area: Area | AreaIdLike, room: Room | RoomNumber, y: number): Promise<OperationId | null>;
-    /** Set a custom room property (string key/value). */
-    setRoomProperty(area: Area | AreaIdLike, room: Room | RoomNumber, name: string, value: string): Promise<OperationId | null>;
-    /** Set a custom area property (string key/value); the write counterpart of `area.data(key)`.
-     *  Pass an empty value to clear it. */
+    /** Set a custom property (string key/value) in the room's own place; reach
+     *  another place with `room.in(place).setData`. */
+    setRoomProperty(
+        area: Area | AreaIdLike,
+        room: Room | RoomNumber,
+        name: string,
+        value: string,
+    ): Promise<OperationId | null>;
+    /** Set a custom area property (string key/value) in the area's own place; the write
+     *  counterpart of `area.data(key)`. Pass an empty value to clear it. */
     setAreaProperty(area: Area | AreaIdLike, name: string, value: string): Promise<OperationId | null>;
-    /** Add a case-insensitive tag to a room (normalized to UPPERCASE; re-adding is a no-op). */
+    /** Delete a property from the room's own place; no other place's value changes. */
+    deleteRoomProperty(area: Area | AreaIdLike, room: Room | RoomNumber, name: string): Promise<OperationId | null>;
+    /** Delete a property from the area's own place. */
+    deleteAreaProperty(area: Area | AreaIdLike, name: string): Promise<OperationId | null>;
+    /** Add a case-insensitive tag to the room's own place (normalized to UPPERCASE;
+     *  re-adding is a no-op): on a map room, the map's tags, which everyone who reads
+     *  the map sees. To tag it in a Secret or your Private additions, use
+     *  `room.in(place).addTag(tag)`. */
     addRoomTag(area: Area | AreaIdLike, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
-    /** Remove a tag from a room (case-insensitive). */
+    /** Remove a tag from the room's own place (case-insensitive). */
     removeRoomTag(area: Area | AreaIdLike, room: Room | RoomNumber, tag: string): Promise<OperationId | null>;
     /**
-     * The nearest reachable room carrying `tag` (case-insensitive) from `from`, by the same
-     * weighted search as `getPathBetweenRooms` (the start room counts if it carries the tag),
-     * or `undefined` if none is reachable. Path to it with `getPathBetweenRooms`.
+     * The nearest reachable room carrying `tag` (case-insensitive) in any place you
+     * read, or in the one `options.in` names, from `from`, by the same weighted search
+     * as `getPathBetweenRooms`, which takes the hidden doors the map's places keep
+     * (the start room counts if it carries the tag), or `undefined` if none is
+     * reachable. Path to it with `getPathBetweenRooms`.
      */
-    findNearestRoomWithTag(from: Room, tag: string): Room | undefined;
+    findNearestRoomWithTag(from: Room, tag: string, options?: PlaceOptions): Room | undefined;
     /**
      * The nearest reachable room that carries every tag in `all` and none of the
-     * tags in `none` (all case-insensitive); `undefined` if no such room is
-     * reachable or the filter is empty. Used by multi-tag speedwalks like
-     * `\inn.peace` and `\!peace.guild`.
+     * tags in `none` (all case-insensitive), where a room's tags are every place's
+     * you read (or the one place `options.in` names), so one tag can come from the
+     * map and another from a Secret; `undefined` if no such room is reachable or
+     * the filter is empty. Used by multi-tag speedwalks like `\inn.peace` and
+     * `\!peace.guild`.
      */
     findNearestRoomWithTags(
         from: Room,
         filter: { all?: string[]; none?: string[] },
+        options?: PlaceOptions,
     ): Room | undefined;
     /**
      * The nearest reachable room belonging to `area` from `from`, by the same
@@ -760,18 +1159,28 @@ interface Mapper {
      * Create a room and return its new room number. The write is a
      * must-not-exist create: if the allocated number is taken by the time
      * the write lands (another client raced it in), it rejects with
-     * `room_number_exists` instead of silently merging into that room.
+     * `roomNumberExists` instead of silently merging into that room.
      */
     createRoom(area: Area | AreaIdLike, params: CreateRoomParams): Promise<RoomNumber>;
     /** Update multiple fields of a room in one cache update; only present fields change. */
     updateRoom(area: Area | AreaIdLike, room: Room | RoomNumber, fields: UpdateRoomParams): Promise<OperationId | null>;
     /** Batch-update many rooms of one area in a single cache update. */
     updateRooms(area: Area | AreaIdLike, updates: [RoomNumber, UpdateRoomParams][]): Promise<OperationId[]>;
-    /** Create an exit on a room and return its new id. */
+    /**
+     * Create an exit on a room, in the room's own place, and return its new id.
+     * Give a map room a hidden door that a Secret or your Private additions keep
+     * with `room.in(place).createExit`.
+     * Linking to a Secret room requires Secret Read, not Secret Write; the exit
+     * stays in its chosen place. Its destination is hidden from readers who
+     * cannot read that room.
+     */
     createRoomExit(area: Area | AreaIdLike, room: Room | RoomNumber, exit: ExitArgs): Promise<ExitId>;
     /**
      * Update an existing exit. Resolves after backend acknowledgement; equal
-     * updates resolve to `null` without sending a mutation.
+     * updates resolve to `null` without sending a mutation. An exit a Secret or
+     * your Private additions keep on a map room is changed in that place, which
+     * needs `secrets` write (with read alone, it throws the `secrets-write`
+     * capability error).
      */
     setRoomExit(area: Area | AreaIdLike, room: Room | RoomNumber, exitId: ExitIdLike, exit: ExitUpdates): Promise<OperationId | null>;
     /**
@@ -790,32 +1199,32 @@ interface Mapper {
      * moved rooms. Room numbers stay where free and unreserved, or are reassigned.
      * Resolves with each moved room's old address and new number, with the updated
      * maps available to this session. Invalid offsets or exhausted room numbers
-     * leave maps unchanged (`merge_areas_invalid_translation` or
-     * `merge_areas_room_numbers_exhausted`). After an interrupted save, call
+     * leave maps unchanged (`mergeAreasInvalidTranslation` or
+     * `mergeAreasRoomNumbersExhausted`). After an interrupted save, call
      * `refreshAreas()` before retrying: an error does not guarantee that the maps
      * were left unchanged.
      * All touched maps must use the same storage tier: local or session. Cloud maps
      * and links from a different tier are refused. Refusal messages explain the
      * reason and include a stable code that scripts can check:
-     * - `merge_areas_no_sources`: no source areas were provided.
-     * - `merge_areas_same_area`: a source repeats or is the destination.
-     * - `merge_areas_no_rooms`: an explicit room list is empty.
-     * - `merge_areas_invalid_rooms`: a room list is not an array of 32-bit integers.
-     * - `merge_areas_room_not_found`: a selected room is missing.
-     * - `merge_areas_mixed_tiers`: affected maps use different storage tiers.
-     * - `merge_areas_unsupported_storage`: cloud merges are unsupported.
-     * - `merge_requires_full_projection`: an affected map hides secret content.
-     * - `merge_areas_busy`: pending edits or another operation prevent the merge.
-     * - `merge_areas_source_changed`: maps or incoming links changed while waiting.
-     * - `merge_areas_invalid_translation`: offsets are invalid or coordinates overflow.
-     * - `merge_areas_room_numbers_exhausted`: no representable room number remains.
+     * - `mergeAreasNoSources`: no source areas were provided.
+     * - `mergeAreasSameArea`: a source repeats or is the destination.
+     * - `mergeAreasNoRooms`: an explicit room list is empty.
+     * - `mergeAreasInvalidRooms`: a room list is not an array of 32-bit integers.
+     * - `mergeAreasRoomNotFound`: a selected room is missing.
+     * - `mergeAreasMixedTiers`: affected maps use different storage tiers.
+     * - `mergeAreasUnsupportedStorage`: cloud merges are unsupported.
+     * - `mergeAreasBusy`: pending edits or another operation prevent the merge.
+     * - `mergeAreasSourceChanged`: maps or incoming links changed while waiting.
+     * - `mergeAreasInvalidTranslation`: offsets are invalid or coordinates overflow.
+     * - `mergeAreasRoomNumbersExhausted`: no representable room number remains.
      * Missing maps, invalid connections and storage failures also reject the call.
      * Requires `mapper:write`.
      */
     mergeAreas(into: Area | AreaIdLike, sources: (Area | AreaIdLike | MergeAreaSource)[]): Promise<MergedRoom[]>;
     /** Delete a room. */
     deleteRoom(area: Area | AreaIdLike, room: Room | RoomNumber): Promise<OperationId | null>;
-    /** Delete an exit from a room. */
+    /** Delete an exit from a room; one a Secret or your Private additions keep
+     *  on a map room is deleted from that place, which needs `secrets` write. */
     deleteRoomExit(area: Area | AreaIdLike, room: Room | RoomNumber, exitId: ExitIdLike): Promise<OperationId | null>;
     /** Atomically create one Connection and its one or two traversals. */
     createLink(area: Area | AreaIdLike, link: LinkCreateArgs): Promise<ConnectionId>;
@@ -840,7 +1249,8 @@ interface Mapper {
     /** Update an existing shape; only present fields change. */
     setShape(area: Area | AreaIdLike, shapeId: ShapeIdLike, updates: ShapeUpdates): Promise<OperationId | null>;
     /** Export an area as a portable {@link AreaJson}. Requires copy rights on
-     *  the area. */
+     *  the area. Like a copy, it carries the Secrets you may copy (`"copy"` in
+     *  their actions) and your Private additions, and nothing of other Secrets. */
     exportArea(area: Area | AreaIdLike): Promise<AreaJson>;
     /** Import exported areas as new **local** areas (fresh ids). Exits between
      *  areas in the set are relinked to the new copies; exits pointing

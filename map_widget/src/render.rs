@@ -52,10 +52,7 @@ pub const MIN_SCALING_FOR_MAP_GRID_OPAQUE: f32 = 50.0;
 const LEVEL_STUB_HALF_SIZE: f32 = smudgy_cloud::connection_geometry::LEVEL_MARKER_HALF_SIZE;
 const LEVEL_STUB_OFFSET: f32 = smudgy_cloud::connection_geometry::LEVEL_MARKER_OFFSET;
 
-/// Dash pattern (in map units) for secret connections.
-const SECRET_DASH_SEGMENTS: &[f32] = &[0.12, 0.08];
-/// Dash pattern for the `Dashed` exit style, kept distinct from the secret
-/// dash so the two reads can diverge.
+/// Dash pattern (in map units) for the `Dashed` exit style.
 const STYLE_DASH_SEGMENTS: &[f32] = &[0.16, 0.1];
 /// On/off pattern for the `Dotted` exit style; the short on-segment plus a
 /// round line cap renders as dots.
@@ -74,11 +71,6 @@ const UNKNOWN_MAP_OPACITY: f32 = 0.6;
 /// map units (2.4 px at the default 40 px/unit zoom).
 const CROSS_AREA_LABEL_PADDING: f32 = 0.06;
 const CROSS_AREA_LABEL_RADIUS: f32 = 0.06;
-/// Opacity multiplier applied to secret labels/shapes (and the fill-only
-/// parts of secret connections, which cannot be dashed).
-const SECRET_OPACITY: f32 = 0.6;
-/// Muted accent for the corner mark on secret rooms.
-const SECRET_MARK_COLOR: Color = Color::from_rgb8(201, 164, 92);
 
 /// Multiplies a color's alpha, leaving the rest untouched.
 #[must_use]
@@ -98,41 +90,27 @@ pub fn parse_color(color: &str) -> Option<Color> {
     smudgy_cloud::parse_css_color(color)
 }
 
-/// The Connection stroke: the Connection's own color and dash, with the
-/// secret fallback dash for a `Solid` secret connection so it still reads as
-/// secret. Stroke widths in this canvas are pixel-space (see the module
+/// The Connection stroke: the Connection's own color and dash. Stroke widths in this canvas are pixel-space (see the module
 /// docs); until zoom-aware map-space strokes land, `thickness: 1.0` is the
 /// legacy 1-px stroke.
 #[must_use]
-pub fn connection_stroke(
-    color: Color,
-    thickness: f32,
-    dash: ConnectionDash,
-    is_secret: bool,
-) -> Stroke<'static> {
+pub fn connection_stroke(color: Color, thickness: f32, dash: ConnectionDash) -> Stroke<'static> {
     Stroke {
         line_cap: dash_line_cap(dash),
         line_dash: LineDash {
-            segments: dash_segments(dash, is_secret),
+            segments: dash_segments(dash),
             offset: 0,
         },
         ..solid_stroke(color, thickness)
     }
 }
 
-/// Dash segments for a [`ConnectionDash`], falling back to the secret dash
-/// for a pattern-less (`Solid`) secret connection.
-fn dash_segments(dash: ConnectionDash, is_secret: bool) -> &'static [f32] {
+/// Dash segments for a [`ConnectionDash`].
+fn dash_segments(dash: ConnectionDash) -> &'static [f32] {
     match dash {
         ConnectionDash::Dashed => STYLE_DASH_SEGMENTS,
         ConnectionDash::Dotted => DOTTED_SEGMENTS,
-        ConnectionDash::Solid => {
-            if is_secret {
-                SECRET_DASH_SEGMENTS
-            } else {
-                &[]
-            }
-        }
+        ConnectionDash::Solid => &[],
     }
 }
 
@@ -486,7 +464,6 @@ fn draw_cross_level_stub(
     edge: Point,
     tip: Point,
     opacity: f32,
-    is_secret: bool,
     color: Color,
     width: f32,
 ) {
@@ -501,7 +478,7 @@ fn draw_cross_level_stub(
         line_cap: dash_line_cap(connection.dash),
         line_join: stroke::LineJoin::Round,
         line_dash: LineDash {
-            segments: dash_segments(connection.dash, is_secret),
+            segments: dash_segments(connection.dash),
             offset: 0,
         },
     };
@@ -514,9 +491,6 @@ fn draw_cross_level_stub(
 /// [`ConnectionGeometry`]; this function never re-derives ports, stubs, or
 /// routes.
 ///
-/// When `show_secrets` is false the connection's secrecy is ignored and it
-/// renders like any other exit — the map widget hides what the editor marks.
-///
 /// `suppress_level_stubs` collapses cross-level exits back to the compact
 /// corner triangle, so ghosted adjacent floors don't bristle with
 /// directional stubs; the current floor passes it `false`.
@@ -525,7 +499,6 @@ pub fn draw_connection(
     atlas: &AtlasCache,
     connection: &RoomConnection,
     opacity: f32,
-    show_secrets: bool,
     suppress_level_stubs: bool,
 ) {
     draw_connection_styled(
@@ -533,7 +506,6 @@ pub fn draw_connection(
         atlas,
         connection,
         opacity,
-        show_secrets,
         suppress_level_stubs,
         None,
         None,
@@ -551,7 +523,6 @@ pub fn draw_connection_styled(
     atlas: &AtlasCache,
     connection: &RoomConnection,
     opacity: f32,
-    show_secrets: bool,
     suppress_level_stubs: bool,
     color_override: Option<Color>,
     width_override: Option<f32>,
@@ -559,19 +530,11 @@ pub fn draw_connection_styled(
     show_cross_area_label: bool,
     cross_area_label_background: Option<Color>,
 ) {
-    let is_secret = show_secrets && connection.is_secret;
     let base_color = color_override.unwrap_or(connection.color);
     let width = width_override.unwrap_or(connection.thickness);
     let color = apply_opacity(base_color, opacity);
-    let stroke = connection_stroke(color, width, connection.dash, is_secret);
-    // Secret connections mute their fill-only pieces (level markers,
-    // arrowheads, external dots) — the dash carries secrecy on the stroke.
-    let fill_opacity = if is_secret {
-        opacity * SECRET_OPACITY
-    } else {
-        opacity
-    };
-    let fill_color = apply_opacity(base_color, fill_opacity);
+    let stroke = connection_stroke(color, width, connection.dash);
+    let fill_color = apply_opacity(base_color, opacity);
     let geometry = &connection.geometry;
 
     match &connection.to {
@@ -614,14 +577,13 @@ pub fn draw_connection_styled(
             // the literal "Unknown map" — never a name or id. Exits whose
             // hidden destinations coincide share a server token and thus
             // converge on the identical label.
-            let dim = fill_opacity * UNKNOWN_MAP_OPACITY;
+            let dim = opacity * UNKNOWN_MAP_OPACITY;
             frame.stroke(
                 &path_from_primitives(&geometry.primitives),
                 connection_stroke(
                     apply_opacity(base_color, opacity * UNKNOWN_MAP_OPACITY),
                     width,
                     connection.dash,
-                    is_secret,
                 ),
             );
 
@@ -641,7 +603,7 @@ pub fn draw_connection_styled(
             // Cross-level halves draw a marker treatment only — the shared
             // geometry carries both rooms' stubs, so stroking it from each
             // half would double-draw.
-            let marker_color = apply_opacity(connection.color, fill_opacity);
+            let marker_color = apply_opacity(connection.color, opacity);
             match level_treatment(connection, suppress_level_stubs) {
                 Some(LevelTreatment::Triangle { center, up }) => {
                     draw_level_triangle(frame, center.x, center.y, up, marker_color);
@@ -652,9 +614,7 @@ pub fn draw_connection_styled(
                     }
                 }
                 Some(LevelTreatment::FadingStub { edge, tip }) => {
-                    draw_cross_level_stub(
-                        frame, connection, edge, tip, opacity, is_secret, base_color, width,
-                    );
+                    draw_cross_level_stub(frame, connection, edge, tip, opacity, base_color, width);
                 }
                 None => {}
             }
@@ -667,7 +627,6 @@ pub fn draw_connection_styled(
             atlas,
             connection,
             opacity,
-            show_secrets,
             cross_area_label_background,
         );
     }
@@ -701,14 +660,8 @@ pub fn draw_cross_area_connection_label(
     atlas: &AtlasCache,
     connection: &RoomConnection,
     opacity: f32,
-    show_secrets: bool,
     background: Option<Color>,
 ) {
-    let fill_opacity = if show_secrets && connection.is_secret {
-        opacity * SECRET_OPACITY
-    } else {
-        opacity
-    };
     let geometry = &connection.geometry;
 
     let (content, position, align_x, align_y, label_opacity) = match &connection.to {
@@ -718,7 +671,7 @@ pub fn draw_cross_area_connection_label(
                 |area| area.get_name().to_string(),
             );
             let (_, text_anchor, align_x, align_y) = marker_anchor(geometry);
-            (area_name, text_anchor, align_x, align_y, fill_opacity)
+            (area_name, text_anchor, align_x, align_y, opacity)
         }
         RoomConnectionEnd::Unknown { .. } => {
             let (tip, text_anchor, align_x, align_y) = marker_anchor(geometry);
@@ -732,7 +685,7 @@ pub fn draw_cross_area_connection_label(
                 label_anchor,
                 align_x,
                 align_y,
-                fill_opacity * UNKNOWN_MAP_OPACITY,
+                opacity * UNKNOWN_MAP_OPACITY,
             )
         }
         _ => return,
@@ -928,16 +881,14 @@ fn canvas_text_size(text: &canvas::Text) -> Size {
 }
 
 /// Draws a room as a filled, outlined rounded square centered on its
-/// coordinates, plus a small corner diamond when the room is secret. The
-/// secret mark is suppressed entirely when `show_secrets` is false.
-pub fn draw_room(frame: &mut canvas::Frame, room: &RoomCache, opacity: f32, show_secrets: bool) {
+/// coordinates.
+pub fn draw_room(frame: &mut canvas::Frame, room: &RoomCache, opacity: f32) {
     draw_room_styled(
         frame,
         room,
         room.get_x(),
         room.get_y(),
         opacity,
-        show_secrets,
         &ResolvedRoomStyle::default(),
     );
 }
@@ -951,7 +902,6 @@ pub fn draw_room_styled(
     x: f32,
     y: f32,
     opacity: f32,
-    show_secrets: bool,
     paint: &ResolvedRoomStyle,
 ) {
     let room_shape = canvas::Path::rounded_rectangle(
@@ -971,26 +921,6 @@ pub fn draw_room_styled(
         &room_shape,
         solid_stroke(apply_opacity(stroke_color, opacity), stroke_width),
     );
-
-    if show_secrets && room.is_secret() {
-        draw_secret_mark(frame, x, y, opacity);
-    }
-}
-
-/// Draws the small diamond marking a secret room, just outside its top-left
-/// corner (mirroring the level stubs at the other corners).
-fn draw_secret_mark(frame: &mut canvas::Frame, x: f32, y: f32, opacity: f32) {
-    let cx = x - LEVEL_STUB_OFFSET;
-    let cy = y - LEVEL_STUB_OFFSET;
-
-    let mut path = canvas::path::Builder::new();
-    path.move_to(Point::new(cx, cy - LEVEL_STUB_HALF_SIZE));
-    path.line_to(Point::new(cx + LEVEL_STUB_HALF_SIZE, cy));
-    path.line_to(Point::new(cx, cy + LEVEL_STUB_HALF_SIZE));
-    path.line_to(Point::new(cx - LEVEL_STUB_HALF_SIZE, cy));
-    path.close();
-
-    frame.fill(&path.build(), apply_opacity(SECRET_MARK_COLOR, opacity));
 }
 
 /// Draws the player's position marker on a room center.
@@ -1036,14 +966,8 @@ fn font_weight(weight: i32) -> iced::font::Weight {
 const LABEL_FONT_SIZE_REFERENCE_SCALING: f32 = 40.0;
 
 /// Draws a text label: optional background fill, then text aligned within
-/// the label's bounds. Secret labels draw at reduced opacity, unless
-/// `show_secrets` is false, in which case secrecy is ignored.
-pub fn draw_label(frame: &mut canvas::Frame, label: &Label, opacity: f32, show_secrets: bool) {
-    let opacity = if show_secrets && label.is_secret {
-        opacity * SECRET_OPACITY
-    } else {
-        opacity
-    };
+/// the label's bounds.
+pub fn draw_label(frame: &mut canvas::Frame, label: &Label, opacity: f32) {
     let top_left = Point::new(label.x, label.y);
     let size = Size::new(label.width, label.height);
 
@@ -1088,15 +1012,8 @@ pub fn draw_label(frame: &mut canvas::Frame, label: &Label, opacity: f32, show_s
     frame.fill_text(text);
 }
 
-/// Draws a shape: optional fill and optional stroke. Secret shapes draw at
-/// reduced opacity, unless `show_secrets` is false, in which case secrecy is
-/// ignored.
-pub fn draw_shape(frame: &mut canvas::Frame, shape: &Shape, opacity: f32, show_secrets: bool) {
-    let opacity = if show_secrets && shape.is_secret {
-        opacity * SECRET_OPACITY
-    } else {
-        opacity
-    };
+/// Draws a shape: optional fill and optional stroke.
+pub fn draw_shape(frame: &mut canvas::Frame, shape: &Shape, opacity: f32) {
     let top_left = Point::new(shape.x, shape.y);
     let size = Size::new(shape.width, shape.height);
 

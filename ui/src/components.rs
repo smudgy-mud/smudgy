@@ -1,3 +1,5 @@
+pub mod clan_map_offers;
+pub mod clan_panel;
 pub mod cloud_errors;
 pub mod color_picker;
 pub mod modal;
@@ -5,7 +7,6 @@ pub mod permissions;
 pub mod resize_grips;
 pub mod session_input;
 pub mod social_panel;
-pub mod stroke_sample;
 pub mod tab_strip;
 pub mod toast;
 pub mod toolbar;

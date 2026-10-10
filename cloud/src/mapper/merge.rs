@@ -28,6 +28,9 @@ impl Inner {
         into: AreaId,
         sources: Vec<AreaMergeSource>,
     ) -> CloudResult<AreaMergeCommit> {
+        for area_id in std::iter::once(into).chain(sources.iter().map(|source| source.id)) {
+            self.refuse_source_area(area_id)?;
+        }
         local_projection::ensure_room_remaps(self).await?;
         let (tier, inbound) = self.merge_third_parties(into, &sources)?;
         let deleted: Vec<AreaId> = sources
@@ -39,9 +42,12 @@ impl Inner {
             .chain(sources.iter().map(|source| source.id))
             .chain(inbound.iter().copied())
             .collect();
-        let fences = tokio::time::timeout(MERGE_DRAIN_TIMEOUT, self.fence_drained_areas(&touched))
-            .await
-            .map_err(|_| Self::merge_refusal("merge_areas_busy"))??;
+        let fences = tokio::time::timeout(
+            MERGE_DRAIN_TIMEOUT,
+            self.fence_drained_areas(&touched, "merge_areas_busy"),
+        )
+        .await
+        .map_err(|_| Self::merge_refusal("merge_areas_busy"))??;
         let hold = Uuid::new_v4();
         let hold_guard = RoomNumberHold {
             inner: Arc::downgrade(self),
@@ -163,9 +169,8 @@ impl Inner {
         let tier = tier_of(&into);
         let cache = self.atlas_cache.load_full();
         let check_touched = |id: AreaId| -> CloudResult<()> {
-            let area = cache.get_area(&id).ok_or(CloudError::AreaNotFound(id))?;
-            if !area.effective_access().is_cleared_for_secrets() {
-                return Err(Self::merge_refusal("merge_requires_full_projection"));
+            if cache.get_area(&id).is_none() {
+                return Err(CloudError::AreaNotFound(id));
             }
             if tier_of(&id) != tier {
                 return Err(Self::merge_refusal("merge_areas_mixed_tiers"));
@@ -207,8 +212,13 @@ impl Inner {
     /// round; a stream of them that never lets the fence close is a busy
     /// area, reported as such rather than waited on forever. A queue that
     /// cannot drain on its own (parked for review, mid-rename) is refused by
-    /// the fence itself, before anything is frozen.
-    async fn fence_drained_areas(&self, touched: &[AreaId]) -> CloudResult<Vec<AreaMoveFence>> {
+    /// the fence itself, before anything is frozen. `busy` is the refusal
+    /// code for a busy area.
+    pub(super) async fn fence_drained_areas(
+        &self,
+        touched: &[AreaId],
+        busy: &'static str,
+    ) -> CloudResult<Vec<AreaMoveFence>> {
         let mut attempts = 0;
         loop {
             for id in touched {
@@ -217,7 +227,7 @@ impl Inner {
                 }
             }
             let fences = self.begin_area_move(touched).map_err(|error| match error {
-                CloudError::PendingOperations(_) => Self::merge_refusal("merge_areas_busy"),
+                CloudError::PendingOperations(_) => Self::merge_refusal(busy),
                 other => other,
             })?;
             for fence in &fences {
@@ -231,12 +241,12 @@ impl Inner {
             Self::release_fences(fences);
             attempts += 1;
             if attempts == MERGE_FENCE_ATTEMPTS {
-                return Err(Self::merge_refusal("merge_areas_busy"));
+                return Err(Self::merge_refusal(busy));
             }
         }
     }
 
-    fn release_fences(fences: Vec<AreaMoveFence>) {
+    pub(super) fn release_fences(fences: Vec<AreaMoveFence>) {
         for fence in fences {
             fence.release();
         }
@@ -283,7 +293,6 @@ impl Inner {
             let rev = self
                 .pending
                 .confirmed_rev(*id)
-                .0
                 .unwrap_or_else(|| area.get_rev());
             expected.push((*id, rev));
         }

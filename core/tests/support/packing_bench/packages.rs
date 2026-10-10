@@ -140,7 +140,7 @@ fn dependencies(manifest: &PackageManifest, versions: &[(&str, &str)]) -> Vec<Re
                 .unwrap()
                 .1;
             result.push(ResolvedDependency {
-                owner_nickname: declaration.key.owner,
+                owner_nickname: Some(declaration.key.owner).filter(|owner| !owner.is_empty()),
                 name: declaration.key.name,
                 range: declaration.range.unwrap_or_else(|| "*".into()),
                 resolved_version: version.into(),
@@ -192,6 +192,7 @@ fn install(
                 manifest: manifest.clone(),
                 modules,
                 dependencies,
+                owner: None,
             },
         )
         .unwrap();

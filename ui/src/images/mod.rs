@@ -60,7 +60,7 @@ pub fn image_store() -> ImageStore {
 }
 
 /// The authenticated package-API client the `PackageAsset` arm uses to re-resolve a version
-/// when an asset blob is missing locally (presigned content URLs are ephemeral and never
+/// when an asset blob is missing locally (signed bundle URLs are ephemeral and never
 /// cached, so a late first display needs a fresh resolve). Sessions register theirs at
 /// construction; every session shares one account, so last-write-wins is correct, and the
 /// [`CredentialSource`](smudgy_cloud::backends::CredentialSource) inside hot-swaps on
@@ -195,9 +195,10 @@ impl UiImageFetcher {
 ///    probe (editing an asset repaints).
 /// 2. **Installed** — content-addressed blob from the shared package cache, keyed by the
 ///    hash the load-time resolution metadata recorded for `subpath`.
-/// 3. **Blob miss** — re-resolve the exact version over the network for a fresh presigned
-///    URL, verify the hash matches the metadata, byte-fetch (SHA-256-verified in the
-///    client), enforce the size cap, and cache the body forever (immutable versions).
+/// 3. **Blob miss** — re-resolve the exact version over the network for a fresh signed
+///    bundle URL, verify the hash matches the metadata, fetch that one body (decoded and
+///    SHA-256-verified in the client), enforce the size cap, and cache the body forever
+///    (immutable versions).
 async fn load_package_asset(
     owner: &str,
     name: &str,
@@ -225,7 +226,7 @@ async fn load_package_asset(
         return Ok((bytes, None));
     }
 
-    // Blob miss: a fresh resolve for ephemeral presigned URLs. Requires the client a
+    // Blob miss: a fresh resolve for an ephemeral signed bundle URL. Requires the client a
     // session registered; without one (headless tests) the asset is transiently absent.
     let Some(client) = package_client_slot().load_full() else {
         return Err(FetchError::transient(format!(
@@ -233,7 +234,7 @@ async fn load_package_asset(
         )));
     };
     let wire = client
-        .resolve_package(owner, name, Some(version))
+        .resolve_package(Some(owner), name, Some(version))
         .await
         .map_err(|err| FetchError::transient(format!("{owner}/{name}@{version}: {err}")))?;
     let module = wire
@@ -272,7 +273,7 @@ async fn load_package_asset(
         )));
     }
     let bytes = client
-        .fetch_module_bytes(&module.content_url, &module.content_hash)
+        .fetch_body(&wire.bundle_url, &wire.bodies, &module.content_hash)
         .await
         .map_err(|err| {
             FetchError::transient(format!("{owner}/{name}@{version}/{subpath}: {err}"))

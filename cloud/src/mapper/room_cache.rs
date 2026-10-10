@@ -46,11 +46,10 @@ where
     }
 }
 
-/// A property value plus its owner-side secrecy flag.
+/// A property's value.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PropertyEntry {
     pub value: String,
-    pub is_secret: bool,
 }
 
 /// Room with all associated data
@@ -58,6 +57,7 @@ pub struct PropertyEntry {
 
 pub struct RoomCache {
     room_number: RoomNumber,
+    room_source: crate::SourceId,
     title: String,
     description: String,
     title_and_description: String,
@@ -72,11 +72,29 @@ pub struct RoomCache {
     tags: BTreeSet<String>,
     exits: Vec<ExitCache>,
     visible_exit_bitfield: ExitBitfield,
-    is_secret: bool,
     external_id: Option<String>,
 }
 
 impl RoomCache {
+    pub(crate) fn with_source(mut self, source: crate::SourceId) -> Self {
+        self.room_source = source;
+        self
+    }
+
+    #[must_use]
+    pub fn address(&self) -> crate::RoomAddress {
+        crate::RoomAddress::new(self.room_source, self.room_number)
+    }
+
+    pub(crate) fn with_viewer(mut self, viewer: Option<uuid::Uuid>) -> Self {
+        self.exits = self
+            .exits
+            .into_iter()
+            .map(|exit| exit.with_viewer(viewer))
+            .collect();
+        self
+    }
+
     #[must_use]
     pub fn new(room_number: RoomNumber) -> Self {
         Self {
@@ -150,16 +168,6 @@ impl RoomCache {
             .map(|(k, v)| (k.as_str(), v.value.as_str()))
     }
 
-    /// Like [`Self::properties`] but including each property's secrecy flag.
-    pub fn properties_with_secrecy(&self) -> impl Iterator<Item = (&str, &PropertyEntry)> {
-        self.properties.iter().map(|(k, v)| (k.as_str(), v))
-    }
-
-    #[must_use]
-    pub fn is_property_secret(&self, name: &str) -> bool {
-        self.properties.get(name).is_some_and(|p| p.is_secret)
-    }
-
     /// Case-insensitive tag membership test.
     #[must_use]
     pub fn has_tag(&self, tag: &str) -> bool {
@@ -176,11 +184,6 @@ impl RoomCache {
         &self.tags
     }
 
-    #[must_use]
-    pub fn is_secret(&self) -> bool {
-        self.is_secret
-    }
-
     /// The room's server-global external id (GMCP/MSDP room identity), if bound.
     #[must_use]
     pub fn get_external_id(&self) -> Option<&str> {
@@ -195,7 +198,6 @@ impl RoomCache {
             .map(|(name, entry)| Property {
                 name: name.clone(),
                 value: entry.value.clone(),
-                is_secret: entry.is_secret,
             })
             .collect();
         properties.sort_by(|a, b| a.name.cmp(&b.name));
@@ -210,28 +212,7 @@ impl RoomCache {
             properties,
             exits: self.exits.iter().map(ExitCache::to_exit).collect(),
             tags: self.tags.clone(),
-            is_secret: self.is_secret,
             external_id: self.external_id.clone(),
-        }
-    }
-
-    #[must_use]
-    pub fn with_secrecy(&self, is_secret: bool) -> Self {
-        Self {
-            is_secret,
-            ..self.clone()
-        }
-    }
-
-    #[must_use]
-    pub fn with_property_secrecy(&self, name: &str, is_secret: bool) -> Self {
-        let mut new_properties = self.properties.clone();
-        if let Some(entry) = new_properties.get_mut(name) {
-            entry.is_secret = is_secret;
-        }
-        Self {
-            properties: new_properties,
-            ..self.clone()
         }
     }
 
@@ -243,9 +224,7 @@ impl RoomCache {
     #[must_use]
     pub fn set_property(&self, name: String, value: String) -> Self {
         let mut new_properties = self.properties.clone();
-        // Preserve secrecy on overwrite; new properties default to public.
-        let is_secret = new_properties.get(&name).is_some_and(|p| p.is_secret);
-        new_properties.insert(name, PropertyEntry { value, is_secret });
+        new_properties.insert(name, PropertyEntry { value });
 
         Self {
             properties: new_properties,
@@ -348,6 +327,8 @@ impl RoomCache {
                         to_area_id: None,
                         to_room_number: None,
                         to_direction: None,
+                        to_secret_map: None,
+                        to_private_map: None,
                         ..exit.clone()
                     }
                 } else {
@@ -399,9 +380,6 @@ impl RoomCache {
             new_room.iced_color = parse_css_color(&color).unwrap_or(DEFAULT_ROOM_COLOR);
             new_room.color = color;
         }
-        if let Some(is_secret) = updates.is_secret {
-            new_room.is_secret = is_secret;
-        }
         if let Some(external_id) = &updates.external_id {
             new_room.external_id.clone_from(external_id);
         }
@@ -448,6 +426,7 @@ impl From<RoomWithDetails> for RoomCache {
 
         Self {
             room_number: room.room_number,
+            room_source: crate::SourceId::Map,
             title_and_description: format!("{}\r\n{}", room.title, room.description),
             title: room.title,
             description: room.description,
@@ -458,21 +437,12 @@ impl From<RoomWithDetails> for RoomCache {
             properties: room
                 .properties
                 .into_iter()
-                .map(|p| {
-                    (
-                        p.name,
-                        PropertyEntry {
-                            value: p.value,
-                            is_secret: p.is_secret,
-                        },
-                    )
-                })
+                .map(|p| (p.name, PropertyEntry { value: p.value }))
                 .collect(),
             tags: room.tags,
             visible_exit_bitfield: Self::visible_exit_bitfield_of(&exits),
             exits,
             iced_color,
-            is_secret: room.is_secret,
             external_id: room.external_id,
         }
     }

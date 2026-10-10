@@ -6,20 +6,27 @@
 //! the viewport still has once the chrome is laid out, falling back to a
 //! floor height (and the scrollbar) when the viewport is too short. The
 //! caller passes the viewport height it learned outside the scrollable.
+//!
+//! Bounded dialogs instead use the parent's height limit. Their body can
+//! shrink to its content, but leaves room for the header and footer first.
 
 use iced::advanced::layout::{self, Layout, Node};
 use iced::advanced::widget::{Operation, Tree};
 use iced::advanced::{Clipboard, Shell, Widget, mouse, overlay};
 use iced::{Element, Event, Length, Point, Rectangle, Size, Vector};
 
-/// Children stacked top to bottom; the child at `grow` is sized to the viewport
-/// height left over after every other child, never below `min_grow_height`.
+/// Children stacked top to bottom, with one child's height calculated after
+/// reserving space for all the others.
 pub struct GrowColumn<'a, Message, Theme, Renderer> {
     children: Vec<Element<'a, Message, Theme, Renderer>>,
     grow: usize,
-    min_grow_height: f32,
-    available_height: f32,
+    height: BodyHeight,
     spacing: f32,
+}
+
+enum BodyHeight {
+    Viewport { minimum: f32, available: f32 },
+    Bounded,
 }
 
 impl<'a, Message, Theme, Renderer> GrowColumn<'a, Message, Theme, Renderer> {
@@ -40,8 +47,28 @@ impl<'a, Message, Theme, Renderer> GrowColumn<'a, Message, Theme, Renderer> {
         Self {
             children,
             grow,
-            min_grow_height,
-            available_height,
+            height: BodyHeight::Viewport {
+                minimum: min_grow_height,
+                available: available_height,
+            },
+            spacing: 0.0,
+        }
+    }
+
+    /// Reserve the other children's height before laying out `body` within
+    /// the remaining parent limits. A shrinking scrollable stays compact
+    /// when its content fits and scrolls when it does not. Unlike `new`, this
+    /// is used outside a scrollable, where the parent supplies finite limits.
+    ///
+    /// # Panics
+    /// Panics if `body` is not a valid child index.
+    #[must_use]
+    pub fn bounded(children: Vec<Element<'a, Message, Theme, Renderer>>, body: usize) -> Self {
+        assert!(body < children.len(), "body index out of range");
+        Self {
+            children,
+            grow: body,
+            height: BodyHeight::Bounded,
             spacing: 0.0,
         }
     }
@@ -91,9 +118,14 @@ where
             nodes[index] = Some(node);
         }
         let gaps = self.spacing * (self.children.len().saturating_sub(1)) as f32;
-        let grow_height = (self.available_height - chrome_height - gaps).max(self.min_grow_height);
-        let grow_limits =
-            layout::Limits::new(Size::new(0.0, grow_height), Size::new(width, grow_height));
+        let (minimum, maximum) = match self.height {
+            BodyHeight::Viewport { minimum, available } => {
+                let height = (available - chrome_height - gaps).max(minimum);
+                (height, height)
+            }
+            BodyHeight::Bounded => (0.0, (limits.max().height - chrome_height - gaps).max(0.0)),
+        };
+        let grow_limits = layout::Limits::new(Size::new(0.0, minimum), Size::new(width, maximum));
         nodes[self.grow] = Some(self.children[self.grow].as_widget_mut().layout(
             &mut tree.children[self.grow],
             renderer,
@@ -274,6 +306,27 @@ mod tests {
     fn grow_child_never_shrinks_below_its_floor() {
         let mut column = column(120.0);
         assert_eq!(child_heights(&mut column), vec![40.0, 100.0, 30.0]);
+    }
+
+    #[test]
+    fn bounded_body_reserves_footer_space_and_keeps_short_content_compact() {
+        for (content, expected) in [(30.0, 120.0), (900.0, 300.0)] {
+            let children: Vec<TestElement<'static>> = vec![
+                Space::new().height(40.0).into(),
+                Space::new().height(content).into(),
+                Space::new().height(30.0).into(),
+            ];
+            let mut column = GrowColumn::bounded(children, 1).spacing(10.0);
+            let mut tree = Tree::new(&column as &dyn Widget<(), iced::Theme, ()>);
+            let node = column.layout(
+                &mut tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, Size::new(400.0, 300.0)),
+            );
+            assert_eq!(node.size().height, expected);
+            assert_eq!(node.children()[2].bounds().height, 30.0);
+            assert_eq!(node.children()[2].bounds().y + 30.0, expected);
+        }
     }
 
     #[test]

@@ -316,10 +316,16 @@ impl AutomationsWindow {
             .map(|delta| delta.version.clone());
         let mut meta = row![].spacing(20.0).align_y(Vertical::Center);
         if let Some(detail) = self.installed_detail.as_deref() {
-            meta = meta.push(metric(
-                crate::i18n::ts!("package-metric-author"),
-                &detail.owner_nickname,
-            ));
+            // A clan's package names its clan to the clan's members.
+            let author = match self
+                .installed_rating
+                .as_deref()
+                .filter(|rated| rated.package.is_clan_owned())
+            {
+                Some(rated) => self.package_clan_label(rated.package.owner_id),
+                None => super::packages::owner_label(detail.owner_nickname.as_deref()),
+            };
+            meta = meta.push(metric(crate::i18n::ts!("package-metric-author"), &author));
         }
         if let Some(v) = &loaded {
             meta = meta.push(metric(
@@ -912,6 +918,7 @@ impl AutomationsWindow {
             && !self.share_busy
             && !self.dirty
             && !self.manifest_dirty
+            && self.may_publish_here()
             && matches!(verdict, PublishVerdict::Ready);
         if tab == LocalPackageTab::Sharing && !signed_in {
             body = body.push(self.signed_out_banner());
@@ -922,6 +929,12 @@ impl AutomationsWindow {
             body = body.push(text(feedback.clone()).size(12.0).style(common::danger));
         }
         if tab == LocalPackageTab::Sharing && signed_in {
+            if let Some(owner) = self.clan_owner_lines() {
+                body = body.push(owner);
+            }
+            if let Some(picker) = self.publish_owner_picker() {
+                body = body.push(picker);
+            }
             body = body.push(
                 row![
                     iced::widget::space::horizontal(),
@@ -1033,6 +1046,8 @@ impl AutomationsWindow {
             .share_versions
             .iter()
             .position(|v| !v.yanked && !v.deleted);
+        // A clan's versions are yanked and retired by members it lets do so.
+        let may_retire = self.may_retire_here();
         for (i, v) in self.share_versions.iter().enumerate() {
             // A hard-deleted number: content is gone, but the number stays reserved. Show
             // it greyed so the author sees it's spent; no actions.
@@ -1063,6 +1078,10 @@ impl AutomationsWindow {
                         .size(11.0)
                         .style(common::faint),
                 );
+            }
+            if !may_retire {
+                versions = versions.push(left);
+                continue;
             }
             let mut actions = row![
                 left,
@@ -1102,11 +1121,13 @@ impl AutomationsWindow {
             }
             versions = versions.push(actions);
         }
-        versions = versions.push(
-            text(crate::i18n::t!("package-yank-help"))
-                .size(11.0)
-                .style(common::faint),
-        );
+        if may_retire {
+            versions = versions.push(
+                text(crate::i18n::t!("package-yank-help"))
+                    .size(11.0)
+                    .style(common::faint),
+            );
+        }
         if tab == LocalPackageTab::Sharing && signed_in {
             body = body.push(versions);
         }

@@ -78,6 +78,41 @@ pub fn bad_request(msg: &str) -> Response {
     err(400, msg)
 }
 
+/// The service's map, atlas and copy name rule (`validName`): at most 255
+/// code points and no NUL, a 400 judged before anything is looked up.
+pub fn name_refusal(name: &str) -> Option<Response> {
+    if name.chars().count() > 255 {
+        return Some(bad_request("Name must be at most 255 characters"));
+    }
+    if name.contains('\0') {
+        return Some(bad_request("Name must not contain NUL characters"));
+    }
+    None
+}
+
+/// `?expected_rev=` as the service reads it (`expectedRevision`): every
+/// value must be a whole number, or the request is a 400 before anything is
+/// looked up. The last one given wins.
+pub fn expected_rev(query: Option<&str>) -> Result<Option<i64>, Response> {
+    let mut expected = None;
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        if key != "expected_rev" {
+            continue;
+        }
+        let digits = value.strip_prefix(['+', '-']).unwrap_or(&value);
+        let parsed = if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            value.parse::<i64>().ok().filter(|n| n.abs() < (1 << 53))
+        } else {
+            None
+        };
+        let Some(parsed) = parsed else {
+            return Err(bad_request("Invalid expected_rev"));
+        };
+        expected = Some(parsed);
+    }
+    Ok(expected)
+}
+
 /// 409 used when a globally-unique nickname is already taken.
 pub fn conflict(msg: &str) -> Response {
     err(409, msg)
@@ -93,8 +128,24 @@ pub enum CredKind {
 }
 
 /// Authorization-header dispatch: optional `Bearer ` strip, then
-/// `smudgy_sess_` prefix -> sessions, anything else -> api keys.
+/// `smudgy_sess_` prefix -> sessions, anything else -> api keys. The
+/// credentials of an account being deleted authenticate only `DELETE /me`
+/// ([`resolve_credential`]); everywhere else they are a 401, as for an
+/// unknown credential.
 pub fn authenticate(state: &MockState, headers: &HeaderMap) -> Result<(Uuid, CredKind), Response> {
+    let (user_id, kind) = resolve_credential(state, headers)?;
+    if state.deleting_accounts.contains(&user_id) {
+        return Err(err(401, "Missing or invalid credentials"));
+    }
+    Ok((user_id, kind))
+}
+
+/// The credential's owner and kind, whether or not the account is being
+/// deleted.
+pub fn resolve_credential(
+    state: &MockState,
+    headers: &HeaderMap,
+) -> Result<(Uuid, CredKind), Response> {
     let raw = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

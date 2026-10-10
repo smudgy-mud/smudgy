@@ -615,10 +615,11 @@ declare module "smudgy:core" {
 
   /**
    * Looks up an event by name at runtime, for generic tooling that doesn't
-   * know the event ahead of time. `producer` is `"smudgy://owner/name"`,
-   * `"user"`, or a platform name (`"sys"`, `"map"`); the payload is
-   * untyped. The `smudgy:events/...` modules serve the same handles fully
-   * typed.
+   * know the event ahead of time. `producer` is a package's address
+   * (`"smudgy:@name"`, or `"smudgy://owner/name"`: a package is its name, so
+   * either spelling finds it), `"user"`, or a platform name (`"sys"`,
+   * `"map"`); the payload is untyped. The `smudgy:events/...` modules serve
+   * the same handles fully typed.
    */
   export const events: {
     lookup(producer: string, name: string): EventConsumer<unknown>;
@@ -3378,7 +3379,11 @@ declare module "smudgy:events/map" {
    * same local store, or sharing the same session mapper, even when its current
    * room did not move. Queued remaps arrive in commit order before `room`
    * for the final relocated current location.
-   * Use these remaps to migrate trails and other address-based state. */
+   * Use these remaps to migrate trails and other address-based state.
+   * Without the `secrets` capability, rooms moved into a Secret or Private
+   * additions read as rooms leaving the map and rooms moved out of one as
+   * rooms joining it: no remap names such a place, and a merge left with no
+   * remaps does not fire. */
   export const merged: EventConsumer<{ into: AreaId; rooms: MergedRoom[] }>;
 
   /**
@@ -3394,6 +3399,24 @@ declare module "smudgy:events/map" {
    * areaId, may change.
    */
   export const room: EventConsumer<{ areaId: AreaId; roomNumber: number | null }>;
+
+  /**
+   * Fires when the user clicks a room in a session map view (a `MapView`
+   * widget): the left button pressed and released over the same room.
+   * `areaId` and `roomNumber` name the room as the `mapper` API does, so
+   * `mapper.getAreaById(areaId).room(roomNumber)` finds it; a room a Secret
+   * or your Private additions keep of their own is named by that place's own
+   * area, as `map:room` names it.
+   *
+   * What smudgy does with the click is up to you: nothing happens unless a
+   * script acts on it.
+   *
+   * Without the `secrets` capability, it fires only for a room of a map
+   * your session's mapper holds: a click on a Secret's or Private
+   * additions' own room does not fire at all, as on a map without them,
+   * where nothing is there to click.
+   */
+  export const click: EventConsumer<{ areaId: AreaId; roomNumber: number }>;
 }
 
 declare module "smudgy:events/input" {

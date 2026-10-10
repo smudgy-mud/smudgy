@@ -837,7 +837,8 @@ declare module "smudgy:widgets" {
     export function TextEditor(props?: TextEditorProps, children?: WidgetChildren): SmudgyElement;
     /** A clickable button. */
     export function Button(props?: ButtonProps, children?: WidgetChildren): SmudgyElement;
-    /** The map view for the current session. */
+    /** The map view for the current session. Clicking a room in it fires
+     *  `click` from `smudgy:events/map`. */
     export function MapView(props?: MapViewProps, children?: WidgetChildren): SmudgyElement;
     /** Draws shape records and runs their declared animations. */
     export function Canvas(props?: CanvasProps, children?: WidgetChildren): SmudgyElement;

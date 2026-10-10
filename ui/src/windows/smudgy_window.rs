@@ -170,6 +170,8 @@ pub enum Event {
         /// The originating session's server entry — the scope context the map
         /// editor filters and writes cloud-map associations against.
         server_name: Arc<String>,
+        /// The room the player is in, where the editor opens.
+        location: Option<(AreaId, i32)>,
     },
     SetMapperCurrentLocation(AreaId, Option<i32>),
     /// The user closed a session (title-bar ✕). Teardown — store removal,
@@ -2898,6 +2900,7 @@ impl SmudgyWindow {
                                     Update::with_event(Event::CreateNewMapEditorWindow {
                                         mapper: mapper.clone(),
                                         server_name: Arc::new(active_session.server_name.clone()),
+                                        location: active_session.current_location,
                                     })
                                 })
                                 .unwrap_or_else(Update::none)

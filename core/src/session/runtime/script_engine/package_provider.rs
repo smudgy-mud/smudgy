@@ -28,12 +28,13 @@ use smudgy_cloud::{
 };
 use smudgy_script::{
     PackageDependency, PackageError, PackageKey, PackageManifest, PackageModuleSource,
-    PackageParameter, PackagePermissions, PackageProvider, ReferrerRef, ResolvedPackage,
-    canonical_url,
+    PackageOwner, PackageParameter, PackagePermissions, PackageProvider, ReferrerRef,
+    ResolvedPackage, SmudgySpecifier, canonical_url,
 };
 
 #[cfg(test)]
-use super::package_cache::{CachedModule, CachedResolution};
+use super::package_cache::CachedModule;
+use super::package_cache::CachedResolution;
 use super::package_cache::{PackageCache, is_code_module, package_integrity, resolution_from_wire};
 use super::package_solver::{self, DepEdge, DepRequirement, Solve};
 use crate::models::shared_packages::{self, LockedPackage, SharedPackageLock, UpdateMode};
@@ -106,7 +107,7 @@ struct LockedDep {
 /// One resolved package instance's locked **code dependencies**: dependency package → lock.
 type LockedDeps = HashMap<PackageKey, LockedDep>;
 
-/// Staleness bound on the wire-metadata memo: the wire carries *presigned* module URLs
+/// Staleness bound on the wire-metadata memo: the wire carries a *signed* bundle URL
 /// (900 s server TTL), so a memo hit older than this refetches rather than hand an
 /// expired URL to a blob-cache-miss body fetch. Every hit within one engine build — the
 /// burst the memo exists to collapse — lands far inside the bound.
@@ -240,10 +241,13 @@ pub struct SmudgyPackageProvider {
     /// version's wire metadata is immutable, and one engine build asks for the same node
     /// from several angles (`cap_version`'s candidate walk, the closure solves,
     /// `resolve_impl`), so each node is fetched at most once per build. Entries age out
-    /// after [`WIRE_MEMO_TTL`] — the wire's presigned module URLs must stay live.
+    /// after [`WIRE_MEMO_TTL`] — the wire's signed bundle URL must stay live.
     /// **Shared** across forks like `disk_cache`: the memoized facts are
     /// isolate-independent even though each isolate solves its closure independently.
     wire_memo: Rc<RefCell<WireMemo>>,
+    /// Each published package's owner as the registry reports it, keyed by package identity
+    /// (its name). Shared across forks like `wire_memo`: an owner is an isolate-independent fact.
+    owners: Rc<RefCell<HashMap<PackageKey, PackageOwner>>>,
     /// The current account's nickname, used as the canonical owner for every local
     /// leaf-name override. `None` when logged out / no handle allocated, in which case
     /// local packages use the reserved `local` owner.
@@ -418,6 +422,7 @@ impl SmudgyPackageProvider {
             closure_permission_union: RefCell::new(PackagePermissions::default()),
             disk_cache: PackageCache::new().ok(),
             wire_memo: Rc::new(RefCell::new(HashMap::new())),
+            owners: Rc::new(RefCell::new(HashMap::new())),
             account_nickname: (!local_owner
                 .eq_ignore_ascii_case(crate::models::local_packages::LOCAL_OWNER))
             .then_some(local_owner),
@@ -466,6 +471,7 @@ impl SmudgyPackageProvider {
             // Shared like the disk cache: wire metadata is an isolate-independent,
             // immutable fact, so one fetch serves every isolate's walk.
             wire_memo: Rc::clone(&self.wire_memo),
+            owners: Rc::clone(&self.owners),
             account_nickname: self.account_nickname.clone(),
             local_snapshots: Rc::clone(&self.local_snapshots),
             local_names: Arc::clone(&self.local_names),
@@ -532,12 +538,15 @@ impl SmudgyPackageProvider {
         ))
     }
 
-    /// Canonical runtime identity for a requested coordinate. Published packages retain their
-    /// full coordinate; an existing local same-leaf package always returns the local identity.
+    /// Canonical runtime identity for a requested coordinate. An existing local same-leaf
+    /// package always returns the local identity. A published package's name is global, so
+    /// every spelling of it (`smudgy:@name`, `smudgy://any-owner/name`) takes the spelling of
+    /// its installed row, where its persistent state lives; an uninstalled one keeps the
+    /// requested spelling.
     #[must_use]
     pub fn canonical_key(&self, key: &PackageKey) -> PackageKey {
         match self.local_snapshot(key) {
-            LocalSnapshot::Missing => key.clone(),
+            LocalSnapshot::Missing => self.installed_spelling(key).unwrap_or_else(|| key.clone()),
             LocalSnapshot::Loaded(local) => PackageKey {
                 owner: self.local_owner().to_string(),
                 name: local.name.clone(),
@@ -549,6 +558,19 @@ impl SmudgyPackageProvider {
                 name: key.name.clone(),
             },
         }
+    }
+
+    /// The coordinate of the installed row that governs `key`'s name, if exactly one does.
+    fn installed_spelling(&self, key: &PackageKey) -> Option<PackageKey> {
+        let lock = self.lock.borrow();
+        let specifier = key.to_user_specifier();
+        if lock.has_ambiguous_identity(&specifier) {
+            return None;
+        }
+        let row = lock.find(&specifier)?;
+        SmudgySpecifier::parse(&row.specifier)
+            .ok()
+            .map(|installed| installed.package_key())
     }
 
     /// Resolve any package coordinate with a locally-authored same-leaf package from
@@ -692,7 +714,7 @@ impl SmudgyPackageProvider {
                 // Preserve the author's declared coordinate in the edge. Consumers of
                 // this metadata canonicalize it before loading, while retaining the alias
                 // here keeps diagnostics tied to what the manifest actually requested.
-                owner_nickname: dependency.key.owner.clone(),
+                owner_nickname: owner_field(&dependency.key.owner),
                 name: dependency.key.name.clone(),
                 range: dependency.range.clone().unwrap_or_default(),
                 resolved_version: local.manifest.version.clone(),
@@ -730,7 +752,7 @@ impl SmudgyPackageProvider {
                 .ok_or_else(|| unresolved(&format!("package resolution failed: {error}")))?,
         };
         Ok(ResolvedDependency {
-            owner_nickname: dependency.key.owner.clone(),
+            owner_nickname: owner_field(&dependency.key.owner),
             name: dependency.key.name.clone(),
             range: dependency.range.clone().unwrap_or_default(),
             resolved_version,
@@ -821,11 +843,66 @@ impl SmudgyPackageProvider {
         }))
     }
 
+    /// The owner a resolve wire reports for `key`, recorded for the session. A user's package
+    /// carries its owner's nickname; a package without one (a clan's) is looked up once by ID,
+    /// which names its clan. An owner the registry does not name stays unknown.
+    async fn learn_owner(
+        &self,
+        key: &PackageKey,
+        wire: &ResolvedPackageWire,
+    ) -> Option<PackageOwner> {
+        let owner = if let Some(nickname) = wire.owner_nickname.as_deref() {
+            Some(PackageOwner::user(nickname))
+        } else {
+            if let Some(known) = self.owners.borrow().get(key).cloned() {
+                return Some(known);
+            }
+            match self.client.get_package(wire.package_id).await {
+                Ok(detail) if detail.package.is_clan_owned() => {
+                    Some(PackageOwner::clan(&detail.package.owner_id.to_string()))
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    debug!("Owner of {} unknown: {error}", key.to_user_specifier());
+                    None
+                }
+            }
+        };
+        if let Some(owner) = &owner {
+            self.owners.borrow_mut().insert(key.clone(), owner.clone());
+        }
+        owner
+    }
+
+    /// Who owns `key`'s package: the account for a local package; else the owner recorded this
+    /// session, in the version's cached metadata, or, failing both, reported by a resolve of
+    /// `version`.
+    async fn owner_of(&self, key: &PackageKey, version: &str) -> Option<PackageOwner> {
+        let key = self.canonical_key(key);
+        if !matches!(self.local_snapshot(&key), LocalSnapshot::Missing) {
+            return Some(PackageOwner::user(self.local_owner()));
+        }
+        if let Some(owner) = self.owners.borrow().get(&key).cloned() {
+            return Some(owner);
+        }
+        if let Some(owner) = self
+            .disk_cache
+            .as_ref()
+            .and_then(|cache| cache.read_meta(&key, version))
+            .and_then(|meta| meta.owner)
+        {
+            self.owners.borrow_mut().insert(key, owner.clone());
+            return Some(owner);
+        }
+        self.fetch_wire(&key, Some(version)).await.ok()?;
+        self.owners.borrow().get(&key).cloned()
+    }
+
     /// Resolve `key`'s wire metadata at `version` (`None` = latest) over the network,
     /// memoized by concrete version. The solve pre-pass, `cap_version`'s candidate walk,
     /// and `resolve_impl` all ask for the same nodes; a published version's metadata is
     /// immutable, so one fetch serves them all (entries age out after [`WIRE_MEMO_TTL`]
-    /// to keep the wire's presigned module URLs live). Every successful fetch also
+    /// to keep the wire's signed bundle URL live). Every successful fetch also
     /// persists the version's [`CachedResolution`](super::package_cache::CachedResolution) —
     /// metadata walks warm the offline
     /// cache, not just code loads. `None` asks the network unconditionally: what
@@ -849,10 +926,11 @@ impl SmudgyPackageProvider {
         }
         let wire = Rc::new(
             self.client
-                .resolve_package(&key.owner, &key.name, version)
+                .resolve_package(Some(&key.owner), &key.name, version)
                 .await?,
         );
-        self.write_meta_for_wire(key, &wire);
+        let owner = self.learn_owner(key, &wire).await;
+        self.write_meta_for_wire(key, &wire, owner);
         self.wire_memo.borrow_mut().insert(
             (key.clone(), wire.version.clone()),
             (Instant::now(), Rc::clone(&wire)),
@@ -870,7 +948,12 @@ impl SmudgyPackageProvider {
     /// [`PackageCache::refresh_meta`]. Best-effort: no cache, an unparseable manifest,
     /// or a failed write costs only the cache entry (the code-load path surfaces
     /// `InvalidManifest` itself).
-    fn write_meta_for_wire(&self, key: &PackageKey, wire: &ResolvedPackageWire) {
+    fn write_meta_for_wire(
+        &self,
+        key: &PackageKey,
+        wire: &ResolvedPackageWire,
+        owner: Option<PackageOwner>,
+    ) {
         let Some(cache) = &self.disk_cache else {
             return;
         };
@@ -884,7 +967,7 @@ impl SmudgyPackageProvider {
             &wire.modules,
             &wire.dependencies,
         ) {
-            Ok(meta) => meta,
+            Ok(meta) => CachedResolution { owner, ..meta },
             Err(error) => {
                 warn!(
                     "Not caching package metadata for {}@{}: {error:#}",
@@ -940,7 +1023,7 @@ impl SmudgyPackageProvider {
             .has_ambiguous_identity(&key.to_user_specifier())
         {
             return Err(CloudError::InvalidInput(format!(
-                "multiple installed rows for {}; uninstall the aliases and review a new install",
+                "multiple installed rows for {}; uninstall the stale one and the other keeps its settings",
                 key.to_user_specifier()
             )));
         }
@@ -1014,7 +1097,7 @@ impl SmudgyPackageProvider {
         let persisted = shared_packages::mutate_lock(&self.server_name, |disk| {
             if disk.has_ambiguous_identity(specifier) {
                 anyhow::bail!(
-                    "multiple installed rows for {specifier}; uninstall the aliases and review a new install"
+                    "multiple installed rows for {specifier}; uninstall the stale one and the other keeps its settings"
                 );
             }
             if let Some(entry) = disk.find_mut(specifier) {
@@ -1080,7 +1163,7 @@ impl SmudgyPackageProvider {
             .iter()
             .filter(|dep| dep.kind == DependencyKind::Dependency)
             .filter_map(|dep| {
-                let requested = dep_package_key(&dep.owner_nickname, &dep.name)?;
+                let requested = dep_package_key(dep.owner_nickname.as_deref(), &dep.name)?;
                 let (key, selected_version) = self.local_override(&requested).map_or_else(
                     || (requested.clone(), dep.resolved_version.clone()),
                     |(local_key, local)| (local_key, local.manifest.version.clone()),
@@ -1256,7 +1339,8 @@ impl SmudgyPackageProvider {
                 .iter()
                 .filter(|dep| dep.kind == DependencyKind::Dependency)
             {
-                let Some(requested_dep_key) = dep_package_key(&dep.owner_nickname, &dep.name)
+                let Some(requested_dep_key) =
+                    dep_package_key(dep.owner_nickname.as_deref(), &dep.name)
                 else {
                     continue;
                 };
@@ -1502,7 +1586,7 @@ impl SmudgyPackageProvider {
                 .iter()
                 .filter(|dep| dep.kind == DependencyKind::Dependency)
             {
-                if let Some(dep_key) = dep_package_key(&dep.owner_nickname, &dep.name) {
+                if let Some(dep_key) = dep_package_key(dep.owner_nickname.as_deref(), &dep.name) {
                     stack.push((dep_key, dep.resolved_version.clone()));
                 }
             }
@@ -1557,7 +1641,7 @@ impl SmudgyPackageProvider {
                 .iter()
                 .filter(|dep| dep.kind == DependencyKind::Dependency)
             {
-                if let Some(dep_key) = dep_package_key(&dep.owner_nickname, &dep.name) {
+                if let Some(dep_key) = dep_package_key(dep.owner_nickname.as_deref(), &dep.name) {
                     stack.push((dep_key, dep.resolved_version.clone()));
                 }
             }
@@ -1618,15 +1702,22 @@ fn manifest_native_refusal(name: &str, manifest: &PackageManifest) -> Option<Str
     floor.refusal(&shared_packages::running_smudgy_release())
 }
 
-/// Build a [`PackageKey`] from a resolve dependency's owner nickname + name.
-fn dep_package_key(owner_nickname: &str, name: &str) -> Option<PackageKey> {
-    if owner_nickname.is_empty() {
+/// Build a [`PackageKey`] from a resolve dependency's owner nickname (absent when the
+/// target's owner has none, such as a clan) and name. Names are global, so the name alone
+/// addresses the target.
+fn dep_package_key(owner_nickname: Option<&str>, name: &str) -> Option<PackageKey> {
+    if name.is_empty() {
         return None;
     }
     Some(PackageKey {
-        owner: owner_nickname.to_string(),
+        owner: owner_nickname.unwrap_or_default().to_string(),
         name: name.to_string(),
     })
+}
+
+/// A key's owner segment as an optional wire owner: empty is none.
+fn owner_field(owner: &str) -> Option<String> {
+    Some(owner.to_string()).filter(|owner| !owner.is_empty())
 }
 
 impl SmudgyPackageProvider {
@@ -1674,7 +1765,7 @@ impl SmudgyPackageProvider {
             let lock = self.lock.borrow();
             if lock.has_ambiguous_identity(&state_specifier) {
                 return Err(PackageError::InvalidManifest(format!(
-                    "multiple installed rows for {state_specifier}; uninstall the aliases and review a new install"
+                    "multiple installed rows for {state_specifier}; uninstall the stale one and the other keeps its settings"
                 )));
             }
             let entry = lock.find(&state_specifier);
@@ -1899,35 +1990,62 @@ impl SmudgyPackageProvider {
         // clear load error (and fails any dependent that needs it).
         self.check_required_params(&specifier, &specifier, &manifest.params)?;
 
-        let mut modules = Vec::with_capacity(wire.modules.len());
-        for module in &wire.modules {
-            // Assets (images and other binaries) never enter the module graph: they are
-            // fetched lazily, by hash, when something actually displays them (the image
-            // side-channel). Eagerly fetching them here both downloaded every published
-            // image at load time and garbled the whole package load on the first
-            // non-UTF-8 body. They stay in the CachedResolution written below.
-            if !is_code_module(&module.media_type, &module.subpath) {
-                continue;
-            }
-            // Content-addressed: a cached body for this hash never changes, so reuse it
-            // and only download misses (then cache them).
+        // Assets (images and other binaries) never enter the module graph: they are
+        // fetched lazily, by hash, when something actually displays them (the image
+        // side-channel). Eagerly fetching them here both downloaded every published
+        // image at load time and garbled the whole package load on the first
+        // non-UTF-8 body. They stay in the CachedResolution written below.
+        let code_modules: Vec<&ResolvedModuleWire> = wire
+            .modules
+            .iter()
+            .filter(|module| is_code_module(&module.media_type, &module.subpath))
+            .collect();
+        // Content-addressed: a cached body for this hash never changes, so reuse it and
+        // fetch only the misses, all in one bundle request (then cache them).
+        let mut texts: HashMap<String, String> = HashMap::new();
+        let mut missing: Vec<&str> = Vec::new();
+        for module in &code_modules {
             let cached = self
                 .disk_cache
                 .as_ref()
                 .and_then(|cache| cache.read_blob(&module.content_hash));
-            let text = if let Some(text) = cached {
-                text
-            } else {
-                let text = self
-                    .client
-                    .fetch_module_body(&module.content_url, &module.content_hash)
-                    .await
-                    .map_err(|err| fetch_error(&specifier, module, &err))?;
-                if let Some(cache) = &self.disk_cache {
-                    let _ = cache.write_blob(&module.content_hash, &text);
+            match cached {
+                Some(text) => {
+                    texts.insert(module.content_hash.clone(), text);
                 }
-                text
-            };
+                None => missing.push(&module.content_hash),
+            }
+        }
+        if !missing.is_empty() {
+            let fetched = self
+                .client
+                .fetch_bodies(&wire.bundle_url, &wire.bodies, &missing)
+                .await
+                .map_err(|err| fetch_error(&specifier, &code_modules, &err))?;
+            for (hash, bytes) in fetched {
+                let text = String::from_utf8(bytes).map_err(|err| {
+                    let subpath = code_modules
+                        .iter()
+                        .find(|module| module.content_hash == hash)
+                        .map_or("", |module| module.subpath.as_str());
+                    PackageError::Network(format!(
+                        "fetching {subpath} for {specifier}: package module body is not valid UTF-8: {err}"
+                    ))
+                })?;
+                if let Some(cache) = &self.disk_cache {
+                    let _ = cache.write_blob(&hash, &text);
+                }
+                texts.insert(hash, text);
+            }
+        }
+        let mut modules = Vec::with_capacity(code_modules.len());
+        for module in &code_modules {
+            let text = texts.get(&module.content_hash).cloned().ok_or_else(|| {
+                PackageError::Network(format!(
+                    "fetching {} for {specifier}: the package bundle did not carry its body",
+                    module.subpath
+                ))
+            })?;
             modules.push(PackageModuleSource {
                 subpath: module.subpath.clone(),
                 text,
@@ -1967,6 +2085,10 @@ impl SmudgyPackageProvider {
 impl PackageProvider for SmudgyPackageProvider {
     fn canonical_key(&self, key: &PackageKey) -> PackageKey {
         Self::canonical_key(self, key)
+    }
+
+    async fn package_owner(&self, key: &PackageKey, version: &str) -> Option<PackageOwner> {
+        self.owner_of(key, version).await
     }
 
     async fn resolve_package(
@@ -2107,25 +2229,67 @@ impl PackageProvider for SmudgyPackageProvider {
 }
 
 /// Maps a module-body fetch error onto a [`PackageError`], distinguishing an integrity
-/// failure (never serve unverified bytes) from a transport error.
-fn fetch_error(specifier: &str, module: &ResolvedModuleWire, err: &CloudError) -> PackageError {
+/// failure (never serve unverified bytes) from a transport error. One bundle request covers
+/// every missing body, so the failing module is the one whose hash the error names.
+fn fetch_error(specifier: &str, modules: &[&ResolvedModuleWire], err: &CloudError) -> PackageError {
     let message = err.to_string();
+    let module = modules
+        .iter()
+        .find(|module| message.contains(module.content_hash.as_str()));
+    let target = module.map_or_else(
+        || specifier.to_string(),
+        |module| format!("{specifier}/{}", module.subpath),
+    );
     if message.contains("integrity mismatch") {
         PackageError::IntegrityMismatch {
-            specifier: format!("{specifier}/{}", module.subpath),
-            expected: module.content_hash.clone(),
+            specifier: target,
+            expected: module.map_or_else(String::new, |module| module.content_hash.clone()),
             actual: message,
         }
     } else {
-        PackageError::Network(format!(
-            "fetching {} for {specifier}: {message}",
-            module.subpath
-        ))
+        PackageError::Network(format!("fetching {target}: {message}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_spelling_of_an_installed_package_takes_its_rows_spelling() {
+        let provider = test_provider();
+        provider.lock.borrow_mut().packages = vec![LockedPackage::new(
+            "smudgy://Rich_E/Speedwalks",
+            UpdateMode::Auto,
+        )];
+        for spelling in ["smudgy:@speedwalks", "smudgy://someone/SPEEDWALKS"] {
+            let requested = SmudgySpecifier::parse(spelling).unwrap().package_key();
+            let canonical = provider.canonical_key(&requested);
+            assert_eq!(canonical.owner, "Rich_E", "{spelling}");
+            assert_eq!(
+                canonical.to_user_specifier(),
+                "smudgy://Rich_E/Speedwalks",
+                "{spelling}"
+            );
+        }
+        // An ownerless install keeps its ownerless spelling for every alias.
+        provider.lock.borrow_mut().packages =
+            vec![LockedPackage::new("smudgy:@guild-lib", UpdateMode::Auto)];
+        let requested = SmudgySpecifier::parse("smudgy://wbk/guild-lib")
+            .unwrap()
+            .package_key();
+        assert_eq!(
+            provider.canonical_key(&requested).to_user_specifier(),
+            "smudgy:@guild-lib"
+        );
+        // An uninstalled package keeps the requested spelling.
+        let elsewhere = SmudgySpecifier::parse("smudgy:@elsewhere")
+            .unwrap()
+            .package_key();
+        assert_eq!(
+            provider.canonical_key(&elsewhere).to_user_specifier(),
+            "smudgy:@elsewhere"
+        );
+    }
+
     #[tokio::test]
     async fn mixed_case_duplicate_installs_refuse_resolution() {
         use_temp_smudgy_home();
@@ -2270,7 +2434,7 @@ mod tests {
 
     fn dep(name: &str, range: &str, version: &str) -> ResolvedDependency {
         ResolvedDependency {
-            owner_nickname: "wbk".into(),
+            owner_nickname: Some("wbk".into()),
             name: name.into(),
             range: range.into(),
             resolved_version: version.into(),
@@ -2306,9 +2470,12 @@ mod tests {
 
     #[test]
     fn dep_package_key_builds_from_nickname_and_name() {
-        assert_eq!(dep_package_key("wbk", "util"), Some(pkg_key("util")));
-        // An empty owner nickname is rejected.
-        assert!(dep_package_key("", "util").is_none());
+        assert_eq!(dep_package_key(Some("wbk"), "util"), Some(pkg_key("util")));
+        // A target whose owner has no nickname is addressed by its name.
+        let ownerless = dep_package_key(None, "util").expect("an ownerless edge");
+        assert_eq!(ownerless.owner, "");
+        assert_eq!(ownerless, pkg_key("util"));
+        assert!(dep_package_key(None, "").is_none());
     }
 
     #[test]
@@ -3522,10 +3689,13 @@ mod tests {
         let base_url = format!("http://127.0.0.1:{port}");
 
         let mut resolves: HashMap<(String, String, String), String> = HashMap::new();
-        let mut bodies: HashMap<String, String> = HashMap::new();
+        // One-body bundles, keyed by the body's hash: its zstd frame as the registry stores it.
+        let mut bundles: HashMap<String, Vec<u8>> = HashMap::new();
         for package in packages {
             let hash = sha256_hex(package.body);
-            bodies.insert(hash.clone(), package.body.to_string());
+            let frame = zstd::bulk::compress(package.body.as_bytes(), 19).expect("compress body");
+            let (byte_size, compressed_size) = (package.body.len(), frame.len());
+            bundles.insert(hash.clone(), frame);
             let deps = package
                 .deps
                 .iter()
@@ -3539,7 +3709,7 @@ mod tests {
             let (owner, name, version) = (package.owner, package.name, package.version);
             let extra = package.manifest_extra;
             let wire = format!(
-                r#"{{"data":{{"package_id":"00000000-0000-0000-0000-000000000001","owner_nickname":"{owner}","name":"{name}","version":"{version}","manifest":{{"name":"{name}","version":"{version}"{extra}}},"modules":[{{"subpath":"index.ts","content_hash":"{hash}","media_type":"application/typescript","content_url":"{base_url}/blob/{hash}"}}],"dependencies":[{deps}]}}}}"#
+                r#"{{"data":{{"package_id":"00000000-0000-0000-0000-000000000001","owner_nickname":"{owner}","name":"{name}","version":"{version}","manifest":{{"name":"{name}","version":"{version}"{extra}}},"modules":[{{"subpath":"index.ts","content_hash":"{hash}","media_type":"application/typescript","byte_size":{byte_size}}}],"bodies":[{{"content_hash":"{hash}","byte_size":{byte_size},"compressed_size":{compressed_size}}}],"bundle_url":"{base_url}/bundle/{hash}?sig=mock","dependencies":[{deps}]}}}}"#
             );
             resolves.insert(
                 (
@@ -3600,22 +3770,30 @@ mod tests {
                             name.to_ascii_lowercase(),
                             version.to_string(),
                         ))
-                        .cloned()
-                } else if let Some(hash) = path.strip_prefix("/blob/") {
+                        .map(|wire| ("application/json", wire.clone().into_bytes()))
+                } else if let Some(hash) = path.strip_prefix("/bundle/") {
                     body_count.fetch_add(1, Ordering::SeqCst);
-                    bodies.get(hash).cloned()
+                    bundles
+                        .get(hash)
+                        .map(|frame| ("application/octet-stream", frame.clone()))
                 } else {
                     None
                 };
-                let (status, body) = match payload {
-                    Some(body) => ("200 OK", body),
-                    None => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+                let (status, content_type, body) = match payload {
+                    Some((content_type, body)) => ("200 OK", content_type, body),
+                    None => (
+                        "404 Not Found",
+                        "application/json",
+                        br#"{"error":"not found"}"#.to_vec(),
+                    ),
                 };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                let mut response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                let _ = stream.write_all(&response);
                 let _ = stream.flush();
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             }
@@ -3727,6 +3905,7 @@ mod tests {
                 is_entry: true,
             }],
             dependencies: deps.to_vec(),
+            owner: None,
         };
         cache.write_meta(key, version, &meta).expect("write meta");
         cache

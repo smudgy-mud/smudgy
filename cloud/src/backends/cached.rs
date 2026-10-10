@@ -11,13 +11,12 @@ use parking_lot::RwLock;
 use tokio::task;
 use uuid::Uuid;
 
-use super::{
-    AreaMergeCommit, AreaMergePlan, LEGACY_ACCESS_FINGERPRINT, MapperBackend, cloud::CloudMapper,
-};
+use super::{AreaMergeCommit, AreaMergePlan, MapperBackend, cloud::CloudMapper};
 use crate::{
     Area, AreaId, AreaLoadSource, AreaUpdates, AreaWithDetails, Atlas, AtlasId, AtlasListItem,
-    CloudError, CloudResult, CreateAreaRequest, MapStorage, SyncRow,
-    mutation::{MutationEnvelope, MutationResult},
+    CloudError, CloudResult, CreateAreaRequest, MapStorage, SourceId, SyncRow,
+    cloud_api::{SecretChange, SecretGrant, SecretSummary},
+    mutation::{MoveRequest, MoveResult, MutationEnvelope, MutationResult},
 };
 
 /// Case-insensitive check for the `.json` cache-file extension.
@@ -30,8 +29,9 @@ fn has_json_extension(name: &str) -> bool {
 /// The versioned sub-namespace all cache files live under. Bumped with the
 /// area document format ([`crate::AREA_FORMAT_VERSION`]): cloud cache files
 /// are disposable, so a format change simply abandons the old namespace and
-/// refetches — a v1 cache file is never deserialized as v2.
-const CACHE_FORMAT_NAMESPACE: &str = "v2";
+/// refetches — a cache file of an older format is never deserialized as the
+/// current one.
+pub const CACHE_FORMAT_NAMESPACE: &str = "v4";
 
 /// Removes cache state from earlier formats: pre-viewer-namespace files
 /// (`{area_id}-{rev}.json` directly in the cache root) and the pre-`v2/`
@@ -74,13 +74,12 @@ fn remove_legacy_cache_files(cache_dir: &Path) {
     }
 }
 
-/// What we last learned about an area's server-side state. A cache hit
-/// requires the cached copy to match on **both** fields: `rev` detects area
-/// activity and `fingerprint` detects capability flips that bump no rev.
+/// What we last learned about an area's server-side state: the token over
+/// the caller's projection, which moves with content and with access alike.
+/// A cache hit requires the cached copy to carry the same token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KnownAreaState {
-    rev: i64,
-    fingerprint: Option<String>,
+    token: String,
 }
 
 /// A write can finish before `/me` resolves. Retain that generation's dirty
@@ -120,6 +119,9 @@ where
     cloud_hints: RwLock<CloudHintState>,
     writer_id: Uuid,
     area_cache: RwLock<HashMap<AreaId, Arc<AreaWithDetails>>>,
+    /// Serialize a read's cache installation with invalidation after a write.
+    /// Otherwise an older in-flight GET can repopulate a just-invalidated cache.
+    area_io: RwLock<HashMap<AreaId, Arc<tokio::sync::Mutex<()>>>>,
     known: RwLock<HashMap<AreaId, KnownAreaState>>,
     last_sources: RwLock<HashMap<AreaId, AreaLoadSource>>,
 }
@@ -167,33 +169,20 @@ where
             cloud_hints,
             writer_id: Uuid::new_v4(),
             area_cache: RwLock::new(HashMap::new()),
+            area_io: RwLock::new(HashMap::new()),
             known: RwLock::new(HashMap::new()),
             last_sources: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Client-side fingerprint of an area's access block; `None` for legacy
-    /// servers that send no access block. Computing it locally keeps
-    /// `GET /areas` and `GET /sync` reconciliation consistent.
-    fn fingerprint_of(area: &Area) -> Option<String> {
-        area.access.map(|access| access.fingerprint())
-    }
-
-    /// Maps a server sync-row fingerprint onto the client representation:
-    /// the synthesized legacy sentinel becomes `None` so it compares equal
-    /// to areas served without an access block.
-    fn normalize_fingerprint(fingerprint: &str) -> Option<String> {
-        (fingerprint != LEGACY_ACCESS_FINGERPRINT).then(|| fingerprint.to_string())
-    }
-
     async fn cache_area(&self, area: &AreaWithDetails) {
-        let fingerprint = Self::fingerprint_of(&area.area);
+        let token = area.area.view_token();
 
         // Disk persistence is best-effort: a read-only or full disk must not
         // turn a successful network fetch into a failed read.
         let disk_namespace_is_proven = !self.inner.supports_sync() || self.viewer.read().is_some();
         if disk_namespace_is_proven {
-            if let Err(err) = self.write_area_to_disk(area, fingerprint.as_deref()).await {
+            if let Err(err) = self.write_area_to_disk(area, &token).await {
                 warn!(
                     "Failed to persist area {} to the disk cache: {err}",
                     area.area.id
@@ -211,22 +200,25 @@ where
             known.insert(
                 area.area.id,
                 KnownAreaState {
-                    rev: area.area.rev,
-                    fingerprint: fingerprint.clone(),
+                    token: token.clone(),
                 },
             );
         }
 
-        // Remove every other on-disk rev/fingerprint for this area by scan:
+        // Remove every other on-disk token for this area by scan:
         // the sync engine records fresh revs into `known` *before* refetching,
         // so a previously-known-state comparison cannot identify stale files.
         if disk_namespace_is_proven {
             let keep = self
-                .cache_file_path(&area.area.id, area.area.rev, fingerprint.as_deref())
+                .cache_file_path(&area.area.id, &token)
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned());
             self.remove_area_files(&area.area.id, keep).await;
         }
+    }
+
+    fn area_io(&self, area: AreaId) -> Arc<tokio::sync::Mutex<()>> {
+        self.area_io.write().entry(area).or_default().clone()
     }
 
     async fn try_cache_hit(&self, area_id: &AreaId) -> Option<AreaWithDetails> {
@@ -236,9 +228,7 @@ where
             .area_cache
             .read()
             .get(area_id)
-            .filter(|area| {
-                area.area.rev == known.rev && Self::fingerprint_of(&area.area) == known.fingerprint
-            })
+            .filter(|area| area.area.view_token() == known.token)
             .map(|area| (**area).clone())
         {
             self.record_source(area_id, AreaLoadSource::Cache);
@@ -246,10 +236,7 @@ where
         }
 
         if !self.inner.supports_sync() || self.viewer.read().is_some() {
-            if let Some(area) = self
-                .read_area_from_disk(area_id, known.rev, known.fingerprint.as_deref())
-                .await
-            {
+            if let Some(area) = self.read_area_from_disk(area_id, &known.token).await {
                 let mut cache = self.area_cache.write();
                 cache.insert(*area_id, Arc::new(area.clone()));
                 self.record_source(area_id, AreaLoadSource::Cache);
@@ -261,6 +248,7 @@ where
     }
 
     async fn invalidate_area(&self, area_id: &AreaId) {
+        let _io = self.area_io(*area_id).lock_owned().await;
         {
             let mut cache = self.area_cache.write();
             cache.remove(area_id);
@@ -272,10 +260,22 @@ where
         };
 
         if let Some(prev) = previous {
-            self.remove_cached_file(area_id, prev.rev, prev.fingerprint.as_deref())
-                .await;
+            self.remove_cached_file(area_id, &prev.token).await;
         }
         self.last_sources.write().remove(area_id);
+    }
+
+    /// After an accepted write to an area under a captured credential
+    /// generation: drop the area's cached bytes while that credential is
+    /// still current (a changed one has its own viewer cache), then announce
+    /// the change.
+    async fn settle_area_write(&self, area_id: &AreaId, auth_generation: u64, hint: u64) {
+        if self.inner.auth_generation() == auth_generation {
+            self.invalidate_area(area_id).await;
+        } else {
+            self.check_auth_generation();
+        }
+        self.publish_cloud_change(hint);
     }
 
     /// Evicts every cached area whose id is not in `ids`, deleting their
@@ -314,8 +314,7 @@ where
             known.insert(
                 area.id,
                 KnownAreaState {
-                    rev: area.rev,
-                    fingerprint: Self::fingerprint_of(area),
+                    token: area.view_token(),
                 },
             );
         }
@@ -408,17 +407,12 @@ where
         self.cache_dir.join(CACHE_FORMAT_NAMESPACE).join(name)
     }
 
-    fn cache_file_path(&self, area_id: &AreaId, rev: i64, fingerprint: Option<&str>) -> PathBuf {
-        let fp = fingerprint.unwrap_or("none");
-        self.viewer_dir().join(format!("{area_id}-{rev}-{fp}.json"))
+    fn cache_file_path(&self, area_id: &AreaId, token: &str) -> PathBuf {
+        self.viewer_dir().join(format!("{area_id}-{token}.json"))
     }
 
-    async fn write_area_to_disk(
-        &self,
-        area: &AreaWithDetails,
-        fingerprint: Option<&str>,
-    ) -> CloudResult<()> {
-        let path = self.cache_file_path(&area.area.id, area.area.rev, fingerprint);
+    async fn write_area_to_disk(&self, area: &AreaWithDetails, token: &str) -> CloudResult<()> {
+        let path = self.cache_file_path(&area.area.id, token);
         let dir = self.viewer_dir();
         let area_clone = area.clone();
 
@@ -434,13 +428,8 @@ where
         Ok(())
     }
 
-    async fn read_area_from_disk(
-        &self,
-        area_id: &AreaId,
-        rev: i64,
-        fingerprint: Option<&str>,
-    ) -> Option<AreaWithDetails> {
-        let path = self.cache_file_path(area_id, rev, fingerprint);
+    async fn read_area_from_disk(&self, area_id: &AreaId, token: &str) -> Option<AreaWithDetails> {
+        let path = self.cache_file_path(area_id, token);
 
         match task::spawn_blocking(move || -> CloudResult<AreaWithDetails> {
             let bytes = fs::read(&path)?;
@@ -451,18 +440,18 @@ where
         {
             Ok(Ok(area)) => Some(area),
             Ok(Err(err)) => {
-                warn!("Failed to read cached area {area_id}:{rev}: {err}");
+                warn!("Failed to read cached area {area_id} ({token}): {err}");
                 None
             }
             Err(join_err) => {
-                warn!("Cache read task for area {area_id}:{rev} failed: {join_err}");
+                warn!("Cache read task for area {area_id} ({token}) failed: {join_err}");
                 None
             }
         }
     }
 
-    async fn remove_cached_file(&self, area_id: &AreaId, rev: i64, fingerprint: Option<&str>) {
-        let path = self.cache_file_path(area_id, rev, fingerprint);
+    async fn remove_cached_file(&self, area_id: &AreaId, token: &str) {
+        let path = self.cache_file_path(area_id, token);
 
         if let Err(err) = task::spawn_blocking(move || -> Result<(), io::Error> {
             match fs::remove_file(&path) {
@@ -475,7 +464,7 @@ where
         .map_err(io::Error::other)
         .and_then(|res| res)
         {
-            warn!("Failed to remove cached file for area {area_id} rev {rev}: {err}");
+            warn!("Failed to remove cached file for area {area_id} ({token}): {err}");
         }
     }
 
@@ -582,20 +571,8 @@ where
     }
 
     async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
-        let auth_generation = self.inner.auth_generation();
-        self.check_auth_generation();
-        if let Some(area) = self.try_cache_hit(area_id).await {
-            return Ok(area);
-        }
-
-        let fetched = self.inner.get_area(area_id).await?;
-        if self.inner.auth_generation() != auth_generation {
-            self.check_auth_generation();
-            return Err(CloudError::CredentialChanged);
-        }
-        self.cache_area(&fetched).await;
-        self.record_source(area_id, AreaLoadSource::Remote);
-        Ok(fetched)
+        self.get_area_at_generation(area_id, self.inner.auth_generation())
+            .await
     }
 
     async fn get_area_at_generation(
@@ -603,6 +580,7 @@ where
         area_id: &AreaId,
         auth_generation: u64,
     ) -> CloudResult<AreaWithDetails> {
+        let _io = self.area_io(*area_id).lock_owned().await;
         if self.inner.auth_generation() != auth_generation {
             self.check_auth_generation();
             return Err(CloudError::CredentialChanged);
@@ -678,7 +656,12 @@ where
         self.inner.has_credential()
     }
 
+    fn default_storage(&self) -> MapStorage {
+        self.inner.default_storage()
+    }
+
     async fn purge_area(&self, area_id: &AreaId) {
+        let _io = self.area_io(*area_id).lock_owned().await;
         {
             let mut cache = self.area_cache.write();
             cache.remove(area_id);
@@ -703,8 +686,7 @@ where
             known.insert(
                 row.area_id,
                 KnownAreaState {
-                    rev: row.rev,
-                    fingerprint: Self::normalize_fingerprint(&row.access_fingerprint),
+                    token: row.projection_token.clone(),
                 },
             );
         }
@@ -775,6 +757,33 @@ where
     // backend; the cache is invalidated only after an accepted delete (a
     // revision-conflict refusal leaves the area — and its cache entry —
     // standing).
+    async fn review_local_move(
+        &self,
+        area_id: &AreaId,
+        auth_generation: u64,
+    ) -> CloudResult<crate::relocation::LocalMoveReview> {
+        self.inner.review_local_move(area_id, auth_generation).await
+    }
+
+    async fn finish_local_move(
+        &self,
+        area_id: &AreaId,
+        guard: &crate::relocation::LocalMoveGuard,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
+        self.inner
+            .finish_local_move(area_id, guard, auth_generation)
+            .await?;
+        if self.inner.auth_generation() == auth_generation {
+            self.invalidate_area(area_id).await;
+        } else {
+            self.check_auth_generation();
+        }
+        self.publish_cloud_change(hint);
+        Ok(())
+    }
+
     async fn delete_area_expecting(
         &self,
         area_id: &AreaId,
@@ -844,7 +853,192 @@ where
         Ok(result)
     }
 
+    // ===== SECRETS AND MOVES =====
+    //
+    // Each accepted write moved a source of the map, so its cached bytes are
+    // stale; a refusal changed nothing and keeps them.
+
+    async fn create_secret_as(
+        &self,
+        area_id: &AreaId,
+        secret: &crate::clan_secrets::NewSecret,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        let hint = self.cloud_write_generation();
+        let secret = self
+            .inner
+            .create_secret_as(area_id, secret, auth_generation)
+            .await?;
+        self.settle_area_write(area_id, auth_generation, hint).await;
+        Ok(secret)
+    }
+
+    async fn update_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        change: &SecretChange,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        let hint = self.cloud_write_generation();
+        let updated = self
+            .inner
+            .update_secret(area_id, secret, change, auth_generation)
+            .await?;
+        self.settle_area_write(area_id, auth_generation, hint).await;
+        Ok(updated)
+    }
+
+    async fn rename_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        name: &str,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        let hint = self.cloud_write_generation();
+        let renamed = self
+            .inner
+            .rename_secret(area_id, secret, name, auth_generation)
+            .await?;
+        self.settle_area_write(area_id, auth_generation, hint).await;
+        Ok(renamed)
+    }
+
+    async fn recolor_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        color: Option<&str>,
+        auth_generation: u64,
+    ) -> CloudResult<SecretSummary> {
+        let hint = self.cloud_write_generation();
+        let recolored = self
+            .inner
+            .recolor_secret(area_id, secret, color, auth_generation)
+            .await?;
+        self.settle_area_write(area_id, auth_generation, hint).await;
+        Ok(recolored)
+    }
+
+    async fn delete_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
+        self.inner
+            .delete_secret(area_id, secret, auth_generation)
+            .await?;
+        self.settle_area_write(area_id, auth_generation, hint).await;
+        Ok(())
+    }
+
+    // Grant writes move no revision and change nothing the caller reads, so
+    // the cached map stays as it is.
+
+    async fn secret_grants(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        auth_generation: u64,
+    ) -> CloudResult<Vec<SecretGrant>> {
+        self.inner
+            .secret_grants(area_id, secret, auth_generation)
+            .await
+    }
+
+    async fn grant_secret(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grantee_id: Uuid,
+        actions: &[&str],
+        auth_generation: u64,
+    ) -> CloudResult<SecretGrant> {
+        self.inner
+            .grant_secret(area_id, secret, grantee_id, actions, auth_generation)
+            .await
+    }
+
+    async fn update_secret_grant(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grant_id: Uuid,
+        actions: &[&str],
+        auth_generation: u64,
+    ) -> CloudResult<SecretGrant> {
+        self.inner
+            .update_secret_grant(area_id, secret, grant_id, actions, auth_generation)
+            .await
+    }
+
+    async fn revoke_secret_grant(
+        &self,
+        area_id: &AreaId,
+        secret: &SourceId,
+        grant_id: Uuid,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        self.inner
+            .revoke_secret_grant(area_id, secret, grant_id, auth_generation)
+            .await
+    }
+
+    async fn move_content(
+        &self,
+        area_id: &AreaId,
+        request: &MoveRequest,
+        auth_generation: u64,
+    ) -> CloudResult<MoveResult> {
+        let hint = self.cloud_write_generation();
+        let result = self
+            .inner
+            .move_content(area_id, request, auth_generation)
+            .await?;
+        self.settle_area_write(area_id, auth_generation, hint).await;
+        Ok(result)
+    }
+
+    async fn review_move_content(
+        &self,
+        area_id: &AreaId,
+        request: &MoveRequest,
+        auth_generation: u64,
+    ) -> CloudResult<crate::access_review::AccessReview> {
+        self.inner
+            .review_move_content(area_id, request, auth_generation)
+            .await
+    }
+
     // ===== MULTI-AREA TRANSACTIONS =====
+    async fn review_filing(
+        &self,
+        area_id: &AreaId,
+        atlas_id: Option<AtlasId>,
+        auth_generation: u64,
+    ) -> CloudResult<crate::access_review::AccessReview> {
+        self.inner
+            .review_filing(area_id, atlas_id, auth_generation)
+            .await
+    }
+
+    async fn commit_reviewed_filing(
+        &self,
+        area_id: &AreaId,
+        atlas_id: Option<AtlasId>,
+        token: &str,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
+        self.inner
+            .commit_reviewed_filing(area_id, atlas_id, token, auth_generation)
+            .await?;
+        self.settle_area_write(area_id, auth_generation, hint).await;
+        Ok(())
+    }
 
     async fn merge_areas(&self, plan: &AreaMergePlan) -> CloudResult<AreaMergeCommit> {
         // Pure passthrough of the plan; the upstream judges its revisions. A
@@ -866,6 +1060,10 @@ where
 
     async fn list_atlases(&self) -> CloudResult<Vec<AtlasListItem>> {
         self.inner.list_atlases().await
+    }
+
+    async fn list_atlases_in(&self, storage: MapStorage) -> CloudResult<Vec<AtlasListItem>> {
+        self.inner.list_atlases_in(storage).await
     }
 
     async fn create_atlas(&self, name: &str) -> CloudResult<Atlas> {
@@ -902,6 +1100,19 @@ where
             self.publish_cloud_change(hint);
         }
         result
+    }
+
+    async fn finish_local_atlas_move(
+        &self,
+        atlas_id: &AtlasId,
+        auth_generation: u64,
+    ) -> CloudResult<()> {
+        let hint = self.cloud_write_generation();
+        self.inner
+            .finish_local_atlas_move(atlas_id, auth_generation)
+            .await?;
+        self.publish_cloud_change(hint);
+        Ok(())
     }
 
     fn cloud_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
@@ -953,13 +1164,95 @@ where
     }
 }
 
+/// Removes what this client keeps on disk for one cloud viewer: its area
+/// cache under `cache_dir` (the directory a [`CachedBackend`] was built
+/// with), and its queued writes under each mutation-journal root in
+/// `journal_roots`. For an account that no longer exists, whose maps must not
+/// outlive it on this computer and whose queued writes can never be sent.
+/// Best-effort: a missing directory is fine, and other failures are logged.
+pub fn forget_viewer_on_disk(cache_dir: &Path, journal_roots: &[PathBuf], viewer: Uuid) {
+    let mut doomed = vec![
+        cache_dir
+            .join(CACHE_FORMAT_NAMESPACE)
+            .join(viewer.to_string()),
+    ];
+    for root in journal_roots {
+        doomed.extend(crate::mapper::pending::viewer_journal_directories(
+            root, viewer,
+        ));
+    }
+    for directory in doomed {
+        match fs::remove_dir_all(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                "Failed to remove {} for a deleted account: {error}",
+                directory.display()
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod forget_viewer_tests {
+    use super::*;
+
+    #[test]
+    fn forgetting_a_viewer_removes_its_cache_and_journals_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("smudgy-forget-viewer-{}", Uuid::new_v4()));
+        let gone = Uuid::new_v4();
+        let kept = Uuid::new_v4();
+        let cache = root.join("maps");
+        let journal = root
+            .join("Arctic")
+            .join("local")
+            .join("pending-cloud-mutations");
+        let viewer_journal = |viewer: Uuid| {
+            journal
+                .join("servers")
+                .join("abc123")
+                .join("viewers")
+                .join(viewer.to_string())
+        };
+        for directory in [
+            cache.join(CACHE_FORMAT_NAMESPACE).join(gone.to_string()),
+            cache.join(CACHE_FORMAT_NAMESPACE).join(kept.to_string()),
+            viewer_journal(gone),
+            viewer_journal(kept),
+            journal.join("local").join("active"),
+        ] {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("x.json"), b"{}").unwrap();
+        }
+
+        forget_viewer_on_disk(&cache, &[journal.clone(), root.join("Nowhere")], gone);
+
+        assert!(
+            !cache
+                .join(CACHE_FORMAT_NAMESPACE)
+                .join(gone.to_string())
+                .exists()
+        );
+        assert!(!viewer_journal(gone).exists());
+        assert!(
+            cache
+                .join(CACHE_FORMAT_NAMESPACE)
+                .join(kept.to_string())
+                .exists()
+        );
+        assert!(viewer_journal(kept).exists());
+        assert!(journal.join("local").join("active").join("x.json").exists());
+        fs::remove_dir_all(root).ok();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         AreaAccess, CloudError, RoomNumber,
         backends::{AreaMergeOutcome, AreaMergeSource, Translate},
-        mutation::{ResourceKind, VersionInfo},
+        mutation::VersionInfo,
     };
     use async_trait::async_trait;
     use chrono::Utc;
@@ -975,6 +1268,7 @@ mod tests {
         storage: Arc<Mutex<HashMap<AreaId, AreaWithDetails>>>,
         list_calls: Arc<AtomicUsize>,
         get_calls: Arc<AtomicUsize>,
+        get_gate: Arc<Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
         viewer: Arc<Mutex<Option<Uuid>>>,
         generation: Arc<AtomicU64>,
         cloud_origin: Option<String>,
@@ -988,6 +1282,7 @@ mod tests {
                 storage: Arc::new(Mutex::new(storage)),
                 list_calls: Arc::new(AtomicUsize::new(0)),
                 get_calls: Arc::new(AtomicUsize::new(0)),
+                get_gate: Arc::default(),
                 viewer: Arc::new(Mutex::new(None)),
                 generation: Arc::new(AtomicU64::new(0)),
                 cloud_origin: None,
@@ -1029,7 +1324,12 @@ mod tests {
 
         async fn get_area(&self, area_id: &AreaId) -> CloudResult<AreaWithDetails> {
             self.get_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(self.area(area_id))
+            let area = self.area(area_id);
+            let gate = self.get_gate.lock().take();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            Ok(area)
         }
 
         async fn viewer_identity(&self) -> CloudResult<Option<Uuid>> {
@@ -1070,12 +1370,7 @@ mod tests {
             area.area.rev += 1;
             Ok(MutationResult {
                 operation_id: envelope.operation_id,
-                versions: vec![VersionInfo {
-                    resource: ResourceKind::Area,
-                    id: area_id.0,
-                    rev: area.area.rev,
-                    deleted: false,
-                }],
+                versions: vec![VersionInfo::map_source(area_id.0, area.area.rev)],
                 data: Vec::new(),
             })
         }
@@ -1108,12 +1403,7 @@ mod tests {
             Ok(AreaMergeCommit {
                 outcome: AreaMergeOutcome {
                     rooms: Vec::new(),
-                    versions: vec![VersionInfo {
-                        resource: ResourceKind::Area,
-                        id: plan.into.0,
-                        rev: destination.area.rev,
-                        deleted: false,
-                    }],
+                    versions: vec![VersionInfo::map_source(plan.into.0, destination.area.rev)],
                 },
                 documents: vec![destination],
             })
@@ -1140,7 +1430,10 @@ mod tests {
 
     fn sample_area(area_id: AreaId, rev: i64, access: Option<AreaAccess>) -> AreaWithDetails {
         AreaWithDetails {
+            room_data: Vec::new(),
+            sources: Vec::new(),
             area: Area {
+                projection_token: None,
                 id: area_id,
                 user_id: None,
                 atlas_id: None,
@@ -1154,9 +1447,12 @@ mod tests {
                 copied_from_rev: None,
                 copied_at: None,
                 family_token: None,
+                clan_id: None,
+                clan_name: None,
+                actions: None,
+                clan_ownership: crate::clan_maps::ClanOwnership::default(),
             },
             format_version: crate::AREA_FORMAT_VERSION,
-            content_hash: None,
             properties: vec![],
             rooms: vec![],
             labels: vec![],
@@ -1188,6 +1484,33 @@ mod tests {
                     .collect()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn invalidation_cannot_be_undone_by_an_older_get() {
+        let id = AreaId(Uuid::new_v4());
+        let backend = MockBackend::new(vec![sample_area_with_rev(id, 1)]);
+        let cached = CachedBackend::new(backend.clone(), temp_cache_dir());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *backend.get_gate.lock() = Some(gate.clone());
+        let (old, ()) = tokio::join!(cached.get_area(&id), async {
+            while backend.get_calls.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+            backend.update_area(sample_area_with_rev(id, 2));
+            let invalidation = cached.invalidate_area(&id);
+            tokio::pin!(invalidation);
+            tokio::select! {
+                () = &mut invalidation => panic!("invalidation must wait for the older read"),
+                () = tokio::task::yield_now() => {}
+            }
+            gate.add_permits(1);
+            invalidation.await;
+        });
+        assert_eq!(old.unwrap().area.rev, 1);
+        assert_eq!(cached.get_area(&id).await.unwrap().area.rev, 2);
+        assert_eq!(backend.get_calls.load(Ordering::Relaxed), 2);
+        fs::remove_dir_all(&cached.cache_dir).unwrap();
     }
 
     #[tokio::test]
@@ -1260,18 +1583,23 @@ mod tests {
         fs::remove_dir_all(cache_dir).ok();
     }
 
-    /// Capability flips bump no rev; the fingerprint alone must invalidate.
+    /// An access change moves the projection token but no revision; the
+    /// token alone must invalidate.
     #[tokio::test]
-    async fn refetches_when_fingerprint_changes_with_same_rev() {
+    async fn refetches_when_the_token_changes_with_same_rev() {
         let area_id = AreaId(Uuid::new_v4());
-        let backend = MockBackend::new(vec![sample_area(area_id, 1, Some(SHARED_VIEW))]);
+        let mut viewing = sample_area(area_id, 1, Some(SHARED_VIEW));
+        viewing.area.projection_token = Some("p_view".to_string());
+        let backend = MockBackend::new(vec![viewing]);
         let cache_dir = temp_cache_dir();
         let cached = CachedBackend::new(backend.clone(), cache_dir.clone());
 
         cached.list_areas().await.expect("list ok");
         cached.get_area(&area_id).await.expect("first fetch");
 
-        backend.update_area(sample_area(area_id, 1, Some(SHARED_EDIT)));
+        let mut editing = sample_area(area_id, 1, Some(SHARED_EDIT));
+        editing.area.projection_token = Some("p_edit".to_string());
+        backend.update_area(editing);
 
         cached.list_areas().await.expect("list ok");
         let refreshed = cached.get_area(&area_id).await.expect("second fetch");
@@ -1301,7 +1629,13 @@ mod tests {
         cached.get_area(&area_id).await.expect("cache hit");
         assert_eq!(backend.get_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
-            area_files_in(&cache_dir.join("v2").join(viewer_a.to_string()), &area_id).len(),
+            area_files_in(
+                &cache_dir
+                    .join(CACHE_FORMAT_NAMESPACE)
+                    .join(viewer_a.to_string()),
+                &area_id
+            )
+            .len(),
             1
         );
 
@@ -1314,11 +1648,23 @@ mod tests {
         cached.get_area(&area_id).await.expect("refetch");
         assert_eq!(backend.get_calls.load(Ordering::Relaxed), 2);
         assert_eq!(
-            area_files_in(&cache_dir.join("v2").join(viewer_b.to_string()), &area_id).len(),
+            area_files_in(
+                &cache_dir
+                    .join(CACHE_FORMAT_NAMESPACE)
+                    .join(viewer_b.to_string()),
+                &area_id
+            )
+            .len(),
             1
         );
         assert_eq!(
-            area_files_in(&cache_dir.join("v2").join(viewer_a.to_string()), &area_id).len(),
+            area_files_in(
+                &cache_dir
+                    .join(CACHE_FORMAT_NAMESPACE)
+                    .join(viewer_a.to_string()),
+                &area_id
+            )
+            .len(),
             1
         );
 
@@ -1335,7 +1681,7 @@ mod tests {
         cached.list_areas().await.expect("list ok");
         cached.get_area(&area_id).await.expect("first fetch");
 
-        let viewer_dir = cache_dir.join("v2").join("anon");
+        let viewer_dir = cache_dir.join(CACHE_FORMAT_NAMESPACE).join("anon");
         assert_eq!(area_files_in(&viewer_dir, &area_id).len(), 1);
 
         cached.purge_area(&area_id).await;
@@ -1366,6 +1712,7 @@ mod tests {
             .execute_mutation(
                 &area_id,
                 &MutationEnvelope {
+                    source: crate::SourceId::map(),
                     operation_id: Uuid::new_v4(),
                     preconditions: Vec::new(),
                     payload: Vec::new(),
@@ -1399,16 +1746,13 @@ mod tests {
         assert_eq!(backend.get_calls.load(Ordering::Relaxed), 2);
 
         // Area B vanished from the row set; area A moved to rev 2.
-        backend.update_area(sample_area(area_a, 2, Some(SHARED_VIEW)));
+        let moved = sample_area(area_a, 2, Some(SHARED_VIEW));
+        backend.update_area(moved.clone());
         cached
-            .note_sync_rows(&[SyncRow {
-                area_id: area_a,
-                rev: 2,
-                access_fingerprint: SHARED_VIEW.fingerprint(),
-            }])
+            .note_sync_rows(&[SyncRow::synthesized(&moved.area)])
             .await;
 
-        let viewer_dir = cache_dir.join("v2").join("anon");
+        let viewer_dir = cache_dir.join(CACHE_FORMAT_NAMESPACE).join("anon");
         assert!(area_files_in(&viewer_dir, &area_b).is_empty());
 
         // A's known rev moved, so the stale cached copy is bypassed.
@@ -1448,7 +1792,11 @@ mod tests {
         cached.list_areas().await.expect("list ok");
         cached.get_area(&area_id).await.expect("fetch");
         assert_eq!(
-            area_files_in(&cache_dir.join("v2").join("anon"), &area_id).len(),
+            area_files_in(
+                &cache_dir.join(CACHE_FORMAT_NAMESPACE).join("anon"),
+                &area_id
+            )
+            .len(),
             1,
             "fresh fetches land inside the v2 namespace"
         );
@@ -1528,7 +1876,7 @@ mod tests {
             assert!(!in_memory.contains(&id), "{id} left in memory");
             assert!(!known.contains(&id), "{id} left in the known-state map");
             assert!(
-                area_files_in(&cache_dir.join("v2").join("anon"), &id).is_empty(),
+                area_files_in(&cache_dir.join(CACHE_FORMAT_NAMESPACE).join("anon"), &id).is_empty(),
                 "{id} left on disk"
             );
         }

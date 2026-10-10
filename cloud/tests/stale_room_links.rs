@@ -1,7 +1,7 @@
 //! Links to deleted rooms across maps and storage tiers: deleting a room
 //! clears every other map's links to it where that map is saved, through the
-//! map's own edit queue, and a new room never takes a number a link still
-//! names.
+//! map's own edit queue, so a new room under the freed number starts with
+//! no link into it.
 
 mod support;
 
@@ -57,6 +57,7 @@ async fn settle(mapper: &Mapper) {
 
 fn room(number: i32) -> AreaMutation {
     AreaMutation::UpsertRoom {
+        room_source: None,
         room_number: RoomNumber(number),
         body: RoomUpdates::default(),
     }
@@ -65,6 +66,7 @@ fn room(number: i32) -> AreaMutation {
 /// Exit `exit` from room `from` to room `to.1` of map `to.0`.
 fn link(from: i32, exit: ExitId, to: (AreaId, i32)) -> AreaMutation {
     AreaMutation::CreateExit {
+        room_source: None,
         room_number: RoomNumber(from),
         body: ExitArgs {
             id: Some(exit),
@@ -196,8 +198,8 @@ async fn a_local_maps_link_to_a_deleted_cloud_room_is_cleared_in_the_local_store
     let server = MockServer::spawn().await;
     let owner = server.create_user("links-local@example.com", "links-local", true);
     let c = server.create_area(&owner, "C");
-    server.add_room(c, 1, "One", false);
-    server.add_room(c, 2, "Two", false);
+    server.add_room(c, 1, "One");
+    server.add_room(c, 2, "Two");
     let scratch = Scratch::new("cloud-room");
     let mapper = signed_in_mapper(&server.base_url, &owner.api_key, scratch.path()).await;
     wait_until(|| mapper.get_current_atlas().get_area(&c).is_some()).await;
@@ -259,11 +261,11 @@ async fn a_cloud_maps_link_to_a_deleted_cloud_room_is_left_to_the_server() {
     let server = MockServer::spawn().await;
     let owner = server.create_user("links-cloud@example.com", "links-cloud", true);
     let c = server.create_area(&owner, "C");
-    server.add_room(c, 1, "One", false);
-    server.add_room(c, 2, "Two", false);
+    server.add_room(c, 1, "One");
+    server.add_room(c, 2, "Two");
     let x = server.create_area(&owner, "X");
-    server.add_room(x, 5, "Five", false);
-    let exit = ExitId(server.add_exit(x, 5, "North", Some((c, 2)), false));
+    server.add_room(x, 5, "Five");
+    let exit = ExitId(server.add_exit(x, 5, "North", Some((c, 2))));
     let scratch = Scratch::new("cloud-cloud");
     let mapper = signed_in_mapper(&server.base_url, &owner.api_key, scratch.path()).await;
     let host = RoomKey::new(x, RoomNumber(5));

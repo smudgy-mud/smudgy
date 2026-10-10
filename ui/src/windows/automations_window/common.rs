@@ -323,18 +323,7 @@ fn relation_tag<'a>(label: String) -> ThemedElement<'a, Message> {
         .into()
 }
 
-/// A raised surface card (stat cards, panels).
-pub fn card_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(theme.styles.general.container_background)),
-        border: Border {
-            color: theme.styles.general.border,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..Default::default()
-    }
-}
+pub use crate::theme::builtins::container::card as card_style;
 
 /// The surface used for inset code/source blocks.
 pub fn code_surface_style(theme: &Theme) -> container::Style {

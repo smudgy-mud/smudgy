@@ -1,4 +1,6 @@
-//! The inspector pane: editable forms for the current selection.
+//! The inspector pane: editable forms for the current selection, and the
+//! map panel's data fields. Which panel the pane shows is
+//! [`super::panels::shown`]'s to say.
 //!
 //! Field buffers live in [`State`] so the user can type freely (including
 //! transiently invalid numbers); every valid change commits immediately
@@ -7,37 +9,36 @@
 //! selection changes, after undo/redo, and when another writer bumps the
 //! area revision — but not on the echo of the user's own commits.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use iced::widget::{
-    Column, button, checkbox, column, container, pick_list, row, rule, scrollable, space, text,
-    text_editor, text_input, tooltip,
+    Column, button, column, container, pick_list, row, rule, scrollable, space, text, text_editor,
+    text_input,
 };
-use iced::{Length, Task, alignment::Vertical};
-use smudgy_cloud::cloud_api::{RoomPropertyRef, SecretMarksRequest, SecretMarksResult};
+use iced::{Length, Padding, Task, alignment::Vertical};
+use smudgy_cloud::mapper::RoomKey;
 use smudgy_cloud::mapper::area_cache::AreaCache;
-use smudgy_cloud::mapper::exit_cache::ExitCache;
-use smudgy_cloud::mapper::room_cache::PropertyEntry;
-use smudgy_cloud::mapper::{AtlasCache, RoomKey};
 use smudgy_cloud::{
-    AreaId, CloudError, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionRouting,
-    ConnectionUpdates, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS,
-    ExitDirection, ExitId, HorizontalAlignment, LabelId, LabelUpdates, Mapper, RoomNumber,
-    RoomSide, RoomUpdates, SegmentShape, ShapeId, ShapeType, ShapeUpdates, VerticalAlignment,
+    AreaId, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionRouting, ConnectionUpdates,
+    CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS, ExitDirection,
+    HorizontalAlignment, LabelId, LabelUpdates, Mapper, RoomNumber, RoomSide, RoomUpdates,
+    SegmentShape, ShapeId, ShapeType, ShapeUpdates, SourceId, VerticalAlignment,
 };
 use smudgy_map_widget::map_editor::{EntityId, MapEditor};
 use smudgy_map_widget::render::parse_color;
 
 use crate::assets::{bootstrap_icons, fonts};
-use crate::components::cloud_errors::display_error;
 use crate::components::color_picker::{self, ColorPicker};
-use crate::components::stroke_sample::StrokeSample;
 use crate::theme::Element as ThemedElement;
 use crate::theme::builtins;
 use crate::update::Update;
 use crate::widgets::wrap_row::wrap_row;
 
-use super::commands::FieldId;
+use super::commands::{ExitRef, FieldId};
+use super::document::Document;
+use super::panels::Panel;
+use super::source_rooms::{self, SourceRoomRef};
 use super::{MapEditorWindow, commands};
 
 const FIELD_SPACING: f32 = 10.0;
@@ -66,7 +67,7 @@ pub(super) fn endpoint_updates(
         let render = area.get_room_connections().iter().find(|item| {
             item.connection_id == connection_id && item.geometry.stub_tip_b.is_some()
         })?;
-        let room = area.get_room(&endpoint.room_number)?;
+        let room = area.get_room_at(endpoint.address())?;
         let new_tip = smudgy_cloud::connection_geometry::stub_tip(
             smudgy_cloud::connection_geometry::port_position(
                 smudgy_cloud::MapPoint::new(room.get_x(), room.get_y()),
@@ -115,17 +116,17 @@ pub(super) fn endpoint_updates(
 pub(super) fn endpoint_reanchor(
     area: &AreaCache,
     connection: &smudgy_cloud::Connection,
-    room: RoomNumber,
+    room: smudgy_cloud::RoomAddress,
     direction: ExitDirection,
 ) -> Option<ConnectionUpdates> {
     if connection.kind == smudgy_cloud::ConnectionKind::SelfLoop {
         return None;
     }
-    let endpoint_b = if connection.endpoint_a.room_number == room {
+    let endpoint_b = if connection.endpoint_a.address() == room {
         false
     } else if connection
         .endpoint_b
-        .is_some_and(|endpoint| endpoint.room_number == room)
+        .is_some_and(|endpoint| endpoint.address() == room)
     {
         true
     } else {
@@ -140,13 +141,13 @@ pub(super) fn endpoint_reanchor(
     // bearing so the anchor lands toward the destination, exactly as
     // connection creation does.
     let bearing = (|| {
-        let this = area.get_room(&room)?;
+        let this = area.get_room_at(room)?;
         let other_number = if endpoint_b {
-            connection.endpoint_a.room_number
+            connection.endpoint_a.address()
         } else {
-            connection.endpoint_b?.room_number
+            connection.endpoint_b?.address()
         };
-        let other = area.get_room(&other_number)?;
+        let other = area.get_room_at(other_number)?;
         Some(smudgy_cloud::MapPoint::new(
             other.get_x() - this.get_x(),
             other.get_y() - this.get_y(),
@@ -213,13 +214,13 @@ fn endpoint_bearing(
     };
     let axis_x = wall_axis_is_x(endpoint.side);
     if let Some(other) = other {
-        if other.room_number == endpoint.room_number {
+        if other.address() == endpoint.address() {
             let outward = other.side.outward();
             return if axis_x { outward.x } else { outward.y };
         }
         if let (Some(room), Some(partner)) = (
-            area.get_room(&endpoint.room_number),
-            area.get_room(&other.room_number),
+            area.get_room_at(endpoint.address()),
+            area.get_room_at(other.address()),
         ) {
             return if axis_x {
                 partner.get_x() - room.get_x()
@@ -228,7 +229,7 @@ fn endpoint_bearing(
             };
         }
     }
-    area.get_room(&endpoint.room_number)
+    area.get_room_at(endpoint.address())
         .and_then(|room| {
             room.get_exits()
                 .iter()
@@ -244,29 +245,20 @@ fn endpoint_bearing(
 /// anywhere: creation, migration, and retargeting all pin ports at their
 /// direction's semantic default. Manual endpoints remain fixed. AutoPinned
 /// endpoints use their rank in the full bearing-ordered group, preserving
-/// stable UUID/role tie-breaks and the public/effective-secret layout split.
+/// stable UUID/role tie-breaks.
 pub(super) fn redistribute_port_updates(
     area: &AreaCache,
-    room_number: RoomNumber,
+    room: smudgy_cloud::RoomAddress,
     side: RoomSide,
-    secret: bool,
 ) -> Vec<(ConnectionId, ConnectionUpdates)> {
     let mut group = Vec::new();
     for connection in area.get_connections() {
-        let connection_secret = area
-            .get_room_connections()
-            .iter()
-            .find(|rendered| rendered.connection_id == connection.id)
-            .is_some_and(|rendered| rendered.is_secret);
-        if connection_secret != secret {
-            continue;
-        }
         for (endpoint_b, endpoint) in [
             (false, Some(connection.endpoint_a)),
             (true, connection.endpoint_b),
         ] {
             let Some(endpoint) = endpoint else { continue };
-            if endpoint.room_number == room_number && endpoint.side == side {
+            if endpoint.address() == room && endpoint.side == side {
                 group.push(WallEndpoint {
                     connection_id: connection.id,
                     endpoint_b,
@@ -316,13 +308,28 @@ pub enum Message {
     YChanged(String),
     ColorChanged(String),
     PropertyValueChanged(usize, String),
+    /// A Secret's or Private's data on the selected map room.
+    PlaceValueChanged(SourceId, usize, String),
+    PlacePropertyDeleted(SourceId, usize),
+    PlaceNewNameChanged(SourceId, String),
+    PlaceNewValueChanged(SourceId, String),
+    PlacePropertyAdded(SourceId),
+    PlaceMenuToggled(bool),
+    PlaceStarted(SourceId),
     PropertyDeleted(usize),
     NewPropertyNameChanged(String),
     NewPropertyValueChanged(String),
     AddProperty,
-    RoomTagInputChanged(String),
-    RoomTagAdded(String),
-    RoomTagRemoved(String),
+    /// The tag input of the selected rooms' Tags block.
+    TagInputChanged(String),
+    /// Enter in the tag input: add the typed tag where the input writes.
+    TagSubmitted,
+    /// A suggestion under the tag input: add it where the input writes.
+    TagSuggestionPicked(String),
+    /// A chip's ×: remove the tag from that place on the selected rooms.
+    TagRemoved(SourceId, String),
+    /// Tab: whether the tag input had focus, to complete it.
+    TagCompleted(bool),
     BulkColorChanged(String),
     BulkLevelChanged(String),
     ApplyBulkColor,
@@ -332,28 +339,13 @@ pub enum Message {
     NewAreaPropertyNameChanged(String),
     NewAreaPropertyValueChanged(String),
     AddAreaProperty,
-    ExitFromDirectionChanged(usize, ExitDirection),
-    ExitToAreaChanged(usize, AreaChoice),
-    ExitToRoomChanged(usize, String),
-    ExitToDirectionChanged(usize, ExitDirection),
-    ExitPathChanged(usize, String),
-    ExitCommandChanged(usize, String),
-    ExitWeightChanged(usize, String),
-    ExitHiddenToggled(usize, bool),
-    ExitClosedToggled(usize, bool),
-    ExitLockedToggled(usize, bool),
-    ExitDeleted(usize),
-    AddExit,
     ConnectionRoutingChanged(ConnectionRouting),
     ConnectionSegmentShapeChanged(SegmentShape),
     ConnectionCornerChanged(CornerStyle),
     ConnectionDashChanged(ConnectionDash),
     ConnectionColorChanged(String),
-    /// A width row in the visual stroke panel was clicked.
+    /// The thickness slider was let go at this width.
     ConnectionThicknessPicked(f32),
-    ThicknessPanelToggled,
-    DashPanelToggled,
-    ConnectionAddReturn,
     ConnectionEndpointSideChanged(bool, RoomSide),
     ConnectionEndpointOffsetChanged(bool, String),
     ConnectionEndpointReset(bool),
@@ -361,9 +353,6 @@ pub enum Message {
     ConnectionClearRoute,
     ConnectionReroute,
     ConnectionReset,
-    ConnectionDelete,
-    ConnectionUnlink(usize),
-    ConnectionPair(ConnectionId),
     LabelTextChanged(String),
     LabelColorChanged(String),
     LabelBackgroundChanged(String),
@@ -380,19 +369,6 @@ pub enum Message {
     ShapeBoundsChanged(BoundsField, String),
     PickerToggled(ColorField),
     Picker(color_picker::Message),
-    RoomSecretToggled(bool),
-    ExitSecretToggled(usize, bool),
-    LabelSecretToggled(bool),
-    ShapeSecretToggled(bool),
-    RoomPropertySecretToggled(usize, bool),
-    AreaPropertySecretToggled(usize, bool),
-    BulkSecretMark(bool),
-    SecretMarksCompleted {
-        area_id: AreaId,
-        request: SecretMarksRequest,
-        bulk: bool,
-        result: Result<SecretMarksResult, CloudError>,
-    },
 }
 
 /// One of the four bounds fields shared by labels and shapes.
@@ -416,45 +392,10 @@ pub enum ColorField {
     Connection,
 }
 
-/// An area option in the exit-destination picker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AreaChoice {
-    pub id: AreaId,
-    pub name: String,
-}
-
-impl fmt::Display for AreaChoice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.name)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ExitRow {
-    id: ExitId,
-    from_room: RoomNumber,
-    from_direction: ExitDirection,
-    to_area: Option<AreaId>,
-    to_room: String,
-    to_direction: Option<ExitDirection>,
-    path: String,
-    command: String,
-    weight: String,
-    is_hidden: bool,
-    is_closed: bool,
-    is_locked: bool,
-    is_secret: bool,
-    /// The destination exists but was redacted ("Unknown map"): the
-    /// destination controls render disabled instead of pretending the exit
-    /// is dangling.
-    to_unknown: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 struct PropertyRow {
     name: String,
     value: String,
-    is_secret: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -498,7 +439,6 @@ struct ConnectionBuffers {
     endpoint_b_side: RoomSide,
     endpoint_b_offset: String,
     has_endpoint_b: bool,
-    is_secret: bool,
 }
 
 impl Default for ConnectionBuffers {
@@ -515,9 +455,59 @@ impl Default for ConnectionBuffers {
             endpoint_b_side: RoomSide::West,
             endpoint_b_offset: "0.5".to_string(),
             has_endpoint_b: false,
-            is_secret: false,
         }
     }
+}
+
+/// What one Secret or Private keeps for the selected map room, with its
+/// add-row buffers.
+#[derive(Debug, Clone)]
+struct PlaceData {
+    source: SourceId,
+    name: String,
+    has_data: bool,
+    writable: bool,
+    properties: Vec<PropertyRow>,
+    new_name: String,
+    new_value: String,
+}
+
+/// Every Secret's and Private's properties on map room `map_room`, in color
+/// order (their tags show in the Tags block, their links in the room's
+/// Exits); a place keeping data there (properties, tags or exits) shows its
+/// group. A place that keeps nothing there is listed empty, ready to add to.
+fn place_data(area: &AreaCache, room_source: SourceId, map_room: RoomNumber) -> Vec<PlaceData> {
+    let mut sources: Vec<SourceId> = super::secrets::secrets(area)
+        .iter()
+        .map(|bundle| bundle.source)
+        .collect();
+    sources.push(SourceId::Private);
+    sources.insert(0, SourceId::Map);
+    sources
+        .into_iter()
+        .filter(|source| *source != room_source)
+        .map(|source| {
+            let attachment = area.document_layer(source).and_then(|layer| {
+                layer.attachment(smudgy_cloud::RoomAddress::new(room_source, map_room))
+            });
+            let (properties, has_exits) = match attachment {
+                Some(room) => (
+                    sorted_properties(room.properties()),
+                    !room.get_exits().is_empty(),
+                ),
+                None => (Vec::new(), false),
+            };
+            PlaceData {
+                source,
+                name: super::secrets::place_name(area, source),
+                has_data: !properties.is_empty() || has_exits,
+                writable: super::secrets::can_write(area, source),
+                properties,
+                new_name: String::new(),
+                new_value: String::new(),
+            }
+        })
+        .collect()
 }
 
 /// Inspector field buffers, rebuilt by [`State::resync`].
@@ -532,14 +522,21 @@ pub struct State {
     properties: Vec<PropertyRow>,
     new_property_name: String,
     new_property_value: String,
-    /// The selected room's tags (normalized UPPERCASE, sorted).
-    tags: Vec<String>,
-    /// Distinct tags across the selected room's area, for the "add existing"
-    /// suggestions. Computed once per resync, not per render.
-    known_tags: Vec<String>,
-    /// The add-tag input buffer.
-    new_tag: String,
-    exits: Vec<ExitRow>,
+    /// The selected rooms' tags, place by place.
+    tags: super::tags::SelectionTags,
+    /// The tag input.
+    tag_input: String,
+    /// The selection the tag input was typed for: a rebuild keeps the
+    /// input while the selection holds.
+    tag_selection: Option<SelectionKey>,
+    /// The place the tag input was typed for. The input empties when the
+    /// place it would write changes, so a tag never lands somewhere other
+    /// than the place shown while it was typed.
+    tag_place: Option<SourceId>,
+    /// What each Secret and Private keeps for the selected map room.
+    places: Vec<PlaceData>,
+    /// The link editor's state for the selected room or link.
+    pub links: super::link_panel::LinkPanel,
     label: LabelBuffers,
     shape: ShapeBuffers,
     connection: ConnectionBuffers,
@@ -554,17 +551,6 @@ pub struct State {
     new_area_property_value: String,
     /// The open color picker, if any, and the field it edits.
     picker: Option<(ColorField, ColorPicker)>,
-    /// The visual stroke-width sample panel is open.
-    thickness_panel_open: bool,
-    /// The visual dash-style sample panel is open.
-    dash_panel_open: bool,
-    /// Secrecy of the single selected room/label/shape.
-    is_secret: bool,
-    /// Error from the last secret-marks call (preserved across resyncs;
-    /// cleared when the next secrecy action starts).
-    secret_error: Option<String>,
-    /// Per-type changed counts from the last bulk secret-marks call.
-    secret_notice: Option<String>,
 }
 
 impl State {
@@ -580,23 +566,66 @@ impl State {
             ColorField::Connection => &self.connection.color,
         }
     }
-}
 
-impl State {
-    /// Rebuilds every buffer from the current cache snapshot. Secrecy
-    /// error/notice lines survive the rebuild (resyncs fire on every cache
-    /// change, which would otherwise hide them before they're read).
-    pub fn resync(&mut self, mapper: &Mapper, editor: &MapEditor) {
-        let secret_error = self.secret_error.take();
-        let secret_notice = self.secret_notice.take();
-        *self = Self::default();
-        self.secret_error = secret_error;
-        self.secret_notice = secret_notice;
+    /// Empties the tag input.
+    pub fn clear_tag_input(&mut self) {
+        self.tag_input.clear();
+        self.tag_place = None;
+    }
 
+    /// Reads the selected rooms' tags again, leaving every other buffer
+    /// (and whatever is being typed in it) as it is.
+    pub fn reread_tags(&mut self, mapper: &Mapper, editor: &MapEditor) {
         let atlas = mapper.get_current_atlas();
         let Some(area) = editor.area_id().and_then(|id| atlas.get_area(&id)) else {
             return;
         };
+        let selection = editor.selection();
+        self.tags =
+            super::tags::SelectionTags::read(&area, selection.rooms(), selection.source_rooms());
+    }
+}
+
+/// A selection as the tag input remembers it.
+type SelectionKey = (Option<AreaId>, HashSet<EntityId>);
+
+fn selection_key(editor: &MapEditor) -> SelectionKey {
+    (editor.area_id(), editor.selection().iter().collect())
+}
+
+impl State {
+    /// Rebuilds every buffer from the current cache snapshot. The tag input
+    /// stays while the selection is the one it was typed for.
+    pub fn resync(&mut self, mapper: &Mapper, editor: &MapEditor) {
+        let key = selection_key(editor);
+        let tag_input = std::mem::take(&mut self.tag_input);
+        let tag_place = self.tag_place.take();
+        let kept = self.tag_selection.take() == Some(key.clone());
+        let mut links = std::mem::take(&mut self.links);
+        *self = Self::default();
+        if kept {
+            self.tag_input = tag_input;
+            self.tag_place = tag_place;
+        }
+        self.tag_selection = Some(key);
+
+        let atlas = mapper.get_current_atlas();
+        let Some(area) = editor.area_id().and_then(|id| atlas.get_area(&id)) else {
+            links.resync((editor.area_id(), editor.selection().single()), None);
+            self.links = links;
+            return;
+        };
+        let link = match editor.selection().single() {
+            Some(EntityId::Connection(id)) => {
+                super::links::link_view(&atlas, &area, id, editor.connection_anchor())
+            }
+            _ => None,
+        };
+        links.resync(
+            (editor.area_id(), editor.selection().single()),
+            link.as_ref(),
+        );
+        self.links = links;
 
         match editor.selection().single() {
             Some(EntityId::Room(room_number)) => {
@@ -607,48 +636,29 @@ impl State {
                     self.x = room.get_x().to_string();
                     self.y = room.get_y().to_string();
                     self.color = room.get_color().to_string();
-                    self.is_secret = room.is_secret();
-                    self.properties = sorted_properties(room.properties_with_secrecy());
-                    self.tags = room.tags().map(String::from).collect();
-                    // Distinct tags across this area, for "add existing" suggestions.
-                    let mut known: std::collections::BTreeSet<String> =
-                        std::collections::BTreeSet::new();
-                    for r in area.get_rooms() {
-                        known.extend(r.tags().map(String::from));
-                    }
-                    self.known_tags = known.into_iter().collect();
-
-                    self.exits = room
-                        .get_exits()
-                        .iter()
-                        .map(|exit| ExitRow {
-                            id: exit.id,
-                            from_room: room_number,
-                            from_direction: exit.from_direction,
-                            to_area: exit.to_area_id,
-                            to_room: exit
-                                .to_room_number
-                                .map(|n| n.to_string())
-                                .unwrap_or_default(),
-                            to_direction: exit.to_direction,
-                            path: exit.path.clone().unwrap_or_default(),
-                            command: exit.command.clone().unwrap_or_default(),
-                            weight: exit.weight.to_string(),
-                            is_hidden: exit.is_hidden,
-                            is_closed: exit.is_closed,
-                            is_locked: exit.is_locked,
-                            is_secret: exit.is_secret,
-                            to_unknown: exit.to_unknown,
-                        })
-                        .collect();
-                    // Cache order moves updated exits to the back; sort by
-                    // id so rows stay put while being edited.
-                    self.exits.sort_by_key(|row| row.id.0);
+                    self.properties = sorted_properties(room.properties());
+                    self.tags = super::tags::SelectionTags::read(&area, [room_number], []);
+                    self.places = place_data(&area, SourceId::Map, room_number);
+                }
+            }
+            Some(EntityId::SourceRoom(source, room_number)) => {
+                if let Some(room) =
+                    smudgy_map_widget::sources::source_room(&area, source, room_number)
+                {
+                    self.title = room.get_title().to_string();
+                    self.description = text_editor::Content::with_text(room.get_description());
+                    self.level = room.get_level().to_string();
+                    self.x = room.get_x().to_string();
+                    self.y = room.get_y().to_string();
+                    self.color = room.get_color().to_string();
+                    self.properties = sorted_properties(room.properties());
+                    self.tags =
+                        super::tags::SelectionTags::read(&area, [], [(source, room_number)]);
+                    self.places = place_data(&area, source, room_number);
                 }
             }
             Some(EntityId::Label(label_id)) => {
-                if let Some(label) = area.get_label(&label_id) {
-                    self.is_secret = label.is_secret;
+                if let Some((_, label)) = area.find_label(&label_id) {
                     self.label = LabelBuffers {
                         text: label.text.clone(),
                         color: label.color.clone(),
@@ -665,8 +675,7 @@ impl State {
                 }
             }
             Some(EntityId::Shape(shape_id)) => {
-                if let Some(shape) = area.get_shape(&shape_id) {
-                    self.is_secret = shape.is_secret;
+                if let Some((_, shape)) = area.find_shape(&shape_id) {
                     self.shape = ShapeBuffers {
                         shape_type: shape.shape_type.clone(),
                         background: shape.background_color.clone().unwrap_or_default(),
@@ -681,7 +690,11 @@ impl State {
                 }
             }
             Some(EntityId::Connection(connection_id)) => {
-                if let Some(connection) = area.get_connection(connection_id) {
+                // A Secret's link reads from its Secret's document.
+                let document = Document::of_connection(&area, connection_id);
+                if let Some(document) = document
+                    && let Some(connection) = document.content().get_connection(connection_id)
+                {
                     let endpoint_b = connection.endpoint_b;
                     self.connection = ConnectionBuffers {
                         routing: connection.routing,
@@ -699,50 +712,28 @@ impl State {
                             |endpoint| endpoint.port_offset.to_string(),
                         ),
                         has_endpoint_b: endpoint_b.is_some(),
-                        is_secret: area
-                            .get_room_connections()
-                            .iter()
-                            .find(|render| render.connection_id == connection_id)
-                            .is_some_and(|render| render.is_secret),
                     };
-                    for room in area.get_rooms() {
-                        for exit in room.get_exits() {
-                            if exit.connection_id == connection_id {
-                                self.exits.push(ExitRow {
-                                    id: exit.id,
-                                    from_room: room.get_room_number(),
-                                    from_direction: exit.from_direction,
-                                    to_area: exit.to_area_id,
-                                    to_room: exit
-                                        .to_room_number
-                                        .map(|n| n.to_string())
-                                        .unwrap_or_default(),
-                                    to_direction: exit.to_direction,
-                                    path: exit.path.clone().unwrap_or_default(),
-                                    command: exit.command.clone().unwrap_or_default(),
-                                    weight: exit.weight.to_string(),
-                                    is_hidden: exit.is_hidden,
-                                    is_closed: exit.is_closed,
-                                    is_locked: exit.is_locked,
-                                    is_secret: exit.is_secret,
-                                    to_unknown: exit.to_unknown,
-                                });
-                            }
-                        }
-                    }
-                    self.exits.sort_by_key(|row| row.id.0);
                 }
             }
             None => {
                 if editor.selection().is_empty() {
-                    self.area_properties = sorted_properties(area.properties_with_secrecy());
+                    self.area_properties = sorted_properties(area.properties());
                 } else {
+                    self.tags = super::tags::SelectionTags::read(
+                        &area,
+                        editor.selection().rooms(),
+                        editor.selection().source_rooms(),
+                    );
                     // Multi-selection: prefill the bulk fields with values
-                    // the rooms agree on; disagreements show "(mixed)".
-                    let rooms: Vec<_> = editor
-                        .selection()
+                    // the rooms agree on, whatever place holds them;
+                    // disagreements show "(mixed)".
+                    let selection = editor.selection();
+                    let rooms: Vec<_> = selection
                         .rooms()
                         .filter_map(|number| area.get_room(&number))
+                        .chain(selection.source_rooms().filter_map(|(source, number)| {
+                            smudgy_map_widget::sources::source_room(&area, source, number)
+                        }))
                         .collect();
 
                     if let Some(first) = rooms.first() {
@@ -770,14 +761,11 @@ impl State {
     }
 }
 
-fn sorted_properties<'a>(
-    properties: impl Iterator<Item = (&'a str, &'a PropertyEntry)>,
-) -> Vec<PropertyRow> {
+fn sorted_properties<'a>(properties: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<PropertyRow> {
     let mut rows: Vec<PropertyRow> = properties
-        .map(|(name, entry)| PropertyRow {
+        .map(|(name, value)| PropertyRow {
             name: name.to_string(),
-            value: entry.value.clone(),
-            is_secret: entry.is_secret,
+            value: value.to_string(),
         })
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -795,11 +783,208 @@ impl MapEditorWindow {
         }
     }
 
+    /// `source`'s data on the selected, readable room, wherever that room lives.
+    fn place_target(&self, source: SourceId) -> Option<SourceRoomRef> {
+        let (room_source, number) = match self.editor.selection().single()? {
+            EntityId::Room(number) => (SourceId::Map, number),
+            EntityId::SourceRoom(anchor, number) => (anchor, number),
+            _ => return None,
+        };
+        Some(SourceRoomRef::data_on_source(
+            self.editor.area_id()?,
+            source,
+            room_source,
+            number,
+        ))
+    }
+
+    fn place_mut(&mut self, source: SourceId) -> Option<&mut PlaceData> {
+        self.inspector
+            .places
+            .iter_mut()
+            .find(|place| place.source == source)
+    }
+
+    fn selected_source_room(&self) -> Option<SourceRoomRef> {
+        match self.editor.selection().single() {
+            Some(EntityId::SourceRoom(source, room_number)) => Some(SourceRoomRef::own(
+                self.editor.area_id()?,
+                source,
+                room_number,
+            )),
+            _ => None,
+        }
+    }
+
+    /// The open map's tags, place by place, read once per revision.
+    pub(super) fn tag_index(
+        &self,
+        area: &std::sync::Arc<AreaCache>,
+    ) -> std::rc::Rc<super::tags::TagIndex> {
+        self.tag_index.get(area, self.secrets_apply())
+    }
+
+    /// The place the selected rooms' tag input writes: on map rooms "Add
+    /// to", on a place's own room that place; `None` without selected rooms.
+    pub(super) fn tag_destination(&self) -> Option<SourceId> {
+        let selection = self.editor.selection();
+        match selection.single() {
+            Some(EntityId::Room(_)) => Some(super::tags::destination(SourceId::Map, self.add_to())),
+            Some(EntityId::SourceRoom(source, _)) => {
+                Some(super::tags::destination(source, self.add_to()))
+            }
+            Some(_) => None,
+            None => (selection.rooms().next().is_some()
+                || selection.source_rooms().next().is_some())
+            .then(|| self.add_to()),
+        }
+    }
+
+    /// Where the tag input writes, when the viewer may add there and some
+    /// selected room can carry that place's tags.
+    pub(super) fn tag_input_place(&self) -> Option<SourceId> {
+        let place = self.tag_destination()?;
+        let area = self
+            .mapper
+            .get_current_atlas()
+            .get_area(&self.editor.area_id()?)?;
+        let applicable = self.tag_rooms(place).len();
+        (super::secrets::can_add(&area, place) && applicable > 0).then_some(place)
+    }
+
+    /// The readable selected rooms, with their source retained independently
+    /// of the place that owns the tag.
+    fn tag_rooms(&self, place: SourceId) -> Vec<(SourceId, RoomNumber)> {
+        let selection = self.editor.selection();
+        let keeps_own = self
+            .editor
+            .area_id()
+            .and_then(|id| self.mapper.get_current_atlas().get_area(&id))
+            .is_some_and(|area| area.keeps_only_own_rooms(place));
+        let mut rooms: Vec<_> = selection
+            .rooms()
+            .map(|number| (SourceId::Map, number))
+            .chain(selection.source_rooms())
+            .filter(|(source, _)| !keeps_own || *source == place)
+            .collect();
+        rooms.sort_unstable();
+        rooms
+    }
+
+    /// Empties the tag input when the place it writes is no longer the
+    /// place it was typed for: "Add to" changed, or the place went away or
+    /// stopped taking additions, by any route.
+    pub(super) fn drop_stale_tag_input(&mut self) {
+        if !self.inspector.tag_input.is_empty()
+            && self.tag_input_place() != self.inspector.tag_place
+        {
+            self.inspector.clear_tag_input();
+        }
+    }
+
+    /// What the tag input suggests now.
+    pub(super) fn tag_suggestions(&self) -> Vec<super::tags::Suggestion> {
+        let Some(place) = self.tag_input_place() else {
+            return Vec::new();
+        };
+        let Some(area) = self
+            .editor
+            .area_id()
+            .and_then(|id| self.mapper.get_current_atlas().get_area(&id))
+        else {
+            return Vec::new();
+        };
+        let tags = &self.inspector.tags;
+        self.tag_index(&area)
+            .suggestions(place, &self.inspector.tag_input, |tag| {
+                tags.all_have(place, tag, area.keeps_only_own_rooms(place))
+            })
+    }
+
+    /// Adds `tag` where the tag input writes, on every selected room that
+    /// can carry it there and lacks it, as one undo entry. The input clears
+    /// and keeps focus; a tag every room already has changes nothing.
+    fn add_tag(&mut self, tag: &str) -> Update<super::Message, super::Event> {
+        let focus = iced::widget::operation::focus(super::tags::input_id(self.window_id));
+        let Some(place) = self.tag_input_place() else {
+            return Update::none();
+        };
+        let Some(area) = self
+            .editor
+            .area_id()
+            .and_then(|id| self.mapper.get_current_atlas().get_area(&id))
+        else {
+            return Update::none();
+        };
+        let rooms = self.tag_rooms(place);
+        let name = super::secrets::place_name(&area, place);
+        let change = source_rooms::change_tags(&area, place, &rooms, tag, true, &name);
+        self.inspector.tag_input.clear();
+        let Some(change) = change else {
+            return Update::with_task(focus);
+        };
+        let several = self.editor.selection().single().is_none();
+        let applicable = rooms.len();
+        let changed = change.changed;
+        // A refusal (where it may not write, or applying it) lands in the
+        // footer; the count would hide it.
+        let notice_before = self.editor_notice.as_ref().map(|(shown, _)| *shown);
+        let mut update = self.push_command(Some(change.command));
+        let refused = self.editor_notice.as_ref().map(|(shown, _)| *shown) != notice_before;
+        if several && !refused {
+            let tag = smudgy_cloud::mapper::normalize_tag(tag);
+            let already = applicable.saturating_sub(changed);
+            let notice = if already == 0 {
+                crate::i18n::t!("inspector-tag-added", "tag" => tag, "count" => applicable)
+            } else {
+                crate::i18n::t!(
+                    "inspector-tag-added-some-had",
+                    "tag" => tag,
+                    "count" => applicable,
+                    "already" => already
+                )
+            };
+            self.editor_notice = Some((std::time::Instant::now(), notice));
+        }
+        self.inspector.resync(&self.mapper, &self.editor);
+        update.task = Task::batch([update.task, focus]);
+        update
+    }
+
+    /// Removes `tag` from `place` on every selected room carrying it there,
+    /// as one undo entry, where the viewer may remove from `place`.
+    fn remove_tag(&mut self, place: SourceId, tag: &str) -> Update<super::Message, super::Event> {
+        let Some(area) = self
+            .editor
+            .area_id()
+            .and_then(|id| self.mapper.get_current_atlas().get_area(&id))
+        else {
+            return Update::none();
+        };
+        if !super::secrets::can_remove(&area, place) {
+            return Update::none();
+        }
+        let rooms = self.tag_rooms(place);
+        let name = super::secrets::place_name(&area, place);
+        let Some(change) = source_rooms::change_tags(&area, place, &rooms, tag, false, &name)
+        else {
+            return Update::none();
+        };
+        let update = self.push_command(Some(change.command));
+        self.inspector.resync(&self.mapper, &self.editor);
+        update
+    }
+
     fn commit_room_field(
         &mut self,
         field: FieldId,
         updates: RoomUpdates,
     ) -> Update<super::Message, super::Event> {
+        if let Some(target) = self.selected_source_room() {
+            let command =
+                source_rooms::edit_field(&self.mapper.get_current_atlas(), target, field, updates);
+            return self.push_command(command);
+        }
         let Some(room_key) = self.selected_room_key() else {
             return Update::none();
         };
@@ -851,8 +1036,8 @@ impl MapEditorWindow {
             .get_current_atlas()
             .get_area(&area_id)
             .and_then(|area| {
-                area.get_connection(connection_id)
-                    .map(|connection| connection.routing == ConnectionRouting::Automatic)
+                area.find_connection(connection_id)
+                    .map(|(_, connection)| connection.routing == ConnectionRouting::Automatic)
             })
             .unwrap_or(false)
         {
@@ -905,70 +1090,55 @@ impl MapEditorWindow {
         self.push_command(command)
     }
 
-    fn commit_exit_field(
-        &mut self,
-        index: usize,
-        field: FieldId,
-        change: impl FnOnce(&mut smudgy_cloud::ExitUpdates),
-    ) -> Update<super::Message, super::Event> {
-        let Some(exit_id) = self.inspector.exits.get(index).map(|row| row.id) else {
-            return Update::none();
-        };
-        let room_key = self.selected_room_key().or_else(|| {
-            Some(RoomKey::new(
-                self.editor.area_id()?,
-                self.inspector.exits.get(index)?.from_room,
-            ))
-        });
-        let Some(room_key) = room_key else {
-            return Update::none();
-        };
-        let command = commands::edit_exit_field(
-            &self.mapper.get_current_atlas(),
-            room_key,
-            exit_id,
-            field,
-            change,
-        );
-        self.push_command(command)
-    }
-
     /// Commits an exit direction change with the matching Connection
     /// endpoint re-anchor in one undo unit: the port follows the new
     /// direction to its home slot. `to_side` targets the destination
     /// endpoint instead (only when no member exit originates there — a
     /// reciprocal member's own direction governs its port).
-    fn commit_exit_direction_field(
+    pub(super) fn commit_exit_direction(
         &mut self,
-        index: usize,
+        exit_ref: ExitRef,
         field: FieldId,
         direction: ExitDirection,
         to_side: bool,
     ) -> Update<super::Message, super::Event> {
-        let Some(row) = self.inspector.exits.get(index) else {
-            return Update::none();
-        };
-        let exit_id = row.id;
-        let from_room = row.from_room;
-        let room_key = self
-            .selected_room_key()
-            .or_else(|| Some(RoomKey::new(self.editor.area_id()?, from_room)));
-        let Some(room_key) = room_key else {
-            return Update::none();
-        };
+        self.commit_exit_direction_with(exit_ref, field, direction, to_side, None)
+    }
+
+    /// [`Self::commit_exit_direction`], with `also` (a write and its undo)
+    /// in the same undo step: the other exit's arrival, kept elsewhere.
+    pub(super) fn commit_exit_direction_with(
+        &mut self,
+        exit_ref: ExitRef,
+        field: FieldId,
+        direction: ExitDirection,
+        to_side: bool,
+        also: Option<(commands::Mutation, commands::Mutation)>,
+    ) -> Update<super::Message, super::Event> {
         let atlas = self.mapper.get_current_atlas();
+        let Some(map) = atlas.get_area(&exit_ref.area_id) else {
+            return Update::none();
+        };
+        // The exit's link lives in the exit's own place.
+        let Some(document) = Document::of(&map, exit_ref.place) else {
+            return Update::none();
+        };
+        let area = document.content();
         let connection_edit = (|| {
-            let area = atlas.get_area(&room_key.area_id)?;
-            let room = area.get_room(&room_key.room_number)?;
-            let exit = room.get_exits().iter().find(|exit| exit.id == exit_id)?;
+            let room = area.get_room_at(exit_ref.room)?;
+            let exit = room
+                .get_exits()
+                .iter()
+                .find(|exit| exit.id == exit_ref.id)?;
             let connection = area.get_connection(exit.connection_id)?;
             let target_room = if to_side {
-                let to_room = exit.to_room_number?;
-                if exit.to_area_id != Some(room_key.area_id) {
+                let destination = exit.destination_address()?;
+                let to_room = destination.room;
+                if destination.map != exit_ref.area_id {
                     return None;
                 }
                 if area
-                    .get_room(&to_room)?
+                    .get_room_at(to_room)?
                     .get_exits()
                     .iter()
                     .any(|other| other.connection_id == connection.id)
@@ -977,9 +1147,9 @@ impl MapEditorWindow {
                 }
                 to_room
             } else {
-                room_key.room_number
+                exit_ref.room
             };
-            endpoint_reanchor(&area, connection, target_room, direction)
+            endpoint_reanchor(area, connection, target_room, direction)
                 .map(|updates| (connection.id, updates))
         })();
         let change = |updates: &mut smudgy_cloud::ExitUpdates| {
@@ -995,12 +1165,10 @@ impl MapEditorWindow {
             Some((connection_id, updates)) => {
                 // Re-anchoring an Automatic route's endpoint leaves its
                 // stored route stale exactly like an inspector port edit.
-                if atlas.get_area(&room_key.area_id).is_some_and(|area| {
-                    area.get_connection(*connection_id)
-                        .is_some_and(|connection| {
-                            connection.routing == ConnectionRouting::Automatic
-                        })
-                }) {
+                if area
+                    .get_connection(*connection_id)
+                    .is_some_and(|connection| connection.routing == ConnectionRouting::Automatic)
+                {
                     self.automatic_routes_maybe_stale.insert(*connection_id);
                 }
                 // If the endpoint will now render as its level triangle,
@@ -1009,7 +1177,7 @@ impl MapEditorWindow {
                 // invisible port. (All other cases keep their handles —
                 // the enum is positionless, so the selection stays valid
                 // at the new anchor.)
-                let becomes_triangle = atlas.get_area(&room_key.area_id).is_some_and(|area| {
+                let becomes_triangle =
                     area.get_connection(*connection_id)
                         .is_some_and(|connection| {
                             smudgy_cloud::connection_geometry::renders_as_level_triangle(
@@ -1019,77 +1187,28 @@ impl MapEditorWindow {
                                     direction,
                                 ),
                             )
-                        })
-                });
+                        });
                 if becomes_triangle {
                     self.editor.clear_selected_connection_handle();
                 }
                 commands::edit_exit_with_endpoint(
                     &atlas,
-                    room_key,
-                    exit_id,
+                    exit_ref,
                     change,
                     *connection_id,
                     updates.clone(),
                 )
             }
             // No endpoint to move: the plain coalescing exit edit.
-            None => commands::edit_exit_field(&atlas, room_key, exit_id, field, change),
+            None => commands::edit_exit_field(&atlas, exit_ref, field, change),
+        };
+        let command = match also {
+            Some((redo, undo)) => command.map(|command| command.also(redo, undo)),
+            None => command,
         };
         let update = self.push_command(command);
         self.inspector.resync(&self.mapper, &self.editor);
         update
-    }
-
-    /// Sends one secret-marks POST and optimistically mirrors the flags into
-    /// the local cache (reverted by [`Message::SecretMarksCompleted`] on
-    /// failure). Secrecy edits deliberately bypass the undo stack, like area
-    /// rename: they flip a server-side sharing flag, not map geometry.
-    ///
-    /// The request is filtered to entities whose cached flag actually
-    /// differs from the target before anything is applied or sent, so the
-    /// optimistic application and a failure's revert are exact inverses —
-    /// re-marking an already-secret entity must not be "reverted" to public.
-    fn send_secret_marks(
-        &mut self,
-        area_id: AreaId,
-        mut request: SecretMarksRequest,
-        bulk: bool,
-    ) -> Update<super::Message, super::Event> {
-        if !self.secrets_cleared() {
-            return Update::none();
-        }
-
-        self.inspector.secret_error = None;
-        self.inspector.secret_notice = None;
-
-        retain_changing_marks(&self.mapper, area_id, &mut request);
-        if secret_marks_request_is_empty(&request) {
-            // Everything already matches the target: nothing to apply,
-            // send, or revert.
-            if bulk {
-                self.inspector.secret_notice = Some(crate::i18n::t!("inspector-nothing-changed"));
-            }
-            return Update::none();
-        }
-
-        apply_marks_locally(&self.mapper, area_id, &request, request.secret);
-        self.refresh_seen_rev();
-        self.inspector.resync(&self.mapper, &self.editor);
-
-        let client = self.cloud.client.clone();
-        let echo = request.clone();
-        Update::with_task(Task::perform(
-            async move { client.secret_marks(area_id, &request).await },
-            move |result| {
-                super::Message::Inspector(Message::SecretMarksCompleted {
-                    area_id,
-                    request: echo.clone(),
-                    bulk,
-                    result,
-                })
-            },
-        ))
     }
 
     pub(super) fn update_inspector(
@@ -1176,12 +1295,103 @@ impl MapEditorWindow {
                     Update::none()
                 }
             }
+            Message::PlaceValueChanged(source, index, value) => {
+                let Some(target) = self.place_target(source) else {
+                    return Update::none();
+                };
+                let Some(row) = self
+                    .place_mut(source)
+                    .and_then(|place| place.properties.get_mut(index))
+                else {
+                    return Update::none();
+                };
+                row.value = value.clone();
+                let name = row.name.clone();
+                let command = source_rooms::set_property(
+                    &self.mapper.get_current_atlas(),
+                    target,
+                    name,
+                    value,
+                );
+                self.push_command(command)
+            }
+            Message::PlacePropertyDeleted(source, index) => {
+                let Some(target) = self.place_target(source) else {
+                    return Update::none();
+                };
+                let Some(place) = self.place_mut(source) else {
+                    return Update::none();
+                };
+                if index >= place.properties.len() {
+                    return Update::none();
+                }
+                let row = place.properties.remove(index);
+                let command = source_rooms::delete_property(
+                    &self.mapper.get_current_atlas(),
+                    target,
+                    row.name,
+                );
+                self.push_command(command)
+            }
+            Message::PlaceNewNameChanged(source, value) => {
+                if let Some(place) = self.place_mut(source) {
+                    place.new_name = value;
+                }
+                Update::none()
+            }
+            Message::PlaceNewValueChanged(source, value) => {
+                if let Some(place) = self.place_mut(source) {
+                    place.new_value = value;
+                }
+                Update::none()
+            }
+            Message::PlacePropertyAdded(source) => {
+                let Some(target) = self.place_target(source) else {
+                    return Update::none();
+                };
+                let Some(place) = self.place_mut(source) else {
+                    return Update::none();
+                };
+                let name = place.new_name.trim().to_string();
+                if name.is_empty() {
+                    return Update::none();
+                }
+                let value = std::mem::take(&mut place.new_value);
+                place.new_name.clear();
+                let command = source_rooms::set_property(
+                    &self.mapper.get_current_atlas(),
+                    target,
+                    name,
+                    value,
+                );
+                let update = self.push_command(command);
+                self.inspector.resync(&self.mapper, &self.editor);
+                update
+            }
+            Message::PlaceMenuToggled(open) => {
+                self.secrets.place_menu_open = open;
+                Update::none()
+            }
+            Message::PlaceStarted(source) => {
+                self.secrets.place_menu_open = false;
+                self.secrets.place_started = Some(source);
+                Update::none()
+            }
             Message::PropertyValueChanged(index, value) => {
                 let Some(row) = self.inspector.properties.get_mut(index) else {
                     return Update::none();
                 };
                 row.value = value.clone();
                 let name = row.name.clone();
+                if let Some(target) = self.selected_source_room() {
+                    let command = source_rooms::set_property(
+                        &self.mapper.get_current_atlas(),
+                        target,
+                        name,
+                        value,
+                    );
+                    return self.push_command(command);
+                }
                 let Some(room_key) = self.selected_room_key() else {
                     return Update::none();
                 };
@@ -1198,6 +1408,14 @@ impl MapEditorWindow {
                     return Update::none();
                 }
                 let row = self.inspector.properties.remove(index);
+                if let Some(target) = self.selected_source_room() {
+                    let command = source_rooms::delete_property(
+                        &self.mapper.get_current_atlas(),
+                        target,
+                        row.name,
+                    );
+                    return self.push_command(command);
+                }
                 let Some(room_key) = self.selected_room_key() else {
                     return Update::none();
                 };
@@ -1222,21 +1440,26 @@ impl MapEditorWindow {
                     return Update::none();
                 }
                 let value = self.inspector.new_property_value.clone();
-                let Some(room_key) = self.selected_room_key() else {
-                    return Update::none();
+                let command = if let Some(target) = self.selected_source_room() {
+                    source_rooms::set_property(
+                        &self.mapper.get_current_atlas(),
+                        target,
+                        name.clone(),
+                        value.clone(),
+                    )
+                } else {
+                    let Some(room_key) = self.selected_room_key() else {
+                        return Update::none();
+                    };
+                    commands::set_room_property(
+                        &self.mapper.get_current_atlas(),
+                        room_key,
+                        name.clone(),
+                        value.clone(),
+                    )
                 };
-                let command = commands::set_room_property(
-                    &self.mapper.get_current_atlas(),
-                    room_key,
-                    name.clone(),
-                    value.clone(),
-                );
                 let update = self.push_command(command);
-                self.inspector.properties.push(PropertyRow {
-                    name,
-                    value,
-                    is_secret: false,
-                });
+                self.inspector.properties.push(PropertyRow { name, value });
                 self.inspector
                     .properties
                     .sort_by(|a, b| a.name.cmp(&b.name));
@@ -1244,53 +1467,42 @@ impl MapEditorWindow {
                 self.inspector.new_property_value.clear();
                 update
             }
-            Message::RoomTagInputChanged(value) => {
-                self.inspector.new_tag = value;
+            Message::TagInputChanged(value) => {
+                if self.inspector.tag_input.is_empty() {
+                    self.inspector.tag_place = self.tag_input_place();
+                }
+                self.inspector.tag_input = value;
                 Update::none()
             }
-            Message::RoomTagAdded(tag) => {
-                let Some(room_key) = self.selected_room_key() else {
-                    return Update::none();
-                };
-                // `add_room_tag` normalizes + dedupes; it returns None (no command)
-                // when the tag is empty or already present.
-                let Some(command) =
-                    commands::add_room_tag(&self.mapper.get_current_atlas(), room_key, tag.clone())
-                else {
-                    // Clear the input even on a no-op add of the typed buffer.
-                    if smudgy_cloud::mapper::normalize_tag(&tag)
-                        == smudgy_cloud::mapper::normalize_tag(&self.inspector.new_tag)
-                    {
-                        self.inspector.new_tag.clear();
-                    }
-                    return Update::none();
-                };
-                let update = self.push_command(Some(command));
-                let normalized = smudgy_cloud::mapper::normalize_tag(&tag);
-                if !self.inspector.tags.iter().any(|t| *t == normalized) {
-                    self.inspector.tags.push(normalized.clone());
-                    self.inspector.tags.sort();
-                }
-                if smudgy_cloud::mapper::normalize_tag(&self.inspector.new_tag) == normalized {
-                    self.inspector.new_tag.clear();
-                }
-                update
+            Message::TagSubmitted if self.tag_input_place() != self.inspector.tag_place => {
+                // Typed for a place it would no longer reach.
+                self.inspector.clear_tag_input();
+                Update::none()
             }
-            Message::RoomTagRemoved(tag) => {
-                let Some(room_key) = self.selected_room_key() else {
-                    return Update::none();
-                };
-                let Some(command) = commands::remove_room_tag(
-                    &self.mapper.get_current_atlas(),
-                    room_key,
-                    tag.clone(),
-                ) else {
-                    return Update::none();
-                };
-                let update = self.push_command(Some(command));
-                let normalized = smudgy_cloud::mapper::normalize_tag(&tag);
-                self.inspector.tags.retain(|t| *t != normalized);
-                update
+            Message::TagSubmitted => match super::tags::typed(&self.inspector.tag_input) {
+                super::tags::Typed::Tag(tag) => self.add_tag(&tag),
+                // Too long: the message under the input says so.
+                super::tags::Typed::Empty | super::tags::Typed::TooLong => Update::none(),
+            },
+            Message::TagSuggestionPicked(tag) => self.add_tag(&tag),
+            Message::TagRemoved(place, tag) => self.remove_tag(place, &tag),
+            Message::TagCompleted(focused) => {
+                let first = self
+                    .tag_suggestions()
+                    .into_iter()
+                    .next()
+                    .map(|suggestion| suggestion.tag);
+                match first {
+                    Some(tag) if focused => {
+                        self.inspector.tag_place = self.tag_input_place();
+                        self.inspector.tag_input = tag;
+                        Update::with_task(iced::widget::operation::move_cursor_to_end(
+                            super::tags::input_id(self.window_id),
+                        ))
+                    }
+                    // Not completing a tag: Tab moves on.
+                    _ => Update::with_task(focus_step(self.window_id, false)),
+                }
             }
             Message::BulkColorChanged(value) => {
                 self.inspector.bulk_color = value;
@@ -1380,167 +1592,16 @@ impl MapEditorWindow {
                 self.inspector.new_area_property_value = value;
                 Update::none()
             }
-            Message::ExitFromDirectionChanged(index, direction) => {
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.from_direction = direction;
-                }
-                self.commit_exit_direction_field(index, FieldId::FromDirection, direction, false)
-            }
-            Message::ExitToAreaChanged(index, choice) => {
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.to_area = Some(choice.id);
-                }
-                self.commit_exit_field(index, FieldId::Destination, move |updates| {
-                    updates.to_area_id = Some(choice.id);
-                })
-            }
-            Message::ExitToRoomChanged(index, value) => {
-                let parsed = if value.trim().is_empty() {
-                    Some(None)
-                } else {
-                    value
-                        .trim()
-                        .parse::<i32>()
-                        .ok()
-                        .map(|n| Some(RoomNumber(n)))
-                };
-                // A room number with no area picked means the current area
-                // — the dropdown hints this with the area's name as its
-                // placeholder, and committing makes it explicit.
-                let implied_area = match (&parsed, self.inspector.exits.get(index)) {
-                    (Some(Some(_)), Some(row)) if row.to_area.is_none() => self.editor.area_id(),
-                    _ => None,
-                };
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.to_room = value;
-                    if parsed == Some(None) {
-                        row.to_area = None;
-                        row.to_direction = None;
-                    } else if implied_area.is_some() {
-                        row.to_area = implied_area;
-                    }
-                }
-                match parsed {
-                    Some(to_room_number) => {
-                        self.commit_exit_field(index, FieldId::Destination, move |updates| {
-                            updates.to_room_number = to_room_number;
-                            if let Some(area_id) = implied_area {
-                                updates.to_area_id = Some(area_id);
-                            }
-                            if to_room_number.is_none() {
-                                // The wire contract can only null a
-                                // destination as a whole (`clear_to`); an
-                                // update can never blank just the room. An
-                                // emptied room field therefore unlinks the
-                                // exit entirely (edit_exit_field turns this
-                                // into clear_to on the way out).
-                                updates.to_area_id = None;
-                                updates.to_direction = None;
-                            }
-                        })
-                    }
-                    None => Update::none(),
-                }
-            }
-            Message::ExitToDirectionChanged(index, direction) => {
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.to_direction = Some(direction);
-                }
-                self.commit_exit_direction_field(index, FieldId::Destination, direction, true)
-            }
-            Message::ExitPathChanged(index, value) => {
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.path = value.clone();
-                }
-                self.commit_exit_field(index, FieldId::Path, move |updates| {
-                    updates.path = if value.is_empty() { None } else { Some(value) };
-                })
-            }
-            Message::ExitCommandChanged(index, value) => {
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.command = value.clone();
-                }
-                self.commit_exit_field(index, FieldId::Command, move |updates| {
-                    updates.command = if value.is_empty() { None } else { Some(value) };
-                })
-            }
-            Message::ExitWeightChanged(index, value) => {
-                let parsed = value.parse::<f32>().ok();
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.weight = value;
-                }
-                match parsed {
-                    Some(weight) => {
-                        self.commit_exit_field(index, FieldId::Weight, move |updates| {
-                            updates.weight = Some(weight);
-                        })
-                    }
-                    None => Update::none(),
-                }
-            }
-            Message::ExitHiddenToggled(index, hidden) => {
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.is_hidden = hidden;
-                }
-                self.commit_exit_field(index, FieldId::Flags, move |updates| {
-                    updates.is_hidden = Some(hidden);
-                })
-            }
-            Message::ExitClosedToggled(index, closed) => {
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.is_closed = closed;
-                }
-                self.commit_exit_field(index, FieldId::Flags, move |updates| {
-                    updates.is_closed = Some(closed);
-                })
-            }
-            Message::ExitLockedToggled(index, locked) => {
-                if let Some(row) = self.inspector.exits.get_mut(index) {
-                    row.is_locked = locked;
-                }
-                self.commit_exit_field(index, FieldId::Flags, move |updates| {
-                    updates.is_locked = Some(locked);
-                })
-            }
-            Message::ExitDeleted(index) => {
-                if index >= self.inspector.exits.len() {
-                    return Update::none();
-                }
-                // Exits to a redacted destination are not deletable one at a
-                // time: undo could only recreate them dangling, destroying
-                // the owner's cross-area link. The view hides the button;
-                // commands::delete_exit refuses too.
-                if self.inspector.exits[index].to_unknown {
-                    return Update::none();
-                }
-                let row = self.inspector.exits.remove(index);
-                let room_key = self
-                    .selected_room_key()
-                    .or_else(|| Some(RoomKey::new(self.editor.area_id()?, row.from_room)));
-                let Some(room_key) = room_key else {
-                    return Update::none();
-                };
-                let command =
-                    commands::delete_exit(&self.mapper.get_current_atlas(), room_key, row.id);
-                self.push_command(command)
-            }
-            Message::AddExit => {
-                let Some(room_key) = self.selected_room_key() else {
-                    return Update::none();
-                };
-                // The row appears via the resync that runs when the async
-                // create completes.
-                self.push_command(Some(commands::add_default_exit(
-                    room_key.area_id,
-                    room_key.room_number,
-                )))
-            }
             Message::ConnectionRoutingChanged(routing) => {
                 let Some((area_id, connection_id)) = self.selected_connection_id() else {
                     return Update::none();
                 };
                 let atlas = self.mapper.get_current_atlas();
-                let Some(area) = atlas.get_area(&area_id) else {
+                let Some(map) = atlas.get_area(&area_id) else {
+                    return Update::none();
+                };
+                // A Secret's link is read from its Secret's document.
+                let Some((area, _)) = map.connection_document(connection_id) else {
                     return Update::none();
                 };
                 let Some(connection) = area.get_connection(connection_id) else {
@@ -1567,7 +1628,11 @@ impl MapEditorWindow {
                     return Update::none();
                 };
                 let atlas = self.mapper.get_current_atlas();
-                let Some(area) = atlas.get_area(&area_id) else {
+                let Some(map) = atlas.get_area(&area_id) else {
+                    return Update::none();
+                };
+                // A Secret's link is read from its Secret's document.
+                let Some((area, _)) = map.connection_document(connection_id) else {
                     return Update::none();
                 };
                 let Some(connection) = area.get_connection(connection_id) else {
@@ -1588,7 +1653,7 @@ impl MapEditorWindow {
                     ) else {
                         self.editor_notice = Some((
                             std::time::Instant::now(),
-                            "That route has too many points to normalize as Orthogonal".to_string(),
+                            crate::i18n::t!("inspector-route-too-many-points"),
                         ));
                         return Update::none();
                     };
@@ -1618,7 +1683,6 @@ impl MapEditorWindow {
             }
             Message::ConnectionDashChanged(dash) => {
                 self.inspector.connection.dash = dash;
-                self.inspector.dash_panel_open = false;
                 self.commit_connection_field(
                     FieldId::DashStyle,
                     ConnectionUpdates {
@@ -1646,7 +1710,6 @@ impl MapEditorWindow {
                 )
             }
             Message::ConnectionThicknessPicked(thickness) => {
-                self.inspector.thickness_panel_open = false;
                 if !smudgy_cloud::THICKNESS_RANGE.contains(&thickness) {
                     return Update::none();
                 }
@@ -1660,35 +1723,16 @@ impl MapEditorWindow {
                     "Change connection thickness",
                 )
             }
-            Message::ThicknessPanelToggled => {
-                self.inspector.thickness_panel_open = !self.inspector.thickness_panel_open;
-                self.inspector.dash_panel_open = false;
-                Update::none()
-            }
-            Message::DashPanelToggled => {
-                self.inspector.dash_panel_open = !self.inspector.dash_panel_open;
-                self.inspector.thickness_panel_open = false;
-                Update::none()
-            }
-            Message::ConnectionAddReturn => {
-                let Some((area_id, connection_id)) = self.selected_connection_id() else {
-                    return Update::none();
-                };
-                let command = commands::add_return_exit(
-                    &self.mapper.get_current_atlas(),
-                    area_id,
-                    connection_id,
-                );
-                let update = self.push_command(command);
-                self.inspector.resync(&self.mapper, &self.editor);
-                update
-            }
             Message::ConnectionEndpointSideChanged(endpoint_b, side) => {
                 let Some((area_id, connection_id)) = self.selected_connection_id() else {
                     return Update::none();
                 };
                 let atlas = self.mapper.get_current_atlas();
-                let Some(area) = atlas.get_area(&area_id) else {
+                let Some(map) = atlas.get_area(&area_id) else {
+                    return Update::none();
+                };
+                // A Secret's link is read from its Secret's document.
+                let Some((area, _)) = map.connection_document(connection_id) else {
                     return Update::none();
                 };
                 let Some(connection) = area.get_connection(connection_id) else {
@@ -1709,7 +1753,7 @@ impl MapEditorWindow {
                     self.inspector.connection.endpoint_a_side = side;
                     endpoint
                 };
-                let Some(updates) = endpoint_updates(&area, connection_id, endpoint, endpoint_b)
+                let Some(updates) = endpoint_updates(area, connection_id, endpoint, endpoint_b)
                 else {
                     return Update::none();
                 };
@@ -1731,7 +1775,11 @@ impl MapEditorWindow {
                     return Update::none();
                 };
                 let atlas = self.mapper.get_current_atlas();
-                let Some(area) = atlas.get_area(&area_id) else {
+                let Some(map) = atlas.get_area(&area_id) else {
+                    return Update::none();
+                };
+                // A Secret's link is read from its Secret's document.
+                let Some((area, _)) = map.connection_document(connection_id) else {
                     return Update::none();
                 };
                 let Some(connection) = area.get_connection(connection_id) else {
@@ -1750,7 +1798,7 @@ impl MapEditorWindow {
                     endpoint.port_mode = smudgy_cloud::PortMode::Manual;
                     endpoint
                 };
-                let Some(updates) = endpoint_updates(&area, connection_id, endpoint, endpoint_b)
+                let Some(updates) = endpoint_updates(area, connection_id, endpoint, endpoint_b)
                 else {
                     return Update::none();
                 };
@@ -1761,7 +1809,11 @@ impl MapEditorWindow {
                     return Update::none();
                 };
                 let atlas = self.mapper.get_current_atlas();
-                let Some(area) = atlas.get_area(&area_id) else {
+                let Some(map) = atlas.get_area(&area_id) else {
+                    return Update::none();
+                };
+                // A Secret's link is read from its Secret's document.
+                let Some((area, _)) = map.connection_document(connection_id) else {
                     return Update::none();
                 };
                 let Some(connection) = area.get_connection(connection_id) else {
@@ -1775,25 +1827,26 @@ impl MapEditorWindow {
                     return Update::none();
                 };
                 let direction = area
-                    .get_rooms()
-                    .iter()
+                    .document_rooms()
                     .find_map(|room| {
                         room.get_exits()
                             .iter()
                             .find(|exit| {
                                 exit.connection_id == connection_id
-                                    && room.get_room_number() == endpoint.room_number
+                                    && room.address() == endpoint.address()
                             })
                             .map(|exit| exit.from_direction)
                     })
                     .or_else(|| {
-                        area.get_rooms().iter().find_map(|room| {
+                        area.document_rooms().find_map(|room| {
                             room.get_exits()
                                 .iter()
                                 .find(|exit| {
                                     exit.connection_id == connection_id
-                                        && exit.to_area_id == Some(area_id)
-                                        && exit.to_room_number == Some(endpoint.room_number)
+                                        && exit.destination_address().is_some_and(|destination| {
+                                            destination.map == area_id
+                                                && destination.room == endpoint.address()
+                                        })
                                 })
                                 .and_then(|exit| exit.to_direction)
                         })
@@ -1808,7 +1861,7 @@ impl MapEditorWindow {
                 endpoint.side = side;
                 endpoint.port_offset = offset;
                 endpoint.port_mode = smudgy_cloud::PortMode::AutoPinned;
-                let Some(updates) = endpoint_updates(&area, connection_id, endpoint, endpoint_b)
+                let Some(updates) = endpoint_updates(area, connection_id, endpoint, endpoint_b)
                 else {
                     return Update::none();
                 };
@@ -1825,7 +1878,11 @@ impl MapEditorWindow {
                     return Update::none();
                 };
                 let atlas = self.mapper.get_current_atlas();
-                let Some(area) = atlas.get_area(&area_id) else {
+                let Some(map) = atlas.get_area(&area_id) else {
+                    return Update::none();
+                };
+                // A Secret's link is read from its Secret's document.
+                let Some((area, _)) = map.connection_document(connection_id) else {
                     return Update::none();
                 };
                 let Some(connection) = area.get_connection(connection_id) else {
@@ -1838,33 +1895,24 @@ impl MapEditorWindow {
                 }) else {
                     return Update::none();
                 };
-                let secret = area
-                    .get_room_connections()
-                    .iter()
-                    .find(|rendered| rendered.connection_id == connection_id)
-                    .is_some_and(|rendered| rendered.is_secret);
-                let edits =
-                    redistribute_port_updates(&area, endpoint.room_number, endpoint.side, secret);
+                let edits = redistribute_port_updates(area, endpoint.address(), endpoint.side);
+                // The place's own write access gates the push.
                 if edits.is_empty() {
                     return Update::none();
                 }
-                let preview = edits
-                    .iter()
-                    .filter_map(|(id, update)| {
-                        update
-                            .endpoint_a
-                            .or(update.endpoint_b)
-                            .map(|endpoint| (*id, endpoint.port_offset))
-                    })
-                    .collect();
-                self.modal = Some(super::modals::Modal::ConfirmRedistributePorts {
+                let shown = Document::of_connection(&map, connection_id)
+                    .map_or(endpoint.room_number, |document| {
+                        document.shown_room(endpoint.address()).0
+                    });
+                let command = super::commands::edit_connections(
+                    &atlas,
                     area_id,
-                    room_number: endpoint.room_number,
-                    side: endpoint.side,
-                    secret,
-                    preview,
-                });
-                Update::none()
+                    edits,
+                    format!("Redistribute room {shown} {} ports", endpoint.side),
+                );
+                let update = self.push_command(command);
+                self.inspector.resync(&self.mapper, &self.editor);
+                update
             }
             Message::ConnectionClearRoute => {
                 let routing = self
@@ -1874,7 +1922,7 @@ impl MapEditorWindow {
                             .get_current_atlas()
                             .get_area(&area_id)
                             .and_then(|area| {
-                                area.get_connection(connection_id).map(|connection| {
+                                area.find_connection(connection_id).map(|(_, connection)| {
                                     matches!(
                                         connection.routing,
                                         ConnectionRouting::Manual | ConnectionRouting::Automatic
@@ -1914,27 +1962,6 @@ impl MapEditorWindow {
                 },
                 "Reset connection appearance",
             ),
-            Message::ConnectionDelete => self.delete_selection(),
-            Message::ConnectionUnlink(index) => {
-                let Some((area_id, connection_id)) = self.selected_connection_id() else {
-                    return Update::none();
-                };
-                let Some(exit_id) = self.inspector.exits.get(index).map(|row| row.id) else {
-                    return Update::none();
-                };
-                self.push_command(Some(commands::unlink_exit(area_id, exit_id, connection_id)))
-            }
-            Message::ConnectionPair(merge_connection_id) => {
-                let Some((area_id, keep_connection_id)) = self.selected_connection_id() else {
-                    return Update::none();
-                };
-                self.push_command(commands::pair_connections(
-                    &self.mapper.get_current_atlas(),
-                    area_id,
-                    keep_connection_id,
-                    merge_connection_id,
-                ))
-            }
             Message::LabelTextChanged(value) => {
                 self.inspector.label.text = value.clone();
                 self.commit_label_field(
@@ -2199,11 +2226,9 @@ impl MapEditorWindow {
                     value.clone(),
                 );
                 let update = self.push_command(command);
-                self.inspector.area_properties.push(PropertyRow {
-                    name,
-                    value,
-                    is_secret: false,
-                });
+                self.inspector
+                    .area_properties
+                    .push(PropertyRow { name, value });
                 self.inspector
                     .area_properties
                     .sort_by(|a, b| a.name.cmp(&b.name));
@@ -2211,282 +2236,7 @@ impl MapEditorWindow {
                 self.inspector.new_area_property_value.clear();
                 update
             }
-            Message::RoomSecretToggled(secret) => {
-                let Some(room_key) = self.selected_room_key() else {
-                    return Update::none();
-                };
-                self.inspector.is_secret = secret;
-                let mut request = empty_secret_marks_request(secret);
-                request.rooms.push(room_key.room_number.0);
-                self.send_secret_marks(room_key.area_id, request, false)
-            }
-            Message::ExitSecretToggled(index, secret) => {
-                let Some(room_key) = self.selected_room_key() else {
-                    return Update::none();
-                };
-                let Some(row) = self.inspector.exits.get_mut(index) else {
-                    return Update::none();
-                };
-                row.is_secret = secret;
-                let exit_id = row.id;
-                let mut request = empty_secret_marks_request(secret);
-                request.exits.push(exit_id);
-                self.send_secret_marks(room_key.area_id, request, false)
-            }
-            Message::LabelSecretToggled(secret) => {
-                let Some((area_id, label_id)) = self.selected_label_id() else {
-                    return Update::none();
-                };
-                self.inspector.is_secret = secret;
-                let mut request = empty_secret_marks_request(secret);
-                request.labels.push(label_id);
-                self.send_secret_marks(area_id, request, false)
-            }
-            Message::ShapeSecretToggled(secret) => {
-                let Some((area_id, shape_id)) = self.selected_shape_id() else {
-                    return Update::none();
-                };
-                self.inspector.is_secret = secret;
-                let mut request = empty_secret_marks_request(secret);
-                request.shapes.push(shape_id);
-                self.send_secret_marks(area_id, request, false)
-            }
-            Message::RoomPropertySecretToggled(index, secret) => {
-                let Some(room_key) = self.selected_room_key() else {
-                    return Update::none();
-                };
-                let Some(row) = self.inspector.properties.get_mut(index) else {
-                    return Update::none();
-                };
-                row.is_secret = secret;
-                let name = row.name.clone();
-                let mut request = empty_secret_marks_request(secret);
-                request.room_properties.push(RoomPropertyRef {
-                    room_number: room_key.room_number.0,
-                    name,
-                });
-                self.send_secret_marks(room_key.area_id, request, false)
-            }
-            Message::AreaPropertySecretToggled(index, secret) => {
-                let Some(area_id) = self.editor.area_id() else {
-                    return Update::none();
-                };
-                let Some(row) = self.inspector.area_properties.get_mut(index) else {
-                    return Update::none();
-                };
-                row.is_secret = secret;
-                let name = row.name.clone();
-                let mut request = empty_secret_marks_request(secret);
-                request.area_properties.push(name);
-                self.send_secret_marks(area_id, request, false)
-            }
-            Message::BulkSecretMark(secret) => {
-                let Some(area_id) = self.editor.area_id() else {
-                    return Update::none();
-                };
-                // Only entities directly selected; exits of selected rooms
-                // are deliberately not implied.
-                let mut request = empty_secret_marks_request(secret);
-                request.rooms = self.editor.selection().rooms().map(|n| n.0).collect();
-                request.labels = self.editor.selection().labels().collect();
-                request.shapes = self.editor.selection().shapes().collect();
-                if request.rooms.is_empty()
-                    && request.labels.is_empty()
-                    && request.shapes.is_empty()
-                {
-                    return Update::none();
-                }
-                self.send_secret_marks(area_id, request, true)
-            }
-            Message::SecretMarksCompleted {
-                area_id,
-                request,
-                bulk,
-                result,
-            } => {
-                match result {
-                    Ok(counts) => {
-                        // The server bumped the area rev; pull it promptly.
-                        self.mapper.sync_now();
-                        if bulk {
-                            self.inspector.secret_notice =
-                                Some(format_marks_notice(counts, request.secret));
-                        }
-                    }
-                    Err(error) => {
-                        // Roll the optimistic flags back.
-                        apply_marks_locally(&self.mapper, area_id, &request, !request.secret);
-                        self.refresh_seen_rev();
-                        self.inspector.resync(&self.mapper, &self.editor);
-                        self.inspector.secret_error = Some(match error {
-                            // The server never distinguishes "missing" from
-                            // "not allowed"; neither do we.
-                            CloudError::NotFoundOrNoAccess => {
-                                crate::i18n::t!("inspector-secrets-not-editable")
-                            }
-                            other => display_error(&other),
-                        });
-                    }
-                }
-                Update::none()
-            }
         }
-    }
-}
-
-/// An empty (no-op) secret-marks request body.
-pub(super) fn empty_secret_marks_request(secret: bool) -> SecretMarksRequest {
-    SecretMarksRequest {
-        secret,
-        rooms: Vec::new(),
-        exits: Vec::new(),
-        labels: Vec::new(),
-        shapes: Vec::new(),
-        room_properties: Vec::new(),
-        area_properties: Vec::new(),
-    }
-}
-
-/// Whether a secret-marks request targets no entities at all.
-fn secret_marks_request_is_empty(request: &SecretMarksRequest) -> bool {
-    request.rooms.is_empty()
-        && request.exits.is_empty()
-        && request.labels.is_empty()
-        && request.shapes.is_empty()
-        && request.room_properties.is_empty()
-        && request.area_properties.is_empty()
-}
-
-/// Drops entities whose cached flag already equals the request's target, so
-/// the request lists exactly the entities the operation will change.
-/// Entities missing from the cache are kept: their current state can't be
-/// proven, and both the optimistic apply and a revert no-op on unknown ids.
-fn retain_changing_marks(mapper: &Mapper, area_id: AreaId, request: &mut SecretMarksRequest) {
-    let atlas = mapper.get_current_atlas();
-    let Some(area) = atlas.get_area(&area_id) else {
-        return;
-    };
-    let target = request.secret;
-
-    request.rooms.retain(|number| {
-        area.get_room(&RoomNumber(*number))
-            .is_none_or(|room| room.is_secret() != target)
-    });
-    request.exits.retain(|exit_id| {
-        area.get_rooms()
-            .iter()
-            .flat_map(|room| room.get_exits())
-            .find(|exit| exit.id == *exit_id)
-            .is_none_or(|exit| exit.is_secret != target)
-    });
-    request.labels.retain(|label_id| {
-        area.get_label(label_id)
-            .is_none_or(|label| label.is_secret != target)
-    });
-    request.shapes.retain(|shape_id| {
-        area.get_shape(shape_id)
-            .is_none_or(|shape| shape.is_secret != target)
-    });
-    request.room_properties.retain(|property| {
-        area.get_room(&RoomNumber(property.room_number))
-            .is_none_or(|room| {
-                room.properties_with_secrecy()
-                    .find(|(name, _)| *name == property.name)
-                    .is_none_or(|(_, entry)| entry.is_secret != target)
-            })
-    });
-    request.area_properties.retain(|name| {
-        area.properties_with_secrecy()
-            .find(|(n, _)| *n == name.as_str())
-            .is_none_or(|(_, entry)| entry.is_secret != target)
-    });
-}
-
-/// Mirrors a secret-marks request into the local cache with `secret` as the
-/// flag value (pass the opposite of the request's own value to revert an
-/// optimistic application).
-pub(super) fn apply_marks_locally(
-    mapper: &Mapper,
-    area_id: AreaId,
-    request: &SecretMarksRequest,
-    secret: bool,
-) {
-    let rooms: Vec<RoomNumber> = request.rooms.iter().copied().map(RoomNumber).collect();
-    let room_properties: Vec<(RoomNumber, String)> = request
-        .room_properties
-        .iter()
-        .map(|property| (RoomNumber(property.room_number), property.name.clone()))
-        .collect();
-    mapper.apply_local_secret_marks(
-        area_id,
-        secret,
-        &rooms,
-        &request.exits,
-        &request.labels,
-        &request.shapes,
-        &room_properties,
-        &request.area_properties,
-    );
-}
-
-/// "3 rooms, 1 label marked secret" — per-type counts of rows the server
-/// actually changed.
-fn format_marks_notice(counts: SecretMarksResult, secret: bool) -> String {
-    fn push_part(parts: &mut Vec<String>, count: u64, singular: &str, plural: &str) {
-        if count > 0 {
-            let key = if count == 1 { singular } else { plural };
-            let mut args = smudgy_i18n::FluentArgs::new();
-            args.set("count", count);
-            parts.push(crate::i18n::translate_with(key, &args));
-        }
-    }
-
-    let mut parts = Vec::new();
-    push_part(
-        &mut parts,
-        counts.rooms,
-        "inspector-count-room-one",
-        "inspector-count-rooms",
-    );
-    push_part(
-        &mut parts,
-        counts.exits,
-        "inspector-count-exit-one",
-        "inspector-count-exits",
-    );
-    push_part(
-        &mut parts,
-        counts.labels,
-        "inspector-count-label-one",
-        "inspector-count-labels",
-    );
-    push_part(
-        &mut parts,
-        counts.shapes,
-        "inspector-count-shape-one",
-        "inspector-count-shapes",
-    );
-    push_part(
-        &mut parts,
-        counts.room_properties,
-        "inspector-count-room-property-one",
-        "inspector-count-room-properties",
-    );
-    push_part(
-        &mut parts,
-        counts.area_properties,
-        "inspector-count-area-property-one",
-        "inspector-count-area-properties",
-    );
-
-    if parts.is_empty() {
-        return crate::i18n::t!("inspector-nothing-changed");
-    }
-    let items = parts.join(", ");
-    if secret {
-        crate::i18n::t!("inspector-marked-secret", "items" => items)
-    } else {
-        crate::i18n::t!("inspector-unmarked", "items" => items)
     }
 }
 
@@ -2496,75 +2246,39 @@ fn heading<'a>(content: String) -> iced::widget::Text<'a, crate::Theme> {
     text(content).size(16)
 }
 
-/// A heading with a subtle lock glyph appended when the entity is secret.
-fn secret_aware_heading<'a>(content: String, is_secret: bool) -> ThemedElement<'a, super::Message> {
-    let mut heading_row = row![heading(content)].spacing(6).align_y(Vertical::Center);
-    if is_secret {
-        heading_row = heading_row.push(
-            text(super::ICON_LOCK_FILL)
-                .font(fonts::BOOTSTRAP_ICONS)
-                .size(13.0)
-                .style(|theme: &crate::Theme| iced::widget::text::Style {
-                    color: Some(theme.styles.text.normal.scale_alpha(0.6)),
-                }),
-        );
-    }
-    heading_row.into()
-}
-
-/// The pending secrecy error or bulk-marks notice, when present.
-fn secrecy_status<'a>(state: &State) -> Option<ThemedElement<'a, super::Message>> {
-    if let Some(error) = &state.secret_error {
-        Some(
-            text(error.clone())
-                .size(12)
-                .style(builtins::text::danger)
-                .into(),
-        )
-    } else {
-        state.secret_notice.as_ref().map(|notice| {
-            text(notice.clone())
-                .size(12)
-                .style(|theme: &crate::Theme| iced::widget::text::Style {
-                    color: Some(theme.styles.text.normal.scale_alpha(0.7)),
-                })
-                .into()
-        })
-    }
-}
-
-/// A small lock icon button toggling one property row's secrecy.
-fn lock_toggle<'a>(is_secret: bool, on_press: super::Message) -> ThemedElement<'a, super::Message> {
-    tooltip(
-        button(
-            text(if is_secret {
-                super::ICON_LOCK_FILL
-            } else {
-                super::ICON_UNLOCK
-            })
-            .font(fonts::BOOTSTRAP_ICONS)
-            .size(14.0)
-            .style(move |theme: &crate::Theme| iced::widget::text::Style {
-                color: Some(if is_secret {
-                    theme.styles.text.normal
-                } else {
-                    theme.styles.text.normal.scale_alpha(0.35)
-                }),
-            }),
-        )
-        .style(builtins::button::toolbar)
-        .on_press(on_press),
-        if is_secret {
-            "Unmark secret"
-        } else {
-            "Mark secret"
-        },
-        tooltip::Position::Bottom,
-    )
+/// A room's heading. A map room is "Room #3"; a room of another place names
+/// the place, after a dot in its color: "● Bookcase #1".
+fn room_heading(
+    window: &MapEditorWindow,
+    room_number: smudgy_cloud::RoomNumber,
+    source: Option<smudgy_cloud::SourceId>,
+) -> ThemedElement<'_, super::Message> {
+    let atlas = window.mapper.get_current_atlas();
+    let area = window.editor.area_id().and_then(|id| atlas.get_area(&id));
+    let (Some(source), Some(area)) = (source.filter(|source| !source.is_map()), area) else {
+        return heading(crate::i18n::t!(
+            "inspector-room-heading",
+            "number" => room_number.to_string()
+        ))
+        .into();
+    };
+    let color = smudgy_map_widget::sources::source_color(&area, source);
+    row![
+        text("\u{25CF}")
+            .size(16)
+            .style(move |_theme: &crate::Theme| text::Style { color }),
+        heading(crate::i18n::t!(
+            "inspector-place-room-heading",
+            "place" => super::secrets::place_name(&area, source),
+            "number" => room_number.to_string()
+        )),
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center)
     .into()
 }
 
-fn field_label<'a>(label: impl Into<String>) -> iced::widget::Text<'a, crate::Theme> {
+pub(super) fn field_label<'a>(label: impl Into<String>) -> iced::widget::Text<'a, crate::Theme> {
     text(label.into())
         .size(11)
         .style(|theme: &crate::Theme| iced::widget::text::Style {
@@ -2686,9 +2400,6 @@ struct PropertyHooks {
     on_new_name: fn(String) -> Message,
     on_new_value: fn(String) -> Message,
     on_add: Message,
-    /// Per-row secrecy lock toggle; `None` hides all secrecy UI (the viewer
-    /// isn't cleared for secrets).
-    on_secret_toggle: Option<fn(usize, bool) -> Message>,
 }
 
 /// The shared key/value property list editor (rooms and areas).
@@ -2697,6 +2408,9 @@ fn properties_section<'a>(
     new_name: &'a str,
     new_value: &'a str,
     hooks: &PropertyHooks,
+    window: &'a MapEditorWindow,
+    from: smudgy_cloud::SourceId,
+    anchor: Option<(smudgy_cloud::SourceId, smudgy_cloud::RoomNumber)>,
 ) -> ThemedElement<'a, super::Message> {
     let mut section = Column::new().spacing(4);
     section = section.push(field_label(crate::i18n::t!("inspector-properties")));
@@ -2718,18 +2432,21 @@ fn properties_section<'a>(
             .size(13)
             .on_input(move |value| { super::Message::Inspector(on_value_change(index, value)) })
             .width(Length::FillPortion(3)),
+            trash_button(super::Message::Inspector(on_delete(index))),
         ]
         .spacing(4)
         .align_y(Vertical::Center);
-
-        if let Some(on_secret) = hooks.on_secret_toggle {
-            widgets = widgets.push(lock_toggle(
-                property_row.is_secret,
-                super::Message::Inspector(on_secret(index, !property_row.is_secret)),
-            ));
+        if let Some(move_to) = super::moves::property_move(
+            window,
+            from,
+            smudgy_cloud::mutation::PropertyAddress {
+                name: property_row.name.clone(),
+                room_number: anchor.map(|(_, number)| number),
+                room_source: anchor.map_or(smudgy_cloud::SourceId::Map, |(source, _)| source),
+            },
+        ) {
+            widgets = widgets.push(move_to);
         }
-
-        widgets = widgets.push(trash_button(super::Message::Inspector(on_delete(index))));
         section = section.push(widgets);
     }
 
@@ -2755,83 +2472,287 @@ fn properties_section<'a>(
     section.into()
 }
 
-/// The room-tags editor: current tags as removable chips, an input to add a new
-/// tag (normalized to UPPERCASE on commit), and one-click chips for tags already
-/// in use elsewhere in the area. A validated set, not free-text editing.
-fn tags_section<'a>(
-    tags: &'a [String],
-    known_tags: &'a [String],
-    new_tag: &'a str,
-) -> ThemedElement<'a, super::Message> {
-    let mut section = Column::new().spacing(4);
-    section = section.push(field_label(crate::i18n::t!("inspector-tags")));
-
-    if !tags.is_empty() {
-        let chips: Vec<ThemedElement<'a, super::Message>> = tags
-            .iter()
-            .map(|tag| {
-                let tag = tag.clone();
-                button(text(format!("{tag}  \u{00d7}")).size(12))
-                    .style(builtins::button::secondary)
-                    .on_press(super::Message::Inspector(Message::RoomTagRemoved(tag)))
-                    .into()
-            })
-            .collect();
-        section = section.push(wrap_row(chips).spacing(6.0, 6.0));
+/// "● Name" (or "Map", with no dot) in muted ink: the place a run of chips,
+/// a suggestion or the tag input's destination belongs to.
+fn place_label<'a>(area: &AreaCache, place: SourceId) -> ThemedElement<'a, super::Message> {
+    let mut label = row![].spacing(4).align_y(Vertical::Center);
+    if !place.is_map() {
+        label = label.push(super::secrets::dot(
+            smudgy_map_widget::sources::source_color(area, place),
+        ));
     }
-
-    section = section.push(
-        row![
-            text_input(crate::i18n::ts!("inspector-add-tag-placeholder"), new_tag)
-                .size(13)
-                .on_input(|value| super::Message::Inspector(Message::RoomTagInputChanged(value)))
-                .on_submit(super::Message::Inspector(Message::RoomTagAdded(
-                    new_tag.to_string()
-                )))
-                .width(Length::Fill),
-            button(text(crate::i18n::t!("action-add")).size(13))
-                .style(builtins::button::secondary)
-                .on_press(super::Message::Inspector(Message::RoomTagAdded(
-                    new_tag.to_string()
-                ))),
-        ]
-        .spacing(4)
-        .align_y(Vertical::Center),
-    );
-
-    // Suggestions: tags used elsewhere in the area but not on this room.
-    let suggestions: Vec<ThemedElement<'a, super::Message>> = known_tags
-        .iter()
-        .filter(|t| !tags.iter().any(|cur| cur == *t))
-        .map(|tag| {
-            let tag = tag.clone();
-            button(text(format!("+ {tag}")).size(11))
-                .style(builtins::button::secondary)
-                .on_press(super::Message::Inspector(Message::RoomTagAdded(tag)))
-                .into()
-        })
-        .collect();
-    if !suggestions.is_empty() {
-        section = section
-            .push(text(crate::i18n::t!("inspector-in-this-area")).size(11))
-            .push(wrap_row(suggestions).spacing(6.0, 4.0));
-    }
-
-    section.into()
+    label
+        .push(
+            text(super::secrets::place_name(area, place))
+                .size(12)
+                .style(muted_text),
+        )
+        .into()
 }
 
+/// One tag chip: the tag, with its count over the selection when several
+/// rooms are selected, and × where the viewer may remove from its place.
+fn tag_chip<'a>(
+    place: SourceId,
+    tag: &str,
+    count: Option<(usize, usize)>,
+    removable: bool,
+) -> ThemedElement<'a, super::Message> {
+    let mut label = match count {
+        Some((count, total)) => format!("{tag}  {count}/{total}"),
+        None => tag.to_string(),
+    };
+    if removable {
+        label.push_str("  \u{00d7}");
+    }
+    let chip = button(text(label).size(12));
+    if removable {
+        chip.style(builtins::button::secondary)
+            .on_press(super::Message::Inspector(Message::TagRemoved(
+                place,
+                tag.to_string(),
+            )))
+            .into()
+    } else {
+        chip.style(|theme: &crate::Theme, _status| {
+            builtins::button::secondary(theme, iced::widget::button::Status::Active)
+        })
+        .into()
+    }
+}
+
+/// The selected rooms' Tags block: one chip per (tag, place) in runs by
+/// place (the rooms' own place, then "Add to", then color order), each run
+/// led by its place; and the input adding a tag where it writes, with what
+/// it would skip, its suggestions, and a hint when the typed tag so far
+/// lives only somewhere more private. `None` without selected rooms. On a
+/// map without places the chips are one plain list.
+fn tags_block(window: &MapEditorWindow) -> Option<ThemedElement<'_, super::Message>> {
+    let state = &window.inspector;
+    let selection_tags = &state.tags;
+    if selection_tags.rooms == 0 {
+        return None;
+    }
+    let atlas = window.mapper.get_current_atlas();
+    let area = atlas.get_area(&window.editor.area_id()?)?;
+    let places_apply = window.secrets_apply();
+    let index = window.tag_index(&area);
+    let several = window.editor.selection().single().is_none();
+    let own = match window.editor.selection().single() {
+        Some(EntityId::SourceRoom(source, _)) => source,
+        _ => SourceId::Map,
+    };
+    let order = if places_apply {
+        super::tags::run_order(own, window.add_to(), index.places())
+    } else {
+        vec![own]
+    };
+
+    let mut block = Column::new()
+        .spacing(4)
+        .push(field_label(crate::i18n::t!("inspector-tags")));
+
+    // The runs sit in one column of their own, so the input after them keeps
+    // its place (and its focus) however many runs there are.
+    let mut runs = Column::new().spacing(6);
+    for place in order {
+        let Some(tags) = selection_tags.in_place(place) else {
+            continue;
+        };
+        let removable = super::secrets::can_remove(&area, place);
+        let mut run: Vec<ThemedElement<'_, super::Message>> = Vec::new();
+        if places_apply {
+            run.push(
+                container(place_label(&area, place))
+                    .padding(Padding::ZERO.top(3.0))
+                    .into(),
+            );
+        }
+        for (tag, count) in tags {
+            let count = several.then_some((*count, selection_tags.rooms));
+            run.push(tag_chip(place, tag, count, removable));
+        }
+        runs = runs.push(wrap_row(run).spacing(6.0, 6.0));
+    }
+    block = block.push(runs);
+
+    // Where the input writes, while the viewer may add there.
+    let Some(destination) = window
+        .tag_destination()
+        .filter(|place| super::secrets::can_add(&area, *place))
+    else {
+        return Some(block.into());
+    };
+    let plan = super::tags::bulk_plan(
+        selection_tags.map_rooms,
+        &selection_tags.own_rooms,
+        destination,
+        area.keeps_only_own_rooms(destination),
+    );
+    let destination_name = super::secrets::place_name(&area, destination);
+    if plan.applicable > 0 {
+        let mut input_row = row![
+            text_input(
+                crate::i18n::ts!("inspector-add-tag-placeholder"),
+                &state.tag_input
+            )
+            .id(super::tags::input_id(window.window_id))
+            .size(13)
+            .on_input(|value| super::Message::Inspector(Message::TagInputChanged(value)))
+            .on_submit(super::Message::Inspector(Message::TagSubmitted))
+            .width(Length::Fill),
+        ]
+        .spacing(6)
+        .align_y(Vertical::Center);
+        if places_apply {
+            input_row = input_row
+                .push(
+                    text(crate::i18n::t!("inspector-tag-to"))
+                        .size(12)
+                        .style(muted_text),
+                )
+                .push(place_label(&area, destination));
+        }
+        if several {
+            input_row = input_row.push(
+                text(crate::i18n::t!("inspector-tag-on-rooms", "count" => plan.applicable))
+                    .size(12)
+                    .style(muted_text),
+            );
+        }
+        block = block.push(input_row);
+
+        let typed = super::tags::typed(&state.tag_input);
+        match &typed {
+            super::tags::Typed::TooLong => {
+                block = block.push(
+                    text(crate::i18n::t!(
+                        "inspector-tag-too-long",
+                        "limit" => super::tags::TAG_LIMIT
+                    ))
+                    .size(11)
+                    .style(builtins::text::danger),
+                );
+            }
+            super::tags::Typed::Tag(tag) => {
+                if let Some(holder) = index.more_private_only(destination, tag) {
+                    let holder_name = super::secrets::place_name(&area, holder);
+                    let hint = if destination.is_map() {
+                        crate::i18n::t!(
+                            "inspector-tag-hint-map",
+                            "tag" => tag.clone(),
+                            "place" => holder_name
+                        )
+                    } else {
+                        crate::i18n::t!(
+                            "inspector-tag-hint-place",
+                            "tag" => tag.clone(),
+                            "place" => holder_name,
+                            "destination" => destination_name.clone()
+                        )
+                    };
+                    block = block.push(
+                        row![
+                            super::secrets::dot(smudgy_map_widget::sources::source_color(
+                                &area, holder
+                            )),
+                            text(hint).size(11),
+                        ]
+                        .spacing(6)
+                        .align_y(Vertical::Center),
+                    );
+                }
+            }
+            super::tags::Typed::Empty => {}
+        }
+    }
+
+    // Before Enter, say which selected rooms can't carry the place's tags
+    // (all of them, when the input is not offered).
+    if several && !plan.skipped.is_empty() {
+        let mut skipped = Column::new().spacing(2).push(
+            text(crate::i18n::t!(
+                "inspector-tag-adds-to",
+                "count" => plan.applicable,
+                "total" => selection_tags.rooms
+            ))
+            .size(11)
+            .style(muted_text),
+        );
+        for (place, count) in &plan.skipped {
+            skipped = skipped.push(
+                row![
+                    super::secrets::dot(smudgy_map_widget::sources::source_color(&area, *place)),
+                    text(crate::i18n::t!(
+                        "inspector-tag-cant-carry",
+                        "count" => *count,
+                        "place" => super::secrets::place_name(&area, *place),
+                        "destination" => destination_name.clone()
+                    ))
+                    .size(11)
+                    .style(muted_text),
+                ]
+                .spacing(6)
+                .align_y(Vertical::Center),
+            );
+        }
+        block = block.push(skipped);
+    }
+
+    let suggestions = window.tag_suggestions();
+    if !suggestions.is_empty() {
+        let mut list = Column::new().spacing(1);
+        for suggestion in suggestions {
+            let mut line = row![text(suggestion.tag.clone()).size(12).width(Length::Fill)]
+                .spacing(4)
+                .align_y(Vertical::Center);
+            if places_apply {
+                if suggestion.used_in.is_map() {
+                    line = line.push(
+                        text(crate::i18n::t!("inspector-tag-used-on-map"))
+                            .size(11)
+                            .style(muted_text),
+                    );
+                } else {
+                    line = line
+                        .push(
+                            text(crate::i18n::t!("inspector-tag-used-in"))
+                                .size(11)
+                                .style(muted_text),
+                        )
+                        .push(place_label(&area, suggestion.used_in));
+                }
+            }
+            list = list.push(
+                button(line)
+                    .style(builtins::button::list_item)
+                    .width(Length::Fill)
+                    .padding([2, 6])
+                    .on_press(super::Message::Inspector(Message::TagSuggestionPicked(
+                        suggestion.tag,
+                    ))),
+            );
+        }
+        block = block.push(list);
+    }
+
+    Some(block.into())
+}
+
+/// A room's fields. A source's room (`source`) names its source in its
+/// source's color.
 fn single_room_view<'a>(
     window: &'a MapEditorWindow,
     room_number: smudgy_cloud::RoomNumber,
+    source: Option<smudgy_cloud::SourceId>,
 ) -> Column<'a, super::Message, crate::Theme> {
     let state = &window.inspector;
-    let cleared = window.secrets_cleared();
 
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
-    content = content.push(secret_aware_heading(
-        crate::i18n::t!("inspector-room-heading", "number" => room_number.to_string()),
-        state.is_secret,
-    ));
+    content = content.push(room_heading(window, room_number, source));
+    if let Some(field) = super::moves::in_field(window) {
+        content = content.push(field);
+    }
 
     content = content.push(labeled_input(
         crate::i18n::t!("inspector-title"),
@@ -2902,20 +2823,9 @@ fn single_room_view<'a>(
         content = content.push(picker);
     }
 
-    if cleared {
-        content = content.push(
-            checkbox(state.is_secret)
-                .label(crate::i18n::t!("inspector-secret-room"))
-                .size(14)
-                .text_size(13)
-                .on_toggle(|secret| super::Message::Inspector(Message::RoomSecretToggled(secret))),
-        );
-        if let Some(status) = secrecy_status(state) {
-            content = content.push(status);
-        }
+    if let Some(tags) = tags_block(window) {
+        content = content.push(tags);
     }
-
-    content = content.push(tags_section(&state.tags, &state.known_tags, &state.new_tag));
 
     content = content.push(properties_section(
         &state.properties,
@@ -2927,270 +2837,205 @@ fn single_room_view<'a>(
             on_new_name: Message::NewPropertyNameChanged,
             on_new_value: Message::NewPropertyValueChanged,
             on_add: Message::AddProperty,
-            on_secret_toggle: cleared
-                .then_some(Message::RoomPropertySecretToggled as fn(usize, bool) -> Message),
         },
+        window,
+        source.unwrap_or(smudgy_cloud::SourceId::Map),
+        Some((source.unwrap_or(smudgy_cloud::SourceId::Map), room_number)),
     ));
 
-    content = content.push(exits_section(window));
+    // A map room's data in each place, then every link touching the room,
+    // wherever it is kept.
+    if let Some(places) = places_section(window) {
+        content = content.push(places);
+    }
+    content = content.push(super::link_panel::room_exits(window));
 
     content
 }
 
-fn exits_section(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> {
-    let state = &window.inspector;
-    let cleared = window.secrets_cleared();
+/// The selected map room's data in each Secret and Private: one group per
+/// place that keeps properties or exits there, the place "Add to" points at
+/// first and always shown, and an "Add" menu for the rest.
+fn places_section(window: &MapEditorWindow) -> Option<ThemedElement<'_, super::Message>> {
+    if !window.secrets_apply() {
+        return None;
+    }
     let atlas = window.mapper.get_current_atlas();
-
-    // Session (ephemeral) areas are excluded as destinations: an exit from a
-    // persistent map into an area that vanishes with the session would dangle.
-    let ephemeral = window.mapper.session_area_ids();
-    let mut area_choices: Vec<AreaChoice> = atlas
-        .areas()
-        .filter(|area| !ephemeral.contains(area.get_id()))
-        .map(|area| AreaChoice {
-            id: *area.get_id(),
-            name: area.get_name().to_string(),
-        })
+    let area = atlas.get_area(&window.editor.area_id()?)?;
+    let add_to = window.add_to();
+    let started = window.secrets.place_started;
+    let places = &window.inspector.places;
+    let shown = |place: &PlaceData| {
+        place.has_data || place.source == add_to || Some(place.source) == started
+    };
+    let mut order: Vec<&PlaceData> = places
+        .iter()
+        .filter(|place| place.source == add_to)
         .collect();
-    area_choices.sort_by_key(|choice| choice.name.to_lowercase());
+    order.extend(
+        places
+            .iter()
+            .filter(|place| place.source != add_to && shown(place)),
+    );
 
     let mut section = Column::new().spacing(8);
-    let connection_selected = matches!(
-        window.editor.selection().single(),
-        Some(EntityId::Connection(_))
-    );
-    section = section.push(field_label(if connection_selected {
-        "Traversal"
-    } else {
-        "Exits"
-    }));
-
-    // With a perspective anchor, the traversal leaving the anchor room
-    // lists first — matching the endpoint editors' From/To order.
-    let area = window.editor.area_id().and_then(|id| atlas.get_area(&id));
-    // An unpicked destination area defaults to the current one when a room
-    // number is entered; the dropdown hints that with the area's name as
-    // its dimmed placeholder.
-    let area_placeholder = area.as_ref().map_or_else(
-        || crate::i18n::t!("inspector-area-placeholder"),
-        |area| area.get_name().to_string(),
-    );
-    let mut order: Vec<usize> = (0..state.exits.len()).collect();
-    if connection_selected && let Some(anchor) = window.editor.connection_anchor() {
-        order.sort_by_key(|&index| state.exits[index].from_room != anchor);
+    section = section.push(field_label(crate::i18n::t!("mapper-additional-room-data")));
+    for place in order {
+        let color = smudgy_map_widget::sources::source_color(&area, place.source);
+        section = section.push(place_group(window, place, color));
     }
 
-    for (position, &index) in order.iter().enumerate() {
-        let exit = &state.exits[index];
-        if position > 0 {
-            section = section.push(rule::horizontal(1));
-        }
-        if connection_selected {
-            let title = area
-                .as_ref()
-                .and_then(|area| area.get_room(&exit.from_room))
-                .map(|room| room.get_title())
-                .filter(|title| !title.is_empty());
-            let from_room = title.map_or_else(
-                || {
-                    crate::i18n::t!(
-                        "inspector-exit-from-room",
-                        "number" => exit.from_room.to_string()
+    let addable: Vec<&PlaceData> = places
+        .iter()
+        .filter(|place| !shown(place) && super::secrets::can_add(&area, place.source))
+        .collect();
+    if !addable.is_empty() {
+        let open = window.secrets.place_menu_open;
+        let trigger = button(text(format!("{} \u{25BE}", crate::i18n::t!("action-add"))).size(12))
+            .style(builtins::button::subtle)
+            .padding([3, 8])
+            .on_press(super::Message::Inspector(Message::PlaceMenuToggled(!open)));
+        let menu = open.then(|| {
+            let mut list = Column::new().spacing(2);
+            for place in addable {
+                let color = smudgy_map_widget::sources::source_color(&area, place.source);
+                list = list.push(
+                    button(
+                        row![
+                            super::secrets::dot(color),
+                            text(place.name.clone()).size(12)
+                        ]
+                        .spacing(6)
+                        .align_y(Vertical::Center),
                     )
-                },
-                |title| {
-                    crate::i18n::t!(
-                        "inspector-exit-from-room-titled",
-                        "number" => exit.from_room.to_string(),
-                        "title" => title
-                    )
-                },
-            );
-            section = section.push(text(from_room).size(12).style(muted_text));
-        }
+                    .width(Length::Fill)
+                    .padding([6, 10])
+                    .style(builtins::button::link)
+                    .on_press(super::Message::Inspector(
+                        Message::PlaceStarted(place.source),
+                    )),
+                );
+            }
+            container(list)
+                .width(200)
+                .padding(6)
+                .style(builtins::container::card)
+                .into()
+        });
+        section = section.push(crate::widgets::dropdown::Dropdown::new(
+            trigger,
+            menu,
+            super::Message::Inspector(Message::PlaceMenuToggled(false)),
+        ));
+    }
+    Some(section.into())
+}
 
-        let selected_area = exit
-            .to_area
-            .and_then(|id| area_choices.iter().find(|choice| choice.id == id).cloned());
-
-        if exit.to_unknown {
-            // The destination exists but was redacted by the server: show an
-            // honest, disabled "Unknown map" destination (placeholder only —
-            // there is no name or id to show) instead of a dangling exit.
-            // No trash button either: the destination is unknowable
-            // client-side, so a delete could never be undone faithfully
-            // (the recreate would dangle, destroying the owner's link).
-            section = section.push(
-                row![
-                    pick_list(
-                        &ExitDirection::ALL[..],
-                        Some(exit.from_direction),
-                        move |d| {
-                            super::Message::Inspector(Message::ExitFromDirectionChanged(index, d))
-                        }
-                    )
-                    .text_size(12)
-                    .width(Length::Fill),
-                    text("\u{2192}").size(13),
-                    // No `.on_input`: renders as a disabled field whose
-                    // placeholder reads "Unknown map".
-                    text_input(crate::i18n::ts!("inspector-unknown-map"), "")
-                        .size(12)
-                        .width(Length::Fill),
-                ]
-                .spacing(4)
-                .align_y(Vertical::Center),
-            );
-            section = section.push(
-                text(crate::i18n::t!("inspector-unshared-destination"))
-                    .size(11)
-                    .style(muted_text),
-            );
+/// One place's data on the selected map room: its properties, editable
+/// where the viewer may write there. Its tags show in the Tags block and
+/// its links in the room's Exits.
+fn place_group<'a>(
+    window: &'a MapEditorWindow,
+    place: &'a PlaceData,
+    color: Option<iced::Color>,
+) -> ThemedElement<'a, super::Message> {
+    let source = place.source;
+    let mut heading = row![].spacing(6).align_y(Vertical::Center);
+    if !source.is_map() {
+        heading = heading.push(super::secrets::dot(color));
+    }
+    let mut group = Column::new()
+        .spacing(4)
+        .push(heading.push(text(place.name.clone()).size(13)));
+    for (index, property) in place.properties.iter().enumerate() {
+        let value: ThemedElement<'_, super::Message> = if place.writable {
+            text_input(
+                crate::i18n::ts!("inspector-value-placeholder"),
+                &property.value,
+            )
+            .size(13)
+            .on_input(move |value| {
+                super::Message::Inspector(Message::PlaceValueChanged(source, index, value))
+            })
+            .into()
         } else {
-            section = section.push(
-                row![
-                    pick_list(
-                        &ExitDirection::ALL[..],
-                        Some(exit.from_direction),
-                        move |d| {
-                            super::Message::Inspector(Message::ExitFromDirectionChanged(index, d))
-                        }
-                    )
-                    .text_size(12)
-                    .width(Length::Fill),
-                    text("\u{2192}").size(13),
-                    pick_list(area_choices.clone(), selected_area, move |choice| {
-                        super::Message::Inspector(Message::ExitToAreaChanged(index, choice))
-                    })
-                    .placeholder(area_placeholder.clone())
-                    .text_size(12)
-                    .width(Length::Fill),
-                    trash_button(super::Message::Inspector(Message::ExitDeleted(index))),
-                ]
-                .spacing(4)
-                .align_y(Vertical::Center),
-            );
-
-            section = section.push(
-                row![
-                    text_input(
-                        crate::i18n::ts!("inspector-room-number-placeholder"),
-                        &exit.to_room
-                    )
-                    .size(12)
-                    .on_input(move |value| {
-                        super::Message::Inspector(Message::ExitToRoomChanged(index, value))
-                    })
-                    .width(Length::FillPortion(1)),
-                    pick_list(&ExitDirection::ALL[..], exit.to_direction, move |d| {
-                        super::Message::Inspector(Message::ExitToDirectionChanged(index, d))
-                    })
-                    .placeholder(crate::i18n::t!("inspector-return-direction-placeholder"))
-                    .text_size(12)
-                    .width(Length::FillPortion(2)),
-                ]
-                .spacing(4)
-                .align_y(Vertical::Center),
-            );
-        }
-
-        let mut flags = row![
-            checkbox(exit.is_hidden)
-                .label(crate::i18n::t!("inspector-hidden"))
-                .size(14)
-                .text_size(12)
-                .on_toggle(move |checked| {
-                    super::Message::Inspector(Message::ExitHiddenToggled(index, checked))
-                }),
-            checkbox(exit.is_closed)
-                .label(crate::i18n::t!("inspector-closed"))
-                .size(14)
-                .text_size(12)
-                .on_toggle(move |checked| {
-                    super::Message::Inspector(Message::ExitClosedToggled(index, checked))
-                }),
-            checkbox(exit.is_locked)
-                .label(crate::i18n::t!("inspector-locked"))
-                .size(14)
-                .text_size(12)
-                .on_toggle(move |checked| {
-                    super::Message::Inspector(Message::ExitLockedToggled(index, checked))
-                }),
+            text(property.value.clone()).size(13).into()
+        };
+        let mut line = row![
+            text(property.name.clone())
+                .size(13)
+                .width(Length::FillPortion(2)),
+            container(value).width(Length::FillPortion(3)),
         ]
-        .spacing(8)
+        .spacing(4)
         .align_y(Vertical::Center);
-
-        if cleared {
-            flags = flags.push(
-                checkbox(exit.is_secret)
-                    .label(crate::i18n::t!("inspector-secret"))
-                    .size(14)
-                    .text_size(12)
-                    .on_toggle(move |checked| {
-                        super::Message::Inspector(Message::ExitSecretToggled(index, checked))
-                    }),
-            );
+        if place.writable {
+            line = line.push(trash_button(super::Message::Inspector(
+                Message::PlacePropertyDeleted(source, index),
+            )));
         }
-
-        section = section.push(flags);
-
-        // Connection appearance moves to the Connection inspector.
-        section = section.push(
+        let anchor = match window.editor.selection().single() {
+            Some(EntityId::Room(number)) => Some((smudgy_cloud::SourceId::Map, number)),
+            Some(EntityId::SourceRoom(source, number)) => Some((source, number)),
+            _ => None,
+        };
+        if let Some((room_source, room_number)) = anchor
+            && let Some(move_to) = super::moves::property_move(
+                window,
+                source,
+                smudgy_cloud::mutation::PropertyAddress {
+                    name: property.name.clone(),
+                    room_number: Some(room_number),
+                    room_source,
+                },
+            )
+        {
+            line = line.push(move_to);
+        }
+        group = group.push(line);
+    }
+    if place.writable {
+        group = group.push(
             row![
                 text_input(
-                    crate::i18n::ts!("inspector-weight-placeholder"),
-                    &exit.weight
+                    crate::i18n::ts!("inspector-name-placeholder"),
+                    &place.new_name
                 )
-                .size(12)
+                .size(13)
                 .on_input(move |value| {
-                    super::Message::Inspector(Message::ExitWeightChanged(index, value))
+                    super::Message::Inspector(Message::PlaceNewNameChanged(source, value))
                 })
-                .width(Length::FillPortion(1)),
-            ]
-            .spacing(4)
-            .align_y(Vertical::Center),
-        );
-
-        section = section.push(
-            row![
+                .width(Length::FillPortion(2)),
                 text_input(
-                    crate::i18n::ts!("inspector-command-placeholder"),
-                    &exit.command
+                    crate::i18n::ts!("inspector-value-placeholder"),
+                    &place.new_value
                 )
-                .size(12)
+                .size(13)
                 .on_input(move |value| {
-                    super::Message::Inspector(Message::ExitCommandChanged(index, value))
+                    super::Message::Inspector(Message::PlaceNewValueChanged(source, value))
                 })
-                .width(Length::FillPortion(1)),
-                text_input(crate::i18n::ts!("inspector-path-placeholder"), &exit.path)
-                    .size(12)
-                    .on_input(move |value| {
-                        super::Message::Inspector(Message::ExitPathChanged(index, value))
-                    })
-                    .width(Length::FillPortion(1)),
-            ]
-            .spacing(4)
-            .align_y(Vertical::Center),
-        );
-        if connection_selected && state.exits.len() == 2 {
-            section = section.push(
-                button(text(crate::i18n::t!("inspector-unlink-direction")).size(12))
+                .on_submit(super::Message::Inspector(Message::PlacePropertyAdded(
+                    source
+                )))
+                .width(Length::FillPortion(3)),
+                button(text(crate::i18n::t!("action-add")).size(13))
                     .style(builtins::button::secondary)
-                    .on_press(super::Message::Inspector(Message::ConnectionUnlink(index))),
-            );
-        }
-    }
-
-    if !connection_selected {
-        section = section.push(
-            button(text(crate::i18n::t!("inspector-add-exit")).size(13))
-                .style(builtins::button::secondary)
-                .on_press(super::Message::Inspector(Message::AddExit)),
+                    .on_press(super::Message::Inspector(Message::PlacePropertyAdded(
+                        source
+                    ))),
+            ]
+            .spacing(4)
+            .align_y(Vertical::Center),
         );
     }
-
-    section.into()
+    container(group)
+        .padding(Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: 10.0,
+            right: 0.0,
+        })
+        .into()
 }
 
 /// Localized names for the language-independent cloud enums the connection
@@ -3205,16 +3050,6 @@ fn side_name(side: RoomSide) -> &'static str {
     }
 }
 
-fn kind_name(kind: smudgy_cloud::ConnectionKind) -> &'static str {
-    match kind {
-        smudgy_cloud::ConnectionKind::Internal => crate::i18n::ts!("connection-kind-internal"),
-        smudgy_cloud::ConnectionKind::SelfLoop => crate::i18n::ts!("connection-kind-self-loop"),
-        smudgy_cloud::ConnectionKind::CrossLevel => crate::i18n::ts!("connection-kind-cross-level"),
-        smudgy_cloud::ConnectionKind::Dangling => crate::i18n::ts!("connection-kind-dangling"),
-        smudgy_cloud::ConnectionKind::External => crate::i18n::ts!("connection-kind-external"),
-    }
-}
-
 /// Wraps [`RoomSide`] so the endpoint pick_list renders translated wall names
 /// while messages keep carrying the plain enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3226,6 +3061,50 @@ impl fmt::Display for SideChoice {
     }
 }
 
+/// A link setting's translated name.
+trait Named: Copy {
+    fn name(self) -> &'static str;
+}
+
+impl Named for ConnectionRouting {
+    fn name(self) -> &'static str {
+        match self {
+            ConnectionRouting::Stub => crate::i18n::ts!("routing-stub"),
+            ConnectionRouting::Simple => crate::i18n::ts!("routing-simple"),
+            ConnectionRouting::Manual => crate::i18n::ts!("routing-manual"),
+            ConnectionRouting::Automatic => crate::i18n::ts!("routing-automatic"),
+        }
+    }
+}
+
+impl Named for SegmentShape {
+    fn name(self) -> &'static str {
+        match self {
+            SegmentShape::Direct => crate::i18n::ts!("segments-direct"),
+            SegmentShape::Orthogonal => crate::i18n::ts!("inspector-connection-orthogonal"),
+        }
+    }
+}
+
+impl Named for CornerStyle {
+    fn name(self) -> &'static str {
+        match self {
+            CornerStyle::Sharp => crate::i18n::ts!("corners-sharp"),
+            CornerStyle::Rounded => crate::i18n::ts!("corners-rounded"),
+        }
+    }
+}
+
+impl Named for ConnectionDash {
+    fn name(self) -> &'static str {
+        match self {
+            ConnectionDash::Solid => crate::i18n::ts!("dash-solid"),
+            ConnectionDash::Dashed => crate::i18n::ts!("dash-dashed"),
+            ConnectionDash::Dotted => crate::i18n::ts!("dash-dotted"),
+        }
+    }
+}
+
 const SIDE_CHOICES: [SideChoice; 4] = [
     SideChoice(RoomSide::North),
     SideChoice(RoomSide::East),
@@ -3233,338 +3112,173 @@ const SIDE_CHOICES: [SideChoice; 4] = [
     SideChoice(RoomSide::West),
 ];
 
-fn connection_view(
-    window: &MapEditorWindow,
+/// A link's appearance in the link editor, expanded: its route (Simple,
+/// Manual, Automatic, as its kind and place allow), segments, corners,
+/// line, colour (with Reset to its place's) and thickness; how an automatic
+/// route stands; and its ports, which the canvas also drags.
+#[allow(clippy::too_many_lines)]
+pub(super) fn link_appearance<'a>(
+    window: &'a MapEditorWindow,
+    map: &AreaCache,
     connection_id: ConnectionId,
-) -> Column<'_, super::Message, crate::Theme> {
-    let atlas = window.mapper.get_current_atlas();
+    writable: bool,
+) -> ThemedElement<'a, super::Message> {
+    use super::link_panel::{LinkMessage, labeled, segmented};
     let state = &window.inspector;
-    let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
-    let Some(area_id) = window.editor.area_id() else {
-        return content.push(text(crate::i18n::t!("inspector-no-area-selected")));
+    let mut content = Column::new().spacing(8);
+    let Some(document) = Document::of_connection(map, connection_id) else {
+        return content.into();
     };
-    let Some(area) = atlas.get_area(&area_id) else {
-        return content.push(text(crate::i18n::t!("inspector-no-area-selected")));
-    };
+    let area = document.content();
     let Some(connection) = area.get_connection(connection_id) else {
-        return content.push(text(crate::i18n::t!("inspector-connection-missing")));
+        return content.into();
     };
-    content = content.push(secret_aware_heading(
-        crate::i18n::t!("inspector-connection-heading"),
-        state.connection.is_secret,
+    let place = document.source();
+    let inspector = |message: Message| super::Message::Inspector(message);
+
+    // The automatic router plans around the map's rooms, so it routes the
+    // map's links only.
+    let mut routes: Vec<ConnectionRouting> = [
+        ConnectionRouting::Simple,
+        ConnectionRouting::Manual,
+        ConnectionRouting::Automatic,
+    ]
+    .into_iter()
+    .filter(|routing| {
+        connection.kind.allows_routing(*routing)
+            && (place.is_map() || *routing != ConnectionRouting::Automatic)
+    })
+    .collect();
+    if state.connection.routing == ConnectionRouting::Stub {
+        routes.insert(0, ConnectionRouting::Stub);
+    }
+    let routes: Vec<(ConnectionRouting, &'static str)> = routes
+        .into_iter()
+        .map(|routing| (routing, routing.name()))
+        .collect();
+    content = content.push(labeled(
+        crate::i18n::t!("inspector-connection-route"),
+        segmented(
+            &routes,
+            state.connection.routing,
+            writable,
+            move |routing| inspector(Message::ConnectionRoutingChanged(routing)),
+        ),
     ));
-
-    // The perspective anchor: when the selection came from one of this
-    // connection's rooms, that room is the "From" end regardless of the
-    // stored endpoint order.
-    let anchor = window.editor.connection_anchor();
-    let flipped = anchor.is_some_and(|room| {
-        connection
-            .endpoint_b
-            .is_some_and(|endpoint| endpoint.room_number == room)
-            && connection.endpoint_a.room_number != room
-    });
-    let room_label = |number: RoomNumber| {
-        area.get_room(&number)
-            .map(|room| room.get_title())
-            .filter(|title| !title.is_empty())
-            .map_or_else(
-                || crate::i18n::t!("inspector-room-label", "number" => number.to_string()),
-                |title| {
-                    crate::i18n::t!(
-                        "inspector-room-label-titled",
-                        "number" => number.to_string(),
-                        "title" => title
-                    )
-                },
-            )
-    };
-    let endpoints = connection.endpoint_b.map_or_else(
-        || {
-            crate::i18n::t!(
-                "inspector-connection-outward",
-                "room" => room_label(connection.endpoint_a.room_number)
-            )
-        },
-        |endpoint| {
-            let (from, to) = if flipped {
-                (endpoint, connection.endpoint_a)
-            } else {
-                (connection.endpoint_a, endpoint)
-            };
-            crate::i18n::t!(
-                "inspector-connection-between",
-                "room_a" => room_label(from.room_number),
-                "side_a" => side_name(from.side),
-                "room_b" => room_label(to.room_number),
-                "side_b" => side_name(to.side)
-            )
-        },
-    );
-
-    // Endpoints rendered as their fixed level triangle have no port to
-    // place, so the wall/offset row gives way to a note. Same-level
-    // up/down lines and cross-area up/down stubs keep the port editor.
-    let render_item = area
-        .get_room_connections()
-        .iter()
-        .find(|item| item.connection_id == connection_id);
-    let level_endpoint = |endpoint_b: bool| {
-        render_item.is_some_and(|item| {
-            let stub = if endpoint_b { item.stub_b } else { item.stub_a };
-            smudgy_cloud::connection_geometry::renders_as_level_triangle(
-                item.kind,
-                item.routing,
-                stub,
-            )
-        })
-    };
-
-    // One labeled endpoint editor; `role` is the perspective label the
-    // anchor ordering assigns ("From"/"To").
-    let endpoint_editor =
-        |endpoint_b: bool, role: &'static str| -> ThemedElement<'_, super::Message> {
-            let endpoint = if endpoint_b {
-                connection.endpoint_b.unwrap_or(connection.endpoint_a)
-            } else {
-                connection.endpoint_a
-            };
-            let mut col = Column::new().spacing(4);
-            col = col.push(
-                text(format!("{role} · {}", room_label(endpoint.room_number)))
-                    .size(11)
-                    .style(muted_text),
-            );
-            if level_endpoint(endpoint_b) {
-                col = col.push(
-                    text(crate::i18n::t!("inspector-connection-level-anchored"))
-                        .size(12)
-                        .style(muted_text),
-                );
-                return col.into();
-            }
-            let (side, offset_buffer) = if endpoint_b {
-                (
-                    state.connection.endpoint_b_side,
-                    &state.connection.endpoint_b_offset,
-                )
-            } else {
-                (
-                    state.connection.endpoint_a_side,
-                    &state.connection.endpoint_a_offset,
-                )
-            };
-            col = col.push(
-                row![
-                    pick_list(&SIDE_CHOICES[..], Some(SideChoice(side)), move |choice| {
-                        super::Message::Inspector(Message::ConnectionEndpointSideChanged(
-                            endpoint_b, choice.0,
-                        ))
-                    })
-                    .text_size(12)
-                    .width(Length::FillPortion(2)),
-                    text_input(
-                        crate::i18n::ts!("inspector-connection-port-placeholder"),
-                        offset_buffer
-                    )
-                    .on_input(move |value| super::Message::Inspector(
-                        Message::ConnectionEndpointOffsetChanged(endpoint_b, value),
-                    ))
-                    .size(12)
-                    .width(Length::FillPortion(1)),
-                    button(text(crate::i18n::t!("inspector-connection-auto")).size(11))
-                        .style(builtins::button::secondary)
-                        .on_press(super::Message::Inspector(Message::ConnectionEndpointReset(
-                            endpoint_b,
-                        ))),
-                    button(text(crate::i18n::t!("inspector-connection-redistribute")).size(11))
-                        .style(builtins::button::secondary)
-                        .on_press(super::Message::Inspector(
-                            Message::ConnectionRedistributePorts(endpoint_b)
-                        )),
-                ]
-                .spacing(6),
-            );
-            let offset_valid = offset_buffer
-                .parse::<f32>()
-                .is_ok_and(|offset| (0.0..=1.0).contains(&offset));
-            if !offset_valid {
-                col = col.push(
-                    text(crate::i18n::t!("inspector-connection-port-invalid"))
-                        .size(11)
-                        .style(builtins::text::danger),
-                );
-            }
-            col.into()
-        };
-
-    // Link
-    content = content.push(field_label(crate::i18n::t!("inspector-link")));
-    content = content.push(text(format!("{} · {endpoints}", kind_name(connection.kind))).size(12));
-    if state.connection.has_endpoint_b {
-        let (first, second) = if flipped {
-            (true, false)
-        } else {
-            (false, true)
-        };
-        content = content.push(endpoint_editor(
-            first,
-            crate::i18n::ts!("inspector-endpoint-from"),
-        ));
-        content = content.push(endpoint_editor(
-            second,
-            crate::i18n::ts!("inspector-endpoint-to"),
-        ));
-    } else {
-        content = content.push(endpoint_editor(
-            false,
-            crate::i18n::ts!("inspector-endpoint-from"),
-        ));
-    }
-
-    if state.exits.len() == 1 {
-        let selected = &state.exits[0];
-        let mut has_reciprocal_candidate = false;
-        for candidate in area.get_connections() {
-            if candidate.id == connection_id {
-                continue;
-            }
-            let mut candidate_members = area
-                .get_rooms()
-                .iter()
-                .flat_map(|room| {
-                    room.get_exits()
-                        .iter()
-                        .map(move |exit| (room.get_room_number(), exit))
-                })
-                .filter(|(_, exit)| exit.connection_id == candidate.id);
-            let Some((candidate_from, candidate_exit)) = candidate_members.next() else {
-                continue;
-            };
-            if candidate_members.next().is_some() {
-                continue;
-            }
-            let selected_to = selected.to_room.parse::<i32>().ok().map(RoomNumber);
-            let reciprocal = selected.to_area == Some(area_id)
-                && candidate_exit.to_area_id == Some(area_id)
-                && selected_to == Some(candidate_from)
-                && candidate_exit.to_room_number == Some(selected.from_room)
-                && selected
-                    .to_direction
-                    .is_none_or(|direction| direction == candidate_exit.from_direction)
-                && candidate_exit
-                    .to_direction
-                    .is_none_or(|direction| direction == selected.from_direction);
-            if reciprocal {
-                has_reciprocal_candidate = true;
-                content = content.push(
-                    button(text(crate::i18n::t!("inspector-connection-pair-reciprocal")).size(12))
-                        .style(builtins::button::secondary)
-                        .on_press(super::Message::Inspector(Message::ConnectionPair(
-                            candidate.id,
-                        ))),
-                );
-            }
-        }
-
-        // One-way → two-way when no reciprocal exists to Pair with:
-        // creates the return exit on the destination room, attached to
-        // this link. Only for same-area, non-redacted, non-loop
-        // destinations whose return direction is still free.
-        let return_free = || {
-            let to_room = selected
-                .to_room
-                .trim()
-                .parse::<i32>()
-                .ok()
-                .map(RoomNumber)?;
-            let destination = area.get_room(&to_room)?;
-            let return_direction = selected
-                .to_direction
-                .unwrap_or_else(|| selected.from_direction.opposite());
-            Some(!destination.get_exits().iter().any(|other| {
-                other.from_direction == return_direction
-                    || (other.to_area_id == Some(area_id)
-                        && other.to_room_number == Some(selected.from_room))
-            }))
-        };
-        if selected.to_area == Some(area_id)
-            && !selected.to_unknown
-            && !has_reciprocal_candidate
-            && connection.kind != smudgy_cloud::ConnectionKind::SelfLoop
-            && return_free() == Some(true)
-        {
-            content = content.push(
-                button(text(crate::i18n::t!("inspector-add-return")).size(12))
-                    .style(builtins::button::secondary)
-                    .on_press_maybe(
-                        window
-                            .can_edit_active_area()
-                            .then_some(super::Message::Inspector(Message::ConnectionAddReturn)),
-                    ),
-            );
-        }
-    }
-
-    // Route
-    content = content.push(rule::horizontal(1));
-    content = content.push(field_label(crate::i18n::t!("inspector-connection-route")));
-    let routing_choices = if connection.kind == smudgy_cloud::ConnectionKind::Internal {
-        &ConnectionRouting::ALL[..]
-    } else {
-        &ConnectionRouting::ALL[..2]
-    };
-    content = content.push(
-        pick_list(routing_choices, Some(state.connection.routing), |routing| {
-            super::Message::Inspector(Message::ConnectionRoutingChanged(routing))
-        })
-        .text_size(12),
-    );
-    if matches!(
+    let manual = state.connection.routing == ConnectionRouting::Manual;
+    let routed = matches!(
         state.connection.routing,
         ConnectionRouting::Manual | ConnectionRouting::Automatic
-    ) {
-        let shape: ThemedElement<'_, super::Message> = if state.connection.routing
-            == ConnectionRouting::Manual
-        {
-            pick_list(
-                &SegmentShape::ALL[..],
-                Some(state.connection.segment_shape),
-                |shape| super::Message::Inspector(Message::ConnectionSegmentShapeChanged(shape)),
-            )
-            .text_size(12)
-            .width(Length::Fill)
-            .into()
-        } else {
-            container(text(crate::i18n::t!("inspector-connection-orthogonal")).size(12))
-                .width(Length::Fill)
-                .into()
-        };
-        content = content.push(
-            row![
-                shape,
-                pick_list(
-                    &CornerStyle::ALL[..],
-                    Some(state.connection.corner),
-                    |corner| super::Message::Inspector(Message::ConnectionCornerChanged(corner)),
-                )
-                .text_size(12)
-                .width(Length::Fill),
-            ]
-            .spacing(6),
-        );
+    );
+    let shapes: Vec<(SegmentShape, &'static str)> = SegmentShape::ALL
+        .iter()
+        .map(|shape| (*shape, shape.name()))
+        .collect();
+    content = content.push(labeled(
+        crate::i18n::t!("link-segments"),
+        segmented(
+            &shapes,
+            state.connection.segment_shape,
+            writable && manual,
+            move |shape| inspector(Message::ConnectionSegmentShapeChanged(shape)),
+        ),
+    ));
+    let corners: Vec<(CornerStyle, &'static str)> = CornerStyle::ALL
+        .iter()
+        .map(|corner| (*corner, corner.name()))
+        .collect();
+    content = content.push(labeled(
+        crate::i18n::t!("link-corners"),
+        segmented(
+            &corners,
+            state.connection.corner,
+            writable && routed,
+            move |corner| inspector(Message::ConnectionCornerChanged(corner)),
+        ),
+    ));
+    let dashes: Vec<(ConnectionDash, &'static str)> = ConnectionDash::ALL
+        .iter()
+        .map(|dash| (*dash, dash.name()))
+        .collect();
+    content = content.push(labeled(
+        crate::i18n::t!("link-line"),
+        segmented(&dashes, state.connection.dash, writable, move |dash| {
+            inspector(Message::ConnectionDashChanged(dash))
+        }),
+    ));
+
+    let color_valid = parse_color(&state.connection.color).is_some();
+    let mut color_input = text_input(
+        crate::i18n::ts!("inspector-css-color-placeholder"),
+        &state.connection.color,
+    )
+    .size(12)
+    .padding([4, 6])
+    .width(Length::Fill);
+    if writable {
+        color_input =
+            color_input.on_input(move |value| inspector(Message::ConnectionColorChanged(value)));
     }
-    if connection.kind == smudgy_cloud::ConnectionKind::Internal {
-        content = content.push(
-            button(text(crate::i18n::t!("inspector-connection-reroute")).size(12))
-                .style(builtins::button::secondary)
+    content = content.push(labeled(
+        crate::i18n::t!("inspector-color"),
+        row![
+            swatch_button(window, &state.connection.color, ColorField::Connection),
+            color_input,
+            button(text(crate::i18n::t!("link-color-reset")).size(12))
+                .style(builtins::button::link)
+                .padding([2, 4])
                 .on_press_maybe(
-                    window
-                        .can_edit_active_area()
-                        .then_some(super::Message::Inspector(Message::ConnectionReroute)),
+                    (writable && state.connection.color != DEFAULT_CONNECTION_COLOR)
+                        .then_some(super::Message::Links(LinkMessage::ColorReset)),
                 ),
+        ]
+        .spacing(6)
+        .align_y(Vertical::Center),
+    ));
+    if !color_valid {
+        content = content.push(
+            text(crate::i18n::t!("inspector-invalid-value"))
+                .size(11)
+                .style(builtins::text::danger),
         );
     }
+    if let Some(picker) = picker_for(window, ColorField::Connection) {
+        content = content.push(picker);
+    }
+    let thickness = state.links.thickness.unwrap_or_else(|| {
+        state
+            .connection
+            .thickness
+            .parse::<f32>()
+            .unwrap_or(DEFAULT_CONNECTION_THICKNESS)
+    });
+    let mut thickness_slider = iced::widget::slider(
+        smudgy_cloud::THICKNESS_RANGE,
+        thickness.clamp(
+            *smudgy_cloud::THICKNESS_RANGE.start(),
+            *smudgy_cloud::THICKNESS_RANGE.end(),
+        ),
+        |value| super::Message::Links(LinkMessage::Thickness(value)),
+    )
+    .step(0.25_f32);
+    if writable {
+        thickness_slider =
+            thickness_slider.on_release(super::Message::Links(LinkMessage::ThicknessReleased));
+    }
+    content = content.push(labeled(
+        crate::i18n::t!("link-thickness"),
+        row![
+            thickness_slider,
+            text(format!("{thickness:.2}"))
+                .size(12)
+                .font(fonts::GEIST_MONO_VF)
+                .width(40),
+        ]
+        .spacing(8)
+        .align_y(Vertical::Center),
+    ));
+
+    // How an automatic route stands, and route upkeep.
     if connection.routing == ConnectionRouting::Automatic {
         if window.automatic_route_is_stale(connection_id) {
             content = content.push(
@@ -3597,158 +3311,135 @@ fn connection_view(
             ConnectionRouting::Stub | ConnectionRouting::Simple
         )
     {
-        content =
-            content.push(text(crate::i18n::t!("inspector-connection-route-inactive")).size(12));
+        content = content.push(
+            text(crate::i18n::t!("inspector-connection-route-inactive"))
+                .size(12)
+                .style(muted_text),
+        );
     }
-    content = content.push(
+    let mut upkeep = row![].spacing(6);
+    if connection.kind == smudgy_cloud::ConnectionKind::Internal && place.is_map() {
+        upkeep = upkeep.push(
+            button(text(crate::i18n::t!("inspector-connection-reroute")).size(12))
+                .style(builtins::button::secondary)
+                .on_press_maybe(writable.then_some(inspector(Message::ConnectionReroute))),
+        );
+    }
+    upkeep = upkeep.push(
         button(text(crate::i18n::t!("inspector-connection-clear-route")).size(12))
             .style(builtins::button::secondary)
             .on_press_maybe(
-                (window.can_edit_active_area()
-                    && (!connection.route_points.is_empty()
-                        || matches!(
-                            connection.routing,
-                            ConnectionRouting::Manual | ConnectionRouting::Automatic
-                        )))
-                .then_some(super::Message::Inspector(Message::ConnectionClearRoute)),
+                (writable && (!connection.route_points.is_empty() || routed))
+                    .then_some(inspector(Message::ConnectionClearRoute)),
             ),
     );
+    content = content.push(upkeep);
 
-    // Appearance
-    content = content.push(rule::horizontal(1));
-    content = content.push(field_label(crate::i18n::t!("inspector-appearance")));
-    content = content.push(color_input(
-        window,
-        ColorField::Connection,
-        crate::i18n::t!("inspector-color"),
-        crate::i18n::ts!("inspector-css-color-placeholder"),
-        &state.connection.color,
-        false,
-        Message::ConnectionColorChanged,
-    ));
-
-    // Width and dash are chosen visually: the buttons render the current
-    // stroke, and their panels render every choice as it would draw with
-    // the connection's current color/dash/width.
-    let sample_color =
-        parse_color(&state.connection.color).unwrap_or(iced::Color::from_rgb8(164, 164, 164));
-    let current_thickness = state
-        .connection
-        .thickness
-        .parse::<f32>()
-        .unwrap_or(DEFAULT_CONNECTION_THICKNESS);
-    let sample = |thickness: f32, dash: ConnectionDash| StrokeSample {
-        color: sample_color,
-        thickness,
-        dash,
-    };
-    content = content.push(
-        row![
-            column![
-                field_label(crate::i18n::t!("inspector-width")),
-                button(sample(current_thickness, state.connection.dash).view(Length::Fill, 18.0))
-                    .style(builtins::button::secondary)
-                    .padding(3)
-                    .width(Length::Fill)
-                    .on_press(super::Message::Inspector(Message::ThicknessPanelToggled)),
-            ]
-            .spacing(2)
-            .width(Length::FillPortion(1)),
-            column![
-                field_label(crate::i18n::t!("inspector-style")),
-                button(sample(current_thickness, state.connection.dash).view(Length::Fill, 18.0))
-                    .style(builtins::button::secondary)
-                    .padding(3)
-                    .width(Length::Fill)
-                    .on_press(super::Message::Inspector(Message::DashPanelToggled)),
-            ]
-            .spacing(2)
-            .width(Length::FillPortion(1)),
-        ]
-        .spacing(6),
-    );
-    if state.thickness_panel_open {
-        const WIDTH_CHOICES: [f32; 11] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let mut panel = Column::new().spacing(2);
-        let width_row = |thickness: f32, label: String| {
-            button(
-                row![
-                    text(label).size(11).width(44.0),
-                    sample(thickness, state.connection.dash).view(Length::Fill, 16.0),
-                ]
-                .spacing(6)
-                .align_y(Vertical::Center),
+    // Ports: where the link meets each room's wall.
+    let render_item = area
+        .get_room_connections()
+        .iter()
+        .find(|item| item.connection_id == connection_id);
+    let level_endpoint = |endpoint_b: bool| {
+        render_item.is_some_and(|item| {
+            let stub = if endpoint_b { item.stub_b } else { item.stub_a };
+            smudgy_cloud::connection_geometry::renders_as_level_triangle(
+                item.kind,
+                item.routing,
+                stub,
             )
-            .style(if (thickness - current_thickness).abs() < 0.005 {
-                builtins::button::primary
-            } else {
-                builtins::button::toolbar
-            })
-            .padding(3)
-            .width(Length::Fill)
-            .on_press(super::Message::Inspector(
-                Message::ConnectionThicknessPicked(thickness),
-            ))
+        })
+    };
+    let atlas = window.mapper.get_current_atlas();
+    let here = *map.get_id();
+    let port = |endpoint_b: bool| -> ThemedElement<'a, super::Message> {
+        let endpoint = if endpoint_b {
+            connection.endpoint_b.unwrap_or(connection.endpoint_a)
+        } else {
+            connection.endpoint_a
         };
-        // A stored width outside the offered list stays visible and
-        // reselectable rather than silently vanishing.
-        if !WIDTH_CHOICES
-            .iter()
-            .any(|choice| (choice - current_thickness).abs() < 0.005)
-        {
-            panel = panel.push(width_row(current_thickness, format!("{current_thickness}")));
-        }
-        for choice in WIDTH_CHOICES {
-            panel = panel.push(width_row(choice, format!("{choice}")));
-        }
-        content = content.push(panel);
-    }
-    if state.dash_panel_open {
-        let mut panel = Column::new().spacing(2);
-        for dash in ConnectionDash::ALL {
-            panel = panel.push(
-                button(
-                    row![
-                        text(dash.to_string()).size(11).width(44.0),
-                        sample(current_thickness, dash).view(Length::Fill, 16.0),
-                    ]
-                    .spacing(6)
-                    .align_y(Vertical::Center),
+        let room = super::links::name(
+            &atlas,
+            here,
+            super::links::doc_room(&document, endpoint.address()),
+        );
+        let mut col = Column::new()
+            .spacing(4)
+            .push(super::link_panel::named_line(&room, 11));
+        if level_endpoint(endpoint_b) {
+            return col
+                .push(
+                    text(crate::i18n::t!("inspector-connection-level-anchored"))
+                        .size(12)
+                        .style(muted_text),
                 )
-                .style(if dash == state.connection.dash {
-                    builtins::button::primary
-                } else {
-                    builtins::button::toolbar
+                .into();
+        }
+        let (side, offset_buffer) = if endpoint_b {
+            (
+                state.connection.endpoint_b_side,
+                state.connection.endpoint_b_offset.clone(),
+            )
+        } else {
+            (
+                state.connection.endpoint_a_side,
+                state.connection.endpoint_a_offset.clone(),
+            )
+        };
+        let offset_valid = offset_buffer
+            .parse::<f32>()
+            .is_ok_and(|offset| (0.0..=1.0).contains(&offset));
+        col = col.push(
+            row![
+                pick_list(&SIDE_CHOICES[..], Some(SideChoice(side)), move |choice| {
+                    inspector(Message::ConnectionEndpointSideChanged(endpoint_b, choice.0))
                 })
-                .padding(3)
-                .width(Length::Fill)
-                .on_press(super::Message::Inspector(
-                    Message::ConnectionDashChanged(dash),
-                )),
+                .text_size(12)
+                .width(Length::FillPortion(2)),
+                text_input(
+                    crate::i18n::ts!("inspector-connection-port-placeholder"),
+                    &offset_buffer
+                )
+                .on_input(
+                    move |value| inspector(Message::ConnectionEndpointOffsetChanged(
+                        endpoint_b, value
+                    ))
+                )
+                .size(12)
+                .width(Length::FillPortion(1)),
+                button(text(crate::i18n::t!("inspector-connection-auto")).size(11))
+                    .style(builtins::button::secondary)
+                    .on_press(inspector(Message::ConnectionEndpointReset(endpoint_b))),
+                button(text(crate::i18n::t!("inspector-connection-redistribute")).size(11))
+                    .style(builtins::button::secondary)
+                    .on_press_maybe(
+                        (!redistribute_port_updates(area, endpoint.address(), endpoint.side)
+                            .is_empty())
+                        .then_some(inspector(Message::ConnectionRedistributePorts(endpoint_b)))
+                    ),
+            ]
+            .spacing(6),
+        );
+        if !offset_valid {
+            col = col.push(
+                text(crate::i18n::t!("inspector-connection-port-invalid"))
+                    .size(11)
+                    .style(builtins::text::danger),
             );
         }
-        content = content.push(panel);
+        col.into()
+    };
+    content = content.push(field_label(crate::i18n::t!("link-ports")));
+    content = content.push(port(false));
+    if state.connection.has_endpoint_b {
+        content = content.push(port(true));
     }
     content = content.push(
         button(text(crate::i18n::t!("inspector-connection-reset")).size(12))
             .style(builtins::button::secondary)
-            .on_press(super::Message::Inspector(Message::ConnectionReset)),
+            .on_press_maybe(writable.then_some(inspector(Message::ConnectionReset))),
     );
-    content = content.push(exits_section(window));
-    content = content.push(rule::horizontal(1));
-    content = content.push(
-        button(
-            text(if state.exits.len() == 2 {
-                crate::i18n::t!("inspector-connection-delete-both")
-            } else {
-                crate::i18n::t!("inspector-connection-delete")
-            })
-            .size(12),
-        )
-        .style(builtins::button::secondary)
-        .on_press(super::Message::Inspector(Message::ConnectionDelete)),
-    );
-    content
+    content.into()
 }
 
 /// The shared x/y/width/height grid for labels and shapes.
@@ -3829,22 +3520,9 @@ fn label_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     let state = &window.inspector.label;
 
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
-    content = content.push(secret_aware_heading(
-        crate::i18n::t!("inspector-label"),
-        window.inspector.is_secret,
-    ));
-
-    if window.secrets_cleared() {
-        content = content.push(
-            checkbox(window.inspector.is_secret)
-                .label(crate::i18n::t!("inspector-secret"))
-                .size(14)
-                .text_size(13)
-                .on_toggle(|secret| super::Message::Inspector(Message::LabelSecretToggled(secret))),
-        );
-        if let Some(status) = secrecy_status(&window.inspector) {
-            content = content.push(status);
-        }
+    content = content.push(heading(crate::i18n::t!("inspector-label")));
+    if let Some(field) = super::moves::in_field(window) {
+        content = content.push(field);
     }
 
     content = content.push(labeled_input(
@@ -3937,22 +3615,9 @@ fn shape_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::The
     let state = &window.inspector.shape;
 
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
-    content = content.push(secret_aware_heading(
-        crate::i18n::t!("inspector-shape"),
-        window.inspector.is_secret,
-    ));
-
-    if window.secrets_cleared() {
-        content = content.push(
-            checkbox(window.inspector.is_secret)
-                .label(crate::i18n::t!("inspector-secret"))
-                .size(14)
-                .text_size(13)
-                .on_toggle(|secret| super::Message::Inspector(Message::ShapeSecretToggled(secret))),
-        );
-        if let Some(status) = secrecy_status(&window.inspector) {
-            content = content.push(status);
-        }
+    content = content.push(heading(crate::i18n::t!("inspector-shape")));
+    if let Some(field) = super::moves::in_field(window) {
+        content = content.push(field);
     }
 
     content = content.push(
@@ -4022,16 +3687,26 @@ fn multi_selection_view(window: &MapEditorWindow) -> Column<'_, super::Message, 
     let state = &window.inspector;
     let selection = window.editor.selection();
 
-    let rooms = selection.rooms().count();
+    let rooms = selection.rooms().count() + selection.source_rooms().count();
     let connections = selection.connections().count();
     let labels = selection.labels().count();
     let shapes = selection.shapes().count();
 
     let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
-    content = content.push(heading(format!("{} selected", selection.len())));
+    content = content.push(heading(crate::i18n::t!(
+        "inspector-selected",
+        "count" => selection.len()
+    )));
+    if let Some(field) = super::moves::in_field(window) {
+        content = content.push(field);
+    }
     content = content.push(
-        text(format!(
-            "{connections} connections, {rooms} rooms, {labels} labels, {shapes} shapes"
+        text(crate::i18n::t!(
+            "inspector-selection-counts",
+            "links" => connections,
+            "rooms" => rooms,
+            "labels" => labels,
+            "shapes" => shapes
         ))
         .size(13),
     );
@@ -4067,7 +3742,7 @@ fn multi_selection_view(window: &MapEditorWindow) -> Column<'_, super::Message, 
         }
 
         let level_placeholder = if state.bulk_level_mixed {
-            "(mixed)"
+            crate::i18n::ts!("inspector-mixed-placeholder")
         } else {
             "0"
         };
@@ -4083,87 +3758,12 @@ fn multi_selection_view(window: &MapEditorWindow) -> Column<'_, super::Message, 
             ]
             .spacing(2),
         );
-    }
-
-    if window.secrets_cleared() {
-        content = content.push(
-            column![
-                field_label(crate::i18n::t!("inspector-secrecy")),
-                row![
-                    button(text(crate::i18n::t!("inspector-mark-secret")).size(13))
-                        .style(builtins::button::secondary)
-                        .on_press(super::Message::Inspector(Message::BulkSecretMark(true))),
-                    button(text(crate::i18n::t!("inspector-unmark-secret")).size(13))
-                        .style(builtins::button::secondary)
-                        .on_press(super::Message::Inspector(Message::BulkSecretMark(false))),
-                ]
-                .spacing(8),
-            ]
-            .spacing(2),
-        );
-        if let Some(status) = secrecy_status(state) {
-            content = content.push(status);
+        if let Some(tags) = tags_block(window) {
+            content = content.push(tags);
         }
     }
 
     content
-}
-
-/// An "Active / Inactive" status with a switch (the same action the area
-/// list's switch fires), surfacing the control beyond the area list for
-/// discoverability. Active maps are used to find your location as you play.
-fn identification_toggle<'a>(
-    window: &MapEditorWindow,
-    area_id: AreaId,
-) -> ThemedElement<'a, super::Message> {
-    let enabled = window.mapper.is_area_enabled(&area_id);
-    let (icon, tip) = if enabled {
-        (
-            bootstrap_icons::TOGGLE_ON,
-            crate::i18n::t!("inspector-active-tip"),
-        )
-    } else {
-        (
-            bootstrap_icons::TOGGLE_OFF,
-            crate::i18n::t!("inspector-inactive-tip"),
-        )
-    };
-    let status_style: fn(&crate::Theme) -> iced::widget::text::Style = if enabled {
-        builtins::text::success
-    } else {
-        muted_text
-    };
-    let status_line = row![
-        text(crate::i18n::t!("inspector-this-map"))
-            .size(12)
-            .style(muted_text),
-        text(if enabled {
-            crate::i18n::t!("inspector-active")
-        } else {
-            crate::i18n::t!("inspector-inactive")
-        })
-        .size(12)
-        .style(status_style),
-        space::horizontal(),
-        tooltip(
-            button(text(icon).font(fonts::BOOTSTRAP_ICONS).size(16.0),)
-                .style(builtins::button::toolbar)
-                .on_press(super::Message::ToggleAreaEnabled(area_id)),
-            text(tip),
-            tooltip::Position::Bottom,
-        ),
-    ]
-    .spacing(6)
-    .align_y(Vertical::Center);
-
-    column![
-        status_line,
-        text(crate::i18n::t!("inspector-active-help"))
-            .size(11)
-            .style(muted_text),
-    ]
-    .spacing(2)
-    .into()
 }
 
 /// The "Copies of this map" section: one row per cache-resident family
@@ -4243,25 +3843,43 @@ fn copies_section<'a>(
     Some(section.into())
 }
 
-fn area_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Theme> {
+/// The map panel's data fields: where the map was copied from and who
+/// shared it, its copies, and its properties, which the viewer edits where
+/// they may edit the map.
+pub(super) fn data_fields<'a>(
+    window: &'a MapEditorWindow,
+    area: &AreaCache,
+) -> Column<'a, super::Message, crate::Theme> {
     let atlas = window.mapper.get_current_atlas();
     let state = &window.inspector;
+    let mut content = Column::new().spacing(FIELD_SPACING);
 
-    let mut content = Column::new().spacing(FIELD_SPACING).padding(12);
-
-    let Some(area) = window.editor.area_id().and_then(|id| atlas.get_area(&id)) else {
-        return content.push(text(crate::i18n::t!("inspector-no-area-selected")));
-    };
-
-    content = content.push(heading(area.get_name().to_string()));
-    content = content.push(
-        text(format!(
-            "{} rooms \u{b7} level {}",
-            area.room_count(),
-            window.editor.level()
-        ))
-        .size(13),
-    );
+    // A view-only map: who shared it, and its properties to read.
+    if !area.effective_access().can_edit {
+        content = content.push(
+            text(crate::i18n::t!(
+                "inspector-view-only",
+                "attribution" => window.sharer_attribution(*area.get_id())
+            ))
+            .size(12)
+            .style(muted_text),
+        );
+        let mut properties: Vec<(String, String)> = area
+            .properties()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        if !properties.is_empty() {
+            properties.sort();
+            let mut list = Column::new()
+                .spacing(4)
+                .push(field_label(crate::i18n::t!("inspector-area-properties")));
+            for (name, value) in properties {
+                list = list.push(text(format!("{name}: {value}")).size(12));
+            }
+            content = content.push(list);
+        }
+        return content;
+    }
 
     // Clone provenance (owner-only data; the server omits it otherwise).
     if area.is_owned()
@@ -4294,8 +3912,7 @@ fn area_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Them
         content = content.push(text(line).size(12).style(muted_text));
     }
 
-    // Shared (but editable) areas get the enriched attribution here, since
-    // read_only_view never runs for them.
+    // A shared map the viewer may edit names who shared it here.
     if !area.is_owned() {
         content = content.push(
             text(window.sharer_attribution(*area.get_id()))
@@ -4304,16 +3921,13 @@ fn area_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Them
         );
     }
 
-    // Room-identification status + discoverable toggle (for any area).
-    content = content.push(identification_toggle(window, *area.get_id()));
-
     // Copy family: when ≥2 cache-resident clones share an ancestry, let the
     // user pick which one is active for room identification.
     if let Some(section) = copies_section(window, *area.get_id()) {
         content = content.push(section);
     }
 
-    content = content.push(properties_section(
+    content.push(properties_section(
         &state.area_properties,
         &state.new_area_property_name,
         &state.new_area_property_value,
@@ -4323,98 +3937,79 @@ fn area_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Them
             on_new_name: Message::NewAreaPropertyNameChanged,
             on_new_value: Message::NewAreaPropertyValueChanged,
             on_add: Message::AddAreaProperty,
-            on_secret_toggle: window
-                .secrets_cleared()
-                .then_some(Message::AreaPropertySecretToggled as fn(usize, bool) -> Message),
         },
-    ));
-
-    if window.secrets_cleared()
-        && let Some(status) = secrecy_status(state)
-    {
-        content = content.push(status);
-    }
-
-    if let Some(RoomKey { room_number, .. }) = window.hovered_room
-        && let Some(room) = area.get_room(&room_number)
-    {
-        content = content.push(heading(crate::i18n::t!(
-            "inspector-room-heading",
-            "number" => room_number.to_string()
-        )));
-        content = content.push(text(room.get_title().to_string()).size(13));
-        content = content.push(text(room.get_description().to_string()).size(12));
-    }
-
-    content
+        window,
+        smudgy_cloud::SourceId::Map,
+        None,
+    ))
 }
 
+/// The inspector pane's id, scoping Tab's moves between its inputs.
+fn pane_id(window: iced::window::Id) -> iced::widget::Id {
+    iced::widget::Id::from(format!("inspector-pane-{window:?}"))
+}
+
+/// Moves focus to the inspector's next input (or, `back`, its previous
+/// one); from nowhere, to its first (or last).
+pub(super) fn focus_step(window: iced::window::Id, back: bool) -> Task<super::Message> {
+    use iced::advanced::widget::operation::{focusable, scope};
+    let step: Box<dyn iced::advanced::widget::Operation<()>> = if back {
+        Box::new(focusable::focus_previous::<()>())
+    } else {
+        Box::new(focusable::focus_next::<()>())
+    };
+    iced::advanced::widget::operate(scope(pane_id(window), step)).discard()
+}
+
+/// The inspector pane: an atlas's panel while one is chosen in the map list,
+/// else the open map's panel, a Secret's or Private's page, or the canvas
+/// selection's view under a link back to the map's panel.
 pub fn view(window: &MapEditorWindow) -> ThemedElement<'_, super::Message> {
     let atlas = window.mapper.get_current_atlas();
     let area = window.editor.area_id().and_then(|id| atlas.get_area(&id));
 
-    let selection = window.editor.selection();
-
-    // View-only shared areas swap the editable forms for a read-only
-    // summary. Mutations are also gated centrally in mod.rs (push_command /
-    // handle_mutation_request), so this is presentation, not enforcement.
-    let read_only = area
-        .as_ref()
-        .is_some_and(|area| !area.effective_access().can_edit);
-
-    let content: Column<'_, super::Message, crate::Theme> = if area.is_none() {
-        Column::new()
-            .padding(12)
-            .push(text(crate::i18n::t!("inspector-no-area-selected")))
-    } else if read_only {
-        read_only_view(window)
-    } else if let Some(entity) = selection.single() {
-        match entity {
-            EntityId::Connection(connection_id) => connection_view(window, connection_id),
-            EntityId::Room(room_number) => single_room_view(window, room_number),
-            EntityId::Label(_) => label_view(window),
-            EntityId::Shape(_) => shape_view(window),
-        }
-    } else if selection.is_empty() {
-        area_view(window)
-    } else {
-        multi_selection_view(window)
-    };
+    let content: Column<'_, super::Message, crate::Theme> =
+        match (super::panels::shown(window, area.is_some()), area.as_ref()) {
+            (Panel::Atlas(atlas_id), _) => super::atlas_panel::view(window, atlas_id),
+            (Panel::Map, Some(area)) => super::map_panel::view(window, area),
+            (Panel::Place(source), Some(area)) => Column::new()
+                .push(super::panels::back_link(area.get_name()))
+                .push(super::secrets::place_page(window, area, source)),
+            (Panel::Selection, Some(area)) => Column::new()
+                .push(super::panels::back_link(area.get_name()))
+                .push(selection_view(window)),
+            (Panel::NoMap | Panel::Map | Panel::Place(_) | Panel::Selection, _) => Column::new()
+                .padding(12)
+                .push(text(crate::i18n::t!("inspector-no-area-selected"))),
+        };
 
     container(scrollable(content).height(Length::Fill))
+        .id(pane_id(window.window_id))
         .style(builtins::container::opaque)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
-/// "{direction} → {target}" for the read-only exit listing, honoring the
-/// projection: unknown destinations never get a name.
-fn exit_summary(atlas: &AtlasCache, area: &AreaCache, exit: &ExitCache) -> String {
-    let target = if exit.to_unknown {
-        crate::i18n::t!("inspector-unknown-map")
-    } else if let Some(to_area) = exit.to_area_id.filter(|to| to != area.get_id()) {
-        let name = atlas.get_area(&to_area).map_or_else(
-            || crate::i18n::t!("inspector-another-area"),
-            |a| a.get_name().to_string(),
-        );
-        match exit.to_room_number {
-            Some(number) => crate::i18n::t!(
-                "inspector-exit-target-area-room",
-                "area" => name,
-                "room" => number.to_string()
-            ),
-            None => name,
+/// The canvas selection's view: read-only where the viewer can't change
+/// what is selected where it lives. View-only maps swap the editable forms
+/// for a read-only summary; mutations are also gated centrally in mod.rs
+/// (push_command / handle_mutation_request), so this is presentation, not
+/// enforcement.
+fn selection_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Theme> {
+    if !window.selection_writable() {
+        return read_only_view(window);
+    }
+    match window.editor.selection().single() {
+        Some(EntityId::Connection(_)) => super::link_panel::link_editor(window),
+        Some(EntityId::Room(room_number)) => single_room_view(window, room_number, None),
+        Some(EntityId::SourceRoom(source, room_number)) => {
+            single_room_view(window, room_number, Some(source))
         }
-    } else {
-        match exit.to_room_number {
-            Some(number) => {
-                crate::i18n::t!("inspector-exit-target-room", "room" => number.to_string())
-            }
-            None => crate::i18n::t!("inspector-exit-target-nowhere"),
-        }
-    };
-    format!("{} \u{2192} {}", exit.from_direction, target)
+        Some(EntityId::Label(_)) => label_view(window),
+        Some(EntityId::Shape(_)) => shape_view(window),
+        None => multi_selection_view(window),
+    }
 }
 
 fn muted_text(theme: &crate::Theme) -> iced::widget::text::Style {
@@ -4423,7 +4018,60 @@ fn muted_text(theme: &crate::Theme) -> iced::widget::text::Style {
     }
 }
 
-/// The whole inspector pane for a view-only shared area: an attribution
+/// A room's title, description, position and properties, read-only, below
+/// its heading in `content`. A room of any place reads the same way.
+fn read_only_room<'a>(
+    mut content: Column<'a, super::Message, crate::Theme>,
+    room: &smudgy_cloud::mapper::room_cache::RoomCache,
+    window: &'a MapEditorWindow,
+    source: smudgy_cloud::SourceId,
+    room_number: smudgy_cloud::RoomNumber,
+) -> Column<'a, super::Message, crate::Theme> {
+    if !room.get_title().is_empty() {
+        content = content.push(text(room.get_title().to_string()).size(13));
+    }
+    if !room.get_description().is_empty() {
+        content = content.push(text(room.get_description().to_string()).size(12));
+    }
+    content = content.push(
+        text(crate::i18n::t!(
+            "inspector-room-position",
+            "level" => room.get_level(),
+            "x" => format!("{:.1}", room.get_x()),
+            "y" => format!("{:.1}", room.get_y())
+        ))
+        .size(12)
+        .style(muted_text),
+    );
+    let mut properties: Vec<(String, String)> = room
+        .properties()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    if !properties.is_empty() {
+        properties.sort();
+        content = content.push(field_label(crate::i18n::t!("inspector-properties")));
+        for (name, value) in properties {
+            let mut property = row![text(format!("{name}: {value}")).size(12)]
+                .spacing(6)
+                .align_y(Vertical::Center);
+            if let Some(move_to) = super::moves::property_move(
+                window,
+                source,
+                smudgy_cloud::mutation::PropertyAddress {
+                    name,
+                    room_number: Some(room_number),
+                    room_source: source,
+                },
+            ) {
+                property = property.push(move_to);
+            }
+            content = content.push(property);
+        }
+    }
+    content
+}
+
+/// A selection the viewer can't change where it lives: an attribution
 /// banner plus read-only summaries of the selection — no inputs at all.
 #[allow(clippy::too_many_lines)]
 fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate::Theme> {
@@ -4448,102 +4096,59 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
     content = content.push(rule::horizontal(1));
 
     let selection = window.editor.selection();
+    // The selection's own lines sit in one column, so the Tags block after
+    // them keeps its place (and its input's focus) as they change.
+    let mut details = Column::new().spacing(8);
     if let Some(entity) = selection.single() {
         match entity {
-            EntityId::Connection(connection_id) => {
-                if let Some(connection) = area.get_connection(connection_id) {
-                    content =
-                        content.push(heading(crate::i18n::t!("inspector-connection-heading")));
-                    let span = connection.endpoint_b.map_or_else(
-                        || {
-                            crate::i18n::t!(
-                                "inspector-connection-span",
-                                "room" => connection.endpoint_a.room_number.to_string()
-                            )
+            EntityId::Connection(_) => {
+                details = details.push(super::link_panel::read_only_link(window));
+            }
+            EntityId::SourceRoom(source, room_number) => {
+                if let Some(room) =
+                    smudgy_map_widget::sources::source_room(&area, source, room_number)
+                {
+                    details = details.push(room_heading(window, room_number, Some(source)));
+                    details = read_only_room(details, room, window, source, room_number);
+                    if let Some(links) = super::link_panel::read_only_links(
+                        window,
+                        smudgy_map_widget::map_editor::PlacedRoom {
+                            source,
+                            number: room_number,
                         },
-                        |endpoint| {
-                            crate::i18n::t!(
-                                "inspector-connection-span-to",
-                                "room_a" => connection.endpoint_a.room_number.to_string(),
-                                "room_b" => endpoint.room_number.to_string()
-                            )
-                        },
-                    );
-                    let direction = if area
-                        .get_room_connections()
-                        .iter()
-                        .find(|render| render.connection_id == connection_id)
-                        .is_some_and(|render| render.is_bidirectional)
-                    {
-                        crate::i18n::ts!("inspector-connection-bidirectional")
-                    } else {
-                        crate::i18n::ts!("inspector-connection-one-way")
-                    };
-                    content = content.push(
-                        text(format!(
-                            "{} · {span} · {direction}",
-                            kind_name(connection.kind)
-                        ))
-                        .size(12),
-                    );
+                    ) {
+                        details = details.push(links);
+                    }
                 }
             }
             EntityId::Room(room_number) => {
                 if let Some(room) = area.get_room(&room_number) {
-                    content = content.push(heading(crate::i18n::t!(
-                        "inspector-room-heading",
-                        "number" => room_number.to_string()
-                    )));
-                    if !room.get_title().is_empty() {
-                        content = content.push(text(room.get_title().to_string()).size(13));
-                    }
-                    if !room.get_description().is_empty() {
-                        content = content.push(text(room.get_description().to_string()).size(12));
-                    }
-                    content = content.push(
-                        text(crate::i18n::t!(
-                            "inspector-room-position",
-                            "level" => room.get_level(),
-                            "x" => format!("{:.1}", room.get_x()),
-                            "y" => format!("{:.1}", room.get_y())
-                        ))
-                        .size(12)
-                        .style(muted_text),
+                    details = details.push(room_heading(window, room_number, None));
+                    details = read_only_room(
+                        details,
+                        room,
+                        window,
+                        smudgy_cloud::SourceId::Map,
+                        room_number,
                     );
-
-                    let mut properties: Vec<(String, String)> = room
-                        .properties()
-                        .map(|(name, value)| (name.to_string(), value.to_string()))
-                        .collect();
-                    if !properties.is_empty() {
-                        properties.sort();
-                        content =
-                            content.push(field_label(crate::i18n::t!("inspector-properties")));
-                        for (name, value) in properties {
-                            content = content.push(text(format!("{name}: {value}")).size(12));
-                        }
-                    }
-
-                    let exits = room.get_exits();
-                    if !exits.is_empty() {
-                        content = content.push(field_label(crate::i18n::t!("inspector-exits")));
-                        for exit in exits {
-                            content =
-                                content.push(text(exit_summary(&atlas, &area, exit)).size(12));
-                        }
+                    if let Some(links) = super::link_panel::read_only_links(
+                        window,
+                        smudgy_map_widget::map_editor::PlacedRoom::map(room_number),
+                    ) {
+                        details = details.push(links);
                     }
                 }
             }
             EntityId::Label(label_id) => {
-                if let Some(label) = area.get_label(&label_id) {
-                    content = content.push(heading(crate::i18n::t!("inspector-label")));
-                    content = content.push(text(label.text.clone()).size(13));
+                if let Some((_, label)) = area.find_label(&label_id) {
+                    details = details.push(heading(crate::i18n::t!("inspector-label")));
+                    details = details.push(text(label.text.clone()).size(13));
                 }
             }
             EntityId::Shape(shape_id) => {
-                if let Some(shape) = area.get_shape(&shape_id) {
-                    content = content.push(heading(crate::i18n::t!("inspector-shape")));
-                    content = content.push(
+                if let Some((_, shape)) = area.find_shape(&shape_id) {
+                    details = details.push(heading(crate::i18n::t!("inspector-shape")));
+                    details = details.push(
                         text(crate::i18n::t!(
                             "inspector-shape-summary",
                             "width" => format!("{:.0}", shape.width),
@@ -4557,29 +4162,8 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
                 }
             }
         }
-    } else if selection.is_empty() {
-        content = content.push(heading(area.get_name().to_string()));
-        content = content.push(
-            text(crate::i18n::t!(
-                "inspector-room-count",
-                "count" => area.room_count()
-            ))
-            .size(12)
-            .style(muted_text),
-        );
-        let mut properties: Vec<(String, String)> = area
-            .properties()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect();
-        if !properties.is_empty() {
-            properties.sort();
-            content = content.push(field_label(crate::i18n::t!("inspector-area-properties")));
-            for (name, value) in properties {
-                content = content.push(text(format!("{name}: {value}")).size(12));
-            }
-        }
     } else {
-        content = content.push(
+        details = details.push(
             text(crate::i18n::t!(
                 "inspector-entities-selected",
                 "count" => selection.len()
@@ -4588,16 +4172,137 @@ fn read_only_view(window: &MapEditorWindow) -> Column<'_, super::Message, crate:
         );
     }
 
-    if let Some(RoomKey { room_number, .. }) = window.hovered_room
-        && let Some(room) = area.get_room(&room_number)
+    content = content.push(details);
+    if let Some(tags) = tags_block(window) {
+        content = content.push(tags);
+    }
+
+    // A map room the viewer can't edit can still carry their Private notes
+    // and what Secrets they may write keep for it.
+    if matches!(
+        selection.single(),
+        Some(EntityId::Room(_) | EntityId::SourceRoom(..))
+    ) && let Some(places) = places_section(window)
     {
-        content = content.push(heading(crate::i18n::t!(
-            "inspector-room-heading",
-            "number" => room_number.to_string()
-        )));
-        content = content.push(text(room.get_title().to_string()).size(13));
-        content = content.push(text(room.get_description().to_string()).size(12));
+        content = content.push(places);
     }
 
     content
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn secret_room_inspector_shows_map_owned_notes_separately() {
+        let (mapper, area_id, secret) = super::super::source_rooms::tests::loaded().await;
+        let target = super::SourceRoomRef::data_on_source(
+            area_id,
+            smudgy_cloud::SourceId::Map,
+            secret,
+            smudgy_cloud::RoomNumber(2),
+        );
+        let command = super::source_rooms::set_property(
+            &mapper.get_current_atlas(),
+            target,
+            "notes".into(),
+            "Map-owned note".into(),
+        )
+        .unwrap();
+        let mut stack = super::super::commands::CommandStack::default();
+        let _ = stack.push_and_apply(&mapper, command);
+        assert_eq!(stack.take_last_error(), None);
+        let area = mapper.get_current_atlas().get_area(&area_id).unwrap();
+        let places = super::place_data(&area, secret, smudgy_cloud::RoomNumber(2));
+        let note = places.iter().find(|place| place.source.is_map()).unwrap();
+        assert!(note.has_data);
+        assert_eq!(note.properties[0].value, "Map-owned note");
+        assert!(
+            !places.iter().any(|place| place.source == secret),
+            "own properties stay in the main section"
+        );
+        let ordinary = super::place_data(
+            &area,
+            smudgy_cloud::SourceId::Map,
+            smudgy_cloud::RoomNumber(2),
+        );
+        assert!(
+            !ordinary
+                .iter()
+                .flat_map(|place| &place.properties)
+                .any(|property| property.value == "Map-owned note")
+        );
+    }
+    use super::*;
+
+    #[tokio::test]
+    async fn a_rebuild_keeps_the_tag_input_while_the_selection_holds() {
+        let (mapper, area_id, secret) = super::super::source_rooms::tests::loaded().await;
+        let mut editor = MapEditor::new(mapper.clone(), Some(area_id));
+        editor.select(EntityId::Room(RoomNumber(2)));
+        let mut state = State::default();
+        state.resync(&mapper, &editor);
+        // The Secret's tag on the map room reads under the Secret.
+        assert_eq!(state.tags.in_place(secret).map(|tags| tags.len()), Some(1));
+
+        state.tag_input = "pea".to_string();
+        state.resync(&mapper, &editor);
+        assert_eq!(state.tag_input, "pea", "an outside change keeps the input");
+
+        // A place changing alone re-reads the tags, nothing else.
+        let area = mapper
+            .get_current_atlas()
+            .get_area(&area_id)
+            .expect("loaded");
+        let change = source_rooms::change_tags(
+            &area,
+            secret,
+            &[(SourceId::Map, RoomNumber(2))],
+            "wine",
+            true,
+            "Hidden",
+        )
+        .expect("room 2 lacks it");
+        let mut stack = commands::CommandStack::default();
+        let _ = stack.push_and_apply(&mapper, change.command);
+        state.new_property_name = "draft".to_string();
+        state.reread_tags(&mapper, &editor);
+        assert_eq!(state.tags.in_place(secret).map(|tags| tags.len()), Some(2));
+        assert_eq!(state.tag_input, "pea");
+        assert_eq!(state.new_property_name, "draft");
+
+        editor.select(EntityId::Room(RoomNumber(1)));
+        state.resync(&mapper, &editor);
+        assert!(state.tag_input.is_empty(), "another room starts over");
+    }
+
+    /// A room of another place is headed by the place's name and the room's
+    /// number in it, in every language.
+    #[test]
+    fn a_place_rooms_heading_names_the_place_and_number() {
+        for catalog in smudgy_i18n::available_catalogs() {
+            let translator = smudgy_i18n::Translator::for_tag(catalog.tag).unwrap();
+            let heading = smudgy_i18n::t!(
+                translator,
+                "inspector-place-room-heading",
+                "place" => "Bookcase",
+                "number" => "1"
+            );
+            assert!(
+                heading.contains("Bookcase") && heading.contains("#1") && !heading.contains('⟦'),
+                "{}: {heading}",
+                catalog.tag
+            );
+            let room = smudgy_i18n::t!(
+                translator,
+                "mapper-room-name-titled",
+                "number" => "1",
+                "title" => "Hidden Study"
+            );
+            assert!(
+                room.contains("#1") && room.contains("Hidden Study") && !room.contains('⟦'),
+                "{}: {room}",
+                catalog.tag
+            );
+        }
+    }
 }

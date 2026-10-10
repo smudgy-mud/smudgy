@@ -17,7 +17,7 @@
 use crate::{
     Connection, ConnectionDash, ConnectionEndpoint, ConnectionId, ConnectionKind,
     ConnectionRouting, CornerStyle, DEFAULT_CONNECTION_COLOR, DEFAULT_CONNECTION_THICKNESS,
-    ExitDirection, ExitId, MapPoint, PortMode, RoomNumber, RoomSide, SegmentShape,
+    ExitDirection, ExitId, MapPoint, PortMode, RoomAddress, RoomSide, SegmentShape,
     connection::{default_anchor_for_bearing, default_anchor_for_direction},
 };
 
@@ -28,10 +28,10 @@ use crate::{
 pub struct ExitTopology {
     pub id: ExitId,
     pub connection_id: ConnectionId,
-    pub from_room: RoomNumber,
+    pub from_room: RoomAddress,
     pub from_direction: ExitDirection,
     /// Destination room when it stays in this area.
-    pub to_room_in_area: Option<RoomNumber>,
+    pub to_room_in_area: Option<RoomAddress>,
     /// The arrival wall/direction at the destination, when known.
     pub to_direction: Option<ExitDirection>,
     /// The destination is outside this area (another area, or hidden behind
@@ -74,7 +74,7 @@ pub fn attach_exit(
     exit: &ExitTopology,
     peers: &[ExitTopology],
     connections: &mut Vec<Connection>,
-    room_site: impl Fn(RoomNumber) -> Option<RoomSite>,
+    room_site: impl Fn(RoomAddress) -> Option<RoomSite>,
     new_connection_id: Option<ConnectionId>,
 ) -> ConnectionId {
     if new_connection_id.is_none()
@@ -140,7 +140,7 @@ fn directions_compatible(exit: &ExitTopology, candidate: &ExitTopology) -> bool 
 #[must_use]
 pub fn default_connection_for(
     exit: &ExitTopology,
-    room_site: impl Fn(RoomNumber) -> Option<RoomSite>,
+    room_site: impl Fn(RoomAddress) -> Option<RoomSite>,
 ) -> Connection {
     let origin_site = room_site(exit.from_room);
     match exit.to_room_in_area {
@@ -179,8 +179,8 @@ pub fn default_connection_for(
             };
             let origin_endpoint = endpoint(exit.from_room, side_a, offset_a);
             let destination_endpoint = endpoint(to_room, side_b, offset_b);
-            // Canonical order: the lower room number is endpoint A.
-            let (a, b) = if to_room < exit.from_room {
+            // Wire order puts Map rooms first, then compares room numbers.
+            let (a, b) = if to_room.connection_order_key() < exit.from_room.connection_order_key() {
                 (destination_endpoint, origin_endpoint)
             } else {
                 (origin_endpoint, destination_endpoint)
@@ -221,15 +221,15 @@ pub fn remove_orphan_connection(
 /// surviving member become Dangling, anchored at the surviving origin with
 /// endpoint B and the stored route cleared.
 pub fn repair_after_room_delete(
-    deleted: RoomNumber,
+    deleted: RoomAddress,
     survivors: &[ExitTopology],
     connections: &mut Vec<Connection>,
 ) {
     connections.retain_mut(|connection| {
-        let touches = connection.endpoint_a.room_number == deleted
+        let touches = connection.endpoint_a.address() == deleted
             || connection
                 .endpoint_b
-                .is_some_and(|b| b.room_number == deleted);
+                .is_some_and(|b| b.address() == deleted);
         let survivor = survivors
             .iter()
             .find(|exit| exit.connection_id == connection.id);
@@ -256,7 +256,7 @@ pub fn repair_after_destinations_cleared(
     cleared: &[ExitTopology],
     exits: &[ExitTopology],
     connections: &mut Vec<Connection>,
-    room_site: impl Fn(RoomNumber) -> Option<RoomSite>,
+    room_site: impl Fn(RoomAddress) -> Option<RoomSite>,
 ) {
     for before in cleared {
         let after = ExitTopology {
@@ -286,7 +286,7 @@ pub fn reattach_after_update(
     after: &ExitTopology,
     peers: &[ExitTopology],
     connections: &mut Vec<Connection>,
-    room_site: impl Fn(RoomNumber) -> Option<RoomSite>,
+    room_site: impl Fn(RoomAddress) -> Option<RoomSite>,
 ) -> ConnectionId {
     let partner = peers
         .iter()
@@ -322,7 +322,7 @@ pub fn reattach_after_update(
 pub(crate) fn retarget_in_place(
     connection: &mut Connection,
     after: &ExitTopology,
-    room_site: &impl Fn(RoomNumber) -> Option<RoomSite>,
+    room_site: &impl Fn(RoomAddress) -> Option<RoomSite>,
 ) {
     let origin = after.from_room;
     // The endpoint that stays: the one on the exit's origin room, rebuilt
@@ -330,7 +330,7 @@ pub(crate) fn retarget_in_place(
     let origin_endpoint = [Some(connection.endpoint_a), connection.endpoint_b]
         .into_iter()
         .flatten()
-        .find(|endpoint| endpoint.room_number == origin)
+        .find(|endpoint| endpoint.address() == origin)
         .unwrap_or_else(|| {
             let (side, offset) = default_anchor_for_direction(after.from_direction, None);
             endpoint(origin, side, offset)
@@ -340,7 +340,7 @@ pub(crate) fn retarget_in_place(
     let old_destination = [Some(connection.endpoint_a), connection.endpoint_b]
         .into_iter()
         .flatten()
-        .find(|other| other.room_number != origin);
+        .find(|other| other.address() != origin);
 
     match after.to_room_in_area {
         Some(to_room) if to_room == origin => {
@@ -367,7 +367,7 @@ pub(crate) fn retarget_in_place(
             // (Manual pins included); anything else is recomputed as an
             // AutoPinned direction default.
             let destination = old_destination
-                .filter(|endpoint| endpoint.room_number == to_room)
+                .filter(|endpoint| endpoint.address() == to_room)
                 .unwrap_or_else(|| {
                     let bearing = bearing_between(room_site(to_room), room_site(origin));
                     let (side, offset) = match after.to_direction {
@@ -380,13 +380,17 @@ pub(crate) fn retarget_in_place(
                 (Some(a), Some(b)) if a.level != b.level => ConnectionKind::CrossLevel,
                 _ => ConnectionKind::Internal,
             };
-            let stored_a_room = if origin < to_room { origin } else { to_room };
-            let (a, b) = if origin_endpoint.room_number == stored_a_room {
+            let stored_a_room = if origin.connection_order_key() < to_room.connection_order_key() {
+                origin
+            } else {
+                to_room
+            };
+            let (a, b) = if origin_endpoint.address() == stored_a_room {
                 (origin_endpoint, destination)
             } else {
                 (destination, origin_endpoint)
             };
-            if connection.endpoint_a.room_number != a.room_number {
+            if connection.endpoint_a.address() != a.address() {
                 // Canonical order flipped: the stored path must not visibly
                 // flip with it.
                 connection.route_points.reverse();
@@ -415,7 +419,7 @@ fn make_dangling(connection: &mut Connection, survivor: &ExitTopology) {
     let keep = [Some(connection.endpoint_a), connection.endpoint_b]
         .into_iter()
         .flatten()
-        .find(|endpoint| endpoint.room_number == survivor.from_room)
+        .find(|endpoint| endpoint.address() == survivor.from_room)
         .unwrap_or_else(|| {
             let (side, offset) = default_anchor_for_direction(survivor.from_direction, None);
             endpoint(survivor.from_room, side, offset)
@@ -442,9 +446,10 @@ fn clamp_routing(connection: &mut Connection) {
     }
 }
 
-fn endpoint(room_number: RoomNumber, side: RoomSide, port_offset: f32) -> ConnectionEndpoint {
+fn endpoint(room_number: RoomAddress, side: RoomSide, port_offset: f32) -> ConnectionEndpoint {
     ConnectionEndpoint {
-        room_number,
+        source: room_number.wire_source(),
+        room_number: room_number.number,
         side,
         port_offset,
         port_mode: PortMode::AutoPinned,
@@ -488,6 +493,7 @@ fn side_ordinal(side: RoomSide) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RoomNumber;
     use uuid::Uuid;
 
     fn exit(
@@ -501,15 +507,15 @@ mod tests {
         ExitTopology {
             id: ExitId(Uuid::from_u128(id)),
             connection_id: connection,
-            from_room: RoomNumber(from_room),
+            from_room: RoomAddress::map(RoomNumber(from_room)),
             from_direction,
-            to_room_in_area: to_room.map(RoomNumber),
+            to_room_in_area: to_room.map(|n| RoomAddress::map(RoomNumber(n))),
             to_direction,
             leaves_area: false,
         }
     }
 
-    fn flat_site(_: RoomNumber) -> Option<RoomSite> {
+    fn flat_site(_: RoomAddress) -> Option<RoomSite> {
         Some(RoomSite {
             x: 0.0,
             y: 0.0,
@@ -590,7 +596,7 @@ mod tests {
             Some(RoomSite {
                 x: 0.0,
                 y: 0.0,
-                level: i32::from(room == RoomNumber(5)),
+                level: i32::from(room == RoomAddress::map(RoomNumber(5))),
             })
         });
         assert_eq!(cross.kind, ConnectionKind::CrossLevel);
@@ -633,7 +639,7 @@ mod tests {
 
     #[test]
     fn room_delete_repair_converts_survivors_and_drops_orphans() {
-        let deleted = RoomNumber(9);
+        let deleted = RoomAddress::map(RoomNumber(9));
         let survivor_conn = ConnectionId::new();
         let orphan_conn = ConnectionId::new();
         let survivor = ExitTopology {
@@ -648,7 +654,7 @@ mod tests {
                 routing: ConnectionRouting::Manual,
                 route_points: vec![MapPoint::new(1.0, 1.0)],
                 ..blank_connection(
-                    endpoint(RoomNumber(1), RoomSide::East, 0.5),
+                    endpoint(RoomAddress::map(RoomNumber(1)), RoomSide::East, 0.5),
                     None,
                     ConnectionKind::Internal,
                 )
@@ -688,19 +694,23 @@ mod tests {
         );
         let mut connections = vec![Connection {
             id,
-            endpoint_a: endpoint(RoomNumber(5), RoomSide::West, 0.5),
-            endpoint_b: Some(endpoint(RoomNumber(6), RoomSide::East, 0.5)),
+            endpoint_a: endpoint(RoomAddress::map(RoomNumber(5)), RoomSide::West, 0.5),
+            endpoint_b: Some(endpoint(
+                RoomAddress::map(RoomNumber(6)),
+                RoomSide::East,
+                0.5,
+            )),
             routing: ConnectionRouting::Manual,
             route_points: vec![MapPoint::new(1.0, 0.0), MapPoint::new(2.0, 0.0)],
             ..blank_connection(
-                endpoint(RoomNumber(5), RoomSide::West, 0.5),
+                endpoint(RoomAddress::map(RoomNumber(5)), RoomSide::West, 0.5),
                 None,
                 ConnectionKind::Internal,
             )
         }];
         // Retarget 5 → 2: canonical order flips (2 < 5).
         let after = ExitTopology {
-            to_room_in_area: Some(RoomNumber(2)),
+            to_room_in_area: Some(RoomAddress::map(RoomNumber(2))),
             ..before
         };
         let result = reattach_after_update(&before, &after, &[], &mut connections, flat_site);
@@ -731,11 +741,15 @@ mod tests {
         );
         let mut connections = vec![Connection {
             id,
-            endpoint_b: Some(endpoint(RoomNumber(2), RoomSide::West, 0.5)),
+            endpoint_b: Some(endpoint(
+                RoomAddress::map(RoomNumber(2)),
+                RoomSide::West,
+                0.5,
+            )),
             routing: ConnectionRouting::Automatic,
             route_points: vec![MapPoint::new(1.0, 0.0)],
             ..blank_connection(
-                endpoint(RoomNumber(1), RoomSide::East, 0.5),
+                endpoint(RoomAddress::map(RoomNumber(1)), RoomSide::East, 0.5),
                 None,
                 ConnectionKind::Internal,
             )
@@ -775,15 +789,19 @@ mod tests {
         );
         let mut connections = vec![Connection {
             id: shared,
-            endpoint_b: Some(endpoint(RoomNumber(2), RoomSide::West, 0.5)),
+            endpoint_b: Some(endpoint(
+                RoomAddress::map(RoomNumber(2)),
+                RoomSide::West,
+                0.5,
+            )),
             ..blank_connection(
-                endpoint(RoomNumber(1), RoomSide::East, 0.5),
+                endpoint(RoomAddress::map(RoomNumber(1)), RoomSide::East, 0.5),
                 None,
                 ConnectionKind::Internal,
             )
         }];
         let after = ExitTopology {
-            to_room_in_area: Some(RoomNumber(3)),
+            to_room_in_area: Some(RoomAddress::map(RoomNumber(3))),
             to_direction: None,
             ..before
         };
@@ -802,7 +820,7 @@ mod tests {
         let id = ConnectionId::new();
         let keeper = exit(1, id, 1, ExitDirection::East, None, None);
         let mut connections = vec![blank_connection(
-            endpoint(RoomNumber(1), RoomSide::East, 0.5),
+            endpoint(RoomAddress::map(RoomNumber(1)), RoomSide::East, 0.5),
             None,
             ConnectionKind::Dangling,
         )];
