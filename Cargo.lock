@@ -11549,6 +11549,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "smudgy_session_model",
  "sys_traits",
  "tempfile",

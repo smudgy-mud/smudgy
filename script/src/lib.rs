@@ -63,6 +63,8 @@ pub use web_workers::{WorkerMode, worker_host_denied_extension};
 
 /// Publish-time TypeScript `.d.ts` generation via the vendored, embedded tsc.
 pub mod dts;
+mod npm_editor;
+pub use npm_editor::NpmTypeObserver;
 
 // Each smudgy_script build embeds one startup snapshot. V8 uses one shared heap
 // for all live isolates, so every isolate in the process must use that snapshot.
@@ -253,6 +255,7 @@ pub struct ScriptRuntimeOptions {
 }
 
 pub struct ScriptRuntime {
+    npm_services: Rc<SmudgyNpmServices>,
     /// `ManuallyDrop` so [`Drop for ScriptRuntime`](Self::drop) can tear the worker down
     /// *inside* `_tokio`'s context — see that impl for why. Never dropped anywhere else;
     /// all other access goes through `Deref`/`DerefMut`.
@@ -595,6 +598,7 @@ impl ScriptRuntime {
         }
 
         Ok(Self {
+            npm_services,
             worker: ManuallyDrop::new(worker),
             inspector_address,
             _inspector_server: inspector_server,
@@ -606,6 +610,12 @@ impl ScriptRuntime {
 
     pub fn deno_runtime(&mut self) -> &mut JsRuntime {
         &mut self.worker.js_runtime
+    }
+
+    /// Exposes already imported npm packages to an external editor project. This
+    /// does not install packages or change runtime resolution or permissions.
+    pub fn enable_npm_editor_types(&mut self, directory: PathBuf, observer: NpmTypeObserver) {
+        self.npm_services.enable_editor_types(directory, observer);
     }
 
     pub fn inspector_address(&self) -> Option<SocketAddr> {

@@ -337,6 +337,24 @@ impl ScriptModuleLoader {
         npm.resolve_package_import(specifier, &referrer)
     }
 
+    /// Shorthand belongs to authored scripts and Smudgy package modules. In particular,
+    /// scoped bare imports inside npm packages must stay with Node's resolver, including
+    /// misses: they must never fall back to a same-named Smudgy package.
+    fn allows_package_shorthand(&self, referrer: &str) -> bool {
+        if referrer.is_empty() || referrer == "." {
+            return true;
+        }
+        let Ok(referrer) = ModuleSpecifier::parse(referrer) else {
+            return false;
+        };
+        crate::package_resolver::parse_canonical(&referrer).is_some()
+            || (referrer.scheme() == "file"
+                && !self
+                    .npm
+                    .as_ref()
+                    .is_some_and(|npm| npm.is_npm_package_specifier(&referrer)))
+    }
+
     fn load_sync(&self, specifier: &ModuleSpecifier) -> Result<ModuleSource, ModuleLoaderError> {
         let source = match specifier.scheme() {
             "file" => {
@@ -414,6 +432,9 @@ impl ModuleLoader for ScriptModuleLoader {
         referrer: &str,
         kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
+        let expanded = (specifier.starts_with('@') && self.allows_package_shorthand(referrer))
+            .then(|| format!("smudgy:{specifier}"));
+        let specifier = expanded.as_deref().unwrap_or(specifier);
         if specifier.starts_with("node:") {
             return ModuleSpecifier::parse(specifier).map_err(JsErrorBox::from_err);
         }
@@ -1160,6 +1181,59 @@ mod npm_resolution_tests {
 
 #[cfg(test)]
 mod dep_gating_tests {
+    #[test]
+    fn shorthand_uses_the_same_dependency_gate_and_marker() {
+        let loader = loader_with_app(r#"{"version":"1.0.0","dependencies":["smudgy:@util"]}"#);
+        assert_eq!(
+            loader
+                .resolve("@util/sub", APP_REFERRER, ResolutionKind::Import)
+                .unwrap(),
+            loader
+                .resolve("smudgy:@util/sub", APP_REFERRER, ResolutionKind::Import)
+                .unwrap(),
+        );
+        assert!(
+            loader
+                .resolve("@undeclared", APP_REFERRER, ResolutionKind::Import)
+                .is_err()
+        );
+        assert!(
+            loader
+                .resolve("@", APP_REFERRER, ResolutionKind::Import)
+                .is_err()
+        );
+        assert!(
+            loader
+                .resolve("@util/../other", APP_REFERRER, ResolutionKind::Import)
+                .is_err()
+        );
+        let requires = loader_with_app(r#"{"version":"1.0.0","requires":["smudgy:@util"]}"#);
+        assert!(
+            requires
+                .resolve("@util", APP_REFERRER, ResolutionKind::Import)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn shorthand_is_not_applied_to_remote_modules() {
+        let loader = loader_with_app(r#"{"version":"1.0.0"}"#);
+        for referrer in [
+            "https://example.org/mod.js",
+            "jsr:@scope/pkg",
+            "npm:@scope/pkg",
+            "data:text/javascript,",
+        ] {
+            assert!(!loader.allows_package_shorthand(referrer), "{referrer}");
+            assert!(
+                loader
+                    .resolve("@app", referrer, ResolutionKind::Import)
+                    .is_err(),
+                "{referrer}"
+            );
+        }
+    }
+
     #[test]
     fn mixed_case_declared_dependency_is_allowed() {
         let loader =

@@ -7,9 +7,10 @@
 //! - **blobs** (`blobs/<hash[0:2]>/<hash[2:4]>/<hash>`): module bodies keyed by their
 //!   SHA-256, so the provider only re-downloads bodies it doesn't already have, and
 //!   identical bodies dedupe across packages/versions.
-//! - **metadata** (`meta/<owner>/<name>/<version>.json`): the manifest + module
-//!   list for a concrete version, so a *pinned* package resolves fully offline. Owner
-//!   and name are ASCII-folded; unique directories from the old layout remain readable.
+//! - **metadata** (`meta-v2/<name>/<version>.json`): the manifest + module list for a
+//!   concrete version, keyed by the ASCII-folded global name. Pre-migration `meta/`
+//!   files cannot establish which duplicate survived and are never served. Each version
+//!   needs one fresh registry lookup after upgrading; its verified blobs remain reusable.
 //!
 //! Bodies are written only after the provider verified their hash on fetch. Reads verify the
 //! hash again: a content-addressed filename does not protect against later disk corruption or
@@ -17,7 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use semver::Version;
@@ -33,7 +34,7 @@ use crate::models::persistence::write_atomic;
 
 /// A cached resolution of a concrete package version (no signed bundle URLs — those are
 /// ephemeral; bodies live in the blob cache, keyed by `content_hash`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedResolution {
     pub version: String,
     /// The package-level fingerprint ([`package_integrity`]) a network-verified load stamps
@@ -54,7 +55,7 @@ pub struct CachedResolution {
 }
 
 /// One module's metadata within a [`CachedResolution`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedModule {
     pub subpath: String,
     pub content_hash: String,
@@ -257,70 +258,9 @@ impl PackageCache {
     /// names it, whoever owns it now.
     fn meta_path(&self, key: &PackageKey, version: &str) -> PathBuf {
         self.root
-            .join("meta")
-            .join(smudgy_script::owner_segment(""))
+            .join("meta-v2")
             .join(key.name.to_ascii_lowercase())
             .join(format!("{version}.json"))
-    }
-
-    /// Old caches kept metadata under the owner segment an address was spelled with. Look in
-    /// the requested spelling's directory first, then in the one owner directory holding this
-    /// name and version, if exactly one does. Directory names match ignoring ASCII case, so
-    /// case-sensitive filesystems find them too.
-    fn legacy_meta_path(&self, key: &PackageKey, version: &str) -> Option<PathBuf> {
-        self.spelled_legacy_meta_path(key, version)
-            .filter(|path| path.exists())
-            .or_else(|| self.any_owner_legacy_meta_path(key, version))
-    }
-
-    /// The legacy metadata file under any owner directory, if exactly one holds `key`'s name
-    /// at `version`.
-    fn any_owner_legacy_meta_path(&self, key: &PackageKey, version: &str) -> Option<PathBuf> {
-        let file = format!("{version}.json");
-        let mut found = fs::read_dir(self.root.join("meta"))
-            .ok()?
-            .filter_map(Result::ok)
-            .filter(|owner| owner.file_type().is_ok_and(|kind| kind.is_dir()))
-            .filter_map(|owner| {
-                fs::read_dir(owner.path())
-                    .ok()?
-                    .filter_map(Result::ok)
-                    .find(|package| {
-                        package.file_type().is_ok_and(|kind| kind.is_dir())
-                            && package
-                                .file_name()
-                                .to_str()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&key.name))
-                    })
-                    .map(|package| package.path().join(&file))
-            })
-            .filter(|path| path.is_file());
-        let path = found.next()?;
-        found.next().is_none().then_some(path)
-    }
-
-    /// The legacy metadata file under the owner segment `key` spells.
-    fn spelled_legacy_meta_path(&self, key: &PackageKey, version: &str) -> Option<PathBuf> {
-        fn directory(parent: &Path, name: &str) -> Option<PathBuf> {
-            let mut matches = fs::read_dir(parent)
-                .ok()?
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry.file_type().is_ok_and(|kind| kind.is_dir())
-                        && entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
-                });
-            let path = matches.next()?.path();
-            matches.next().is_none().then_some(path)
-        }
-        let owner = directory(
-            &self.root.join("meta"),
-            smudgy_script::owner_segment(&key.owner),
-        )?;
-        let package = directory(&owner, &key.name)?;
-        Some(package.join(format!("{version}.json")))
     }
 
     /// Whether a module body is already cached and still matches its content hash.
@@ -395,7 +335,7 @@ impl PackageCache {
 
     /// The cached resolution metadata for a concrete version, if present and readable.
     ///
-    /// Older cache files are accepted as written: a module without a media type is code, and a
+    /// Within the current namespace, a module without a media type is code, and a
     /// dependency edge written before relation kinds were preserved has its kind recovered from
     /// the cached manifest — an edge the manifest's `requires` list names is a
     /// [`DependencyKind::Requires`] root, every other edge a code dependency.
@@ -403,11 +343,6 @@ impl PackageCache {
     pub fn read_meta(&self, key: &PackageKey, version: &str) -> Option<CachedResolution> {
         validate_cache_identity(key, version).ok()?;
         let path = self.meta_path(key, version);
-        let path = if path.exists() {
-            path
-        } else {
-            self.legacy_meta_path(key, version)?
-        };
         let content = fs::read_to_string(path).ok()?;
         let value: serde_json::Value = serde_json::from_str(&content).ok()?;
         let kind_less: Vec<usize> = value
@@ -483,15 +418,10 @@ impl PackageCache {
             .with_context(|| format!("write meta {}", path.display()))
     }
 
-    /// Persist resolution metadata unless an equally-complete copy is already cached —
-    /// the self-healing form of [`write_meta`](Self::write_meta). Versions are
-    /// immutable, so the common case skips a redundant serialize + write; but a cache
-    /// file written before `CachedResolution` grew a field deserializes with that field
-    /// defaulted (a pre-`dependencies` file folds to a root-only closure; a
-    /// pre-`media_type` file misclassifies modules), and freezing it forever would
-    /// silently under-report the version's true facts. So a fresh resolution that
-    /// carries dependency edges or modules the cached copy lacks — or finds the cached
-    /// file unreadable (torn, corrupt) — overwrites it instead of skipping.
+    /// Persist fresh registry metadata, skipping identical writes. A changed fingerprint
+    /// replaces the entire record, even when both versions have the same module count.
+    /// For identical content, preserve known ownership and dependency edges when a less
+    /// complete response omits them. Fresh owner information always supersedes the cache.
     ///
     /// # Errors
     /// Returns an error if the cache directory cannot be created or the file written.
@@ -501,16 +431,21 @@ impl PackageCache {
         version: &str,
         resolution: &CachedResolution,
     ) -> Result<()> {
+        let mut refreshed = resolution.clone();
         if let Some(cached) = self.read_meta(key, version) {
-            let missing_deps =
-                cached.dependencies.is_empty() && !resolution.dependencies.is_empty();
-            let missing_modules = cached.modules.len() < resolution.modules.len();
-            let missing_owner = cached.owner.is_none() && resolution.owner.is_some();
-            if !missing_deps && !missing_modules && !missing_owner {
+            if cached.integrity == refreshed.integrity {
+                if refreshed.owner.is_none() {
+                    refreshed.owner.clone_from(&cached.owner);
+                }
+                if refreshed.dependencies.is_empty() && cached.manifest == refreshed.manifest {
+                    refreshed.dependencies.clone_from(&cached.dependencies);
+                }
+            }
+            if cached == refreshed {
                 return Ok(());
             }
         }
-        self.write_meta(key, version, resolution)
+        self.write_meta(key, version, &refreshed)
     }
 }
 
@@ -519,7 +454,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mixed_case_cache_coordinates_reuse_new_and_legacy_metadata() {
+    fn mixed_case_cache_coordinates_reuse_current_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_in(dir.path());
         let key = PackageKey {
@@ -534,15 +469,6 @@ mod tests {
             dependencies: vec![],
             owner: None,
         };
-        // Plant the pre-fix layout directly. On case-sensitive filesystems the
-        // folded request must discover the legacy directory spelling.
-        let legacy = cache.root.join("meta/Rich_E/Speedwalks/1.0.0.json");
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, serde_json::to_vec(&resolution).unwrap()).unwrap();
-        assert_eq!(
-            cache.read_meta(&key.folded(), "1.0.0").unwrap().integrity,
-            "sum"
-        );
         assert_eq!(
             cache.meta_path(&key, "1.0.0"),
             cache.meta_path(&key.folded(), "1.0.0")
@@ -590,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_metadata_under_another_owner_is_found_by_name() {
+    fn pre_migration_metadata_is_ignored_and_verified_blobs_are_reusable() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache_in(dir.path());
         let legacy = |owner: &str, integrity: &str| {
@@ -610,28 +536,65 @@ mod tests {
             owner: owner.into(),
             name: "mapper".into(),
         };
-        legacy("alice", "alice's");
-        for owner in ["", "alice", "clan-now"] {
-            assert_eq!(
-                cache
-                    .read_meta(&key(owner), "1.0.0")
-                    .map(|meta| meta.integrity)
-                    .as_deref(),
-                Some("alice's"),
-                "{owner:?}"
-            );
+        for legacy_owner in ["alice", "bob", "@"] {
+            legacy(legacy_owner, legacy_owner);
+            for owner in ["", "alice", "bob", "clan-now"] {
+                assert!(cache.read_meta(&key(owner), "1.0.0").is_none(), "{owner:?}");
+            }
         }
-        assert!(cache.read_meta(&key(""), "2.0.0").is_none());
-        // Two owner directories holding the name: only the spelled one is trusted.
-        legacy("bob", "bob's");
-        assert_eq!(
-            cache
-                .read_meta(&key("bob"), "1.0.0")
-                .map(|meta| meta.integrity)
-                .as_deref(),
-            Some("bob's")
-        );
-        assert!(cache.read_meta(&key("carol"), "1.0.0").is_none());
+        let body = "export const value = 1;";
+        let hash = sha256_hex(body.as_bytes());
+        cache.write_blob(&hash, body).unwrap();
+        let fresh = CachedResolution {
+            version: "1.0.0".into(),
+            integrity: "fresh".into(),
+            manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
+            modules: vec![],
+            dependencies: vec![],
+            owner: Some(PackageOwner::user("bob")),
+        };
+        cache.refresh_meta(&key("alice"), "1.0.0", &fresh).unwrap();
+        for owner in ["", "alice", "bob"] {
+            assert_eq!(cache.read_meta(&key(owner), "1.0.0"), Some(fresh.clone()));
+        }
+        assert_eq!(cache.read_blob(&hash).as_deref(), Some(body));
+    }
+
+    #[test]
+    fn refresh_replaces_changed_content_and_owner_without_a_module_count_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let mut fresh = CachedResolution {
+            version: "1.0.0".into(),
+            integrity: "old".into(),
+            manifest: PackageManifest::parse(r#"{"version":"1.0.0"}"#).unwrap(),
+            modules: vec![CachedModule {
+                subpath: "index.ts".into(),
+                content_hash: sha256_hex(b"old"),
+                media_type: "application/typescript".into(),
+                byte_size: 3,
+                is_entry: true,
+            }],
+            dependencies: vec![],
+            owner: Some(PackageOwner::user("old-owner")),
+        };
+        cache.write_meta(&key(), "1.0.0", &fresh).unwrap();
+        fresh.integrity = "new".into();
+        fresh.modules[0].content_hash = sha256_hex(b"new");
+        fresh.owner = Some(PackageOwner::user("survivor"));
+        cache.refresh_meta(&key(), "1.0.0", &fresh).unwrap();
+        assert_eq!(cache.read_meta(&key(), "1.0.0"), Some(fresh.clone()));
+
+        // Ownership is mutable even when version contents remain identical.
+        fresh.owner = Some(PackageOwner::clan("guild"));
+        cache.refresh_meta(&key(), "1.0.0", &fresh).unwrap();
+        assert_eq!(cache.read_meta(&key(), "1.0.0"), Some(fresh.clone()));
+        let no_owner = CachedResolution {
+            owner: None,
+            ..fresh.clone()
+        };
+        cache.refresh_meta(&key(), "1.0.0", &no_owner).unwrap();
+        assert_eq!(cache.read_meta(&key(), "1.0.0"), Some(fresh));
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {

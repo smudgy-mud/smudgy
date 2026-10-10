@@ -554,9 +554,8 @@ impl SmudgyPackageProvider {
     }
 
     /// Canonical runtime identity for a requested coordinate. An existing local same-leaf
-    /// package always returns the local identity. Modern imports and matching legacy imports
-    /// take the installed row's spelling, where its persistent state lives. A different
-    /// legacy owner keeps its spelling and is refused before cached code can be served.
+    /// package always returns the local identity. Every published address takes the installed
+    /// row's spelling, where its persistent state lives, regardless of the requested owner.
     #[must_use]
     pub fn canonical_key(&self, key: &PackageKey) -> PackageKey {
         match self.local_snapshot(key) {
@@ -584,36 +583,7 @@ impl SmudgyPackageProvider {
         let row = lock.find(&specifier)?;
         SmudgySpecifier::parse(&row.specifier)
             .ok()
-            .filter(|installed| {
-                key.owner.is_empty() || key.owner.eq_ignore_ascii_case(&installed.owner)
-            })
             .map(|installed| installed.package_key())
-    }
-
-    /// A legacy address must not borrow another publisher's installed version,
-    /// settings, or cached code. Local development overrides keep their separate state.
-    fn check_legacy_owner(
-        &self,
-        requested: &PackageKey,
-        owner: Option<&PackageOwner>,
-    ) -> Result<(), PackageError> {
-        if requested.owner.is_empty() || self.is_local_override(requested) {
-            return Ok(());
-        }
-        if owner.is_some_and(|owner| *owner != PackageOwner::user(&requested.owner)) {
-            return Err(PackageError::NotFound(requested.to_user_specifier()));
-        }
-        if let Some(installed) = self
-            .lock
-            .borrow()
-            .find(&requested.to_user_specifier())
-            .and_then(|row| SmudgySpecifier::parse(&row.specifier).ok())
-            && !installed.owner.is_empty()
-            && !installed.owner.eq_ignore_ascii_case(&requested.owner)
-        {
-            return Err(PackageError::NotFound(requested.to_user_specifier()));
-        }
-        Ok(())
     }
 
     /// Resolve any package coordinate with a locally-authored same-leaf package from
@@ -956,8 +926,6 @@ impl SmudgyPackageProvider {
         key: &PackageKey,
         version: Option<&str>,
     ) -> Result<Rc<ResolvedPackageWire>, CloudError> {
-        self.check_legacy_owner(key, self.owners.borrow().get(key))
-            .map_err(|_| CloudError::NotFoundOrNoAccess)?;
         if let Some(version) = version {
             let memoized = self
                 .wire_memo
@@ -974,14 +942,6 @@ impl SmudgyPackageProvider {
                 .resolve_package(Some(&key.owner), &key.name, version)
                 .await?,
         );
-        if !key.owner.is_empty()
-            && !wire
-                .owner_nickname
-                .as_deref()
-                .is_some_and(|owner| owner.eq_ignore_ascii_case(&key.owner))
-        {
-            return Err(CloudError::NotFoundOrNoAccess);
-        }
         let owner = self.learn_owner(key, &wire).await;
         self.write_meta_for_wire(key, &wire, owner);
         self.wire_memo.borrow_mut().insert(
@@ -1054,8 +1014,6 @@ impl SmudgyPackageProvider {
         key: &PackageKey,
         version: Option<&str>,
     ) -> Result<WalkMeta, CloudError> {
-        self.check_legacy_owner(key, self.owners.borrow().get(key))
-            .map_err(|_| CloudError::NotFoundOrNoAccess)?;
         if let LocalSnapshot::Invalid(error) = self.local_snapshot(key) {
             return Err(CloudError::InvalidInput(format!(
                 "local package {} is invalid: {error}",
@@ -1088,8 +1046,6 @@ impl SmudgyPackageProvider {
                 .as_ref()
                 .and_then(|cache| cache.read_meta(key, version))
         {
-            self.check_legacy_owner(key, meta.owner.as_ref())
-                .map_err(|_| CloudError::NotFoundOrNoAccess)?;
             return Ok(WalkMeta {
                 key: key.clone(),
                 state_specifier: key.to_user_specifier(),
@@ -1795,7 +1751,6 @@ impl SmudgyPackageProvider {
         referrer: Option<&ReferrerRef>,
         track: bool,
     ) -> Result<Rc<ResolvedPackage>, PackageError> {
-        self.check_legacy_owner(requested_key, self.owners.borrow().get(requested_key))?;
         if let LocalSnapshot::Invalid(error) = self.local_snapshot(requested_key) {
             let local = PackageKey {
                 owner: self.local_owner().to_string(),
@@ -1855,14 +1810,6 @@ impl SmudgyPackageProvider {
         // ([`LockedPackage::staged_version`]). `None` only when discovery genuinely
         // needs the cloud — a never-resolved Auto root with no solve entry.
         let determined = selected.clone().or_else(|| staged.clone());
-        if let Some(version) = &determined {
-            let cached_owner = self
-                .disk_cache
-                .as_ref()
-                .and_then(|cache| cache.read_meta(&key, version))
-                .and_then(|meta| meta.owner);
-            self.check_legacy_owner(requested_key, cached_owner.as_ref())?;
-        }
 
         // Already resolved this version this session → reuse that instance. Keyed by the
         // *selected* version, so two importers that locked different versions coexist (two
@@ -2344,13 +2291,17 @@ fn fetch_error(specifier: &str, modules: &[&ResolvedModuleWire], err: &CloudErro
 #[cfg(test)]
 mod tests {
     #[test]
-    fn modern_and_matching_legacy_imports_take_the_installed_spelling() {
+    fn every_address_owner_takes_the_installed_spelling() {
         let provider = test_provider();
         provider.lock.borrow_mut().packages = vec![LockedPackage::new(
             "smudgy://Rich_E/Speedwalks",
             UpdateMode::Auto,
         )];
-        for spelling in ["smudgy:@speedwalks", "smudgy://rich_e/SPEEDWALKS"] {
+        for spelling in [
+            "smudgy:@speedwalks",
+            "smudgy://rich_e/SPEEDWALKS",
+            "smudgy://someone/Speedwalks",
+        ] {
             let requested = SmudgySpecifier::parse(spelling).unwrap().package_key();
             let canonical = provider.canonical_key(&requested);
             assert_eq!(canonical.owner, "Rich_E", "{spelling}");
@@ -2360,7 +2311,7 @@ mod tests {
                 "{spelling}"
             );
         }
-        // A legacy import stays owner-scoped instead of redirecting to an ownerless row.
+        // An ownerless install keeps its spelling for every legacy address.
         provider.lock.borrow_mut().packages =
             vec![LockedPackage::new("smudgy:@guild-lib", UpdateMode::Auto)];
         let requested = SmudgySpecifier::parse("smudgy://wbk/guild-lib")
@@ -2368,7 +2319,7 @@ mod tests {
             .package_key();
         assert_eq!(
             provider.canonical_key(&requested).to_user_specifier(),
-            "smudgy://wbk/guild-lib"
+            "smudgy:@guild-lib"
         );
         // An uninstalled package keeps the requested spelling.
         let elsewhere = SmudgySpecifier::parse("smudgy:@elsewhere")
@@ -2381,24 +2332,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_import_cannot_redirect_to_another_installed_owner() {
-        let provider = test_provider();
-        provider.lock.borrow_mut().packages = vec![LockedPackage::new(
-            "smudgy://survivor/tools",
-            UpdateMode::Auto,
-        )];
+    async fn legacy_import_reuses_the_published_package_and_its_actual_owner() {
+        let registry = spawn_registry(&[MockPackage {
+            owner: "survivor",
+            name: "tools",
+            version: "1.0.0",
+            manifest_extra: "",
+            deps: &[],
+            body: "export const value = 1;",
+        }]);
+        let provider = provider_for(&registry);
+        persist_installed_entry(
+            &provider,
+            LockedPackage::new(
+                "smudgy://survivor/tools",
+                UpdateMode::Pinned {
+                    version: "1.0.0".into(),
+                },
+            ),
+        );
         let removed = SmudgySpecifier::parse("smudgy://removed/tools")
             .unwrap()
             .package_key();
-        assert!(matches!(
-            provider.resolve_package(&removed, None).await,
-            Err(PackageError::NotFound(_))
-        ));
-        assert!(matches!(
-            provider.resolve_package_for_stub(&removed).await,
-            Err(PackageError::NotFound(_))
-        ));
-        assert!(provider.loaded_packages().is_empty());
+        let wire = provider.fetch_wire(&removed, Some("1.0.0")).await.unwrap();
+        assert_eq!(wire.owner_nickname.as_deref(), Some("survivor"));
+        let resolved = provider.resolve_package(&removed, None).await.unwrap();
+        assert_eq!(resolved.key.owner, "survivor");
+        assert_eq!(resolved.resolved_version, "1.0.0");
+        let stub = provider.resolve_package_for_stub(&removed).await.unwrap();
+        assert!(Rc::ptr_eq(&resolved, &stub));
+        assert_eq!(
+            provider.package_owner(&removed, "1.0.0").await,
+            Some(PackageOwner::user("survivor"))
+        );
+        assert_eq!(provider.loaded_packages().len(), 1);
         assert_eq!(
             provider.lock.borrow().packages[0].specifier,
             "smudgy://survivor/tools"
@@ -3831,7 +3798,7 @@ mod tests {
         let port = listener.local_addr().expect("local_addr").port();
         let base_url = format!("http://127.0.0.1:{port}");
 
-        let mut resolves: HashMap<(String, String, String), String> = HashMap::new();
+        let mut resolves: HashMap<(String, String), String> = HashMap::new();
         // One-body bundles, keyed by the body's hash: its zstd frame as the registry stores it.
         let mut bundles: HashMap<String, Vec<u8>> = HashMap::new();
         for package in packages {
@@ -3854,22 +3821,8 @@ mod tests {
             let wire = format!(
                 r#"{{"data":{{"package_id":"00000000-0000-0000-0000-000000000001","owner_nickname":"{owner}","name":"{name}","version":"{version}","manifest":{{"name":"{name}","version":"{version}"{extra}}},"modules":[{{"subpath":"index.ts","content_hash":"{hash}","media_type":"application/typescript","byte_size":{byte_size}}}],"bodies":[{{"content_hash":"{hash}","byte_size":{byte_size},"compressed_size":{compressed_size}}}],"bundle_url":"{base_url}/bundle/{hash}?sig=mock","dependencies":[{deps}]}}}}"#
             );
-            resolves.insert(
-                (
-                    owner.to_ascii_lowercase(),
-                    name.to_ascii_lowercase(),
-                    version.into(),
-                ),
-                wire.clone(),
-            );
-            resolves.insert(
-                (
-                    owner.to_ascii_lowercase(),
-                    name.to_ascii_lowercase(),
-                    "latest".into(),
-                ),
-                wire,
-            );
+            resolves.insert((name.to_ascii_lowercase(), version.into()), wire.clone());
+            resolves.insert((name.to_ascii_lowercase(), "latest".into()), wire);
         }
 
         let resolve_hits = Arc::new(AtomicUsize::new(0));
@@ -3898,21 +3851,16 @@ mod tests {
                 let (path, query) = target.split_once('?').unwrap_or((target, ""));
                 let payload = if path == "/packages/resolve" {
                     resolve_count.fetch_add(1, Ordering::SeqCst);
-                    let (mut owner, mut name, mut version) = ("", "", "latest");
+                    let (mut name, mut version) = ("", "latest");
                     for pair in query.split('&') {
                         match pair.split_once('=') {
-                            Some(("owner", value)) => owner = value,
                             Some(("name", value)) => name = value,
                             Some(("version", value)) => version = value,
                             _ => {}
                         }
                     }
                     resolves
-                        .get(&(
-                            owner.to_ascii_lowercase(),
-                            name.to_ascii_lowercase(),
-                            version.to_string(),
-                        ))
+                        .get(&(name.to_ascii_lowercase(), version.to_string()))
                         .map(|wire| ("application/json", wire.clone().into_bytes()))
                 } else if let Some(hash) = path.strip_prefix("/bundle/") {
                     body_count.fetch_add(1, Ordering::SeqCst);
@@ -4052,6 +4000,99 @@ mod tests {
         };
         cache.write_meta(key, version, &meta).expect("write meta");
         cache
+    }
+
+    fn pre_migration_cache(dir: &std::path::Path, body: &str) -> (PackageCache, LockedPackage) {
+        let cache = PackageCache::with_root(dir.to_path_buf());
+        let hash = sha256_hex(body);
+        cache.write_blob(&hash, body).unwrap();
+        let integrity = format!("index.ts={hash}");
+        let meta = CachedResolution {
+            version: "1.0.0".into(),
+            integrity: integrity.clone(),
+            manifest: PackageManifest::parse(r#"{"name":"tools","version":"1.0.0"}"#).unwrap(),
+            modules: vec![CachedModule {
+                subpath: "index.ts".into(),
+                content_hash: hash,
+                media_type: "application/typescript".into(),
+                byte_size: i64::try_from(body.len()).unwrap(),
+                is_entry: true,
+            }],
+            dependencies: vec![],
+            owner: Some(PackageOwner::user("removed")),
+        };
+        for owner in ["removed", "@"] {
+            let path = dir.join("meta").join(owner).join("tools/1.0.0.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        }
+        let mut entry = LockedPackage::new(
+            "smudgy://removed/tools",
+            UpdateMode::Pinned {
+                version: "1.0.0".into(),
+            },
+        );
+        entry.last_resolved_version = Some("1.0.0".into());
+        entry.integrity = Some(integrity);
+        (cache, entry)
+    }
+
+    #[tokio::test]
+    async fn migration_resolves_the_survivor_once_then_serves_it_offline() {
+        let body = "export const value = 'survivor';";
+        let registry = spawn_registry(&[MockPackage {
+            owner: "survivor",
+            name: "tools",
+            version: "1.0.0",
+            manifest_extra: "",
+            deps: &[],
+            body,
+        }]);
+        let mut provider = provider_for(&registry);
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, entry) = pre_migration_cache(dir.path(), "export const value = 'removed';");
+        // A shared blob can already exist without proving which package owns it.
+        cache.write_blob(&sha256_hex(body), body).unwrap();
+        provider.disk_cache = Some(cache.clone());
+        persist_installed_entry(&provider, entry);
+        let key = SmudgySpecifier::parse("smudgy://removed/tools")
+            .unwrap()
+            .package_key();
+        assert!(provider.build_from_cache(&key, "1.0.0").is_none());
+        assert!(provider.closure_union_from_cache(&key, "1.0.0").is_none());
+        let resolved = provider.resolve_package(&key, None).await.unwrap();
+        assert_eq!(resolved.modules[0].text, body);
+        assert_eq!(registry.resolve_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.body_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            provider.package_owner(&key, "1.0.0").await,
+            Some(PackageOwner::user("survivor"))
+        );
+
+        let mut offline = provider_for(&registry);
+        offline.client = PackageApiClient::new("http://127.0.0.1:0", CredentialSource::new(None));
+        offline.disk_cache = Some(cache);
+        *offline.lock.borrow_mut() = provider.lock.borrow().clone();
+        let resolved = offline.resolve_package(&key, None).await.unwrap();
+        assert_eq!(resolved.modules[0].text, body);
+        assert_eq!(registry.resolve_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_migration_metadata_cannot_authorize_an_offline_fallback() {
+        let registry = spawn_registry(&[]);
+        let mut provider = provider_for(&registry);
+        provider.client = PackageApiClient::new("http://127.0.0.1:0", CredentialSource::new(None));
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, entry) = pre_migration_cache(dir.path(), "export const value = 'removed';");
+        provider.disk_cache = Some(cache);
+        persist_installed_entry(&provider, entry);
+        let key = SmudgySpecifier::parse("smudgy://removed/tools")
+            .unwrap()
+            .package_key();
+        assert!(provider.resolve_package(&key, None).await.is_err());
+        assert!(provider.resolve_package_for_stub(&key).await.is_err());
+        assert!(provider.loaded_packages().is_empty());
     }
 
     /// An installed Auto lock entry whose staged (`last_resolved_version`) is `version`,

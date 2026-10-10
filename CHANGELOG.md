@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- User scripts and Smudgy package modules can import `@name` or `@name/subpath`
+  as shorthand for `smudgy:@name` or `smudgy:@name/subpath`. Static imports,
+  re-exports, and dynamic imports share the same package instance and checks.
+  Imports inside npm packages retain Node resolution. Manifest dependencies
+  continue to use explicit `smudgy:@name` addresses. Generated TypeScript paths
+  give installed Smudgy roots and subpaths precedence throughout external editor
+  projects, including npm declarations. Successful `npm:` imports automatically
+  supply editor paths from Smudgy's downloaded packages, including versioned
+  imports and `exports`-based types. No separate npm install or editor extension
+  is needed. Editor paths update in the background after the import loads.
 - **Smudgy now has an experimental browser client built on the same session and
   UI foundations as the native app.** The WebAssembly build supports multiple
   sessions, shared preferences and themes, session tabs, draggable pane grids,
@@ -86,6 +96,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Published packages resolve by their globally unique name regardless of legacy
+  owner spelling. Local packages with that name retain priority. This also fixes
+  false owner-conflict errors when installing a package required by a local package.
+  Upgrading requires one online metadata refresh per cached version before offline
+  use resumes; verified module bodies are reused, but old metadata cannot select a
+  package removed during name deduplication.
 - **Map changes reach other sessions in the same running app.** Sessions sharing
   local maps see saved changes together. Cloud changes reach other sessions
   using the same service and account. Changes made to

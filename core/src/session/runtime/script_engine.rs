@@ -1841,6 +1841,10 @@ impl<'a> ScriptEngine<'a> {
             WorkerMode::TrustedComputeOnly,
         )
         .expect("Failed to create JS runtime");
+        main_runtime.enable_npm_editor_types(
+            server_path.join(".smudgy/npm"),
+            crate::models::script_typings::npm_types_observer(server_path.clone()),
+        );
         // Surface the v8 inspector endpoint (main only) so it can be debugged via the bundled
         // `smudgy_inspector` helper (or any CDP client).
         if let Some(addr) = main_runtime.inspector_address() {
@@ -2285,6 +2289,10 @@ impl<'a> ScriptEngine<'a> {
                         continue;
                     }
                 };
+                runtime.enable_npm_editor_types(
+                    server_path.join(".smudgy/npm"),
+                    crate::models::script_typings::npm_types_observer(server_path.clone()),
+                );
                 let set = ModuleSet {
                     local_modules: Vec::new(),
                     packages: vec![runtime_key.to_user_specifier()],

@@ -3546,6 +3546,9 @@ fn discover_legacy_secret_slots(
             .ok()
             .and_then(|text| PackageManifest::parse(&text).ok())
             .or_else(|| {
+                // Pre-index secrets need the original manifest, even if a deduplicated
+                // package now has different parameters in the current metadata cache.
+                // Legacy metadata is used only for cleanup, never resolution or code loading.
                 let version = package.staged_version()?;
                 let meta = get_smudgy_home()
                     .ok()?

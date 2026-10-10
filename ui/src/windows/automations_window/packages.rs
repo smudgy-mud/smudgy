@@ -1021,19 +1021,13 @@ async fn resolve_required_closure_from_edges(
 
     // Constraints from packages that already exist are fixed for this planning run. A local folder
     // owns its leaf, so its dormant remote fallback contributes neither a manifest nor a second
-    // identity. This is also where impossible multiple-remote-author leaf state fails closed.
+    // identity. Multiple published lock rows for one name remain ambiguous local state.
     let local_leaves = local_manifests
         .keys()
         .map(|specifier| package_display_name(specifier).to_ascii_lowercase())
         .collect::<HashSet<_>>();
     let mut fixed_ranges: BTreeMap<RequiredKey, Vec<RequirerRange>> = BTreeMap::new();
-    let mut remote_owner_by_leaf: BTreeMap<String, String> = BTreeMap::new();
-    if !local_leaves.contains(&root_name.to_ascii_lowercase()) {
-        remote_owner_by_leaf.insert(
-            root_name.to_ascii_lowercase(),
-            root_owner.to_ascii_lowercase(),
-        );
-    }
+    let mut installed_remote_leaves = HashSet::new();
     let mut local_manifests_seen = HashSet::new();
     for package in installed {
         let Some((owner, name)) = parse_specifier(&package.specifier) else {
@@ -1045,16 +1039,12 @@ async fn resolve_required_closure_from_edges(
         if local_leaves.contains(&leaf) && !is_local_state {
             continue;
         }
-        if !is_local_state {
-            if let Some(existing) = remote_owner_by_leaf.insert(leaf.clone(), owner.clone())
-                && !existing.eq_ignore_ascii_case(&owner)
-            {
-                closure.unavailable = Some(crate::i18n::t!(
-                    "package-remote-leaf-conflict",
-                    "name" => &name
-                ));
-                return closure;
-            }
+        if !is_local_state && !installed_remote_leaves.insert(leaf) {
+            closure.unavailable = Some(crate::i18n::t!(
+                "package-remote-leaf-conflict",
+                "name" => &name
+            ));
+            return closure;
         }
         let manifest = if let Some(manifest) = local_manifests.get(&package.specifier) {
             local_manifests_seen.insert(package.specifier.clone());
@@ -1115,21 +1105,6 @@ async fn resolve_required_closure_from_edges(
         for (key, plan) in &planned {
             if reachable.contains(key) {
                 add_required_ranges(&mut ranges, &plan.root.name, plan.edges.clone());
-            }
-        }
-
-        for (owner, name) in ranges.keys() {
-            if owner.eq_ignore_ascii_case(local_packages::LOCAL_OWNER) {
-                continue;
-            }
-            if let Some(existing) = remote_owner_by_leaf.insert(name.clone(), owner.clone())
-                && !existing.eq_ignore_ascii_case(owner)
-            {
-                closure.unavailable = Some(crate::i18n::t!(
-                    "package-remote-leaf-conflict",
-                    "name" => name
-                ));
-                return closure;
             }
         }
 
@@ -9748,6 +9723,44 @@ mod tests {
     use iced::advanced::widget::tree::Tree;
 
     use super::*;
+
+    #[tokio::test]
+    async fn installing_a_root_required_by_a_local_package_ignores_address_owner() {
+        let client = PackageApiClient::new(
+            "http://127.0.0.1:0",
+            smudgy_cloud::CredentialSource::new(None),
+        );
+        let local_specifier = "smudgy://local/mapper";
+        let installed = [LockedPackage::new(local_specifier, UpdateMode::Auto)];
+        for requirement in ["smudgy:@prompt", "smudgy://former-owner/PROMPT"] {
+            let manifest = serde_json::from_value(serde_json::json!({
+                "version": "1.0.0", "requires": [requirement]
+            }))
+            .unwrap();
+            let local_manifests = HashMap::from([(local_specifier.to_string(), manifest)]);
+            let closure = resolve_required_closure_from_edges(
+                &client,
+                "publisher",
+                "prompt",
+                "2.1.0",
+                Vec::new(),
+                &installed,
+                &local_manifests,
+            )
+            .await;
+            assert!(
+                closure.unavailable.is_none(),
+                "{requirement}: {:?}",
+                closure.unavailable
+            );
+            assert!(closure.conflict.is_none());
+            assert!(closure.needs_smudgy.is_none());
+            assert!(
+                closure.roots.is_empty(),
+                "the root must not be installed twice"
+            );
+        }
+    }
 
     #[test]
     fn required_closure_keeps_nested_requirements_and_reports_partial_metadata() {
