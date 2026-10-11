@@ -77,17 +77,23 @@ pub use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WidgetsEnabled(pub bool);
 
+/// Whether this isolate may compile WGSL and construct shader-backed text effects.
+/// Bridged from `permissions.smudgy.widgets: ["shaders"]` for the same crate-DAG
+/// reason as [`WidgetsEnabled`]. An absent flag denies access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WidgetShadersEnabled(pub bool);
+
 /// The current isolate's identity, encoded as a flat string, parked here for the same
 /// crate-DAG reason as [`WidgetsEnabled`]: the leaf `smudgy_widgets` crate cannot name `core`'s
-/// `IsolateId`, but a widget callback (a v8 handle bound to the isolate that created it) must be
-/// routed back to that isolate to run. `core` seeds this into each isolate's `OpState` (from
+/// `IsolateId`, but a widget callback lease must be routed back to the isolate whose registry
+/// owns its V8 function. `core` seeds this into each isolate's `OpState` (from
 /// `IsolateId::to_widget_token`), the `smudgy_widgets` button op stamps it onto the callback
 /// message, and `core` decodes it (`IsolateId::from_widget_token`) to dispatch the call into the
 /// owning isolate instead of always `main`.
 ///
 /// Token shape: `<instance>\u{1f}<role>`. The leading `instance` field names the exact isolate
 /// *instantiation* and CHANGES whenever an engine rebuild recreates the role's isolate — it is
-/// what lets `core` refuse a callback whose v8 handle belongs to a disposed predecessor. A
+/// what lets `core` refuse a lease into a retired callback registry before touching V8. A
 /// consumer deriving a key that must stay stable across rebuilds (e.g. a UI-side text-editor
 /// buffer) strips the first `\u{1f}`-delimited field and keys on the role part.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -832,6 +832,10 @@ pub struct StyledLine {
     /// Clickable ranges, sorted and non-overlapping (usually empty — an empty
     /// vec does not allocate). Unlike `spans`, these need not cover the text.
     pub links: Vec<LinkSpan>,
+    /// Sparse, script-authored visual effects. Plain terminal output allocates nothing.
+    pub decorations: Option<Arc<Vec<crate::inline_content::InlineDecoration>>>,
+    pub objects: Option<Arc<Vec<crate::inline_content::InlineObject>>>,
+    pub fonts: Option<Arc<Vec<crate::inline_content::InlineFont>>>,
     /// The line's pre-VT wire form (escape sequences included, CR/LF excluded),
     /// captured only while some trigger carries a raw pattern — raw matching is
     /// this field's sole consumer, and the lossy copy is pure overhead for the
@@ -972,6 +976,9 @@ impl StyledLine {
     pub fn is_blank_fragment(&self) -> bool {
         self.text.is_empty()
             && self.links.is_empty()
+            && self.decorations.is_none()
+            && self.objects.is_none()
+            && self.fonts.is_none()
             && self.raw.as_ref().is_none_or(String::is_empty)
     }
 
@@ -981,6 +988,9 @@ impl StyledLine {
             text: String::from(text),
             spans: span_info,
             links: Vec::new(),
+            decorations: None,
+            objects: None,
+            fonts: None,
             raw: None,
         }
     }
@@ -992,6 +1002,9 @@ impl StyledLine {
             text,
             spans: span_info,
             links: Vec::new(),
+            decorations: None,
+            objects: None,
+            fonts: None,
             raw: None,
         }
     }
@@ -1002,6 +1015,9 @@ impl StyledLine {
             text: String::from(text),
             spans: span_info,
             links: Vec::new(),
+            decorations: None,
+            objects: None,
+            fonts: None,
             raw: raw.map(|raw| String::from_utf8_lossy(raw).into_owned()),
         }
     }
@@ -1018,6 +1034,9 @@ impl StyledLine {
             text: String::from(text),
             spans: span_info,
             links: Vec::new(),
+            decorations: None,
+            objects: None,
+            fonts: None,
             raw: raw.map(Cow::into_owned),
         }
     }
@@ -1069,6 +1088,9 @@ impl StyledLine {
             text: String::with_capacity(text_len),
             spans: Vec::with_capacity(span_len),
             links: Vec::with_capacity(link_len),
+            decorations: None,
+            objects: None,
+            fonts: None,
             raw: has_raw.then(|| String::with_capacity(raw_len)),
         };
 
@@ -1091,6 +1113,40 @@ impl StyledLine {
                     tooltip: link.tooltip.clone(),
                     style: link.style.clone(),
                 }));
+            if let Some(fonts) = &fragment.fonts {
+                let target =
+                    Arc::make_mut(combined.fonts.get_or_insert_with(|| Arc::new(Vec::new())));
+                target.extend(fonts.iter().map(|font| font.shifted(offset)));
+                target.truncate(4096);
+            }
+            if let Some(objects) = &fragment.objects {
+                let target =
+                    Arc::make_mut(combined.objects.get_or_insert_with(|| Arc::new(Vec::new())));
+                target.extend(objects.iter().cloned().map(|mut object| {
+                    object.range = object.range.start + offset..object.range.end + offset;
+                    object
+                }));
+                let excess = target
+                    .len()
+                    .saturating_sub(crate::inline_content::MAX_INLINE_OBJECTS);
+                target.drain(..excess);
+            }
+            if let Some(decorations) = &fragment.decorations {
+                let target = Arc::make_mut(
+                    combined
+                        .decorations
+                        .get_or_insert_with(|| Arc::new(Vec::new())),
+                );
+                target.extend(decorations.iter().cloned().map(|mut decoration| {
+                    decoration.range.start += offset;
+                    decoration.range.end += offset;
+                    decoration
+                }));
+                let excess = target
+                    .len()
+                    .saturating_sub(crate::inline_content::MAX_INLINE_DECORATIONS);
+                target.drain(..excess);
+            }
             if let (Some(raw), Some(fragment_raw)) = (&mut combined.raw, &fragment.raw) {
                 raw.push_str(fragment_raw);
             }
@@ -1211,6 +1267,14 @@ impl StyledLine {
             text: new_text,
             spans: new_spans,
             links: self.remap_links(begin, end, insert_len),
+            objects: crate::inline_content::remap_objects(&self.objects, begin, end, insert_len),
+            fonts: crate::inline_content::remap_fonts(&self.fonts, begin, end, insert_len),
+            decorations: crate::inline_content::remap_decorations(
+                &self.decorations,
+                begin,
+                end,
+                insert_len,
+            ),
             raw: self.raw.clone(),
         }
     }
@@ -1315,6 +1379,9 @@ impl StyledLine {
             spans: new_spans,
             // A recolor moves no bytes, so the link ranges are untouched.
             links: self.links.clone(),
+            decorations: self.decorations.clone(),
+            objects: self.objects.clone(),
+            fonts: self.fonts.clone(),
             raw: self.raw.clone(),
         }
     }
@@ -1409,6 +1476,9 @@ impl StyledLine {
             text: text[..begin].to_string() + &text[end..],
             spans: new_spans,
             links: self.remap_links(begin, end, 0),
+            objects: crate::inline_content::remap_objects(&self.objects, begin, end, 0),
+            fonts: crate::inline_content::remap_fonts(&self.fonts, begin, end, 0),
+            decorations: crate::inline_content::remap_decorations(&self.decorations, begin, end, 0),
             raw: self.raw.clone(),
         }
     }
@@ -1498,6 +1568,9 @@ impl StyledLine {
             text,
             spans,
             links,
+            decorations: None,
+            objects: None,
+            fonts: None,
             raw: None,
         }
     }
@@ -1520,6 +1593,9 @@ impl StyledLine {
             }],
             text: text.into_owned(),
             links: Vec::new(),
+            decorations: None,
+            objects: None,
+            fonts: None,
             raw: None,
         }
     }

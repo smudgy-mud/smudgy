@@ -1,0 +1,20 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -131,6 +131,16 @@
+         }
+     }
+ 
++    /// Device, target format and engine-owned storage for custom shader pipelines.
++    /// Storage is shared by renderers using this engine and drops with the engine.
++    pub fn shader_context(&self) -> (
++        &wgpu::Device,
++        wgpu::TextureFormat,
++        &std::sync::RwLock<primitive::Storage>,
++    ) {
++        (&self.engine.device, self.engine.format, &self.engine.primitive_storage)
++    }
++
+     fn draw(
+         &mut self,
+         clear_color: Option<Color>,

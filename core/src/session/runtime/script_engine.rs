@@ -3262,24 +3262,45 @@ impl<'a> ScriptEngine<'a> {
         )
     }
 
-    pub fn execute_javascript_function(
+    /// Resolve a thread-safe widget lease only in its creating isolate generation.
+    pub fn execute_widget_callback(
+        &mut self,
+        isolate_id: &IsolateId,
+        instance: u64,
+        callback: &smudgy_session_model::native_callback::CallbackLease,
+        args: &[String],
+    ) -> Result<ActionResult> {
+        let Ok(bundle) = self.isolate_mut(isolate_id) else {
+            return Ok(ActionResult::None);
+        };
+        if bundle.instance != instance {
+            return Ok(ActionResult::None);
+        }
+        let function = {
+            let deno = bundle.runtime.deno_runtime();
+            let _entered = EnteredIsolate::enter(deno);
+            deno.op_state().borrow()
+                .try_borrow::<smudgy_session_model::native_callback::CallbackRegistry<v8::Global<v8::Function>>>()
+                .and_then(|registry| registry.get(callback).cloned())
+        };
+        match function {
+            Some(function) => {
+                self.execute_javascript_function(isolate_id, instance, &function, args)
+            }
+            None => Ok(ActionResult::None),
+        }
+    }
+
+    fn execute_javascript_function(
         &mut self,
         isolate_id: &IsolateId,
         instance: u64,
         function: &v8::Global<v8::Function>,
         args: &[String],
     ) -> Result<ActionResult> {
-        // `smudgy_widgets` widget callbacks arrive as a raw v8 handle from the UI thread. The
-        // handle is isolate-bound, so we dispatch it into its OWN isolate (`isolate_id`, threaded
-        // from the button op via `WidgetIsolate`): a sandboxed package's `onPress` runs in its own
-        // isolate, not main, avoiding a cross-isolate handle use. An isolate that
-        // has since been dropped surfaces as an `isolate_mut` error, not a crash.
-        // The role can also resolve to a LIVE isolate that is not the one that minted the
-        // callback: a reload rebuilds every isolate under the same `IsolateId`, and a widget
-        // mounted before the reload (or a press already in flight across it) still carries the
-        // old instantiation's handle — whose host isolate is disposed, so even materializing a
-        // `Local` from it aborts the thread. The instance nonce names the exact instantiation;
-        // a mismatch is dropped here, before any v8 access.
+        // Only internal hotkeys and callbacks resolved on this script thread reach
+        // this helper. Keep the generation check here as well: materializing a
+        // Global from another isolate generation would abort inside V8.
         let live = self.isolate_mut(isolate_id)?.instance;
         if live != instance {
             warn!(

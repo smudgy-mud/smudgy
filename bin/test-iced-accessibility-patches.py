@@ -13,7 +13,7 @@ import tomllib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PATCH_ROOT = ROOT / "target" / "patch"
 CRATES = ("iced_runtime-0.14.0", "iced_winit-0.14.1", "iced-code-editor")
-SUPPORT_PATCHES = ("cosmic-text-0.15.0", "iced_graphics-0.14.0")
+SUPPORT_PATCHES = ("cosmic-text-0.15.0", "iced_graphics-0.14.0", "iced_wgpu-0.14.0")
 
 
 def run(*args: str, cwd: pathlib.Path) -> None:
@@ -118,6 +118,7 @@ iced_runtime = { path = "iced_runtime-0.14.0" }
 iced_winit = { path = "iced_winit-0.14.1" }
 cosmic-text = { path = "../cosmic-text-0.15.0" }
 iced_graphics = { path = "../iced_graphics-0.14.0" }
+iced_wgpu = { path = "../iced_wgpu-0.14.0" }
 """,
             encoding="utf-8",
         )

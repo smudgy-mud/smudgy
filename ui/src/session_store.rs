@@ -664,6 +664,7 @@ fn safe_link_confirmation_display(action: &LinkAction) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    InlineWidget(smudgy_widgets::WidgetMessage),
     None,
     Input(session_input::Message),
     /// A message for one pane-hosted input's `SessionInput`.
@@ -1946,6 +1947,7 @@ impl ManagedSession {
                             // Script-created terminal panes scroll as one full
                             // surface instead of retaining a live tail.
                             split_terminal_pane::ScrolledLayout::FullPane,
+                            Some(self.inline_widget_resolver()),
                         );
                         if pane.input.is_some() {
                             stack![
@@ -2553,6 +2555,10 @@ impl ManagedSession {
     /// Handle session-specific messages
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::InlineWidget(message) => {
+                let message = self.widget_message(message);
+                self.update(message)
+            }
             Message::SetMapperCurrentLocation(area_id, room_number) => {
                 self.current_location = room_number.map(|room_number| (area_id, room_number));
                 self.map_store.set_current_location(area_id, room_number);
@@ -3299,6 +3305,7 @@ impl ManagedSession {
             self.grid_change_handler(),
             self.main_font_size,
             split_terminal_pane::ScrolledLayout::SplitWithLiveTail,
+            Some(self.inline_widget_resolver()),
         ))
         .on_release(Message::TerminalClicked);
 
@@ -3487,14 +3494,29 @@ impl ManagedSession {
                 self.widget_root.view(filter, || Box::new(default))
             })
         })
-        .map(|widget_message| match widget_message {
+        .map(|message| self.widget_message(message))
+    }
+
+    fn inline_widget_resolver(&self) -> smudgy_ui_shared::inline_object::Resolver {
+        let maps = self.map_store.clone();
+        let text = self.text_store.clone();
+        smudgy_ui_shared::inline_object::resolver(move |object| {
+            with_store_context(&maps, || {
+                with_text_store_context(&text, || smudgy_widgets::inline_element(object))
+            })
+            .map(|element| element.map(Message::InlineWidget))
+        })
+    }
+
+    fn widget_message(&self, widget_message: smudgy_widgets::WidgetMessage) -> Message {
+        match widget_message {
             smudgy_widgets::WidgetMessage::InvokeCallback {
                 callback,
                 isolate,
                 args,
             } => {
                 let (isolate, instance) = IsolateId::from_widget_token(&isolate.0);
-                self.send_runtime_action(RuntimeAction::ExecuteJavascriptFunction {
+                self.send_runtime_action(RuntimeAction::ExecuteWidgetCallback {
                     isolate,
                     instance,
                     function: callback,
@@ -3503,6 +3525,15 @@ impl ManagedSession {
                 Message::None
             }
             smudgy_widgets::WidgetMessage::Noop => Message::None,
+            smudgy_widgets::WidgetMessage::TerminalLink(event) => self
+                .link_handler()
+                .map_or(Message::None, |handler| handler(event)),
+            smudgy_widgets::WidgetMessage::TerminalTooltip(request) => {
+                if let Some(handler) = self.link_tooltip_handler() {
+                    handler(request);
+                }
+                Message::None
+            }
             // Apply the edit to the editor's buffer (UI-thread store), and on a real text change
             // fire the script's `onChange` with the buffer's new full text via the creating isolate.
             smudgy_widgets::WidgetMessage::TextEditorAction {
@@ -3515,7 +3546,7 @@ impl ManagedSession {
                     && let Some(callback) = on_change
                 {
                     let (isolate, instance) = IsolateId::from_widget_token(&isolate.0);
-                    self.send_runtime_action(RuntimeAction::ExecuteJavascriptFunction {
+                    self.send_runtime_action(RuntimeAction::ExecuteWidgetCallback {
                         isolate,
                         instance,
                         function: callback,
@@ -3527,7 +3558,7 @@ impl ManagedSession {
             smudgy_widgets::WidgetMessage::MapMessage { id, message } => {
                 Message::WidgetMapMessage { id, message }
             }
-        })
+        }
     }
 
     fn map_cache_dir() -> PathBuf {

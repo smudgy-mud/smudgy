@@ -5,6 +5,8 @@ edition = "2024"
 
 [features]
 default = []
+# Host instrumentation; independent of release/bench profiles and iced-debug.
+profiling = []
 web-audio-cpal = []
 
 [dependencies]
@@ -13,10 +15,12 @@ bytemuck = { version = "1", features = ["derive"] }
 encoding_rs = "0.8"
 iced = { workspace = true }
 iced_runtime = { workspace = true }
+iced_wgpu = "=0.14.0"
 log = { workspace = true }
 regex = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 smallvec = { workspace = true }
 smudgy_protocol = { workspace = true }
 smudgy_theme = { workspace = true }
@@ -27,4 +31,7 @@ unicode-segmentation = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+naga = { version = "=27.0.3", features = ["wgsl-in"] }
+iced_tiny_skia = "=0.14.0"
+tiny-skia = { version = "0.11", features = ["png-format"] }
 serde_json = { workspace = true }

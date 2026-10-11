@@ -7,11 +7,13 @@ use serde::{Deserialize, Serialize};
 
 pub mod automation;
 pub mod connect;
+pub mod inline_content;
 pub mod input;
 pub mod input_policy;
 pub mod layout_template;
 pub mod line_operation;
 pub mod naming;
+pub mod native_callback;
 pub mod pane;
 pub mod pane_name;
 pub mod preferences;
@@ -67,3 +69,5 @@ pub enum Color {
     DefaultForeground { bold: bool },
     DefaultBackground,
 }
+
+pub mod text_shader;

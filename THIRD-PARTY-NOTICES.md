@@ -164,11 +164,11 @@ covers.
 
 **Summary**
 
-- MIT License: 998
+- MIT License: 1001
 - Apache License 2.0: 90
 - Mozilla Public License 2.0: 41
 - Unicode License v3: 28
-- BSD 3-Clause "New" or "Revised" License: 15
+- BSD 3-Clause "New" or "Revised" License: 16
 - ISC License: 11
 - Creative Commons Zero v1.0 Universal: 4
 - Community Data License Agreement Permissive 2.0: 4
@@ -3468,6 +3468,7 @@ Used by:
 - aws-lc-sys 0.41.0
 - brotli 8.0.1
 - curve25519-dalek 4.1.3
+- sha1_smol 1.0.1
 
 ~~~
 Copyright (c) <year> <owner>.
@@ -3997,7 +3998,7 @@ THE SOFTWARE IS PROVIDED "AS IS" AND ISC DISCLAIMS ALL WARRANTIES WITH REGARD TO
 
 Used by:
 
-- smudgy_core 0.5.8-ptb
+- smudgy_core 0.5.8-dev
 - rustybuzz 0.20.1
 
 ~~~
@@ -4084,6 +4085,40 @@ Used by:
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE
+
+~~~
+
+### MIT License
+
+Used by:
+
+- smudgy_web_client 0.5.8-dev
+
+~~~
+# Browser build third-party notices
+
+The browser package installer includes `esbuild-wasm` 0.28.2 under the MIT
+License:
+
+Copyright (c) 2020 Evan Wallace
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ~~~
 
@@ -6699,6 +6734,36 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- tungstenite 0.26.2
+
+~~~
+Copyright (c) 2017 Alexey Galakhov
+Copyright (c) 2016 Jason Housley
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
 - digest 0.10.7
 - hmac 0.12.1
 
@@ -6834,6 +6899,36 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+~~~
+
+### MIT License
+
+Used by:
+
+- tokio-tungstenite 0.26.2
+
+~~~
+Copyright (c) 2017 Daniel Abramov
+Copyright (c) 2017 Alexey Galakhov
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ~~~
 
@@ -14250,6 +14345,7 @@ Used by:
 - iced-code-editor 0.5.1
 - iced_graphics 0.14.0
 - iced_runtime 0.14.0
+- iced_wgpu 0.14.0
 - iced_winit 0.14.1
 - accesskit 0.24.1
 - accesskit_atspi_common 0.19.1
@@ -14352,7 +14448,6 @@ Used by:
 - iced_program 0.14.0
 - iced_renderer 0.14.0
 - iced_tiny_skia 0.14.0
-- iced_wgpu 0.14.0
 - iced_widget 0.14.2
 - import_map 0.25.0
 - include_dir 0.7.4

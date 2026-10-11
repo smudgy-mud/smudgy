@@ -1187,6 +1187,9 @@ pub struct SmudgyCapabilities {
     pub mapper_write: bool,
     /// `widgets: ["create"]` — create & change on-screen widgets (`iced_jsx`).
     pub widgets: bool,
+    /// `widgets: ["shaders"]` — compile WGSL modules and construct `TextEffect` widgets.
+    /// Independent of `widgets: ["create"]`, which gates on-screen widget attachment.
+    pub widget_shaders: bool,
     /// `interop: ["read"]` — consume the cross-package interop surface: read/watch session-store
     /// state and subscribe to events (client `sys:`/`map:` + other packages).
     pub interop_read: bool,
@@ -1239,6 +1242,7 @@ impl SmudgyCapabilities {
             mapper_read: true,
             mapper_write: true,
             widgets: true,
+            widget_shaders: true,
             interop_read: true,
             interop_write: true,
             interop_broadcast: true,
@@ -1273,6 +1277,7 @@ impl SmudgyCapabilities {
         self.mapper_read |= other.mapper_read;
         self.mapper_write |= other.mapper_write;
         self.widgets |= other.widgets;
+        self.widget_shaders |= other.widget_shaders;
         self.interop_read |= other.interop_read;
         self.interop_write |= other.interop_write;
         self.interop_broadcast |= other.interop_broadcast;
@@ -1304,6 +1309,7 @@ impl SmudgyCapabilities {
             && (!self.mapper_read || ceiling.mapper_read)
             && (!self.mapper_write || ceiling.mapper_write)
             && (!self.widgets || ceiling.widgets)
+            && (!self.widget_shaders || ceiling.widget_shaders)
             && (!self.interop_read || ceiling.interop_read)
             && (!self.interop_write || ceiling.interop_write)
             && (!self.interop_broadcast || ceiling.interop_broadcast)
@@ -1333,6 +1339,7 @@ impl SmudgyCapabilities {
             mapper_read: self.mapper_read && !baseline.mapper_read,
             mapper_write: self.mapper_write && !baseline.mapper_write,
             widgets: self.widgets && !baseline.widgets,
+            widget_shaders: self.widget_shaders && !baseline.widget_shaders,
             interop_read: self.interop_read && !baseline.interop_read,
             interop_write: self.interop_write && !baseline.interop_write,
             interop_broadcast: self.interop_broadcast && !baseline.interop_broadcast,
@@ -1400,6 +1407,7 @@ impl From<SmudgyCapabilitiesWire> for SmudgyCapabilities {
             mapper_read: has_token(&wire.mapper, "read") || mapper_write,
             mapper_write,
             widgets: has_token(&wire.widgets, "create"),
+            widget_shaders: has_token(&wire.widgets, "shaders"),
             interop_read: has_token(&wire.interop, "read"),
             interop_write: has_token(&wire.interop, "write"),
             interop_broadcast: has_token(&wire.interop, "broadcast"),
@@ -1451,6 +1459,9 @@ impl From<SmudgyCapabilities> for SmudgyCapabilitiesWire {
         let mut widgets = Vec::new();
         if caps.widgets {
             widgets.push("create".to_string());
+        }
+        if caps.widget_shaders {
+            widgets.push("shaders".to_string());
         }
         let mut interop = Vec::new();
         if caps.interop_read {
@@ -2406,7 +2417,10 @@ pub(crate) fn load_widgets_module(
              export const Stack = __w.Stack;\n\
              export const Container = __w.Container;\n\
              export const Text = __w.Text;\n\
+             export const Span = __w.Span;\n\
+             export const TextEffect = __w.TextEffect;\n\
              export const ProgressBar = __w.ProgressBar;\n\
+             export const Slider = __w.Slider;\n\
              export const Scrollable = __w.Scrollable;\n\
              export const Markdown = __w.Markdown;\n\
              export const Modal = __w.Modal;\n\
@@ -2976,7 +2990,7 @@ impl std::error::Error for PackageError {}
 // Helpers
 // ---------------------------------------------------------------------------
 
-const MODULE_EXTENSIONS: [&str; 5] = [".ts", ".js", ".tsx", ".jsx", ".json"];
+const MODULE_EXTENSIONS: [&str; 6] = [".ts", ".js", ".tsx", ".jsx", ".json", ".wgsl"];
 const INDEX_STEMS: [&str; 2] = ["index", "mod"];
 
 fn validate_subpath(sub: &str) -> Result<(), SmudgySpecifierError> {
@@ -5353,6 +5367,40 @@ mod tests {
         assert!(!caps.is_within(&none));
         assert!(caps.added_since(&none).workers);
         assert!(caps.is_within(&SmudgyCapabilities::all()));
+    }
+
+    #[test]
+    fn shader_capability_is_explicit_independent_and_part_of_update_consent() {
+        let create = perms_with_smudgy(r#"{ "widgets": ["create"] }"#).smudgy;
+        assert!(
+            !create.widget_shaders,
+            "old widget grants do not authorize GPU shaders"
+        );
+        let shader = perms_with_smudgy(r#"{ "widgets": [" SHADERS "] }"#).smudgy;
+        assert!(shader.widget_shaders && !shader.widgets);
+        let back: SmudgyCapabilities =
+            serde_json::from_str(&serde_json::to_string(&shader).unwrap()).unwrap();
+        assert_eq!(shader, back);
+        assert!(!shader.is_within(&create));
+        assert!(shader.added_since(&create).widget_shaders);
+        let mut union = create;
+        union.merge(&shader);
+        assert!(union.widgets && union.widget_shaders);
+        assert!(shader.is_within(&union));
+        assert!(union.is_within(&SmudgyCapabilities::all()));
+        assert!(union.added_since(&union).is_empty());
+        let mut baseline = PackagePermissions {
+            smudgy: create,
+            ..Default::default()
+        };
+        let ask = PackagePermissions {
+            smudgy: shader,
+            ..Default::default()
+        };
+        assert!(!ask.is_within(&baseline));
+        assert!(ask.added_since(&baseline).smudgy.widget_shaders);
+        baseline.merge(&ask);
+        assert!(ask.is_within(&baseline));
     }
 
     #[test]

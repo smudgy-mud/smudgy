@@ -35,6 +35,12 @@ pub enum LinkUpdate {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum LineOperation {
+    /// One atomic text splice with optional native visual decorations.
+    SpliceRich {
+        content: Arc<crate::inline_content::InlineContent>,
+        begin: usize,
+        end: usize,
+    },
     /// Insert `str` over `[begin, end)`. The style channels the write left
     /// unset inherit the style at the insertion point, like a splice.
     Insert {
@@ -101,13 +107,70 @@ impl LineOperation {
             Self::Insert { begin, .. }
             | Self::Replace { begin, .. }
             | Self::Remove { begin, .. }
-            | Self::Splice { begin, .. } => *begin >= boundary,
+            | Self::Splice { begin, .. }
+            | Self::SpliceRich { begin, .. } => *begin >= boundary,
         }
     }
 
     #[must_use]
     pub fn apply(&self, line: &Arc<StyledLine>) -> Arc<StyledLine> {
         match self {
+            Self::SpliceRich {
+                content,
+                begin,
+                end,
+            } => {
+                let begin = crate::styled_line::floor_char_boundary(&line.text, *begin);
+                let mut result = Self::Splice {
+                    runs: content.runs.clone(),
+                    begin,
+                    end: *end,
+                }
+                .apply(line);
+                if !content.decorations.is_empty() {
+                    let result = Arc::make_mut(&mut result);
+                    let decorations = Arc::make_mut(
+                        result
+                            .decorations
+                            .get_or_insert_with(|| Arc::new(Vec::new())),
+                    );
+                    decorations.extend(
+                        content
+                            .decorations
+                            .iter()
+                            .map(|effect| effect.instantiate(begin)),
+                    );
+                    let excess = decorations
+                        .len()
+                        .saturating_sub(crate::inline_content::MAX_INLINE_DECORATIONS);
+                    decorations.drain(..excess);
+                }
+                if !content.fonts.is_empty() {
+                    let result = Arc::make_mut(&mut result);
+                    let fonts =
+                        Arc::make_mut(result.fonts.get_or_insert_with(|| Arc::new(Vec::new())));
+                    fonts.extend(content.fonts.iter().map(|font| font.shifted(begin)));
+                    fonts.sort_by_key(|font| font.range.start);
+                    fonts.truncate(4096);
+                }
+                if !content.objects.is_empty() {
+                    let result = Arc::make_mut(&mut result);
+                    let objects =
+                        Arc::make_mut(result.objects.get_or_insert_with(|| Arc::new(Vec::new())));
+                    objects.extend(
+                        content
+                            .objects
+                            .iter()
+                            .map(|object| object.instantiate(begin)),
+                    );
+                    objects.sort_by_key(|object| object.range.start);
+                    let excess = objects
+                        .len()
+                        .saturating_sub(crate::inline_content::MAX_INLINE_OBJECTS);
+                    objects.drain(..excess);
+                }
+                result
+            }
             LineOperation::Insert {
                 str,
                 begin,

@@ -40,7 +40,7 @@ use anyhow::{Error as AnyError, bail};
 use deno_core::OpState;
 use deno_core::op2;
 use deno_core::v8;
-use smudgy_cloud::{AreaId, WidgetIsolate, WidgetsEnabled};
+use smudgy_cloud::{AreaId, WidgetIsolate, WidgetShadersEnabled, WidgetsEnabled};
 
 use super::script_uuid::ScriptUuid;
 use smudgy_script::SmudgyCapabilities;
@@ -54,6 +54,9 @@ deno_core::extension!(
     op_smudgy_get_sessions,
     op_smudgy_session_echo,
     op_smudgy_session_echo_styled,
+    op_smudgy_prepare_span,
+    op_smudgy_echo_inline,
+    op_smudgy_splice_inline,
     op_smudgy_session_reload,
     op_smudgy_session_connect,
     op_smudgy_session_disconnect,
@@ -318,6 +321,7 @@ deno_core::extension!(
     workers_enabled: bool,
   },
   state = |state, options| {
+    state.put(smudgy_session_model::inline_content::InlineContentExchange::default());
     state.put::<SessionId>(options.session_id);
     state.put::<ServerName>(ServerName(options.server_name));
     state.put::<ProfileName>(ProfileName(options.profile_name));
@@ -365,6 +369,7 @@ deno_core::extension!(
     // Bridge the `widgets` grant to the `smudgy_widgets` ops, which live in a leaf crate that cannot
     // name `SmudgyGrants` (`smudgy_cloud` is the crate both share — see its `WidgetsEnabled`).
     state.put::<WidgetsEnabled>(WidgetsEnabled(options.smudgy_grants.widgets));
+    state.put::<WidgetShadersEnabled>(WidgetShadersEnabled(options.smudgy_grants.widget_shaders));
     state.put::<WorkersEnabled>(WorkersEnabled(options.workers_enabled));
     state.put::<EventRegistry>(options.event_registry);
     state.put::<crate::session::runtime::SharedSessionStore>(options.session_store);
@@ -556,6 +561,7 @@ pub struct SmudgyGrants {
     pub mapper_read: bool,
     pub mapper_write: bool,
     pub widgets: bool,
+    pub widget_shaders: bool,
     /// `interop: ["read"]` — read/watch session-store state + subscribe to any event
     /// (`sys:`/`map:`/package).
     pub interop_read: bool,
@@ -605,6 +611,7 @@ impl SmudgyGrants {
             mapper_read: true,
             mapper_write: true,
             widgets: true,
+            widget_shaders: true,
             interop_read: true,
             interop_write: true,
             interop_broadcast: true,
@@ -633,6 +640,7 @@ impl SmudgyGrants {
             mapper_read: caps.mapper_read,
             mapper_write: caps.mapper_write,
             widgets: caps.widgets,
+            widget_shaders: caps.widget_shaders,
             interop_read: caps.interop_read,
             interop_write: caps.interop_write,
             interop_broadcast: caps.interop_broadcast,
@@ -4485,9 +4493,123 @@ fn splice_runs(
     ))
 }
 
-/// Splice styled (possibly linked) runs into the CURRENT line — the write path for
-/// `line.insert`/`replaceAt`/`replace` given styled text; the styled sibling of
-/// [`op_smudgy_insert`], behind the same `change-display` gate.
+/// Resolve authored text and links for a detached native Span. Mounting or writing
+/// it to the transcript is gated separately at the corresponding entry point.
+#[op2]
+fn op_smudgy_prepare_span(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    #[serde] runs: Vec<StyledRunWire>,
+    callbacks: v8::Local<v8::Array>,
+) -> Result<u32, StyledTextOpError> {
+    use smudgy_session_model::inline_content::{
+        InlineContent, InlineContentExchange, MAX_INLINE_TEXT_BYTES,
+    };
+    if runs.len() > 4096
+        || runs.iter().map(|run| run.text.len()).sum::<usize>() > MAX_INLINE_TEXT_BYTES
+    {
+        return Err(StyledTextOpError::Invalid(
+            "Span content exceeds its size limit".into(),
+        ));
+    }
+    let runs = splice_runs(scope, state, runs, callbacks)?;
+    state
+        .borrow_mut::<InlineContentExchange>()
+        .put(Arc::new(InlineContent {
+            fonts: Arc::default(),
+            runs,
+            decorations: Arc::new(Vec::new()),
+            objects: Arc::new(Vec::new()),
+        }))
+        .map_err(|error| StyledTextOpError::Invalid(error.into()))
+}
+
+fn take_inline_content(
+    state: &mut OpState,
+    token: u32,
+) -> Result<Arc<smudgy_session_model::inline_content::InlineContent>, StyledTextOpError> {
+    state
+        .borrow_mut::<smudgy_session_model::inline_content::InlineContentExchange>()
+        .take(token)
+        .map_err(|error| StyledTextOpError::Invalid(error.into()))
+}
+
+#[op2]
+fn op_smudgy_echo_inline(
+    state: &mut OpState,
+    session_id: u32,
+    token: u32,
+    #[string] pane: Option<String>,
+) -> Result<(), StyledTextOpError> {
+    let content = take_inline_content(state, token)?;
+    let target = SessionId::from(session_id);
+    let grant = if pane.is_some() {
+        grants(state).panes
+    } else {
+        grants(state).echo
+    };
+    ensure_session_target(
+        state,
+        target,
+        grant,
+        if pane.is_some() { "panes" } else { "echo" },
+    )?;
+    if !content.decorations.is_empty() || !content.objects.is_empty() {
+        ensure(state.borrow::<smudgy_cloud::WidgetsEnabled>().0, "widgets")?;
+    }
+    let lines = vec![Arc::new(content.line(ECHO_DEFAULT_STYLE))];
+    let action = if let Some(name) = pane {
+        let namespace = pane_namespace(state);
+        let key = resolve_own_terminal_pane(state, target, &namespace, &name)?;
+        RuntimeAction::PaneEchoStyled {
+            key,
+            namespace,
+            name: Arc::from(name),
+            lines,
+        }
+    } else {
+        RuntimeAction::EchoStyled(lines)
+    };
+    route_session_action(state, target, action);
+    Ok(())
+}
+
+#[op2]
+fn op_smudgy_splice_inline(
+    state: &mut OpState,
+    token: u32,
+    line_number: Option<u32>,
+    begin: u32,
+    end: u32,
+) -> Result<(), StyledTextOpError> {
+    let content = take_inline_content(state, token)?;
+    ensure(grants(state).change_display, "change-display")?;
+    if !content.decorations.is_empty() || !content.objects.is_empty() {
+        ensure(state.borrow::<smudgy_cloud::WidgetsEnabled>().0, "widgets")?;
+    }
+    let operation = LineOperation::SpliceRich {
+        content,
+        begin: begin as usize,
+        end: end as usize,
+    };
+    if let Some(line_number) = line_number {
+        queue_own_action(
+            state,
+            RuntimeAction::PerformLineOperation {
+                line_number: line_number as usize,
+                operation: Box::new(operation),
+            },
+        );
+    } else {
+        ensure_current_line(state)?;
+        state
+            .borrow::<Rc<RefCell<Vec<LineOperation>>>>()
+            .borrow_mut()
+            .push(operation);
+    }
+    Ok(())
+}
+
 #[op2]
 fn op_smudgy_splice(
     scope: &mut v8::PinScope,

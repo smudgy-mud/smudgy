@@ -8,6 +8,8 @@ arc-swap = { workspace = true }
 deno_core = { workspace = true }
 deno_error = { workspace = true }
 tokio = { workspace = true }
+smudgy_session_model = { workspace = true }
+smudgy_ui_shared = { workspace = true }
 smudgy_theme = { workspace = true }
 smudgy_map_widget = { workspace = true }
 smudgy_cloud = { workspace = true }

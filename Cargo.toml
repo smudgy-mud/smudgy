@@ -180,6 +180,9 @@ unic-langid = "0.9.6"
 #   OpenType feature control that upstream iced lacks — the terminal opts its
 #   font family out of ligatures (liga/clig/calt/dlig), which break monospace
 #   column alignment, while UI text keeps them.
+# - `iced_wgpu` (patches/iced_wgpu+0.14.0.patch): exposes the device, target
+#   format and existing engine-owned primitive storage so custom shaders can
+#   prewarm off the UI thread and release their caches with the engine.
 # - `cosmic-text` (patches/cosmic-text+0.15.0.patch): variable faces are
 #   accepted at every requested weight covered by their `wght` axis (backport
 #   of upstream pop-os/cosmic-text#486). Also, upstream's `monospace_fallback`
@@ -216,6 +219,7 @@ unic-langid = "0.9.6"
 crates = [
     "iced-code-editor",
     "iced_graphics",
+    "iced_wgpu",
     "iced_runtime",
     "iced_winit",
     "cosmic-text",
@@ -227,6 +231,7 @@ crates = [
 ]
 
 [patch.crates-io]
+iced_wgpu = { path = "./target/patch/iced_wgpu-0.14.0" }
 iced_graphics = { path = "./target/patch/iced_graphics-0.14.0" }
 iced_runtime = { path = "./target/patch/iced_runtime-0.14.0" }
 iced_winit = { path = "./target/patch/iced_winit-0.14.1" }

@@ -1805,6 +1805,9 @@ fn smudgy_cannot_lines(caps: &SmudgyCapabilities) -> Vec<String> {
     if !caps.widgets {
         out.push(crate::i18n::t!("permission-cannot-widgets"));
     }
+    if !caps.widget_shaders {
+        out.push(crate::i18n::t!("permission-cannot-widget-shaders"));
+    }
     if !caps.panes {
         out.push(crate::i18n::t!("permission-cannot-panes"));
     }

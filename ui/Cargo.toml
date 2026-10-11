@@ -134,8 +134,11 @@ web-audio-cpal = [
 # beacon a running `comet` viewer connects to). Dev-only instrumentation -- keep it out
 # of release builds. Usage: cargo run --features iced-debug
 iced-debug = ["iced/debug"]
+profiling = ["smudgy_ui_shared/profiling"]
 
 [dev-dependencies]
+iced_tiny_skia = "0.14.0"
+tiny-skia = { version = "0.11", features = ["png-format"] }
 async-trait = "0.1"
 smudgy_audio = { workspace = true, features = ["test-support"] }
 # Isolated on-disk fixtures for the workspace load/set-aside tests (same

@@ -84,6 +84,29 @@ Please avoid introducing new compiler or Clippy warnings. Existing unrelated
 warnings do not need to be fixed as part of your change. Documentation-only
 changes do not need to run the full Rust test suite.
 
+## Renderer profiling
+
+The default-off `profiling` Cargo feature enables host capture counters and
+`smudgy_ui_shared::profiling::snapshot()`, grouped by renderer subsystem. It is
+independent of `iced-debug`, benchmark tooling, and Cargo's debug/release profiles.
+Admission limits and cache budgets are enforced in every build.
+
+Build the desktop with `cargo run -p smudgy_ui --release --features profiling --locked`.
+To record native redraw cadence, also set `SMUDGY_FRAME_PROBE` to a CSV output path
+before launch. Without that variable, no recorder subscription or file is created;
+without the feature, the counters and recorder are not compiled. Unit tests enable
+capture counters for assertions.
+
+The CSV combines window redraw events and process-wide capture statistics. Use
+one window for cadence measurements. These are host observations, not GPU timers
+or display scan-out measurements. Label performance results as **baseline**
+(without the feature) or **instrumented** (with it); do not compare them as if they
+were the same build. GPU regression tests run serialized:
+
+```sh
+cargo test -p smudgy_ui_shared --lib --locked -- --ignored --test-threads=1
+```
+
 ## Translations
 
 English (`en-US`) is the source catalog. The Traditional Chinese (`zh-TW`),

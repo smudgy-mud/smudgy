@@ -1,6 +1,7 @@
 use std::{cell::RefCell, ffi::CStr, sync::Arc};
 
 use crate::image_store::{EntryState, ImageEntryCell, ImageStore};
+use crate::shader_budget::ShaderBudget;
 use crate::{WidgetMessage, WidgetRoot};
 use deno_core::{GarbageCollected, OpState, ascii_str, op2, v8};
 use iced::alignment::{Horizontal, Vertical};
@@ -9,8 +10,13 @@ use smudgy_cloud::image_source::{
     ImageSourcePolicy, RegisteredImageCreator, ResolvedImageSource, SrcMemoKey, memo_key,
     register_creator, resolve_src,
 };
-use smudgy_cloud::{Mapper, Node, StoreBindings, WidgetIsolate, WidgetsEnabled};
+use smudgy_cloud::{
+    Mapper, Node, StoreBindings, WidgetIsolate, WidgetShadersEnabled, WidgetsEnabled,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+type WidgetCallbacks =
+    smudgy_session_model::native_callback::CallbackRegistry<v8::Global<v8::Function>>;
 
 /// Thrown when an isolate without the `widgets` smudgy capability mounts/removes a widget
 /// (see `smudgy/script/PACKAGE-ISOLATES-OP-CAPABILITIES.md`). Same `NotCapable`-style message + generic
@@ -36,17 +42,47 @@ fn ensure_widgets(state: &OpState) -> Result<(), WidgetsNotCapable> {
 
 #[derive(Clone)]
 struct Element {
-    view_fn:
-        Arc<dyn Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>>,
+    terminal_text: Arc<str>,
+    paint_outset: u16,
+    inline: Option<Arc<smudgy_session_model::inline_content::InlineContent>>,
+    view_fn: Arc<
+        dyn Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>
+            + Send
+            + Sync,
+    >,
 }
 
 impl Element {
     fn new(
         f: impl Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>
+        + Send
+        + Sync
         + 'static,
     ) -> Self {
         Self {
+            terminal_text: Arc::from("[widget]"),
+            paint_outset: 0,
             view_fn: Arc::new(f),
+            inline: None,
+        }
+    }
+
+    fn from_inline(content: Arc<smudgy_session_model::inline_content::InlineContent>) -> Self {
+        let view_content = content.clone();
+        Self {
+            terminal_text: Arc::from(""),
+            paint_outset: 0,
+            inline: Some(content),
+            view_fn: Arc::new(move || {
+                smudgy_ui_shared::terminal_span::TerminalSpan::new(
+                    view_content.clone(),
+                    WidgetMessage::TerminalLink,
+                    WidgetMessage::TerminalTooltip,
+                )
+                .started_at(crate::canvas::inline_start())
+                .inline_widgets(Some(nested_inline_resolver()))
+                .into()
+            }),
         }
     }
 
@@ -103,7 +139,14 @@ deno_core::extension!(
     op_smudgy_widget_build_row,
     op_smudgy_widget_build_stack,
     op_smudgy_widget_build_text,
+    op_smudgy_widget_build_span,
+    op_smudgy_widget_join_spans,
+    op_smudgy_widget_compile_text_shader,
+    op_smudgy_widget_build_text_effect,
+    op_smudgy_widget_export_inline,
+    op_smudgy_widget_terminal_metadata,
     op_smudgy_widget_build_progress_bar,
+    op_smudgy_widget_build_slider,
     op_smudgy_widget_build_button,
     op_smudgy_widget_build_scrollable,
     op_smudgy_widget_build_markdown,
@@ -131,6 +174,9 @@ deno_core::extension!(
     image_store: Option<ImageStore>
   },
   state = |state, options| {
+    state.put::<WidgetCallbacks>(WidgetCallbacks::default());
+    state.put::<InlineLifetime>(InlineLifetime::default());
+    state.put::<ShaderBudget>(ShaderBudget::default());
     state.put::<SmudgyWidgetRoot>(options.widget_root);
     state.put::<Option<Mapper>>(options.mapper);
     state.put::<Option<ImageStore>>(options.image_store);
@@ -173,14 +219,18 @@ macro_rules! get_number_prop {
 }
 
 macro_rules! get_v8_function_prop {
-    ($scope:ident, $obj:ident, $name:expr) => {{
+    ($scope:ident, $state:ident, $obj:ident, $name:expr) => {{
         let prop = ascii_str!($name)
             .v8_string($scope)
             .expect("Could not allocate string")
             .into();
         $obj.get($scope, prop).and_then(|v| {
             v8::Local::<v8::Function>::try_from(v)
-                .map(|v| v8::Global::new($scope, v))
+                .map(|v| {
+                    $state
+                        .borrow_mut::<WidgetCallbacks>()
+                        .register(v8::Global::new($scope, v))
+                })
                 .ok()
         })
     }};
@@ -433,7 +483,7 @@ enum SerdeProp<T> {
         prop: BoundProp,
         name: &'static str,
         parse: fn(&Node) -> Result<T, serde_json::Error>,
-        cache: RefCell<Option<(Arc<Node>, Option<T>)>>,
+        cache: std::sync::Mutex<Option<(Arc<Node>, Option<T>)>>,
     },
 }
 
@@ -448,13 +498,13 @@ impl<T: Clone> SerdeProp<T> {
                 cache,
             } => {
                 let loaded = prop.cell.load();
-                if let Some((snapshot, parsed)) = cache.borrow().as_ref()
+                if let Some((snapshot, parsed)) = cache.lock().unwrap().as_ref()
                     && Arc::ptr_eq(snapshot, &loaded)
                 {
                     return parsed.clone();
                 }
                 let parsed = Self::parse_snapshot(&loaded, prop, name, *parse);
-                *cache.borrow_mut() = Some((loaded, parsed.clone()));
+                *cache.lock().unwrap() = Some((loaded, parsed.clone()));
                 parsed
             }
         }
@@ -518,7 +568,7 @@ where
             prop,
             name,
             parse,
-            cache: RefCell::new(None),
+            cache: std::sync::Mutex::new(None),
         });
     }
     match deno_core::serde_v8::from_v8::<P>(scope, value) {
@@ -790,7 +840,7 @@ fn op_smudgy_widget_build_column(
     let spacing = get_dyn_f32_prop!(scope, state, props, "spacing");
     let padding = get_dyn_f32_prop!(scope, state, props, "padding");
 
-    let mut attr_fns: Vec<Box<dyn Fn(Column) -> Column>> = Vec::new();
+    let mut attr_fns: Vec<Box<dyn Fn(Column) -> Column + Send + Sync>> = Vec::new();
 
     if let Some(width) = width {
         attr_fns.push(Box::new(move |column: Column| match width.get() {
@@ -842,7 +892,7 @@ fn op_smudgy_widget_build_container(
     let align_y = get_vertical_prop!(scope, props, "align_y");
     let background = get_dyn_color_prop!(scope, state, props, "background");
 
-    let mut attr_fns: Vec<Box<dyn Fn(Container) -> Container>> = Vec::new();
+    let mut attr_fns: Vec<Box<dyn Fn(Container) -> Container + Send + Sync>> = Vec::new();
 
     if let Some(width) = width {
         attr_fns.push(Box::new(move |container: Container| match width.get() {
@@ -897,7 +947,7 @@ fn op_smudgy_widget_build_progress_bar(
     state: &mut OpState,
     props: v8::Local<v8::Object>,
 ) -> Element {
-    let mut attr_fns: Vec<Box<dyn Fn(ProgressBar) -> ProgressBar>> = Vec::new();
+    let mut attr_fns: Vec<Box<dyn Fn(ProgressBar) -> ProgressBar + Send + Sync>> = Vec::new();
 
     // Range and colors resolve per render: bound props (`value={vitals.bind('hp')}` is the
     // flagship binding case) re-read their cells each frame with no rebuild.
@@ -971,6 +1021,80 @@ fn op_smudgy_widget_build_progress_bar(
 
 #[op2]
 #[cppgc]
+fn op_smudgy_widget_build_slider(
+    scope: &mut v8::PinScope,
+    state: &mut OpState,
+    props: v8::Local<v8::Object>,
+    #[string] isolate_token: &str,
+) -> Element {
+    let min = get_dyn_f32_prop!(scope, state, props, "min");
+    let max = get_dyn_f32_prop!(scope, state, props, "max");
+    let value = get_dyn_f32_prop!(scope, state, props, "value");
+    let step = get_dyn_f32_prop!(scope, state, props, "step");
+    let width = get_dyn_length_prop!(scope, state, props, "width");
+    let height = get_dyn_f32_prop!(scope, state, props, "height");
+    let on_change = get_v8_function_prop!(scope, state, props, "onChange");
+    let on_release = get_v8_function_prop!(scope, state, props, "onRelease");
+    let isolate = WidgetIsolate(isolate_token.to_string());
+
+    Element::new(move || {
+        let min = min
+            .as_ref()
+            .and_then(DynProp::get)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let max = max
+            .as_ref()
+            .and_then(DynProp::get)
+            .filter(|v| v.is_finite())
+            .unwrap_or(100.0)
+            .max(min);
+        let value = value
+            .as_ref()
+            .and_then(DynProp::get)
+            .filter(|v| v.is_finite())
+            .unwrap_or(min)
+            .clamp(min, max);
+        let step = step
+            .as_ref()
+            .and_then(DynProp::get)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0);
+        let callback = on_change.clone();
+        let callback_isolate = isolate.clone();
+        let mut slider = iced::widget::slider(min..=max, value, move |value: f32| {
+            callback.as_ref().map_or(WidgetMessage::Noop, |callback| {
+                WidgetMessage::InvokeCallback {
+                    callback: callback.clone(),
+                    isolate: callback_isolate.clone(),
+                    args: vec![value.to_string()],
+                }
+            })
+        })
+        .step(step);
+        if let Some(callback) = &on_release {
+            slider = slider.on_release(WidgetMessage::InvokeCallback {
+                callback: callback.clone(),
+                isolate: isolate.clone(),
+                args: vec![],
+            });
+        }
+        if let Some(width) = width.as_ref().and_then(DynProp::get) {
+            slider = slider.width(width);
+        }
+        if let Some(height) = height
+            .as_ref()
+            .and_then(DynProp::get)
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            slider = slider.height(height);
+        }
+        slider.into()
+    })
+}
+
+#[op2]
+#[cppgc]
 fn op_smudgy_widget_build_row(
     scope: &mut v8::PinScope,
     state: &mut OpState,
@@ -984,7 +1108,7 @@ fn op_smudgy_widget_build_row(
     let spacing = get_dyn_f32_prop!(scope, state, props, "spacing");
     let padding = get_dyn_f32_prop!(scope, state, props, "padding");
 
-    let mut attr_fns: Vec<Box<dyn Fn(Row) -> Row>> = Vec::new();
+    let mut attr_fns: Vec<Box<dyn Fn(Row) -> Row + Send + Sync>> = Vec::new();
 
     if let Some(width) = width {
         attr_fns.push(Box::new(move |row: Row| match width.get() {
@@ -1032,7 +1156,7 @@ fn op_smudgy_widget_build_stack(
     let width = get_dyn_length_prop!(scope, state, props, "width");
     let height = get_dyn_length_prop!(scope, state, props, "height");
 
-    let mut attr_fns: Vec<Box<dyn Fn(Stack) -> Stack>> = Vec::new();
+    let mut attr_fns: Vec<Box<dyn Fn(Stack) -> Stack + Send + Sync>> = Vec::new();
 
     if let Some(width) = width {
         attr_fns.push(Box::new(move |stack: Stack| match width.get() {
@@ -1171,7 +1295,7 @@ fn op_smudgy_widget_build_button(
 ) -> Element {
     let child = child.clone();
 
-    let mut attr_fns: Vec<Box<dyn Fn(Button) -> Button>> = Vec::new();
+    let mut attr_fns: Vec<Box<dyn Fn(Button) -> Button + Send + Sync>> = Vec::new();
 
     let width = get_dyn_length_prop!(scope, state, props, "width");
     if let Some(width) = width {
@@ -1189,9 +1313,9 @@ fn op_smudgy_widget_build_button(
         }));
     }
 
-    let on_press = get_v8_function_prop!(scope, props, "onPress");
+    let on_press = get_v8_function_prop!(scope, state, props, "onPress");
     if let Some(on_press) = on_press {
-        let on_press_arc = Arc::new(on_press);
+        let on_press_arc = on_press;
         let isolate = WidgetIsolate(isolate_token.to_string());
 
         attr_fns.push(Box::new(move |button: Button| {
@@ -1241,7 +1365,7 @@ fn op_smudgy_widget_build_scrollable(
     let direction = get_string_prop!(scope, props, "direction");
     let anchor_end = get_string_prop!(scope, props, "anchor").is_some_and(|a| a == "end");
 
-    let mut attr_fns: Vec<Box<dyn Fn(Scrollable) -> Scrollable>> = Vec::new();
+    let mut attr_fns: Vec<Box<dyn Fn(Scrollable) -> Scrollable + Send + Sync>> = Vec::new();
 
     if let Some(width) = width {
         attr_fns.push(Box::new(move |scrollable: Scrollable| match width.get() {
@@ -1829,12 +1953,15 @@ fn op_smudgy_widget_build_markdown(
     #[string] content: &str,
     #[string] isolate_token: &str,
 ) -> Element {
-    let items = intern_markdown_items(content);
+    let content = content.to_owned();
     let size = get_dyn_f32_prop!(scope, state, props, "size");
-    let on_link = get_v8_function_prop!(scope, props, "onLink").map(Arc::new);
+    let on_link = get_v8_function_prop!(scope, state, props, "onLink");
     let isolate = WidgetIsolate(isolate_token.to_string());
 
     Element::new(move || {
+        // Parsed Markdown has UI-local interior caches. Do not transfer it from
+        // the script thread; intern it on the thread that builds the view.
+        let items = intern_markdown_items(&content);
         // Colors are read every render (not snapshotted at build), so switching the terminal scheme
         // reflows mounted Markdown without a rebuild. `current()` is a lock-free `ArcSwap` load; the
         // UI resolves these from the active terminal palette (`smudgy_theme::markdown`).
@@ -1862,6 +1989,7 @@ fn op_smudgy_widget_build_markdown(
 #[cppgc]
 fn op_smudgy_widget_build_text_editor(
     scope: &mut v8::PinScope,
+    state: &mut OpState,
     props: v8::Local<v8::Object>,
     #[string] isolate_token: &str,
 ) -> Element {
@@ -1883,7 +2011,7 @@ fn op_smudgy_widget_build_text_editor(
         ),
     };
     let initial_text = get_opt_string_prop!(scope, props, "value").unwrap_or_default();
-    let on_change = get_v8_function_prop!(scope, props, "onChange").map(Arc::new);
+    let on_change = get_v8_function_prop!(scope, state, props, "onChange");
     let isolate = WidgetIsolate(isolate_token.to_string());
 
     let config = crate::text_editor::EditorConfig {
@@ -1905,13 +2033,13 @@ fn op_smudgy_widget_build_text_editor(
     // UI-thread store isn't reachable, so we reseed on the FIRST frame of this build instead: a
     // fresh mount (e.g. a script reload that re-uses the same `id`) resets the buffer to `value`,
     // while later frames of the same mount preserve in-progress edits.
-    let seeded = std::cell::Cell::new(false);
+    let seeded = std::sync::atomic::AtomicBool::new(false);
 
     Element::new(move || {
         let key = key.clone();
         let isolate = isolate.clone();
         let on_change = on_change.clone();
-        let first_frame = !seeded.replace(true);
+        let first_frame = !seeded.swap(true, Ordering::Relaxed);
         crate::text_editor::with_active_text_store(|store| {
             let handle = if first_frame {
                 store.seed_editor(&key, &initial_text)
@@ -1948,7 +2076,7 @@ fn op_smudgy_widget_build_modal(
     // `onDismiss`. With no `onDismiss` the backdrop still blocks input but never dismisses, so an
     // in-progress edit can't be lost to a stray click.
     let background = get_dyn_color_prop!(scope, state, props, "background");
-    let on_dismiss = get_v8_function_prop!(scope, props, "onDismiss").map(Arc::new);
+    let on_dismiss = get_v8_function_prop!(scope, state, props, "onDismiss");
     let isolate = WidgetIsolate(isolate_token.to_string());
 
     Element::new(move || {
@@ -2458,8 +2586,8 @@ fn op_smudgy_widget_build_canvas(
     };
 
     let on_pointer =
-        get_v8_function_prop!(scope, props, "onPointer").map(|callback| PointerHandler {
-            callback: Arc::new(callback),
+        get_v8_function_prop!(scope, state, props, "onPointer").map(|callback| PointerHandler {
+            callback,
             isolate: WidgetIsolate(isolate_token.to_string()),
         });
 
@@ -2470,7 +2598,17 @@ fn op_smudgy_widget_build_canvas(
         _ => crate::canvas::ViewFit::Fill,
     };
 
+    // Pixel outsets are bounded and nonnegative before narrowing to storage.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let overflow = if get_opt_string_prop!(scope, props, "overflow").as_deref() == Some("pane") {
+        u16::MAX
+    } else {
+        get_number_prop!(scope, props, "overflow")
+            .unwrap_or(0.0)
+            .clamp(0.0, 2048.0) as u16
+    };
     let program = SceneProgram {
+        started: None,
         scene,
         view_box,
         fit,
@@ -2487,6 +2625,16 @@ fn op_smudgy_widget_build_canvas(
             .as_ref()
             .and_then(DynProp::get)
             .unwrap_or(iced::Length::Fill);
+        let mut program = program.clone();
+        program.started = crate::canvas::inline_start();
+        if overflow > 0 {
+            return iced::Element::new(crate::canvas::OverflowCanvas {
+                program,
+                width,
+                height,
+                overflow,
+            });
+        }
         // Clipped like the map canvas: scene geometry may exceed the bounds (the burst-alert
         // ring deliberately does), and tiny-skia's damage-tracked partial redraws would leave
         // the spill on screen without the clipping container.
@@ -2825,7 +2973,7 @@ fn op_smudgy_widget_build_image(
                     creator: creator.clone(),
                     store: store.clone(),
                     table,
-                    memo: RefCell::new(None),
+                    memo: std::sync::Mutex::new(None),
                 }),
                 _ => None,
             }
@@ -2946,13 +3094,13 @@ struct BoundImageCtx {
     creator: Arc<RegisteredImageCreator>,
     store: ImageStore,
     table: Arc<BoundSrcTable>,
-    memo: RefCell<Option<(String, Option<Arc<ImageEntryCell>>)>>,
+    memo: std::sync::Mutex<Option<(String, Option<Arc<ImageEntryCell>>)>>,
 }
 
 impl BoundImageCtx {
     fn resolve(&self, raw: &str) -> Option<Arc<ImageEntryCell>> {
         {
-            let memo = self.memo.borrow();
+            let memo = self.memo.lock().unwrap();
             if let Some((last, cell)) = memo.as_ref()
                 && last == raw
             {
@@ -2966,7 +3114,7 @@ impl BoundImageCtx {
             }
         }
         let cell = self.table.resolve(raw, &self.creator, &self.store);
-        *self.memo.borrow_mut() = Some((raw.to_string(), cell.clone()));
+        *self.memo.lock().unwrap() = Some((raw.to_string(), cell.clone()));
         cell
     }
 }
@@ -3010,7 +3158,7 @@ fn op_smudgy_widget_build_checkbox(
     // No `onToggle` leaves iced's `on_toggle` unset, which renders the disabled style — the
     // right read for a display-only checkmark (unlike Radio, whose factory requires a
     // handler, because iced has no disabled radio rendering).
-    let on_toggle = get_v8_function_prop!(scope, props, "onToggle").map(Arc::new);
+    let on_toggle = get_v8_function_prop!(scope, state, props, "onToggle");
     let isolate = WidgetIsolate(isolate_token.to_string());
 
     Element::new(move || {
@@ -3099,7 +3247,7 @@ fn op_smudgy_widget_build_radio(
     // The factory requires `onSelect` (a handler-less radio would render enabled and swallow
     // clicks); the op stays defensive with a Noop for direct op callers. The click message
     // depends only on build-time values, so it is built once here and cloned per frame.
-    let on_select = get_v8_function_prop!(scope, props, "onSelect").map(Arc::new);
+    let on_select = get_v8_function_prop!(scope, state, props, "onSelect");
     let isolate = WidgetIsolate(isolate_token.to_string());
     let message = match on_select {
         Some(callback) => WidgetMessage::InvokeCallback {
@@ -3234,6 +3382,40 @@ fn op_smudgy_widget_build_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_inline_resolver_reenters_the_contexts_it_was_viewed_under() {
+        use smudgy_session_model::inline_content::{InlineObject, InlineOwner};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let maps = crate::map::MapStore::new();
+        let text = crate::text_editor::TextEditorStore::new();
+        let resolver = crate::map::with_store_context(&maps, || {
+            crate::text_editor::with_text_store_context(&text, nested_inline_resolver)
+        });
+        let seen = Arc::new(AtomicU8::new(0));
+        let probe = seen.clone();
+        let factory: NativeFactory = Arc::new(move || {
+            let maps = crate::map::with_active_store(|_| ()).is_some();
+            let text = crate::text_editor::with_active_text_store(|_| ()).is_some();
+            probe.store(u8::from(maps) | (u8::from(text) << 1), Ordering::Relaxed);
+            iced::widget::text("probe").into()
+        });
+        let resource = Arc::new(NativeInlineWidget(std::sync::Mutex::new(Some(factory))));
+        let object = InlineObject::new(0..5, resource, InlineOwner::default());
+        // The enclosing pane lays its spans out after leaving both contexts.
+        assert!(crate::map::with_active_store(|_| ()).is_none());
+        assert!(crate::text_editor::with_active_text_store(|_| ()).is_none());
+        assert!(
+            resolver
+                .resolve::<WidgetMessage, smudgy_theme::Theme, iced::Renderer>(&object)
+                .is_some()
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 0b11);
+        // Viewed under no context, it adds none.
+        let bare = nested_inline_resolver();
+        bare.resolve::<WidgetMessage, smudgy_theme::Theme, iced::Renderer>(&object);
+        assert_eq!(seen.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn command_autolinks_become_links() {
@@ -3589,7 +3771,7 @@ mod tests {
             prop: bound(json!([{ "style": "route", "rooms": [1] }])),
             name: "apply",
             parse: style_applications_from_node,
-            cache: RefCell::new(None),
+            cache: std::sync::Mutex::new(None),
         };
 
         let first = prop.get().expect("initial snapshot parses");
@@ -3602,7 +3784,7 @@ mod tests {
             prop: inner, cache, ..
         } = &prop
         {
-            let cached = cache.borrow();
+            let cached = cache.lock().unwrap();
             let (snapshot, _) = cached.as_ref().expect("cache is populated");
             assert!(
                 Arc::ptr_eq(snapshot, &inner.cell.load()),
@@ -3779,4 +3961,446 @@ mod tests {
         assert!(!is_command_autolink("a href=\"x\"")); // real HTML attributes
         assert!(!is_command_autolink("3 blind mice")); // not letter-led
     }
+}
+
+#[derive(Default)]
+struct InlineLifetime(
+    smudgy_session_model::inline_content::InlineOwner,
+    Vec<std::sync::Weak<NativeInlineWidget>>,
+);
+impl Drop for InlineLifetime {
+    fn drop(&mut self) {
+        self.0.retire();
+        for resource in &self.1 {
+            if let Some(resource) = resource.upgrade() {
+                resource.0.lock().unwrap().take();
+            }
+        }
+    }
+}
+
+#[derive(Debug, deno_core::thiserror::Error, deno_error::JsError)]
+#[class(type)]
+#[error("widgets: {0}")]
+struct InlineError(String);
+impl From<String> for InlineError {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for InlineError {
+    fn from(message: &str) -> Self {
+        Self(message.into())
+    }
+}
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_build_span(state: &mut OpState, token: u32) -> Result<Element, InlineError> {
+    let content = state
+        .borrow_mut::<smudgy_session_model::inline_content::InlineContentExchange>()
+        .take(token)?;
+    Ok(Element::from_inline(content))
+}
+
+#[op2]
+#[cppgc]
+#[allow(clippy::needless_pass_by_value)] // The serde op boundary owns its input.
+fn op_smudgy_widget_join_spans(
+    state: &mut OpState,
+    #[cppgc] children: &ElementList,
+    token: u32,
+    #[serde] font: smudgy_session_model::inline_content::InlineFontOptions,
+) -> Result<Element, InlineError> {
+    use smudgy_session_model::inline_content::{
+        InlineContent, InlineFontOptions, MAX_INLINE_DECORATIONS, MAX_INLINE_TEXT_BYTES,
+    };
+    if font
+        .font_size
+        .is_some_and(|size| !(1..=512).contains(&size))
+        || font
+            .font_weight
+            .is_some_and(|weight| !(100..=900).contains(&weight) || weight % 100 != 0)
+    {
+        return Err(
+            "Span fontSize must be 1..512 pixels; fontWeight must be 100..900 in steps of 100"
+                .into(),
+        );
+    }
+    if let Some(face) = &font.font_face {
+        smudgy_ui_shared::inline_fonts::validate(face).map_err(InlineError::from)?;
+    }
+    let style = state
+        .borrow_mut::<smudgy_session_model::inline_content::InlineContentExchange>()
+        .take(token)?;
+    let base = style.runs.first().ok_or("missing Span base style")?;
+    let mut runs = Vec::new();
+    let mut effects = Vec::new();
+    let mut objects = Vec::new();
+    let mut fonts = Vec::new();
+    let mut offset = 0;
+    for child in children.0.borrow().iter() {
+        let content = inline_content(state, child)?;
+        if offset + content.text_len() > MAX_INLINE_TEXT_BYTES
+            || objects.len() + content.objects.len()
+                > smudgy_session_model::inline_content::MAX_INLINE_OBJECTS
+            || runs.len() + content.runs.len() > 4096
+            || effects.len() + content.decorations.len() > MAX_INLINE_DECORATIONS
+            || fonts.len() + content.fonts.len() * 2 + 1 > 4096
+        {
+            return Err("inline content exceeds its size limit".into());
+        }
+        runs.extend(content.runs.iter().cloned().map(|mut run| {
+            run.fg = run.fg.or(base.fg);
+            run.bg = run.bg.or(base.bg);
+            run.attributes = smudgy_session_model::TextAttributesUpdate {
+                bold: run.attributes.bold.or(base.attributes.bold),
+                faint: run.attributes.faint.or(base.attributes.faint),
+                italic: run.attributes.italic.or(base.attributes.italic),
+                underline: run.attributes.underline.or(base.attributes.underline),
+                blink: run.attributes.blink.or(base.attributes.blink),
+                crossed_out: run.attributes.crossed_out.or(base.attributes.crossed_out),
+                reverse: run.attributes.reverse.or(base.attributes.reverse),
+            };
+            run
+        }));
+        effects.extend(content.decorations.iter().map(|effect| {
+            let mut effect = effect.clone();
+            effect.range = effect.range.start + offset..effect.range.end + offset;
+            effect
+        }));
+        objects.extend(content.objects.iter().cloned().map(|mut object| {
+            object.range = object.range.start + offset..object.range.end + offset;
+            object
+        }));
+        // Child overrides win; parent choices fill gaps and unset fields.
+        let mut cursor = 0;
+        for child_font in content.fonts.iter() {
+            if cursor < child_font.range.start && font != InlineFontOptions::default() {
+                fonts.push(smudgy_session_model::inline_content::InlineFont {
+                    range: offset + cursor..offset + child_font.range.start,
+                    options: font.clone(),
+                });
+            }
+            fonts.push(smudgy_session_model::inline_content::InlineFont {
+                range: offset + child_font.range.start..offset + child_font.range.end,
+                options: child_font.options.inherit(&font),
+            });
+            cursor = child_font.range.end;
+        }
+        if cursor < content.text_len() && font != InlineFontOptions::default() {
+            fonts.push(smudgy_session_model::inline_content::InlineFont {
+                range: offset + cursor..offset + content.text_len(),
+                options: font.clone(),
+            });
+        }
+        offset += content.text_len();
+    }
+    Ok(Element::from_inline(Arc::new(InlineContent {
+        runs: Arc::new(runs),
+        decorations: Arc::new(effects),
+        objects: Arc::new(objects),
+        fonts: Arc::new(fonts),
+    })))
+}
+
+struct TextShaderHandle(Arc<smudgy_session_model::text_shader::Shader>);
+// The handle contains only native, immutable Arc data and no V8 references.
+unsafe impl GarbageCollected for TextShaderHandle {
+    fn get_name(&self) -> &'static CStr {
+        c"SmudgyTextShader"
+    }
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+}
+fn ensure_widget_shaders(state: &OpState) -> Result<(), InlineError> {
+    if state
+        .try_borrow::<WidgetShadersEnabled>()
+        .is_some_and(|grant| grant.0)
+    {
+        Ok(())
+    } else {
+        Err("this package did not request the 'widgets:shaders' capability".into())
+    }
+}
+
+#[cfg(test)]
+mod shader_permission_tests {
+    use super::*;
+
+    #[test]
+    fn compilation_denies_absent_or_false_permission_before_parsing_or_allocation() {
+        let mut state = OpState::new(None);
+        for flag in [None, Some(false)] {
+            if let Some(flag) = flag {
+                state.put(WidgetShadersEnabled(flag));
+            }
+            // There is deliberately no shader budget in this state, and invalid WGSL.
+            // A denied call must reach neither the budget nor source validation.
+            let error = compile_text_shader(&mut state, "denied.wgsl", "invalid")
+                .err()
+                .expect("a shader grant is required");
+            assert!(error.to_string().contains("widgets:shaders"));
+        }
+    }
+
+    #[test]
+    fn a_previously_compiled_handle_does_not_bypass_text_effect_permission() {
+        let mut state = OpState::new(None);
+        state.put(WidgetShadersEnabled(true));
+        state.put(ShaderBudget::default());
+        let shader = compile_text_shader(
+            &mut state,
+            "allowed.wgsl",
+            "fn effect(p: vec2f) -> vec4f { return sampleText(p); }",
+        )
+        .unwrap();
+        state.put(WidgetShadersEnabled(false));
+        let child = Element::new(|| iced::widget::text("detached").into());
+        let spec = TextEffectSpec {
+            overflow: "bounds".into(),
+            scale: 1.0,
+            capture_scale: 1.0,
+            fade_in: 0,
+            fade_out: 0,
+            uniforms: serde_json::Map::new(),
+            duration: 1000,
+            outset: 0,
+            composite: "underlay".into(),
+            finish: "remove".into(),
+            animated: true,
+        };
+        let error = build_text_effect(&mut state, &child, &shader, &spec)
+            .err()
+            .expect("even an existing handle needs permission to build an effect");
+        assert!(error.to_string().contains("widgets:shaders"));
+    }
+}
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_compile_text_shader(
+    state: &mut OpState,
+    #[string] label: &str,
+    #[string] source: &str,
+) -> Result<TextShaderHandle, InlineError> {
+    compile_text_shader(state, label, source)
+}
+
+fn compile_text_shader(
+    state: &mut OpState,
+    label: &str,
+    source: &str,
+) -> Result<TextShaderHandle, InlineError> {
+    // Gate before validation, reflection, native allocation or GPU prewarming. WGSL
+    // imports and the raw compilation hook converge here, including module-cache misses.
+    ensure_widget_shaders(state)?;
+    let cache = state.borrow_mut::<ShaderBudget>();
+    let shader = cache.compile(label, source).map_err(InlineError::from)?;
+    smudgy_ui_shared::text_effect::prewarm(&shader).map_err(InlineError::from)?;
+    Ok(TextShaderHandle(shader))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextEffectSpec {
+    overflow: String,
+    scale: f32,
+    capture_scale: f32,
+    fade_in: u32,
+    fade_out: u32,
+    uniforms: serde_json::Map<String, serde_json::Value>,
+    duration: u32,
+    outset: u16,
+    composite: String,
+    finish: String,
+    animated: bool,
+}
+#[op2]
+#[cppgc]
+#[allow(clippy::needless_pass_by_value)] // The serde op boundary owns its input.
+fn op_smudgy_widget_build_text_effect(
+    state: &mut OpState,
+    #[cppgc] child: &Element,
+    #[cppgc] shader: &TextShaderHandle,
+    #[serde] spec: TextEffectSpec,
+) -> Result<Element, InlineError> {
+    build_text_effect(state, child, shader, &spec)
+}
+
+fn build_text_effect(
+    state: &mut OpState,
+    child: &Element,
+    shader: &TextShaderHandle,
+    spec: &TextEffectSpec,
+) -> Result<Element, InlineError> {
+    use smudgy_session_model::{
+        inline_content::{InlineDecoration, TextEffect},
+        text_shader::ShaderEffect,
+    };
+    ensure_widget_shaders(state)?;
+    let content = child
+        .inline
+        .as_ref()
+        .ok_or_else(|| InlineError::from("TextEffect requires text or one Span"))?;
+    if !content.objects.is_empty() || !content.decorations.is_empty() {
+        return Err(
+            "TextEffect's Span may contain styled text, but not widgets or nested effects".into(),
+        );
+    }
+    if spec.fade_in > 3_600_000
+        || spec.fade_out > 3_600_000
+        || spec.duration > 3_600_000
+        || spec.outset > 2048
+        || !["bounds", "pane"].contains(&spec.overflow.as_str())
+        || !["underlay", "replace"].contains(&spec.composite.as_str())
+        || !["hold", "remove"].contains(&spec.finish.as_str())
+    {
+        return Err("invalid TextEffect duration, fades, outset, composite or finish".into());
+    }
+    let uniforms = shader
+        .0
+        .uniforms(&spec.uniforms)
+        .map_err(InlineError::from)?;
+    let effect = InlineDecoration::new(
+        0..content.text_len(),
+        TextEffect {
+            shader: Arc::new(ShaderEffect {
+                pane: spec.overflow == "pane",
+                scale: smudgy_session_model::text_shader::EffectScale::new(spec.scale)?,
+                capture_scale: smudgy_session_model::text_shader::CaptureScale::new(
+                    spec.capture_scale,
+                )?,
+                fade_in_ms: spec.fade_in,
+                fade_out_ms: spec.fade_out,
+                shader: shader.0.clone(),
+                uniforms,
+                replace: spec.composite == "replace",
+                hold: spec.finish == "hold",
+                animated: spec.animated,
+            }),
+
+            duration_ms: spec.duration,
+            outset: spec.outset,
+        },
+        state.borrow::<InlineLifetime>().0.clone(),
+    );
+    let mut content = (**content).clone();
+    Arc::make_mut(&mut content.decorations).push(effect);
+    Ok(Element::from_inline(Arc::new(content)))
+}
+
+#[op2(fast)]
+fn op_smudgy_widget_export_inline(
+    state: &mut OpState,
+    #[cppgc] element: &Element,
+) -> Result<u32, InlineError> {
+    let content = inline_content(state, element)?;
+    state
+        .borrow_mut::<smudgy_session_model::inline_content::InlineContentExchange>()
+        .put(content)
+        .map_err(Into::into)
+}
+
+/// Factory ownership follows the existing `WidgetRoot` thread handoff: construction
+/// and retirement happen on the isolate thread; invocation happens on the UI thread.
+/// The mutex also prevents a retired isolate's closures from being invoked again.
+type NativeFactory = Arc<
+    dyn Fn() -> iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>
+        + Send
+        + Sync,
+>;
+struct NativeInlineWidget(std::sync::Mutex<Option<NativeFactory>>);
+
+/// A nested span builds its widgets during the enclosing pane's layout, after
+/// the enclosing resolver's store contexts have been left. This view closure
+/// runs inside those contexts, so capture them now and re-enter them for every
+/// nested factory call; a `TextEditor` or `MapView` inside a `Span` then finds its
+/// store on its first frame instead of consuming its seed as a placeholder.
+fn nested_inline_resolver() -> smudgy_ui_shared::inline_object::Resolver {
+    let maps = crate::map::with_active_store(Clone::clone);
+    let text = crate::text_editor::with_active_text_store(Clone::clone);
+    smudgy_ui_shared::inline_object::resolver(move |object| {
+        let build = || inline_element(object);
+        let build = || match &text {
+            Some(store) => crate::text_editor::with_text_store_context(store, build),
+            None => build(),
+        };
+        match &maps {
+            Some(store) => crate::map::with_store_context(store, build),
+            None => build(),
+        }
+    })
+}
+
+#[must_use]
+pub fn inline_element(
+    object: &smudgy_session_model::inline_content::InlineObject,
+) -> Option<iced::Element<'static, WidgetMessage, smudgy_theme::Theme, iced::Renderer>> {
+    if !object.owner.active() {
+        return None;
+    }
+    let resource = object.resource.downcast_ref::<NativeInlineWidget>()?;
+    let guard = resource.0.lock().ok()?;
+    guard
+        .as_ref()
+        .map(|factory| crate::canvas::with_inline_start(object.started, || factory()))
+}
+
+fn inline_content(
+    state: &mut OpState,
+    element: &Element,
+) -> Result<Arc<smudgy_session_model::inline_content::InlineContent>, InlineError> {
+    use smudgy_session_model::inline_content::{InlineContent, InlineObject};
+    if let Some(content) = &element.inline {
+        return Ok(content.clone());
+    }
+    let lifetime = state.borrow_mut::<InlineLifetime>();
+    lifetime.1.retain(|resource| resource.strong_count() != 0);
+    if lifetime.1.len() >= 1024 {
+        return Err("at most 1024 live terminal widget resources are allowed; clear old output before adding more".into());
+    }
+    let resource = Arc::new(NativeInlineWidget(std::sync::Mutex::new(Some(
+        element.view_fn.clone(),
+    ))));
+    lifetime.1.push(Arc::downgrade(&resource));
+    let text = if element.terminal_text.is_empty() {
+        "[widget]"
+    } else {
+        &element.terminal_text
+    };
+    let mut object = InlineObject::new(0..text.len(), resource, lifetime.0.clone());
+    object.paint_outset = element.paint_outset;
+    Ok(Arc::new(InlineContent {
+        runs: Arc::new(vec![smudgy_session_model::line_operation::SpliceRun {
+            text: text.into(),
+            fg: None,
+            bg: None,
+            attributes: smudgy_session_model::TextAttributesUpdate::default(),
+            link: None,
+        }]),
+        decorations: Arc::new(Vec::new()),
+        objects: Arc::new(vec![object]),
+        fonts: Arc::default(),
+    }))
+}
+
+#[op2]
+#[cppgc]
+fn op_smudgy_widget_terminal_metadata(
+    #[cppgc] element: &Element,
+    #[string] text: String,
+    outset: u32,
+) -> Result<Element, InlineError> {
+    if text.len() > 4096
+        || text.contains(['\r', '\n'])
+        || (outset > 2048 && outset != u32::from(u16::MAX))
+    {
+        return Err(
+            "terminalText must be a single line of at most 4096 bytes; overflow is 0..2048 pixels or pane"
+                .into(),
+        );
+    }
+    let mut element = element.clone();
+    element.terminal_text = text.into();
+    element.paint_outset = u16::try_from(outset).unwrap();
+    Ok(element)
 }
